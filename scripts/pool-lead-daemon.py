@@ -40,6 +40,7 @@ LEAD_LABEL = "pool-lead"
 # script) so the policy module stays free of any concrete skill path.
 _NOTIFY_SCRIPT = _HERE.parent / "skills" / "task-progress" / "scripts" / "notify.py"
 _KICK_SCRIPT = _HERE / "kick-pool.sh"
+_DRIVE_LIB = _HERE / "pool-runtime-drive.sh"
 # launchd PENDS non-demand spawns (both KeepAlive and StartInterval), so the
 # plist never revives a dead follower — the lead drives recovery instead.
 RECOVERY_EVERY_S = 60
@@ -64,6 +65,21 @@ def _send_notice(source: str, channel: str, message: str) -> bool:
         return r.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def _runtime_of(instance: str) -> "str | None":
+    """That core's runtime, from its own plist. Shells out to the drive lib so
+    plist parsing has one owner; None on any failure keeps the default."""
+    plist = (Path.home() / "Library" / "LaunchAgents"
+             / f"com.sutando.{instance}.plist")
+    try:
+        r = subprocess.run(
+            ["bash", "-c",
+             f'. "{_DRIVE_LIB}" && pool_runtime_from_plist "{plist}"'],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() or None if r.returncode == 0 else None
 
 
 def _workspace() -> Path:
@@ -101,7 +117,7 @@ def main() -> int:
         return 0 <= age < LEAD_STALE_S
 
     lead = PoolLead(tasks, state, followers, alive,
-                    metrics=PoolMetrics(state))
+                    metrics=PoolMetrics(state), runtime_fn=_runtime_of)
     status = PoolStatusWriter(tasks, state, followers, alive)
     notifier = PoolNotifier(tasks, state, _send_notice)
     ledger = ScaleLedger(state)

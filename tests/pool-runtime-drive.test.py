@@ -405,7 +405,11 @@ class KickPoolWiringTest(DriveHarness):
                 cur.append(line)
         return r, calls
 
-    def test_each_session_is_driven_with_its_own_runtimes_entry(self):
+    def test_only_a_runtime_without_self_wakeup_is_driven(self):
+        """claude arms a Monitor watcher and a session cron in-session, so the
+        pane nudge is redundant; codex has neither and is the one that needs
+        it. Both panes are IDLE here — the state that WOULD be typed into — so
+        claude's silence is the gate, not the classifier."""
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
             r, calls = self.run_kick(td, {
@@ -414,15 +418,46 @@ class KickPoolWiringTest(DriveHarness):
             })
             sends = self.sends(calls)
             self.assertEqual(
-                [c for c in sends if c[2] == "core-1"],
-                [["send-keys", "-t", "core-1", "/proactive-loop-pool pass", "Enter"]],
-                r.stdout + r.stderr)
+                [c for c in sends if c[2] == "core-1"], [],
+                "claude wakes itself; no keys belong in its live session\n"
+                + r.stdout + r.stderr)
+            self.assertIn("wakes itself", r.stdout)
             four = [c for c in sends if c[2] == "core-4"]
             self.assertEqual(len(four), 2, four)
             self.assertIn("skills/proactive-loop-pool/CODEX.md", four[0][5])
             self.assertEqual(four[1][3], "C-m")
             self.assertEqual(r.returncode, 0)
-            self.assertIn("kicked 2", r.stdout)
+            self.assertIn("kicked 1", r.stdout)
+
+    def test_a_dead_claude_core_is_still_revived(self):
+        """The runtime gate covers keystrokes only. A session that does not
+        exist cannot wake itself by any means, so kickstart still runs."""
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            home = td / "home"
+            agents = home / "Library" / "LaunchAgents"
+            agents.mkdir(parents=True)
+            stub = td / "stub-tmux"
+            write_exec(stub, KICK_STUB_TMUX)
+            (td / "sessions").write_text("")          # no live sessions
+            (agents / "com.sutando.core-1.plist").write_text(
+                PLIST.format(
+                    runtime_keys="    <key>POOL_RUNTIME</key>"
+                                 "<string>claude</string>\n"))
+            fake_bin = td / "bin"
+            fake_bin.mkdir()
+            write_exec(fake_bin / "launchctl",
+                       '#!/bin/sh\necho "$@" >> "$STUB_DIR/launchctl-argv"\n')
+            env = dict(os.environ, HOME=str(home), STUB_DIR=str(td),
+                       TMUX_BIN=str(stub),
+                       PATH=f"{fake_bin}:{os.environ['PATH']}")
+            env.pop("SUTANDO_POOL_SOCKET", None)
+            r = subprocess.run(["bash", str(KICK)], env=env,
+                               capture_output=True, text=True, timeout=120)
+            self.assertIn("NO SESSION (dead)", r.stdout)
+            self.assertIn("kickstart",
+                          (td / "launchctl-argv").read_text(),
+                          "a dead claude core must still be revived")
 
     def test_a_core_whose_plist_names_an_unknown_runtime_is_left_alone(self):
         with tempfile.TemporaryDirectory() as t:
@@ -475,6 +510,7 @@ class AdapterDelegationTest(unittest.TestCase):
         installer = (REPO / "scripts" / "install-core-pool.sh").read_text()
         self.assertIn("pool-runtime-drive.sh", installer)
         self.assertNotIn("pool_runtime_supported() {", installer)
+
 
 
 if __name__ == "__main__":

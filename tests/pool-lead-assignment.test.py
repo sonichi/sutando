@@ -15,7 +15,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
-from pool_lead import AFFINITY_IDLE_S, PoolLead  # noqa: E402
+from pool_lead import (ASSIGN_STUCK_S, ASSIGN_STUCK_S_BY_RUNTIME,  # noqa: E402
+                       AFFINITY_IDLE_S, PoolLead)
 
 
 class PoolLeadTests(unittest.TestCase):
@@ -238,6 +239,75 @@ class AffinityBusyYieldTest(unittest.TestCase):
         self._new_task()
         out = dict(self.lead.sweep())
         self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+
+
+class StuckDeadlineByRuntimeTests(unittest.TestCase):
+    """A runtime with no in-session wake-up only sees an assignment when its
+    wrapper nudges it; the deadline must outlast that cadence."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.tasks, self.state = root / "tasks", root / "state"
+        self.tasks.mkdir()
+        self.state.mkdir()
+        self.clock = [1000.0]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _lead(self, runtime_fn=None):
+        return PoolLead(
+            self.tasks, self.state,
+            followers_fn=lambda: ["core-9"],
+            alive_fn=lambda i: True,
+            now_fn=lambda: self.clock[0],
+            runtime_fn=runtime_fn)
+
+    def _assign(self, lead, name="task-x"):
+        (self.tasks / f"{name}.assigned-core-9.txt").write_text(f"id: {name}\n")
+        lead.reclaim_stuck_assignments()      # adopts into the ledger
+        return f"{name}.assigned-core-9.txt"
+
+    def test_codex_survives_past_the_claude_deadline(self):
+        lead = self._lead(runtime_fn=lambda i: "codex")
+        f = self._assign(lead)
+        self.clock[0] += ASSIGN_STUCK_S + 60   # past 300s, inside codex's 900s
+        self.assertEqual(lead.reclaim_stuck_assignments(), [],
+                         "codex assignment repooled before its runtime could "
+                         "be nudged")
+        self.assertTrue((self.tasks / f).exists())
+        self.clock[0] += ASSIGN_STUCK_S_BY_RUNTIME["codex"]
+        self.assertEqual(lead.reclaim_stuck_assignments(), [f],
+                         "codex deadline never fires")
+
+    def test_claude_keeps_the_default_deadline(self):
+        lead = self._lead(runtime_fn=lambda i: "claude")
+        f = self._assign(lead)
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.assertEqual(lead.reclaim_stuck_assignments(), [f])
+
+    def test_no_resolver_keeps_the_default(self):
+        lead = self._lead(runtime_fn=None)
+        f = self._assign(lead)
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.assertEqual(lead.reclaim_stuck_assignments(), [f])
+
+    def test_a_broken_resolver_fails_to_the_default(self):
+        def boom(_i):
+            raise RuntimeError("plist unreadable")
+        lead = self._lead(runtime_fn=boom)
+        f = self._assign(lead)
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.assertEqual(lead.reclaim_stuck_assignments(), [f])
+
+    def test_an_explicit_max_age_overrides_the_table(self):
+        lead = self._lead(runtime_fn=lambda i: "codex")
+        f = self._assign(lead)
+        self.clock[0] += 61
+        self.assertEqual(lead.reclaim_stuck_assignments(max_age_s=60), [f],
+                         "a caller-supplied deadline must win")
 
 
 if __name__ == "__main__":

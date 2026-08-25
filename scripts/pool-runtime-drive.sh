@@ -50,6 +50,13 @@ pool_runtime_from_plist() {
   printf '%s' "$rt"
 }
 
+# rc 0 = this runtime arms its own in-session wake-up, so an external pane
+# nudge adds nothing and only risks typing into a live session. Callers decide
+# what to do with that; pool_drive_kick still drives whatever it is handed.
+pool_runtime_self_wakes() {
+  [ -n "$(_pool_drive_knob "${1:-}" self_wakes 2>/dev/null)" ]
+}
+
 pool_drive_nudge_text() {
   case "${1:-}" in
     claude) printf '%s' '/proactive-loop-pool pass' ;;
@@ -89,6 +96,10 @@ _pool_drive_knob() {
     claude:submit_key) printf '%s' 'Enter' ;;
     # Codex's TUI submits on C-m; the symbolic Enter can stage without sending.
     codex:submit_key) printf '%s' 'C-m' ;;
+    # self_wakes: non-empty = the runtime arms its own wake-up in-session, so an
+    # external pane nudge is redundant keystroke injection into a live session.
+    claude:self_wakes) printf '%s' '1' ;;
+    codex:self_wakes) printf '' ;;
     *) return 2 ;;
   esac
 }

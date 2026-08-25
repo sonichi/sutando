@@ -73,6 +73,13 @@ for sess in ${sessions:-}; do
   # unreadable or unknown one yields the empty string, which fails closed below.
   runtime=$(pool_runtime_from_plist \
     "$HOME/Library/LaunchAgents/com.sutando.${sess}.plist" || true)
+  # Only a runtime with no in-session wake-up needs the pane nudge. The dead
+  # cores above are still revived regardless of runtime — that is a session
+  # restart, not keystrokes into a live one.
+  if pool_runtime_self_wakes "$runtime"; then
+    echo "$sess: $runtime wakes itself (watcher + session cron) — no keys sent"
+    continue
+  fi
   if pool_drive_kick "$runtime" "$sess" tmux_cmd "${sess#"$SESSION_PREFIX"}"; then
     kicked=$((kicked+1))
   fi

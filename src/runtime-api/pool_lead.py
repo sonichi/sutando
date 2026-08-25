@@ -31,6 +31,9 @@ AFFINITY_IDLE_S = 30 * 60
 # the moment the handler is busy (latency over continuity — owner preference).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
+# A runtime without in-session wake-up only sees an assignment when its wrapper
+# nudges it, so its deadline must exceed that cadence (codex: 300s).
+ASSIGN_STUCK_S_BY_RUNTIME = {"codex": 900}
 DONE_FLAG_RETENTION_S = 7 * 86400
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
@@ -70,10 +73,13 @@ def _read_lane(path: Path) -> str:
 
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
-                 now_fn=time.time, metrics=None, results_dir=None):
+                 now_fn=time.time, metrics=None, results_dir=None,
+                 runtime_fn=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
-        production binder wires instance_registry + the .alive files."""
+        production binder wires instance_registry + the .alive files.
+        runtime_fn(instance) -> runtime name or None; injected so plist
+        lookup stays at the edge. None keeps the single deadline."""
         self.tasks_dir = Path(tasks_dir)
         self.state_dir = Path(state_dir)
         self.results_dir = (Path(results_dir) if results_dir
@@ -82,6 +88,7 @@ class PoolLead:
         self.alive_fn = alive_fn
         self.now = now_fn
         self.metrics = metrics  # PoolMetrics or None; recording is optional
+        self.runtime_fn = runtime_fn
 
     # ── affinity table (single-writer: the lead) ────────────────────────────
     def _affinity_path(self) -> Path:
@@ -222,6 +229,17 @@ class PoolLead:
         except OSError:
             pass  # hygiene is best-effort; assignment correctness never depends on it
 
+    def _stuck_after(self, instance: str, default_s: float) -> float:
+        """Per-runtime unclaimed deadline. An explicit max_age_s from the
+        caller is a deliberate override and wins over the table."""
+        if self.runtime_fn is None or default_s != ASSIGN_STUCK_S:
+            return default_s
+        try:
+            rt = self.runtime_fn(instance)
+        except Exception:  # noqa: BLE001 — a broken resolver keeps the default
+            return default_s
+        return ASSIGN_STUCK_S_BY_RUNTIME.get(rt or "", default_s)
+
     def reclaim_stuck_assignments(self, max_age_s: int = ASSIGN_STUCK_S) -> "list[str]":
         """Repool assignments a LIVE follower has not claimed in time. A hung
         session's wrapper keeps its heartbeat fresh, so reclaim_dead never
@@ -244,7 +262,8 @@ class PoolLead:
             if ts is None:
                 ledger[f.name] = self.now()  # adopt pre-ledger assignments
                 continue
-            if self.now() - float(ts) < max_age_s or not self.alive_fn(m.group(2)):
+            if (self.now() - float(ts) < self._stuck_after(m.group(2), max_age_s)
+                    or not self.alive_fn(m.group(2))):
                 continue  # young, or dead (reclaim_dead owns that path)
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
