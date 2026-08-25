@@ -240,6 +240,15 @@ check("a successful save round-trips", (_rt["repo"], _rt["number"]), ("o/r", 3))
 check("round-trip preserves the watch set",
       tuple(_rt["waiting_for"]), tuple(sorted(g.WATCH)))
 
+# a scalar string must never reach the durable record as N single-char conditions
+check("a scalar watch string is refused before save() publishes characters",
+      _raises(lambda: g.save("task-dur-scalar", ResponsibilityScope(
+          subjects=(g.subject_for("o/r", 3),), actor=_A,
+          watch_conditions="github.pull_request.updated",
+          success_conditions=g.SUCCESS, failure_conditions=g.FAILURE), "waiting")), True)
+check("...and no record was published for it",
+      (g.state_dir() / "task-dur-scalar.json").exists(), False)
+
 # --- an unknown observation must not become a concrete outcome ---
 _SAVED_GH, _SAVED_ACTOR = g._gh, g.resolve_actor
 g.resolve_actor = lambda *a, **k: _A
@@ -270,4 +279,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 48 assertions, control verified")
+print("PASS: 50 assertions, control verified")

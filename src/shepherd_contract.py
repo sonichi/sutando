@@ -20,6 +20,7 @@ polling and provider calls belong to the adapters that bind it.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -130,9 +131,29 @@ class ResponsibilityScope:
     failure_conditions: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
+        # frozen=True stops attribute rebinding, not mutation of what was passed in.
+        # Snapshot before validating, or a caller's alias edits an accepted scope.
+        if isinstance(self.subjects, (str, bytes)) or not isinstance(self.subjects, Iterable):
+            raise ValueError(
+                f"ResponsibilityScope.subjects must be an iterable of Subject, "
+                f"got {type(self.subjects).__name__}")
+        object.__setattr__(self, "subjects", tuple(self.subjects))
         for name in ("watch_conditions", "success_conditions", "failure_conditions"):
+            value = getattr(self, name)
+            # A bare str is iterable, so frozenset() would silently rebuild it as a
+            # set of single characters -- each one passing the per-element check.
+            if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+                raise ValueError(
+                    f"ResponsibilityScope.{name} must be a non-string collection, "
+                    f"got {type(value).__name__}")
+            object.__setattr__(self, name, frozenset(value))
             for element in getattr(self, name):
                 _require_text(f"ResponsibilityScope.{name}", "element", element)
+        for subject in self.subjects:
+            if not isinstance(subject, Subject):
+                raise ValueError(
+                    f"ResponsibilityScope.subjects element must be a Subject, "
+                    f"got {type(subject).__name__}")
         clash = self.success_conditions & self.failure_conditions
         if clash:
             raise ValueError(

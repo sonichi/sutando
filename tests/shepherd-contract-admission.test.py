@@ -149,6 +149,36 @@ check("is_terminal(waiting)", is_terminal("waiting"), False)
 overlap = set(SHEPHERD_STATES) & set(ltp.LIFECYCLE_STATES)
 check("no state-name collision with local_task_protocol", overlap, set())
 
+# A frozen dataclass still holds the caller's container; snapshot or the scope moves.
+_subs = [PR]
+_cond = {"github.pull_request.updated"}
+_alias = ResponsibilityScope(subjects=_subs, actor=SCOPE.actor, watch_conditions=_cond,
+                             success_conditions={"github.pull_request.merged"},
+                             failure_conditions=frozenset())
+_other = Subject(PR.provider, PR.kind, PR.resource_id + "-other")
+_ev = ObservedEvent("github.pull_request.updated", _other, SCOPE.actor)
+_before = admit(_ev, _alias)[0]
+_subs.append(_other)
+_cond.add("mutated")
+check("a caller's alias cannot widen an accepted scope", admit(_ev, _alias)[0], _before)
+check("...and the condition set is unchanged too", "mutated" in _alias.watch_conditions, False)
+
+
+def _rejects(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+check("a scalar string is refused, not iterated as characters",
+      _rejects(lambda: ResponsibilityScope(
+          subjects=(PR,), actor=SCOPE.actor,
+          watch_conditions="github.pull_request.updated",
+          success_conditions={"github.pull_request.merged"},
+          failure_conditions=frozenset())), True)
+
 # negative control: the harness must be able to report a failure at all
 _probe = len(failures)
 check("CONTROL (expected to fail)", "x", "y")
@@ -179,4 +209,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 27 assertions, control verified")
+print("PASS: 30 assertions, control verified")
