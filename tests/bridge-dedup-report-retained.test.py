@@ -15,9 +15,13 @@ Run: python3 tests/bridge-dedup-report-retained.test.py
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import importlib.util
 import io
+import json
+import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -25,6 +29,32 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+
+# Bridges resolve channel config AT IMPORT. Isolate before any exec_module runs,
+# in this file: relying on another module's setup is not isolation.
+_CFG = tempfile.mkdtemp(prefix="ccd-dedup-retained-")
+atexit.register(lambda: shutil.rmtree(_CFG, ignore_errors=True))
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+os.environ["HOME"] = _CFG
+_cfg_discord = Path(_CFG) / "channels" / "discord"
+_cfg_discord.mkdir(parents=True, exist_ok=True)
+(_cfg_discord / "access.json").write_text(json.dumps({"allowFrom": []}))
+(_cfg_discord / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+
+_cfg_telegram = Path(_CFG) / "channels" / "telegram"
+_cfg_telegram.mkdir(parents=True, exist_ok=True)
+(_cfg_telegram / "access.json").write_text(json.dumps({"allowFrom": []}))
+(_cfg_telegram / ".env").write_text("TELEGRAM_BOT_TOKEN=test-token-not-real\n")
+
+_cfg_slack = Path(_CFG) / "channels" / "slack"
+_cfg_slack.mkdir(parents=True, exist_ok=True)
+(_cfg_slack / "access.json").write_text(json.dumps({"allowFrom": []}))
+(_cfg_slack / ".env").write_text(
+    "SLACK_BOT_TOKEN=xoxb-test-not-real\nSLACK_APP_TOKEN=xapp-test-not-real\n")
+os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
+os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
+os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-not-real")
 
 
 def _load_harness():
@@ -38,21 +68,6 @@ def _load_harness():
 
 
 H = _load_harness()
-
-import json  # noqa: E402
-import os  # noqa: E402
-
-# A bridge that will not import produces a SKIP -- a test that cannot fail.
-_CFG = Path(os.environ["CLAUDE_CONFIG_DIR"])
-for _ch, _env in (("telegram", "TELEGRAM_BOT_TOKEN=test-token-not-real\n"),
-                  ("slack", "SLACK_BOT_TOKEN=xoxb-test-not-real\n"
-                            "SLACK_APP_TOKEN=xapp-test-not-real\n")):
-    _d = _CFG / "channels" / _ch
-    _d.mkdir(parents=True, exist_ok=True)
-    if not (_d / "access.json").exists():
-        (_d / "access.json").write_text(json.dumps({"allowFrom": []}))
-    (_d / ".env").write_text(_env)
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
 
 from dedup_recovery import report_disposition  # noqa: E402
 
