@@ -5,6 +5,8 @@ Analyzes call logs, task history, and notes to surface one actionable pattern.
 Output: results/insight-{date}.txt (voice agent can speak it).
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
