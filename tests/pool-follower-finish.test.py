@@ -7,8 +7,11 @@ Run: python3 tests/pool-follower-finish.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -143,6 +146,56 @@ class FinishTests(unittest.TestCase):
         self.assertFalse(calls[0][1])
         self.assertIn("archive", calls[1][0])
         self.assertTrue(calls[1][1])
+
+
+class MetricsTests(FinishTests):
+    """Per-task completion record — the pool's only source of duration."""
+
+    def _metrics(self):
+        return Path(self.tmp.name) / "data" / "pool-metrics.jsonl"
+
+    def _finish_m(self, claimed, body, instance="me"):
+        return pf.finish_task(self.tasks, self.results, self.state,
+                              instance, claimed, body, self._metrics())
+
+    def test_no_metrics_path_writes_no_file(self):
+        self._finish(self._claim("a1"), "task: a1\nbody\n")
+        self.assertFalse(self._metrics().exists())
+
+    def test_record_carries_core_source_and_duration(self):
+        claimed = self._claim("a1")
+        claimed.write_text("id: task-a1\nsource: ag2space\ntask: x\n")
+        os.utime(claimed, (time.time() - 30, time.time() - 30))
+        self._finish_m(claimed, "task: a1\nbody\n")
+        rec = json.loads(self._metrics().read_text().strip())
+        self.assertEqual(rec["task_id"], "a1")
+        self.assertEqual(rec["core"], "me")
+        self.assertEqual(rec["source"], "ag2space")
+        # arrival survives the assign/claim renames, so duration is real
+        self.assertGreaterEqual(rec["duration_s"], 30)
+        self.assertLess(rec["duration_s"], 120)
+
+    def test_appends_one_line_per_task(self):
+        for tid in ("a1", "b2", "c3"):
+            self._finish_m(self._claim(tid), f"task: {tid}\nbody\n")
+        lines = self._metrics().read_text().strip().splitlines()
+        self.assertEqual([json.loads(x)["task_id"] for x in lines],
+                         ["a1", "b2", "c3"])
+
+    def test_refused_finish_records_nothing(self):
+        with self.assertRaises(ValueError):
+            self._finish_m(self._claim("a1"), "task: b2\nbody\n")
+        self.assertFalse(self._metrics().exists())
+
+    def test_unwritable_metrics_path_does_not_fail_the_task(self):
+        # bookkeeping must never turn a delivered answer into a failure
+        blocked = Path(self.tmp.name) / "blocked"
+        blocked.write_text("not a directory")
+        out = pf.finish_task(self.tasks, self.results, self.state, "me",
+                             self._claim("a1"), "task: a1\nbody\n",
+                             blocked / "sub" / "m.jsonl")
+        self.assertTrue(out.exists())
+        self.assertTrue((self.tasks / "archive" / "task-a1.txt").exists())
 
 
 if __name__ == "__main__":
