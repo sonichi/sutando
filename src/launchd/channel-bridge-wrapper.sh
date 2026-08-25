@@ -116,13 +116,9 @@ while [ "$STOPPING" = 0 ]; do
   CHILD_PID=$!
   set +e
   wait "$CHILD_PID"
-  CHILD_RC=$?
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
-  # A clean exit is a deliberate stand-down, not a crash: single_instance.py
-  # exits 0 when a peer holds the lock, so respawning it is the restart loop.
-  [ "$CHILD_RC" -eq 0 ] && exit 0
   emit_restart_alert
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!

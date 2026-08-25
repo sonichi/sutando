@@ -100,7 +100,67 @@ def test_wrapper_restart_signal() -> None:
         check(len(exec_log.read_text().splitlines()) >= 2, "wrapper restarts an exited bridge child")
 
 
+def test_clean_exit_is_a_standdown():
+    """exit 0 must NOT respawn and must NOT alert — the inverse of the crash case.
+
+    The crash test above proves a non-zero child comes back. Only this one pins
+    the change itself: before it, the wrapper could not tell a deliberate
+    stand-down from a crash, so a child exiting 0 was respawned forever. Live on
+    2026-08-24 that produced 95 laps against a held lock, one owner alert each.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo = root / "repo"
+        workspace = root / "workspace"
+        config = root / "config"
+        (repo / "src" / "launchd").mkdir(parents=True)
+        (repo / "src").mkdir(exist_ok=True)
+        (repo / "scripts").mkdir()
+        (config / "channels" / "slack").mkdir(parents=True)
+        workspace.mkdir()
+        shutil.copy2(WRAPPER, repo / "src" / "launchd" / WRAPPER.name)
+        (repo / "src" / "slack-bridge.py").write_text("# dummy\n")
+        (config / "channels" / "slack" / ".env").write_text("SLACK_BOT_TOKEN=x-test\n")
+        helper = repo / "scripts" / "sutando-config.sh"
+        helper.write_text(
+            "#!/bin/bash\n"
+            f"if [ \"$1\" = workspace ]; then echo '{workspace}'; "
+            f"else echo \"{config}/$2\"; fi\n"
+        )
+        helper.chmod(0o755)
+        fake_python = root / "python"
+        # exit 0 — a child standing down because another instance holds the lock.
+        fake_python.write_text(
+            "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\nexit 0\n")
+        fake_python.chmod(0o755)
+        exec_log = root / "exec.log"
+        env = os.environ.copy()
+        env.update({
+            "SUTANDO_CHANNEL_BRIDGE_PYTHON": str(fake_python),
+            "TEST_EXEC_LOG": str(exec_log),
+            "HOME": str(root),
+            "SUTANDO_CHANNEL_BRIDGE_RESTART_DELAY": "0.05",
+        })
+        wrapper = repo / "src" / "launchd" / WRAPPER.name
+        proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Give it long enough that a RESPAWNING wrapper would have looped several
+        # times: 0.05s delay, so ~1s is ~20 laps' worth of opportunity.
+        import time
+        time.sleep(1.0)
+        proc.terminate()
+        proc.wait(timeout=5)
+
+        launches = len(exec_log.read_text().splitlines()) if exec_log.exists() else 0
+        check(launches == 1,
+              f"a clean exit is launched ONCE and not respawned (launches={launches})")
+        alerts = list((workspace / "results").glob("proactive-slack-bridge-restarted-*.txt"))
+        check(not alerts,
+              f"a clean exit writes NO owner alert (found {[a.name for a in alerts]})")
+
+
 if __name__ == "__main__":
     test_contract()
     test_wrapper_restart_signal()
+    test_clean_exit_is_a_standdown()
     print("all passed")
