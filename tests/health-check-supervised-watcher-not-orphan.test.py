@@ -71,9 +71,10 @@ check("names the live parent", "ppid 12626" in v["detail"], v["detail"])
 print("single watcher whose parent is live but NOT a core (the new middle case):")
 vX = _verdict({"777": {"777"}}, {"777": "888", "888": "1"}, core_pids=set())
 check("does NOT bless it", "legitimate" not in vX["detail"], vX["detail"])
-check("does NOT stop it", "Do NOT stop" in vX["detail"] or "unverified (1)" in vX["detail"],
+check("does NOT stop it", "do not stop it" in vX["detail"].lower(), vX["detail"])
+check("names it unverified", "UNVERIFIED" in vX["detail"], vX["detail"])
+check("does not claim supervision", "do not assume it is supervised" in vX["detail"],
       vX["detail"])
-check("names it unverified", "unverified (1): 777" in vX["detail"], vX["detail"])
 
 def says_stop(detail):
     """A stop REMEDY, not the substring. 'Do NOT stop them' contains 'stop

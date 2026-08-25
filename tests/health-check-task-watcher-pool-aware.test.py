@@ -138,7 +138,9 @@ class EveryMultiRootVerdictNamesEveryGroup(unittest.TestCase):
     CASES = {
         "absent sentinel": dict(sentinel=None, sentinel_alive=False),
         "dead sentinel": dict(sentinel=999, sentinel_alive=False),
-        "live sentinel": dict(sentinel=100, sentinel_alive=True),
+        # sentinel=999 keeps all named roots in `extras`; the sentinel's own
+        # tree has its own dedicated cases below.
+        "live sentinel": dict(sentinel=999, sentinel_alive=True),
     }
 
     def test_all_three_labels_present_when_every_root_is_ownerless(self):

@@ -101,7 +101,7 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
     with tempfile.TemporaryDirectory() as td:
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent)
+                 hc._ps_snapshot, hc._pid_parent, hc._local_core_pids)
         try:
             hc.WORKSPACE_DIR = Path(td)
             if argv is not None:
@@ -109,10 +109,13 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
             hc._watcher_trees = lambda *a, **k: (trees or {})
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda pid, ps=None: (parents or {}).get(pid)
+            # Unstubbed this reads the HOST's tmux, the leak this fixture already
+            # avoids for parents; a fabricated parent stands in for the core.
+            hc._local_core_pids = lambda: {v for v in (parents or {}).values() if v != "1"}
             return hc.check_task_watcher()
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._local_core_pids) = saved
 
 
 @contextlib.contextmanager
@@ -127,17 +130,20 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
     with tempfile.TemporaryDirectory() as td:
         ws = make_workspace(Path(td), core_alive=True, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent)
+                 hc._ps_snapshot, hc._pid_parent, hc._local_core_pids)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = lambda p: argv
             hc._watcher_trees = lambda *a, **k: {pid: {pid}}
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda p, ps=None: "500"
+            # 500 stands in for the core session that spawned this watcher;
+            # unstubbed, this would read the HOST's tmux.
+            hc._local_core_pids = lambda: {"500"}
             yield ws
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._local_core_pids) = saved
 
 
 def case_r_supervised_watcher_exposes_restamp_pid() -> list[str]:
@@ -619,7 +625,7 @@ def case_l_dead_sentinel_with_live_orphan() -> list[str]:
     fails = []
     if r["status"] != "warn":
         fails.append(f"l) expected warn, got {r['status']}")
-    if "orphaned" not in r["detail"]:
+    if "ownerless (1): 9000" not in r["detail"]:
         fails.append(f"l) detail should name the orphan, got {r['detail']!r}")
     if "IS being drained" not in r["detail"]:
         fails.append("l) must not claim tasks/ is unattended when a watcher runs")
@@ -631,7 +637,7 @@ def case_m_absent_sentinel_with_live_orphan() -> list[str]:
     fails = []
     if r["status"] != "warn":
         fails.append(f"m) expected warn, got {r['status']}")
-    if "orphaned" not in r["detail"]:
+    if "ownerless (1): 9000" not in r["detail"]:
         fails.append(f"m) detail should name the orphan, got {r['detail']!r}")
     return fails
 
@@ -647,7 +653,7 @@ def case_m2_fabricated_pid_ignores_the_host_process_table() -> list[str]:
         r = run_check(core_alive=True, pid_text=None, trees={"9000": {"9000"}})
     finally:
         hc._pid_parent = saved
-    if "orphaned" not in r["detail"]:
+    if "ownerless (1): 9000" not in r["detail"]:
         return [f"m2) host pid table leaked into the verdict, got {r['detail']!r}"]
     return []
 

@@ -6905,10 +6905,12 @@ def _split_by_core_ownership(roots, ps_out, core_pids) -> tuple:
     parents = _full_parent_map(ps_out)
     owned, unverified, ownerless = [], [], []
     for r in roots:
-        pp = parents.get(r)
+        # The immediate parent goes through `_pid_parent`, which is the seam the
+        # rest of the probe (and its callers' fixtures) already reads.
+        pp = _pid_parent(r, ps_out)
         if not pp or pp == "1":
             ownerless.append(r)
-        elif core_pids and set(_ancestry(r, parents)) & set(core_pids):
+        elif core_pids and set(_ancestry(r, {**parents, r: pp})) & set(core_pids):
             owned.append(r)
         else:
             unverified.append(r)
@@ -6975,6 +6977,15 @@ def check_task_watcher() -> dict:
             core_pids = _local_core_pids()
             supervised, unverified, unowned = _split_by_core_ownership(
                 roots, ps_out, core_pids)
+            if len(roots) == 1 and unverified:
+                # One tree, a live parent, no core attribution. Nothing to
+                # duplicate and nothing proved: no stop, no blessing, no restamp.
+                return {"name": name, "status": "warn",
+                        "detail": f"watcher pid {roots[0]} runs under a live parent "
+                                  f"(ppid {parents[roots[0]]}) that could not be traced to a "
+                                  "core session, and wrote no PID sentinel. Ownership is "
+                                  "UNVERIFIED — do not stop it and do not assume it is "
+                                  "supervised; restart cleanly only when tasks/ is empty."}
             if len(roots) == 1 and supervised:
                 # Its session is still its parent, so it IS supervised and there is
                 # no second tree to duplicate work. Killing it is what opens a gap.
@@ -7037,13 +7048,14 @@ def check_task_watcher() -> dict:
     extras = sorted(r for r, members in trees.items() if str(pid) not in members)
     if extras:
         core_pids = _local_core_pids()
-        # The sentinel's OWN root is classified too. Splitting only `extras`
-        # leaves an orphaned sentinel tree unclassified beside a live replacement.
+        owned, unverified, orphaned = _split_by_core_ownership(extras, ps_out, core_pids)
+        # Surfaces only when DEFINITELY reparented: unknown parentage is absence
+        # of evidence, and the sentinel is the tracked live watcher by definition.
         sentinel_root = next((r for r, m in trees.items() if str(pid) in m), None)
-        all_roots = sorted(trees) if sentinel_root else extras
-        owned, unverified, orphaned = _split_by_core_ownership(
-            all_roots, ps_out, core_pids)
-        keep = f", keep the sentinel's ({pid})" if sentinel_root in owned else ""
+        sentinel_orphaned = bool(sentinel_root) and _pid_parent(sentinel_root, ps_out) == "1"
+        if sentinel_orphaned:
+            orphaned = sorted(orphaned + [sentinel_root])
+        keep = "" if sentinel_orphaned else f", keep the sentinel's ({pid})"
         if not orphaned and not unverified:
             return {"name": name, "status": "warn",
                     "detail": f"{len(trees)} watcher trees running, {len(extras)} not tracked by the "
