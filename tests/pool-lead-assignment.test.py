@@ -15,7 +15,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
-from pool_lead import AFFINITY_IDLE_S, PoolLead  # noqa: E402
+from pool_lead import (AFFINITY_BUSY_MAX, AFFINITY_IDLE_S,  # noqa: E402
+                       ASSIGN_STUCK_S, NOCLAIM_COOLDOWN_S, PoolLead)
 
 
 class PoolLeadTests(unittest.TestCase):
@@ -277,6 +278,86 @@ class AffinityBusyYieldTest(unittest.TestCase):
         self._new_task()
         out = dict(self.lead.sweep())
         self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+
+class RoutineLaneEscape(unittest.TestCase):
+    """A wedged lane core must not absorb every routine task. Its heartbeat
+    stays fresh throughout, so failing-to-claim is the only usable signal."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.tasks = root / "tasks"; self.tasks.mkdir()
+        self.state = root / "state"; self.state.mkdir()
+        self.alive = {"core-1": True, "core-2": True, "core-3": True}
+        self.clock = [1000.0]
+        self.lead = PoolLead(
+            self.tasks, self.state,
+            followers_fn=lambda: list(self.alive),
+            alive_fn=lambda i: self.alive.get(i, False),
+            now_fn=lambda: self.clock[0])
+        # highest-numbered follower is the routine lane
+        self.lane = max(self.alive, key=lambda f: (len(f), f))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _routine(self, name):
+        (self.tasks / name).write_text(f"id: {name[:-4]}\npriority: low\ntask: t\n")
+
+    def test_lane_core_that_never_claims_stops_receiving_routine_work(self):
+        """The live loop: assign -> no claim -> repool -> assign again. The
+        lane core heartbeats the whole time, so only the repool distinguishes
+        it from a busy follower."""
+        self._routine("task-r1.txt")
+        first = dict(self.lead.sweep())["task-r1.txt"]
+        self.assertEqual(first, self.lane, "routine should start on the lane core")
+
+        # it never claims. The lead reclaims every pass: the first sighting
+        # only adopts the assignment into the ledger, the next one repools it.
+        self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.assertEqual(self.lead.reclaim_stuck_assignments(),
+                         [f"task-r1.assigned-{self.lane}.txt"])
+        self.assertTrue(self.alive[self.lane], "lane core still heartbeats")
+
+        second = dict(self.lead.sweep())["task-r1.txt"]
+        self.assertNotEqual(second, self.lane,
+                            "repooled routine work went straight back to the "
+                            "follower that just failed to claim it")
+        self.assertIn(second, self.alive)
+
+    def test_a_busy_lane_core_keeps_its_lane(self):
+        """Load alone must not evict the lane: a follower working through a
+        backlog is not the same as one wedged at its input layer."""
+        (self.tasks / f"task-busy.claimed-{self.lane}.txt").write_text("x")
+        self._routine("task-r2.txt")
+        self.assertEqual(dict(self.lead.sweep())["task-r2.txt"], self.lane)
+
+    def test_cooldown_expires_and_the_lane_is_restored(self):
+        self._routine("task-r3.txt")
+        self.lead.sweep()
+        self.lead.reclaim_stuck_assignments()          # adopt
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.lead.reclaim_stuck_assignments()          # repool + mark
+        self.assertFalse(self.lead._claiming(self.lane))
+        self.clock[0] += NOCLAIM_COOLDOWN_S
+        self.assertTrue(self.lead._claiming(self.lane),
+                        "cooldown must expire, or a recovered core is exiled")
+        for f in list(self.tasks.iterdir()):
+            f.unlink()
+        self._routine("task-r4.txt")
+        self.assertEqual(dict(self.lead.sweep())["task-r4.txt"], self.lane)
+
+    def test_saturated_lane_core_spills_routine_to_another_follower(self):
+        for i in range(AFFINITY_BUSY_MAX):
+            (self.tasks / f"task-b{i}.claimed-{self.lane}.txt").write_text("x")
+        self._routine("task-r5.txt")
+        got = dict(self.lead.sweep())["task-r5.txt"]
+        self.assertNotEqual(got, self.lane,
+                            "routine pinned to a lane core already at "
+                            "AFFINITY_BUSY_MAX outstanding items")
+
 
 
 if __name__ == "__main__":

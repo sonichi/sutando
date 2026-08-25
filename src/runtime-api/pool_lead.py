@@ -31,6 +31,9 @@ AFFINITY_IDLE_S = 30 * 60
 # the moment the handler is busy (latency over continuity — owner preference).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
+# A repool pops the ledger entry, so "is it stuck right now" reads false on the
+# very next sweep — the follower must stay marked or the task returns to it.
+NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S
 DONE_FLAG_RETENTION_S = 7 * 86400
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
@@ -121,7 +124,11 @@ class PoolLead:
         # owner traffic stays off it except as saturated-pool overflow.
         lane_core = (max(followers, key=lambda f: (len(str(f)), str(f)))
                      if len(followers) > 1 else None)
-        if lane == "routine" and lane_core is not None:
+        # Same escape the owner side already has: pinned unconditionally, one
+        # wedged lane core absorbs every routine task and no other is offered.
+        if (lane == "routine" and lane_core is not None
+                and self._load(lane_core) < AFFINITY_BUSY_MAX
+                and self._claiming(lane_core)):
             return lane_core
         primary = [f for f in followers if f != lane_core] or followers
         if channel:
@@ -135,7 +142,7 @@ class PoolLead:
                 return row["instance"]
         pick = min(primary, key=lambda f: (self._load(f), str(f)))
         if (lane_core is not None and self._load(pick) >= AFFINITY_BUSY_MAX
-                and self._load(lane_core) == 0):
+                and self._load(lane_core) == 0 and self._claiming(lane_core)):
             return lane_core  # overflow: whole owner lane saturated, lane idle
         return pick
 
@@ -224,6 +231,40 @@ class PoolLead:
         except OSError:
             pass  # hygiene is best-effort; assignment correctness never depends on it
 
+    # ── no-claim cooldown ───────────────────────────────────────────────────
+    def _noclaim_path(self) -> Path:
+        return self.state_dir / "pool" / "no-claim.json"
+
+    def _load_noclaim(self) -> dict:
+        try:
+            d = json.loads(self._noclaim_path().read_text())
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _mark_noclaim(self, instance: str) -> None:
+        """Record that this follower held an assignment past the stuck window.
+        Survives the repool that clears the assignment ledger."""
+        table = self._load_noclaim()
+        table[instance] = self.now()
+        cutoff = self.now() - NOCLAIM_COOLDOWN_S
+        table = {k: v for k, v in table.items() if float(v) >= cutoff}
+        p = self._noclaim_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp3")
+            tmp.write_text(json.dumps(table))
+            os.replace(tmp, p)
+        except OSError:
+            pass  # best-effort: a lost mark costs one retry, never correctness
+
+    def _claiming(self, instance: str) -> bool:
+        """False while a follower is inside the cooldown after failing to claim.
+        Heartbeat cannot answer this: a session wedged at its input layer beats
+        perfectly while never claiming, so `alive_fn` says yes throughout."""
+        ts = self._load_noclaim().get(instance)
+        return ts is None or (self.now() - float(ts)) >= NOCLAIM_COOLDOWN_S
+
     def reclaim_stuck_assignments(self, max_age_s: int = ASSIGN_STUCK_S) -> "list[str]":
         """Repool assignments a LIVE follower has not claimed in time. A hung
         session's wrapper keeps its heartbeat fresh, so reclaim_dead never
@@ -254,6 +295,7 @@ class PoolLead:
                 continue
             ledger.pop(f.name, None)
             live.discard(f.name)
+            self._mark_noclaim(m.group(2))
             out.append(f.name)
         self._save_assign_ledger({k: v for k, v in ledger.items() if k in live})
         return out
