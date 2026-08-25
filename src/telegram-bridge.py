@@ -671,10 +671,43 @@ def poll_progress(pending_replies: dict) -> None:
             pending_task_tiers.pop(tid, None)
 
 
+def log_privacy_setting(get_me):
+    """Report the bot-wide BotFather privacy setting at boot.
+
+    Scope matters: this flag is GLOBAL, and an administrator bot receives every group
+    message regardless of it — so the flag alone never determines what one group delivers.
+    """
+    try:
+        me = (get_me() or {}).get("result") or {}
+    except Exception as e:  # noqa: BLE001 — a diagnostic must never take the bridge down
+        return f"[Telegram] privacy-setting: getMe failed ({e}) — setting unknown"
+    if not me:
+        return "[Telegram] privacy-setting: getMe returned no result — setting unknown"
+    BOT_EXCEPTION = (
+        "one exception applies regardless: Telegram never delivers a message sent by "
+        "another bot, even to an administrator or with privacy mode off "
+        "(https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)"
+    )
+    if me.get("can_read_all_group_messages"):
+        return ("[Telegram] privacy-setting: privacy mode OFF (BotFather, bot-wide) — "
+                f"all group messages from human senders are delivered to this bot; "
+                f"{BOT_EXCEPTION}")
+    return (
+        "[Telegram] privacy-setting: privacy mode ON (BotFather, bot-wide). In a group where "
+        f"@{me.get('username') or 'this bot'} is NOT an administrator it receives only "
+        "commands addressed to it (/command@bot), replies to its own messages, messages sent "
+        "via it inline, and general commands when it posted last — a plain @username mention "
+        "is NOT delivered. Where it IS a group administrator it receives everything from human "
+        f"senders regardless of this setting, so this flag alone does not describe any "
+        f"particular group's reach; {BOT_EXCEPTION}"
+    )
+
+
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
     print("Telegram bridge started. Polling for messages...", flush=True)
+    print(log_privacy_setting(lambda: api("getMe")), flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
