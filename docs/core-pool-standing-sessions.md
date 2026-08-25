@@ -72,6 +72,42 @@ Two workers must never drive one group's pane at once — which is a lock, and
 #3314's atomic-rename assignment already is one. Extend the assignment key from
 *task* to *task + group-session lease*.
 
+### Where the lease lives — two structures, two lifetimes
+
+Raised in review: does the group-session lease ride the assignment filename, or
+the lead-held binding record? The answer decides whether decision 3 is free, and
+both readings were live in an earlier draft of this text.
+
+They are **different objects and must not be merged**:
+
+```
+task lease      assignment FILENAME     dies with the assignment
+                task-X.assigned-<inst>  reclaim_dead()'s rename already releases it
+                                        -> genuinely free, no new mechanism
+
+group binding   lead-held RECORD        deliberately OUTLIVES the core
+                                        restore-after-preempt requires exactly this
+                                        -> reclaim_dead does NOT and must not touch it
+```
+
+Decision 3's "extend the assignment key from *task* to *task + group-session
+lease*" means the **task-scoped** lease: two workers must not drive one group's
+pane *at the same instant*, and a rename-based lock expresses that correctly and
+for free.
+
+The **binding** cannot use the same mechanism, because decision 4 requires it to
+survive the core — a lease that dies with its holder is the one thing restore
+must not have. So the binding needs its own liveness, and it is not a rename:
+it is the lead observing that a binding's occupant is gone and re-seating it.
+That is cost #3 below, and it is the reason cost #3 exists rather than being
+folded into reclaim.
+
+The failure mode if the two are conflated: a core dying mid-turn releases its
+task (correct) and also drops its binding (wrong — the group is now unseated with
+no record of where it belonged), or the binding self-expires on a timer and a
+preempted group is silently re-seated somewhere else while restore still thinks
+it owns it.
+
 ## Decision 4 — fixed N is replaced by lead-managed sizing
 
 The lead already never holds an `N`. It takes its fleet as injected callables
