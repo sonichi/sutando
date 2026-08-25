@@ -488,6 +488,15 @@ def main() -> int:
           and "--source ag2space --channel-id '!room:ag2.space'" in sk
           and "write the result to results/task-SKILL.txt" in sk,
           "owner task carries the ag2space skill-instructions block (context-first, notify, result path)")
+    # notify.py falls back to channels/<source>/.env only when url+token are
+    # absent from the environment, and its containment guard can refuse that read.
+    _env_hint = 'set -a; . "$CLAUDE_CONFIG_DIR/channels/ag2space/.env"; set +a'
+    _notify_line = next(ln for ln in sk.splitlines() if "NOTIFY FIRST" in ln)
+    check(_env_hint in _notify_line and _notify_line.index(_env_hint)
+          < _notify_line.index("notify.py"),
+          "notify step carries the channel-env prelude BEFORE the notify.py call")
+    check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
+          "the env prelude rides both gateway-calling steps (context-first + notify)")
     check(sk.rstrip().splitlines()[-1].startswith("3. Process"),
           "skill block is the file tail (appended after access_tier)")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
