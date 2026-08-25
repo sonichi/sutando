@@ -42,11 +42,11 @@ _PRESENT_RE = re.compile(
 def read_routing(path: Path) -> "tuple[str, str] | None":
     """(source, channel) from a task header, or None when unroutable."""
     try:
-        head = path.read_text(errors="replace")[:2048]
+        text = path.read_text(errors="replace")
     except OSError:
         return None
     fields = {m.group("key"): m.group("val")
-              for m in _HEADER_RE.finditer(head)}
+              for m in _HEADER_RE.finditer(text)}
     channel = fields.get("channel_id") or fields.get("chat_id")
     source = fields.get("source")
     if not channel or not source:

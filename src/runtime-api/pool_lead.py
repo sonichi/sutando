@@ -48,10 +48,10 @@ _LANE_RE = re.compile(
 
 def _read_channel(path: Path) -> "str | None":
     try:
-        head = path.read_text(errors="replace")[:2048]
+        text = path.read_text(errors="replace")
     except OSError:
         return None
-    m = _CHANNEL_RE.search(head)
+    m = _CHANNEL_RE.search(text)
     return m.group(1) if m else None
 
 
@@ -60,10 +60,10 @@ def _read_lane(path: Path) -> str:
     'owner' otherwise. Unreadable or unenumerated headers fail to 'owner' —
     a malformed header must never shunt an owner message behind maintenance."""
     try:
-        head = path.read_text(errors="replace")[:2048]
+        text = path.read_text(errors="replace")
     except OSError:
         return "owner"
-    fields = dict(m.group("key", "val") for m in _LANE_RE.finditer(head))
+    fields = dict(m.group("key", "val") for m in _LANE_RE.finditer(text))
     tier = fields.get("access_tier")
     if (tier is not None and tier != "owner") or fields.get("priority") == "low" \
             or fields.get("interaction_type") == "self_reflective":
