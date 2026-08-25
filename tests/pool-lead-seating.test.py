@@ -44,7 +44,7 @@ class Base(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def make(self, pid="pro-main"):
-        return self.store.create(pid, ROOMS, "claude", writer=LEAD)
+        return self.store.create(pid, ROOMS, writer=LEAD)
 
     def load(self, name, inst=None):
         suffix = f".assigned-{inst}" if inst else ""
@@ -108,7 +108,7 @@ class SeatingTests(Base):
         for pid in ("pro-a", "pro-b"):
             self.store.create(pid, {f"!{pid}:x": {"read": True,
                                                   "write": "scoped"}},
-                              "claude", writer=LEAD)
+                              writer=LEAD)
         moved = self.lead.reconcile_seating()
         self.assertEqual([p for p, _ in moved], ["pro-a", "pro-b"])
 
