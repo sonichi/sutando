@@ -118,10 +118,8 @@ class ObservedEvent:
 
     def __post_init__(self) -> None:
         _require_text("ObservedEvent", "event_type", self.event_type)
-        # A duck-typed stand-in satisfies every attribute the decision functions
-        # read, so `is_verified` becomes self-declared unless the TYPE is checked.
-        # EXACT type, not isinstance: a subclass can override is_verified/matches and
-        # would then decide its own trust, which is what the scheme allowlist exists to deny.
+        # EXACT type, not isinstance: a duck-typed stand-in OR a subclass can supply
+        # is_verified/matches and would then decide the trust the allowlist exists to deny.
         if type(self.subject) is not Subject:
             raise ValueError(
                 f"ObservedEvent.subject must be exactly a Subject, got {type(self.subject).__name__}")
