@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""A watcher with no PID sentinel is an orphan only when its parent is unknown or
-init; a known live parent means supervised, so the remedy must not say to stop it.
+"""A watcher with no PID sentinel is an orphan when its parent is unknown or init.
+A live parent is NOT on its own evidence of supervision — only ancestry reaching a
+VERIFIED local core session is. A live-but-unattributable parent is `unverified`:
+the remedy must neither stop it nor call it legitimate.
 """
 from __future__ import annotations
 
@@ -28,49 +30,64 @@ def check(label, cond, extra=""):
         print(f"  FAIL {label}  {extra}")
 
 
-def _verdict(trees, parents):
-    """check_task_watcher() with no sentinel, given tree roots and their ppids."""
-    # "" is a scan that RAN and found nothing; None means ps is unavailable,
-    # which would contradict this scenario's premise that watchers exist.
+def _verdict(trees, parents, core_pids=frozenset()):
+    """check_task_watcher() with no sentinel, given tree roots and their ppids.
+
+    `parents` becomes a real ps table: the ownership split walks the FULL process
+    table, so stubbing `_pid_parent` alone would leave every root ownerless and
+    quietly pass the wrong thing.
+    """
+    table = "  PID  PPID ARGS\n" + "".join(
+        f"{k} {v} bash src/watch-tasks-stream.sh\n"
+        for k, v in parents.items() if v is not None)
     with tempfile.TemporaryDirectory() as ws:
         with patch.object(hc, "WORKSPACE_DIR", Path(ws)), \
              patch.object(hc, "_fresh_local_core_record", return_value={"ts": 1}), \
              patch.object(hc, "_watcher_trees", return_value=trees), \
-             patch.object(hc, "_ps_snapshot", return_value=""), \
+             patch.object(hc, "_ps_snapshot", return_value=table), \
+             patch.object(hc, "_local_core_pids", return_value=set(core_pids)), \
              patch.object(hc, "_pid_parent", side_effect=lambda pid, ps=None: parents.get(str(pid))):
             return hc.check_task_watcher()
 
 
 print("single SUPERVISED watcher (the live case):")
-v = _verdict({"12631": {"12631"}}, {"12631": "12626"})
+v = _verdict({"12631": {"12631"}}, {"12631": "12626", "12626": "1"}, {"12626"})
 check("still warns (the sentinel gap is real)", v["status"] == "warn", str(v))
 check("does NOT say 'orphaned'", "orphaned" not in v["detail"], v["detail"])
 check("does NOT tell you to stop it", "stop them" not in v["detail"], v["detail"])
 check("says do NOT stop it", "Do NOT stop it" in v["detail"], v["detail"])
 check("names the live parent", "ppid 12626" in v["detail"], v["detail"])
 
+print("single watcher whose parent is live but NOT a core (the new middle case):")
+vX = _verdict({"777": {"777"}}, {"777": "888", "888": "1"}, core_pids=set())
+check("does NOT bless it", "legitimate" not in vX["detail"], vX["detail"])
+check("does NOT stop it", "Do NOT stop" in vX["detail"] or "unverified (1)" in vX["detail"],
+      vX["detail"])
+check("names it unverified", "unverified (1): 777" in vX["detail"], vX["detail"])
+
 def says_stop(detail):
     """A stop REMEDY, not the substring. 'Do NOT stop them' contains 'stop
     them', so a bare `in` check passes on the opposite verdict — it did."""
-    return "Stop those" in detail and "Do NOT stop" not in detail
+    return "Stop ONLY the ownerless roots" in detail and "Do NOT stop" not in detail
 
 
 print("single REPARENTED watcher (a true orphan):")
 v2 = _verdict({"555": {"555"}}, {"555": "1"})
-check("keeps the orphan verdict", "orphaned" in v2["detail"], v2["detail"])
+check("keeps the orphan verdict", "ownerless (1): 555" in v2["detail"], v2["detail"])
 check("keeps the stop remedy", says_stop(v2["detail"]), v2["detail"])
 
 print("single watcher with UNKNOWN parent (must stay an orphan):")
 # An unknown ppid cannot support "runs under a live session" — saying so would
 # print a self-contradicting "(ppid None)".
 vU = _verdict({"9000": {"9000"}}, {})
-check("keeps the orphan verdict", "orphaned" in vU["detail"], vU["detail"])
+check("keeps the orphan verdict", "ownerless (1): 9000" in vU["detail"], vU["detail"])
 check("does not claim a live session", "live session" not in vU["detail"], vU["detail"])
 
 print("TWO supervised watchers (a pool, not duplicates — BEHAVIOUR CHANGE):")
 # A pool runs one watcher per core and the claim protocol dedups, so a second
 # SUPERVISED tree is not a duplicate. This block used to assert the opposite.
-v3 = _verdict({"100": {"100"}, "200": {"200"}}, {"100": "99", "200": "98"})
+v3 = _verdict({"100": {"100"}, "200": {"200"}},
+             {"100": "99", "200": "98", "99": "1", "98": "1"}, {"99", "98"})
 check("does NOT tell you to stop a pool", not says_stop(v3["detail"]), v3["detail"])
 check("says leave them alone", "Do NOT stop them" in v3["detail"], v3["detail"])
 check("counts both trees", "2 watcher trees" in v3["detail"], v3["detail"])
@@ -79,7 +96,7 @@ check("names both roots", "100" in v3["detail"] and "200" in v3["detail"], v3["d
 print("TWO watchers, both REPARENTED (genuine duplicates — unchanged):")
 v3b = _verdict({"100": {"100"}, "200": {"200"}}, {"100": "1", "200": "1"})
 check("still says stop", says_stop(v3b["detail"]), v3b["detail"])
-check("counts both orphans", "2 of 2 are orphaned" in v3b["detail"], v3b["detail"])
+check("counts both orphans", "ownerless (2): 100, 200" in v3b["detail"], v3b["detail"])
 
 print("no watchers at all (unchanged):")
 v4 = _verdict({}, {})
