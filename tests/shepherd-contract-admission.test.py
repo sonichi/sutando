@@ -280,9 +280,17 @@ check("an event cannot carry a subclassed subject or actor either",
                                       _EvilActor("totally.fake", "attacker")))),
       (True, True))
 
+
+check("source_id must be a string; '' stays legal for an unresolved id",
+      (_rejects(lambda: ObservedEvent("github.pull_request.merged", PR, _asserted, 7)),
+       _rejects(lambda: ObservedEvent("github.pull_request.merged", PR, _asserted, None)),
+       _rejects(lambda: ObservedEvent("github.pull_request.merged", PR, _asserted, "  ")),
+       ObservedEvent("github.pull_request.merged", PR, _asserted).source_id),
+      (True, True, True, ""))
+
 if failures:
     print(f"FAIL ({len(failures)}):")
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 36 assertions, control verified")
+print("PASS: 37 assertions, control verified")
