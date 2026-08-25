@@ -16,16 +16,25 @@ then sets up its own in-session machinery. Codex has neither surface:
 
 | | Claude follower | Codex follower |
 |---|---|---|
-| Invocation | `/proactive-loop-pool` slash command passed at launch | prompt injected into the core pane by `src/agent/codex/cli/task-notifier.sh` |
-| Task wake-up | `Monitor` tool streaming `src/watch-tasks-stream.sh` in-session | the notifier's external watcher (separate managed tmux session) |
-| Periodic sweep | `CronCreate` `*/5 * * * *` registered by the session | **not available** — `src/agent/codex/README.md`: "Codex has no session `CronCreate` surface" |
+| Invocation | `/proactive-loop-pool` slash command passed at launch | pool-mode prompt passed as codex's `[PROMPT]` positional by `scripts/pool-core-wrapper.sh` |
+| Task wake-up | `Monitor` tool streaming `src/watch-tasks-stream.sh` in-session | **none in-session** — only the wrapper's periodic nudge |
+| Periodic sweep | `CronCreate` `*/5 * * * *` registered by the session | the wrapper's external nudge, every 300s |
 
-The third row is the one that changes behaviour rather than just plumbing: a
-Codex follower cannot arm its own catch-up sweep, so an assignment the watcher
-misses is not retried from inside the session. The sweep has to be driven
-externally (the OS-backed cron runner the Codex launcher already reconciles, or
-the lead's reconcile loop). Until that is wired, treat a Codex follower as
-watcher-driven only.
+Both followers are the same persistent shape: an interactive CLI in a tmux
+session named `core-N`, restarted by launchd when the session ends. Only the
+argv and the entry differ.
+
+The last two rows are what changes behaviour rather than just plumbing. A Codex
+follower cannot arm its own catch-up sweep (`src/agent/codex/README.md`: "Codex
+has no session `CronCreate` surface") and has no in-session watcher, so the
+wrapper drives the sweep from outside at the same 5-minute cadence the Claude
+follower registers with `CronCreate`. That is the whole of a Codex follower's
+wake-up: **assignment latency is up to 300s**, against sub-second for a Claude
+follower. Nothing is dropped, but nothing is instant either.
+
+The nudge is skipped while the pane shows `esc to interrupt` and retried on the
+next poll — Codex's interactive input is not a durable queue, so typing into a
+running turn can interleave with it.
 
 ## The injected prompt must be pool-aware
 
@@ -43,6 +52,16 @@ protocol:
 Sutando pool task ready: <filename>. You are core-<n>. Do not read the task
 file or write results/ directly — follow skills/proactive-loop-pool/CODEX.md:
 acquire work first, and complete only through the finish helper.
+```
+
+The wrapper's session entry and its periodic nudge use the same shape without a
+filename, since neither names a specific task — `POOL_CODEX_ENTRY` in
+`scripts/pool-core-wrapper.sh`:
+
+```
+Sutando pool mode. You are core-<n>. Do not read task files or write results/
+directly — follow skills/proactive-loop-pool/CODEX.md: acquire work first, and
+complete only through the finish helper.
 ```
 
 ## Acquire
@@ -86,13 +105,44 @@ does not carry them:
 - Do not register the host cron set; the lead owns it.
 - Do not start `core_heartbeat.py` — liveness is the wrapper's job.
 
-## Not yet wired
+## How a Codex follower is installed
 
-Stated so nobody reads this file as "Codex followers work today":
+```bash
+bash scripts/install-core-pool.sh 3 --core-runtime=3:codex   # core-3 only
+bash scripts/install-core-pool.sh 3 --runtime=codex          # the whole pool
+```
 
-- `scripts/install-core-pool.sh` resolves `claude` and injects `POOL_CLAUDE_BIN`;
-  it has no runtime dimension, so it cannot install a Codex follower yet.
+`--runtime` (or `$SUTANDO_POOL_RUNTIME`) sets the default; `--core-runtime=<N>:<rt>`
+overrides one core. Supported names match `src/agent/start-cli.sh`'s allowlist —
+anything else exits 2 rather than falling back to Claude. The installer resolves
+the runtime's absolute binary and the Codex config store
+(`sutando-config.sh core-config-dir-{env-name,value} codex`) and injects
+`POOL_RUNTIME`, `POOL_RUNTIME_BIN`, `POOL_RUNTIME_CONFIG_ENV` and
+`POOL_RUNTIME_CONFIG_DIR` into that core's plist. A core with nothing specified
+stays Claude with exactly the environment it had before the dimension existed.
+
+## Wired / not wired
+
+Stated so nobody reads this file as "Codex followers are at parity":
+
+Wired:
+
+- `scripts/install-core-pool.sh` has a per-core runtime dimension and installs a
+  Codex follower (above).
+- `scripts/pool-core-wrapper.sh` dispatches on `POOL_RUNTIME` and launches Codex
+  with the flags `src/agent/codex/cli/start-cli.sh` uses, plus the pool entry.
+- The catch-up sweep, driven externally by the wrapper at 300s.
+
+Not wired:
+
 - `task-notifier.sh` has no pool mode — it still emits the single-core prompt.
-- The external periodic sweep described above does not exist.
+  A Codex follower therefore has no event-driven wake-up at all; the 300s nudge
+  is its only one.
+- `scripts/kick-pool.sh` reads Claude's REPL markers (`❯ /proactive-loop-pool`)
+  and sends Claude's keystrokes, so the recovery watchdog cannot kick a hung
+  Codex follower — it only sees the shared `esc to interrupt` busy marker and
+  the launchd `kickstart` path for a dead session.
+- No live install has been exercised: the plists and the launch argv are
+  generated and tested, no Codex follower has been booted under launchd.
 
-This file is the entry those three pieces bind to, not a replacement for them.
+This file is the entry those pieces bind to, not a replacement for them.
