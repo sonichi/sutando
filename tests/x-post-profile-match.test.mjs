@@ -14,11 +14,14 @@
  *
  * Run: node tests/x-post-profile-match.test.mjs
  */
+import { execFileSync } from 'node:child_process';
 import {
 	lineHoldsProfile,
 	pidsHoldingProfile,
 	pidsFromLsofFields,
 	gcftPids,
+	classifyLsofProbe,
+	execTimedOut,
 } from '../skills/x-twitter/profile-match.mjs';
 
 let failures = 0;
@@ -155,6 +158,36 @@ const holders = pidsFromLsofFields(FIELDS);           // 4242, 7777
 const gcft = new Set(gcftPids(PG));                   // 4242, 5150
 check('intersection kills only a GCfT process holding our profile',
 	JSON.stringify(holders.filter((x) => gcft.has(x))) === JSON.stringify(['4242']));
+
+// --- a REAL execFileSync timeout, not a hand-written fixture ------------------
+// The bug was a fixture-shaped belief: `e.killed` is documented on the ASYNC exec
+// error, so a fixture that sets it passes while the shipped sync path never does.
+let timeoutErr = null;
+try {
+	execFileSync('sleep', ['5'], { timeout: 250 });
+} catch (e) { timeoutErr = e; }
+check('control: a real execFileSync timeout was captured', timeoutErr !== null);
+check('control: the real timeout error has NO own `killed` property — this is the defect',
+	timeoutErr !== null && !Object.prototype.hasOwnProperty.call(timeoutErr, 'killed'),
+	timeoutErr && `killed=${JSON.stringify(timeoutErr.killed)}`);
+check('the old predicate `!!e.killed` reads FALSE on it',
+	timeoutErr !== null && !!timeoutErr.killed === false);
+check('execTimedOut reads TRUE on it',
+	timeoutErr !== null && execTimedOut(timeoutErr) === true,
+	timeoutErr && `code=${timeoutErr.code} signal=${timeoutErr.signal}`);
+
+// A timed-out lsof that printed PART of the holder list is the dangerous shape:
+// stdout is non-empty, so without the timeout flag it classifies as a complete read.
+const PARTIAL = 'p4242\nn/tmp/x-profile/Singleton';
+check('old path: partial stdout from a timeout classifies as KNOWN (unsafe)',
+	classifyLsofProbe({ threw: true, killed: !!(timeoutErr && timeoutErr.killed), stdout: PARTIAL }).known === true);
+check('fixed path: the same probe classifies as UNKNOWN, so the caller fails closed',
+	classifyLsofProbe({ threw: true, killed: execTimedOut(timeoutErr), stdout: PARTIAL }).known === false);
+
+for (const [name, v] of [['null', null], ['undefined', undefined], ['string', 'boom']]) {
+	check(`execTimedOut degenerate: ${name}`, execTimedOut(v) === false);
+}
+check('execTimedOut is false for an ordinary non-zero exit', execTimedOut({ status: 1, code: 1 }) === false);
 
 console.log(failures ? `\nFAIL — ${failures} profile-match check(s)` : '\nPASS — x-post profile match');
 process.exit(failures ? 1 : 0);

@@ -110,6 +110,19 @@ export function gcftPids(pgrepOutput) {
  * risking a second Chrome launching against a still-active profile. Callers MUST fail
  * closed on `known: false`: treat it as "cannot say", never as "zero holders".
  */
+/**
+ * Did `execFileSync` kill this child on its own `timeout`? Node reports that as
+ * `code: 'ETIMEDOUT'` with `signal: 'SIGTERM'` and NO `killed` property at all —
+ * `killed` is set on the async `exec` error, not the sync one. Reading `e.killed`
+ * therefore evaluates false on a real timeout, and the probe is then classified by
+ * its stdout: a timed-out lsof that printed a partial holder list reads as a
+ * complete one, and releaseProfileLock() SIGKILLs from it.
+ */
+export function execTimedOut(e) {
+	if (!e || typeof e !== 'object') return false;
+	return e.killed === true || e.code === 'ETIMEDOUT' || e.signal === 'SIGTERM';
+}
+
 export function classifyLsofProbe({ threw, killed, stdout } = {}) {
 	if (killed) return { known: false, pids: [] };
 	if (threw && !(typeof stdout === 'string' && stdout.length > 0)) {

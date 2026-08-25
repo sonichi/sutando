@@ -44,7 +44,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { normalizeComposerText, composerMatches } from './composer-text.mjs';
-import { gcftPids, classifyLsofProbe } from './profile-match.mjs';
+import { gcftPids, classifyLsofProbe, execTimedOut } from './profile-match.mjs';
 import { resolveProfileDir } from './profile-dir.mjs';
 import { readManifestConfig, resolveSetting } from './manifest-config.mjs';
 
@@ -177,9 +177,9 @@ function pidsForProfile() {
     });
     probe = classifyLsofProbe({ threw: false, killed: false, stdout: out });
   } catch (e) {
-    // lsof exits 1 even when it PRINTS holders (verified: one holder, output correct,
-    // exit=1) — classifyLsofProbe knows that shape. `e.killed` marks our own timeout.
-    probe = classifyLsofProbe({ threw: true, killed: !!(e && e.killed), stdout: e && e.stdout });
+    // lsof exits 1 even when it PRINTS holders, so a throw is not proof of "none".
+    // execTimedOut, not e.killed: execFileSync's timeout error carries no `killed`.
+    probe = classifyLsofProbe({ threw: true, killed: execTimedOut(e), stdout: e && e.stdout });
   }
   if (!probe.known) return { known: false, pids: [] };
   if (probe.pids.length === 0) {
