@@ -481,7 +481,9 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
                                    channel_id, f"task-{int(time.time() * 1000)}")
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
-        return "honour", None
+        # A planner that raised proved nothing about the asker being answered.
+        # "honour" archives; "defer" retains so a later pass can retry.
+        return "defer", None
 
 
 def archive_path(kind: str, task_id: str) -> "Path":
@@ -4792,8 +4794,10 @@ async def poll_results():
                                 else None)
                             _holder_text = _holder_file.read_text() if _holder_file else None
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
+                            # Cross-channel is an unconfirmed report: the asker is
+                            # only served once the notify or the re-queue lands.
                             _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
-                                         if not _target else ("honour", None))
+                                         if not _target else ("report", None))
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
                                 save_pending_replies()
@@ -4819,6 +4823,7 @@ async def poll_results():
                                         f"even after a re-queue — flagging instead of looping. "
                                         f"This needs a direct answer here."
                                     )
+                                    _delivered = True
                                 else:
                                     # First time — reject + re-queue for an
                                     # in-channel answer.
@@ -4837,6 +4842,7 @@ async def poll_results():
                                         f"{_new_id} for in-channel answer",
                                         flush=True,
                                     )
+                                    _delivered = True
                         except Exception as e:
                             print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
                         if report_disposition(_act, _delivered) == "retain":

@@ -173,6 +173,60 @@ class DiscordRealLoop(unittest.TestCase):
                             f"asker never told; sent={r['sent']}")
             self.assertFalse(r["result_remaining"], "retained a report that WAS delivered")
 
+    def test_a_planner_that_raises_retains_both_files(self):
+        """A planner exception proved nothing about the asker being answered.
+
+        Before the fix `_dedup_recover` returned ("honour", None), which
+        report_disposition archives -- retiring an unanswered question."""
+        with tempfile.TemporaryDirectory() as td:
+            db = self.db
+            _orig_plan = db.plan_dedup_recovery
+            db.plan_dedup_recovery = lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("plan exploded"))
+            try:
+                r = self._one_pass(td, f"[deduped: {H.HOLDER}]", send_raises=False)
+            finally:
+                db.plan_dedup_recovery = _orig_plan
+            self.assertIn("plan exploded", r["log"],
+                          "control broken: the planner did not raise")
+            self.assertEqual(r["sent"], [], "nobody should have been told")
+            self.assertTrue(r["result_remaining"],
+                            f"result archived after a failed plan; log={r['log'][-400:]}")
+            self.assertTrue(r["task_remaining"],
+                            "task archived after a failed plan -- the question is unrecoverable")
+
+    def test_a_cross_channel_notice_that_raises_retains_both_files(self):
+        """The sibling shape: _target prelabelled the action terminal, so an
+        exception from the second-pass notify still archived the question."""
+        with tempfile.TemporaryDirectory() as td:
+            db = self.db
+            _orig_t = db.dedup_cross_channel_target
+            db.dedup_cross_channel_target = lambda *a, **k: 9999
+            try:
+                r = self._one_pass(td, f"[deduped: {H.HOLDER}]", send_raises=True)
+            finally:
+                db.dedup_cross_channel_target = _orig_t
+            self.assertEqual(r["sent"], [], "control broken: the notify did not fail")
+            self.assertTrue(r["result_remaining"],
+                            f"result archived after a failed cross-channel notice; "
+                            f"log={r['log'][-400:]}")
+            self.assertTrue(r["task_remaining"],
+                            "task archived after a failed cross-channel notice")
+
+    def test_a_delivered_cross_channel_notice_still_retires(self):
+        """Positive control: without it the two tests above pass by construction."""
+        with tempfile.TemporaryDirectory() as td:
+            db = self.db
+            _orig_t = db.dedup_cross_channel_target
+            db.dedup_cross_channel_target = lambda *a, **k: 9999
+            try:
+                r = self._one_pass(td, f"[deduped: {H.HOLDER}]", send_raises=False)
+            finally:
+                db.dedup_cross_channel_target = _orig_t
+            self.assertTrue(r["sent"], "control broken: the notify never sent")
+            self.assertFalse(r["result_remaining"],
+                             "retained a cross-channel notice that WAS delivered")
+
     def test_empty_holder_spellings_reach_recovery(self):
         """`[deduped:]` and `[deduped: ]` are dedup markers, not silent archives."""
         for marker in ("[deduped:]", "[deduped: ]"):
