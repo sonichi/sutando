@@ -3,7 +3,11 @@
 as. They disagreed silently before: a present-but-blank shell_command made the
 runner skip the entry while the dashboard advertised its fallback skill."""
 import importlib.util
+import json
+import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -45,20 +49,63 @@ for bad, why in [("   ", "blank"), ("", "empty"), (123, "int"),
 check(sel({"prompt_skill": "fallback"})[0] == cef.SKILL,
       "control: with NO shell key at all, the skill leg is correct")
 
-# --- the runner's own predicate, mirrored ------------------------------------
-def runner_would_skip(entry):
-    """Verbatim shape of src/cron-runner.py's pre-existing guard."""
-    if "shell_command" not in entry:
-        return False
-    v = entry.get("shell_command")
-    return not isinstance(v, str) or not v.strip()
+# Production parity. A mirrored copy of the runner's predicate stood in for the
+# runner here, and agreed with the selector while production disagreed with both.
+_spec = importlib.util.spec_from_file_location(
+    "cron_runner_prod", REPO / "src" / "cron-runner.py")
+_runner = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(_runner)
+except SystemExit:
+    pass
+import dashboard_schedules as _ds  # noqa: E402
 
 
-for entry in [{"shell_command": "echo hi"}, {"shell_command": "  "},
-              {"shell_command": 1}, {"prompt_skill": "f"}, {},
-              {"shell_command": "x", "prompt_skill": "f"}]:
-    check((sel(entry)[0] == cef.MALFORMED) == runner_would_skip(entry),
-          f"selector agrees with the runner's skip predicate on {entry}")
+def _runner_emits(entry):
+    """The task: line the REAL emit_task writes — not a re-derivation of it."""
+    with tempfile.TemporaryDirectory() as td:
+        tasks = Path(td) / "tasks"
+        tasks.mkdir()
+        prev = os.environ.get("SUTANDO_TASKS_DIR")
+        os.environ["SUTANDO_TASKS_DIR"] = str(tasks)
+        try:
+            written = _runner.emit_task(entry.get("name", "j"), entry)
+            m = re.search(r"^task:\s*(.*)$", written.read_text(), re.M)
+            return m.group(1) if m else ""
+        finally:
+            if prev is None:
+                os.environ.pop("SUTANDO_TASKS_DIR", None)
+            else:
+                os.environ["SUTANDO_TASKS_DIR"] = prev
+
+
+def _dashboard_kind(entry):
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "crons.json"
+        f.write_text(json.dumps([entry]))
+        return _ds.list_schedules(f)[0].get("kind")
+
+
+# Each adjacent prompt_skill shape, alongside a real prompt: emitted target and
+# advertised kind must agree.
+for why, extra in [("absent", {}),
+                   ("blank", {"prompt_skill": "   "}),
+                   ("padded", {"prompt_skill": " morning "}),
+                   ("non-string", {"prompt_skill": 5}),
+                   ("real skill", {"prompt_skill": "morning"})]:
+    e = {"name": "j", "cron": "* * * * *", "launchd": True,
+         "prompt": "do work", **extra}
+    emitted = _runner_emits(e)
+    runner_kind = cef.SKILL if emitted.startswith("/") else cef.PROMPT
+    check(runner_kind == _dashboard_kind(e),
+          f"{why} prompt_skill: runner ({runner_kind}, emits {emitted!r}) and "
+          f"dashboard ({_dashboard_kind(e)!r}) agree")
+    check(runner_kind == sel(e)[0],
+          f"{why} prompt_skill: the runner follows the shared selector")
+
+check(_runner_emits({"name": "j", "cron": "* * * * *", "launchd": True,
+                     "prompt_skill": "   ", "prompt": "do work"}) == "do work",
+      "a blank prompt_skill must not emit a slash-command with no skill name")
 
 check(sel("not-a-dict")[0] == cef.MALFORMED, "a non-dict entry is MALFORMED")
 

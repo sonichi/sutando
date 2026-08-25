@@ -45,7 +45,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cron_execution_form import MALFORMED, select_execution_form  # noqa: E402
+from cron_execution_form import (MALFORMED, SHELL, SKILL,  # noqa: E402
+                                 select_execution_form)
 from typing import Iterator, Optional
 
 # --- workspace + host resolution (mirror the rest of the codebase) ----------
@@ -373,12 +374,10 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
 def emit_task(name: str, entry: dict) -> Path:
     now_ms = int(time.time() * 1000)
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    # A launchd cron either carries a direct `prompt` or a `prompt_skill`
-    # (invoked as a slash command), matching the schedule-crons contract.
-    if entry.get("prompt_skill"):
-        body_task = f"/{entry['prompt_skill']}"
-    else:
-        body_task = entry.get("prompt", "")
+    # Same selector the dispatch loop and the dashboard bind: raw truthiness
+    # here made a blank `prompt_skill` emit `/   ` while both lists said prompt.
+    form, target = select_execution_form(entry)
+    body_task = f"/{target}" if form == SKILL else target
     safe_name = _sanitize_name(name)
     task_id = f"task-cron-{safe_name}-{now_ms}"
     # Defang forged header/fence lines in the (config-supplied) body, then place
@@ -468,8 +467,7 @@ def run(now_epoch: Optional[int] = None) -> list:
                 continue
             # Shared with dashboard_schedules so the two cannot disagree about
             # which form an entry runs as (or that it will not run at all).
-            form, _form_detail = select_execution_form(entry)
-            shell_command = entry.get("shell_command")
+            form, target = select_execution_form(entry)
             if form == MALFORMED:
                 print(
                     f"cron-runner: skipping {name}: shell_command must be a non-empty string",
@@ -489,9 +487,9 @@ def run(now_epoch: Optional[int] = None) -> list:
             if due_epoch is not None:
                 # Direct shell jobs must stay claimable and idempotent like prompt jobs; only
                 # the execution differs.
-                if shell_command is not None:
+                if form == SHELL:
                     _run_shell_command(
-                        name, shell_command, _shell_timeout_for(entry))
+                        name, target, _shell_timeout_for(entry))
                     emitted.append(name)
                 elif not core_alive:
                     # Preserve the previous boundary so a short outage can
