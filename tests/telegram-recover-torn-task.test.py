@@ -78,10 +78,8 @@ def test_torn_task_does_not_kill_recovery():
             return
         check(got.get("task-OK") == 222,
               f"the clean task is still recovered alongside a torn one, got {got!r}")
-        # The tear is in the body; the headers above it are intact, so the
-        # replacement decode recovers the torn file's OWN routing too. Pinned
-        # because it is the point of errors="replace" — a mode that skipped the
-        # file would keep the assert above green and lose this reply.
+        # The headers sit above the tear, so the replacement decode recovers
+        # this file too; a mode that skipped it keeps the assert above green.
         check(got.get("task-TORN") == 111,
               f"the torn task's own routing survives the tear, got {got!r}")
 
