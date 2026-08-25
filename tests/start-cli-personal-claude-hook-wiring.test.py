@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-start-cli.sh must call scripts/install-personal-claude-hook.sh on every
-launch, not just via startup.sh.
+src/agent/claude/cli/start-cli.sh must call
+scripts/install-personal-claude-hook.sh on every Claude launch, unconditionally
+and before any tmux/CLAUDE_CONFIG_DIR work — the single Claude launch
+chokepoint (startup.sh, --restart, menu bar, supervisor all exec this file).
 
-Direct restarts (menu bar, health-check recovery, manual --restart,
-supervisor) documented in start-cli.sh do not pass through startup.sh --
-the same gap that was already fixed there once for
-SUTANDO_SELF_DEVELOPMENT_ENABLED propagation and the quota-proxy wiring.
-The PERSONAL_CLAUDE.md compaction hook's registration
-(scripts/install-personal-claude-hook.sh) never got the same treatment: a
-core whose first-ever launch is a direct restart path would never get the
-hook installed. This test asserts start-cli.sh invokes the (idempotent)
-installer unconditionally, before it ever reaches runtime dispatch.
+Earlier revision put the call in src/agent/start-cli.sh, the generic
+runtime-dispatch script shared by Claude and Codex — an adapter-edge
+violation (this hook is Claude-only policy) that also fired the call for a
+Codex launch. Moved here per review; this file proves the new call site and
+that the generic dispatcher no longer carries Claude-specific policy.
 
-Hermetic: a real scripts/install-personal-claude-hook.sh is stubbed out so
-this test only proves the CALL happens, not the installer's own behavior
-(that is tests/personal-claude-compact-hook.test.py's job).
+Hermetic: real scripts/install-personal-claude-hook.sh is stubbed. The
+wiring test truncates the REAL start-cli.sh source at (and including) the
+install-hook call, so it proves the actual call executes, in the actual
+resolver context, without needing a full tmux/claude launch (which the
+sibling Chrome-seed test also deliberately avoids).
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -26,80 +27,104 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+LAUNCHER = REPO / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
+CALL_RE = re.compile(r'^\s*bash "\$REPO/scripts/install-personal-claude-hook\.sh"')
 
 
 class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "repo"
-        for rel in ("src/agent/start-cli.sh", "scripts/sutando-config.sh"):
-            dest = self.root / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(REPO / rel, dest)
+        (self.root / "src/agent/claude/cli").mkdir(parents=True)
+        (self.root / "scripts").mkdir(parents=True)
 
-        # Stub the installer: record that it ran, then exit 0 (idempotent
-        # no-op on a real re-run, so `|| true` in the caller never masks a
-        # real failure here).
-        installer = self.root / "scripts" / "install-personal-claude-hook.sh"
+        lines = LAUNCHER.read_text().splitlines(keepends=True)
+        call_idx = next((i for i, ln in enumerate(lines) if CALL_RE.match(ln)), None)
+        self.assertIsNotNone(
+            call_idx,
+            "install-personal-claude-hook.sh call not found in "
+            "src/agent/claude/cli/start-cli.sh — did it move or get removed?",
+        )
+        # Truncate immediately after the call so the harness never reaches the
+        # tmux/CLAUDE_CONFIG_DIR machinery below it.
+        truncated = "".join(lines[: call_idx + 1])
+        (self.root / "src/agent/claude/cli/start-cli.sh").write_text(truncated)
+        (self.root / "src/agent/claude/cli/start-cli.sh").chmod(0o755)
+
+        shutil.copy2(
+            REPO / "scripts/python-binary.sh", self.root / "scripts/python-binary.sh"
+        )
+
         self.marker = self.root / "installer-ran.marker"
-        installer.write_text(
-            "#!/usr/bin/env bash\n"
-            f"echo ran >> '{self.marker}'\n"
-        )
+        installer = self.root / "scripts/install-personal-claude-hook.sh"
+        installer.write_text(f"#!/usr/bin/env bash\necho ran >> '{self.marker}'\n")
         installer.chmod(0o755)
-
-        # Stub core-runtime resolution to fail immediately AFTER the
-        # install call — proves ordering (installer runs before dispatch)
-        # without needing a real runtime launcher or tmux session.
-        config = self.root / "scripts" / "sutando-config.sh"
-        config.write_text(
-            "#!/usr/bin/env bash\n"
-            'if [ "$1" = "core-runtime" ]; then\n'
-            '  echo "start-cli: intentional test stop" >&2\n'
-            "  exit 7\n"
-            "fi\n"
-        )
-        config.chmod(0o755)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_installer_runs_before_runtime_dispatch(self):
+    def test_claude_launcher_invokes_installer_unconditionally(self):
         result = subprocess.run(
-            ["/bin/bash", str(self.root / "src/agent/start-cli.sh")],
+            ["/bin/bash", str(self.root / "src/agent/claude/cli/start-cli.sh")],
             capture_output=True,
             text=True,
             timeout=30,
         )
         self.assertTrue(
             self.marker.exists(),
-            "start-cli.sh did not invoke install-personal-claude-hook.sh "
+            "the Claude launcher did not invoke install-personal-claude-hook.sh "
             f"(stderr: {result.stderr})",
         )
         self.assertEqual(self.marker.read_text().count("ran"), 1)
-        # start-cli.sh maps any core-runtime failure to exit 1; reaching
-        # that (not some earlier abort) proves the install call ran BEFORE
-        # dispatch, not that dispatch never happens for real.
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("failed to resolve core runtime", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_installer_failure_does_not_abort_launch(self):
-        installer = self.root / "scripts" / "install-personal-claude-hook.sh"
+        installer = self.root / "scripts/install-personal-claude-hook.sh"
         installer.write_text("#!/usr/bin/env bash\nexit 1\n")
         installer.chmod(0o755)
         result = subprocess.run(
-            ["/bin/bash", str(self.root / "src/agent/start-cli.sh")],
+            ["/bin/bash", str(self.root / "src/agent/claude/cli/start-cli.sh")],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        # set -euo pipefail would abort the whole launcher on a bare failed
-        # call; `|| true` is what keeps a broken/missing installer from
-        # taking the core down with it. Reaching start-cli.sh's OWN
-        # core-runtime error message (not a raw `set -e` abort with no
-        # message) is what proves that.
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("failed to resolve core runtime", result.stderr)
+        # `|| true` after the call is what keeps a broken/missing installer
+        # from taking the whole launcher down with it (bash -e).
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class RuntimeScopingTest(unittest.TestCase):
+    """The hook is Claude-only policy: it must not be wired into the generic
+    dispatcher (which also routes Codex launches) or the Codex launcher."""
+
+    def test_generic_dispatcher_does_not_call_installer(self):
+        text = (REPO / "src/agent/start-cli.sh").read_text()
+        self.assertNotIn(
+            "install-personal-claude-hook.sh",
+            text,
+            "src/agent/start-cli.sh is the generic Claude/Codex dispatcher — "
+            "it must not carry Claude-only hook-install policy",
+        )
+
+    def test_codex_launcher_does_not_call_installer(self):
+        codex_launcher = REPO / "src/agent/codex/cli/start-cli.sh"
+        self.assertTrue(codex_launcher.is_file())
+        text = codex_launcher.read_text()
+        self.assertNotIn(
+            "install-personal-claude-hook.sh",
+            text,
+            "the PERSONAL_CLAUDE.md compact hook wires into Claude Code's "
+            "own settings.json — Codex must never call this installer",
+        )
+
+    def test_startup_sh_does_not_call_installer(self):
+        text = (REPO / "src/startup.sh").read_text()
+        self.assertNotIn(
+            "install-personal-claude-hook.sh",
+            text,
+            "startup.sh execs into src/agent/start-cli.sh for every runtime; "
+            "the call belongs only at the Claude launch chokepoint",
+        )
 
 
 if __name__ == "__main__":
