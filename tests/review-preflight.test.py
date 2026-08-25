@@ -163,5 +163,91 @@ class ReviewPreflightErrorPathTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
 
+class PriorArtTest(unittest.TestCase):
+    """The reviewer-facing half: what is ALREADY on the thread.
+
+    Grounded 2026-08-24 — a reviewer checked a PR's *reviews*, found none
+    blocking, and filed a REQUEST_CHANGES duplicating a finding a peer had
+    posted six minutes earlier as a *comment*. Reviews and comments are
+    different endpoints; consulting one and concluding about both is the bug.
+    """
+
+    @staticmethod
+    def _runner(reviews="[]", comments="[]", rc=0, boom=None):
+        class R:
+            def __init__(self, out):
+                self.returncode = rc
+                self.stdout = out
+
+        def run(argv):
+            if boom:
+                raise boom
+            return R(reviews if "/reviews" in argv[2] else comments)
+
+        return run
+
+    def test_a_comment_is_surfaced_even_though_it_is_not_a_review(self):
+        run = self._runner(comments='[{"created_at":"2026-08-24T11:36:36Z",'
+                                    '"user":{"login":"sonichi"},"body":"the finding"}]')
+        seen = pf.prior_art("3327", runner=run)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("sonichi", seen[0])
+        self.assertIn("(comment)", seen[0])
+
+    def test_a_COMMENTED_review_with_a_body_IS_surfaced(self):
+        """Regression: filtering on state deleted the record, not a duplicate.
+
+        Measured on #3356 — its ONLY review was a 2805-byte COMMENTED blocking
+        finding, and that body is absent from issues/comments, so the old
+        `state == "COMMENTED": continue` hid the most substantial prior art on
+        the thread. On a repo where agents share a login, a COMMENTED review is
+        the only review shape an agent can leave."""
+        run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
+                                   '"state":"COMMENTED","body":"a real finding"}]')
+        seen = pf.prior_art("1", runner=run)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("COMMENTED", seen[0])
+
+    def test_an_empty_bodied_review_is_skipped(self):
+        """The real rule is skip-on-EMPTY: an approval with no prose says nothing
+        a reviewer needs to read before writing."""
+        run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
+                                   '"state":"APPROVED","body":"   "}]')
+        self.assertEqual(pf.prior_art("1", runner=run), [])
+
+    def test_unknown_is_not_empty(self):
+        """The load-bearing case: a failed check must not render as a clean one."""
+        for label, run in (("gh missing", self._runner(boom=OSError("no gh"))),
+                           ("gh failed", self._runner(rc=1)),
+                           ("bad json", self._runner(reviews="not json"))):
+            with self.subTest(label):
+                self.assertIsNone(pf.prior_art("1", runner=run), label)
+        unknown = "\n".join(pf.prior_art_block("1", None))
+        empty = "\n".join(pf.prior_art_block("1", []))
+        self.assertIn("COULD NOT CHECK", unknown)
+        self.assertNotIn("COULD NOT CHECK", empty)
+        self.assertNotEqual(unknown, empty)
+
+    def test_the_block_says_why_reviews_alone_are_not_enough(self):
+        body = "\n".join(pf.prior_art_block("1", ["t  sonichi (comment)"]))
+        self.assertIn("COMMENTED", body)
+        self.assertIn("sonichi", body)
+
+    def test_a_truncated_list_says_it_is_truncated(self):
+        """A bare count above a shorter list reads as a wrong count, not a cut list."""
+        many = [f"t{i}  sonichi (comment)" for i in range(63)]
+        body = pf.prior_art_block("1", many)
+        rows = [ln for ln in body if ln.startswith("  t")]
+        self.assertEqual(len(rows), pf.PRIOR_ART_SHOWN)
+        self.assertIn(f"showing last {pf.PRIOR_ART_SHOWN} of 63", body[0])
+        self.assertNotIn("(63)", body[0])
+
+    def test_an_untruncated_list_does_not_claim_truncation(self):
+        few = [f"t{i}  sonichi (comment)" for i in range(pf.PRIOR_ART_SHOWN)]
+        head = pf.prior_art_block("1", few)[0]
+        self.assertIn(f"({pf.PRIOR_ART_SHOWN})", head)
+        self.assertNotIn("showing last", head)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
