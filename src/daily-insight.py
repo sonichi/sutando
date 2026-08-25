@@ -532,7 +532,7 @@ def dev_activity_insight(dev):
             f"({where}); the other {n - landed} are still on branches.")
 
 
-def generate_insight():
+def generate_insight() -> str | None:
     # Real code output is the highest-signal insight — surface it first so a
     # productive day never reads as "you just made some notes" (owner 2026-07-21).
     dev_line = dev_activity_insight(analyze_dev_activity())
@@ -601,7 +601,11 @@ def generate_insight():
         )
 
     if not insights:
-        insights.append("Not enough data yet to generate behavioral insights. Keep using Sutando — patterns will emerge.")
+        # No insight is NOT an insight. Returning prose here made "not enough
+        # data" indistinguishable from a finding to every consumer downstream:
+        # main() wrote it to the delivered results file, and morning-briefing
+        # read it back out of the sentinel and spoke it as "Insight: …".
+        return None
 
     # Pick the most interesting one (longest = most specific)
     best = max(insights, key=len)
@@ -624,6 +628,15 @@ def main():
         return
 
     insight = generate_insight()
+    if insight is None:
+        # Stamp an EMPTY sentinel: it still suppresses same-day regeneration,
+        # and get_daily_insight()'s `.strip() or None` then yields no insight,
+        # so the briefing omits the line instead of reading this back. No
+        # results file, so nothing is delivered either.
+        sentinel.write_text("")
+        print("No insight today — not enough data. Sentinel stamped empty; nothing delivered.")
+        return
+
     output_path.write_text(insight)
     sentinel.write_text(insight)
     print(f"Daily insight → {output_path}")
