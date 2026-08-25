@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""The lister must name a reply nothing is coming for, AND stay silent about
+one a consumer can still reach. A run that finds nothing proves neither."""
+import importlib.util
+import io
+import contextlib
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location(
+    "lur", REPO / "scripts" / "list-undelivered-replies.py")
+lur = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lur)
+
+
+class Lister(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        for d in ("tasks", "tasks/archive", "results"):
+            (self.ws / d).mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _orphan(self, tid, dest="!ROOM:ag2.space", tier="owner", where="archive"):
+        hdr = (f"id: {tid}\nsource: ag2space\nchannel_id: {dest}\n"
+               f"user_id: @someone:ag2.space\naccess_tier: {tier}\ntask: t\n")
+        (self.ws / "tasks" / where / f"{tid}.txt").write_text(hdr) if where == "archive" \
+            else (self.ws / "tasks" / f"{tid}.txt").write_text(hdr)
+        (self.ws / "results" / f"{tid}.txt").write_text("the reply body\n")
+
+    def test_names_the_orphan_and_its_destination(self):
+        self._orphan("task-aaa")
+        rows = lur.undelivered(self.ws)
+        self.assertEqual([r[0] for r in rows], ["task-aaa"])
+        self.assertEqual(rows[0][2]["channel_id"], "!ROOM:ag2.space")
+        self.assertEqual(rows[0][2]["access_tier"], "owner")
+
+    def test_a_task_still_queued_is_not_listed(self):
+        """Negative control: a consumer can still reach that pair, so
+        reporting it would send an operator to deliver a live reply twice."""
+        self._orphan("task-bbb", where="tasks")
+        self.assertEqual(lur.undelivered(self.ws), [])
+
+    def test_a_header_without_a_room_is_flagged_not_guessed(self):
+        (self.ws / "tasks" / "archive" / "task-ccc.txt").write_text(
+            "id: task-ccc\nsource: local\ntask: t\n")
+        (self.ws / "results" / "task-ccc.txt").write_text("body\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            lur.main(["--workspace", str(self.ws)])
+        out = buf.getvalue()
+        self.assertIn("dest   UNKNOWN", out)
+        self.assertIn("do NOT guess a room", out)
+
+    def test_empty_workspace_says_so(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            lur.main(["--workspace", str(self.ws)])
+        self.assertIn("no replies awaiting delivery", buf.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
