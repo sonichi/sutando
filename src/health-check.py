@@ -9172,27 +9172,16 @@ def run_all_checks() -> list[dict]:
         # modification. This catches the case where a fix is on disk but the
         # running process is from a previous version (e.g., PR #203 silently
         # not in effect because nobody restarted the bridge after merge).
-        # One ps read for both the stale check and the pin, and the pin is
-        # resolved even when the code is NOT stale: a restart destroys a pinned
-        # witness whichever diagnostic prescribed it.
-        ps_out = ""
-        pin_armed = None
-        try:
-            ps_out = subprocess.run(
-                ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
-                capture_output=True, text=True, timeout=5
-            ).stdout.strip()
-            if ps_out:
-                pin_armed = process_pins.armed_detail(
-                    _pin_verdicts(name, {pids[0]: ps_out}))
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
         proc_start = None
         try:
             src_file = REPO_DIR / "src" / f"{name}.py"
             if src_file.exists() and pids:
                 src_mtime = src_file.stat().st_mtime
+                # Use ps to get process start time as Unix epoch
+                ps_out = subprocess.run(
+                    ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
+                    capture_output=True, text=True, timeout=5
+                ).stdout.strip()
                 if ps_out:
                     from datetime import datetime as _dt
                     proc_start = _dt.strptime(ps_out, "%a %b %d %H:%M:%S %Y").timestamp()
@@ -9238,19 +9227,11 @@ def run_all_checks() -> list[dict]:
                 if log_path.endswith(".log") or log_path.endswith(".log.bak"):
                     if not Path(log_path).exists():
                         status = "warn"
-                        if pin_armed:
-                            # The finding stays visible; the REMEDY does not.
-                            # Printing a kickstart line here tells an operator to
-                            # perform the exact restart the pin exists to forbid.
-                            detail = (f"{pin_armed} [log inode dead "
-                                      f"({log_path} unlinked) — not actionable "
-                                      "while pinned]")
-                        else:
-                            detail = (
-                                f"running but log inode dead ({log_path} unlinked) — "
-                                f"restart with: launchctl kickstart -k gui/$(id -u)/com.sutando.{name} "
-                                "(or nohup+disown on Mini)"
-                            )
+                        detail = (
+                            f"running but log inode dead ({log_path} unlinked) — "
+                            f"restart with: launchctl kickstart -k gui/$(id -u)/com.sutando.{name} "
+                            "(or nohup+disown on Mini)"
+                        )
                         break
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
@@ -9272,15 +9253,7 @@ def run_all_checks() -> list[dict]:
                 override = bridge_log_content_status(name, status, tail, detail,
                                                      log_path=log_file)
                 if override is not None:
-                    # Same veto as check 5, and for the same reason: these
-                    # overrides prescribe restarts (discord-bridge's token case
-                    # "always overrides"), so an armed pin keeps the finding and
-                    # drops the remedy rather than being replaced by it.
-                    if pin_armed:
-                        status = override[0] if override[0] != "ok" else status
-                        detail = f"{pin_armed} [{override[1]}]"
-                    else:
-                        status, detail = override
+                    status, detail = override
             except OSError:
                 pass
 

@@ -15,10 +15,19 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
 from unittest import mock
+
+# health-check imports the bridge config path, which falls back to the real home
+# when CLAUDE_CONFIG_DIR is unset — so this must be bound BEFORE the import below,
+# at module level, or the test reads whatever the developer happens to have.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-pin-veto-")
+_ccd = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_ccd.mkdir(parents=True, exist_ok=True)
+(_ccd / "access.json").write_text("{}")
 
 REPO = Path(__file__).resolve().parents[1]
 PID = "424242"
@@ -56,9 +65,6 @@ def _bridge_detail(pinned: bool) -> tuple:
         (ws / "logs").mkdir(parents=True)
         (repo / "src").mkdir(parents=True)
         (repo / "src" / "slack-bridge.py").write_text("# bridge\n")
-        chan = ws / "channels" / "slack"
-        chan.mkdir(parents=True)
-        (chan / "access.json").write_text("{}")
         pins = {"pins": [{"service": "slack-bridge", "pid": PID, "lstart": LSTART,
                           "reason": "branch-only witness in flight",
                           "expires_at": "2099-01-01T00:00:00Z"}]} if pinned else {"pins": []}
