@@ -1389,6 +1389,9 @@ function taskTimeFromRow(row, existing) {
 }
 
 function mergeTaskRow(existing, row) {
+  // An explicitly present result wins even when empty: the server clears the
+  // body it can no longer vouch for, and `||` would restore the superseded one.
+  const hasResult = Object.prototype.hasOwnProperty.call(row, 'result');
   const hasWorkstreamId = Object.prototype.hasOwnProperty.call(row, 'workstream_id');
   const hasWorkstreamName = Object.prototype.hasOwnProperty.call(row, 'workstream_name');
   if (row.status === 'working' && row.workstream_id &&
@@ -1400,7 +1403,7 @@ function mergeTaskRow(existing, row) {
     status: row.status || existing.status || 'done',
     text: row.text || existing.text || row.id,
     time: taskTimeFromRow(row, existing),
-    result: row.result || existing.result || '',
+    result: hasResult ? (row.result || '') : (existing.result || ''),
     source: row.source || existing.source || '',
     workstream_id: hasWorkstreamId ? (row.workstream_id || '') : (existing.workstream_id || ''),
     workstream_name: hasWorkstreamName ? (row.workstream_name || '') : (existing.workstream_name || ''),
