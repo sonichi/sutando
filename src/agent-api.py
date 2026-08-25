@@ -377,9 +377,8 @@ def _active_task_rows() -> list[dict]:
             status = "done"
             result_text = live_body
         elif result_file.exists():
-            # Live body observed but mid-write. The cached row and the archive
-            # both hold the SUPERSEDED answer, so reporting either as `done`
-            # is the stale-body inconsistency this guard exists to remove.
+            # Mid-write: the cached row and the archive both hold the
+            # SUPERSEDED answer, so neither may be reported as `done`.
             status = "working"
             result_text = ""
         elif existing.get("status") == "done" or existing.get("result"):
