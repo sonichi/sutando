@@ -413,7 +413,7 @@ start_gateway_lanes() {
   _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)" || _RELAY_ENV=""
   if [ -z "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
     for _tok_var in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
-      python3 "$REPO/src/channel_token.py" --has "$_tok_var" \
+      "${PY:-python3}" "$REPO/src/channel_token.py" --has "$_tok_var" \
         ${_RELAY_ENV:+--env-file "$_RELAY_ENV"} >/dev/null 2>&1 && { _tok_rc=0; break; }
     done
   else
