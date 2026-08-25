@@ -551,7 +551,9 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
         if not task_file:
             continue
         try:
-            text = task_file.read_text()
+            # Recovery runs right after the crash that tore these files, so a
+            # strict read here exits main() — headers are at the top and survive.
+            text = task_file.read_text(errors="replace")
         except OSError:
             continue
         headers = local_task_protocol.parse_task_headers(text).headers
