@@ -8876,10 +8876,25 @@ def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
                for pid in out.split() if pid.isdigit())
 
 
+def proxy_liveness_status(proxy_check: dict) -> str:
+    """The status the quota consumers should read, which is NOT the remedy.
+
+    An armed pin makes `status` warn while the proxy keeps routing. Both
+    consumers already accept "stale" for exactly that state — listening, not
+    freshly deployed — so a pinned-live proxy maps onto it.
+    """
+    if proxy_check.get("live") and proxy_check.get("status") not in ("ok", "stale"):
+        return "stale"
+    return proxy_check.get("status")
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
     check = check_port(7846, "credential-proxy", probe=False)
+    # Liveness, captured before staleness/pin rewrite `status`: a pinned proxy
+    # still routes, so its consumers must not read the pin as "down".
+    check["live"] = check["status"] == "ok"
     if check["status"] == "down":
         check["status"] = "warn"
         check["detail"] = "not running (optional)"
@@ -8942,12 +8957,14 @@ def run_all_checks() -> list[dict]:
     proxy_check = check_credential_proxy()
     checks.append(proxy_check)
 
+    proxy_live = proxy_liveness_status(proxy_check)
+
     # Quota telemetry — only meaningful when the proxy is actually up.
-    checks.append(check_quota_telemetry(proxy_check["status"]))
+    checks.append(check_quota_telemetry(proxy_live))
     # ...and WHOSE account those numbers describe. The check above answers
     # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
     # passes every branch above (observed 2026-08-03).
-    checks.append(check_quota_account_identity(proxy_check["status"]))
+    checks.append(check_quota_account_identity(proxy_live))
 
     # Core over-quota — fail loudly to the remote owner surface so an exhausted
     # model no longer stalls every task silently (owner-reported 2026-08-01).
