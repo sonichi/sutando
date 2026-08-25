@@ -650,6 +650,62 @@ def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict
     return {"source": "none", "path": None}
 
 
+# Bridges that import vault_intercept, and so need detect-secrets at RUNTIME.
+# Mirrors the three _vault_scanner_check call sites in src/startup.sh.
+_VAULT_SCANNER_BRIDGES = ["telegram-bridge", "discord-bridge", "slack-bridge"]
+
+
+def check_secret_scanner_mode() -> dict:
+    """Report the secret scanner's DEGRADED mode as standing status.
+
+    startup.sh names it once at boot and vault_intercept names it at the moment
+    a `vault set` is refused; nothing reports it in between, so a host scans
+    inbound bridge text with 17 provider detectors off and health-check still
+    prints no failures.
+    """
+    degraded, checked = [], []
+    for bridge in _VAULT_SCANNER_BRIDGES:
+        interp = _bridge_interpreter(bridge)
+        if interp is None:
+            continue  # bridge cannot launch at all; its own probe owns that
+        if interp in checked:
+            continue
+        checked.append(interp)
+        try:
+            probe = subprocess.run([interp, "-c", "import detect_secrets"],
+                                   capture_output=True, timeout=10)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return {
+                "name": "secret-scanner",
+                "status": "warn",
+                "detail": f"could not probe {interp} for detect-secrets ({exc}) — mode unknown, not proven healthy",
+            }
+        if probe.returncode != 0:
+            degraded.append(interp)
+    if not checked:
+        return {
+            "name": "secret-scanner",
+            "status": "warn",
+            "detail": "no launchable bridge interpreter found — scanner mode unknown",
+        }
+    if not degraded:
+        return {
+            "name": "secret-scanner",
+            "status": "ok",
+            "detail": f"detect-secrets present in all {len(checked)} bridge interpreter(s)",
+        }
+    fix = f"{degraded[0]} -m pip install detect-secrets"
+    return {
+        "name": "secret-scanner",
+        "status": "warn",
+        "detail": (f"DEGRADED in {len(degraded)}/{len(checked)} bridge interpreter(s) "
+                   f"({', '.join(degraded)}): detect-secrets missing, so its provider "
+                   f"detectors and entropy checks are off and inbound text is scanned by "
+                   f"repo-local whole-line rules only; unquoted `vault set` is REFUSED. "
+                   f"Fix: {fix} (add --break-system-packages if PEP 668 blocks it)"),
+    }
+
+
 def check_node_runtime() -> dict:
     """Surface WHICH node the JS services resolve to — or a loud red line when
     none exists. The 2026-07-13 outage class: an interactive terminal finding
@@ -9040,6 +9096,7 @@ def run_all_checks() -> list[dict]:
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.
     checks.append(check_node_runtime())
+    checks.append(check_secret_scanner_mode())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
     checks.extend(check_dynamic_loop_freshness())
