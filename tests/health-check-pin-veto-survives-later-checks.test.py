@@ -21,9 +21,8 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-# health-check imports the bridge config path, which falls back to the real home
-# when CLAUDE_CONFIG_DIR is unset — so this must be bound BEFORE the import below,
-# at module level, or the test reads whatever the developer happens to have.
+# Bound at module level BEFORE the import: health-check resolves the channel
+# allowlist under CLAUDE_CONFIG_DIR, falling back to the real home when unset.
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-pin-veto-")
 _ccd = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
 _ccd.mkdir(parents=True, exist_ok=True)
