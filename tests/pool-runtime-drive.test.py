@@ -284,6 +284,19 @@ class CodexKickTest(DriveHarness):
             self.assertIn("-e", calls[0],
                           "codex needs SGR codes to tell placeholder from input")
 
+    def test_idle_is_recognized_whatever_sgr_prefix_codex_uses(self):
+        # Live codex emits ESC[0;1m once it has replied, not the ESC[1m a fresh
+        # pane shows; pinning one spelling defers a codex core's ONLY sweep.
+        for prefix in ("[1m", "[0;1m", "[22;1m"):
+            pane = (f"{ESC}{prefix}›{ESC}[0m "
+                    f"{ESC}[2mImprove documentation in @filename{ESC}[0m\n"
+                    "  gpt-5.6-sol xhigh · /repo\n")
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as t:
+                r, calls = self.kick(Path(t), pane)
+                self.assertIn("RC=0", r.stdout,
+                              f"{prefix} idle prompt must drive: {r.stderr}")
+                self.assertEqual(len(self.sends(calls)), 2)
+
     def test_busy_pane_is_skipped(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
