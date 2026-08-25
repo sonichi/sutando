@@ -119,5 +119,25 @@ class TestSingleInstance(unittest.TestCase):
             self.assertTrue(lock_path.exists(), f"{name} lock file missing")
 
 
+    # In-process, so coverage records the stand-down line itself. The sibling
+    # test proves the exit code via a real child; that path is invisible to
+    # coverage because it runs in another interpreter.
+    def test_standdown_exits_with_the_declared_constant(self):
+        import os as _os
+        mod = _load_single_instance(self.workspace)
+        calls = []
+        real_exit = _os._exit
+        _os._exit = lambda code: (calls.append(code), (_ for _ in ()).throw(SystemExit(code)))[0]
+        try:
+            mod.acquire("coverage-standdown-probe")      # first holder: returns
+            with self.assertRaises(SystemExit):
+                mod.acquire("coverage-standdown-probe")  # contender: stands down
+        finally:
+            _os._exit = real_exit
+        self.assertEqual(calls, [mod.EXIT_STANDDOWN],
+                         "acquire() must stand down with EXIT_STANDDOWN, not a bare 0")
+        self.assertEqual(mod.EXIT_STANDDOWN, 75)
+
+
 if __name__ == "__main__":
     unittest.main()
