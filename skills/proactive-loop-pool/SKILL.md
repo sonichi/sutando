@@ -6,7 +6,7 @@ user-invocable: true
 
 # Proactive Loop (Pool-Aware)
 
-Variant of `/proactive-loop` that's safe to run in N parallel claude sessions sharing one workspace. The **only behavioral difference** from `/proactive-loop` is step 1 — task pickup goes through the atomic-rename claim before reading the task file. Losing the claim race means another session is processing the task; this session walks away. The rest of the loop body is unchanged.
+Variant of `/proactive-loop` that's safe to run in N parallel sessions sharing one workspace. Each core declares its own runtime — `claude` or `codex` — so a pool can mix both; this file is the Claude entry, [`CODEX.md`](CODEX.md) is the Codex one. The **only behavioral difference** from `/proactive-loop` is step 1 — task pickup goes through the atomic-rename claim before reading the task file. Losing the claim race means another session is processing the task; this session walks away. The rest of the loop body is unchanged.
 
 This skill exists for the multi-core pool installed by `bash scripts/install-core-pool.sh N`. Each launchd-managed core session in the pool invokes `/proactive-loop-pool` instead of `/proactive-loop`.
 
@@ -77,7 +77,7 @@ task: <id>
 EOF
 ```
 
-The `task: <id>` first line is a pairing check: the helper refuses (exit 2, zero writes) if it doesn't match the claimed file's id — this is what prevents a session holding two claims from writing each reply into the other task's result file. The helper strips that line before writing, so users never see it, then writes `results/task-<id>.txt` atomically, touches your done-flag, and archives the claimed file under its canonical name (`tasks/archive/task-<id>.txt` — result consumers resolve by that name; a claimed-suffix archive name dead-letters the reply) — in that order. Never hand-write the result/flag/archive steps yourself.
+The `task: <id>` first line is a pairing check: the helper refuses (exit 2, zero writes) if it doesn't match the claimed file's id — this is what prevents a session holding two claims from writing each reply into the other task's result file. The helper strips that line before writing, so users never see it, then writes `results/task-<id>.txt` atomically, touches your done-flag, and archives the claimed file under its canonical name (`tasks/archive/task-<id>.txt` — result consumers resolve by that name; a claimed-suffix archive name dead-letters the reply) — in that order. It last appends one line to `data/pool-metrics.jsonl` (`task_id`, `core`, `source`, `arrived_at`, `finished_at`, `duration_s`) — the pool's only record of how long anything takes; that append is fail-open and can never turn a delivered answer into a failed task. Never hand-write the result/flag/archive steps yourself.
 
 **Initial sweep on session start**: the watcher's initial sweep emits TASK_FILE events for any pre-existing files. Run the claim step on each; expect to win some and lose others depending on which sibling session got there first.
 
@@ -104,14 +104,27 @@ Identical to `/proactive-loop`'s numbered steps 2-11:
 
 These steps run independently per session. Quota / active-engagement / presenter-mode skip conditions all apply per-session — each pool member checks them on its own pass.
 
-## Phase 2a known limitations
+## Crash recovery (both former Phase 2b gaps are closed)
 
-This skill ships in Phase 2a of #880. Two pieces are NOT yet wired in:
+A crashed follower no longer needs an owner to rename anything by hand. The lead
+sweeps every pass (`scripts/pool-lead-daemon.py` → `src/runtime-api/pool_lead.py`):
 
-- **Done-flag side-effect gate** (Phase 2b). Without it, the rare crash-then-replay window can fire a side effect twice. Mitigation today: rare crashes within the few-second window between claim and side-effect-completion.
-- **Boot-time orphan watchdog** (Phase 2b). If a pool session crashes after claiming but before processing, the claim file is stranded until owner manually renames it back. Mitigation today: `launchctl bootout <core> && launchctl bootstrap <core>` re-runs the session which won't re-claim a stale file (but won't release it either — manual rename needed).
+- `reclaim_dead()` / `reclaim_stuck_assignments()` — an assignment a dead or
+  wedged core never claimed goes back to the pool.
+- `reclaim_claimed()` — a claim held by a core that died is restored to its
+  canonical name so bridges can deliver it.
+- `prune_done_flags()` — retires flags whose task is long gone.
 
-For "let me try it tonight" the limitations above are acceptable. Phase 2b ships the watchdog + done-flag gate.
+**The done-flag is a gate, not a marker.** `reclaim_claimed` treats a task as
+delivered only when the done-flag **and** result evidence both exist. A done-flag
+*alone* means the core died between flagging and writing the result — nothing
+user-visible happened — so the task is repooled for reassignment rather than
+silently dropped. That is what stops a crash-then-replay from firing a side
+effect twice, and it is why `finish_task` writes the result before the flag.
+
+Still true, and worth knowing: a follower gets no second chance from *inside*
+its own session. Recovery is the lead's job, so a pool with a dead lead
+degrades to leaderless claiming and stops reclaiming.
 
 ## Disabling the pool
 

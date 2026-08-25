@@ -213,6 +213,30 @@ runs. Two things make it usable on a running pool:
     # remove it again — plist, tmux session AND the stale beat, in one step
     bash scripts/uninstall-core-pool.sh --only-core=2
 
+`--only-core` converts a core in place but **cannot resize the pool** — it
+refuses when the N given differs from the installed size. Adding a fourth core
+is therefore a full install, which boots out and re-bootstraps every core and
+the lead. That is less disruptive than it sounds: the tmux sessions outlive the
+launchd jobs, so running sessions keep their context and the job is only a
+supervisor. Plan for the churn anyway; nothing guarantees that ordering.
+
+### Measuring the pool
+
+`finish_task` appends one line per completed task to `data/pool-metrics.jsonl`:
+`task_id`, `core`, `source`, `arrived_at`, `finished_at`, `duration_s`. Arrival
+comes from the claimed file's mtime, which survives the assign/claim renames, so
+the duration is measured rather than inferred.
+
+Two fields are deliberately absent. `assigned_at` and `claimed_at` would need
+the lead to stamp them — the renames preserve mtime, so those instants do not
+exist by the time a follower finishes, and a field that cannot be populated
+honestly is worse than no field.
+
+This is the only durable record of pool timing. Result files are deleted once a
+bridge delivers them, and archive mtimes are arrival times, not completion
+times — so without this file, questions like "did anything wait on a busy core"
+and "what does N=3 buy over N=1" are unanswerable after the fact.
+
 Without `--only-core` the installer boots out the lead and every core, so
 changing one follower restarts the whole pool. Without the teardown path,
 `launchctl bootout` alone leaves the plist behind — the recovery sweep revives

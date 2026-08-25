@@ -310,11 +310,9 @@ PY
   echo "installed: com.sutando.pool-lead (log: $LOG_DIR/pool-lead.log)"
 }
 
-# Regression guard: Phase 2a ships the launchd plumbing + claim primitive,
-# but NOT the `/proactive-loop-pool` skill. If we install plists that invoke
-# a non-existent skill, launchd's KeepAlive will restart the failing claude
-# process every ThrottleInterval seconds and burn quota. Refuse the install
-# unless the skill is on disk OR the caller explicitly passes --force.
+# Regression guard: plists invoking a skill that is not on disk make launchd's
+# KeepAlive restart the failing process every ThrottleInterval seconds and burn
+# quota. Refuse unless the skill is present OR the caller passes --force.
 #
 # Check the dir the followers actually load skills from — the resolved
 # CLAUDE_CONFIG_DIR this script just symlinked into. `-d` follows the symlink,
@@ -333,9 +331,10 @@ if [ "$SKILL_FOUND" -eq 0 ] && [ "$FORCE" -eq 0 ] && [ "$LEAD_ONLY" -eq 0 ]; the
 error: '/proactive-loop-pool' skill not found at:
 $(for d in "${SKILL_DIR_CANDIDATES[@]}"; do echo "  $d"; done)
 
-This is by design — Phase 2a ships the claim primitive + launchd shape, but
-the pool-aware skill is Phase 2b. Installing now would spawn launchd jobs
-that loop-fail on missing skill and burn quota.
+The skill ships in this repo under skills/proactive-loop-pool/; install.sh
+symlinks it into the runtime's skills directory. Not finding it means that
+link is missing — installing anyway spawns launchd jobs that loop-fail on
+the missing skill and burn quota.
 
 To bypass and install anyway (e.g. for plist-shape testing), re-run with:
   bash scripts/install-core-pool.sh $N --force
@@ -485,8 +484,7 @@ fi
 echo "Installed pool of $N core(s) + lead."
 echo "Logs: $LOG_DIR/core-{1..$N}.log, $LOG_DIR/pool-lead.log"
 echo
-echo "IMPORTANT: This PR ships the launchd plumbing + claim primitive."
-echo "The pool-aware skill '/proactive-loop-pool' is NOT in this PR (Phase 2b)."
-echo "If you install with N>1 before the pool-aware skill is in place, you"
-echo "will get duplicate task processing. Stay at N=1 until Phase 2b lands,"
-echo "or test the claim primitive directly via tests/claim-task.test.py."
+for _i in $(seq 1 "$N"); do
+  echo "  core-$_i: runtime=$(core_runtime_for "$_i")"
+done
+echo "Watch the pool: bash scripts/pool-status.sh   |   observe a core: tmux attach -t core-N"
