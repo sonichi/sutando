@@ -117,3 +117,42 @@ assert pinned["status"] == "warn", pinned
 assert "DO NOT RESTART" in pinned["detail"], pinned
 
 print("PASS: all three prescriptions consult the pin; each arm's no-pin control fired")
+
+
+# --- _proc_lstarts fail-open paths ------------------------------------------
+
+# Both must yield ([], {}) so a probe failure cannot hide a stale deploy and
+# the binary-vs-source arm still runs regardless of process start.
+import subprocess as _sp
+
+
+def _probe_with(run_impl):
+    orig_run, orig_filt = hc.subprocess.run, hc._filter_pids_this_checkout
+    hc.subprocess.run = run_impl
+    hc._filter_pids_this_checkout = lambda pids: pids
+    try:
+        return hc._proc_lstarts("svc-pattern")
+    finally:
+        hc.subprocess.run, hc._filter_pids_this_checkout = orig_run, orig_filt
+
+
+class _Out:
+    def __init__(self, s): self.stdout = s
+
+
+# pgrep matches nothing -> no pids, no lstarts.
+assert _probe_with(lambda cmd, **kw: _Out("\n")) == ([], {})
+
+# The probe itself fails -> fail OPEN, never a fabricated start time.
+def _boom(cmd, **_kw):
+    raise _sp.TimeoutExpired(cmd, 5)
+
+
+assert _probe_with(_boom) == ([], {})
+
+# CONTROL: a working probe must still return data, or the two asserts above
+# would pass on a helper that always returns empty.
+good = _probe_with(lambda cmd, **kw: _Out(f"{PID}\n" if "pgrep" in cmd[0] else f"{PID} {LSTART}\n"))
+assert good[1] == {PID: LSTART}, good
+
+print("PASS: _proc_lstarts fails open on no-match and on probe error; positive control returns data")
