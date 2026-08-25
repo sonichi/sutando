@@ -83,24 +83,39 @@ def launch_plan(store: ProfileStore, core: str, runtime: str,
                 "session_id": plan["session_id"], "note": plan["note"]}
 
     cap = runtime_capability(runtime)
+    # The child is recorded as PENDING before exec and the head stays where it
+    # is; only a child that actually starts promotes itself via --outcome ok.
+    sid = new_id_fn() if cap["preassign"] else None
     gid = store.begin_generation(pid, core, epoch, runtime,
-                                 plan.get("reason") or "initial")
-    if not cap["preassign"]:
+                                 plan.get("reason") or "initial",
+                                 session_id=sid)
+    if sid is None:
         return {"action": NEW, "args": [], "profile_id": pid,
                 "seat_epoch": epoch, "generation_id": gid,
                 "note": plan["note"] + f"; {runtime} cannot pre-assign an id, "
                                        f"so it is read back after start"}
-    sid = new_id_fn()
-    store.promote_generation(pid, core, epoch, gid, sid)
     return {"action": NEW, "args": ["--session-id", sid], "profile_id": pid,
             "seat_epoch": epoch, "generation_id": gid, "session_id": sid,
             "note": plan["note"]}
 
 
 def report(store: ProfileStore, core: str, profile_id: str, seat_epoch: int,
-           session_id, ok: bool) -> dict:
+           session_id, ok: bool, generation_id=None) -> dict:
+    """Settle a pending generation. The head moves HERE, once the child has
+    demonstrably started — never at plan time."""
     store.record_attempt(profile_id, core, seat_epoch, session_id, ok)
-    return {"recorded": bool(ok), "session_id": session_id}
+    settled = None
+    if generation_id:
+        if ok:
+            store.promote_generation(profile_id, core, seat_epoch,
+                                     generation_id, session_id)
+            settled = "promoted"
+        else:
+            store.fail_generation(profile_id, core, seat_epoch, generation_id,
+                                  "resume_failed")
+            settled = "failed"
+    return {"recorded": bool(ok), "session_id": session_id,
+            "generation": settled}
 
 
 def main() -> int:
@@ -113,6 +128,7 @@ def main() -> int:
     ap.add_argument("--profile-id")
     ap.add_argument("--seat-epoch", type=int)
     ap.add_argument("--session-id")
+    ap.add_argument("--generation-id")
     a = ap.parse_args()
     store = _store(Path(a.workspace))
     try:
@@ -122,7 +138,7 @@ def main() -> int:
                                            "--seat-epoch"}))
                 return 2
             out = report(store, a.core, a.profile_id, a.seat_epoch,
-                         a.session_id, a.outcome == "ok")
+                         a.session_id, a.outcome == "ok", a.generation_id)
         else:
             probe = None if a.probe_ok is None else a.probe_ok == "1"
             out = launch_plan(store, a.core, a.runtime, probe)

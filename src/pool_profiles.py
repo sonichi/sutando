@@ -12,8 +12,8 @@ room-watermark references have somewhere to live.
 
 Three rules keep it consistent under concurrency:
 
-- The lead alone writes seating state, and every seating change bumps a
-  monotonic epoch.
+- Seating is the lead's to write. The writer argument is a convention check
+  that catches a mistaken caller, not enforcement against a hostile one.
 - A core may write lineage only while holding the current epoch, so a core
   that died, was re-seated elsewhere and briefly revived is fenced out by
   comparison rather than by liveness.
@@ -390,9 +390,15 @@ class ProfileStore:
 
     def begin_generation(self, profile_id: str, core_id: str, seat_epoch: int,
                          runtime: str, reason: str,
-                         parent_generation_id: "str | None" = "HEAD") -> str:
+                         parent_generation_id: "str | None" = "HEAD",
+                         session_id: "str | None" = None) -> str:
         """Open a pending child of the current head. The head does NOT move —
-        a session that never starts must not leave the profile headless."""
+        a session that never starts must not leave the profile headless.
+
+        session_id may be supplied when the runtime lets the caller pre-assign
+        one: recording it here, before exec, is what stops a crash mid-startup
+        from leaving a live session that belongs to no lineage.
+        """
         if runtime not in RUNTIMES:
             raise PolicyViolation(f"runtime must be one of {RUNTIMES}")
         if reason not in TRANSITION_REASONS:
@@ -410,7 +416,7 @@ class ProfileStore:
                 raise UnknownGeneration(f"{profile_id}/{parent}")
             gid = f"g{len(prof['generations']) + 1}"
             prof["generations"][gid] = {
-                "session_id": None, "parent_generation_id": parent,
+                "session_id": session_id, "parent_generation_id": parent,
                 "runtime": runtime, "status": "pending",
                 "transition_reason": reason, "started_at": self.now(),
                 "ended_at": None, "transcript_ref": None,
@@ -438,10 +444,15 @@ class ProfileStore:
 
     def promote_generation(self, profile_id: str, core_id: str,
                            seat_epoch: int, generation_id: str,
-                           session_id: str) -> str:
+                           session_id: "str | None" = None) -> str:
         """Compare-and-set the head: only a pending generation whose recorded
-        parent is still the head may take it. Refuses otherwise."""
-        if not isinstance(session_id, str) or not session_id:
+        parent is still the head may take it. Refuses otherwise.
+
+        Omit session_id when it was pre-assigned at begin_generation; a runtime
+        that can only report its id after starting supplies it here.
+        """
+        if session_id is not None and (not isinstance(session_id, str)
+                                       or not session_id):
             raise PolicyViolation("session_id must be a non-empty string")
 
         def apply(data):
@@ -463,8 +474,12 @@ class ProfileStore:
                 parent = prof["generations"][parent_id]
                 parent["status"] = "superseded"
                 parent["ended_at"] = self.now()
+            if session_id is not None:
+                gen["session_id"] = session_id
+            if not gen["session_id"]:
+                raise PolicyViolation(
+                    f"{generation_id} has no session id to promote")
             gen["status"] = "active"
-            gen["session_id"] = session_id
             prof["head_generation_id"] = generation_id
             return generation_id
 
@@ -516,6 +531,13 @@ class ProfileStore:
             if transcript_sha256 is not None:
                 gen["transcript_sha256"] = transcript_sha256
             if digest_ref is not None:
+                # A digest and a hash of different bytes would let the record
+                # claim a summary of a transcript it cannot identify.
+                if not (transcript_sha256 or gen["transcript_sha256"]):
+                    raise PolicyViolation(
+                        "a digest needs the transcript_sha256 of the bytes it "
+                        "was generated from, set in the same call or already "
+                        "recorded")
                 gen["digest_ref"] = digest_ref
             if room_watermarks is not None:
                 gen["room_watermarks"].update(room_watermarks)

@@ -279,7 +279,7 @@ class AncestryTests(Base):
         e, g1 = self.started(session="sess-A")
         self.store.annotate_generation(
             "pro-main", "core-1", e, g1, transcript_ref="/t/sess-A.jsonl",
-            digest_ref="/d/sess-A.md",
+            transcript_sha256="b" * 64, digest_ref="/d/sess-A.md",
             room_watermarks={"!room-a:ag2.space": "$evt1"})
         gen = self.store.get("pro-main")["generations"][g1]
         self.assertEqual(gen["transcript_ref"], "/t/sess-A.jsonl")
@@ -314,6 +314,25 @@ class ReconstructionTests(Base):
             "pro-main", "core-1", e, g1, transcript_ref=str(t),
             transcript_sha256=hashlib.sha256(body).hexdigest())
         return e, g1, t
+
+    def test_a_digest_without_a_transcript_hash_is_refused(self):
+        """Otherwise the hash and the digest can describe different bytes and
+        the record cannot say which transcript it summarised."""
+        self.make()
+        e, g1 = self.started(session="sess-A")
+        with self.assertRaises(PolicyViolation):
+            self.store.annotate_generation("pro-main", "core-1", e, g1,
+                                           digest_ref="/d/sess-A.md")
+
+    def test_a_digest_with_its_hash_in_the_same_call_is_accepted(self):
+        self.make()
+        e, g1 = self.started(session="sess-A")
+        self.store.annotate_generation(
+            "pro-main", "core-1", e, g1, digest_ref="/d/x.md",
+            transcript_sha256="a" * 64)
+        gen = self.store.get("pro-main")["generations"][g1]
+        self.assertEqual((gen["digest_ref"], gen["transcript_sha256"]),
+                         ("/d/x.md", "a" * 64))
 
     def test_a_present_matching_transcript_is_full(self):
         _, g1, _ = self._gen_with_transcript()

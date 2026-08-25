@@ -52,6 +52,15 @@ class Base(unittest.TestCase):
         return launch_plan(self.store, core, runtime, probe_ok,
                            new_id_fn=lambda: next(self.ids))
 
+    def start(self, core="core-1", runtime="claude", probe_ok=None):
+        """plan, then report the child as started — the full startup path."""
+        p = self.plan(core, runtime, probe_ok)
+        if p.get("generation_id"):
+            report(self.store, core, p["profile_id"], p["seat_epoch"],
+                   p.get("session_id"), ok=True,
+                   generation_id=p["generation_id"])
+        return p
+
 
 class FirstStartTests(Base):
     def test_an_unseated_core_starts_unmanaged_rather_than_failing(self):
@@ -62,12 +71,31 @@ class FirstStartTests(Base):
         pid, _ = self.make_seated()
         p = self.plan()
         self.assertEqual(p["args"], ["--session-id", "uuid-1"])
-        # written BEFORE the process exists — that is the whole point
+        # recorded BEFORE the process exists, but only as a PENDING child:
+        # the head must not move until the child demonstrably started
+        gen = self.store.get(pid)["generations"][p["generation_id"]]
+        self.assertEqual((gen["session_id"], gen["status"]),
+                         ("uuid-1", "pending"))
+        self.assertIsNone(self.store.get(pid)["head_generation_id"])
+
+    def test_a_child_that_never_starts_leaves_no_head(self):
+        pid, _ = self.make_seated()
+        p = self.plan()
+        report(self.store, "core-1", pid, p["seat_epoch"], p["session_id"],
+               ok=False, generation_id=p["generation_id"])
+        prof = self.store.get(pid)
+        self.assertIsNone(prof["head_generation_id"])
+        self.assertEqual(prof["generations"][p["generation_id"]]["status"],
+                         "failed")
+
+    def test_a_started_child_takes_the_head(self):
+        pid, _ = self.make_seated()
+        p = self.start()
         self.assertEqual(self.store.head(pid)["session_id"], "uuid-1")
 
     def test_a_recorded_session_is_resumed_next_time(self):
         self.make_seated()
-        self.plan()
+        self.start()
         p = self.plan()
         self.assertEqual((p["action"], p["args"]),
                          (RESUME, ["--resume", "uuid-1"]))
@@ -83,14 +111,14 @@ class FirstStartTests(Base):
 class FailurePathTests(Base):
     def _fail_twice(self):
         pid, epoch = self.make_seated()
-        self.plan()  # creates uuid-1 and promotes it
+        self.start()  # uuid-1 recorded and promoted after a good start
         for _ in range(2):
             report(self.store, "core-1", pid, epoch, "uuid-1", ok=False)
         return pid, epoch
 
     def test_one_failure_still_resumes_the_same_session(self):
         pid, epoch = self.make_seated()
-        self.plan()
+        self.start()
         report(self.store, "core-1", pid, epoch, "uuid-1", ok=False)
         self.assertEqual(self.plan()["args"], ["--resume", "uuid-1"])
 
@@ -101,7 +129,7 @@ class FailurePathTests(Base):
 
     def test_a_healthy_probe_starts_a_new_generation(self):
         pid, _ = self._fail_twice()
-        p = self.plan(probe_ok=True)
+        p = self.start(probe_ok=True)
         self.assertEqual((p["action"], p["args"]),
                          (NEW, ["--session-id", "uuid-2"]))
         self.assertEqual(self.store.head(pid)["session_id"], "uuid-2")
@@ -130,7 +158,7 @@ class FencingTests(Base):
 
     def test_the_new_core_gets_the_profile_and_its_session(self):
         pid, _ = self.make_seated(core="core-1")
-        self.plan(core="core-1")
+        self.start(core="core-1")
         self.store.reseat(pid, "core-2", writer=LEAD)
         p = self.plan(core="core-2")
         self.assertEqual((p["action"], p["args"]),
