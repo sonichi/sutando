@@ -28,6 +28,8 @@ markers live in `src/result_markers.py`. Stdlib only, no network, no daemon.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import secrets
 import sys
@@ -83,6 +85,27 @@ def receipt_path(receipts_dir, task_id: str) -> Path:
     return Path(receipts_dir) / f"task-{task_id}.ok"
 
 
+def receipt_body(task_id: str, body: str) -> str:
+    """What a receipt attests: which task, and the exact bytes published for it.
+    An empty receipt (every pre-upgrade one) attests neither."""
+    return json.dumps({"task_id": task_id,
+                       "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                       "bytes": len(body.encode("utf-8"))}, sort_keys=True) + "\n"
+
+
+def receipt_attests(receipts_dir, task_id: str, body: str) -> bool:
+    """True only when the receipt names THIS task and THESE bytes. Presence is
+    not attestation: an empty or stale receipt answers False."""
+    try:
+        raw = receipt_path(receipts_dir, task_id).read_text()
+        rec = json.loads(raw)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict) or rec.get("task_id") != task_id:
+        return False
+    return rec.get("sha256") == hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 def has_pairing_receipt(receipts_dir, task_id: str) -> bool:
     try:
         return receipt_path(receipts_dir, task_id).is_file()
@@ -116,7 +139,7 @@ def write_paired_result(results_dir, task_id: str, body: str,
         try:
             d = Path(receipts_dir)
             d.mkdir(parents=True, exist_ok=True)
-            receipt_path(d, task_id).write_text("")
+            receipt_path(d, task_id).write_text(receipt_body(task_id, rest))
         except OSError as e:
             print(f"result_write: pairing receipt not written: {e}",
                   file=sys.stderr)

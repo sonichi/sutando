@@ -386,5 +386,47 @@ class ConcurrentDefaultWritersTest(unittest.TestCase):
                       "harness cannot produce the collision it claims to prevent")
 
 
+class ReceiptAttestsTheBytesItPublished(unittest.TestCase):
+    """A receipt that only proves a file EXISTS cannot tell a correct pairing
+    from a reply composed for another task. It must name the bytes."""
+
+    def _write(self, td, task="task-A", body="task: A\nthe answer for A\n"):
+        res, rec = Path(td) / "results", Path(td) / "receipts"
+        out = result_write.write_paired_result(res, task, body, receipts_dir=rec)
+        return rec, out.read_text()
+
+    def test_receipt_names_the_task_and_the_published_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            rec, published = self._write(td)
+            self.assertTrue(result_write.receipt_attests(rec, "A", published))
+
+    def test_a_body_composed_for_another_task_is_not_attested(self):
+        with tempfile.TemporaryDirectory() as td:
+            rec, _ = self._write(td)
+            self.assertFalse(
+                result_write.receipt_attests(rec, "A", "answer composed for B"),
+                "the receipt attested bytes it never saw")
+
+    def test_a_receipt_does_not_attest_a_different_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            rec, published = self._write(td)
+            self.assertFalse(result_write.receipt_attests(rec, "B", published))
+
+    def test_a_pre_upgrade_empty_receipt_attests_nothing_but_still_exists(self):
+        # Additive by design: the presence gate keeps its current answer, so
+        # results already pending at upgrade cannot be stranded by this change.
+        with tempfile.TemporaryDirectory() as td:
+            rec, published = self._write(td)
+            result_write.receipt_path(rec, "A").write_text("")
+            self.assertFalse(result_write.receipt_attests(rec, "A", published))
+            self.assertTrue(result_write.has_pairing_receipt(rec, "A"))
+
+    def test_a_corrupt_receipt_is_not_attestation(self):
+        with tempfile.TemporaryDirectory() as td:
+            rec, published = self._write(td)
+            result_write.receipt_path(rec, "A").write_text("{not json")
+            self.assertFalse(result_write.receipt_attests(rec, "A", published))
+
+
 if __name__ == "__main__":
     unittest.main()
