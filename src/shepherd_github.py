@@ -134,12 +134,20 @@ def _record_lock(task_id: str):
     p = _contract_path(task_id).with_suffix(".lock")
     p.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o600)
+    # Unlocking a lock never acquired is wrong, and one flat finally lets a failed
+    # unlock skip the close -- leaking the descriptor with the lock still held.
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _subject_parts(scope: ResponsibilityScope) -> tuple[str, int]:

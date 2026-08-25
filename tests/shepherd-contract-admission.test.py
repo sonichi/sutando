@@ -204,9 +204,45 @@ check("a self-declared identity does not satisfy a verified-identity scope",
 check("...and the same value under two schemes is not the same actor",
       _asserted.matches(_verified_scope.actor), False)
 
+
+# A duck-typed stand-in satisfies every attribute the decision functions read, so
+# without a TYPE check `is_verified` is whatever the caller says it is.
+class _ForeignActor:
+    scheme, value = "totally.fake", "attacker"
+    is_discriminating = is_verified = True
+
+    def matches(self, other):
+        return True
+
+
+def _rejects(thunk):
+    try:
+        thunk()
+    except ValueError:
+        return True
+    return False
+
+
+check("a scope cannot be built without a real Actor",
+      _rejects(lambda: ResponsibilityScope(
+          subjects=(PR,), actor=None,
+          watch_conditions=SCOPE.watch_conditions,
+          success_conditions=SCOPE.success_conditions,
+          failure_conditions=SCOPE.failure_conditions)), True)
+check("a foreign object cannot self-certify as the scope's actor",
+      _rejects(lambda: ResponsibilityScope(
+          subjects=(PR,), actor=_ForeignActor(),
+          watch_conditions=SCOPE.watch_conditions,
+          success_conditions=SCOPE.success_conditions,
+          failure_conditions=SCOPE.failure_conditions)), True)
+check("an event cannot carry a non-Subject subject or a foreign actor",
+      (_rejects(lambda: ObservedEvent("github.pull_request.merged", "o/r#1", _asserted)),
+       _rejects(lambda: ObservedEvent("github.pull_request.merged", PR, _ForeignActor()))),
+      (True, True))
+
 if failures:
     print(f"FAIL ({len(failures)}):")
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 30 assertions, control verified")
+print("PASS: 33 assertions, control verified")

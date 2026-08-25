@@ -118,6 +118,15 @@ class ObservedEvent:
 
     def __post_init__(self) -> None:
         _require_text("ObservedEvent", "event_type", self.event_type)
+        # A duck-typed stand-in satisfies every attribute the decision functions
+        # read, so `is_verified` becomes self-declared unless the TYPE is checked.
+        if not isinstance(self.subject, Subject):
+            raise ValueError(
+                f"ObservedEvent.subject must be a Subject, got {type(self.subject).__name__}")
+        if self.actor is not None and not isinstance(self.actor, Actor):
+            raise ValueError(
+                f"ObservedEvent.actor must be an Actor or None, "
+                f"got {type(self.actor).__name__}")
 
 
 @dataclass(frozen=True)
@@ -154,6 +163,10 @@ class ResponsibilityScope:
                 raise ValueError(
                     f"ResponsibilityScope.subjects element must be a Subject, "
                     f"got {type(subject).__name__}")
+        if not isinstance(self.actor, Actor):
+            raise ValueError(
+                f"ResponsibilityScope.actor must be an Actor, "
+                f"got {type(self.actor).__name__}")
         clash = self.success_conditions & self.failure_conditions
         if clash:
             raise ValueError(

@@ -266,6 +266,44 @@ check("an empty projection is refused, not read as progress",
       _raises(lambda: g.observe("o/r", 3)), True)
 g._gh, g.resolve_actor = _SAVED_GH, _SAVED_ACTOR
 
+
+import errno  # noqa: E402
+import fcntl  # noqa: E402
+
+# A flat `finally` unlocks a lock it may never have held, and a failing unlock
+# then skips the close -- leaking the descriptor with the lock still held.
+
+_REAL_FLOCK = fcntl.flock
+
+
+def _open_fds():
+    return {int(n) for n in os.listdir("/dev/fd") if n.isdigit()}
+
+
+def _fault(task_id, fail_acquire, fail_unlock):
+    def fake(fd, op):
+        if op == fcntl.LOCK_EX and fail_acquire:
+            raise OSError(errno.EAGAIN, "acquire failure")
+        if op == fcntl.LOCK_UN and fail_unlock:
+            raise OSError(errno.EIO, "unlock failure")
+        return _REAL_FLOCK(fd, op)
+
+    before = _open_fds()
+    g.fcntl.flock = fake
+    try:
+        g.save(task_id, scope, "waiting")
+    except BaseException:
+        pass
+    finally:
+        g.fcntl.flock = _REAL_FLOCK
+    return len(_open_fds() - before), (g.state_dir() / f"{task_id}.json").exists()
+
+
+check("an acquisition fault closes the descriptor and publishes nothing",
+      _fault("task-lock-acq", True, False), (0, False))
+check("a release fault still closes the descriptor; the record was already written",
+      _fault("task-lock-rel", False, True), (0, True))
+
 # negative control: the harness must be able to register a failure
 _n = len(failures)
 check("CONTROL (expected to fail)", 1, 2)
@@ -279,4 +317,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 50 assertions, control verified")
+print("PASS: 52 assertions, control verified")
