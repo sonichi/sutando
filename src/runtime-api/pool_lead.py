@@ -113,6 +113,14 @@ class PoolLead:
         return [f for f in self.followers_fn()
                 if _INST_RE.match(str(f)) and self.alive_fn(f)]
 
+    @staticmethod
+    def _home_of(row) -> "str | None":
+        """A row's home core. Pre-`home` rows name their handler as home, so an
+        existing affinity.json migrates on read rather than resetting."""
+        if not isinstance(row, dict):
+            return None
+        return row.get("home") or row.get("instance")
+
     def _load(self, instance: str) -> int:
         pat = re.compile(
             rf"\.(?:assigned|claimed)-{re.escape(instance)}\.txt$")
@@ -132,14 +140,15 @@ class PoolLead:
             return lane_core
         primary = [f for f in followers if f != lane_core] or followers
         if channel:
-            row = affinity.get(channel)
-            if (isinstance(row, dict) and row.get("instance") in primary
-                    and self.now() - float(row.get("ts") or 0)
+            home = self._home_of(affinity.get(channel))
+            if (home in primary
+                    and self.now() - float(
+                        (affinity.get(channel) or {}).get("ts") or 0)
                     < AFFINITY_IDLE_S
                     # a backlogged handler serializes the whole channel;
                     # parallelism outranks continuity past this depth
-                    and self._load(row["instance"]) < AFFINITY_BUSY_MAX):
-                return row["instance"]
+                    and self._load(home) < AFFINITY_BUSY_MAX):
+                return home
         pick = min(primary, key=lambda f: (self._load(f), str(f)))
         if (lane_core is not None and self._load(pick) >= AFFINITY_BUSY_MAX
                 and self._load(lane_core) == 0):
@@ -177,7 +186,14 @@ class PoolLead:
             except OSError:
                 continue
             if channel:
-                affinity[channel] = {"instance": inst, "ts": self.now()}
+                # `home` survives an overflow assignment — that is what makes a
+                # yield temporary instead of a permanent move.
+                prior = affinity.get(channel)
+                home = self._home_of(prior)
+                if home not in followers:
+                    home = inst
+                affinity[channel] = {"instance": inst, "home": home,
+                                     "ts": self.now()}
             if self.metrics is not None:
                 self.metrics.assigned(f.name, inst, channel,
                                       max(0.0, self.now() - arrived))

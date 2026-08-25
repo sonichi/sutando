@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import json
 import shutil
 import sys
 import tempfile
@@ -17,7 +18,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
-from pool_lead import (ASSIGN_STUCK_S, ASSIGN_STUCK_S_BY_RUNTIME,  # noqa: E402
+from pool_lead import (AFFINITY_BUSY_MAX,  # noqa: E402
+                       ASSIGN_STUCK_S, ASSIGN_STUCK_S_BY_RUNTIME,
                        AFFINITY_IDLE_S, PoolLead)
 
 
@@ -340,6 +342,73 @@ class AffinityIdleEnvKnob(unittest.TestCase):
     def test_a_too_small_value_is_clamped_not_obeyed(self):
         # a sub-minute window would rebalance mid-conversation every time
         self.assertEqual(self._idle_for("5"), 60)
+
+
+
+class AffinityHomeCore(unittest.TestCase):
+    """A room keeps a home core: a busy handler yields the message, not the room."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.tasks, self.state = root / "tasks", root / "state"
+        self.tasks.mkdir()
+        self.state.mkdir()
+        self.clock = [1000.0]
+        self.live = ["core-a", "core-b", "core-c"]
+        self.lead = PoolLead(
+            self.tasks, self.state,
+            followers_fn=lambda: list(self.live),
+            alive_fn=lambda i: i in self.live,
+            now_fn=lambda: self.clock[0])
+        self.ch = "!room:x"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _send(self, name):
+        (self.tasks / f"{name}.txt").write_text(
+            f"id: {name}\nchannel_id: {self.ch}\n")
+        return self.lead.sweep()[0][1]
+
+    def _busy(self, inst, n):
+        for i in range(n):
+            (self.tasks / f"task-b{inst}{i}.claimed-{inst}.txt").write_text("id: x\n")
+
+    def _unbusy(self):
+        for f in self.tasks.glob("task-b*"):
+            f.unlink()
+
+    def _row(self):
+        return json.loads(
+            (self.state / "pool" / "affinity.json").read_text())[self.ch]
+
+    def test_room_returns_home_after_the_handler_drains(self):
+        self.assertEqual(self._send("task-1"), "core-a")
+        self._busy("core-a", AFFINITY_BUSY_MAX)
+        self.assertNotEqual(self._send("task-2"), "core-a", "should yield")
+        self.assertEqual(self._row()["home"], "core-a",
+                         "an overflow must not move the room's home")
+        self._unbusy()
+        self.assertEqual(self._send("task-3"), "core-a",
+                         "room did not return home once the queue drained")
+
+    def test_a_pre_home_row_migrates_on_read(self):
+        # an affinity.json written before this field existed
+        (self.state / "pool").mkdir(parents=True, exist_ok=True)
+        (self.state / "pool" / "affinity.json").write_text(
+            json.dumps({self.ch: {"instance": "core-b", "ts": self.clock[0]}}))
+        self.assertEqual(self._send("task-1"), "core-b",
+                         "legacy row's handler is its home")
+        self.assertEqual(self._row()["home"], "core-b")
+
+    def test_a_departed_home_is_replaced_not_honoured_forever(self):
+        self.assertEqual(self._send("task-1"), "core-a")
+        self.live.remove("core-a")          # core-a leaves the pool
+        got = self._send("task-2")
+        self.assertNotEqual(got, "core-a")
+        self.assertEqual(self._row()["home"], got,
+                         "a home that left the pool must be re-established")
 
 
 if __name__ == "__main__":
