@@ -148,6 +148,24 @@ class FencingTests(Base):
             self.store.begin_generation("pro-main", "core-1", old, "claude",
                                         "initial")
 
+    def test_a_core_that_is_not_the_seat_is_fenced_on_the_current_epoch(self):
+        # Mirror of the stale-epoch case: the epoch is readable via get(), so
+        # only the core_id half stops a peer writing into another's lineage.
+        self.make()
+        e = self.seated()
+        with self.assertRaises(SeatFenced):
+            self.store.begin_generation("pro-main", "core-2", e, "claude",
+                                        "initial")
+
+    def test_a_non_seat_core_cannot_promote_on_the_current_epoch(self):
+        self.make()
+        e = self.seated()
+        gid = self.store.begin_generation("pro-main", "core-1", e, "claude",
+                                          "initial")
+        with self.assertRaises(SeatFenced):
+            self.store.promote_generation("pro-main", "core-2", e, gid, "sess")
+        self.assertIsNone(self.store.get("pro-main")["head_generation_id"])
+
     def test_an_unseated_profile_accepts_no_lineage_write(self):
         self.make()
         e = self.seated()
