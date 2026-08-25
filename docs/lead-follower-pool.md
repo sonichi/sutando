@@ -62,10 +62,49 @@ behavior, verbatim — and return to assignment-only the moment the lead's beat
 is fresh again. Availability degrades to "no policy" rather than "no service",
 and no consensus protocol enters the system. launchd restarts the lead.
 
+## Channel affinity, as actually implemented (#884, `src/claim_task.py`)
+
+The lead will subsume this policy, but the shipped mechanism is race-side and
+worth stating exactly, because two of its properties are commonly misread.
+
+**State.** One file per channel, `state/cores/channel-<id>.handler`, written
+atomically (temp + rename) as `{"core_id": ..., "last_handled_at": <epoch>}`.
+
+**Two independent gates.** A follower defers to the recorded handler only when
+BOTH hold; they fail for different reasons and protect different things:
+
+| gate | test | protects against |
+|---|---|---|
+| freshness | `now - last_handled_at < IDLE_THRESHOLD` (30 min) | a live core hoarding a channel it has stopped serving |
+| liveness | `.alive` mtime `< ALIVE_THRESHOLD` (90 s) | a **dead** core stranding the channel |
+
+Crash recovery therefore does **not** depend on the idle threshold: a dead
+handler releases its channel in 90 seconds no matter how long that window is.
+The idle threshold governs only rebalancing among cores that are still alive —
+so raising it is far cheaper than it first appears.
+
+**`last_handled_at` is claim-stamped, not activity-stamped.** It is written in
+exactly one place — on a successful claim — and never refreshed while the task
+runs or when it completes. The value means "when this core last *started* work
+on this channel," which has a consequence worth designing around: a core that
+spends longer than `IDLE_THRESHOLD` on a single task goes stale *while actively
+working on that channel's task*, and the next message races freely to a core
+with none of the conversation. The busy core stays perfectly **alive**
+throughout — the heartbeat is a sidecar and keeps beating — so the failure is
+not "busy mistaken for idle"; activity is never measured at all.
+
+The minimal correction is to stamp completion as well as claim, converting the
+window from "since work started" to "since work ended". Making the number
+larger treats the symptom and leaves the wrong event being measured.
+
+`SUTANDO_CORE_IDLE_THRESHOLD_SEC` overrides the window; non-numeric and
+non-positive values fall back to the default rather than disabling affinity.
+
 ## What the lead's policy module owns (one place, finally)
 
 - **Channel affinity:** sticky follower per channel, idle-timeout rebalance
-  (the #884 semantics, now a table in one process instead of race-side state).
+  (the #884 semantics above, now a table in one process instead of race-side
+  state — which is also the natural place to fix the claim-stamp defect).
 - **Priority:** `urgent > normal > low` before mtime FIFO — the contract
   `src/task_priority.py` documents but leaderless claiming could not honor.
 - **Thread consolidation:** burst detection assigns the whole burst to one
