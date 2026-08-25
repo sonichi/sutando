@@ -4115,8 +4115,18 @@ def check_voice_transport(voice_check: dict) -> dict:
             if connecting_after > 20:
                 elapsed_min = connecting_after * 30 // 60
                 check["status"] = "fail"
-                check["detail"] = f"stuck CONNECTING ~{elapsed_min}min after code={code} transport close — needs kickstart"
-                check["_stuck_connecting"] = True
+                # A kickstart destroys a pinned witness exactly as a stale-code
+                # restart would, so the veto has to reach this branch too.
+                _, _lstarts = _proc_lstarts("voice-agent.ts")
+                _armed = process_pins.armed_detail(
+                    _pin_verdicts(voice_check.get("name") or "voice-agent", _lstarts))
+                base = (f"stuck CONNECTING ~{elapsed_min}min after "
+                        f"code={code} transport close")
+                if _armed:
+                    check["detail"] = f"{base}, but {_armed}"
+                else:
+                    check["detail"] = f"{base} — needs kickstart"
+                    check["_stuck_connecting"] = True
             elif code == "1006":
                 # code=1006 is an abnormal network close (often a DNS blip). If DNS
                 # resolves now the transport will self-recover on next client connect
