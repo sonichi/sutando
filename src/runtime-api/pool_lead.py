@@ -70,10 +70,14 @@ def _read_lane(path: Path) -> str:
 
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
-                 now_fn=time.time, metrics=None, results_dir=None):
+                 now_fn=time.time, metrics=None, results_dir=None,
+                 runtime_fn=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
-        production binder wires instance_registry + the .alive files."""
+        production binder wires instance_registry + the .alive files.
+        runtime_fn(instance) -> 'claude'|'codex'; absent means all-claude,
+        which is what every pool was before the runtime dimension existed."""
+        self.runtime_fn = runtime_fn or (lambda _inst: "claude")
         self.tasks_dir = Path(tasks_dir)
         self.state_dir = Path(state_dir)
         self.results_dir = (Path(results_dir) if results_dir
@@ -119,7 +123,11 @@ class PoolLead:
               affinity: dict, lane: str = "owner") -> str:
         # Soft lanes (owner 2026-08-23): the highest core is the routine lane;
         # owner traffic stays off it except as saturated-pool overflow.
-        lane_core = (max(followers, key=lambda f: (len(str(f)), str(f)))
+        # Highest CLAUDE core (owner 2026-08-25): a codex follower sweeps on a
+        # timer, so maintenance parked there waits for a poll. All-codex: any.
+        eligible = [f for f in followers
+                    if self.runtime_fn(f) == "claude"] or followers
+        lane_core = (max(eligible, key=lambda f: (len(str(f)), str(f)))
                      if len(followers) > 1 else None)
         if lane == "routine" and lane_core is not None:
             return lane_core
