@@ -75,6 +75,21 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 
    **Do not gate on the sentinel alone.** `watch-tasks-stream.sh` writes it once at startup, so an absent file means "no watcher" OR "a live watcher whose file was removed" — indistinguishable. Measured 2026-08-07 on a live core: `_watcher_trees()` returned `{'12631': ['12631']}` (functioning — it emitted `TASK_FILE:` for a probe) with the sentinel absent from disk. Gating on the sentinel there would have started a **second** watcher, and both then emit every task, so every task is processed twice. `_watcher_trees()` is also what makes the `pgrep` warning below unnecessary to re-solve: it drops its own pid and matches on argv shape. Don't use `pgrep -f watch-tasks-stream`: pgrep's `-f` argument matches the literal string `watch-tasks-stream` against full argv, which matches the bash wrapper invoking this very pgrep call (the wrapper's argv contains the search string), producing a transient self-match that returns a PID for a subshell that's already gone by the next `ps`. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 0 — single anti-pattern, single fix. Documented as F5 in `workspace/build_log.md` 2026-06-03T00:02Z validation pass; replayed on the very next session bootstrap (07:25Z) — Sutando.app's checkWatcher Timer caught the gap and sent a `watcher` keystroke, but two owner DMs were silently held in `tasks/` for ~5 min first. Don't kick off `bash src/watch-tasks.sh` (retired 2026-05-14).
 
+1.6. **Arm the registration watchdog, then handle tasks freely — registration is guarded by a mechanism, not by deferral.** Because step 1.5 arms the watcher before the registration loop, a `TASK_FILE` notification (the startup sweep's, or a live arrival) can land while steps 2-4 are still running. Without a rule here the agent improvises under the general "process notifications when they arrive" instruction, pivots to the task, and may never finish registration — losing the `/proactive-loop` fallback, the one thing that guarantees the session has a recurring work driver (that silent loss is the incident class this step exists to close). The old cure was a deferral rule ("finish registration first"), which cost a waiting user the whole registration window before any answer. This step replaces discipline with a watchdog: immediately after step 1.5, before touching any task, arm ONE Monitor:
+
+   ```
+   Monitor tool — description "schedule-crons watchdog", timeout_ms 3600000, command:
+   T0=$(date +%s); STAMP="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)/schedule-crons-stamp.json"
+   sleep 90
+   while [ "$(stat -f %m "$STAMP" 2>/dev/null || echo 0)" -lt "$T0" ]; do
+     echo "CRONS-UNREGISTERED: schedule-crons has not stamped this boot — return and register now"
+     sleep 60
+   done
+   echo "CRONS-STAMPED: registration complete"
+   ```
+
+   Then respond to task notifications as they land: send the fail-open progress ack first (`python3 skills/task-progress/scripts/notify.py ...` — one subprocess, no state mutation, cannot derail anything), and use judgment on handling — a short waiting owner task may simply be served before registration continues; anything substantial gets the ack and is handled when the agent is next free. Either way registration cannot be silently dropped: if it slips, the watchdog emits a nag every 60s until step 5.7's completion stamp lands, and the terminal `CRONS-STAMPED` line confirms the guard saw the stamp — which is also why that stamp write is not optional bookkeeping; it is what releases the watchdog. The 90s grace means a normal boot never hears from it, and the 1-hour cap bounds noise if a boot dies (an unregistered state dies with its session). Detection and re-prompt share one source of truth: the same stamp `health-check.py`'s `session-crons` probe already reads. `stat -f %m` is the darwin form; swap for a `python3 -c` mtime read on linux.
+
 2. Check existing cron jobs with CronList
 3. For each job in the config:
    - Skip entries carrying a `monitor` object — they are Monitors, not crons (no `cron`, no prompt to register); step 5.4 owns their arming, and a `CronCreate` attempt on one is invalid.
