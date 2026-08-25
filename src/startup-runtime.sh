@@ -319,7 +319,7 @@ reap_wedged_voice_agent() {
     return 0
   fi
   if out="$("$PY" "$REPO/scripts/voice-lock.py" takeover \
-      --pidfile "$WORKSPACE/.voice-agent.pid" \
+      --pidfile "$(bash "$REPO/scripts/sutando-config.sh" voice-pidfile "$WORKSPACE")" \
       --guard "$WORKSPACE/.voice-agent.lock.guard" \
       --workspace "$WORKSPACE" \
       --mode adopted --port "$port" \
