@@ -601,10 +601,8 @@ def generate_insight() -> str | None:
         )
 
     if not insights:
-        # No insight is NOT an insight. Returning prose here made "not enough
-        # data" indistinguishable from a finding to every consumer downstream:
-        # main() wrote it to the delivered results file, and morning-briefing
-        # read it back out of the sentinel and spoke it as "Insight: …".
+        # Prose here is indistinguishable from a finding downstream: it gets
+        # written to the delivered results file and spoken by the briefing.
         return None
 
     # Pick the most interesting one (longest = most specific)
@@ -629,10 +627,8 @@ def main():
 
     insight = generate_insight()
     if insight is None:
-        # Stamp an EMPTY sentinel: it still suppresses same-day regeneration,
-        # and get_daily_insight()'s `.strip() or None` then yields no insight,
-        # so the briefing omits the line instead of reading this back. No
-        # results file, so nothing is delivered either.
+        # Empty sentinel still suppresses same-day regeneration, while
+        # get_daily_insight()'s `.strip() or None` yields no insight.
         sentinel.write_text("")
         print("No insight today — not enough data. Sentinel stamped empty; nothing delivered.")
         return
