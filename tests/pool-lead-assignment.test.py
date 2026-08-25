@@ -349,6 +349,33 @@ class RoutineLaneEscape(unittest.TestCase):
         self._routine("task-r4.txt")
         self.assertEqual(dict(self.lead.sweep())["task-r4.txt"], self.lane)
 
+    def test_owner_lane_also_skips_a_core_that_failed_to_claim(self):
+        """The lane pin was only one branch. A repool DROPS the follower's
+        load, so least-loaded actively prefers the core that just failed."""
+        owner = [f for f in self.alive if f != self.lane]
+        victim = min(owner)                       # least-loaded picks this one
+        (self.tasks / "task-o1.txt").write_text("id: task-o1\ntask: t\n")
+        self.assertEqual(dict(self.lead.sweep())["task-o1.txt"], victim)
+
+        self.lead.reclaim_stuck_assignments()     # adopt
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.assertEqual(self.lead.reclaim_stuck_assignments(),
+                         [f"task-o1.assigned-{victim}.txt"])
+        again = dict(self.lead.sweep())["task-o1.txt"]
+        self.assertNotEqual(again, victim,
+                            "owner-lane work returned to the core that just "
+                            "failed to claim it")
+        self.assertNotEqual(again, self.lane, "and must not fall to the lane")
+
+    def test_every_follower_in_cooldown_still_assigns(self):
+        """Narrowing to claiming-only must never empty the candidate set —
+        a pool where everyone is in cooldown must still place work."""
+        for f in self.alive:
+            self.lead._mark_noclaim(f)
+        (self.tasks / "task-o2.txt").write_text("id: task-o2\ntask: t\n")
+        out = dict(self.lead.sweep())
+        self.assertIn(out.get("task-o2.txt"), self.alive)
+
     def test_saturated_lane_core_spills_routine_to_another_follower(self):
         for i in range(AFFINITY_BUSY_MAX):
             (self.tasks / f"task-b{i}.claimed-{self.lane}.txt").write_text("x")

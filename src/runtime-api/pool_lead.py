@@ -131,6 +131,9 @@ class PoolLead:
                 and self._claiming(lane_core)):
             return lane_core
         primary = [f for f in followers if f != lane_core] or followers
+        # A repool drops the follower's load, so least-loaded actively PREFERS
+        # the core that just failed to claim. Never narrow to empty.
+        primary = [f for f in primary if self._claiming(f)] or primary
         if channel:
             row = affinity.get(channel)
             if (isinstance(row, dict) and row.get("instance") in primary
