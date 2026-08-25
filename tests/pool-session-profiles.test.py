@@ -11,6 +11,7 @@ Run: python3 tests/pool-session-profiles.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -298,6 +299,64 @@ class AncestryTests(Base):
         with self.assertRaises(PolicyViolation):
             self.store.begin_generation("pro-main", "core-1", e, "gemini",
                                         "initial")
+
+
+class ReconstructionTests(Base):
+    """Capability is derived from the files, never stored — a stored field
+    rots the moment a retention job unlinks a transcript."""
+
+    def _gen_with_transcript(self, body=b"hello"):
+        self.make()
+        e, g1 = self.started(session="sess-A")
+        t = Path(self.tmp.name) / "sess-A.jsonl"
+        t.write_bytes(body)
+        self.store.annotate_generation(
+            "pro-main", "core-1", e, g1, transcript_ref=str(t),
+            transcript_sha256=hashlib.sha256(body).hexdigest())
+        return e, g1, t
+
+    def test_a_present_matching_transcript_is_full(self):
+        _, g1, _ = self._gen_with_transcript()
+        self.assertEqual(
+            self.store.reconstruction_capability("pro-main", g1), "full")
+
+    def test_an_altered_transcript_is_tampered_not_full(self):
+        _, g1, t = self._gen_with_transcript()
+        t.write_bytes(b"hello, but edited")
+        self.assertEqual(
+            self.store.reconstruction_capability("pro-main", g1), "tampered")
+
+    def test_a_reaped_transcript_falls_back_to_the_digest(self):
+        e, g1, t = self._gen_with_transcript()
+        self.store.annotate_generation("pro-main", "core-1", e, g1,
+                                       digest_ref="/d/sess-A.md")
+        t.unlink()
+        self.assertEqual(
+            self.store.reconstruction_capability("pro-main", g1),
+            "digest_only")
+
+    def test_no_transcript_and_no_digest_is_none(self):
+        self.make()
+        _, g1 = self.started(session="sess-A")
+        self.assertEqual(
+            self.store.reconstruction_capability("pro-main", g1), "none")
+
+    def test_a_transcript_without_a_hash_is_unverified_not_full(self):
+        self.make()
+        e, g1 = self.started(session="sess-A")
+        t = Path(self.tmp.name) / "nohash.jsonl"
+        t.write_bytes(b"x")
+        self.store.annotate_generation("pro-main", "core-1", e, g1,
+                                       transcript_ref=str(t))
+        self.assertEqual(
+            self.store.reconstruction_capability("pro-main", g1), "unverified")
+
+    def test_capability_is_not_a_stored_field(self):
+        self.make()
+        self.started()
+        gen = self.store.get("pro-main")["generations"]["g1"]
+        self.assertEqual(
+            [k for k in gen if "capab" in k or "reconstruct" in k], [])
 
 
 class RoomPolicyTests(Base):

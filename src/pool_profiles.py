@@ -29,6 +29,7 @@ atomic-rename claim. Injected path/clock; stdlib only.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import time
@@ -135,7 +136,8 @@ def _validate_policy(p) -> dict:
 def _validate_generation(pid: str, gid: str, gen) -> None:
     required = {"session_id", "parent_generation_id", "runtime", "status",
                 "transition_reason", "started_at", "ended_at",
-                "transcript_ref", "digest_ref", "room_watermarks"}
+                "transcript_ref", "transcript_sha256", "digest_ref",
+                "room_watermarks"}
     if not isinstance(gen, dict) or set(gen) != required:
         raise ProfileStoreCorrupt(f"{pid}/{gid}: generation keys must be "
                                   f"{sorted(required)}")
@@ -261,6 +263,32 @@ class ProfileStore:
             gid = prof["generations"][gid]["parent_generation_id"]
         return out
 
+    def reconstruction_capability(self, profile_id: str,
+                                  generation_id: str) -> str:
+        """How far this generation can be rebuilt, computed from the files NOW.
+
+        Stored as a field it would rot: a retention job unlinking a transcript
+        without rewriting the record leaves the lineage asserting 'full'.
+        """
+        prof = self.get(profile_id)
+        gen = prof["generations"].get(generation_id)
+        if gen is None:
+            raise UnknownGeneration(f"{profile_id}/{generation_id}")
+        ref, want = gen["transcript_ref"], gen["transcript_sha256"]
+        if ref:
+            try:
+                blob = Path(ref).read_bytes()
+            except OSError:
+                blob = None
+            if blob is not None:
+                if want is None:
+                    return "unverified"
+                got = hashlib.sha256(blob).hexdigest()
+                # A present-but-altered transcript is worse than an absent one:
+                # it reads as authoritative history while no longer being it.
+                return "full" if got == want else "tampered"
+        return "digest_only" if gen["digest_ref"] else "none"
+
     def profile_for_room(self, room_id: str) -> "str | None":
         for pid, prof in sorted(self.load()["profiles"].items()):
             if room_id in prof["rooms"]:
@@ -381,7 +409,8 @@ class ProfileStore:
                 "session_id": None, "parent_generation_id": parent,
                 "runtime": runtime, "status": "pending",
                 "transition_reason": reason, "started_at": self.now(),
-                "ended_at": None, "transcript_ref": None, "digest_ref": None,
+                "ended_at": None, "transcript_ref": None,
+                "transcript_sha256": None, "digest_ref": None,
                 "room_watermarks": {}}
             return gid
 
@@ -447,8 +476,8 @@ class ProfileStore:
 
     def annotate_generation(self, profile_id: str, core_id: str,
                             seat_epoch: int, generation_id: str, *,
-                            transcript_ref=None, digest_ref=None,
-                            room_watermarks=None) -> dict:
+                            transcript_ref=None, transcript_sha256=None,
+                            digest_ref=None, room_watermarks=None) -> dict:
         """Attach the per-generation references. Kept separate from promotion
         because a transcript path and a digest become known at different times."""
         if room_watermarks is not None and not isinstance(room_watermarks, dict):
@@ -464,6 +493,8 @@ class ProfileStore:
                 raise UnknownGeneration(f"{profile_id}/{generation_id}")
             if transcript_ref is not None:
                 gen["transcript_ref"] = transcript_ref
+            if transcript_sha256 is not None:
+                gen["transcript_sha256"] = transcript_sha256
             if digest_ref is not None:
                 gen["digest_ref"] = digest_ref
             if room_watermarks is not None:
