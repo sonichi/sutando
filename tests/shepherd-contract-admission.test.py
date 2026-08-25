@@ -157,6 +157,23 @@ if len(failures) != _probe + 1:
     sys.exit(1)
 failures.pop()
 
+# An ASSERTED identity must not satisfy a scope demanding a VERIFIED one. Both
+# schemes are STRONG, so this reaches Actor.matches(), not the discriminating gate.
+_ID = "qingyun-air"
+_verified_scope = ResponsibilityScope(
+    subjects=(PR,), actor=Actor("matrix.mxid", _ID),
+    watch_conditions=SCOPE.watch_conditions,
+    success_conditions=SCOPE.success_conditions,
+    failure_conditions=SCOPE.failure_conditions)
+_asserted = Actor("git.commit_author_email", _ID)
+check("both schemes are strong, so matches() is actually reached",
+      (_asserted.is_discriminating, _verified_scope.actor.is_discriminating), (True, True))
+check("a self-declared identity does not satisfy a verified-identity scope",
+      admit(ObservedEvent("github.pull_request.merged", PR, _asserted), _verified_scope)[0],
+      "ignored")
+check("...and the same value under two schemes is not the same actor",
+      _asserted.matches(_verified_scope.actor), False)
+
 if failures:
     print(f"FAIL ({len(failures)}):")
     for f in failures:

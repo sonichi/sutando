@@ -194,6 +194,59 @@ g.observe = lambda repo, num: __import__("shepherd_contract").ObservedEvent(
 check("verified merge terminates the objective", g.resume("task-dur-4")[0], "succeeded")
 g.observe = _REAL_OBSERVE
 
+# --- a record save() accepts must be one load() can resume (PR #3312 review) ---
+from shepherd_contract import ResponsibilityScope, Subject  # noqa: E402
+
+_A = Actor(g.ACTOR_SCHEME, "someone@example.com")
+
+
+def _scope(**kw):
+    d = dict(subjects=(g.subject_for("o/r", 3),), actor=_A, watch_conditions=g.WATCH,
+             success_conditions=g.SUCCESS, failure_conditions=g.FAILURE)
+    d.update(kw)
+    return ResponsibilityScope(**d)
+
+
+def _raises(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
+
+
+check("empty watch set is refused at SAVE, not at the next load",
+      _raises(lambda: g._write_record("task-dur-emptywatch", _scope(
+          watch_conditions=frozenset()), "waiting")), True)
+check("a scope with no reachable outcome is refused at SAVE",
+      _raises(lambda: g._write_record("task-dur-emptyout", _scope(
+          success_conditions=frozenset(), failure_conditions=frozenset()), "waiting")), True)
+# the record encodes one subject; a wider scope must not silently narrow on reload
+check("a scope this record cannot encode is refused, not narrowed",
+      _raises(lambda: g._write_record("task-dur-wide", _scope(subjects=(
+          g.subject_for("o/r", 3), Subject("gitlab", "merge_request", "grp/proj!9"))),
+          "waiting")), True)
+# round-trip: whatever save() accepted, load() must return unchanged
+g.save("task-dur-roundtrip", _scope(), "waiting")
+_rt = g.load("task-dur-roundtrip")
+check("a successful save round-trips", (_rt["repo"], _rt["number"]), ("o/r", 3))
+check("round-trip preserves the watch set",
+      tuple(_rt["waiting_for"]), tuple(sorted(g.WATCH)))
+
+# --- an unknown observation must not become a concrete outcome ---
+_SAVED_GH, _SAVED_ACTOR = g._gh, g.resolve_actor
+g.resolve_actor = lambda *a, **k: _A
+g._gh = lambda *a, **k: "closed false"
+check("CONTROL a valid projection still maps to its outcome",
+      g.observe("o/r", 3).event_type, "github.pull_request.closed_unmerged")
+g._gh = lambda *a, **k: "closed null"
+check("an unknown merged token is refused, not read as unmerged",
+      _raises(lambda: g.observe("o/r", 3)), True)
+g._gh = lambda *a, **k: ""
+check("an empty projection is refused, not read as progress",
+      _raises(lambda: g.observe("o/r", 3)), True)
+g._gh, g.resolve_actor = _SAVED_GH, _SAVED_ACTOR
+
 # negative control: the harness must be able to register a failure
 _n = len(failures)
 check("CONTROL (expected to fail)", 1, 2)
@@ -207,4 +260,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 39 assertions, control verified")
+print("PASS: 47 assertions, control verified")

@@ -58,6 +58,10 @@ def _gh(*args: str) -> str:
     return out.stdout.strip()
 
 
+PR_STATES = frozenset({"open", "closed"})
+MERGED_TOKENS = frozenset({"true", "false"})
+
+
 def subject_for(repo: str, number: int) -> Subject:
     return Subject(PROVIDER, "pull_request", f"{repo}#{number}")
 
@@ -75,7 +79,15 @@ def observe(repo: str, number: int) -> ObservedEvent:
     """Current PR state as one event. Terminal states win over progress."""
     raw = _gh("api", f"repos/{repo}/pulls/{number}", "-q",
               "[.state, (.merged|tostring)]|join(\" \")")
-    state, merged = (raw.split() + ["", ""])[:2]
+    # An unrecognized projection is UNKNOWN, not "not merged": padding it out
+    # would publish a concrete failure proposal for a state we never observed.
+    parts = raw.split()
+    if len(parts) != 2:
+        raise ValueError(f"unreadable PR projection for {repo}#{number}: {raw!r}")
+    state, merged = parts
+    if state not in PR_STATES or merged not in MERGED_TOKENS:
+        raise ValueError(
+            f"unknown PR projection for {repo}#{number}: state={state!r} merged={merged!r}")
     if merged == "true":
         etype = "github.pull_request.merged"
     elif state == "closed":
@@ -138,6 +150,13 @@ def _subject_parts(scope: ResponsibilityScope) -> tuple[str, int]:
             if s.provider == PROVIDER and s.kind == "pull_request"]
     if len(subs) != 1:
         raise ValueError(f"expected exactly 1 {PROVIDER} pull_request subject, got {len(subs)}")
+    # The record encodes ONE subject, so a wider scope would be silently narrowed
+    # on reload -- resuming a different contract than the one accepted.
+    extra = [s for s in scope.subjects if s not in subs]
+    if extra:
+        raise ValueError(
+            f"scope carries {len(extra)} subject(s) this record cannot encode: "
+            f"{[f'{s.provider}:{s.kind}:{s.resource_id}' for s in extra]}")
     repo, sep, number = subs[0].resource_id.rpartition("#")
     if not sep or not repo.strip() or not number.isdigit():
         raise ValueError(f"malformed subject resource_id: {subs[0].resource_id!r}")
@@ -205,14 +224,18 @@ def _write_record(task_id: str, scope: ResponsibilityScope, state: str,
         raise ValueError(f"refusing to persist state {state!r}; not in SHEPHERD_STATES")
     repo, number = _subject_parts(scope)
     p = _contract_path(task_id)
-    _atomic_write(p, {
+    payload = {
         "task_id": task_id, "provider": PROVIDER, "repo": repo, "number": number,
         "actor_scheme": scope.actor.scheme, "actor_value": scope.actor.value,
         "state": state, "note": note,
         "waiting_for": sorted(scope.watch_conditions),
         "success_conditions": sorted(scope.success_conditions),
         "failure_conditions": sorted(scope.failure_conditions),
-    })
+    }
+    # The loader's schema, applied before publish -- not a copy of it. A record
+    # that save() accepts but load() rejects is a contract no successor can resume.
+    _validate_record(payload, task_id)
+    _atomic_write(p, payload)
     return p
 
 
