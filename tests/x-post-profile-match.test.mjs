@@ -189,5 +189,13 @@ for (const [name, v] of [['null', null], ['undefined', undefined], ['string', 'b
 }
 check('execTimedOut is false for an ordinary non-zero exit', execTimedOut({ status: 1, code: 1 }) === false);
 
+// A probe called with nothing measured nothing: the tri-state must say so.
+for (const [name, v] of [['no arguments', undefined], ['null', null], ['a string', 'oops']]) {
+	check(`classifyLsofProbe fails closed: ${name}`, classifyLsofProbe(v).known === false,
+		JSON.stringify(classifyLsofProbe(v)));
+}
+check('a clean empty probe is still a CONFIRMED zero, not unknown',
+	classifyLsofProbe({ threw: false, killed: false, stdout: '' }).known === true);
+
 console.log(failures ? `\nFAIL — ${failures} profile-match check(s)` : '\nPASS — x-post profile match');
 process.exit(failures ? 1 : 0);

@@ -123,7 +123,11 @@ export function execTimedOut(e) {
 	return e.killed === true || e.code === 'ETIMEDOUT' || e.signal === 'SIGTERM';
 }
 
-export function classifyLsofProbe({ threw, killed, stdout } = {}) {
+export function classifyLsofProbe(outcome) {
+	// A probe that measured nothing is the case the tri-state exists to name, so the
+	// no-argument path answers "cannot say" rather than a confident zero holders.
+	if (!outcome || typeof outcome !== 'object') return { known: false, pids: [] };
+	const { threw, killed, stdout } = outcome;
 	if (killed) return { known: false, pids: [] };
 	if (threw && !(typeof stdout === 'string' && stdout.length > 0)) {
 		return { known: false, pids: [] };
