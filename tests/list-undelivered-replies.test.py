@@ -45,6 +45,30 @@ class Lister(unittest.TestCase):
         self._orphan("task-bbb", where="tasks")
         self.assertEqual(lur.undelivered(self.ws), [])
 
+    def test_a_claimed_task_is_not_listed(self):
+        """A task being worked right now lives under its claimed name, not the
+        plain one. Listing it sends an operator to deliver a reply the worker
+        is about to deliver itself."""
+        self._orphan("task-ddd", where="tasks")
+        (self.ws / "tasks" / "task-ddd.txt").rename(
+            self.ws / "tasks" / "task-ddd.claimed-core-2.txt")
+        self.assertEqual(lur.undelivered(self.ws), [])
+
+    def test_an_assigned_task_is_not_listed(self):
+        """Same class one step earlier: the lead has handed it to a core that
+        has not claimed it yet."""
+        self._orphan("task-eee", where="tasks")
+        (self.ws / "tasks" / "task-eee.txt").rename(
+            self.ws / "tasks" / "task-eee.assigned-core-3.txt")
+        self.assertEqual(lur.undelivered(self.ws), [])
+
+    def test_a_longer_task_id_does_not_suppress_a_real_orphan(self):
+        """The dot in `{id}.*.txt` is load-bearing. Without it the live
+        task-fff0 would prefix-match and hide task-fff, which IS orphaned."""
+        self._orphan("task-fff0", where="tasks")
+        self._orphan("task-fff")
+        self.assertEqual([r[0] for r in lur.undelivered(self.ws)], ["task-fff"])
+
     def test_a_header_without_a_room_is_flagged_not_guessed(self):
         (self.ws / "tasks" / "archive" / "task-ccc.txt").write_text(
             "id: task-ccc\nsource: local\ntask: t\n")

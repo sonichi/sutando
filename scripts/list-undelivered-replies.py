@@ -43,10 +43,13 @@ def _task_header(ws: Path, task_id: str) -> dict:
 
 def undelivered(ws: Path) -> list:
     out = []
+    tasks = ws / "tasks"
     for res in sorted((ws / "results").glob("task-*.txt")):
         task_id = res.stem
-        if any((ws / "tasks").glob(f"{task_id}.txt")):
-            continue  # still queued: a consumer may yet reach this pair
+        # Queued, assigned or claimed: a consumer may yet reach this pair. The
+        # literal dot stops `{id}*.txt` prefix-matching and hiding a real orphan.
+        if (tasks / f"{task_id}.txt").exists() or any(tasks.glob(f"{task_id}.*.txt")):
+            continue
         out.append((task_id, res, _task_header(ws, task_id)))
     return out
 
