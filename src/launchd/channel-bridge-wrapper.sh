@@ -122,10 +122,13 @@ while [ "$STOPPING" = 0 ]; do
   [ "$STOPPING" = 0 ] || break
   # A clean exit is a deliberate stand-down, not a crash: single_instance.py
   # exits 0 when a peer holds the lock, so respawning it is the restart loop.
-  # launchd KeepAlive is unconditional, so exiting hands the respawn to launchd,
-  # which re-enters above and alerts off the marker. Clear it: a stand-down is
-  # not a restart to report.
-  [ "$CHILD_RC" -eq 0 ] && { rm -f "$MARKER"; exit 0; }
+  # 75 == single_instance.EXIT_STANDDOWN: a peer holds the lock. Gate on THAT,
+  # never on 0 -- a bridge whose main loop returns also exits 0, and treating
+  # that as deliberate would leave it down silently, with the alert suppressed.
+  # Clear the marker too: launchd KeepAlive is unconditional, so exiting hands
+  # the respawn back to launchd, which re-enters above and alerts off a marker
+  # this run left behind.
+  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
   emit_restart_alert
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!

@@ -100,8 +100,8 @@ def test_wrapper_restart_signal() -> None:
         check(len(exec_log.read_text().splitlines()) >= 2, "wrapper restarts an exited bridge child")
 
 
-def _stage_clean_exit(root):
-    """Wrapper + config staged with a child that exits 0 (a peer holds the lock)."""
+def _stage_clean_exit(root, rc=75):
+    """Wrapper + config staged with a child exiting `rc` (75 = declared stand-down)."""
     repo, workspace, config = root / "repo", root / "workspace", root / "config"
     (repo / "src" / "launchd").mkdir(parents=True)
     (repo / "scripts").mkdir()
@@ -119,7 +119,8 @@ def _stage_clean_exit(root):
     helper.chmod(0o755)
     fake_python = root / "python"
     fake_python.write_text(
-        "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\nexit 0\n")
+        "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\n"
+        f"exit {rc}\n")
     fake_python.chmod(0o755)
     exec_log = root / "exec.log"
     env = os.environ.copy()
@@ -138,7 +139,7 @@ def _alerts(workspace):
 
 
 def test_clean_exit_is_a_standdown():
-    """exit 0 must NOT respawn and must NOT alert - the inverse of the crash case.
+    """exit 75 must NOT respawn and must NOT alert - the inverse of the crash case.
 
     The crash test above proves a non-zero child comes back. Only this one pins
     the change itself: before it, the wrapper could not tell a deliberate
@@ -182,9 +183,36 @@ def test_a_launchd_relaunch_after_a_standdown_does_not_alert():
               f"a relaunch after a stand-down writes NO owner alert (found {_alerts(workspace)})")
 
 
+def test_a_bare_exit_zero_is_NOT_a_standdown():
+    """The guard must key on the DECLARED code, never on "clean".
+
+    single_instance is the only deliberate stand-down in the tree, but it is not
+    the only way to exit 0: a bridge whose main loop returns falls off __main__
+    and exits 0 too. Standing down on that inverts the bug being fixed - instead
+    of spamming the owner it leaves the bridge off and suppresses the very alert
+    that would have told him. Silence is the worse direction.
+    """
+    import time
+    with tempfile.TemporaryDirectory() as raw:
+        wrapper, workspace, exec_log, env = _stage_clean_exit(Path(raw), rc=0)
+        proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1.0)
+        # Still supervising == did not stand down. Timing-independent, unlike a
+        # lap count: emit_restart_alert shells out to osascript, so one lap can
+        # fill the window and a low count would read as a stand-down.
+        still_running = proc.poll() is None
+        proc.terminate(); proc.wait(timeout=5)
+        check(still_running,
+              "a bare exit 0 keeps the wrapper supervising (it did not stand down)")
+        check(bool(_alerts(workspace)),
+              "a bare exit 0 still alerts the owner - it is not a declared stand-down")
+
+
 if __name__ == "__main__":
     test_contract()
     test_wrapper_restart_signal()
     test_clean_exit_is_a_standdown()
     test_a_launchd_relaunch_after_a_standdown_does_not_alert()
+    test_a_bare_exit_zero_is_NOT_a_standdown()
     print("all passed")
