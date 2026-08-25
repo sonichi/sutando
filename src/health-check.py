@@ -6342,6 +6342,36 @@ def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
     return set(_worker_holdings(ps_output))
 
 
+_POOL_HELD_RE = re.compile(r"\.(assigned|claimed)-([^.]+)\.txt$")
+
+
+def _pool_held_note(pooled: "list") -> str:
+    """Who holds what, by follower — the pool's in-flight signal is the name."""
+    by: dict = {}
+    for f in pooled:
+        m = _POOL_HELD_RE.search(f.name)
+        key = f"{m.group(1)}:{m.group(2)}"
+        by[key] = by.get(key, 0) + 1
+    return ", ".join(f"{k}x{v}" for k, v in sorted(by.items()))
+
+
+def _split_pool_held(files: "list") -> tuple:
+    """(not-held-by-a-follower, held-by-a-follower)."""
+    held = [f for f in files if _POOL_HELD_RE.search(f.name)]
+    return [f for f in files if f not in held], held
+
+
+def _pool_note(pooled: "list") -> str:
+    if not pooled:
+        return ""
+    return f", {len(pooled)} held by pool followers ({_pool_held_note(pooled)})"
+
+
+def _pool_only_detail(pooled: "list") -> str:
+    return (f"{len(pooled)} task(s) held by pool followers ({_pool_held_note(pooled)}), "
+            f"0 unassigned — the pool is working, not stalled")
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -6355,6 +6385,10 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     files = _pending_task_files(tasks_dir)
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
+    # A follower holds by RENAMING, so argv-based holdings see none of it.
+    files, pooled = _split_pool_held(files)
+    if pooled and not files:
+        return {"name": name, "status": "ok", "detail": _pool_only_detail(pooled)}
     now = time.time()
     # An in-flight task looks exactly like a stalled one on disk; the worker's
     # argv is the only thing that tells them apart.
@@ -6381,13 +6415,14 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                    "cannot be established")
     held_verdict = (" — all held by a live worker, not stalled" if held_is_progress
                     else wedged_note if all_held else None)
+    pool_note = _pool_note(pooled)
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
             # ok, not warn: every `warn` is alertable (emit_task_for_failures /
             # notify_for_failures), so rewording alone still fires the false alert.
             "status": "ok" if held_is_progress else "warn",
-            "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
+            "detail": (f"{len(files)} unassigned task(s) queued{held_note}{pool_note}, oldest {oldest_age}s"
                        + (held_verdict or " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
@@ -6398,11 +6433,11 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
         return {
             "name": name,
             "status": "ok" if held_is_progress else "warn",
-            "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
+            "detail": (f"{len(files)} unassigned task(s) queued{held_note}{pool_note}, oldest {oldest_age}s"
                        + (held_verdict or f" — undrained past {stuck_age_sec}s")),
         }
     return {"name": name, "status": "ok",
-            "detail": f"{len(files)} task(s){held_note}, oldest {oldest_age}s"}
+            "detail": f"{len(files)} task(s){held_note}{pool_note}, oldest {oldest_age}s"}
 
 
 def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
