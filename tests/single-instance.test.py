@@ -2,7 +2,7 @@
 
 Covers:
   (a) acquire() succeeds when no other holder — lock file written with PID.
-  (b) Second acquire() from a new process exits 0 (launchd-safe).
+  (b) Second acquire() from a new process exits 75 (EXIT_STANDDOWN).
   (c) Lock releases when the holder process dies — next acquire() wins.
   (d) acquire() on two different names is independent (no cross-lock).
 
@@ -55,12 +55,13 @@ class TestSingleInstance(unittest.TestCase):
         pid_in_file = int(lock_path.read_text().strip())
         self.assertEqual(pid_in_file, os.getpid())
 
-    # (b) Second process attempting the same lock exits 0.
-    def test_second_process_exits_zero(self):
+    # (b) Second process attempting the same lock stands down with 75.
+    def test_second_process_exits_standdown_code(self):
         mod = _load_single_instance(self.workspace)
         mod.acquire("test-second")
         # Spawn a child process that tries to acquire the same lock.
-        # It should exit 0 (not 1) because we hold it in this process.
+        # 75, not 0: a bridge whose main loop merely returns also exits 0, so a
+        # supervisor cannot tell that from a deliberate stand-down.
         child = subprocess.run(
             [
                 sys.executable, "-c",
@@ -71,7 +72,8 @@ class TestSingleInstance(unittest.TestCase):
             capture_output=True,
             timeout=10,
         )
-        self.assertEqual(child.returncode, 0, "contending process should exit 0")
+        self.assertEqual(child.returncode, 75,
+                         "contending process should exit EXIT_STANDDOWN (75)")
         self.assertIn(b"already holds the lock", child.stderr)
 
     # (c) Lock releases after holder dies — next acquire wins.
@@ -94,7 +96,7 @@ class TestSingleInstance(unittest.TestCase):
         holder.wait(timeout=5)
         # Now this process should be able to acquire.
         mod = _load_single_instance(self.workspace)
-        # If lock still held, acquire() would call os._exit(0) — but since
+        # If lock still held, acquire() would call os._exit(75) — but since
         # holder died, the OS released the flock and we should proceed normally.
         try:
             mod.acquire("test-release")
