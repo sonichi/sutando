@@ -296,14 +296,29 @@ class DeliveryCoreKeyOwnership(unittest.TestCase):
         self.assertEqual(serialization.parse_idempotency_key(k.value), k)
         self.assertNotEqual(k, I.idempotency_key(I.TaskId("task-X"), "gw"))
 
-    def test_preserved_key_rejects_ungrammatical_input(self):
-        for bad in ("", "task a", "task/a", "task\\a", "task-💥"):
+    def test_preserved_key_keeps_the_whole_shipped_domain(self):
+        # The parent formatted EVERY string byte-for-byte, and the outbox
+        # admits opaque ids, so narrowing this domain strands live claims.
+        for item in ("task a", "task/a", "task\\a", "task-💥", "a/b/c"):
+            with self.subTest(item=item):
+                self.assertEqual(I.legacy_idempotency_key(item).value,
+                                 f"{item}#0")
+
+    def test_preserved_key_rejects_only_genuinely_invalid_input(self):
+        for bad in ("", "x" * 300):
             with self.assertRaises(ValueError, msg=bad):
                 I.legacy_idempotency_key(bad)
         with self.assertRaises(TypeError):
             I.legacy_idempotency_key("task-X", True)
         with self.assertRaises(ValueError):
             I.legacy_idempotency_key("task-X", -1)
+
+    def test_canonical_grammar_stays_strict(self):
+        # Widening is scoped to the opaque legacy shape; the canonical
+        # constructor must still reject the same characters it always did.
+        for bad in ("e:task X@gw", "e:a/b@gw"):
+            with self.assertRaises(ValueError, msg=bad):
+                I.IdempotencyKey(bad)
 
 
 class AttemptedThenRequeuedLegacyRoundTrip(unittest.TestCase):

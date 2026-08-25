@@ -21,16 +21,18 @@ _MAX_LEN = 200
 # at least one unit — empty components are constructor-impossible.
 _COMPONENT = r"(?:[^%@#+~:/\\]|%[0-9A-F]{2})+"
 _DELIVERY_BASE = rf"(?:d|legacy):{_COMPONENT}@{_COMPONENT}(?:\+r[1-9][0-9]*)*"
-# delivery_core's shipped key <item_id>#<epoch>, unescaped. Disjoint from
-# "e:...@...", which has no '#', so the two shapes stay unambiguous.
-_LEGACY_KEY = r"[^/\\]+#[0-9]+"
+# delivery_core's shipped key <item_id>#<epoch>, unescaped and OPAQUE: path
+# separators included. Disjoint from "e:...@...", which has no '#'.
+_LEGACY_KEY = r".+#[0-9]+"
 
 
-def _validate(value: str, kind: str) -> None:
+def _validate(value: str, kind: str, *, charset: bool = True) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{kind} must be a non-empty string")
     if len(value) > _MAX_LEN:
         raise ValueError(f"{kind} exceeds {_MAX_LEN} chars")
+    if not charset:
+        return
     for ch in value:
         if not 0x21 <= ord(ch) <= 0x7E or ch in "/\\":
             raise ValueError(f"{kind} contains forbidden character {ch!r}")
@@ -41,10 +43,18 @@ class _Identity:
     value: str
 
     _PATTERN: ClassVar[Optional[re.Pattern]] = None
+    # Bytes an earlier release already shipped: length stays bounded, but the
+    # charset rule cannot apply — narrowing it strands live deliveries.
+    _OPAQUE: ClassVar[Optional[re.Pattern]] = None
 
     def __post_init__(self) -> None:
         kind = type(self).__name__
-        _validate(self.value, kind)
+        opaque = type(self)._OPAQUE
+        is_opaque = bool(opaque is not None and isinstance(self.value, str)
+                         and opaque.fullmatch(self.value))
+        _validate(self.value, kind, charset=not is_opaque)
+        if is_opaque:
+            return
         pattern = type(self)._PATTERN
         if pattern is not None and not pattern.fullmatch(self.value):
             raise ValueError(f"{kind} grammar rejects {self.value!r}")
@@ -77,7 +87,8 @@ class IdempotencyKey(_Identity):
     admissible shapes: the canonical e:<task>@<boundary>, and the pre-B
     provider key <item_id>#<epoch> that legacy_idempotency_key preserves."""
 
-    _PATTERN = re.compile(rf"e:{_COMPONENT}@{_COMPONENT}|{_LEGACY_KEY}")
+    _PATTERN = re.compile(rf"e:{_COMPONENT}@{_COMPONENT}")
+    _OPAQUE = re.compile(_LEGACY_KEY)
 
 
 class IncarnationId(_Identity):
