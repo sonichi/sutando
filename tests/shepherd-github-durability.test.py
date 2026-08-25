@@ -379,6 +379,9 @@ _raises("scope_from_saved rejects another provider's record",
         lambda: g.scope_from_saved({**_ok, "provider": "gitlab"}))
 _raises("scope_from_saved rejects a blank repo with a bool number",
         lambda: g.scope_from_saved({**_ok, "repo": "", "number": True}))
+_raises("scope_from_saved rejects a record with no reachable outcome",
+        lambda: g.scope_from_saved({**_ok, "success_conditions": [],
+                                    "failure_conditions": []}))
 check("scope_from_saved still rehydrates a good record",
       g.scope_from_saved(_ok).subjects[0].resource_id, "org/a#3")
 

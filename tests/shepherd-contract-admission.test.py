@@ -35,9 +35,12 @@ SCOPE = ResponsibilityScope(
 )
 
 failures = []
+_ASSERTIONS = 0
 
 
 def check(name, got, want):
+    global _ASSERTIONS
+    _ASSERTIONS += 1
     if got != want:
         failures.append(f"{name}: got {got!r}, want {want!r}")
 
@@ -140,6 +143,10 @@ check("overlapping success/failure rejected",
           failure_conditions=frozenset({"done"}))), True)
 check("scope with no subject rejected",
       raises(lambda: ResponsibilityScope(subjects=(), actor=MINE)), True)
+check("a non-iterable subjects collection is rejected",
+      raises(lambda: ResponsibilityScope(subjects=7, actor=MINE)), True)
+check("a bare string subjects collection is rejected",
+      raises(lambda: ResponsibilityScope(subjects="github:pull_request:o/r#1", actor=MINE)), True)
 
 check("is_terminal(succeeded)", is_terminal("succeeded"), True)
 check("is_terminal(waiting)", is_terminal("waiting"), False)
@@ -293,4 +300,4 @@ if failures:
     for f in failures:
         print("  -", f)
     sys.exit(1)
-print("PASS: 37 assertions, control verified")
+print(f"PASS: {_ASSERTIONS} assertions, control verified")
