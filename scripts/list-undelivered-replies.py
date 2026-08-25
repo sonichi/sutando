@@ -58,7 +58,7 @@ def main(argv: "list[str] | None" = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--workspace", help="override the resolved workspace")
     args = ap.parse_args(argv)
-    repo = Path(__file__).resolve().parent.parent
+    repo = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root (sys.path only; resolution goes through the loader)
     ws = Path(args.workspace) if args.workspace else _resolve_workspace(repo)
 
     rows = undelivered(ws)
