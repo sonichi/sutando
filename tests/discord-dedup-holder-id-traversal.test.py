@@ -61,8 +61,10 @@ def main() -> int:
     # 3. The bridge applies it at the call site, and only around the lookup —
     #    the recovery branch itself must still run for an unresolvable holder.
     src = (REPO / "src" / "discord-bridge.py").read_text(encoding="utf-8")
+    # The branch condition deliberately does NOT test _skip.extra: an empty
+    # holder is a dedup marker too, and the shared plan answers it.
     call = re.search(
-        r"if _skip\.value == \"deduped\" and _skip\.extra:(.{0,600}?)_holder_text",
+        r"if _skip\.value == \"deduped\":(.{0,700}?)_holder_text",
         src, re.S)
     check(call is not None, "3) the dedup branch is where it was")
     if call:

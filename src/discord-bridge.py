@@ -154,7 +154,7 @@ from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -4781,7 +4781,8 @@ async def poll_results():
                     # own channel. Loop guard: a task that comes back
                     # cross-channel-deduped a SECOND time is not re-queued again
                     # — notify in-channel instead (owner-directed).
-                    if _skip.value == "deduped" and _skip.extra:
+                    if _skip.value == "deduped":
+                        _act, _delivered = "defer", None
                         try:
                             # find_task_file globs unchecked; an id failing the
                             # gate find_result applies is "holder not found".
@@ -4797,7 +4798,10 @@ async def poll_results():
                                 pending_replies[_pl] = channel
                                 save_pending_replies()
                             elif _act == "report":
+                                # The asker learns nothing if this send fails, so
+                                # its outcome decides retirement, not the attempt.
                                 await channel.send(_pl)
+                                _delivered = True
                             if _target:
                                 _orig_file = find_task_file(TASKS_DIR, task_id)
                                 _orig_text = _orig_file.read_text() if _orig_file else None
@@ -4834,8 +4838,14 @@ async def poll_results():
                                         flush=True,
                                     )
                         except Exception as e:
-                            # Best-effort; never block the archive of this result.
                             print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
+                        if report_disposition(_act, _delivered) == "retain":
+                            # Nobody was told. Keep the result AND the task so a
+                            # later pass retries; archiving loses the question.
+                            print(
+                                f"  [dedup] report not delivered for {task_id} — "
+                                f"retaining for retry", flush=True)
+                            continue
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     # §7 audit: skip-marked results are resolved deliveries, not
                     # silent voids — one line per resolved result per spec.

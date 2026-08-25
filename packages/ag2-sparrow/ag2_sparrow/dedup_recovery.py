@@ -32,7 +32,12 @@ except ImportError:  # pragma: no cover - flat src/ import path
     )
     from task_archive import find_task_file
 
-__all__ = ["plan_dedup_recovery", "REPORT_TEMPLATE", "MALFORMED_TEMPLATE"]
+__all__ = [
+    "plan_dedup_recovery",
+    "report_disposition",
+    "REPORT_TEMPLATE",
+    "MALFORMED_TEMPLATE",
+]
 
 MALFORMED_TEMPLATE = (
     "⚠️ This was folded into another task, but the holder id on the marker is "
@@ -104,3 +109,25 @@ def plan_dedup_recovery(
         return "requeue", new_task_id
 
     return "report", REPORT_TEMPLATE.format(holder=holder)
+
+
+def report_disposition(action: str, delivered=None) -> str:
+    """Is this exchange terminal, given what the adapter's send actually did?
+
+    ``delivered`` is the adapter's own outcome for the send the plan asked for:
+    ``True`` confirmed, ``False`` refused/failed, ``None`` unknown. Only the
+    ``report`` action consults it — the other actions do not send.
+
+    Returns ``"archive"`` (retire task + result) or ``"retain"`` (leave both in
+    place so a later pass retries). An unrecognised action retains: this decides
+    whether an unanswered request survives, so the unknown case fails closed.
+
+    Separated from ``plan_dedup_recovery`` because the plan is made before the
+    send and this is decided after it; every adapter owns the send and none of
+    them should own the rule for what a failed one means.
+    """
+    if action == "report":
+        return "archive" if delivered is True else "retain"
+    if action in ("honour", "requeue"):
+        return "archive"
+    return "retain"
