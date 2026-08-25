@@ -28,6 +28,14 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
 fi
 
+# Same restart-path gap as above, for the PERSONAL_CLAUDE.md compaction hook:
+# its registration (scripts/install-personal-claude-hook.sh) is idempotent
+# and only wired into startup.sh, so a first-ever install that only ever
+# goes through a direct restart (menu bar, health-check recovery, --restart,
+# supervisor) never gets it. Re-running here costs nothing once installed —
+# same idempotent-every-launch pattern as the proxy wiring above.
+bash "$REPO/scripts/install-personal-claude-hook.sh" 2>&1 || true
+
 runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)" || {
   echo "start-cli: failed to resolve core runtime" >&2
   exit 1
