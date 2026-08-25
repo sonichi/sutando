@@ -52,7 +52,7 @@ def _configured_target(repo_root=None):
     bridges = load_config(repo_root).get("bridges") or {}
     raw = bridges.get("discord_post_gate")
     if isinstance(raw, dict):
-        return {str(k): str(v or "").strip() for k, v in raw.items()}
+        return {str(k).strip(): str(v or "").strip() for k, v in raw.items()}
     return str(raw or "").strip()
 
 
@@ -115,7 +115,7 @@ def resolve_validator(repo_root=None):
     if isinstance(target, dict):
         # Normalize here too: a safety property must not depend on an
         # upstream caller having stripped its input ("   " is truthy).
-        target = {str(k): (v.strip() if isinstance(v, str) else v)
+        target = {str(k).strip(): (v.strip() if isinstance(v, str) else v)
                   for k, v in target.items()}
         if not any(target.values()):
             # A mapping naming no usable path is a CONFIGURED gate that would
