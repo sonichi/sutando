@@ -23,6 +23,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 from task_priority import sort_tasks_by_priority  # noqa: E402
+from pool_profiles import ProfileStoreCorrupt  # noqa: E402
 
 # Sticky-channel window (#884 semantics): tasks from a channel follow its
 # handler until the channel has been idle this long, then rebalance.
@@ -73,7 +74,8 @@ def _read_lane(path: Path) -> str:
 
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
-                 now_fn=time.time, metrics=None, results_dir=None):
+                 now_fn=time.time, metrics=None, results_dir=None,
+                 profiles=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
         production binder wires instance_registry + the .alive files."""
@@ -85,6 +87,7 @@ class PoolLead:
         self.alive_fn = alive_fn
         self.now = now_fn
         self.metrics = metrics  # PoolMetrics or None; recording is optional
+        self.profiles = profiles  # ProfileStore or None; seating is optional
 
     # ── affinity table (single-writer: the lead) ────────────────────────────
     def _affinity_path(self) -> Path:
@@ -148,6 +151,39 @@ class PoolLead:
                 and self._load(lane_core) == 0 and self._claiming(lane_core)):
             return lane_core  # overflow: whole owner lane saturated, lane idle
         return pick
+
+    # ── profile seating (single-writer: the lead) ───────────────────────────
+    def reconcile_seating(self) -> "list[tuple[str, str | None]]":
+        """Keep every profile seated on a live core; returns what moved.
+
+        No scheduling effect yet — assignment does not read seats, so this only
+        maintains the table. A profile whose core is gone is re-seated rather
+        than dropped, which is what makes a core's death a move and not a loss.
+        """
+        if self.profiles is None:
+            return []
+        try:
+            store = self.profiles.load()
+        except ProfileStoreCorrupt:
+            return []  # never re-seat off a store we could not read
+        writer = self.profiles.lead_label
+        live = self._live_followers()
+        moved: "list[tuple[str, str | None]]" = []
+        for pid, prof in sorted(store["profiles"].items()):
+            held = prof["seat"]["core_id"]
+            if held is not None and held in live:
+                continue
+            if not live:
+                # Unseat rather than leave a dead holder: a stale seat would
+                # still pass the epoch check if that core ever came back.
+                if held is not None:
+                    self.profiles.unseat(pid, writer=writer)
+                    moved.append((pid, None))
+                continue
+            pick = min(live, key=lambda f: (self._load(f), str(f)))
+            self.profiles.seat(pid, pick, writer=writer)
+            moved.append((pid, pick))
+        return moved
 
     # ── the sweep ───────────────────────────────────────────────────────────
     def sweep(self) -> "list[tuple[str, str]]":
