@@ -175,6 +175,19 @@ class RuntimeAwareLaneTests(LaneBase):
         lead.sweep()
         self.assertEqual(self._assigned_to("task-o6"), "core-3")
 
+    def test_single_claude_with_codex_gets_owner_work(self):
+        # the sole claude doubles as lane core but must stay owner-eligible
+        lead = self._lead({"core-1": "claude", "core-4": "codex"})
+        self._write("task-o7.txt", owner_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-o7"), "core-1")
+
+    def test_single_claude_with_codex_gets_routine_work(self):
+        lead = self._lead({"core-1": "claude", "core-4": "codex"})
+        self._write("task-r6.txt", routine_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-r6"), "core-1")
+
     def test_no_runtime_fn_keeps_the_pre_runtime_behaviour(self):
         self._write("task-r3.txt", routine_task())
         self.lead.sweep()

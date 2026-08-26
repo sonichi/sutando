@@ -166,8 +166,9 @@ class PoolLead:
             return lane_core
         # owner lane prefers claude seats: a codex follower's wrapper polls on
         # a timer (measured p50 87s idle vs 291s), so it serves as overflow only
-        primary = ([f for f in eligible if f != lane_core]
-                   or [f for f in followers if f != lane_core] or followers)
+        # a sole claude seat doubles as lane core yet stays owner-eligible:
+        # falling past all claude seats would hand owner work to codex
+        primary = [f for f in eligible if f != lane_core] or eligible
         if channel:
             row = affinity.get(channel)
             # Binding: a live home core keeps its room regardless of load or
