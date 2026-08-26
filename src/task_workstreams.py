@@ -451,20 +451,7 @@ def _task_record_from_path(path: Path, result: str = "") -> Optional[TaskRecord]
 def _exact_result(workspace: Path, task_id: str) -> str:
     """Read an exact-id result without enumerating result files."""
     results_dir = workspace / "results"
-    filename = f"{task_id}.txt"
-    candidates = [results_dir / filename, results_dir / "archive" / filename]
-    for root in (results_dir / "archive", results_dir):
-        try:
-            with os.scandir(root) as entries:
-                directories = [
-                    Path(entry.path) for entry in entries
-                    if entry.is_dir() and (
-                        root.name == "archive" or entry.name.startswith("archive-")
-                    )
-                ]
-        except OSError:
-            directories = []
-        candidates.extend(directory / filename for directory in directories)
+    candidates = local_task_protocol.iter_result_candidates(results_dir, task_id)
     for path in candidates:
         try:
             if path.is_file():

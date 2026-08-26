@@ -594,12 +594,10 @@ def iter_result_candidates(results_dir: Path, task_id: str) -> list[Path]:
 def find_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate a task's result: live dir first, then archive. Archival trails
     delivery, so an archive-only lookup reads a fresh result as never delivered."""
-    if not valid_archive_lookup_id(task_id):
-        return None
-    live = Path(results_dir) / f"{task_id}.txt"
-    if live.is_file():
-        return live
-    return find_archived_result(results_dir, task_id)
+    for candidate in iter_result_candidates(results_dir, task_id):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:

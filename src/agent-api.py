@@ -374,12 +374,11 @@ def _active_task_rows() -> list[dict]:
         existing = task_history.get(task_id, {})
         # Priority: live file, then in-memory history, then archive. The
         # archive lookup is what survives a restart, when history is empty.
-        archived_file = None
-        for month_dir in (RESULT_DIR / "archive").glob("*/"):
-            candidate = month_dir / f"{task_id}.txt"
-            if candidate.exists():
-                archived_file = candidate
-                break
+        # This scanned `archive/*/` UNSORTED, so with two month dirs it picked
+        # an arbitrary one. The shared enumeration is ordered newest-first.
+        archived_file = next(
+            (c for c in local_task_protocol.iter_result_candidates(RESULT_DIR, task_id)
+             if c != result_file and c.is_file()), None)
         # Status and body must answer the SAME question; `done` from existence
         # plus a body from readiness reports done-with-an-empty-result.
         live_body = read_ready_result(result_file)
@@ -647,10 +646,11 @@ def get_task_result(task_id: str):
         candidates.append(result_file)
     if safe_id:
         # task-bridge archives within seconds of delivery, so a direct /result
-        # poll often arrives after the file has moved.
-        filename = f"{safe_id}.txt"
-        candidates += [d / filename for d in
-                       sorted((RESULT_DIR / "archive").glob("*/"), reverse=True)]
+        # poll often arrives after the file has moved. One owner for the
+        # layouts: this used to know only month dirs.
+        candidates += [c for c in
+                       local_task_protocol.iter_result_candidates(RESULT_DIR, safe_id)
+                       if c != result_file]
     for candidate in candidates:
         # Readiness, not existence: a body read mid-write decodes fatally.
         body = read_ready_result(candidate)
