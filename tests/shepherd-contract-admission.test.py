@@ -303,7 +303,7 @@ check("source_id must be a string; '' stays legal for an unresolved id",
       (True, True, True, ""))
 
 
-# --- the TOP-LEVEL event/scope objects are seams too (reported at 187edf73) ---
+# --- the TOP-LEVEL event/scope objects are seams too ---
 # A scope SUBCLASS inherits the nested blessing yet overrides what admit() trusts.
 class _EvilScope(ResponsibilityScope):
     def covers_subject(self, subject):

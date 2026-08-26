@@ -270,7 +270,7 @@ check("...and no record was published for it",
 # Malformed targets must be rejected BEFORE any credentialed call: count stubs.
 _gh_calls = []
 _real_gh_for_p2 = g._gh
-g._gh = lambda *a: (_gh_calls.append(a), "")[1]
+g._gh = lambda *a: (_gh_calls.append(a), "open false")[1]
 _hostile_repos = ["owner/repo/../../victim/private", "repo-only", " owner/repo",
                   "owner/repo ", "owner/repo?x=1", "owner//repo", "owner/..", ""]
 for _hr in _hostile_repos:
@@ -280,6 +280,16 @@ for _hr in _hostile_repos:
     except ValueError:
         _rejected = True
     check(f"observe rejects {_hr!r} before any gh call", (_rejected, len(_gh_calls)), (True, 0))
+for _vr in ("github/.github", "github/.github-private"):
+    _gh_calls.clear()
+    try:
+        g.observe(_vr, 1)
+        _ok = True
+    except ValueError:
+        _ok = False
+    check(f"observe ACCEPTS valid dot-leading repo {_vr!r} (reaches gh)",
+          (_ok, len(_gh_calls) > 0), (True, True))
+_gh_calls.clear()
 for _hn in (-1, 0, True, "007", "1e3"):
     _rejected = False
     try:
@@ -344,7 +354,7 @@ check("an acquisition fault closes the descriptor and publishes nothing",
 check("a release fault still closes the descriptor; the record was already written",
       _fault("task-lock-rel", False, True), (0, True))
 
-# --- save() is create-or-advance, never rebind (reported at 8421ca66) ---------
+# --- save() is create-or-advance, never rebind ---------
 def _raises(name, fn):
     global _ASSERTIONS
     _ASSERTIONS += 1
@@ -378,7 +388,7 @@ check("an unchanged binding may advance its state", g.load("task-bind-2")["state
 g.save("task-bind-2", g.scope_for("org/a", 3, MINE), "blocked", "idempotent")
 check("re-saving the same state is idempotent", g.load("task-bind-2")["state"], "blocked")
 
-# --- one canonical PR number at every seam (reported at 8421ca66) -------------
+# --- one canonical PR number at every seam -------------
 # int() would fold each of these into a DIFFERENT subject than the one supplied.
 for bad, why in [("01", "leading zero"), ("\u0661", "Arabic-Indic digit"),
                  (-1, "negative"), (0, "zero"), (True, "bool"), ("1.0", "non-digit")]:
@@ -414,7 +424,7 @@ _raises("scope_from_saved rejects a record with no reachable outcome",
 check("scope_from_saved still rehydrates a good record",
       g.scope_from_saved(_ok).subjects[0].resource_id, "org/a#3")
 
-# --- hostile SCALAR SUBCLASSES must not cross any boundary (reported at 113feaec) ---
+# --- hostile SCALAR SUBCLASSES must not cross any boundary ---
 class _EscapingId(str):
     """valid_task_id() sees the safe underlying value; __format__ renders the escape."""
     def __format__(self, spec): return "../../escaped"
@@ -486,7 +496,7 @@ for pair, want in (("open false", "github.pull_request.updated"),
 _raises("projection 'open true' is REFUSED (merged PRs are never open)",
         lambda: _proj("open true"))
 
-# --- the checked binding must BE the written binding (reported at 187edf73) ---
+# --- the checked binding must BE the written binding ---
 def _type_raises(name, fn):
     global _ASSERTIONS
     _ASSERTIONS += 1
@@ -549,7 +559,7 @@ check("save() writes the very payload it checked",
       len(_written) == 1 and _written[0] is _built[0], True)
 check("...and that payload is durable", g.load("task-switch-2")["state"], "blocked")
 
-# --- trust binds to the ADAPTER, not to core (reported at 528d94a0) ----------
+# --- trust binds to the ADAPTER, not to core ----------
 # Fresh interpreters: only a new process can witness what core ALONE trusts.
 _PROBE = ("from shepherd_contract import Actor;"
           "print(Actor('git.commit_author_email','x').is_discriminating,"

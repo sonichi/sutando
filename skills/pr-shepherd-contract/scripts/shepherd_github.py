@@ -75,7 +75,10 @@ VALID_PR_PROJECTIONS = frozenset({("open", "false"), ("closed", "false"), ("clos
 _ASCII_DIGITS = frozenset("0123456789")
 
 
-_REPO_SEGMENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+# Owner and repo NAME have different grammars: an owner login never leads with
+# a dot, but GitHub serves `.github` / `.github-private` repositories.
+_OWNER_SEGMENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+_NAME_SEGMENT = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")
 
 
 def _pr_repo(value: object, where: str) -> str:
@@ -86,8 +89,8 @@ def _pr_repo(value: object, where: str) -> str:
         raise ValueError(f"{where}: repo must be a str (exact type), got "
                          f"{type(value).__name__}")
     parts = value.split("/")
-    if (len(parts) != 2 or not all(_REPO_SEGMENT.match(s) for s in parts)
-            or any(s in (".", "..") for s in parts)):
+    if (len(parts) != 2 or not _OWNER_SEGMENT.match(parts[0])
+            or not _NAME_SEGMENT.match(parts[1])):
         raise ValueError(f"{where}: repo must be canonical owner/name "
                          f"(exactly two path-safe segments), got {value!r}")
     return value
