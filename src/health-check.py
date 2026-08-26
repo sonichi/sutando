@@ -1477,8 +1477,15 @@ def check_env_split(repo_env: "Path | None" = None,
             return set()
         return out
 
-    # Selection mirrors resolve_dotenv: with both present, the repo file wins.
-    selected, other, sel_name, oth_name = repo_env, ws_env, "repo", "workspace"
+    # The canonical resolver owns selection; a re-derivation drifts (PR block).
+    from sutando_config import resolve_dotenv  # noqa: PLC0415
+    picked = resolve_dotenv(repo_env.parent, ws_env.parent)
+    if picked == repo_env:
+        selected, other, sel_name, oth_name = repo_env, ws_env, "repo", "workspace"
+    elif picked == ws_env:
+        selected, other, sel_name, oth_name = ws_env, repo_env, "workspace", "repo"
+    else:
+        return None
     missing = sorted(_keys(other) - _keys(selected))
     if not missing:
         return None

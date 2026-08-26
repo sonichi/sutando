@@ -27,8 +27,10 @@ def check(name, got, want):
 
 with tempfile.TemporaryDirectory() as td:
     td = Path(td)
-    repo_env = td / "repo.env"
-    ws_env = td / "ws.env"
+    (td / "repo").mkdir()
+    (td / "ws").mkdir()
+    repo_env = td / "repo" / ".env"
+    ws_env = td / "ws" / ".env"
 
     # 1. stub selected + full other -> warn naming the missing keys, not values
     repo_env.write_text("GEMINI_API_KEY=stub-value\n")
@@ -84,8 +86,10 @@ import os
 if os.geteuid() != 0:
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        repo_env = td / "repo.env"
-        ws_env = td / "ws.env"
+        (td / "repo").mkdir()
+        (td / "ws").mkdir()
+        repo_env = td / "repo" / ".env"
+        ws_env = td / "ws" / ".env"
         repo_env.write_text("GEMINI_API_KEY=x\n")
         ws_env.write_text("DISCORD_BOT_TOKEN=v\n")
         repo_env.chmod(0)
@@ -96,6 +100,25 @@ if os.geteuid() != 0:
                   r is not None and "DISCORD_BOT_TOKEN" in r["detail"], True)
         finally:
             repo_env.chmod(0o600)
+
+# 5b. selection is DELEGATED: when the canonical resolver picks the workspace
+# file, the probe must follow it, not re-derive repo-first by hand
+import sutando_config
+from unittest.mock import patch as _patch
+
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir()
+    (td / "ws").mkdir()
+    repo_env = td / "repo" / ".env"
+    ws_env = td / "ws" / ".env"
+    repo_env.write_text("GEMINI_API_KEY=x\nEXTRA_KEY=y\n")
+    ws_env.write_text("GEMINI_API_KEY=x\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=ws_env):
+        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+    check("probe follows the resolver's pick",
+          r is not None and "workspace .env" in r["detail"]
+          and "EXTRA_KEY" in r["detail"], True)
 
 # 6. run_all_checks wiring: the call site is separate code from the probe
 # (same pattern as health-check-bridge-log-content's integration section).
