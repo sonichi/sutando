@@ -57,6 +57,10 @@ def pin(pid, lstart, reason):
             "reason": reason, "expires_at": FUTURE}
 
 
+class TraceContractError(AssertionError):
+    """Raised when the post-result record contract is not met."""
+
+
 class PinMigrationVisibilityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="pin-migrate-"))
@@ -116,12 +120,10 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self.assertEqual(cp.stdout, expected_stdout)
         self.assertEqual(cp.stderr, "")
 
-        records = self._read_trace()
-        self.assertEqual(records, [{                          # parent-defined
-            "v": 1, "kind": "result", "run_id": run_id, "call_id": call_id,
-            "argv": argv, "operand": str(known.resolve()),
-            "rc": 0, "stdout": expected_stdout, "stderr": "",
-        }])
+        expected = self._probe_record(
+            run_id=run_id, call_id=call_id, argv=argv,
+            operand=str(known.resolve()), stdout=expected_stdout)
+        self._require_trace(expected, run_id=run_id)
 
     def test_TRACE_READER_rejects_a_corrupt_line(self) -> None:
         """A corrupt record and an absent one must not look alike. The old
@@ -169,9 +171,32 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             (dead.returncode, dead.stdout, dead.stderr),
             (live.returncode, live.stdout, live.stderr),
             "mutant changed observable behavior - it is not a recorder-only control")
-        records = self._read_trace()
-        self.assertEqual(records, [],
-                         "control is inert: a suppressed writer still produced records")
+        # Fail through the SAME contract that certified the live record: zero
+        # records is this test's passing value, so asserting it proves nothing.
+        expected = self._probe_record(
+            run_id=self._run_id, call_id=call_id, argv=argv[1:],
+            operand=str(known.resolve()), stdout=f"SHIM-LIVE-{call_id}\n")
+        with self.assertRaisesRegex(
+                TraceContractError,
+                r"^expected 1 post-result record; found 0$"):
+            self._require_trace(expected, run_id=self._run_id)
+
+    def _require_trace(self, expected: list[dict], *, run_id: str | None = None) -> None:
+        """The post-result contract. Both the live probe and the dead-writer
+        control go through this, so weakening it breaks the control too."""
+        actual = self._read_trace(run_id=run_id)
+        if len(actual) != len(expected):
+            raise TraceContractError(
+                f"expected {len(expected)} post-result record; found {len(actual)}")
+        if actual != expected:
+            raise TraceContractError("post-result record mismatch")
+
+    @staticmethod
+    def _probe_record(*, run_id, call_id, argv, operand, stdout):
+        """Parent-authored expected record. Never built from an observed trace."""
+        return [{"v": 1, "kind": "result", "run_id": run_id, "call_id": call_id,
+                 "argv": argv, "operand": operand,
+                 "rc": 0, "stdout": stdout, "stderr": ""}]
 
     _TRACE_KEYS = {"v", "kind", "run_id", "call_id", "argv",
                    "operand", "rc", "stdout", "stderr"}
