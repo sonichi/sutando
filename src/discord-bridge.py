@@ -363,6 +363,7 @@ from policy.egress.attachment import (  # noqa: E402
     classify_attachment as _classify_attachment,
     ATTACH_SEND as _ATTACH_SEND,
     ATTACH_MISSING as _ATTACH_MISSING,
+    ATTACH_EMPTY as _ATTACH_EMPTY,
     ATTACH_REFUSED as _ATTACH_REFUSED,
 )
 
@@ -5456,6 +5457,13 @@ async def poll_proactive():
                                                 f"file not found: {fpath}",
                                                 flush=True,
                                             )
+                                        elif _outcome == _ATTACH_EMPTY:
+                                            await _target_ch.send(
+                                                "(a file marker in this reply had no path"
+                                                " — nothing attached)")
+                                            print("  [proactive channel-redirect] file marker "
+                                                  "with EMPTY path — malformed, surfaced",
+                                                  flush=True)
                                         elif _outcome == _ATTACH_REFUSED:
                                             # Authorization denial, not absence: silence
                                             # here reads as a successful attach.
@@ -5827,6 +5835,12 @@ async def poll_dm_fallback():
                                 elif _outcome == _ATTACH_MISSING:
                                     # See poll_results — log only, no user noise.
                                     print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
+                                elif _outcome == _ATTACH_EMPTY:
+                                    await target_channel.send(
+                                        "(a file marker in this reply had no path"
+                                        " — nothing attached)")
+                                    print("  [dm-fallback channel-redirect] file marker with "
+                                          "EMPTY path — malformed, surfaced", flush=True)
                                 elif _outcome == _ATTACH_REFUSED:
                                     await target_channel.send(f"(file not allowed: {fpath})")
                                     print(f"  [dm-fallback channel-redirect] REJECTED file (not in allowlist): {fpath}", flush=True)

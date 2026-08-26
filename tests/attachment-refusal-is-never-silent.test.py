@@ -68,16 +68,24 @@ finally:
 # --- wiring: neither redirect loop may keep the two-branch shape --------------
 src = (REPO / "src" / "discord-bridge.py").read_text()
 for tag in ("[proactive channel-redirect]", "[dm-fallback channel-redirect]"):
-    i = src.find(tag)
-    check(i > 0, f"{tag} block is present")
-    # Window around the block's attachment loop.
-    j = max(0, i - 2500)
-    window = src[j:i + 2500]
-    check("_ATTACH_REFUSED" in window,
-          f"{tag} handles the REFUSED outcome explicitly")
+    check(src.find(tag) > 0, f"{tag} block is present")
 
-check(src.count("_ATTACH_REFUSED") >= 2,
-      "both redirect loops route through the shared classifier")
+# Completeness, not proximity: a window-based check fails when the code gets
+# MORE correct, which is how the EMPTY branch broke this assertion.
+for outcome in ("_ATTACH_SEND", "_ATTACH_MISSING", "_ATTACH_REFUSED", "_ATTACH_EMPTY"):
+    check(src.count(outcome) >= 3,
+          f"{outcome} is imported AND handled at both migrated loops "
+          f"(found {src.count(outcome)}, want >=3)")
+
+# An outcome used but never imported is a NameError the branch coverage hides.
+import ast
+tree = ast.parse(src)
+imported = {a.asname or a.name for n in ast.walk(tree)
+            if isinstance(n, ast.ImportFrom) for a in n.names}
+used = {x.id for x in ast.walk(tree)
+        if isinstance(x, ast.Name) and x.id.startswith("_ATTACH_")}
+check(not (used - imported),
+      f"every _ATTACH_* name used is imported (unresolved: {sorted(used - imported)})")
 
 print("\nRESULT:", "FAIL" if fail else "PASS")
 sys.exit(fail)
