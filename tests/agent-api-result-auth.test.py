@@ -48,9 +48,8 @@ api.RESULT_DIR.mkdir()
 api.API_TOKEN = "test-token-123"
 
 SECRET_BODY = "the owner's private answer\n"
-# /result returns the READY body, which delivery.read_ready_result strips --
-# that strip is the emptiness test (whitespace-only means not-ready), so it
-# cannot be bypassed without re-forking the single readiness owner.
+# /result serves the READY body, which read_ready_result strips -- that strip
+# IS the emptiness test, so it cannot be bypassed without re-forking the owner.
 SECRET_READ = SECRET_BODY.strip()
 (api.RESULT_DIR / "task-owner-1.txt").write_text(SECRET_BODY)
 (api.TASK_DIR / "task-pending-1.txt").write_text("id: task-pending-1\ntask: still running\n")
