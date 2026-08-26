@@ -95,7 +95,7 @@ def _seed(task_id, scope, state, note=""):
     fixture that re-seeds one id across states must use the lock-held primitive --
     which is also exactly what a racing resume() pass does."""
     with g._record_lock(task_id):
-        return g._write_record(task_id, scope, state, note)
+        return g._write_record(task_id, g._record_payload(task_id, scope, state, note))
 
 # resume() must be monotonic: re-observing may not reopen a closed objective,
 # and ordinary progress may not flatten blocked/needs_human into waiting
@@ -456,6 +456,69 @@ for pair, want in (("open false", "github.pull_request.updated"),
     check(f"projection {pair!r} maps to {want.split('.')[-1]}", _proj(pair).event_type, want)
 _raises("projection 'open true' is REFUSED (merged PRs are never open)",
         lambda: _proj("open true"))
+
+# --- the checked binding must BE the written binding (reported at 187edf73) ---
+def _type_raises(name, fn):
+    global _ASSERTIONS
+    _ASSERTIONS += 1
+    try:
+        fn()
+    except TypeError:
+        return
+    failures.append(f"{name}: did NOT raise TypeError")
+
+
+class _SwitchingScope(ResponsibilityScope):
+    """Reads as org/old#1 while the binding is checked, then as org/new#2 for
+    any later payload build — the write must not trust a second read."""
+    armed = False
+    reads = 0
+
+    def __getattribute__(self, name):
+        if name == "subjects" and _SwitchingScope.armed:
+            _SwitchingScope.reads += 1
+            if _SwitchingScope.reads > 2:
+                return (g.subject_for("org/new", 2),)
+        return object.__getattribute__(self, name)
+
+
+g.save("task-switch-1", g.scope_for("org/old", 1, MINE), "waiting", "seed")
+_sw = _SwitchingScope(
+    subjects=(g.subject_for("org/old", 1),), actor=MINE,
+    watch_conditions=g.WATCH, success_conditions=g.SUCCESS,
+    failure_conditions=g.FAILURE)
+_SwitchingScope.armed = True
+_type_raises("a ResponsibilityScope SUBCLASS is refused at save()",
+             lambda: g.save("task-switch-1", _sw, "waiting", "advance"))
+_SwitchingScope.armed = False
+check("...and the durable subject did not move",
+      g.load("task-switch-1")["repo"], "org/old")
+
+# Identity, not equality: the dict that passed the under-lock binding check is
+# the very object handed to the atomic write.
+g.save("task-switch-2", g.scope_for("org/old", 1, MINE), "waiting", "seed")
+_built, _written = [], []
+_real_payload, _real_atomic = g._record_payload, g._atomic_write
+
+
+def _spy_payload(*a, **k):
+    _built.append(_real_payload(*a, **k))
+    return _built[-1]
+
+
+def _spy_atomic(path, payload):
+    _written.append(payload)
+    return _real_atomic(path, payload)
+
+
+g._record_payload, g._atomic_write = _spy_payload, _spy_atomic
+try:
+    g.save("task-switch-2", g.scope_for("org/old", 1, MINE), "blocked", "advance")
+finally:
+    g._record_payload, g._atomic_write = _real_payload, _real_atomic
+check("save() writes the very payload it checked",
+      len(_written) == 1 and _written[0] is _built[0], True)
+check("...and that payload is durable", g.load("task-switch-2")["state"], "blocked")
 
 # negative control: the harness must be able to register a failure
 _n = len(failures)

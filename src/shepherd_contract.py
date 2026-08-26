@@ -186,6 +186,18 @@ class ResponsibilityScope:
         return any(s.matches(subject) for s in self.subjects)
 
 
+def _require_admissible(event: ObservedEvent, scope: ResponsibilityScope) -> None:
+    """TypeError, not a decision: a subclass can override every predicate the
+    decision reads, so no verdict derived from it means anything — even
+    `ambiguous` would let a forged scope keep being polled as legitimate."""
+    if type(event) is not ObservedEvent:
+        raise TypeError(f"event must be exactly ObservedEvent, "
+                        f"got {type(event).__name__}")
+    if type(scope) is not ResponsibilityScope:
+        raise TypeError(f"scope must be exactly ResponsibilityScope, "
+                        f"got {type(scope).__name__}")
+
+
 def admit(event: ObservedEvent, scope: ResponsibilityScope) -> tuple[str, str]:
     """Decide whether `event` belongs to `scope`. Returns (decision, reason).
 
@@ -193,6 +205,7 @@ def admit(event: ObservedEvent, scope: ResponsibilityScope) -> tuple[str, str]:
     attributed is not evidence, and silently claiming it is how one actor's
     work becomes another's record.
     """
+    _require_admissible(event, scope)
     if not scope.covers_subject(event.subject):
         return "ignored", "subject outside scope"
 
@@ -221,6 +234,7 @@ def _is_outcome(event: ObservedEvent, scope: ResponsibilityScope) -> bool:
 def proposed_terminal_state(event: ObservedEvent,
                             scope: ResponsibilityScope) -> Optional[str]:
     """The terminal state this event WOULD imply if its actor were authenticated."""
+    _require_admissible(event, scope)
     decision, _ = admit(event, scope)
     if decision != "accepted":
         return None
@@ -237,10 +251,24 @@ def terminal_state_for(event: ObservedEvent, scope: ResponsibilityScope) -> Opti
     An asserted (self-declared) identity can attribute but cannot close: whoever
     writes the record can set that field, so alone it is a claim, not evidence.
     """
+    _require_admissible(event, scope)
     if not event.actor or not event.actor.is_verified:
         return None
     return proposed_terminal_state(event, scope)
 
 
-def is_terminal(state: str) -> bool:
-    return state in TERMINAL_STATES
+def require_shepherd_state(value: object, where: str) -> str:
+    """EXACT str BEFORE membership. A str subclass overriding __eq__ satisfies
+    `in SHEPHERD_STATES` while json.dump persists its underlying value."""
+    if type(value) is not str:
+        raise ValueError(f"{where}: state must be an exact str, "
+                         f"got {type(value).__name__}: {value!r}")
+    if value not in SHEPHERD_STATES:
+        raise ValueError(f"{where}: state {value!r} is not in SHEPHERD_STATES")
+    return value
+
+
+def is_terminal(state: object) -> bool:
+    # Same exact-str-before-membership policy as require_shepherd_state: a str
+    # subclass overriding __eq__/__hash__ must not read as terminal.
+    return type(state) is str and state in TERMINAL_STATES

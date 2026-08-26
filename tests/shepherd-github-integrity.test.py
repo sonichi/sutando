@@ -288,7 +288,7 @@ check("...without a network call", "not re-observed" in why17, True)
 def _race(task_id, scope, state, note=""):
     """save() refuses a rebind outright, so only a resume() pass reaches here."""
     with g._record_lock(task_id):
-        return g._write_record(task_id, scope, state, note)
+        return g._write_record(task_id, g._record_payload(task_id, scope, state, note))
 
 
 g.save("task-integrity-18", scope_for("org/old", 1), "waiting", "seed")

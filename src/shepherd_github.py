@@ -23,7 +23,6 @@ from typing import Optional
 
 from local_task_protocol import valid_task_id
 from shepherd_contract import (
-    SHEPHERD_STATES,
     Actor,
     ObservedEvent,
     ResponsibilityScope,
@@ -31,6 +30,7 @@ from shepherd_contract import (
     admit,
     is_terminal,
     proposed_terminal_state,
+    require_shepherd_state,
     terminal_state_for,
 )
 from workspace_default import resolve_workspace
@@ -64,17 +64,6 @@ VALID_PR_PROJECTIONS = frozenset({("open", "false"), ("closed", "false"), ("clos
 
 
 _ASCII_DIGITS = frozenset("0123456789")
-
-
-def _shepherd_state(value: object, where: str) -> str:
-    """EXACT str BEFORE membership. A str subclass overriding __eq__ satisfies
-    `in SHEPHERD_STATES` while json.dump persists its underlying value."""
-    if type(value) is not str:
-        raise ValueError(f"{where}: state must be an exact str, "
-                         f"got {type(value).__name__}: {value!r}")
-    if value not in SHEPHERD_STATES:
-        raise ValueError(f"{where}: state {value!r} is not in SHEPHERD_STATES")
-    return value
 
 
 def _pr_repo(value: object, where: str) -> str:
@@ -266,7 +255,7 @@ def _validate_record(rec: dict, task_id: str) -> dict:
     if rec["task_id"] != task_id:
         raise ValueError(f"contract for {task_id} carries task_id {rec['task_id']!r}")
     try:
-        _shepherd_state(rec["state"], f"contract for {task_id}")
+        require_shepherd_state(rec["state"], f"contract for {task_id}")
     except ValueError as exc:
         raise ValueError(f"contract for {task_id} carries invalid state "
                          f"{rec['state']!r}") from exc
@@ -302,7 +291,12 @@ def _record_payload(task_id: str, scope: ResponsibilityScope, state: str,
                     note: str = "") -> dict:
     """The record a write WOULD produce. Separated from the write so save() can
     compare the proposed binding against the stored one before committing."""
-    state = _shepherd_state(state, "refusing to persist")
+    # EXACT type: a subclass can answer the binding check from one value and a
+    # later attribute read from another, so it must never reach a payload build.
+    if type(scope) is not ResponsibilityScope:
+        raise TypeError(f"scope must be exactly ResponsibilityScope, "
+                        f"got {type(scope).__name__}")
+    state = require_shepherd_state(state, "refusing to persist")
     repo, number = _subject_parts(scope)
     payload = {
         "task_id": task_id, "provider": PROVIDER, "repo": repo, "number": number,
@@ -317,12 +311,12 @@ def _record_payload(task_id: str, scope: ResponsibilityScope, state: str,
     return _validate_record(payload, task_id)
 
 
-def _write_record(task_id: str, scope: ResponsibilityScope, state: str,
-                  note: str = "") -> Path:
-    """Caller holds the record lock AND has established the transition is legal.
-    resume() qualifies its own write; save() is the public seam that does not."""
+def _write_record(task_id: str, payload: dict) -> Path:
+    """Caller holds the record lock, established the transition is legal, and
+    built `payload` via _record_payload: the dict that passed the caller's
+    checks is the dict written -- never rebuilt from the (overridable) scope."""
     p = _contract_path(task_id)
-    _atomic_write(p, _record_payload(task_id, scope, state, note))
+    _atomic_write(p, payload)
     return p
 
 
@@ -334,10 +328,12 @@ def save(task_id: str, scope: ResponsibilityScope, state: str,
     Without this, two creators racing on one task id are last-writer-wins, and a
     finished objective can be reopened against a different pull request.
     """
+    # Built ONCE, before the lock: invalid input never takes the lock, and the
+    # payload compared below is byte-for-byte the payload committed.
+    proposed = _record_payload(task_id, scope, state, note)
     with _record_lock(task_id):
         prior = load(task_id)
         if prior is not None:
-            proposed = _record_payload(task_id, scope, state, note)
             if _binding(proposed) != _binding(prior):
                 raise ValueError(
                     f"contract for {task_id} is bound to {prior['repo']}#{prior['number']} "
@@ -349,7 +345,7 @@ def save(task_id: str, scope: ResponsibilityScope, state: str,
                 raise ValueError(
                     f"contract for {task_id} is terminal ({prior['state']}); "
                     f"refusing to reopen as {state!r}")
-        return _write_record(task_id, scope, state, note)
+        return _write_record(task_id, proposed)
 
 
 def load(task_id: str) -> Optional[dict]:
@@ -429,12 +425,12 @@ def resume(task_id: str) -> tuple[str, str]:
 
         decision, why = admit(event, scope)
         if decision != "accepted":
-            _write_record(task_id, scope, prior, why)
+            _write_record(task_id, _record_payload(task_id, scope, prior, why))
             return prior, f"{event.event_type} {decision}: {why}"
 
         terminal = terminal_state_for(event, scope)
         if terminal:
-            _write_record(task_id, scope, terminal, why)
+            _write_record(task_id, _record_payload(task_id, scope, terminal, why))
             return terminal, f"{event.event_type} accepted -> {terminal}"
 
         # Progress is not a transition: keep whatever state the objective was in
@@ -442,5 +438,5 @@ def resume(task_id: str) -> tuple[str, str]:
         proposed = proposed_terminal_state(event, scope)
         note = (f"{event.event_type} accepted; outcome proposed={proposed} but actor "
                 f"scheme is asserted, not verified — not terminating") if proposed else why
-        _write_record(task_id, scope, prior, note)
+        _write_record(task_id, _record_payload(task_id, scope, prior, note))
         return prior, note

@@ -295,6 +295,66 @@ check("source_id must be a string; '' stays legal for an unresolved id",
        ObservedEvent("github.pull_request.merged", PR, _asserted).source_id),
       (True, True, True, ""))
 
+
+# --- the TOP-LEVEL event/scope objects are seams too (reported at 187edf73) ---
+# The nested checks bless Subject/Actor, but a ResponsibilityScope SUBCLASS
+# inherits that blessing and can override the predicates admit() trusts.
+class _EvilScope(ResponsibilityScope):
+    def covers_subject(self, subject):
+        return True
+
+
+class _EvilEvent(ObservedEvent):
+    pass
+
+
+def _type_rejects(thunk):
+    try:
+        thunk()
+    except TypeError:
+        return True
+    return False
+
+
+_INSIDE = Subject("github", "pull_request", "org/inside#1")
+_OUTSIDE_EVENT = ObservedEvent(
+    "github.pull_request.merged",
+    Subject("github", "pull_request", "org/outside#2"), MINE)
+_evil = _EvilScope(
+    subjects=(_INSIDE,), actor=MINE,
+    watch_conditions=SCOPE.watch_conditions,
+    success_conditions=SCOPE.success_conditions,
+    failure_conditions=SCOPE.failure_conditions)
+check("a scope SUBCLASS cannot admit an out-of-scope subject via admit()",
+      _type_rejects(lambda: admit(_OUTSIDE_EVENT, _evil)), True)
+check("...nor propose a terminal state for it",
+      _type_rejects(lambda: proposed_terminal_state(_OUTSIDE_EVENT, _evil)), True)
+check("...nor terminate it",
+      _type_rejects(lambda: terminal_state_for(_OUTSIDE_EVENT, _evil)), True)
+check("an ObservedEvent SUBCLASS is refused at admit()",
+      _type_rejects(lambda: admit(
+          _EvilEvent("github.pull_request.merged", PR, MINE), SCOPE)), True)
+check("an exact event/scope pair still decides (control)",
+      admit(ObservedEvent("github.pull_request.merged", PR, MINE), SCOPE)[0],
+      "accepted")
+
+
+class _ForgedState(str):
+    """Overrides equality so membership in TERMINAL_STATES passes for a value
+    that is not a shepherd state at all."""
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return hash("succeeded")
+
+
+check("is_terminal refuses a forged str subclass",
+      is_terminal(_ForgedState("totally.fake")), False)
+check("is_terminal refuses a non-str outright", is_terminal(None), False)
+check("is_terminal still recognises a genuine terminal state (control)",
+      is_terminal("succeeded"), True)
+
 if failures:
     print(f"FAIL ({len(failures)}):")
     for f in failures:
