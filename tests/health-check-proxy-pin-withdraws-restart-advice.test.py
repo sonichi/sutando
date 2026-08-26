@@ -63,8 +63,15 @@ class ProxyPinWithdrawsRestartAdvice(unittest.TestCase):
         self.assertNotIn("Then restart the proxy", d)
 
     def test_pinned_row_KEEPS_the_diagnosis(self):
-        # Withdrawing the remedy must not withdraw the finding.
-        self.assertIn("CLAUDE_CONFIG_DIR", self._identity(PIN)["detail"])
+        """Withdrawing the remedy must not withdraw the finding.
+
+        Assert the branch-INDEPENDENT part. The remedy sentence names
+        CLAUDE_CONFIG_DIR only when a plist exists, so asserting that string
+        passes on a host with one and fails in CI, which has none.
+        """
+        d = self._identity(PIN)["detail"]
+        self.assertIn("DIFFERENT login", d)
+        self.assertIn("Claude Code-credentials-other", d)
 
     def test_unpinned_row_retains_the_normal_remedy(self):
         d = self._identity(None)["detail"]
