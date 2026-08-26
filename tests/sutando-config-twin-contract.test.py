@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parent.parent
 CONFIG = REPO / "sutando.config.json"
 SCHEMA = REPO / "docs" / "sutando-config.schema.json"
 TS_TWIN = REPO / "src" / "sutando_config.ts"
+PY_TWIN = REPO / "src" / "sutando_config.py"
 
 failures = []
 
@@ -36,19 +37,33 @@ def check(name, ok, detail=""):
         failures.append(f"{name}: {detail}")
 
 
-def ts_known_top_level_keys(text):
-    """Parse KNOWN_TOP_LEVEL_KEYS out of the TS twin without executing it."""
-    m = re.search(r"KNOWN_TOP_LEVEL_KEYS\s*=\s*new Set\(\[(.*?)\]\)", text, re.S)
+def ts_set_literal(text, name):
+    """Parse a `const NAME = new Set([...])` out of the TS twin without executing it."""
+    m = re.search(name + r"\s*=\s*new Set\(\[(.*?)\]\)", text, re.S)
     if not m:
         return None
     return set(re.findall(r"'([^']+)'", m.group(1)))
+
+
+def ts_known_top_level_keys(text):
+    return ts_set_literal(text, "KNOWN_TOP_LEVEL_KEYS")
+
+
+def py_set_literal(text, name):
+    """Parse a `NAME = {...}` string-set out of the Python twin without importing it."""
+    m = re.search(name + r"\s*=\s*\{(.*?)\}", text, re.S)
+    if not m:
+        return None
+    return set(re.findall(r'"([^"]+)"', m.group(1)))
 
 
 print("cross-loader config contract")
 
 config = json.loads(CONFIG.read_text())
 schema = json.loads(SCHEMA.read_text())
-ts_keys = ts_known_top_level_keys(TS_TWIN.read_text())
+ts_text = TS_TWIN.read_text()
+py_text = PY_TWIN.read_text()
+ts_keys = ts_known_top_level_keys(ts_text)
 
 check("TS twin exposes a parseable KNOWN_TOP_LEVEL_KEYS", ts_keys is not None,
       "regex found no Set literal — did the declaration shape change?")
@@ -82,6 +97,24 @@ check("every TS-known key is declared in the JSON schema",
       not ts_not_in_schema,
       f"TS accepts but schema rejects (a user setting these gets an invalid config): "
       f"{ts_not_in_schema}")
+
+# 4. A schema-object key missing from one twin's guard set means that loader keeps the
+#    old divergent behavior on a malformed config (Python raised, TS fell through).
+ts_obj = ts_set_literal(ts_text, "OBJECT_TOP_LEVEL_KEYS")
+py_obj = py_set_literal(py_text, "_OBJECT_TOP_LEVEL_KEYS")
+check("TS twin exposes a parseable OBJECT_TOP_LEVEL_KEYS", ts_obj is not None,
+      "regex found no Set literal — did the declaration shape change?")
+check("Python twin exposes a parseable _OBJECT_TOP_LEVEL_KEYS", py_obj is not None,
+      "regex found no set literal — did the declaration shape change?")
+ts_obj, py_obj = ts_obj or set(), py_obj or set()
+check("both twins guard the same object-typed blocks", ts_obj == py_obj,
+      f"TS-only: {sorted(ts_obj - py_obj)}; Python-only: {sorted(py_obj - ts_obj)}")
+
+schema_obj = {k for k, v in schema.get("properties", {}).items() if v.get("type") == "object"}
+check("the guarded set matches the schema's object-typed properties",
+      ts_obj == schema_obj,
+      f"guarded-not-in-schema: {sorted(ts_obj - schema_obj)}; "
+      f"schema-object-not-guarded: {sorted(schema_obj - ts_obj)}")
 
 print()
 if failures:
