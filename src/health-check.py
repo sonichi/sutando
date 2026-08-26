@@ -4951,7 +4951,8 @@ def _plist_via_plutil(path: "Path") -> "dict | None":
     return parsed if isinstance(parsed, dict) else None
 
 
-def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dict:
+def check_quota_account_identity(proxy_status: str, core_env_prober=None,
+                                 restart_veto: "str | None" = None) -> dict:
     """Does the proxy resolve THIS core's login, or a different account's?
 
     `check_quota_telemetry` above answers "is quota-state fresh, and does it
@@ -5036,7 +5037,8 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     from_proc = _proxy_config_dir_from_process()
     if from_proc is not _PROXY_ENV_UNREADABLE:
         return _quota_identity_verdict(name, core_cfg, from_proc, "process",
-                                       plist_present=plist.is_file())
+                                       plist_present=plist.is_file(),
+                                       restart_veto=restart_veto)
     if not plist.is_file():
         return {"name": name, "status": "ok",
                 "detail": ("credential proxy is not launchd-managed and its "
@@ -5101,12 +5103,13 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
                            f"{type(proxy_cfg).__name__}, not a string — cannot resolve its keychain item")}
 
     return _quota_identity_verdict(name, core_cfg, proxy_cfg, cfg_source,
-                                   plist_present=True)
+                                   plist_present=True, restart_veto=restart_veto)
 
 
 def _quota_identity_verdict(name: str, core_cfg: Optional[str],
                             proxy_cfg: Optional[str], source: str,
-                            plist_present: bool = False) -> dict:
+                            plist_present: bool = False,
+                            restart_veto: "str | None" = None) -> dict:
     """Compare the two resolved keychain ITEM NAMES and report.
 
     `source` names where the proxy's CLAUDE_CONFIG_DIR came from ("plist" or
@@ -5161,10 +5164,16 @@ def _quota_identity_verdict(name: str, core_cfg: Optional[str],
                     if plist_present else
                     f"No credential-proxy plist is installed, so there is none to correct. "
                 )
-                + f"Then restart the proxy with CLAUDE_CONFIG_DIR set to this core's "
-                f"({core_cfg!r}). Restarting it changes "
-                f"which account subsequent requests bill, so confirm that is the intended "
-                f"login first."
+                + (
+                    f"DO NOT RESTART the proxy: {restart_veto}. Restarting it would "
+                    f"destroy that process state, and the diagnosis above stands "
+                    f"without it — correct the configuration and leave the proxy up."
+                    if restart_veto else
+                    f"Then restart the proxy with CLAUDE_CONFIG_DIR set to this core's "
+                    f"({core_cfg!r}). Restarting it changes "
+                    f"which account subsequent requests bill, so confirm that is the intended "
+                    f"login first."
+                )
             )
         ),
     }
@@ -9012,6 +9021,13 @@ def check_credential_proxy() -> dict:
                          if _process_executes_artifact(artifact, "credential-proxy")
                          else None),
         )
+    if not check.get("restart_veto"):
+        # A HEALTHY pinned proxy reaches no staleness arm, so nothing else sets
+        # the field the remedy text and the --fix boundary both key on.
+        _, _pls = _proc_lstarts("credential-proxy")
+        _armed = process_pins.armed_detail(_pin_verdicts("credential-proxy", _pls))
+        if _armed:
+            check["restart_veto"] = _armed
     return check
 MENUBAR_LABEL = "com.sutando.menubar"
 MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
@@ -9070,11 +9086,14 @@ def run_all_checks() -> list[dict]:
     proxy_veto = proxy_restart_veto(proxy_check)
 
     # Quota telemetry — only meaningful when the proxy is actually up.
-    checks.append(carry_proxy_veto(check_quota_telemetry(proxy_live), proxy_veto))
+    # NOT carry_proxy_veto: this check's remedy relaunches the CORE, and a pin on
+    # the proxy must not veto a different process's remedy.
+    checks.append(check_quota_telemetry(proxy_live))
     # ...and WHOSE account those numbers describe. The check above answers
     # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
     # passes every branch above (observed 2026-08-03).
-    checks.append(carry_proxy_veto(check_quota_account_identity(proxy_live), proxy_veto))
+    checks.append(carry_proxy_veto(
+        check_quota_account_identity(proxy_live, restart_veto=proxy_veto), proxy_veto))
 
     # Core over-quota — fail loudly to the remote owner surface so an exhausted
     # model no longer stalls every task silently (owner-reported 2026-08-01).
