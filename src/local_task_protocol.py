@@ -52,6 +52,7 @@ task-last; until then both parsers exist and are named for their trust model.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -503,6 +504,8 @@ def media_attachment_headers(attachment_refs: Iterable["AttachmentRef"], has_tex
 # ── Archive rules ────────────────────────────────────────────────────────────
 
 _MONTH_DIR_RE = re.compile(r"^\d{4}-\d{2}$")
+# The gateway's flat archive suffix is an epoch stamp and nothing else.
+_EPOCH_SUFFIX_RE = re.compile(r"^\d+$")
 
 
 def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
@@ -549,7 +552,11 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
-    flat = sorted(archive.glob(f"{task_id}-*.txt"))
+    prefix = f"{task_id}-"
+    # `<id>-*` alone also matches a LONGER task's file, attributing its result
+    # to this id; only the documented numeric epoch suffix is this task's.
+    flat = sorted(p for p in archive.glob(f"{glob.escape(prefix)}*.txt")
+                  if _EPOCH_SUFFIX_RE.match(p.name[len(prefix):-len(".txt")]))
     return flat[-1] if flat else None
 
 

@@ -998,6 +998,19 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+
+# Runtime self-report (#3279 verification layer 3): a host loader may inject
+# {build_sha, entrypoint} BEFORE exec'ing this source; standalone stays empty.
+RUNTIME_IDENTITY: dict = globals().get("RUNTIME_IDENTITY") or {}
+_ENGINE_COUNTS = {"core_confirmed": 0, "legacy_sends": 0}
+
+
+def _engine_desc() -> str:
+    c = _DELIVERY_CORE
+    if c is None:
+        return "DeliveryCore(unbuilt)"
+    return (f"DeliveryCore({type(c.backend).__name__}"
+            f"->{type(c.provider).__name__})")
 # Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
 # event_id: trust the bare ok as delivered (at-least-once beats never).
 _PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
@@ -1960,6 +1973,8 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "gateway": _redact_url(URL),
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
+            "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
+                        **_ENGINE_COUNTS},
         }
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
@@ -2848,6 +2863,7 @@ def _post_proactive() -> None:
         except OSError:
             claim.unlink(missing_ok=True)
         _PROACTIVE_ATTEMPTS.pop(f.name, None)
+        _ENGINE_COUNTS["legacy_sends"] += 1
         _log(f"delivered proactive {f.name} to {dest_room}")
 
 
@@ -2960,6 +2976,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
              f"(attempts={core.backend.attempts(broker_tid)}) — will retry")
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
+        _ENGINE_COUNTS["core_confirmed"] += 1
         # A confirmed send was otherwise silent, so nothing on the happy path
         # told a live round trip apart from the legacy one it replaces.
         _log(f"result {tid} delivered via DeliveryCore "

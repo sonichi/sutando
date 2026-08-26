@@ -14,7 +14,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
-from pool_lead import PoolLead  # noqa: E402
+from pool_lead import (AFFINITY_BUSY_MAX,  # noqa: E402
+                       ASSIGN_STUCK_S, NOCLAIM_COOLDOWN_S, PoolLead)
 
 
 class PoolLeadTests(unittest.TestCase):
@@ -46,6 +47,45 @@ class PoolLeadTests(unittest.TestCase):
 
     def _names(self):
         return sorted(f.name for f in self.tasks.iterdir())
+
+    def _result(self, stem, where="."):
+        d = self.tasks.parent / "results" / where
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{stem}.txt").write_text("answer\n")
+
+    def _flag(self, stem, inst):
+        d = self.state / "cores" / inst / "done"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{stem}.flag").write_text("")
+
+    def test_result_without_flag_is_not_reassigned(self):
+        """finish_task writes the result BEFORE the flag, so result-without-flag
+        is the reachable crash residue and the work is already COMPLETE.
+        Gating on both halves swept it back out for re-execution."""
+        self._task("task-T1.txt")
+        self._result("task-T1")            # crashed after result, before flag
+        self.assertEqual(self.lead.sweep(), [])
+        self.assertEqual(self._names(), ["task-T1.txt"])
+
+    def test_both_halves_present_is_not_reassigned(self):
+        self._task("task-T2.txt")
+        self._result("task-T2")
+        self._flag("task-T2", "core-a")
+        self.assertEqual(self.lead.sweep(), [])
+
+    def test_flag_without_result_IS_assigned(self):
+        """The unreachable-by-finish_task case, kept as the negative control:
+        no result means no user-visible effect, so the task must still run."""
+        self._task("task-T3.txt")
+        self._flag("task-T3", "core-a")
+        self.assertEqual([n for n, _ in self.lead.sweep()], ["task-T3.txt"])
+
+    def test_consumed_result_dispositions_also_count(self):
+        for i, where in enumerate(("archive", "undelivered")):
+            stem = f"task-T4{i}"
+            self._task(f"{stem}.txt")
+            self._result(stem, where)
+        self.assertEqual(self.lead.sweep(), [])
 
     def test_urgent_assigned_before_low_backlog(self):
         self._task("task-low1.txt", priority="low")
@@ -284,6 +324,113 @@ class AffinityBusyYieldTest(unittest.TestCase):
         self.assertEqual(
             self.lead._load_affinity()["chan-A"]["instance"],
             out["task-stuck.txt"])  # new home re-stamped
+
+
+class RoutineLaneEscape(unittest.TestCase):
+    """A wedged lane core must not absorb every routine task. Its heartbeat
+    stays fresh throughout, so failing-to-claim is the only usable signal."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.tasks = root / "tasks"; self.tasks.mkdir()
+        self.state = root / "state"; self.state.mkdir()
+        self.alive = {"core-1": True, "core-2": True, "core-3": True}
+        self.clock = [1000.0]
+        self.lead = PoolLead(
+            self.tasks, self.state,
+            followers_fn=lambda: list(self.alive),
+            alive_fn=lambda i: self.alive.get(i, False),
+            now_fn=lambda: self.clock[0])
+        # highest-numbered follower is the routine lane
+        self.lane = max(self.alive, key=lambda f: (len(f), f))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _routine(self, name):
+        (self.tasks / name).write_text(f"id: {name[:-4]}\npriority: low\ntask: t\n")
+
+    def test_lane_core_that_never_claims_stops_receiving_routine_work(self):
+        """The live loop: assign -> no claim -> repool -> assign again. The
+        lane core heartbeats the whole time, so only the repool distinguishes
+        it from a busy follower."""
+        self._routine("task-r1.txt")
+        first = dict(self.lead.sweep())["task-r1.txt"]
+        self.assertEqual(first, self.lane, "routine should start on the lane core")
+
+        # it never claims. The lead reclaims every pass: the first sighting
+        # only adopts the assignment into the ledger, the next one repools it.
+        self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.assertEqual(self.lead.reclaim_stuck_assignments(),
+                         [f"task-r1.assigned-{self.lane}.txt"])
+        self.assertTrue(self.alive[self.lane], "lane core still heartbeats")
+
+        second = dict(self.lead.sweep())["task-r1.txt"]
+        self.assertNotEqual(second, self.lane,
+                            "repooled routine work went straight back to the "
+                            "follower that just failed to claim it")
+        self.assertIn(second, self.alive)
+
+    def test_a_busy_lane_core_keeps_its_lane(self):
+        """Load alone must not evict the lane: a follower working through a
+        backlog is not the same as one wedged at its input layer."""
+        (self.tasks / f"task-busy.claimed-{self.lane}.txt").write_text("x")
+        self._routine("task-r2.txt")
+        self.assertEqual(dict(self.lead.sweep())["task-r2.txt"], self.lane)
+
+    def test_cooldown_expires_and_the_lane_is_restored(self):
+        self._routine("task-r3.txt")
+        self.lead.sweep()
+        self.lead.reclaim_stuck_assignments()          # adopt
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.lead.reclaim_stuck_assignments()          # repool + mark
+        self.assertFalse(self.lead._claiming(self.lane))
+        self.clock[0] += NOCLAIM_COOLDOWN_S
+        self.assertTrue(self.lead._claiming(self.lane),
+                        "cooldown must expire, or a recovered core is exiled")
+        for f in list(self.tasks.iterdir()):
+            f.unlink()
+        self._routine("task-r4.txt")
+        self.assertEqual(dict(self.lead.sweep())["task-r4.txt"], self.lane)
+
+    def test_owner_lane_also_skips_a_core_that_failed_to_claim(self):
+        """The lane pin was only one branch. A repool DROPS the follower's
+        load, so least-loaded actively prefers the core that just failed."""
+        owner = [f for f in self.alive if f != self.lane]
+        victim = min(owner)                       # least-loaded picks this one
+        (self.tasks / "task-o1.txt").write_text("id: task-o1\ntask: t\n")
+        self.assertEqual(dict(self.lead.sweep())["task-o1.txt"], victim)
+
+        self.lead.reclaim_stuck_assignments()     # adopt
+        self.clock[0] += ASSIGN_STUCK_S + 1
+        self.assertEqual(self.lead.reclaim_stuck_assignments(),
+                         [f"task-o1.assigned-{victim}.txt"])
+        again = dict(self.lead.sweep())["task-o1.txt"]
+        self.assertNotEqual(again, victim,
+                            "owner-lane work returned to the core that just "
+                            "failed to claim it")
+        self.assertNotEqual(again, self.lane, "and must not fall to the lane")
+
+    def test_every_follower_in_cooldown_still_assigns(self):
+        """Narrowing to claiming-only must never empty the candidate set —
+        a pool where everyone is in cooldown must still place work."""
+        for f in self.alive:
+            self.lead._mark_noclaim(f)
+        (self.tasks / "task-o2.txt").write_text("id: task-o2\ntask: t\n")
+        out = dict(self.lead.sweep())
+        self.assertIn(out.get("task-o2.txt"), self.alive)
+
+    def test_saturated_lane_core_spills_routine_to_another_follower(self):
+        for i in range(AFFINITY_BUSY_MAX):
+            (self.tasks / f"task-b{i}.claimed-{self.lane}.txt").write_text("x")
+        self._routine("task-r5.txt")
+        got = dict(self.lead.sweep())["task-r5.txt"]
+        self.assertNotEqual(got, self.lane,
+                            "routine pinned to a lane core already at "
+                            "AFFINITY_BUSY_MAX outstanding items")
+
 
 
 if __name__ == "__main__":

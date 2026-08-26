@@ -20,7 +20,8 @@ labels.
    - group follow-ups and status checks with the goal they continue;
    - group work across voice, web, Discord, and other sources when the goal is
      the same;
-   - reuse an `existing_workstreams[].id` when appropriate;
+   - reuse an `existing_workstreams[].id` when appropriate — the stored workstream keeps
+     its own title, so `name` may be omitted on reuse;
    - omit isolated, ambiguous, or low-confidence tasks so they remain
      ungrouped;
    - give every proposed group a confidence from 0 to 1.
@@ -33,7 +34,7 @@ labels.
      "workstreams": [
        {
          "workstream_id": "<existing id, or omit for a new workstream>",
-         "name": "concise workstream name",
+         "name": "concise workstream name (omit when reusing workstream_id)",
          "summary": "one short semantic description",
          "confidence": 0.9,
          "task_ids": ["task-..."]
