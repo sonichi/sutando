@@ -66,6 +66,17 @@ VALID_PR_PROJECTIONS = frozenset({("open", "false"), ("closed", "false"), ("clos
 _ASCII_DIGITS = frozenset("0123456789")
 
 
+def _shepherd_state(value: object, where: str) -> str:
+    """EXACT str BEFORE membership. A str subclass overriding __eq__ satisfies
+    `in SHEPHERD_STATES` while json.dump persists its underlying value."""
+    if type(value) is not str:
+        raise ValueError(f"{where}: state must be an exact str, "
+                         f"got {type(value).__name__}: {value!r}")
+    if value not in SHEPHERD_STATES:
+        raise ValueError(f"{where}: state {value!r} is not in SHEPHERD_STATES")
+    return value
+
+
 def _pr_repo(value: object, where: str) -> str:
     """`#` is the subject separator, so a repo carrying one makes the encoded
     resource_id parse back as a different repo and number."""
@@ -254,8 +265,11 @@ def _validate_record(rec: dict, task_id: str) -> dict:
     # only comparing it to the requested id detects a copied or renamed file.
     if rec["task_id"] != task_id:
         raise ValueError(f"contract for {task_id} carries task_id {rec['task_id']!r}")
-    if rec["state"] not in SHEPHERD_STATES:
-        raise ValueError(f"contract for {task_id} carries invalid state {rec['state']!r}")
+    try:
+        _shepherd_state(rec["state"], f"contract for {task_id}")
+    except ValueError as exc:
+        raise ValueError(f"contract for {task_id} carries invalid state "
+                         f"{rec['state']!r}") from exc
     if rec["provider"] != PROVIDER:
         raise ValueError(f"contract for {task_id} is not a {PROVIDER} record")
     at = f"contract for {task_id}"
@@ -288,8 +302,7 @@ def _record_payload(task_id: str, scope: ResponsibilityScope, state: str,
                     note: str = "") -> dict:
     """The record a write WOULD produce. Separated from the write so save() can
     compare the proposed binding against the stored one before committing."""
-    if state not in SHEPHERD_STATES:
-        raise ValueError(f"refusing to persist state {state!r}; not in SHEPHERD_STATES")
+    state = _shepherd_state(state, "refusing to persist")
     repo, number = _subject_parts(scope)
     payload = {
         "task_id": task_id, "provider": PROVIDER, "repo": repo, "number": number,

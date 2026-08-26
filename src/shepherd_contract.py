@@ -131,7 +131,7 @@ class ObservedEvent:
                 f"got {type(self.actor).__name__}")
         # "" means the adapter resolved no id and stays legal; anything non-str, or a
         # blank that only LOOKS like an id, would key idempotency on a value that is not one.
-        if not isinstance(self.source_id, str) or (self.source_id and not self.source_id.strip()):
+        if type(self.source_id) is not str or (self.source_id and not self.source_id.strip()):
             raise ValueError(
                 f"ObservedEvent.source_id must be a string ('' when unresolved), "
                 f"got {self.source_id!r}")

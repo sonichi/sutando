@@ -403,6 +403,19 @@ class _EvilInt(int):
     def __lt__(self, other): return False
 
 
+class _ForgedRepo(str):
+    """Hides its '#' from the substring guard; the encoded resource_id then
+    rpartitions back to a repo the caller never named."""
+    def __contains__(self, item): return False
+
+
+class _ForgedState(str):
+    """Overrides equality so `in SHEPHERD_STATES` passes; json.dump would then
+    persist the underlying invalid value for the next process to choke on."""
+    def __eq__(self, other): return True
+    def __hash__(self): return hash("waiting")
+
+
 _outside = pathlib.Path(WORK) / "escaped.json"
 _raises("hostile task_id (str subclass) is refused before it becomes a path",
         lambda: g.save(_EscapingId("task-safe"), scope, "waiting"))
@@ -413,6 +426,20 @@ _raises("forged Actor scalar (str subclass) is refused at construction",
         lambda: Actor(_ForgedStr("totally.fake"), _ForgedStr("nobody@example.com")))
 _raises("an int subclass PR number is refused",
         lambda: g.subject_for("org/repo", _EvilInt(-1)))
+_raises("a repo str subclass that hides its '#' is refused",
+        lambda: g.subject_for(_ForgedRepo("org/repo#99"), 7))
+check("...so no subject can encode a repo the caller never named",
+      g.subject_for("org/repo", 7).resource_id.rpartition("#")[0], "org/repo")
+
+# state is DURABLE: membership alone lets a lying subclass reach json.dump, so
+# save() would report success for a record the next process cannot load.
+_raises("a forged state (str subclass) is refused by public save()",
+        lambda: g.save("task-forged-state", scope, _ForgedState("totally.fake")))
+check("...and NOTHING was published for it",
+      (g.state_dir() / "task-forged-state.json").exists(), False)
+g.save("task-state-ok", scope, "waiting")
+check("...while a valid state still round-trips through save/load",
+      g.load("task-state-ok")["state"], "waiting")
 check("a genuine int still constructs", g.subject_for("org/repo", 9).resource_id, "org/repo#9")
 
 # --- observe(): an IMPOSSIBLE (state, merged) pair is malformed evidence -----
