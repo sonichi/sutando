@@ -358,10 +358,8 @@ classify() {
 # newest-wins snapshot silently resurrects the older content. Emit nanoseconds.
 mtime_ns() {
     local f="$1" v sec frac
-    # `stat -f` is BSD "format" but GNU "--file-system", so on Linux it can
-    # SUCCEED with non-numeric output and mask the fallback. Validate, don't trust.
-    # LC_ALL=C: GNU stat prints localeconv()->decimal_point, so a comma-decimal
-    # locale yields "sec,nsec" -- rejected here, silently degrading to whole seconds.
+    # GNU `stat -f` is --file-system (succeeds, non-numeric) and GNU prints
+    # localeconv()->decimal_point. Hence LC_ALL=C, and validate rather than trust.
     v=""
     for _c in "stat -f %Fm" "stat -c %.9Y" "stat -f %m" "stat -c %Y"; do
         v="$(LC_ALL=C $_c "$f" 2>/dev/null || true)"
@@ -1159,6 +1157,9 @@ _sha256_of() {
         out="$(sha256sum "$1" 2>/dev/null)"; rc=$?
     fi
     [ "$rc" -eq 0 ] || return 1
+    # coreutils escapes a filename containing \\ or newline and prefixes the LINE
+    # with \\; the digest itself is unchanged, so strip it before validating.
+    out="${out#\\}"
     out="${out%% *}"
     case "$out" in
         *[!0-9a-fA-F]*|"") return 1 ;;

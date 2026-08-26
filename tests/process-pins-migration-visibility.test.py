@@ -179,10 +179,13 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             td = pathlib.Path(td); bin_ = td / "bin"; bin_.mkdir()
             shim = bin_ / "stat"
+            # The shim must NOT call host stat: GNU treats -f as --file-system and
+            # emits the very non-numeric report this patch exists to reject.
             shim.write_text(
                 '#!/bin/sh\n'
                 'case "$1" in -f) exit 1 ;; -c) fmt="$2"; f="$3" ;; *) exit 1 ;; esac\n'
-                'ns=$(/usr/bin/stat -f %Fm "$f" 2>/dev/null)\n'
+                'case "${f##*/}" in a) ns=1700000000.100000000 ;; '
+                'b) ns=1700000000.900000000 ;; *) exit 1 ;; esac\n'
                 'case "$fmt" in\n'
                 '  %.9Y) sep=","; [ "$LC_ALL" = "C" ] && sep="."\n'
                 '        printf \'%s%s%s\\n\' "${ns%%.*}" "$sep" '
