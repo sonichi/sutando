@@ -789,7 +789,14 @@ def check_port(port: int, name: str, probe: bool = False,
                     if _armed:
                         _row["restart_veto"] = _armed
                     return _row
-        return {"name": name, "status": "ok" if up else "down", "detail": f"port {port}"}
+        if not up:
+            _, _ls = _proc_lstarts(pgrep_pattern or name)
+            _row = {"name": name, "status": "down", "detail": f"port {port}"}
+            # A closed port on a LIVE pinned process still prescribes a restart,
+            # which is exactly what the pin forbids.
+            _apply_pin_verdict(_row, _pin_verdicts(name, _ls), "down", f"port {port}")
+            return _row
+        return {"name": name, "status": "ok", "detail": f"port {port}"}
     except Exception as e:
         return {"name": name, "status": "error", "detail": str(e)}
 
@@ -3701,6 +3708,15 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
         return [], {}
 
 
+def _apply_pin_verdict(check, results, status, detail):
+    """Set the verdict AND carry the armed veto. Setting status/detail alone
+    leaves the remedy unenforced at the --fix action boundary."""
+    check["status"], check["detail"] = status, detail
+    armed = process_pins.armed_detail(results)
+    if armed:
+        check["restart_veto"] = armed
+
+
 def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800,
                           binary_path: Optional[Path] = None, artifact_threshold_sec: int = 120,
                           service: Optional[str] = None) -> None:
@@ -3747,10 +3763,11 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
                 age_min = int((src_mtime - bin_mtime) / 60)
                 # A rebuild destroys a branch-only compiled witness exactly as a
                 # restart does, so this prescription consults the pin too.
-                check["status"], check["detail"] = process_pins.verdict_for(
-                    _pin_verdicts(service or check.get("name") or "", lstart_by_pid),
+                _r = _pin_verdicts(service or check.get("name") or "", lstart_by_pid)
+                _apply_pin_verdict(check, _r, *process_pins.verdict_for(
+                    _r,
                     f"binary is {age_min} min older than source",
-                    f"running, but binary is {age_min} min older than source — rebuild needed")
+                    f"running, but binary is {age_min} min older than source — rebuild needed"))
                 return
         except OSError:
             pass
@@ -3769,12 +3786,13 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
                     age_min = int((bin_mtime - proc_start) / 60)
                     # Same pin policy as the src-vs-process arm below: an armed
                     # pin means restarting would discard a branch-only artifact.
-                    check["status"], check["detail"] = process_pins.verdict_for(
-                        _pin_verdicts(service or check.get("name") or "", lstart_by_pid),
+                    _r = _pin_verdicts(service or check.get("name") or "", lstart_by_pid)
+                    _apply_pin_verdict(check, _r, *process_pins.verdict_for(
+                        _r,
                         f"the artifact it executes was rebuilt {age_min} min "
                         f"after the process started",
                         f"running, but the artifact it executes was rebuilt "
-                        f"{age_min} min after the process started -- restart needed")
+                        f"{age_min} min after the process started -- restart needed"))
                     return
             except OSError:
                 pass
@@ -3792,9 +3810,9 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
                 return
             # An armed pin means the tree moved BACKWARD past this process:
             # restarting adopts the tree and discards what only the process has.
-            check["status"], check["detail"] = process_pins.stale_verdict(
-                _pin_verdicts(service or check.get("name") or "", lstart_by_pid),
-                int((src_mtime - proc_start) / 60))
+            _r = _pin_verdicts(service or check.get("name") or "", lstart_by_pid)
+            _apply_pin_verdict(check, _r, *process_pins.stale_verdict(
+                _r, int((src_mtime - proc_start) / 60)))
     except (subprocess.TimeoutExpired, OSError):
         pass
 
