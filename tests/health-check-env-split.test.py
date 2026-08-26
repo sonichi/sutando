@@ -50,8 +50,8 @@ with tempfile.TemporaryDirectory() as td:
     check("identical key sets stay silent",
           hc.check_env_split(repo_env=repo_env, ws_env=ws_env), None)
 
-    # 2b. every whitespace shape of `export` must yield the key (PR block:
-    # multi-space/tab separators silently dropped keys in the OTHER file)
+    # 2b. every whitespace shape of `export` must yield the key — multi-space/tab
+    # separators must not silently drop keys in the OTHER file
     repo_env.write_text("GEMINI_API_KEY=stub\n")
     for label, content in [
         ("multi-space", "export   DISCORD_BOT_TOKEN=v\n"),
@@ -120,7 +120,7 @@ with tempfile.TemporaryDirectory() as td:
           r is not None and "workspace .env" in r["detail"]
           and "EXTRA_KEY" in r["detail"], True)
 
-# 5c. a third-tier resolver pick (the #1973 future) must WARN, not silence
+# 5c. a third-tier resolver pick must WARN, not silence
 with tempfile.TemporaryDirectory() as td:
     td = Path(td)
     (td / "repo").mkdir()
@@ -135,6 +135,40 @@ with tempfile.TemporaryDirectory() as td:
     check("third-tier pick warns instead of silencing",
           r is not None and r["status"] == "warn"
           and "outside both compared candidates" in r["detail"], True)
+
+# 5d. the reviewer's adjacent input: ONE legacy candidate + third-tier pick
+# must still WARN — the two-candidate gate must not run before selection.
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir()
+    (td / "ws").mkdir()
+    repo_env = td / "repo" / ".env"
+    ws_env = td / "ws" / ".env"          # absent on disk
+    repo_env.write_text("LEGACY_ONLY=1\n")
+    third = td / "bundle.env"
+    third.write_text("SELECTED_ONLY=1\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=third):
+        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+    check("one-candidate + third-tier pick still warns",
+          r is not None and r["status"] == "warn"
+          and "outside both compared candidates" in r["detail"], True)
+
+# 5e. controls: a lone SELECTED candidate stays silent; zero candidates too.
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir()
+    (td / "ws").mkdir()
+    repo_env = td / "repo" / ".env"
+    ws_env = td / "ws" / ".env"
+    repo_env.write_text("A=1\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=repo_env):
+        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+    check("single selected candidate is silent", r, None)
+    with _patch.object(sutando_config, "resolve_dotenv",
+                       return_value=td / "bundle.env"):
+        r = hc.check_env_split(repo_env=td / "no" / ".env",
+                               ws_env=td / "no2" / ".env")
+    check("zero candidates stay silent", r, None)
 
 # 6. run_all_checks wiring: the call site is separate code from the probe
 # (same pattern as health-check-bridge-log-content's integration section).

@@ -1447,17 +1447,19 @@ def check_env_split(repo_env: "Path | None" = None,
                     ws_env: "Path | None" = None) -> "dict | None":
     """Warn when the SELECTED .env is missing keys the unselected one carries.
 
-    resolve_dotenv picks exactly one file (repo .env wins when it exists, else
-    the workspace .env) and nothing ever compares the two — so a 1-key stub in
-    the winning slot partial-loads with no warning while full credentials sit
-    in the loser (report tk-5156f372c3: "silent partial load, no warning").
-    Key NAMES only; values are never read into the message.
+    resolve_dotenv picks one file and nothing ever compares candidates — so a
+    1-key stub in the winning slot partial-loads with no warning while full
+    credentials sit in the loser. Key NAMES only; values never enter the message.
 
-    Returns None when only one file exists or the selected file is a superset.
+    Returns None when no unselected candidate exists or the selected file is a
+    superset of every candidate it can be compared against.
     """
     repo_env = repo_env if repo_env is not None else REPO_DIR / ".env"
     ws_env = ws_env if ws_env is not None else WORKSPACE_DIR / ".env"
-    if not (repo_env.is_file() and ws_env.is_file()):
+    # Selection must be resolved BEFORE any candidate-count gate: a third-tier
+    # pick with a single legacy file is exactly the split this probe warns on.
+    candidates = [p for p in (repo_env, ws_env) if p.is_file()]
+    if not candidates:
         return None
 
     def _keys(path: Path) -> "set[str]":
@@ -1466,7 +1468,7 @@ def check_env_split(repo_env: "Path | None" = None,
             for line in path.read_text(errors="replace").splitlines():
                 line = line.strip()
                 # split(None) eats any space/tab run: `export   K=` and
-                # `export\tK=` must not silently drop the key (PR block).
+                # `export\tK=` must not silently drop the key.
                 parts = line.split(None, 1)
                 if parts and parts[0] == "export":
                     line = parts[1] if len(parts) == 2 else ""
@@ -1477,16 +1479,18 @@ def check_env_split(repo_env: "Path | None" = None,
             return set()
         return out
 
-    # The canonical resolver owns selection; a re-derivation drifts (PR block).
+    # The canonical resolver owns selection; a re-derivation drifts.
     from sutando_config import resolve_dotenv  # noqa: PLC0415
     picked = resolve_dotenv(repo_env.parent, ws_env.parent)
-    if picked == repo_env:
+    if picked == repo_env and ws_env.is_file():
         selected, other, sel_name, oth_name = repo_env, ws_env, "repo", "workspace"
-    elif picked == ws_env:
+    elif picked == ws_env and repo_env.is_file():
         selected, other, sel_name, oth_name = ws_env, repo_env, "workspace", "repo"
+    elif picked in candidates:
+        return None  # single candidate, and it is the selected one
     else:
-        # A third-tier pick (#1973) must not silence the probe: silence is the
-        # failure this probe exists to catch.
+        # A third-tier pick beside >=1 legacy candidate must not silence the
+        # probe: silence is the failure this probe exists to catch.
         return {
             "name": "env-split",
             "status": "warn",
