@@ -58,10 +58,18 @@ class ReconnectObservabilityTest(unittest.TestCase):
     def test_handlers_are_registered_and_increment(self) -> None:
         """The gap was a MISSING handler, so absence is the thing to assert."""
         tree = ast.parse(SRC)
-        found = {n.name for n in ast.walk(tree)
-                 if isinstance(n, ast.AsyncFunctionDef)
-                 and n.name in {"on_resumed", "on_disconnect", "on_ready"}}
-        self.assertEqual(found, {"on_ready", "on_resumed", "on_disconnect"})
+        want = {"on_ready", "on_resumed", "on_disconnect"}
+        handlers = {n.name: n for n in ast.walk(tree)
+                    if isinstance(n, ast.AsyncFunctionDef) and n.name in want}
+        self.assertEqual(set(handlers), want)
+        # A defined-but-undecorated handler is never registered, so discord.py
+        # never calls it — name presence alone cannot see that.
+        for name, node in handlers.items():
+            self.assertTrue(
+                any(isinstance(d, ast.Attribute) and d.attr == "event"
+                    and isinstance(d.value, ast.Name) and d.value.id == "client"
+                    for d in node.decorator_list),
+                f"{name} must carry @client.event or it is never registered")
         for name, counter in (("on_resumed", "_resume_count"),
                               ("on_disconnect", "_disconnect_count")):
             body = next(ast.unparse(n) for n in ast.walk(tree)
