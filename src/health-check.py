@@ -6843,10 +6843,11 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
 def _local_core_pids() -> "set | None":
     """PIDs of core sessions on THIS host, or None if that cannot be determined.
 
-    Deliberately NOT from `state/cores/*.alive`: that directory is synced across
-    hosts, so a peer's record can name a pid that is live and unrelated here
-    (measured: two hosts, same pid 8654). tmux sockets are per-host, so this
-    cannot be inflated by sync.
+    Deliberately NOT from `state/cores/*.alive`: nothing prunes a record whose
+    host LABEL has since changed, so that directory accumulates stale files from
+    this same machine, and a recycled pid in one of them names a live unrelated
+    process (measured: three labels, one heartbeat pid; a fourth naming a pid
+    dead since June). tmux is asked live, so it cannot go stale this way.
     """
     pids, saw_any = set(), False
     fmt = "#{pane_pid}"
