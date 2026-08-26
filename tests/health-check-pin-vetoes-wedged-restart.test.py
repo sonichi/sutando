@@ -93,8 +93,12 @@ try:
         "expires_at": "2099-01-01T00:00:00Z",
     }]}))
     armed = hc.check_port(port, SERVICE, probe=True)
-    check(armed["status"] != "wedged",
-          f"an armed pin changes the verdict away from wedged (got {armed['status']})")
+    # The pin vetoes the REMEDY, never the DIAGNOSIS: `warn` is a benign
+    # status, so downgrading here drops a live outage out of `issues`.
+    check(armed["status"] == "wedged",
+          f"the diagnosis SURVIVES the pin (got {armed['status']})")
+    check(armed["status"] not in ("ok", "warn"),
+          "and the status is not benign, so --quiet still exits non-zero")
     check("restart needed" not in armed["detail"],
           "the restart prescription is withdrawn")
     check("DO NOT RESTART" in armed["detail"],

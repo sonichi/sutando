@@ -98,6 +98,13 @@ def evaluate(pins: list, service: str, lstart_by_pid: dict, now_ts: float) -> li
     return out
 
 
+def other_notes(results: list) -> str:
+    """Non-ARMED pin notes, formatted. An armed sibling changes the
+    prescription; it does not retract the other pins' findings."""
+    return "".join(f" [{note}]" for verdict, _pin, note in results
+                   if verdict != ARMED)
+
+
 def verdict_for(results: list, warn_lead: str, stale_detail: str) -> tuple:
     """(status, detail) for ANY prescription an armed pin must override.
 
@@ -106,10 +113,7 @@ def verdict_for(results: list, warn_lead: str, stale_detail: str) -> tuple:
     rebuild destroys it exactly as a restart does.
     """
     armed = armed_detail(results)
-    # A non-matching pin is a finding at BOTH verdicts: an armed sibling
-    # changes the prescription, it does not retract the other pins' notes.
-    others = "".join(f" [{note}]" for verdict, _pin, note in results
-                     if verdict != ARMED)
+    others = other_notes(results)
     if armed:
         return ("warn", f"{warn_lead}, but {armed}{others}")
     return ("stale", f"{stale_detail}{others}")

@@ -774,16 +774,17 @@ def check_port(port: int, name: str, probe: bool = False,
                     # An armed pin forbids the restart this verdict prescribes,
                     # exactly as it does for the staleness arms.
                     _, _lstarts = _proc_lstarts(pgrep_pattern or name)
-                    _armed = process_pins.armed_detail(
-                        _pin_verdicts(name, _lstarts))
+                    _res = _pin_verdicts(name, _lstarts)
+                    _armed = process_pins.armed_detail(_res)
+                    _notes = process_pins.other_notes(_res)
                     _base = f"port {port} listening but unresponsive"
-                    if _armed:
-                        return {"name": name, "status": "warn",
-                                "detail": f"{_base}, but {_armed}"}
+                    # Status stays `wedged` even when pinned: `warn` is benign
+                    # and would drop a live outage out of `issues` entirely.
+                    _remedy = f"but {_armed}" if _armed else "restart needed"
                     return {
                         "name": name,
                         "status": "wedged",
-                        "detail": f"{_base} — restart needed",
+                        "detail": f"{_base} — {_remedy}{_notes}",
                     }
         return {"name": name, "status": "ok" if up else "down", "detail": f"port {port}"}
     except Exception as e:
@@ -4125,9 +4126,9 @@ def check_voice_transport(voice_check: dict) -> dict:
             if connecting_after > 20:
                 elapsed_min = connecting_after * 30 // 60
                 check["status"] = "fail"
-                # A kickstart destroys a pinned witness exactly as a stale-code
-                # restart would, so the veto has to reach this branch too.
-                _, _lstarts = _proc_lstarts("voice-agent.ts")
+                # A kickstart destroys a pinned witness; packaged installs run
+                # dist/voice-agent.js, so a .ts-only probe misses the pin.
+                _, _lstarts = _proc_lstarts("voice-agent[.]ts|voice-agent[.]js")
                 _armed = process_pins.armed_detail(
                     _pin_verdicts(voice_check.get("name") or "voice-agent", _lstarts))
                 base = (f"stuck CONNECTING ~{elapsed_min}min after "
