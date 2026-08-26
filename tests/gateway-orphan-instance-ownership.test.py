@@ -32,6 +32,8 @@ _SAVED_ENV = {k: os.environ.get(k) for k in _ENV_KEYS}
 
 
 def tearDownModule():
+    import shutil
+    shutil.rmtree(_FIXTURE_CFG, ignore_errors=True)
     for k, v in _SAVED_ENV.items():
         if v is None:
             os.environ.pop(k, None)
@@ -41,7 +43,9 @@ def tearDownModule():
 
 os.environ["REMOTE_TASK_TOKEN"] = FIXTURE_TOKEN
 os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9/fixture"
-_FIXTURE_CFG = tempfile.mkdtemp(prefix="ownership-fixture-cfg-")
+# Resolved once: on macOS mkdtemp returns /var/... which resolves to
+# /private/var/... — unresolved-vs-resolved comparison would misclassify.
+_FIXTURE_CFG = str(Path(tempfile.mkdtemp(prefix="ownership-fixture-cfg-")).resolve())
 _ch = Path(_FIXTURE_CFG) / "channels" / "ag2space"
 _ch.mkdir(parents=True)
 (_ch / ".env").write_text("REMOTE_TASK_TOKEN=fixture-file-token\n")
@@ -61,16 +65,37 @@ def _is_sensitive(sp: str) -> bool:
 
 
 def _in_fixture(sp: str) -> bool:
-    # Trailing-separator anchored: "<fixture>-outside/..." must NOT match.
-    return sp == _FIXTURE_CFG or sp.startswith(_FIXTURE_CFG + os.sep)
+    # Resolve, then trailing-separator anchor: "<fixture>-outside/..." and
+    # unresolved /var vs /private/var spellings must both classify right.
+    rp = str(Path(sp).resolve())
+    return rp == _FIXTURE_CFG or rp.startswith(_FIXTURE_CFG + os.sep)
+
+
+def _protected_identities():
+    """Resolved identities of the CURRENT candidate sources that lie outside
+    the fixture — identity match, not basename or prefix guessing (rui):
+    an AG2_DEVICE_ENV pointed at ANY filename is protected by identity."""
+    out = set()
+    cands = [os.environ.get("AG2_DEVICE_ENV")]
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg:
+        cands.append(os.path.join(cfg, "channels", "ag2space", ".env"))
+    for c in cands:
+        if not c:
+            continue
+        rp = str(Path(c).resolve())
+        if not _in_fixture(rp):
+            out.add(rp)
+    return out
 
 
 def _fresh_import():
     """Guarded fresh import: the spy RAISES before opening any protected
-    path outside the fixture — the file is never read, matching the claim
-    (findings 7 and 9). The post-import audit remains as the belt."""
+    identity — prevention, scoped to the high-level io reader path
+    (os.open is out of scope by declaration). Post-import audit = belt."""
     import builtins
     import io
+    protected = _protected_identities()
     opened = []
     real_open = builtins.open
     real_io_open = io.open
@@ -81,7 +106,7 @@ def _fresh_import():
             sp = None
         if sp is not None:
             opened.append(sp)
-            if _is_sensitive(sp) and not _in_fixture(sp):
+            if str(Path(sp).resolve()) in protected:
                 raise IsolationViolation(f"pre-open block: {sp}")
         return real_io_open(file, *a, **kw)
     for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
@@ -185,8 +210,9 @@ class ImportIsolationGuard(unittest.TestCase):
     exists or is read — the escape file is a dummy."""
 
     def test_guard_fires_on_an_out_of_fixture_candidate(self):
-        outside = tempfile.mkdtemp(prefix="outside-fixture-")
-        escape = Path(outside) / "device.env"
+        outside_td = tempfile.TemporaryDirectory(prefix="outside-fixture-")
+        self.addCleanup(outside_td.cleanup)
+        escape = Path(outside_td.name) / "device.env"
         escape.write_text("# dummy, not a credential\n")
         saved = os.environ["AG2_DEVICE_ENV"]
         os.environ["AG2_DEVICE_ENV"] = str(escape)
