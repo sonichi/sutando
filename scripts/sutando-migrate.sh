@@ -257,7 +257,7 @@ CLASS_RULES=(
     "agent-inbox/*|structural"
     "scripts/*|collision-keep-both"  # owner-custom tools: user content, never drop a version
     ".claude-sutando/*|structural"  # agent config tree: same relpath, never clobber dest
-    "hosts/*|structural"  # per-host identity state: same relpath, never clobber (as state/auth)
+    "hosts/*|structural"  # per-host identity state; collisions keep both (newer primary + sidecar)
     "relay/*|structural"
     # Catchall — per Lucy #design 2026-06-02 + owner direction: workspace
     # sources B+C may have user-custom dirs/files (experiments/, obsidian-vault/,
@@ -1174,14 +1174,12 @@ commit_one() {
         structural|collision-keep-both)
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
-                # Same content (mtime+size) → identical-drop. Different →
-                # keep-both: rename source-incoming to <file>.legacy-<tag>.
-                local src_mt src_sz dst_mt dst_sz
+                # Identical content (sha) → identical-drop. mtime+size alone
+                # certified equal-mtime/equal-size DIFFERENT bytes as identical.
+                local src_mt dst_mt
                 src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
                 dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
-                dst_sz="$(stat -f %z "$dst_path" 2>/dev/null || stat -c %s "$dst_path")"
-                if [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
+                if sha_match "$src_file" "$dst_path"; then
                     echo "identical-drop"
                     return 0
                 fi

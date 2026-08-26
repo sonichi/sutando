@@ -41,6 +41,17 @@ touch -t 202506010800 "$B/notes/divergent.md"
 touch -t 202606010800 "$C/notes/divergent.md"
 touch -t 202606012100 "$A/notes/divergent.md"
 
+# --- Fixture: hosts/ + relay/ same-mtime same-size DIFFERENT content (reviewer
+# repro on #3418): mtime+size identical-drop certified these as identical and
+# dropped the source variant. Content-hash must classify them as collisions.
+mkdir -p "$A/hosts/Test-Host" "$A/relay" "$DEST/hosts/Test-Host" "$DEST/relay"
+printf 'AAAA\n' > "$A/hosts/Test-Host/crons.json"
+printf 'BBBB\n' > "$DEST/hosts/Test-Host/crons.json"
+touch -t 202606011200 "$A/hosts/Test-Host/crons.json" "$DEST/hosts/Test-Host/crons.json"
+printf 'RRRR\n' > "$A/relay/relay-1.md"
+printf 'SSSS\n' > "$DEST/relay/relay-1.md"
+touch -t 202606011200 "$A/relay/relay-1.md" "$DEST/relay/relay-1.md"
+
 # --- Fixture: rehome — loose root JSON at C ---
 echo '{"k":"v"}' > "$C/cloud-auth.json"
 
@@ -170,6 +181,19 @@ else
         echo "  OK: notes/divergent.md collision A-wins; C-version sidecared at $(basename "$sidecar_path") (timestamped per Mini #3)"
     fi
 fi
+
+# 3b. hosts/ + relay/ equal-mtime equal-size different content must be a
+#     COLLISION (both variants present under DEST), never identical-drop.
+for pair in "hosts/Test-Host/crons.json|AAAA|BBBB" "relay/relay-1.md|RRRR|SSSS"; do
+    rel="${pair%%|*}"; rest="${pair#*|}"; srcv="${rest%%|*}"; dstv="${rest#*|}"
+    hits_src="$( { grep -rl "$srcv" "$DEST/$(dirname "$rel")" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    hits_dst="$( { grep -rl "$dstv" "$DEST/$(dirname "$rel")" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    if [ "$hits_src" -ge 1 ] && [ "$hits_dst" -ge 1 ]; then
+        echo "  OK: $rel equal-mtime/equal-size different content preserved as collision (both variants under DEST)"
+    else
+        echo "  FAIL: $rel — same-mtime/same-size different content lost a variant (src-present=$hits_src dst-present=$hits_dst)"; fail=1
+    fi
+done
 
 # 4. cloud-auth.json re-homed to dest/state/auth/ per Mini #design 2026-06-02
 if [ ! -f "$DEST/state/auth/cloud-auth.json" ]; then
