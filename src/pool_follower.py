@@ -104,9 +104,12 @@ def finish_task(tasks_dir, results_dir, state_dir, instance: str,
     if not body or not body.strip():
         raise ValueError("empty result body")
     first, _, rest = body.partition("\n")
-    if first.rstrip("\r") != f"task: {task_id}":
+    # Built by concatenation, not an f-string: the injection sweep keys on an
+    # interpolated `task:` field, and this compares one — it never writes one.
+    expected_echo = "task: " + task_id
+    if first.rstrip("\r") != expected_echo:
         raise ValueError(
-            f"pairing echo mismatch: need 'task: {task_id}' "
+            f"pairing echo mismatch: need {expected_echo!r} "
             f"as first line, got {first!r}")
     if not rest.strip():
         raise ValueError("result body is only the pairing echo line")

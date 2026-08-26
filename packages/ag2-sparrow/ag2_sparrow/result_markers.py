@@ -439,3 +439,9 @@ def first_action(result: ParseResult, kind: ActionKind) -> Action | None:
         if a.kind == kind:
             return a
     return None
+
+
+def has_skip_action(actions) -> bool:
+    """True if `actions` (a ParseResult.actions list) carries a skip-kind
+    marker (`[no-send]`/`[REPLIED]`/`[deduped:...]`) — the body must never be sent."""
+    return any(a.kind == "skip" for a in actions)
