@@ -49,11 +49,10 @@ python3 src/morning-briefing.py
 
 ## How to deliver
 
-`src/morning-briefing.py` already writes `results/proactive-<ts>.txt` (spoken by voice) and sends a Discord DM for the base data. If you gathered email or insight in steps 1–4, append them as a follow-up proactive file:
+`src/morning-briefing.py` already writes `results/proactive-<ts>.txt` (spoken by voice) and sends a Discord DM for the base data. If you gathered email in steps 1–3, append it as a follow-up proactive file:
 
 ```bash
-echo "📧 Email: [count] unread. [summary]
-💡 Insight: [insight text]" > "$WORKSPACE/results/proactive-$(date +%s).txt"
+echo "📧 Email: [count] unread. [summary]" > "$WORKSPACE/results/proactive-$(date +%s).txt"
 ```
 
 ## Calendar source (Google Workspace) — activation
@@ -84,4 +83,4 @@ The canonical daily schedule produces the Google-calendar cache first, then runs
 }
 ```
 
-Calling `/morning-briefing` manually runs the same script plus GWS/insight augmentation.
+Calling `/morning-briefing` manually runs the same script plus GWS augmentation.
