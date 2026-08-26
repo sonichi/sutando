@@ -90,6 +90,28 @@ class LiveTreeDrift(unittest.TestCase):
         r = hc.check_live_tree_drift(repo_root=self.clone)
         self.assertEqual(r["status"], "ok", r)
 
+    def test_non_git_dir_is_ok_not_error(self):
+        with tempfile.TemporaryDirectory() as plain:
+            r = hc.check_live_tree_drift(repo_root=plain)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("not a git checkout", r["detail"])
+
+    def test_deleted_tracked_file_counts_dirty_never_stale(self):
+        (self.clone / "f.txt").unlink()  # " D" porcelain row with no mtime
+        r = hc.check_live_tree_drift(repo_root=self.clone)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("1 tracked dirty", r["detail"])
+
+    def test_internal_error_degrades_to_warn(self):
+        real = hc.time.time
+        hc.time.time = lambda: (_ for _ in ()).throw(RuntimeError("clock"))
+        try:
+            r = hc.check_live_tree_drift(repo_root=self.clone)
+        finally:
+            hc.time.time = real
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("could not measure", r["detail"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
