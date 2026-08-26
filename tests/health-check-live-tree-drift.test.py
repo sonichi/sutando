@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """check_live_tree_drift: a live checkout far behind its upstream, or carrying
-day-old dirty files, must WARN; a current clean tree stays ok. Born from
-2026-08-26: the live tree was 116 behind with ~190 dirty files and no probe
-noticed."""
+day-old dirty files, must WARN; a current clean tree stays ok."""
 import importlib.util
 import os
 import subprocess
@@ -101,6 +99,31 @@ class LiveTreeDrift(unittest.TestCase):
         r = hc.check_live_tree_drift(repo_root=self.clone)
         self.assertEqual(r["status"], "ok", r)
         self.assertIn("1 tracked dirty", r["detail"])
+
+    def test_probe_routes_every_git_call_through_git_argv(self):
+        # Production-path proof: substitute the resolver and count real calls.
+        calls = []
+        real = hc.git_argv
+        hc.git_argv = lambda *a: (calls.append(a) or real(*a))
+        try:
+            r = hc.check_live_tree_drift(repo_root=self.clone)
+        finally:
+            hc.git_argv = real
+        self.assertEqual(r["status"], "ok", r)
+        self.assertGreaterEqual(len(calls), 3, "probe bypassed git_argv")
+        self.assertTrue(all(a[0] == "-C" for a in calls), calls)
+
+    def test_no_runnable_git_is_ok_not_a_recurring_warn(self):
+        def _raise(*a):
+            raise hc.GitUnavailable("no git")
+        real = hc.git_argv
+        hc.git_argv = _raise
+        try:
+            r = hc.check_live_tree_drift(repo_root=self.clone)
+        finally:
+            hc.git_argv = real
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("no runnable git", r["detail"])
 
     def test_internal_error_degrades_to_warn(self):
         real = hc.time.time

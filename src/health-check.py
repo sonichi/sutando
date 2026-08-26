@@ -5930,7 +5930,7 @@ def check_live_tree_drift(repo_root: "Path | None" = None,
     name = "live-tree-drift"
     root = Path(repo_root) if repo_root else REPO_DIR
     def _git(*args):
-        r = _sp.run(["git", "-C", str(root), *args],
+        r = _sp.run(git_argv("-C", str(root), *args),
                     capture_output=True, text=True, timeout=20)
         # rstrip only: porcelain lines carry a SIGNIFICANT leading space
         # (" M file"); .strip() would eat it and shift every field parse.
@@ -5971,6 +5971,9 @@ def check_live_tree_drift(repo_root: "Path | None" = None,
                                "attended restart window")}
         return {"name": name, "status": "ok",
                 "detail": f"{behind} behind upstream, {len(dirty)} tracked dirty"}
+    except GitUnavailable:
+        # No runnable git is a host state, not drift — never re-warn per pass.
+        return {"name": name, "status": "ok", "detail": "no runnable git on this host"}
     except Exception as exc:  # a broken guard must not fail the whole health run
         return {"name": name, "status": "warn",
                 "detail": f"drift probe could not measure: {str(exc)[:80]}"}
