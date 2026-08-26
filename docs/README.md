@@ -56,6 +56,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
 - [Lead-follower agent pool design](lead-follower-pool.md)
+- [Sutando Server & the Agent ID card](server-and-identity.md) — runtime-api identity-surface design note.
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)
