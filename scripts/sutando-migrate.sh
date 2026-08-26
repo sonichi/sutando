@@ -1245,8 +1245,7 @@ commit_one() {
                     echo "src-newer"
                 elif [ "$src_mt" -lt "$dst_mt" ]; then
                     echo "dest-newer"
-                elif [ "$(shasum -a256 < "$src_file" 2>/dev/null | cut -d" " -f1)" \
-                     = "$(shasum -a256 < "$dst_path" 2>/dev/null | cut -d" " -f1)" ]; then
+                elif sha_match "$src_file" "$dst_path"; then
                     echo "dest-newer"
                 else
                     # Same instant, different content: scan order is not a
