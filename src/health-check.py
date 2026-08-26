@@ -2145,17 +2145,19 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             note += (f"; +{grew:,} B over the last {hours:.1f}h"
                      + (f", which is ~{left / rate:.1f}h of remaining headroom at that rate"
                         if rate > 0 and left > 0 else ""))
-            # The max window is the worst case, so `gain <= 0` skips every flat one
-            # and a quoted deadline outlives its regime. Report the recent window too.
-            recent = next(((at, sz) for at, sz in reversed(points)
-                           if (newest_at - at) / 3600.0 >= 0.5), None)
-            if recent is not None:
-                r_span = (newest_at - recent[0]) / 3600.0
-                r_gain = effective_bytes - recent[1]
-                if r_gain <= 0:
-                    note += (f"; but the last {r_span:.1f}h show {r_gain:+,} B — flat or "
+            # A stopped climb reads flat in the RECENT window; a burst on a flat
+            # run reads flat over the FULL history. Neither window sees both.
+            controls = [c for c in (next(((at, sz) for at, sz in reversed(points)
+                                          if (newest_at - at) / 3600.0 >= 0.5), None),
+                                    points[0]) if c is not None]
+            for c_at, c_sz in controls:
+                c_span = (newest_at - c_at) / 3600.0
+                c_gain = effective_bytes - c_sz
+                if c_span >= 0.5 and c_gain <= 0:
+                    note += (f"; but the last {c_span:.1f}h show {c_gain:+,} B — flat or "
                              f"shrinking, so the figure above spans a change in write rate "
                              f"and its deadline is stale; re-measure before acting on it")
+                    break
         return note
     except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
         return _TREND_UNAVAILABLE
