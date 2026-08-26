@@ -13,17 +13,19 @@ import time
 from pathlib import Path
 
 
-def _workspace() -> Path:
+def _workspace() -> "Path | None":
+    # Canonical resolver only: on any failure return None and the caller
+    # skips the write — never invent a fallback tree for mutable state
     repo = next((p for p in Path(__file__).resolve().parents
                  if (p / "src" / "workspace_default.py").is_file()), None)
-    if repo is not None:
-        try:
-            sys.path.insert(0, str(repo / "src"))
-            from workspace_default import resolve_workspace  # noqa: E402
-            return Path(resolve_workspace())
-        except Exception:
-            return repo / "workspace"
-    return Path.home() / "workspace"
+    if repo is None:
+        return None
+    try:
+        sys.path.insert(0, str(repo / "src"))
+        from workspace_default import resolve_workspace  # noqa: E402
+        return Path(resolve_workspace())
+    except Exception:
+        return None
 
 
 def _target(tool: str, ti: dict) -> str:
@@ -157,6 +159,8 @@ def main() -> int:
         rec["detail"] = detail          # /full-only; consumers gate on the level
     try:
         ws = _workspace()
+        if ws is None:
+            sys.exit(0)  # fail open: no canonical workspace, no write
         feed = ws / "state" / "activity-feed.jsonl"
         feed.parent.mkdir(parents=True, exist_ok=True)
         # Bound the file so an always-on feed can't grow without limit.
