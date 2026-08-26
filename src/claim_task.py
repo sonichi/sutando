@@ -24,8 +24,8 @@ Exit codes:
     2 — usage error
 
 Library:
-    from claim_task import claim, claim_with_affinity
-    claimed_path = claim(task_id, core_id, workspace=None)
+    from claim_task import claim_plain, claim_with_affinity
+    claimed_path = claim_plain(task_id, core_id, workspace=None)
     claimed_path = claim_with_affinity(task_id, core_id, channel_id, workspace=None)
 
 LEAD-FOLLOWER NOTE (L1+): `claim_with_affinity` is the LEGACY race-side
@@ -43,7 +43,7 @@ LEAD-FOLLOWER NOTE (L1+): `claim_with_affinity` is the LEGACY race-side
     inactivity, the handler entry expires and the next task races freely.
 
     `channel_id=None` is the no-affinity fallback (voice tasks, etc.),
-    delegating to plain `claim()`.
+    delegating to plain `claim_plain()`.
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def _validate_id(name: str, kind: str) -> str:
     return name
 
 
-def claim(task_id: str, core_id: str, workspace: Path | None = None) -> Path | None:
+def claim_plain(task_id: str, core_id: str, workspace: Path | None = None) -> Path | None:
     """Attempt to claim a task by atomic-rename.
 
     Returns the path to the claim file on success, or None if the claim
@@ -103,7 +103,7 @@ def claim(task_id: str, core_id: str, workspace: Path | None = None) -> Path | N
 
 
 # Channel-affinity layer (#884): sticky-handler semantics over plain
-# claim(); only invoked when the caller passes channel_id.
+# claim_plain(); only invoked when the caller passes channel_id.
 
 DEFAULT_IDLE_THRESHOLD_SEC = 30 * 60   # 30 min — chat-pattern cohesion
 ALIVE_THRESHOLD_SEC = 90               # 3 missed 30s heartbeats = dead
@@ -189,7 +189,7 @@ def claim_with_affinity(
     """Claim a task, honoring per-channel sticky-handler affinity (#884).
 
     Semantics:
-      - channel_id=None → delegate to plain claim() (no affinity).
+      - channel_id=None → delegate to plain claim_plain() (no affinity).
       - Channel has a fresh handler (within IDLE_THRESHOLD) AND that handler
         is alive (heartbeat < 90s) AND it's NOT this core: return None
         (respect the handler).
@@ -205,7 +205,7 @@ def claim_with_affinity(
     task_id = _validate_id(task_id, "task_id")
     core_id = _validate_id(core_id, "core_id")
     if channel_id is None:
-        return claim(task_id, core_id, workspace=workspace)
+        return claim_plain(task_id, core_id, workspace=workspace)
     channel_id = _validate_channel_id(channel_id)
 
     ws = workspace if workspace is not None else _workspace_root()
@@ -230,7 +230,7 @@ def claim_with_affinity(
             if core_id != handler_core:
                 return None
             # I am the handler — claim normally + refresh handler mtime.
-            result = claim(task_id, core_id, workspace=ws)
+            result = claim_plain(task_id, core_id, workspace=ws)
             if result is not None:
                 _write_handler(handler_p, core_id, now)
             return result
@@ -238,7 +238,7 @@ def claim_with_affinity(
 
     # Race-claim path: any core may attempt, kernel decides. Winner refreshes
     # the handler file with their core_id + now.
-    result = claim(task_id, core_id, workspace=ws)
+    result = claim_plain(task_id, core_id, workspace=ws)
     if result is not None:
         _write_handler(handler_p, core_id, now)
     return result
@@ -257,7 +257,7 @@ def _main(argv: list[str]) -> int:
         if channel_id:
             result = claim_with_affinity(task_id, core_id, channel_id)
         else:
-            result = claim(task_id, core_id)
+            result = claim_plain(task_id, core_id)
     except ValueError as e:
         print(f"claim_task: {e}", file=sys.stderr)
         return 2
