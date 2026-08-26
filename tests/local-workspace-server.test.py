@@ -29,6 +29,8 @@ class ServerHarness(unittest.TestCase):
         (root / "app.js").write_text("console.log('x')")
         (root / "sub").mkdir()
         (root / "sub" / "a.css").write_text("body{}")
+        (root / "slide 1.png").write_bytes(b"png-ish")
+        (root / "café.txt").write_text("utf8 name")
         (root / "secret-outside.txt")  # never created — target of traversal
         cls.srv, cls.cap = serve.build_server(root, port=0, ttl=3600)
         cls.port = cls.srv.server_address[1]
@@ -76,8 +78,27 @@ class ServerHarness(unittest.TestCase):
     def test_traversal_is_refused(self):
         for p in (f"/{self.cap}/../secret-outside.txt",
                   f"/{self.cap}/sub/../../secret-outside.txt",
-                  f"/{self.cap}/%2e%2e/secret-outside.txt"):
+                  f"/{self.cap}/%2e%2e/secret-outside.txt",
+                  f"/{self.cap}/..%2fsecret-outside.txt",
+                  f"/{self.cap}/sub/..%2F..%2Fsecret-outside.txt",
+                  f"/{self.cap}/%2e%2e%2fsecret-outside.txt"):
             self.assertEqual(self._req(p)[0], 404, p)
+
+    def test_percent_encoded_names_serve_normally(self):
+        """Positive control for the decode step: a browser encodes the space
+        and the UTF-8 name; both must resolve to the real files."""
+        st, body, _ = self._req(f"/{self.cap}/slide%201.png")
+        self.assertEqual((st, body), (200, b"png-ish"))
+        st, body, _ = self._req(f"/{self.cap}/caf%C3%A9.txt")
+        self.assertEqual((st, body), (200, b"utf8 name"))
+
+    def test_decode_is_single_pass_and_strict(self):
+        # %252e%252e decodes ONCE to the literal name "%2e%2e" — a missing
+        # file, never a second decode into "..".
+        self.assertEqual(
+            self._req(f"/{self.cap}/%252e%252e/secret-outside.txt")[0], 404)
+        # Malformed UTF-8 percent-bytes are refused, not served mangled.
+        self.assertEqual(self._req(f"/{self.cap}/caf%FF.txt")[0], 404)
 
     def test_no_directory_listing(self):
         self.assertEqual(self._req(f"/{self.cap}/sub/")[0], 404)

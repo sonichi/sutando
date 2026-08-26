@@ -22,6 +22,7 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote
 
 # Explicit core types; mimetypes fills the long tail. HTML gets the sandbox
 # CSP below — the deck must stay inert even if opened outside the panel.
@@ -56,7 +57,13 @@ def make_handler(root: Path, capability: str, port: int, expires_at: float):
                 return self._deny(403, "bad host")
             if time.time() > expires_at:
                 return self._deny(403, "capability expired — restart the server")
-            parts = self.path.split("?", 1)[0].lstrip("/").split("/", 1)
+            # Decode percent-encoding exactly once (never recursively) BEFORE
+            # the checks, so %2e%2e/..%2f are checked as the traversal they are.
+            try:
+                path = unquote(self.path.split("?", 1)[0], errors="strict")
+            except UnicodeDecodeError:
+                return self._deny(404, "not found")
+            parts = path.lstrip("/").split("/", 1)
             if not hmac.compare_digest(parts[0], capability):
                 return self._deny(404, "not found")
             rel = parts[1] if len(parts) > 1 and parts[1] else "index.html"
