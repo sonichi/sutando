@@ -200,7 +200,11 @@ _st, _why = g.resume("task-dur-3")
 check("unadmitted event preserves state", _st, "waiting")
 check("unadmitted event reports the decision", "ignored" in _why, True)
 
-# a VERIFIED actor's outcome does terminate, exercising the terminal branch
+# a VERIFIED actor's outcome does terminate, exercising the terminal branch.
+# The GitHub adapter registers no Matrix scheme; the authenticating seam is
+# installed HERE, explicitly, as the test's own fixture.
+from shepherd_contract import register_actor_scheme as _reg_verified  # noqa: E402
+_reg_verified("matrix.mxid", verified=True)
 VERIFIED = Actor("matrix.mxid", "@qingyun-air.agent:ag2.space")
 vscope = g.scope_for("o/r", 2, VERIFIED)
 g.save("task-dur-4", vscope, "waiting")
@@ -541,8 +545,8 @@ _with_skill = subprocess.run(
      f"sys.path.insert(0, {str(SKILL)!r});"
      "import shepherd_github;" + _PROBE],
     capture_output=True, text=True)
-check("importing the skill registers exactly those schemes",
-      (_with_skill.returncode, _with_skill.stdout.split()), (0, ["True", "True"]))
+check("importing the skill registers ONLY the Git scheme",
+      (_with_skill.returncode, _with_skill.stdout.split()), (0, ["True", "False"]))
 
 # negative control: the harness must be able to register a failure
 _n = len(failures)

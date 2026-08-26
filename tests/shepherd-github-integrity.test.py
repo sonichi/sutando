@@ -196,6 +196,10 @@ st, why = _resume_with("task-integrity-12", ignored)
 check("an event about another subject does not move the state", st, "waiting")
 check("...and says it was ignored", "ignored" in why, True)
 
+# The GitHub adapter registers no Matrix scheme; install the verified seam
+# here explicitly as this test's authenticating fixture.
+from shepherd_contract import register_actor_scheme as _reg_verified  # noqa: E402
+_reg_verified("matrix.mxid", verified=True)
 merged_verified = g.ObservedEvent(
     event_type="github.pull_request.merged",
     subject=g.subject_for("org/repo-a", 12),
