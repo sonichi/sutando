@@ -339,7 +339,8 @@ class BenchTests(unittest.TestCase):
         self.assertIn("Baseline version:", report)
         slow = example_run("slow", False, 20, no_response=1)
         data, _ = bench.compare_runs(baseline, slow)
-        self.assertEqual(data["regressions"], ["pass_rate", "no_response"])
+        self.assertEqual(data["regressions"],
+                         ["pass_rate", "no_response", "cases_regressed"])
         # Completed-but-slow isolates the p95 threshold.
         slow = example_run("slow", True, 20)
         data, _ = bench.compare_runs(baseline, slow)
@@ -348,6 +349,67 @@ class BenchTests(unittest.TestCase):
         other["suite"]["name"] = "different"
         with self.assertRaises(ValueError):
             bench.compare_runs(baseline, other)
+
+    def test_compare_reports_per_case_transitions(self):
+        def run(label, outcomes):
+            rows = [{
+                "case_id": cid, "category": "test", "repetition": 1,
+                "task_id": f"task-{cid}", "status": "completed", "passed": ok,
+                "latency_ms": 10.0, "wait_ms": 10.0, "response": "OK",
+                "result_path": None, "checks": [],
+            } for cid, ok in outcomes.items()]
+            doc = example_run(label)
+            doc["cases"] = rows
+            doc["summary"] = bench.summarize(rows)
+            return doc
+
+        # The case this exists for: identical pass rates, one case broken and
+        # another recovered, which every aggregate metric reports as unchanged.
+        baseline = run("base", {"a": True, "b": False})
+        candidate = run("cand", {"a": False, "b": True})
+        data, report = bench.compare_runs(baseline, candidate)
+        self.assertEqual(data["metrics"]["pass_rate"]["baseline"],
+                         data["metrics"]["pass_rate"]["candidate"])
+        self.assertEqual(data["cases"]["regressed"], ["a"])
+        self.assertEqual(data["cases"]["recovered"], ["b"])
+        self.assertIn("cases_regressed", data["regressions"])
+        self.assertIn("`a`", report)
+
+        # Control: an unchanged run must NOT report a regression, or the check
+        # above passes for every input.
+        data, _ = bench.compare_runs(baseline, run("same", {"a": True, "b": False}))
+        self.assertEqual(data["cases"]["regressed"], [])
+        self.assertNotIn("cases_regressed", data["regressions"])
+        self.assertEqual(data["cases"]["transitions"],
+                         {"pass_to_pass": 1, "pass_to_fail": 0,
+                          "fail_to_pass": 0, "fail_to_fail": 1})
+
+    def test_compare_case_needs_every_repetition(self):
+        def run(label, reps):
+            rows = [{
+                "case_id": "flaky", "category": "test", "repetition": i + 1,
+                "task_id": f"task-{i}", "status": "completed", "passed": ok,
+                "latency_ms": 10.0, "wait_ms": 10.0, "response": "OK",
+                "result_path": None, "checks": [],
+            } for i, ok in enumerate(reps)]
+            doc = example_run(label)
+            doc["cases"] = rows
+            doc["summary"] = bench.summarize(rows)
+            return doc
+
+        data, _ = bench.compare_runs(run("base", [True, True]), run("cand", [True, False]))
+        self.assertEqual(data["cases"]["regressed"], ["flaky"])
+
+    def test_compare_names_cases_present_on_one_side_only(self):
+        baseline = example_run("base")
+        candidate = example_run("cand")
+        candidate["cases"] = [dict(candidate["cases"][0], case_id="two")]
+        candidate["summary"] = bench.summarize(candidate["cases"])
+        data, _ = bench.compare_runs(baseline, candidate)
+        self.assertEqual(data["cases"]["only_in_baseline"], ["one"])
+        self.assertEqual(data["cases"]["only_in_candidate"], ["two"])
+        # No shared cases, so nothing can have regressed.
+        self.assertEqual(data["cases"]["regressed"], [])
 
     def test_main_commands(self):
         with tempfile.TemporaryDirectory() as td:
