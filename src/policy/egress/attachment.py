@@ -114,3 +114,31 @@ def is_path_sendable(fpath: str, extra_roots: tuple[str, ...] = ()) -> bool:
         if real.startswith(prefix):
             return True
     return False
+
+# Outcome names for classify_attachment. A caller must handle every one:
+# the defect this exists to prevent is a branch set that silently drops the
+# case it does not name.
+ATTACH_SEND = "send"
+ATTACH_EMPTY = "empty"
+ATTACH_MISSING = "missing"
+ATTACH_REFUSED = "refused"
+
+
+def classify_attachment(fpath: str, extra_roots: tuple = ()) -> tuple:
+    """(outcome, normalized path) for one `[file:]` marker value.
+
+    REFUSED is the case that motivates this: a path that exists but fails the
+    allowlist is authorization-denied, not absent, and a caller that tests only
+    `sendable` then `not isfile` matches neither branch -- so the file is
+    dropped with no send, no log and no error.
+    """
+    norm = os.path.expanduser((fpath or "").strip())
+    if not norm:
+        return (ATTACH_EMPTY, norm)
+    # Order preserved from the call sites this replaces: authorization first,
+    # so a sendable path never pays a stat.
+    if is_path_sendable(norm, extra_roots):
+        return (ATTACH_SEND, norm)
+    if not os.path.isfile(norm):
+        return (ATTACH_MISSING, norm)
+    return (ATTACH_REFUSED, norm)
