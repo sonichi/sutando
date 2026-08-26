@@ -197,14 +197,23 @@ def test_a_bare_exit_zero_is_NOT_a_standdown():
         wrapper, workspace, exec_log, env = _stage_clean_exit(Path(raw), rc=0)
         proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(1.0)
-        # Still supervising == did not stand down. A lap count would be timing-
-        # dependent: emit_restart_alert shells out, so one lap can fill the window.
-        still_running = proc.poll() is None
-        proc.terminate(); proc.wait(timeout=5)
+        try:
+            # Poll to a deadline instead of sleeping a fixed second: emit_restart_alert
+            # shells out, so a fixed window can end before the first alert is observable.
+            deadline = time.monotonic() + 10.0
+            alerted = False
+            while time.monotonic() < deadline:
+                alerted = bool(_alerts(workspace))
+                if alerted or proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            still_running = proc.poll() is None
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
         check(still_running,
               "a bare exit 0 keeps the wrapper supervising (it did not stand down)")
-        check(bool(_alerts(workspace)),
+        check(alerted,
               "a bare exit 0 still alerts the owner - it is not a declared stand-down")
 
 

@@ -120,8 +120,6 @@ while [ "$STOPPING" = 0 ]; do
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
-  # A clean exit is a deliberate stand-down, not a crash: single_instance.py
-  # exits 0 when a peer holds the lock, so respawning it is the restart loop.
   # 75 == single_instance.EXIT_STANDDOWN: a peer holds the lock. Gate on THAT,
   # never on 0 -- a bridge whose main loop returns also exits 0, and treating
   # that as deliberate would leave it down silently, with the alert suppressed.

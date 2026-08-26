@@ -7,9 +7,11 @@
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
-# sys.executable, not /usr/bin/python3 — that is the Xcode CLT stub on a clean
-# macOS host and running it raises the install dialog (REVIEW.md criterion 7).
-PY="$(python3 -c 'import sys; print(sys.executable)')"
+# resolve_python, not a bare `python3` — REVIEW.md:92-96 notes the scanner
+# cannot see the bare-name form, which is the CLT stub on a clean macOS host.
+# shellcheck source=../scripts/python-binary.sh
+. "$REPO/scripts/python-binary.sh"
+PY="$(require_python "$REPO" "run the wrapper stand-down test")" || exit 1
 
 run_case() {  # $1=exit code the stub bridge returns -> prints restart count
   d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts"
