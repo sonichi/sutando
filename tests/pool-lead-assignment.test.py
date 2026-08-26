@@ -306,10 +306,31 @@ class AffinityBusyYieldTest(unittest.TestCase):
         (self.tasks / "task-w3.claimed-core-2.txt").write_text("x")
         stuck = self.tasks / "task-w4.assigned-core-2.txt"
         stuck.write_text("id: task-w4\nchannel_id: chan-A\n")
+        import os as _os
+        _os.utime(stuck, (self.lead.now() - 1801.0,) * 2)
         self.lead._save_assign_ledger({stuck.name: self.lead.now() - 1801.0})
         out = self.lead.reclaim_stuck_assignments(max_age_s=300)
         self.assertEqual(len(out), 1)
         self.assertFalse(stuck.exists(), "past the cap the assignment repools")
+
+    def test_post_busy_grace_lets_the_core_claim_before_repool(self):
+        # a core that was busy through the whole window gets a fresh short
+        # claim grace when the busy spell ends, instead of an instant repool
+        busy = self.tasks / "task-g1.claimed-core-2.txt"
+        busy.write_text("x")
+        stuck = self.tasks / "task-g2.assigned-core-2.txt"
+        stuck.write_text("id: task-g2\nchannel_id: chan-A\n")
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
+        self.assertEqual(self.lead.reclaim_stuck_assignments(max_age_s=300), [])
+        ledger = self.lead._load_assign_ledger()
+        age = self.lead.now() - ledger[stuck.name]
+        self.assertLess(age, 300.0, "busy sweep must leave a claim grace")
+        busy.unlink()  # busy spell ends
+        self.assertEqual(self.lead.reclaim_stuck_assignments(max_age_s=300), [],
+                         "inside the grace window nothing repools")
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 361.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=300)
+        self.assertEqual(len(out), 1, "grace expired unclaimed: repool")
 
     def test_unclaimed_reclaim_releases_the_room_binding(self):
         # home core heartbeats but never claims: reclaim must drop the row

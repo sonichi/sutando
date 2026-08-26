@@ -29,6 +29,7 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
 BUSY_DEFER_MAX_S = 1800.0    # busy defers repool this long, then wedge rules apply
+BUSY_EXIT_GRACE_S = 60.0     # claim window left after a busy spell ends
 DONE_FLAG_RETENTION_S = 7 * 86400
 # Repool pops the ledger entry; the follower must stay marked non-claiming
 # or the task returns to it.
@@ -352,10 +353,15 @@ class PoolLead:
                 continue
             if self.now() - float(ts) < max_age_s or not self.alive_fn(m.group(2)):
                 continue  # young, or dead (reclaim_dead owns that path)
+            try:
+                assigned_age = self.now() - f.stat().st_mtime
+            except OSError:
+                assigned_age = self.now() - float(ts)
             if (self._claimed_load(m.group(2)) > 0
-                    and self.now() - float(ts) < BUSY_DEFER_MAX_S):
-                # busy defers reclaim but is not proof of progress: the ledger
-                # ts is NOT reset, so a wedged core still yields at the cap
+                    and assigned_age < BUSY_DEFER_MAX_S):
+                # busy pauses the clock and leaves a post-busy claim grace;
+                # the cap anchors to file age, so a wedged core still yields
+                ledger[f.name] = self.now() - max_age_s + BUSY_EXIT_GRACE_S
                 continue
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
