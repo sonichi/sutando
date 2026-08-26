@@ -591,6 +591,27 @@ def iter_result_candidates(results_dir: Path, task_id: str) -> list[Path]:
     return out
 
 
+def resolve_result(results_dir: Path, task_id: str,
+                   reader=None) -> tuple[str, Path | None, str | None]:
+    """Readiness over the ordered candidates: ready / pending / missing.
+
+    The FIRST candidate that exists but is not readable ENDS the search as
+    pending. Falling past it to an older candidate answers `ready` with a
+    superseded body, and callers treat ready as terminal — so the newer answer
+    is stranded. An authoritative pending must outrank any cache.
+    """
+    if reader is None:
+        from delivery.readiness import read_ready_result  # noqa: PLC0415
+        reader = read_ready_result
+    for candidate in iter_result_candidates(results_dir, task_id):
+        body = reader(candidate)
+        if body is not None:
+            return ("ready", candidate, body)
+        if candidate.exists():
+            return ("pending", candidate, None)
+    return ("missing", None, None)
+
+
 def find_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate a task's result: live dir first, then archive. Archival trails
     delivery, so an archive-only lookup reads a fresh result as never delivered."""

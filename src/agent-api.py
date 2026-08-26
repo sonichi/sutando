@@ -370,34 +370,19 @@ def _active_task_rows() -> list[dict]:
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
-        result_file = RESULT_DIR / f"{task_id}.txt"
         existing = task_history.get(task_id, {})
-        # Priority: live file, then in-memory history, then archive. The
-        # archive lookup is what survives a restart, when history is empty.
-        # This scanned `archive/*/` UNSORTED, so with two month dirs it picked
-        # an arbitrary one. The shared enumeration is ordered newest-first.
-        archived_file = next(
-            (c for c in local_task_protocol.iter_result_candidates(RESULT_DIR, task_id)
-             if c != result_file and c.is_file()), None)
-        # Status and body must answer the SAME question; `done` from existence
-        # plus a body from readiness reports done-with-an-empty-result.
-        live_body = read_ready_result(result_file)
-        archived_body = (read_ready_result(archived_file)
-                         if archived_file is not None else None)
-        if live_body is not None:
+        # One owner for candidates AND readiness. An authoritative `pending`
+        # outranks the cache: cache and older candidates are both superseded.
+        state, _found, body = local_task_protocol.resolve_result(RESULT_DIR, task_id)
+        if state == "ready":
             status = "done"
-            result_text = live_body
-        elif result_file.exists():
-            # Mid-write: the cached row and the archive both hold the
-            # SUPERSEDED answer, so neither may be reported as `done`.
+            result_text = body
+        elif state == "pending":
             status = "working"
             result_text = ""
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
-        elif archived_body is not None:
-            status = "done"
-            result_text = archived_body
         else:
             status = "working"
             result_text = ""
@@ -640,23 +625,12 @@ def get_task_result(task_id: str):
     stranded. `pending` is merely retryable.
     """
     safe_id = _safe_id(task_id)
-    candidates = []
-    result_file = _safe_path(RESULT_DIR, task_id)
-    if result_file:
-        candidates.append(result_file)
     if safe_id:
-        # task-bridge archives within seconds of delivery, so a direct /result
-        # poll often arrives after the file has moved. One owner for the
-        # layouts: this used to know only month dirs.
-        candidates += [c for c in
-                       local_task_protocol.iter_result_candidates(RESULT_DIR, safe_id)
-                       if c != result_file]
-    for candidate in candidates:
         # Readiness, not existence: a body read mid-write decodes fatally.
-        body = read_ready_result(candidate)
-        if body is not None:
+        state, _found, body = local_task_protocol.resolve_result(RESULT_DIR, safe_id)
+        if state == "ready":
             return {"task_id": safe_id, "status": "completed", "result": body}
-        if candidate.exists():
+        if state == "pending":
             return {"task_id": safe_id, "status": "pending"}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():

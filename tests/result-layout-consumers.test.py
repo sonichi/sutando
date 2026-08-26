@@ -78,6 +78,29 @@ with tempfile.TemporaryDirectory() as td:
     check("_exact_result sees flat gateway form",
           tw._exact_result(ws, "task-flat"), "flat body")
 
+# An authoritative `pending` must outrank the in-memory cache: a torn archive
+# candidate means the newest answer is mid-write, so the cache is superseded.
+original = (api.TASK_DIR, api.RESULT_DIR, api.WORKSPACE_DIR)
+try:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        api.TASK_DIR, api.RESULT_DIR, api.WORKSPACE_DIR = root / "tasks", root / "results", root
+        api.TASK_DIR.mkdir()
+        (api.RESULT_DIR / "archive" / "2026-08").mkdir(parents=True)
+        api.task_history.clear()
+        task = api.TASK_DIR / "task-torn.txt"
+        task.write_text("source: discord\ntask: torn probe\n")
+        os.utime(task, (2000, 2000))
+        api.task_history["task-torn"] = {"status": "done", "result": "OLD ANSWER - superseded",
+                                         "text": "torn probe", "time": 1000, "source": "discord"}
+        # Truncated multi-byte sequence: present, decodes fatally, not ready.
+        (api.RESULT_DIR / "archive" / "2026-08" / "task-torn.txt").write_bytes(b"NEW ANSWER \xe2\x9c")
+        row = next((r for r in api._active_task_rows() if "torn probe" in str(r.get("text", ""))), None)
+        check("torn archive -> working, not the cached OLD ANSWER",
+              ((row or {}).get("status"), (row or {}).get("result")), ("working", ""))
+finally:
+    api.TASK_DIR, api.RESULT_DIR, api.WORKSPACE_DIR = original
+
 print()
 print(f"{len(fails)} failure(s)" if fails else "all checks passed")
 sys.exit(1 if fails else 0)
