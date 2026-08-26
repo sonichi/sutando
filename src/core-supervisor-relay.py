@@ -274,6 +274,8 @@ def _is_deliverable(source):
     # would recreate the selected-then-send-fails class via a different
     # mismatch. If notify.py ever learns more filenames (#2686's try-both),
     # widen BOTH sides together.
+    # The one sanctioned escape is the desktop app's own copy of the file,
+    # $SUTANDO_APP_SUPPORT/channels/<source>/.env (notify.py _channel_env_is_contained).
     base = (os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
             or os.path.join(os.path.expanduser("~"), ".claude"))
     channels_dir = os.path.join(base, "channels")
@@ -281,8 +283,13 @@ def _is_deliverable(source):
     if not os.path.isfile(env_path):
         return False
     real_env = os.path.realpath(env_path)
-    real_root = os.path.realpath(channels_dir)
-    return real_env.startswith(real_root + os.sep)
+    if real_env.startswith(os.path.realpath(channels_dir) + os.sep):
+        return True
+    app_support = (os.environ.get("SUTANDO_APP_SUPPORT") or "").strip()
+    if not app_support:
+        return False
+    relocated = os.path.join(app_support, "channels", source, ".env")
+    return real_env == os.path.realpath(relocated)
 
 
 def resolve_active_target(activity_path):

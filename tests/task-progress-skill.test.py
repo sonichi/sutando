@@ -486,28 +486,27 @@ class TestSendRemoteGateway(unittest.TestCase):
     def _symlinked_channels_root(
         self,
         source: str = "ag2space",
+        target_subdir: str = "channels",
         target_dirname: str | None = None,
         target_filename: str = ".env",
-    ) -> str:
-        """A channels/<source>/.env that is a SYMLINK to a real file living in a
-        SEPARATE temp directory — mirrors the real-world AG2 Space desktop-app
-        layout, where `$CLAUDE_CONFIG_DIR/channels/ag2space/.env` symlinks OUT to
-        `<app-root>/channels/ag2space/.env` (see #3150/#3201). That is distinct
-        from `_hermetic_channels_root` above, which is deliberately a real file
-        (never a symlink) so tests that aren't about *this* guard stay pinned.
+    ) -> tuple[str, str]:
+        """A channels/<source>/.env that is a SYMLINK to a real file living under
+        a SEPARATE app-support temp dir — mirrors the AG2 Space desktop-app
+        layout (launch-sutando.sh), where `$CLAUDE_CONFIG_DIR/channels/ag2space/.env`
+        symlinks OUT to `$SUTANDO_APP_SUPPORT/channels/ag2space/.env` (#3150/#3201).
+        Distinct from `_hermetic_channels_root` below, which is deliberately a
+        real file (never a symlink) so tests that aren't about this guard stay pinned.
 
-        By default the symlink target keeps the same `<source>/.env` shape as
-        the real install (same immediate parent dirname, same filename) — that
-        is the one shape the containment guard is meant to accept. Pass
-        `target_dirname`/`target_filename` to break the shape, for the
-        regression test proving the guard still refuses everything else.
+        Returns (config_dir, app_support). By default the target is EXACTLY the
+        one path the guard accepts under the app root; the keyword args move it
+        off that path for the regression tests proving everything else is refused.
         """
         root = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        external = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, external, ignore_errors=True)
+        app_support = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, app_support, ignore_errors=True)
 
-        target_dir = external / (source if target_dirname is None else target_dirname)
+        target_dir = app_support / target_subdir / (source if target_dirname is None else target_dirname)
         target_dir.mkdir(parents=True)
         target = target_dir / target_filename
         target.write_text(
@@ -519,17 +518,36 @@ class TestSendRemoteGateway(unittest.TestCase):
         channel_dir.mkdir(parents=True)
         (channel_dir / ".env").symlink_to(target)
 
-        return str(root)
+        return str(root), str(app_support)
 
-    def test_symlinked_env_matching_shape_is_delivered(self):
+    def _clean_env(self, config_dir: str, app_support: str | None) -> dict:
+        """os.environ with every gateway/base var the sender consults removed, so
+        the file-read path (and only it) is under test. SUTANDO_APP_SUPPORT is
+        set only when the test passes one — a dev running this suite inside the
+        desktop app's core session has the real one exported."""
+        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
+                 "AG2_REMOTE_URL", "CLAUDE_HOME", "SUTANDO_APP_SUPPORT")
+        env = {k: v for k, v in os.environ.items() if k not in _drop}
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+        if app_support is not None:
+            env["SUTANDO_APP_SUPPORT"] = app_support
+        return env
+
+    def _refused(self, env: dict) -> bool:
+        err = io.StringIO()
+        with patch.dict(os.environ, env, clear=True), \
+             contextlib.redirect_stderr(err):
+            result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
+        self.assertFalse(result)
+        return "refusing env path outside channels dir" in err.getvalue()
+
+    def test_symlinked_env_under_app_support_is_delivered(self):
         """Regression for #3150/#3201: the AG2 Space desktop app installs
-        channels/<source>/.env as a symlink OUT of the channels dir, to a real
-        file whose own immediate parent directory is still named <source> — e.g.
-        realpath(.../workspace/.claude-sutando/channels/ag2space/.env) ==
-        .../space.ag2.app/channels/ag2space/.env. That is the app relocating its
-        own per-channel credential file while preserving the <source>/.env
-        relative shape, not an attacker-planted link to an arbitrary target, so
-        the guard must accept it and deliver — not refuse "outside channels dir"."""
+        channels/<source>/.env as a symlink OUT of the channels dir to
+        $SUTANDO_APP_SUPPORT/channels/<source>/.env, its own durable copy of the
+        same credential file. With SUTANDO_APP_SUPPORT exported (the app exports
+        it for every process it spawns) that target is inside the second
+        approved root, so the guard must accept it and deliver."""
         mock_resp = MagicMock()
         mock_resp.__enter__ = lambda s: s
         mock_resp.__exit__ = MagicMock(return_value=False)
@@ -541,50 +559,45 @@ class TestSendRemoteGateway(unittest.TestCase):
             captured["auth"] = req.get_header("Authorization")
             return mock_resp
 
-        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
-        clean_env["CLAUDE_CONFIG_DIR"] = self._symlinked_channels_root()
-        clean_env.pop("CLAUDE_HOME", None)
-        with patch.dict(os.environ, clean_env, clear=True), \
+        cfg, app = self._symlinked_channels_root()
+        with patch.dict(os.environ, self._clean_env(cfg, app), clear=True), \
              patch("urllib.request.urlopen", fake_urlopen):
             result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
         self.assertTrue(result)
         self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
         self.assertEqual(captured["auth"], "Bearer symlinked-token")
 
-    def test_symlinked_env_shape_mismatch_still_refused(self):
-        """The exception is a narrow SHAPE match (same filename, same immediate
-        parent dirname as the source) — not "any symlink is fine". A symlink
-        whose target does NOT have that shape (e.g. its parent directory isn't
-        named after the source — the shape an attacker-planted link to some
-        unrelated sensitive file would have) must still be refused. This is the
-        test that would catch an overly-broad "fix" that disabled the guard."""
-        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
-        clean_env["CLAUDE_CONFIG_DIR"] = self._symlinked_channels_root(
-            target_dirname="not-the-source")
-        clean_env.pop("CLAUDE_HOME", None)
-        err = io.StringIO()
-        with patch.dict(os.environ, clean_env, clear=True), \
-             contextlib.redirect_stderr(err):
-            result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
-        self.assertFalse(result)
-        self.assertIn("refusing env path outside channels dir", err.getvalue())
+    def test_symlinked_env_refused_when_app_support_unset(self):
+        """Fail-closed: the SAME layout without SUTANDO_APP_SUPPORT is just a
+        symlink to some <dir>/channels/ag2space/.env with the right leaf shape —
+        exactly the case a leaf-only check would wave through (review on #3416).
+        No approved second root means no exception."""
+        cfg, _app = self._symlinked_channels_root()
+        self.assertTrue(self._refused(self._clean_env(cfg, None)))
 
-    def test_symlinked_env_wrong_filename_still_refused(self):
-        """Same narrow-shape argument, other axis: the target file itself isn't
-        named `.env` (parent dirname matches, filename doesn't) — still refused."""
-        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
-        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
-        clean_env["CLAUDE_CONFIG_DIR"] = self._symlinked_channels_root(
-            target_filename="secrets.txt")
-        clean_env.pop("CLAUDE_HOME", None)
-        err = io.StringIO()
-        with patch.dict(os.environ, clean_env, clear=True), \
-             contextlib.redirect_stderr(err):
-            result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
-        self.assertFalse(result)
-        self.assertIn("refusing env path outside channels dir", err.getvalue())
+    def test_symlinked_env_under_a_different_root_is_refused(self):
+        """Shape is not identity: SUTANDO_APP_SUPPORT names one root, and a
+        target with the right `<source>/.env` shape under some OTHER root is
+        still outside it. This is the test that would catch a regression back
+        to matching the last two path components."""
+        cfg, _app = self._symlinked_channels_root()
+        other_root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, other_root, ignore_errors=True)
+        self.assertTrue(self._refused(self._clean_env(cfg, other_root)))
+
+    def test_symlinked_env_off_the_exact_path_under_app_support_is_refused(self):
+        """Even under the approved root, only the app's copy of THIS channel's
+        env is accepted: another channel's file, a same-shaped file outside
+        channels/, or a differently named file are all refused."""
+        cases = {
+            "other channel": dict(target_dirname="discord"),
+            "outside channels/": dict(target_subdir="workspace"),
+            "wrong filename": dict(target_filename="secrets.txt"),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                cfg, app = self._symlinked_channels_root(**kwargs)
+                self.assertTrue(self._refused(self._clean_env(cfg, app)))
 
     def _hermetic_channels_root(self, source: str = "ag2space") -> str:
         """A real channels/<source>/.env inside a temp dir, for CLAUDE_CONFIG_DIR.

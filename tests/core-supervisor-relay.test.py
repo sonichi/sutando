@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import tempfile
 import contextlib
 import unittest
@@ -461,6 +462,59 @@ class TestResolveActiveTarget(unittest.TestCase):
                     del os.environ["CLAUDE_CONFIG_DIR"]
                 else:
                     os.environ["CLAUDE_CONFIG_DIR"] = old
+
+    def _with_env(self, **values):
+        """Set/unset env vars for one test; None means unset."""
+        saved = {k: os.environ.get(k) for k in values}
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
+
+    def _relocated_layout(self, source="ag2space"):
+        """$CLAUDE_CONFIG_DIR/channels/<source>/.env -> $APP/channels/<source>/.env,
+        the AG2 Space desktop-app layout (#3150/#3201). Returns (cfg, app)."""
+        cfg = tempfile.mkdtemp()
+        app = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, app, ignore_errors=True)
+        real_dir = os.path.join(app, "channels", source)
+        os.makedirs(real_dir)
+        with open(os.path.join(real_dir, ".env"), "w") as f:
+            f.write("REMOTE_TASK_TOKEN=x\n")
+        link_dir = os.path.join(cfg, "channels", source)
+        os.makedirs(link_dir)
+        os.symlink(os.path.join(real_dir, ".env"), os.path.join(link_dir, ".env"))
+        return cfg, app
+
+    def test_app_support_relocated_env_is_deliverable(self):
+        # notify.py accepts $SUTANDO_APP_SUPPORT/channels/<source>/.env as a
+        # second root (#3150/#3201); the probe must agree or the lane never routes.
+        with tempfile.TemporaryDirectory() as td:
+            cfg, app = self._relocated_layout("dev-ag2space")
+            self._with_env(CLAUDE_CONFIG_DIR=cfg, SUTANDO_APP_SUPPORT=app)
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:d"))
+
+    def test_same_shape_outside_app_support_is_not_deliverable(self):
+        # Containment, not a leaf-shape match: same layout with the var unset or
+        # pointed at another root is a symlink the sender refuses — so must the probe.
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as other:
+            cfg, _app = self._relocated_layout("dev-ag2space")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            self._with_env(CLAUDE_CONFIG_DIR=cfg, SUTANDO_APP_SUPPORT=None)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+            self._with_env(SUTANDO_APP_SUPPORT=other)
+            self.assertEqual(resolve_active_target(p), ("", ""))
 
     def test_claude_home_tier_is_honored(self):
         # notify.py resolves CLAUDE_CONFIG_DIR -> CLAUDE_HOME -> ~/.claude; the

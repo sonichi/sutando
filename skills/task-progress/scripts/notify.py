@@ -12,7 +12,9 @@ Any --source other than slack/discord/telegram is treated as a remote-gateway
 channel: the sender reads channels/<source>/.env (under $CLAUDE_CONFIG_DIR) for
 REMOTE_TASK_URL + REMOTE_TASK_TOKEN and posts the message through the gateway's
 POST /v1/room {op: "message"} endpoint — the same transport the task bridge for
-that provider uses, so progress updates land in the originating room.
+that provider uses, so progress updates land in the originating room. That file
+must resolve inside channels/ itself, or be the AG2 Space desktop app's own
+$SUTANDO_APP_SUPPORT/channels/<source>/.env (see _channel_env_is_contained).
 
 Exits 0 on success, 1 on failure. Fail-open by design — a failed send must never
 block the task itself. The caller should always continue working regardless of exit code.
@@ -239,6 +241,36 @@ def send_telegram(chat_id: str, message: str) -> bool:
 _SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
 
 
+def _channel_env_is_contained(env_path: Path, channels_dir: Path, source: str) -> bool:
+    """Containment for channels/<source>/.env, which may be a symlink.
+
+    A resolution is accepted in exactly two cases, and fails closed otherwise:
+
+      1. it lands inside realpath(channels_dir) — the channels tree itself. A
+         symlinked channels/ dir is fine; an entry that links OUT of it is not.
+      2. it IS realpath($SUTANDO_APP_SUPPORT/channels/<source>/.env). The AG2
+         Space desktop app keeps the durable channel env under its own
+         app-support root and lays $CLAUDE_CONFIG_DIR/channels/ag2space/.env as
+         a symlink to it (launch-sutando.sh; #3150/#3201). SUTANDO_APP_SUPPORT
+         is exported by the app for every process it spawns, so this is a
+         second, explicitly configured root — a containment test, not a shape
+         match. A planted link to /tmp/<source>/.env or ~/x/<source>/.env still
+         fails closed, as does a link to another channel's file under the app
+         root, and everything fails closed when the variable is unset.
+
+    core-supervisor-relay._is_deliverable mirrors this rule exactly (sender/probe
+    alignment, #2701) — widen BOTH together or never.
+    """
+    real_env = os.path.realpath(env_path)
+    if real_env.startswith(os.path.realpath(channels_dir) + os.sep):
+        return True
+    app_support = (os.environ.get("SUTANDO_APP_SUPPORT") or "").strip()
+    if not app_support:
+        return False
+    relocated = os.path.join(app_support, "channels", source, ".env")
+    return real_env == os.path.realpath(relocated)
+
+
 def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
@@ -252,11 +284,8 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     _claude_config = Path(_base) if _base else Path.home() / ".claude"
     channels_dir = _claude_config / "channels"
     env_path = channels_dir / source / ".env"
-    # Belt and suspenders: even a slug-valid name must RESOLVE inside the
-    # channels directory. The containment root is the realpath of channels/
-    # itself (so a symlinked channels dir works), but a channel entry that
-    # symlinks OUT of the directory is refused by design, unless the link's
-    # target still has shape <source>/.env (a relocation, not an escape).
+    # Belt and suspenders: even a slug-valid name must RESOLVE inside an
+    # approved root (_channel_env_is_contained) — anything else is refused.
     # Derive the EFFECTIVE gateway config from os.environ ALONE first — including
     # the alias and the combined "url|secret" one-token form. Only if that is still
     # missing a value do we resolve/guard/read the channel file. Checking just the
@@ -282,19 +311,13 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
 
     url, token = _derive(lambda k: os.environ.get(k, ""))
     if not (url and token):
-        # The file IS needed. Refuse unless the resolved target's filename and
-        # parent dirname match ".env" and `source` exactly (a relocation, not an escape).
-        real_env = os.path.realpath(env_path)
-        real_root = os.path.realpath(channels_dir)
-        same_shape = (
-            os.path.basename(real_env) == ".env"
-            and os.path.basename(os.path.dirname(real_env)) == source
-        )
-        if not real_env.startswith(real_root + os.sep) and not same_shape:
+        # The file IS needed, so the containment check applies — two approved
+        # roots, fail-closed outside both (see _channel_env_is_contained).
+        if not _channel_env_is_contained(env_path, channels_dir, source):
             print(f"[task-progress] refusing env path outside channels dir: {env_path}",
                   file=sys.stderr)
             return False
-        env = _env_file(real_env)
+        env = _env_file(os.path.realpath(env_path))
         url, token = _derive(lambda k: os.environ.get(k, "") or env.get(k, ""))
     if not url or not token:
         print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
