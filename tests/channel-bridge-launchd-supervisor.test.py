@@ -8,6 +8,7 @@ import plistlib
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -133,6 +134,27 @@ def _stage_clean_exit(root, rc=75):
     return repo / "src" / "launchd" / WRAPPER.name, workspace, exec_log, env
 
 
+SETTLE = 3.0  # seconds a respawn or alert gets to appear before absence is claimed
+
+
+def _wait_for(pred, timeout, interval=0.05):
+    """Poll to a deadline, returning as soon as pred() is true.
+
+    Absence is only meaningful after a window: emit_restart_alert shells out, so
+    a check taken immediately can precede the alert it claims is not there.
+    """
+    deadline = time.monotonic() + timeout
+    val = pred()
+    while not val and time.monotonic() < deadline:
+        time.sleep(interval)
+        val = pred()
+    return val
+
+
+def _launches(exec_log):
+    return len(exec_log.read_text().splitlines()) if exec_log.exists() else 0
+
+
 def _alerts(workspace):
     return sorted(p.name for p in
                   (workspace / "results").glob("proactive-slack-bridge-restarted-*.txt"))
@@ -151,14 +173,19 @@ def test_clean_exit_is_a_standdown():
         wrapper, workspace, exec_log, env = _stage_clean_exit(Path(raw))
         proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        # 0.05s delay, so ~1s is ~20 laps' worth of opportunity for a respawner.
-        time.sleep(1.0)
-        proc.terminate()
-        proc.wait(timeout=5)
-        launches = len(exec_log.read_text().splitlines()) if exec_log.exists() else 0
-        check(launches == 1,
-              f"a clean exit is launched ONCE and not respawned (launches={launches})")
-        check(not _alerts(workspace),
+        try:
+            # A fixed window is wrong BOTH ways here: too early and the first
+            # launch has not happened, too late and a respawn is missed.
+            started = _wait_for(lambda: _launches(exec_log) >= 1, 10.0)
+            respawned = _wait_for(lambda: _launches(exec_log) >= 2, SETTLE)
+            alerted = _wait_for(lambda: bool(_alerts(workspace)), SETTLE)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+        check(started, "the child is launched at all (else the rest is vacuous)")
+        check(not respawned,
+              f"a clean exit is NOT respawned (launches={_launches(exec_log)})")
+        check(not alerted,
               f"a clean exit writes NO owner alert (found {_alerts(workspace)})")
 
 
@@ -177,10 +204,33 @@ def test_a_launchd_relaunch_after_a_standdown_does_not_alert():
                                capture_output=True, text=True, timeout=30)
             check(r.returncode == 0,
                   f"lap {lap}: a stand-down exits 0, letting launchd decide (rc={r.returncode})")
-        launches = len(exec_log.read_text().splitlines()) if exec_log.exists() else 0
+        launches = _launches(exec_log)
         check(launches == 3, f"each relaunch starts the child exactly once ({launches})")
-        check(not _alerts(workspace),
+        # The laps have exited, but emit_restart_alert shells out — an alert can
+        # still land after the last one returns, so absence needs a window.
+        check(not _wait_for(lambda: bool(_alerts(workspace)), SETTLE),
               f"a relaunch after a stand-down writes NO owner alert (found {_alerts(workspace)})")
+
+
+def test_the_alert_detector_actually_fires():
+    """Positive control for every `no alert` assertion in this suite.
+
+    Three arms claim an alert is ABSENT. That claim is vacuous unless the same
+    helper, on the same staging, can be shown to observe one - a detector that
+    never fires reports silence identically to a system that is behaving.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        # rc=1 is a crash, which is exactly what SHOULD alert.
+        wrapper, workspace, _exec_log, env = _stage_clean_exit(Path(raw), rc=1)
+        proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            seen = _wait_for(lambda: bool(_alerts(workspace)), SETTLE)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+        check(seen,
+              f"a CRASH is alerted within the same {SETTLE}s window the negatives use")
 
 
 def test_a_bare_exit_zero_is_NOT_a_standdown():
@@ -198,15 +248,8 @@ def test_a_bare_exit_zero_is_NOT_a_standdown():
         proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            # Poll to a deadline instead of sleeping a fixed second: emit_restart_alert
-            # shells out, so a fixed window can end before the first alert is observable.
-            deadline = time.monotonic() + 10.0
-            alerted = False
-            while time.monotonic() < deadline:
-                alerted = bool(_alerts(workspace))
-                if alerted or proc.poll() is not None:
-                    break
-                time.sleep(0.05)
+            _wait_for(lambda: bool(_alerts(workspace)) or proc.poll() is not None, 10.0)
+            alerted = bool(_alerts(workspace))
             still_running = proc.poll() is None
         finally:
             proc.terminate()
@@ -222,5 +265,6 @@ if __name__ == "__main__":
     test_wrapper_restart_signal()
     test_clean_exit_is_a_standdown()
     test_a_launchd_relaunch_after_a_standdown_does_not_alert()
+    test_the_alert_detector_actually_fires()
     test_a_bare_exit_zero_is_NOT_a_standdown()
     print("all passed")
