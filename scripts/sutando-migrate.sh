@@ -356,6 +356,25 @@ classify() {
 
 # Integer-second mtime orders two same-second writes by SCAN ORDER, which for a
 # newest-wins snapshot silently resurrects the older content. Emit nanoseconds.
+# One reader for every numeric stat field. GNU `-f` is --file-system: for a
+# valid operand it still prints a report to STDOUT and exits nonzero, so a bare
+# `bsd || gnu` substitution concatenates the report with the fallback's answer.
+_stat_field() {
+    local kind="$1" f="$2" bsd gnu v
+    case "$kind" in
+        mtime) bsd=%m; gnu=%Y ;;
+        size)  bsd=%z; gnu=%s ;;
+        *)     printf '0'; return 1 ;;
+    esac
+    v="$(LC_ALL=C stat -f "$bsd" "$f" 2>/dev/null)" || v=""
+    case "$v" in ''|*[!0-9]*) v="" ;; esac
+    if [ -z "$v" ]; then
+        v="$(LC_ALL=C stat -c "$gnu" "$f" 2>/dev/null)" || v=""
+        case "$v" in ''|*[!0-9]*) v="" ;; esac
+    fi
+    printf '%s' "${v:-0}"
+}
+
 mtime_ns() {
     local f="$1" v sec frac
     # GNU `stat -f` is --file-system (succeeds, non-numeric) and GNU prints
@@ -367,7 +386,7 @@ mtime_ns() {
     done
     case "$v" in
         *.*) sec="${v%%.*}"; frac="${v#*.}" ;;
-        "")  sec="$(LC_ALL=C stat -f %m "$f" 2>/dev/null || LC_ALL=C stat -c %Y "$f" 2>/dev/null || echo 0)"; frac="" ;;
+        "")  sec="$(_stat_field mtime "$f")"; frac="" ;;
         *)   sec="$v"; frac="" ;;
     esac
     frac="${frac}000000000"
@@ -379,7 +398,7 @@ age_safe() {
     local file="$1"
     local now mtime age
     now="$(date +%s)"
-    mtime="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
+    mtime="$(_stat_field mtime "$file")"
     age=$((now - mtime))
     [ "$age" -ge "$INFLIGHT_GUARD_SEC" ]
 }
@@ -404,8 +423,8 @@ record_xsrc() {
     # $1=tag, $2=relpath, $3=class, $4=abs-path
     local tag="$1" rel="$2" cls="$3" file="$4"
     local mt sz
-    mt="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
-    sz="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
+    mt="$(_stat_field mtime "$file")"
+    sz="$(_stat_field size "$file")"
     printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$tag" "$cls" "$mt" "$sz" >> "$XSRC_INDEX"
 }
 
@@ -433,7 +452,11 @@ scan_source() {
         REPORT_LINES+=("  prior partial migration sentinels:")
         while IFS= read -r s; do
             local sm
-            sm="$(stat -f '%Sm' -t '%Y-%m-%d' "$s" 2>/dev/null || stat -c '%y' "$s" 2>/dev/null | cut -d' ' -f1)"
+            # Separate calls: GNU -f prints a report to stdout AND exits nonzero,
+            # so one `||` substitution would concatenate report with date.
+            sm="$(LC_ALL=C stat -f '%Sm' -t '%Y-%m-%d' "$s" 2>/dev/null)"
+            case "$sm" in ''|*[!0-9-]*) sm="" ;; esac
+            [ -n "$sm" ] || sm="$(LC_ALL=C stat -c '%y' "$s" 2>/dev/null | cut -d' ' -f1)"
             REPORT_LINES+=("    $(basename "$s")  ($sm)")
         done <<<"$sentinels"
     fi
@@ -516,7 +539,7 @@ scan_source() {
         esac
 
         cls="$(classify "$rel")"
-        size="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
+        size="$(_stat_field size "$file")"
         bytes_total=$((bytes_total + size))
 
         # Index for cross-source collision detection (only classes that
@@ -1210,10 +1233,10 @@ commit_one() {
                 # Same content (mtime+size) → identical-drop. Different →
                 # keep-both: rename source-incoming to <file>.legacy-<tag>.
                 local src_mt src_sz dst_mt dst_sz
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
-                dst_sz="$(stat -f %z "$dst_path" 2>/dev/null || stat -c %s "$dst_path")"
+                src_mt="$(_stat_field mtime "$src_file")"
+                src_sz="$(_stat_field size "$src_file")"
+                dst_mt="$(_stat_field mtime "$dst_path")"
+                dst_sz="$(_stat_field size "$dst_path")"
                 if [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
                     echo "identical-drop"
                     return 0
@@ -1302,8 +1325,8 @@ commit_one() {
             # Per-mtime swap, identical-drop, or write-fresh.
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
+                src_mt="$(_stat_field mtime "$src_file")"
+                dst_mt="$(_stat_field mtime "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     copy_preserving_mtime "$src_file" "$dst_path"
                     echo "rehomed-newer"
@@ -1333,8 +1356,8 @@ commit_one() {
             dst_path="$DEST_REAL/logs/workspace-narrative.log"
             mkdir -p "$(dirname "$dst_path")"
             local src_mt src_sz
-            src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-            src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
+            src_mt="$(_stat_field mtime "$src_file")"
+            src_sz="$(_stat_field size "$src_file")"
             # Mini #design 2026-06-02 08:10Z: an `{ ... } > tmp && mv ...`
             # compound on a single line is NOT covered by `set -e` for its
             # left-side failure — the compound returns non-zero but execution
@@ -1610,7 +1633,7 @@ commit_source() {
         # is 0 (delete-source phase-2 path; pre-flight didn't run).
         if [ "$PROGRESS_TOTAL" -gt 0 ]; then
             PROGRESS_N=$((PROGRESS_N + 1))
-            _fsize="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
+            _fsize="$(_stat_field size "$file")"
             printf "  [%d/%d] %s (%s) → %s\n" \
                 "$PROGRESS_N" "$PROGRESS_TOTAL" "${rel:0:60}" \
                 "$(humanize_bytes "$_fsize")" "$outcome" >&2
@@ -2163,7 +2186,7 @@ rollback_main() {
     else
         : > "$tar_listing"  # empty backup: nothing to preserve, everything is "added since"
     fi
-    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(stat -f %z "$backup_path")" >&2
+    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(_stat_field size "$backup_path")" >&2
     local sd
     [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback walk: DEST_REAL=$DEST_REAL" >&2
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}" "${WORKSPACE_SURFACE_FILES[@]}"; do
