@@ -5918,6 +5918,64 @@ def check_daily_cron_punctuality() -> dict:
     return _interpret_daily_punctuality(jobs)
 
 
+def check_live_tree_drift(repo_root: "Path | None" = None,
+                          behind_max: int = 30,
+                          dirty_age_max_s: int = 86400) -> dict:
+    """Warn when the LIVE checkout drifts: >=behind_max commits behind its own
+    upstream branch, or tracked dirty files older than dirty_age_max_s.
+    Measured 2026-08-26: the live tree sat 116 behind with ~190 dirty files
+    (some running in production while existing in no commit); nothing alarmed.
+    Diagnostic only — reconciliation needs an attended restart window."""
+    import subprocess as _sp
+    name = "live-tree-drift"
+    root = Path(repo_root) if repo_root else Path(__file__).resolve().parent.parent
+    def _git(*args):
+        r = _sp.run(["git", "-C", str(root), *args],
+                    capture_output=True, text=True, timeout=20)
+        # rstrip only: porcelain lines carry a SIGNIFICANT leading space
+        # (" M file"); .strip() would eat it and shift every field parse.
+        return r.returncode, r.stdout.rstrip("\n")
+    try:
+        rc, branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+        if rc != 0:
+            return {"name": name, "status": "ok", "detail": "not a git checkout"}
+        behind = 0
+        rc, up = _git("rev-parse", "--abbrev-ref", "@{upstream}")
+        if rc == 0 and up:
+            rc2, n = _git("rev-list", "--count", f"HEAD..{up}")
+            if rc2 == 0 and n.isdigit():
+                behind = int(n)
+        rc, porcelain = _git("status", "--porcelain")
+        dirty = [l[3:] for l in porcelain.splitlines()
+                 if l[:2].strip() and not l.startswith("??")]
+        now = time.time()
+        stale = []
+        for rel in dirty:
+            p = root / rel
+            try:
+                if now - p.stat().st_mtime > dirty_age_max_s:
+                    stale.append(rel)
+            except OSError:
+                continue  # deleted-in-tree entries have no mtime; count as dirty only
+        problems = []
+        if behind >= behind_max:
+            problems.append(f"{behind} commits behind {up}")
+        if stale:
+            problems.append(f"{len(stale)} tracked dirty file(s) older than "
+                            f"{dirty_age_max_s // 3600}h (e.g. {stale[0]})")
+        if problems:
+            return {"name": name, "status": "warn",
+                    "detail": ("live tree drifting: " + "; ".join(problems) +
+                               " — running daemons restart onto whatever is on disk; "
+                               "commit/rescue the dirty state, then reconcile in an "
+                               "attended restart window")}
+        return {"name": name, "status": "ok",
+                "detail": f"{behind} behind upstream, {len(dirty)} tracked dirty"}
+    except Exception as exc:  # a broken guard must not fail the whole health run
+        return {"name": name, "status": "warn",
+                "detail": f"drift probe could not measure: {str(exc)[:80]}"}
+
+
 def check_disk_space() -> dict:
     """Free space on the volume(s) the core actually writes to.
 
@@ -9445,6 +9503,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
     checks.append(check_runtime_identity())
+    checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
 
     return checks
