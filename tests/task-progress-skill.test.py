@@ -21,6 +21,8 @@ REPO = Path(__file__).parent.parent
 SCRIPT = REPO / "skills" / "task-progress" / "scripts" / "notify.py"
 sys.path.insert(0, str(REPO / "src"))
 
+import channel_env_containment  # noqa: E402 — the shared module notify.py delegates to
+
 
 def _load() -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("notify", SCRIPT)
@@ -656,6 +658,21 @@ class TestSendRemoteGateway(unittest.TestCase):
                          {"op": "message", "room_id": "!room:ag2.space", "body": "hi"})
         self.assertEqual(captured["auth"], "Bearer sekret")
 
+    def test_containment_delegates_to_shared_module_not_a_copy(self):
+        """Delegation, not re-implementation: stub the shared
+        src/channel_env_containment.py function to always refuse, and even
+        the legitimate app-support relocation (normally accepted) must now
+        be refused. If notify.py carried its own copy of the rule, this
+        module-level stub would have no effect and the send would still
+        succeed."""
+        cfg, app = self._symlinked_channels_root()
+        with patch.object(channel_env_containment, "channel_env_is_contained",
+                          return_value=False):
+            mod = _load()  # reload so the patched shared function is bound in
+            with patch.dict(os.environ, self._clean_env(cfg, app), clear=True):
+                result = mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
+        self.assertFalse(result)
+
     def test_remote_task_token_combined_form_delivers(self):
         """Regression for #2101 review round 2 (P1): the compact combined form in
         REMOTE_TASK_TOKEN itself (REMOTE_TASK_TOKEN=url|secret, no separate
@@ -878,6 +895,19 @@ class TestChannelEnvContainment(unittest.TestCase):
         os.environ.pop("REMOTE_TASK_URL", None)
         os.environ.pop("REMOTE_TASK_TOKEN", None)
         self.assertTrue(self._refused())
+
+
+class TestChannelEnvContainmentDelegation(unittest.TestCase):
+    """notify.py must call the shared src/channel_env_containment.py function,
+    not carry its own copy — the exact duplication CLAUDE.md's architecture
+    rules call out (see also TestSendRemoteGateway
+    .test_containment_delegates_to_shared_module_not_a_copy for the
+    behavioral half of this proof)."""
+
+    def test_binds_the_shared_function_by_identity(self):
+        mod = _load()
+        self.assertIs(mod._channel_env_is_contained,
+                      channel_env_containment.channel_env_is_contained)
 
 
 if __name__ == "__main__":

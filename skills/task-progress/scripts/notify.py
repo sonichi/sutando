@@ -14,7 +14,8 @@ REMOTE_TASK_URL + REMOTE_TASK_TOKEN and posts the message through the gateway's
 POST /v1/room {op: "message"} endpoint — the same transport the task bridge for
 that provider uses, so progress updates land in the originating room. That file
 must resolve inside channels/ itself, or be the AG2 Space desktop app's own
-$SUTANDO_APP_SUPPORT/channels/<source>/.env (see _channel_env_is_contained).
+$SUTANDO_APP_SUPPORT/channels/<source>/.env (containment policy owned by
+src/channel_env_containment.py; see _channel_env_is_contained below).
 
 Exits 0 on success, 1 on failure. Fail-open by design — a failed send must never
 block the task itself. The caller should always continue working regardless of exit code.
@@ -241,34 +242,21 @@ def send_telegram(chat_id: str, message: str) -> bool:
 _SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
 
 
-def _channel_env_is_contained(env_path: Path, channels_dir: Path, source: str) -> bool:
-    """Containment for channels/<source>/.env, which may be a symlink.
+def _load_channel_env_containment():
+    """The shared containment policy (src/channel_env_containment.py), or a
+    fail-closed stub when src/ isn't importable this way — never silently
+    widen the guard just because the import failed."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        from channel_env_containment import channel_env_is_contained  # type: ignore
+        return channel_env_is_contained
+    except Exception:
+        return lambda env_path, channels_dir, source: False
 
-    A resolution is accepted in exactly two cases, and fails closed otherwise:
 
-      1. it lands inside realpath(channels_dir) — the channels tree itself. A
-         symlinked channels/ dir is fine; an entry that links OUT of it is not.
-      2. it IS realpath($SUTANDO_APP_SUPPORT/channels/<source>/.env). The AG2
-         Space desktop app keeps the durable channel env under its own
-         app-support root and lays $CLAUDE_CONFIG_DIR/channels/ag2space/.env as
-         a symlink to it (launch-sutando.sh; #3150/#3201). SUTANDO_APP_SUPPORT
-         is exported by the app for every process it spawns, so this is a
-         second, explicitly configured root — a containment test, not a shape
-         match. A planted link to /tmp/<source>/.env or ~/x/<source>/.env still
-         fails closed, as does a link to another channel's file under the app
-         root, and everything fails closed when the variable is unset.
-
-    core-supervisor-relay._is_deliverable mirrors this rule exactly (sender/probe
-    alignment, #2701) — widen BOTH together or never.
-    """
-    real_env = os.path.realpath(env_path)
-    if real_env.startswith(os.path.realpath(channels_dir) + os.sep):
-        return True
-    app_support = (os.environ.get("SUTANDO_APP_SUPPORT") or "").strip()
-    if not app_support:
-        return False
-    relocated = os.path.join(app_support, "channels", source, ".env")
-    return real_env == os.path.realpath(relocated)
+# Single shared owner: src/channel_env_containment.py (see its docstring for
+# the accept/refuse rule; also delegated to by core-supervisor-relay.py).
+_channel_env_is_contained = _load_channel_env_containment()
 
 
 def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:

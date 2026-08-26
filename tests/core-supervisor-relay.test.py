@@ -14,12 +14,15 @@ import importlib.util
 import json
 import os
 import shutil
+import sys
 import tempfile
 import contextlib
 import unittest
+from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "core-supervisor-relay.py")
+sys.path.insert(0, os.path.join(_HERE, "..", "src"))
 _spec = importlib.util.spec_from_file_location("core_supervisor_relay", _SRC)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
@@ -28,6 +31,8 @@ compose_message = _mod.compose_message
 run_cycle = _mod.run_cycle
 main = _mod.main
 resolve_active_target = _mod.resolve_active_target
+
+import channel_env_containment  # noqa: E402 — the shared module the probe delegates to
 
 _LOGIN = {"state": "blocked-human", "detail": "awaiting user: login",
           "prompt": "Login\nSelect login method:\n  1. Claude account", "kind": "login"}
@@ -552,6 +557,63 @@ class TestResolveActiveTarget(unittest.TestCase):
             self.assertEqual(resolve_active_target(self._write(td, "{bad json")), ("", ""))
             self.assertEqual(resolve_active_target(self._write(td, [1, 2, 3])), ("", ""))
 
+
+
+class TestChannelEnvContainmentDelegation(unittest.TestCase):
+    """The probe (_is_deliverable) must call the shared
+    src/channel_env_containment.py function, not carry its own copy of the
+    containment rule — the exact duplication CLAUDE.md's architecture rules
+    call out as the defect."""
+
+    def _reload(self):
+        """A fresh module instance, separate from the shared `_mod` every
+        other test class depends on, so patching the shared function's
+        binding here can't affect them."""
+        spec = importlib.util.spec_from_file_location("core_supervisor_relay_fresh", _SRC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_binds_the_shared_function_by_identity(self):
+        self.assertIs(_mod._channel_env_is_contained,
+                      channel_env_containment.channel_env_is_contained)
+
+    def test_containment_delegates_to_shared_module_not_a_copy(self):
+        """Stub the shared function to always refuse, reload the probe, and
+        confirm even an otherwise-deliverable app-support relocation is now
+        refused. If _is_deliverable carried its own copy of the rule, this
+        module-level stub would have no effect."""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = tempfile.mkdtemp()
+            app = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+            self.addCleanup(shutil.rmtree, app, ignore_errors=True)
+            real_dir = os.path.join(app, "channels", "dev-ag2space")
+            os.makedirs(real_dir)
+            with open(os.path.join(real_dir, ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            link_dir = os.path.join(cfg, "channels", "dev-ag2space")
+            os.makedirs(link_dir)
+            os.symlink(os.path.join(real_dir, ".env"), os.path.join(link_dir, ".env"))
+
+            p = os.path.join(td, "last-owner-activity.json")
+            with open(p, "w") as f:
+                json.dump({"channel": "dev-ag2space", "channel_id": "!r:d"}, f)
+
+            saved = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "SUTANDO_APP_SUPPORT")}
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            os.environ["SUTANDO_APP_SUPPORT"] = app
+            try:
+                with patch.object(channel_env_containment, "channel_env_is_contained",
+                                  return_value=False):
+                    fresh = self._reload()
+                    self.assertEqual(fresh.resolve_active_target(p), ("", ""))
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
 
 
 class TestBackendRecordContract(unittest.TestCase):
