@@ -722,7 +722,8 @@ def check_node_runtime() -> dict:
     }
 
 
-def check_port(port: int, name: str, probe: bool = False) -> dict:
+def check_port(port: int, name: str, probe: bool = False,
+               pgrep_pattern: str = "") -> dict:
     """Check if a port is listening, optionally probing for a live response.
 
     A wedged server can keep its listen socket open while never answering
@@ -770,10 +771,19 @@ def check_port(port: int, name: str, probe: bool = False) -> dict:
                     except OSError:  # pragma: no cover — only fires on recv error mid-drain; not triggered in tests
                         pass
                 except Exception:
+                    # An armed pin forbids the restart this verdict prescribes,
+                    # exactly as it does for the staleness arms.
+                    _, _lstarts = _proc_lstarts(pgrep_pattern or name)
+                    _armed = process_pins.armed_detail(
+                        _pin_verdicts(name, _lstarts))
+                    _base = f"port {port} listening but unresponsive"
+                    if _armed:
+                        return {"name": name, "status": "warn",
+                                "detail": f"{_base}, but {_armed}"}
                     return {
                         "name": name,
                         "status": "wedged",
-                        "detail": f"port {port} listening but unresponsive — restart needed",
+                        "detail": f"{_base} — restart needed",
                     }
         return {"name": name, "status": "ok" if up else "down", "detail": f"port {port}"}
     except Exception as e:
