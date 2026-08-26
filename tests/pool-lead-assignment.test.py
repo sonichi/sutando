@@ -248,6 +248,18 @@ class AffinityBusyYieldTest(unittest.TestCase):
         row = self.lead._load_affinity()["chan-A"]
         self.assertEqual(row["instance"], "core-2", "binding must survive")
 
+    def test_busy_core_keeps_unclaimed_assignments_and_its_rooms(self):
+        # busy != wedged: a mid-task core claims later; repooling moved
+        # bound rooms off their context core
+        (self.tasks / "task-w1.claimed-core-2.txt").write_text("x")
+        stuck = self.tasks / "task-w2.assigned-core-2.txt"
+        stuck.write_text("id: task-w2\nchannel_id: chan-A\n")
+        self.lead._save_assign_ledger({stuck.name: 0.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=1)
+        self.assertEqual(out, [])
+        self.assertTrue(stuck.exists(), "assignment must stay put")
+        self.assertIn("chan-A", self.lead._load_affinity())
+
     def test_unclaimed_reclaim_releases_the_room_binding(self):
         # home core heartbeats but never claims: reclaim must drop the row
         # so the re-pick moves the room to a core that answers.

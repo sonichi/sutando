@@ -127,6 +127,16 @@ class PoolLead:
         return [f for f in self.followers_fn()
                 if _INST_RE.match(str(f)) and self.alive_fn(f)]
 
+    def _claimed_load(self, instance: str) -> int:
+        """Claims only — assigned-but-unclaimed files do not count. A core
+        with claims in flight is BUSY, which is not the same as wedged."""
+        pat = re.compile(rf"\.claimed-{re.escape(instance)}\.txt$")
+        try:
+            return sum(1 for f in self.tasks_dir.iterdir()
+                       if pat.search(f.name))
+        except OSError:
+            return 0
+
     def _load(self, instance: str) -> int:
         pat = re.compile(
             rf"\.(?:assigned|claimed)-{re.escape(instance)}\.txt$")
@@ -299,6 +309,11 @@ class PoolLead:
                 continue
             if self.now() - float(ts) < max_age_s or not self.alive_fn(m.group(2)):
                 continue  # young, or dead (reclaim_dead owns that path)
+            if self._claimed_load(m.group(2)) > 0:
+                # busy, not wedged: it will claim when it frees up. Repooling
+                # here moved bound rooms off their context core (owner report)
+                ledger[f.name] = self.now()
+                continue
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
