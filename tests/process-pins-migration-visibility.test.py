@@ -283,6 +283,44 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "a FAILED `-f %Fm` that printed a number was accepted as the answer: "
             "the loop broke on numeric output instead of on a successful call")
 
+    def test_INTERLEAVED_only_BOTH_shim_answers_pick_the_shim_winner(self) -> None:
+        """Reciprocal + interleaved, so a mixed host/shim pair cannot pass.
+
+        A single non-interleaved row is satisfied by `always keep destination`,
+        and ordinary reciprocal values can still be satisfied by consuming ONE
+        operand's shim answer and one host answer. Interleaving makes every
+        mixed pair agree with the HOST winner, so only reading both shim values
+        selects the shim winner:
+
+            shim-D-wins: real_D < shim_A < shim_D < real_A
+            shim-A-wins: real_A < shim_D < shim_A < real_D
+
+        All four land inside one whole second, so `%Y` ties and only the
+        successful `%.9Y` answers can decide.
+        """
+        SEC = 1700000000
+        armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+        rows = [
+            # (label, real_a, real_d, shim_a, shim_d, expected)
+            ("shim-D-wins", 0.9, 0.1, 400000000, 600000000, "stale"),
+            ("shim-A-wins", 0.1, 0.9, 600000000, 400000000, "warn"),
+        ]
+        for label, ra, rd, sa, sd, expected in rows:
+            with self.subTest(row=label):
+                self.setUp()
+                bin_ = self._gnu_stat_shim(
+                    synth={"a": (SEC, sa), "dest": (SEC, sd)})
+                self._write("src/a", armed, SEC + ra)
+                self._write("dest", [], SEC + rd)
+                self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
+                                         "LC_ALL": "de_DE.UTF-8"})
+                status, _ = self._verdict(
+                    self.tmp / "dest" / "state" / "process-pins.json")
+                self.assertEqual(
+                    status, expected,
+                    f"{label}: expected the SHIM winner ({expected}); a host or "
+                    f"mixed host/shim pair yields the other verdict")
+
     def test_GNU_migrator_CONSUMES_shim_values_not_host_stat(self) -> None:
         """Prove the shim's ANSWER drove the decision, not merely that it ran.
 
