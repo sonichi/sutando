@@ -3022,9 +3022,11 @@ def _dedup_plan(tid: str, holder_id: str | None):
         _save_task_rooms(rooms)
         return True
 
+    # The re-ask id must live in THIS lane's namespace (`_owns_local_tid`):
+    # an unscoped mint on a named instance is orphaned to the primary's sweep.
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+        _local_tid(f"task-{uuid.uuid4().hex[:18]}"), commit_identity=_commit)
     return action, payload, room
 
 
