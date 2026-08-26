@@ -4,6 +4,7 @@ one a consumer can still reach. A run that finds nothing proves neither."""
 import importlib.util
 import io
 import contextlib
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +32,38 @@ class Lister(unittest.TestCase):
         (self.ws / "tasks" / where / f"{tid}.txt").write_text(hdr) if where == "archive" \
             else (self.ws / "tasks" / f"{tid}.txt").write_text(hdr)
         (self.ws / "results" / f"{tid}.txt").write_text("the reply body\n")
+
+    def test_a_task_that_exists_nowhere_yields_an_empty_header(self):
+        """The `return {}` fallback: a result whose task file is gone from every
+        location must still be listed, with UNKNOWN rather than a crash."""
+        (self.ws / "results" / "task-vanished.txt").write_text("body\n")
+        rows = lur.undelivered(self.ws)
+        self.assertEqual([r[0] for r in rows], ["task-vanished"])
+        self.assertEqual(rows[0][2], {})
+
+    def test_an_unreadable_candidate_falls_through_to_the_next(self):
+        """A directory where a task file should be raises OSError on read; the
+        loop must continue rather than abort on the first candidate."""
+        (self.ws / "tasks" / "task-dir.txt").mkdir()
+        (self.ws / "tasks" / "archive" / "task-dir.txt").write_text(
+            "id: task-dir\nchannel_id: !R:ag2.space\n")
+        self.assertEqual(lur._task_header(self.ws, "task-dir")["channel_id"],
+                         "!R:ag2.space")
+
+    def test_resolve_workspace_goes_through_the_loader(self):
+        """Covers the bootstrap: it must return the SAME path the shared
+        resolver does, not a repo-relative guess of its own."""
+        saved = list(sys.path)
+        try:
+            got = lur._resolve_workspace(REPO)
+        finally:
+            sys.path[:] = saved
+        sys.path.insert(0, str(REPO / "src"))
+        try:
+            from workspace_default import resolve_workspace
+            self.assertEqual(got, Path(resolve_workspace()))
+        finally:
+            sys.path[:] = saved
 
     def test_names_the_orphan_and_its_destination(self):
         self._orphan("task-aaa")
