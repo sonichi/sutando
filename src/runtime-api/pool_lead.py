@@ -24,6 +24,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 from task_priority import sort_tasks_by_priority  # noqa: E402
+from pool_follower import LEAD_STALE_S  # noqa: E402
 
 # Depth at which channelless work overflows to the idle lane core; room
 # affinity itself is binding and never yields on load (owner 2026-08-26).
@@ -435,10 +436,34 @@ class PoolLead:
         return out
 
     # ── crash recovery ──────────────────────────────────────────────────────
+    def _host_gap_defers_reclaim(self) -> bool:
+        """Every follower stale in the same instant is a host gap (sleep, clock
+        jump), not N deaths — beats stop together only when the machine does.
+
+        Defers one stale window rather than suppressing: a woken follower
+        re-beats within it, while a genuine whole-pool outage still reclaims
+        once the window passes.
+        """
+        try:
+            followers = list(self.followers_fn())
+        except Exception:  # noqa: BLE001 — a broken resolver must not defer
+            return False
+        if not followers:
+            return False
+        if any(self.alive_fn(f) for f in followers):
+            self._reclaim_defer_until = None
+            return False
+        now = self.now()
+        if getattr(self, "_reclaim_defer_until", None) is None:
+            self._reclaim_defer_until = now + LEAD_STALE_S
+        return now < self._reclaim_defer_until
+
     def reclaim_dead(self) -> "list[str]":
         """Return dead followers' assignments to the unassigned pool.
         Claimed files are NOT touched here — a claim means work may have
         side-effected; that recovery keeps the done-flag path (L2)."""
+        if self._host_gap_defers_reclaim():
+            return []
         reclaimed = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.assigned-(.+)\.txt$")
         try:
@@ -516,6 +541,8 @@ class PoolLead:
         session's wrapper keeps its heartbeat fresh, so reclaim_dead never
         fires — unclaimed age is the only signal. No claim = no work started,
         so repooling cannot double-fire a side effect."""
+        if self._host_gap_defers_reclaim():
+            return []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.assigned-(.+)\.txt$")
         ledger = self._load_assign_ledger()
         out = []
@@ -606,6 +633,8 @@ class PoolLead:
         deliver (sweep skips it). The reachable crash residue is a result
         with no done-flag — finish_task writes the result first — and that
         work is COMPLETE, so it must not be repooled for re-execution."""
+        if self._host_gap_defers_reclaim():
+            return []
         out = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
         try:
