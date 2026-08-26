@@ -42,7 +42,8 @@ class PoolLeadTests(unittest.TestCase):
             self.tasks, self.state,
             followers_fn=lambda: list(self.alive),
             alive_fn=lambda i: self.alive.get(i, False),
-            now_fn=lambda: self.clock[0])
+            now_fn=lambda: self.clock[0],
+            mono_fn=lambda: self.clock[0])
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -388,7 +389,8 @@ class RoutineLaneEscape(unittest.TestCase):
             self.tasks, self.state,
             followers_fn=lambda: list(self.alive),
             alive_fn=lambda i: self.alive.get(i, False),
-            now_fn=lambda: self.clock[0])
+            now_fn=lambda: self.clock[0],
+            mono_fn=lambda: self.clock[0])
         # highest-numbered follower is the routine lane
         self.lane = max(self.alive, key=lambda f: (len(f), f))
 

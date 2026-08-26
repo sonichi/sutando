@@ -31,7 +31,8 @@ class HygieneBase(unittest.TestCase):
         self.lead = PoolLead(self.tasks, self.state,
                              followers_fn=lambda: list(self.alive),
                              alive_fn=lambda i: self.alive.get(i, False),
-                             now_fn=lambda: self.clock[0])
+                             now_fn=lambda: self.clock[0],
+            mono_fn=lambda: self.clock[0])
 
     def tearDown(self):
         self.tmp.cleanup()
