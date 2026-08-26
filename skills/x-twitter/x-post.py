@@ -368,17 +368,27 @@ def main():
     # Read-only commands that app-only bearer auth can handle. Skip OAuth1
     # setup (and its `requests`/`oauthlib` install) so X_BEARER_TOKEN-only
     # environments don't need pip.
-    if args.command in ("search", "read", "user-timeline") and BEARER_TOKEN:
+    # BEARER-ONLY commands are settled here, before get_auth(): that call loads
+    # the optional OAuth deps, so a clean host would report a pip problem for a
+    # command whose real blocker is a missing bearer token.
+    if args.command == "user-timeline":
+        if not BEARER_TOKEN:
+            print("'user-timeline' needs X_BEARER_TOKEN (app-only auth); OAuth1 "
+                  "credentials cannot serve it. Set X_BEARER_TOKEN in .env.",
+                  file=sys.stderr)
+            sys.exit(2)
+        # 5..100 is THIS endpoint's bound, measured against it. `search`
+        # rejects below 10; applying that here refused valid requests.
+        if not 5 <= args.limit <= 100:
+            print(f"--limit must be between 5 and 100 (got {args.limit})")
+            sys.exit(2)
+        get_user_timeline(args.username, max_results=args.limit,
+                          exclude=args.exclude)
+        return
+
+    if args.command in ("search", "read") and BEARER_TOKEN:
         if args.command == "search":
             search_tweets(args.query, auth=None, max_results=args.limit)
-        elif args.command == "user-timeline":
-            # 5..100 is THIS endpoint's bound, measured against it. `search`
-            # rejects below 10; applying that here refused valid requests.
-            if not 5 <= args.limit <= 100:
-                print(f"--limit must be between 5 and 100 (got {args.limit})")
-                sys.exit(2)
-            get_user_timeline(args.username, max_results=args.limit,
-                              exclude=args.exclude)
         else:
             read_tweet(args.tweet_id, auth=None)
         return
@@ -399,11 +409,8 @@ def main():
     elif args.command == "engagement":
         read_tweet(args.tweet_id, auth)  # same output, includes metrics
     else:
-        # Reached when a command is handled ONLY in the bearer fast path and no
-        # bearer is set. Falling off the chain here would exit 0 with no output.
-        print(f"'{args.command}' needs X_BEARER_TOKEN (app-only auth); OAuth1 "
-              f"credentials alone cannot serve it. Set X_BEARER_TOKEN in .env.",
-              file=sys.stderr)
+        # A command with no arm here would otherwise exit 0 silently.
+        print(f"'{args.command}' is not handled by this dispatch.", file=sys.stderr)
         sys.exit(2)
 
 

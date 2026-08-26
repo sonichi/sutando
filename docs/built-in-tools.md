@@ -85,10 +85,14 @@ python3 skills/x-twitter/x-post.py post "With video" --media /path/to.mp4  # wit
 python3 skills/x-twitter/x-post.py search "query"                          # search recent
 python3 skills/x-twitter/x-post.py read 123456789                          # read tweet
 python3 skills/x-twitter/x-post.py mentions                                # recent @mentions
-python3 skills/x-twitter/x-post.py timeline                                # your tweets
+python3 skills/x-twitter/x-post.py timeline                                # YOUR tweets (OAuth1)
+python3 skills/x-twitter/x-post.py user-timeline <handle>                  # ANOTHER account (bearer)
 python3 skills/x-twitter/x-post.py engagement 123456789                    # likes/rt/views
 ```
-Requires X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET in .env.
+`post`/`mentions`/`timeline` need X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET.
+`search`/`read`/`user-timeline` run on X_BEARER_TOKEN alone. `timeline` resolves `users/me` and is
+OAuth1-only; `user-timeline` reads the same endpoint by handle over bearer, so it works where
+`timeline` cannot. Its `--limit` is 5..100 (`search`'s is 10..100 — different endpoints).
 Always confirm post content with user before publishing.
 
 **Reminders** — read/write macOS Reminders (to-do list):

@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""`user-timeline` must fail loudly where it cannot run, and accept what X accepts.
+"""`user-timeline` dispatch: hermetic, and asserts the CALL rather than the absence of an error.
 
-Two defects this pins, both found in review of #3428:
+Rewritten after review. The first version ran the CLI as a subprocess and treated
+"did not print the limit error" as acceptance — which a DNS failure, an HTTP
+error, a traceback or a silent return all satisfy. It proved nothing about
+dispatch or argument forwarding, and its accepted cases entered the real X
+request path, where the subprocess could reload the repo .env and use live
+credentials.
 
-1. The command was handled ONLY in the bearer fast path. With OAuth1 credentials
-   present and no X_BEARER_TOKEN, the lower dispatch had no matching arm and no
-   `else`, so the process fell off the chain and exited 0 with no output — a
-   silent no-op that is indistinguishable from success.
+This version imports the module once, replaces `get_user_timeline` and
+`get_auth` with recorders, and asserts what was invoked and with which
+arguments. No network, no subprocess, no .env influence on the outcome.
 
-2. The limit guard enforced 10..100. That is the `search` endpoint's bound,
-   measured against `search` and applied here. `users/{id}/tweets` accepts 5,
-   and said so itself: "The `max_results` query parameter value [4] is not
-   between 5 and 100". So the guard refused valid requests.
+Pins three behaviours:
+  * 5 and 100 reach get_user_timeline exactly once, with the parsed arguments.
+  * 4 and 101 reach neither it nor get_auth() — refused on the bound alone.
+  * No bearer reaches neither, and says X_BEARER_TOKEN rather than reporting a
+    pip problem: get_auth() loads the optional OAuth deps, so ordering the
+    bearer check after it misreports a clean host.
 """
 
-import os
+import contextlib
+import importlib.util
+import io
 import pathlib
-import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -33,45 +40,78 @@ def check(label, ok, detail=""):
         failures.append(label)
 
 
-def run(args, env_extra):
-    """Run the CLI with a controlled env. Never touches the network: every case
-    here is refused during dispatch, before any endpoint call."""
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("X_BEARER_TOKEN", "X_API_KEY", "X_API_SECRET",
-                        "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET")}
-    env.update(env_extra)
-    return subprocess.run([sys.executable, str(SCRIPT)] + args,
-                          capture_output=True, text=True, env=env, timeout=60)
+def load():
+    """Fresh module each time so module-level globals cannot leak between cases."""
+    spec = importlib.util.spec_from_file_location("xp_under_test", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-OAUTH_ONLY = {"X_API_KEY": "k", "X_API_SECRET": "s",
-              "X_ACCESS_TOKEN": "t", "X_ACCESS_TOKEN_SECRET": "ts"}
+def run(argv, bearer):
+    """Invoke main() with recorders in place. Returns (exit_code, calls, output)."""
+    mod = load()
+    mod.BEARER_TOKEN = bearer          # after import: .env cannot influence the case
+    calls = {"timeline": [], "auth": 0}
+    mod.get_user_timeline = lambda *a, **k: calls["timeline"].append((a, k))
 
-# 1. OAuth1-only host: must NOT exit 0 silently.
-r = run(["user-timeline", "Chi_Wang_"], OAUTH_ONLY)
-check("oauth1-only: nonzero exit", r.returncode != 0, f"rc={r.returncode}")
-check("oauth1-only: says what is missing",
-      "X_BEARER_TOKEN" in (r.stdout + r.stderr),
-      f"stdout={r.stdout[:80]!r} stderr={r.stderr[:80]!r}")
-check("oauth1-only: not a silent no-op",
-      bool((r.stdout + r.stderr).strip()), "produced no output at all")
+    def _auth(*_a, **_k):
+        # RECORD, never raise: raising here aborts the whole suite on the first
+        # offending case, so one defect hides every check after it.
+        calls["auth"] += 1
+        raise SystemExit(90)   # sentinel exit, distinguishable from the CLI's own codes
 
-# 2. Limit bound is THIS endpoint's, 5..100. Refusals happen before any call,
-#    so a bearer value is supplied but never used.
-BEARER = {"X_BEARER_TOKEN": "unused-refused-before-any-request"}
-for limit, want_refused in ((4, True), (101, True), (5, False), (100, False)):
-    r = run(["user-timeline", "Chi_Wang_", "--limit", str(limit)], BEARER)
-    refused = (r.returncode == 2 and "--limit must be between" in (r.stdout + r.stderr))
-    check(f"--limit {limit} {'refused' if want_refused else 'accepted by the guard'}",
-          refused == want_refused,
-          f"rc={r.returncode} out={(r.stdout + r.stderr)[:70]!r}")
+    mod.get_auth = _auth
+    buf = io.StringIO()
+    code = 0
+    old = sys.argv
+    sys.argv = ["x-post.py"] + argv
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            try:
+                mod.main()
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 1
+    finally:
+        sys.argv = old
+    return code, calls, buf.getvalue()
 
-# 3. The message must name the real bound; 10 was the search endpoint's.
-r = run(["user-timeline", "Chi_Wang_", "--limit", "4"], BEARER)
-msg = r.stdout + r.stderr
-check("guard message names 5..100", "between 5 and 100" in msg, msg[:90])
-check("guard message does not repeat the search bound",
-      "between 10 and 100" not in msg, msg[:90])
+
+# --- accepted bounds actually DISPATCH, with the arguments parsed ------------
+for limit in (5, 100):
+    code, calls, out = run(["user-timeline", "Chi_Wang_", "--limit", str(limit)], "tok")
+    check(f"--limit {limit}: get_user_timeline called exactly once",
+          len(calls["timeline"]) == 1, f"called {len(calls['timeline'])}x, out={out[:60]!r}")
+    if calls["timeline"]:
+        a, k = calls["timeline"][0]
+        check(f"--limit {limit}: forwarded username and limit",
+              a[:1] == ("Chi_Wang_",) and k.get("max_results") == limit,
+              f"args={a} kwargs={k}")
+    check(f"--limit {limit}: get_auth not reached", calls["auth"] == 0)
+
+# --exclude must reach the function, not be silently dropped.
+code, calls, out = run(
+    ["user-timeline", "Chi_Wang_", "--limit", "5", "--exclude", "retweets,replies"], "tok")
+check("--exclude forwarded verbatim",
+      bool(calls["timeline"]) and calls["timeline"][0][1].get("exclude") == "retweets,replies",
+      f"calls={calls['timeline']}")
+
+# --- rejected bounds dispatch to NOTHING ------------------------------------
+for limit in (4, 101):
+    code, calls, out = run(["user-timeline", "Chi_Wang_", "--limit", str(limit)], "tok")
+    check(f"--limit {limit}: refused with rc=2", code == 2, f"rc={code}")
+    check(f"--limit {limit}: get_user_timeline NOT called", not calls["timeline"])
+    check(f"--limit {limit}: get_auth NOT called", calls["auth"] == 0)
+    check(f"--limit {limit}: message names 5..100", "between 5 and 100" in out, out[:70])
+
+# --- no bearer: refused before get_auth(), and says which credential ---------
+code, calls, out = run(["user-timeline", "Chi_Wang_", "--limit", "10"], "")
+check("no bearer: rc=2", code == 2, f"rc={code}")
+check("no bearer: get_user_timeline NOT called", not calls["timeline"])
+check("no bearer: get_auth NOT reached (would report a pip problem)", calls["auth"] == 0)
+check("no bearer: names X_BEARER_TOKEN", "X_BEARER_TOKEN" in out, out[:80])
+check("no bearer: does not report a dependency problem",
+      "pip3 install" not in out and "missing dependencies" not in out, out[:80])
 
 print(f"\n{checked - len(failures)}/{checked} passed")
 sys.exit(1 if failures else 0)
