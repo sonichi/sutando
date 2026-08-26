@@ -42,9 +42,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 PROVIDER = "github"
 ACTOR_SCHEME = "git.commit_author_email"
-# The contract ships no schemes, and this adapter registers only the scheme
-# GitHub can resolve. A verified scheme belongs to the seam that authenticates
-# it (a Matrix adapter, or a test's explicit fixture) — never here.
+# Only the scheme GitHub resolves; a verified scheme belongs to whatever
+# seam authenticates it (a Matrix adapter or a test fixture), never here.
 register_actor_scheme(ACTOR_SCHEME)
 
 WATCH = frozenset({

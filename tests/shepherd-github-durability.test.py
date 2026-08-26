@@ -200,9 +200,7 @@ _st, _why = g.resume("task-dur-3")
 check("unadmitted event preserves state", _st, "waiting")
 check("unadmitted event reports the decision", "ignored" in _why, True)
 
-# a VERIFIED actor's outcome does terminate, exercising the terminal branch.
-# The GitHub adapter registers no Matrix scheme; the authenticating seam is
-# installed HERE, explicitly, as the test's own fixture.
+# The adapter ships no Matrix scheme; the test installs its own verified seam.
 from shepherd_contract import register_actor_scheme as _reg_verified  # noqa: E402
 _reg_verified("matrix.mxid", verified=True)
 VERIFIED = Actor("matrix.mxid", "@qingyun-air.agent:ag2.space")
