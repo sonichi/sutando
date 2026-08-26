@@ -91,38 +91,6 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"migrate failed:\n{r.stdout}\n{r.stderr}")
         return r
 
-    def _probe_shim(self, trace: Path, run_id: str) -> Path:
-        """Shim whose ONLY writer is its normal synchronous finish() path.
-
-        No probe-only writer: a reserved argv reaches the same record code
-        production uses, so a dead production writer cannot pass the probe.
-        """
-        bin_ = self.tmp / "probebin"
-        bin_.mkdir(exist_ok=True)
-        (bin_ / "stat").write_text(
-            "#!/usr/bin/env python3\n"
-            "import json, os, sys\n"
-            f"TRACE = {str(trace)!r}\n"
-            f"RUN_ID = {run_id!r}\n"
-            "a = sys.argv[1:]\n"
-            "def finish(argv, operand, rc, out, err):\n"
-            "    with open(TRACE, 'a') as f:\n"
-            "        f.write(json.dumps({'v': 1, 'kind': 'result',\n"
-            "            'run_id': RUN_ID, 'call_id': _cid, 'argv': argv,\n"
-            "            'operand': operand, 'rc': rc,\n"
-            "            'stdout': out, 'stderr': err}) + '\\n')\n"
-            "        f.flush(); os.fsync(f.fileno())\n"
-            "    sys.stdout.write(out); sys.stderr.write(err)\n"
-            "    sys.exit(rc)\n"
-            "_cid = ''\n"
-            "if a and a[0].startswith('--sutando-shim-probe='):\n"
-            "    _cid = a[0].split('=', 1)[1]\n"
-            "    _op = os.path.realpath(a[1])\n"
-            "    finish(a, _op, 0, f'SHIM-LIVE-{_cid}\\n', '')\n"
-            "sys.exit(1)\n")
-        (bin_ / "stat").chmod(0o755)
-        return bin_
-
     def test_RECORDER_is_live_independent_oracle_plus_falsification(self) -> None:
         """Prove the recorder can emit at all, before trusting any silence.
 
@@ -134,12 +102,11 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         import json
         import subprocess
         import uuid
-        run_id, call_id = uuid.uuid4().hex, uuid.uuid4().hex[:12]
-        trace = self.tmp / f"probe-{run_id}.jsonl"
+        call_id = uuid.uuid4().hex[:12]
         known = self._write("src/a", [], 1700000000)
-        self.assertFalse(trace.exists(), "trace must not pre-exist")
-
-        bin_ = self._probe_shim(trace, run_id)
+        bin_ = self._gnu_stat_shim()
+        run_id, trace = self._run_id, self._trace
+        self.assertEqual(trace.read_text(), "", "bind-check must leave the trace empty")
         env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
         argv = [f"--sutando-shim-probe={call_id}", str(known)]
         cp = subprocess.run(["stat", *argv], capture_output=True, text=True, env=env)
@@ -163,13 +130,16 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         import json
         import subprocess
         import uuid
-        run_id, call_id = uuid.uuid4().hex, uuid.uuid4().hex[:12]
-        trace = self.tmp / f"probe-{run_id}.jsonl"
+        call_id = uuid.uuid4().hex[:12]
         known = self._write("src/a", [], 1700000000)
-        bin_ = self._probe_shim(trace, run_id)
+        bin_ = self._gnu_stat_shim()
+        trace = self._trace
         shim = bin_ / "stat"
-        shim.write_text(shim.read_text().replace(
-            "    with open(TRACE, 'a') as f:", "    return  # MUTANT: writer dead"))
+        src = shim.read_text()
+        needle = '    with open(TRACE, "a") as fh:'
+        self.assertEqual(src.count(needle), 1,
+                         f"mutant needle not found ({needle!r}) - control would be inert")
+        shim.write_text(src.replace(needle, "    return  # MUTANT: writer dead"))
         shim.chmod(0o755)
 
         env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
@@ -180,57 +150,92 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self.assertEqual(records, [],
                          "control is inert: a dead writer still produced records")
 
+    @staticmethod
+    def _disable_subsecond(src: str) -> str:
+        """Force the %Y fallback. Asserts the patch applied: a .replace() that
+        matches nothing silently returns the input and the test passes anyway."""
+        needle = 'if fmt == "%.9Y":'
+        assert src.count(needle) == 1, f"disable-subsecond needle not found ({needle!r})"
+        return src.replace(needle, "if False:")
+
     def _gnu_stat_shim(self, comma: bool = True, synth: dict | None = None,
                        poison: dict | None = None,
                        synth9: dict | None = None) -> Path:
-        """A faithful-enough GNU `stat` on PATH: -f is --file-system (fails),
-        -c formats succeed, and fractions use the locale's decimal separator."""
+        """GNU-ish `stat` whose ONE writer serves both production and the probe.
+
+        A reserved --sutando-shim-probe argv takes the same finish() path, so a
+        dead production writer cannot be certified live by a probe-only writer.
+        """
         import uuid
         nonce = f"SHIM-BOUND-{uuid.uuid4().hex[:12]}"
+        run_id = uuid.uuid4().hex
+        self._nonce, self._run_id = nonce, run_id
         bin_ = self.tmp / "shimbin"
         bin_.mkdir(exist_ok=True)
         self._trace = self.tmp / "stat-trace.log"
-        self._nonce = nonce
-        (bin_ / "stat").write_text(
-            "#!/usr/bin/env python3\n"
-            "import os, sys, time\n"
-            "a = sys.argv[1:]\n"
-            "import json as _j\n"
-            f"open({str(self._trace)!r}, 'a').write("
-            f"_j.dumps(['{nonce}'] + a) + '\\n')\n"
-            f"_POISON = {poison or {}!r}\n"
-            "if not a or a[0] == '-f':\n"
-            "    if len(a) > 2 and a[1] == '%Fm':\n"
-            "        _pk = os.path.basename(os.path.dirname(os.path.dirname(a[2])))\n"
-            "        if _pk in _POISON:\n"
-            "            print(_POISON[_pk]); sys.exit(1)\n"
-            "    sys.stderr.write('stat: cannot read file system information\\n')\n"
-            f"    sys.stderr.write('{nonce}\\n')\n"
-            "    print('  File: \"x\"'); print('    ID: 0 Namelen: 255'); sys.exit(1)\n"
-            "if a[0] != '-c':\n"
-            "    sys.exit(1)\n"
-            "fmt, f = a[1], a[2]\n"
-            "st = os.stat(f)\n"
-            "comma = os.environ.get('LC_ALL') != 'C'\n"
-            "sep = ',' if comma else '.'\n"
-            f"_SYNTH = {synth or {}!r}\n"
-            "_k = os.path.basename(os.path.dirname(os.path.dirname(f)))\n"
-            f"_SYNTH9 = {synth9 or {}!r}\n"
-            "if fmt == '%.9Y':\n"
-            "    if _k in _SYNTH9:\n"
-            "        _w9, _n9 = _SYNTH9[_k]\n"
-            "        print(f'{_w9}{sep}{_n9:09d}')\n"
-            "    elif _k in _SYNTH:\n"
-            "        _w, _n = _SYNTH[_k]\n"
-            "        print(f'{_w}{sep}{_n:09d}')\n"
-            "    else:\n"
-            "        print(f'{int(st.st_mtime)}{sep}{st.st_mtime_ns % 1000000000:09d}')\n"
-            "elif fmt == '%Y':\n"
-            "    print(_SYNTH[_k][0] if _k in _SYNTH else int(st.st_mtime))\n"
-            "elif fmt in ('%s', '%z'):  print(st.st_size)\n"
-            "elif fmt == '%y':  print(time.strftime('%Y-%m-%d %H:%M:%S',\n"
-            "                          time.localtime(st.st_mtime)))\n"
-            "else: sys.exit(1)\n")
+
+        tmpl = r"""#!/usr/bin/env python3
+import os, sys, time, json as _j
+a = sys.argv[1:]
+TRACE, NONCE, RUN_ID = __TRACE__, __NONCE__, __RUNID__
+_POISON, _SYNTH, _SYNTH9 = __POISON__, __SYNTH__, __SYNTH9__
+
+def finish(rc, out, err, operand="", call_id=""):
+    with open(TRACE, "a") as fh:
+        fh.write(_j.dumps({"v": 1, "kind": "result", "run_id": RUN_ID,
+                           "call_id": call_id, "argv": a, "operand": operand,
+                           "rc": rc, "stdout": out, "stderr": err}) + "\n")
+        fh.flush(); os.fsync(fh.fileno())
+    sys.stdout.write(out); sys.stderr.write(err)
+    sys.exit(rc)
+
+def _key(pth):
+    return os.path.basename(os.path.dirname(os.path.dirname(pth)))
+
+if a and a[0].startswith("--sutando-shim-probe="):
+    _cid = a[0].split("=", 1)[1]
+    finish(0, "SHIM-LIVE-" + _cid + "\n", "", os.path.realpath(a[1]), _cid)
+
+if not a or a[0] == "-f":
+    if len(a) > 2 and a[1] == "%Fm" and _key(a[2]) in _POISON:
+        finish(1, _POISON[_key(a[2])] + "\n", "", os.path.realpath(a[2]))
+    _op = os.path.realpath(a[2]) if len(a) > 2 else ""
+    finish(1, '  File: "x"\n    ID: 0 Namelen: 255\n',
+           "stat: cannot read file system information\n" + NONCE + "\n", _op)
+
+if a[0] != "-c":
+    finish(1, "", "")
+
+fmt, f = a[1], a[2]
+st = os.stat(f)
+sep = "," if os.environ.get("LC_ALL") != "C" else "."
+_k = _key(f)
+if fmt == "%.9Y":
+    if _k in _SYNTH9:
+        _w, _n = _SYNTH9[_k]
+    elif _k in _SYNTH:
+        _w, _n = _SYNTH[_k]
+    else:
+        _w, _n = int(st.st_mtime), st.st_mtime_ns % 1000000000
+    out = "%d%s%09d\n" % (_w, sep, _n)
+elif fmt == "%Y":
+    out = str(_SYNTH[_k][0] if _k in _SYNTH else int(st.st_mtime)) + "\n"
+elif fmt in ("%s", "%z"):
+    out = str(st.st_size) + "\n"
+elif fmt == "%y":
+    out = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)) + "\n"
+else:
+    finish(1, "", "", os.path.realpath(f))
+finish(0, out, "", os.path.realpath(f))
+"""
+        for token, value in (("__TRACE__", repr(str(self._trace))),
+                             ("__NONCE__", repr(nonce)),
+                             ("__RUNID__", repr(run_id)),
+                             ("__POISON__", repr(poison or {})),
+                             ("__SYNTH__", repr(synth or {})),
+                             ("__SYNTH9__", repr(synth9 or {}))):
+            tmpl = tmpl.replace(token, value)
+        (bin_ / "stat").write_text(tmpl)
         (bin_ / "stat").chmod(0o755)
         self._assert_shim_binds(bin_, nonce)
         return bin_
@@ -268,10 +273,15 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 rec = json.loads(ln)
             except ValueError:
                 continue
-            if not rec or rec[0] != self._nonce or len(rec) < 4:
+            if not isinstance(rec, dict) or rec.get("kind") != "result":
                 continue
-            # rec == [nonce, flag, fmt, path]; macOS resolves /var -> /private/var
-            calls.add((rec[1], rec[2], str(Path(rec[3]).resolve())))
+            if rec.get("run_id") != self._run_id or not rec.get("operand"):
+                continue
+            argv = rec.get("argv") or []
+            if len(argv) < 3:
+                continue
+            # macOS resolves /var -> /private/var, so compare resolved operands
+            calls.add((argv[0], argv[1], str(Path(rec["operand"]).resolve())))
         operands = [
             str((self.tmp / "src/a" / "state" / "process-pins.json").resolve()),
             str((self.tmp / "dest" / "state" / "process-pins.json").resolve()),
@@ -401,7 +411,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                     synth9={"a": (na, 0), "dest": (nd, 0)})
                 shim = bin_ / "stat"
                 shim.write_text(
-                    shim.read_text().replace("if fmt == '%.9Y':", "if False:"))
+                    self._disable_subsecond(shim.read_text()))
                 shim.chmod(0o755)
                 a_path = self._write("src/a", armed, ra)
                 d_path = self._write("dest", [], rd)
@@ -529,7 +539,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 self.setUp()
                 bin_ = self._gnu_stat_shim()
                 shim = bin_ / "stat"
-                body = shim.read_text().replace("if fmt == '%.9Y':", "if False:")
+                body = self._disable_subsecond(shim.read_text())
                 shim.write_text(body)
                 shim.chmod(0o755)
                 armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
