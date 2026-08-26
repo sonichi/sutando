@@ -125,6 +125,10 @@ class SweepHonoursOwnership(unittest.TestCase):
         posted = []
         mod.RESULTS_DIR = d
         mod.ARCHIVE_RESULTS_DIR = d / "archive"
+        # TASKS_DIR must be fixture-bound too: _archive_result creates
+        # TASKS_DIR/archive, so an ambient value escapes the sandbox.
+        mod.TASKS_DIR = d / "tasks"
+        mod.TASKS_DIR.mkdir()
         mod._last_orphan_sweep = 0.0
         mod._delivered_copy_exists = lambda tid: False
         mod.find_task_file = lambda tasks_dir, tid: d / f"{tid}.task"
@@ -147,6 +151,95 @@ class SweepHonoursOwnership(unittest.TestCase):
         self.assertEqual(posted, ["111"],
                          "the dev lane must deliver only its own result (as the "
                          "bare broker id); 'task-111' here is the original defect")
+
+
+class DedupRequeueStaysInItsLane(unittest.TestCase):
+    """The re-ask id `_dedup_plan` mints must be OWNED by the minting lane.
+
+    Unscoped (`task-<uuid>`), a named instance's requeue is orphaned to the
+    primary: after an in-flight-ledger loss — the exact condition the orphan
+    sweep exists to recover — the dev lane skips its own recovered answer and
+    the primary consumes it without the dev alias. This drives the production
+    `_dedup_plan` (via `_post_ready_results`) and `_reconcile_orphan_results`
+    end to end across both lanes sharing one RESULTS_DIR.
+    """
+
+    ORIG_BROKER = "task-orig1234567890"       # the id the broker waits on
+    HOLDER = "task-22d83e59601f3a1fef"
+
+    def _bind(self, mod, d: Path, posted: list):
+        """Fixture-bind every path/state the flows touch (no ambient escapes)."""
+        results, tasks, state = d / "results", d / "tasks", d / "state"
+        (results / "archive").mkdir(parents=True, exist_ok=True)
+        tasks.mkdir(exist_ok=True)
+        state.mkdir(exist_ok=True)
+        mod.RESULTS_DIR = results
+        mod.ARCHIVE_RESULTS_DIR = results / "archive"
+        mod.TASKS_DIR = tasks
+        mod.DEDUP_ALIAS_FILE = state / f"remote-dedup-alias-{id(mod)}.json"
+        rooms = {}
+        mod._load_task_rooms = lambda *a, **k: dict(rooms)
+        mod._save_task_rooms = lambda r, *a, **k: rooms.update(r)
+        mod._forget_task_room = lambda *a, **k: None
+        mod._save_inflight = lambda *a, **k: None
+        mod._delivered_copy_exists = lambda tid: False
+        mod._req = lambda method, path, payload=None, **kw: (
+            posted.append(payload.get("id")) or {})
+
+    def test_named_lane_requeue_is_recovered_by_its_own_sweep(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        shared = Path(td.name)                  # one host: shared results dir
+
+        dev_posts, primary_posts = [], []
+        dev = _bridge("dev")
+        self._bind(dev, shared, dev_posts)
+        orig_local = dev._local_tid(self.ORIG_BROKER)
+
+        # Pass 1 on the dev lane: unsubstantiated dedup -> re-ask minted.
+        (dev.TASKS_DIR / f"{orig_local}.txt").write_text(
+            f"id: {orig_local}\nsource: gateway\naccess_tier: owner\ntask: q\n")
+        (dev.RESULTS_DIR / f"{orig_local}.txt").write_text(
+            f"[deduped: {self.HOLDER}]")
+        (dev.ARCHIVE_RESULTS_DIR / f"{self.HOLDER}-1785976425.txt").write_text("")
+        dev._post_ready_results({orig_local})
+        requeued = [p for p in dev.TASKS_DIR.glob("task-*")
+                    if p.stem != orig_local and p.parent == dev.TASKS_DIR]
+        self.assertEqual(len(requeued), 1, "no re-ask was written")
+        new_id = requeued[0].stem
+
+        # The blocker itself: the mint must live in the dev namespace.
+        self.assertTrue(dev._owns_local_tid(new_id),
+                        f"re-ask id {new_id!r} escaped the dev lane")
+
+        # The core answers the re-ask; the in-flight ledger is then LOST.
+        answer = shared / "results" / f"{new_id}.txt"
+        answer.write_text("the recovered answer\n")
+        old = time.time() - (dev.ORPHAN_GRACE_S + 60)
+        os.utime(answer, (old, old))
+
+        # Primary lane, same shared results dir: must leave it untouched.
+        primary = _bridge(None)
+        pdir = Path(tempfile.mkdtemp(dir=td.name))
+        self._bind(primary, pdir, primary_posts)
+        primary.RESULTS_DIR = shared / "results"          # the shared surface
+        primary.ARCHIVE_RESULTS_DIR = shared / "results" / "archive"
+        self.assertFalse(primary._owns_local_tid(new_id),
+                         "primary claims the dev lane's re-ask id")
+        primary._last_orphan_sweep = 0.0
+        primary._reconcile_orphan_results(set())
+        self.assertEqual(primary_posts, [],
+                         "primary sweep delivered the dev lane's answer")
+        self.assertTrue(answer.exists(),
+                        "primary sweep consumed the dev lane's file")
+
+        # Dev's own sweep recovers it — under the ORIGINAL broker id.
+        dev._last_orphan_sweep = 0.0
+        dev._reconcile_orphan_results(set())
+        self.assertEqual(dev_posts, [self.ORIG_BROKER],
+                         "recovered answer must POST under the id the broker "
+                         "is waiting on (alias -> _broker_tid unwrap)")
+        self.assertFalse(answer.exists(), "delivered result was not archived")
 
 
 if __name__ == "__main__":
