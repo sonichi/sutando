@@ -1147,17 +1147,29 @@ preflight_summary() {
 }
 
 # SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
-sha_match() {
-    local a="$1" b="$2"
-    local ha hb
+# Print a validated SHA-256 digest for $1, or nothing. Non-empty is not the
+# test: a broken hasher prints a non-digest token for BOTH files and compares equal.
+_sha256_of() {
+    local out rc
     if command -v shasum >/dev/null 2>&1; then
-        ha="$(shasum -a 256 "$a" 2>/dev/null | awk '{print $1}')"
-        hb="$(shasum -a 256 "$b" 2>/dev/null | awk '{print $1}')"
+        out="$(shasum -a 256 "$1" 2>/dev/null)"; rc=$?
     else
-        ha="$(sha256sum "$a" 2>/dev/null | awk '{print $1}')"
-        hb="$(sha256sum "$b" 2>/dev/null | awk '{print $1}')"
+        out="$(sha256sum "$1" 2>/dev/null)"; rc=$?
     fi
-    [ -n "$ha" ] && [ "$ha" = "$hb" ]
+    [ "$rc" -eq 0 ] || return 1
+    out="${out%% *}"
+    case "$out" in
+        *[!0-9a-fA-F]*|"") return 1 ;;
+    esac
+    [ "${#out}" -eq 64 ] || return 1
+    printf '%s' "$out"
+}
+
+sha_match() {
+    local ha hb
+    ha="$(_sha256_of "$1")" || return 1
+    hb="$(_sha256_of "$2")" || return 1
+    [ "$ha" = "$hb" ]
 }
 
 # Per-file commit dispatch. $1=src-file abs, $2=src-relpath, $3=src-tag, $4=class
