@@ -187,11 +187,13 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 self.assertEqual(status, "stale" if newer_is_release else "warn")
 
 
-    def test_COMMA_LOCALE_real_migrator_resolves_BOTH_directions(self) -> None:
+    def test_COMMA_LOCALE_real_migrator_resolves_subsecond_on_dest_newer(self) -> None:
         """Drive the REAL migrator under emulated GNU stat in a comma locale.
 
         Same second, different subsecond: without LC_ALL=C the fraction is
         rejected, both sides tie, and the tie branch aborts AMBIGUOUS (rc 1).
+        Both runs keep c newer -- this swaps WHICH SIDE is armed, not the
+        scan direction; direction is covered by test_newest_wins_in_BOTH_directions.
         """
         SEC = 1700000000
         for newer_is_release in (True, False):
