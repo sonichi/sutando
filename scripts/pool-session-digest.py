@@ -120,27 +120,36 @@ def _safe(value) -> str:
     return str(value if value is not None else "").translate(_CTRL)
 
 
-def _one_line(text: str, width: int) -> str:
-    flat = _safe(" ".join((text or "").split()))
+def _one_line(text, width: int) -> str:
+    # Leaf values are as untrusted as the record: a dict where a string belongs
+    # must render empty, not raise and take the rest of the transcript with it.
+    if not isinstance(text, str):
+        return ""
+    flat = _safe(" ".join(text.split()))
     return flat[:width] + ("…" if len(flat) > width else "")
 
 
 def _event(rec: dict, block: dict, width: int) -> "tuple[str, str, str] | None":
     """(ts, kind, summary) for a content block worth showing, else None."""
-    ts = _safe((rec.get("timestamp") or "")[11:19])
+    raw_ts = rec.get("timestamp")
+    ts = _safe(raw_ts[11:19]) if isinstance(raw_ts, str) else ""
     kind = block.get("type")
     if kind == "text":
-        body = _one_line(block.get("text", ""), width)
+        body = _one_line(block.get("text"), width)
         return (ts, "SAY", body) if body else None
     if kind == "thinking":
-        body = _one_line(block.get("thinking", ""), width)
+        body = _one_line(block.get("thinking"), width)
         return (ts, "THINK", body) if body else None
     if kind == "tool_use":
-        name = _safe(block.get("name", "?"))
-        inp = block.get("input") or {}
-        detail = inp.get("command") or inp.get("file_path") or inp.get("pattern") or ""
-        if not detail and isinstance(inp, dict) and inp:
-            detail = json.dumps(inp)[:width]
+        name = block.get("name")
+        name = _safe(name) if isinstance(name, str) else "?"
+        inp = block.get("input")
+        if isinstance(inp, dict):
+            detail = inp.get("command") or inp.get("file_path") or inp.get("pattern") or ""
+            if not detail and inp:
+                detail = json.dumps(inp, default=str)[:width]
+        else:
+            detail = "" if inp is None else str(inp)[:width]
         return (ts, name.upper()[:6], _one_line(str(detail), width))
     return None
 
@@ -179,7 +188,11 @@ def digest(path: Path, keep: int, width: int, want_thinking: bool) -> dict:
                 blocks[btype] += 1
                 if btype == "thinking" and not want_thinking:
                     continue
-                ev = _event(rec, block, width)
+                try:
+                    ev = _event(rec, block, width)
+                except Exception:  # noqa: BLE001
+                    # Backstop for future _event() edits; no JSON value reaches it today.
+                    ev = None
                 if ev:
                     tail.append(ev)
     return {"records": records, "blocks": blocks, "tail": list(tail), "last_ts": last_ts}

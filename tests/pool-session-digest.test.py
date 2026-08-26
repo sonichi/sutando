@@ -75,6 +75,48 @@ class DigestTest(unittest.TestCase):
         return {"type": "assistant", "timestamp": utc_iso(1),
                 "message": {"content": blocks}}
 
+    # `rendered` is what the block degrades to; None means dropped is fine.
+    # Isolation alone would pass a before/after check with every guard reverted.
+    MALFORMED_LEAVES = {
+        "tool_input_is_a_string": ({"type": "tool_use", "name": "Bash",
+                                    "input": "not-a-dict"}, "not-a-dict"),
+        "text_is_an_object": ({"type": "text", "text": {"a": 1}}, None),
+        "thinking_is_an_array": ({"type": "thinking",
+                                  "thinking": ["a", "b"]}, None),
+        "tool_name_is_an_int": ({"type": "tool_use", "name": 42,
+                                 "input": {"command": "ls"}}, "ls"),
+        "tool_input_value_nested": ({"type": "tool_use", "name": "Bash",
+                                     "input": {"command": {"deep": 1}}},
+                                    "{'deep': 1}"),
+    }
+
+    def test_a_malformed_leaf_does_not_hide_later_events(self):
+        for name, (bad, rendered) in self.MALFORMED_LEAVES.items():
+            with self.subTest(name):
+                self._write([self._rec([{"type": "text", "text": "before"}]),
+                             self._rec([bad]),
+                             self._rec([{"type": "text", "text": "after"}])])
+                out = digest_mod.digest(self.path, keep=10, width=80,
+                                        want_thinking=True)
+                bodies = [e[2] for e in out["tail"]]
+                self.assertIn("after", bodies,
+                              f"{name}: the malformed record hid every later event")
+                self.assertIn("before", bodies, name)
+                if rendered is not None:
+                    self.assertIn(rendered, bodies,
+                                  f"{name}: degraded to dropped, not rendered")
+
+    def test_a_non_string_timestamp_does_not_hide_later_events(self):
+        """`(rec.get("timestamp") or "")[11:19]` subscripts an int and raises;
+        `or ""` does not catch it, because a non-zero int is truthy."""
+        self._write([self._rec([{"type": "text", "text": "before"}]),
+                     {"type": "assistant", "timestamp": 1234567890,
+                      "message": {"content": [{"type": "text", "text": "mid"}]}},
+                     self._rec([{"type": "text", "text": "after"}])])
+        out = digest_mod.digest(self.path, keep=10, width=80, want_thinking=True)
+        bodies = [e[2] for e in out["tail"]]
+        self.assertEqual(bodies, ["before", "mid", "after"])
+
     def test_counts_blocks_and_tolerates_junk_lines(self):
         self.path.write_text(
             json.dumps(self._rec([{"type": "text", "text": "hello"}])) + "\n"
