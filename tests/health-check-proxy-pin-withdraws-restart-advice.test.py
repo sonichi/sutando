@@ -82,9 +82,8 @@ class ProxyPinWithdrawsRestartAdvice(unittest.TestCase):
         self.assertNotIn("DO NOT RESTART", d)
 
 
-# Any phrasing that TELLS the owner to replace the process. Asserting the bare word
-# "reload" cannot work: the veto sentence contains it ("DO NOT RESTART or reload"),
-# so a substring check passes on the prohibition and the instruction alike.
+# The veto sentence contains "DO NOT RESTART or reload", so a bare "reload"
+# substring passes on the prohibition and the instruction alike. Match imperatives.
 _IMPERATIVE = re.compile(r"(then reload it|reload it FIRST|Then restart the proxy|and reload it)",
                          re.IGNORECASE)
 
