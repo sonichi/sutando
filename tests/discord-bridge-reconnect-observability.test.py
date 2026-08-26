@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""A RESUME leaves no trace in this bridge, so "no ready lines" was read as
+"no reconnects". These counters make the two classes distinguishable.
+
+Helpers are AST-extracted from src/discord-bridge.py (importing the module
+would require discord.py), matching the other discord-bridge tests.
+"""
+from __future__ import annotations
+
+import ast
+import re
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+BRIDGE = REPO / "src" / "discord-bridge.py"
+SRC = BRIDGE.read_text()
+
+
+def _load():
+    tree = ast.parse(SRC)
+    keep, names = [], {"_ready_count", "_resume_count", "_disconnect_count"}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in names for t in node.targets):
+            keep.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name == "_reconnect_state":
+            keep.append(node)
+    ns: dict = {}
+    exec(compile(ast.Module(body=keep, type_ignores=[]), "<bridge>", "exec"), ns)
+    return ns
+
+
+class ReconnectObservabilityTest(unittest.TestCase):
+    def test_all_three_counters_exist_and_start_at_zero(self) -> None:
+        ns = _load()
+        for name in ("_ready_count", "_resume_count", "_disconnect_count"):
+            self.assertEqual(ns[name], 0, name)
+
+    def test_state_line_reports_each_counter_independently(self) -> None:
+        """Distinct values, so a formatter that prints one twice cannot pass."""
+        ns = _load()
+        ns["_ready_count"], ns["_resume_count"], ns["_disconnect_count"] = 3, 7, 5
+        line = eval("_reconnect_state()", ns)
+        self.assertIn("session #3", line)
+        self.assertIn("resume #7", line)
+        self.assertIn("disconnect #5", line)
+
+    def test_handlers_are_registered_and_increment(self) -> None:
+        """The gap was a MISSING handler, so absence is the thing to assert."""
+        tree = ast.parse(SRC)
+        found = {n.name for n in ast.walk(tree)
+                 if isinstance(n, ast.AsyncFunctionDef)
+                 and n.name in {"on_resumed", "on_disconnect", "on_ready"}}
+        self.assertEqual(found, {"on_ready", "on_resumed", "on_disconnect"})
+        for name, counter in (("on_resumed", "_resume_count"),
+                              ("on_disconnect", "_disconnect_count")):
+            body = next(ast.unparse(n) for n in ast.walk(tree)
+                        if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
+            self.assertIn(f"{counter} += 1", body, f"{name} must advance {counter}")
+            self.assertIn("_reconnect_state()", body, f"{name} must use the shared shape")
+
+    def test_resume_line_is_greppable_apart_from_ready(self) -> None:
+        """A resume that logged 'ready' would be indistinguishable again."""
+        self.assertRegex(SRC, r"Discord bridge resumed: ")
+        self.assertRegex(SRC, r"Discord bridge disconnected: ")
+        self.assertEqual(len(re.findall(r"Discord bridge ready: ", SRC)), 1)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
