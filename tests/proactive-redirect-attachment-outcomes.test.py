@@ -135,6 +135,16 @@ try:
     check(any("file not allowed" in str(a) for a, _ in sends),
           "and the refusal is SURFACED to the target, not swallowed")
 
+    # ---- EMPTY: a CALLER must ACT on it, not merely receive it -------------
+    from result_markers import parse_markers as _pm
+    assert [a.value for a in _pm("[file: ]\n").actions
+            if a.kind == "attach"] == [""], "fixture invalid: blank marker must parse to attach('')"
+    oute = run(f"[channel: {TARGET}]\nbody\n[file: ]\n")
+    check("EMPTY path" in oute,
+          "an EMPTY attachment path is LOGGED, not silently dropped")
+    check(any("had no path" in str(a) for a, _ in sends),
+          "and the malformed marker is SURFACED to the target")
+
     # ---- SEND: an allowlisted file ----------------------------------------
     ok_dir = pathlib.Path(bridge.SEND_ALLOWED_ROOTS[0])
     sendable = None
@@ -170,8 +180,26 @@ try:
     check(any("file not allowed" in str(a) for a, _ in sends),
           "dm-fallback: and the refusal is SURFACED to the target")
 
+    # dm-fallback EMPTY: the other call site, driven the same way.
+    (tasks / "question-empty.txt").write_text(
+        "id: question-empty\naccess_tier: owner\ntask: probe\n")
+    fe = results / "question-empty.txt"
+    fe.write_text(f"[channel: {TARGET}]\nbody\n[file: ]\n")
+    os.utime(fe, (aged, aged))
+    sends.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        with contextlib.suppress(Exception):
+            asyncio.run(asyncio.wait_for(bridge.poll_dm_fallback(), timeout=3.0))
+    feout = buf.getvalue()
+    check("EMPTY path" in feout and "dm-fallback" in feout,
+          "dm-fallback: an EMPTY attachment path is LOGGED")
+    check(any("had no path" in str(a) for a, _ in sends),
+          "dm-fallback: and the malformed marker is SURFACED")
+
     # Control: the refused-branch probe must be able to score zero.
     check("REJECTED file" not in "", "control: the probe matches nothing on empty output")
+    check("EMPTY path" not in "", "control: the EMPTY probe also scores zero on empty output")
 finally:
     if prior is None:
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
