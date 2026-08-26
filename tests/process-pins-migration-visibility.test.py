@@ -117,7 +117,24 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "                          time.localtime(st.st_mtime)))\n"
             "else: sys.exit(1)\n")
         (bin_ / "stat").chmod(0o755)
+        self._assert_shim_binds(bin_)
         return bin_
+
+    def _assert_shim_binds(self, bin_: Path) -> None:
+        """Executable-on-disk is not bound-on-PATH.
+
+        If this dir loses PATH precedence the host stat answers and every
+        GNU assertion below passes without the instrument ever firing.
+        """
+        import subprocess
+        env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
+        r = subprocess.run(["stat", "-f", "%m", str(bin_)],
+                           capture_output=True, text=True, env=env)
+        self.assertNotEqual(r.returncode, 0,
+                            "shim did NOT bind: `stat -f` succeeded, so host stat answered")
+        self.assertIn("File:", r.stdout,
+                      f"shim did NOT bind: stdout lacks its signature ({r.stdout[:60]!r})")
+
 
     def _verdict(self, pins_path):
         """Drive the real reader exactly as check_bridges does."""
