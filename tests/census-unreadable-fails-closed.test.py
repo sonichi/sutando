@@ -63,7 +63,8 @@ check("vanished entry is not scanned either", gone["scanned"], 1)
 
 # The transition the reviewer asked for: torn -> whole, with the verified task
 # as the control. The CLI line is the actual rollout evidence, so assert on it.
-import subprocess, sys as _sys
+import subprocess
+import sys as _sys
 d = ws_with({"task-ok0000000001.txt": VERIFIED})
 torn_p = d / "tasks" / "task-flip000000001.txt"
 torn_p.write_bytes(b"id: task-flip000000001\nsource: voice\ntask: \xff\xfe")
