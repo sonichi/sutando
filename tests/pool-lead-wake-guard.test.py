@@ -34,17 +34,20 @@ class WakeGuardBase(unittest.TestCase):
         self.pool = ["core-1", "core-2"]
         self.alive = {"core-1": True, "core-2": True}
         self.clock = 1_000.0
+        self.mono = 500.0
         self.lead = PoolLead(self.tasks, self.state,
                              followers_fn=lambda: list(self.pool),
                              alive_fn=lambda i: self.alive.get(i, False),
                              now_fn=lambda: self.clock,
+                             mono_fn=lambda: self.mono,
                              results_dir=self.results)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def _sleep_whole_host(self, seconds):
-        """What a clamshell sleep does: every beat ages together, clock jumps."""
+        """What a clamshell sleep does: every beat ages together, wall jumps
+        and monotonic does NOT — that skew is the evidence under test."""
         for inst in self.pool:
             self.alive[inst] = False
         self.clock += seconds
@@ -58,6 +61,7 @@ class WakeGuardBase(unittest.TestCase):
         outs = []
         while self.clock < target:
             self.clock += 2
+            self.mono += 2          # awake: both clocks advance together
             outs += fn()
         return outs
 
@@ -65,12 +69,14 @@ class WakeGuardBase(unittest.TestCase):
 class HostGapDefersReclaim(WakeGuardBase):
     def test_claim_of_live_core_survives_a_host_sleep(self):
         (self.tasks / "task-a.claimed-core-2.txt").write_text("x")
+        self.assertEqual(self.lead.reclaim_claimed(), [])  # baseline tick
         self._sleep_whole_host(968)
         self.assertEqual(self.lead.reclaim_claimed(), [])
         self.assertEqual(self._names(), ["task-a.claimed-core-2.txt"])
 
     def test_assignment_survives_a_host_sleep(self):
         (self.tasks / "task-b.assigned-core-1.txt").write_text("x")
+        self.assertEqual(self.lead.reclaim_dead(), [])  # baseline tick
         self._sleep_whole_host(968)
         self.assertEqual(self.lead.reclaim_dead(), [])
         self.assertEqual(self._names(), ["task-b.assigned-core-1.txt"])
@@ -190,9 +196,10 @@ class AwakeSlowDaemonIsNotSleep(unittest.TestCase):
         self.results = root / "results"; self.results.mkdir()
         self.wall = 1000.0
         self.mono = 500.0
+        self.alive = {"core-1": True, "core-2": True}
         self.lead = PoolLead(self.tasks, self.state,
                              followers_fn=lambda: ["core-1", "core-2"],
-                             alive_fn=lambda i: i == "core-1",
+                             alive_fn=lambda i: self.alive.get(i, False),
                              now_fn=lambda: self.wall,
                              mono_fn=lambda: self.mono,
                              results_dir=self.results)
@@ -200,28 +207,60 @@ class AwakeSlowDaemonIsNotSleep(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _stale_claim(self):
+    def _claim_of_live_core(self):
         f = self.tasks / "task-w.claimed-core-2.txt"
         f.write_text("id: task-w\n")
         return f
 
+    def _baseline_tick(self, claim):
+        """Seed the wall/monotonic pair the NEXT tick is compared against.
+
+        Without this the first call hits the fresh-lead branch, and with a
+        sibling alive it repools immediately — every later assertion then
+        holds for a claim that is already gone, so the gap-only rule passes
+        the suite too.
+        """
+        self.assertEqual(self.lead.reclaim_claimed(), [],
+                         "claimant alive: nothing to reclaim yet")
+        self.assertTrue(claim.exists(), "baseline must not consume the claim")
+
     def test_slow_awake_ticks_never_defer(self):
         # wall and monotonic advance together: no skew, no grace, ever
-        claim = self._stale_claim()
-        self.lead.reclaim_claimed()
+        claim = self._claim_of_live_core()
+        self._baseline_tick(claim)
+        self.alive["core-2"] = False          # now it genuinely dies
+        self.wall += 300.0; self.mono += 300.0
+        self.assertEqual(self.lead.reclaim_claimed(),
+                         [("task-w.claimed-core-2.txt", "repooled")],
+                         "a 300s AWAKE gap is not sleep: reclaim must proceed")
+        self.assertFalse(claim.exists())
+
+    def test_repeated_long_awake_gaps_never_renew_a_grace(self):
+        # his second shape: a recurring 60s recovery timeout must not keep
+        # re-opening the window ahead of the observation that it expired
+        claim = self._claim_of_live_core()
+        self._baseline_tick(claim)
+        self.alive["core-2"] = False
         for _ in range(5):
-            self.wall += 300.0; self.mono += 300.0
-            out = self.lead.reclaim_claimed()
-        self.assertFalse(claim.exists(), "dead core-2's claim must repool")
+            self.wall += 60.0; self.mono += 60.0
+            if not claim.exists():
+                break
+            self.lead.reclaim_claimed()
+        self.assertFalse(claim.exists(),
+                         "repeated awake 60s gaps must not defer forever")
 
     def test_sleep_skew_opens_one_expiring_grace(self):
-        claim = self._stale_claim()
-        self.lead.reclaim_claimed()
+        claim = self._claim_of_live_core()
+        self._baseline_tick(claim)
+        self.alive["core-2"] = False
         self.wall += 300.0; self.mono += 2.0  # host slept ~298s
         self.assertEqual(self.lead.reclaim_claimed(), [], "grace after sleep")
+        self.assertTrue(claim.exists(), "claim survives inside the grace")
         self.wall += LEAD_STALE_S + 1; self.mono += LEAD_STALE_S + 1
-        self.lead.reclaim_claimed()
-        self.assertFalse(claim.exists(), "grace expired: reclaim resumes")
+        self.assertEqual(self.lead.reclaim_claimed(),
+                         [("task-w.claimed-core-2.txt", "repooled")],
+                         "grace expired: reclaim resumes")
+        self.assertFalse(claim.exists())
 
 
 if __name__ == "__main__":
