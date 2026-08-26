@@ -9,6 +9,7 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $workspace = Join-Path $env:TEMP "sutando-dispatcher-live-$PID"
 $shimDir = Join-Path $workspace 'bin'
 $errorModeFile = Join-Path $workspace 'fake-error-mode'
+$staleModeFile = Join-Path $workspace 'fake-stale-once'
 $dispatcherPid = 0
 $oldPath = $env:PATH
 $oldTestMode = $env:SUTANDO_TEST_MODE
@@ -59,6 +60,14 @@ try {
     New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
     $shim = @'
 @echo off
+if exist "%SUTANDO_FAKE_STALE_FILE%" (
+  echo %* | findstr /C:"--resume" >nul
+  if not errorlevel 1 (
+    del "%SUTANDO_FAKE_STALE_FILE%"
+    echo No conversation found with session ID: stale-windows-session 1>&2
+    exit /b 1
+  )
+)
 if exist "%SUTANDO_FAKE_ERROR_FILE%" (
   echo {"type":"result","subtype":"success","is_error":true,"api_error_status":500,"result":"API Error: 500 fake gateway","session_id":"windows-ci-session"}
   exit /b 1
@@ -75,6 +84,12 @@ exit /b 0
     $env:SUTANDO_TEST_MODE = '1'
     $env:SUTANDO_WORKSPACE = $workspace
     $env:SUTANDO_FAKE_ERROR_FILE = $errorModeFile
+    $env:SUTANDO_FAKE_STALE_FILE = $staleModeFile
+
+    New-Item -ItemType Directory -Force -Path (Join-Path $workspace 'state') | Out-Null
+    Set-Content -Path (Join-Path $workspace 'state\dispatcher-sessions.json') `
+        -Value '{"windows-ci":"stale-windows-session"}' -Encoding ascii
+    New-Item -ItemType File -Path $staleModeFile | Out-Null
 
     & pwsh -NoProfile -File (Join-Path $repo 'src\task-dispatcher.ps1') -Background
     if ($LASTEXITCODE -ne 0) { throw "dispatcher launch exited $LASTEXITCODE" }
@@ -95,6 +110,11 @@ exit /b 0
     $ownerBody = (Get-Content $ownerResult -Raw).Trim()
     if ($ownerBody -ne 'WINDOWS_OWNER_OK') {
         throw "unexpected owner result: $ownerBody"
+    }
+    $sessionMap = Get-Content (Join-Path $workspace 'state\dispatcher-sessions.json') -Raw |
+        ConvertFrom-Json
+    if ($sessionMap.'windows-ci' -eq 'stale-windows-session') {
+        throw 'stale session mapping was not rotated'
     }
 
     $nonOwnerId = "task-windows-team-$PID"
@@ -128,6 +148,7 @@ exit /b 0
         dispatcher_alive = $true
         owner_result = $ownerBody
         owner_archived = (Test-Path $ownerArchive)
+        stale_session_recovered = ($sessionMap.'windows-ci' -ne 'stale-windows-session')
         non_owner_result = $nonOwnerBody
         non_owner_archived = (Test-Path $nonOwnerArchive)
         structured_error = $errorBody
@@ -141,6 +162,7 @@ exit /b 0
     $env:SUTANDO_TEST_MODE = $oldTestMode
     $env:SUTANDO_WORKSPACE = $oldWorkspace
     Remove-Item Env:SUTANDO_FAKE_ERROR_FILE -ErrorAction SilentlyContinue
+    Remove-Item Env:SUTANDO_FAKE_STALE_FILE -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
     if (Test-Path $workspace) {
         for ($attempt = 0; $attempt -lt 10; $attempt++) {

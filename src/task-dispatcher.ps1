@@ -250,6 +250,28 @@ Log "session map: loaded $(($script:sessions.Keys | Measure-Object).Count) chann
 # New-Guid v4 - used when a channel needs a fresh session.
 function New-SessionId { [guid]::NewGuid().ToString() }
 
+function Invoke-ClaudeTurn($prompt, $sessionId, $createSession, $stderrPath) {
+    Remove-Item -Path $stderrPath -ErrorAction SilentlyContinue
+    if ($createSession) {
+        $stdout = $prompt | & $CLAUDE --print --output-format json `
+            --session-id $sessionId `
+            --dangerously-skip-permissions 2>$stderrPath
+    } else {
+        $stdout = $prompt | & $CLAUDE --print --output-format json `
+            --resume $sessionId `
+            --dangerously-skip-permissions 2>$stderrPath
+    }
+    $exitCode = $LASTEXITCODE
+    $stderr = Get-Content -Raw -Path $stderrPath -ErrorAction SilentlyContinue
+    Remove-Item -Path $stderrPath -ErrorAction SilentlyContinue
+    [pscustomobject]@{ Stdout = $stdout; ExitCode = $exitCode; Stderr = $stderr }
+}
+
+function Test-StaleClaudeSession($call) {
+    $stdout = if ($call.Stdout -is [array]) { $call.Stdout -join "`n" } else { [string]$call.Stdout }
+    return "$stdout`n$($call.Stderr)" -match '(?i)No conversation found with session ID'
+}
+
 # Claim a task by renaming it to `.processing` - atomic on NTFS. Returns the
 # new path on success, $null if some other process already claimed it.
 function Claim-Task($file) {
@@ -350,20 +372,24 @@ $prompt
     # so the agent doesn't pause asking for tool-call approvals - matches the
     # interactive sutando-core posture.
     $stderrPath = "$claimedPath.stderr"
-    if ($isNew) {
-        # Create the session with our pre-generated UUID; subsequent turns
-        # will --resume it.
-        $stdout = $prompt | & $CLAUDE --print --output-format json `
-            --session-id $sessionId `
-            --dangerously-skip-permissions 2>$stderrPath
-    } else {
-        $stdout = $prompt | & $CLAUDE --print --output-format json `
-            --resume $sessionId `
-            --dangerously-skip-permissions 2>$stderrPath
+    $call = Invoke-ClaudeTurn $prompt $sessionId $isNew $stderrPath
+    if (-not $isNew -and (Test-StaleClaudeSession $call)) {
+        $staleSessionId = $sessionId
+        $sessionId = New-SessionId
+        [System.Threading.Monitor]::Enter($sessionLock)
+        try {
+            $script:sessions[$channel] = $sessionId
+            Save-SessionMap $script:sessions
+        } finally {
+            [System.Threading.Monitor]::Exit($sessionLock)
+        }
+        Log "${taskId}: stale session $staleSessionId — retrying once with fresh session $sessionId"
+        $isNew = $true
+        $call = Invoke-ClaudeTurn $prompt $sessionId $true $stderrPath
     }
-    $exitCode = $LASTEXITCODE
-    $stderr = Get-Content -Raw -Path $stderrPath -ErrorAction SilentlyContinue
-    Remove-Item -Path $stderrPath -ErrorAction SilentlyContinue
+    $stdout = $call.Stdout
+    $exitCode = $call.ExitCode
+    $stderr = $call.Stderr
 
     # Default to whatever claude printed; we override below on parse success.
     $result = if ($stdout -is [array]) { $stdout -join "`n" } else { [string]$stdout }
