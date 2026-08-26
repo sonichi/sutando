@@ -48,6 +48,10 @@ api.RESULT_DIR.mkdir()
 api.API_TOKEN = "test-token-123"
 
 SECRET_BODY = "the owner's private answer\n"
+# /result returns the READY body, which delivery.read_ready_result strips --
+# that strip is the emptiness test (whitespace-only means not-ready), so it
+# cannot be bypassed without re-forking the single readiness owner.
+SECRET_READ = SECRET_BODY.strip()
 (api.RESULT_DIR / "task-owner-1.txt").write_text(SECRET_BODY)
 (api.TASK_DIR / "task-pending-1.txt").write_text("id: task-pending-1\ntask: still running\n")
 
@@ -116,7 +120,7 @@ check("wrong-bearer body does not leak the result", SECRET_BODY.strip() not in r
 # ── 2. Token configured: the authenticated poll is unchanged ─────────────────
 code, data, _ = req("GET", "/result/task-owner-1")
 check("authenticated /result returns the completed result",
-      code == 200 and data.get("status") == "completed" and data.get("result") == SECRET_BODY,
+      code == 200 and data.get("status") == "completed" and data.get("result") == SECRET_READ,
       str(data))
 
 code, data, _ = req("GET", "/result/task-pending-1")
@@ -148,7 +152,7 @@ api.API_TOKEN = ""
 
 code, data, _ = req("GET", "/result/task-owner-1", token=None)
 check("tokenless core still serves /result unauthenticated",
-      code == 200 and data.get("result") == SECRET_BODY, str(data))
+      code == 200 and data.get("result") == SECRET_READ, str(data))
 
 code, data, _ = req("GET", "/result/task-pending-1", token=None)
 check("tokenless core still reports pending", code == 200 and data.get("status") == "pending", str(data))
