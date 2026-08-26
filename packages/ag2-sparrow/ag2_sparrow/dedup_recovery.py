@@ -40,7 +40,12 @@ REPORT_TEMPLATE = (
 )
 
 
-def _read(path) -> str | None:
+# Present-but-unreadable is not missing: an answer may land a moment later, so
+# a terminal decision now would re-ask a question that is about to be answered.
+UNREADABLE = object()
+
+
+def _read(path):
     if path is None:
         return None
     try:
@@ -48,7 +53,7 @@ def _read(path) -> str | None:
     except (OSError, UnicodeDecodeError):
         # UnicodeDecodeError is a ValueError, so a torn holder escaped `except
         # OSError`; errors="replace" would decode it into a false non-skip answer.
-        return None
+        return UNREADABLE if path.exists() else None
 
 
 def plan_dedup_recovery(
@@ -76,6 +81,8 @@ def plan_dedup_recovery(
     holder = (holder_id or "").strip()
     orig_text = _read(find_task_file(Path(tasks_dir), task_id))
     holder_text = _read(find_result(Path(results_dir), holder)) if holder else None
+    if orig_text is UNREADABLE or holder_text is UNREADABLE:
+        return "defer", None
 
     decision = dedup_decision(holder_text, orig_text)
     if decision == "honour":

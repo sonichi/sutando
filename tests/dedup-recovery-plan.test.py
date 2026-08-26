@@ -171,16 +171,17 @@ class CommitIdentityTest(unittest.TestCase):
 
 
 class UnreadableInputTest(unittest.TestCase):
-    """A task or holder path that exists but cannot be read is 'no record',
-    not an exception into the delivery loop."""
+    """An unreadable path is RETRYABLE, not 'no record'. Reversed at the
+    reviewer's request on #3317: treating it as missing takes a terminal
+    action against an answer that may land a moment later."""
 
-    def test_unreadable_original_task_is_treated_as_missing(self):
+    def test_unreadable_original_task_defers(self):
         with tempfile.TemporaryDirectory() as td:
             sp = _Space(td)
             sp.holder("")
             # A directory where the task file is expected: read_text raises.
             (sp.tasks / f"{TID}.txt").mkdir()
-            self.assertEqual(sp.plan()[0], "report")
+            self.assertEqual(sp.plan()[0], "defer")
 
     def test_unreadable_holder_result_is_treated_as_not_delivered(self):
         with tempfile.TemporaryDirectory() as td:

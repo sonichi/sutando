@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""A holder result that is mid-write must not read as a deliberate skip.
+"""A holder result that is mid-write is RETRYABLE, not missing.
 
-Strict read raised UnicodeDecodeError (a ValueError, so it escaped
-`except OSError`); the caller then retired the original owner request.
+Reverses this file's earlier contract at the reviewer's request on #3317. It
+asserted torn == absent ("a half-written file is not evidence"), which takes a
+terminal decision against an answer that may land moments later.
 """
 import pathlib
 import sys
@@ -24,19 +25,20 @@ class TornHolderTest(unittest.TestCase):
         return plan_dedup_recovery(results, tasks, "task-orig00000001", HOLDER,
                                    "chan", "task-newid00000001")
 
-    def test_a_torn_holder_does_not_read_as_a_skip(self):
+    def test_a_torn_holder_defers_rather_than_deciding(self):
         torn = self.plan(lambda r: (r / f"{HOLDER}.txt").write_bytes(
             b"task: holder0000001\n\xff\xfe partial"))
         skip = self.plan(lambda r: (r / f"{HOLDER}.txt").write_text(
             "task: holder0000001\n[no-send]\n"))
         self.assertNotEqual(torn[0], skip[0])
-        self.assertEqual(torn[0], "report")
+        self.assertEqual(torn, ("defer", None))
 
-    def test_a_torn_holder_matches_an_absent_one(self):
-        # Unreadable is unreadable; a half-written file is not evidence.
+    def test_a_torn_holder_does_NOT_match_an_absent_one(self):
+        # The reversal: absent means nothing is coming, torn means something is.
         torn = self.plan(lambda r: (r / f"{HOLDER}.txt").write_bytes(b"\xff\xfe"))
         absent = self.plan(lambda r: None)
-        self.assertEqual(torn, absent)
+        self.assertEqual(torn[0], "defer")
+        self.assertNotEqual(torn, absent)
 
     def test_a_whole_skip_is_still_honoured(self):
         # Control: the fix must not turn every holder into a report.
