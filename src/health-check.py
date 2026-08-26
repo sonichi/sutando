@@ -2827,6 +2827,10 @@ _SERVICE_SOURCES = (
     ("src/remote-gateway-bridge.py", "remote-gateway-bridge.py"),
     ("packages/ag2-sparrow/ag2_sparrow/", "remote-gateway-bridge.py"),
     ("skills/phone-conversation/scripts/conversation-server.ts", "conversation-server.ts"),
+    # KeepAlive jobs in src/launchd/ whose program SURVIVES as a process. A
+    # wrapper that `exec`s is gone from the table, so its payload's row covers it.
+    ("src/launchd/channel-bridge-wrapper.sh", "channel-bridge-wrapper.sh"),
+    ("src/Sutando/", "Sutando.app/Contents/MacOS/Sutando"),
 )
 
 
