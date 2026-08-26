@@ -993,8 +993,26 @@ fi
 exit 0
 ''', timeout="5")
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("no pairing receipt", result.stderr)
+        # The gate moved from presence to attestation; re-pointed rather than
+        # loosened, because a stale receipt also has to fail here.
+        self.assertIn("does not attest the bytes", result.stderr)
         self.assertNotIn("no result for", result.stderr)
+
+    def test_managed_notifier_rejects_a_receipt_that_no_longer_matches(self):
+        """The case presence cannot see: the receipt IS there, minted by the
+        real writer, and the result was overwritten afterwards."""
+        result = self._managed_post_condition_run("""
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  paired_result task-owner.txt
+  printf 'a different answer\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
+fi
+exit 0
+""", timeout="5")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("does not attest the bytes", result.stderr)
 
     def test_managed_notifier_accepts_a_result_written_through_the_helper(self):
         """Positive control: the same harness passes when pairing is satisfied."""

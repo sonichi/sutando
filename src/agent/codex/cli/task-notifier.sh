@@ -137,8 +137,11 @@ assert_result_paired() {
     return 1
   fi
   task_id="$(task_id_of "$filename")"
-  if [ ! -f "$RESULT_PAIRING_DIR/task-$task_id.ok" ]; then
-    echo "task-notifier: result for $filename has no pairing receipt in $RESULT_PAIRING_DIR; it was not written through src/result_write.py, so it may answer a different task" >&2
+  # Attestation, not presence: an empty or stale receipt is exactly what a
+  # presence check cannot tell apart from a matching one.
+  if ! python3 "$REPO/src/result_write.py" attests "$task_id" \
+      --results-dir "$RESULTS_DIR" --receipts-dir "$RESULT_PAIRING_DIR" >/dev/null 2>&1; then
+    echo "task-notifier: the pairing receipt in $RESULT_PAIRING_DIR does not attest the bytes now in $filename; it was not written through src/result_write.py, or it was overwritten, so it may answer a different task" >&2
     return 1
   fi
   return 0

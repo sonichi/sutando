@@ -212,8 +212,40 @@ def _write_cli(argv: "list[str]") -> int:
     return 0
 
 
+def _attests_cli(argv) -> int:
+    """`attests <task_id> [--results-dir X --receipts-dir Y]` -> 0 when the
+    receipt names this task AND the bytes currently in the result file.
+
+    Exists so a shell caller can check ATTESTATION rather than presence: an
+    empty or stale receipt is exactly what presence cannot tell apart.
+    """
+    if not argv:
+        print(USAGE, file=sys.stderr)
+        return 2
+    task_id, rest = argv[0], argv[1:]
+    opts: "dict[str, str]" = {}
+    while rest:
+        flag = rest.pop(0)
+        if not flag.startswith("--") or not rest:
+            print(USAGE, file=sys.stderr)
+            return 2
+        opts[flag[2:]] = rest.pop(0)
+    if set(opts) - {"workspace", "results-dir", "receipts-dir"}:
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        results, receipts = _resolve_dirs(opts)
+        body = (Path(results) / f"task-{task_id}.txt").read_text()
+    except (OSError, ValueError) as e:
+        print(f"result unreadable: {e}", file=sys.stderr)
+        return 1
+    return 0 if receipt_attests(receipts, task_id, body) else 1
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "write":
         sys.exit(_write_cli(sys.argv[2:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "attests":
+        sys.exit(_attests_cli(sys.argv[2:]))
     print(USAGE, file=sys.stderr)
     sys.exit(2)
