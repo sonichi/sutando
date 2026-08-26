@@ -30,9 +30,9 @@ AFFINITY_IDLE_S = 30 * 60
 # Outstanding assigned+claimed before affinity yields. Env-tunable: 1 = yield
 # the moment the handler is busy (latency over continuity — owner preference).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
-ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
-# A repool pops the ledger entry, so "is it stuck right now" reads false on the
-# very next sweep — the follower must stay marked or the task returns to it.
+ASSIGN_STUCK_S = 300
+# Assigned-unclaimed past ASSIGN_STUCK_S repools; the repool pops the ledger
+# entry, so the follower must stay marked or the task returns to it.
 NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S
 DONE_FLAG_RETENTION_S = 7 * 86400
 
