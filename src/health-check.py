@@ -6372,6 +6372,25 @@ def _pool_only_detail(pooled: "list") -> str:
             f"0 unassigned — the pool is working, not stalled")
 
 
+def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
+    """Pool-held files old enough that no holder is plausibly still working.
+
+    Holding is a RENAME, so a file whose holder died keeps that name forever:
+    nothing on main reclaims it (`sweep-stranded-claims.sh` is a documented
+    one-shot, wired to no scheduler). Age is the discriminator that needs no
+    per-instance liveness — deliberately, since `state/cores/*.alive` is synced
+    across hosts and a peer's record can vouch for a dead local holder.
+    """
+    out = []
+    for f in pooled:
+        try:
+            if now - f.stat().st_mtime >= stuck_age_sec:
+                out.append(f)
+        except OSError:
+            continue
+    return out
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -6387,9 +6406,17 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
         return {"name": name, "status": "ok", "detail": "queue empty"}
     # A follower holds by RENAMING, so argv-based holdings see none of it.
     files, pooled = _split_pool_held(files)
-    if pooled and not files:
-        return {"name": name, "status": "ok", "detail": _pool_only_detail(pooled)}
     now = time.time()
+    if pooled and not files:
+        stuck = _pool_held_stuck(pooled, now, stuck_age_sec)
+        if stuck:
+            oldest_h = int(now - min(f.stat().st_mtime for f in stuck)) // 3600
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(stuck)} of {len(pooled)} pool-held task(s) have not moved "
+                              f"in over {stuck_age_sec // 60} min (oldest {oldest_h}h): "
+                              f"{_pool_held_note(stuck)}. A hold is a rename, so a dead holder "
+                              f"keeps the name forever — check those followers are alive"}
+        return {"name": name, "status": "ok", "detail": _pool_only_detail(pooled)}
     # An in-flight task looks exactly like a stalled one on disk; the worker's
     # argv is the only thing that tells them apart.
     holdings = _worker_holdings()

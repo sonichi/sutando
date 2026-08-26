@@ -53,6 +53,34 @@ class PoolHeldQueue(unittest.TestCase):
         self.assertIn("0 unassigned", r["detail"])
         self.assertNotIn("may be stuck", r["detail"])
 
+    def test_a_pool_hold_that_never_moves_is_not_ok(self):
+        """A hold is a RENAME, so a dead holder keeps the name forever. Nothing
+        on main reclaims it, so 'the pool is working' would be permanent."""
+        self._task("task-z.claimed-core-9.txt", age_s=6 * 3600)
+        r = self.hc.check_task_queue()
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("claimed:core-9", r["detail"])
+        self.assertNotIn("not stalled", r["detail"])
+
+    def test_assigned_is_gated_the_same_as_claimed(self):
+        """`reclaim_dead` is on the unmerged pool branch, so on this tree an
+        old `.assigned-` is no more self-correcting than an old `.claimed-`."""
+        self._task("task-y.assigned-core-8.txt", age_s=6 * 3600)
+        r = self.hc.check_task_queue()
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("assigned:core-8", r["detail"])
+
+    def test_only_the_stale_holds_are_named(self):
+        """Positive control: a fresh hold alongside a stale one must not be
+        swept into the warning, or the probe just reports the whole pool."""
+        self._task("task-fresh.claimed-core-1.txt", age_s=60)
+        self._task("task-stale.claimed-core-9.txt", age_s=6 * 3600)
+        r = self.hc.check_task_queue()
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("1 of 2", r["detail"])
+        self.assertIn("core-9", r["detail"])
+        self.assertNotIn("core-1", r["detail"])
+
     def test_a_real_pileup_still_warns(self):
         """The guard must not disarm the probe: unassigned work still fires."""
         for i in range(4):
