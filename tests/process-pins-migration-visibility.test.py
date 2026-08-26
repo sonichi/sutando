@@ -94,6 +94,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
     def _gnu_stat_shim(self, comma: bool = True) -> Path:
         """A faithful-enough GNU `stat` on PATH: -f is --file-system (fails),
         -c formats succeed, and fractions use the locale's decimal separator."""
+        import uuid
+        nonce = f"SHIM-BOUND-{uuid.uuid4().hex[:12]}"
         bin_ = self.tmp / "shimbin"
         bin_.mkdir(exist_ok=True)
         (bin_ / "stat").write_text(
@@ -102,6 +104,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "a = sys.argv[1:]\n"
             "if not a or a[0] == '-f':\n"
             "    sys.stderr.write('stat: cannot read file system information\\n')\n"
+            f"    sys.stderr.write('{nonce}\\n')\n"
             "    print('  File: \"x\"'); print('    ID: 0 Namelen: 255'); sys.exit(1)\n"
             "if a[0] != '-c':\n"
             "    sys.exit(1)\n"
@@ -117,23 +120,22 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "                          time.localtime(st.st_mtime)))\n"
             "else: sys.exit(1)\n")
         (bin_ / "stat").chmod(0o755)
-        self._assert_shim_binds(bin_)
+        self._assert_shim_binds(bin_, nonce)
         return bin_
 
-    def _assert_shim_binds(self, bin_: Path) -> None:
+    def _assert_shim_binds(self, bin_: Path, nonce: str) -> None:
         """Executable-on-disk is not bound-on-PATH.
 
-        If this dir loses PATH precedence the host stat answers and every
-        GNU assertion below passes without the instrument ever firing.
+        Assert on a NONCE, never on nonzero-exit + `File:` -- host GNU stat
+        emits exactly that for `-f` (it is --file-system), so that predicate
+        is satisfied by the host on the one platform it must discriminate on.
         """
         import subprocess
         env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
         r = subprocess.run(["stat", "-f", "%m", str(bin_)],
                            capture_output=True, text=True, env=env)
-        self.assertNotEqual(r.returncode, 0,
-                            "shim did NOT bind: `stat -f` succeeded, so host stat answered")
-        self.assertIn("File:", r.stdout,
-                      f"shim did NOT bind: stdout lacks its signature ({r.stdout[:60]!r})")
+        self.assertIn(nonce, r.stderr,
+                      f"shim did NOT bind: host stat answered (stderr={r.stderr[:80]!r})")
 
 
     def _verdict(self, pins_path):
