@@ -75,12 +75,12 @@ class ReconnectObservabilityTest(unittest.TestCase):
             body = next(ast.unparse(n) for n in ast.walk(tree)
                         if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
             self.assertIn(f"{counter} += 1", body, f"{name} must advance {counter}")
-        # Silent by design: the flap rate that would justify a per-event line
-        # is the very thing nothing here has measured.
+        # discord.py re-dispatches disconnect per retry while ready/resumed fire
+        # only on success, so in an outage this is the only line emitted.
         disc = next(ast.unparse(n) for n in ast.walk(tree)
                     if isinstance(n, ast.AsyncFunctionDef) and n.name == "on_disconnect")
-        self.assertNotIn("print(", disc, "on_disconnect must not log per event")
-        for name in ("on_resumed", "on_ready"):
+        self.assertIn("print(", disc, "on_disconnect must log per event (outage liveness)")
+        for name in ("on_resumed", "on_ready", "on_disconnect"):
             body = next(ast.unparse(n) for n in ast.walk(tree)
                         if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
             self.assertIn("_reconnect_state()", body, f"{name} must report the counters")
@@ -88,6 +88,7 @@ class ReconnectObservabilityTest(unittest.TestCase):
     def test_resume_line_is_greppable_apart_from_ready(self) -> None:
         """A resume that logged 'ready' would be indistinguishable again."""
         self.assertRegex(SRC, r"Discord bridge resumed: ")
+        self.assertRegex(SRC, r"Discord bridge disconnected: ")
         self.assertEqual(len(re.findall(r"Discord bridge ready: ", SRC)), 1)
 
 

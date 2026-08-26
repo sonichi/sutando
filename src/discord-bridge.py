@@ -2694,10 +2694,12 @@ async def on_resumed():  # pragma: no cover — gateway callback; counter logic 
 
 
 @client.event
-async def on_disconnect():  # pragma: no cover — gateway callback; counter logic is unit-tested
-    # Silent: a per-event line could bury ready/resume at an unmeasured flap rate.
+async def on_disconnect():  # pragma: no cover — gateway callback
+    # Re-dispatched per retry while ready/resumed need success: the only outage line.
     global _disconnect_count
     _disconnect_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge disconnected: "
+          f"{_reconnect_state()}", flush=True)
 
 
 @client.event
