@@ -274,11 +274,30 @@ def _valid_local_tid(tid: str) -> bool:
     return bool(m) and m.group(1) not in (".", "..")
 
 
+def _owns_local_tid(tid: str) -> bool:
+    """Is this LOCAL task id inside THIS bridge's namespace?
+
+    `_local_tid` mints `task-<inst>~<broker_id>` for a named instance and leaves
+    the primary's ids unscoped, so ownership is decidable from the id alone. A
+    shared `RESULTS_DIR` therefore needs no coordination — each lane can tell its
+    own files from a sibling's.
+
+    Both directions matter. A named instance must not touch unscoped ids, and the
+    primary must not touch `~`-scoped ones: `task-*` matches `task-dev~1` too, so
+    filtering only the instance side would leave the primary cannibalising every
+    named lane — the same defect mirrored.
+    """
+    if GATEWAY_INSTANCE:
+        return tid.startswith(f"task-{GATEWAY_INSTANCE}~")
+    # `~` is outside the broker-id alphabet, so any scoped id — including an
+    # instance this build does not know — is someone else's. Unowned > misrouted.
+    return "~" not in tid
+
+
 def _task_pending(tid: str) -> bool:
     """Is this task still live in tasks/, under ANY of its names?
 
-    A pooled task is renamed twice — unassigned -> `.assigned-<core>` (lead
-    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
+    A pooled task is renamed twice — unassigned -> `.assigned-<core>` (lead    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
     "is this still being worked?" must accept all three, so the question has
     one owner: a state missed here reads as finished, which drops a reply
     mid-flight or re-queues work another core already holds."""
@@ -3358,7 +3377,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         return
     _last_orphan_sweep = now
     try:
-        candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
+        # RESULTS_DIR is shared across lanes; the glob is not namespace-aware.
+        candidates = sorted(p for p in RESULTS_DIR.glob("task-*.txt")
+                            if _owns_local_tid(p.stem))
     except OSError:
         return
     for rfile in candidates:
