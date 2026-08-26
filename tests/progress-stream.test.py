@@ -145,6 +145,14 @@ sc._reset_cache_for_tests()
 
 # --- should_stream_task (owner-only) ---
 check("owner streams", ps.should_stream_task("owner") is True)
+check("collaborator streams despite team tier",
+      ps.should_stream_task("team", True) is True)
+check("team WITHOUT collaborator does not stream",
+      ps.should_stream_task("team", False) is False)
+check("collaborator flag defaults off (unchanged callers keep owner-only)",
+      ps.should_stream_task("team") is False)
+check("other tier never streams even as collaborator=False",
+      ps.should_stream_task("other") is False)
 check("owner streams (caps/space)", ps.should_stream_task("  Owner ") is True)
 check("None tier streams (legacy owner)", ps.should_stream_task(None) is True)
 check("team does NOT stream", ps.should_stream_task("team") is False)
