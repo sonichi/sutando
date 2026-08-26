@@ -254,11 +254,22 @@ class AffinityBusyYieldTest(unittest.TestCase):
         (self.tasks / "task-w1.claimed-core-2.txt").write_text("x")
         stuck = self.tasks / "task-w2.assigned-core-2.txt"
         stuck.write_text("id: task-w2\nchannel_id: chan-A\n")
-        self.lead._save_assign_ledger({stuck.name: 0.0})
-        out = self.lead.reclaim_stuck_assignments(max_age_s=1)
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=300)
         self.assertEqual(out, [])
         self.assertTrue(stuck.exists(), "assignment must stay put")
         self.assertIn("chan-A", self.lead._load_affinity())
+
+    def test_wedged_busy_core_yields_at_the_deferral_cap(self):
+        # a claimed file is not proof of progress: past BUSY_DEFER_MAX_S the
+        # assignment repools even though the core still holds a claim
+        (self.tasks / "task-w3.claimed-core-2.txt").write_text("x")
+        stuck = self.tasks / "task-w4.assigned-core-2.txt"
+        stuck.write_text("id: task-w4\nchannel_id: chan-A\n")
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 1801.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=300)
+        self.assertEqual(len(out), 1)
+        self.assertFalse(stuck.exists(), "past the cap the assignment repools")
 
     def test_unclaimed_reclaim_releases_the_room_binding(self):
         # home core heartbeats but never claims: reclaim must drop the row

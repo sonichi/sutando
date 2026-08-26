@@ -28,6 +28,7 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 # affinity itself is binding and never yields on load (owner 2026-08-26).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
+BUSY_DEFER_MAX_S = 1800.0  # busy core keeps assignments this long, then wedge rules apply
 DONE_FLAG_RETENTION_S = 7 * 86400
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
@@ -309,10 +310,10 @@ class PoolLead:
                 continue
             if self.now() - float(ts) < max_age_s or not self.alive_fn(m.group(2)):
                 continue  # young, or dead (reclaim_dead owns that path)
-            if self._claimed_load(m.group(2)) > 0:
-                # busy, not wedged: it will claim when it frees up. Repooling
-                # here moved bound rooms off their context core (owner report)
-                ledger[f.name] = self.now()
+            if (self._claimed_load(m.group(2)) > 0
+                    and self.now() - float(ts) < BUSY_DEFER_MAX_S):
+                # busy defers reclaim but is not proof of progress: the ledger
+                # ts is NOT reset, so a wedged core still yields at the cap
                 continue
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
