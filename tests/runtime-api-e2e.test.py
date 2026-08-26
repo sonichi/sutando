@@ -574,16 +574,21 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         w14 = cli("request", "wait", h14["requestId"], "--timeout", "10")
         check(w14["status"] == "completed" and w14["resolvedBy"] == "@owner:example.org",
               "owner card answer Done resolves the request to completed")
+        # Live negative control over the REAL socket: the plain Unix client
+        # that raised the request must not be able to settle it (review P1).
         h15 = cli("human-action", "request", "--action", "Plug in the drive")
-        c15 = cli("human-action", "complete", h15["requestId"], "--note", "done irl")
-        check(c15["status"] == "completed",
-              "API complete path resolves the request")
-        act15 = pending_action_for(h15["requestId"], store)
-        check(act15 is not None and act15["status"] == "resolved",
-              "API completion closes the mirrored card (no dangling question)")
+        cli("human-action", "complete", h15["requestId"], "--note", "done irl",
+            expect_rc=1)
         s15 = cli("human-action", "status", h15["requestId"])
-        check(s15["status"] == "completed" and s15["result"] == {"note": "done irl"},
-              "human_action status returns the terminal record")
+        check(s15["status"] == "pending",
+              "ungranted CLI complete leaves the durable row pending")
+        act15 = pending_action_for(h15["requestId"], store)
+        check(act15 is not None and act15["status"] == "pending",
+              "ungranted CLI complete leaves the card open for the human")
+        store.resolve(act15["action_id"], {"1": [1]}, "@owner:example.org")
+        w15 = cli("request", "wait", h15["requestId"], "--timeout", "10")
+        check(w15["status"] == "completed",
+              "the human's own card answer still settles the action")
 
         # 15. task waiting_for_* weave: a live task with a pending HITL
         # request is parked in its waiting state; resolving the request
@@ -595,7 +600,9 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         check(st16["state"] == "waiting_for_human_action"
               and st16["waitingOn"] == ["waiting_for_human_action"],
               "pending human_action parks the task in waiting_for_human_action")
-        cli("human-action", "complete", h16["requestId"])
+        act16 = pending_action_for(h16["requestId"], store)
+        store.resolve(act16["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", h16["requestId"], "--timeout", "10")
         st16b = cli("task", "status", tid16)
         check(st16b["state"] == "pending",
               "resolving the request returns the task to the normal lifecycle")
@@ -612,7 +619,9 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         check(h15b["requestId"] in rl_ids
               and any(r.get("action") == "List me" for r in rl["requests"]),
               "request list enumerates pending human requests with summaries")
-        cli("human-action", "complete", h15b["requestId"])
+        act15b = pending_action_for(h15b["requestId"], store)
+        store.resolve(act15b["action_id"], {"1": [1]}, "@owner:example.org")
+        cli("request", "wait", h15b["requestId"], "--timeout", "10")
         rl2 = cli("request", "list")
         check(h15b["requestId"] not in [r["requestId"] for r in rl2["requests"]],
               "resolved requests leave the pending list")

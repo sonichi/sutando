@@ -33,6 +33,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
+- **`claim_task.py`** — Atomic-rename claim primitive for the multi-core agent pool (#880, #884).
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
@@ -63,8 +64,10 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`discord_proactive_send.py`** — Send-leg of proactive text delivery through the shared DeliveryProvider.
 - **`discord_reader.py`** — Alias of `channels.discord.reader` (phase-1a restructure); one transition window.
 - **`discord_rest_client.py`** — Alias of `channels.discord.client` (phase-1a restructure); one transition window.
+- **`discord_result_delivery.py`** — Discord result-delivery state, bound to the shared outbox (#3279 action 2).
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
+- **`entrance_links.py`** — EntranceLink records — verified provider-identity ↔ Stand bindings (I2).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
@@ -104,6 +107,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`pool_follower.py`** — Follower-side work acquisition (lead-follower pool, slice L2).
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
@@ -144,6 +148,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
+- **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
@@ -239,6 +244,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`__init__.py`** — Discord channel: API mechanics + injected post-gate (bridge, client, http, reader, post_gate).
 - **`client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
 - **`delivery_provider.py`** — DiscordDeliveryProvider: binds the shared DiscordRestClient into the 3013 delivery-core seam — the first production provider behind it.
+- **`entrance_verify.py`** — Discord entrance verification — the provider-I/O edge of EntranceLink.
 - **`http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
 - **`post_gate.py`** — Production injection seam for the Discord post-gate.
 - **`reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
@@ -332,10 +338,16 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
 - **`identity_view.py`** — Read-only identity surface for THIS agent (the Sutando Server "smallest slice"): sutando.info / sutando.status / sutando.owner / sutando.allowlist.
+- **`instance_key.py`** — Composite (agent_id, instance_id) identity encoding — the ONE owner shared by the durable registry (flat manifest filenames) and the live run dir (the directory holding this instance's socket and lock).
 - **`instance_registry.py`** — Sutando Instance Manifest registry — persistent "this agent exists here" records, M1 of the manifest spec (taxonomy part 4/5): Agent existence ≠ agent process existence.
+- **`pool_lead.py`** — Lead-side assignment engine (lead-follower pool, slice L1).
+- **`pool_metrics.py`** — Lead-side pool metrics (slice L4 — the owner's 2026-05-19 quality bar).
+- **`pool_notify.py`** — Lead-side progress communication (lead-follower pool, slice L5).
+- **`pool_scale.py`** — Lead-side follower autoscaling policy (lead-follower pool, slice L6).
+- **`pool_status.py`** — Owner-facing pool snapshot (single writer: the lead daemon).
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
-- **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
+- **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py), the CLI (src/runtime-cli/sutando-runtime.py) and the shell descriptor (scripts/sutando-config.sh, which execs this module).
 - **`runtime_view.py`** — Runtime surface for THIS agent: runtime.health / runtime.details.
 - **`schedules_view.py`** — Schedule surface for the Sutando Server: schedule.list.
 - **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).

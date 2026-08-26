@@ -40,10 +40,10 @@ from typing import Optional
 # reinvented-fallback bug class as core_heartbeat.py (fixed alongside).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from task_archive import task_id_from_filename  # noqa: E402
 from util_paths import personal_path  # noqa: E402
 
 
-TASK_ID_RE = re.compile(r"^task-(.+)\.txt$")
 
 
 def _ensure_vault(vault: Path) -> None:
@@ -53,8 +53,9 @@ def _ensure_vault(vault: Path) -> None:
 
 
 def _task_id_from_path(path: Path) -> Optional[str]:
-    m = TASK_ID_RE.match(path.name)
-    return f"task-{m.group(1)}" if m else None
+    # Delegates so a CLAIMED file yields its real id: the old greedy
+    # `^task-(.+)\.txt$` returned `task-x.claimed-core-2` for one.
+    return task_id_from_filename(path.name)
 
 
 def _parse_task_file(path: Path) -> dict:

@@ -16,9 +16,11 @@ Exit: 0 on pass, 1 on fail.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -183,6 +185,26 @@ class TuiBranchTests(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_sibling_instance_same_agent_marks_unverified(self):
+        # same Stand, different installation: agentId matches but instanceId
+        # does not — must fail closed (the action gate then refuses work)
+        def payload(d):
+            req = json.loads(d.decode().splitlines()[0])
+            r = ({"agentId": "@me:x", "instanceId": "other-install"}
+                 if req.get("method") == "sutando.info" else {"state": "online"})
+            return (json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                                "result": r}).encode() + b"\n")
+        sock, srv = self._serve_once(payload)
+        try:
+            v = tui.instance_view({
+                "identity": {"agent_id": "@me:x"},
+                "instance_id": "mine",
+                "endpoint": {"path": sock}})
+            self.assertEqual(v["instanceId"], "mine")
+            self.assertFalse(v["identityVerified"])
+        finally:
+            srv.close()
+
     def test_views_lists_registry_manifests(self):
         import tempfile as _tf
         with _tf.TemporaryDirectory() as td:
@@ -205,16 +227,18 @@ class TuiActionIdentityGate(unittest.TestCase):
 
     def _drive(self, verified, keys):
         import tui as t
-        view = {"agentId": "@x:1", "server": "running", "core": "running",
-                "health": "healthy", "endpoint": "/tmp/x.sock",
+        view = {"agentId": "@x:1", "instanceId": "default", "server": "running",
+                "core": "running", "health": "healthy", "endpoint": "/tmp/x.sock",
                 "identityVerified": verified, "_manifest": {}}
         calls = []
         feed = iter(keys + ["q"])
         with mock.patch.object(t, "_views", lambda: [view]), \
              mock.patch.object(t, "_rpc_at",
-                               lambda ep, m, p: calls.append((ep, m, p)) or {}), \
+                               lambda ep, m, p, **kw:
+                               calls.append((ep, m, p)) or {}), \
              mock.patch.object(t.instance_registry, "attach",
-                               lambda a: calls.append(("attach", a)) or
+                               lambda a, instance=None:
+                               calls.append(("attach", a)) or
                                {"ok": False, "error": "nope"}), \
              mock.patch("builtins.input", lambda *_a: next(feed)):
             t.main([])
@@ -234,6 +258,138 @@ class TuiActionIdentityGate(unittest.TestCase):
         calls = self._drive(True, ["t @x:1 hello"])
         self.assertIn(("/tmp/x.sock", "task.submit", {"task": "hello"}),
                       calls)
+
+
+class _FakeInstance:
+    """A minimal JSON-RPC peer that answers as ONE (agent, instance) identity
+    and records the work it is asked to do."""
+
+    def __init__(self, path: str, agent: str, instance: str):
+        self.path, self.agent, self.instance = path, agent, instance
+        self.received = []
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(path)
+        self.srv.listen(8)
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,),
+                             daemon=True).start()
+
+    def _serve(self, conn):
+        buf = b""
+        while True:
+            try:
+                chunk = conn.recv(65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    req = json.loads(line)
+                except ValueError:
+                    continue
+                conn.sendall((json.dumps(
+                    {"jsonrpc": "2.0", "id": req.get("id"),
+                     "result": self._answer(req)}) + "\n").encode())
+        conn.close()
+
+    def _answer(self, req):
+        method = req.get("method")
+        if method == "sutando.info":
+            return {"agentId": self.agent, "instanceId": self.instance}
+        if method == "runtime.health":
+            return {"state": "online"}
+        self.received.append((method, req.get("params")))
+        return {"ok": True}
+
+    def close(self):
+        self.srv.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+class TuiSocketReplacementTests(unittest.TestCase):
+    """The endpoint that answered while the view was built is not necessarily
+    the endpoint that receives the command: the TUI blocks on input in
+    between. A sibling runtime that rebinds the path must not inherit the
+    earlier verification."""
+
+    AGENT = "@same:x"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sock = str(Path(self.tmp.name) / "rt.sock")
+        self.peers = []
+        os.environ["SUTANDO_INSTANCE_REGISTRY"] = str(
+            Path(self.tmp.name) / "instances")
+        import instance_registry as reg
+        reg.write_manifest(self.AGENT, instance="blue", endpoint=self.sock)
+        self.blue = self._peer("blue")
+
+    def tearDown(self):
+        for p in self.peers:
+            p.close()
+        os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
+        self.tmp.cleanup()
+
+    def _peer(self, instance):
+        p = _FakeInstance(self.sock, self.AGENT, instance)
+        self.peers.append(p)
+        return p
+
+    def _replace_with_red(self):
+        self.blue.close()
+        self.red = self._peer("red")
+
+    def _drive(self, command, on_input=None):
+        state = {"n": 0}
+
+        def _input(*_a):
+            state["n"] += 1
+            if state["n"] == 1:
+                if on_input:
+                    on_input()
+                return command
+            return "q"
+
+        with mock.patch("builtins.input", _input):
+            tui.main([])
+
+    def test_task_submit_does_not_reach_a_replaced_socket(self):
+        self.red = None
+        self._drive(f"t {self.AGENT}/blue private-for-blue",
+                    on_input=self._replace_with_red)
+        self.assertEqual(self.red.received, [],
+                         "private task reached the sibling runtime that "
+                         "rebound the endpoint after verification")
+        self.assertEqual(self.blue.received, [])
+
+    def test_request_list_does_not_read_from_a_replaced_socket(self):
+        self.red = None
+        self._drive(f"h {self.AGENT}/blue", on_input=self._replace_with_red)
+        self.assertEqual(self.red.received, [],
+                         "request history was read from the sibling runtime "
+                         "that rebound the endpoint after verification")
+
+    def test_unreplaced_socket_still_receives_the_task(self):
+        self._drive(f"t {self.AGENT}/blue hello")
+        self.assertEqual(self.blue.received,
+                         [("task.submit", {"task": "hello"})])
+
+    def test_unreplaced_socket_still_serves_request_list(self):
+        self._drive(f"h {self.AGENT}/blue")
+        self.assertEqual(self.blue.received, [("request.list", {})])
 
 
 if __name__ == "__main__":

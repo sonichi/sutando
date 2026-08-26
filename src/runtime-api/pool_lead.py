@@ -34,6 +34,9 @@ ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
 # A runtime without in-session wake-up only sees an assignment when its wrapper
 # nudges it, so its deadline must exceed that cadence (codex: 300s).
 ASSIGN_STUCK_S_BY_RUNTIME = {"codex": 900}
+# Assigned-unclaimed past ASSIGN_STUCK_S repools; the repool pops the ledger
+# entry, so the follower must stay marked or the task returns to it.
+NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S
 DONE_FLAG_RETENTION_S = 7 * 86400
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
@@ -48,10 +51,10 @@ _LANE_RE = re.compile(
 
 def _read_channel(path: Path) -> "str | None":
     try:
-        head = path.read_text(errors="replace")[:2048]
+        text = path.read_text(errors="replace")
     except OSError:
         return None
-    m = _CHANNEL_RE.search(head)
+    m = _CHANNEL_RE.search(text)
     return m.group(1) if m else None
 
 
@@ -60,10 +63,10 @@ def _read_lane(path: Path) -> str:
     'owner' otherwise. Unreadable or unenumerated headers fail to 'owner' —
     a malformed header must never shunt an owner message behind maintenance."""
     try:
-        head = path.read_text(errors="replace")[:2048]
+        text = path.read_text(errors="replace")
     except OSError:
         return "owner"
-    fields = dict(m.group("key", "val") for m in _LANE_RE.finditer(head))
+    fields = dict(m.group("key", "val") for m in _LANE_RE.finditer(text))
     tier = fields.get("access_tier")
     if (tier is not None and tier != "owner") or fields.get("priority") == "low" \
             or fields.get("interaction_type") == "self_reflective":
@@ -128,9 +131,16 @@ class PoolLead:
         # owner traffic stays off it except as saturated-pool overflow.
         lane_core = (max(followers, key=lambda f: (len(str(f)), str(f)))
                      if len(followers) > 1 else None)
-        if lane == "routine" and lane_core is not None:
+        # Same escape the owner side already has: pinned unconditionally, one
+        # wedged lane core absorbs every routine task and no other is offered.
+        if (lane == "routine" and lane_core is not None
+                and self._load(lane_core) < AFFINITY_BUSY_MAX
+                and self._claiming(lane_core)):
             return lane_core
         primary = [f for f in followers if f != lane_core] or followers
+        # A repool drops the follower's load, so least-loaded actively PREFERS
+        # the core that just failed to claim. Never narrow to empty.
+        primary = [f for f in primary if self._claiming(f)] or primary
         if channel:
             row = affinity.get(channel)
             if (isinstance(row, dict) and row.get("instance") in primary
@@ -142,7 +152,7 @@ class PoolLead:
                 return row["instance"]
         pick = min(primary, key=lambda f: (self._load(f), str(f)))
         if (lane_core is not None and self._load(pick) >= AFFINITY_BUSY_MAX
-                and self._load(lane_core) == 0):
+                and self._load(lane_core) == 0 and self._claiming(lane_core)):
             return lane_core  # overflow: whole owner lane saturated, lane idle
         return pick
 
@@ -162,8 +172,10 @@ class PoolLead:
         affinity = self._load_affinity()
         out = []
         for f in sort_tasks_by_priority(pending):
-            if self._done_flag_exists(f.name) and self._result_evidence(f.name):
-                continue  # processed by a since-dead claimer; bridge owns it now
+            if self._result_evidence(f.name):
+                # finish_task writes the result BEFORE the flag, so result-
+                # without-flag is COMPLETE; reassigning would re-execute it.
+                continue
             channel = _read_channel(f)
             inst = self._pick(channel, followers, affinity, _read_lane(f))
             target = f.with_name(
@@ -240,6 +252,40 @@ class PoolLead:
             return default_s
         return ASSIGN_STUCK_S_BY_RUNTIME.get(rt or "", default_s)
 
+    # ── no-claim cooldown ───────────────────────────────────────────────────
+    def _noclaim_path(self) -> Path:
+        return self.state_dir / "pool" / "no-claim.json"
+
+    def _load_noclaim(self) -> dict:
+        try:
+            d = json.loads(self._noclaim_path().read_text())
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _mark_noclaim(self, instance: str) -> None:
+        """Record that this follower held an assignment past the stuck window.
+        Survives the repool that clears the assignment ledger."""
+        table = self._load_noclaim()
+        table[instance] = self.now()
+        cutoff = self.now() - NOCLAIM_COOLDOWN_S
+        table = {k: v for k, v in table.items() if float(v) >= cutoff}
+        p = self._noclaim_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp3")
+            tmp.write_text(json.dumps(table))
+            os.replace(tmp, p)
+        except OSError:
+            pass  # best-effort: a lost mark costs one retry, never correctness
+
+    def _claiming(self, instance: str) -> bool:
+        """False while a follower is inside the cooldown after failing to claim.
+        Heartbeat cannot answer this: a session wedged at its input layer beats
+        perfectly while never claiming, so `alive_fn` says yes throughout."""
+        ts = self._load_noclaim().get(instance)
+        return ts is None or (self.now() - float(ts)) >= NOCLAIM_COOLDOWN_S
+
     def reclaim_stuck_assignments(self, max_age_s: int = ASSIGN_STUCK_S) -> "list[str]":
         """Repool assignments a LIVE follower has not claimed in time. A hung
         session's wrapper keeps its heartbeat fresh, so reclaim_dead never
@@ -271,6 +317,7 @@ class PoolLead:
                 continue
             ledger.pop(f.name, None)
             live.discard(f.name)
+            self._mark_noclaim(m.group(2))
             out.append(f.name)
         self._save_assign_ledger({k: v for k, v in ledger.items() if k in live})
         return out
@@ -299,15 +346,6 @@ class PoolLead:
                     continue
         return removed
 
-    def _done_flag_exists(self, task_name: str) -> bool:
-        cores = self.state_dir / "cores"
-        try:
-            dirs = [d for d in cores.iterdir() if d.is_dir()]
-        except OSError:
-            return False
-        stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
-        return any((d / "done" / f"{stem}.flag").exists() for d in dirs)
-
     def _result_evidence(self, task_name: str) -> bool:
         """A result was produced: live in results/, or already consumed by a
         bridge (archive/ and undelivered/ are the two consumer dispositions)."""
@@ -319,12 +357,11 @@ class PoolLead:
             self.results_dir / "undelivered" / name))
 
     def reclaim_claimed(self) -> "list[tuple[str, str]]":
-        """Recover claimed files whose claimer died. Delivered means the
-        claimer's done-flag AND result evidence both exist; then restore
-        the canonical name so bridges can deliver (sweep skips it). A
-        done-flag alone is a crash between flag and result write — no
-        user-visible effect happened, so repool for reassignment rather
-        than silently losing the task."""
+        """Recover claimed files whose claimer died. Delivered means result
+        evidence exists; then restore the canonical name so bridges can
+        deliver (sweep skips it). The reachable crash residue is a result
+        with no done-flag — finish_task writes the result first — and that
+        work is COMPLETE, so it must not be repooled for re-execution."""
         out = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
         try:
@@ -340,7 +377,6 @@ class PoolLead:
                 os.rename(f, f.with_name(canonical))
             except OSError:
                 continue
-            done = (self._done_flag_exists(canonical)
-                    and self._result_evidence(canonical))
+            done = self._result_evidence(canonical)
             out.append((f.name, "delivered" if done else "repooled"))
         return out

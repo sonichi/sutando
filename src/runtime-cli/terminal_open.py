@@ -40,9 +40,12 @@ def applescript_for(command: str, window: bool = False) -> str:
             f'  do script "{command}" in front window\nend tell')
 
 
-def build_open_plan(agent_id: str, terminal: str, window: bool = False) -> dict:
+def build_open_plan(agent_id: str, terminal: str, window: bool = False,
+                    instance: str | None = None) -> dict:
     """Decide how to open. Returns {"method": ..., ...} — never spawns."""
     command = f"sutando attach {agent_id}"
+    if instance and instance != "default":
+        command += f" --instance {instance}"
     if terminal == "apple_terminal":
         return {"method": "applescript",
                 "script": applescript_for(command, window=window),
@@ -59,8 +62,10 @@ def build_open_plan(agent_id: str, terminal: str, window: bool = False) -> dict:
     return {"method": "manual", "command": command}
 
 
-def open_instance(agent_id: str, window: bool = False) -> dict:  # pragma: no cover — spawns a real terminal tab; build_open_plan/applescript_for are the tested pure core
-    plan = build_open_plan(agent_id, detect_terminal(), window=window)
+def open_instance(agent_id: str, window: bool = False,
+                  instance: str | None = None) -> dict:  # pragma: no cover — spawns a real terminal tab; build_open_plan/applescript_for are the tested pure core
+    plan = build_open_plan(agent_id, detect_terminal(), window=window,
+                           instance=instance)
     if plan["method"] == "applescript":
         subprocess.run(["osascript", "-e", plan["script"]], check=False)
         return {"ok": True, "opened": "new_window" if window else "new_tab",

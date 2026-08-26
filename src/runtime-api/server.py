@@ -17,7 +17,8 @@ connect probe fails, 256 KB frame cap, per-request timeouts. The socket is
 same-user local RPC; any remote capability service must re-authorize fully.
 
 Run:  python3 src/runtime-api/server.py
-Env:  SUTANDO_RUNTIME_SOCKET  socket path (default <run dir>/sutando-runtime.sock)
+Env:  SUTANDO_RUNTIME_SOCKET  socket path (default resolved by rundir.py:
+                              <run dir>/<(agent, instance) key>/runtime.sock)
       SUTANDO_RUNTIME_DB      sqlite path (default <state>/runtime-state.sqlite)
       SUTANDO_HA_DIR          human-actions dir (default <state>/human-actions)
       SUTANDO_RUN_DIR         run dir (platform default via rundir.py)
@@ -49,7 +50,8 @@ from protocol import (MAX_LINE_BYTES, ELICITATION_TYPES, ProtocolError,  # noqa:
                       error_frame, notification_frame, parse_line, result_frame)
 from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
-from rundir import socket_path, instance_id, lock_path  # noqa: E402
+from rundir import (agent_id as _resolve_agent_id, instance_id,  # noqa: E402
+                    lock_path, runtime_state_dir, socket_path)
 
 from dispatcher import RuntimeDispatcher  # noqa: E402
 from agents_view import AgentsView  # noqa: E402
@@ -68,14 +70,9 @@ from capability_registry import (EphemeralCapabilityRegistry,  # noqa: E402
 
 
 def _state_dir() -> Path:
-    ws = os.environ.get("SUTANDO_RUNTIME_STATE")
-    if ws:
-        return Path(ws)
-    # Canonical workspace resolution (repo rule: use the helper, never a
-    # guessed relative fallback) — workspace_default lives in src/, one level up.
-    sys.path.insert(0, str(_HERE.parent))
-    from workspace_default import resolve_workspace  # noqa: PLC0415
-    return Path(resolve_workspace()) / "state"
+    # Same resolution the CLI's actor chain uses (rundir.py) — a second copy
+    # here would let daemon and client read different enrolled identities.
+    return runtime_state_dir()
 
 
 def _log(msg: str) -> None:
@@ -110,16 +107,12 @@ def _host_label() -> str | None:
         return None
 
 
+def resolve_actor_id(state_dir) -> str:
+    """The daemon's own actor identity — delegated to the shared chain in
+    rundir.py so the CLI and the shell descriptor resolve the SAME actor, and
+    therefore the same socket (review P1 regression)."""
+    return _resolve_agent_id(state_dir or None)
 
-def _enrolled_agent_id(state_dir) -> "str | None":
-    if not state_dir:
-        return None
-    try:
-        rec = json.loads((Path(state_dir) / "auth" / "ag2space.json").read_text())
-        v = (rec.get("agent_id") or "").strip()
-        return v or None
-    except (OSError, ValueError):
-        return None
 
 class RuntimeServer:
     def __init__(self, socket_path: str, db_path: str, ha_dir: str,
@@ -139,13 +132,7 @@ class RuntimeServer:
         self._state_dir = state_dir
         # Actor identity is resolved DAEMON-SIDE, here, and handed to the
         # dispatcher explicitly — a client parameter can never override it.
-        # Env first, then the enrolled identity (same chain as the WSS leg),
-        # so info/agent-list rows join on the real agent id, not a fallback.
-        self.actor_id = (os.environ.get("SUTANDO_AGENT_ID")
-                         or os.environ.get("AGENT_MXID")
-                         or os.environ.get("AGENT_ID")
-                         or _enrolled_agent_id(state_dir)
-                         or "local-agent")
+        self.actor_id = resolve_actor_id(state_dir)
         # Request-domain orchestration (approvals, capabilities, idempotency,
         # durable transitions) lives in dispatcher.py; this class = transport.
         host_label = _host_label() if state_dir else None
@@ -154,7 +141,8 @@ class RuntimeServer:
             agents_view=AgentsView(state_dir) if state_dir else None,
             identity_view=(IdentityView(state_dir, self.actor_id,
                                         channels_dir=_channels_dir(),
-                                        host_label=host_label)
+                                        host_label=host_label,
+                                        instance=instance_id())
                            if state_dir else None),
             tasks_view=(TasksView(Path(state_dir).parent / "tasks",
                                   Path(state_dir).parent / "results",
@@ -214,7 +202,7 @@ class RuntimeServer:
 
     def mark_stopped(self) -> None:
         try:
-            instance_registry.mark_stopped(self.actor_id)
+            instance_registry.mark_stopped(self.actor_id, instance_id())
         except Exception:  # noqa: BLE001
             pass
 
@@ -446,7 +434,9 @@ class RuntimeServer:
         # Same-instance double start is illegal; flock held for the daemon's
         # life (per-open-file-description — keep the fd referenced on self).
         import fcntl
-        lp = lock_path()
+        # Identity-scoped: two actors sharing an instance_id are two instances,
+        # not a double start of one.
+        lp = lock_path(instance_id(), agent=self.actor_id)
         lp.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(lp.parent, 0o700)
         self._lock_fd = open(lp, "w")
@@ -454,8 +444,8 @@ class RuntimeServer:
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise SystemExit(
-                f"instance {instance_id()!r} already has an authoritative "
-                f"server (lock held: {lp}) — refusing double start")
+                f"instance {self.actor_id!r}/{instance_id()!r} already has an "
+                f"authoritative server (lock held: {lp}) — refusing double start")
         self._lock_fd.write(str(os.getpid()))
         self._lock_fd.flush()
         sp = Path(self.socket_path)
@@ -500,7 +490,8 @@ def build_runtime_server(provider_factories=(), *, state_dir=None,
     return RuntimeServer(
         # Canonical shared resolution (rundir.py) — daemon and CLI must agree
         # on the same default socket, on every platform (review blocker).
-        socket_path=runtime_socket or socket_path(),
+        socket_path=runtime_socket or socket_path(
+            agent=resolve_actor_id(state)),
         db_path=os.environ.get("SUTANDO_RUNTIME_DB")
         or str(state / "runtime-state.sqlite"),
         ha_dir=os.environ.get("SUTANDO_HA_DIR")

@@ -65,6 +65,27 @@ class ScaleDownTests(unittest.TestCase):
             call(pending_unassigned=0, in_flight={"core-1": 0},
                  current_n=1, last_busy_ts=T - 2000, last_change_ts=T - 2000))
 
+    def test_total_follower_loss_does_not_shrink_the_pool(self):
+        """`all([])` is True, so an empty in_flight — every follower gone —
+        reads as a fully idle pool and shrinks it during the outage. The
+        up-branch is guarded with `and live`; both must agree."""
+        self.assertIsNone(
+            call(pending_unassigned=0, in_flight={},
+                 last_busy_ts=T - 2000, last_change_ts=T - 2000))
+
+    def test_total_loss_with_backlog_also_holds(self):
+        """Same empty pool, work waiting: neither branch may fire."""
+        self.assertIsNone(
+            call(pending_unassigned=5, in_flight={},
+                 last_busy_ts=T - 2000, last_change_ts=T - 2000))
+
+    def test_a_reporting_idle_pool_still_scales_down(self):
+        """Control: the guard must reject only the EMPTY case, not idleness —
+        otherwise scale-down is dead and the test above passes vacuously."""
+        self.assertEqual(
+            call(pending_unassigned=0, in_flight={"core-1": 0},
+                 last_busy_ts=T - 2000, last_change_ts=T - 2000), 1)
+
 
 class LedgerTests(unittest.TestCase):
     def test_roundtrip_and_defaults(self):

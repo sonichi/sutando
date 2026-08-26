@@ -9,7 +9,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -230,8 +230,11 @@ class TestCollector(unittest.TestCase):
         self.assertIn("no plain-daily jobs", r["detail"])
 
     def test_end_to_end_late_daily_job_warns(self):
-        arts = [(f"insight-2026-08-0{d}.txt", (2026, 8, d, 7, 30, 0, 0, 0, -1))
-                for d in range(1, 8)]
+        # Dates are RELATIVE: a fixed window ages until the job reads as
+        # naming-drift rather than lateness, which is a different verdict.
+        days = [datetime.now().date() - timedelta(days=k) for k in range(7, 0, -1)]
+        arts = [(f"insight-{d.isoformat()}.txt",
+                 (d.year, d.month, d.day, 7, 30, 0, 0, 0, -1)) for d in days]
         r = self._run(json.dumps([{"name": "daily-insight", "cron": "50 6 * * *"}]), arts)
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("late", r["detail"])
@@ -335,6 +338,84 @@ class TestMidnightBoundary(unittest.TestCase):
             [job("daily-insight", 6, 50, arts, today_seen=True)])
         self.assertEqual(r["status"], "warn", r["detail"])
         self.assertIn("+40 min late", r["detail"])
+
+
+class TestNamingDriftIsUncheckedNotLate(unittest.TestCase):
+    """A job whose output filenames changed keeps matching its OLD files forever.
+    The probe then reports a lateness median computed from a dead corpus and blames
+    the job for 'no output today' — two confident claims about something it stopped
+    measuring. Observed live: morning-briefing's output moved from `briefing-<date>`
+    to `proactive-morning-<epoch>` on 2026-07-16; for the next 38 days the probe
+    reported '7 run(s), median +31 min late' from July files and 'no output today'
+    every day, while the job ran fine."""
+
+    def test_stale_corpus_is_unchecked_not_late(self):
+        arts = [(f"2026-07-{d:02d}", DUE + 45) for d in range(10, 17)]
+        r = hc._interpret_daily_punctuality(
+            [job("morning-briefing", 6, 50, arts, today_seen=False, since_due=459)
+             | {"naming_stale": True, "newest_artifact": "2026-07-16",
+                "artifact_age_days": 39}])
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("UNCHECKED", r["detail"])
+        self.assertIn("2026-07-16", r["detail"])
+        # Assert the RENDERED claim shapes, not bare phrases: the UNCHECKED text
+        # quotes these terms while explaining them, so a substring test misfires.
+        self.assertNotIn("no output today, 459 min past due", r["detail"])
+        self.assertNotIn("run(s), median", r["detail"])
+
+    def test_a_current_corpus_is_still_scored_normally(self):
+        """Control: the demotion must be caused by staleness, not by the new field."""
+        arts = [(f"2026-08-{d:02d}", DUE + 45) for d in range(10, 17)]
+        r = hc._interpret_daily_punctuality(
+            [job("daily-insight", 6, 50, arts) | {"naming_stale": False,
+                                                  "newest_artifact": "2026-08-16",
+                                                  "artifact_age_days": 2}])
+        self.assertIn("min late", r["detail"], r)
+        self.assertNotIn("UNCHECKED", r["detail"])
+
+    def test_drift_alone_prevents_a_clean_ok(self):
+        """Without adding `drifted` to the clean branch, one drifted job among
+        otherwise-punctual ones would return ok and certify what nobody measured."""
+        good = [(f"2026-08-{d:02d}", DUE + 1) for d in range(10, 17)]
+        jobs = [job("fine", 6, 50, good),
+                job("drifted", 6, 50, good) | {"naming_stale": True,
+                                               "newest_artifact": "2026-06-01",
+                                               "artifact_age_days": 84}]
+        r = hc._interpret_daily_punctuality(jobs)
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("drifted", r["detail"])
+
+
+class TestCollectorMarksStaleNaming(unittest.TestCase):
+    """The collector owns staleness because `now` lives there."""
+
+    def _run(self, newest_day):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td); (ws / "hosts" / "H").mkdir(parents=True)
+            (ws / "results").mkdir()
+            (ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+                [{"name": "x-insight", "cron": "50 6 * * *"}]))
+            (ws / "results" / f"insight-{newest_day}.txt").write_text("x")
+            with mock.patch.object(hc, "WORKSPACE_DIR", ws), \
+                 mock.patch.object(hc, "_host_label", lambda: "H"):
+                return hc.check_daily_cron_punctuality()
+
+    def test_old_only_artifact_is_marked_stale(self):
+        r = self._run("2026-01-05")
+        self.assertIn("UNCHECKED", r["detail"], r)
+        self.assertIn("2026-01-05", r["detail"])
+
+    def test_todays_artifact_is_not_marked_stale(self):
+        r = self._run(datetime.now().strftime("%Y-%m-%d"))
+        self.assertNotIn("UNCHECKED", r["detail"], r)
+
+    def test_a_shape_valid_but_impossible_date_does_not_crash_the_probe(self):
+        """`_daily_artifact_minutes` matches dates by SHAPE (\d{4}-\d{2}-\d{2}),
+        so `2026-13-45` reaches the parser and raises. An unparseable date makes
+        the age unknown, which must read as "cannot tell", never as stale."""
+        r = self._run("2026-13-45")
+        self.assertNotIn("UNCHECKED", r["detail"], r)
+        self.assertIn(r["status"], ("ok", "warn"))
 
 
 if __name__ == "__main__":
