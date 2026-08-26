@@ -255,7 +255,8 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     # Belt and suspenders: even a slug-valid name must RESOLVE inside the
     # channels directory. The containment root is the realpath of channels/
     # itself (so a symlinked channels dir works), but a channel entry that
-    # symlinks OUT of the directory is refused by design.
+    # symlinks OUT of the directory is refused by design, unless the link's
+    # target still has shape <source>/.env (a relocation, not an escape).
     # Derive the EFFECTIVE gateway config from os.environ ALONE first — including
     # the alias and the combined "url|secret" one-token form. Only if that is still
     # missing a value do we resolve/guard/read the channel file. Checking just the
@@ -281,11 +282,15 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
 
     url, token = _derive(lambda k: os.environ.get(k, ""))
     if not (url and token):
-        # The file IS needed, so the containment check applies — unchanged. A
-        # channel entry that symlinks OUT of channels/ is refused by design.
+        # The file IS needed. Refuse unless the resolved target's filename and
+        # parent dirname match ".env" and `source` exactly (a relocation, not an escape).
         real_env = os.path.realpath(env_path)
         real_root = os.path.realpath(channels_dir)
-        if not real_env.startswith(real_root + os.sep):
+        same_shape = (
+            os.path.basename(real_env) == ".env"
+            and os.path.basename(os.path.dirname(real_env)) == source
+        )
+        if not real_env.startswith(real_root + os.sep) and not same_shape:
             print(f"[task-progress] refusing env path outside channels dir: {env_path}",
                   file=sys.stderr)
             return False

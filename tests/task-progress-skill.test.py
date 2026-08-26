@@ -483,6 +483,109 @@ class TestSendRemoteGateway(unittest.TestCase):
         self.assertFalse(result)
 
 
+    def _symlinked_channels_root(
+        self,
+        source: str = "ag2space",
+        target_dirname: str | None = None,
+        target_filename: str = ".env",
+    ) -> str:
+        """A channels/<source>/.env that is a SYMLINK to a real file living in a
+        SEPARATE temp directory — mirrors the real-world AG2 Space desktop-app
+        layout, where `$CLAUDE_CONFIG_DIR/channels/ag2space/.env` symlinks OUT to
+        `<app-root>/channels/ag2space/.env` (see #3150/#3201). That is distinct
+        from `_hermetic_channels_root` above, which is deliberately a real file
+        (never a symlink) so tests that aren't about *this* guard stay pinned.
+
+        By default the symlink target keeps the same `<source>/.env` shape as
+        the real install (same immediate parent dirname, same filename) — that
+        is the one shape the containment guard is meant to accept. Pass
+        `target_dirname`/`target_filename` to break the shape, for the
+        regression test proving the guard still refuses everything else.
+        """
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        external = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, external, ignore_errors=True)
+
+        target_dir = external / (source if target_dirname is None else target_dirname)
+        target_dir.mkdir(parents=True)
+        target = target_dir / target_filename
+        target.write_text(
+            "REMOTE_TASK_URL=https://gw.example/relay\n"
+            "REMOTE_TASK_TOKEN=symlinked-token\n"
+        )
+
+        channel_dir = root / "channels" / source
+        channel_dir.mkdir(parents=True)
+        (channel_dir / ".env").symlink_to(target)
+
+        return str(root)
+
+    def test_symlinked_env_matching_shape_is_delivered(self):
+        """Regression for #3150/#3201: the AG2 Space desktop app installs
+        channels/<source>/.env as a symlink OUT of the channels dir, to a real
+        file whose own immediate parent directory is still named <source> — e.g.
+        realpath(.../workspace/.claude-sutando/channels/ag2space/.env) ==
+        .../space.ag2.app/channels/ag2space/.env. That is the app relocating its
+        own per-channel credential file while preserving the <source>/.env
+        relative shape, not an attacker-planted link to an arbitrary target, so
+        the guard must accept it and deliver — not refuse "outside channels dir"."""
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["auth"] = req.get_header("Authorization")
+            return mock_resp
+
+        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
+        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env["CLAUDE_CONFIG_DIR"] = self._symlinked_channels_root()
+        clean_env.pop("CLAUDE_HOME", None)
+        with patch.dict(os.environ, clean_env, clear=True), \
+             patch("urllib.request.urlopen", fake_urlopen):
+            result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
+        self.assertTrue(result)
+        self.assertEqual(captured["url"], "https://gw.example/relay/v1/room")
+        self.assertEqual(captured["auth"], "Bearer symlinked-token")
+
+    def test_symlinked_env_shape_mismatch_still_refused(self):
+        """The exception is a narrow SHAPE match (same filename, same immediate
+        parent dirname as the source) — not "any symlink is fine". A symlink
+        whose target does NOT have that shape (e.g. its parent directory isn't
+        named after the source — the shape an attacker-planted link to some
+        unrelated sensitive file would have) must still be refused. This is the
+        test that would catch an overly-broad "fix" that disabled the guard."""
+        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
+        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env["CLAUDE_CONFIG_DIR"] = self._symlinked_channels_root(
+            target_dirname="not-the-source")
+        clean_env.pop("CLAUDE_HOME", None)
+        err = io.StringIO()
+        with patch.dict(os.environ, clean_env, clear=True), \
+             contextlib.redirect_stderr(err):
+            result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
+        self.assertFalse(result)
+        self.assertIn("refusing env path outside channels dir", err.getvalue())
+
+    def test_symlinked_env_wrong_filename_still_refused(self):
+        """Same narrow-shape argument, other axis: the target file itself isn't
+        named `.env` (parent dirname matches, filename doesn't) — still refused."""
+        _drop = ("REMOTE_TASK_URL", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "AG2_REMOTE_URL")
+        clean_env = {k: v for k, v in os.environ.items() if k not in _drop}
+        clean_env["CLAUDE_CONFIG_DIR"] = self._symlinked_channels_root(
+            target_filename="secrets.txt")
+        clean_env.pop("CLAUDE_HOME", None)
+        err = io.StringIO()
+        with patch.dict(os.environ, clean_env, clear=True), \
+             contextlib.redirect_stderr(err):
+            result = self.mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
+        self.assertFalse(result)
+        self.assertIn("refusing env path outside channels dir", err.getvalue())
+
     def _hermetic_channels_root(self, source: str = "ag2space") -> str:
         """A real channels/<source>/.env inside a temp dir, for CLAUDE_CONFIG_DIR.
 
