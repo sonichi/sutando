@@ -1443,6 +1443,54 @@ def check_workspace_root_tidy() -> "dict | None":
         ),
     }
 
+def check_env_split(repo_env: "Path | None" = None,
+                    ws_env: "Path | None" = None) -> "dict | None":
+    """Warn when the SELECTED .env is missing keys the unselected one carries.
+
+    resolve_dotenv picks exactly one file (repo .env wins when it exists, else
+    the workspace .env) and nothing ever compares the two — so a 1-key stub in
+    the winning slot partial-loads with no warning while full credentials sit
+    in the loser (report tk-5156f372c3: "silent partial load, no warning").
+    Key NAMES only; values are never read into the message.
+
+    Returns None when only one file exists or the selected file is a superset.
+    """
+    repo_env = repo_env if repo_env is not None else REPO_DIR / ".env"
+    ws_env = ws_env if ws_env is not None else WORKSPACE_DIR / ".env"
+    if not (repo_env.is_file() and ws_env.is_file()):
+        return None
+
+    def _keys(path: Path) -> "set[str]":
+        out = set()
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                name, sep, _ = line.partition("=")
+                if sep and name and not name.startswith("#")                         and name.replace("_", "").isalnum():
+                    out.add(name)
+        except OSError:
+            return set()
+        return out
+
+    # Selection mirrors resolve_dotenv: with both present, the repo file wins.
+    selected, other, sel_name, oth_name = repo_env, ws_env, "repo", "workspace"
+    missing = sorted(_keys(other) - _keys(selected))
+    if not missing:
+        return None
+    return {
+        "name": "env-split",
+        "status": "warn",
+        "detail": (
+            f"the {sel_name} .env ({selected}) is the one loaders select, but it "
+            f"is missing {len(missing)} key(s) present in the {oth_name} .env: "
+            f"{', '.join(missing)}. Loads are silently partial until the keys are "
+            f"merged into {selected} (names compared only; values never read)."
+        ),
+    }
+
+
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
 
@@ -9071,6 +9119,10 @@ def run_all_checks() -> list[dict]:
     _mem_override = check_memory_dir_override()
     if _mem_override:
         checks.append(_mem_override)
+
+    _env_split = check_env_split()
+    if _env_split:
+        checks.append(_env_split)
 
     _mem_siblings = check_memory_dir_siblings()
     if _mem_siblings:
