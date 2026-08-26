@@ -372,10 +372,10 @@ def main():
         if args.command == "search":
             search_tweets(args.query, auth=None, max_results=args.limit)
         elif args.command == "user-timeline":
-            # X rejects max_results outside 10..100 with a 400 whose message is
-            # about the parameter, not about the account — say so up front.
-            if not 10 <= args.limit <= 100:
-                print(f"--limit must be between 10 and 100 (got {args.limit})")
+            # 5..100 is THIS endpoint's bound, measured against it. `search`
+            # rejects below 10; applying that here refused valid requests.
+            if not 5 <= args.limit <= 100:
+                print(f"--limit must be between 5 and 100 (got {args.limit})")
                 sys.exit(2)
             get_user_timeline(args.username, max_results=args.limit,
                               exclude=args.exclude)
@@ -398,6 +398,13 @@ def main():
         get_timeline(auth)
     elif args.command == "engagement":
         read_tweet(args.tweet_id, auth)  # same output, includes metrics
+    else:
+        # Reached when a command is handled ONLY in the bearer fast path and no
+        # bearer is set. Falling off the chain here would exit 0 with no output.
+        print(f"'{args.command}' needs X_BEARER_TOKEN (app-only auth); OAuth1 "
+              f"credentials alone cannot serve it. Set X_BEARER_TOKEN in .env.",
+              file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
