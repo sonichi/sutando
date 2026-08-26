@@ -264,7 +264,7 @@ def _valid_local_tid(tid: str) -> bool:
 def _task_pending(tid: str) -> bool:
     """Is this task still live in tasks/, under ANY of its names?
 
-    A pooled task is renamed twice -- unassigned -> `.assigned-<core>` (lead
+    A pooled task is renamed twice — unassigned -> `.assigned-<core>` (lead
     picked a core) -> `.claimed-<core>` (core took it). Every caller asking
     "is this still being worked?" must accept all three, so the question has
     one owner: a state missed here reads as finished, which drops a reply

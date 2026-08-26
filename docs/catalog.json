@@ -56,7 +56,7 @@
    "last_verified": "2026-08-24"
   },
   "docs/benchmark-reports/2026-08-24-3a73e03.md": {
-   "title": "Sutando comprehensive benchmark \u2014 2026-08-24",
+   "title": "Sutando comprehensive benchmark — 2026-08-24",
    "audience": [
     "users",
     "operators",
@@ -79,7 +79,7 @@
    "last_verified": "2026-08-13"
   },
   "docs/census/d1-identity-census.md": {
-   "title": "D1 identity/state census \u2014 Discord / AG2 Space / Slack",
+   "title": "D1 identity/state census — Discord / AG2 Space / Slack",
    "audience": [
     "contributors",
     "maintainers"
@@ -251,7 +251,7 @@
    "last_verified": "2026-08-04"
   },
   "docs/runtime/claude-hook-contract-v1.md": {
-   "title": "Claude Code Hook Contract \u2014 v1",
+   "title": "Claude Code Hook Contract — v1",
    "audience": [
     "contributors",
     "maintainers"
@@ -271,7 +271,7 @@
    "last_verified": null
   },
   "docs/sparrow-v1-contract.md": {
-   "title": "ag2-sparrow v1 \u2014 the frozen delivery contract",
+   "title": "ag2-sparrow v1 — the frozen delivery contract",
    "audience": [
     "contributors",
     "maintainers"
@@ -405,13 +405,23 @@
    "last_verified": null
   },
   "docs/lead-follower-pool.md": {
-   "title": "Lead-follower agent pool \u2014 design",
+   "title": "Lead-follower agent pool — design",
    "audience": [
     "contributors",
     "maintainers"
    ],
    "status": "canonical",
    "canonical_for": "lead-follower multi-core pool architecture (assignment, claim, recovery)",
+   "last_verified": "2026-08-26"
+  },
+  "docs/server-and-identity.md": {
+   "title": "Sutando Server & the Agent ID card — design",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the server v0 composition (daemon, CLI, registry) and the agent identity-card contract it exposes",
    "last_verified": "2026-08-26"
   }
  }

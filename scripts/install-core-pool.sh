@@ -4,6 +4,18 @@
 #
 # Usage:
 #   bash scripts/install-core-pool.sh [N] [--force] [--check-only] [--lead-only]
+#                                     [--only-core=<N>]
+#                                     [--runtime=<claude|codex>]
+#                                     [--core-runtime=<N>:<claude|codex>]...
+#
+# --runtime sets every core's CLI runtime (default `claude`, or
+# $SUTANDO_POOL_RUNTIME); --core-runtime overrides a single core. Supported
+# names match src/agent/start-cli.sh's allowlist; anything else exits 2.
+#
+# --only-core installs or refreshes ONE core in place. The full run boots out
+# the lead and every core, so switching a single follower's runtime used to
+# restart the whole working pool; this path touches that core's plist and job
+# only. Omit N and it is inferred from the installed pool.
 #
 # --check-only runs every preflight (config dir, skill, binaries, staging) and
 # exits without touching launchd — the seam the preflight tests exercise.
@@ -29,17 +41,73 @@ N=""
 FORCE=0
 CHECK_ONLY=0
 LEAD_ONLY=0
+ONLY_CORE=""
+# This script lives at `<repo>/scripts/install-core-pool.sh`; the staging block
+# and the preflight below both address repo files by absolute path.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The runtime allowlist has one owner, shared with the wrapper and the watchdog.
+# shellcheck source=./pool-runtime-drive.sh
+source "$REPO_DIR/scripts/pool-runtime-drive.sh"
+POOL_RUNTIME_DEFAULT="${SUTANDO_POOL_RUNTIME:-claude}"
+CORE_RUNTIME_SPECS=""
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
     --check-only) CHECK_ONLY=1 ;;
     --lead-only) LEAD_ONLY=1 ;;
+    --only-core=*)
+      ONLY_CORE="${arg#--only-core=}"
+      case "$ONLY_CORE" in
+        ''|*[!0-9]*) echo "error: --only-core expects a positive integer; got '$ONLY_CORE'" >&2; exit 2 ;;
+      esac
+      [ "$ONLY_CORE" -ge 1 ] || { echo "error: --only-core must be >= 1; got '$ONLY_CORE'" >&2; exit 2; } ;;
+    --runtime=*)
+      POOL_RUNTIME_DEFAULT="${arg#--runtime=}" ;;
+    --core-runtime=*)
+      _spec="${arg#--core-runtime=}"
+      case "$_spec" in
+        *:*) : ;;
+        *) echo "error: --core-runtime expects <N>:<runtime>; got '$_spec'" >&2; exit 2 ;;
+      esac
+      _spec_idx="${_spec%%:*}"
+      _spec_rt="${_spec#*:}"
+      case "$_spec_idx" in
+        ''|*[!0-9]*) echo "error: --core-runtime core index must be a positive integer; got '$_spec_idx'" >&2; exit 2 ;;
+      esac
+      pool_runtime_supported "$_spec_rt" || {
+        echo "error: unsupported core runtime '$_spec_rt' (supported: claude, codex)" >&2
+        exit 2
+      }
+      CORE_RUNTIME_SPECS="$CORE_RUNTIME_SPECS$_spec_idx=$_spec_rt"$'\n' ;;
     --*) echo "error: unknown option '$arg'" >&2; exit 2 ;;
     *)
       [ -z "$N" ] || { echo "error: more than one N given ('$N', '$arg')" >&2; exit 2; }
       N="$arg" ;;
   esac
 done
+# A single-core refresh must not redeclare the pool size, so infer the installed
+# size and either adopt it or require an explicit N to agree with it.
+if [ -n "$ONLY_CORE" ]; then
+  # Installed size comes from the plists ALONE. Seeding it with $ONLY_CORE made
+  # the "installed" size depend on which core was being asked for.
+  _installed=0
+  shopt -s nullglob
+  for _p in "$HOME/Library/LaunchAgents"/com.sutando.core-[0-9]*.plist; do
+    _s="$(basename "$_p" .plist)"; _s="${_s#com.sutando.core-}"; _s="${_s%-heartbeat}"
+    case "$_s" in ''|*[!0-9]*) continue ;; esac
+    [ "$_s" -gt "$_installed" ] && _installed="$_s"
+  done
+  shopt -u nullglob
+  if [ -z "$N" ]; then
+    N="$_installed"; [ "$ONLY_CORE" -gt "$N" ] && N="$ONLY_CORE"
+  elif [ "$_installed" -gt 0 ] && [ "$N" -ne "$_installed" ]; then
+    # Writing N into this core alone would leave it declaring a size its peers
+    # do not; a full install is how the size changes for everyone.
+    echo "error: --only-core preserves the installed pool size ($_installed), but N=$N" >&2
+    echo "       was given. Drop the N, or run a full install to resize the pool." >&2
+    exit 2
+  fi
+fi
 N="${N:-3}"
 case "$N" in
   ''|*[!0-9]*) echo "error: N must be a positive integer; got '$N'" >&2; exit 2 ;;
@@ -49,10 +117,41 @@ if [ "$N" -lt 1 ] || [ "$N" -gt 16 ]; then
   exit 2
 fi
 
-# Resolve repo root first: the preflight below and the staging block both
-# address repo files by absolute path. This script lives at
-# `<repo>/scripts/install-core-pool.sh`.
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+pool_runtime_supported "$POOL_RUNTIME_DEFAULT" || {
+  echo "error: unsupported core runtime '$POOL_RUNTIME_DEFAULT' (supported: claude, codex)" >&2
+  exit 2
+}
+# Last spec for an index wins; an out-of-range index is a typo, not a no-op.
+core_runtime_for() {
+  local want="$1" line answer="$POOL_RUNTIME_DEFAULT"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in "$want="*) answer="${line#*=}" ;; esac
+  done <<< "$CORE_RUNTIME_SPECS"
+  printf '%s' "$answer"
+}
+while IFS= read -r _line; do
+  [ -n "$_line" ] || continue
+  _line_idx="${_line%%=*}"
+  if [ "$_line_idx" -lt 1 ] || [ "$_line_idx" -gt "$N" ]; then
+    echo "error: --core-runtime names core $_line_idx, outside the installed pool [1, $N]" >&2
+    exit 2
+  fi
+done <<< "$CORE_RUNTIME_SPECS"
+if [ -n "$ONLY_CORE" ] && [ "$ONLY_CORE" -gt "$N" ]; then
+  echo "error: --only-core names core $ONLY_CORE, outside the pool [1, $N]" >&2
+  exit 2
+fi
+# The set of cores this run touches. --only-core narrows it to one.
+if [ -n "$ONLY_CORE" ]; then CORE_INDICES="$ONLY_CORE"; else CORE_INDICES="$(seq 1 "$N")"; fi
+POOL_USES_CODEX=0
+POOL_USES_CLAUDE=0
+for _i in $CORE_INDICES; do
+  case "$(core_runtime_for "$_i")" in
+    codex) POOL_USES_CODEX=1 ;;
+    claude) POOL_USES_CLAUDE=1 ;;
+  esac
+done
 
 # Resolve workspace via the canonical default (matches every other Sutando
 # component). Resolved via the M0 helper (env override retired post-#1440).
@@ -106,7 +205,8 @@ LOG_DIR="$HOME/Library/Application Support/Sutando/logs"
 mkdir -p "$STAGE_DIR" "$LOG_DIR"
 # kick-pool is staged from the repo too, so the recovery watchdog cannot drift
 # away from the session naming the wrapper creates (an unversioned copy rotted).
-for w in pool-core-wrapper.sh pool-follower-beat.sh pool-lead-wrapper.sh kick-pool.sh; do
+for w in pool-core-wrapper.sh pool-follower-beat.sh pool-lead-wrapper.sh kick-pool.sh \
+         pool-runtime-drive.sh; do
   cp "$REPO_DIR/scripts/$w" "$STAGE_DIR/$w"
   chmod +x "$STAGE_DIR/$w"
 done
@@ -124,10 +224,37 @@ if [ -z "$TMUX_BIN" ]; then
   echo "error: 'tmux' not found on \$PATH (persistent-form followers run in tmux)" >&2
   exit 1
 fi
-if [ -z "$CLAUDE_BIN" ]; then
+if [ -z "$CLAUDE_BIN" ] && [ "$POOL_USES_CLAUDE" -eq 1 ]; then
   echo "error: 'claude' CLI not found on \$PATH" >&2
   exit 1
 fi
+CODEX_BIN=""
+CODEX_CONFIG_ENV=""
+CODEX_CONFIG_DIR=""
+if [ "$POOL_USES_CODEX" -eq 1 ]; then
+  CODEX_BIN="$(command -v codex || true)"
+  if [ -z "$CODEX_BIN" ]; then
+    echo "error: 'codex' CLI not found on \$PATH (a core was declared runtime=codex)" >&2
+    exit 1
+  fi
+  if [ ! -f "$REPO_DIR/skills/proactive-loop-pool/CODEX.md" ]; then
+    echo "error: missing $REPO_DIR/skills/proactive-loop-pool/CODEX.md (the Codex pool entry)" >&2
+    exit 1
+  fi
+  # Codex followers must share the operator's authenticated store, resolved the
+  # same way src/agent/codex/cli/start-cli.sh resolves it.
+  CODEX_CONFIG_ENV="$(bash "$REPO_DIR/scripts/sutando-config.sh" core-config-dir-env-name codex 2>/dev/null || true)"
+  CODEX_CONFIG_DIR="$(bash "$REPO_DIR/scripts/sutando-config.sh" core-config-dir-value codex 2>/dev/null || true)"
+fi
+
+# Absolute binary per runtime — launchd hands the follower no usable PATH.
+runtime_bin_for() {
+  case "$1" in
+    claude) printf '%s' "$CLAUDE_BIN" ;;
+    codex) printf '%s' "$CODEX_BIN" ;;
+    *) echo "install-core-pool: unsupported core runtime: $1" >&2; return 2 ;;
+  esac
+}
 
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$LAUNCH_AGENTS"
@@ -183,11 +310,9 @@ PY
   echo "installed: com.sutando.pool-lead (log: $LOG_DIR/pool-lead.log)"
 }
 
-# Regression guard: Phase 2a ships the launchd plumbing + claim primitive,
-# but NOT the `/proactive-loop-pool` skill. If we install plists that invoke
-# a non-existent skill, launchd's KeepAlive will restart the failing claude
-# process every ThrottleInterval seconds and burn quota. Refuse the install
-# unless the skill is on disk OR the caller explicitly passes --force.
+# Regression guard: plists invoking a skill that is not on disk make launchd's
+# KeepAlive restart the failing process every ThrottleInterval seconds and burn
+# quota. Refuse unless the skill is present OR the caller passes --force.
 #
 # Check the dir the followers actually load skills from — the resolved
 # CLAUDE_CONFIG_DIR this script just symlinked into. `-d` follows the symlink,
@@ -206,9 +331,10 @@ if [ "$SKILL_FOUND" -eq 0 ] && [ "$FORCE" -eq 0 ] && [ "$LEAD_ONLY" -eq 0 ]; the
 error: '/proactive-loop-pool' skill not found at:
 $(for d in "${SKILL_DIR_CANDIDATES[@]}"; do echo "  $d"; done)
 
-This is by design — Phase 2a ships the claim primitive + launchd shape, but
-the pool-aware skill is Phase 2b. Installing now would spawn launchd jobs
-that loop-fail on missing skill and burn quota.
+The skill ships in this repo under skills/proactive-loop-pool/; install.sh
+symlinks it into the runtime's skills directory. Not finding it means that
+link is missing — installing anyway spawns launchd jobs that loop-fail on
+the missing skill and burn quota.
 
 To bypass and install anyway (e.g. for plist-shape testing), re-run with:
   bash scripts/install-core-pool.sh $N --force
@@ -220,12 +346,22 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   echo "preflight OK: CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR_EFFECTIVE"
   echo "preflight OK: skill=${SKILL_DIR_CANDIDATES[0]}"
   echo "preflight OK: workspace=$WORKSPACE"
+  for i in $CORE_INDICES; do
+    echo "preflight OK: core-$i runtime=$(core_runtime_for "$i") bin=$(runtime_bin_for "$(core_runtime_for "$i")")"
+  done
   exit 0
 fi
 
-install_pool_lead
-if [ "$LEAD_ONLY" -eq 1 ]; then
-  exit 0
+# A single-core refresh leaves the lead running: booting it out would stall
+# assignment for every other follower to change one core.
+if [ -z "$ONLY_CORE" ]; then
+  install_pool_lead
+  if [ "$LEAD_ONLY" -eq 1 ]; then
+    exit 0
+  fi
+elif [ "$LEAD_ONLY" -eq 1 ]; then
+  echo "error: --only-core and --lead-only are mutually exclusive" >&2
+  exit 2
 fi
 
 # Stop any pre-existing pool members beyond N so we shrink cleanly when
@@ -239,6 +375,10 @@ fi
 # launchctl bootstrap`. Don't loosen this glob.
 shopt -s nullglob
 for existing in "$LAUNCH_AGENTS"/com.sutando.core-[0-9]*.plist; do
+  # A single-core refresh declares nothing about the pool's size, so it must
+  # never shrink it: the inferred N would remove nothing, but an explicit
+  # `--only-core=2 3` would silently tear down core 4.
+  [ -z "$ONLY_CORE" ] || continue
   base="$(basename "$existing")"
   # Two flavors land in this glob:
   #   com.sutando.core-<N>.plist           — the claude session
@@ -257,10 +397,30 @@ for existing in "$LAUNCH_AGENTS"/com.sutando.core-[0-9]*.plist; do
 done
 shopt -u nullglob
 
-# Generate / refresh N plists. Bootout-then-bootstrap so a re-install picks
-# up changes to env / paths / command.
-for i in $(seq 1 "$N"); do
+# Generate / refresh each targeted plist. Bootout-then-bootstrap so a re-install
+# picks up changes to env / paths / command.
+for i in $CORE_INDICES; do
   PLIST="$LAUNCH_AGENTS/com.sutando.core-$i.plist"
+  # POOL_CLAUDE_BIN below is retained unchanged: a wrapper staged by an earlier
+  # install reads it and knows nothing about POOL_RUNTIME/POOL_RUNTIME_BIN.
+  CORE_RUNTIME="$(core_runtime_for "$i")"
+  CORE_RUNTIME_BIN="$(runtime_bin_for "$CORE_RUNTIME")"
+  # Read the runtime this slot was installed with BEFORE overwriting the plist:
+  # the wrapper reuses an existing tmux session, so a converted core would keep
+  # running the old CLI until something ends that session.
+  PREV_RUNTIME="$(pool_runtime_from_plist "$PLIST" || true)"
+  # Templated, not hand-edited: a plist edited in place is silently replaced by
+  # the next install, so the tuning would vanish without any error.
+  SWEEP_NUDGE_ENTRY=""
+  if [ -n "${SUTANDO_POOL_SWEEP_NUDGE_S:-}" ]; then
+    SWEEP_NUDGE_ENTRY="    <key>SUTANDO_POOL_SWEEP_NUDGE_S</key><string>$SUTANDO_POOL_SWEEP_NUDGE_S</string>"
+  fi
+  RUNTIME_CONFIG_KEYS=""
+  if [ "$CORE_RUNTIME" = "codex" ] && [ -n "$CODEX_CONFIG_ENV" ] && [ -n "$CODEX_CONFIG_DIR" ]; then
+    RUNTIME_CONFIG_KEYS="    <key>POOL_RUNTIME_CONFIG_ENV</key><string>$CODEX_CONFIG_ENV</string>
+    <key>POOL_RUNTIME_CONFIG_DIR</key><string>$CODEX_CONFIG_DIR</string>
+"
+  fi
   cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -279,13 +439,16 @@ for i in $(seq 1 "$N"); do
   <dict>
     <key>SUTANDO_CORE_ID</key><string>$i</string>
     <key>SUTANDO_CORE_POOL_SIZE</key><string>$N</string>
+$SWEEP_NUDGE_ENTRY
     <key>POOL_REPO_DIR</key><string>$REPO_DIR</string>
     <key>POOL_CLAUDE_BIN</key><string>$CLAUDE_BIN</string>
     <key>POOL_TMUX_BIN</key><string>$TMUX_BIN</string>
     <key>POOL_WORKSPACE</key><string>$WORKSPACE</string>
     <key>CLAUDE_CONFIG_DIR</key><string>$CLAUDE_CONFIG_DIR_EFFECTIVE</string>
     <key>PATH</key><string>$POOL_PATH</string>
-  </dict>
+    <key>POOL_RUNTIME</key><string>$CORE_RUNTIME</string>
+    <key>POOL_RUNTIME_BIN</key><string>$CORE_RUNTIME_BIN</string>
+${RUNTIME_CONFIG_KEYS}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
@@ -298,11 +461,15 @@ for i in $(seq 1 "$N"); do
 PLIST_EOF
   # bootout first (idempotent — succeeds if not loaded) then bootstrap.
   launchctl bootout "$DOMAIN/com.sutando.core-$i" 2>/dev/null || true
+  if [ -n "$PREV_RUNTIME" ] && [ "$PREV_RUNTIME" != "$CORE_RUNTIME" ]; then
+    echo "core-$i: runtime $PREV_RUNTIME → $CORE_RUNTIME; ending the old session"
+    "$TMUX_BIN" kill-session -t "core-$i" 2>/dev/null || true
+  fi
   bootstrap_with_retry "$PLIST"
   # bootstrap alone leaves the job loaded-but-never-started (observed: a
   # scaled-up core sat dead until poked), and RunAtLoad does not close it.
   launchctl kickstart "$DOMAIN/com.sutando.core-$i" 2>/dev/null || true
-  echo "installed: com.sutando.core-$i (workspace=$WORKSPACE)"
+  echo "installed: com.sutando.core-$i (workspace=$WORKSPACE, runtime=$CORE_RUNTIME)"
 
   # Retired heartbeat sidecar: it ran `core_heartbeat.py`, which ignores
   # SUTANDO_CORE_ID (writes `<hostlabel>.alive`) and gates on a tmux pane a
@@ -316,11 +483,15 @@ PLIST_EOF
 done
 
 echo
+if [ -n "$ONLY_CORE" ]; then
+  echo "Refreshed com.sutando.core-$ONLY_CORE only (lead and other cores untouched)."
+  echo "Log: $LOG_DIR/core-$ONLY_CORE.log"
+  exit 0
+fi
 echo "Installed pool of $N core(s) + lead."
 echo "Logs: $LOG_DIR/core-{1..$N}.log, $LOG_DIR/pool-lead.log"
 echo
-echo "IMPORTANT: This PR ships the launchd plumbing + claim primitive."
-echo "The pool-aware skill '/proactive-loop-pool' is NOT in this PR (Phase 2b)."
-echo "If you install with N>1 before the pool-aware skill is in place, you"
-echo "will get duplicate task processing. Stay at N=1 until Phase 2b lands,"
-echo "or test the claim primitive directly via tests/claim-task.test.py."
+for _i in $(seq 1 "$N"); do
+  echo "  core-$_i: runtime=$(core_runtime_for "$_i")"
+done
+echo "Watch the pool: bash scripts/pool-status.sh   |   observe a core: tmux attach -t core-N"

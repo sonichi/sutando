@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # kick-pool.sh — detect + recover hung pool followers (#880 D1 recovery path).
 #
-# Walks the pool's tmux sessions. Per session: submit a staged
-# `/proactive-loop-pool`, type one into an idle REPL, Escape out of an
-# interactive menu, and never overwrite other staged input. Sessions showing
-# "esc to interrupt" are mid-task and skipped, so it is safe on a healthy pool.
+# Walks the pool's tmux sessions. Per session: resolve that core's runtime from
+# its installed plist, then hand the pane to pool-runtime-drive.sh, which owns
+# every marker and keystroke (submit a staged pool entry, type one into an idle
+# REPL, dismiss a menu, never overwrite other staged input, skip a busy core).
+# This script keeps only session enumeration, launchd revival and tmux binding.
 #
 # Exit: 0 = at least one kick, 1 = nothing needed, 2 = error.
 #
@@ -13,6 +14,16 @@
 # for tests; SUTANDO_POOL_SOCKET set to a real socket path still works.
 
 set -u
+
+# The staged copy is a sibling. Refuse rather than run with no driving policy:
+# an install staged before the library existed would type nothing, silently.
+DRIVE_LIB="$(dirname "$0")/pool-runtime-drive.sh"
+if ! [ -r "$DRIVE_LIB" ]; then
+  echo "kick-pool: missing $DRIVE_LIB — re-run scripts/install-core-pool.sh" >&2
+  exit 2
+fi
+# shellcheck source=./pool-runtime-drive.sh
+. "$DRIVE_LIB"
 
 # Resolved from PATH, never a literal prefix: the wrapper injects
 # POOL_TMUX_BIN, and the launchd job sets a PATH that carries the real one.
@@ -58,36 +69,13 @@ for plist in "$HOME/Library/LaunchAgents/com.sutando.${SESSION_PREFIX}"*.plist; 
   fi
 done
 for sess in ${sessions:-}; do
-  pane=$(tmux_cmd capture-pane -t "$sess" -p -S -8 2>/dev/null)
-
-  if echo "$pane" | grep -q "esc to interrupt"; then
-    echo "$sess: BUSY (processing) — skip"
-    continue
-  fi
-
-  if echo "$pane" | grep -qE "Esc to cancel|Enter to select"; then
-    echo "$sess: in interactive menu → Escape"
-    tmux_cmd send-keys -t "$sess" Escape
-    sleep 1
-    pane=$(tmux_cmd capture-pane -t "$sess" -p -S -8 2>/dev/null)
-  fi
-
-  if echo "$pane" | grep -qE '^❯ /proactive-loop-pool *$'; then
-    echo "$sess: /proactive-loop-pool staged → Enter"
-    tmux_cmd send-keys -t "$sess" Enter
+  # The core's own plist is the only authority on which runtime it runs. An
+  # unreadable or unknown one yields the empty string, which fails closed below.
+  runtime=$(pool_runtime_from_plist \
+    "$HOME/Library/LaunchAgents/com.sutando.${sess}.plist" || true)
+  if pool_drive_kick "$runtime" "$sess" tmux_cmd "${sess#"$SESSION_PREFIX"}"; then
     kicked=$((kicked+1))
-    continue
   fi
-
-  if echo "$pane" | grep -qE '^❯ .+$'; then
-    staged=$(echo "$pane" | grep -E '^❯ ' | tail -1 | sed 's/^❯ //; s/ *$//')
-    echo "$sess: HAS STAGED INPUT ('$staged') — skip (won't overwrite)"
-    continue
-  fi
-
-  echo "$sess: idle REPL → type + send /proactive-loop-pool pass"
-  tmux_cmd send-keys -t "$sess" "/proactive-loop-pool pass" Enter
-  kicked=$((kicked+1))
 done
 
 echo "kick-pool: kicked $kicked core(s)"
