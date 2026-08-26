@@ -51,6 +51,14 @@ printf 'RRRR\n' > "$A/relay/relay-1.md"
 printf 'SSSS\n' > "$DEST/relay/relay-1.md"
 touch -t 202606011200 "$A/relay/relay-1.md" "$DEST/relay/relay-1.md"
 
+# --- Fixture: unreadable-identity — identical bytes both sides, but the SOURCE
+# copy is unreadable: the scan must report UNVERIFIED, never proven divergence.
+mkdir -p "$A/notes" "$DEST/notes"
+printf 'same bytes\n' > "$A/notes/unreadable.md"
+printf 'same bytes\n' > "$DEST/notes/unreadable.md"
+touch -t 202606011300 "$A/notes/unreadable.md" "$DEST/notes/unreadable.md"
+chmod 000 "$A/notes/unreadable.md"
+
 # --- Fixture: rehome — loose root JSON at C ---
 echo '{"k":"v"}' > "$C/cloud-auth.json"
 
@@ -153,6 +161,16 @@ if t.get("proxy_identical_divergent", 0) < 2:
 ident_true = sum(1 for n in notable.values() if n["byte_identical"] is True)
 if t["identical_content"] != ident_true:
     bad.append(f"identical_content={t['identical_content']} != byte-verified count {ident_true}")
+n = notable.get("notes/unreadable.md")
+if n is None:
+    bad.append("notes/unreadable.md: missing from notable_collisions")
+elif n["byte_identical"] is not None:
+    bad.append(f"notes/unreadable.md: byte_identical={n['byte_identical']!r}, want None (unverified)")
+if t.get("identity_unverified") != 1:
+    bad.append(f"identity_unverified={t.get('identity_unverified')!r}, want 1")
+if any(nn["rel"] == "notes/unreadable.md" for nn in d["notable_collisions"])\
+        and t.get("proxy_identical_divergent", 0) != 2:
+    bad.append(f"proxy_identical_divergent={t.get('proxy_identical_divergent')} counts the unreadable file, want exactly 2")
 if bad:
     print("; ".join(bad)); sys.exit(1)
 sys.exit(0)
@@ -165,6 +183,35 @@ else
 fi
 
 echo
+echo "==== TEST: scan uses the resolved interpreter, not PATH python3 ===="
+# Control for the clean-macOS CLT-stub case: PATH python3 is a failing shim and
+# $SUTANDO_PY points at a real interpreter — both report paths must still work.
+REAL_PY="$(command -v python3)"
+SHIMDIR="$TMP/shim-bin"
+mkdir -p "$SHIMDIR"
+printf '#!/bin/sh\nexit 97\n' > "$SHIMDIR/python3"
+chmod +x "$SHIMDIR/python3"
+fail_stub=0
+STUB_HUMAN="$(PATH="$SHIMDIR:$PATH" SUTANDO_PY="$REAL_PY" RUN_MIGRATE scan --source A,B,C 2>&1 || true)"
+if ! echo "$STUB_HUMAN" | grep -q "of which identical-content (byte-verified):  [0-9]"; then
+    echo "  FAIL: human scan lost its identity report under a shadowed PATH python3"
+    fail_stub=1
+fi
+STUB_JSON="$TMP/scan-stub.json"
+if ! PATH="$SHIMDIR:$PATH" SUTANDO_PY="$REAL_PY" RUN_MIGRATE scan --source A,B,C --json 2>/dev/null > "$STUB_JSON"; then
+    echo "  FAIL: json scan exited non-zero under a shadowed PATH python3"
+    fail_stub=1
+elif ! "$REAL_PY" -c 'import json,sys;raw=open(sys.argv[1]).read();d=json.JSONDecoder().raw_decode(raw[raw.index("{"):])[0];assert "identity_unverified" in d["totals"]' "$STUB_JSON" 2>/dev/null; then
+    echo "  FAIL: json scan emitted no parseable contract under a shadowed PATH python3"
+    fail_stub=1
+fi
+[ "$fail_stub" -eq 0 ] && echo "  OK: both report paths ran on \$SUTANDO_PY with PATH python3 shadowed"
+
+# Restore the unreadable fixture before commit — its scan job is done, and the
+# commit-phase copy semantics for unreadable sources are a separate contract.
+chmod 644 "$A/notes/unreadable.md"
+
+echo
 echo "==== TEST: commit ===="
 COMMIT_OUT="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
 echo "$COMMIT_OUT" | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" | head -40
@@ -173,6 +220,7 @@ INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "migration-backup-.*\.tar\.gz"
 echo
 echo "==== ASSERTIONS ===="
 fail=0
+[ "${fail_stub:-0}" -ne 0 ] && { echo "FAIL: interpreter-resolution control"; fail=1; }
 [ "${fail_scan_json:-0}" = "1" ] && fail=1
 
 # 1. build_log.md sidecar default: each source's variant goes to legacy/<tag>/build_log.md
