@@ -104,15 +104,15 @@ class LaneRoutingTests(LaneBase):
         self.assertEqual(self._assigned_to("task-r4"), "core-1")
         self.assertEqual(self._assigned_to("task-o4"), "core-1")
 
-    def test_owner_affinity_on_lane_core_is_not_honored(self):
-        # yesterday's handler was the lane core; fresh owner traffic must
-        # migrate to the owner lane rather than stick to the routine core
+    def test_explicit_binding_beats_lane_defaults(self):
+        # binding rows are always deliberate now (sweep cannot stamp the
+        # lane core) — honor them on ANY alive seat, incl. lane core/codex
         (self.state / "pool").mkdir(parents=True)
         (self.state / "pool" / "affinity.json").write_text(
             '{"C1": {"instance": "core-2", "ts": 999.0}}')
         self._write("task-o5.txt", owner_task(channel="C1"))
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-o5"), "core-1")
+        self.assertEqual(self._assigned_to("task-o5"), "core-2")
 
     def test_numeric_core_ordering(self):
         self.pool = ["core-2", "core-10"]
@@ -164,6 +164,16 @@ class RuntimeAwareLaneTests(LaneBase):
         self._write("task-r2.txt", routine_task())
         lead.sweep()
         self.assertEqual(self._assigned_to("task-r2"), "core-2")
+
+    def test_explicit_binding_to_codex_is_honored(self):
+        lead = self._lead({"core-1": "claude", "core-2": "claude",
+                           "core-3": "codex"})
+        (self.state / "pool").mkdir(parents=True, exist_ok=True)
+        (self.state / "pool" / "affinity.json").write_text(
+            '{"C2": {"instance": "core-3", "ts": 999.0}}')
+        self._write("task-o6.txt", owner_task(channel="C2"))
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-o6"), "core-3")
 
     def test_no_runtime_fn_keeps_the_pre_runtime_behaviour(self):
         self._write("task-r3.txt", routine_task())

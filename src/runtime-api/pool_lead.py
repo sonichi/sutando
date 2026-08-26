@@ -161,7 +161,9 @@ class PoolLead:
             row = affinity.get(channel)
             # Binding: a live home core keeps its room regardless of load or
             # idle age; only death or an unclaimed-reclaim moves the room.
-            if isinstance(row, dict) and row.get("instance") in primary:
+            # ANY alive follower qualifies — an explicit pin (incl. codex or
+            # the lane core) is a deliberate choice and beats lane defaults.
+            if isinstance(row, dict) and row.get("instance") in followers:
                 self._last_pick[str(row["instance"])] = self.now()
                 return row["instance"]
         # equal load -> least-recently-picked, so an idle pool round-robins
