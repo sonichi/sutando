@@ -7480,6 +7480,33 @@ def _probe_codex_task_notifier(target: dict) -> dict:
     }
 
 
+def check_codex_presence(which=shutil.which) -> dict:
+    """Report a missing `codex` binary. Every non-owner task is required to run
+    via `codex exec --sandbox read-only` with no permitted fallback, so losing
+    the binary disables sandboxed delegation and nothing else reports it."""
+    name = "codex-presence"
+    resolved = which("codex")
+    if resolved:
+        return {"name": name, "status": "ok", "detail": f"codex resolves to {resolved}"}
+
+    # Config surviving a vanished binary is the engine-update signature: the
+    # update replaces the tree, and a tree-local `npm -g` install goes with it.
+    config = Path.home() / ".codex"
+    wiped = config.is_dir()
+    detail = (
+        "codex is NOT on PATH — sandboxed non-owner delegation is unavailable, "
+        "and it is the only permitted path for guest/team tasks. "
+    )
+    detail += (
+        f"{config} still exists, so this is a wiped binary rather than a lost login; "
+        "reinstall OUTSIDE the engine tree (`npm install -g --prefix ~/.local "
+        "@openai/codex`) so the next engine update cannot take it again."
+        if wiped else
+        f"{config} is absent too, so codex was likely never installed on this host."
+    )
+    return {"name": name, "status": "warn", "detail": detail}
+
+
 def check_codex_task_notifier() -> dict:
     """Detect a missing managed notifier even when a bare watcher looks alive."""
     if not _codex_runtime_selected():
@@ -9441,6 +9468,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_codex_task_notifier())
+    checks.append(check_codex_presence())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
