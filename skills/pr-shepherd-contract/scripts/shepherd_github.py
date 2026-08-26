@@ -13,6 +13,7 @@ the workspace is the durable per-user location and survives app updates.
 
 from __future__ import annotations
 
+import re
 import contextlib
 import fcntl
 import json
@@ -74,12 +75,21 @@ VALID_PR_PROJECTIONS = frozenset({("open", "false"), ("closed", "false"), ("clos
 _ASCII_DIGITS = frozenset("0123456789")
 
 
+_REPO_SEGMENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+
 def _pr_repo(value: object, where: str) -> str:
-    """`#` is the subject separator, so a repo carrying one makes the encoded
-    resource_id parse back as a different repo and number."""
-    if type(value) is not str or not value.strip() or "#" in value:
-        raise ValueError(f"{where}: repo must be a non-empty str (exact type) "
-                         f"without '#', got {type(value).__name__}: {value!r}")
+    """Canonical `owner/name` only: the value is interpolated into a gh API
+    path, so anything looser (extra segments, `..`, whitespace, query text)
+    addresses a different resource than the subject it is stored under."""
+    if type(value) is not str:
+        raise ValueError(f"{where}: repo must be a str (exact type), got "
+                         f"{type(value).__name__}")
+    parts = value.split("/")
+    if (len(parts) != 2 or not all(_REPO_SEGMENT.match(s) for s in parts)
+            or any(s in (".", "..") for s in parts)):
+        raise ValueError(f"{where}: repo must be canonical owner/name "
+                         f"(exactly two path-safe segments), got {value!r}")
     return value
 
 
@@ -113,6 +123,8 @@ def subject_for(repo: str, number: int) -> Subject:
 def resolve_actor(repo: str, number: int) -> Optional[Actor]:
     """Last non-merge commit's author email. Merge commits carry no authored
     content, so they must not decide whose work a branch is."""
+    repo = _pr_repo(repo, "resolve_actor")
+    number = _pr_number(number, "resolve_actor")
     raw = _gh("api", f"repos/{repo}/pulls/{number}/commits", "--paginate", "-q",
               ".[]|select((.parents|length)<2)|.commit.author.email")
     emails = [e for e in raw.splitlines() if e.strip()]
@@ -121,6 +133,8 @@ def resolve_actor(repo: str, number: int) -> Optional[Actor]:
 
 def observe(repo: str, number: int) -> ObservedEvent:
     """Current PR state as one event. Terminal states win over progress."""
+    repo = _pr_repo(repo, "observe")
+    number = _pr_number(number, "observe")
     raw = _gh("api", f"repos/{repo}/pulls/{number}", "-q",
               "[.state, (.merged|tostring)]|join(\" \")")
     # An unrecognized projection is UNKNOWN, not "not merged": padding it out

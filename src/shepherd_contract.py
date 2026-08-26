@@ -21,6 +21,7 @@ polling and provider calls belong to the adapters that bind it.
 from __future__ import annotations
 
 from collections.abc import Iterable
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -85,6 +86,9 @@ VERIFIED_ACTOR_SCHEMES = frozenset()
 STRONG_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | VERIFIED_ACTOR_SCHEMES
 
 
+_REGISTRY_LOCK = threading.Lock()
+
+
 def register_actor_scheme(scheme: str, *, verified: bool = False) -> None:
     """Adapter seam: declare an actor-resolution scheme as discriminating.
     Verified schemes may close an objective on their own; asserted schemes
@@ -92,15 +96,19 @@ def register_actor_scheme(scheme: str, *, verified: bool = False) -> None:
     changing a scheme's strength is refused -- trust never moves by accident."""
     global ASSERTED_ACTOR_SCHEMES, VERIFIED_ACTOR_SCHEMES, STRONG_ACTOR_SCHEMES
     _require_text("register_actor_scheme", "scheme", scheme)
-    other = ASSERTED_ACTOR_SCHEMES if verified else VERIFIED_ACTOR_SCHEMES
-    if scheme in other:
-        raise ValueError(f"actor scheme {scheme!r} is already registered at the "
-                         f"opposite strength; refusing to change its trust")
-    if verified:
-        VERIFIED_ACTOR_SCHEMES = VERIFIED_ACTOR_SCHEMES | {scheme}
-    else:
-        ASSERTED_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | {scheme}
-    STRONG_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | VERIFIED_ACTOR_SCHEMES
+    if type(verified) is not bool:
+        raise TypeError(f"register_actor_scheme verified must be a bool, got "
+                        f"{type(verified).__name__}: a truthy flag must never grant trust")
+    with _REGISTRY_LOCK:
+        other = ASSERTED_ACTOR_SCHEMES if verified else VERIFIED_ACTOR_SCHEMES
+        if scheme in other:
+            raise ValueError(f"actor scheme {scheme!r} is already registered at the "
+                             f"opposite strength; refusing to change its trust")
+        if verified:
+            VERIFIED_ACTOR_SCHEMES = VERIFIED_ACTOR_SCHEMES | {scheme}
+        else:
+            ASSERTED_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | {scheme}
+        STRONG_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | VERIFIED_ACTOR_SCHEMES
 
 
 @dataclass(frozen=True)

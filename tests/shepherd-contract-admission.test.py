@@ -380,6 +380,39 @@ check("re-registering at the OPPOSITE strength is refused",
       _rejects(lambda: sc.register_actor_scheme("gitlab.job_token", verified=True)), True)
 check("a blank scheme cannot be registered",
       _rejects(lambda: sc.register_actor_scheme("  ")), True)
+
+# Trust from a FLAG must require an exact bool: any truthy config-shaped value
+# ('false', 1, ...) must raise, never grant verified authority.
+for _hostile in ("false", "true", 1, 0, None, [1]):
+    def _reg(v=_hostile):
+        sc.register_actor_scheme(f"hostile.{type(v).__name__}.{v!r}", verified=v)
+    try:
+        _reg(); _raised = None
+    except TypeError:
+        _raised = TypeError
+    except Exception as e:  # noqa: BLE001
+        _raised = type(e)
+    check(f"non-bool verified flag {type(_hostile).__name__} {_hostile!r} raises TypeError",
+          _raised, TypeError)
+
+# Concurrent opposite-strength registration of ONE scheme: exactly one side
+# wins and the other raises; the scheme must never land in BOTH sets.
+import threading as _th
+_errors, _barrier = [], _th.Barrier(2)
+def _race(flag):
+    try:
+        _barrier.wait()
+        sc.register_actor_scheme("race.scheme", verified=flag)
+    except ValueError as e:
+        _errors.append(e)
+_t1 = _th.Thread(target=_race, args=(True,)); _t2 = _th.Thread(target=_race, args=(False,))
+_t1.start(); _t2.start(); _t1.join(); _t2.join()
+_in_both = ("race.scheme" in sc.ASSERTED_ACTOR_SCHEMES
+            and "race.scheme" in sc.VERIFIED_ACTOR_SCHEMES)
+check("concurrent opposite-strength registration never lands in both sets",
+      _in_both, False)
+check("...and the loser raised rather than silently coexisting",
+      (len(_errors), "race.scheme" in sc.STRONG_ACTOR_SCHEMES), (1, True))
 check("earlier registrations survive later ones",
       ("git.commit_author_email" in sc.ASSERTED_ACTOR_SCHEMES,
        "matrix.mxid" in sc.VERIFIED_ACTOR_SCHEMES), (True, True))

@@ -267,6 +267,30 @@ check("...and no record was published for it",
       (g.state_dir() / "task-dur-scalar.json").exists(), False)
 
 # --- an unknown observation must not become a concrete outcome ---
+# Malformed GitHub targets must be rejected BEFORE any credentialed call:
+# stub _gh with a counter and assert zero invocations for every hostile shape.
+_gh_calls = []
+_real_gh_for_p2 = g._gh
+g._gh = lambda *a: (_gh_calls.append(a), "")[1]
+_hostile_repos = ["owner/repo/../../victim/private", "repo-only", " owner/repo",
+                  "owner/repo ", "owner/repo?x=1", "owner//repo", "owner/..", ""]
+for _hr in _hostile_repos:
+    _rejected = False
+    try:
+        g.observe(_hr, 1)
+    except ValueError:
+        _rejected = True
+    check(f"observe rejects {_hr!r} before any gh call", (_rejected, len(_gh_calls)), (True, 0))
+for _hn in (-1, 0, True, "007", "1e3"):
+    _rejected = False
+    try:
+        g.resolve_actor("owner/repo", _hn)
+    except ValueError:
+        _rejected = True
+    check(f"resolve_actor rejects PR number {_hn!r} before any gh call",
+          (_rejected, len(_gh_calls)), (True, 0))
+g._gh = _real_gh_for_p2
+
 _SAVED_GH, _SAVED_ACTOR = g._gh, g.resolve_actor
 g.resolve_actor = lambda *a, **k: _A
 g._gh = lambda *a, **k: "closed false"
