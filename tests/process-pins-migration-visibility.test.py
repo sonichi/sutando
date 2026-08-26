@@ -74,8 +74,10 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         os.utime(f, (mtime, mtime))
         return f
 
-    def _migrate(self):
+    def _migrate(self, extra_env=None):
         env = dict(os.environ)
+        if extra_env:
+            env.update(extra_env)
         env.update(HOME=str(self.tmp / "home"),
                    SUTANDO_MIGRATE_DEST=str(self.tmp / "dest"),
                    SUTANDO_MIGRATE_SRC_A=str(self.tmp / "src/a"),
@@ -88,6 +90,34 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             capture_output=True, text=True, env=env, timeout=180)
         self.assertEqual(r.returncode, 0, f"migrate failed:\n{r.stdout}\n{r.stderr}")
         return r
+
+    def _gnu_stat_shim(self, comma: bool = True) -> Path:
+        """A faithful-enough GNU `stat` on PATH: -f is --file-system (fails),
+        -c formats succeed, and fractions use the locale's decimal separator."""
+        bin_ = self.tmp / "shimbin"
+        bin_.mkdir(exist_ok=True)
+        (bin_ / "stat").write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            "a = sys.argv[1:]\n"
+            "if not a or a[0] == '-f':\n"
+            "    sys.stderr.write('stat: cannot read file system information\\n')\n"
+            "    print('  File: \"x\"'); print('    ID: 0 Namelen: 255'); sys.exit(1)\n"
+            "if a[0] != '-c':\n"
+            "    sys.exit(1)\n"
+            "fmt, f = a[1], a[2]\n"
+            "st = os.stat(f)\n"
+            "comma = os.environ.get('LC_ALL') != 'C'\n"
+            "sep = ',' if comma else '.'\n"
+            "if fmt == '%.9Y':\n"
+            "    print(f'{int(st.st_mtime)}{sep}{st.st_mtime_ns % 1000000000:09d}')\n"
+            "elif fmt == '%Y':  print(int(st.st_mtime))\n"
+            "elif fmt in ('%s', '%z'):  print(st.st_size)\n"
+            "elif fmt == '%y':  print(time.strftime('%Y-%m-%d %H:%M:%S',\n"
+            "                          time.localtime(st.st_mtime)))\n"
+            "else: sys.exit(1)\n")
+        (bin_ / "stat").chmod(0o755)
+        return bin_
 
     def _verdict(self, pins_path):
         """Drive the real reader exactly as check_bridges does."""
@@ -156,6 +186,54 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
                 self.assertEqual(status, "stale" if newer_is_release else "warn")
 
+
+    def test_COMMA_LOCALE_real_migrator_resolves_BOTH_directions(self) -> None:
+        """Drive the REAL migrator under emulated GNU stat in a comma locale.
+
+        Same second, different subsecond: without LC_ALL=C the fraction is
+        rejected, both sides tie, and the tie branch aborts AMBIGUOUS (rc 1).
+        """
+        SEC = 1700000000
+        for newer_is_release in (True, False):
+            with self.subTest(newer_is_release=newer_is_release):
+                self.setUp()
+                bin_ = self._gnu_stat_shim()
+                armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+                fa = self._write("src/a", armed if not newer_is_release else [], SEC)
+                fc = self._write("src/c", [] if not newer_is_release else armed, SEC)
+                # a OLDER than c by 800ms, inside the same whole second.
+                os.utime(fa, ns=(SEC * 10**9 + 100_000_000,) * 2)
+                os.utime(fc, ns=(SEC * 10**9 + 900_000_000,) * 2)
+                self.assertEqual(int(fa.stat().st_mtime), int(fc.stat().st_mtime),
+                                 "fixture must sit in ONE second or the tie never arises")
+                self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
+                                         "LC_ALL": "de_DE.UTF-8"})
+                status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
+                # c is newer in both runs, so c's content decides both times.
+                self.assertEqual(status, "warn" if newer_is_release else "stale")
+
+    def test_COMMA_LOCALE_whole_second_FALLBACK_is_exercised(self) -> None:
+        """Older GNU without %.9Y must still migrate correctly in a comma locale.
+
+        Covers the whole-second fallback candidates, which the subsecond test
+        never reaches because %.9Y answers first.
+        """
+        SEC = 1700000000
+        for newer_is_release in (True, False):
+            with self.subTest(newer_is_release=newer_is_release):
+                self.setUp()
+                bin_ = self._gnu_stat_shim()
+                shim = bin_ / "stat"
+                body = shim.read_text().replace("if fmt == '%.9Y':", "if False:")
+                shim.write_text(body)
+                shim.chmod(0o755)
+                armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+                self._write("src/a", armed if not newer_is_release else [], SEC)
+                self._write("src/c", [] if not newer_is_release else armed, SEC + 5)
+                self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
+                                         "LC_ALL": "de_DE.UTF-8"})
+                status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
+                self.assertEqual(status, "warn" if newer_is_release else "stale")
 
     def test_COMMA_LOCALE_stat_still_yields_subsecond_ordering(self) -> None:
         """A comma-decimal locale must not collapse mtime to whole seconds.
