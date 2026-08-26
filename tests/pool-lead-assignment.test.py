@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""PoolLead (L1): priority-ordered assignment, sticky affinity with idle
-rebalance, least-loaded fallback, dead-follower reclaim, no-follower inertness.
+"""PoolLead (L1): priority-ordered assignment, binding room affinity, least-loaded fallback, dead-follower reclaim, no-follower inertness.
 
 Run: python3 tests/pool-lead-assignment.test.py   (stdlib only)
 """
@@ -15,7 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
-from pool_lead import AFFINITY_IDLE_S, PoolLead  # noqa: E402
+from pool_lead import PoolLead  # noqa: E402
 
 
 class PoolLeadTests(unittest.TestCase):
@@ -66,17 +65,16 @@ class PoolLeadTests(unittest.TestCase):
         second = dict(self.lead.sweep())["task-c2.txt"]
         self.assertEqual(second, first)
 
-    def test_idle_channel_rebalances(self):
+    def test_idle_gap_does_not_move_the_room(self):
+        # binding: a week of silence must not lose the room's context core
         self._task("task-c1.txt", channel="C123")
         first = dict(self.lead.sweep())["task-c1.txt"]
         for f in list(self.tasks.iterdir()):
             f.unlink()  # handler finished everything
-        self.clock[0] += AFFINITY_IDLE_S + 1
+        self.clock[0] += 7 * 86400
         self._task("task-c2.txt", channel="C123")
         second = dict(self.lead.sweep())["task-c2.txt"]
-        self.assertIn(second, self.alive)
-        # no inequality assert: a rebalance may re-pick the same core by
-        # load; only the stickiness must be gone
+        self.assertEqual(second, first)
         row = self.lead._load_affinity()["C123"]
         self.assertEqual(row["ts"], self.clock[0])
 
@@ -199,7 +197,9 @@ class ReclaimClaimedTest(unittest.TestCase):
 
 
 class AffinityBusyYieldTest(unittest.TestCase):
-    """A backlogged affinity handler yields to the least-loaded follower."""
+    """Binding affinity (owner 2026-08-26): a room's home core keeps its
+    work while alive — load never moves a room, only death or an
+    unclaimed-reclaim does. Context continuity outranks latency."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -227,17 +227,31 @@ class AffinityBusyYieldTest(unittest.TestCase):
         f.write_text("id: task-fresh\nchannel_id: chan-A\n")
         return f
 
-    def test_busy_handler_yields_to_idle_follower(self):
-        self._backlog("core-2", 3)  # at AFFINITY_BUSY_MAX
-        self._new_task()
-        out = dict(self.lead.sweep())
-        self.assertEqual(out.get("task-fresh.txt"), "core-1")
-
-    def test_handler_below_threshold_keeps_channel(self):
-        self._backlog("core-2", 2)  # under AFFINITY_BUSY_MAX
+    def test_busy_home_core_keeps_the_room(self):
+        self._backlog("core-2", 5)  # far past any depth threshold
         self._new_task()
         out = dict(self.lead.sweep())
         self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+    def test_handler_below_threshold_keeps_channel(self):
+        self._backlog("core-2", 2)
+        self._new_task()
+        out = dict(self.lead.sweep())
+        self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+    def test_unclaimed_reclaim_releases_the_room_binding(self):
+        # home core heartbeats but never claims: reclaim must drop the row
+        # so the re-pick moves the room to a core that answers.
+        stuck = self.tasks / "task-stuck.assigned-core-2.txt"
+        stuck.write_text("id: task-stuck\nchannel_id: chan-A\n")
+        self.lead._save_assign_ledger({stuck.name: 0.0})
+        self.lead.reclaim_stuck_assignments(max_age_s=1)
+        self.assertNotIn("chan-A", self.lead._load_affinity())
+        out = dict(self.lead.sweep())
+        self.assertNotEqual(out.get("task-stuck.txt"), "core-2")
+        self.assertEqual(
+            self.lead._load_affinity()["chan-A"]["instance"],
+            out["task-stuck.txt"])  # new home re-stamped
 
 
 if __name__ == "__main__":

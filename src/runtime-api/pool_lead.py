@@ -24,11 +24,8 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
-# Sticky-channel window (#884 semantics): tasks from a channel follow its
-# handler until the channel has been idle this long, then rebalance.
-AFFINITY_IDLE_S = 30 * 60
-# Outstanding assigned+claimed before affinity yields. Env-tunable: 1 = yield
-# the moment the handler is busy (latency over continuity — owner preference).
+# Depth at which channelless work overflows to the idle lane core; room
+# affinity itself is binding and never yields on load (owner 2026-08-26).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
 DONE_FLAG_RETENTION_S = 7 * 86400
@@ -141,12 +138,9 @@ class PoolLead:
                    or [f for f in followers if f != lane_core] or followers)
         if channel:
             row = affinity.get(channel)
-            if (isinstance(row, dict) and row.get("instance") in primary
-                    and self.now() - float(row.get("ts") or 0)
-                    < AFFINITY_IDLE_S
-                    # a backlogged handler serializes the whole channel;
-                    # parallelism outranks continuity past this depth
-                    and self._load(row["instance"]) < AFFINITY_BUSY_MAX):
+            # Binding: a live home core keeps its room regardless of load or
+            # idle age; only death or an unclaimed-reclaim moves the room.
+            if isinstance(row, dict) and row.get("instance") in primary:
                 self._last_pick[str(row["instance"])] = self.now()
                 return row["instance"]
         # equal load -> least-recently-picked, so an idle pool round-robins
@@ -272,6 +266,15 @@ class PoolLead:
             ledger.pop(f.name, None)
             live.discard(f.name)
             out.append(f.name)
+            # The home core proved unresponsive: release the room's binding so
+            # the re-pick moves it (and re-stamps the new core as home).
+            ch = _read_channel(f.with_name(m.group(1) + ".txt"))
+            if ch:
+                aff = self._load_affinity()
+                row = aff.get(ch)
+                if isinstance(row, dict) and row.get("instance") == m.group(2):
+                    del aff[ch]
+                    self._save_affinity(aff)
         self._save_assign_ledger({k: v for k, v in ledger.items() if k in live})
         return out
 
