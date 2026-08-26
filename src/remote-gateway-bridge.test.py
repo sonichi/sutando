@@ -488,15 +488,44 @@ def main() -> int:
           and "--source ag2space --channel-id '!room:ag2.space'" in sk
           and "write the result to results/task-SKILL.txt" in sk,
           "owner task carries the ag2space skill-instructions block (context-first, notify, result path)")
-    # notify.py falls back to channels/<source>/.env only when url+token are
-    # absent from the environment, and its containment guard can refuse that read.
-    _env_hint = 'set -a; . "$CLAUDE_CONFIG_DIR/channels/ag2space/.env"; set +a'
+    # notify.py falls back to a channel env file only when url+token are absent
+    # from the environment, and WHICH file carries them differs per onboarding.
+    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
     _notify_line = next(ln for ln in sk.splitlines() if "NOTIFY FIRST" in ln)
     check(_env_hint in _notify_line and _notify_line.index(_env_hint)
           < _notify_line.index("notify.py"),
           "notify step carries the channel-env prelude BEFORE the notify.py call")
     check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
           "the env prelude rides both gateway-calling steps (context-first + notify)")
+    # The string assertions above pass even if the prelude names a file holding no
+    # gateway vars — the defect review of #3397 measured exactly that. So EXERCISE
+    # the resolver against both real onboarding layouts, and against neither-has-it.
+    import os as _os
+    import subprocess as _sp
+    import tempfile as _tf
+    _helper = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                            "scripts", "channel-env.sh")
+    def _resolve(files):
+        d = _tf.mkdtemp()
+        ch = _os.path.join(d, "channels", "ag2space")
+        _os.makedirs(ch)
+        for name, body in files.items():
+            with open(_os.path.join(ch, name), "w") as fh:
+                fh.write(body)
+        env = dict(_os.environ, CLAUDE_CONFIG_DIR=d)
+        r = _sp.run(["bash", _helper, "ag2space"], capture_output=True, text=True, env=env)
+        return r.returncode, r.stdout.strip()
+    _TOK = "REMOTE_TASK_URL=https://gw/relay\nREMOTE_TASK_TOKEN=s3cret\n"
+    _MATRIX = "AG2SPACE_HOMESERVER=https://chat.ag2.space\nACCESS_TOKEN=matrix-only\n"
+    rc, got = _resolve({".env": _TOK})
+    check(rc == 0 and got.endswith("/.env"),
+          "layout A (.env carries the token) resolves to .env")
+    rc, got = _resolve({".env": _MATRIX, "relay-client.env": _TOK})
+    check(rc == 0 and got.endswith("/relay-client.env"),
+          "layout B (.env is matrix-only, sibling carries the token) resolves to the sibling")
+    rc, got = _resolve({".env": _MATRIX})
+    check(rc != 0 and not got,
+          "no file defines the token -> resolver FAILS instead of naming a tokenless file")
     check(sk.rstrip().splitlines()[-1].startswith("3. Process"),
           "skill block is the file tail (appended after access_tier)")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
