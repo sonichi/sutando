@@ -168,6 +168,25 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                     self._read_trace()
                 self.assertIn(needle, str(caught.exception))
 
+    def test_TRACE_READER_frames_on_LF_only(self) -> None:
+        """read_text()+splitlines() treat bare CR and U+2028 as separators, so a
+        writer that never emits them could still be framed by them."""
+        self._gnu_stat_shim()
+        one = json.dumps(self._one_valid_record())
+        for label, payload in (
+                ("terminal bare CR", (one + "\r").encode()),
+                ("CR-separated pair", (one + "\r" + one + "\n").encode()),
+                ("U+2028-separated pair", (one + "\u2028" + one + "\n").encode()),
+        ):
+            with self.subTest(framing=label):
+                self._trace.write_bytes(payload)
+                with self.assertRaises(AssertionError):
+                    self._read_trace()
+
+        # CRLF stays acceptable: json tolerates the trailing \r as whitespace.
+        self._trace.write_bytes((one + "\r\n").encode())
+        self.assertEqual(len(self._read_trace()), 1)
+
     def test_TRACE_CONTRACT_rejects_a_same_length_wrong_record(self) -> None:
         """Calibrates the equal-length branch. A validator that returns on any
         non-empty trace passes both recorder controls but fails this one."""
@@ -250,11 +269,17 @@ class PinMigrationVisibilityTest(unittest.TestCase):
     def _read_trace(self, *, run_id: str | None = None) -> list[dict]:
         """Sole reader of the trace. Malformed lines RAISE rather than skip: a
         corrupt record and an absent one must not look alike to any caller."""
-        raw = self._trace.read_text() if self._trace.exists() else ""
-        if raw and not raw.endswith("\n"):
+        # BYTES, not read_text(): universal-newline translation plus
+        # str.splitlines() treat bare CR and U+2028 as record separators.
+        blob = self._trace.read_bytes() if self._trace.exists() else b""
+        if blob and not blob.endswith(b"\n"):
             raise AssertionError("trace does not end in a newline - final record may be truncated")
         out = []
-        for n, ln in enumerate(raw.splitlines(), 1):
+        for n, raw_ln in enumerate(blob.split(b"\n")[:-1] if blob else [], 1):
+            try:
+                ln = raw_ln.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise AssertionError(f"trace line {n} is not UTF-8 ({exc})")
             if not ln.strip():
                 raise AssertionError(f"trace line {n} is blank")
             try:
