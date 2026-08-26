@@ -1647,7 +1647,12 @@ commit_source() {
             n_skipped=$((n_skipped+1)); continue
         fi
         cls="$(classify "$rel")"
-        outcome="$(commit_one "$file" "$rel" "$tag" "$cls")"
+        # A command substitution swallows the exit status, so `set -e` cannot
+        # carry a refusal out of here — capture it explicitly or the walk goes on.
+        outcome="$(commit_one "$file" "$rel" "$tag" "$cls")" || {
+            echo "sutando-migrate: commit refused for $rel — source sentinel NOT written" >&2
+            return 1
+        }
         # Per-file progress on stderr — visible feedback during the copy walk
         # so long migrations don't feel like a hang. Skipped when PROGRESS_TOTAL
         # is 0 (delete-source phase-2 path; pre-flight didn't run).
