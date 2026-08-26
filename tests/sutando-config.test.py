@@ -702,5 +702,32 @@ class TestSutandoConfig(unittest.TestCase):
         self.assertEqual(out["scalar_int"], 42)  # non-string passthrough
 
 
+class TestNullBlockIsAbsent(unittest.TestCase):
+    """A null block loads today on both loaders; guarding it must not change that."""
+
+    def _load(self, body):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "sutando.config.local.json"
+            p.write_text(body)
+            return sutando_config._load_json(p)
+
+    def test_null_block_loads_and_reads_as_absent(self):
+        out = self._load('{"vault": null, "workspace": null}')
+        self.assertIsNone(out["vault"])
+        # the shape every consumer already relies on
+        self.assertIsNone((out.get("vault") or {}).get("remote_url"))
+
+    def test_scalar_and_array_blocks_still_rejected(self):
+        for body, shown in (('{"workspace": "/tmp/ws"}', "str"),
+                            ('{"vault": []}', "list")):
+            with self.assertRaises(RuntimeError) as cm:
+                self._load(body)
+            self.assertIn(shown, str(cm.exception))
+
+    def test_real_object_block_still_loads(self):
+        out = self._load('{"vault": {"remote_url": "git@example:v.git"}}')
+        self.assertEqual(out["vault"]["remote_url"], "git@example:v.git")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

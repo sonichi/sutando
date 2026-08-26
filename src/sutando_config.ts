@@ -142,7 +142,10 @@ function loadJsonFile(path: string): { [k: string]: Json } {
 	for (const key of [...OBJECT_TOP_LEVEL_KEYS].sort()) {
 		if (!(key in obj)) continue;
 		const v = obj[key];
-		if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+		// null is how every consumer already spells "absent" (`or {}`), so
+		// rejecting it would break configs that work on both loaders today.
+		if (v === null) continue;
+		if (typeof v !== 'object' || Array.isArray(v)) {
 			throw new Error(
 				`sutando config: ${path} key '${key}' must be a JSON object, got ` +
 					`${Array.isArray(v) ? 'array' : typeof v} ${JSON.stringify(v)}. ` +

@@ -165,6 +165,10 @@ def _load_json(path: Path) -> Dict[str, Any]:
             f"sutando config: {path} top-level must be a JSON object, got {type(data).__name__}"
         )
     for key in sorted(_OBJECT_TOP_LEVEL_KEYS & set(data)):
+        # null is how every consumer already spells "absent" (`or {}`), so
+        # rejecting it would break configs that work on both loaders today.
+        if data[key] is None:
+            continue
         if not isinstance(data[key], dict):
             raise RuntimeError(
                 f"sutando config: {path} key {key!r} must be a JSON object, got "
