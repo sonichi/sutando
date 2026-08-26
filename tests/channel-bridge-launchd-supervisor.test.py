@@ -75,8 +75,14 @@ def test_wrapper_restart_signal() -> None:
             "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$TEST_EXEC_LOG\"\nexit 1\n")
         fake_python.chmod(0o755)
         exec_log = root / "exec.log"
+        # Crash path alerts too: shim the sink here as well, not only in
+        # _stage_clean_exit — this staging builds its own env.
+        shims = root / "shims"; shims.mkdir(exist_ok=True)
+        (shims / "osascript").write_text("#!/bin/bash\nexit 0\n")
+        (shims / "osascript").chmod(0o755)
         env = os.environ.copy()
         env.update({
+            "PATH": f"{shims}:{env.get('PATH','')}",
             "SUTANDO_CHANNEL_BRIDGE_PYTHON": str(fake_python),
             "TEST_EXEC_LOG": str(exec_log),
             "HOME": str(root),
@@ -124,8 +130,13 @@ def _stage_clean_exit(root, rc=75):
         f"exit {rc}\n")
     fake_python.chmod(0o755)
     exec_log = root / "exec.log"
+    # Same reason as the shell harness: keep the real notification sink out.
+    shims = root / "shims"; shims.mkdir(exist_ok=True)
+    (shims / "osascript").write_text("#!/bin/bash\nexit 0\n")
+    (shims / "osascript").chmod(0o755)
     env = os.environ.copy()
     env.update({
+        "PATH": f"{shims}:{env.get('PATH','')}",
         "SUTANDO_CHANNEL_BRIDGE_PYTHON": str(fake_python),
         "TEST_EXEC_LOG": str(exec_log),
         "HOME": str(root),

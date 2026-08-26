@@ -19,7 +19,11 @@ run_case() {  # $1=exit code the stub bridge returns -> prints restart count
   chmod +x "$d/scripts/sutando-config.sh"
   echo "import sys; sys.exit($1)" > "$d/src/discord-bridge.py"
   cp "$REPO/src/launchd/channel-bridge-wrapper.sh" "$d/src/launchd/"
-  ( cd "$d"; DISCORD_BOT_TOKEN=t SUTANDO_CHANNEL_BRIDGE_PYTHON="$PY" \
+  # The wrapper alerts via `osascript display notification`; unshimmed, running
+  # this suite fires real desktop alerts at the owner.
+  mkdir -p "$d/shims"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
+  chmod +x "$d/shims/osascript"
+  ( cd "$d"; PATH="$d/shims:$PATH" DISCORD_BOT_TOKEN=t SUTANDO_CHANNEL_BRIDGE_PYTHON="$PY" \
       SUTANDO_CHANNEL_BRIDGE_RESTART_DELAY=1 \
       bash src/launchd/channel-bridge-wrapper.sh discord > o.log 2>&1 & p=$!
     sleep 5; kill -TERM $p 2>/dev/null; wait $p 2>/dev/null )
