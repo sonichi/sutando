@@ -781,11 +781,14 @@ def check_port(port: int, name: str, probe: bool = False,
                     # Status stays `wedged` even when pinned: `warn` is benign
                     # and would drop a live outage out of `issues` entirely.
                     _remedy = f"but {_armed}" if _armed else "restart needed"
-                    return {
+                    _row = {
                         "name": name,
                         "status": "wedged",
                         "detail": f"{_base} — {_remedy}{_notes}",
                     }
+                    if _armed:
+                        _row["restart_veto"] = _armed
+                    return _row
         return {"name": name, "status": "ok" if up else "down", "detail": f"port {port}"}
     except Exception as e:
         return {"name": name, "status": "error", "detail": str(e)}
@@ -3974,7 +3977,10 @@ def check_voice_watchers(voice_check: dict) -> dict:
     # Only run if voice-agent itself is ok; otherwise the check is moot.
     # Distinguish "stale" (process running, old code) from absent.
     vs = voice_check.get("status")
-    if vs != "ok":
+    # A pinned process is running, so the parse below still holds. Returning
+    # early here would let the pin suppress the diagnosis, not just the remedy.
+    _veto = voice_check.get("restart_veto")
+    if vs != "ok" and not _veto:
         check["status"] = "warn"
         check["detail"] = _voice_dep_detail(voice_check)
         return check
@@ -4006,7 +4012,12 @@ def check_voice_watchers(voice_check: dict) -> dict:
                 missing.append(pat.replace("Watching for ", ""))
         if missing:
             check["status"] = "fail"
-            check["detail"] = f"missing watcher(s): {', '.join(missing)} — restart voice-agent"
+            _found = f"missing watcher(s): {', '.join(missing)}"
+            if _veto:
+                check["detail"] = f"{_found}, but {_veto}"
+                check["restart_veto"] = _veto
+            else:
+                check["detail"] = f"{_found} — restart voice-agent"
     except OSError as e:
         check["status"] = "warn"
         check["detail"] = f"log read failed: {e}"
@@ -4051,7 +4062,10 @@ def check_voice_transport(voice_check: dict) -> dict:
     """
     check = {"name": "voice-transport", "status": "ok", "detail": "no recent transport errors"}
     vs = voice_check.get("status")
-    if vs != "ok":
+    # A pinned process is running, so the parse below still holds. Returning
+    # early here would let the pin suppress the diagnosis, not just the remedy.
+    _veto = voice_check.get("restart_veto")
+    if vs != "ok" and not _veto:
         check["status"] = "warn"
         check["detail"] = _voice_dep_detail(voice_check)
         return check
@@ -4135,6 +4149,7 @@ def check_voice_transport(voice_check: dict) -> dict:
                         f"code={code} transport close")
                 if _armed:
                     check["detail"] = f"{base}, but {_armed}"
+                    check["restart_veto"] = _armed
                 else:
                     check["detail"] = f"{base} — needs kickstart"
                     check["_stuck_connecting"] = True
@@ -9232,6 +9247,7 @@ def run_all_checks() -> list[dict]:
         # witness whichever diagnostic prescribed it.
         ps_out = ""
         pin_armed = None
+        bridge_veto = None
         try:
             ps_out = subprocess.run(
                 ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
@@ -9299,6 +9315,7 @@ def run_all_checks() -> list[dict]:
                             detail = (f"{pin_armed} [log inode dead "
                                       f"({log_path} unlinked) — not actionable "
                                       "while pinned]")
+                            bridge_veto = pin_armed
                         else:
                             detail = (
                                 f"running but log inode dead ({log_path} unlinked) — "
@@ -9331,12 +9348,16 @@ def run_all_checks() -> list[dict]:
                     if pin_armed:
                         status = override[0] if override[0] != "ok" else status
                         detail = f"{pin_armed} [{override[1]}]"
+                        bridge_veto = pin_armed
                     else:
                         status, detail = override
             except OSError:
                 pass
 
-        checks.append({"name": name, "status": status, "detail": detail})
+        _bridge_row = {"name": name, "status": status, "detail": detail}
+        if bridge_veto:
+            _bridge_row["restart_veto"] = bridge_veto
+        checks.append(_bridge_row)
 
     # ag2.space gateway bridge (mobile path); check_gateway_bridge() returns
     # None when the gateway isn't configured, so filter it out. (The function's
@@ -10852,6 +10873,11 @@ def main():
             print()
             print("Attempting fixes...")
             for c in issues:
+                # A pin vetoes the ACTION, never the diagnosis. Enforced here
+                # because every remedy branch below passes through this point.
+                if c.get("restart_veto"):
+                    print(f"  {c['name']}: not restarted — {c['restart_veto']}")
+                    continue
                 if c["name"].startswith("com.sutando."):
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
