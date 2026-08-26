@@ -29,11 +29,9 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
 BUSY_DEFER_MAX_S = 1800.0    # busy defers repool this long, then wedge rules apply
-BUSY_EXIT_GRACE_S = 60.0     # claim window left after a busy spell ends
 DONE_FLAG_RETENTION_S = 7 * 86400
-# Repool pops the ledger entry; the follower must stay marked non-claiming
-# or the task returns to it.
-NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S
+BUSY_EXIT_GRACE_S = 60.0     # claim window left after a busy spell ends
+NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S  # repool pops ledger; keep follower marked non-claiming
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
 # assigned/claimed states explicitly rather than banning dots
@@ -238,6 +236,7 @@ class PoolLead:
                 arrived = self.now()
             try:
                 os.rename(f, target)  # atomic; a racing writer keeps its file
+                os.utime(target)  # stamp assignment time; rename keeps arrival mtime
             except OSError:
                 continue
             # Only an owner-lane pick off the lane core may (re)bind a room:

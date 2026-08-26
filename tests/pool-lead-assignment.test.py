@@ -332,6 +332,22 @@ class AffinityBusyYieldTest(unittest.TestCase):
         out = self.lead.reclaim_stuck_assignments(max_age_s=300)
         self.assertEqual(len(out), 1, "grace expired unclaimed: repool")
 
+    def test_stale_queued_task_still_gets_the_busy_cap_from_assignment(self):
+        # rename preserves arrival mtime; assignment must stamp its own time
+        # or a task queued > cap is repooled the moment the claim window ends
+        import os as _os
+        (self.tasks / "task-s1.claimed-core-2.txt").write_text("x")
+        old = self.tasks / "task-s2.txt"
+        old.write_text("id: task-s2\nsource: slack\nchannel_id: chan-A\n"
+                       "access_tier: owner\npriority: normal\ntask: hi\n")
+        _os.utime(old, (self.lead.now() - 7200.0,) * 2)  # queued two hours
+        self.lead.sweep()
+        stuck = self.tasks / "task-s2.assigned-core-2.txt"
+        self.assertTrue(stuck.exists())
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=300)
+        self.assertEqual(out, [], "busy cap must measure from assignment")
+
     def test_unclaimed_reclaim_releases_the_room_binding(self):
         # home core heartbeats but never claims: reclaim must drop the row
         # so the re-pick moves the room to a core that answers.

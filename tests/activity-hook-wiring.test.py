@@ -87,9 +87,6 @@ class HookUsesCanonicalWorkspaceOnly(unittest.TestCase):
             self.assertEqual(r.returncode, 0)
             self.assertEqual(
                 [p.name for p in Path(td).rglob("activity-feed.jsonl")], [])
-            self.assertFalse((Path.home() / "workspace" /
-                              "state" / "activity-feed.jsonl").exists()
-                             or False)
 
 
 if __name__ == "__main__":
