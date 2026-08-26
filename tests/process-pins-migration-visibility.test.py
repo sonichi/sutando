@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -45,6 +46,10 @@ SERVICE = "discord-bridge"
 LIVE_PID, LIVE_LSTART = "222", "Sun Aug 24 09:11:02 2026"
 DEAD_PID = "111"
 FUTURE = "2099-01-01T00:00:00Z"
+
+
+_NOW = int(time.time())
+OLDER, NEWER = _NOW - 7200, _NOW - 3600   # both well past INFLIGHT_GUARD_SEC=60
 
 
 def pin(pid, lstart, reason):
@@ -95,14 +100,14 @@ class PinMigrationVisibilityTest(unittest.TestCase):
 
     def test_POSITIVE_CONTROL_a_local_armed_pin_still_suppresses_the_restart(self) -> None:
         """The pin mechanism itself is untouched by the reclassification."""
-        f = self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
+        f = self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], OLDER)
         status, detail = self._verdict(f)
         self.assertEqual(status, "warn", detail)
         self.assertIn(f"DO NOT RESTART {SERVICE} pid {LIVE_PID}", detail)
 
     def test_NEGATIVE_CONTROL_a_released_record_prescribes_a_restart(self) -> None:
         """An empty pin set is the operator saying 'you may restart now'."""
-        f = self._write("src/a", [], 2_000_000_000)
+        f = self._write("src/a", [], NEWER)
         status, detail = self._verdict(f)
         self.assertEqual(status, "stale", detail)
         self.assertIn("restart needed", detail)
@@ -111,7 +116,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
 
     def test_a_lone_live_pin_ARRIVES_at_the_canonical_path(self) -> None:
         """Same-host move: the pid is still live, so the pin must survive."""
-        self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
+        self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], OLDER)
         self._migrate()
         canonical = self.tmp / "dest" / "state" / "process-pins.json"
         self.assertTrue(canonical.exists(), "a live pin was destroyed by the migration")
@@ -121,8 +126,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
 
     def test_no_pin_is_stranded_in_an_unread_sidecar(self) -> None:
         """The canonical path is the only thing load_pins opens."""
-        self._write("src/a", [pin(DEAD_PID, "Sat Aug 23 01:00:00 2026", "stale witness")], 2_000_000_000)
-        self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
+        self._write("src/a", [pin(DEAD_PID, "Sat Aug 23 01:00:00 2026", "stale witness")], NEWER)
+        self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], OLDER)
         self._migrate()
         state = self.tmp / "dest" / "state"
         strays = sorted(q.name for q in state.glob("process-pins.json.*"))
@@ -130,8 +135,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
 
     def test_migration_does_not_resurrect_a_RELEASED_pin(self) -> None:
         """Absence from the NEWER array is the release. A union would re-arm it."""
-        self._write("src/a", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
-        self._write("src/c", [], 2_000_000_000)          # newer: released
+        self._write("src/a", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], OLDER)
+        self._write("src/c", [], NEWER)          # newer: released
         self._migrate()
         canonical = self.tmp / "dest" / "state" / "process-pins.json"
         self.assertTrue(canonical.exists())
@@ -145,8 +150,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             with self.subTest(newer_is_release=newer_is_release):
                 self.setUp()
                 armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
-                self._write("src/a", armed if not newer_is_release else [], 2_000_000_000)
-                self._write("src/c", [] if not newer_is_release else armed, 1_000_000_000)
+                self._write("src/a", armed if not newer_is_release else [], NEWER)
+                self._write("src/c", [] if not newer_is_release else armed, OLDER)
                 self._migrate()
                 status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
                 self.assertEqual(status, "stale" if newer_is_release else "warn")
