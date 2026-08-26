@@ -39,9 +39,9 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Per-host workspace convention](workspace-hosts-convention.md)
 - [Per-host carried-path rules](workspace-per-host-paths.md)
 - [State-sync allowlist design](state-sync-allowlist.md)
-- [Shared-checkout discipline](shared-checkout-discipline.md) — asserting branch
-  and tree state immediately before each write to a concurrently-worked tree,
-  and what each provenance probe can and cannot witness.
+- [Shared-checkout discipline](shared-checkout-discipline.md) — isolating writers
+  rather than checking harder, measuring against an immutable OID, and treating
+  external process observations as context rather than provenance.
 - [Testing and coverage](testing-coverage.md)
 - [Voice-agent test framework](voice-agent-test-framework.md)
 

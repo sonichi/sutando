@@ -244,7 +244,7 @@
     "maintainers"
    ],
    "status": "draft",
-   "canonical_for": "asserting branch and tree state immediately before each write to a checkout worked by concurrent sessions, and the limits of each provenance probe",
+   "canonical_for": "isolating writers on a checkout worked by concurrent sessions, measuring against an immutable OID, and the limits of each provenance probe",
    "last_verified": "2026-08-24"
   },
   "docs/slack-bridge.md": {
