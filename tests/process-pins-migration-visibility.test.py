@@ -341,16 +341,25 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 self.setUp()
                 bin_ = self._gnu_stat_shim(
                     synth={"a": (SEC, sa), "dest": (SEC, sd)})
-                self._write("src/a", armed, SEC + ra)
-                self._write("dest", [], SEC + rd)
+                a_path = self._write("src/a", armed, SEC + ra)
+                d_path = self._write("dest", [], SEC + rd)
+                a_bytes, d_bytes = a_path.read_bytes(), d_path.read_bytes()
                 self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
                                          "LC_ALL": "de_DE.UTF-8"})
-                status, _ = self._verdict(
-                    self.tmp / "dest" / "state" / "process-pins.json")
+                canonical = self.tmp / "dest" / "state" / "process-pins.json"
+                status, _ = self._verdict(canonical)
                 self.assertEqual(
                     status, expected,
                     f"{label}: expected the SHIM winner ({expected}); a host or "
                     f"mixed host/shim pair yields the other verdict")
+                # BYTES, not the derived verdict: load_pins() maps truncated,
+                # malformed and absent alike to [] -> "stale", so a verdict-only
+                # oracle accepts corruption isolated to the dest-winning branch.
+                want = d_bytes if expected == "stale" else a_bytes
+                self.assertEqual(
+                    canonical.read_bytes(), want,
+                    f"{label}: verdict matched but the surviving BYTES are not "
+                    f"the expected candidate's")
 
     def test_GNU_migrator_CONSUMES_shim_values_not_host_stat(self) -> None:
         """Prove the shim's ANSWER drove the decision, not merely that it ran.
