@@ -51,10 +51,24 @@ os.environ["AG2_DEVICE_ENV"] = str(Path(_FIXTURE_CFG) / "device.env")
 _LOG_TMPDIRS: "list" = []   # fixture log dirs, one per re-import
 
 
+class IsolationViolation(AssertionError):
+    """Raised BEFORE a protected open — prevention, not post-hoc detection."""
+
+
+def _is_sensitive(sp: str) -> bool:
+    return (("channels" in sp and "ag2space" in sp)
+            or sp.endswith("device.env") or sp.endswith("/.env"))
+
+
+def _in_fixture(sp: str) -> bool:
+    # Trailing-separator anchored: "<fixture>-outside/..." must NOT match.
+    return sp == _FIXTURE_CFG or sp.startswith(_FIXTURE_CFG + os.sep)
+
+
 def _fresh_import():
-    """Guarded fresh import: an open() spy proves no channel/device config
-    outside the fixture tree is touched — file-ACCESS isolation, not the
-    narrower token-value equality (review finding 7)."""
+    """Guarded fresh import: the spy RAISES before opening any protected
+    path outside the fixture — the file is never read, matching the claim
+    (findings 7 and 9). The post-import audit remains as the belt."""
     import builtins
     import io
     opened = []
@@ -62,9 +76,13 @@ def _fresh_import():
     real_io_open = io.open
     def _spy(file, *a, **kw):
         try:
-            opened.append(str(os.fspath(file)))
+            sp = str(os.fspath(file))
         except TypeError:
-            pass
+            sp = None
+        if sp is not None:
+            opened.append(sp)
+            if _is_sensitive(sp) and not _in_fixture(sp):
+                raise IsolationViolation(f"pre-open block: {sp}")
         return real_io_open(file, *a, **kw)
     for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
         del sys.modules[name]
@@ -77,10 +95,8 @@ def _fresh_import():
     finally:
         builtins.open = real_open
         io.open = real_io_open
-    sensitive = [p for p in opened
-                 if (("channels" in p and "ag2space" in p)
-                     or p.endswith("device.env") or p.endswith("/.env"))]
-    escaped = [p for p in sensitive if not p.startswith(_FIXTURE_CFG)]
+    sensitive = [p for p in opened if _is_sensitive(p)]
+    escaped = [p for p in sensitive if not _in_fixture(p)]
     assert not escaped, f"import opened real channel/device config: {escaped}"
     # Positive control on the instrument: the fixture .env IS read eagerly,
     # so the spy must have seen it — an empty list means a blind spy.
@@ -175,7 +191,9 @@ class ImportIsolationGuard(unittest.TestCase):
         saved = os.environ["AG2_DEVICE_ENV"]
         os.environ["AG2_DEVICE_ENV"] = str(escape)
         try:
-            with self.assertRaises(AssertionError):
+            # The SPECIFIC pre-open exception, raised DURING import — a
+            # generic AssertionError could pass for the wrong reason.
+            with self.assertRaises(IsolationViolation):
                 _fresh_import()
         finally:
             os.environ["AG2_DEVICE_ENV"] = saved
