@@ -1813,9 +1813,17 @@ commit_main() {
     echo
 
     # Order: C (richest) → A (merges atop C) → B (sentinel-deduped legacy)
-    [ -n "$C_REAL_OK" ] && include_src C && commit_source C "$C_REAL_OK"
-    [ -n "$A_REAL_OK" ] && include_src A && commit_source A "$A_REAL_OK"
-    [ -n "$B_REAL_OK" ] && include_src B && commit_source B "$B_REAL_OK"
+    # Propagate explicitly: errexit is exempt inside a containing conditional,
+    # and a refusal that keeps walking writes A's and B's sentinels anyway.
+    for _src in C A B; do
+        eval "_ok=\${${_src}_REAL_OK}"
+        [ -n "$_ok" ] || continue
+        include_src "$_src" || continue
+        commit_source "$_src" "$_ok" || {
+            echo "sutando-migrate: source $_src refused — halting before the remaining sources; no further sentinels written" >&2
+            return 1
+        }
+    done
 
     # β rehome of source's .git → dest/.git is a SEPARATE step. See
     # sutando-plus/scripts/sutando-migrate-sync.sh — runs AFTER this commit
@@ -2385,7 +2393,7 @@ case "$MODE" in
         fi
         ;;
     commit)
-        commit_main
+        commit_main || exit 1
         ;;
     verify)
         verify_main
