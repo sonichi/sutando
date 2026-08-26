@@ -75,10 +75,8 @@ VALID_PR_PROJECTIONS = frozenset({("open", "false"), ("closed", "false"), ("clos
 _ASCII_DIGITS = frozenset("0123456789")
 
 
-# Owner and repo NAME have different grammars: an owner login never leads with
-# a dot, but GitHub serves `.github` / `.github-private` repositories.
-# \Z, not $: with .match(), $ also accepts a terminal newline, which would
-# persist "owner/repo\n" and address a different gh endpoint on every resume.
+# Owner logins never lead with a dot; repo NAMES may (`.github`). \Z not $:
+# under .match(), $ accepts a terminal newline and persists "owner/repo\n".
 _OWNER_SEGMENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\Z")
 _NAME_SEGMENT = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+\Z")
 
