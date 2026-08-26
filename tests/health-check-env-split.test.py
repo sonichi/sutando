@@ -58,6 +58,35 @@ with tempfile.TemporaryDirectory() as td:
     check("single .env stays silent",
           hc.check_env_split(repo_env=repo_env, ws_env=ws_env), None)
 
+# 5. unreadable selected file -> reads as empty, so the other's keys all warn
+# (chmod 000 does not block root, where read_text would succeed; skip there)
+import os
+
+if os.geteuid() != 0:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        repo_env = td / "repo.env"
+        ws_env = td / "ws.env"
+        repo_env.write_text("GEMINI_API_KEY=x\n")
+        ws_env.write_text("DISCORD_BOT_TOKEN=v\n")
+        repo_env.chmod(0)
+        try:
+            r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+            check("unreadable selected env warns", r is not None and r["status"], "warn")
+            check("unreadable selected env lists the other's keys",
+                  r is not None and "DISCORD_BOT_TOKEN" in r["detail"], True)
+        finally:
+            repo_env.chmod(0o600)
+
+# 6. run_all_checks wiring: the call site is separate code from the probe
+# (same pattern as health-check-bridge-log-content's integration section).
+from unittest.mock import patch
+
+_sentinel = {"name": "env-split", "status": "warn", "detail": "wiring-sentinel"}
+with patch.object(hc, "check_env_split", return_value=_sentinel):
+    _rows = [c for c in hc.run_all_checks() if c.get("detail") == "wiring-sentinel"]
+check("run_all_checks carries the env-split row", len(_rows), 1)
+
 if fails:
     print(f"FAIL ({len(fails)})")
     sys.exit(1)
