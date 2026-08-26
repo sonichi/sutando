@@ -5,6 +5,11 @@ A sibling structural test pins the wiring in source. This one drives the real
 coroutine, because a source-shape assertion cannot tell whether the branch runs,
 and the branch is the whole fix.
 
+Scope: this covers the poll_proactive redirect loop only. The identical loop in
+poll_dm_fallback is NOT exercised here -- reaching it needs the target channel
+to resolve at OWNER tier and the dm-result shell-out to be stubbed, which this
+harness does not do. That half is uncovered, deliberately and knowingly.
+
 The defect: a path that EXISTS but fails the allowlist matched neither
 `_is_path_sendable` nor `not os.path.isfile`, so it was dropped with no send, no
 log and no exception -- byte-identical to a successful attach from the outside.
@@ -24,6 +29,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import time
 import types
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -32,7 +38,11 @@ os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-attach-outcomes-"
 _cfg = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
 _cfg.mkdir(parents=True, exist_ok=True)
 (_cfg / ".env").write_text("DISCORD_BOT_TOKEN=test-stub-token\n")
-(_cfg / "access.json").write_text('{"allowFrom": ["1022910063620390932"], "groups": {}}\n')
+# The dm-fallback redirect refuses a target whose tier is not owner, so the
+# target id needs an owner entry or that loop is never reached.
+(_cfg / "access.json").write_text(
+    '{"allowFrom": ["1022910063620390932"], "groups": {}, '
+    '"tierMap": {"1022910063620390932": "owner", "1530802402603700415": "owner"}}\n')
 tmp = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"])
 BRIDGE = REPO / "src" / "discord-bridge.py"
 TARGET = 1530802402603700415
