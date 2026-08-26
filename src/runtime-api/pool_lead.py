@@ -120,16 +120,21 @@ class PoolLead:
         except OSError:
             return 0
 
-    def _pick(self, channel: "str | None", followers: "list[str]",
-              affinity: dict, lane: str = "owner") -> str:
-        # Soft lanes (owner 2026-08-23): the highest core is the routine lane;
-        # owner traffic stays off it except as saturated-pool overflow.
-        # Highest CLAUDE core (owner 2026-08-25): a codex follower sweeps on a
-        # timer, so maintenance parked there waits for a poll. All-codex: any.
+    def _lane_core_of(self, followers: "list[str]") -> "str | None":
+        """Highest CLAUDE core is the routine lane (owner 2026-08-25); a codex
+        follower sweeps on a timer, so maintenance there waits for a poll."""
         eligible = [f for f in followers
                     if self.runtime_fn(f) == "claude"] or followers
-        lane_core = (max(eligible, key=lambda f: (len(str(f)), str(f)))
-                     if len(followers) > 1 else None)
+        return (max(eligible, key=lambda f: (len(str(f)), str(f)))
+                if len(followers) > 1 else None)
+
+    def _pick(self, channel: "str | None", followers: "list[str]",
+              affinity: dict, lane: str = "owner") -> str:
+        # Soft lanes (owner 2026-08-23): owner traffic stays off the lane
+        # core except as saturated-pool overflow.
+        eligible = [f for f in followers
+                    if self.runtime_fn(f) == "claude"] or followers
+        lane_core = self._lane_core_of(followers)
         if lane == "routine" and lane_core is not None:
             return lane_core
         # owner lane prefers claude seats: a codex follower's wrapper polls on
@@ -171,7 +176,8 @@ class PoolLead:
             if self._done_flag_exists(f.name) and self._result_evidence(f.name):
                 continue  # processed by a since-dead claimer; bridge owns it now
             channel = _read_channel(f)
-            inst = self._pick(channel, followers, affinity, _read_lane(f))
+            lane = _read_lane(f)
+            inst = self._pick(channel, followers, affinity, lane)
             target = f.with_name(
                 f.name[:-len(".txt")] + f".assigned-{inst}.txt")
             try:
@@ -182,7 +188,9 @@ class PoolLead:
                 os.rename(f, target)  # atomic; a racing writer keeps its file
             except OSError:
                 continue
-            if channel:
+            # Only an owner-lane pick off the lane core may (re)bind a room:
+            # a routine/overflow landing there must not become a sticky steal
+            if channel and lane == "owner" and inst != self._lane_core_of(followers):
                 affinity[channel] = {"instance": inst, "ts": self.now()}
             if self.metrics is not None:
                 self.metrics.assigned(f.name, inst, channel,

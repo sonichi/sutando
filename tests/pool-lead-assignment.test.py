@@ -239,6 +239,15 @@ class AffinityBusyYieldTest(unittest.TestCase):
         out = dict(self.lead.sweep())
         self.assertEqual(out.get("task-fresh.txt"), "core-2")
 
+    def test_routine_assignment_never_rebinds_a_room(self):
+        # owner report 2026-08-26: a routine task tagged with a room stamped
+        # the lane core over the owner's binding, making the steal sticky.
+        (self.tasks / "task-r9.txt").write_text(
+            "id: task-r9\nchannel_id: chan-A\npriority: low\ntask: t\n")
+        self.lead.sweep()
+        row = self.lead._load_affinity()["chan-A"]
+        self.assertEqual(row["instance"], "core-2", "binding must survive")
+
     def test_unclaimed_reclaim_releases_the_room_binding(self):
         # home core heartbeats but never claims: reclaim must drop the row
         # so the re-pick moves the room to a core that answers.
