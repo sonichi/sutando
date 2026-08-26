@@ -12,7 +12,8 @@ import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-spec = importlib.util.spec_from_file_location("cen", REPO / "src" / "task_envelope_census.py")
+REPO_SRC = REPO / "src" / "task_envelope_census.py"
+spec = importlib.util.spec_from_file_location("cen", REPO_SRC)
 cen = importlib.util.module_from_spec(spec)
 sys.modules["cen"] = cen
 spec.loader.exec_module(cen)
@@ -59,6 +60,33 @@ d = ws_with({"task-ok0000000001.txt": VERIFIED})
 gone = cen.census(workspace=d, days=3650)
 check("vanished entry does NOT count as unreadable", gone.get("unreadable", 0), 0)
 check("vanished entry is not scanned either", gone["scanned"], 1)
+
+# The transition the reviewer asked for: torn -> whole, with the verified task
+# as the control. The CLI line is the actual rollout evidence, so assert on it.
+import subprocess, sys as _sys
+d = ws_with({"task-ok0000000001.txt": VERIFIED})
+torn_p = d / "tasks" / "task-flip000000001.txt"
+torn_p.write_bytes(b"id: task-flip000000001\nsource: voice\ntask: \xff\xfe")
+
+
+def cli(ws):
+    r = subprocess.run([_sys.executable, str(REPO_SRC), "--workspace", str(ws), "--days", "3650"],
+                       capture_output=True, text=True)
+    return r.stdout.strip().splitlines()[-1].strip()
+
+
+before_n = cen.census(workspace=d, days=3650).get("unreadable", 0)
+before_line = cli(d)
+torn_p.write_text("id: task-flip000000001\nenvelope_hmac: v1:deadbeef\nsource: voice\ntask: now whole\n")
+after_n = cen.census(workspace=d, days=3650).get("unreadable", 0)
+after_line = cli(d)
+
+check("torn: unreadable == 1", before_n, 1)
+check("whole: unreadable back to 0", after_n, 0)
+check("torn: gate reads UNKNOWN", "UNKNOWN" in before_line, True)
+check("whole: gate reads MET", "MET" in after_line, True)
+check("control: the verified task was scanned throughout",
+      cen.census(workspace=d, days=3650)["scanned"], 2)
 
 print()
 print(f"{len(fails)} failure(s)" if fails else "all checks passed")
