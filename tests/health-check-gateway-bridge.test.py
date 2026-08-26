@@ -259,10 +259,8 @@ def main() -> int:
     check("_gateway_serving: absent file → None",
           hc._gateway_serving(Path(_tf.mkdtemp()) / "nope.json", now) is None)
 
-    # 7b) A sidecar too STALE to consult is evidence, not silence. Before this,
-    # _gateway_serving()'s None sent the probe to its process-only "ok" branch,
-    # so a bridge that stopped writing outcomes entirely read as healthy —
-    # strictly worse than the connected:false the same file was frozen on.
+    # 7b) Stale sidecar. Before this, _gateway_serving()'s None sent the probe
+    # to its process-only "ok" branch, so a stopped writer read as healthy.
     check("_gateway_status_stale_age_s: fresh → None",
           hc._gateway_status_stale_age_s(_sc({"connected": True, "ts": now}), now) is None)
     check("_gateway_status_stale_age_s: stale → the age in seconds",

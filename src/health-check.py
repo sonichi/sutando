@@ -5556,9 +5556,8 @@ def check_gateway_bridge() -> "dict | None":
         }
     if verdict is True:
         return {"name": "gateway-bridge", "status": "ok", "detail": "running + connected"}
-    # A sidecar too STALE to consult is evidence the writer stopped, not absence
-    # of evidence: the bridge rewrites it on every poll outcome, so silence past
-    # the freshness window outranks whatever `connected` it froze on.
+    # The bridge rewrites this file on every poll outcome, so silence past the
+    # freshness window means the writer stopped — evidence, not absence of it.
     stale_age = _gateway_status_stale_age_s()
     if stale_age is not None:
         return {
