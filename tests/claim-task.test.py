@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from claim_task import claim  # noqa: E402
+from claim_task import claim_plain as claim  # noqa: E402
 
 
 def _try_claim(ws_str: str, task_id: str, core_id: str, q: "mp.Queue[str]") -> None:
@@ -34,7 +34,7 @@ def _try_claim(ws_str: str, task_id: str, core_id: str, q: "mp.Queue[str]") -> N
     threads in CPython would serialize via the GIL and obscure the race."""
     sys.path.insert(0, str(Path(ws_str).parent / "src"))  # safety
     sys.path.insert(0, str(ROOT / "src"))
-    from claim_task import claim as _claim
+    from claim_task import claim_plain as _claim
 
     result = _claim(task_id, core_id, workspace=Path(ws_str))
     q.put(f"{core_id}:{'won' if result is not None else 'lost'}:{result}")
