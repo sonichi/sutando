@@ -4174,8 +4174,10 @@ def check_voice_transport(voice_check: dict) -> dict:
                 # A kickstart destroys a pinned witness; packaged installs run
                 # dist/voice-agent.js, so a .ts-only probe misses the pin.
                 _, _lstarts = _proc_lstarts("voice-agent[.]ts|voice-agent[.]js")
+                # `_proc_lstarts` fails closed to ({}, {}), so a probe TIMEOUT is
+                # indistinguishable from "unpinned" — fall back to the established veto.
                 _armed = process_pins.armed_detail(
-                    _pin_verdicts(voice_check.get("name") or "voice-agent", _lstarts))
+                    _pin_verdicts(voice_check.get("name") or "voice-agent", _lstarts)) or _veto
                 base = (f"stuck CONNECTING ~{elapsed_min}min after "
                         f"code={code} transport close")
                 if _armed:
@@ -8961,6 +8963,23 @@ def _process_executes_artifact(artifact: Path, pgrep_pattern: str) -> bool:
                for pid in out.split() if pid.isdigit())
 
 
+def carry_proxy_veto(check: dict, veto: "str | None") -> dict:
+    """A non-ok dependent check must carry the proxy's veto to the --fix boundary.
+    That boundary reads check["restart_veto"]; a status string cannot hold it."""
+    if veto and check.get("status") != "ok":
+        check["restart_veto"] = veto
+    return check
+
+
+def proxy_restart_veto(proxy_check: dict) -> "str | None":
+    """The armed veto, kept STRUCTURED for the consumers.
+
+    `proxy_liveness_status` flattens a pinned proxy to "stale"; a string cannot
+    carry the pin, so the --fix boundary sees no veto on the dependent checks.
+    """
+    return proxy_check.get("restart_veto")
+
+
 def proxy_liveness_status(proxy_check: dict) -> str:
     """The status the quota consumers should read, which is NOT the remedy.
 
@@ -9048,13 +9067,14 @@ def run_all_checks() -> list[dict]:
     checks.append(proxy_check)
 
     proxy_live = proxy_liveness_status(proxy_check)
+    proxy_veto = proxy_restart_veto(proxy_check)
 
     # Quota telemetry — only meaningful when the proxy is actually up.
-    checks.append(check_quota_telemetry(proxy_live))
+    checks.append(carry_proxy_veto(check_quota_telemetry(proxy_live), proxy_veto))
     # ...and WHOSE account those numbers describe. The check above answers
     # "fresh?"; this one answers "ours?" — a fresh file for a foreign account
     # passes every branch above (observed 2026-08-03).
-    checks.append(check_quota_account_identity(proxy_live))
+    checks.append(carry_proxy_veto(check_quota_account_identity(proxy_live), proxy_veto))
 
     # Core over-quota — fail loudly to the remote owner surface so an exhausted
     # model no longer stalls every task silently (owner-reported 2026-08-01).
