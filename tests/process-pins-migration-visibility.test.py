@@ -91,6 +91,95 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"migrate failed:\n{r.stdout}\n{r.stderr}")
         return r
 
+    def _probe_shim(self, trace: Path, run_id: str) -> Path:
+        """Shim whose ONLY writer is its normal synchronous finish() path.
+
+        No probe-only writer: a reserved argv reaches the same record code
+        production uses, so a dead production writer cannot pass the probe.
+        """
+        bin_ = self.tmp / "probebin"
+        bin_.mkdir(exist_ok=True)
+        (bin_ / "stat").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            f"TRACE = {str(trace)!r}\n"
+            f"RUN_ID = {run_id!r}\n"
+            "a = sys.argv[1:]\n"
+            "def finish(argv, operand, rc, out, err):\n"
+            "    with open(TRACE, 'a') as f:\n"
+            "        f.write(json.dumps({'v': 1, 'kind': 'result',\n"
+            "            'run_id': RUN_ID, 'call_id': _cid, 'argv': argv,\n"
+            "            'operand': operand, 'rc': rc,\n"
+            "            'stdout': out, 'stderr': err}) + '\\n')\n"
+            "        f.flush(); os.fsync(f.fileno())\n"
+            "    sys.stdout.write(out); sys.stderr.write(err)\n"
+            "    sys.exit(rc)\n"
+            "_cid = ''\n"
+            "if a and a[0].startswith('--sutando-shim-probe='):\n"
+            "    _cid = a[0].split('=', 1)[1]\n"
+            "    _op = os.path.realpath(a[1])\n"
+            "    finish(a, _op, 0, f'SHIM-LIVE-{_cid}\\n', '')\n"
+            "sys.exit(1)\n")
+        (bin_ / "stat").chmod(0o755)
+        return bin_
+
+    def test_RECORDER_is_live_independent_oracle_plus_falsification(self) -> None:
+        """Prove the recorder can emit at all, before trusting any silence.
+
+        Two observations of one call, each compared to a literal fixed here in
+        advance: neither the expected stdout nor the expected record is derived
+        from the other, so a dead recorder cannot be certified by a live
+        subprocess (or vice versa).
+        """
+        import json
+        import subprocess
+        import uuid
+        run_id, call_id = uuid.uuid4().hex, uuid.uuid4().hex[:12]
+        trace = self.tmp / f"probe-{run_id}.jsonl"
+        known = self._write("src/a", [], 1700000000)
+        self.assertFalse(trace.exists(), "trace must not pre-exist")
+
+        bin_ = self._probe_shim(trace, run_id)
+        env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
+        argv = [f"--sutando-shim-probe={call_id}", str(known)]
+        cp = subprocess.run(["stat", *argv], capture_output=True, text=True, env=env)
+
+        expected_stdout = f"SHIM-LIVE-{call_id}\n"          # parent-defined
+        self.assertEqual(cp.returncode, 0)
+        self.assertEqual(cp.stdout, expected_stdout)
+        self.assertEqual(cp.stderr, "")
+
+        # read-only validator: raw bytes, never invokes the shim, never repairs
+        records = [json.loads(l) for l in
+                   trace.read_text().splitlines() if l.strip()]
+        self.assertEqual(records, [{                          # parent-defined
+            "v": 1, "kind": "result", "run_id": run_id, "call_id": call_id,
+            "argv": argv, "operand": str(known.resolve()),
+            "rc": 0, "stdout": expected_stdout, "stderr": "",
+        }])
+
+    def test_RECORDER_liveness_check_can_FAIL(self) -> None:
+        """Falsification control: break the writer, require the oracle to notice."""
+        import json
+        import subprocess
+        import uuid
+        run_id, call_id = uuid.uuid4().hex, uuid.uuid4().hex[:12]
+        trace = self.tmp / f"probe-{run_id}.jsonl"
+        known = self._write("src/a", [], 1700000000)
+        bin_ = self._probe_shim(trace, run_id)
+        shim = bin_ / "stat"
+        shim.write_text(shim.read_text().replace(
+            "    with open(TRACE, 'a') as f:", "    return  # MUTANT: writer dead"))
+        shim.chmod(0o755)
+
+        env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
+        subprocess.run(["stat", f"--sutando-shim-probe={call_id}", str(known)],
+                       capture_output=True, text=True, env=env)
+        records = ([json.loads(l) for l in trace.read_text().splitlines() if l.strip()]
+                   if trace.exists() else [])
+        self.assertEqual(records, [],
+                         "control is inert: a dead writer still produced records")
+
     def _gnu_stat_shim(self, comma: bool = True, synth: dict | None = None,
                        poison: dict | None = None,
                        synth9: dict | None = None) -> Path:
