@@ -104,8 +104,9 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "#!/usr/bin/env python3\n"
             "import os, sys, time\n"
             "a = sys.argv[1:]\n"
+            "import json as _j\n"
             f"open({str(self._trace)!r}, 'a').write("
-            f"'{nonce}\\t' + ' '.join(a) + '\\n')\n"
+            f"_j.dumps(['{nonce}'] + a) + '\\n')\n"
             "if not a or a[0] == '-f':\n"
             "    sys.stderr.write('stat: cannot read file system information\\n')\n"
             f"    sys.stderr.write('{nonce}\\n')\n"
@@ -144,24 +145,40 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         # assertion, which asks whether the MIGRATOR subprocess used the shim.
         self._trace.write_text("")
 
-    def _assert_migrator_used_shim(self) -> None:
-        """The direct probe binds THIS call; the migrator is another process.
+    def _assert_migrator_used_shim(self, *, fallback: bool = False) -> None:
+        """The comparator's OWN stat calls, not merely "the shim ran".
 
-        Production redirects stat's stderr, so the nonce is unobservable there
-        -- the trace file is the only witness that the activated path ran on
-        the shim rather than on host stat.
+        The trace opens with SIZE probes (-f %z / -c %s), so requiring any
+        -f plus any -c is satisfied before an mtime format is ever considered
+        -- the mtime decision could be delegated to host stat and still pass.
         """
+        import json
         seen = self._trace.read_text() if self._trace.exists() else ""
-        self.assertTrue(
-            seen.strip(),
-            "migrator never invoked the shim: post-migration trace is EMPTY "
-            "(host stat answered the activated path)")
-        calls = [ln.split("\t", 1)[1] for ln in seen.splitlines() if "\t" in ln]
-        self.assertTrue(any(c.startswith("-f") for c in calls),
-                        f"no BSD-form (-f) call from the migrator: {calls[:6]}")
-        self.assertTrue(any(c.startswith("-c") for c in calls),
-                        f"no GNU-form (-c) fallback from the migrator: {calls[:6]}")
-
+        calls = set()
+        for ln in seen.splitlines():
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue
+            if not rec or rec[0] != self._nonce or len(rec) < 3:
+                continue
+            # macOS: fixture enters as /var/..., production resolves /private/var/...
+            # rec == [nonce, flag, fmt, path]
+            calls.add((rec[1], rec[2], str(Path(rec[3]).resolve())))
+        src_a = str((self.tmp / "src/a").resolve())
+        dest = str((self.tmp / "dest").resolve())
+        want = [("-f", "%Fm"), ("-c", "%.9Y")]
+        if fallback:
+            want.append(("-c", "%Y"))
+        for flag, fmt in want:
+            hits = [c for c in calls if c[0] == flag and c[1] == fmt]
+            self.assertTrue(
+                hits,
+                f"comparator never asked the shim for {flag} {fmt} -- the mtime "
+                f"decision did not run on the shim. traced: {sorted(calls)[:8]}")
+            self.assertTrue(
+                any(h[2].startswith(src_a) or h[2].startswith(dest) for h in hits),
+                f"{flag} {fmt} traced, but not against the fixture paths: {hits[:4]}")
 
     def _verdict(self, pins_path):
         """Drive the real reader exactly as check_bridges does."""
@@ -279,7 +296,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 self._write("src/c", [] if not newer_is_release else armed, SEC + 5)
                 self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
                                          "LC_ALL": "de_DE.UTF-8"})
-                self._assert_migrator_used_shim()
+                self._assert_migrator_used_shim(fallback=True)
                 status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
                 self.assertEqual(status, "warn" if newer_is_release else "stale")
 
