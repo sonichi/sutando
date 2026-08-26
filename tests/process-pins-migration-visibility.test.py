@@ -407,25 +407,33 @@ finish(a, *dispatch(a))
             tmpl = tmpl.replace(token, value)
         (bin_ / "stat").write_text(tmpl)
         (bin_ / "stat").chmod(0o755)
-        self._assert_shim_binds(bin_, nonce)
+        self._assert_shim_binds(bin_)
         return bin_
 
-    def _assert_shim_binds(self, bin_: Path, nonce: str) -> None:
+    def _assert_shim_binds(self, bin_: Path) -> None:
         """Executable-on-disk is not bound-on-PATH.
 
-        Assert on a NONCE, never on nonzero-exit + `File:` -- host GNU stat
-        emits exactly that for `-f` (it is --file-system), so that predicate
-        is satisfied by the host on the one platform it must discriminate on.
+        Binds through the RESERVED probe argv, not the production `-f %m`
+        shape, so the BSD lane can own that shape and return success.
         """
         import subprocess
+        import uuid
+        cid = f"bind-{uuid.uuid4().hex[:12]}"
+        argv = [f"--sutando-shim-probe={cid}", str(bin_)]
+        stdout = f"SHIM-LIVE-{cid}\n"
+        expected = self._probe_record(
+            run_id=self._run_id, call_id=cid, argv=argv,
+            operand=str(bin_.resolve()), stdout=stdout)
+
+        self._trace.write_bytes(b"")
+        self.assertEqual(self._trace.read_bytes(), b"")
         env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
-        r = subprocess.run(["stat", "-f", "%m", str(bin_)],
-                           capture_output=True, text=True, env=env)
-        self.assertIn(nonce, r.stderr,
-                      f"shim did NOT bind: host stat answered (stderr={r.stderr[:80]!r})")
-        # Truncate: this probe's own entry must not satisfy the production
-        # assertion, which asks whether the MIGRATOR subprocess used the shim.
-        self._trace.write_text("")
+        cp = subprocess.run(["stat", *argv], capture_output=True,
+                            text=True, env=env)
+        self.assertEqual((cp.returncode, cp.stdout, cp.stderr),
+                         (0, stdout, ""), "shim did not bind through PATH")
+        self._require_trace(expected, run_id=self._run_id)
+        self._trace.write_bytes(b"")
 
     def _assert_migrator_used_shim(self, *, fallback: bool = False) -> None:
         """Bind the trace to the EXACT operands, both of them.
