@@ -146,11 +146,12 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self._trace.write_text("")
 
     def _assert_migrator_used_shim(self, *, fallback: bool = False) -> None:
-        """The comparator's OWN stat calls, not merely "the shim ran".
+        """Bind the trace to the EXACT operands, both of them.
 
-        The trace opens with SIZE probes (-f %z / -c %s), so requiring any
-        -f plus any -c is satisfied before an mtime format is ever considered
-        -- the mtime decision could be delegated to host stat and still pass.
+        A root prefix accepts a decoy under that root -- and startswith() is
+        string prefix, not path containment, so root src/a also admits
+        src/attacker/... Require (flag, fmt, exact path) for every required
+        format against BOTH files the comparator must stat.
         """
         import json
         seen = self._trace.read_text() if self._trace.exists() else ""
@@ -160,25 +161,23 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 rec = json.loads(ln)
             except ValueError:
                 continue
-            if not rec or rec[0] != self._nonce or len(rec) < 3:
+            if not rec or rec[0] != self._nonce or len(rec) < 4:
                 continue
-            # macOS: fixture enters as /var/..., production resolves /private/var/...
-            # rec == [nonce, flag, fmt, path]
+            # rec == [nonce, flag, fmt, path]; macOS resolves /var -> /private/var
             calls.add((rec[1], rec[2], str(Path(rec[3]).resolve())))
-        src_a = str((self.tmp / "src/a").resolve())
-        dest = str((self.tmp / "dest").resolve())
-        want = [("-f", "%Fm"), ("-c", "%.9Y")]
+        operands = [
+            str((self.tmp / "src/a" / "state" / "process-pins.json").resolve()),
+            str((self.tmp / "dest" / "state" / "process-pins.json").resolve()),
+        ]
+        fmts = [("-f", "%Fm"), ("-c", "%.9Y")]
         if fallback:
-            want.append(("-c", "%Y"))
-        for flag, fmt in want:
-            hits = [c for c in calls if c[0] == flag and c[1] == fmt]
-            self.assertTrue(
-                hits,
-                f"comparator never asked the shim for {flag} {fmt} -- the mtime "
-                f"decision did not run on the shim. traced: {sorted(calls)[:8]}")
-            self.assertTrue(
-                any(h[2].startswith(src_a) or h[2].startswith(dest) for h in hits),
-                f"{flag} {fmt} traced, but not against the fixture paths: {hits[:4]}")
+            fmts.append(("-c", "%Y"))
+        want = {(fl, fm, op) for fl, fm in fmts for op in operands}
+        missing = sorted(want - calls)
+        self.assertFalse(
+            missing,
+            f"comparator did not stat these on the shim: {missing}\n"
+            f"traced: {sorted(calls)[:10]}")
 
     def _verdict(self, pins_path):
         """Drive the real reader exactly as check_bridges does."""
