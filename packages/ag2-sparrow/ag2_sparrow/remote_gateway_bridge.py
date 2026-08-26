@@ -213,6 +213,18 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+# Optional fence for instanced lanes: claim only rooms on this suffix
+GATEWAY_ROOM_SUFFIX = (os.environ.get("GATEWAY_ROOM_SUFFIX") or "").strip()
+
+
+def _instance_may_claim(peek_room: "str | None") -> bool:
+    """Unaddressed proactives default to the owner's primary surface, which
+    only the DEFAULT lane serves — an instanced lane must never claim them."""
+    if not GATEWAY_INSTANCE:
+        return True
+    if peek_room is None:
+        return False
+    return not GATEWAY_ROOM_SUFFIX or peek_room.endswith(GATEWAY_ROOM_SUFFIX)
 
 
 def _local_tid(broker_tid: str) -> str:
@@ -2813,6 +2825,8 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if not _instance_may_claim(peek_room):
+            continue  # the default lane's file (or another lane's suffix)
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
         if route == "send" and peek_room is None and not PROACTIVE_ROOM:
@@ -2846,6 +2860,7 @@ def _post_proactive() -> None:
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
+                route == "send" and not _instance_may_claim(room_override)) or (
                 route == "send" and room_override is None and not PROACTIVE_ROOM):
             # Hand back rather than eat: a foreign target seen only post-claim,
             # or one that vanished with no default (room_id=None loses the body).
