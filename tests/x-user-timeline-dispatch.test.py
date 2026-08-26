@@ -177,18 +177,24 @@ check("no bearer: does not report a dependency problem",
 if not os.environ.get("XP_SKIP_TMP_PROBE"):
     _tmproot = pathlib.Path(tempfile.gettempdir())
     _before = {q.name for q in _tmproot.glob("xp-iso-*")}
-    subprocess.run([sys.executable, __file__],
-                   env={**os.environ, "XP_SKIP_TMP_PROBE": "1"},
-                   capture_output=True, text=True)
+    _child = subprocess.run([sys.executable, __file__],
+                            env={**os.environ, "XP_SKIP_TMP_PROBE": "1"},
+                            capture_output=True, text=True)
     _after = {q.name for q in _tmproot.glob("xp-iso-*")}
+    # rc AND the tail handshake: a child that died before creating its tree also
+    # leaves nothing behind, so absence alone passes for the wrong reason.
+    check("cleanup probe: the child ran to completion",
+          _child.returncode == 0 and "/" in _child.stdout.strip().splitlines()[-1],
+          f"rc={_child.returncode} tail={_child.stdout.strip().splitlines()[-1:]!r}")
     check("a completed run of this suite leaves no xp-iso-* tree",
           not (_after - _before), f"leaked: {sorted(_after - _before)}")
 else:
+    check("cleanup probe: the child ran to completion (inner run: skipped)", True)
     check("a completed run of this suite leaves no xp-iso-* tree (inner run: skipped)", True)
 
 
 # --- completion is pinned: a case dropped or an early abort fails here -----
-EXPECTED = 34
+EXPECTED = 35
 check(f"all {EXPECTED} checks ran (guards against a silent early exit)",
       checked + 1 == EXPECTED, f"ran {checked + 1}")
 
