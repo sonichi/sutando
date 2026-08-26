@@ -79,7 +79,7 @@ if [ -z "${OLD_PID}" ]; then
 fi
 
 # --- 1a. guarded lock takeover (design 1b; impl plan WS1 Step 5 + S4) ---
-# The voice-agent holds a structured JSON lock (`.voice-agent.pid`) created by
+# The voice-agent holds a structured JSON lock (state/locks/voice-agent.pid) created by
 # the guarded bundled-Python helper scripts/voice-lock.py. If a previous
 # kickstart killed the LaunchAgent wrapper but left the node worker alive
 # (orphaned), the new instance sees the lock and exits 7 — a silent no-op from
@@ -95,7 +95,7 @@ fi
 # below catches a resulting silent no-op.
 SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
-PID_FILE="${WORKSPACE}/.voice-agent.pid"
+PID_FILE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" voice-pidfile "$WORKSPACE")"
 GUARD_FILE="${WORKSPACE}/.voice-agent.lock.guard"
 if [ -f "${PID_FILE}" ]; then
   # Interpreter per amendment R4/T1: sutando-config.sh python-bin (smoke-tested,
