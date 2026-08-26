@@ -84,5 +84,24 @@ class AnomalyEvents(TraceBase):
              if e["event"] == "anomalous_owner_pick"], [])
 
 
+
+class ExplicitPinToLaneCoreIsNotAnomalous(TraceBase):
+    def test_bound_lane_core_pick_writes_no_anomaly(self):
+        # explicit pin to the lane core is a deliberate binding, not a misroute
+        (self.state / "pool").mkdir(exist_ok=True)
+        (self.state / "pool" / "affinity.json").write_text(
+            '{"C7": {"instance": "core-3", "ts": 999.0}}')
+        (self.tasks / "task-p1.txt").write_text(
+            "id: task-p1\nsource: slack\nchannel_id: C7\n"
+            "access_tier: owner\npriority: normal\ntask: hi\n")
+        self.lead.sweep()
+        anomalies = [e for e in self._lines()
+                     if e["event"] == "anomalous_owner_pick"]
+        self.assertEqual(anomalies, [])
+        hits = [f.name for f in self.tasks.iterdir()
+                if f.name.startswith("task-p1.assigned-")]
+        self.assertEqual(hits, ["task-p1.assigned-core-3.txt"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

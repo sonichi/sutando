@@ -215,7 +215,7 @@ class PoolLead:
                 bound = affinity[channel].get("instance")
             inst = self._pick(channel, followers, affinity, lane)
             if lane == "owner" and (
-                    inst == self._lane_core_of(followers)
+                    (inst == self._lane_core_of(followers) and inst != bound)
                     or (bound is not None and bound not in followers)):
                 self._trace({"ts": self.now(), "event": "anomalous_owner_pick",
                              "task": f.name, "inst": str(inst), "bound": bound,
