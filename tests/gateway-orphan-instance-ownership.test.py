@@ -39,10 +39,8 @@ def _bridge(instance):
     for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
         del sys.modules[name]
     mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
-    # Bind the module logger into a fixture dir: _log appends to the REAL
-    # ~/.ag2-sparrow log otherwise, forging "orphan sweep: recovered +
-    # delivered" lines — the exact artifact class the live witness is read
-    # from. Logger-level, so new _log call sites stay contained too.
+    # _log appends to the REAL ~/.ag2-sparrow log — rebind it per import or
+    # the suite forges the witness-class "orphan sweep" lines.
     log_tmp = tempfile.TemporaryDirectory()
     _LOG_TMPDIRS.append(log_tmp)          # keep alive for the module's life
     mod._LOG_DIR = Path(log_tmp.name)
