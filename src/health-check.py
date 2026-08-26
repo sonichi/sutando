@@ -1465,8 +1465,11 @@ def check_env_split(repo_env: "Path | None" = None,
         try:
             for line in path.read_text(errors="replace").splitlines():
                 line = line.strip()
-                if line.startswith("export "):
-                    line = line[len("export "):]
+                # split(None) eats any space/tab run: `export   K=` and
+                # `export\tK=` must not silently drop the key (PR block).
+                parts = line.split(None, 1)
+                if parts and parts[0] == "export":
+                    line = parts[1] if len(parts) == 2 else ""
                 name, sep, _ = line.partition("=")
                 if sep and name and not name.startswith("#")                         and name.replace("_", "").isalnum():
                     out.add(name)

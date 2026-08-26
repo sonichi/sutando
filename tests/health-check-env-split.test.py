@@ -48,6 +48,25 @@ with tempfile.TemporaryDirectory() as td:
     check("identical key sets stay silent",
           hc.check_env_split(repo_env=repo_env, ws_env=ws_env), None)
 
+    # 2b. every whitespace shape of `export` must yield the key (PR block:
+    # multi-space/tab separators silently dropped keys in the OTHER file)
+    repo_env.write_text("GEMINI_API_KEY=stub\n")
+    for label, content in [
+        ("multi-space", "export   DISCORD_BOT_TOKEN=v\n"),
+        ("space-tab", "export \t DISCORD_BOT_TOKEN=v\n"),
+        ("tab-separator", "export\tDISCORD_BOT_TOKEN=v\n"),
+        ("bare-export-line", "export\nDISCORD_BOT_TOKEN=v\n"),
+    ]:
+        ws_env.write_text(content)
+        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+        check(f"export {label} still warns",
+              r is not None and "DISCORD_BOT_TOKEN" in r["detail"], True)
+    ws_env.write_text("#DISCORD_BOT_TOKEN=v\n")
+    check("commented key stays silent (negative control)",
+          hc.check_env_split(repo_env=repo_env, ws_env=ws_env), None)
+    repo_env.write_text("GEMINI_API_KEY=x\n")
+    ws_env.write_text("GEMINI_API_KEY=other-value\n")
+
     # 3. selected is a superset -> silent
     repo_env.write_text("GEMINI_API_KEY=x\nEXTRA=y\n")
     check("selected superset stays silent",
