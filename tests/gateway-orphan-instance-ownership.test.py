@@ -24,11 +24,64 @@ for _p in (REPO / "packages" / "ag2-sparrow", REPO / "src"):
 
 
 FIXTURE_TOKEN = "fixture-token-not-a-credential"
-# Module scope: every fresh import resolves the token via a chain ending in
-# the real channel .env + Keychain; the env tier short-circuits it first.
+# Import-time config reads the ENTIRE channel .env via env-derived paths;
+# both sources point into a fixture tree so no import opens a real file.
+_ENV_KEYS = ("REMOTE_TASK_TOKEN", "REMOTE_TASK_URL", "CLAUDE_CONFIG_DIR",
+             "AG2_DEVICE_ENV", "GATEWAY_INSTANCE")
+_SAVED_ENV = {k: os.environ.get(k) for k in _ENV_KEYS}
+
+
+def tearDownModule():
+    for k, v in _SAVED_ENV.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 os.environ["REMOTE_TASK_TOKEN"] = FIXTURE_TOKEN
 os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9/fixture"
+_FIXTURE_CFG = tempfile.mkdtemp(prefix="ownership-fixture-cfg-")
+_ch = Path(_FIXTURE_CFG) / "channels" / "ag2space"
+_ch.mkdir(parents=True)
+(_ch / ".env").write_text("REMOTE_TASK_TOKEN=fixture-file-token\n")
+(Path(_FIXTURE_CFG) / "device.env").write_text("# fixture device env\n")
+os.environ["CLAUDE_CONFIG_DIR"] = _FIXTURE_CFG
+os.environ["AG2_DEVICE_ENV"] = str(Path(_FIXTURE_CFG) / "device.env")
 _LOG_TMPDIRS: "list" = []   # fixture log dirs, one per re-import
+
+
+def _fresh_import():
+    """Guarded fresh import: an open() spy proves no channel/device config
+    outside the fixture tree is touched — file-ACCESS isolation, not the
+    narrower token-value equality (review finding 7)."""
+    import builtins
+    opened = []
+    real_open = builtins.open
+    def _spy(file, *a, **kw):
+        try:
+            opened.append(str(os.fspath(file)))
+        except TypeError:
+            pass
+        return real_open(file, *a, **kw)
+    for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
+        del sys.modules[name]
+    builtins.open = _spy
+    try:
+        mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+    finally:
+        builtins.open = real_open
+    sensitive = [p for p in opened
+                 if (("channels" in p and "ag2space" in p)
+                     or p.endswith("device.env") or p.endswith("/.env"))]
+    escaped = [p for p in sensitive if not p.startswith(_FIXTURE_CFG)]
+    assert not escaped, f"import opened real channel/device config: {escaped}"
+    # Positive control on the instrument: the fixture .env IS read eagerly,
+    # so the spy must have seen it — an empty list means a blind spy.
+    assert any(p.startswith(_FIXTURE_CFG) for p in sensitive), (
+        "open-spy saw no fixture config read — instrument is blind")
+    assert mod.TOKEN == FIXTURE_TOKEN
+    return mod
 
 
 def _bridge(instance):
@@ -41,14 +94,7 @@ def _bridge(instance):
         os.environ["GATEWAY_INSTANCE"] = instance
     else:
         os.environ.pop("GATEWAY_INSTANCE", None)
-    os.environ["REMOTE_TASK_TOKEN"] = FIXTURE_TOKEN
-    os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9/fixture"
-    for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
-        del sys.modules[name]
-    mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
-    assert mod.TOKEN == FIXTURE_TOKEN, (
-        "import resolved a token that is not the fixture — the credential "
-        "fallback chain was consulted")
+    mod = _fresh_import()
     # _log appends to the REAL ~/.ag2-sparrow log — rebind it per import or
     # the suite forges the witness-class "orphan sweep" lines.
     log_tmp = tempfile.TemporaryDirectory()
@@ -97,10 +143,7 @@ class PerLaneLogFile(unittest.TestCase):
                 os.environ["GATEWAY_INSTANCE"] = inst
             else:
                 os.environ.pop("GATEWAY_INSTANCE", None)
-            for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
-                del sys.modules[name]
-            mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
-            assert mod.TOKEN == FIXTURE_TOKEN
+            mod = _fresh_import()
             names[inst] = mod._LOG_FILE.name
             # contain the import's logger immediately (no real-log writes)
             log_tmp = tempfile.TemporaryDirectory()
@@ -112,6 +155,27 @@ class PerLaneLogFile(unittest.TestCase):
         self.assertEqual(len(set(names.values())), 3,
                          "two lanes sharing a log file re-creates the "
                          "unattributable-witness ambiguity")
+
+
+class ImportIsolationGuard(unittest.TestCase):
+    """The guard's own two-sided proof: it FIRES on an out-of-fixture .env
+    candidate, and passes on the contained import. No credential content
+    exists or is read — the escape file is a dummy."""
+
+    def test_guard_fires_on_an_out_of_fixture_candidate(self):
+        outside = tempfile.mkdtemp(prefix="outside-fixture-")
+        escape = Path(outside) / "device.env"
+        escape.write_text("# dummy, not a credential\n")
+        saved = os.environ["AG2_DEVICE_ENV"]
+        os.environ["AG2_DEVICE_ENV"] = str(escape)
+        try:
+            with self.assertRaises(AssertionError):
+                _fresh_import()
+        finally:
+            os.environ["AG2_DEVICE_ENV"] = saved
+
+    def test_contained_import_passes_the_guard(self):
+        _fresh_import()   # raises if any config open escapes the fixture
 
 
 class DualBridgeSharedResultsDir(unittest.TestCase):
