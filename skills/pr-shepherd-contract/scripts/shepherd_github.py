@@ -42,9 +42,11 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 PROVIDER = "github"
 ACTOR_SCHEME = "git.commit_author_email"
-# Idempotent: the scheme is a core default; registering pins this adapter to
-# the contract's seam rather than to that default staying in place.
+VERIFIED_SCHEME = "matrix.mxid"
+# The contract ships no schemes; trust exists only while this adapter is
+# installed. matrix.mxid rides here as its sole consumer until a Matrix adapter owns it.
 register_actor_scheme(ACTOR_SCHEME)
+register_actor_scheme(VERIFIED_SCHEME, verified=True)
 
 WATCH = frozenset({
     "github.check_suite.completed",

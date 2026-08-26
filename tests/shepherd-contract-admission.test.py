@@ -19,6 +19,13 @@ from shepherd_contract import (  # noqa: E402
     terminal_state_for,
 )
 
+import shepherd_contract as sc  # noqa: E402
+
+# The contract ships no schemes; this suite declares the ones its fixtures
+# use, exactly as an adapter does at its optional edge.
+sc.register_actor_scheme("git.commit_author_email")
+sc.register_actor_scheme("matrix.mxid", verified=True)
+
 PR = Subject("github", "pull_request", "sonichi/sutando#3291")
 OTHER_PR = Subject("github", "pull_request", "sonichi/sutando#3311")
 
@@ -355,8 +362,6 @@ check("is_terminal still recognises a genuine terminal state (control)",
       is_terminal("succeeded"), True)
 
 
-import shepherd_contract as sc  # noqa: E402
-
 # --- the scheme sets are a SEAM, not provider knowledge baked into core -------
 # Registration mutates module state, so this section stays LAST.
 check("an unregistered scheme is weak by default",
@@ -375,7 +380,7 @@ check("re-registering at the OPPOSITE strength is refused",
       _rejects(lambda: sc.register_actor_scheme("gitlab.job_token", verified=True)), True)
 check("a blank scheme cannot be registered",
       _rejects(lambda: sc.register_actor_scheme("  ")), True)
-check("the defaults are unchanged by registration",
+check("earlier registrations survive later ones",
       ("git.commit_author_email" in sc.ASSERTED_ACTOR_SCHEMES,
        "matrix.mxid" in sc.VERIFIED_ACTOR_SCHEMES), (True, True))
 

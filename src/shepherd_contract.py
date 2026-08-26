@@ -72,15 +72,16 @@ class Subject:
         )
 
 
-# Discriminating: can tell two actors apart. Self-declared, so it can also be
-# SET by whoever writes the record -- attribution, never authorization.
-ASSERTED_ACTOR_SCHEMES = frozenset({"git.commit_author_email"})
+# Discriminating: can tell two actors apart -- attribution, never authorization.
+# Ships EMPTY: schemes are provider policy, registered by adapters at their edge.
+ASSERTED_ACTOR_SCHEMES = frozenset()
 
 # Authenticated by the provider, so it may close an objective on its own.
-VERIFIED_ACTOR_SCHEMES = frozenset({"matrix.mxid"})
+# Ships EMPTY for the same reason.
+VERIFIED_ACTOR_SCHEMES = frozenset()
 
-# Closed by construction: an unknown or misspelled scheme is in neither set and
-# is therefore weak, never strong by default.
+# Closed by construction: an unknown, misspelled or unregistered scheme is in
+# neither set and is therefore weak, never strong by default.
 STRONG_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | VERIFIED_ACTOR_SCHEMES
 
 

@@ -524,6 +524,26 @@ check("save() writes the very payload it checked",
       len(_written) == 1 and _written[0] is _built[0], True)
 check("...and that payload is durable", g.load("task-switch-2")["state"], "blocked")
 
+# --- trust binds to the ADAPTER, not to core (reported at 528d94a0) ----------
+# Fresh interpreters: only a new process can witness what core ALONE trusts.
+_PROBE = ("from shepherd_contract import Actor;"
+          "print(Actor('git.commit_author_email','x').is_discriminating,"
+          "Actor('matrix.mxid','x').is_verified)")
+_core_alone = subprocess.run(
+    [sys.executable, "-c",
+     f"import sys; sys.path.insert(0, {str(ROOT / 'src')!r});" + _PROBE],
+    capture_output=True, text=True)
+check("core ALONE trusts no provider scheme",
+      (_core_alone.returncode, _core_alone.stdout.split()), (0, ["False", "False"]))
+_with_skill = subprocess.run(
+    [sys.executable, "-c",
+     f"import sys; sys.path.insert(0, {str(ROOT / 'src')!r});"
+     f"sys.path.insert(0, {str(SKILL)!r});"
+     "import shepherd_github;" + _PROBE],
+    capture_output=True, text=True)
+check("importing the skill registers exactly those schemes",
+      (_with_skill.returncode, _with_skill.stdout.split()), (0, ["True", "True"]))
+
 # negative control: the harness must be able to register a failure
 _n = len(failures)
 check("CONTROL (expected to fail)", 1, 2)
