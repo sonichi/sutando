@@ -136,8 +136,8 @@ with tempfile.TemporaryDirectory() as td:
           r is not None and r["status"] == "warn"
           and "outside both compared candidates" in r["detail"], True)
 
-# 5d. the reviewer's adjacent input: ONE legacy candidate + third-tier pick
-# must still WARN — the two-candidate gate must not run before selection.
+# 5d. one legacy candidate + a third-tier pick must still WARN — the
+# two-candidate gate must never run before selection.
 with tempfile.TemporaryDirectory() as td:
     td = Path(td)
     (td / "repo").mkdir()
