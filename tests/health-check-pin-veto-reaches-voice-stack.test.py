@@ -118,6 +118,30 @@ for armed in (False, True):
         check(not row.get("restart_veto"), "control: unpinned row carries NO veto")
         check(row["status"] == "stale", f"control: and is plainly stale ({row['status']})")
 
+# ---- HEALTHY pinned process: reaches NO staleness arm at all --------------
+hc._file_unchanged_since = lambda _f, _s: True      # nothing is stale
+for armed in (False, True):
+    arm(armed)
+    hc.check_port = lambda *a, **k: {"name": "voice-agent", "status": "ok",
+                                     "detail": "port 9900"}
+    hc.check_bodhi_dist = lambda: {"name": "bodhi-dist", "status": "ok", "detail": "-"}
+    rows = {c["name"]: c for c in hc.check_voice_stack()}
+    v, w = rows["voice-agent"], rows["voice-watchers"]
+    tag = "ARMED " if armed else "UNPIN "
+    print(f"  {tag} voice={v['status']} veto={v.get('restart_veto') is not None} "
+          f"watcher={w['status']} | {w['detail'][:52]}")
+    if armed:
+        check(v.get("restart_veto"),
+              "healthy pinned voice row carries the veto (no staleness arm fires)")
+        check("restart voice-agent" not in w["detail"],
+              "so the watcher remedy is withdrawn on a HEALTHY pinned process")
+        check(w["status"] == "fail" and "missing watcher(s)" in w["detail"],
+              "while the watcher finding itself survives")
+    else:
+        check(not v.get("restart_veto"), "control: healthy UNPINNED row has no veto")
+        check("restart voice-agent" in w["detail"],
+              "control: and its remedy still stands")
+
 if fail:
     print("FAIL: the veto does not reach the voice stack from the producer")
     sys.exit(1)

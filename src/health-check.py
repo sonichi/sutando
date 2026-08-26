@@ -541,6 +541,13 @@ def check_voice_stack(
             REPO_DIR / "src" / "voice-agent.ts",
             "voice-agent.ts",
         )
+    if not voice_check.get("restart_veto"):
+        # A HEALTHY pinned process reaches no staleness arm, so nothing else
+        # sets the field both consumers key on.
+        _, _vls = _proc_lstarts("voice-agent[.]ts|voice-agent[.]js")
+        _varmed = process_pins.armed_detail(_pin_verdicts("voice-agent", _vls))
+        if _varmed:
+            voice_check["restart_veto"] = _varmed
     checks = [
         voice_check,
         check_voice_watchers(voice_check),
