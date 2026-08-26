@@ -115,9 +115,8 @@ def is_path_sendable(fpath: str, extra_roots: tuple[str, ...] = ()) -> bool:
             return True
     return False
 
-# Outcome names for classify_attachment. A caller must handle every one:
-# the defect this exists to prevent is a branch set that silently drops the
-# case it does not name.
+# A caller must handle every outcome: a branch set that omits one drops
+# that case silently.
 ATTACH_SEND = "send"
 ATTACH_EMPTY = "empty"
 ATTACH_MISSING = "missing"

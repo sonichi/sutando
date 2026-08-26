@@ -5457,9 +5457,8 @@ async def poll_proactive():
                                                 flush=True,
                                             )
                                         elif _outcome == _ATTACH_REFUSED:
-                                            # Authorization denial, not absence. Surfaced the
-                                            # same way poll_results does it: silence here is
-                                            # indistinguishable from a successful attach.
+                                            # Authorization denial, not absence: silence
+                                            # here reads as a successful attach.
                                             await _target_ch.send(f"(file not allowed: {fpath})")
                                             print(
                                                 f"  [proactive channel-redirect] REJECTED file "
