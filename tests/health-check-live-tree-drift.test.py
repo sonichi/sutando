@@ -34,13 +34,16 @@ class LiveTreeDrift(unittest.TestCase):
         root = Path(self.tmp.name)
         self.origin = root / "origin.git"
         self.clone = root / "clone"
-        subprocess.run(["git", "init", "-q", "--bare", str(self.origin)], check=True)
+        # -b main on init+clone: a defaultBranch-dependent bare HEAD dangles
+        # on CI, so the clone checks out no branch and set-upstream exits 128.
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main",
+                        str(self.origin)], check=True)
         subprocess.run(["git", "init", "-q", str(root / "seed")], check=True)
         seed = root / "seed"
         (seed / "f.txt").write_text("a\n")
         _git(seed, "add", "f.txt"); _git(seed, "commit", "-qm", "c1")
         _git(seed, "push", "-q", str(self.origin), "HEAD:main")
-        subprocess.run(["git", "clone", "-q", str(self.origin), str(self.clone)],
+        subprocess.run(["git", "clone", "-q", "-b", "main", str(self.origin), str(self.clone)],
                        check=True)
         _git(self.clone, "branch", "--set-upstream-to=origin/main")
 
