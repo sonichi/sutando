@@ -18,6 +18,16 @@ from pool_lead import (AFFINITY_BUSY_MAX,  # noqa: E402
                        ASSIGN_STUCK_S, NOCLAIM_COOLDOWN_S, PoolLead)
 
 
+def _pass_awake(clock, seconds, fn):
+    """Daemon-cadence advance: a single clock leap reads as host sleep."""
+    outs = []
+    end = clock[0] + seconds
+    while clock[0] < end:
+        clock[0] = min(clock[0] + 20, end)
+        outs += fn()
+    return outs
+
+
 class PoolLeadTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -399,9 +409,9 @@ class RoutineLaneEscape(unittest.TestCase):
         # it never claims. The lead reclaims every pass: the first sighting
         # only adopts the assignment into the ledger, the next one repools it.
         self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
-        self.clock[0] += ASSIGN_STUCK_S + 1
-        self.assertEqual(self.lead.reclaim_stuck_assignments(),
-                         [f"task-r1.assigned-{self.lane}.txt"])
+        outs = _pass_awake(self.clock, ASSIGN_STUCK_S + 1,
+                           self.lead.reclaim_stuck_assignments)
+        self.assertEqual(outs, [f"task-r1.assigned-{self.lane}.txt"])
         self.assertTrue(self.alive[self.lane], "lane core still heartbeats")
 
         second = dict(self.lead.sweep())["task-r1.txt"]
@@ -421,8 +431,8 @@ class RoutineLaneEscape(unittest.TestCase):
         self._routine("task-r3.txt")
         self.lead.sweep()
         self.lead.reclaim_stuck_assignments()          # adopt
-        self.clock[0] += ASSIGN_STUCK_S + 1
-        self.lead.reclaim_stuck_assignments()          # repool + mark
+        _pass_awake(self.clock, ASSIGN_STUCK_S + 1,
+                    self.lead.reclaim_stuck_assignments)  # repool + mark
         self.assertFalse(self.lead._claiming(self.lane))
         self.clock[0] += NOCLAIM_COOLDOWN_S
         self.assertTrue(self.lead._claiming(self.lane),
@@ -441,9 +451,9 @@ class RoutineLaneEscape(unittest.TestCase):
         self.assertEqual(dict(self.lead.sweep())["task-o1.txt"], victim)
 
         self.lead.reclaim_stuck_assignments()     # adopt
-        self.clock[0] += ASSIGN_STUCK_S + 1
-        self.assertEqual(self.lead.reclaim_stuck_assignments(),
-                         [f"task-o1.assigned-{victim}.txt"])
+        outs = _pass_awake(self.clock, ASSIGN_STUCK_S + 1,
+                           self.lead.reclaim_stuck_assignments)
+        self.assertEqual(outs, [f"task-o1.assigned-{victim}.txt"])
         again = dict(self.lead.sweep())["task-o1.txt"]
         self.assertNotEqual(again, victim,
                             "owner-lane work returned to the core that just "

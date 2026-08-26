@@ -52,6 +52,15 @@ class WakeGuardBase(unittest.TestCase):
     def _names(self):
         return sorted(f.name for f in self.tasks.iterdir())
 
+    def _tick_until(self, target, fn):
+        """Advance like the live daemon: 2s ticks, collecting reclaim output.
+        A single clock leap between calls would read as ANOTHER host sleep."""
+        outs = []
+        while self.clock < target:
+            self.clock += 2
+            outs += fn()
+        return outs
+
 
 class HostGapDefersReclaim(WakeGuardBase):
     def test_claim_of_live_core_survives_a_host_sleep(self):
@@ -73,13 +82,49 @@ class HostGapDefersReclaim(WakeGuardBase):
         self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
         self.assertEqual(self._names(), ["task-c.assigned-core-1.txt"])
 
-    def test_woken_follower_clears_the_deferral(self):
+    def test_claim_owner_rebeat_within_grace_keeps_claim(self):
         (self.tasks / "task-d.claimed-core-2.txt").write_text("x")
         self._sleep_whole_host(968)
         self.assertEqual(self.lead.reclaim_claimed(), [])
         self.alive["core-2"] = True          # beat resumes on wake
         self.assertEqual(self.lead.reclaim_claimed(), [])
         self.assertEqual(self._names(), ["task-d.claimed-core-2.txt"])
+
+    def test_sibling_beating_first_does_not_end_the_grace(self):
+        # after wake a sibling can beat BEFORE the claim owner; the grace
+        # must hold on the lead's tick gap, not on any-follower-alive
+        (self.tasks / "task-e.claimed-core-2.txt").write_text("x")
+        self.assertEqual(self.lead.reclaim_claimed(), [])  # pre-sleep tick
+        self._sleep_whole_host(968)
+        self.alive["core-1"] = True          # sibling beats first
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        self.assertEqual(self.lead.reclaim_dead(), [])
+        self.assertEqual(self._names(), ["task-e.claimed-core-2.txt"])
+
+    def test_sibling_first_after_lead_observed_all_stale(self):
+        # other ordering: lead observes all-stale, THEN the sibling
+        # beats — the open window must not close early
+        (self.tasks / "task-f.claimed-core-2.txt").write_text("x")
+        self.assertEqual(self.lead.reclaim_claimed(), [])  # pre-sleep tick
+        self._sleep_whole_host(968)
+        self.assertEqual(self.lead.reclaim_claimed(), [])  # observes all-stale
+        self.alive["core-1"] = True          # sibling beats second
+        self.clock += 2
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        self.assertEqual(self._names(), ["task-f.claimed-core-2.txt"])
+
+    def test_grace_expires_by_time_and_still_stale_claimant_repools(self):
+        # the window is a grace, not amnesty: a claimant that never
+        # re-beats is reclaimed once the window passes, sibling alive or not.
+        (self.tasks / "task-g.claimed-core-2.txt").write_text(
+            "id: task-g\n")
+        self.assertEqual(self.lead.reclaim_claimed(), [])  # pre-sleep tick
+        self._sleep_whole_host(968)
+        self.alive["core-1"] = True
+        self.assertEqual(self.lead.reclaim_claimed(), [])  # in grace
+        outs = self._tick_until(968 + 1_000 + LEAD_STALE_S + 4,
+                                self.lead.reclaim_claimed)
+        self.assertEqual(outs, [("task-g.claimed-core-2.txt", "repooled")])
 
 
 class GenuineFailuresStillReclaim(WakeGuardBase):
@@ -96,9 +141,9 @@ class GenuineFailuresStillReclaim(WakeGuardBase):
         (self.tasks / "task-f.claimed-core-1.txt").write_text("x")
         self._sleep_whole_host(968)
         self.assertEqual(self.lead.reclaim_claimed(), [])
-        self.clock += LEAD_STALE_S + 1        # still nothing beating
-        self.assertEqual(self.lead.reclaim_claimed(),
-                         [("task-f.claimed-core-1.txt", "repooled")])
+        outs = self._tick_until(self.clock + LEAD_STALE_S + 4,
+                                self.lead.reclaim_claimed)  # nothing beating
+        self.assertEqual(outs, [("task-f.claimed-core-1.txt", "repooled")])
         self.assertEqual(self._names(), ["task-f.txt"])
 
     def test_empty_pool_is_not_a_host_gap(self):
@@ -128,9 +173,9 @@ class DeliveredTasksKeepTheirDisposition(WakeGuardBase):
         (self.results / "task-i.txt").write_text("answer")
         self._sleep_whole_host(968)
         self.assertEqual(self.lead.reclaim_claimed(), [])
-        self.clock += LEAD_STALE_S + 1
-        self.assertEqual(self.lead.reclaim_claimed(),
-                         [("task-i.claimed-core-2.txt", "delivered")])
+        outs = self._tick_until(self.clock + LEAD_STALE_S + 4,
+                                self.lead.reclaim_claimed)
+        self.assertEqual(outs, [("task-i.claimed-core-2.txt", "delivered")])
 
 
 if __name__ == "__main__":

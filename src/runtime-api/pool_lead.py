@@ -26,6 +26,9 @@ sys.path.insert(0, str(_HERE.parent))
 from task_priority import sort_tasks_by_priority  # noqa: E402
 from pool_follower import LEAD_STALE_S  # noqa: E402
 
+# tick gap past one beat period = host sleep; shorter can't stale a beat
+HOST_GAP_S = 30.0
+
 # Depth at which channelless work overflows to the idle lane core; room
 # affinity itself is binding and never yields on load (owner 2026-08-26).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
@@ -437,26 +440,32 @@ class PoolLead:
 
     # ── crash recovery ──────────────────────────────────────────────────────
     def _host_gap_defers_reclaim(self) -> bool:
-        """Every follower stale in the same instant is a host gap (sleep, clock
-        jump), not N deaths — beats stop together only when the machine does.
+        """Host-gap evidence comes from the LEAD'S OWN tick cadence: reclaim
+        entrypoints run every ~2s, so a large gap between calls means the host
+        slept — independent of which follower happens to re-beat first
+        (staggered 30s beats make sibling-before-claimant an ordinary wake).
 
-        Defers one stale window rather than suppressing: a woken follower
-        re-beats within it, while a genuine whole-pool outage still reclaims
-        once the window passes.
+        The grace window, once opened, expires by TIME ONLY — a sibling
+        heartbeat must not end it while the claim owner's beat is still due.
+        A genuine outage (no tick gap) is never deferred mid-run.
         """
-        try:
-            followers = list(self.followers_fn())
-        except Exception:  # noqa: BLE001 — a broken resolver must not defer
-            return False
-        if not followers:
-            return False
-        if any(self.alive_fn(f) for f in followers):
-            self._reclaim_defer_until = None
-            return False
         now = self.now()
-        if getattr(self, "_reclaim_defer_until", None) is None:
-            self._reclaim_defer_until = now + LEAD_STALE_S
-        return now < self._reclaim_defer_until
+        last = getattr(self, "_last_reclaim_tick", None)
+        self._last_reclaim_tick = now
+        if last is not None:
+            if now - last > HOST_GAP_S:
+                self._reclaim_defer_until = now + LEAD_STALE_S
+        else:
+            # fresh lead + all-stale pool: indistinguishable from a
+            # post-wake lead restart — grace one window
+            try:
+                followers = list(self.followers_fn())
+            except Exception:  # noqa: BLE001 — broken resolver must not defer
+                return False
+            if followers and not any(self.alive_fn(f) for f in followers):
+                self._reclaim_defer_until = now + LEAD_STALE_S
+        du = getattr(self, "_reclaim_defer_until", None)
+        return du is not None and now < du
 
     def reclaim_dead(self) -> "list[str]":
         """Return dead followers' assignments to the unassigned pool.
