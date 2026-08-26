@@ -82,7 +82,9 @@ def receipts_dir_for(workspace) -> Path:
 
 
 def receipt_path(receipts_dir, task_id: str) -> Path:
-    return Path(receipts_dir) / f"task-{task_id}.ok"
+    """Accepts `abc` or `task-abc`. Writers hold the bare id; delivery consumers
+    hold the prefixed one, and a lookup that misses fails OPEN — silently."""
+    return Path(receipts_dir) / f"task-{str(task_id).removeprefix('task-')}.ok"
 
 
 def receipt_body(task_id: str, body: str) -> str:
@@ -116,10 +118,12 @@ def receipt_verifier(receipts_dir, task_id: str):
     permanent exemption: once no unreceipted results remain, the caller can
     drop straight to `receipt_attests`.
     """
+    bare = str(task_id).removeprefix("task-")
+
     def _attests(raw_body: str) -> bool:
-        if not has_pairing_receipt(receipts_dir, task_id):
+        if not has_pairing_receipt(receipts_dir, bare):
             return True
-        return receipt_attests(receipts_dir, task_id, raw_body)
+        return receipt_attests(receipts_dir, bare, raw_body)
     return _attests
 
 
