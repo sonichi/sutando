@@ -65,41 +65,6 @@ class ContractTest(unittest.TestCase):
             read_ready_result(self._write(td, None), attests=lambda raw: calls.append(raw))
         self.assertEqual(calls, [])
 
-    def test_the_id_form_a_bridge_actually_holds_still_verifies(self):
-        """The source scan below proves the call EXISTS; this proves it BITES.
-
-        Writers hold `abc`, delivery consumers hold `task-abc`, and a receipt
-        lookup that misses fails OPEN — so a wrong id form is enforcement that
-        silently does nothing and looks wired in every grep.
-        """
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "rw", REPO / "src" / "result_write.py")
-        rw = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rw)
-        with tempfile.TemporaryDirectory() as td:
-            ws = Path(td)
-            results = ws / "results"
-            results.mkdir()
-            receipts = rw.receipts_dir_for(ws)
-            receipts.mkdir(parents=True)
-            rw.write_paired_result(results, "abc", "task: abc\nthe answer\n",
-                                   receipts_dir=receipts)
-            published = results / "task-abc.txt"
-            published.write_text("someone else's answer\n")
-            for form in ("abc", "task-abc"):
-                with self.subTest(form):
-                    self.assertIsNone(
-                        read_ready_result(
-                            published,
-                            attests=rw.receipt_verifier(receipts, form)),
-                        f"{form}: a crossed body was delivered")
-            published.write_text("the answer\n")
-            self.assertEqual(
-                read_ready_result(published,
-                                  attests=rw.receipt_verifier(receipts, "task-abc")),
-                "the answer", "positive control: the intact body must pass")
-
     def test_every_delivery_consumer_passes_an_attestation(self):
         """The digest is worthless if no live path consults it — the exact gap
         this change closes. Each src/ bridge must bind `attests=` on the call

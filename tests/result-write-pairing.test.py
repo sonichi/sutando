@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
 import result_write  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 
 
 class PairedResultWriteTests(unittest.TestCase):
@@ -428,5 +429,45 @@ class ReceiptAttestsTheBytesItPublished(unittest.TestCase):
             self.assertFalse(result_write.receipt_attests(rec, "A", published))
 
 
+class AttestationBitesAtTheIdFormBridgesHold(unittest.TestCase):
+    """A source scan proves the delivery call EXISTS; only this proves it BITES.
+
+    Writers hold `abc`, delivery consumers hold `task-abc`, and a receipt lookup
+    that misses fails OPEN — so a wrong id form is enforcement that does nothing
+    and still greps as wired.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        ws = Path(self.tmp.name)
+        self.results = ws / "results"
+        self.results.mkdir()
+        self.receipts = result_write.receipts_dir_for(ws)
+        self.receipts.mkdir(parents=True)
+        result_write.write_paired_result(
+            self.results, "abc", "task: abc\nthe answer\n",
+            receipts_dir=self.receipts)
+        self.published = self.results / "task-abc.txt"
+
+    def test_a_crossed_body_is_refused_in_either_id_form(self):
+        self.published.write_text("someone else's answer\n")
+        for form in ("abc", "task-abc"):
+            with self.subTest(form):
+                self.assertIsNone(
+                    read_ready_result(
+                        self.published,
+                        attests=result_write.receipt_verifier(self.receipts, form)),
+                    f"{form}: a crossed body was delivered")
+
+    def test_the_intact_body_still_passes(self):
+        """Positive control: a gate that refuses everything is not a gate."""
+        self.assertEqual(
+            read_ready_result(
+                self.published,
+                attests=result_write.receipt_verifier(self.receipts, "task-abc")),
+            "the answer")
+
+
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
