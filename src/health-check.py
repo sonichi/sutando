@@ -650,6 +650,62 @@ def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict
     return {"source": "none", "path": None}
 
 
+# Bridges that import vault_intercept, and so need detect-secrets at RUNTIME.
+# Mirrors the three _vault_scanner_check call sites in src/startup.sh.
+_VAULT_SCANNER_BRIDGES = ["telegram-bridge", "discord-bridge", "slack-bridge"]
+
+
+def check_secret_scanner_mode() -> dict:
+    """Report the secret scanner's DEGRADED mode as standing status.
+
+    startup.sh names it once at boot and vault_intercept names it at the moment
+    a `vault set` is refused; nothing reports it in between, so a host scans
+    inbound bridge text with 17 provider detectors off and health-check still
+    prints no failures.
+    """
+    degraded, checked = [], []
+    for bridge in _VAULT_SCANNER_BRIDGES:
+        interp = _bridge_interpreter(bridge)
+        if interp is None:
+            continue  # bridge cannot launch at all; its own probe owns that
+        if interp in checked:
+            continue
+        checked.append(interp)
+        try:
+            probe = subprocess.run([interp, "-c", "import detect_secrets"],
+                                   capture_output=True, timeout=10)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return {
+                "name": "secret-scanner",
+                "status": "warn",
+                "detail": f"could not probe {interp} for detect-secrets ({exc}) — mode unknown, not proven healthy",
+            }
+        if probe.returncode != 0:
+            degraded.append(interp)
+    if not checked:
+        return {
+            "name": "secret-scanner",
+            "status": "warn",
+            "detail": "no launchable bridge interpreter found — scanner mode unknown",
+        }
+    if not degraded:
+        return {
+            "name": "secret-scanner",
+            "status": "ok",
+            "detail": f"detect-secrets present in all {len(checked)} bridge interpreter(s)",
+        }
+    fix = f"{degraded[0]} -m pip install detect-secrets"
+    return {
+        "name": "secret-scanner",
+        "status": "warn",
+        "detail": (f"DEGRADED in {len(degraded)}/{len(checked)} bridge interpreter(s) "
+                   f"({', '.join(degraded)}): detect-secrets missing, so its provider "
+                   f"detectors and entropy checks are off and inbound text is scanned by "
+                   f"repo-local whole-line rules only; unquoted `vault set` is REFUSED. "
+                   f"Fix: {fix} (add --break-system-packages if PEP 668 blocks it)"),
+    }
+
+
 def check_node_runtime() -> dict:
     """Surface WHICH node the JS services resolve to — or a loud red line when
     none exists. The 2026-07-13 outage class: an interactive terminal finding
@@ -2145,17 +2201,19 @@ def _index_growth_note(index: Path, effective_bytes: int) -> str:
             note += (f"; +{grew:,} B over the last {hours:.1f}h"
                      + (f", which is ~{left / rate:.1f}h of remaining headroom at that rate"
                         if rate > 0 and left > 0 else ""))
-            # The max window is the worst case, so `gain <= 0` skips every flat one
-            # and a quoted deadline outlives its regime. Report the recent window too.
-            recent = next(((at, sz) for at, sz in reversed(points)
-                           if (newest_at - at) / 3600.0 >= 0.5), None)
-            if recent is not None:
-                r_span = (newest_at - recent[0]) / 3600.0
-                r_gain = effective_bytes - recent[1]
-                if r_gain <= 0:
-                    note += (f"; but the last {r_span:.1f}h show {r_gain:+,} B — flat or "
+            # A stopped climb reads flat in the RECENT window; a burst on a flat
+            # run reads flat over the FULL history. Neither window sees both.
+            controls = [c for c in (next(((at, sz) for at, sz in reversed(points)
+                                          if (newest_at - at) / 3600.0 >= 0.5), None),
+                                    points[0]) if c is not None]
+            for c_at, c_sz in controls:
+                c_span = (newest_at - c_at) / 3600.0
+                c_gain = effective_bytes - c_sz
+                if c_span >= 0.5 and c_gain <= 0:
+                    note += (f"; but the last {c_span:.1f}h show {c_gain:+,} B — flat or "
                              f"shrinking, so the figure above spans a change in write rate "
                              f"and its deadline is stale; re-measure before acting on it")
+                    break
         return note
     except (GitUnavailable, OSError, subprocess.SubprocessError, ValueError):
         return _TREND_UNAVAILABLE
@@ -5560,6 +5618,20 @@ def check_gateway_bridge() -> "dict | None":
         }
     if verdict is True:
         return {"name": "gateway-bridge", "status": "ok", "detail": "running + connected"}
+    # The bridge rewrites this file on every poll outcome, so silence past the
+    # freshness window means the writer stopped — evidence, not absence of it.
+    stale_age = _gateway_status_stale_age_s()
+    if stale_age is not None:
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": (
+                f"process running but its status sidecar has not been written for "
+                f"{stale_age:.0f}s (freshness window {GATEWAY_STATUS_MAX_AGE_S:.0f}s) — "
+                "the bridge is not reporting poll outcomes, so ag2.space mobile "
+                "messages may not be delivered"
+            ),
+        }
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
@@ -5694,6 +5766,27 @@ def check_runtime_identity(path: "Path | None" = None,
                           + " ".join(bits)}
     return {"name": name, "status": "ok",
             "detail": ("entrypoint=canonical " + " ".join(bits))}
+
+
+def _gateway_status_stale_age_s(path: "Path | None" = None,
+                                now: "float | None" = None) -> "float | None":
+    """Age of the sidecar's `ts` when it is present, usable, and PAST the
+    freshness window; None when absent/unreadable/malformed or still fresh.
+
+    Distinct from `_gateway_serving()` returning None, which folds "no sidecar"
+    together with "sidecar stopped being written" — only the latter is a signal.
+    """
+    import time as _time
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    now = _time.time() if now is None else now
+    try:
+        ts = json.loads(Path(p).read_text()).get("ts")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    age = now - ts
+    return age if age > GATEWAY_STATUS_MAX_AGE_S else None
 
 
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
@@ -9044,6 +9137,7 @@ def run_all_checks() -> list[dict]:
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.
     checks.append(check_node_runtime())
+    checks.append(check_secret_scanner_mode())
     # Comm-handling liveness (P1): loud when the owner-comm sweep goes stale.
     checks.append(check_comm_sweep_freshness())
     checks.extend(check_dynamic_loop_freshness())
