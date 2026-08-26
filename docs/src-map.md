@@ -147,6 +147,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
+- **`stand_identity.py`** — Is a `Stand:` trailer mine?
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
