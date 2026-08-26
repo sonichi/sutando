@@ -352,9 +352,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                     status, expected,
                     f"{label}: expected the SHIM winner ({expected}); a host or "
                     f"mixed host/shim pair yields the other verdict")
-                # BYTES, not the derived verdict: load_pins() maps truncated,
-                # malformed and absent alike to [] -> "stale", so a verdict-only
-                # oracle accepts corruption isolated to the dest-winning branch.
+                # BYTES, not the verdict: load_pins() maps truncated/malformed/
+                # absent alike to [] -> "stale", hiding dest-branch corruption.
                 want = d_bytes if expected == "stale" else a_bytes
                 self.assertEqual(
                     canonical.read_bytes(), want,
