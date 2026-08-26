@@ -120,12 +120,25 @@ for armed in (False, True):
 
 # ---- HEALTHY pinned process: reaches NO staleness arm at all --------------
 hc._file_unchanged_since = lambda _f, _s: True      # nothing is stale
+
+# Hermetic: drive the REAL resolver with an explicit env, so the check does not
+# depend on this host carrying a voice credential.
+VENV = {"GEMINI_API_KEY": "test-only-not-a-real-key"}
+VENV_PATH = tmp / "absent.env"
+assert hc.resolve_voice_health_config(env=VENV, env_path=VENV_PATH)["enabled"] is True, (
+    "fixture invalid: voice must be ENABLED or check_voice_stack takes its "
+    "disabled early return and the code under test never runs")
+
 for armed in (False, True):
     arm(armed)
     hc.check_port = lambda *a, **k: {"name": "voice-agent", "status": "ok",
                                      "detail": "port 9900"}
     hc.check_bodhi_dist = lambda: {"name": "bodhi-dist", "status": "ok", "detail": "-"}
-    rows = {c["name"]: c for c in hc.check_voice_stack()}
+    rows = {c["name"]: c for c in hc.check_voice_stack(env=VENV, env_path=VENV_PATH)}
+    # Disabled mode returns all four rows `ok`; reaching the composition is what
+    # makes every assertion below meaningful.
+    check(rows["voice-watchers"]["status"] != "ok",
+          "hermetic: the composition ran (not the disabled early return)")
     v, w = rows["voice-agent"], rows["voice-watchers"]
     tag = "ARMED " if armed else "UNPIN "
     print(f"  {tag} voice={v['status']} veto={v.get('restart_veto') is not None} "
