@@ -118,6 +118,43 @@ class ServerHarness(unittest.TestCase):
         """The 404s above are the guard firing, not a broken server."""
         self.assertEqual(self._req(f"/{self.cap}/index.html")[0], 200)
 
+    def test_symlink_escape_is_refused_by_resolve_containment(self):
+        """A symlink inside root pointing outside survives the '..' check;
+        only the resolve-containment gate stops it."""
+        outside = tempfile.mkdtemp()
+        (Path(outside) / "secret.txt").write_text("outside")
+        link = Path(self.tmp.name) / "evil"
+        link.symlink_to(outside)
+        try:
+            self.assertEqual(
+                self._req(f"/{self.cap}/evil/secret.txt")[0], 404)
+        finally:
+            link.unlink()
+
+
+class BuildAndCli(unittest.TestCase):
+    def test_non_directory_root_is_refused(self):
+        with self.assertRaises(SystemExit):
+            serve.build_server(Path("/nonexistent-root-xyz"), port=0, ttl=60)
+
+    def test_main_runs_end_to_end_and_exits_cleanly(self):
+        """Covers the CLI body in-process: serve_forever is interrupted the
+        way Ctrl-C would, and main must exit 0."""
+        root = tempfile.mkdtemp()
+        Path(root, "index.html").write_text("<p>cli</p>")
+        real_serve = serve.ThreadingHTTPServer.serve_forever
+        serve.ThreadingHTTPServer.serve_forever = (
+            lambda self, *a, **kw: (_ for _ in ()).throw(KeyboardInterrupt()))
+        real_argv = sys.argv
+        sys.argv = ["serve.py", "--root", root, "--port", "0", "--ttl", "60"]
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                serve.main()
+            self.assertEqual(cm.exception.code, 0)
+        finally:
+            sys.argv = real_argv
+            serve.ThreadingHTTPServer.serve_forever = real_serve
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
