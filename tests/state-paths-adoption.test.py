@@ -161,6 +161,16 @@ ALLOWLIST = {
     # must run before any other Sutando module is loaded, so it inlines
     # the workspace resolution rather than importing workspace_default.
     "src/core_heartbeat.py",
+    # Pool modules never resolve the workspace: pool_follower's CLI derives
+    # it from the claimed file's own location (authoritative even for a
+    # non-default workspace); pool_lead receives injected dirs and defaults
+    # results_dir to a sibling of the injected tasks_dir.
+    "src/pool_follower.py",
+    "src/runtime-api/pool_lead.py",
+    # claim_task's flagged token is docstring prose; pool_notify's is the
+    # ledger's JSON key "tasks" — neither is a filesystem path.
+    "src/claim_task.py",
+    "src/runtime-api/pool_notify.py",
     # task_archive.py is a pure locator helper — it takes tasks_dir as a
     # parameter from the caller and never resolves workspace itself. The
     # flagged token appears only in the module docstring (example usage),
