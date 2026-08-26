@@ -139,6 +139,44 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             self._read_trace()                                       # well-formed, wrong schema
         self.assertIn("schema mismatch", str(caught.exception))
 
+    def _one_valid_record(self, **over):
+        rec = {"v": 1, "kind": "result", "run_id": self._run_id, "call_id": "c" * 12,
+               "argv": ["-c", "%Y", "/x"], "operand": "/x",
+               "rc": 0, "stdout": "", "stderr": ""}
+        rec.update(over)
+        return rec
+
+    def test_TRACE_READER_rejects_each_permissive_shape(self) -> None:
+        """Equality conflates True/1.0 with 1, json.loads keeps the last of a
+        duplicate key, and a missing final newline can mean a truncated write."""
+        self._gnu_stat_shim()
+        cases = [
+            ("v is bool", json.dumps(self._one_valid_record(v=True)) + "\n", "v is bool"),
+            ("rc is bool", json.dumps(self._one_valid_record(rc=False)) + "\n", "rc is bool"),
+            ("rc is float", json.dumps(self._one_valid_record(rc=0.0)) + "\n", "rc is float"),
+            ("argv not str", json.dumps(self._one_valid_record(argv=[1, 2, 3])) + "\n", "argv must be"),
+            ("dup key", '{"v": 1, "v": 1, "kind": "result", "run_id": "r", "call_id": "c",'
+                        ' "argv": [], "operand": "/x", "rc": 0, "stdout": "", "stderr": ""}\n',
+             "duplicate key"),
+            ("no final newline", json.dumps(self._one_valid_record()), "does not end in a newline"),
+            ("blank line", "\n" + json.dumps(self._one_valid_record()) + "\n", "is blank"),
+        ]
+        for label, payload, needle in cases:
+            with self.subTest(shape=label):
+                self._trace.write_text(payload)
+                with self.assertRaises(AssertionError) as caught:
+                    self._read_trace()
+                self.assertIn(needle, str(caught.exception))
+
+    def test_TRACE_CONTRACT_rejects_a_same_length_wrong_record(self) -> None:
+        """Calibrates the equal-length branch. A validator that returns on any
+        non-empty trace passes both recorder controls but fails this one."""
+        self._gnu_stat_shim()
+        expected = [self._one_valid_record()]
+        self._trace.write_text(json.dumps(self._one_valid_record(rc=1)) + "\n")
+        with self.assertRaisesRegex(TraceContractError, r"^post-result record mismatch$"):
+            self._require_trace(expected, run_id=self._run_id)
+
     def test_RECORDER_liveness_check_can_FAIL(self) -> None:
         """Falsification control. The mutant is a FLAG, not a text edit: rc and
         streams must stay identical, so a pass cannot be a shim that never ran."""
@@ -201,21 +239,41 @@ class PinMigrationVisibilityTest(unittest.TestCase):
     _TRACE_KEYS = {"v", "kind", "run_id", "call_id", "argv",
                    "operand", "rc", "stdout", "stderr"}
 
+    @staticmethod
+    def _no_dup_keys(pairs):
+        """json.loads keeps the LAST duplicate key silently; refuse instead."""
+        seen = [k for k, _ in pairs]
+        if len(seen) != len(set(seen)):
+            raise ValueError(f"duplicate key(s): {sorted({k for k in seen if seen.count(k) > 1})}")
+        return dict(pairs)
+
     def _read_trace(self, *, run_id: str | None = None) -> list[dict]:
         """Sole reader of the trace. Malformed lines RAISE rather than skip: a
         corrupt record and an absent one must not look alike to any caller."""
         raw = self._trace.read_text() if self._trace.exists() else ""
+        if raw and not raw.endswith("\n"):
+            raise AssertionError("trace does not end in a newline - final record may be truncated")
         out = []
         for n, ln in enumerate(raw.splitlines(), 1):
             if not ln.strip():
-                continue
+                raise AssertionError(f"trace line {n} is blank")
             try:
-                rec = json.loads(ln)
+                rec = json.loads(ln, object_pairs_hook=self._no_dup_keys)
             except ValueError as exc:
                 raise AssertionError(f"trace line {n} is not JSON ({exc}): {ln[:120]!r}")
             if not isinstance(rec, dict) or set(rec) != self._TRACE_KEYS:
                 raise AssertionError(
                     f"trace line {n} schema mismatch: {sorted(rec) if isinstance(rec, dict) else type(rec).__name__}")
+            # `type(...) is int` not `== 1`: True == 1 and 1.0 == 1 in Python,
+            # so an equality test admits bools and floats into an int field.
+            for key, want in (("v", int), ("rc", int)):
+                if type(rec[key]) is not want:
+                    raise AssertionError(f"trace line {n}: {key} is {type(rec[key]).__name__}, want int")
+            for key in ("kind", "run_id", "call_id", "operand", "stdout", "stderr"):
+                if type(rec[key]) is not str:
+                    raise AssertionError(f"trace line {n}: {key} is {type(rec[key]).__name__}, want str")
+            if type(rec["argv"]) is not list or any(type(a) is not str for a in rec["argv"]):
+                raise AssertionError(f"trace line {n}: argv must be a list of str")
             if rec["v"] != 1 or rec["kind"] != "result":
                 raise AssertionError(f"trace line {n}: v={rec['v']!r} kind={rec['kind']!r}")
             if run_id is not None and rec["run_id"] != run_id:
