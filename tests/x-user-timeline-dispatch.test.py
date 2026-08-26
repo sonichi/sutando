@@ -35,6 +35,7 @@ import io
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -135,8 +136,10 @@ for limit in (5, 100):
 # --exclude must reach the function, not be silently dropped.
 code, calls, out = run(
     ["user-timeline", "Chi_Wang_", "--limit", "5", "--exclude", "retweets,replies"], "tok")
+check("--exclude: dispatched exactly once",
+      len(calls["timeline"]) == 1, f"called {len(calls['timeline'])}x")
 check("--exclude forwarded verbatim",
-      bool(calls["timeline"]) and calls["timeline"][0][1].get("exclude") == "retweets,replies",
+      len(calls["timeline"]) == 1 and calls["timeline"][0][1].get("exclude") == "retweets,replies",
       f"calls={calls['timeline']}")
 check("--exclude case exits 0", code == 0, f"rc={code}, out={out[:60]!r}")
 
@@ -169,8 +172,23 @@ check("no bearer: names X_BEARER_TOKEN", "X_BEARER_TOKEN" in out, out[:80])
 check("no bearer: does not report a dependency problem",
       "pip3 install" not in out and "missing dependencies" not in out, out[:80])
 
+# --- temp cleanup is pinned by RUNNING THIS SUITE as a subprocess and looking
+# for what it left behind. An in-process check cannot see atexit cleanup at all.
+if not os.environ.get("XP_SKIP_TMP_PROBE"):
+    _tmproot = pathlib.Path(tempfile.gettempdir())
+    _before = {q.name for q in _tmproot.glob("xp-iso-*")}
+    subprocess.run([sys.executable, __file__],
+                   env={**os.environ, "XP_SKIP_TMP_PROBE": "1"},
+                   capture_output=True, text=True)
+    _after = {q.name for q in _tmproot.glob("xp-iso-*")}
+    check("a completed run of this suite leaves no xp-iso-* tree",
+          not (_after - _before), f"leaked: {sorted(_after - _before)}")
+else:
+    check("a completed run of this suite leaves no xp-iso-* tree (inner run: skipped)", True)
+
+
 # --- completion is pinned: a case dropped or an early abort fails here -----
-EXPECTED = 32
+EXPECTED = 34
 check(f"all {EXPECTED} checks ran (guards against a silent early exit)",
       checked + 1 == EXPECTED, f"ran {checked + 1}")
 
