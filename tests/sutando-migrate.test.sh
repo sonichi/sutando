@@ -41,9 +41,8 @@ touch -t 202506010800 "$B/notes/divergent.md"
 touch -t 202606010800 "$C/notes/divergent.md"
 touch -t 202606012100 "$A/notes/divergent.md"
 
-# --- Fixture: hosts/ + relay/ same-mtime same-size DIFFERENT content (reviewer
-# repro on #3418): mtime+size identical-drop certified these as identical and
-# dropped the source variant. Content-hash must classify them as collisions.
+# --- Fixture: hosts/ + relay/ same-mtime same-size DIFFERENT content —
+# equal proxies must never certify identity; only a content hash may.
 mkdir -p "$A/hosts/Test-Host" "$A/relay" "$DEST/hosts/Test-Host" "$DEST/relay"
 printf 'AAAA\n' > "$A/hosts/Test-Host/crons.json"
 printf 'BBBB\n' > "$DEST/hosts/Test-Host/crons.json"
@@ -131,6 +130,41 @@ RUN_MIGRATE scan --source A,B,C 2>&1 \
     | head -25 || true
 
 echo
+echo "==== TEST: scan --json content-identity regression ===="
+# Equal mtime+size but different bytes (hosts/ + relay/ fixtures) must be
+# actionable, never certified identical_content, in the machine contract.
+SCAN_JSON_FILE="$TMP/scan-out.json"
+RUN_MIGRATE scan --source A,B,C --json 2>/dev/null > "$SCAN_JSON_FILE"
+if python3 - "$SCAN_JSON_FILE" <<'PYSCAN'
+import json, sys
+raw = open(sys.argv[1]).read()
+d = json.JSONDecoder().raw_decode(raw[raw.index("{"):])[0]
+t = d["totals"]
+notable = {n["rel"]: n for n in d["notable_collisions"]}
+bad = []
+for rel in ("hosts/Test-Host/crons.json", "relay/relay-1.md"):
+    n = notable.get(rel)
+    if n is None:
+        bad.append(f"{rel}: missing from notable_collisions"); continue
+    if n["byte_identical"] is not False:
+        bad.append(f"{rel}: byte_identical={n['byte_identical']!r}, want False")
+if t.get("proxy_identical_divergent", 0) < 2:
+    bad.append(f"proxy_identical_divergent={t.get('proxy_identical_divergent')}, want >=2")
+ident_true = sum(1 for n in notable.values() if n["byte_identical"] is True)
+if t["identical_content"] != ident_true:
+    bad.append(f"identical_content={t['identical_content']} != byte-verified count {ident_true}")
+if bad:
+    print("; ".join(bad)); sys.exit(1)
+sys.exit(0)
+PYSCAN
+then
+    echo "  OK: scan --json marks equal-proxy divergent fixtures actionable (byte_identical=false)"
+else
+    echo "  FAIL: scan --json content-identity contract"
+    fail_scan_json=1
+fi
+
+echo
 echo "==== TEST: commit ===="
 COMMIT_OUT="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
 echo "$COMMIT_OUT" | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" | head -40
@@ -139,6 +173,7 @@ INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "migration-backup-.*\.tar\.gz"
 echo
 echo "==== ASSERTIONS ===="
 fail=0
+[ "${fail_scan_json:-0}" = "1" ] && fail=1
 
 # 1. build_log.md sidecar default: each source's variant goes to legacy/<tag>/build_log.md
 for tag in A B C; do

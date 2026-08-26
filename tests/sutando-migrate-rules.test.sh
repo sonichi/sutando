@@ -48,8 +48,8 @@ assert_class "pending-questions.md" "append" || fail=1
 assert_class "pending-questions-resolved-archive-2026-05-24.md" "rehome-dated-snapshot" "notes/archive" || fail=1
 assert_class "session-state.md" "newest-mtime" || fail=1
 
-# Per-host state tree + relay notes (tk-7e767bb426 class): quarantining these
-# breaks every hosts/<label>/ reader; PERSONAL_CLAUDE.md's canonical home is here.
+# Per-host state tree + relay notes: quarantining these breaks every
+# hosts/<label>/ reader; PERSONAL_CLAUDE.md's canonical home is here.
 assert_class "hosts/Some-Host/crons.json" "structural" "<dest>/hosts/Some-Host/crons.json" || fail=1
 assert_class "hosts/Some-Host/PERSONAL_CLAUDE.md" "structural" "<dest>/hosts/Some-Host/PERSONAL_CLAUDE.md" || fail=1
 assert_class "hosts/Some-Host/pending-questions.md" "structural" || fail=1
