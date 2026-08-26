@@ -28,11 +28,11 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 # affinity itself is binding and never yields on load (owner 2026-08-26).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
-BUSY_DEFER_MAX_S = 1800.0  # busy core keeps assignments this long, then wedge rules apply
-# The repool pops the ledger entry, so the follower must stay marked as
-# non-claiming or the task returns to it.
-NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S
+BUSY_DEFER_MAX_S = 1800.0    # busy defers repool this long, then wedge rules apply
 DONE_FLAG_RETENTION_S = 7 * 86400
+# Repool pops the ledger entry; the follower must stay marked non-claiming
+# or the task returns to it.
+NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
 # assigned/claimed states explicitly rather than banning dots
@@ -79,9 +79,8 @@ class PoolLead:
         runtime_fn(instance) -> 'claude'|'codex'; absent means all-claude,
         which is what every pool was before the runtime dimension existed."""
         self.runtime_fn = runtime_fn or (lambda _inst: "claude")
-        # tie-break memory: an all-idle pool must rotate, not always pick the
-        # lexicographically-first follower (measured: core-1 took 50% of all
-        # assignments because every load-tie broke to the same name)
+        # tie-break memory: an all-idle pool rotates instead of always
+        # handing every load-tie to the lexicographically-first follower
         self._last_pick: "dict[str, float]" = {}
         self.tasks_dir = Path(tasks_dir)
         self.state_dir = Path(state_dir)
@@ -179,10 +178,8 @@ class PoolLead:
         primary = [f for f in primary if self._claiming(f)] or primary
         if channel:
             row = affinity.get(channel)
-            # Binding: a live home core keeps its room regardless of load or
-            # idle age; only death or an unclaimed-reclaim moves the room.
-            # ANY alive follower qualifies — an explicit pin (incl. codex or
-            # the lane core) is a deliberate choice and beats lane defaults.
+            # Binding: a live home core keeps its room; only death or an
+            # unclaimed-reclaim moves it. Explicit pins beat lane defaults.
             if isinstance(row, dict) and row.get("instance") in followers:
                 self._last_pick[str(row["instance"])] = self.now()
                 return row["instance"]

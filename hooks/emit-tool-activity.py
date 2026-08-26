@@ -35,9 +35,8 @@ def _target(tool: str, ti: dict) -> str:
             # Verb only (+ safe subcommand for verb-based tools) — never args,
             # which can carry secrets (export FOO=…, curl -H "Authorization …").
             cmd = str(ti.get("command", ""))
-            # Reduce to the first REAL command so the verb reflects the work, not
-            # a `cd` prefix — handles both `cd <dir> && real` and newline-multiline
-            # `cd <dir>\nreal` (our common shapes).
+            # Reduce to the first real command so the verb reflects the work,
+            # not a `cd` prefix (handles && chains and multiline forms).
             real = ""
             for line in cmd.splitlines():
                 line = line.strip()
@@ -80,9 +79,8 @@ def _target(tool: str, ti: dict) -> str:
 
 
 def _detail(tool: str, ti: dict) -> str:
-    # The actual CONTENT of the tool call — the diff / command / text — for the
-    # /full level only. This carries secrets (that's the point of /full being
-    # opt-in above /verbose); the terse `step` above stays secret-safe.
+    # Full call content, /full level only — carries secrets by design;
+    # the terse step above stays secret-safe.
     try:
         if tool == "Bash":
             return str(ti.get("command", ""))[:400]
