@@ -157,5 +157,29 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 self.assertEqual(status, "stale" if newer_is_release else "warn")
 
 
+    def test_SUB_SECOND_ordering_decides_not_scan_order(self) -> None:
+        """Two writes in the same second must still order by their real mtime.
+
+        Integer-second `stat` collapses them and the comparator then falls back
+        to scan order, which resurrects whichever copy happens to be scanned
+        last — a released pin coming back, or a live one being dropped.
+        """
+        base = _NOW - 3600
+        for release_is_newer in (True, False):
+            with self.subTest(release_is_newer=release_is_newer):
+                self.setUp()
+                armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+                a_pins, c_pins = ([], armed) if release_is_newer else (armed, [])
+                fa = self._write("src/a", a_pins, base)
+                fc = self._write("src/c", c_pins, base)
+                # Same SECOND, different sub-second instant. A is the newer one.
+                os.utime(fc, ns=(int(base * 1e9) + 100_000_000,) * 2)
+                os.utime(fa, ns=(int(base * 1e9) + 900_000_000,) * 2)
+                self._migrate()
+                status, detail = self._verdict(
+                    self.tmp / "dest" / "state" / "process-pins.json")
+                self.assertEqual(status, "stale" if release_is_newer else "warn", detail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -354,6 +354,20 @@ classify() {
     echo "unknown"
 }
 
+# Integer-second mtime orders two same-second writes by SCAN ORDER, which for a
+# newest-wins snapshot silently resurrects the older content. Emit nanoseconds.
+mtime_ns() {
+    local f="$1" v sec frac
+    v="$(stat -f %Fm "$f" 2>/dev/null || stat -c %.9Y "$f" 2>/dev/null || true)"
+    case "$v" in
+        *.*) sec="${v%%.*}"; frac="${v#*.}" ;;
+        "")  sec="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"; frac="" ;;
+        *)   sec="$v"; frac="" ;;
+    esac
+    frac="${frac}000000000"
+    printf '%s%s\n' "$sec" "${frac:0:9}"
+}
+
 # Check inflight age — returns 0 if file is older than guard
 age_safe() {
     local file="$1"
@@ -1218,13 +1232,21 @@ commit_one() {
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
+                src_mt="$(mtime_ns "$src_file")"
+                dst_mt="$(mtime_ns "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     copy_preserving_mtime "$src_file" "$dst_path"
                     echo "src-newer"
-                else
+                elif [ "$src_mt" -lt "$dst_mt" ]; then
                     echo "dest-newer"
+                elif [ "$(shasum -a256 < "$src_file" 2>/dev/null | cut -d" " -f1)" \
+                     = "$(shasum -a256 < "$dst_path" 2>/dev/null | cut -d" " -f1)" ]; then
+                    echo "dest-newer"
+                else
+                    # Same instant, different content: scan order is not a
+                    # tiebreak, and picking either can discard a live decision.
+                    echo "AMBIGUOUS: $rel differs at an identical mtime — resolve by hand" >&2
+                    return 1
                 fi
             else
                 copy_preserving_mtime "$src_file" "$dst_path"
