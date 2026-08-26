@@ -6377,9 +6377,11 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
 
     Holding is a RENAME, so a file whose holder died keeps that name forever:
     nothing on main reclaims it (`sweep-stranded-claims.sh` is a documented
-    one-shot, wired to no scheduler). Age is the discriminator that needs no
-    per-instance liveness — deliberately, since `state/cores/*.alive` is synced
-    across hosts and a peer's record can vouch for a dead local holder.
+    one-shot, wired to no scheduler). Age, not the holder's
+    `state/cores/<holder>.alive`: nothing on main writes that file, and where a
+    pool wrapper does, it beats from a sidecar rather than the session — so a
+    follower wedged at its input layer stays "alive" while never finishing the
+    task, which is the stall this exists to catch. Age catches death and wedge.
     """
     out = []
     for f in pooled:
