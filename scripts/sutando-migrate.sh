@@ -360,14 +360,16 @@ mtime_ns() {
     local f="$1" v sec frac
     # `stat -f` is BSD "format" but GNU "--file-system", so on Linux it can
     # SUCCEED with non-numeric output and mask the fallback. Validate, don't trust.
+    # LC_ALL=C: GNU stat prints localeconv()->decimal_point, so a comma-decimal
+    # locale yields "sec,nsec" -- rejected here, silently degrading to whole seconds.
     v=""
     for _c in "stat -f %Fm" "stat -c %.9Y" "stat -f %m" "stat -c %Y"; do
-        v="$($_c "$f" 2>/dev/null || true)"
+        v="$(LC_ALL=C $_c "$f" 2>/dev/null || true)"
         case "$v" in ''|*[!0-9.]*) v="" ;; *) break ;; esac
     done
     case "$v" in
         *.*) sec="${v%%.*}"; frac="${v#*.}" ;;
-        "")  sec="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"; frac="" ;;
+        "")  sec="$(LC_ALL=C stat -f %m "$f" 2>/dev/null || LC_ALL=C stat -c %Y "$f" 2>/dev/null || echo 0)"; frac="" ;;
         *)   sec="$v"; frac="" ;;
     esac
     frac="${frac}000000000"

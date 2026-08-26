@@ -157,6 +157,65 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 self.assertEqual(status, "stale" if newer_is_release else "warn")
 
 
+    def test_COMMA_LOCALE_stat_still_yields_subsecond_ordering(self) -> None:
+        """A comma-decimal locale must not collapse mtime to whole seconds.
+
+        GNU stat prints localeconv()->decimal_point, so `stat -c %.9Y` returns
+        "sec,nsec" under e.g. de_DE. The validator rejects the comma, degrades to
+        integer %Y, and two distinct writes tie -- a false AMBIGUOUS abort.
+        """
+        import os
+        import pathlib
+        import re
+        import subprocess
+        import tempfile
+        src = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "sutando-migrate.sh"
+        body = re.search(r"^mtime_ns\(\) \{.*?^\}", src.read_text(), re.S | re.M)
+        self.assertIsNotNone(body, "mtime_ns not found -- test cannot bind its subject")
+        fixed = body.group(0)
+        broken = fixed.replace("LC_ALL=C ", "")
+        self.assertNotEqual(fixed, broken, "no LC_ALL=C present: control cannot discriminate")
+
+        with tempfile.TemporaryDirectory() as td:
+            td = pathlib.Path(td); bin_ = td / "bin"; bin_.mkdir()
+            shim = bin_ / "stat"
+            shim.write_text(
+                '#!/bin/sh\n'
+                'case "$1" in -f) exit 1 ;; -c) fmt="$2"; f="$3" ;; *) exit 1 ;; esac\n'
+                'ns=$(/usr/bin/stat -f %Fm "$f" 2>/dev/null)\n'
+                'case "$fmt" in\n'
+                '  %.9Y) sep=","; [ "$LC_ALL" = "C" ] && sep="."\n'
+                '        printf \'%s%s%s\\n\' "${ns%%.*}" "$sep" '
+                '"$(printf \'%s\' "${ns#*.}000000000" | cut -c1-9)" ;;\n'
+                '  %Y)   printf \'%s\\n\' "${ns%%.*}" ;;\n'
+                'esac\n')
+            shim.chmod(0o755)
+            self.assertTrue(os.access(shim, os.X_OK), "shim not executable -- invalid control")
+
+            a, b = td / "a", td / "b"
+            a.write_text("A")
+            os.utime(a, ns=(1_700_000_000_100_000_000, 1_700_000_000_100_000_000))
+            b.write_text("B")
+            os.utime(b, ns=(1_700_000_000_900_000_000, 1_700_000_000_900_000_000))
+
+            def probe(fn_src: str, target: pathlib.Path) -> str:
+                lib = td / "lib.sh"; lib.write_text(fn_src)
+                env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}",
+                       "LC_ALL": "de_DE.UTF-8"}
+                r = subprocess.run(["bash", "-c", f'. "{lib}"; mtime_ns "{target}"'],
+                                   capture_output=True, text=True, env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                return r.stdout.strip()
+
+            # Negative half: without LC_ALL=C the comma is rejected and both tie.
+            self.assertEqual(probe(broken, a), probe(broken, b),
+                             "control is inert: pre-fix form did not tie under a comma locale")
+            # Positive half: the shipped form orders, in BOTH directions.
+            fa, fb = probe(fixed, a), probe(fixed, b)
+            self.assertNotEqual(fa, fb, "comma locale still collapsed subsecond mtime")
+            self.assertLess(int(fa), int(fb))
+            self.assertGreater(int(fb), int(fa))
+
     def test_SUB_SECOND_ordering_decides_not_scan_order(self) -> None:
         """Two writes in the same second must still order by their real mtime.
 
