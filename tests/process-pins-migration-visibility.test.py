@@ -92,7 +92,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         return r
 
     def _gnu_stat_shim(self, comma: bool = True, synth: dict | None = None,
-                       poison: dict | None = None) -> Path:
+                       poison: dict | None = None,
+                       synth9: dict | None = None) -> Path:
         """A faithful-enough GNU `stat` on PATH: -f is --file-system (fails),
         -c formats succeed, and fractions use the locale's decimal separator."""
         import uuid
@@ -125,8 +126,12 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "sep = ',' if comma else '.'\n"
             f"_SYNTH = {synth or {}!r}\n"
             "_k = os.path.basename(os.path.dirname(os.path.dirname(f)))\n"
+            f"_SYNTH9 = {synth9 or {}!r}\n"
             "if fmt == '%.9Y':\n"
-            "    if _k in _SYNTH:\n"
+            "    if _k in _SYNTH9:\n"
+            "        _w9, _n9 = _SYNTH9[_k]\n"
+            "        print(f'{_w9}{sep}{_n9:09d}')\n"
+            "    elif _k in _SYNTH:\n"
             "        _w, _n = _SYNTH[_k]\n"
             "        print(f'{_w}{sep}{_n:09d}')\n"
             "    else:\n"
@@ -282,6 +287,32 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             status, "stale",
             "a FAILED `-f %Fm` that printed a number was accepted as the answer: "
             "the loop broke on numeric output instead of on a successful call")
+
+    def test_WHOLE_SECOND_fallback_is_the_call_that_DECIDES(self) -> None:
+        """The `%Y` fallback must be what chose, not merely what was available.
+
+        A previous version disabled `%.9Y` and passed either way, because with
+        equal fractions `%.9Y` names the same winner as `%Y` -- so the disable
+        line certified nothing. Here the two tables name OPPOSITE winners, so
+        the verdict identifies which call decided.
+        """
+        SEC = 1700000000
+        armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+        bin_ = self._gnu_stat_shim(
+            synth={"a": (SEC + 1, 0), "dest": (SEC + 2, 0)},    # %Y  -> dest wins
+            synth9={"a": (SEC + 9, 0), "dest": (SEC + 0, 0)})   # %.9Y -> a wins
+        shim = bin_ / "stat"
+        shim.write_text(shim.read_text().replace("if fmt == '%.9Y':", "if False:"))
+        shim.chmod(0o755)
+        self._write("src/a", armed, SEC + 5)
+        self._write("dest", [], SEC)
+        self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
+                                 "LC_ALL": "de_DE.UTF-8"})
+        status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
+        self.assertEqual(
+            status, "stale",
+            "the %Y fallback did not decide: verdict follows the %.9Y table "
+            "(a wins -> warn), so the subsecond call answered after all")
 
     def test_INTERLEAVED_only_BOTH_shim_answers_pick_the_shim_winner(self) -> None:
         """Reciprocal + interleaved, so a mixed host/shim pair cannot pass.
