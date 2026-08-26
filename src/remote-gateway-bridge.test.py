@@ -497,9 +497,8 @@ def main() -> int:
           "notify step carries the channel-env prelude BEFORE the notify.py call")
     check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
           "the env prelude rides both gateway-calling steps (context-first + notify)")
-    # The string assertions above pass even if the prelude names a file holding no
-    # gateway vars — the defect review of #3397 measured exactly that. So EXERCISE
-    # the resolver against both real onboarding layouts, and against neither-has-it.
+    # A string assertion passes even when the named file holds no gateway vars,
+    # so drive the resolver itself across both real layouts and neither-has-it.
     import os as _os
     import subprocess as _sp
     import tempfile as _tf
