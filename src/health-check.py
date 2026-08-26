@@ -805,7 +805,13 @@ def check_port(port: int, name: str, probe: bool = False,
             return _row
         return {"name": name, "status": "ok", "detail": f"port {port}"}
     except Exception as e:
-        return {"name": name, "status": "error", "detail": str(e)}
+        _row = {"name": name, "status": "error", "detail": str(e)}
+        try:
+            _, _els = _proc_lstarts(pgrep_pattern or name)
+            _apply_pin_verdict(_row, _pin_verdicts(name, _els), "error", str(e))
+        except Exception:
+            pass
+        return _row
 
 
 def check_launchd(label: str) -> dict:
@@ -9010,11 +9016,16 @@ def run_all_checks() -> list[dict]:
 
     web_config = resolve_web_client_port()
     if web_config.get("error"):
+        # Synthesized without check_port, so it must resolve the pin itself or a
+        # misconfigured port restarts a pinned process.
         web_check = {
             "name": "web-client",
             "status": "down",
             "detail": web_config["error"],
         }
+        _, _wls = _proc_lstarts("web-client")
+        _apply_pin_verdict(web_check, _pin_verdicts("web-client", _wls),
+                           "down", web_config["error"])
     else:
         web_check = check_port(web_config["port"], "web-client", probe=True)
     if web_check["status"] == "ok":

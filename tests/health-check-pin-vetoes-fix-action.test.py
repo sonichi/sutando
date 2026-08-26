@@ -148,6 +148,28 @@ finally:
             pass
     srv.close()
 
+# ---- the two arms that never call check_port's normal return path ----------
+for armed in (False, True):
+    arm("web-client", armed)
+    # check_port's OUTER error arm: probe raises, so no earlier arm resolves a pin.
+    err = hc.check_port(-1, "web-client", probe=True)
+    check(err["status"] == "error", f"error arm reached (got {err['status']})")
+    check(bool(err.get("restart_veto")) == armed,
+          f"error arm veto=={armed} (got {err.get('restart_veto') is not None})")
+
+    # run_all_checks' SYNTHESIZED down row for an unusable CLIENT_PORT: built
+    # without check_port at all, so it must resolve the pin itself.
+    orig_res = hc.resolve_web_client_port
+    hc.resolve_web_client_port = lambda: {"error": "invalid CLIENT_PORT='x'"}
+    try:
+        rows = {c["name"]: c for c in hc.run_all_checks()}
+    finally:
+        hc.resolve_web_client_port = orig_res
+    w = rows.get("web-client", {})
+    check(w.get("status") == "down", f"synthesized down row reached ({w.get('status')})")
+    check(bool(w.get("restart_veto")) == armed,
+          f"synthesized row veto=={armed} (got {w.get('restart_veto') is not None})")
+
 if fail:
     print("FAIL: --fix restarts a pinned process")
     sys.exit(1)
