@@ -106,6 +106,22 @@ class PoolLead:
         tmp.write_text(json.dumps(table))
         os.replace(tmp, p)
 
+    # ── liveness trace (change-driven; forensic aid for routing anomalies) ──
+    def _trace_path(self) -> Path:
+        return self.state_dir / "pool" / "liveness-trace.jsonl"
+
+    def _trace(self, event: dict) -> None:
+        """Append-only JSONL; a trace failure must never break assignment."""
+        try:
+            p = self._trace_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists() and p.stat().st_size > 5_000_000:
+                p.replace(p.with_suffix(".jsonl.1"))  # one-deep rotation
+            with open(p, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except OSError:
+            pass
+
     # ── pool state ──────────────────────────────────────────────────────────
     def _live_followers(self) -> "list[str]":
         return [f for f in self.followers_fn()
@@ -163,6 +179,11 @@ class PoolLead:
         Priority order first (urgent > normal > low, then mtime), so a
         burst never starves an urgent task behind low-priority backlog."""
         followers = self._live_followers()
+        live = sorted(str(f) for f in followers)
+        if getattr(self, "_last_live_set", None) != live:
+            self._trace({"ts": self.now(), "event": "live_set_changed",
+                         "alive": live, "prev": getattr(self, "_last_live_set", None)})
+            self._last_live_set = live
         if not followers:
             return []  # nothing to assign TO — leave tasks for fallback mode
         try:
@@ -177,7 +198,16 @@ class PoolLead:
                 continue  # processed by a since-dead claimer; bridge owns it now
             channel = _read_channel(f)
             lane = _read_lane(f)
+            bound = None
+            if channel and isinstance(affinity.get(channel), dict):
+                bound = affinity[channel].get("instance")
             inst = self._pick(channel, followers, affinity, lane)
+            if lane == "owner" and (
+                    inst == self._lane_core_of(followers)
+                    or (bound is not None and bound not in followers)):
+                self._trace({"ts": self.now(), "event": "anomalous_owner_pick",
+                             "task": f.name, "inst": str(inst), "bound": bound,
+                             "channel": channel, "alive": live})
             target = f.with_name(
                 f.name[:-len(".txt")] + f".assigned-{inst}.txt")
             try:
