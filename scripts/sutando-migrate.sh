@@ -384,11 +384,21 @@ mtime_ns() {
         # `|| v=""` not `|| true`: numeric OUTPUT is not a successful CALL, and
         # the `||` also keeps the errexit exemption a bare assignment would lose.
         v="$(LC_ALL=C $_c "$f" 2>/dev/null)" || v=""
-        case "$v" in ''|*[!0-9.]*) v="" ;; *) break ;; esac
+        # One integer, or one integer with one fractional part. `[!0-9.]` alone
+        # admits "." and "1.2.3", so a malformed read would read as a timestamp.
+        case "$v" in
+            ''|*[!0-9.]*)      v="" ;;
+            *.*.*)             v="" ;;
+            .|*.)              v="" ;;
+            .*)                v="" ;;
+            *)                 break ;;
+        esac
     done
+    # Exhaustion is NOT epoch 0: empty stdout + nonzero, so no caller can read
+    # an unknown timestamp as the oldest possible file. Real 0 stays valid.
+    [ -n "$v" ] || return 1
     case "$v" in
         *.*) sec="${v%%.*}"; frac="${v#*.}" ;;
-        "")  sec="$(_stat_field mtime "$f")"; frac="" ;;
         *)   sec="$v"; frac="" ;;
     esac
     frac="${frac}000000000"
@@ -1278,8 +1288,16 @@ commit_one() {
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(mtime_ns "$src_file")"
-                dst_mt="$(mtime_ns "$dst_path")"
+                # Guard EACH before any arithmetic or write, source first: a
+                # source failure must stop before the destination is probed.
+                if ! src_mt="$(mtime_ns "$src_file")"; then
+                    echo "AMBIGUOUS: $rel — mtime unavailable for source $src_file — resolve by hand" >&2
+                    return 1
+                fi
+                if ! dst_mt="$(mtime_ns "$dst_path")"; then
+                    echo "AMBIGUOUS: $rel — mtime unavailable for destination $dst_path — resolve by hand" >&2
+                    return 1
+                fi
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     copy_preserving_mtime "$src_file" "$dst_path"
                     echo "src-newer"
