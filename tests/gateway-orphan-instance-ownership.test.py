@@ -74,6 +74,35 @@ class OwnershipMatrix(unittest.TestCase):
         self.assertFalse(_bridge("dev")._owns_local_tid("task-unknown~9"))
 
 
+class PerLaneLogFile(unittest.TestCase):
+    """The log is a per-lane artifact like the other six: an unsuffixed
+    shared file makes sweep lines unattributable, which is circular for
+    the ownership witness this PR is gated on."""
+
+    def test_each_lane_logs_to_its_own_file(self):
+        # Read the RESOLVED default (pre-fixture-rebind) via a fresh import.
+        names = {}
+        for inst in (None, "dev", "staging"):
+            if inst:
+                os.environ["GATEWAY_INSTANCE"] = inst
+            else:
+                os.environ.pop("GATEWAY_INSTANCE", None)
+            for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
+                del sys.modules[name]
+            mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+            names[inst] = mod._LOG_FILE.name
+            # contain the import's logger immediately (no real-log writes)
+            log_tmp = tempfile.TemporaryDirectory()
+            _LOG_TMPDIRS.append(log_tmp)
+            mod._LOG_DIR = Path(log_tmp.name)
+            mod._LOG_FILE = Path(log_tmp.name) / "x.log"
+        self.assertEqual(names[None], "gateway-bridge.log")
+        self.assertEqual(names["dev"], "gateway-bridge.dev.log")
+        self.assertEqual(len(set(names.values())), 3,
+                         "two lanes sharing a log file re-creates the "
+                         "unattributable-witness ambiguity")
+
+
 class DualBridgeSharedResultsDir(unittest.TestCase):
     """Two lanes, one RESULTS_DIR: the selections must partition, not overlap."""
 

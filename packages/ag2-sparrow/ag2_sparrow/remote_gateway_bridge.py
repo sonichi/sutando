@@ -310,7 +310,9 @@ GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
 _LAUNCHED_VIA = "supervised" if os.environ.get("SUTANDO_SUPERVISED") else "bare"
 _LOG_DIR = _STATE.parent / "logs"
-_LOG_FILE = _LOG_DIR / "gateway-bridge.log"
+# Per-lane like every other artifact above — an unsuffixed shared log makes
+# sweep lines unattributable, which is circular for the ownership witness.
+_LOG_FILE = _LOG_DIR / f"gateway-bridge{_INST_SUFFIX}.log"
 _LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # AWP P0: the persistent event channel (if enabled) — a module-level handle so
