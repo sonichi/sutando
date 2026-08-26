@@ -31,6 +31,7 @@ case "$POOL_RUNTIME" in
      '$POOL_RUNTIME_BIN' --dangerously-skip-permissions \
        --add-dir '$POOL_WORKSPACE' -- '/proactive-loop-pool'"
     NUDGE_DEFAULT=1800
+    POLL_DEFAULT=30
     ;;
   codex)
     # Same persistent tmux form; flags mirror src/agent/codex/cli/start-cli.sh,
@@ -46,9 +47,12 @@ case "$POOL_RUNTIME" in
      '$POOL_RUNTIME_BIN' -C '$POOL_REPO_DIR' --add-dir '$POOL_WORKSPACE' \
        --sandbox danger-full-access --ask-for-approval never \
        --search --no-alt-screen '$POOL_CODEX_ENTRY'"
-    # The wrapper nudge is a Codex follower's ONLY sweep: it has no session
-    # CronCreate and no pool-mode notifier, so it runs at the 5-minute cadence.
+    # Codex has no session CronCreate or pool-mode notifier. Assignment files
+    # wake it below; this 5-minute sweep remains the leaderless backstop.
     NUDGE_DEFAULT=300
+    # An assigned file is Codex's durable wake request. Poll it closely, but
+    # let pool_drive_nudge touch the pane only after a positive idle read.
+    POLL_DEFAULT=1
     ;;
   *)
     # Mirrors src/agent/start-cli.sh: an unknown runtime fails loudly rather
@@ -79,14 +83,47 @@ BEAT=$!
 # is only this wrapper's tmux binding.
 pool_tmux() { "$POOL_TMUX_BIN" "$@" 2>/dev/null; }
 
+# The assigned file is the durable pending-wake record. Return one exact path
+# so a successful send can latch it until acquire_work renames or moves it.
+pool_first_assignment() {
+  local task
+  [ "$POOL_RUNTIME" = "codex" ] || return 1
+  for task in "$POOL_WORKSPACE"/tasks/task-*.assigned-core-"$SUTANDO_CORE_ID".txt; do
+    [ -e "$task" ] || return 1
+    printf '%s' "$task"
+    return 0
+  done
+  return 1
+}
+
 NUDGE_S="${SUTANDO_POOL_SWEEP_NUDGE_S:-$NUDGE_DEFAULT}"
+POLL_S="${SUTANDO_POOL_SESSION_POLL:-$POLL_DEFAULT}"
 LAST_NUDGE=$(date +%s)
+WAKE_TARGET=""
+WORK_WAKE_PENDING=0
 while "$POOL_TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; do
-  sleep "${SUTANDO_POOL_SESSION_POLL:-30}"
+  sleep "$POLL_S"
   NOW=$(date +%s)
-  if [ $((NOW - LAST_NUDGE)) -ge "$NUDGE_S" ]; then
+  ASSIGNMENT="$(pool_first_assignment || true)"
+  if [ -n "$WAKE_TARGET" ] && [ ! -e "$WAKE_TARGET" ]; then
+    WAKE_TARGET=""
+  fi
+  if [ "$POOL_RUNTIME" = "codex" ] && [ -z "$WAKE_TARGET" ]; then
+    if [ -n "$ASSIGNMENT" ]; then
+      WORK_WAKE_PENDING=1
+    else
+      WORK_WAKE_PENDING=0
+    fi
+  fi
+  PERIODIC_DUE=0
+  [ $((NOW - LAST_NUDGE)) -ge "$NUDGE_S" ] && PERIODIC_DUE=1
+  if [ "$PERIODIC_DUE" -eq 1 ] || [ "$WORK_WAKE_PENDING" -eq 1 ]; then
     if pool_drive_nudge "$POOL_RUNTIME" "$SESSION" pool_tmux "$SUTANDO_CORE_ID"; then
       LAST_NUDGE=$NOW
+      if [ "$WORK_WAKE_PENDING" -eq 1 ]; then
+        WAKE_TARGET="$ASSIGNMENT"
+        WORK_WAKE_PENDING=0
+      fi
     fi
   fi
 done

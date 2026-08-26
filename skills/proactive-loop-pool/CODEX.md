@@ -17,7 +17,7 @@ then sets up its own in-session machinery. Codex has neither surface:
 | | Claude follower | Codex follower |
 |---|---|---|
 | Invocation | `/proactive-loop-pool` slash command passed at launch | pool-mode prompt passed as codex's `[PROMPT]` positional by `scripts/pool-core-wrapper.sh` |
-| Task wake-up | `Monitor` tool streaming `src/watch-tasks-stream.sh` in-session | **none in-session** — only the wrapper's periodic nudge |
+| Task wake-up | `Monitor` tool streaming `src/watch-tasks-stream.sh` in-session | wrapper watches this core's durable assigned-file state and submits after a positive idle read |
 | Periodic sweep | `CronCreate` `*/5 * * * *` registered by the session | the wrapper's external nudge, every 300s |
 
 Both followers are the same persistent shape: an interactive CLI in a tmux
@@ -26,15 +26,16 @@ argv and the entry differ.
 
 The last two rows are what changes behaviour rather than just plumbing. A Codex
 follower cannot arm its own catch-up sweep (`src/agent/codex/README.md`: "Codex
-has no session `CronCreate` surface") and has no in-session watcher, so the
-wrapper drives the sweep from outside at the same 5-minute cadence the Claude
-follower registers with `CronCreate`. That is the whole of a Codex follower's
-wake-up: **assignment latency is up to 300s**, against sub-second for a Claude
-follower. Nothing is dropped, but nothing is instant either.
+has no session `CronCreate` surface") and has no in-session watcher. Its wrapper
+therefore treats `task-*.assigned-core-N.txt` as a durable pending wake, checks
+that state every second, and submits only after the pane is positively idle.
+The 300-second sweep remains a leaderless/catch-up backstop.
 
-The nudge is skipped while the pane shows `esc to interrupt` and retried on the
-next poll — Codex's interactive input is not a durable queue, so typing into a
-running turn can interleave with it.
+The assignment wake stays pending while the pane shows `esc to interrupt` and
+is retried on the next one-second poll. Codex's interactive input is not a
+durable queue, so typing into a running turn can interleave with it. After a
+successful send, the wrapper latches that exact assigned path until
+`acquire_work` renames or moves it, preventing duplicate prompts.
 
 ## The injected prompt must be pool-aware
 
@@ -54,8 +55,8 @@ file or write results/ directly — follow skills/proactive-loop-pool/CODEX.md:
 acquire work first, and complete only through the finish helper.
 ```
 
-The wrapper's session entry and its periodic nudge use the same shape without a
-filename, since neither names a specific task — `POOL_CODEX_ENTRY` in
+The wrapper's session entry, assignment wake, and periodic nudge use the same
+shape without a filename, since none names a specific task — `POOL_CODEX_ENTRY` in
 `scripts/pool-core-wrapper.sh`:
 
 ```
@@ -150,17 +151,15 @@ Wired:
   Codex follower (above).
 - `scripts/pool-core-wrapper.sh` dispatches on `POOL_RUNTIME` and launches Codex
   with the flags `src/agent/codex/cli/start-cli.sh` uses, plus the pool entry.
+- Assignment-aware wake-up, driven by the wrapper from the durable assigned
+  filename and held until the Codex pane is idle.
 - The catch-up sweep, driven externally by the wrapper at 300s.
 
 Not wired:
 
 - `task-notifier.sh` has no pool mode — it still emits the single-core prompt.
-  A Codex follower therefore has no event-driven wake-up at all; the 300s nudge
-  is its only one.
-- `scripts/kick-pool.sh` reads Claude's REPL markers (`❯ /proactive-loop-pool`)
-  and sends Claude's keystrokes, so the recovery watchdog cannot kick a hung
-  Codex follower — it only sees the shared `esc to interrupt` busy marker and
-  the launchd `kickstart` path for a dead session.
+  Pool wake-up is wrapper-owned and assignment-state-driven rather than using
+  the single-core notifier.
 - No live install has been exercised: the plists and the launch argv are
   generated and tested, no Codex follower has been booted under launchd.
 

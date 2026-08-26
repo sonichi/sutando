@@ -409,6 +409,12 @@ for i in $CORE_INDICES; do
   # the wrapper reuses an existing tmux session, so a converted core would keep
   # running the old CLI until something ends that session.
   PREV_RUNTIME="$(pool_runtime_from_plist "$PLIST" || true)"
+  # Templated, not hand-edited: a plist edited in place is silently replaced by
+  # the next install, so the tuning would vanish without any error.
+  SWEEP_NUDGE_ENTRY=""
+  if [ -n "${SUTANDO_POOL_SWEEP_NUDGE_S:-}" ]; then
+    SWEEP_NUDGE_ENTRY="    <key>SUTANDO_POOL_SWEEP_NUDGE_S</key><string>$SUTANDO_POOL_SWEEP_NUDGE_S</string>"
+  fi
   RUNTIME_CONFIG_KEYS=""
   if [ "$CORE_RUNTIME" = "codex" ] && [ -n "$CODEX_CONFIG_ENV" ] && [ -n "$CODEX_CONFIG_DIR" ]; then
     RUNTIME_CONFIG_KEYS="    <key>POOL_RUNTIME_CONFIG_ENV</key><string>$CODEX_CONFIG_ENV</string>
@@ -433,6 +439,7 @@ for i in $CORE_INDICES; do
   <dict>
     <key>SUTANDO_CORE_ID</key><string>$i</string>
     <key>SUTANDO_CORE_POOL_SIZE</key><string>$N</string>
+$SWEEP_NUDGE_ENTRY
     <key>POOL_REPO_DIR</key><string>$REPO_DIR</string>
     <key>POOL_CLAUDE_BIN</key><string>$CLAUDE_BIN</string>
     <key>POOL_TMUX_BIN</key><string>$TMUX_BIN</string>

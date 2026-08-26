@@ -260,6 +260,19 @@ def _valid_local_tid(tid: str) -> bool:
     m = _LOCAL_TID_RE.fullmatch(tid)
     return bool(m) and m.group(1) not in (".", "..")
 
+
+def _task_pending(tid: str) -> bool:
+    """Is this task still live in tasks/, under ANY of its names?
+
+    A pooled task is renamed twice — unassigned -> `.assigned-<core>` (lead
+    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
+    "is this still being worked?" must accept all three, so the question has
+    one owner: a state missed here reads as finished, which drops a reply
+    mid-flight or re-queues work another core already holds."""
+    return ((TASKS_DIR / f"{tid}.txt").exists()
+            or any(TASKS_DIR.glob(f"{tid}.assigned-*"))
+            or any(TASKS_DIR.glob(f"{tid}.claimed-*")))
+
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
@@ -2213,7 +2226,7 @@ def _write_task(task: dict) -> str | None:
     task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived.
-    if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
+    if _task_pending(tid):
         return tid
     # Relay redelivery of already-handled work: on reconnect the gateway replays
     # its unacked pool, including tasks this node long since processed (the
@@ -3106,8 +3119,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     instead of being raced. Returns the new suspects set for the next pass."""
     gone = {tid for tid in inflight
             if _valid_local_tid(tid)
-            and not (TASKS_DIR / f"{tid}.txt").exists()
-            and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
+            and not _task_pending(tid)
             and not (RESULTS_DIR / f"{tid}.txt").exists()
             and not _task_archived_recently(tid)}
     confirmed = gone & suspects

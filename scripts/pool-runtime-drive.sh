@@ -65,6 +65,9 @@ pool_drive_nudge_text() {
 # inline is one row here, so a second runtime cannot silently inherit it.
 _pool_drive_knob() {
   local rt="$1" knob="$2" esc="$POOL_DRIVE_ESC" nb="$POOL_DRIVE_NBSP"
+  # Codex varies the prompt's SGR prefix (`[1m` fresh, `[0;1m` after a reply),
+  # so match any parameter list — pinning one spelling silently stops driving.
+  local cx="${esc}\\[[0-9;]*m›${esc}\\[0m"
   case "$rt:$knob" in
     # capture_mode: `ansi` keeps tmux's SGR codes, which is the only way to tell
     # codex's dim placeholder hint from text a caller actually staged.
@@ -81,11 +84,11 @@ _pool_drive_knob() {
     claude:menu_key) printf '%s' 'Escape' ;;
     codex:menu_key) printf '' ;;
     claude:prompt_re) printf '%s' "^❯([ $nb]|\$)" ;;
-    codex:prompt_re) printf '%s' "^${esc}\\[1m›${esc}\\[0m" ;;
+    codex:prompt_re) printf '%s' "^$cx" ;;
     claude:idle_re) printf '%s' "^❯[ $nb]*\$" ;;
-    codex:idle_re) printf '%s' "^${esc}\\[1m›${esc}\\[0m *(${esc}\\[2m.*)?\$" ;;
+    codex:idle_re) printf '%s' "^$cx *(${esc}\\[2m.*)?\$" ;;
     claude:staged_submit_re) printf '%s' "^❯[ $nb]*/proactive-loop-pool[ $nb]*\$" ;;
-    codex:staged_submit_re) printf '%s' "^${esc}\\[1m›${esc}\\[0m Sutando pool mode\\." ;;
+    codex:staged_submit_re) printf '%s' "^$cx Sutando pool mode\\." ;;
     claude:submit_key) printf '%s' 'Enter' ;;
     # Codex's TUI submits on C-m; the symbolic Enter can stage without sending.
     codex:submit_key) printf '%s' 'C-m' ;;

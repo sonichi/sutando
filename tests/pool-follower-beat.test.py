@@ -242,7 +242,15 @@ class PoolWrapperNudgeTest(unittest.TestCase):
         '    ( sleep 3; rm -f "$D/session-alive" ) &\n'
         '    echo $! > "$D/pane-pid";;\n'
         '  list-panes) cat "$D/pane-pid";;\n'
-        '  capture-pane) cat "$D/pane" 2>/dev/null;;\n'
+        '  capture-pane)\n'
+        '    if [ -n "${STUB_BUSY_CAPTURES:-}" ]; then\n'
+        '      n=$(cat "$D/capture-count" 2>/dev/null || echo 0)\n'
+        '      n=$((n + 1)); printf "%s" "$n" > "$D/capture-count"\n'
+        '      if [ "$n" -le "$STUB_BUSY_CAPTURES" ]; then\n'
+        '        echo "Working (5s • esc to interrupt)"; exit 0\n'
+        '      fi\n'
+        '    fi\n'
+        '    cat "$D/pane" 2>/dev/null;;\n'
         'esac\n'
         'exit 0\n')
 
@@ -297,6 +305,29 @@ class PoolWrapperNudgeTest(unittest.TestCase):
                 POOL_RUNTIME="codex", POOL_RUNTIME_BIN=str(td / "stub-codex"))
             self.assertEqual(sends, [],
                              "typing into a running codex turn interleaves")
+
+    def test_codex_assignment_waits_for_idle_then_wakes_exactly_once(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            tasks = td / "tasks"
+            tasks.mkdir()
+            (tasks / "task-wake.assigned-core-4.txt").write_text("assigned\n")
+            sends = self.run_wrapper(
+                td, self.IDLE,
+                POOL_RUNTIME="codex",
+                POOL_RUNTIME_BIN=str(td / "stub-codex"),
+                SUTANDO_POOL_SWEEP_NUDGE_S="9999",
+                SUTANDO_POOL_SESSION_POLL="0.1",
+                STUB_BUSY_CAPTURES="2")
+            self.assertGreaterEqual(
+                int((td / "capture-count").read_text()), 3,
+                "the assignment wake must stay pending until Codex is idle")
+            self.assertEqual(
+                len(sends), 2,
+                "one durable assignment must produce one literal send + submit")
+            self.assertIn("skills/proactive-loop-pool/CODEX.md", sends[0][5])
+            self.assertEqual(sends[1],
+                             ["send-keys", "-t", "core-4", "C-m"])
 
     # The wrapper path drives codex every 300s. It must reach the SAME verdict
     # as the kick path, which classifies each of these panes positively.
