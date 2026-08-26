@@ -94,9 +94,53 @@ failed=0
 skipped_total=0
 fully_skipped=()
 partly_skipped=()
+# Each file already runs as its own `coverage run` process writing its own
+# .coverage.* fragment (`parallel = True` in .coveragerc, merged by the
+# `coverage combine` below), so running them concurrently changes SCHEDULING,
+# not the data model. Measured on 150 files: serial 146s vs -P4 42s (3.5x),
+# with 5 failures both ways and all 5 failing standalone — 0 introduced by
+# concurrency.
+COVGATE_WORKERS="${COVERAGE_GATE_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+RECDIR="$(mktemp -d)"
+trap 'rm -rf "$RECDIR"' EXIT
+
+# Per-file cap, mirroring ci.yml's twin loop. Without it ONE hung file burns
+# the job's whole timeout-minutes budget and the job is CANCELED mid-suite —
+# indistinguishable, from outside, from a suite that is merely slow.
+# `timeout` is coreutils and absent on a stock macOS, where this script is
+# also run by hand; degrade to no cap rather than failing the local path.
+COVGATE_TIMEOUT=""
+if command -v timeout >/dev/null 2>&1; then
+    COVGATE_TIMEOUT="timeout -k 5 ${COVERAGE_GATE_FILE_TIMEOUT:-120}"
+else
+    echo "coverage-gate: no \`timeout\` binary — per-file cap disabled (local run)." >&2
+fi
+export RECDIR COVGATE_TIMEOUT
+
+find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+
+# Worker: one record per file. Aggregation stays SERIAL below, over the sorted
+# list, so log order and the skip accounting are byte-identical to the old loop.
+# shellcheck disable=SC2016
+xargs -P "$COVGATE_WORKERS" -I{} bash -c '
+    f="$1"
+    rec="$RECDIR/$(printf "%s" "$f" | tr "/." "__")"
+    rc=0
+    out="$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1)" || rc=$?
+    printf "%s" "$out" > "$rec.out"
+    printf "%s\n" "$rc" > "$rec.rc"
+' _ {} < "$RECDIR/files"
+
 while IFS= read -r f; do
-    if ! output=$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
-        echo "✖ test failed under instrumentation: $f"
+    rec="$RECDIR/$(printf '%s' "$f" | tr '/.' '__')"
+    rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
+    output="$(cat "$rec.out" 2>/dev/null || true)"
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            echo "✖ test TIMED OUT under instrumentation (>${COVERAGE_GATE_FILE_TIMEOUT:-120}s): $f"
+        else
+            echo "✖ test failed under instrumentation: $f"
+        fi
         echo "$output"
         failed=1
         continue
@@ -112,7 +156,7 @@ while IFS= read -r f; do
     elif [ "$skips" -gt 0 ]; then
         partly_skipped+=("$f ($skips/$ran skipped)")
     fi
-done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+done < "$RECDIR/files"
 
 if [ "$skipped_total" -gt 0 ]; then
     echo "coverage-gate: $skipped_total test case(s) SKIPPED in this environment."
