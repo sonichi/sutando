@@ -267,8 +267,7 @@ check("...and no record was published for it",
       (g.state_dir() / "task-dur-scalar.json").exists(), False)
 
 # --- an unknown observation must not become a concrete outcome ---
-# Malformed GitHub targets must be rejected BEFORE any credentialed call:
-# stub _gh with a counter and assert zero invocations for every hostile shape.
+# Malformed targets must be rejected BEFORE any credentialed call: count stubs.
 _gh_calls = []
 _real_gh_for_p2 = g._gh
 g._gh = lambda *a: (_gh_calls.append(a), "")[1]
