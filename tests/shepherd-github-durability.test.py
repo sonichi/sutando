@@ -272,7 +272,9 @@ _gh_calls = []
 _real_gh_for_p2 = g._gh
 g._gh = lambda *a: (_gh_calls.append(a), "open false")[1]
 _hostile_repos = ["owner/repo/../../victim/private", "repo-only", " owner/repo",
-                  "owner/repo ", "owner/repo?x=1", "owner//repo", "owner/..", ""]
+                  "owner/repo ", "owner/repo?x=1", "owner//repo", "owner/..", "",
+                  # terminal LF: $ under .match() accepts it; \Z must not
+                  "owner/repo\n", "owner\n/repo", "owner/repo\n\n"]
 for _hr in _hostile_repos:
     _rejected = False
     try:

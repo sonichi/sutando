@@ -415,6 +415,24 @@ raises("scope_from_saved rejects a blank element",
 check("scope_from_saved still accepts a well-formed record",
       sorted(g.scope_from_saved(base).success_conditions), sorted(base["success_conditions"]))
 
+# --- 17. terminal-LF never reaches persistence: repo via save(), task id via path gate
+_lf_scope_err = False
+try:
+    g.save("task-integrity-lf-repo", scope_for("org/repo-a\n", 17), "waiting", "seed")
+except ValueError:
+    _lf_scope_err = True
+check("save() rejects a terminal-LF repo before publication",
+      (_lf_scope_err, [q.name for q in (g.state_dir()).glob("*") if "task-integrity-lf-repo" in q.name]),
+      (True, []))
+_lf_tid_err = False
+try:
+    g.save("task-integrity-lf-tid\n", scope_for("org/repo-a", 18), "waiting", "seed")
+except ValueError:
+    _lf_tid_err = True
+_matches_lf = [q.name for q in (g.state_dir()).glob("*") if "task-integrity-lf-tid" in q.name]
+check("save() rejects a terminal-LF task id before publication",
+      (_lf_tid_err, _matches_lf), (True, []))
+
 print(f"integrity: {len(failures)} failure(s)")
 for f in failures:
     print("  FAIL", f)
