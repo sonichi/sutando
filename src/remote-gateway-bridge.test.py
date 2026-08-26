@@ -735,12 +735,11 @@ def main() -> int:
     check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
           and "sk-live" not in (_posted[0].get("body") or ""),
           "team deduped with out-of-grammar extra is withheld, not re-posted")
-    _act = rtc.parse_markers("[deduped: task-abc_123]").actions[0]
-    check(rtc._suppression_stub(_act) == "[deduped: task-abc_123]",
-          "in-grammar deduped extra reconstructs the exact marker line")
-    import types as _types
-    check(rtc._suppression_stub(
-              _types.SimpleNamespace(value="future-marker", extra=None)) is None,
+    import team_result_guard as _guard
+    check(_guard.suppression_stub_for_tier("[deduped: task-abc_123]", "team")
+          == "[deduped: task-abc_123]",
+          "in-grammar deduped body reconstructs the exact marker line")
+    check(_guard.suppression_stub_for_tier("[future-marker]", "team") is None,
           "unknown skip marker yields no stub (guard path, not [no-send])")
 
     # DeliveryCore wiring, proven by side effects only the seam produces:

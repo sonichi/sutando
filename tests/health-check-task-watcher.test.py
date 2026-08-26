@@ -55,6 +55,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "_helpers"))
+from os_probes import PS_SKIP_REASON, ps_available  # noqa: E402
+
 REPO = Path(__file__).resolve().parent.parent
 
 MOD_PATH = REPO / "src" / "health-check.py"
@@ -74,7 +77,9 @@ def make_workspace(td: Path, *, core_alive: bool, pid_text: str | None) -> Path:
     if core_alive:
         cores = state / "cores"
         cores.mkdir(exist_ok=True)
-        beat = cores / "testhost.alive"
+        # Host-labelled: the probe asks whether THIS host's core is alive,
+        # so a fixed name would only ever satisfy the fleet-wide reader.
+        beat = cores / f"{hc._host_label()}.alive"
         beat.write_text("{}")
         # _any_core_alive uses a 90s window; a just-written file is inside it.
     if pid_text is not None:
@@ -545,6 +550,11 @@ def case_h_proc_argv_reads_a_real_process() -> list[str]:
     caller expects.
     """
     fails = []
+    if not ps_available():
+        # Loud, never silent: without ps this case would assert '' == '' and
+        # pass for the wrong reason, which is worse than not running it.
+        print(f"      SKIP h) {PS_SKIP_REASON}")
+        return fails
     mine = hc._proc_argv(os.getpid())
     if not mine:
         fails.append("h) _proc_argv(os.getpid()) returned empty for a live process")

@@ -270,6 +270,12 @@ def _stripe_mode(root: Path) -> bool:
         return False
     except (OSError, ValueError) as e:
         raise RuntimeError(f"unreadable stripes fence {fp}: {e}") from e
+    if not isinstance(data, dict):
+        # Valid JSON of the wrong shape is corruption, not a missing fence:
+        # refuse in the same class, so callers need one boundary, not two.
+        raise RuntimeError(
+            f"stripes fence {fp} is {type(data).__name__}, not an object: "
+            f"migration required, refusing to guess")
     if data.get("stripes") != LOCK_STRIPES:
         # Mixed stripe counts are the same defect class as mixed namespaces.
         raise RuntimeError(
@@ -702,6 +708,17 @@ def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None
     if destination:
         d["destination"] = destination
     _write_item(Path(root), item_id, d)
+
+
+def item_status(root: Path, item_id: str) -> Optional[str]:
+    """Public read of an item's lifecycle status (READY/CLAIMED/DELIVERED/
+    PARKED...); None when no record exists or the record is unreadable."""
+    try:
+        if not _item_path(Path(root), item_id).exists():
+            return None
+        return _read_item(Path(root), item_id).get("status")
+    except Exception:
+        return None
 
 
 def attempts_for(root: Path, item_id: str) -> int:

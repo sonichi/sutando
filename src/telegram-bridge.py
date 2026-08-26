@@ -58,7 +58,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -82,7 +82,7 @@ RESULTS_DIR = REPO / "results"
 # lacked the personal-notes, iclr-backups and launch-assets roots, so a file
 # Discord would happily send was silently dropped from a Telegram reply.
 # Telegram inherits the complete canonical policy with no extra roots.
-from send_allowlist import is_path_sendable as _is_path_sendable  # noqa: E402
+from policy.egress.attachment import is_path_sendable as _is_path_sendable  # noqa: E402
 
 
 # --- Config loading (independent of _is_path_sendable above) ---
@@ -1023,7 +1023,8 @@ def main():  # pragma: no cover
                     # Destination outranks activity routing, uniformly;
                     # discord's DM fallback stays the after-grace catch-all.
                     return should_claim_proactive_file(
-                        name, OWNER_ACTIVITY_FILE, "telegram")
+                        name, OWNER_ACTIVITY_FILE, "telegram",
+                        body_reader=lambda _n=name: (RESULTS_DIR / _n).read_text())
 
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \

@@ -150,9 +150,10 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
-from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+
+from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -168,8 +169,9 @@ REPLY_CHAIN_MAX_DEPTH = 8
 # reached within this bound, an explicit truncation marker is emitted.
 REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
-import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
-import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
+import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink)
+import discord_result_delivery as _drd  # noqa: E402  (top-level so hooks carry no lazy import)
+import delivery.router as result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 
 #: Consecutive polls each result file has been present-but-empty. Bridge-owned
 #: state; threshold and wording live in result_router so the bridges cannot drift.
@@ -354,7 +356,7 @@ OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 # `src/dm-result.py`'s REST-fallback delivery (per liususan091219
 # review on PR #1029: keeping the policy as a copy in each file will
 # drift, even with "keep in sync" comments).
-from send_allowlist import (  # noqa: E402
+from policy.egress.attachment import (  # noqa: E402
     SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS,
     is_path_sendable as _is_path_sendable_shared,
@@ -519,6 +521,29 @@ def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
     archive_file(task_file, "tasks", task_id)
     if gone:
         _clear_delivered(task_id)
+
+
+def _anchor_from_task_file(task_id: str):
+    """Recover the quote-reply anchor `pending_reply_anchors` lost to a restart.
+    By delivery time the task may be claimed or already archived, so try both."""
+    candidates = []
+    try:
+        live = find_task_file(TASKS_DIR, task_id)
+        if live is not None:
+            candidates.append(live)
+        for pattern in (f"*/{task_id}.txt", f"*/{task_id}.claimed-core-*.txt"):
+            candidates.extend(sorted(ARCHIVE_TASKS_DIR.glob(pattern)))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                if line.startswith("source_message_id:"):
+                    raw = line.split(":", 1)[1].strip()
+                    return int(raw) if raw.isdigit() else None
+        except Exception:
+            continue
+    return None
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
@@ -4713,6 +4738,10 @@ async def poll_results():
                 # messages instead of quote-replies. Caught by live test
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
+                if source_message_anchor is None:
+                    # Survives a bridge restart: the in-memory dict is gone but
+                    # the task file still carries source_message_id.
+                    source_message_anchor = _anchor_from_task_file(task_id)
                 # Clear the progress-streamer's tier map here (NOT only in
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
@@ -4820,9 +4849,19 @@ async def poll_results():
                 # Avoids the double-delivery vector when the bridge
                 # restarts between channel.send() returning and
                 # archive_file() finishing. See DELIVERED_DIR docstring.
-                if _is_delivered(task_id):
-                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
+                if _drd.is_delivered(RESULTS_DIR, task_id, DELIVERED_DIR):
+                    print(f"  Skipped (already delivered per outbox/sentinel): {task_id}", flush=True)
                     _archive_delivered_pair(result_file, task_id)
+                    continue
+                if _drd.is_parked(RESULTS_DIR, task_id):
+                    # terminal park recorded but a crash preceded the archive:
+                    # finish the archive now so the pair cannot loop forever
+                    print(f"  Parked (terminal) — archiving: {task_id}", flush=True)
+                    _archive_delivered_pair(result_file, task_id)
+                    continue
+                _send_tok = _drd.claim_for_send(RESULTS_DIR, task_id)
+                if _send_tok is None:
+                    # another incarnation holds the claim right now
                     continue
 
                 try:
@@ -5001,7 +5040,8 @@ async def poll_results():
                     # triggers the skip-block above (archive + clear,
                     # no re-send). Without this, the result file
                     # would re-send on restart producing a duplicate.
-                    _mark_delivered(task_id)
+                    _drd.confirm(RESULTS_DIR, _send_tok,
+                                 str(getattr(channel, "id", "")))
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                     # Observability: one delivered-reply event.
                     _emit_channel(
@@ -5014,6 +5054,10 @@ async def poll_results():
                         },
                     )
                 except Exception as e:
+                    _ambiguous = isinstance(e, (TimeoutError,)) or \
+                        "timeout" in str(e).lower()
+                    (_drd.unknown if _ambiguous else _drd.failed_terminal)(
+                        RESULTS_DIR, _send_tok)
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
@@ -5194,8 +5238,8 @@ def _proactive_provider():
     client (and its 30s upload timeout pin)."""
     global _PROACTIVE_PROVIDER
     if _PROACTIVE_PROVIDER is None:
-        from discord_post_gate import make_client
-        from discord_delivery_provider import DiscordDeliveryProvider
+        from channels.discord.post_gate import make_client
+        from channels.discord.delivery_provider import DiscordDeliveryProvider
         _PROACTIVE_PROVIDER = DiscordDeliveryProvider(
             make_client(TOKEN, timeout=30))
     return _PROACTIVE_PROVIDER
@@ -5212,9 +5256,65 @@ def _proactive_fence():
     if _PROACTIVE_FENCE is None:
         from proactive_claim_fence import ProactiveClaimFence
         from ag2_sparrow.delivery_core import DesignAClaimBackend
+        from sutando_config import resolve_claim_backend
+        # The NAME is policy (sutando_config); mapping it to a class is this
+        # adapter's job, which keeps delivery-core imports out of the config module.
+        root = RESULTS_DIR / ".outbox-discord-proactive"
+        backend = DesignAClaimBackend(root)
+        # A switch must not hide Design A state: items/attempt history in
+        # .items would read as vanished under C and resurrect on rollback.
+        items = root / ".items"
+        try:
+            if items.is_dir():
+                entries = list(items.iterdir())  # ANY entry blocks
+            elif os.path.lexists(items):
+                # A file OR a dangling symlink at .items is unrecognized
+                # A-side state, not proof of absence — refuse, fail closed.
+                entries = [items]
+            else:
+                entries = []
+        except OSError:
+            entries = [items]  # unreadable A-side state: fail closed
+        if resolve_claim_backend() == "c":
+            from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
+            if entries:
+                print(f"  [proactive] claim_backend=c refused: {len(entries)} "
+                      f"unmigrated Design A entr(y/ies) at {items} — "
+                      "complete the A->C migration first; running on Design A",
+                      flush=True)
+            else:
+                try:
+                    backend = DesignCClaimBackend(root)
+                except (RuntimeError, OSError) as exc:
+                    # C refuses an un-activated root (RuntimeError); namespace
+                    # mkdirs raise OSError; both fall back, not reach on_ready.
+                    print(f"  [proactive] claim_backend=c requested but unusable: "
+                          f"{type(exc).__name__}: {exc} — running on Design A this cycle",
+                          flush=True)
+        if isinstance(backend, DesignAClaimBackend):
+            # REVERSE fence (C -> A): A over a root C has operated resets the
+            # durable retry budget and resurrects parked items (duplicate DMs).
+            from ag2_sparrow.delivery_core.migration import (
+                TransitionRefusalBackend, c_live_state)
+            live = c_live_state(root)
+            if live and entries:
+                # MIXED state: neither protocol is safely authoritative —
+                # A resets C's budget, C hides A's items. Operator reconciles.
+                reason = (f"root carries BOTH unmigrated Design A entries and "
+                          f"live C state ({', '.join(live)} at {root})")
+                print(f"  [proactive] {reason} — proactive delivery DEFERRED; "
+                      "reconcile the root (migrate or clean one side) before "
+                      "either backend runs here", flush=True)
+                backend = TransitionRefusalBackend(reason)
+            elif live:
+                reason = (f"Design A refused on a C-operated root "
+                          f"({', '.join(live)} at {root})")
+                print(f"  [proactive] {reason} — proactive delivery DEFERRED; "
+                      "re-select claim_backend=c or migrate C state back to A "
+                      "before running A here", flush=True)
+                backend = TransitionRefusalBackend(reason)
         _PROACTIVE_FENCE = ProactiveClaimFence(
-            DesignAClaimBackend(RESULTS_DIR / ".outbox-discord-proactive"),
-            RESULTS_DIR, worker="discord-proactive")
+            backend, RESULTS_DIR, worker="discord-proactive")
     return _PROACTIVE_FENCE
 
 
@@ -5259,7 +5359,8 @@ async def poll_proactive():
                 if f.name.startswith("proactive-") and f.suffix == ".txt" \
                         and should_claim_proactive_file(
                             f.name, STATE_DIR / "last-owner-activity.json",
-                            "discord"):
+                            "discord",
+                            body_reader=lambda _f=f: _f.read_text()):
                     # Claim-by-rename: atomically move the file to a
                     # `.sending` suffix so a concurrent poll iteration
                     # (this coroutine, a race with the same-node telegram
@@ -5871,7 +5972,7 @@ def _rest_client(timeout: int = 10):
     """The shared Discord REST chokepoint for the CLI send/edit paths. A test
     binds a scripted transport through here so the PRODUCTION client stays in
     the loop; make_client resolves the injected post-gate for this process."""
-    from discord_post_gate import make_client
+    from channels.discord.post_gate import make_client
     return make_client(TOKEN, timeout=timeout)
 
 

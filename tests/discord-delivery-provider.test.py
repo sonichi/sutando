@@ -26,7 +26,7 @@ from outbox import DeliveryOutcome as TO, RetrySafety
 from outbox_adapter import DeliveryReceipt as TransportReceipt
 
 spec = importlib.util.spec_from_file_location(
-    "ddp", REPO / "src" / "discord_delivery_provider.py")
+    "ddp", REPO / "src" / "channels" / "discord" / "delivery_provider.py")
 ddp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ddp)
 

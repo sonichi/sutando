@@ -137,11 +137,24 @@ def proactive_destination(name) -> "str | None":
 
 
 def should_claim_proactive_file(name, state_file_path: Path,
-                                this_channel: str) -> bool:
-    """Per-FILE claim decision: destination outranks activity routing."""
+                                this_channel: str,
+                                body_reader=None) -> bool:
+    """Per-FILE claim decision: filename tag, then the BODY's own redirect,
+    then activity routing. The body leg closes the cross-bridge deadlock:
+    a [channel: <discord-id>] body was foreign to the claiming gateway
+    (hand back) yet invisible to discord's activity-routed gate (skip)."""
     dest = proactive_destination(name)
     if dest is not None:
         return dest == this_channel
+    if body_reader is not None:
+        try:
+            body = body_reader()
+        except OSError:
+            body = None
+        if body:
+            kind = body_target_channel(body)
+            if kind is not None:
+                return kind == this_channel
     return should_claim_proactive(state_file_path, this_channel)
 
 
