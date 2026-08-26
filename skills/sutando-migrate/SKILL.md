@@ -22,7 +22,7 @@ Guided workspace migration for existing users (M1 Part 2). Reach for this when:
 Run `bash scripts/sutando-migrate.sh scan --json`. Parse the JSON for:
 - Total unique relpaths across A+B+C+dest
 - Per-source byte counts
-- Cross-source collision triage: `identical_content` (byte-verified drop-dup, no action) + `mtime_only_diff` (commit's newest-mtime auto-resolves) + `size_mismatch` and `proxy_identical_divergent` (REAL content conflicts — owner attention; the latter is equal mtime+size with DIFFERENT bytes, where proxies lie)
+- Cross-source collision triage: `identical_content` (byte-verified drop-dup, no action) + `mtime_only_diff` (commit's newest-mtime auto-resolves) + `size_mismatch` and `proxy_identical_divergent` (REAL content conflicts — owner attention; the latter is equal mtime+size with PROVEN-different bytes, both hashes read OK) + `identity_unverified` (hash failed on an unreadable entry — actionable: fix permissions, re-scan; per-collision `byte_identical` is tri-state true/false/null)
 - Notable actionable entries — anything with `byte_identical: false` (build_log, conversation.log, hosts/*, state/* divergences)
 
 Present a concise 4–6 line summary to owner via:

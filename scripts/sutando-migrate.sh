@@ -283,6 +283,20 @@ if [ ! -x "$HELPER" ] && [ ! -f "$HELPER" ]; then
     echo "sutando-migrate: cannot find $HELPER (expected next to this script)" >&2
     exit 2
 fi
+
+# Scan reports need a real interpreter; resolve_python refuses Apple's CLT stub,
+# so a miss dies loudly here instead of raising the stub's modal dialog.
+_SUTANDO_PY_RESOLVED=""
+require_python() {
+    if [ -z "$_SUTANDO_PY_RESOLVED" ]; then
+        _SUTANDO_PY_RESOLVED="$(resolve_python "$REPO_DIR")"
+        if [ -z "$_SUTANDO_PY_RESOLVED" ]; then
+            echo "sutando-migrate: no runnable python3 — set SUTANDO_PY or install the Command Line Tools" >&2
+            exit 2
+        fi
+    fi
+    printf '%s' "$_SUTANDO_PY_RESOLVED"
+}
 # Dest resolution deferred to after arg parsing so --respect-env can take effect.
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -773,10 +787,49 @@ index_dest_for_collisions() {
     done < <(find "${dest_walk[@]}" -type f -print0 2>/dev/null)
 }
 
+# Single owner of content-identity policy for BOTH renderers (human + JSON):
+# per-relpath verdict identical|divergent|unverified over the XSRC index.
+xsrc_identity_verdicts() {
+    local py; py="$(require_python)"
+    "$py" - "$XSRC_INDEX" <<'PYIDENT'
+import sys, json, hashlib
+from collections import defaultdict
+by_rel = defaultdict(list)
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 6:
+                by_rel[parts[0]].append(parts[5])
+except OSError:
+    print("{}"); raise SystemExit
+def sha(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+out = {}
+for rel, paths in by_rel.items():
+    if len(paths) < 2:
+        continue
+    hs = [sha(p) for p in paths]
+    if None in hs:
+        out[rel] = "unverified"
+    elif len(set(hs)) == 1:
+        out[rel] = "identical"
+    else:
+        out[rel] = "divergent"
+json.dump(out, sys.stdout)
+PYIDENT
+}
+
 report_cross_source() {
-    # Post-process XSRC_INDEX (TSV: relpath\ttag\tclass\tmtime\tsize) and print
-    # any relpath that appears in 2+ rows (cross-source / dest collision).
-    # Emits a compact per-class summary + a per-class detail list (capped).
+    # Print every relpath appearing in 2+ XSRC_INDEX rows (cross-source / dest
+    # collision) as a per-class summary + capped per-class detail list.
     local total_xs total_xs_files
     total_xs_files="$(awk -F'\t' '{print $1}' "$XSRC_INDEX" | sort -u | wc -l | tr -d ' ')"
     total_xs="$(awk -F'\t' '
@@ -794,44 +847,18 @@ report_cross_source() {
         return
     fi
 
-    # Identical-content collisions: byte-verified (sha256 over every entry of
-    # the relpath). An unreadable entry fails closed to divergent — a proxy
-    # match (mtime+size) must never certify content identity.
-    local total_identical
-    total_identical="$(python3 - "$XSRC_INDEX" <<'PYIDENT'
-import sys, hashlib
-from collections import defaultdict
-by_rel = defaultdict(list)
-try:
-    with open(sys.argv[1]) as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) >= 6:
-                by_rel[parts[0]].append(parts[5])
-except OSError:
-    print(0); raise SystemExit
-def sha(path):
-    try:
-        h = hashlib.sha256()
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
-        return None
-ident = 0
-for rel, paths in by_rel.items():
-    if len(paths) < 2:
-        continue
-    hs = {sha(p) for p in paths}
-    if None not in hs and len(hs) == 1:
-        ident += 1
-print(ident)
-PYIDENT
-)"
+    # Verdicts come from the single identity owner (xsrc_identity_verdicts);
+    # an unreadable entry is UNVERIFIED — never certified, never called divergent.
+    local verdicts total_identical total_unverified
+    verdicts="$(xsrc_identity_verdicts)"
+    read -r total_identical total_unverified <<<"$("$(require_python)" -c \
+'import sys,json;v=json.load(sys.stdin);print(sum(1 for x in v.values() if x=="identical"), sum(1 for x in v.values() if x=="unverified"))' <<<"$verdicts")"
 
     REPORT_LINES+=("  of which identical-content (byte-verified):  $total_identical (commit will pick one canonical + skip rest)")
-    REPORT_LINES+=("  genuine cross-source conflicts (need strategy):  $((total_xs - total_identical))")
+    if [ "$total_unverified" -gt 0 ]; then
+        REPORT_LINES+=("  unverified (could not hash — fix permissions, re-scan):  $total_unverified")
+    fi
+    REPORT_LINES+=("  genuine cross-source conflicts (need strategy):  $((total_xs - total_identical - total_unverified))")
 
     # Per-class breakdown of cross-source collisions
     REPORT_LINES+=("  by class:")
@@ -2163,14 +2190,14 @@ rollback_main() {
 }
 
 emit_json() {
-    # Reads XSRC_INDEX (TSV) + the resolved source paths/state and emits a
-    # machine-readable JSON dump for downstream tooling (dashboards, skill
-    # wrappers, the eventual --commit dry-run UI). Python3 is the bash-friendly
-    # path — sutando already requires it.
-    python3 - "$DEST_REAL" "$A_REAL_OK" "$B_REAL_OK" "$C_REAL_OK" "$XSRC_INDEX" <<'PY'
+    # Machine-readable JSON for downstream tooling. Identity verdicts come from
+    # xsrc_identity_verdicts (single policy owner shared with the human report).
+    local py vf; py="$(require_python)"; vf="$(mktemp)"
+    xsrc_identity_verdicts > "$vf"
+    "$py" - "$DEST_REAL" "$A_REAL_OK" "$B_REAL_OK" "$C_REAL_OK" "$XSRC_INDEX" "$vf" <<'PY'
 import json, sys, os
 from collections import defaultdict
-dest, a, b, c, idx_path = sys.argv[1:6]
+dest, a, b, c, idx_path, verdicts_path = sys.argv[1:7]
 entries = []
 if os.path.exists(idx_path):
     with open(idx_path) as f:
@@ -2185,23 +2212,14 @@ by_rel = defaultdict(list)
 for e in entries:
     by_rel[e["rel"]].append(e)
 collisions = {k: v for k, v in by_rel.items() if len(v) > 1}
-import hashlib
-def _sha(path):
-    try:
-        h = hashlib.sha256()
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
-        return None
-def byte_identical(v):
-    """Content identity is HASH identity; an unreadable entry fails closed to
-    divergent — a proxy match (mtime+size) must never certify it."""
-    hs = {_sha(e["path"]) for e in v}
-    return None not in hs and len(hs) == 1
-ident_verdict = {k: byte_identical(v) for k, v in collisions.items()}
-identical = sum(1 for x in ident_verdict.values() if x)
+with open(verdicts_path) as vf:
+    _verdicts = json.load(vf)
+# Tri-state from the shared owner: True / False / None (None = could not hash;
+# unverified is its own actionable class, never rendered as proven divergence).
+_MAP = {"identical": True, "divergent": False, "unverified": None}
+ident_verdict = {k: _MAP[_verdicts.get(k, "unverified")] for k in collisions}
+identical = sum(1 for x in ident_verdict.values() if x is True)
+unverified = sum(1 for x in ident_verdict.values() if x is None)
 genuine = len(collisions) - identical
 by_class = defaultdict(int)
 for v in collisions.values():
@@ -2211,12 +2229,12 @@ def has_size_mismatch(entries):
     return len({e["size"] for e in entries}) > 1
 def has_mtime_mismatch(entries):
     return len({e["mtime"] for e in entries}) > 1
-# Sort by actionability: any byte-divergent collision whose proxies agree
-# (equal mtime+size, different content) is as real as a size mismatch and
-# sorts first with it; then mtime-only, then byte-identical (drop-dup).
+# Actionability sort: size-mismatch, verified-divergent-with-agreeing-proxies,
+# and unverified first; then mtime-only; byte-identical (drop-dup) last.
 def sort_key(item):
     k, v = item
-    if has_size_mismatch(v) or not ident_verdict[k]:
+    if has_size_mismatch(v) or ident_verdict[k] is None or (
+            ident_verdict[k] is False and not has_mtime_mismatch(v)):
         prio = 0
     elif has_mtime_mismatch(v):
         prio = 1
@@ -2231,10 +2249,11 @@ notable = [{"class": v[0]["class"], "rel": k,
            for k, v in sorted(collisions.items(), key=sort_key)]
 size_diff = sum(1 for v in collisions.values() if has_size_mismatch(v))
 mtime_only = sum(1 for k, v in collisions.items() if not has_size_mismatch(v)
-                 and has_mtime_mismatch(v) and not ident_verdict[k])
+                 and has_mtime_mismatch(v) and ident_verdict[k] is False)
+# Only two successfully-read, differing hashes may claim proven divergence.
 proxy_identical_divergent = sum(
     1 for k, v in collisions.items()
-    if not has_size_mismatch(v) and not has_mtime_mismatch(v) and not ident_verdict[k])
+    if not has_size_mismatch(v) and not has_mtime_mismatch(v) and ident_verdict[k] is False)
 out = {
     "dest": dest,
     "sources": {"A": a or None, "B": b or None, "C": c or None},
@@ -2244,9 +2263,11 @@ out = {
         "identical_content": identical,  # byte-verified, never proxy-inferred
         "mtime_only_diff": mtime_only,  # commit's newest-mtime auto-resolves
         "size_mismatch": size_diff,     # actionable — real content conflicts
-        # Actionable — equal mtime+size but different bytes; the proxies lie here.
+        # Actionable — equal mtime+size but PROVEN different bytes (both read OK).
         "proxy_identical_divergent": proxy_identical_divergent,
-        "genuine_conflicts": genuine,   # collisions - byte-identical
+        # Actionable — hash failed (unreadable entry); fix permissions, re-scan.
+        "identity_unverified": unverified,
+        "genuine_conflicts": genuine,   # collisions - byte-identical (incl. unverified)
 
         "by_class": dict(by_class),
     },
