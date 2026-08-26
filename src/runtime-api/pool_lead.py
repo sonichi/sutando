@@ -78,6 +78,10 @@ class PoolLead:
         runtime_fn(instance) -> 'claude'|'codex'; absent means all-claude,
         which is what every pool was before the runtime dimension existed."""
         self.runtime_fn = runtime_fn or (lambda _inst: "claude")
+        # tie-break memory: an all-idle pool must rotate, not always pick the
+        # lexicographically-first follower (measured: core-1 took 50% of all
+        # assignments because every load-tie broke to the same name)
+        self._last_pick: "dict[str, float]" = {}
         self.tasks_dir = Path(tasks_dir)
         self.state_dir = Path(state_dir)
         self.results_dir = (Path(results_dir) if results_dir
@@ -131,7 +135,10 @@ class PoolLead:
                      if len(followers) > 1 else None)
         if lane == "routine" and lane_core is not None:
             return lane_core
-        primary = [f for f in followers if f != lane_core] or followers
+        # owner lane prefers claude seats: a codex follower's wrapper polls on
+        # a timer (measured p50 87s idle vs 291s), so it serves as overflow only
+        primary = ([f for f in eligible if f != lane_core]
+                   or [f for f in followers if f != lane_core] or followers)
         if channel:
             row = affinity.get(channel)
             if (isinstance(row, dict) and row.get("instance") in primary
@@ -140,11 +147,15 @@ class PoolLead:
                     # a backlogged handler serializes the whole channel;
                     # parallelism outranks continuity past this depth
                     and self._load(row["instance"]) < AFFINITY_BUSY_MAX):
+                self._last_pick[str(row["instance"])] = self.now()
                 return row["instance"]
-        pick = min(primary, key=lambda f: (self._load(f), str(f)))
+        # equal load -> least-recently-picked, so an idle pool round-robins
+        pick = min(primary, key=lambda f: (
+            self._load(f), self._last_pick.get(str(f), 0.0), str(f)))
         if (lane_core is not None and self._load(pick) >= AFFINITY_BUSY_MAX
                 and self._load(lane_core) == 0):
-            return lane_core  # overflow: whole owner lane saturated, lane idle
+            pick = lane_core  # overflow: owner lane saturated, lane idle
+        self._last_pick[str(pick)] = self.now()
         return pick
 
     # ── the sweep ───────────────────────────────────────────────────────────

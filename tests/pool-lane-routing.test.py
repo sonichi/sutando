@@ -149,14 +149,15 @@ class RuntimeAwareLaneTests(LaneBase):
         lead.sweep()
         self.assertEqual(self._assigned_to("task-r1"), "core-2")
 
-    def test_owner_work_avoids_the_lane_core_not_the_codex_core(self):
-        # core-2 is the lane; core-3 (codex) is back in the owner pool.
+    def test_owner_work_queues_on_claude_over_idle_codex(self):
+        # owner 2026-08-26: a codex seat is turnaround-slow, so owner work
+        # waits behind a lightly-loaded claude seat rather than landing there.
         lead = self._lead({"core-1": "claude", "core-2": "claude",
                            "core-3": "codex"})
         self._occupy("core-1", 1)
         self._write("task-o1.txt", owner_task())
         lead.sweep()
-        self.assertEqual(self._assigned_to("task-o1"), "core-3")
+        self.assertEqual(self._assigned_to("task-o1"), "core-1")
 
     def test_all_codex_pool_still_has_a_lane(self):
         lead = self._lead({"core-1": "codex", "core-2": "codex"})
