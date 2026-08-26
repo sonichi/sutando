@@ -126,7 +126,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         }])
 
     def test_RECORDER_liveness_check_can_FAIL(self) -> None:
-        """Falsification control: break the writer, require the oracle to notice."""
+        """Falsification control. The mutant is a FLAG, not a text edit: rc and
+        streams must stay identical, so a pass cannot be a shim that never ran."""
         import json
         import subprocess
         import uuid
@@ -134,21 +135,31 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         known = self._write("src/a", [], 1700000000)
         bin_ = self._gnu_stat_shim()
         trace = self._trace
+        argv = ["stat", f"--sutando-shim-probe={call_id}", str(known)]
+        env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
+
+        live = subprocess.run(argv, capture_output=True, text=True, env=env)
+        self.assertEqual(
+            len([l for l in trace.read_text().splitlines() if l.strip()]), 1,
+            "unmutated shim must record exactly one result")
+
         shim = bin_ / "stat"
         src = shim.read_text()
-        needle = '    with open(TRACE, "a") as fh:'
+        needle = "DROP_RESULTS = False"
         self.assertEqual(src.count(needle), 1,
-                         f"mutant needle not found ({needle!r}) - control would be inert")
-        shim.write_text(src.replace(needle, "    return  # MUTANT: writer dead"))
+                         f"mutant needle absent ({needle!r}) - control would be inert")
+        shim.write_text(src.replace(needle, "DROP_RESULTS = True"))
         shim.chmod(0o755)
+        trace.write_text("")
 
-        env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
-        subprocess.run(["stat", f"--sutando-shim-probe={call_id}", str(known)],
-                       capture_output=True, text=True, env=env)
-        records = ([json.loads(l) for l in trace.read_text().splitlines() if l.strip()]
-                   if trace.exists() else [])
+        dead = subprocess.run(argv, capture_output=True, text=True, env=env)
+        self.assertEqual(
+            (dead.returncode, dead.stdout, dead.stderr),
+            (live.returncode, live.stdout, live.stderr),
+            "mutant changed observable behavior - it is not a recorder-only control")
+        records = [json.loads(l) for l in trace.read_text().splitlines() if l.strip()]
         self.assertEqual(records, [],
-                         "control is inert: a dead writer still produced records")
+                         "control is inert: a suppressed writer still produced records")
 
     @staticmethod
     def _disable_subsecond(src: str) -> str:
@@ -179,54 +190,60 @@ import os, sys, time, json as _j
 a = sys.argv[1:]
 TRACE, NONCE, RUN_ID = __TRACE__, __NONCE__, __RUNID__
 _POISON, _SYNTH, _SYNTH9 = __POISON__, __SYNTH__, __SYNTH9__
+DROP_RESULTS = False
 
-def finish(rc, out, err, operand="", call_id=""):
+def record_result(rec):
+    if DROP_RESULTS:
+        return
     with open(TRACE, "a") as fh:
-        fh.write(_j.dumps({"v": 1, "kind": "result", "run_id": RUN_ID,
-                           "call_id": call_id, "argv": a, "operand": operand,
-                           "rc": rc, "stdout": out, "stderr": err}) + "\n")
+        fh.write(_j.dumps(rec) + "\n")
         fh.flush(); os.fsync(fh.fileno())
+
+def finish(argv, operand, call_id, rc, out, err):
+    record_result({"v": 1, "kind": "result", "run_id": RUN_ID,
+                   "call_id": call_id, "argv": argv, "operand": operand,
+                   "rc": rc, "stdout": out, "stderr": err})
     sys.stdout.write(out); sys.stderr.write(err)
-    sys.exit(rc)
+    raise SystemExit(rc)
 
 def _key(pth):
     return os.path.basename(os.path.dirname(os.path.dirname(pth)))
 
-if a and a[0].startswith("--sutando-shim-probe="):
-    _cid = a[0].split("=", 1)[1]
-    finish(0, "SHIM-LIVE-" + _cid + "\n", "", os.path.realpath(a[1]), _cid)
-
-if not a or a[0] == "-f":
-    if len(a) > 2 and a[1] == "%Fm" and _key(a[2]) in _POISON:
-        finish(1, _POISON[_key(a[2])] + "\n", "", os.path.realpath(a[2]))
-    _op = os.path.realpath(a[2]) if len(a) > 2 else ""
-    finish(1, '  File: "x"\n    ID: 0 Namelen: 255\n',
-           "stat: cannot read file system information\n" + NONCE + "\n", _op)
-
-if a[0] != "-c":
-    finish(1, "", "")
-
-fmt, f = a[1], a[2]
-st = os.stat(f)
-sep = "," if os.environ.get("LC_ALL") != "C" else "."
-_k = _key(f)
-if fmt == "%.9Y":
-    if _k in _SYNTH9:
-        _w, _n = _SYNTH9[_k]
-    elif _k in _SYNTH:
-        _w, _n = _SYNTH[_k]
+def dispatch(a):
+    if a and a[0].startswith("--sutando-shim-probe="):
+        _cid = a[0].split("=", 1)[1]
+        return os.path.realpath(a[1]), _cid, 0, "SHIM-LIVE-" + _cid + "\n", ""
+    if not a or a[0] == "-f":
+        if len(a) > 2 and a[1] == "%Fm" and _key(a[2]) in _POISON:
+            return os.path.realpath(a[2]), "", 1, _POISON[_key(a[2])] + "\n", ""
+        _op = os.path.realpath(a[2]) if len(a) > 2 else ""
+        return (_op, "", 1, '  File: "x"\n    ID: 0 Namelen: 255\n',
+                "stat: cannot read file system information\n" + NONCE + "\n")
+    if a[0] != "-c":
+        return "", "", 1, "", ""
+    fmt, f = a[1], a[2]
+    st = os.stat(f)
+    sep = "," if os.environ.get("LC_ALL") != "C" else "."
+    _k, op = _key(f), os.path.realpath(f)
+    if fmt == "%.9Y":
+        if _k in _SYNTH9:
+            _w, _n = _SYNTH9[_k]
+        elif _k in _SYNTH:
+            _w, _n = _SYNTH[_k]
+        else:
+            _w, _n = int(st.st_mtime), st.st_mtime_ns % 1000000000
+        out = "%d%s%09d\n" % (_w, sep, _n)
+    elif fmt == "%Y":
+        out = str(_SYNTH[_k][0] if _k in _SYNTH else int(st.st_mtime)) + "\n"
+    elif fmt in ("%s", "%z"):
+        out = str(st.st_size) + "\n"
+    elif fmt == "%y":
+        out = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)) + "\n"
     else:
-        _w, _n = int(st.st_mtime), st.st_mtime_ns % 1000000000
-    out = "%d%s%09d\n" % (_w, sep, _n)
-elif fmt == "%Y":
-    out = str(_SYNTH[_k][0] if _k in _SYNTH else int(st.st_mtime)) + "\n"
-elif fmt in ("%s", "%z"):
-    out = str(st.st_size) + "\n"
-elif fmt == "%y":
-    out = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)) + "\n"
-else:
-    finish(1, "", "", os.path.realpath(f))
-finish(0, out, "", os.path.realpath(f))
+        return op, "", 1, "", ""
+    return op, "", 0, out, ""
+
+finish(a, *dispatch(a))
 """
         for token, value in (("__TRACE__", repr(str(self._trace))),
                              ("__NONCE__", repr(nonce)),
