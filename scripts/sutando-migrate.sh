@@ -235,9 +235,7 @@ CLASS_RULES=(
     "state/contextual-chips.json|structural"
     # A pin names a LOCAL pid + lstart, so it is meaningless on another host and
     # a union can never express the removal the cleanup contract prescribes.
-    # Same-host path move, so the pinned pid is still LIVE at the destination.
-    # Structural (per-host copies) for the state/auth reason: never newest-mtime.
-    "state/process-pins.json|structural"
+    "state/process-pins.json|skip-ephemeral"
     # Accumulated grants, not a snapshot: newest-mtime drops the whole
     # allow-set when a fresh install writes an empty one first.
     "state/slack-allowed-recipients.json|union-json-array"
