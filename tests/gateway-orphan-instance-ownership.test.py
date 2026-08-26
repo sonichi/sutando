@@ -23,6 +23,9 @@ for _p in (REPO / "packages" / "ag2-sparrow", REPO / "src"):
         sys.path.insert(0, str(_p))
 
 
+_LOG_TMPDIRS: "list" = []   # fixture log dirs, one per re-import
+
+
 def _bridge(instance):
     """Import the bridge fresh with GATEWAY_INSTANCE set (or cleared).
 
@@ -35,7 +38,16 @@ def _bridge(instance):
         os.environ.pop("GATEWAY_INSTANCE", None)
     for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
         del sys.modules[name]
-    return importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+    mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+    # Bind the module logger into a fixture dir: _log appends to the REAL
+    # ~/.ag2-sparrow log otherwise, forging "orphan sweep: recovered +
+    # delivered" lines — the exact artifact class the live witness is read
+    # from. Logger-level, so new _log call sites stay contained too.
+    log_tmp = tempfile.TemporaryDirectory()
+    _LOG_TMPDIRS.append(log_tmp)          # keep alive for the module's life
+    mod._LOG_DIR = Path(log_tmp.name)
+    mod._LOG_FILE = Path(log_tmp.name) / "gateway-bridge.log"
+    return mod
 
 
 class OwnershipMatrix(unittest.TestCase):
