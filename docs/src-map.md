@@ -27,6 +27,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
+- **`channel_env_containment.py`** — Shared containment policy for a channel's `.env` credential file.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
 - **`chat_redaction.py`** — The chat-body redaction CHAIN, owned in one place.
@@ -63,6 +64,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`discord_proactive_send.py`** — Send-leg of proactive text delivery through the shared DeliveryProvider.
 - **`discord_reader.py`** — Alias of `channels.discord.reader` (phase-1a restructure); one transition window.
 - **`discord_rest_client.py`** — Alias of `channels.discord.client` (phase-1a restructure); one transition window.
+- **`discord_result_delivery.py`** — Discord result-delivery state, bound to the shared outbox (#3279 action 2).
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
@@ -145,6 +147,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
+- **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
