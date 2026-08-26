@@ -173,19 +173,27 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         writer that never emits them could still be framed by them."""
         self._gnu_stat_shim()
         one = json.dumps(self._one_valid_record())
-        for label, payload in (
-                ("terminal bare CR", (one + "\r").encode()),
-                ("CR-separated pair", (one + "\r" + one + "\n").encode()),
-                ("U+2028-separated pair", (one + "\u2028" + one + "\n").encode()),
+        # Pin the REASON, not just "some AssertionError": with the utf-8 handler
+        # removed, json.loads still raises and a generic assertRaises passes.
+        for label, payload, needle in (
+                ("terminal bare CR", (one + "\r").encode(),
+                 "does not end in a newline"),
+                ("CR-separated pair", (one + "\r" + one + "\n").encode(),
+                 "is not JSON"),
+                ("U+2028-separated pair", (one + "\u2028" + one + "\n").encode(),
+                 "is not JSON"),
+                ("invalid UTF-8", b"\xff\n", "is not UTF-8"),
         ):
             with self.subTest(framing=label):
                 self._trace.write_bytes(payload)
-                with self.assertRaises(AssertionError):
+                with self.assertRaises(AssertionError) as caught:
                     self._read_trace()
+                self.assertIn(needle, str(caught.exception))
 
         # CRLF stays acceptable: json tolerates the trailing \r as whitespace.
+        # Compare the RECORD, not the count — a dummy single row satisfies len==1.
         self._trace.write_bytes((one + "\r\n").encode())
-        self.assertEqual(len(self._read_trace()), 1)
+        self.assertEqual(self._read_trace(), [self._one_valid_record()])
 
     def test_TRACE_CONTRACT_rejects_a_same_length_wrong_record(self) -> None:
         """Calibrates the equal-length branch. A validator that returns on any
