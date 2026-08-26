@@ -56,21 +56,27 @@ def _fresh_import():
     outside the fixture tree is touched — file-ACCESS isolation, not the
     narrower token-value equality (review finding 7)."""
     import builtins
+    import io
     opened = []
     real_open = builtins.open
+    real_io_open = io.open
     def _spy(file, *a, **kw):
         try:
             opened.append(str(os.fspath(file)))
         except TypeError:
             pass
-        return real_open(file, *a, **kw)
+        return real_io_open(file, *a, **kw)
     for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
         del sys.modules[name]
+    # Patch BOTH names: pathlib routes through io.open, not builtins.open,
+    # so a builtins-only spy misses Path.read_text-style reads.
     builtins.open = _spy
+    io.open = _spy
     try:
         mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
     finally:
         builtins.open = real_open
+        io.open = real_io_open
     sensitive = [p for p in opened
                  if (("channels" in p and "ag2space" in p)
                      or p.endswith("device.env") or p.endswith("/.env"))]
