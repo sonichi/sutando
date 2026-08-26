@@ -5928,7 +5928,7 @@ def check_live_tree_drift(repo_root: "Path | None" = None,
     Diagnostic only — reconciliation needs an attended restart window."""
     import subprocess as _sp
     name = "live-tree-drift"
-    root = Path(repo_root) if repo_root else Path(__file__).resolve().parent.parent
+    root = Path(repo_root) if repo_root else REPO_DIR
     def _git(*args):
         r = _sp.run(["git", "-C", str(root), *args],
                     capture_output=True, text=True, timeout=20)
