@@ -116,14 +116,26 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self.assertEqual(cp.stdout, expected_stdout)
         self.assertEqual(cp.stderr, "")
 
-        # read-only validator: raw bytes, never invokes the shim, never repairs
-        records = [json.loads(l) for l in
-                   trace.read_text().splitlines() if l.strip()]
+        records = self._read_trace()
         self.assertEqual(records, [{                          # parent-defined
             "v": 1, "kind": "result", "run_id": run_id, "call_id": call_id,
             "argv": argv, "operand": str(known.resolve()),
             "rc": 0, "stdout": expected_stdout, "stderr": "",
         }])
+
+    def test_TRACE_READER_rejects_a_corrupt_line(self) -> None:
+        """A corrupt record and an absent one must not look alike. The old
+        per-site readers skipped malformed lines, making them indistinguishable."""
+        self._gnu_stat_shim()
+        self._trace.write_text('{"v": 1, "kind": "result"\n')       # truncated JSON
+        with self.assertRaises(AssertionError) as caught:
+            self._read_trace()
+        self.assertIn("not JSON", str(caught.exception))
+
+        self._trace.write_text(json.dumps({"v": 1, "kind": "result"}) + "\n")
+        with self.assertRaises(AssertionError) as caught:
+            self._read_trace()                                       # well-formed, wrong schema
+        self.assertIn("schema mismatch", str(caught.exception))
 
     def test_RECORDER_liveness_check_can_FAIL(self) -> None:
         """Falsification control. The mutant is a FLAG, not a text edit: rc and
@@ -157,9 +169,34 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             (dead.returncode, dead.stdout, dead.stderr),
             (live.returncode, live.stdout, live.stderr),
             "mutant changed observable behavior - it is not a recorder-only control")
-        records = [json.loads(l) for l in trace.read_text().splitlines() if l.strip()]
+        records = self._read_trace()
         self.assertEqual(records, [],
                          "control is inert: a suppressed writer still produced records")
+
+    _TRACE_KEYS = {"v", "kind", "run_id", "call_id", "argv",
+                   "operand", "rc", "stdout", "stderr"}
+
+    def _read_trace(self, *, run_id: str | None = None) -> list[dict]:
+        """Sole reader of the trace. Malformed lines RAISE rather than skip: a
+        corrupt record and an absent one must not look alike to any caller."""
+        raw = self._trace.read_text() if self._trace.exists() else ""
+        out = []
+        for n, ln in enumerate(raw.splitlines(), 1):
+            if not ln.strip():
+                continue
+            try:
+                rec = json.loads(ln)
+            except ValueError as exc:
+                raise AssertionError(f"trace line {n} is not JSON ({exc}): {ln[:120]!r}")
+            if not isinstance(rec, dict) or set(rec) != self._TRACE_KEYS:
+                raise AssertionError(
+                    f"trace line {n} schema mismatch: {sorted(rec) if isinstance(rec, dict) else type(rec).__name__}")
+            if rec["v"] != 1 or rec["kind"] != "result":
+                raise AssertionError(f"trace line {n}: v={rec['v']!r} kind={rec['kind']!r}")
+            if run_id is not None and rec["run_id"] != run_id:
+                continue
+            out.append(rec)
+        return out
 
     @staticmethod
     def _disable_subsecond(src: str) -> str:
@@ -282,20 +319,11 @@ finish(a, *dispatch(a))
         src/attacker/... Require (flag, fmt, exact path) for every required
         format against BOTH files the comparator must stat.
         """
-        import json
-        seen = self._trace.read_text() if self._trace.exists() else ""
         calls = set()
-        for ln in seen.splitlines():
-            try:
-                rec = json.loads(ln)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict) or rec.get("kind") != "result":
-                continue
-            if rec.get("run_id") != self._run_id or not rec.get("operand"):
-                continue
-            argv = rec.get("argv") or []
-            if len(argv) < 3:
+        for rec in self._read_trace(run_id=self._run_id):
+            argv = rec["argv"]
+            # the reserved probe carries 2 argv elements; stat calls carry 3
+            if len(argv) < 3 or not rec["operand"]:
                 continue
             # macOS resolves /var -> /private/var, so compare resolved operands
             calls.add((argv[0], argv[1], str(Path(rec["operand"]).resolve())))
