@@ -12,6 +12,7 @@ must fail them -- the previous suite stayed green through exactly that deletion.
 """
 from __future__ import annotations
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -77,6 +78,57 @@ class ProxyPinWithdrawsRestartAdvice(unittest.TestCase):
         d = self._identity(None)["detail"]
         self.assertIn("Then restart the proxy", d)
         self.assertNotIn("DO NOT RESTART", d)
+
+
+# Any phrasing that TELLS the owner to replace the process. Asserting the bare word
+# "reload" cannot work: the veto sentence contains it ("DO NOT RESTART or reload"),
+# so a substring check passes on the prohibition and the instruction alike.
+_IMPERATIVE = re.compile(r"(then reload it|reload it FIRST|Then restart the proxy|and reload it)",
+                         re.IGNORECASE)
+
+
+class VetoGatesEveryRemedyBranch(unittest.TestCase):
+    """A pin must silence BOTH remedy branches, not just the process one.
+
+    `_quota_identity_verdict` builds the plist remedy and returns before the veto
+    clause is reached, so a pinned proxy on the plist-fallback path still read
+    "then reload it". The prior regression forced the process branch only, and
+    rejected just the literal "Then restart the proxy", so it passed 5/5 while
+    two live reload prescriptions survived.
+    """
+
+    def _detail(self, veto, from_proc, plist):
+        def _svc(cfg):
+            return "Claude Code-credentials" if cfg == "/core/cfg" else "Claude Code-credentials-other"
+        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": "/core/cfg"}), \
+             patch.object(hc, "_resolved_credential_service", _svc), \
+             patch.object(hc, "_proxy_config_dir_from_process", return_value=from_proc), \
+             patch.object(hc.Path, "is_file", lambda self: plist):
+            return hc.check_quota_account_identity(
+                "ok", core_env_prober=lambda *a, **k: True, restart_veto=veto)["detail"]
+
+    def test_plist_fallback_pinned_carries_the_veto_and_no_imperative(self):
+        d = self._detail(PIN, hc._PROXY_ENV_UNREADABLE, True)
+        self.assertIn("DO NOT RESTART", d)
+        self.assertEqual(_IMPERATIVE.findall(d), [])
+
+    def test_plist_fallback_unpinned_keeps_its_reload(self):
+        d = self._detail(None, hc._PROXY_ENV_UNREADABLE, True)
+        self.assertNotIn("DO NOT RESTART", d)
+        self.assertTrue(_IMPERATIVE.search(d))
+
+    def test_process_with_installed_plist_pinned_drops_reload_FIRST(self):
+        d = self._detail(PIN, "/other/cfg", True)
+        self.assertIn("DO NOT RESTART", d)
+        self.assertEqual(_IMPERATIVE.findall(d), [])
+
+    def test_process_with_installed_plist_unpinned_keeps_both(self):
+        d = self._detail(None, "/other/cfg", True)
+        self.assertTrue(_IMPERATIVE.search(d))
+
+    def test_every_pinned_row_keeps_the_diagnosis(self):
+        for fp, pl in ((hc._PROXY_ENV_UNREADABLE, True), ("/other/cfg", True), ("/other/cfg", False)):
+            self.assertIn("DIFFERENT login", self._detail(PIN, fp, pl))
 
 
 if __name__ == "__main__":

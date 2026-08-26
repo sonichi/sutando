@@ -5131,6 +5131,14 @@ def _quota_identity_verdict(name: str, core_cfg: Optional[str],
                            f"({core_service}) — name match only; this check "
                            f"does not read tokens")}
 
+    # ONE veto string, consulted by BOTH remedy branches. The plist branch used to
+    # terminate before the veto clause, so a pinned proxy still read "then reload it".
+    _veto_tail = (
+        f"DO NOT RESTART or reload the proxy: {restart_veto}. Either would replace the "
+        f"process and destroy that state; the diagnosis above stands without it — correct "
+        f"the configuration and leave the proxy running."
+    ) if restart_veto else None
+
     return {
         "name": name,
         "status": "warn",
@@ -5149,7 +5157,8 @@ def _quota_identity_verdict(name: str, core_cfg: Optional[str],
                 f"(launchd inherits no shell env): "
                 f"proxy plist has {'no' if not proxy_cfg else repr(proxy_cfg)} value. "
                 f"Fix: pin CLAUDE_CONFIG_DIR in "
-                f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist, then reload it."
+                f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist"
+                + (f". {_veto_tail}" if _veto_tail else ", then reload it.")
                 if source == "plist" else
                 # Reaching the process path says nothing about who STARTED it,
                 # so "not launchd-managed" would assert state never checked.
@@ -5158,17 +5167,16 @@ def _quota_identity_verdict(name: str, core_cfg: Optional[str],
                 + (
                     f"A credential-proxy plist IS installed, so the proxy may be "
                     f"launchd-managed: correct CLAUDE_CONFIG_DIR in "
-                    f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist and reload it "
-                    f"FIRST — under KeepAlive a bare restart is respawned with the plist's "
-                    f"environment and the fix does not stick. "
+                    f"~/Library/LaunchAgents/com.sutando.credential-proxy.plist. "
+                    + ("" if _veto_tail else
+                       "Reload it FIRST — under KeepAlive a bare restart is respawned with "
+                       "the plist's environment and the fix does not stick. ")
                     if plist_present else
                     f"No credential-proxy plist is installed, so there is none to correct. "
                 )
                 + (
-                    f"DO NOT RESTART the proxy: {restart_veto}. Restarting it would "
-                    f"destroy that process state, and the diagnosis above stands "
-                    f"without it — correct the configuration and leave the proxy up."
-                    if restart_veto else
+                    _veto_tail
+                    if _veto_tail else
                     f"Then restart the proxy with CLAUDE_CONFIG_DIR set to this core's "
                     f"({core_cfg!r}). Restarting it changes "
                     f"which account subsequent requests bill, so confirm that is the intended "
