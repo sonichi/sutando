@@ -381,7 +381,9 @@ mtime_ns() {
     # localeconv()->decimal_point. Hence LC_ALL=C, and validate rather than trust.
     v=""
     for _c in "stat -f %Fm" "stat -c %.9Y" "stat -f %m" "stat -c %Y"; do
-        v="$(LC_ALL=C $_c "$f" 2>/dev/null || true)"
+        # `|| v=""` not `|| true`: numeric OUTPUT is not a successful CALL, and
+        # the `||` also keeps the errexit exemption a bare assignment would lose.
+        v="$(LC_ALL=C $_c "$f" 2>/dev/null)" || v=""
         case "$v" in ''|*[!0-9.]*) v="" ;; *) break ;; esac
     done
     case "$v" in

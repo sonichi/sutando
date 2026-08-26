@@ -91,7 +91,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"migrate failed:\n{r.stdout}\n{r.stderr}")
         return r
 
-    def _gnu_stat_shim(self, comma: bool = True, synth: dict | None = None) -> Path:
+    def _gnu_stat_shim(self, comma: bool = True, synth: dict | None = None,
+                       poison: dict | None = None) -> Path:
         """A faithful-enough GNU `stat` on PATH: -f is --file-system (fails),
         -c formats succeed, and fractions use the locale's decimal separator."""
         import uuid
@@ -107,7 +108,12 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "import json as _j\n"
             f"open({str(self._trace)!r}, 'a').write("
             f"_j.dumps(['{nonce}'] + a) + '\\n')\n"
+            f"_POISON = {poison or {}!r}\n"
             "if not a or a[0] == '-f':\n"
+            "    if len(a) > 2 and a[1] == '%Fm':\n"
+            "        _pk = os.path.basename(os.path.dirname(os.path.dirname(a[2])))\n"
+            "        if _pk in _POISON:\n"
+            "            print(_POISON[_pk]); sys.exit(1)\n"
             "    sys.stderr.write('stat: cannot read file system information\\n')\n"
             f"    sys.stderr.write('{nonce}\\n')\n"
             "    print('  File: \"x\"'); print('    ID: 0 Namelen: 255'); sys.exit(1)\n"
@@ -253,6 +259,29 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
                 self.assertEqual(status, "stale" if newer_is_release else "warn")
 
+
+    def test_FAILED_stat_call_printing_a_number_is_NOT_a_successful_answer(self) -> None:
+        """Numeric OUTPUT is not a successful CALL.
+
+        `-f %Fm` exits nonzero here while printing a plausible mtime. Honouring
+        rc, the loop must discard it and fall through to `-c %.9Y`. Ignoring rc
+        (the `|| true` this replaced), it takes the poisoned value and picks the
+        other winner.
+        """
+        SEC = 1700000000
+        synth = {"a": (SEC, 100000000), "dest": (SEC, 900000000)}   # -> dest wins
+        poison = {"a": f"{SEC + 99}.000000000"}                     # -> a wins, if trusted
+        bin_ = self._gnu_stat_shim(synth=synth, poison=poison)
+        armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+        self._write("src/a", armed, SEC + 5)
+        self._write("dest", [], SEC)
+        self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
+                                 "LC_ALL": "de_DE.UTF-8"})
+        status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
+        self.assertEqual(
+            status, "stale",
+            "a FAILED `-f %Fm` that printed a number was accepted as the answer: "
+            "the loop broke on numeric output instead of on a successful call")
 
     def test_GNU_migrator_CONSUMES_shim_values_not_host_stat(self) -> None:
         """Prove the shim's ANSWER drove the decision, not merely that it ran.
