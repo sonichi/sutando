@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -78,7 +80,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         os.utime(f, (mtime, mtime))
         return f
 
-    def _migrate(self, extra_env=None):
+    def _migrate(self, extra_env=None, *, expect_rc=0):
         env = dict(os.environ)
         if extra_env:
             env.update(extra_env)
@@ -92,7 +94,14 @@ class PinMigrationVisibilityTest(unittest.TestCase):
              "--no-confirm", "--no-claude-import", "--no-hook-bridge",
              "--no-channel-bridge"],
             capture_output=True, text=True, env=env, timeout=180)
-        self.assertEqual(r.returncode, 0, f"migrate failed:\n{r.stdout}\n{r.stderr}")
+        # expect_rc=None defers the check so a row asserts its own property
+        # first; otherwise every defect fails on the exit code and stops discriminating.
+        if expect_rc == 0:
+            self.assertEqual(r.returncode, 0, f"migrate failed:\n{r.stdout}\n{r.stderr}")
+        elif expect_rc == "nonzero":
+            self.assertNotEqual(
+                r.returncode, 0,
+                f"migrate was required to refuse and exited 0:\n{r.stdout}\n{r.stderr}")
         return r
 
     def test_RECORDER_is_live_independent_oracle_plus_falsification(self) -> None:
@@ -324,7 +333,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
 
     def _gnu_stat_shim(self, comma: bool = True, synth: dict | None = None,
                        poison: dict | None = None,
-                       synth9: dict | None = None) -> Path:
+                       synth9: dict | None = None, exhaust=None) -> Path:
         """GNU-ish `stat` whose ONE writer serves both production and the probe.
 
         A reserved --sutando-shim-probe argv takes the same finish() path, so a
@@ -342,6 +351,7 @@ import os, sys, time, json as _j
 a = sys.argv[1:]
 TRACE, RUN_ID = __TRACE__, __RUNID__
 _POISON, _SYNTH, _SYNTH9 = __POISON__, __SYNTH__, __SYNTH9__
+_EXHAUST = __EXHAUST__
 DROP_RESULTS = False
 
 def record_result(rec):
@@ -374,6 +384,11 @@ def dispatch(a):
     if a[0] != "-c":
         return "", "", 1, "", ""
     fmt, f = a[1], a[2]
+    if _key(f) in _EXHAUST:
+        # Empty stdout + nonzero on every -c lane; the two -f lanes already
+        # fail, so mtime_ns exhausts exactly as it does on a real I/O error.
+        return (os.path.realpath(f), "", 1, "",
+                "stat: cannot stat '" + f + "': Input/output error\n")
     st = os.stat(f)
     sep = "," if os.environ.get("LC_ALL") != "C" else "."
     _k, op = _key(f), os.path.realpath(f)
@@ -401,7 +416,8 @@ finish(a, *dispatch(a))
                              ("__RUNID__", repr(run_id)),
                              ("__POISON__", repr(poison or {})),
                              ("__SYNTH__", repr(synth or {})),
-                             ("__SYNTH9__", repr(synth9 or {}))):
+                             ("__SYNTH9__", repr(synth9 or {})),
+                             ("__EXHAUST__", repr(sorted(exhaust or [])))):
             tmpl = tmpl.replace(token, value)
         (bin_ / "stat").write_text(tmpl)
         (bin_ / "stat").chmod(0o755)
@@ -555,6 +571,173 @@ finish(a, *dispatch(a))
             status, "stale",
             "a FAILED `-f %Fm` that printed a number was accepted as the answer: "
             "the loop broke on numeric output instead of on a successful call")
+
+    _MTIME_LANES = (["-f", "%Fm"], ["-c", "%.9Y"], ["-f", "%m"], ["-c", "%Y"])
+
+    def _mtime_probes(self, operand):
+        """Ordered mtime-lane probes for one operand. Size/format reads excluded
+        so 'was it compared' cannot be answered by an unrelated stat."""
+        return [r for r in self._read_trace()
+                if r["operand"] == str(Path(operand).resolve())
+                and r["argv"][:2] in [list(x) for x in self._MTIME_LANES]]
+
+    def _sentinels(self):
+        return sorted(p.name for p in (self.tmp / "dest" / "state").glob(".migrated-from-*"))
+
+    def _collision(self, sec):
+        """One armed source/dest pair, returning both paths and their bytes."""
+        armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+        a = self._write("src/a", armed, sec + 5)
+        d = self._write("dest", [], sec)
+        return a, d, a.read_bytes(), d.read_bytes()
+
+    @staticmethod
+    def _extract_shipped_fn(name):
+        """The SHIPPED function text, not a restatement of it. Refuses on a
+        count other than one so a rename cannot silently test nothing."""
+        src = (REPO / "scripts" / "sutando-migrate.sh").read_text()
+        blocks = re.findall(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}$", src,
+                            re.S | re.M)
+        if len(blocks) != 1:
+            raise AssertionError(f"{name}(): found {len(blocks)} definitions, want 1")
+        return blocks[0]
+
+    def test_MTIME_NS_GRAMMAR_rows_against_the_shipped_function(self) -> None:
+        """Epoch zero, malformed values and exhaustion, driven through the
+        shipped mtime_ns. Epoch zero must stay a usable answer; exhaustion must
+        be distinguishable from it -- that collapse is what wrote the sentinel."""
+        fn = self._extract_shipped_fn("mtime_ns")
+        rows = [
+            # stat output,        expect_rc, expect_stdout
+            ("0",                  0, "0000000000"),
+            ("0.000000000",        0, "0000000000"),
+            ("1700000000",         0, "1700000000000000000"),
+            ("1700000000.5",       0, "1700000000500000000"),
+            ("1700000000.123456789", 0, "1700000000123456789"),
+            (".",                  1, ""),
+            ("1.2.3",              1, ""),
+            (".5",                 1, ""),
+            ("7.",                 1, ""),
+            ("abc",                1, ""),
+            ("",                   1, ""),          # exhaustion: empty on every lane
+        ]
+        binn = self.tmp / "grammarbin"
+        binn.mkdir()
+        for value, want_rc, want_out in rows:
+            with self.subTest(stat_returns=repr(value)):
+                # A stat that answers every lane with one fixture value; empty
+                # value also exits nonzero, which is what exhaustion looks like.
+                (binn / "stat").write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s' {shlex.quote(value + ('' if value == '' else chr(10)))}\n"
+                    f"exit {0 if value else 1}\n")
+                (binn / "stat").chmod(0o755)
+                r = subprocess.run(
+                    ["bash", "-c", f"set -euo pipefail\n{fn}\nmtime_ns /nonexistent"],
+                    capture_output=True, text=True,
+                    env={**os.environ, "PATH": f"{binn}:{os.environ['PATH']}"})
+                self.assertEqual(r.returncode, want_rc,
+                                 f"{value!r}: rc {r.returncode}, want {want_rc}")
+                self.assertEqual(r.stdout.strip(), want_out,
+                                 f"{value!r}: stdout {r.stdout.strip()!r}, want {want_out!r}")
+
+    def test_EXHAUSTION_WITNESS_unarmed_control_migrates(self) -> None:
+        """Control for the two exhaustion rows: same fixture, nothing armed.
+
+        Without it, 'no sentinel and unchanged bytes' is also what a migrator
+        that never ran produces -- the arming would certify nothing.
+        """
+        SEC = 1700000000
+        bin_ = self._gnu_stat_shim(synth9={"a": (SEC, 900000000),
+                                           "dest": (SEC, 100000000)})
+        a, d, a_bytes, _ = self._collision(SEC)
+        r = self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}"})
+        self.assertEqual(r.returncode, 0)
+        canonical = self.tmp / "dest" / "state" / "process-pins.json"
+        self.assertEqual(canonical.read_bytes(), a_bytes,
+                         "control: the newer source did not win, so the "
+                         "comparator never ran and the arming proves nothing")
+        self.assertTrue(self._sentinels(), "control: no sentinel was written")
+        self.assertTrue(self._mtime_probes(a), "control: source was never probed")
+        self.assertTrue(self._mtime_probes(d), "control: dest was never probed")
+        self.assertNotIn("AMBIGUOUS", r.stderr)
+
+    def test_EXHAUSTION_WITNESS_source_refuses_before_probing_dest(self) -> None:
+        """Source exhaustion: named refusal, nonzero rc, nothing written, and
+        the destination is never probed -- the short-circuit is observed, not read."""
+        SEC = 1700000000
+        bin_ = self._gnu_stat_shim(synth9={"a": (SEC, 900000000),
+                                           "dest": (SEC, 100000000)},
+                                   exhaust=["a"])
+        a, d, a_bytes, d_bytes = self._collision(SEC)
+        r = self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}"},
+                          expect_rc=None)
+        self.assertIn("AMBIGUOUS", r.stderr)
+        self.assertIn(str(a.resolve()), r.stderr,
+                      "the refusal must name the operand it could not read")
+        self.assertIn("source", r.stderr.split("AMBIGUOUS", 1)[1].split("\n")[0])
+        self.assertEqual(a.read_bytes(), a_bytes, "source bytes changed on a refusal")
+        self.assertEqual(d.read_bytes(), d_bytes, "dest bytes changed on a refusal")
+        self.assertEqual(self._sentinels(), [],
+                         "a sentinel was written despite the refusal: the next "
+                         "run would skip this source entirely")
+        self.assertTrue(self._mtime_probes(a), "source was never probed at all")
+        self.assertEqual(
+            self._mtime_probes(d), [],
+            "destination was probed after the source read failed: the "
+            "comparison is not short-circuiting on the source")
+        self.assertNotEqual(r.returncode, 0, "refused but exited 0")
+
+    def test_EXHAUSTION_WITNESS_dest_refuses_after_source_succeeds(self) -> None:
+        """Destination exhaustion: the source probe COMPLETES first, then the
+        destination read exhausts. Ordering is asserted from the trace."""
+        SEC = 1700000000
+        bin_ = self._gnu_stat_shim(synth9={"a": (SEC, 900000000),
+                                           "dest": (SEC, 100000000)},
+                                   exhaust=["dest"])
+        a, d, a_bytes, d_bytes = self._collision(SEC)
+        r = self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}"},
+                          expect_rc=None)
+        self.assertIn("AMBIGUOUS", r.stderr)
+        self.assertIn(str(d.resolve()), r.stderr)
+        self.assertIn("destination", r.stderr.split("AMBIGUOUS", 1)[1].split("\n")[0])
+        self.assertEqual(a.read_bytes(), a_bytes)
+        self.assertEqual(d.read_bytes(), d_bytes)
+        self.assertEqual(self._sentinels(), [], "sentinel written despite refusal")
+        src_ok = [r_ for r_ in self._mtime_probes(a) if r_["rc"] == 0]
+        self.assertTrue(src_ok, "source never completed a successful probe")
+        dest_bad = [r_ for r_ in self._mtime_probes(d) if r_["rc"] != 0]
+        self.assertTrue(dest_bad, "destination never exhausted")
+        full = self._read_trace()
+        self.assertLess(full.index(src_ok[-1]), full.index(dest_bad[0]),
+                        "destination was probed before the source succeeded")
+        self.assertNotEqual(r.returncode, 0, "refused but exited 0")
+
+    def test_EXHAUSTION_WITNESS_refusal_halts_remaining_sources(self) -> None:
+        """C refuses; A and B must not proceed. Measured, not reasoned: errexit
+        is exempt inside a containing conditional, and a walk that continued
+        would write the later sources' sentinels and still exit 0."""
+        SEC = 1700000000
+        bin_ = self._gnu_stat_shim(synth9={"c": (SEC, 900000000),
+                                           "a": (SEC, 800000000),
+                                           "dest": (SEC, 100000000)},
+                                   exhaust=["c"])
+        armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+        self._write("src/c", armed, SEC + 5)
+        a = self._write("src/a", armed, SEC + 5)
+        d = self._write("dest", [], SEC)
+        d_bytes = d.read_bytes()
+        r = self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}"},
+                          expect_rc=None)
+        self.assertIn("AMBIGUOUS", r.stderr)
+        self.assertEqual(self._sentinels(), [],
+                         "a later source wrote its sentinel after C refused")
+        self.assertEqual(
+            self._mtime_probes(a), [],
+            "source A was compared after C refused: the refusal did not halt "
+            "the walk, so a partial migration reports success")
+        self.assertEqual(d.read_bytes(), d_bytes)
+        self.assertNotEqual(r.returncode, 0, "refused but exited 0")
 
     def test_WHOLE_SECOND_fallback_RECIPROCAL_and_byte_checked(self) -> None:
         """Reciprocity on the %Y path, or an always-keep-destination impl passes.
