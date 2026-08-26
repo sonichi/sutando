@@ -97,6 +97,11 @@ WORKSPACE_SURFACE_DIRS=(
     # Agent config tree (report 9de2a03d): skills, settings, hooks, memory.
     # Quarantining it silently breaks every configured hook/skill path.
     ".claude-sutando"
+    # Per-host state tree (tk-7e767bb426 class): crons.json, PERSONAL_CLAUDE.md,
+    # pending-questions, current-track — every reader resolves hosts/<label>/.
+    "hosts"
+    # Session-relay notes: the next session's catchup input.
+    "relay"
 )
 
 # Per `feedback_per_source_surface_lists` 2026-06-02: dirs in Mini's #7
@@ -252,6 +257,8 @@ CLASS_RULES=(
     "agent-inbox/*|structural"
     "scripts/*|collision-keep-both"  # owner-custom tools: user content, never drop a version
     ".claude-sutando/*|structural"  # agent config tree: same relpath, never clobber dest
+    "hosts/*|structural"  # per-host identity state: same relpath, never clobber (as state/auth)
+    "relay/*|structural"
     # Catchall — per Lucy #design 2026-06-02 + owner direction: workspace
     # sources B+C may have user-custom dirs/files (experiments/, obsidian-vault/,
     # personal-src/, repro-*.ts, etc.) outside the canonical surface. Anything
