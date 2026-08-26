@@ -120,6 +120,22 @@ with tempfile.TemporaryDirectory() as td:
           r is not None and "workspace .env" in r["detail"]
           and "EXTRA_KEY" in r["detail"], True)
 
+# 5c. a third-tier resolver pick (the #1973 future) must WARN, not silence
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir()
+    (td / "ws").mkdir()
+    repo_env = td / "repo" / ".env"
+    ws_env = td / "ws" / ".env"
+    repo_env.write_text("A=1\n")
+    ws_env.write_text("A=1\n")
+    third = td / "bundle.env"
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=third):
+        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+    check("third-tier pick warns instead of silencing",
+          r is not None and r["status"] == "warn"
+          and "outside both compared candidates" in r["detail"], True)
+
 # 6. run_all_checks wiring: the call site is separate code from the probe
 # (same pattern as health-check-bridge-log-content's integration section).
 from unittest.mock import patch

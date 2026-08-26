@@ -1485,7 +1485,18 @@ def check_env_split(repo_env: "Path | None" = None,
     elif picked == ws_env:
         selected, other, sel_name, oth_name = ws_env, repo_env, "workspace", "repo"
     else:
-        return None
+        # A third-tier pick (#1973) must not silence the probe: silence is the
+        # failure this probe exists to catch.
+        return {
+            "name": "env-split",
+            "status": "warn",
+            "detail": (
+                f"resolve_dotenv selected {picked}, outside both compared "
+                f"candidates ({repo_env}, {ws_env}) — env-split cannot compare "
+                f"key sets against the selected file; extend the probe to the "
+                f"new tier."
+            ),
+        }
     missing = sorted(_keys(other) - _keys(selected))
     if not missing:
         return None
