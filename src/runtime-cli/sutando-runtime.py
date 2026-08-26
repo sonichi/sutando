@@ -30,7 +30,8 @@ Issuing commands return immediately with {"requestId", "status": "pending"};
 exit 0 on a well-formed response (whatever the status), 1 on transport or
 protocol error — status interpretation belongs to the caller.
 
-Env: SUTANDO_RUNTIME_SOCKET (default <run dir>/sutando-runtime.sock).
+Env: SUTANDO_RUNTIME_SOCKET (default <run dir>/<(agent, instance) key>/runtime.sock,
+resolved by rundir.py — the same actor chain the daemon uses).
 """
 from __future__ import annotations
 
@@ -322,13 +323,13 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:  # p
     pend = bytearray()
     done = loop.create_future()
     orow = [2]  # next output row; transcript fills TOP-down (like Claude Code)
-    lvl = [int(level)]  # 0 quiet · 1 steps · 2 per-tool; toggled by /quiet /activity /verbose
+    lvl = [int(level)]  # 0 quiet · 1 steps · 2 per-tool (/quiet /activity /verbose)
 
-    compose_h = [0]  # current compose-box height (rows); 0 forces the first layout
-    esc = bytearray()   # in-progress ANSI escape sequence (arrow keys, paste markers)
+    compose_h = [0]  # current compose-box height; 0 forces the first layout
+    esc = bytearray()  # in-progress ANSI escape sequence (arrows, paste marks)
 
-    pasting = [False]   # inside a bracketed paste (\033[200~ … \033[201~)
-    paste_run = [-1.0]  # monotonic ts of the last unmarked multi-line paste burst
+    pasting = [False]  # inside a bracketed paste (\033[200~ … \033[201~)
+    paste_run = [-1.0]  # monotonic ts of the last unmarked multi-line burst
 
     def dims():
         s = shutil.get_terminal_size((80, 24))
@@ -587,6 +588,155 @@ def _chat(activity: bool = False, verbose: bool = False, full: bool = False) -> 
     return 0
 
 
+def _fmt_subject(provider: str, subject: str) -> str:
+    if subject.startswith("@"):
+        return subject
+    return f"{provider}:user:{subject}"
+
+
+_PROFILE_LABELS = {"ag2space": "ag2space [production]",
+                   "dev-ag2space": "ag2space [dev]"}
+
+
+def _print_entrance_rows(ents: list, width: int) -> None:
+    width = max(width, len("ag2space [production]")) + 2
+    for e in ents:
+        label = _PROFILE_LABELS.get(e.get("provider", ""), e.get("provider", ""))
+        print(f"  {label.ljust(width)}{e.get('status','')}")
+        ident = e.get("identity") or {}
+        if ident:
+            sub = ident.get("id", "")
+            if ident.get("type"):
+                sub = f"{ident['type']}:{sub}"
+            disp = (e.get("display") or {}).get("name")
+            if disp:
+                sub = f"{disp}   {sub}"
+            print(f"    {'identity'.ljust(width)}{sub}")
+        ver = e.get("verification") or {}
+        if ver.get("method"):
+            print(f"    {'verified by'.ljust(width)}{ver['method']}"
+                  + (f" ({ver['verified_at']})" if ver.get("verified_at") else ""))
+        cred = e.get("credential") or {}
+        if cred.get("fingerprint"):
+            print(f"    {'fingerprint'.ljust(width)}{cred['fingerprint']}")
+        ev = e.get("evidence") or {}
+        subj_label = ("identity" if e.get("status") == "active"
+                      else "subject evidence")
+        for key, label in (("subject_evidence", subj_label),
+                           ("owner_id", "owner id"),
+                           ("credential_present", "credential"),
+                           ("policy_present", "policy")):
+            if key in ev:
+                val = ev[key] if isinstance(ev[key], str) else "present"
+                if key == "owner_id":
+                    val = _fmt_subject(e.get("provider", ""), val)
+                print(f"    {label.ljust(width)}{val}")
+        if e.get("stand_binding"):
+            print(f"    {'Stand binding'.ljust(width)}{e['stand_binding']}")
+        st = e.get("storage") or {}
+        if st.get("directory"):
+            print(f"    {'storage'.ljust(width)}{st['directory']}")
+
+
+def _print_resolve(result: dict) -> int:
+    if result.get("conflict"):
+        print("error: provider identity is linked to multiple Stands",
+              file=sys.stderr)
+        for c in result.get("candidates", []):
+            ver = (c.get("verification") or {}).get("method", "unverified")
+            print(f"  {c.get('stand_id','?')} — {ver}", file=sys.stderr)
+        print("manual resolution required", file=sys.stderr)
+        return 3
+    if result.get("store_corrupt"):
+        # unreadable is a different claim from absent — never collapse them
+        print("entrance-links store unreadable — resolution unavailable "
+              "(repair state/auth/entrance-links.json)", file=sys.stderr)
+        return 4
+    if not result.get("resolved"):
+        msg = f"not linked: {result.get('provider')} {result.get('subject')}"
+        if result.get("verified_unlinked"):
+            msg += " (provider-verified, awaiting owner authorization)"
+        print(msg, file=sys.stderr)
+        return 1
+    lk = result.get("link") or {}
+    width = 12
+    print(f"{'Stand'.ljust(width)}{result.get('stand_id','')}")
+    print(f"{'Provider'.ljust(width)}{lk.get('provider','')}")
+    subj = lk.get("provider_subject") or {}
+    sv = subj.get("id", "")
+    if subj.get("type"):
+        sv = f"{subj['type']}:{sv}"
+    print(f"{'Subject'.ljust(width)}{sv}")
+    disp = (lk.get("display") or {}).get("name")
+    if disp:
+        print(f"{'Display'.ljust(width)}{disp}")
+    print(f"{'Link'.ljust(width)}{lk.get('link_id','')}")
+    print(f"{'Status'.ljust(width)}{lk.get('status','')}")
+    ver = lk.get("verification") or {}
+    if ver.get("method"):
+        print(f"{'Verified'.ljust(width)}{ver['method']}"
+              + (f", {ver['verified_at']}" if ver.get("verified_at") else ""))
+    return 0
+
+
+def _print_stand_card(card: dict, section: "str | None") -> int:
+    stand = card.get("stand") or {}
+    if section == "id":
+        sid = stand.get("stand_id")
+        if not sid:
+            print("no stand record", file=sys.stderr)
+            return 1
+        print(sid)
+        return 0
+    width = 16
+    show = lambda name: section is None or section == name  # noqa: E731
+    if section is None:
+        label = stand.get("stand_id", "")
+        if stand.get("display_name"):
+            label = f"{stand['display_name']}   {label}"
+        print(f"Stand   {label}")
+        if stand.get("status"):
+            print(f"  {'Status'.ljust(width)}{stand['status']}")
+        print()
+    if show("owner"):
+        owners = card.get("owners") or []
+        if owners:
+            o = owners[0]
+            oid = o.get("person_id", "")
+            if o.get("display_name"):
+                oid = f"{o['display_name']} ({oid})"
+            role = f"   {o['role']}" if o.get("role") else ""
+            print(f"Owner   {oid}{role}")
+        else:
+            print("Owner   Not established")
+            for ev in card.get("owner_evidence") or []:
+                print(f"  {'Evidence'.ljust(width)}"
+                      f"{_fmt_subject(ev['provider'], ev['subject'])}"
+                      f" via {ev['provider']}")
+        print()
+    if show("channels") or section == "entrances":
+        ents = card.get("channels") or []
+        print("Channels")
+        if ents:
+            _print_entrance_rows(ents, width)
+        else:
+            print("  none configured")
+        print()
+    if show("devices"):
+        devs = card.get("devices") or []
+        print("Devices")
+        if devs:
+            for d in devs:
+                row = f"  {d.get('label', d.get('device_id', '')).ljust(width)}"
+                row += (d.get("device_type") or "unknown").ljust(10)
+                row += d.get("status", "")
+                print(row.rstrip())
+        else:
+            print("  No enrolled devices")
+        print()
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="sutando-runtime")
     sub = ap.add_subparsers(dest="group", required=True)
@@ -651,6 +801,14 @@ def main(argv=None) -> int:
     idn = sub.add_parser("sutando").add_subparsers(dest="cmd", required=True)
     for name in ("info", "status", "owner", "allowlist"):
         idn.add_parser(name)
+    std = idn.add_parser("stand")
+    std.add_argument("sub", nargs="?",
+                     choices=["id", "owner", "channels", "entrances",
+                              "devices", "resolve"])
+    std.add_argument("extra", nargs="*")
+    std.add_argument("--json", action="store_true", dest="as_json")
+    std.add_argument("--details", action="store_true", dest="details")
+
     rt = sub.add_parser("runtime").add_subparsers(dest="cmd", required=True)
     for name in ("health", "details"):
         rt.add_parser(name)
@@ -673,13 +831,17 @@ def main(argv=None) -> int:
     ist = ins.add_parser("start")
     ist.add_argument("agent_id")
     ist.add_argument("--wait", type=float, default=10.0)
+    ist.add_argument("--instance", default=None,
+                     help="instance id when the agent runs more than one")
     iat = ins.add_parser("attach")
     iat.add_argument("agent_id")
     iat.add_argument("--print", action="store_true",
                      help="print the tmux command instead of exec'ing it")
+    iat.add_argument("--instance", default=None)
     iop = ins.add_parser("open")
     iop.add_argument("agent_id")
     iop.add_argument("--window", action="store_true")
+    iop.add_argument("--instance", default=None)
 
     tsk = sub.add_parser("task").add_subparsers(dest="cmd", required=True)
     tsk.add_parser("list")
@@ -714,11 +876,13 @@ def main(argv=None) -> int:
         import instance_registry
         if args.cmd == "start":
             out = instance_registry.start_instance(args.agent_id,
-                                                   wait_s=args.wait)
+                                                   wait_s=args.wait,
+                                                   instance=args.instance)
             print(json.dumps(out, ensure_ascii=False, indent=1))
             return 0 if out.get("ok") else 1
         if args.cmd == "attach":
-            out = instance_registry.attach(args.agent_id)
+            out = instance_registry.attach(args.agent_id,
+                                           instance=args.instance)
             if not out.get("ok"):
                 print(json.dumps(out, ensure_ascii=False), file=sys.stderr)
                 return 1
@@ -730,7 +894,8 @@ def main(argv=None) -> int:
             return 0
         if args.cmd == "open":
             import terminal_open
-            out = terminal_open.open_instance(args.agent_id, window=args.window)
+            out = terminal_open.open_instance(args.agent_id, window=args.window,
+                                              instance=args.instance)
             print(json.dumps(out, ensure_ascii=False, indent=1))
             return 0 if out.get("ok") else 1
         print(json.dumps({"instances": instance_registry.list_instances()},
@@ -773,7 +938,30 @@ def main(argv=None) -> int:
                       else _rpc("agent.status", {"agentId": args.agent_id},
                                 timeout=15))
         elif args.group == "sutando":
-            result = _rpc(f"sutando.{args.cmd}", {}, timeout=15)
+            params = {}
+            method = f"sutando.{args.cmd}"
+            if args.cmd == "stand":
+                if getattr(args, "details", False):
+                    params["details"] = True
+                if args.sub == "resolve":
+                    if len(getattr(args, "extra", []) or []) != 2:
+                        print("usage: sutando stand resolve <provider> <subject>",
+                              file=sys.stderr)
+                        return 2
+                    method = "sutando.resolve"
+                    params = {"provider": args.extra[0],
+                              "subject": args.extra[1]}
+            result = _rpc(method, params, timeout=15)
+            if args.cmd == "stand" and not args.as_json:
+                if args.sub == "resolve":
+                    return _print_resolve(result)
+                return _print_stand_card(result, args.sub)
+            if args.cmd == "stand" and args.sub == "resolve"                     and not result.get("resolved"):
+                print(json.dumps(result, ensure_ascii=False, indent=1))
+                # same exit contract as human mode: conflict 3, corrupt 4
+                if result.get("store_corrupt"):
+                    return 4
+                return 3 if result.get("conflict") else 1
         elif args.group == "runtime":
             result = _rpc(f"runtime.{args.cmd}", {}, timeout=15)
         elif args.group == "human-action":

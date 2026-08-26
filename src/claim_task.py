@@ -51,13 +51,8 @@ import os
 import sys
 from pathlib import Path
 
-
-def _workspace_root() -> Path:
-    """Resolve workspace root, matching the rest of the codebase (#762)."""
-    env = os.environ.get("SUTANDO_WORKSPACE")
-    if env:
-        return Path(os.path.expanduser(env))
-    return Path.home() / ".sutando" / "workspace"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
 
 
 def _validate_id(name: str, kind: str) -> str:
@@ -84,7 +79,7 @@ def claim_plain(task_id: str, core_id: str, workspace: Path | None = None) -> Pa
     """
     task_id = _validate_id(task_id, "task_id")
     core_id = _validate_id(core_id, "core_id")
-    ws = workspace if workspace is not None else _workspace_root()
+    ws = workspace if workspace is not None else resolve_workspace()
     src = ws / "tasks" / f"task-{task_id}.txt"
     dst = ws / "tasks" / f"task-{task_id}.claimed-core-{core_id}.txt"
     try:
@@ -94,9 +89,11 @@ def claim_plain(task_id: str, core_id: str, workspace: Path | None = None) -> Pa
         return dst
     except FileNotFoundError:
         return None
-    except OSError:
-        # EXDEV/permission = lost-race; the contract is "won or lost",
-        # never "threw"
+    except OSError as exc:
+        # A lost race and a core that can NEVER claim both return None; the
+        # errno is the only thing separating them, so say it before dropping it.
+        print(f"claim_task: unexpected errno {exc.errno} claiming "
+              f"{src.name}: {exc.strerror}", file=sys.stderr)
         return None
 
 
@@ -206,7 +203,7 @@ def claim_with_affinity(
         return claim_plain(task_id, core_id, workspace=workspace)
     channel_id = _validate_channel_id(channel_id)
 
-    ws = workspace if workspace is not None else _workspace_root()
+    ws = workspace if workspace is not None else resolve_workspace()
     now = time.time()
     handler_p = _handler_path(ws, channel_id)
     handler = _read_handler(handler_p)

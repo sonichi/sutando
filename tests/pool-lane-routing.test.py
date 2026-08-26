@@ -16,7 +16,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
-from pool_lead import PoolLead, _read_lane  # noqa: E402
+from pool_lead import PoolLead, _read_channel, _read_lane  # noqa: E402
+from pool_notify import read_routing  # noqa: E402
 
 
 def owner_task(source="slack", channel="C1"):
@@ -130,6 +131,51 @@ class LaneDetectionTests(LaneBase):
     def test_unreadable_fails_open_to_owner(self):
         self.assertEqual(_read_lane(self.tasks / "absent.txt"), "owner")
 
+
+class HeaderPastTheOldCap(LaneBase):
+    """Header fields are read from the whole file. The former 2048-byte slice
+    made a well-formed header indistinguishable from an absent one."""
+
+    # Offsets measured by a reviewer over 600 archived task files: the fields
+    # sat past 2048 in ~35% of them, at 2054-10714.
+    NEAR, FAR = 2054, 10714
+
+    def _task(self, name, header, at):
+        pad = "x" * max(0, at - len("id: t\n"))
+        p = self.tasks / name
+        p.write_text(f"id: t\n{pad}\n{header}\ntask: body\n")
+        self.assertGreater(p.read_text().index(header.split(":")[0]), 2048,
+                           "fixture must place the field past the old cap")
+        return p
+
+    def test_access_tier_just_past_the_cap_is_seen(self):
+        p = self._task("task-near.txt", "access_tier: team", self.NEAR)
+        self.assertEqual(_read_lane(p), "routine")
+
+    def test_access_tier_far_past_the_cap_is_seen(self):
+        p = self._task("task-far.txt", "access_tier: team", self.FAR)
+        self.assertEqual(_read_lane(p), "routine")
+
+    def test_control_same_header_early_is_seen(self):
+        """Without this the pair above could pass for the wrong reason — the
+        function was always correct on headers it could see."""
+        p = self.tasks / "task-early.txt"
+        p.write_text("id: t\naccess_tier: team\ntask: body\n")
+        self.assertEqual(_read_lane(p), "routine")
+
+    def test_owner_header_past_the_cap_still_reads_owner(self):
+        p = self._task("task-owner.txt", "access_tier: owner", self.NEAR)
+        self.assertEqual(_read_lane(p), "owner")
+
+    def test_channel_past_the_cap_is_seen(self):
+        p = self._task("task-chan.txt", "channel_id: C4242", self.NEAR)
+        self.assertEqual(_read_channel(p), "C4242")
+
+    def test_notify_routing_past_the_cap_is_seen(self):
+        p = self.tasks / "task-route.txt"
+        pad = "x" * self.NEAR
+        p.write_text(f"id: t\n{pad}\nsource: discord\nchannel_id: C99\ntask: b\n")
+        self.assertEqual(read_routing(p), ("discord", "C99"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
