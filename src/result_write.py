@@ -106,6 +106,23 @@ def receipt_attests(receipts_dir, task_id: str, body: str) -> bool:
     return rec.get("sha256") == hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def receipt_verifier(receipts_dir, task_id: str):
+    """A readiness predicate for delivery: enforce the digest once a receipt
+    exists, and only then.
+
+    A MISSING receipt is a pre-upgrade result, not a forgery. Requiring one
+    unconditionally would strand every reply written before this shipped — an
+    outage, in the name of a check. That makes this a transition window, not a
+    permanent exemption: once no unreceipted results remain, the caller can
+    drop straight to `receipt_attests`.
+    """
+    def _attests(raw_body: str) -> bool:
+        if not has_pairing_receipt(receipts_dir, task_id):
+            return True
+        return receipt_attests(receipts_dir, task_id, raw_body)
+    return _attests
+
+
 def has_pairing_receipt(receipts_dir, task_id: str) -> bool:
     try:
         return receipt_path(receipts_dir, task_id).is_file()

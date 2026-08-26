@@ -27,12 +27,18 @@ def is_ready_body(text: str | None) -> bool:
     return bool(text and text.strip())
 
 
-def read_ready_result(path: str | Path) -> str | None:
+def read_ready_result(path: str | Path, attests=None) -> str | None:
     """Return the stripped body of `path`, or None when it is not ready.
 
     None covers missing, unreadable and empty-or-whitespace-only files. Callers
     skip on None and retry on a later pass — the file is not consumed, so a
     result that lands between passes is still delivered.
+
+    `attests` is an optional predicate the caller injects to verify the body is
+    the one written for its task. It receives the RAW published bytes, before
+    stripping: a receipt covers what was written, so verifying the stripped form
+    would reject every body that ends in a newline. This module stays free of
+    the digest itself — the adapter binds it.
     """
     p = Path(path)
     try:
@@ -40,6 +46,8 @@ def read_ready_result(path: str | Path) -> str | None:
     except (OSError, UnicodeDecodeError):
         # Missing, unreadable, or a partial write mid-character. Never
         # deliverable, and readable again on a later pass.
+        return None
+    if attests is not None and not attests(body):
         return None
     body = body.strip()
     return body if body else None
