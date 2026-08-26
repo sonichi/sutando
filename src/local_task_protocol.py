@@ -550,6 +550,47 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     return flat[-1] if flat else None
 
 
+def iter_result_candidates(results_dir: Path, task_id: str) -> list[Path]:
+    """Every place a result for `task_id` can live, in consult order.
+
+    Three enumerators grew independently and no two covered the same layouts,
+    so a result was findable or not depending on which one you asked. This is
+    their union. Order is load-bearing for readiness: callers stop at the
+    first candidate that exists, so live must precede archive and newer
+    archive must precede older.
+    """
+    if not valid_archive_lookup_id(task_id):
+        return []
+    results_dir = Path(results_dir)
+    archive = results_dir / "archive"
+    fname = f"{task_id}.txt"
+
+    out = [results_dir / fname, archive / fname]
+
+    def _subdirs(root: Path, keep) -> list[str]:
+        try:
+            with os.scandir(root) as entries:
+                return sorted((e.name for e in entries if keep(e.name) and e.is_dir()),
+                              reverse=True)
+        except (OSError, ValueError):
+            return []
+
+    months = _subdirs(archive, _MONTH_DIR_RE.match)
+    out += [archive / m / fname for m in months]
+    # Non-month archive subdirs: get_task_result globbed every one, so omitting
+    # them here would silently regress that caller.
+    seen = set(months)
+    out += [archive / d / fname for d in _subdirs(archive, lambda n: n not in seen)]
+    # Sibling `results/archive-*/` dirs — only _exact_result knew these.
+    out += [results_dir / d / fname
+            for d in _subdirs(results_dir, lambda n: n.startswith("archive-"))]
+    # Flat gateway form `archive/<id>-<epoch>.txt`, newest last as before.
+    flat = sorted(archive.glob(f"{task_id}-*.txt"))
+    if flat:
+        out.append(flat[-1])
+    return out
+
+
 def find_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate a task's result: live dir first, then archive. Archival trails
     delivery, so an archive-only lookup reads a fresh result as never delivered."""
