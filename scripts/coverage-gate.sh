@@ -118,21 +118,34 @@ fi
 export RECDIR COVGATE_TIMEOUT
 
 find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+# Record key is the LINE INDEX, which is injective by construction. A
+# name-derived key is not: `tr "/." "__"` maps `tests/a/b.test.py` and
+# `tests/a_b.test.py` to the same record, so two workers write one pair of
+# files and the last writer wins — a failing test can be reported with a
+# passing worker's rc and the job exits 0. Today's 625 names happen not to
+# collide; one nested or dotted addition is enough.
+_covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
 
 # Worker: one record per file. Aggregation stays SERIAL below, over the sorted
 # list, so log order and the skip accounting are byte-identical to the old loop.
 # shellcheck disable=SC2016
-xargs -P "$COVGATE_WORKERS" -I{} bash -c '
-    f="$1"
-    rec="$RECDIR/$(printf "%s" "$f" | tr "/." "__")"
+# Feed BARE INTEGERS: `xargs -I{}` rewrites a tab inside the replaced string
+# to a space, so any delimiter-in-argument scheme silently stops splitting.
+# The worker resolves its own path from the shared sorted list instead.
+seq 1 "$_covgate_n" | xargs -P "$COVGATE_WORKERS" -I{} bash -c '
+    idx="$1"
+    f="$(sed -n "${idx}p" "$RECDIR/files")"
+    rec="$RECDIR/$idx"
     rc=0
     out="$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1)" || rc=$?
     printf "%s" "$out" > "$rec.out"
     printf "%s\n" "$rc" > "$rec.rc"
-' _ {} < "$RECDIR/files"
+' _ {}
 
+_covgate_idx=0
 while IFS= read -r f; do
-    rec="$RECDIR/$(printf '%s' "$f" | tr '/.' '__')"
+    _covgate_idx=$((_covgate_idx + 1))
+    rec="$RECDIR/$_covgate_idx"
     rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
     output="$(cat "$rec.out" 2>/dev/null || true)"
     if [ "$rc" -ne 0 ]; then

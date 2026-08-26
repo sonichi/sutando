@@ -276,19 +276,29 @@ jobs:
           trap 'rm -rf "$RECDIR"' EXIT
           export RECDIR
           find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+          # Key on the LINE INDEX: injective by construction. A name-derived key
+          # is not — `tr "/." "__"` maps tests/a/b.test.py and tests/a_b.test.py
+          # to one record, so two workers share a file and the last writer wins,
+          # which can report a failing test with a passing rc.
+          N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
           # `timeout -k 5 120` is unchanged and still per-file: without it one
           # hanging suite burns the job's whole timeout-minutes budget and the
           # job is CANCELED mid-suite.
-          xargs -P "$WORKERS" -I{} bash -c '
-            f="$1"
-            rec="$RECDIR/$(printf "%s" "$f" | tr "/." "__")"
+          # Bare integers: `xargs -I{}` rewrites a tab inside the replaced
+          # string to a space, so a delimiter scheme stops splitting silently.
+          seq 1 "$N" | xargs -P "$WORKERS" -I{} bash -c '
+            idx="$1"
+            f="$(sed -n "${idx}p" "$RECDIR/files")"
+            rec="$RECDIR/$idx"
             out="$(timeout -k 5 120 python3 "$f" 2>&1)" && rc=0 || rc=$?
             printf "%s" "$out" > "$rec.out"
             printf "%s\n" "$rc" > "$rec.rc"
-          ' _ {} < "$RECDIR/files"
+          ' _ {}
+          _idx=0
           while IFS= read -r f; do
             echo "→ $f"
-            rec="$RECDIR/$(printf '%s' "$f" | tr '/.' '__')"
+            _idx=$((_idx + 1))
+            rec="$RECDIR/$_idx"
             rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
             output="$(cat "$rec.out" 2>/dev/null || true)"
             echo "$output" | grep -E 'FAIL|^Results:' || true
