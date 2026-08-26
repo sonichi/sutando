@@ -673,6 +673,28 @@ class TestSendRemoteGateway(unittest.TestCase):
                 result = mod.send_remote_gateway("ag2space", "!room:ag2.space", "hi")
         self.assertFalse(result)
 
+    def test_load_channel_env_containment_fails_closed_when_import_fails(self):
+        """The fallback lambda itself, not just `_channel_env_is_contained`'s
+        already-bound result: force the shared src/channel_env_containment.py
+        import to fail and assert the returned callable refuses even an
+        otherwise-valid-looking containment case — never silently widen the
+        guard just because the import failed."""
+        import builtins
+        real_import = builtins.__import__
+
+        def boom(name, *a, **kw):
+            if name == "channel_env_containment":
+                raise ImportError("simulated: src/ not importable")
+            return real_import(name, *a, **kw)
+
+        with patch.object(builtins, "__import__", boom):
+            fallback = self.mod._load_channel_env_containment()
+
+        cfg, app = self._symlinked_channels_root()
+        env_path = os.path.join(cfg, "channels", "ag2space", ".env")
+        channels_dir = os.path.join(cfg, "channels")
+        self.assertFalse(fallback(env_path, channels_dir, "ag2space"))
+
     def test_remote_task_token_combined_form_delivers(self):
         """Regression for #2101 review round 2 (P1): the compact combined form in
         REMOTE_TASK_TOKEN itself (REMOTE_TASK_TOKEN=url|secret, no separate

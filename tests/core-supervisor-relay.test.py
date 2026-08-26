@@ -615,6 +615,32 @@ class TestChannelEnvContainmentDelegation(unittest.TestCase):
                     else:
                         os.environ[k] = v
 
+    def test_load_channel_env_containment_fails_closed_when_import_fails(self):
+        """The fallback lambda itself, not just the already-bound result:
+        force the shared module's import to fail and confirm the returned
+        callable refuses even an otherwise-valid-looking containment case —
+        never silently widen the guard just because the import failed."""
+        import builtins
+        real_import = builtins.__import__
+
+        def boom(name, *a, **kw):
+            if name == "channel_env_containment":
+                raise ImportError("simulated: src/ not importable")
+            return real_import(name, *a, **kw)
+
+        fresh = self._reload()
+        with patch.object(builtins, "__import__", boom):
+            fallback = fresh._load_channel_env_containment()
+
+        with tempfile.TemporaryDirectory() as td:
+            channels_dir = os.path.join(td, "channels")
+            env_dir = os.path.join(channels_dir, "dev-ag2space")
+            os.makedirs(env_dir)
+            env_path = os.path.join(env_dir, ".env")
+            with open(env_path, "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            self.assertFalse(fallback(env_path, channels_dir, "dev-ag2space"))
+
 
 class TestBackendRecordContract(unittest.TestCase):
     """`_derive_backend` reads the file `core_heartbeat` wrote. The label and the
