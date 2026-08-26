@@ -454,7 +454,7 @@ scan_source() {
             local sm
             # Separate calls: GNU -f prints a report to stdout AND exits nonzero,
             # so one `||` substitution would concatenate report with date.
-            sm="$(LC_ALL=C stat -f '%Sm' -t '%Y-%m-%d' "$s" 2>/dev/null)"
+            sm="$(LC_ALL=C stat -f '%Sm' -t '%Y-%m-%d' "$s" 2>/dev/null)" || sm=""
             case "$sm" in ''|*[!0-9-]*) sm="" ;; esac
             [ -n "$sm" ] || sm="$(LC_ALL=C stat -c '%y' "$s" 2>/dev/null | cut -d' ' -f1)"
             REPORT_LINES+=("    $(basename "$s")  ($sm)")
