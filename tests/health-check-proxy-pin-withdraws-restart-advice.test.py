@@ -12,8 +12,10 @@ must fail them -- the previous suite stayed green through exactly that deletion.
 """
 from __future__ import annotations
 import importlib.util
+import plistlib
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -98,14 +100,27 @@ class VetoGatesEveryRemedyBranch(unittest.TestCase):
     """
 
     def _detail(self, veto, from_proc, plist):
+        """Drive the real reader against a synthetic HOME, never the host's.
+
+        Patching `Path.is_file` true without supplying bytes left production
+        calling `read_bytes()` on the developer's OWN plist: green here, 3/10
+        failures in an empty HOME. A real file keeps plistlib in the tested path.
+        """
         def _svc(cfg):
             return "Claude Code-credentials" if cfg == "/core/cfg" else "Claude Code-credentials-other"
-        with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": "/core/cfg"}), \
-             patch.object(hc, "_resolved_credential_service", _svc), \
-             patch.object(hc, "_proxy_config_dir_from_process", return_value=from_proc), \
-             patch.object(hc.Path, "is_file", lambda self: plist):
-            return hc.check_quota_account_identity(
-                "ok", core_env_prober=lambda *a, **k: True, restart_veto=veto)["detail"]
+        with tempfile.TemporaryDirectory() as home:
+            if plist:
+                agents = Path(home) / "Library/LaunchAgents"
+                agents.mkdir(parents=True)
+                (agents / "com.sutando.credential-proxy.plist").write_bytes(
+                    plistlib.dumps({"EnvironmentVariables": {"CLAUDE_CONFIG_DIR": "/other/cfg"}}))
+            with patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": "/core/cfg"}), \
+                 patch.object(hc.Path, "home", staticmethod(lambda: Path(home))), \
+                 patch.object(hc, "_runtime_may_skip_proxy", return_value=False), \
+                 patch.object(hc, "_resolved_credential_service", _svc), \
+                 patch.object(hc, "_proxy_config_dir_from_process", return_value=from_proc):
+                return hc.check_quota_account_identity(
+                    "ok", core_env_prober=lambda *a, **k: True, restart_veto=veto)["detail"]
 
     def test_plist_fallback_pinned_carries_the_veto_and_no_imperative(self):
         d = self._detail(PIN, hc._PROXY_ENV_UNREADABLE, True)
