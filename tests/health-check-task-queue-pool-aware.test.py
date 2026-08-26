@@ -127,5 +127,41 @@ class PoolHeldQueue(unittest.TestCase):
         self.assertIn("assigned:core-3", d)
 
 
+class PoolHeldStuckVanishing(unittest.TestCase):
+    """A pool file can be renamed or archived between listing and stat(), so the
+    age filter must survive a stat() that raises rather than abandoning the scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "results").mkdir()
+        self.hc = _load(self.ws)
+        self.now = time.time()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _aged(self, name, age_s):
+        import os
+        p = self.ws / "tasks" / name
+        p.write_text("id: t\ntask: body\n")
+        os.utime(p, (self.now - age_s, self.now - age_s))
+        return p
+
+    def test_only_files_past_the_age_are_stuck(self):
+        old = self._aged("task-old.claimed-core-1.txt", 600)
+        fresh = self._aged("task-new.claimed-core-1.txt", 5)
+        out = self.hc._pool_held_stuck([old, fresh], self.now, 300)
+        self.assertEqual(out, [old])
+
+    def test_a_vanished_file_is_skipped_and_the_scan_continues(self):
+        gone = self.ws / "tasks" / "task-gone.claimed-core-1.txt"
+        old = self._aged("task-old.claimed-core-1.txt", 600)
+        # `gone` first: a raise that aborted the loop would drop `old` silently.
+        out = self.hc._pool_held_stuck([gone, old], self.now, 300)
+        self.assertEqual(out, [old])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
