@@ -27,7 +27,7 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 from pool_follower import LEAD_STALE_S  # noqa: E402
 
 # tick gap past one beat period = host sleep; shorter can't stale a beat
-HOST_GAP_S = 30.0
+SLEEP_SKEW_S = 5.0  # wall clock advances through host sleep; monotonic pauses
 
 # Depth at which channelless work overflows to the idle lane core; room
 # affinity itself is binding and never yields on load (owner 2026-08-26).
@@ -124,7 +124,7 @@ def _read_lane(path: Path) -> str:
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
                  now_fn=time.time, metrics=None, results_dir=None,
-                 runtime_fn=None):
+                 mono_fn=time.monotonic, runtime_fn=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
         production binder wires instance_registry + the .alive files.
@@ -141,6 +141,7 @@ class PoolLead:
         self.followers_fn = followers_fn
         self.alive_fn = alive_fn
         self.now = now_fn
+        self.mono = mono_fn
         self.metrics = metrics  # PoolMetrics or None; recording is optional
 
     # ── affinity table (single-writer: the lead) ────────────────────────────
@@ -440,22 +441,25 @@ class PoolLead:
 
     # ── crash recovery ──────────────────────────────────────────────────────
     def _host_gap_defers_reclaim(self) -> bool:
-        """Host-gap evidence comes from the LEAD'S OWN tick cadence: reclaim
-        entrypoints run every ~2s, so a large gap between calls means the host
-        slept — independent of which follower happens to re-beat first
-        (staggered 30s beats make sibling-before-claimant an ordinary wake).
+        """Host-sleep evidence is wall-vs-monotonic SKEW across the lead's
+        own tick, not mere tick-gap size: the monotonic clock pauses through
+        host sleep while wall time advances, so skew is definitive — and an
+        awake-but-slow daemon (long --interval, GC stall) shows wall ~= mono,
+        gets no grace, and cannot renew the deferral.
 
         The grace window, once opened, expires by TIME ONLY — a sibling
         heartbeat must not end it while the claim owner's beat is still due.
-        A genuine outage (no tick gap) is never deferred mid-run.
         """
         now = self.now()
+        mono = self.mono()
         last = getattr(self, "_last_reclaim_tick", None)
+        last_mono = getattr(self, "_last_reclaim_mono", None)
         self._last_reclaim_tick = now
-        if last is not None:
-            if now - last > HOST_GAP_S:
+        self._last_reclaim_mono = mono
+        if last is not None and last_mono is not None:
+            if (now - last) - (mono - last_mono) > SLEEP_SKEW_S:
                 self._reclaim_defer_until = now + LEAD_STALE_S
-        else:
+        elif last is None:
             # fresh lead + all-stale pool: indistinguishable from a
             # post-wake lead restart — grace one window
             try:

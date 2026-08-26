@@ -178,5 +178,51 @@ class DeliveredTasksKeepTheirDisposition(WakeGuardBase):
         self.assertEqual(outs, [("task-i.claimed-core-2.txt", "delivered")])
 
 
+class AwakeSlowDaemonIsNotSleep(unittest.TestCase):
+    """Kewei re-review blocker: a large tick gap while AWAKE must not renew
+    the grace — sleep evidence is wall-vs-monotonic skew, not gap size."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.tasks = root / "tasks"; self.tasks.mkdir()
+        self.state = root / "state"; self.state.mkdir()
+        self.results = root / "results"; self.results.mkdir()
+        self.wall = 1000.0
+        self.mono = 500.0
+        self.lead = PoolLead(self.tasks, self.state,
+                             followers_fn=lambda: ["core-1", "core-2"],
+                             alive_fn=lambda i: i == "core-1",
+                             now_fn=lambda: self.wall,
+                             mono_fn=lambda: self.mono,
+                             results_dir=self.results)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _stale_claim(self):
+        f = self.tasks / "task-w.claimed-core-2.txt"
+        f.write_text("id: task-w\n")
+        return f
+
+    def test_slow_awake_ticks_never_defer(self):
+        # wall and monotonic advance together: no skew, no grace, ever
+        claim = self._stale_claim()
+        self.lead.reclaim_claimed()
+        for _ in range(5):
+            self.wall += 300.0; self.mono += 300.0
+            out = self.lead.reclaim_claimed()
+        self.assertFalse(claim.exists(), "dead core-2's claim must repool")
+
+    def test_sleep_skew_opens_one_expiring_grace(self):
+        claim = self._stale_claim()
+        self.lead.reclaim_claimed()
+        self.wall += 300.0; self.mono += 2.0  # host slept ~298s
+        self.assertEqual(self.lead.reclaim_claimed(), [], "grace after sleep")
+        self.wall += LEAD_STALE_S + 1; self.mono += LEAD_STALE_S + 1
+        self.lead.reclaim_claimed()
+        self.assertFalse(claim.exists(), "grace expired: reclaim resumes")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
