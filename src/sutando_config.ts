@@ -50,6 +50,21 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 ]);
 
 /**
+ * Blocks every consumer reads with property access. A scalar here is what the
+ * schema's `"type": "object"` already forbids; loadJson enforces it at read time.
+ * Python twin: _OBJECT_TOP_LEVEL_KEYS in sutando_config.py.
+ */
+const OBJECT_TOP_LEVEL_KEYS = new Set([
+	'core',
+	'workspace',
+	'claude_sutando_config_dir',
+	'vault',
+	'migrate',
+	'health_check',
+	'bridges',
+]);
+
+/**
  * Walk upward from `start` until we find a directory containing
  * `sutando.config.json`. Returns undefined if not found within 6 hops.
  * Anchors on the config file rather than `.git/` so app bundles + symlinked
@@ -122,6 +137,18 @@ function loadJsonFile(path: string): { [k: string]: Json } {
 	}
 	if (data === null || typeof data !== 'object' || Array.isArray(data)) {
 		throw new Error(`sutando config: ${path} top-level must be a JSON object, got ${typeof data}`);
+	}
+	const obj = data as { [k: string]: Json };
+	for (const key of [...OBJECT_TOP_LEVEL_KEYS].sort()) {
+		if (!(key in obj)) continue;
+		const v = obj[key];
+		if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+			throw new Error(
+				`sutando config: ${path} key '${key}' must be a JSON object, got ` +
+					`${Array.isArray(v) ? 'array' : typeof v} ${JSON.stringify(v)}. ` +
+					`Did you mean {"${key}": {...}}?`,
+			);
+		}
 	}
 	const stripped = stripComments(data);
 	return stripped as { [k: string]: Json };
