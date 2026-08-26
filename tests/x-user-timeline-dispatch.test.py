@@ -23,8 +23,11 @@ Pins three behaviours:
 import contextlib
 import importlib.util
 import io
+import os
 import pathlib
+import shutil
 import sys
+import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "skills" / "x-twitter" / "x-post.py"
@@ -40,9 +43,17 @@ def check(label, ok, detail=""):
         failures.append(label)
 
 
+# Import an ISOLATED COPY, never the repository script. x-post.py reads
+# `<script>/../../.env` at import and writes its values into os.environ.
+_ISO = pathlib.Path(tempfile.mkdtemp(prefix="xp-iso-")) / "skills" / "x-twitter"
+_ISO.mkdir(parents=True)
+shutil.copy2(SCRIPT, _ISO / SCRIPT.name)
+ISO_SCRIPT = _ISO / SCRIPT.name
+
+
 def load():
     """Fresh module each time so module-level globals cannot leak between cases."""
-    spec = importlib.util.spec_from_file_location("xp_under_test", SCRIPT)
+    spec = importlib.util.spec_from_file_location("xp_under_test", ISO_SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -112,6 +123,22 @@ check("no bearer: get_auth NOT reached (would report a pip problem)", calls["aut
 check("no bearer: names X_BEARER_TOKEN", "X_BEARER_TOKEN" in out, out[:80])
 check("no bearer: does not report a dependency problem",
       "pip3 install" not in out and "missing dependencies" not in out, out[:80])
+
+# --- the import itself must not touch host config -------------------------
+before = dict(os.environ)
+load()
+check("importing the module does not mutate os.environ",
+      dict(os.environ) == before,
+      f"changed keys: {sorted(set(os.environ) ^ set(before)) or 'values differ'}")
+check("the imported copy is not the repository script", ISO_SCRIPT != SCRIPT)
+check("the isolated copy sees no .env",
+      not (ISO_SCRIPT.parent.parent.parent / ".env").exists(),
+      str(ISO_SCRIPT.parent.parent.parent / ".env"))
+
+# --- completion is pinned: a case dropped or an early abort fails here -----
+EXPECTED = 24
+check(f"all {EXPECTED} checks ran (guards against a silent early exit)",
+      checked + 1 == EXPECTED, f"ran {checked + 1}")
 
 print(f"\n{checked - len(failures)}/{checked} passed")
 sys.exit(1 if failures else 0)
