@@ -49,12 +49,31 @@ class HookUsesCanonicalWorkspaceOnly(unittest.TestCase):
             capture_output=True, text=True, cwd=cwd, env=env)
 
     def test_writes_into_the_resolved_workspace(self):
-        r = self._run(str(REPO))
-        self.assertEqual(r.returncode, 0)
-        sys.path.insert(0, str(REPO / "src"))
-        from workspace_default import resolve_workspace
-        feed = Path(resolve_workspace()) / "state" / "activity-feed.jsonl"
-        self.assertTrue(feed.exists())
+        # fixture repo skeleton: real resolver code, isolated tree — the
+        # production hook must never be pointed at the checkout's live feed
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            (repo / "hooks").mkdir(parents=True)
+            (repo / "src").mkdir()
+            for mod in ("workspace_default.py", "sutando_config.py"):
+                (repo / "src" / mod).write_text(
+                    (REPO / "src" / mod).read_text())
+            # the resolver anchors the repo root on this file's presence
+            (repo / "sutando.config.json").write_text(
+                (REPO / "sutando.config.json").read_text())
+            hook = repo / "hooks" / "emit-tool-activity.py"
+            hook.write_text((REPO / "hooks" / "emit-tool-activity.py").read_text())
+            r = subprocess.run(
+                [sys.executable, str(hook)],
+                input=json.dumps({"tool_name": "Bash",
+                                  "tool_input": {"command": "true"}}),
+                capture_output=True, text=True, cwd=td)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            feed = repo / "workspace" / "state" / "activity-feed.jsonl"
+            self.assertTrue(feed.exists(), "feed lands in the fixture tree")
+            line = json.loads(feed.read_text().splitlines()[0])
+            self.assertEqual(line.get("kind"), "tool")
+            self.assertIn("step", line)
 
     def test_no_repo_means_no_write_anywhere(self):
         # hook copied outside any checkout: resolver unavailable -> exit 0, no file
