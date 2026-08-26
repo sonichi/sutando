@@ -261,28 +261,39 @@ _DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
 _SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
 
 
+def _load_channel_env_containment():
+    """The shared containment policy (src/channel_env_containment.py), or a
+    fail-closed stub when it isn't importable this way. Mirrors
+    _derive_backend's sys.path fix below: run as a script sys.path[0] is
+    src/, but loaded as a module (tests) it is not."""
+    try:
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from channel_env_containment import channel_env_is_contained  # type: ignore
+        return channel_env_is_contained
+    except Exception:
+        return lambda env_path, channels_dir, source: False
+
+
+# Single shared owner: src/channel_env_containment.py (see its docstring for
+# the accept/refuse rule; also delegated to by notify.py).
+_channel_env_is_contained = _load_channel_env_containment()
+
+
 def _is_deliverable(source):
     if source in _DELIVERABLE_SURFACES:
         return True
     if not source or not _SOURCE_SLUG_RE.match(source):
         return False
-    # Probe for exactly what notify.py's sender reads, mirroring its FULL
-    # resolution contract (review P1 x2 on #2701 — filename alone was not
-    # enough): (1) same three-tier base, CLAUDE_CONFIG_DIR -> CLAUDE_HOME ->
-    # ~/.claude; (2) same realpath containment — a channel entry symlinked
-    # OUTSIDE channels/ is one the sender refuses, so probing it deliverable
-    # would recreate the selected-then-send-fails class via a different
-    # mismatch. If notify.py ever learns more filenames (#2686's try-both),
-    # widen BOTH sides together.
+    # Probe for exactly what notify.py's sender reads: same three-tier base,
+    # then the shared containment policy (review P1 x2 on #2701).
     base = (os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
             or os.path.join(os.path.expanduser("~"), ".claude"))
     channels_dir = os.path.join(base, "channels")
     env_path = os.path.join(channels_dir, source, ".env")
     if not os.path.isfile(env_path):
         return False
-    real_env = os.path.realpath(env_path)
-    real_root = os.path.realpath(channels_dir)
-    return real_env.startswith(real_root + os.sep)
+    return _channel_env_is_contained(env_path, channels_dir, source)
 
 
 def resolve_active_target(activity_path):
