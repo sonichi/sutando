@@ -161,7 +161,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    WS="$(bash scripts/sutando-config.sh workspace)"
    H="$(bash scripts/sutando-config.sh host-label)"
    mkdir -p "$WS/hosts/$H"
-   DIGESTS="$(python3 "$(git -C . rev-parse --show-toplevel)/src/cron_entry_digest.py" "$WS/hosts/$H/crons.json")"
+   DIGESTS="$(python3 src/cron_entry_digest.py "$WS/hosts/$H/crons.json")"
    echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>, \"config_digests\": $DIGESTS}" > "$WS/hosts/$H/schedule-crons-stamp.json"
    ```
    `health-check.py`'s `session-crons` probe compares this host-owned stamp against the same host's core heartbeat `started_at`: a stamp older than the boot means session crons died with a previous session and were never re-registered (the silent 2/18 failure observed on a peer instance 2026-07-23). Do not skip the stamp on re-runs — a fresh stamp is what keeps the guard quiet.
