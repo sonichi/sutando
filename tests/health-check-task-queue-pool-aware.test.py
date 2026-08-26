@@ -6,6 +6,7 @@ import importlib.util
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -80,6 +81,26 @@ class PoolHeldQueue(unittest.TestCase):
         self.assertIn("1 of 2", r["detail"])
         self.assertIn("core-9", r["detail"])
         self.assertNotIn("core-1", r["detail"])
+
+    def test_a_hold_that_vanishes_mid_sweep_is_skipped_not_fatal(self):
+        """The queue moves while the probe reads it: a follower can finish and
+        archive between the listing and the stat. Losing the race must cost that
+        one file, not the whole verdict."""
+        self._task("task-gone.claimed-core-9.txt", age_s=6 * 3600)
+        self._task("task-stays.claimed-core-8.txt", age_s=6 * 3600)
+        real_stat = Path.stat
+        target = self.ws / "tasks" / "task-gone.claimed-core-9.txt"
+
+        def flaky(self_p, *a, **kw):
+            if self_p == target:
+                raise OSError(2, "No such file or directory")
+            return real_stat(self_p, *a, **kw)
+
+        with unittest.mock.patch.object(Path, "stat", flaky):
+            r = self.hc.check_task_queue()
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("core-8", r["detail"])
+        self.assertNotIn("core-9", r["detail"])
 
     def test_a_real_pileup_still_warns(self):
         """The guard must not disarm the probe: unassigned work still fires."""
