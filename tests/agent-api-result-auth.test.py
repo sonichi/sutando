@@ -51,10 +51,8 @@ SECRET_BODY = "the owner's private answer\n"
 (api.RESULT_DIR / "task-owner-1.txt").write_text(SECRET_BODY)
 (api.TASK_DIR / "task-pending-1.txt").write_text("id: task-pending-1\ntask: still running\n")
 
-# Handler runs on the MAIN thread (plain HTTPServer + handle_request loop);
-# requests are issued from a worker thread. Inverted on purpose: the coverage
-# gate's tracer misses handler-THREAD execution, so serving on the main
-# thread is what makes the dispatch lines measurable.
+# Handler on the MAIN thread, requests from a worker: inverted on purpose, the
+# coverage tracer misses handler-THREAD execution so dispatch would read as 0.
 server = http.server.HTTPServer(("127.0.0.1", 0), api.Handler)
 server.timeout = 0.5
 port = server.server_address[1]
@@ -79,9 +77,8 @@ def _raw_req(method, path, body=None, token="test-token-123"):
         with urllib.request.urlopen(r, timeout=10) as resp:
             return resp.status, resp.read().decode()
     except urllib.error.HTTPError as e:
-        # The server may close the socket right after an error response;
-        # reading the body can hit ECONNRESET — the status code is what the
-        # assertions need, so treat the body as best-effort.
+        # The socket may close right after an error response (ECONNRESET), and
+        # only the status is asserted — so the body read is best-effort.
         try:
             payload = e.read().decode()
         except Exception:

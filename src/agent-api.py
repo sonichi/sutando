@@ -854,13 +854,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(*delegation_read_result(
                     unquote(path[len("/delegation/results/"):])))
         elif path.startswith("/result/"):
-            # Result bodies are owner data, so the poll leg is gated exactly
-            # like the write leg it belongs to (POST /task): the token is
-            # checked when one is configured, and a core with none stays open
-            # for local use. NOT the delegation posture above — those refuse
-            # outright without a token because remote submission is
-            # full-capability delegation; /result is polled by the same
-            # local clients that POST /task, so it keeps /task's default.
+            # Owner data: gated like the write leg it belongs to (POST /task) —
+            # token checked when configured. NOT delegation's refuse-outright.
             if not self.check_auth():
                 return
             task_id = path[len("/result/"):]
