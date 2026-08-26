@@ -91,7 +91,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"migrate failed:\n{r.stdout}\n{r.stderr}")
         return r
 
-    def _gnu_stat_shim(self, comma: bool = True) -> Path:
+    def _gnu_stat_shim(self, comma: bool = True, synth: dict | None = None) -> Path:
         """A faithful-enough GNU `stat` on PATH: -f is --file-system (fails),
         -c formats succeed, and fractions use the locale's decimal separator."""
         import uuid
@@ -117,9 +117,16 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "st = os.stat(f)\n"
             "comma = os.environ.get('LC_ALL') != 'C'\n"
             "sep = ',' if comma else '.'\n"
+            f"_SYNTH = {synth or {}!r}\n"
+            "_k = os.path.basename(os.path.dirname(os.path.dirname(f)))\n"
             "if fmt == '%.9Y':\n"
-            "    print(f'{int(st.st_mtime)}{sep}{st.st_mtime_ns % 1000000000:09d}')\n"
-            "elif fmt == '%Y':  print(int(st.st_mtime))\n"
+            "    if _k in _SYNTH:\n"
+            "        _w, _n = _SYNTH[_k]\n"
+            "        print(f'{_w}{sep}{_n:09d}')\n"
+            "    else:\n"
+            "        print(f'{int(st.st_mtime)}{sep}{st.st_mtime_ns % 1000000000:09d}')\n"
+            "elif fmt == '%Y':\n"
+            "    print(_SYNTH[_k][0] if _k in _SYNTH else int(st.st_mtime))\n"
             "elif fmt in ('%s', '%z'):  print(st.st_size)\n"
             "elif fmt == '%y':  print(time.strftime('%Y-%m-%d %H:%M:%S',\n"
             "                          time.localtime(st.st_mtime)))\n"
@@ -246,6 +253,31 @@ class PinMigrationVisibilityTest(unittest.TestCase):
                 status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
                 self.assertEqual(status, "stale" if newer_is_release else "warn")
 
+
+    def test_GNU_migrator_CONSUMES_shim_values_not_host_stat(self) -> None:
+        """Prove the shim's ANSWER drove the decision, not merely that it ran.
+
+        Every earlier witness was blind here: the shim answered from os.stat on
+        the same fixtures, so host and shim always named the same winner. Here
+        they DISAGREE on the pair the migrator actually compares (src vs DEST),
+        and the surviving content shows which answer production consumed.
+        """
+        SEC = 1700000000
+        # host stat: src/a is 5s newer than dest -> src would win, dest overwritten.
+        # shim:      same second, dest has the larger fraction -> dest must survive.
+        synth = {"a": (SEC, 100000000), "dest": (SEC, 900000000)}
+        bin_ = self._gnu_stat_shim(synth=synth)
+        armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+        self._write("src/a", armed, SEC + 5)
+        self._write("dest", [], SEC)
+        self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
+                                 "LC_ALL": "de_DE.UTF-8"})
+        status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
+        self.assertEqual(
+            status, "stale",
+            "migration followed HOST stat (src newer -> dest overwritten with the "
+            "armed pin -> warn) instead of the shim's answer (dest newer -> "
+            "preserved -> stale): shim invoked, value NOT consumed")
 
     def test_COMMA_LOCALE_real_migrator_resolves_subsecond_on_dest_newer(self) -> None:
         """Drive the REAL migrator under emulated GNU stat in a comma locale.
