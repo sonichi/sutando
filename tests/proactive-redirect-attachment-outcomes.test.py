@@ -5,10 +5,10 @@ A sibling structural test pins the wiring in source. This one drives the real
 coroutine, because a source-shape assertion cannot tell whether the branch runs,
 and the branch is the whole fix.
 
-Scope: this covers the poll_proactive redirect loop only. The identical loop in
-poll_dm_fallback is NOT exercised here -- reaching it needs the target channel
-to resolve at OWNER tier and the dm-result shell-out to be stubbed, which this
-harness does not do. That half is uncovered, deliberately and knowingly.
+Covers BOTH copies of the loop: poll_proactive's channel-redirect and
+poll_dm_fallback's. Reaching the latter took one more gate than expected --
+its tier check reads access_tier off the ORIGINATING TASK FILE, not access.json,
+so a result with no matching task defaults to "other" and is dropped.
 
 The defect: a path that EXISTS but fails the allowlist matched neither
 `_is_path_sendable` nor `not os.path.isfile`, so it was dropped with no send, no
@@ -74,9 +74,12 @@ def load_bridge():
 try:
     bridge = load_bridge()
     results, state = tmp / "results", tmp / "state"
-    for d in (results, state, results / "undelivered"):
+    tasks = tmp / "tasks"
+    for d in (results, state, tasks, results / "undelivered"):
         d.mkdir(parents=True, exist_ok=True)
     bridge.RESULTS_DIR, bridge.STATE_DIR = results, state
+    if hasattr(bridge, "TASKS_DIR"):
+        bridge.TASKS_DIR = tasks
 
     sends = []
 
@@ -147,6 +150,25 @@ try:
         sendable.unlink(missing_ok=True)
     else:
         print("SKIP: no writable allowed root on this host for the SEND case")
+
+    # dm-fallback: tier is read off the ORIGINATING TASK FILE, so a result
+    # with no matching task defaults to "other" and is dropped.
+    (tasks / "question-attach.txt").write_text(
+        "id: question-attach\naccess_tier: owner\ntask: probe\n")
+    fb = results / "question-attach.txt"
+    fb.write_text(f"[channel: {TARGET}]\nbody\n[file: {refused}]\n")
+    aged = time.time() - 400          # past the 90s grace window
+    os.utime(fb, (aged, aged))
+    sends.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        with contextlib.suppress(Exception):
+            asyncio.run(asyncio.wait_for(bridge.poll_dm_fallback(), timeout=3.0))
+    fbout = buf.getvalue()
+    check("REJECTED file" in fbout and "dm-fallback" in fbout,
+          "dm-fallback: an allowlist-refused attachment is LOGGED")
+    check(any("file not allowed" in str(a) for a, _ in sends),
+          "dm-fallback: and the refusal is SURFACED to the target")
 
     # Control: the refused-branch probe must be able to score zero.
     check("REJECTED file" not in "", "control: the probe matches nothing on empty output")
