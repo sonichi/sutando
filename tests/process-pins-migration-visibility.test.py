@@ -288,31 +288,46 @@ class PinMigrationVisibilityTest(unittest.TestCase):
             "a FAILED `-f %Fm` that printed a number was accepted as the answer: "
             "the loop broke on numeric output instead of on a successful call")
 
-    def test_WHOLE_SECOND_fallback_is_the_call_that_DECIDES(self) -> None:
-        """The `%Y` fallback must be what chose, not merely what was available.
+    def test_WHOLE_SECOND_fallback_RECIPROCAL_and_byte_checked(self) -> None:
+        """Reciprocity on the %Y path, or an always-keep-destination impl passes.
 
-        A previous version disabled `%.9Y` and passed either way, because with
-        equal fractions `%.9Y` names the same winner as `%Y` -- so the disable
-        line certified nothing. Here the two tables name OPPOSITE winners, so
-        the verdict identifies which call decided.
+        A single dest-winning row is satisfied by mtime_ns returning constants,
+        by dropping `stat -f %m`, and by trying %Y before %m -- destination is
+        pre-seeded with the expected bytes, so no-op looks correct.
         """
         SEC = 1700000000
         armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
-        bin_ = self._gnu_stat_shim(
-            synth={"a": (SEC + 1, 0), "dest": (SEC + 2, 0)},    # %Y  -> dest wins
-            synth9={"a": (SEC + 9, 0), "dest": (SEC + 0, 0)})   # %.9Y -> a wins
-        shim = bin_ / "stat"
-        shim.write_text(shim.read_text().replace("if fmt == '%.9Y':", "if False:"))
-        shim.chmod(0o755)
-        self._write("src/a", armed, SEC + 5)
-        self._write("dest", [], SEC)
-        self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
-                                 "LC_ALL": "de_DE.UTF-8"})
-        status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
-        self.assertEqual(
-            status, "stale",
-            "the %Y fallback did not decide: verdict follows the %.9Y table "
-            "(a wins -> warn), so the subsecond call answered after all")
+        rows = [
+            # label, real_a, real_d, Y_a, Y_d, nine_a, nine_d, expected
+            ("fallback-D-wins", SEC + 3, SEC + 0, SEC + 1, SEC + 2,
+             SEC + 9, SEC + 0, "stale"),
+            ("fallback-A-wins", SEC + 0, SEC + 3, SEC + 2, SEC + 1,
+             SEC + 0, SEC + 9, "warn"),
+        ]
+        for label, ra, rd, ya, yd, na, nd, expected in rows:
+            with self.subTest(row=label):
+                self.setUp()
+                bin_ = self._gnu_stat_shim(
+                    synth={"a": (ya, 0), "dest": (yd, 0)},
+                    synth9={"a": (na, 0), "dest": (nd, 0)})
+                shim = bin_ / "stat"
+                shim.write_text(
+                    shim.read_text().replace("if fmt == '%.9Y':", "if False:"))
+                shim.chmod(0o755)
+                a_path = self._write("src/a", armed, ra)
+                d_path = self._write("dest", [], rd)
+                a_bytes, d_bytes = a_path.read_bytes(), d_path.read_bytes()
+                self._migrate(extra_env={"PATH": f"{bin_}:{os.environ['PATH']}",
+                                         "LC_ALL": "de_DE.UTF-8"})
+                canonical = self.tmp / "dest" / "state" / "process-pins.json"
+                status, _ = self._verdict(canonical)
+                self.assertEqual(
+                    status, expected,
+                    f"{label}: %Y table names {expected}; host or mixed pairs "
+                    f"name the other, and a constant impl cannot satisfy both rows")
+                want = d_bytes if expected == "stale" else a_bytes
+                self.assertEqual(canonical.read_bytes(), want,
+                                 f"{label}: surviving bytes are not the expected candidate's")
 
     def test_INTERLEAVED_only_BOTH_shim_answers_pick_the_shim_winner(self) -> None:
         """Reciprocal + interleaved, so a mixed host/shim pair cannot pass.
