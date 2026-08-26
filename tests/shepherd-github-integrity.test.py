@@ -14,6 +14,8 @@ import threading
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+# The GitHub adapter lives at the optional skill edge, not in core.
+sys.path.insert(0, str(ROOT / "skills" / "pr-shepherd-contract" / "scripts"))
 
 WORK = tempfile.mkdtemp(prefix="shepherd-integrity-")
 

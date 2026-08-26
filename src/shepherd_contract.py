@@ -84,6 +84,24 @@ VERIFIED_ACTOR_SCHEMES = frozenset({"matrix.mxid"})
 STRONG_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | VERIFIED_ACTOR_SCHEMES
 
 
+def register_actor_scheme(scheme: str, *, verified: bool = False) -> None:
+    """Adapter seam: declare an actor-resolution scheme as discriminating.
+    Verified schemes may close an objective on their own; asserted schemes
+    attribute but cannot close. Re-registering at the same strength is a no-op;
+    changing a scheme's strength is refused -- trust never moves by accident."""
+    global ASSERTED_ACTOR_SCHEMES, VERIFIED_ACTOR_SCHEMES, STRONG_ACTOR_SCHEMES
+    _require_text("register_actor_scheme", "scheme", scheme)
+    other = ASSERTED_ACTOR_SCHEMES if verified else VERIFIED_ACTOR_SCHEMES
+    if scheme in other:
+        raise ValueError(f"actor scheme {scheme!r} is already registered at the "
+                         f"opposite strength; refusing to change its trust")
+    if verified:
+        VERIFIED_ACTOR_SCHEMES = VERIFIED_ACTOR_SCHEMES | {scheme}
+    else:
+        ASSERTED_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | {scheme}
+    STRONG_ACTOR_SCHEMES = ASSERTED_ACTOR_SCHEMES | VERIFIED_ACTOR_SCHEMES
+
+
 @dataclass(frozen=True)
 class Actor:
     """Who is responsible. `scheme` names how the adapter resolved it, so

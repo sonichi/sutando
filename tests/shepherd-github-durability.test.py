@@ -10,6 +10,9 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+# The GitHub adapter lives at the optional skill edge, not in core.
+SKILL = ROOT / "skills" / "pr-shepherd-contract" / "scripts"
+sys.path.insert(0, str(SKILL))
 
 # Isolation comes from redirecting state_dir below, NOT from the environment:
 # $SUTANDO_WORKSPACE stopped being honored in v0.8, so setting it isolates nothing.
@@ -45,6 +48,7 @@ probe = subprocess.run(
     [sys.executable, "-c",
      "import sys,pathlib,json;"
      f"sys.path.insert(0,{str(ROOT / 'src')!r});"
+     f"sys.path.insert(0,{str(SKILL)!r});"
      "import shepherd_github as g;"
      f"g.state_dir=lambda: pathlib.Path({WORK!r})/'state'/'shepherd';"
      "r=g.load('task-dur-1');"

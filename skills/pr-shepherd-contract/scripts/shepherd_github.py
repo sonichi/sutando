@@ -1,10 +1,11 @@
 """GitHub adapter for the shepherd contract: turn a real pull request into
 observed events, and persist the waiting contract so a later pass can resume.
 
-The contract stays provider-neutral; everything provider-specific is here --
-including how actor is resolved. For GitHub that is the commit-author email of
-the last non-merge commit, NOT the account login, because several actors can
-push under one login and the login cannot discriminate between them.
+The contract (src/shepherd_contract.py) stays provider-neutral; everything
+provider-specific lives here, at the optional skill edge -- including how actor
+is resolved. For GitHub that is the commit-author email of the last non-merge
+commit, NOT the account login, because several actors can push under one login
+and the login cannot discriminate between them.
 
 State lives under the resolved workspace, never under a home-directory path:
 the workspace is the durable per-user location and survives app updates.
@@ -17,12 +18,15 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-from local_task_protocol import valid_task_id
-from shepherd_contract import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+
+from local_task_protocol import valid_task_id  # noqa: E402
+from shepherd_contract import (  # noqa: E402
     Actor,
     ObservedEvent,
     ResponsibilityScope,
@@ -30,13 +34,17 @@ from shepherd_contract import (
     admit,
     is_terminal,
     proposed_terminal_state,
+    register_actor_scheme,
     require_shepherd_state,
     terminal_state_for,
 )
-from workspace_default import resolve_workspace
+from workspace_default import resolve_workspace  # noqa: E402
 
 PROVIDER = "github"
 ACTOR_SCHEME = "git.commit_author_email"
+# Idempotent: the scheme is a core default; registering pins this adapter to
+# the contract's seam rather than to that default staying in place.
+register_actor_scheme(ACTOR_SCHEME)
 
 WATCH = frozenset({
     "github.check_suite.completed",

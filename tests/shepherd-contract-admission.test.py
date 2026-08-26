@@ -297,8 +297,7 @@ check("source_id must be a string; '' stays legal for an unresolved id",
 
 
 # --- the TOP-LEVEL event/scope objects are seams too (reported at 187edf73) ---
-# The nested checks bless Subject/Actor, but a ResponsibilityScope SUBCLASS
-# inherits that blessing and can override the predicates admit() trusts.
+# A scope SUBCLASS inherits the nested blessing yet overrides what admit() trusts.
 class _EvilScope(ResponsibilityScope):
     def covers_subject(self, subject):
         return True
@@ -354,6 +353,31 @@ check("is_terminal refuses a forged str subclass",
 check("is_terminal refuses a non-str outright", is_terminal(None), False)
 check("is_terminal still recognises a genuine terminal state (control)",
       is_terminal("succeeded"), True)
+
+
+import shepherd_contract as sc  # noqa: E402
+
+# --- the scheme sets are a SEAM, not provider knowledge baked into core -------
+# Registration mutates module state, so this section stays LAST.
+check("an unregistered scheme is weak by default",
+      Actor("gitlab.job_token", "x").is_discriminating, False)
+sc.register_actor_scheme("gitlab.job_token")
+check("a registered asserted scheme discriminates",
+      Actor("gitlab.job_token", "x").is_discriminating, True)
+check("...but is not verified", Actor("gitlab.job_token", "x").is_verified, False)
+sc.register_actor_scheme("oidc.subject", verified=True)
+check("a registered verified scheme is verified",
+      Actor("oidc.subject", "x").is_verified, True)
+check("re-registering at the same strength is a no-op",
+      (sc.register_actor_scheme("gitlab.job_token"),
+       Actor("gitlab.job_token", "x").is_verified), (None, False))
+check("re-registering at the OPPOSITE strength is refused",
+      _rejects(lambda: sc.register_actor_scheme("gitlab.job_token", verified=True)), True)
+check("a blank scheme cannot be registered",
+      _rejects(lambda: sc.register_actor_scheme("  ")), True)
+check("the defaults are unchanged by registration",
+      ("git.commit_author_email" in sc.ASSERTED_ACTOR_SCHEMES,
+       "matrix.mxid" in sc.VERIFIED_ACTOR_SCHEMES), (True, True))
 
 if failures:
     print(f"FAIL ({len(failures)}):")
