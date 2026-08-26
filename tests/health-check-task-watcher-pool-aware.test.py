@@ -23,6 +23,7 @@ import importlib.util
 import re
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -80,6 +81,57 @@ def _probe(ps_rows, roots, core_pids, sentinel=None, sentinel_alive=False):
     hc._any_core_alive = lambda *a, **k: True
     hc._local_core_pids = lambda: core_pids
     return hc.check_task_watcher()
+
+
+class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
+    """`_local_core_pids()` is the ownership oracle, so its tri-state matters:
+    a set means tmux answered, None means it could not be asked at all."""
+
+    def _mod(self, default_rc, default_out, sock=None, sock_rc=0, sock_out=""):
+        hc = _load()
+        hc._resolve_tmux_bin = lambda: "/usr/bin/tmux"
+        hc._resolve_launch_env = lambda: {}
+
+        class R:
+            def __init__(self, rc, out):
+                self.returncode, self.stdout = rc, out
+
+        if default_rc is None:
+            hc.subprocess = types.SimpleNamespace(
+                run=lambda *a, **k: (_ for _ in ()).throw(OSError("no tmux")))
+        else:
+            hc.subprocess = types.SimpleNamespace(
+                run=lambda *a, **k: R(default_rc, default_out))
+        hc._local_core_socket = lambda: sock
+        hc._run_tmux = (lambda s, *a: R(sock_rc, sock_out)) if sock else (lambda s, *a: None)
+        return hc
+
+    def test_pane_pids_from_the_default_socket(self):
+        hc = self._mod(0, "3951\n3952\n38058\n")
+        self.assertEqual(hc._local_core_pids(), {"3951", "3952", "38058"})
+
+    def test_non_numeric_rows_are_dropped(self):
+        """`-F '#{pane_pid}'` on an old tmux can emit the format string itself."""
+        hc = self._mod(0, "3951\n#{pane_pid}\n\n")
+        self.assertEqual(hc._local_core_pids(), {"3951"})
+
+    def test_the_runtime_socket_is_unioned_in(self):
+        hc = self._mod(0, "100\n", sock="/tmp/s.sock", sock_out="200\n")
+        self.assertEqual(hc._local_core_pids(), {"100", "200"})
+
+    def test_tmux_unavailable_is_None_not_an_empty_set(self):
+        """The distinction the whole fail-closed path rests on: None means
+        'could not verify' (everything unverified), a set means 'asked, and
+        these are the cores' (anything absent is genuinely not a core)."""
+        self.assertIsNone(self._mod(None, "")._local_core_pids())
+
+    def test_a_nonzero_exit_is_also_unverifiable(self):
+        self.assertIsNone(self._mod(1, "")._local_core_pids())
+
+    def test_tmux_running_with_no_panes_is_an_empty_set(self):
+        """Positive control against the case above: tmux ANSWERED, so absence
+        is real. Returning None here would silently re-bless every stranger."""
+        self.assertEqual(self._mod(0, "")._local_core_pids(), set())
 
 
 class OwnershipRequiresAVerifiedCoreSession(unittest.TestCase):
