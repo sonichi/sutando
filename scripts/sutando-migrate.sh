@@ -94,11 +94,11 @@ WORKSPACE_SURFACE_DIRS=(
     # Owner-custom tooling surface (report c8310df7): <workspace>/scripts is
     # DATA. The repo's own scripts/ is code — excluded via SOURCE_A_EXCLUDE.
     "scripts"
-    # Agent config tree (report 9de2a03d): skills, settings, hooks, memory.
-    # Quarantining it silently breaks every configured hook/skill path.
+    # Agent config tree: skills, settings, hooks, memory. Quarantining it
+    # silently breaks every configured hook/skill path.
     ".claude-sutando"
-    # Per-host state tree (tk-7e767bb426 class): crons.json, PERSONAL_CLAUDE.md,
-    # pending-questions, current-track — every reader resolves hosts/<label>/.
+    # Per-host state tree: crons.json, PERSONAL_CLAUDE.md, pending-questions,
+    # current-track — every reader resolves hosts/<label>/.
     "hosts"
     # Session-relay notes: the next session's catchup input.
     "relay"
@@ -388,7 +388,7 @@ record_xsrc() {
     local mt sz
     mt="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
     sz="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$tag" "$cls" "$mt" "$sz" >> "$XSRC_INDEX"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$rel" "$tag" "$cls" "$mt" "$sz" "$file" >> "$XSRC_INDEX"
 }
 
 scan_source() {
@@ -794,28 +794,43 @@ report_cross_source() {
         return
     fi
 
-    # Identical-content collisions: cross-source rows where ALL entries share
-    # the same mtime AND size for the relpath. High-confidence "same file
-    # mirrored through sync" — commit can pick one source as canonical and
-    # skip the rest (no real conflict). Common case: memory-sync mirroring
-    # notes/ between B and C.
+    # Identical-content collisions: byte-verified (sha256 over every entry of
+    # the relpath). An unreadable entry fails closed to divergent — a proxy
+    # match (mtime+size) must never certify content identity.
     local total_identical
-    # Concatenated-key idiom (BSD awk has no array-of-array); detect identical
-    # across all entries of a relpath by counting distinct (mtime,size) pairs.
-    total_identical="$(awk -F'\t' '
-        {
-            n[$1]++
-            key = $1 SUBSEP $4 "|" $5
-            if (!(key in seen)) { seen[key]=1; pairs[$1]++ }
-        }
-        END {
-            ident=0
-            for (k in n) if (n[k]>1 && pairs[k]==1) ident++
-            print ident
-        }
-    ' "$XSRC_INDEX" 2>/dev/null || echo 0)"
+    total_identical="$(python3 - "$XSRC_INDEX" <<'PYIDENT'
+import sys, hashlib
+from collections import defaultdict
+by_rel = defaultdict(list)
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 6:
+                by_rel[parts[0]].append(parts[5])
+except OSError:
+    print(0); raise SystemExit
+def sha(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+ident = 0
+for rel, paths in by_rel.items():
+    if len(paths) < 2:
+        continue
+    hs = {sha(p) for p in paths}
+    if None not in hs and len(hs) == 1:
+        ident += 1
+print(ident)
+PYIDENT
+)"
 
-    REPORT_LINES+=("  of which identical-content (same mtime + size):  $total_identical (commit will pick one canonical + skip rest)")
+    REPORT_LINES+=("  of which identical-content (byte-verified):  $total_identical (commit will pick one canonical + skip rest)")
     REPORT_LINES+=("  genuine cross-source conflicts (need strategy):  $((total_xs - total_identical))")
 
     # Per-class breakdown of cross-source collisions
@@ -2160,15 +2175,33 @@ entries = []
 if os.path.exists(idx_path):
     with open(idx_path) as f:
         for line in f:
-            rel, tag, cls, mt, sz = line.rstrip("\n").split("\t")
+            parts = line.rstrip("\n").split("\t")
+            rel, tag, cls, mt, sz = parts[:5]
+            path = parts[5] if len(parts) > 5 else ""
             entries.append({"rel": rel, "tag": tag, "class": cls,
-                            "mtime": int(mt or 0), "size": int(sz or 0)})
+                            "mtime": int(mt or 0), "size": int(sz or 0),
+                            "path": path})
 by_rel = defaultdict(list)
 for e in entries:
     by_rel[e["rel"]].append(e)
 collisions = {k: v for k, v in by_rel.items() if len(v) > 1}
-identical = sum(1 for v in collisions.values()
-                if len({(e["mtime"], e["size"]) for e in v}) == 1)
+import hashlib
+def _sha(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+def byte_identical(v):
+    """Content identity is HASH identity; an unreadable entry fails closed to
+    divergent — a proxy match (mtime+size) must never certify it."""
+    hs = {_sha(e["path"]) for e in v}
+    return None not in hs and len(hs) == 1
+ident_verdict = {k: byte_identical(v) for k, v in collisions.items()}
+identical = sum(1 for x in ident_verdict.values() if x)
 genuine = len(collisions) - identical
 by_class = defaultdict(int)
 for v in collisions.values():
@@ -2178,36 +2211,43 @@ def has_size_mismatch(entries):
     return len({e["size"] for e in entries}) > 1
 def has_mtime_mismatch(entries):
     return len({e["mtime"] for e in entries}) > 1
-# Sort by actionability: size-mismatch (real content conflict) first, then
-# mtime-only diff (commit's newest-mtime resolves it), then identical
-# (drop-dup). Tiebreak by class then rel.
+# Sort by actionability: any byte-divergent collision whose proxies agree
+# (equal mtime+size, different content) is as real as a size mismatch and
+# sorts first with it; then mtime-only, then byte-identical (drop-dup).
 def sort_key(item):
     k, v = item
-    sz_diff = has_size_mismatch(v)
-    mt_diff = has_mtime_mismatch(v)
-    # priority: 0=size-diff (real), 1=mtime-only, 2=identical
-    if sz_diff: prio = 0
-    elif mt_diff: prio = 1
-    else: prio = 2
+    if has_size_mismatch(v) or not ident_verdict[k]:
+        prio = 0
+    elif has_mtime_mismatch(v):
+        prio = 1
+    else:
+        prio = 2
     return (prio, v[0]["class"], k)
 notable = [{"class": v[0]["class"], "rel": k,
+            "byte_identical": ident_verdict[k],
             "size_mismatch": has_size_mismatch(v),
             "mtime_mismatch": has_mtime_mismatch(v),
             "entries": [{"tag": e["tag"], "mtime": e["mtime"], "size": e["size"]} for e in v]}
            for k, v in sorted(collisions.items(), key=sort_key)]
 size_diff = sum(1 for v in collisions.values() if has_size_mismatch(v))
-mtime_only = sum(1 for v in collisions.values() if not has_size_mismatch(v) and has_mtime_mismatch(v))
+mtime_only = sum(1 for k, v in collisions.items() if not has_size_mismatch(v)
+                 and has_mtime_mismatch(v) and not ident_verdict[k])
+proxy_identical_divergent = sum(
+    1 for k, v in collisions.items()
+    if not has_size_mismatch(v) and not has_mtime_mismatch(v) and not ident_verdict[k])
 out = {
     "dest": dest,
     "sources": {"A": a or None, "B": b or None, "C": c or None},
     "totals": {
         "unique_relpaths": len(by_rel),
         "collisions": len(collisions),
-        "identical_content": identical,
+        "identical_content": identical,  # byte-verified, never proxy-inferred
         "mtime_only_diff": mtime_only,  # commit's newest-mtime auto-resolves
-        "size_mismatch": size_diff,     # the actionable subset — real content conflicts
-        # Legacy "genuine_conflicts" kept for backward-compat; equals mtime_only + size_mismatch
-        "genuine_conflicts": genuine,
+        "size_mismatch": size_diff,     # actionable — real content conflicts
+        # Actionable — equal mtime+size but different bytes; the proxies lie here.
+        "proxy_identical_divergent": proxy_identical_divergent,
+        "genuine_conflicts": genuine,   # collisions - byte-identical
+
         "by_class": dict(by_class),
     },
     "notable_collisions": notable[:50],
