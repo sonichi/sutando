@@ -365,12 +365,8 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # Read-only commands that app-only bearer auth can handle. Skip OAuth1
-    # setup (and its `requests`/`oauthlib` install) so X_BEARER_TOKEN-only
-    # environments don't need pip.
-    # BEARER-ONLY commands are settled here, before get_auth(): that call loads
-    # the optional OAuth deps, so a clean host would report a pip problem for a
-    # command whose real blocker is a missing bearer token.
+    # Settled before get_auth(): that call loads the optional OAuth deps, so a
+    # clean host would report a pip problem for a missing-bearer failure.
     if args.command == "user-timeline":
         if not BEARER_TOKEN:
             print("'user-timeline' needs X_BEARER_TOKEN (app-only auth); OAuth1 "
