@@ -469,5 +469,58 @@ class AttestationBitesAtTheIdFormBridgesHold(unittest.TestCase):
             "the answer")
 
 
+class AttestsCliAndCrossTaskReceipt(unittest.TestCase):
+    """The `attests` subcommand exists so a SHELL caller can check attestation
+    rather than presence; it is only reachable through the CLI entry."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        ws = Path(self.tmp.name)
+        self.results = ws / "results"
+        self.results.mkdir()
+        self.receipts = result_write.receipts_dir_for(ws)
+        self.receipts.mkdir(parents=True)
+        result_write.write_paired_result(
+            self.results, "abc", "task: abc\nthe answer\n",
+            receipts_dir=self.receipts)
+
+    def _cli(self, *argv):
+        return result_write._attests_cli(
+            [*argv, "--results-dir", str(self.results),
+             "--receipts-dir", str(self.receipts)])
+
+    def test_a_receipt_naming_a_different_task_does_not_attest(self):
+        """A receipt is only evidence for the task it names. Copying one over
+        another id must not launder the body it never covered."""
+        other = result_write.receipt_path(self.receipts, "abc").read_text()
+        result_write.receipt_path(self.receipts, "zzz").write_text(other)
+        (self.results / "task-zzz.txt").write_text("the answer\n")
+        self.assertFalse(
+            result_write.receipt_attests(self.receipts, "zzz", "the answer\n"))
+
+    def test_cli_exits_0_when_the_receipt_attests_the_current_bytes(self):
+        self.assertEqual(self._cli("abc"), 0)
+
+    def test_cli_exits_1_after_the_result_is_overwritten(self):
+        (self.results / "task-abc.txt").write_text("someone else's answer\n")
+        self.assertEqual(self._cli("abc"), 1)
+
+    def test_cli_exits_1_for_an_empty_receipt(self):
+        """Presence is not attestation — the case the old shell gate missed."""
+        result_write.receipt_path(self.receipts, "abc").write_text("")
+        self.assertEqual(self._cli("abc"), 1)
+
+    def test_cli_exits_1_when_there_is_no_result_file(self):
+        self.assertEqual(self._cli("nosuch"), 1)
+
+    def test_cli_rejects_a_missing_task_id(self):
+        self.assertEqual(result_write._attests_cli([]), 2)
+
+    def test_cli_rejects_a_dangling_or_unknown_flag(self):
+        self.assertEqual(result_write._attests_cli(["abc", "--results-dir"]), 2)
+        self.assertEqual(result_write._attests_cli(["abc", "--nope", "x"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
