@@ -23,6 +23,11 @@ for _p in (REPO / "packages" / "ag2-sparrow", REPO / "src"):
         sys.path.insert(0, str(_p))
 
 
+FIXTURE_TOKEN = "fixture-token-not-a-credential"
+# Module scope: every fresh import resolves the token via a chain ending in
+# the real channel .env + Keychain; the env tier short-circuits it first.
+os.environ["REMOTE_TASK_TOKEN"] = FIXTURE_TOKEN
+os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9/fixture"
 _LOG_TMPDIRS: "list" = []   # fixture log dirs, one per re-import
 
 
@@ -36,9 +41,14 @@ def _bridge(instance):
         os.environ["GATEWAY_INSTANCE"] = instance
     else:
         os.environ.pop("GATEWAY_INSTANCE", None)
+    os.environ["REMOTE_TASK_TOKEN"] = FIXTURE_TOKEN
+    os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9/fixture"
     for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
         del sys.modules[name]
     mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+    assert mod.TOKEN == FIXTURE_TOKEN, (
+        "import resolved a token that is not the fixture — the credential "
+        "fallback chain was consulted")
     # _log appends to the REAL ~/.ag2-sparrow log — rebind it per import or
     # the suite forges the witness-class "orphan sweep" lines.
     log_tmp = tempfile.TemporaryDirectory()
@@ -90,6 +100,7 @@ class PerLaneLogFile(unittest.TestCase):
             for name in [k for k in sys.modules if k.startswith("ag2_sparrow")]:
                 del sys.modules[name]
             mod = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+            assert mod.TOKEN == FIXTURE_TOKEN
             names[inst] = mod._LOG_FILE.name
             # contain the import's logger immediately (no real-log writes)
             log_tmp = tempfile.TemporaryDirectory()
