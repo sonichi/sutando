@@ -2393,7 +2393,7 @@ case "$MODE" in
         fi
         ;;
     commit)
-        commit_main || exit 1
+        commit_main
         ;;
     verify)
         verify_main
