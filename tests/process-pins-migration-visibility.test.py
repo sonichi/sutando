@@ -331,9 +331,8 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         dead production writer cannot be certified live by a probe-only writer.
         """
         import uuid
-        nonce = f"SHIM-BOUND-{uuid.uuid4().hex[:12]}"
         run_id = uuid.uuid4().hex
-        self._nonce, self._run_id = nonce, run_id
+        self._run_id = run_id
         bin_ = self.tmp / "shimbin"
         bin_.mkdir(exist_ok=True)
         self._trace = self.tmp / "stat-trace.log"
@@ -341,7 +340,7 @@ class PinMigrationVisibilityTest(unittest.TestCase):
         tmpl = r"""#!/usr/bin/env python3
 import os, sys, time, json as _j
 a = sys.argv[1:]
-TRACE, NONCE, RUN_ID = __TRACE__, __NONCE__, __RUNID__
+TRACE, RUN_ID = __TRACE__, __RUNID__
 _POISON, _SYNTH, _SYNTH9 = __POISON__, __SYNTH__, __SYNTH9__
 DROP_RESULTS = False
 
@@ -371,7 +370,7 @@ def dispatch(a):
             return os.path.realpath(a[2]), "", 1, _POISON[_key(a[2])] + "\n", ""
         _op = os.path.realpath(a[2]) if len(a) > 2 else ""
         return (_op, "", 1, '  File: "x"\n    ID: 0 Namelen: 255\n',
-                "stat: cannot read file system information\n" + NONCE + "\n")
+                "stat: cannot read file system information\n")
     if a[0] != "-c":
         return "", "", 1, "", ""
     fmt, f = a[1], a[2]
@@ -399,7 +398,6 @@ def dispatch(a):
 finish(a, *dispatch(a))
 """
         for token, value in (("__TRACE__", repr(str(self._trace))),
-                             ("__NONCE__", repr(nonce)),
                              ("__RUNID__", repr(run_id)),
                              ("__POISON__", repr(poison or {})),
                              ("__SYNTH__", repr(synth or {})),
@@ -434,6 +432,8 @@ finish(a, *dispatch(a))
                          (0, stdout, ""), "shim did not bind through PATH")
         self._require_trace(expected, run_id=self._run_id)
         self._trace.write_bytes(b"")
+        self.assertEqual(self._trace.read_bytes(), b"",
+                         "bind must leave no record for migration assertions to see")
 
     def _assert_migrator_used_shim(self, *, fallback: bool = False) -> None:
         """Bind the trace to the EXACT operands, both of them.
