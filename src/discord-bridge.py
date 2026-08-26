@@ -2695,10 +2695,9 @@ async def on_resumed():  # pragma: no cover — gateway callback; counter logic 
 
 @client.event
 async def on_disconnect():  # pragma: no cover — gateway callback; counter logic is unit-tested
+    # Silent: a per-event line could bury ready/resume at an unmeasured flap rate.
     global _disconnect_count
     _disconnect_count += 1
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge disconnected: "
-          f"{_reconnect_state()}", flush=True)
 
 
 @client.event
@@ -2711,7 +2710,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
     # for Discord to infer it. Best-effort — presence must never break startup.
