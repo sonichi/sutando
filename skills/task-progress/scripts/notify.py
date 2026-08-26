@@ -66,16 +66,37 @@ def _env_file(path: str) -> dict[str, str]:
     return result
 
 
-def _token(source: str, var: str) -> str:
-    """Resolve a token from env, then the channel .env file."""
-    val = os.environ.get(var, "").strip()
-    if val:
-        return val
+def _channel_env_path(source: str) -> Path:
     # Mirrors util_paths.claude_home_path ($CLAUDE_CONFIG_DIR -> $CLAUDE_HOME -> ~/.claude).
     _base = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
     _claude_config = Path(_base) if _base else Path.home() / ".claude"
-    env_path = _claude_config / "channels" / source / ".env"
-    return _env_file(str(env_path)).get(var, "")
+    return _claude_config / "channels" / source / ".env"
+
+
+def _load_resolver():
+    """The bridges' own resolver, or None when src/ is not importable."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        from channel_token import resolve_channel_token  # type: ignore
+        return resolve_channel_token
+    except Exception:
+        return None
+
+
+_resolve_channel_token = _load_resolver()
+
+
+def _token(source: str, var: str) -> str:
+    """Resolve a token: process env -> channel `.env` -> vault.
+
+    Delegates to channel_token so these tiers cannot drift from the bridges'.
+    Degrades to the first two tiers alone rather than failing a notification.
+    """
+    env_path = _channel_env_path(source)
+    if _resolve_channel_token is not None:
+        return _resolve_channel_token(var, env_file=env_path)
+    val = os.environ.get(var, "").strip()
+    return val or _env_file(str(env_path)).get(var, "")
 
 
 def _post(url: str, payload: dict, headers: dict) -> bool:
@@ -101,11 +122,11 @@ def _rest_client(token: str):
     """The shared Discord chokepoint + injected post-gate. Resolved and
     imported lazily so non-Discord sources never touch the Discord stack."""
     repo = next(p for p in Path(__file__).resolve().parents
-                if (p / "src" / "discord_rest_client.py").is_file())
+                if (p / "src" / "channels" / "discord" / "client.py").is_file())
     src = str(repo / "src")
     if src not in sys.path:
         sys.path.insert(0, src)
-    from discord_post_gate import make_client
+    from channels.discord.post_gate import make_client
     return make_client(token, timeout=10)
 
 

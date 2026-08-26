@@ -31,7 +31,7 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-import team_result_guard as guard  # noqa: E402
+import policy.egress.result as guard  # noqa: E402
 
 FAILS: list[str] = []
 

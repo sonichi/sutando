@@ -107,7 +107,10 @@ class Lab:
             "exit 0\n"
         )
         (self.bin / "lsof").chmod(0o755)
-        self.pidfile = self.ws / ".voice-agent.pid"
+        locks = self.ws / "state" / "locks"
+        locks.mkdir(parents=True)
+        self.pidfile = locks / "voice-agent.pid"
+        self.legacy_pidfile = self.ws / ".voice-agent.pid"
         self.procs = []
 
     def run_script(self, old_pid="", fresh=True, no_job=False):
@@ -183,6 +186,33 @@ def main():
         check("script succeeds", p.returncode == 0, p.stdout + p.stderr)
         check("packaged-shape owner killed", agent.poll() is not None)
         check("packaged-shape lock stolen", not lab.pidfile.exists())
+
+        # --- transition fallback (#2722): a pre-move agent's root lock must
+        # stay reachable, or the restart path silently cannot stop it.
+        print("legacy-root fallback (pre-move agent):")
+        agent = spawn_dummy(entry_dev)
+        lab.procs.append(agent)
+        structured_lock(lab.legacy_pidfile, agent.pid, my_start_time_ms(agent.pid), entry_dev, lab.ws)
+        p = lab.run_script(old_pid=agent.pid)
+        check("script succeeds", p.returncode == 0, p.stdout + p.stderr)
+        check("pre-move owner killed via fallback", agent.poll() is not None)
+        check("legacy lock stolen", not lab.legacy_pidfile.exists())
+        check("fallback announced on stderr", "transition window" in p.stderr, p.stderr)
+        check("canonical path untouched", not lab.pidfile.exists())
+
+        # --- canonical wins when BOTH exist: without this control the rows
+        # above are consistent with a resolver that always answers legacy.
+        print("canonical-first when both exist:")
+        agent = spawn_dummy(entry_dev)
+        lab.procs.append(agent)
+        structured_lock(lab.pidfile, agent.pid, my_start_time_ms(agent.pid), entry_dev, lab.ws)
+        lab.legacy_pidfile.write_text("{stale legacy junk")
+        p = lab.run_script(old_pid=agent.pid)
+        check("script succeeds", p.returncode == 0, p.stdout + p.stderr)
+        check("canonical owner killed", agent.poll() is not None)
+        check("canonical lock stolen", not lab.pidfile.exists())
+        check("no fallback line when canonical exists", "transition window" not in p.stderr, p.stderr)
+        lab.legacy_pidfile.unlink()
 
         # --- malformed lock → left in place, WARN, no rm -f ---
         print("malformed lock:")

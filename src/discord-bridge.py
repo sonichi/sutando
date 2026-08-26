@@ -149,10 +149,11 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
-from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+
+from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -168,8 +169,9 @@ REPLY_CHAIN_MAX_DEPTH = 8
 # reached within this bound, an explicit truncation marker is emitted.
 REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
-import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
-import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
+import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink)
+import discord_result_delivery as _drd  # noqa: E402  (top-level so hooks carry no lazy import)
+import delivery.router as result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 
 #: Consecutive polls each result file has been present-but-empty. Bridge-owned
 #: state; threshold and wording live in result_router so the bridges cannot drift.
@@ -354,7 +356,7 @@ OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 # `src/dm-result.py`'s REST-fallback delivery (per liususan091219
 # review on PR #1029: keeping the policy as a copy in each file will
 # drift, even with "keep in sync" comments).
-from send_allowlist import (  # noqa: E402
+from policy.egress.attachment import (  # noqa: E402
     SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS,
     is_path_sendable as _is_path_sendable_shared,
@@ -519,6 +521,29 @@ def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
     archive_file(task_file, "tasks", task_id)
     if gone:
         _clear_delivered(task_id)
+
+
+def _anchor_from_task_file(task_id: str):
+    """Recover the quote-reply anchor `pending_reply_anchors` lost to a restart.
+    By delivery time the task may be claimed or already archived, so try both."""
+    candidates = []
+    try:
+        live = find_task_file(TASKS_DIR, task_id)
+        if live is not None:
+            candidates.append(live)
+        for pattern in (f"*/{task_id}.txt", f"*/{task_id}.claimed-core-*.txt"):
+            candidates.extend(sorted(ARCHIVE_TASKS_DIR.glob(pattern)))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                if line.startswith("source_message_id:"):
+                    raw = line.split(":", 1)[1].strip()
+                    return int(raw) if raw.isdigit() else None
+        except Exception:
+            continue
+    return None
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
@@ -4713,6 +4738,10 @@ async def poll_results():
                 # messages instead of quote-replies. Caught by live test
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
+                if source_message_anchor is None:
+                    # Survives a bridge restart: the in-memory dict is gone but
+                    # the task file still carries source_message_id.
+                    source_message_anchor = _anchor_from_task_file(task_id)
                 # Clear the progress-streamer's tier map here (NOT only in
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
@@ -4820,9 +4849,19 @@ async def poll_results():
                 # Avoids the double-delivery vector when the bridge
                 # restarts between channel.send() returning and
                 # archive_file() finishing. See DELIVERED_DIR docstring.
-                if _is_delivered(task_id):
-                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
+                if _drd.is_delivered(RESULTS_DIR, task_id, DELIVERED_DIR):
+                    print(f"  Skipped (already delivered per outbox/sentinel): {task_id}", flush=True)
                     _archive_delivered_pair(result_file, task_id)
+                    continue
+                if _drd.is_parked(RESULTS_DIR, task_id):
+                    # terminal park recorded but a crash preceded the archive:
+                    # finish the archive now so the pair cannot loop forever
+                    print(f"  Parked (terminal) — archiving: {task_id}", flush=True)
+                    _archive_delivered_pair(result_file, task_id)
+                    continue
+                _send_tok = _drd.claim_for_send(RESULTS_DIR, task_id)
+                if _send_tok is None:
+                    # another incarnation holds the claim right now
                     continue
 
                 try:
@@ -5001,7 +5040,8 @@ async def poll_results():
                     # triggers the skip-block above (archive + clear,
                     # no re-send). Without this, the result file
                     # would re-send on restart producing a duplicate.
-                    _mark_delivered(task_id)
+                    _drd.confirm(RESULTS_DIR, _send_tok,
+                                 str(getattr(channel, "id", "")))
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                     # Observability: one delivered-reply event.
                     _emit_channel(
@@ -5014,6 +5054,10 @@ async def poll_results():
                         },
                     )
                 except Exception as e:
+                    _ambiguous = isinstance(e, (TimeoutError,)) or \
+                        "timeout" in str(e).lower()
+                    (_drd.unknown if _ambiguous else _drd.failed_terminal)(
+                        RESULTS_DIR, _send_tok)
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
@@ -5194,8 +5238,8 @@ def _proactive_provider():
     client (and its 30s upload timeout pin)."""
     global _PROACTIVE_PROVIDER
     if _PROACTIVE_PROVIDER is None:
-        from discord_post_gate import make_client
-        from discord_delivery_provider import DiscordDeliveryProvider
+        from channels.discord.post_gate import make_client
+        from channels.discord.delivery_provider import DiscordDeliveryProvider
         _PROACTIVE_PROVIDER = DiscordDeliveryProvider(
             make_client(TOKEN, timeout=30))
     return _PROACTIVE_PROVIDER
@@ -5283,6 +5327,12 @@ async def poll_proactive():
                     # Parse ONCE, here, and reuse below: a second grammar would
                     # miss what parse_markers peels (D7 `**[core: N]**` headers).
                     _pp = parse_markers(text)
+                    # Honor suppression markers, same as poll_dm_fallback —
+                    # else a skip-marked file still gets DM-attempted here.
+                    if has_skip_action(_pp.actions):
+                        print(f"  [proactive] skipped (suppression marker): {f.name}", flush=True)
+                        _proactive_fence().drop(f, "suppression marker (no-send/deduped/REPLIED)")
+                        continue
                     _early_redirect = next(
                         (a for a in _pp.actions if a.kind == "redirect"), None)
                     if _early_redirect is not None and redirect_target_is_foreign(
@@ -5685,7 +5735,7 @@ async def poll_dm_fallback():
                 except OSError:
                     _peek = ""
                 _parsed_fb = parse_markers(_peek)
-                if any(a.kind == "skip" for a in _parsed_fb.actions):
+                if has_skip_action(_parsed_fb.actions):
                     print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
                     _task_id = f.stem
                     _task_file = find_task_file(TASKS_DIR, _task_id)
@@ -5871,7 +5921,7 @@ def _rest_client(timeout: int = 10):
     """The shared Discord REST chokepoint for the CLI send/edit paths. A test
     binds a scripted transport through here so the PRODUCTION client stays in
     the loop; make_client resolves the injected post-gate for this process."""
-    from discord_post_gate import make_client
+    from channels.discord.post_gate import make_client
     return make_client(TOKEN, timeout=timeout)
 
 
