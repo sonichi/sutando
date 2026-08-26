@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""A pin is host-local, so migrating it is not preservation — it is resurrection.
+"""A pin must SURVIVE a migration intact — the sources are paths, not hosts.
 
-`state/process-pins.json` records a LOCAL pid plus its `lstart`. On any other
-host that pair names a different process or nothing at all, so the record has no
-meaning off the machine that wrote it.
+`sutando-migrate.sh` moves per-user state from LEGACY LOCATIONS to the canonical
+M0 path, on ONE machine. So the pinned pid is still running at the destination
+and the record still means what it said.
 
-Two earlier classifications both failed, in opposite directions, and neither is
-visible to a class-only assertion — both "preserve the bytes":
+Three classifications fail, each in its own direction, and none is visible to a
+class-only assertion because all three "preserve the bytes":
 
+  skip-ephemeral     destroys a lone live pin mid-migration — the exact loss the
+                     pin exists to prevent.
   structural         collision sidecars one copy to `.legacy-*`; the only runtime
-                     reader (health-check via `process_pins.load_pins`) opens the
-                     canonical path and never a sidecar, so a live pin migrated
-                     into a file nothing reads.
-  union-json-array   accumulates by record fingerprint, so a newer file can never
-                     delete or supersede an older pin. An operator who RELEASES a
-                     pin (the cleanup contract in `src/process_pins.py` prescribes
-                     exactly that for orphan/mismatch/expired pins) gets it
-                     re-armed by the next migration, and the `--fix` cycle then
-                     keeps stale code running until the resurrected pin expires.
+                     reader (`process_pins.load_pins`) opens the canonical path
+                     and never a sidecar, so the pin lands where nothing reads it.
+  union-json-array   `pins` is a COMPLETE MUTABLE SNAPSHOT: absence from a newer
+                     array IS the release operation. A union cannot tell
+                     "released" from "never present" and re-arms the old pin.
+                     A real union would need stable record ids plus tombstones,
+                     which this schema does not have.
 
-`skip-ephemeral` is the honest class, with a direct sibling precedent one screen
-up in the same rule table: `state/cores/*.alive`, also per-host, also a local pid.
+`newest-mtime` is the honest class: one canonical file, no merge, newest wins.
 
 These drive the real migration script and then the real reader — the only thing
 that separates "the bytes survived" from "the decision survived".
@@ -110,38 +109,47 @@ class PinMigrationVisibilityTest(unittest.TestCase):
 
     # ---- the contract ----
 
-    def test_migration_does_not_write_a_pin_file_at_the_destination(self) -> None:
-        self._write("src/a", [pin(DEAD_PID, "Sat Aug 23 01:00:00 2026", "stale witness")], 2_000_000_000)
+    def test_a_lone_live_pin_ARRIVES_at_the_canonical_path(self) -> None:
+        """Same-host move: the pid is still live, so the pin must survive."""
         self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
         self._migrate()
         canonical = self.tmp / "dest" / "state" / "process-pins.json"
-        self.assertFalse(canonical.exists(),
-                         "a host-local pin was migrated onto another host's record")
+        self.assertTrue(canonical.exists(), "a live pin was destroyed by the migration")
+        status, detail = self._verdict(canonical)
+        self.assertEqual(status, "warn", detail)
+        self.assertIn(f"DO NOT RESTART {SERVICE} pid {LIVE_PID}", detail)
 
     def test_no_pin_is_stranded_in_an_unread_sidecar(self) -> None:
+        """The canonical path is the only thing load_pins opens."""
         self._write("src/a", [pin(DEAD_PID, "Sat Aug 23 01:00:00 2026", "stale witness")], 2_000_000_000)
         self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
         self._migrate()
         state = self.tmp / "dest" / "state"
-        strays = [p.name for p in state.glob("process-pins.json*")] if state.exists() else []
-        self.assertEqual(strays, [], f"pin written where it does not belong: {strays}")
+        strays = sorted(q.name for q in state.glob("process-pins.json.*"))
+        self.assertEqual(strays, [], f"pin written to a path no reader opens: {strays}")
 
     def test_migration_does_not_resurrect_a_RELEASED_pin(self) -> None:
-        """The deletion-authority case: older armed pin, newer released record.
-
-        Under `union-json-array` the destination ends up holding the older armed
-        pin and the reader answers DO NOT RESTART, silently overriding an operator
-        who had deliberately released it.
-        """
-        self._write("src/c", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
-        self._write("src/a", [], 2_000_000_000)          # released, and newer
+        """Absence from the NEWER array is the release. A union would re-arm it."""
+        self._write("src/a", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], 1_000_000_000)
+        self._write("src/c", [], 2_000_000_000)          # newer: released
         self._migrate()
         canonical = self.tmp / "dest" / "state" / "process-pins.json"
-        self.assertFalse(canonical.exists(), "release was overridden by migration")
-        # And a host whose own record is the released one keeps its own answer.
-        status, detail = self._verdict(self.tmp / "src/a" / "state" / "process-pins.json")
+        self.assertTrue(canonical.exists())
+        status, detail = self._verdict(canonical)
         self.assertEqual(status, "stale", detail)
         self.assertIn("restart needed", detail)
+
+    def test_newest_wins_in_BOTH_directions(self) -> None:
+        """Whichever source is newer owns the record — not whichever is scanned first."""
+        for newer_is_release in (True, False):
+            with self.subTest(newer_is_release=newer_is_release):
+                self.setUp()
+                armed = [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")]
+                self._write("src/a", armed if not newer_is_release else [], 2_000_000_000)
+                self._write("src/c", [] if not newer_is_release else armed, 1_000_000_000)
+                self._migrate()
+                status, _ = self._verdict(self.tmp / "dest" / "state" / "process-pins.json")
+                self.assertEqual(status, "stale" if newer_is_release else "warn")
 
 
 if __name__ == "__main__":
