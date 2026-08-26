@@ -6859,8 +6859,12 @@ def _local_core_pids() -> "set | None":
             pids.update(t for t in done.stdout.split() if t.isdigit())
     except Exception:  # noqa: BLE001
         pass
-    sock = _local_core_socket()
-    if sock:
+    # The pool runs on tmux's DEFAULT socket; the main core runs on the runtime
+    # one. Miss it and that core's own watcher is unverifiable, not owned.
+    for sock in {os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+                 _local_core_socket()}:
+        if not sock:
+            continue
         done = _run_tmux(sock, "list-panes", "-a", "-F", fmt)
         if done is not None and done.returncode == 0:
             saw_any = True

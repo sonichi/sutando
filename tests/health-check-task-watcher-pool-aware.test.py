@@ -119,6 +119,22 @@ class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
         hc = self._mod(0, "100\n", sock="/tmp/s.sock", sock_out="200\n")
         self.assertEqual(hc._local_core_pids(), {"100", "200"})
 
+    def test_the_runtime_socket_is_queried_even_without_a_heartbeat(self):
+        """The pool lives on tmux's DEFAULT socket; the main core lives on the
+        runtime one, and `_local_core_socket()` is None without a fresh local
+        heartbeat. Measured live: the main core's own watcher read as
+        `unverified` because that socket was never asked."""
+        hc = self._mod(0, "3951\n")            # default socket: the pool
+        seen = []
+
+        class R:
+            returncode, stdout = 0, "31930\n"  # runtime socket: the main core
+
+        hc._local_core_socket = lambda: None
+        hc._run_tmux = lambda s, *a: (seen.append(s), R())[1]
+        self.assertEqual(hc._local_core_pids(), {"3951", "31930"})
+        self.assertIn("/tmp/sutando-tmux.sock", seen)
+
     def test_tmux_unavailable_is_None_not_an_empty_set(self):
         """The distinction the whole fail-closed path rests on: None means
         'could not verify' (everything unverified), a set means 'asked, and
