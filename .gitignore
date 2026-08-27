@@ -142,7 +142,8 @@ coverage.xml
 diff-cover.md
 coverage-summary.md
 
-# Editor swap/backup files: a vim swap of .env carries the same live secrets,
-# and `.env` alone does not match them. Vim walks .swp -> .swo -> .swn -> ...
+# A vim swap of .env carries the same live secrets, and `.env` never matches
+# them. Vim walks .swp down to .saa; unanchored would swallow real .svg/.sql.
 *.sw[a-p]
+.*.s[a-v][a-z]
 *~
