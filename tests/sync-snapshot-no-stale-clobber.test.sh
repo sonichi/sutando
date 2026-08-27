@@ -208,5 +208,22 @@ check "control: the exclude set does NOT carry an un-anchored *.snap pattern" \
 check "control: the exclude set does NOT deny an unrelated invented pattern" \
       '! printf %s "$_excl" | grep -q "snap\.ZZZZZZZ"' 
 
+# --- control 12: the ignore rule must be BEHAVIOURALLY scoped to hosts/*/ ---
+# A gitignore pattern with no slash matches at EVERY depth, so the source-text
+# greps above pass while `notes/build_log.md.snap.XXXXXX` is silently dropped
+# from backup. Ask git's own resolver instead of reading the string.
+_gi="$(mktemp -d)"; ( cd "$_gi" && git init -q . )
+mkdir -p "$_gi/hosts/testhost" "$_gi/notes"
+: > "$_gi/hosts/testhost/build_log.md.snap.AB12cd"
+: > "$_gi/notes/build_log.md.snap.AB12cd"
+sed -n '/^_compose_exclude_content()/,/^}/p' "$REPO/scripts/sync-workspace.sh" > "$_gi/compose.sh"
+# shellcheck disable=SC1090
+( . "$_gi/compose.sh"; _compose_exclude_content 2>/dev/null ) | grep 'build_log.md.snap' > "$_gi/.git/info/exclude" 2>/dev/null || true
+check "the composed rule DOES ignore a per-host snapshot temp" \
+      '( cd "$_gi" && git check-ignore -q hosts/testhost/build_log.md.snap.AB12cd )'
+check "the composed rule does NOT ignore an unrelated notes/ file of the same name" \
+      '( cd "$_gi" && ! git check-ignore -q notes/build_log.md.snap.AB12cd )'
+rm -rf "$_gi"
+
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

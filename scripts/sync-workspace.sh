@@ -526,7 +526,7 @@ _compose_exclude_content() {
     # Reserved snapshot temp. Cleanup only runs when control RETURNS from the
     # replace, so a process killed mid-stage leaves one under a carried
     # hosts/*/ path and every later `git add -A` would carry it into the vault.
-    echo "build_log.md.snap.??????"
+    echo "hosts/*/build_log.md.snap.??????"
     echo ".env*"
     echo "*.heartbeat"
     echo "*.alive"
