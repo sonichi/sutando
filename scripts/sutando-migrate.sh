@@ -381,6 +381,10 @@ declare -a REPORT_LINES
 # >1 source (cross-source collisions per-source scan misses — e.g. build_log.md
 # in A AND C bound for the same dest path).
 XSRC_INDEX="$(mktemp -t sutando-migrate-xsrc.XXXXXX)"
+# Shadow any INHERITED value before the trap installs: without this, an
+# environment-supplied _VERDICTS_TMP is rm -f'd on EXIT — even by --help —
+# so cleanup could delete an arbitrary writable path this process never made.
+_VERDICTS_TMP=""
 trap 'rm -f "$XSRC_INDEX" "${_VERDICTS_TMP:-}"' EXIT INT TERM
 # Also include dest's existing files (tag "DEST") so we surface dest-collisions
 # uniformly with cross-source collisions.
