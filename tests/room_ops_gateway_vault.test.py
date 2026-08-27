@@ -57,6 +57,11 @@ class GatewayVaultTier(unittest.TestCase):
             os.environ.pop(k, None)
         _VAULT_STORE.clear()
         _VAULT_CALLS.clear()
+        # gateway() now consults channels/ag2space/.env BEFORE the vault, so on a
+        # host that has one the vault tier is never reached. Shadow it like above.
+        _p = mock.patch.object(_gateway, "_channel_env_file", staticmethod(lambda: None))
+        _p.start()
+        self.addCleanup(_p.stop)
 
     def tearDown(self):
         for k, v in self._saved.items():
