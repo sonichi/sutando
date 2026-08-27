@@ -83,10 +83,14 @@ def should_stream_task(access_tier: Optional[str],
     A collaborator is engaged directly and does update it.
     """
     if access_tier is None:
+        # Missing tier field is the platform's owner default (CLAUDE.md).
         return True
-    if is_collaborator:
+    tier = str(access_tier).strip().lower()
+    if tier == "owner":
         return True
-    return str(access_tier).strip().lower() == "owner"
+    # Collaborator is a TEAM designation; any other tier carrying the flag is
+    # inconsistent input — fail closed rather than trust the boolean alone.
+    return is_collaborator and tier == "team"
 
 
 def read_core_status(state_dir: Path) -> Optional[dict]:

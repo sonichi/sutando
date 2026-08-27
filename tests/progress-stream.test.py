@@ -395,6 +395,17 @@ check("hoist: owner/other/guest never collaborate",
 check("hoist: unlisted team sender is NOT collaborator",
       _db.resolve_team_collaborator(_ACC, "team", "u2", 123) is False)
 
+# --- should_stream_task: the collaborator flag must not bypass the tier ---
+
+# The reviewer's exact table: with is_collaborator=True, only team streams
+# (owner streams via its own arm; None is the platform's missing-field=owner).
+for _tier, _want in [("owner", True), ("team", True), ("other", False),
+                     ("guest", False), ("ambient", False), (None, True)]:
+    check(f"tier-gate: collab flag with tier={_tier} -> {_want}",
+          ps.should_stream_task(_tier, is_collaborator=True) is _want)
+check("tier-gate: plain team (no flag) does NOT stream",
+      ps.should_stream_task("team") is False)
+
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
     sys.exit(1)
