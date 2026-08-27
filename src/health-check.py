@@ -5983,6 +5983,10 @@ def check_daily_cron_punctuality() -> dict:
         # sentinel is the only dated record that it finished.
         arts = (_daily_completion_minutes(ws / "state", jname) if launchd
                 else _daily_artifact_minutes(ws / "results", stem))
+        # `launchd` conflates "runs under launchd" with "publishes no dated results
+        # file"; a session-owned job can be the second without being the first.
+        if not arts and not launchd:
+            arts = _daily_completion_minutes(ws / "state", jname)
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         newest = max((d for d, _ in arts), default=None)
