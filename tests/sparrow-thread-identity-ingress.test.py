@@ -35,24 +35,41 @@ TRIGGER = "$trigger"
 
 
 def _drive_gateway_writer(task: dict) -> "str | None":
-    """Run the REAL remote_gateway_bridge._write_task against a temp tasks dir
-    and return the file it wrote. Imported lazily: the module reads config at
-    import time, so the temp dir must be in place first."""
+    """Run the REAL remote_gateway_bridge._write_task against temp dirs.
+
+    Every dir is bound BEFORE import. The module resolves task/result/state
+    once at import time, so redirecting only TASKS_DIR afterwards leaves state
+    pointed at the real ~/.ag2-sparrow — and _write_task -> _record_task_room
+    rewrites the live routing ledger there.
+    """
     import importlib
+    import os
     import tempfile
     tmp = pathlib.Path(tempfile.mkdtemp())
-    sys.modules.pop("ag2_sparrow.remote_gateway_bridge", None)
+    for var, sub in (("AGENT_CONNECT_TASK_DIR", "task"),
+                     ("AGENT_CONNECT_RESULT_DIR", "result"),
+                     ("AGENT_CONNECT_STATE_DIR", "state")):
+        d = tmp / sub
+        d.mkdir(parents=True, exist_ok=True)
+        os.environ[var] = str(d)
+    for mod in [m for m in list(sys.modules) if m.startswith("ag2_sparrow")]:
+        sys.modules.pop(mod, None)
     rgb = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
-    rgb.TASKS_DIR = tmp
+    global _BOUND
+    _BOUND = {"tasks": rgb.TASKS_DIR, "results": rgb.RESULTS_DIR,
+              "state": rgb._STATE, "rooms": rgb.TASK_ROOMS_FILE}
     tid = rgb._write_task(task)
     if not tid:
         return None
-    hits = list(tmp.glob(f"{tid}*.txt"))
+    hits = list((tmp / "task").glob(f"{tid}*.txt")) or list(tmp.rglob(f"{tid}*.txt"))
     return hits[0].read_text() if hits else None
+
 
 
 _FAILED: list[str] = []
 _RAN: list[str] = []
+_BOUND: dict = {}
+_TMP_ROOT = pathlib.Path(__import__("tempfile").gettempdir())
 
 
 def check(label: str, ok: bool) -> None:
@@ -93,6 +110,13 @@ def main() -> None:
         check("CONTROL: a top-level task file carries neither field",
               plain is not None
               and "thread_root:" not in plain and "source_room_id:" not in plain)
+        # Assert where the module BOUND its paths: on a host with no default
+        # state file, observing "nothing changed" would prove nothing.
+        home = pathlib.Path.home() / ".ag2-sparrow"
+        stray = [k for k, v in _BOUND.items()
+                 if home in pathlib.Path(v).parents or pathlib.Path(v) == home]
+        check(f"CONTROL: no writer path points at the real Sparrow state {stray or ''}",
+              bool(_BOUND) and not stray)
 
     # 2) a written task file round-trips them as HEADERS, not body text
     task_file = (
