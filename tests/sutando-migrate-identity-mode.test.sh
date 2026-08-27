@@ -101,10 +101,7 @@ check "unreadable-only: surfaced as identity_unverified" "$B_unverified" "1"
 
 
 # --- control 4: the PRODUCTION scan -> commit -> verify path, not helpers ---
-# The union writer creates a fresh temp and `mv`s it over the destination, so
-# without an explicit policy the process umask decides the result and a private
-# 0600 allowlist silently becomes 0644 while scan and verify both report clean.
-# Every check below drives the real CLI; helper-level coverage cannot see this.
+# Umask would decide the fresh temp's mode: 0600 allowlist -> 0644, scan clean.
 e2e="$(mktemp -d -t migrate-mode-e2e.XXXXXX)"
 trap 'rm -rf "$tmp" "$e2e"' EXIT
 SRC="$e2e/A"; DEST="$e2e/dest"
@@ -136,16 +133,12 @@ check "the destination was actually rewritten (control: not an untouched file)" 
 
 
 # --- control 5: byte_identical is a claim about BYTES, through the real JSON ---
-# Reviewer input: equal bytes, equal mtime, modes 0755 vs 0644 previously reported
-# byte_identical=False and proxy_identical_divergent=1 — no byte differed. Bytes
-# and mode are now two fields; every DECISION still uses both, so drop-safety is
-# unchanged and only the reporting was split.
+# Equal bytes, modes 0755 vs 0644 -> True; every DECISION still uses both fields.
 j5="$(mktemp -d -t migrate-json5.XXXXXX)"
 _scan_case() {  # $1=bytes_differ(0|1) $2=srcmode $3=dstmode -> prints compact json
     local w="$j5/$RANDOM$RANDOM"; mkdir -p "$w/A/notes" "$w/dest/notes"
-    # SAME LENGTH as the destination on purpose: proxy_identical_divergent means
-    # equal size + equal mtime + PROVEN different bytes, so a shorter variant
-    # would be a size_mismatch instead and never exercise that counter.
+    # SAME LENGTH on purpose: proxy_identical_divergent needs equal size + mtime
+    # + different bytes; a shorter variant is a size_mismatch and never reaches it.
     if [ "$1" = "1" ]; then printf 'IDENTICAL BYTES\n' > "$w/A/notes/same.md"
     else printf 'identical bytes\n' > "$w/A/notes/same.md"; fi
     printf 'identical bytes\n' > "$w/dest/notes/same.md"
@@ -168,11 +161,8 @@ check "control: real byte divergence still counts as proven divergence" "$(echo 
 # Control: the only drop-safe shape still reads drop-safe.
 _i="$(_scan_case 0 0644 0644)"
 check "control: equal bytes AND equal modes remain drop-safe" "$(echo "$_i" | cut -d'|' -f4)" "1"
-# A mode-only difference must remain ACTIONABLE, not merely reported. Presence in
-# notable_collisions cannot show that — the cap admits ignorable rows too — but
-# ORDER can: actionable rows sort to the front. The names are chosen so that
-# alphabetical order is the OPPOSITE of the expected order, otherwise this check
-# would pass on the tie-break alone and prove nothing.
+# Presence in notable_collisions cannot show ACTIONABLE (the cap admits ignorable
+# rows); order can. Names make alphabetical the OPPOSITE, so no tie-break pass.
 w6="$j5/ordering"; mkdir -p "$w6/A/notes" "$w6/dest/notes"
 printf 'identical bytes\n' > "$w6/A/notes/aaa-drop-safe.md"
 printf 'identical bytes\n' > "$w6/dest/notes/aaa-drop-safe.md"
@@ -189,9 +179,7 @@ check "a mode-only difference still outranks a drop-safe row (stays ACTIONABLE)"
 rm -rf "$j5"
 
 # --- control 6: the sentinel date probe must SURVIVE either stat dialect ---
-# The scan prints partial-migration sentinels. A bare `sm="$(stat -c ...)"` under
-# `set -euo pipefail` exits the script before its fallback, so on BSD the mere
-# PRESENCE of a sentinel aborted the mandatory preview.
+# Under `set -e` a bare inline `stat -c` exits before reaching its fallback.
 type mtime_date >/dev/null 2>&1 || { echo "FAIL  mtime_date not extracted — the probes below would pass vacuously"; exit 1; }
 _md="$(mktemp -d -t migrate-mtime.XXXXXX)"; printf 'x\n' > "$_md/f"
 _stubdir="$(mktemp -d -t migrate-stub.XXXXXX)"
@@ -220,11 +208,8 @@ _n="$(_probe none)"; check "neither dialect works -> caller SURVIVES"     "${_n%
 check "  ...with an empty value (control: the probe CAN come back empty)" "$([ -z "${_n#*:}" ] && echo yes || echo no)" "yes"
 rm -rf "$_md" "$_stubdir"
 
-# --- control 6b: the REAL scan path, sentinel present, on this host's own stat ---
-# This is the control that DISCRIMINATES. The dialect probes above cannot: the
-# pre-fix code was INLINE, and `set -e` aborts an inline failing assignment but
-# not the same assignment inside a function reached via $(fn) — so a function-
-# shaped probe survives either way. Only the end-to-end scan sees the abort.
+# --- control 6b: the REAL scan path, sentinel present — the DISCRIMINATING control ---
+# `set -e` aborts an inline assignment but not one inside $(fn), so the probes above cannot.
 _e2e="$(mktemp -d -t migrate-e2e.XXXXXX)"; mkdir -p "$_e2e/notes"; printf 'x\n' > "$_e2e/notes/a.md"
 _rc_before=0; env SUTANDO_WORKSPACE="$_e2e" bash scripts/sutando-migrate.sh --source C >/dev/null 2>&1 || _rc_before=$?
 check "baseline: scan of a sentinel-free source succeeds" "$_rc_before" "0"
@@ -236,9 +221,7 @@ check "  ...and the sentinel is actually reported" \
 rm -rf "$_e2e"
 
 # --- control 7: newly migrated directories keep their SOURCE mode ---
-# `cp -p` carries a file's mode; parents from `mkdir -p` take umask, so a 0700
-# source dir landed 0755 and exposed protected personal/relay notes to other
-# local accounts. Drives the real commit path end to end.
+# `cp -p` carries a file's mode; `mkdir -p` parents take umask: 0700 -> 0755.
 _dm_probe() {  # $1=src hosts mode  $2=pre-existing dest mode ("" = none) -> "hosts:Test-Host:file"
   local S D; S="$(mktemp -d)"; D="$(mktemp -d)"
   mkdir -p "$S/hosts/Test-Host"; printf 'x\n' > "$S/hosts/Test-Host/PERSONAL_CLAUDE.md"

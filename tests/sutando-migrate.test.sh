@@ -231,9 +231,8 @@ else
     echo "  OK: no scan residue (isolated TMPDIR empty; verdict count stable $PRE_VERDICTS)"
 fi
 
-# Controls for the narrowed probe: it must still SEE a real leak, and must NOT
-# fire on foreign tooling residue. Without the first, narrowing could have made
-# the assertion unable to fail at all.
+# The narrowed probe must still SEE a real leak and NOT fire on foreign residue;
+# without the first, narrowing could make the assertion unable to fail at all.
 _ctl="$TMP/leak-ctl"; mkdir -p "$_ctl"
 : > "$_ctl/sutando-migrate-verdicts.abc123"
 _pos="$(ls -A "$_ctl" 2>/dev/null | grep '^sutando-migrate-verdicts' || true)"

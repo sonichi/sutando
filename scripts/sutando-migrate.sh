@@ -805,9 +805,8 @@ def sha(path):
     except OSError:
         return None
 def ident_key(path):
-    # Bytes and mode are reported SEPARATELY: a drop decision needs both, but
-    # `byte_identical` is a claim about bytes and must not be false when no
-    # byte differs. `mode-divergent` keeps the drop as actionable regardless.
+    # `byte_identical` is a claim about bytes alone; `mode-divergent` keeps a
+    # bytes-equal/modes-differ row actionable without falsifying it.
     h = sha(path)
     if h is None:
         return None
@@ -1013,11 +1012,8 @@ any_source_sentinel() {
 }
 
 # Atomic per-file copy preserving mtime. Returns 0 on success.
-# Mirror source directory modes onto the destination chain. `cp -p` carries a
-# FILE's mode; parents created by `mkdir -p` would otherwise take umask, so a
-# 0700 source dir lands 0755 and exposes its contents to other local accounts.
-# Never widens: the dest dir takes the INTERSECTION, the same non-widening rule
-# the union-json path already applies to files.
+# `cp -p` carries a FILE's mode; `mkdir -p` parents take umask, so a 0700 source
+# dir would land 0755. The dest takes the INTERSECTION — it never widens.
 mirror_dir_modes() {
     local s d
     s="$(dirname "$1")"; d="$(dirname "$2")"
@@ -1091,9 +1087,8 @@ with open(tmp, "w", encoding="utf-8") as fh:
 # the next source compares against "now" and its scalars can never win.
 win = max(os.path.getmtime(src), os.path.getmtime(dst))
 os.utime(tmp, (win, win))
-# The temp is created fresh, so without this the process umask decides the
-# result and a 0600 destination silently becomes world-readable. Intersect
-# instead: the union may narrow permissions, never widen either input's.
+# The temp is fresh, so umask would otherwise decide the result. Intersect:
+# the union may narrow permissions, never widen either input's.
 import stat as _stat
 _s = _stat.S_IMODE(os.stat(src).st_mode)
 _d = _stat.S_IMODE(os.stat(dst).st_mode)
@@ -1207,21 +1202,14 @@ preflight_summary() {
     echo "$_total_files"
 }
 
-# SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
-# Permission bits only (no file-type prefix): BSD %Lp and GNU %a agree.
-# GNU FIRST, and the order is load-bearing: GNU `stat -f` is --file-system, not
-# a format flag, so it prints a filesystem block to STDOUT and still exits
-# non-zero — a BSD-first `||` chain concatenates that block with the real mode.
-# BSD stat rejects `-c` outright, so GNU-first degrades cleanly the other way.
-# Single owner of the stat portability split.
-# _stat <gnu-fmt> <bsd-fmt> <file> [fallback]
+# _stat <gnu-fmt> <bsd-fmt> <file> [fallback]. GNU FIRST is load-bearing:
+# there `stat -f` is --file-system — it prints a block AND exits non-zero.
 _stat() {
     stat -c "$1" "$3" 2>/dev/null || stat -f "$2" "$3" 2>/dev/null || printf '%s' "${4-}"
 }
 
-# Multi-line on purpose: tests/sutando-migrate-identity-mode.test.sh extracts
-# helpers with a `sed` RANGE that needs a lone closing brace, so a one-line
-# delegate here silently yields an empty mode and every identity check passes.
+# Keep multi-line: the identity-mode test extracts helpers by `sed` range and
+# needs a lone closing brace; a one-liner silently yields an empty mode.
 mode_of() {
     _stat %a %Lp "$1"
 }
@@ -1247,6 +1235,7 @@ identity_match() {
     sha_match "$1" "$2" && [ "$ma" = "$mb" ]
 }
 
+# SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
 sha_match() {
     local a="$1" b="$2"
     local ha hb
@@ -2293,11 +2282,8 @@ for e in entries:
 collisions = {k: v for k, v in by_rel.items() if len(v) > 1}
 with open(verdicts_path) as vf:
     _verdicts = json.load(vf)
-# Tri-state from the shared owner: True / False / None (None = could not hash;
-# unverified is its own actionable class, never rendered as proven divergence).
-# byte tri-state and mode conflict are two facts; mode-divergent means the
-# bytes ARE identical, so byte_identical must say True while the row stays
-# actionable via mode_conflict.
+# Tri-state: None = could not hash — unverified, never proven divergence.
+# mode-divergent keeps byte_identical True, actionable via mode_conflict.
 _MAP = {"identical": True, "mode-divergent": True, "divergent": False, "unverified": None}
 _MODE = {"mode-divergent": True}
 ident_verdict = {k: _MAP[_verdicts.get(k, "unverified")] for k in collisions}
