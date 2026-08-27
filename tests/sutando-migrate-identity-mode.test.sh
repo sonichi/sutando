@@ -98,5 +98,39 @@ check "51-collision: genuine_conflicts counts only the proven one" "$A_genuine" 
 check "unreadable-only: genuine_conflicts is 0" "$B_genuine" "0"
 check "unreadable-only: surfaced as identity_unverified" "$B_unverified" "1"
 
+
+# --- control 4: the PRODUCTION scan -> commit -> verify path, not helpers ---
+# The union writer creates a fresh temp and `mv`s it over the destination, so
+# without an explicit policy the process umask decides the result and a private
+# 0600 allowlist silently becomes 0644 while scan and verify both report clean.
+# Every check below drives the real CLI; helper-level coverage cannot see this.
+e2e="$(mktemp -d -t migrate-mode-e2e.XXXXXX)"
+trap 'rm -rf "$tmp" "$e2e"' EXIT
+SRC="$e2e/A"; DEST="$e2e/dest"
+mkdir -p "$SRC/state" "$DEST/state"
+REL="state/slack-allowed-recipients.json"   # the shipped union-json-array rule
+printf '{"allow": ["a@example.org"]}\n' > "$SRC/$REL";  chmod 0644 "$SRC/$REL"
+printf '{"allow": ["b@example.org"]}\n' > "$DEST/$REL"; chmod 0600 "$DEST/$REL"
+
+RUN_E2E() { SUTANDO_MIGRATE_SRC_A="$SRC" SUTANDO_MIGRATE_DEST="$DEST" \
+            bash scripts/sutando-migrate.sh "$@" 2>&1; }
+
+_scan="$(RUN_E2E scan --source A)"
+check "the union collision is SURFACED by scan, not silently absent" \
+  "$(printf '%s' "$_scan" | grep -c 'slack-allowed-recipients' | tr -d ' ')" "1"
+
+RUN_E2E commit --source A >/dev/null 2>&1
+_mode="$(stat -f '%Lp' "$DEST/$REL" 2>/dev/null || stat -c '%a' "$DEST/$REL")"
+check "a 0644 source must NOT widen a 0600 destination through the union" "$_mode" "600"
+check "and the union still merged both allow-lists" \
+  "$(grep -c 'a@example.org' "$DEST/$REL" | tr -d ' ')" "1"
+check "the pre-existing entry survives the union" \
+  "$(grep -c 'b@example.org' "$DEST/$REL" | tr -d ' ')" "1"
+
+# Positive control: the check above must be capable of FAILING. A destination
+# the union never touched would also read 0600, so prove the path ran.
+check "the destination was actually rewritten (control: not an untouched file)" \
+  "$(grep -c 'a@example.org' "$DEST/$REL" | tr -d ' ')" "1"
+
 if [ "$fails" -gt 0 ]; then echo "$fails FAILURE(S)"; exit 1; fi
 echo "ALL PASS"
