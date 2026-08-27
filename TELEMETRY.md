@@ -83,4 +83,10 @@ use the Privacy toggle in Settings.
 - The PostHog project key (`POSTHOG_API_KEY` / embedded `phc_...`) is **public
   and write-only**; it cannot read data back.
 
-> **Skill-usage breadth (feat/skill-usage-telemetry-hook):** a PostToolUse[Skill] hook (`hooks/skill-usage-telemetry.py`) emits `feature_used{feature: "skill:<name>"}` for EVERY skill the core invokes — auto-registered by `src/observability/claude/hooks/build-hook-settings.mjs`. This broadens feature coverage from hand-instrumented scripts (morning_briefing) to the whole skill surface without touching each skill. Same anonymity + opt-out as `feature_used`.
+> **Skill-usage coverage:** a `PostToolUse[Skill]` hook
+> (`hooks/skill-usage-telemetry.py`) emits `feature_used{feature: "skill:<name>"}`,
+> registered by `src/observability/claude/hooks/build-hook-settings.mjs`. It widens
+> coverage beyond the hand-instrumented scripts without touching each skill, but only
+> for skills invoked **through the `Skill` tool**, and only where the hook is
+> registered — see the scoped contract above. Same anonymity and opt-out as any other
+> `feature_used`.
