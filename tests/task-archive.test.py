@@ -12,7 +12,7 @@ from datetime import datetime
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from task_archive import archive_file, find_task_file
+from task_archive import archive_file, find_task_file, task_id_from_filename
 
 
 def exdev_from(src):
@@ -269,6 +269,93 @@ TA._move_without_clobbering(src, dest / "task-crash.txt")
             self.assertFalse((root / "dest" / "task-crash.txt").exists(),
                              "a truncated record was published under the authoritative name")
             self.assertTrue((root / "live.txt").exists(), "the live source must survive")
+
+
+class TaskIdFromFilename(unittest.TestCase):
+    """`.stem` and a greedy `^task-(.+)\\.txt$` both return the compound name for a
+    CLAIMED file, so the caller looks for a reply under an id nothing writes."""
+
+    def test_every_real_filename_form_yields_one_canonical_id(self):
+        for name in ("task-abc123.txt",
+                     "task-abc123.claimed-core-2.txt",
+                     "task-abc123.claimed-core-11.txt",
+                     "task-abc123.assigned-core-3.txt",
+                     "task-abc123.assigned-follower-7.txt",
+                     "task-abc123.txt.1",
+                     "task-abc123.txt.archive-failed-9"):
+            with self.subTest(name=name):
+                self.assertEqual(task_id_from_filename(name), "task-abc123")
+
+    def test_claimed_is_the_regression_stem_gets_wrong(self):
+        name = "task-abc123.claimed-core-2.txt"
+        self.assertEqual(Path(name).stem, "task-abc123.claimed-core-2")   # the old behaviour
+        self.assertEqual(task_id_from_filename(name), "task-abc123")      # the fixed one
+
+    def test_instance_label_is_opaque(self):
+        """pool_lead interpolates the instance with re.escape, so the label is
+        arbitrary — a reader must not assume `core-<digits>`."""
+        for name in ("task-abc123.claimed-core-x.txt",
+                     "task-abc123.assigned-follower-7.txt",
+                     "task-abc123.claimed-core-2.local.txt"):
+            with self.subTest(name=name):
+                self.assertEqual(task_id_from_filename(name), "task-abc123")
+
+    def test_a_dot_inside_an_id_is_legal(self):
+        """pool_lead allows [A-Za-z0-9._~-] in an id and excludes the state
+        suffixes by lookahead, so banning dots would reject a valid name."""
+        self.assertEqual(task_id_from_filename("task-a.b.txt"), "task-a.b")
+        self.assertEqual(
+            task_id_from_filename("task-a.b.claimed-core-2.txt"), "task-a.b")
+
+    def test_hyphenated_ids_survive(self):
+        self.assertEqual(
+            task_id_from_filename("task-cron-pending-questions-1787641302891.txt"),
+            "task-cron-pending-questions-1787641302891")
+
+    def test_non_task_and_malformed_names_are_rejected_not_guessed(self):
+        for name in ("proactive-123.txt", "notes.txt", "reply-1.txt"):
+            with self.subTest(name=name):
+                self.assertIsNone(task_id_from_filename(name))
+
+    def test_find_task_file_accepts_every_state_the_id_parser_does(self):
+        """One filename grammar for both functions: a narrower glob here handles
+        one state, misses its sibling, and the archive silently strands the file."""
+        cases = {
+            "task-A.txt": "task-A",
+            "task-B.claimed-core-1.txt": "task-B",
+            "task-C.assigned-core-2.txt": "task-C",
+            "task-D.claimed-worker-7.txt": "task-D",
+            "task-E.claimed-core1.txt": "task-E",
+            "task-F.a.claimed-core-3.txt": "task-F.a",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = Path(tmp)
+            for name in cases:
+                (tasks / name).write_text("x")
+            for name, task_id in cases.items():
+                with self.subTest(name=name):
+                    self.assertEqual(task_id_from_filename(name), task_id)
+                    found = find_task_file(tasks, task_id)
+                    self.assertIsNotNone(found, f"{name} not located by {task_id}")
+                    self.assertEqual(found.name, name)
+
+    def test_a_shorter_id_does_not_grab_a_dotted_siblings_file(self):
+        """The glob is a prefix match, so the grammar must confirm the id itself."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = Path(tmp)
+            (tasks / "task-F.a.claimed-core-3.txt").write_text("x")
+            self.assertIsNone(find_task_file(tasks, "task-F"))
+
+    def test_round_trips_with_find_task_file(self):
+        """The two directions must agree, or a locator and a reader disagree."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = Path(tmp)
+            claimed = tasks / "task-abc123.claimed-core-2.txt"
+            claimed.write_text("id: task-abc123\n")
+            task_id = task_id_from_filename(claimed.name)
+            self.assertEqual(task_id, "task-abc123")
+            self.assertEqual(find_task_file(tasks, task_id), claimed)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
