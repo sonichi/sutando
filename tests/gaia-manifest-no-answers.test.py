@@ -56,11 +56,13 @@ def check_collision_guard() -> None:
                    "case_ids": ["gaia-l1-deadbeef"],
                    "excluded": {"reason": "r", "case_ids": []}}, fh)
         bg.MANIFEST = pathlib.Path(fh.name)
+    # Match the REASON, not bare SystemExit: build() has several exit paths, so
+    # a bare except is satisfied by any of them (qingyun-001, #3455).
     refused = False
     try:
         bg.build(pathlib.Path("/nonexistent"))
-    except SystemExit:
-        refused = True
+    except SystemExit as exc:
+        refused = "case-id collision" in str(exc)
     check(refused, "colliding 8-char derived ids are refused, not silently displaced")
 
 
