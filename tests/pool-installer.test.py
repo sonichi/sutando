@@ -17,6 +17,7 @@ never touched.
 """
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -183,7 +184,9 @@ class LeadPlistTest(PoolInstallerHarness):
             envv = data["EnvironmentVariables"]
             self.assertEqual(envv["POOL_REPO_DIR"], str(repo))
             self.assertTrue(Path(envv["POOL_PY"]).name.startswith("python3"))
-            self.assertNotIn("__", repr(data), "unsubstituted plist placeholder")
+            self.assertIsNone(
+                re.search(r"__[A-Z][A-Z0-9_]*__", repr(data)),
+                "unsubstituted plist placeholder")
             # The message must name the directory the logs are actually in.
             self.assertIn(str(logs), r.stdout)
             self.assertNotIn(f"{ws}/logs/core-", r.stdout)

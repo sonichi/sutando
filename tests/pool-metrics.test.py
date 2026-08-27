@@ -30,13 +30,16 @@ class MetricsTests(unittest.TestCase):
         self.m.assigned("task-2", "a", "C1", wait_s=3.0)
         self.m.assigned("task-3", "b", None, wait_s=200.0)  # head-of-line
         self.m.claimed("task-4", "b", fallback=True)
-        self.m.reclaimed("task-5", "a")
+        self.m.reclaimed("task-5", "a", "repooled")
         s = self.m.summarize()
         self.assertEqual(s["assignment_distribution"], {"a": 2, "b": 1})
         self.assertEqual(s["head_of_line_incidents"], 1)
         self.assertEqual(s["fallback_claims"], 1)
         self.assertEqual(s["reclaims"], 1)
         self.assertEqual(s["mean_wait_by_channel"], {"C1": 2.0})
+        row = [r for r in self.m._path().read_text().splitlines()
+               if '"event": "reclaimed"' in r][0]
+        self.assertIn('"disposition": "repooled"', row)
 
     def test_corrupt_line_counted_not_fatal(self):
         self.m.assigned("task-1", "a", None, wait_s=0.5)

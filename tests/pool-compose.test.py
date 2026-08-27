@@ -6,6 +6,7 @@ Run: python3 tests/pool-compose.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -77,6 +78,22 @@ class ComposeTests(unittest.TestCase):
         s = m.summarize()
         self.assertEqual(sum(s["assignment_distribution"].values()), 1)
         self.assertIn("C5", s["mean_wait_by_channel"])
+
+    def test_lead_records_reclaim_decisions_in_durable_metrics(self):
+        from pool_metrics import PoolMetrics
+        m = PoolMetrics(self.state, now_fn=lambda: 1_700_000_000.0)
+        self.lead.metrics = m
+        (self.tasks / "task-r1.assigned-f1.txt").write_text("x")
+        (self.tasks / "task-r2.claimed-f1.txt").write_text("x")
+        self.alive["f1"] = False
+        self.lead.reclaim_dead()
+        self.lead.reclaim_claimed()
+        rows = [json.loads(line) for line in m._path().read_text().splitlines()]
+        self.assertEqual(
+            [(row["task"], row["dead_instance"], row["disposition"])
+             for row in rows],
+            [("task-r1.assigned-f1.txt", "f1", "assigned"),
+             ("task-r2.claimed-f1.txt", "f1", "repooled")])
 
 
 if __name__ == "__main__":

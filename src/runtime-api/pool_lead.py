@@ -22,7 +22,10 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
+from pool_follower import LEAD_STALE_S  # noqa: E402
 from task_priority import sort_tasks_by_priority  # noqa: E402
+
+SLEEP_SKEW_S = 5.0
 
 # Sticky-channel window (#884 semantics): tasks from a channel follow its
 # handler until the channel has been idle this long, then rebalance.
@@ -48,7 +51,8 @@ def _read_channel(path: Path) -> "str | None":
 
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
-                 now_fn=time.time, metrics=None, results_dir=None):
+                 now_fn=time.time, metrics=None, results_dir=None,
+                 mono_fn=time.monotonic):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
         production binder wires instance_registry + the .alive files."""
@@ -59,6 +63,7 @@ class PoolLead:
         self.followers_fn = followers_fn
         self.alive_fn = alive_fn
         self.now = now_fn
+        self.mono = mono_fn
         self.metrics = metrics  # PoolMetrics or None; recording is optional
 
     # ── affinity table (single-writer: the lead) ────────────────────────────
@@ -149,10 +154,35 @@ class PoolLead:
         return out
 
     # ── crash recovery ──────────────────────────────────────────────────────
+    def _host_gap_defers_reclaim(self) -> bool:
+        """Use wall-vs-monotonic skew to distinguish host sleep from a slow
+        daemon. Once opened, the grace expires by time rather than a sibling's
+        heartbeat so staggered beats cannot expose a live claimant."""
+        now = self.now()
+        mono = self.mono()
+        last = getattr(self, "_last_reclaim_tick", None)
+        last_mono = getattr(self, "_last_reclaim_mono", None)
+        self._last_reclaim_tick = now
+        self._last_reclaim_mono = mono
+        if last is not None and last_mono is not None:
+            if (now - last) - (mono - last_mono) > SLEEP_SKEW_S:
+                self._reclaim_defer_until = now + LEAD_STALE_S
+        elif last is None:
+            try:
+                followers = list(self.followers_fn())
+            except Exception:  # noqa: BLE001 — resolver failure must not defer
+                return False
+            if followers and not any(self.alive_fn(f) for f in followers):
+                self._reclaim_defer_until = now + LEAD_STALE_S
+        until = getattr(self, "_reclaim_defer_until", None)
+        return until is not None and now < until
+
     def reclaim_dead(self) -> "list[str]":
         """Return dead followers' assignments to the unassigned pool.
         Claimed files are NOT touched here — a claim means work may have
         side-effected; that recovery keeps the done-flag path (L2)."""
+        if self._host_gap_defers_reclaim():
+            return []
         reclaimed = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.assigned-(.+)\.txt$")
         try:
@@ -167,6 +197,8 @@ class PoolLead:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
                 continue
+            if self.metrics is not None:
+                self.metrics.reclaimed(f.name, m.group(2), "assigned")
             reclaimed.append(f.name)
         return reclaimed
 
@@ -186,6 +218,8 @@ class PoolLead:
         deliver (sweep skips it). The reachable crash residue is a result
         with no done-flag — finish_task writes the result first — and that
         work is COMPLETE, so it must not be repooled for re-execution."""
+        if self._host_gap_defers_reclaim():
+            return []
         out = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
         try:
@@ -202,5 +236,8 @@ class PoolLead:
             except OSError:
                 continue
             done = self._result_evidence(canonical)
-            out.append((f.name, "delivered" if done else "repooled"))
+            disposition = "delivered" if done else "repooled"
+            if self.metrics is not None:
+                self.metrics.reclaimed(f.name, m.group(2), disposition)
+            out.append((f.name, disposition))
         return out

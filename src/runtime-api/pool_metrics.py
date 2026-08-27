@@ -47,8 +47,10 @@ class PoolMetrics:
         self.record("claimed", task=task, instance=instance,
                     fallback=fallback)
 
-    def reclaimed(self, task: str, dead_instance: str):
-        self.record("reclaimed", task=task, dead_instance=dead_instance)
+    def reclaimed(self, task: str, dead_instance: str,
+                  disposition: str = "assigned"):
+        self.record("reclaimed", task=task, dead_instance=dead_instance,
+                    disposition=disposition)
 
     # ── the summary the benchmark reads ─────────────────────────────────────
     def summarize(self, day: "str | None" = None,
