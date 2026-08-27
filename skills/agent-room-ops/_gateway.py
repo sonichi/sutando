@@ -103,7 +103,8 @@ def _from_channel_env(names, env_file=None):
     """First non-empty value among `names` in the channel `.env`; '' if none.
 
     Sits between the process env and the vault, so an exported value still wins
-    and a stored one still loses.
+    and a stored one still loses. Alias set matches the VAULT tier (which
+    includes the legacy AG2_REMOTE_TOKEN), not the narrower env chain.
     """
     try:
         env_file = _channel_env_file() if env_file is None else env_file
@@ -113,13 +114,18 @@ def _from_channel_env(names, env_file=None):
             return ""
         from channel_token import token_from_env_file
         from pathlib import Path
-        for var in names:
-            got = token_from_env_file(var, Path(env_file))
-            if got:
-                return got
-        return ""
     except Exception:
         return ""
+    for var in names:
+        # token_from_env_file is already total on OSError; UnicodeDecodeError is
+        # not an OSError, so decode failures would otherwise read as "no token".
+        try:
+            got = token_from_env_file(var, Path(env_file))
+        except (OSError, UnicodeDecodeError):
+            return ""
+        if got:
+            return got
+    return ""
 
 
 def _token_from_vault(vault_get=None):
@@ -193,7 +199,8 @@ def gateway():
     raw, _name = gc.resolve_alias_precedence(
         os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
     if not raw:
-        raw = _from_channel_env(("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
+        raw = _from_channel_env(
+            ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN"))
     if not raw:
         raw = _token_from_vault()
     explicit_url, _ = gc.resolve_alias_precedence(

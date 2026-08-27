@@ -1280,6 +1280,36 @@ class AcceptanceRunnerArgTests(EnvCase):
 
 
 
+class ChannelEnvLocatorTests(unittest.TestCase):
+    """Exercise the REAL _channel_env_file() — every other test shadows it.
+
+    Without this, drifting the path segments or moving claude_home_path leaves the
+    tier permanently unresolved and the suite green, reproducing the exact symptom
+    this feature removes: "no gateway configured" with a credential on disk.
+    """
+
+    def test_locates_the_channel_env_under_claude_config_dir(self):
+        d = tempfile.mkdtemp()
+        ch = os.path.join(d, "channels", "ag2space")
+        os.makedirs(ch)
+        env = os.path.join(ch, ".env")
+        with open(env, "w") as fh:
+            fh.write("REMOTE_TASK_TOKEN=x\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
+            got = _gateway._channel_env_file()
+        self.assertIsNotNone(got, "real locator returned None for a file that exists")
+        self.assertEqual(os.path.realpath(str(got)), os.path.realpath(env))
+        os.remove(env)
+        for p in (ch, os.path.dirname(ch), d):
+            os.rmdir(p)
+
+    def test_returns_none_when_the_file_is_absent(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, d)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
+            self.assertIsNone(_gateway._channel_env_file())
+
+
 class ChannelEnvTierTests(EnvCase):
     """The channel `.env` tier: env -> channels/ag2space/.env -> vault.
 
@@ -1333,6 +1363,17 @@ class ChannelEnvTierTests(EnvCase):
         base, headers = _gateway.gateway()
         self.assertEqual(base, "")
         self.assertNotIn("Authorization", headers)
+
+    def test_legacy_ag2_remote_token_alias_resolves(self):
+        # Parity with the vault tier, which has always tried this legacy name.
+        # Old installs carry the token under it; without this they stay broken.
+        f = self._write_env("REMOTE_TASK_URL=https://gw.example\n"
+                            "AG2_REMOTE_TOKEN=legacy-secret\n")
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               staticmethod(lambda: f)):
+            base, headers = _gateway.gateway()
+        self.assertEqual(headers.get("Authorization"), "Bearer legacy-secret")
+        self.assertEqual(base, "https://gw.example")
 
     def test_missing_path_is_not_an_error(self):
         with mock.patch.object(_gateway, "_channel_env_file",
