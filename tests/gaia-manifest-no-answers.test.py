@@ -142,6 +142,25 @@ def check_builder_paths() -> None:
         absent = True
     check(absent, "a GAIA root without metadata.parquet is refused")
 
+    # main() round trip: argparse, the --out default, and the write path.
+    out = pathlib.Path(tempfile.mkdtemp()) / "suite.json"
+    bg.load_validation = lambda root: rows
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        _json.dump({"schema": 1, "name": "n", "prompt_preamble": "P: ",
+                    "case_ids": ["gaia-l1-aaaaaaaa", "gaia-l3-bbbbbbbb"],
+                    "excluded": {"reason": "r", "case_ids": []}}, fh)
+        bg.MANIFEST = pathlib.Path(fh.name)
+    argv_backup = sys.argv[:]
+    sys.argv = ["build-gaia-suite.py", "--gaia-root", "/nonexistent", "--out", str(out)]
+    try:
+        bg.main()
+    finally:
+        sys.argv = argv_backup
+    written = _json.loads(out.read_text())
+    check(len(written["cases"]) == 2 and written["name"] == "n"
+          and written["cases"][0]["prompt"] == "P: Q1",
+          "main() writes the built suite to --out")
+
 
 def main() -> int:
     m = json.loads(MANIFEST.read_text())
