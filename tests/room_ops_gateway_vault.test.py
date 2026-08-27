@@ -59,9 +59,25 @@ class GatewayVaultTier(unittest.TestCase):
         _VAULT_CALLS.clear()
         # gateway() now consults channels/ag2space/.env BEFORE the vault, so on a
         # host that has one the vault tier is never reached. Shadow it like above.
-        _p = mock.patch.object(_gateway, "_channel_env_file", staticmethod(lambda: None))
+        # Plain callable, NOT staticmethod(...): _gateway is a module, and before
+        # 3.10 a staticmethod object is not callable — the TypeError would be
+        # swallowed as "no channel tier", so every vault case below would reach
+        # the vault through the error path instead of the absence path.
+        self._shadow_calls = []
+
+        def _no_channel_file():
+            self._shadow_calls.append(1)
+            return None
+
+        _p = mock.patch.object(_gateway, "_channel_env_file", _no_channel_file)
         _p.start()
         self.addCleanup(_p.stop)
+
+    def assert_shadow_was_invoked(self):
+        """Call/effect control: absence must come from the shadow RUNNING."""
+        self.assertTrue(self._shadow_calls,
+                        "shadow never invoked - vault was reached via an error "
+                        "path, not the channel-absent path")
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -77,6 +93,7 @@ class GatewayVaultTier(unittest.TestCase):
         self.assertEqual(
             _gateway._token_from_vault(vault_get=lambda k: vault.get(k)),
             "https://gw.example/relay|s3cr3t")
+
 
     def test_falls_back_to_legacy_alias(self):
         vault = {"AG2_REMOTE_TOKEN": "legacy-secret"}
@@ -141,6 +158,9 @@ class GatewayVaultTier(unittest.TestCase):
         base, headers = _gateway.gateway()
         self.assertEqual(base, "https://gw.example/relay")
         self.assertEqual(headers.get("Authorization"), "Bearer from-vault")
+        # The vault must be reached because the channel file is ABSENT, not
+        # because reading it raised and the guard swallowed it.
+        self.assert_shadow_was_invoked()
 
 
 if __name__ == "__main__":
