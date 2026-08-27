@@ -122,9 +122,8 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
         current = reset > now
         seg = {"reset": reset, "current": current, "points": pts}
         if current and pts:
-            # Value-dedup freezes the stored x while usage stands still, so
-            # freshness comes from `now`: carry the last utilization forward
-            # to the true elapsed fraction before projecting from it.
+            # Dedup freezes stored x while usage stands still; carry the last
+            # utilization forward to now-elapsed and project from there.
             x_now = min((now - (reset - span)) / span, 1.0)
             last = pts[-1]
             if x_now > last["x"]:

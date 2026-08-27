@@ -83,9 +83,8 @@ class RecordSample(unittest.TestCase):
         self.assertEqual(recs[-1]["ts"], 4.0)
 
     def test_stagnant_usage_projects_from_now_not_the_frozen_point(self):
-        # The reviewer's production control: 25% used at 10% elapsed, the
-        # same 25% polled again at 60% elapsed (dedup returns False), then
-        # rendered — the projection must be 0.25/0.6, never 0.25/0.1.
+        # Reviewer's control: 25% @ 10% elapsed, same 25% re-polled at 60%
+        # (dedup'd), rendered — projection must be 0.25/0.6, never 0.25/0.1.
         now0 = 1000000.0
         span = SPAN5
         reset = int(now0 + span * 0.9)          # first poll at 10% elapsed
