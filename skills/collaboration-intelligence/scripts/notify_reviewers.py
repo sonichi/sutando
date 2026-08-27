@@ -109,16 +109,27 @@ def main() -> int:
             print("PLAN:", " ".join(argv))
             continue
         p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-        ok, event = False, ""
+        ok, event, reason = False, "", ""
         try:
             payload = json.loads(p.stdout)
-            ok, event = bool(payload.get("ok")), payload.get("event_id") or ""
         except ValueError:
-            pass
-        # ok:false with rc 0 is the documented silent-fail — never trust rc
-        print(f"{t['name']}: ok={ok} event={event[:24]}"
-              + ("" if ok else f" STDERR={p.stderr[:120]}"))
-        if not ok:
+            payload = None
+        # A non-object payload has no .get and a non-string event_id breaks
+        # the slice; an unusable one must not occupy `reason` and hide stderr.
+        if isinstance(payload, dict):
+            ok = bool(payload.get("ok"))
+            event = str(payload.get("event_id") or "")
+            reason = str(payload.get("reason") or "")
+            fallback = "no reason reported"
+        else:
+            fallback = "unparseable room_ops output"
+        # room_ops reports refusals in-band: rc 0, empty stderr, ok:false + reason.
+        # Printing stderr alone renders every such refusal as a blank line.
+        if ok:
+            print(f"{t['name']}: ok=True event={event[:24]}")
+        else:
+            detail = reason or p.stderr.strip()[:120] or fallback
+            print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
             failures += 1
     if failures:
         return 1
