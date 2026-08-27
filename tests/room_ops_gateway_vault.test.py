@@ -57,12 +57,8 @@ class GatewayVaultTier(unittest.TestCase):
             os.environ.pop(k, None)
         _VAULT_STORE.clear()
         _VAULT_CALLS.clear()
-        # gateway() now consults channels/ag2space/.env BEFORE the vault, so on a
-        # host that has one the vault tier is never reached. Shadow it like above.
-        # Plain callable, NOT staticmethod(...): _gateway is a module, and before
-        # 3.10 a staticmethod object is not callable — the TypeError would be
-        # swallowed as "no channel tier", so every vault case below would reach
-        # the vault through the error path instead of the absence path.
+        # Shadow the channel tier, which gateway() consults before the vault.
+        # Plain callable: _gateway is a module, staticmethod isn't callable <3.10.
         self._shadow_calls = []
 
         def _no_channel_file():
