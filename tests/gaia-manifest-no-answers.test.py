@@ -155,10 +155,8 @@ def main() -> int:
     check(all(CASE_ID.match(c) for c in m["excluded"]["case_ids"]),
           "every excluded id is a bare identifier")
 
-    # Every free-text field is pinned, not just the preamble: a substring
-    # predicate over them misses a smuggled short declarative answer.
-    # Pin EVERY key except the two identifier lists. Naming the fields to add
-    # back is an enumeration, and it missed excluded's other nested keys.
+    # Pin every key except the two identifier lists: naming fields to add back
+    # is an enumeration, and it missed excluded's other nested keys.
     meta = {k: v for k, v in m.items() if k != "case_ids"}
     meta["excluded"] = {k: v for k, v in m["excluded"].items() if k != "case_ids"}
     meta_digest = hashlib.sha256(
