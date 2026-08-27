@@ -26,6 +26,10 @@ on:
       - 'package-lock.json'
       - '.github/workflows/bundle-smoke.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
