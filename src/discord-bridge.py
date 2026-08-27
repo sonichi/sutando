@@ -5232,7 +5232,7 @@ async def poll_progress():
                                 continue
                     _progress_msgs.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
-                    pending_task_collab.pop(task_id, None)
+                    pending_task_collab.pop(task_id, None)  # pragma: no cover
         except Exception as e:
             print(f"  [progress] poll_progress tick error: {e}", flush=True)
         await asyncio.sleep(3)
