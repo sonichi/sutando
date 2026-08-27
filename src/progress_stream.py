@@ -74,17 +74,23 @@ def stream_enabled() -> bool:
     return False
 
 
-def should_stream_task(access_tier: Optional[str]) -> bool:
-    """Only stream progress for OWNER tasks.
+def should_stream_task(access_tier: Optional[str],
+                       is_collaborator: bool = False) -> bool:
+    """Stream progress for OWNER tasks, and for designated COLLABORATORS.
 
-    Non-owner (team/other) tasks are processed in a read-only ``codex`` sandbox
-    that does NOT update ``core-status.json``, so there is no live step to show;
-    worse, posting a placeholder for them would leak processing state for an
-    untrusted sender. ``None`` tier (legacy owner tasks with no field) streams.
+    The exclusion is about the codex sandbox, not about the tier: a sandboxed
+    task never updates ``core-status.json``, so there is no live step to show.
+    A collaborator is engaged directly and does update it.
     """
     if access_tier is None:
+        # Missing tier field is the platform's owner default (CLAUDE.md).
         return True
-    return str(access_tier).strip().lower() == "owner"
+    tier = str(access_tier).strip().lower()
+    if tier == "owner":
+        return True
+    # Collaborator is a TEAM designation; any other tier carrying the flag is
+    # inconsistent input — fail closed rather than trust the boolean alone.
+    return is_collaborator and tier == "team"
 
 
 def read_core_status(state_dir: Path) -> Optional[dict]:
