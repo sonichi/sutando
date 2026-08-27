@@ -237,7 +237,7 @@ def structural() -> list:
         fails.append("tier_instructions must map 'team-collaborator' to engage_rulebook(...)")
     sys.path.insert(0, str(BRIDGE.parent))
     try:
-        from team_guardrail import engage_rulebook, DISCORD_PROVENANCE
+        from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE
         body = engage_rulebook("channel", DISCORD_PROVENANCE, "results/task-{id}.txt")
     except Exception as exc:
         fails.append(f"team-collaborator rulebook is not renderable: {exc}")

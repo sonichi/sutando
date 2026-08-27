@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""The launchd lane is observable through its completion sentinel (#2754).
+
+`check_daily_cron_punctuality` scored only jobs that publish a dated file into
+`results/`. The two jobs that record completion — `state/<job>-<date>.sentinel`,
+written after publish — are launchd-owned and were skipped by the collector, so
+on a host where every session-owned daily job is artifact-less the probe reports
+"0 of N observable" and nothing asserts that the morning briefing ran at all.
+
+The load-bearing property: a sentinel history that stops TODAY must surface as a
+named miss, and a history that is consistently late must surface as late. Both
+were unreachable before, because the lane never entered the scored population.
+"""
+import datetime
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+_spec = importlib.util.spec_from_file_location("hc", REPO / "src" / "health-check.py")
+hc = importlib.util.module_from_spec(_spec)
+try:
+    _spec.loader.exec_module(hc)
+except SystemExit:
+    pass
+
+failures = []
+
+
+def check(name, cond, detail=""):
+    print(("ok   " if cond else "FAIL ") + name + (f" — {detail}" if detail and not cond else ""))
+    if not cond:
+        failures.append(name)
+
+
+CRONS = [
+    {"name": "morning-briefing", "cron": "57 6 * * *", "launchd": True},
+    {"name": "daily-insight", "cron": "50 6 * * *", "launchd": True},
+    # launchd but never stamps: must stay UNCHECKED, never a standing warning.
+    {"name": "agent-landscape-digest", "cron": "30 7 * * *", "launchd": True,
+     "artifact": "landscape"},
+    {"name": "example-digest", "cron": "0 8 * * *"},
+    {"name": "codex-owned", "cron": "40 8 * * *", "execution": "codex-task"},
+]
+
+
+def build(finish=(6, 59), days=5, include_today=True):
+    ws = Path(tempfile.mkdtemp(prefix="punct-"))
+    (ws / "hosts" / "H").mkdir(parents=True)
+    (ws / "state").mkdir()
+    (ws / "results").mkdir()
+    (ws / "hosts" / "H" / "crons.json").write_text(json.dumps(CRONS))
+    today = datetime.date.today()
+    for i in range(days):
+        if i == 0 and not include_today:
+            continue
+        d = today - datetime.timedelta(days=i)
+        (ws / "state" / f"morning-briefing-{d}.sentinel").write_text(
+            f"{d}T{finish[0]:02d}:{finish[1]:02d}:00.000000")
+        # daily-insight stores its payload, not a timestamp: mtime is the only
+        # finish signal, which is why the reader falls back to it.
+        p = ws / "state" / f"daily-insight-{d}.sentinel"
+        p.write_text("payload text, no timestamp")
+        os.utime(p, (time.time(),
+                     datetime.datetime.combine(d, datetime.time(6, 53)).timestamp()))
+    return ws
+
+
+# The probe reads the wall clock, and `due` is combined with TODAY's date, so
+# for the first hour after local midnight no miss can be reported at all.
+class _FixedNow(datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        d = datetime.date.today()
+        return cls(d.year, d.month, d.day, 12, 0, 0)
+
+
+def run(ws):
+    hc.WORKSPACE_DIR = ws
+    hc._host_label = lambda: "H"
+    real = datetime.datetime
+    datetime.datetime = _FixedNow
+    try:
+        return hc.check_daily_cron_punctuality()
+    finally:
+        datetime.datetime = real
+
+
+# ── the lane enters the scored population at all ─────────────────────────────
+r = run(build())
+check("on-time sentinels are observable and on schedule",
+      "2 of 4 daily job(s) observable" in r["detail"] and "all on schedule" in r["detail"],
+      r["detail"])
+check("a launchd job that never stamps stays UNCHECKED, not a warning",
+      "agent-landscape-digest" in r["detail"] and "median" not in r["detail"],
+      r["detail"])
+check("codex-task entries stay out of the population",
+      "codex-owned" not in r["detail"], r["detail"])
+
+# ── broken-must-FAIL: a history that stops today ─────────────────────────────
+r = run(build(include_today=False))
+check("a sentinel history that stops today reports a named miss",
+      "morning-briefing: no output today" in r["detail"], r["detail"])
+check("the mtime-only job is missed too",
+      "daily-insight: no output today" in r["detail"], r["detail"])
+
+# ── broken-must-FAIL: sustained lateness ─────────────────────────────────────
+r = run(build(finish=(8, 29)))
+check("sustained lateness is scored from the sentinel body",
+      "morning-briefing" in r["detail"] and "median +92 min late" in r["detail"],
+      r["detail"])
+
+# ── the body is preferred over mtime, and mtime is the documented fallback ───
+ws = build()
+d = datetime.date.today()
+f = ws / "state" / f"morning-briefing-{d}.sentinel"
+os.utime(f, (time.time(), datetime.datetime.combine(d, datetime.time(23, 30)).timestamp()))
+mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
+check("ISO body wins over a touched mtime",
+      mins and mins[-1][1] == 6 * 60 + 59, f"got {mins[-1] if mins else None}")
+f.write_text("not a timestamp")          # write first: it resets mtime
+os.utime(f, (time.time(), datetime.datetime.combine(d, datetime.time(23, 30)).timestamp()))
+mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
+check("unparseable body falls back to mtime",
+      mins and mins[-1][1] == 23 * 60 + 30, f"got {mins[-1] if mins else None}")
+
+# `-extra-` never matches the glob; a trailing suffix does and is refused by
+# the anchor — only the second actually reaches the regex branch.
+(ws / "state" / f"morning-briefing-extra-{d}.sentinel").write_text(f"{d}T05:00:00")
+mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
+check("a differently-prefixed job is excluded",
+      all(m[1] != 5 * 60 for m in mins), f"got {mins}")
+
+(ws / "state" / f"morning-briefing-{d}-old.sentinel").write_text(f"{d}T04:00:00")
+mins = hc._daily_completion_minutes(ws / "state", "morning-briefing")
+check("a trailing suffix is refused by the anchored date pattern",
+      all(m[1] != 4 * 60 for m in mins), f"got {mins}")
+
+# ── an aware body must localise, or its minute-of-day is UTC while cron times
+# and the mtime fallback are local — a whole-offset error, not a rounding one ──
+ws = build()
+d = datetime.date.today()
+aware = datetime.datetime(d.year, d.month, d.day, 6, 59, tzinfo=datetime.timezone.utc)
+local = aware.astimezone()
+for nm, body in (("z", f"{aware:%Y-%m-%dT%H:%M:%S}Z"),
+                 ("us", f"{aware:%Y-%m-%dT%H:%M:%S}.433037Z"),
+                 ("off", f"{aware:%Y-%m-%dT%H:%M:%S}+00:00")):
+    (ws / "state" / f"{nm}-{d}.sentinel").write_text(body)
+    got = hc._daily_completion_minutes(ws / "state", nm)
+    check(f"{nm}: aware body localises to the same minute-of-day as cron/mtime",
+          got and got[-1][1] == local.hour * 60 + local.minute,
+          f"got {got[-1] if got else None}, want {local.hour * 60 + local.minute}")
+
+# ── absent state/ dir is empty, not an exception ─────────────────────────────
+check("missing state dir returns empty",
+      hc._daily_completion_minutes(Path(tempfile.mkdtemp()) / "nope", "x") == [])
+
+# ── a launchd job that publishes a dated ARTIFACT but stamps no sentinel ─────
+
+# `launchd` says how a job is SCHEDULED, not what dated evidence it leaves; without
+# the fallback such a job reports "no dated artifact" while writing one every day.
+def _launchd_artifact_ws(days=5, include_today=True, name="digest-job", stem="digest-job"):
+    ws = Path(tempfile.mkdtemp(prefix="punct-la-"))
+    (ws / "hosts" / "H").mkdir(parents=True)
+    (ws / "state").mkdir()
+    (ws / "results").mkdir()
+    (ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+        [{"name": name, "cron": "0 6 * * *", "launchd": True, "artifact": stem}]))
+    today = datetime.date.today()
+    for i in range(days):
+        if i == 0 and not include_today:
+            continue
+        d = today - datetime.timedelta(days=i)
+        f = ws / "results" / f"{stem}-{d:%Y%m%d}.txt"
+        f.write_text("x")
+        os.utime(f, (time.time(),
+                     datetime.datetime.combine(d, datetime.time(6, 4)).timestamp()))
+    return ws
+
+
+r = run(_launchd_artifact_ws())
+check("launchd + dated artifact is OBSERVABLE, not UNCHECKED",
+      "digest-job" not in (r.get("detail") or ""), f"got {r.get('detail')!r}")
+check("...and a punctual artifact history is not reported late",
+      r.get("status") == "ok", f"got {r.get('status')}: {r.get('detail')}")
+
+r = run(_launchd_artifact_ws(include_today=False))
+check("a launchd artifact history that stops TODAY surfaces as a named miss",
+      "digest-job" in (r.get("detail") or "") and "no output today" in (r.get("detail") or ""),
+      f"got {r.get('detail')!r}")
+
+# The control that can fail: with NO evidence in either lane the job must stay
+# UNCHECKED, so the fallback cannot manufacture observability out of nothing.
+r = run(_launchd_artifact_ws(days=0))
+check("no sentinel and no artifact stays UNCHECKED",
+      "digest-job" in (r.get("detail") or "")
+      and ("UNCHECKED" in (r.get("detail") or "") or "unverifiable" in (r.get("detail") or "")),
+      f"got {r.get('detail')!r}")
+
+
+# ── declared artifact, zero evidence in EITHER lane (yixuan-ag2 on #3440) ────
+
+# `used_artifact_lane` flips here vs the old `not launchd`, but the interpret
+# layer `continue`s on empty artifacts before the stem_declared gate is read.
+ws = Path(tempfile.mkdtemp(prefix="punct-none-"))
+(ws / "hosts" / "H").mkdir(parents=True)
+(ws / "state").mkdir()
+(ws / "results").mkdir()
+(ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+    [{"name": "never-ran", "cron": "0 6 * * *", "artifact": "never-ran"}]))
+r = run(ws)
+_d = r.get("detail") or ""
+check("a job with no evidence in either lane is UNCHECKED, not a miss",
+      "never-ran" in _d and "past due" not in _d and "no output today" not in _d,
+      f"got {_d!r}")
+
+# The same property at the interpret layer, holding everything but the flag
+# fixed — it must not matter which value stem_declared carries.
+_base = dict(name="j", hour=6, minute=0, artifacts=[], today_seen=False,
+             minutes_since_due=999, conditional=False)
+_outs = [hc._interpret_daily_punctuality([dict(_base, stem_declared=sd)]).get("detail") or ""
+         for sd in (True, False)]
+check("stem_declared cannot change the verdict when artifacts is empty",
+      _outs[0] == _outs[1], f"got {_outs}")
+
+print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
+sys.exit(1 if failures else 0)

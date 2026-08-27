@@ -12,7 +12,7 @@ import tempfile
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from result_router import (  # noqa: E402
+from delivery.router import (  # noqa: E402
     EMPTY_RESULT_POLL_THRESHOLD,
     empty_result_notice,
     note_empty_result,

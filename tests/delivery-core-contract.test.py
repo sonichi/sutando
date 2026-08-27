@@ -471,8 +471,8 @@ class CorePolicy(unittest.TestCase):
                             RetryPolicy(max_attempts=1))
         real_complete, fired, confirmed = self.backend.complete, [], []
 
-        def racing_complete(token, outcome, park_at_attempts=None):
-            ok = real_complete(token, outcome, park_at_attempts)
+        def racing_complete(token, outcome, park_at_attempts=None, **kw):
+            ok = real_complete(token, outcome, park_at_attempts, **kw)
             if not fired:                     # the gap: successor gets in
                 fired.append(True)
                 t2 = self.backend.claim(ITEM, "successor")

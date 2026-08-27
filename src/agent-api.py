@@ -107,11 +107,19 @@ from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
+from task_archive import task_id_from_filename  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
 TASK_WORKSTREAM_GROUPING_SKILL = REPO_DIR / "skills" / "task-workstream-grouping" / "SKILL.md"
-PORT = 7843
+# Overridable so a live-path witness can run against an isolated instance
+# instead of restarting the owner's service; mirrors AGENT_API_BIND below.
+_PORT_ENV = os.environ.get("AGENT_API_PORT")
+if _PORT_ENV is not None and not _PORT_ENV.isdigit():
+    # Refusing rather than defaulting: 7843 is the live service, so a typo'd
+    # witness port must not silently collide with it.
+    raise ValueError(f"AGENT_API_PORT={_PORT_ENV!r} is not a port number")
+PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
@@ -346,18 +354,22 @@ def _active_task_rows() -> list[dict]:
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )[:10]:
-        task_id = task_file.stem
+        # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
+        # the reply at results/{id}.txt — so key AND look up by the canonical id.
+        task_id = task_id_from_filename(task_file.name)
+        if task_id is None:
+            continue
         content = task_file.read_text()
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
-        result_file = RESULT_DIR / task_file.name
+        result_file = RESULT_DIR / f"{task_id}.txt"
         existing = task_history.get(task_id, {})
         # Priority: live file, then in-memory history, then archive. The
         # archive lookup is what survives a restart, when history is empty.
         archived_file = None
         for month_dir in (RESULT_DIR / "archive").glob("*/"):
-            candidate = month_dir / task_file.name
+            candidate = month_dir / f"{task_id}.txt"
             if candidate.exists():
                 archived_file = candidate
                 break
@@ -842,6 +854,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(*delegation_read_result(
                     unquote(path[len("/delegation/results/"):])))
         elif path.startswith("/result/"):
+            # Owner data: gated like the write leg it belongs to (POST /task) —
+            # token checked when configured. NOT delegation's refuse-outright.
+            if not self.check_auth():
+                return
             task_id = path[len("/result/"):]
             result = get_task_result(task_id)
             if result:

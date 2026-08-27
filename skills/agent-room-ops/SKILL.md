@@ -37,6 +37,11 @@ python3 skills/agent-room-ops/room_ops.py doc get '!room:hs' --folder room-todo 
 python3 skills/agent-room-ops/room_ops.py doc put '!room:hs' --folder room-memo --name note.md --file /tmp/note.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc rm  '!room:hs' --folder room-memo --name note.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py grant '!room:hs' --tier '@u:hs=owner' --default-tier guest --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py events emit '!room:hs' --type space.ag2.app.card --content '{"k":1}' --agent '@a:hs'
+#   -> one typed space.ag2.* TIMELINE event sent AS this agent. Same
+#   confirmed/unconfirmed receipt as `say`. Which type namespaces are accepted is the
+#   server's rule, not restated here — a refusal arrives as `reason`.
+#   Timeline needs no power-level grant; `op:state` (roomtype/widget) does.
 ```
 
 `grant` makes a room **authoritative** (design-response-policy-v0.2 / #429): it writes

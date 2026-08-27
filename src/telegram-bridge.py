@@ -58,7 +58,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -82,7 +82,7 @@ RESULTS_DIR = REPO / "results"
 # lacked the personal-notes, iclr-backups and launch-assets roots, so a file
 # Discord would happily send was silently dropped from a Telegram reply.
 # Telegram inherits the complete canonical policy with no extra roots.
-from send_allowlist import is_path_sendable as _is_path_sendable  # noqa: E402
+from policy.egress.attachment import is_path_sendable as _is_path_sendable  # noqa: E402
 
 
 # --- Config loading (independent of _is_path_sendable above) ---
@@ -446,6 +446,12 @@ def send_reply(chat_id, text, task_id: str | None = None) -> dict:
         elif os.path.isfile(fpath):
             api("sendMessage", chat_id=chat_id, text=f"(file access denied: {fpath})")
             print(f"  BLOCKED file: {fpath}")
+        elif not fpath:
+            # An EMPTY target is malformed, not a prose quotation — surface it,
+            # or a file-only result is retired with zero user-visible output.
+            api("sendMessage", chat_id=chat_id,
+                text="(a file marker in this reply had no path — nothing attached)")
+            print("  file marker with EMPTY path — malformed, surfaced", flush=True)
         else:
             # Prose-quoted `[file:/path]` substrings extract as markers
             # but reference no actual file. Don't ship the warning to
@@ -545,7 +551,9 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
         if not task_file:
             continue
         try:
-            text = task_file.read_text()
+            # Recovery runs right after the crash that tore these files, so a
+            # strict read here exits main() — headers are at the top and survive.
+            text = task_file.read_text(errors="replace")
         except OSError:
             continue
         headers = local_task_protocol.parse_task_headers(text).headers
@@ -665,10 +673,43 @@ def poll_progress(pending_replies: dict) -> None:
             pending_task_tiers.pop(tid, None)
 
 
+def log_privacy_setting(get_me):
+    """Report the bot-wide BotFather privacy setting at boot.
+
+    Scope matters: this flag is GLOBAL, and an administrator bot receives every group
+    message regardless of it — so the flag alone never determines what one group delivers.
+    """
+    try:
+        me = (get_me() or {}).get("result") or {}
+    except Exception as e:  # noqa: BLE001 — a diagnostic must never take the bridge down
+        return f"[Telegram] privacy-setting: getMe failed ({e}) — setting unknown"
+    if not me:
+        return "[Telegram] privacy-setting: getMe returned no result — setting unknown"
+    BOT_EXCEPTION = (
+        "one exception applies regardless: Telegram never delivers a message sent by "
+        "another bot, even to an administrator or with privacy mode off "
+        "(https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)"
+    )
+    if me.get("can_read_all_group_messages"):
+        return ("[Telegram] privacy-setting: privacy mode OFF (BotFather, bot-wide) — "
+                f"all group messages from human senders are delivered to this bot; "
+                f"{BOT_EXCEPTION}")
+    return (
+        "[Telegram] privacy-setting: privacy mode ON (BotFather, bot-wide). In a group where "
+        f"@{me.get('username') or 'this bot'} is NOT an administrator it receives only "
+        "commands addressed to it (/command@bot), replies to its own messages, messages sent "
+        "via it inline, and general commands when it posted last — a plain @username mention "
+        "is NOT delivered. Where it IS a group administrator it receives everything from human "
+        f"senders regardless of this setting, so this flag alone does not describe any "
+        f"particular group's reach; {BOT_EXCEPTION}"
+    )
+
+
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
     print("Telegram bridge started. Polling for messages...", flush=True)
+    print(log_privacy_setting(lambda: api("getMe")), flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
@@ -1000,7 +1041,8 @@ def main():  # pragma: no cover
         # and telegram-bridge raced for the SAME proactive-*.txt files
         # and whichever ran first delivered, producing cross-channel
         # surprises. See proactive_routing.py for the decision rule.
-        from proactive_routing import should_claim_proactive_file
+        from proactive_routing import (body_claimable_by,
+                                       should_claim_proactive_file)
         try:
             if not presenter_mode_active(REPO):
                 # discord-bridge.poll_dm_fallback handles briefing-/insight-/
@@ -1021,16 +1063,13 @@ def main():  # pragma: no cover
                 for f in RESULTS_DIR.iterdir():
                     if any(f.name.startswith(p) for p in PROACTIVE_PREFIXES) \
                             and f.suffix == ".txt" and _tg_claims(f.name):
-                        # Peek before claiming: skip Discord-targeted proactive files.
-                        # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                        # claiming it here sends the literal text to Telegram DM instead
-                        # of leaving it for discord-bridge. (#1401)
+                        # Peek before claiming: a body addressed to another bridge
+                        # is delivered by that bridge, not sent here as literal text.
                         try:
                             peek = f.read_text(errors="ignore").lstrip()
                         except OSError:
                             continue
-                        if peek.startswith("[channel:") and \
-                                re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                        if not body_claimable_by(peek, "telegram"):
                             continue
                         # Resolve the recipient BEFORE claiming: the claim renames the
                         # file out of the `*.txt` glob every peer bridge polls.

@@ -738,6 +738,54 @@ class EventsSubscribeTests(EnvCase):
                           ev.subscribe(ROOM, ["message.created"], agent_mxid=HS, gate=None)["reason"])
 
 
+# ----- events: typed emit (op:event) ----- #
+class EventsEmitTests(EnvCase):
+    def test_no_gateway(self):
+        res = ev.emit(ROOM, "space.ag2.app.card", {"k": 1}, agent_mxid=HS, gate=None)
+        self.assertIn("no gateway", res["reason"])
+
+    def test_gate_deny(self):
+        os.environ["RELAY_URL"] = "https://r"
+        res = ev.emit(ROOM, "space.ag2.app.card", {"k": 1}, agent_mxid=HS, gate={})
+        self.assertIn("gate denied", res["reason"])
+
+    def test_emit_envelope_and_event_id(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"event_id": "$abc"}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
+            res = ev.emit(ROOM, "space.ag2.app.card", {"k": 1}, agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["event_id"], "$abc")
+        self.assertEqual(res["state"], "confirmed")
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        self.assertEqual(cap["payload"], {"op": "event", "room_id": ROOM,
+                                          "type": "space.ag2.app.card",
+                                          "content": {"k": 1}})
+
+    def test_missing_event_id_is_unconfirmed_but_ok(self):
+        # Same fail-open receipt as say/mention — a caller must not re-send an
+        # event the gateway may already have landed.
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (200, {"ok": True})):
+            res = ev.emit(ROOM, "space.ag2.app.card", {"k": 1}, agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["state"], "unconfirmed")
+        self.assertIsNone(res["event_id"])
+
+    def test_server_type_refusal_surfaces_verbatim(self):
+        # The namespace rule lives server-side and is deliberately NOT copied
+        # into the client; its refusal must reach the caller as `reason`.
+        os.environ["RELAY_URL"] = "https://r"
+        err = {"error": "event type must be under space.ag2.*"}
+        with mock.patch.object(ev, "http_json", side_effect=lambda m, u, h, p: (200, err)):
+            res = ev.emit(ROOM, "not.ag2.thing", {"k": 1}, agent_mxid=HS, gate=None)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "event type must be under space.ag2.*")
+
+
 # ----- events: long-poll pull ----- #
 class EventsPullTests(EnvCase):
     def test_no_gateway(self):

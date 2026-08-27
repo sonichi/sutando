@@ -351,7 +351,7 @@ On first run:
 1. Grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security
 2. Enable **Allow JavaScript from Apple Events** in Chrome: View → Developer → Allow JavaScript from Apple Events (required for the **Toggle Voice** hotkey — default ⌃V, see [Keyboard shortcuts](#keyboard-shortcuts))
 
-To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sutando main.swift SutandoConfig.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation`, then run `./Sutando`. The app and its accessibility helper are not core boot dependencies.
+To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sutando main.swift SutandoConfig.swift RestartCoordinator.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation`, then run `./Sutando`. The app and its accessibility helper are not core boot dependencies.
 
 ---
 

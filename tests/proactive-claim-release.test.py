@@ -17,7 +17,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from proactive_recovery import recover_orphan_sending_files, release_claim  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 
 CONSUMERS = {
     "discord-bridge": REPO / "src" / "discord-bridge.py",

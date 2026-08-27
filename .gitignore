@@ -1,6 +1,7 @@
 .env
 PERSONAL_CLAUDE.md
 node_modules/
+benchmark-runs/
 dist/
 *.log
 __pycache__/
@@ -46,6 +47,10 @@ assets/
 # brand assets are versioned source
 !packages/ag2-sparrow/assets/
 !packages/ag2-sparrow/assets/**
+# skill assets are versioned source too: a Codex/OpenAI skill manifest
+# references ./assets/ icons, so the blanket rule must not swallow them.
+!skills/*/assets/
+!skills/*/assets/**
 stand-identity.json
 stand-avatar.png
 docs/youtube/
@@ -111,7 +116,8 @@ done/
 # Runtime state file written by the voice client. Pure cruft, no commit value.
 voice-state.json
 
-# Single-instance lock written by src/voice-agent.ts (acquirePidLock).
+# Legacy pre-#2722 voice-agent lock path; canonical is workspace/state/locks/
+# (already covered by workspace/*). Keep through the transition window.
 .voice-agent.pid
 
 # Per-clone Sutando config overrides — workspace path, vault remote, etc.

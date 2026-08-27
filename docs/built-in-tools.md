@@ -70,7 +70,7 @@ imsg messages --chat "+14155551234" --limit 10    # read messages
 ```
 Always confirm message content with user before sending.
 
-**WhatsApp** — send messages via WhatsApp (requires `wacli auth` first; full reference in `skills/whatsapp/SKILL.md`):
+**WhatsApp** — send messages via WhatsApp (unpaired? use the guided connect flow — `skills/whatsapp/scripts/guided_connect.py`, pairing from chat, no terminal; full reference in `skills/whatsapp/SKILL.md`):
 ```bash
 wacli send text --to "+14155551234" --message "Hello!"
 wacli chats list --limit 20
