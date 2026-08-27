@@ -61,6 +61,7 @@ with tempfile.TemporaryDirectory() as td:
     bridge._req = fake_req
     context = {
         "source": "ag2space", "channel_id": "!shared:ag2.space",
+        "room_name": "Design Room",
         "reply_to_event": "$thread", "user_id": "@team:ag2.space",
     }
 
@@ -80,6 +81,9 @@ with tempfile.TemporaryDirectory() as td:
     check("sensitive candidate" in candidate_dm["body"]
           and candidate_dm["mentions"] == [],
           "the candidate is visible in the owner DM outside the action card")
+    check("Original room: `Design Room` (`!shared:ag2.space`)"
+          in candidate_dm["body"],
+          "the review identifies its original room by both name and id")
     check(decision_dm["mentions"] == ["@owner:ag2.space"],
           "the decision card mentions only the registered owner")
     buttons = decision_dm["extra_content"]["space.ag2.a2ui"]
