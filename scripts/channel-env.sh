@@ -18,4 +18,9 @@ esac
 base="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-exec python3 "$repo/src/channel_env_resolve.py" "$base/channels" "$src"
+# A bare `python3` is the Xcode-CLT stub on a Mac without the tools, and it
+# ignores the $SUTANDO_PY the desktop launcher sets.
+. "$repo/scripts/python-binary.sh"
+py="$(require_python "$repo" "resolve the channel env file")" || exit 1
+
+exec "$py" "$repo/src/channel_env_resolve.py" "$base/channels" "$src"

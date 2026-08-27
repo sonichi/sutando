@@ -241,6 +241,37 @@ class TestShellWrapper(_Base):
         self.assertEqual(r.returncode, 2)
         self.assertIn("invalid source", r.stderr)
 
+    def _unrunnable_python_on_path(self) -> str:
+        """A PATH whose python3 cannot run — the shape a Mac without the Xcode
+        CLT presents, which is why the wrapper must not shell a bare python3."""
+        d = self._tmpdir() / "bin"
+        d.mkdir()
+        stub = d / "python3"
+        stub.write_text('#!/bin/sh\necho "python3: not runnable" >&2\nexit 127\n')
+        stub.chmod(0o755)
+        return f"{d}:/usr/bin:/bin"
+
+    def test_configured_interpreter_wins_over_an_unrunnable_path_python(self):
+        cfg = self._tmpdir()
+        chan = cfg / "channels" / "ag2space"
+        chan.mkdir(parents=True)
+        (chan / ".env").write_text(TOKEN_LINE)
+        r = self._run(cfg, PATH=self._unrunnable_python_on_path(),
+                      SUTANDO_PY=sys.executable)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), str(chan / ".env"))
+
+    def test_no_runnable_interpreter_is_loud_and_prints_nothing_on_stdout(self):
+        cfg = self._tmpdir()
+        chan = cfg / "channels" / "ag2space"
+        chan.mkdir(parents=True)
+        (chan / ".env").write_text(TOKEN_LINE)
+        r = self._run(cfg, PATH=self._unrunnable_python_on_path(),
+                      SUTANDO_PY=str(self._tmpdir() / "absent"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "")
+        self.assertNotEqual(r.stderr.strip(), "")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
