@@ -805,8 +805,9 @@ def sha(path):
     except OSError:
         return None
 def ident_key(path):
-    # Identity is bytes AND mode — same rule as the shell's identity_match, so
-    # the scan's "identical" can never promise a drop commit would not honor.
+    # Bytes and mode are reported SEPARATELY: a drop decision needs both, but
+    # `byte_identical` is a claim about bytes and must not be false when no
+    # byte differs. `mode-divergent` keeps the drop as actionable regardless.
     h = sha(path)
     if h is None:
         return None
@@ -821,10 +822,12 @@ for rel, paths in by_rel.items():
     ks = [ident_key(p) for p in paths]
     if None in ks:
         out[rel] = "unverified"
-    elif len(set(ks)) == 1:
-        out[rel] = "identical"
-    else:
+    elif len({k[0] for k in ks}) > 1:
         out[rel] = "divergent"
+    elif len({k[1] for k in ks}) > 1:
+        out[rel] = "mode-divergent"
+    else:
+        out[rel] = "identical"
 json.dump(out, sys.stdout)
 PYIDENT
 }
@@ -2246,9 +2249,18 @@ with open(verdicts_path) as vf:
     _verdicts = json.load(vf)
 # Tri-state from the shared owner: True / False / None (None = could not hash;
 # unverified is its own actionable class, never rendered as proven divergence).
-_MAP = {"identical": True, "divergent": False, "unverified": None}
+# byte tri-state and mode conflict are two facts; mode-divergent means the
+# bytes ARE identical, so byte_identical must say True while the row stays
+# actionable via mode_conflict.
+_MAP = {"identical": True, "mode-divergent": True, "divergent": False, "unverified": None}
+_MODE = {"mode-divergent": True}
 ident_verdict = {k: _MAP[_verdicts.get(k, "unverified")] for k in collisions}
-identical = sum(1 for x in ident_verdict.values() if x is True)
+mode_conflict = {k: _MODE.get(_verdicts.get(k, "unverified"), False) for k in collisions}
+# A row is actionable unless bytes are proven equal AND the modes agree — the
+# drop-safety rule is unchanged, only its REPORTING was split.
+def _actionable_rel(k):
+    return ident_verdict[k] is not True or mode_conflict[k]
+identical = sum(1 for k, x in ident_verdict.items() if x is True and not mode_conflict[k])
 unverified = sum(1 for x in ident_verdict.values() if x is None)
 # Proven divergence ONLY: unverified stays its own class — unknown must never
 # be published as genuine conflict (they already surface as identity_unverified).
@@ -2265,7 +2277,7 @@ def has_mtime_mismatch(entries):
 # else ignorable entries can push the one actionable one past the render cap.
 def sort_key(item):
     k, v = item
-    if ident_verdict[k] is not True:
+    if _actionable_rel(k):
         prio = 0
     elif has_mtime_mismatch(v) or has_size_mismatch(v):
         prio = 1
@@ -2274,14 +2286,15 @@ def sort_key(item):
     return (prio, v[0]["class"], k)
 _rows = [{"class": v[0]["class"], "rel": k,
           "byte_identical": ident_verdict[k],
+          "mode_conflict": mode_conflict[k],
           "size_mismatch": has_size_mismatch(v),
           "mtime_mismatch": has_mtime_mismatch(v),
           "entries": [{"tag": e["tag"], "mtime": e["mtime"], "size": e["size"]} for e in v]}
          for k, v in sorted(collisions.items(), key=sort_key)]
 # The cap may only ever trim IGNORABLE rows: every actionable entry (verdict
 # False or None) is retained even when there are more than 50 of them.
-_actionable = [r for r in _rows if r["byte_identical"] is not True]
-_ignorable = [r for r in _rows if r["byte_identical"] is True]
+_actionable = [r for r in _rows if _actionable_rel(r["rel"])]
+_ignorable = [r for r in _rows if not _actionable_rel(r["rel"])]
 notable = _actionable + _ignorable[: max(0, 50 - len(_actionable))]
 size_diff = sum(1 for v in collisions.values() if has_size_mismatch(v))
 mtime_only = sum(1 for k, v in collisions.items() if not has_size_mismatch(v)

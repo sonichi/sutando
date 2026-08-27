@@ -23,7 +23,8 @@ Run `bash scripts/sutando-migrate.sh scan --json`. Parse the JSON for:
 - Total unique relpaths across A+B+C+dest
 - Per-source byte counts
 - Cross-source collision triage: `identical_content` (byte-verified drop-dup, no action) + `mtime_only_diff` (commit's newest-mtime auto-resolves) + `size_mismatch` and `proxy_identical_divergent` (REAL content conflicts — owner attention; the latter is equal mtime+size with PROVEN-different bytes, both hashes read OK) + `identity_unverified` (hash failed on an unreadable entry — actionable: fix permissions, re-scan; per-collision `byte_identical` is tri-state true/false/null)
-- Notable actionable entries — anything with `byte_identical: false` (proven divergence) **or `byte_identical: null`** (unverified: the hash could not be read — surface the relpath + source so the owner can fix permissions BEFORE greenlight, or commit may partially write then abort)
+- Notable actionable entries — anything with `byte_identical: false` (proven divergence), **`byte_identical: null`** (unverified: the hash could not be read — surface the relpath + source so the owner can fix permissions BEFORE greenlight, or commit may partially write then abort), **or `mode_conflict: true`** (bytes are equal but the permission bits are not — dropping the duplicate would silently pick one file's mode, so it needs the same attention as a content conflict)
+- `byte_identical` is a claim about BYTES ONLY and is never false when no byte differs; a mode-only difference reports `byte_identical: true` **with** `mode_conflict: true`. `identical_content` counts only the drop-safe case — equal bytes AND equal modes — so it stays the signal for "no action".
 
 Present a concise 4–6 line summary to owner via:
 - Discord DM (text)
