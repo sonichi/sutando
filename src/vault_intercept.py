@@ -224,6 +224,50 @@ def set_vault_key(key: str, value: str) -> None:
     _store_in_keychain(key, value)
 
 
+def _deregister_key(key: str) -> None:
+    # Reverse of _register_key: drop KEY from the manifest index. Absent key is
+    # a no-op (no write) so a re-run doesn't churn the file — idempotent by
+    # construction. Atomic write, same as _register_key, for the present case.
+    manifest = _read_manifest()
+    if key not in manifest:
+        return
+    del manifest[key]
+    path = _manifest_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _delete_from_keychain(key: str) -> None:
+    # Reverse of _store_in_keychain. `security delete-generic-password` returns
+    # non-zero (errSecItemNotFound) when the item is already gone; we don't
+    # inspect the code — an absent item is success for an idempotent delete. The
+    # manifest entry is dropped UNCONDITIONALLY afterwards (not gated on the
+    # Keychain result), so a half-state — manifest lists a key whose Keychain
+    # item is gone, or vice versa — is reconciled rather than left ghosting.
+    subprocess.run(
+        ["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
+        capture_output=True,
+    )
+    _deregister_key(key)
+
+
+def delete_vault_key(key: str) -> None:
+    """Remove a secret from Keychain + manifest — the reverse of set_vault_key.
+
+    Idempotent: deleting an absent key, or reconciling a half-state where only
+    one of {Keychain item, manifest entry} survives, is SUCCESS, not an error —
+    the desktop T2.8 teardown re-runs and must not fail on an already-gone key.
+    Raises ValueError on an invalid key name (the same rule set_vault_key
+    enforces — not loosened here).
+    """
+    if not _ENV_KEY_RE.match(key or ""):
+        raise ValueError(f"vault: invalid key name '{key}' (want [A-Za-z_][A-Za-z0-9_]*)")
+    _delete_from_keychain(key)
+
+
 def intercept_vault_commands(text: str) -> InterceptResult:
     """Detect vault-set commands in `text`, store secrets, return sanitized text.
 
