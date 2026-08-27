@@ -143,7 +143,6 @@ diff-cover.md
 coverage-summary.md
 
 # Editor swap/backup files: a vim swap of .env carries the same live secrets,
-# and `.env` alone does not match `.env.swp`.
-*.swp
-*.swo
+# and `.env` alone does not match them. Vim walks .swp -> .swo -> .swn -> ...
+*.sw[a-p]
 *~
