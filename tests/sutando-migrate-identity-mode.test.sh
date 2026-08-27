@@ -31,6 +31,18 @@ check "same bytes + different mode is NOT identical (exec bit must survive)" \
   "$(identity_match "$tmp/a.sh" "$tmp/b.sh" && echo yes || echo no)" "no"
 check "different bytes never identical whatever the mode" \
   "$(printf 'other\n' > "$tmp/d.sh"; chmod 0755 "$tmp/d.sh"; identity_match "$tmp/a.sh" "$tmp/d.sh" && echo yes || echo no)" "no"
+# reviewer control (exact-head finding at beeec419): a failing mode probe
+# must FAIL the identity, never blank-compare into a false duplicate.
+mode_of() { return 1; }
+check "both mode probes failing -> NOT identical (fail closed)" \
+  "$(identity_match "$tmp/a.sh" "$tmp/c.sh" && echo yes || echo no)" "no"
+mode_of() { echo ""; }
+check "empty mode output -> NOT identical (fail closed)" \
+  "$(identity_match "$tmp/a.sh" "$tmp/c.sh" && echo yes || echo no)" "no"
+# restore the real helper for anything below
+# shellcheck disable=SC1090
+. "$helpers"
+
 # every commit/delete/verify decision site uses identity_match, none bare sha_match
 bare="$(grep -cE 'if (\[ -f "\$(cand|g)" \] && )?sha_match ' scripts/sutando-migrate.sh)"
 check "no decision site bypasses the mode check (bare sha_match ifs)" "$bare" "0"

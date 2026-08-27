@@ -1186,7 +1186,14 @@ mode_of() {
 # 0644 dest silently loses the exec bit with no backup carrying it. Identity
 # is bytes AND mode, and scan/commit/verify/delete all use this same test.
 identity_match() {
-    sha_match "$1" "$2" && [ "$(mode_of "$1")" = "$(mode_of "$2")" ]
+    # FAIL CLOSED on an unreadable mode: with both probes failing, a bare
+    # comparison sees "" = "" and certifies identity with mode UNKNOWN —
+    # re-opening the destructive drop/delete path on a transient stat error.
+    local ma mb
+    ma="$(mode_of "$1")" || return 1
+    mb="$(mode_of "$2")" || return 1
+    [ -n "$ma" ] && [ -n "$mb" ] || return 1
+    sha_match "$1" "$2" && [ "$ma" = "$mb" ]
 }
 
 sha_match() {
