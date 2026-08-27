@@ -86,24 +86,39 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
     sample = _sample_from_state(state)
     if sample is None:
         return False
+    def _rewrite(rows):
+        fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
+        with os.fdopen(fd, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+        os.replace(tmp, history_path)
+
+    def _same(rec):
+        return all(rec.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7"))
+
     with _LOCK:
         history = _read_history(history_path)
         if history:
             last = history[-1]
-            if all(last.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7")):
-                # Newer stamp advances the stored ts; same stamp is a no-op;
-                # an unusable stored ts is repaired with the verified sample.
-                try:
-                    stored_ts = float(last.get("ts", 0))
-                except (TypeError, ValueError):
-                    stored_ts = None
-                if stored_ts is None or float(sample["ts"]) > stored_ts:
-                    history[-1] = {**last, "ts": sample["ts"]}
-                    fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
-                    with os.fdopen(fd, "w") as f:
-                        f.write("".join(json.dumps(r) + "\n" for r in history))
-                    os.replace(tmp, history_path)
+            try:
+                stored_ts = float(last.get("ts", 0))
+            except (TypeError, ValueError):
+                stored_ts = None
+            if stored_ts is None and _same(last):
+                # Corrupt trailing row with matching values: repair in place.
+                history[-1] = {**last, "ts": sample["ts"]}
+                _rewrite(history)
                 return False
+            if stored_ts is not None and float(sample["ts"]) <= stored_ts:
+                # A delayed or re-read snapshot no newer than the committed
+                # tail never lands: ordering is canonical by producer time.
+                return False
+            if _same(last):
+                # Unchanged run: keep its FIRST endpoint, advance its LAST.
+                if len(history) >= 2 and _same(history[-2]):
+                    history[-1] = {**last, "ts": sample["ts"]}
+                    _rewrite(history)
+                    return False
+                # Only the run's start exists — append its trailing endpoint.
         if len(history) + 1 > MAX_LINES:
             keep = history[-(MAX_LINES - 1):] + [sample]
             fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))

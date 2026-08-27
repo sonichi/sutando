@@ -52,8 +52,8 @@ class RecordSample(unittest.TestCase):
         self.assertEqual(len(self.path.read_text().splitlines()), 1)
 
     def test_a_changed_utilization_is_a_new_sample(self):
-        qp.record_sample(state(), self.path, now=1.0)
-        self.assertTrue(qp.record_sample(state(u5="0.26"), self.path, now=2.0))
+        qp.record_sample(state(obs=1000.0), self.path)
+        self.assertTrue(qp.record_sample(state(u5="0.26", obs=1060.0), self.path))
         self.assertEqual(len(self.path.read_text().splitlines()), 2)
 
     def test_missing_headers_record_nothing(self):
@@ -136,20 +136,38 @@ class RecordSample(unittest.TestCase):
         finally:
             dashboard.WORKSPACE_DIR = old_ws
 
-    def test_a_newer_identical_observation_advances_the_stored_time(self):
-        # Same values with a LATER last_checked: the producer re-measured, so
-        # the stored ts refreshes and the projection uses the verified 60%.
+    def test_an_unchanged_run_keeps_its_first_endpoint_and_advances_its_last(self):
+        # Reviewer control (#3464, 3rd round): 25% verified at x=.1 then at
+        # x=.6 must yield BOTH endpoints — the early over-pace point survives.
         span = SPAN5
         reset = 1000000 + span
-        st1 = state(u5="0.25", r5=reset, u7="0.1", r7=reset, obs=reset - span + span * 0.1)
-        st2 = state(u5="0.25", r5=reset, u7="0.1", r7=reset, obs=reset - span + span * 0.6)
-        qp.record_sample(st1, self.path)
-        self.assertFalse(qp.record_sample(st2, self.path))  # no new line...
+        def st(frac): return state(u5="0.25", r5=reset, u7="0.1", r7=reset,
+                                   obs=reset - span + span * frac)
+        self.assertTrue(qp.record_sample(st(0.1), self.path))
+        self.assertTrue(qp.record_sample(st(0.6), self.path))   # run end appended
+        self.assertFalse(qp.record_sample(st(0.8), self.path))  # end advanced in place
         recs = qp._read_history(self.path)
-        self.assertEqual(len(recs), 1)                      # ...but ts advanced
+        self.assertEqual([round((r["ts"] - (reset - span)) / span, 2) for r in recs],
+                         [0.1, 0.8])
         seg = qp.chart_payload(self.path, now=float(reset - 1))["windows"]["5h"]["segments"][0]
-        self.assertAlmostEqual(seg["points"][-1]["x"], 0.6, places=3)
-        self.assertAlmostEqual(seg["projected_end"], 0.25 / 0.6, places=3)
+        self.assertAlmostEqual(seg["points"][0]["x"], 0.1, places=2)
+        self.assertAlmostEqual(seg["points"][-1]["x"], 0.8, places=2)
+        self.assertAlmostEqual(seg["projected_end"], 0.25 / 0.8, places=3)
+
+    def test_a_delayed_older_snapshot_never_lands(self):
+        # Reviewer control: newer committed first, stale arrives late, newer
+        # rereads — the file must hold producer order, no stale append.
+        span = SPAN5
+        reset = 1000000 + span
+        newer = state(u5="0.30", r5=reset, u7="0.1", r7=reset, obs=reset - span + span * 0.6)
+        stale = state(u5="0.20", r5=reset, u7="0.1", r7=reset, obs=reset - span + span * 0.1)
+        self.assertTrue(qp.record_sample(newer, self.path))
+        self.assertFalse(qp.record_sample(stale, self.path))   # rejected: ts <= tail
+        self.assertFalse(qp.record_sample(newer, self.path))   # reread: no-op
+        recs = qp._read_history(self.path)
+        self.assertEqual([(round(r["ts"]), r["u5"]) for r in recs],
+                         [(round(reset - span + span * 0.6), 0.30)])
+
 
     def test_concurrent_writers_lose_no_acknowledged_sample(self):
         # Production-writer concurrency at the cap boundary: every thread
