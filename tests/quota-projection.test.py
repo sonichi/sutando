@@ -74,10 +74,55 @@ class RecordSample(unittest.TestCase):
         qp.record_sample(state(), self.path, now=1.0)
         with self.path.open("a") as f:
             f.write('{"ts": 2.0, "u5": 0.3')  # crash mid-write
-        # The torn line is ignored; dedup compares against the last GOOD line,
-        # so an identical sample is still refused.
+        # Dedup keys on the last GOOD line; the changed sample must then
+        # survive a fresh read (torn tail repaired, not concatenated onto).
         self.assertFalse(qp.record_sample(state(), self.path, now=3.0))
         self.assertTrue(qp.record_sample(state(u5="0.30"), self.path, now=4.0))
+        recs = qp._read_history(self.path)
+        self.assertEqual(recs[-1]["u5"], 0.30)
+        self.assertEqual(recs[-1]["ts"], 4.0)
+
+    def test_stagnant_usage_projects_from_now_not_the_frozen_point(self):
+        # The reviewer's production control: 25% used at 10% elapsed, the
+        # same 25% polled again at 60% elapsed (dedup returns False), then
+        # rendered — the projection must be 0.25/0.6, never 0.25/0.1.
+        now0 = 1000000.0
+        span = SPAN5
+        reset = int(now0 + span * 0.9)          # first poll at 10% elapsed
+        qp.record_sample(state(u5="0.25", r5=reset, u7="0.1", r7=reset),
+                         self.path, now=now0)
+        later = reset - span + span * 0.6       # 60% elapsed, usage unchanged
+        self.assertFalse(qp.record_sample(
+            state(u5="0.25", r5=reset, u7="0.1", r7=reset), self.path, now=later))
+        seg = qp.chart_payload(self.path, now=later)["windows"]["5h"]["segments"][0]
+        self.assertAlmostEqual(seg["projected_end"], 0.25 / 0.6, places=3)
+        self.assertAlmostEqual(seg["points"][-1]["x"], 0.6, places=3)
+        self.assertAlmostEqual(seg["points"][-1]["y"], 0.25)
+
+    def test_concurrent_writers_lose_no_acknowledged_sample(self):
+        # Production-writer concurrency at the cap boundary: every thread
+        # whose record_sample returned True must find its sample in the file.
+        import threading
+        old_max = qp.MAX_LINES
+        qp.MAX_LINES = 8
+        try:
+            for i in range(7):                  # near the cap
+                qp.record_sample(state(u5=f"0.{100+i}"), self.path, now=float(i))
+            acked = []
+            lock = threading.Lock()
+            def worker(i):
+                s = state(u5=f"0.{200+i}")
+                if qp.record_sample(s, self.path, now=float(100 + i)):
+                    with lock:
+                        acked.append(float(100 + i))
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+            for th in threads: th.start()
+            for th in threads: th.join()
+            kept = {r["ts"] for r in qp._read_history(self.path)}
+            lost = [ts for ts in acked if ts not in kept]
+            self.assertEqual(lost, [], f"acknowledged samples lost: {lost}")
+        finally:
+            qp.MAX_LINES = old_max
 
 
 class ChartSeries(unittest.TestCase):

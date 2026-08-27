@@ -13,11 +13,16 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 # Window spans are fixed by the rate limiter, not configurable here.
 WINDOW_SPANS = {"5h": 5 * 3600, "7d": 7 * 24 * 3600}
 MAX_LINES = 10000  # ~2 weeks at the dashboard's 15s refresh; rewrite keeps the tail
+
+# One writer transaction: the dashboard serves from ThreadingHTTPServer, so
+# read/decide/write must not interleave across request threads.
+_LOCK = threading.Lock()
 
 
 def _sample_from_state(state: dict, now: float) -> dict | None:
@@ -62,21 +67,32 @@ def record_sample(state: dict, history_path: Path, now: float) -> bool:
     sample = _sample_from_state(state, now)
     if sample is None:
         return False
-    history = _read_history(history_path)
-    if history:
-        last = history[-1]
-        if all(last.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7")):
-            return False
-    if len(history) + 1 > MAX_LINES:
-        keep = history[-(MAX_LINES - 1):] + [sample]
-        fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
-        with os.fdopen(fd, "w") as f:
-            f.write("".join(json.dumps(r) + "\n" for r in keep))
-        os.replace(tmp, history_path)
+    with _LOCK:
+        history = _read_history(history_path)
+        if history:
+            last = history[-1]
+            if all(last.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7")):
+                return False
+        if len(history) + 1 > MAX_LINES:
+            keep = history[-(MAX_LINES - 1):] + [sample]
+            fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
+            with os.fdopen(fd, "w") as f:
+                f.write("".join(json.dumps(r) + "\n" for r in keep))
+            os.replace(tmp, history_path)
+            return True
+        # A crash can leave a newline-less torn tail; appending onto it would
+        # concatenate and lose this acknowledged sample on the next read.
+        needs_nl = False
+        try:
+            raw = history_path.read_bytes()
+            needs_nl = bool(raw) and not raw.endswith(b"\n")
+        except OSError:
+            pass
+        with history_path.open("a") as f:
+            if needs_nl:
+                f.write("\n")
+            f.write(json.dumps(sample) + "\n")
         return True
-    with history_path.open("a") as f:
-        f.write(json.dumps(sample) + "\n")
-    return True
 
 
 def _window_segments(history: list[dict], u_key: str, r_key: str,
@@ -106,9 +122,14 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
         current = reset > now
         seg = {"reset": reset, "current": current, "points": pts}
         if current and pts:
+            # Value-dedup freezes the stored x while usage stands still, so
+            # freshness comes from `now`: carry the last utilization forward
+            # to the true elapsed fraction before projecting from it.
+            x_now = min((now - (reset - span)) / span, 1.0)
             last = pts[-1]
-            # Linear projection at the observed average pace; the chart draws
-            # it dashed from the last real point to the window edge.
+            if x_now > last["x"]:
+                last = {"x": x_now, "y": last["y"]}
+                pts.append(last)
             if last["x"] > 0:
                 seg["projected_end"] = min(last["y"] / last["x"], 2.0)
         segments.append(seg)
