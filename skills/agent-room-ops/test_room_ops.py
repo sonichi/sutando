@@ -1273,5 +1273,131 @@ class AcceptanceRunnerArgTests(EnvCase):
                           "--mode", "taskify", "--task-dir", "/tmp/t"])
 
 
+# ----- thread / reply relations (relations, say, mention) ----- #
+import say as sy, relations as rl  # noqa: E401,E402
+
+ROOT = "$root1"
+LATEST = "$latest1"
+
+
+class RelationFieldsTests(unittest.TestCase):
+    def test_none_is_top_level(self):
+        self.assertEqual(rl.relation_fields(), {})
+
+    def test_reply_only(self):
+        self.assertEqual(rl.relation_fields(reply_to=EV), {"reply_to": EV})
+
+    def test_thread_root_falls_back_to_itself(self):
+        # A caller with only a root has nothing newer to point in_reply_to at.
+        self.assertEqual(rl.relation_fields(thread_root=ROOT),
+                         {"thread_root": ROOT, "reply_to": ROOT})
+
+    def test_thread_root_keeps_explicit_latest(self):
+        self.assertEqual(rl.relation_fields(reply_to=LATEST, thread_root=ROOT),
+                         {"thread_root": ROOT, "reply_to": LATEST})
+
+    def test_malformed_ids_raise(self):
+        for kwargs in ({"reply_to": "evt1"}, {"thread_root": "root"},
+                       {"thread_root": "$r", "reply_to": "nope"}, {"reply_to": "$"}):
+            with self.assertRaises(rl.RelationError):
+                rl.relation_fields(**kwargs)
+
+    def test_whitespace_is_stripped(self):
+        self.assertEqual(rl.relation_fields(reply_to="  $evt1  "), {"reply_to": EV})
+
+
+class SayRelationTests(EnvCase):
+    def _post(self, **kwargs):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {}))[1]):
+            res = sy.say("hi", ROOM, HS, gate=None, **kwargs)
+        return res, cap
+
+    def test_plain_say_carries_no_relation(self):
+        res, cap = self._post()
+        self.assertTrue(res["ok"])
+        self.assertNotIn("reply_to", cap["payload"])
+        self.assertNotIn("thread_root", cap["payload"])
+
+    def test_reply_to_rides_the_payload(self):
+        res, cap = self._post(reply_to=EV)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["reply_to"], EV)
+
+    def test_thread_root_rides_with_its_fallback(self):
+        _res, cap = self._post(thread_root=ROOT, reply_to=LATEST)
+        self.assertEqual(cap["payload"]["thread_root"], ROOT)
+        self.assertEqual(cap["payload"]["reply_to"], LATEST)
+        # The body and op are untouched by the relation fields.
+        self.assertEqual(cap["payload"]["body"], "hi")
+        self.assertEqual(cap["payload"]["op"], "message")
+
+    def test_bad_id_refuses_before_the_network(self):
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            res = sy.say("hi", ROOM, HS, gate=None, reply_to="evt1")
+        self.assertFalse(res["ok"])
+        self.assertIn("event id", res["reason"])
+        self.assertEqual(called, [])   # no post — control below proves the mock fires
+
+    def test_control_good_id_does_post(self):
+        # Pairs with the test above: proves the empty call list there is the
+        # refusal, not a mock that never fires.
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            sy.say("hi", ROOM, HS, gate=None, reply_to=EV)
+        self.assertEqual(len(called), 1)
+
+
+class MentionRelationTests(EnvCase):
+    AGENTS = [{"id": "@peer:hs", "label": "peer"}]
+
+    def test_relation_rides_the_payload(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(mn, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {}))[1]):
+            res = mn.mention("peer", "ping", ROOM, HS, gate=None, agents=self.AGENTS,
+                             thread_root=ROOT)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["thread_root"], ROOT)
+        self.assertEqual(cap["payload"]["reply_to"], ROOT)
+        self.assertEqual(cap["payload"]["mentions"], ["@peer:hs"])
+
+    def test_bad_id_refuses_before_resolve_and_network(self):
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(mn, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            res = mn.mention("peer", "ping", ROOM, HS, gate=None, agents=self.AGENTS,
+                             thread_root="root")
+        self.assertFalse(res["ok"])
+        self.assertEqual(called, [])
+
+
+class RelationCLITests(EnvCase):
+    def test_say_flags_reach_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (cap.update(args=a, kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "hi", "--thread-root", ROOT, "--reply-to", LATEST])
+        self.assertEqual(cap["kw"], {"reply_to": LATEST, "thread_root": ROOT})
+
+    def test_mention_flags_reach_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._mention, "mention",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["mention", "peer", "ping", ROOM, "--reply-to", EV])
+        self.assertEqual(cap["kw"], {"reply_to": EV, "thread_root": None})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

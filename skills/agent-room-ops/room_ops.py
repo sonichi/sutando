@@ -190,11 +190,21 @@ def _main(argv):
     p.add_argument("message")
     p.add_argument("room_id")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--reply-to", dest="reply_to", default=None,
+                   help="event id ($abc) this post replies to")
+    p.add_argument("--thread-root", dest="thread_root", default=None,
+                   help="event id ($abc) of the thread to post into; --reply-to names "
+                        "the newest event in it (defaults to the root)")
 
     p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
     p.add_argument("room_id")
     p.add_argument("message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--reply-to", dest="reply_to", default=None,
+                   help="event id ($abc) this post replies to")
+    p.add_argument("--thread-root", dest="thread_root", default=None,
+                   help="event id ($abc) of the thread to post into; --reply-to names "
+                        "the newest event in it (defaults to the root)")
 
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
                                      "GRANTS access, overriding agents' local allowFrom (#429)")
@@ -247,9 +257,11 @@ def _main(argv):
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
-        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid)
+        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
+                               reply_to=a.reply_to, thread_root=a.thread_root)
     elif a.cmd == "say":
-        res = _say.say(a.message, a.room_id, a.agent_mxid)
+        res = _say.say(a.message, a.room_id, a.agent_mxid,
+                       reply_to=a.reply_to, thread_root=a.thread_root)
     elif a.cmd == "grant":
         import grant as _grant
         try:

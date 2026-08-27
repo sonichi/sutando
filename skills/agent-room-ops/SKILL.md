@@ -32,6 +32,13 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' 'deploy finished, 3 
 #   event id came back. `unconfirmed` is a 200 with no proof: the send probably landed, so do
 #   NOT re-send blindly, but do not drop a fallback/result path on it either.
 #   Use `mention` instead when a specific agent must be triggered; `say` never pings.
+python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'on it' --thread-root '$root' --agent '@a:hs'
+#   `say` and `mention` both take --reply-to / --thread-root. --reply-to lands a rich reply
+#   (in_reply_to) and works against the gateway today. --thread-root asks for an m.thread
+#   reply; the gateway does not carry that field yet, so it currently degrades to the rich
+#   reply emitted alongside it — the post lands, just not inside the thread panel. With only
+#   --thread-root, --reply-to defaults to the root. A malformed event id is REFUSED before
+#   the network rather than posted unrelated.
 python3 skills/agent-room-ops/room_ops.py join   '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc get '!room:hs' --folder room-todo --name TODO.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc put '!room:hs' --folder room-memo --name note.md --file /tmp/note.md --agent '@a:hs'

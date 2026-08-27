@@ -18,6 +18,7 @@ import os
 from _gateway import gate_allows, load_gate, gateway, http_json, degrade_reason, HTTPError, URLError
 from resolve import resolve_user
 import receipt as _receipt
+from relations import RelationError, relation_fields
 
 
 def _result(ok, *, room_id=None, mxid=None, event_id=None, candidates=None, reason=None):
@@ -37,7 +38,8 @@ def build_body(mxid: str, message: str) -> str:
 
 
 def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = None,
-            *, gate=None, agents: list | None = None) -> dict:
+            *, gate=None, agents: list | None = None,
+            reply_to: str | None = None, thread_root: str | None = None) -> dict:
     """Resolve `handle` → mxid and post a triggering @-mention into `room_id`.
 
     Returns {ok, room_id, mxid, event_id, candidates, reason}. On an ambiguous
@@ -49,6 +51,13 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         return _result(False, room_id=room_id, reason="room_id required")
     if not handle:
         return _result(False, room_id=room_id, reason="handle required")
+
+    # Validated before resolve/gate/network for the same reason as in `say`: a
+    # mention that lands outside the thread is worse than one that is refused.
+    try:
+        rel = relation_fields(reply_to=reply_to, thread_root=thread_root)
+    except RelationError as e:
+        return _result(False, room_id=room_id, reason=str(e))
 
     res = resolve_user(handle, agents=agents)
     if not res.get("ok"):
@@ -73,7 +82,7 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         # moment the broker honors it (a peer-review ask, ties to broker #151).
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
-            {"op": "message", "room_id": room_id, "body": body, "mentions": [mxid]},
+            {"op": "message", "room_id": room_id, "body": body, "mentions": [mxid], **rel},
         )
     except HTTPError as e:
         return _result(False, room_id=room_id, mxid=mxid, reason=degrade_reason(e.code))
