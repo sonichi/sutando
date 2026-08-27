@@ -324,6 +324,10 @@ def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
 
 _HARDCODED_WORKSPACE_DEFAULT_REL = "workspace"  # relative to repo root
 
+# Env keys the migration contract deletes rather than honors (v0.8). Single
+# source of truth for deprecation-aware readers; advising a merge would misfire.
+DEPRECATED_ENV_KEYS = frozenset({"SUTANDO_WORKSPACE"})
+
 
 def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
     """Resolve the workspace directory per the canonical contract.

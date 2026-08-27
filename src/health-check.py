@@ -1462,21 +1462,24 @@ def check_env_split(repo_env: "Path | None" = None,
     if not candidates:
         return None
 
-    def _keys(path: Path) -> "set[str]":
-        out = set()
+    def _keys(path: Path) -> "set[str] | None":
+        # None (not empty set) on read failure: an unreadable file is an
+        # UNKNOWN key set, not an empty one — collapsing it silences the probe.
         try:
-            for line in path.read_text(errors="replace").splitlines():
-                line = line.strip()
-                # split(None) eats any space/tab run: `export   K=` and
-                # `export\tK=` must not silently drop the key.
-                parts = line.split(None, 1)
-                if parts and parts[0] == "export":
-                    line = parts[1] if len(parts) == 2 else ""
-                name, sep, _ = line.partition("=")
-                if sep and name and not name.startswith("#")                         and name.replace("_", "").isalnum():
-                    out.add(name)
+            text = path.read_text(errors="replace")
         except OSError:
-            return set()
+            return None
+        out = set()
+        for line in text.splitlines():
+            line = line.strip()
+            # split(None) eats any space/tab run: `export   K=` and
+            # `export\tK=` must not silently drop the key.
+            parts = line.split(None, 1)
+            if parts and parts[0] == "export":
+                line = parts[1] if len(parts) == 2 else ""
+            name, sep, _ = line.partition("=")
+            if sep and name and not name.startswith("#")                     and name.replace("_", "").isalnum():
+                out.add(name)
         return out
 
     # The canonical resolver owns selection; a re-derivation drifts.
@@ -1501,19 +1504,47 @@ def check_env_split(repo_env: "Path | None" = None,
                 f"new tier."
             ),
         }
-    missing = sorted(_keys(other) - _keys(selected))
-    if not missing:
+    sel_keys, oth_keys = _keys(selected), _keys(other)
+    if sel_keys is None or oth_keys is None:
+        # A read failure on either side is an unknown outcome, not a clean
+        # comparison — WARN rather than fall through to a false "no missing".
+        unreadable = []
+        if sel_keys is None:
+            unreadable.append(f"selected {sel_name} .env ({selected})")
+        if oth_keys is None:
+            unreadable.append(f"unselected {oth_name} .env ({other})")
+        return {
+            "name": "env-split",
+            "status": "warn",
+            "detail": (
+                f"env-split comparison could not be completed — unreadable: "
+                f"{'; '.join(unreadable)}. A missing/partial load cannot be ruled "
+                f"out; fix file permissions and re-run."
+            ),
+        }
+    from sutando_config import DEPRECATED_ENV_KEYS  # noqa: PLC0415
+    diff = oth_keys - sel_keys
+    # A deprecated key present only in OTHER must not be advised as a merge —
+    # the migration deletes it; report it as delete-not-merge instead.
+    deprecated = sorted(diff & DEPRECATED_ENV_KEYS)
+    missing = sorted(diff - DEPRECATED_ENV_KEYS)
+    if not missing and not deprecated:
         return None
-    return {
-        "name": "env-split",
-        "status": "warn",
-        "detail": (
+    parts = []
+    if missing:
+        parts.append(
             f"the {sel_name} .env ({selected}) is the one loaders select, but it "
             f"is missing {len(missing)} key(s) present in the {oth_name} .env: "
             f"{', '.join(missing)}. Loads are silently partial until the keys are "
             f"merged into {selected} (names compared only; values never read)."
-        ),
-    }
+        )
+    if deprecated:
+        parts.append(
+            f"The {oth_name} .env also carries {len(deprecated)} deprecated "
+            f"key(s) — {', '.join(deprecated)} — that the migration DELETES; "
+            f"delete these, do not merge them."
+        )
+    return {"name": "env-split", "status": "warn", "detail": " ".join(parts)}
 
 
 def check_memory_dir_siblings() -> "dict | None":

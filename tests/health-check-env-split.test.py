@@ -96,8 +96,11 @@ if os.geteuid() != 0:
         try:
             r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
             check("unreadable selected env warns", r is not None and r["status"], "warn")
-            check("unreadable selected env lists the other's keys",
-                  r is not None and "DISCORD_BOT_TOKEN" in r["detail"], True)
+            # Read failure is UNKNOWN: the probe must not guess a missing-key
+            # list from the readable side — it reports comparison incomplete.
+            check("unreadable selected env reports incomplete, not a guessed list",
+                  r is not None and "could not be completed" in r["detail"]
+                  and "DISCORD_BOT_TOKEN" not in r["detail"], True)
         finally:
             repo_env.chmod(0o600)
 
@@ -169,6 +172,67 @@ with tempfile.TemporaryDirectory() as td:
         r = hc.check_env_split(repo_env=td / "no" / ".env",
                                ws_env=td / "no2" / ".env")
     check("zero candidates stay silent", r, None)
+
+# 7. read-failure is UNKNOWN, not a clean "no missing" — WARN on BOTH
+# orientations. Chmod 000 is skipped under root (reads regardless of mode).
+import os as _os
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir(); (td / "ws").mkdir()
+    repo_env = td / "repo" / ".env"
+    ws_env = td / "ws" / ".env"
+    repo_env.write_text("GEMINI_API_KEY=real\n")
+    ws_env.write_text("GEMINI_API_KEY=real\nDISCORD_BOT_TOKEN=old\n")
+    if _os.geteuid() != 0:
+        # unreadable UNSELECTED (the finding: it used to silence the probe)
+        ws_env.chmod(0o000)
+        try:
+            with _patch.object(sutando_config, "resolve_dotenv",
+                               return_value=repo_env):
+                r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+            check("unreadable unselected WARNs (not silent)",
+                  r is not None and r["status"] == "warn"
+                  and "could not be completed" in r["detail"], True)
+        finally:
+            ws_env.chmod(0o600)
+        # unreadable SELECTED (opposite orientation)
+        repo_env.chmod(0o000)
+        try:
+            with _patch.object(sutando_config, "resolve_dotenv",
+                               return_value=repo_env):
+                r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+            check("unreadable selected WARNs (not silent)",
+                  r is not None and r["status"] == "warn"
+                  and "could not be completed" in r["detail"], True)
+        finally:
+            repo_env.chmod(0o600)
+
+# 8. a deprecated key present only in OTHER is reported as delete-not-merge,
+# never advised as a mergeable missing key. Controls: deprecated-alone + a mix.
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir(); (td / "ws").mkdir()
+    repo_env = td / "repo" / ".env"
+    ws_env = td / "ws" / ".env"
+    dep = sorted(sutando_config.DEPRECATED_ENV_KEYS)[0]  # e.g. SUTANDO_WORKSPACE
+    # deprecated-only diff: must not read as a mergeable missing key
+    repo_env.write_text("GEMINI_API_KEY=real\n")
+    ws_env.write_text(f"GEMINI_API_KEY=real\n{dep}=/some/path\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=repo_env):
+        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+    check("deprecated-only diff never advises a merge",
+          r is not None and "missing" not in r["detail"]
+          and "delete these, do not merge" in r["detail"], True)
+    check("deprecated key is named as delete-not-merge",
+          r is not None and dep in r["detail"], True)
+    # mix: a real missing key AND a deprecated one -> both, correctly separated
+    ws_env.write_text(f"GEMINI_API_KEY=real\nDISCORD_BOT_TOKEN=old\n{dep}=/p\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=repo_env):
+        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+    check("mix: real key advised as merge, deprecated as delete",
+          r is not None and "DISCORD_BOT_TOKEN" in r["detail"]
+          and "missing 1 key" in r["detail"]
+          and "delete these, do not merge" in r["detail"], True)
 
 # 6. run_all_checks wiring: the call site is separate code from the probe
 # (same pattern as health-check-bridge-log-content's integration section).
