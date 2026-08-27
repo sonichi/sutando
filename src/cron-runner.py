@@ -211,24 +211,25 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
     fires = []
     cur = time.localtime(now_epoch)
     y, mo, d = cur.tm_year, cur.tm_mon, cur.tm_mday
-    for _ in range(PERIOD_SCAN_MAX_SECONDS // 86400 + 2):
+    for day_idx in range(PERIOD_SCAN_MAX_SECONDS // 86400 + 2):
         # Anchor on noon: midnight can be skipped or repeated by a DST shift.
         noon = time.mktime((y, mo, d, 12, 0, 0, 0, 0, -1))
         if _day_matches(dom_f, month_f, dow_f, time.localtime(noon)):
-            day = []
-            for h in hours:
+            # Per-hour batching: a DST fold interleaves offsets only within
+            # its own hour. day_idx, not a flag — a flag stays armed for day 1.
+            day_hours = [h for h in hours if h <= cur.tm_hour] if day_idx == 0 else hours
+            for h in day_hours:
+                hour_epochs = []
                 for mi in minutes:
-                    day.extend(_local_epochs(y, mo, d, h, mi))
-            # A repeated hour interleaves two UTC offsets, so the h/m walk no
-            # longer descends on its own and the floor test needs a real sort.
-            for epoch in sorted(day, reverse=True):
-                if epoch > now_epoch:
-                    continue
-                if epoch < floor:
-                    return None
-                fires.append(epoch)
-                if len(fires) == 2:
-                    return fires[0] - fires[1]
+                    hour_epochs.extend(_local_epochs(y, mo, d, h, mi))
+                for epoch in sorted(hour_epochs, reverse=True):
+                    if epoch > now_epoch:
+                        continue
+                    if epoch < floor:
+                        return None
+                    fires.append(epoch)
+                    if len(fires) == 2:
+                        return fires[0] - fires[1]
         prev = time.localtime(noon - 86400)
         y, mo, d = prev.tm_year, prev.tm_mon, prev.tm_mday
     return None

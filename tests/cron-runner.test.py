@@ -842,5 +842,25 @@ def test_malformed_shell_command_is_skipped_and_not_retried():
             cr.REPO_ROOT = original_repo_root
 
 
+
+# qingyun, #3437 review: a dense schedule expanded the whole day while run()
+# held _state_lock. Pin the bound, not a wall-clock time (host-dependent).
+def test_dense_schedule_does_not_expand_the_day():
+    import time as _t
+    calls = {"mk": 0}
+    real = _t.mktime
+    cr.time.mktime = lambda *a: (calls.__setitem__("mk", calls["mk"] + 1) or real(*a))
+    try:
+        now = int(real((2026, 6, 15, 14, 37, 0, 0, 0, -1)))
+        assert cr.cron_period_seconds("* * * * *", now) == 60
+        # one hour is 60 minutes x <=2 epochs, plus the day/noon probes
+        assert calls["mk"] < 200, f"expanded the day: {calls['mk']} mktime calls"
+    finally:
+        cr.time.mktime = real
+    print("OK: dense '* * * * *' stays under the per-hour bound")
+
+
+test_dense_schedule_does_not_expand_the_day()
+
 if __name__ == "__main__":
     _run_all()
