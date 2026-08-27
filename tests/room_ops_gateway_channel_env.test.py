@@ -93,13 +93,21 @@ class ChannelEnvLocator(_Base):
             self.assertIsNone(_gateway._channel_env_file())
 
     def test_none_when_core_src_missing(self):
-        with mock.patch.object(_gateway, "_core_src_on_path",
-                               staticmethod(lambda: False)):
+        # Call/effect control: without it this passes when the stub is never
+        # invoked at all and the None comes from the guard swallowing an error.
+        calls = []
+
+        def not_on_path():
+            calls.append(1)
+            return False
+
+        with mock.patch.object(_gateway, "_core_src_on_path", not_on_path):
             self.assertIsNone(_gateway._channel_env_file())
+        self.assertEqual(calls, [1], "stub never ran - None came from elsewhere")
 
     def test_none_rather_than_raising(self):
         with mock.patch.object(_gateway, "_core_src_on_path",
-                               staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("boom")))):
+                               lambda: (_ for _ in ()).throw(RuntimeError("boom"))):
             self.assertIsNone(_gateway._channel_env_file())
 
 
@@ -115,21 +123,29 @@ class FromChannelEnv(_Base):
         self.assertEqual(_gateway._from_channel_env(("GATEWAY_TOKEN",), env_file=f), "")
 
     def test_empty_when_locator_returns_none(self):
-        with mock.patch.object(_gateway, "_channel_env_file", staticmethod(lambda: None)):
+        with mock.patch.object(_gateway, "_channel_env_file", lambda: None):
             self.assertEqual(_gateway._from_channel_env(("GATEWAY_TOKEN",)), "")
 
     def test_empty_when_core_src_missing(self):
         f = self._envfile("REMOTE_TASK_TOKEN=x\n")
-        with mock.patch.object(_gateway, "_core_src_on_path",
-                               staticmethod(lambda: False)):
+        # Control as above: the file HAS the token, so "" must come from the
+        # off-path branch actually running, not from a swallowed TypeError.
+        calls = []
+
+        def not_on_path():
+            calls.append(1)
+            return False
+
+        with mock.patch.object(_gateway, "_core_src_on_path", not_on_path):
             self.assertEqual(_gateway._from_channel_env(("REMOTE_TASK_TOKEN",), env_file=f), "")
+        self.assertEqual(calls, [1], "stub never ran - '' came from elsewhere")
 
     def test_resolution_failure_is_absence_not_a_crash(self):
         # The guard around the locator+imports: anything raising there must read
         # as "no credential here", never propagate into the caller's gateway().
         def boom():
             raise RuntimeError("locator exploded")
-        with mock.patch.object(_gateway, "_channel_env_file", staticmethod(boom)):
+        with mock.patch.object(_gateway, "_channel_env_file", boom):
             self.assertEqual(_gateway._from_channel_env(("REMOTE_TASK_TOKEN",)), "")
 
     def test_undecodable_file_is_absence_not_a_crash(self):
@@ -146,7 +162,7 @@ class GatewayPrecedence(_Base):
 
     def test_file_supplies_token_and_url(self):
         f = self._envfile("REMOTE_TASK_URL=https://gw.example\nREMOTE_TASK_TOKEN=sekret\n")
-        with mock.patch.object(_gateway, "_channel_env_file", staticmethod(lambda: f)):
+        with mock.patch.object(_gateway, "_channel_env_file", lambda: f):
             base, headers = _gateway.gateway()
         self.assertEqual(base, "https://gw.example")
         self.assertEqual(headers.get("Authorization"), "Bearer sekret")
@@ -155,7 +171,7 @@ class GatewayPrecedence(_Base):
         f = self._envfile("REMOTE_TASK_URL=https://file.example\nREMOTE_TASK_TOKEN=from-file\n")
         os.environ["GATEWAY_URL"] = "https://env.example"
         os.environ["GATEWAY_TOKEN"] = "from-env"
-        with mock.patch.object(_gateway, "_channel_env_file", staticmethod(lambda: f)):
+        with mock.patch.object(_gateway, "_channel_env_file", lambda: f):
             base, headers = _gateway.gateway()
         self.assertEqual(base, "https://env.example")
         self.assertEqual(headers.get("Authorization"), "Bearer from-env")
@@ -163,13 +179,13 @@ class GatewayPrecedence(_Base):
     def test_file_beats_vault(self):
         f = self._envfile("REMOTE_TASK_URL=https://file.example\nREMOTE_TASK_TOKEN=from-file\n")
         _VAULT_STORE["REMOTE_TASK_TOKEN"] = "https://vault.example|from-vault"
-        with mock.patch.object(_gateway, "_channel_env_file", staticmethod(lambda: f)):
+        with mock.patch.object(_gateway, "_channel_env_file", lambda: f):
             base, headers = _gateway.gateway()
         self.assertEqual(headers.get("Authorization"), "Bearer from-file")
 
     def test_legacy_alias_resolves_from_file(self):
         f = self._envfile("REMOTE_TASK_URL=https://gw.example\nAG2_REMOTE_TOKEN=legacy\n")
-        with mock.patch.object(_gateway, "_channel_env_file", staticmethod(lambda: f)):
+        with mock.patch.object(_gateway, "_channel_env_file", lambda: f):
             _, headers = _gateway.gateway()
         self.assertEqual(headers.get("Authorization"), "Bearer legacy")
 
