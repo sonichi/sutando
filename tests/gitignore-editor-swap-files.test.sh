@@ -56,6 +56,12 @@ done
 for f in .foo.svg .schema.sql .data.sas .x.svc .theme.sty; do
     refute_ignored "$f" "hidden $f stays trackable"
 done
+# .swf is inside Vim's shallow range but is also a real extension; the range
+# deliberately skips it, so a real Flash asset must stay trackable.
+for f in movie.swf intro.swf; do
+    refute_ignored "$f" "$f stays trackable — .swf excluded from the swap range"
+done
+
 for f in logo.svg query.sql style.scss run.sh app.swift; do
     refute_ignored "$f" "$f stays trackable"
 done

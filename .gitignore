@@ -142,8 +142,8 @@ coverage.xml
 diff-cover.md
 coverage-summary.md
 
-# A vim swap of .env holds the same live secrets and is spelled identically to a
-# real .env.<3-char> file, so the whole `.env*.s??` namespace is given up here.
-*.sw[a-p]
+# `f` is skipped: .swf is a real extension, and losing every Flash asset costs
+# more than the 11th concurrent swap slot. .env* gives up its whole .s?? space.
+*.sw[a-eg-p]
 *.env*.s[a-w][a-z]
 *~
