@@ -1799,11 +1799,12 @@ def _recover_auth(code: int) -> bool:
     cycle = 0
     while True:
         pending = _reenroll_state["code"]
+        # `backoff_s` means "retryable TRANSPORT backoff"; this loop is waiting on
+        # a human, so it stays 0 — the re-check cadence is not a reconnect estimate.
         _emit_gateway_status(False,
                              error=(f"auth rejected HTTP {code} — relink pending "
                                     f"(code {pending})" if pending else
-                                    f"auth rejected HTTP {code} — waiting for re-connect"),
-                             backoff_s=AUTH_RECHECK_INTERVAL)
+                                    f"auth rejected HTTP {code} — waiting for re-connect"))
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting for token rotation")
