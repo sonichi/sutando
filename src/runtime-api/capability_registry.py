@@ -22,6 +22,7 @@ MAX_READ_TIMEOUT_S = 10.0
 MAX_READ_RESULT_BYTES = 192 * 1024
 MAX_DESCRIPTOR_BYTES = 16 * 1024
 MAX_READ_LIMIT = 100
+MAX_JSON_DEPTH = 64
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _AVAILABILITY = frozenset({
@@ -51,8 +52,11 @@ def _name(value: Any, field: str) -> str:
     return value
 
 
-def _walk_json(value: Any, field: str) -> None:
+def _walk_json(value: Any, field: str, depth: int = 0) -> None:
     """Reject values that JSON can coerce silently (non-string keys, NaN)."""
+    if depth > MAX_JSON_DEPTH:
+        raise ValueError(
+            f"{field} exceeds the {MAX_JSON_DEPTH}-level JSON depth limit")
     if value is None or isinstance(value, (str, bool, int)):
         return
     if isinstance(value, float):
@@ -61,13 +65,13 @@ def _walk_json(value: Any, field: str) -> None:
         return
     if isinstance(value, list):
         for item in value:
-            _walk_json(item, field)
+            _walk_json(item, field, depth + 1)
         return
     if isinstance(value, dict):
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError(f"{field} must contain only string object keys")
-            _walk_json(item, field)
+            _walk_json(item, field, depth + 1)
         return
     raise ValueError(f"{field} must be JSON-compatible")
 
