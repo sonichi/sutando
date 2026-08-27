@@ -7480,6 +7480,11 @@ def _probe_codex_task_notifier(target: dict) -> dict:
     }
 
 
+# telegram assigns inbound "owner" outright (telegram-bridge.py) and reads
+# tierMap only to pick a proactive DM recipient — not to authorize a sender.
+_TIER_MAP_NOT_INBOUND_AUTH = frozenset({"telegram"})
+
+
 def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int = 500):
     """Why this host would need `codex`, or None if nothing here consumes it.
 
@@ -7513,6 +7518,8 @@ def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int 
             if not isinstance(data, dict):
                 continue  # valid JSON, but not an access record
             channel = access_file.parent.name
+            if channel in _TIER_MAP_NOT_INBOUND_AUTH:
+                continue
             raw_map = data.get("tierMap")
             mapped = "tierMap" in data
             if mapped and not isinstance(raw_map, dict):

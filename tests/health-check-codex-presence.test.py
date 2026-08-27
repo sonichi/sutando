@@ -254,6 +254,57 @@ class CodexDelegationConsumer(unittest.TestCase):
             self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
                                                             channels_dir=channels))
 
+    def test_telegram_present_tiermap_is_not_inbound_authorization(self):
+        """The reviewer's exact record. Telegram may carry a tierMap for
+        proactive-owner selection (`_resolve_proactive_owner_id`), but inbound
+        telegram tasks are assigned "owner" outright and never resolve through
+        it — so a second allowlisted sender absent from that map is NOT a
+        non-owner ingress signal."""
+        tasks, channels = self._dirs()
+        self._access(channels, "telegram",
+                     {"allowFrom": ["owner-id", "second-owner"],
+                      "tofuOwner": "owner-id",
+                      "tierMap": {"owner-id": "owner"}})
+        self._task(tasks, "1", "owner")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
+
+    def test_telegram_team_tier_value_is_not_inbound_authorization(self):
+        """Same rule for an explicit non-owner value: telegram consults that
+        map only while choosing a proactive recipient."""
+        tasks, channels = self._dirs()
+        self._access(channels, "telegram",
+                     {"allowFrom": ["a", "b"], "tierMap": {"a": "owner", "b": "team"}})
+        self._task(tasks, "1", "owner")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
+
+    def test_slack_and_discord_still_authorize_by_tiermap(self):
+        """Control for the exclusion: the adapters that DO resolve inbound tier
+        through tierMap must be unaffected, or the fix hides real ingress."""
+        for name in ("slack", "discord"):
+            tasks, channels = self._dirs()
+            self._access(channels, name,
+                         {"allowFrom": ["u1", "u2"], "tierMap": {"u1": "owner"}})
+            with patch.object(hc, "_codex_runtime_selected", return_value=False):
+                why = hc._codex_delegation_consumer(tasks_dir=tasks, channels_dir=channels)
+            self.assertIsNotNone(why, f"{name} must still infer from tierMap")
+            self.assertIn("allowlists", why)
+
+    def test_unknown_channel_still_fails_toward_cannot_be_ruled_out(self):
+        """The exclusion is a DENYLIST, not an allowlist: a future channel that
+        does authorize by tierMap must keep tripping the rule, because a false
+        'no consumer' silently disables delegation while a false positive only
+        sends someone to look."""
+        tasks, channels = self._dirs()
+        self._access(channels, "some-future-bridge",
+                     {"allowFrom": ["u1", "u2"], "tierMap": {"u1": "owner"}})
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNotNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                               channels_dir=channels))
+
     def test_absent_tiermap_key_differs_from_a_present_map_missing_a_user(self):
         """Key ABSENT is grandfathered to owner by `_ensure_tier_map_seeded`;
         key PRESENT but missing the sender fails closed to "other". The two must
