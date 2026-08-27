@@ -208,7 +208,7 @@ python3 skills/schedule-crons/ensure-cron-room.py \
 
 `ensure-cron-room.py` is **idempotent**: for each `"room": "auto"` entry it creates one room (`Sutando · <cron>`), invites the owner, posts a self-identifying first message, and **rewrites `room` to the concrete `!id:ag2.space`**. Entries that already hold a `!id` are skipped — re-running never makes duplicate rooms (the failure mode of ad-hoc creation). If no gateway token resolves, it exits 0 having done nothing. The cron's own prompt then posts output to its `room` id via the gateway op:message path ([[reference_gateway_op_message_room_post]]).
 
-**Which crons opt in:** only *output-producing* crons (pr-shepherd, roadmap-driver, friction-room-sweep, disk-hygiene, ai-frontline-today, morning-briefing). Silent/internal crons (main-loop, sync-memory, briefing-fallback, daily-insight) stay room-less — a room each would be clutter.
+**Which crons opt in:** only *output-producing* crons (pr-shepherd, roadmap-driver, friction-room-sweep, disk-hygiene, ai-frontline-today, morning-briefing). Silent/internal crons (main-loop, sync-memory, briefing-fallback) stay room-less — a room each would be clutter.
 
 **Known gateway constraints (2026-07-11), baked into the helper's design:**
 - **No room-list API** (`GET /v1/rooms` 404; `op:list` unknown) → the `room` id recorded in `crons.json` is the *only* handle on a created room. Never create without writing the id back (the helper writes after each create so a mid-batch hang can't orphan a room).

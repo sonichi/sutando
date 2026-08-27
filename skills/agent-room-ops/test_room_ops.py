@@ -62,6 +62,12 @@ class EnvCase(unittest.TestCase):
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in ENVK}
         _clear()
+        # setUp clears every token var, so an unshadowed gateway() would fall
+        # through and read the operator's REAL channels/ag2space/.env.
+        self._env_file_patch = mock.patch.object(
+            _gateway, "_channel_env_file", lambda: None)
+        self._env_file_patch.start()
+        self.addCleanup(self._env_file_patch.stop)
 
     def tearDown(self):
         _clear()
@@ -1408,6 +1414,107 @@ class CitationCLITests(EnvCase):
             self.assertIn("CITATION", text)
             self.assertIn("does NOT put", text)
 
+
+class ChannelEnvLocatorTests(unittest.TestCase):
+    """Exercise the REAL _channel_env_file() — every other test shadows it.
+
+    Without this, drifting the path segments or moving claude_home_path leaves the
+    tier permanently unresolved and the suite green, reproducing the exact symptom
+    this feature removes: "no gateway configured" with a credential on disk.
+    """
+
+    def test_locates_the_channel_env_under_claude_config_dir(self):
+        d = tempfile.mkdtemp()
+        ch = os.path.join(d, "channels", "ag2space")
+        os.makedirs(ch)
+        env = os.path.join(ch, ".env")
+        with open(env, "w") as fh:
+            fh.write("REMOTE_TASK_TOKEN=x\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
+            got = _gateway._channel_env_file()
+        self.assertIsNotNone(got, "real locator returned None for a file that exists")
+        self.assertEqual(os.path.realpath(str(got)), os.path.realpath(env))
+        os.remove(env)
+        for p in (ch, os.path.dirname(ch), d):
+            os.rmdir(p)
+
+    def test_returns_none_when_the_file_is_absent(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, d)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
+            self.assertIsNone(_gateway._channel_env_file())
+
+
+class ChannelEnvTierTests(EnvCase):
+    """The channel `.env` tier: env -> channels/ag2space/.env -> vault.
+
+    Regression: the desktop-spawned core's supervisor uses a fixed env whitelist,
+    so REMOTE_TASK_* never reach the process even though the channel .env holds
+    them. gateway() read env then vault and skipped the file, reporting
+    "no gateway configured" while a working credential sat on disk.
+    """
+
+    def _write_env(self, body):
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, ".env")
+        with open(f, "w") as fh:
+            fh.write(body)
+        self.addCleanup(lambda: (os.remove(f), os.rmdir(d)))
+        return f
+
+    def test_token_and_url_come_from_channel_env(self):
+        f = self._write_env("REMOTE_TASK_URL=https://gw.example\n"
+                            "REMOTE_TASK_TOKEN=sekret\n")
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: f):
+            base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example")
+        self.assertEqual(headers.get("Authorization"), "Bearer sekret")
+
+    def test_process_env_still_wins_over_the_file(self):
+        f = self._write_env("REMOTE_TASK_URL=https://file.example\n"
+                            "REMOTE_TASK_TOKEN=from-file\n")
+        os.environ["GATEWAY_URL"] = "https://env.example"
+        os.environ["GATEWAY_TOKEN"] = "from-env"
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: f):
+            base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://env.example")
+        self.assertEqual(headers.get("Authorization"), "Bearer from-env")
+
+    def test_file_wins_over_vault(self):
+        f = self._write_env("REMOTE_TASK_URL=https://file.example\n"
+                            "REMOTE_TASK_TOKEN=from-file\n")
+        _VAULT_STORE["REMOTE_TASK_TOKEN"] = "https://vault.example|from-vault"
+        self.addCleanup(_VAULT_STORE.pop, "REMOTE_TASK_TOKEN", None)
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: f):
+            base, headers = _gateway.gateway()
+        self.assertEqual(headers.get("Authorization"), "Bearer from-file")
+        self.assertEqual(base, "https://file.example")
+
+    def test_absent_file_leaves_prior_behaviour_untouched(self):
+        # _channel_env_file() -> None is EnvCase's default shadow.
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "")
+        self.assertNotIn("Authorization", headers)
+
+    def test_legacy_ag2_remote_token_alias_resolves(self):
+        # Parity with the vault tier, which has always tried this legacy name.
+        # Old installs carry the token under it; without this they stay broken.
+        f = self._write_env("REMOTE_TASK_URL=https://gw.example\n"
+                            "AG2_REMOTE_TOKEN=legacy-secret\n")
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: f):
+            base, headers = _gateway.gateway()
+        self.assertEqual(headers.get("Authorization"), "Bearer legacy-secret")
+        self.assertEqual(base, "https://gw.example")
+
+    def test_missing_path_is_not_an_error(self):
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: "/nope/does/not/exist/.env"):
+            base, _ = _gateway.gateway()
+        self.assertEqual(base, "")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
