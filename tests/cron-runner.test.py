@@ -843,8 +843,8 @@ def test_malformed_shell_command_is_skipped_and_not_retried():
 
 
 
-# qingyun, #3437 review: a dense schedule expanded the whole day while run()
-# held _state_lock. Pin the bound, not a wall-clock time (host-dependent).
+# A dense schedule must not expand the whole day under run()'s state lock.
+# Pin the call bound, not a duration — elapsed time is host-dependent.
 def test_dense_schedule_does_not_expand_the_day():
     import time as _t
     calls = {"mk": 0}
