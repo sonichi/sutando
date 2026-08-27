@@ -39,6 +39,7 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+import { keystrokeOutcome } from './osascript-setup-hint.js';
 import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
 // Vision: one-shot frame + start/stop live screen-to-Gemini video.
@@ -215,14 +216,14 @@ export const pressKeyTool: ToolDefinition = {
 			try {
 				execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeKey}"${modStr}`], { timeout: 3_000 });
 			} catch (err) {
-				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 			}
 		} else {
 			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
 			try {
 				execFileSync('osascript', ['-e', `tell application "System Events" to key code ${keyCode}${modStr}`], { timeout: 3_000 });
 			} catch (err) {
-				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 			}
 		}
 		console.log(`${ts()} [PressKey] ${app ? `(${app}) ` : ''}${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
@@ -379,7 +380,7 @@ export const typeTextTool: ToolDefinition = {
 				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
 			} catch (err) {
-				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('Paste', err instanceof Error ? err.message : String(err));
 			}
 		}
 		// Single-line short text: use keystroke
@@ -398,7 +399,7 @@ export const typeTextTool: ToolDefinition = {
 			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
-			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
+			return keystrokeOutcome('Type', err instanceof Error ? err.message : String(err));
 		}
 	},
 };

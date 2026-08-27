@@ -43,7 +43,8 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from proactive_routing import BRIDGE_CHANNELS, should_claim_proactive  # noqa: E402
+from proactive_routing import (BRIDGE_CHANNELS, proactive_destination,  # noqa: E402
+                               should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 
@@ -82,7 +83,46 @@ for _root in (
 # (``rtc._ack_disabled_until = 0.0``) must hit the same namespace the running code
 # uses. A cached ``import ag2_sparrow.remote_gateway_bridge`` gives neither.
 _IMPL = _REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+
+# Runtime self-report, injected BEFORE the exec (anything after it is
+# unreachable when the exec'd source's own __main__ guard fires; see #3285).
+def _build_sha(repo):
+    import subprocess
+    from git_binary import git_argv  # resolver: never the bare CLT stub
+    try:
+        return subprocess.check_output(
+            git_argv("-C", str(repo), "rev-parse", "HEAD"),
+            text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+    except Exception:
+        pass
+    # Bundle install: the manifest's `sha` is the revision authority (its
+    # built_at is a time, not a revision — never substituted here).
+    try:
+        import json as _json
+        mf = _json.loads((Path(repo) / "ENGINE_MANIFEST.json").read_text())
+        m = mf.get("sha") if isinstance(mf, dict) else None
+        return m if isinstance(m, str) and len(m) >= 8 else None
+    except (OSError, ValueError):
+        return None
+
+def _sha256_of(path):
+    import hashlib
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+# BOTH executed source inputs: the loader (this file) and the canonical
+# implementation it compiles — a same-HEAD change to either must be visible.
+RUNTIME_IDENTITY = {"build_sha": _build_sha(_REPO),
+                    "entrypoint": str(Path(__file__).resolve()),
+                    "loader_sha256": _sha256_of(__file__),
+                    "module_sha256": _sha256_of(_IMPL)}
 __package__ = "ag2_sparrow"  # PEP 328: makes the source's relative imports resolve
+# The exec'd source's own __main__ guard must not fire mid-file: main() never
+# returns, so every assignment below the exec stayed unreached in production.
+_RUN_MAIN = __name__ == "__main__"
+__name__ = "ag2_sparrow.remote_gateway_bridge"
 exec(compile(_IMPL.read_text(encoding="utf-8"), str(_IMPL), "exec"), globals())
 
 _CHANNEL = "ag2space"
@@ -147,6 +187,11 @@ def _routed_bridge_still_owns(routed: str, path: Path, now: float) -> bool:
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
     no other bridge will ever take (see _routed_bridge_still_owns)."""
+    # A filename destination outranks everything below, incl. the grace:
+    # a destined file strands visibly rather than leak to the gateway room.
+    dest = proactive_destination(path.name)
+    if dest is not None:
+        return dest == _CHANNEL
     state = WS / "state" / "last-owner-activity.json"
     if should_claim_proactive(state, _CHANNEL):
         return True
@@ -170,3 +215,7 @@ def _ag2space_proactive_claim_gate(path: Path) -> bool:
 # Assigned AFTER the exec: the canonical module's own `PROACTIVE_CLAIM_GATE =
 # None` default runs inside it and would overwrite an earlier assignment.
 PROACTIVE_CLAIM_GATE = _ag2space_proactive_claim_gate
+
+if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
+    __name__ = "__main__"
+    main()  # noqa: F821  (defined by the exec above)

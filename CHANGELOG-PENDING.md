@@ -11,10 +11,12 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Added
 
 <!-- feat() PRs go here -->
+- report-feedback: `--auto` mode for agent-initiated bug reports — honors the owner's `state/feedback-prefs.json` toggles (auto-report + send-logs, both default on), dedupes identical titles (24h), and caps volume (5/day).
 
 ## Fixed
 
 <!-- fix() PRs go here -->
+- report-feedback: read the desktop host's Keychain session (origin-scoped `AG2_CLOUD_TOKEN_*` key) so filing works on Tauri installs, and default the cloud origin to `sutando.ag2.space` (the retired `.ai` host drops the bearer across its redirect).
 
 ## Changed
 

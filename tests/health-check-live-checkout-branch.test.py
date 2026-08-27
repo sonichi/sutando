@@ -74,6 +74,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -257,6 +258,114 @@ def main() -> int:
         r = hc.check_live_checkout_branch(work)
         check(r["status"] == "ok" and "behind" not in r["detail"],
               f"l) up-to-date -> clean ok, got {r}")
+
+    # l2) "0 behind" is a claim about the remote and this probe never fetches, so a
+    #     clean verdict is only as current as the last fetch. Say when that was.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        r = hc.check_live_checkout_branch(work)
+        check("fetch" in r["detail"],
+              f"l2) clean verdict names its fetch age, got {r['detail']}")
+
+    # l3) Backdating FETCH_HEAD alone must move the age: `refs/remotes/*` moves only
+    #     when the remote does, so a reading taken from it would call a quiet main stale.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        fh = common / "FETCH_HEAD"
+        _origin = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                                 capture_output=True, text=True).stdout.strip()
+        fh.write_text(f"deadbeef\t\tbranch 'main' of {_origin}\n")
+        old = time.time() - (26 * 3600 + 5 * 60)
+        os.utime(fh, (old, old))
+        r = hc.check_live_checkout_branch(work)
+        check("26h5m" in r["detail"],
+              f"l3) age tracks FETCH_HEAD mtime, got {r['detail']}")
+
+    # l4) With no fetch on record, say so. A fabricated "0h0m ago" reads as maximally
+    #     fresh — this disclosure's own failure mode, inverted.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        (common / "FETCH_HEAD").unlink(missing_ok=True)
+        r = hc.check_live_checkout_branch(work)
+        check("no fetch of that branch recorded" in r["detail"] and "h0m" not in r["detail"],
+              f"l4) absent FETCH_HEAD is named, not rendered as fresh, got {r['detail']}")
+
+    # l5) A fetch of an UNRELATED ref must not date origin/<expected>. FETCH_HEAD's
+    #     mtime is the last fetch of anything; only its content names the ref.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        (common / "FETCH_HEAD").write_text(
+            "deadbeef\t\t'refs/pull/2270/head' of https://example.invalid/r\n")
+        r = hc.check_live_checkout_branch(work)
+        check("no fetch of that branch recorded" in r["detail"],
+              f"l5) a PR-ref fetch must not read as freshly fetched, got {r['detail']}")
+
+    # l5b) `main` fetched from ANOTHER remote must not date origin/main. FETCH_HEAD
+    #      names the branch AND the URL; only the URL separates the two remotes.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        origin = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                                capture_output=True, text=True).stdout.strip()
+        (common / "FETCH_HEAD").write_text(
+            "deadbeef\t\tbranch 'main' of https://elsewhere.invalid/other-fork\n")
+        r = hc.check_live_checkout_branch(work)
+        check("no fetch of that branch recorded" in r["detail"],
+              f"l5b) another remote's main must not date origin/main, got {r['detail']}")
+        # ...and the origin record, written the same way, DOES date it. Without this the
+        # check above passes for a function that always returns None.
+        (common / "FETCH_HEAD").write_text(f"deadbeef\t\tbranch 'main' of {origin}\n")
+        r = hc.check_live_checkout_branch(work)
+        check("a fetch" in r["detail"],
+              f"l5b-control) origin's own record must date it, got {r['detail']}")
+
+    # l5c) `remote get-url` keeps a trailing `.git` that FETCH_HEAD drops. An exact
+    #      compare would never match a real clone and silently report nothing ever.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        common = Path(subprocess.run(
+            ["git", "-C", str(work), "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True).stdout.strip())
+        if not common.is_absolute():
+            common = work / common
+        origin = subprocess.run(["git", "-C", str(work), "remote", "get-url", "origin"],
+                                capture_output=True, text=True).stdout.strip()
+        subprocess.run(["git", "-C", str(work), "remote", "set-url", "origin", origin + ".git"],
+                       capture_output=True, text=True)
+        (common / "FETCH_HEAD").write_text(f"deadbeef\t\tbranch 'main' of {origin}\n")
+        r = hc.check_live_checkout_branch(work)
+        check("a fetch" in r["detail"],
+              f"l5c) a .git suffix mismatch must still match, got {r['detail']}")
+
+    # l6) A failed `rev-parse --git-common-dir` degrades to None, never to a number.
+    with tempfile.TemporaryDirectory() as td:
+        work = _mk_clone_behind(Path(td), 0)
+        fake = Path(td) / "git-nocommon"
+        fake.write_text("#!/bin/sh\ncase \"$*\" in *--git-common-dir*) exit 3;; esac\nexec git \"$@\"\n")
+        fake.chmod(0o755)
+        age = hc._last_fetch_age_s(work, str(fake), "main")
+        check(age is None, f"l6) nonzero --git-common-dir must degrade to None, got {age}")
+        check(hc._fetch_age_phrase(age) == "no fetch of that branch recorded",
+              f"l6) and renders the named phrase, got {hc._fetch_age_phrase(age)}")
 
     # Behavioral staleness (added 2026-08-03). The count threshold above is
     # deliberately 10 and case k) pins that 1 behind stays ok — both correct for

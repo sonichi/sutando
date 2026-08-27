@@ -12,6 +12,12 @@ For irreversible actions (sending email, deleting files, financial transactions)
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
 
+**"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — not "keep this in
+mind", and not a licence to defer to a later session. Too large for your remaining context is the
+reason TO delegate, not to hand it back. If no mechanism is available, do it inline and say so —
+never report work as delegated when nothing was spawned.
+Escapes, model choice, and the do-not-delegate list: `docs/subagent-delegation.md`.
+
 ## Architecture rules
 
 - **Core services** (`src/`, `skills/phone-conversation/`) are general-purpose infrastructure. They provide generic capabilities (audio streaming, task bridge, tool execution) but must NOT contain feature-specific logic.
@@ -91,7 +97,7 @@ When you review a PR (including another agent's), you MUST follow `CONTRIBUTING.
 - Once a requested change is verified fixed, dismiss or replace the stale REQUEST_CHANGES state. If it remains, cite the exact unresolved behavior.
 - Merge only when the current head is mergeable, required CI + CLA are green, and two maintainers have recorded formal approvals. Never substitute a comment, bot recommendation, stale approval, or admin bypass.
 
-**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the lessons here — read them from `REVIEW.md`. When you review, `review-preflight.py` reads `REVIEW.md` and prints the criteria inline so you see them on every preflight run; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Codex's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
+**Review criteria live in `REVIEW.md` (single source of truth).** Don't duplicate the lessons here — read them from `REVIEW.md`. **Before reviewing, run `python3 scripts/review-preflight.py <PR>`** — it reads `REVIEW.md` and prints the criteria inline; `scripts/review-checks.sh` runs the machine-readable `checks:` block (hardcoded-path scan) in CI; and Codex's managed GitHub-App reviewer reads `REVIEW.md` directly. Adding or editing a lesson is a PR to `REVIEW.md` only.
 
 ## Workspace contract
 
@@ -101,7 +107,7 @@ All per-user mutable state — `tasks/`, `results/`, `state/`, `data/`, `logs/`,
 
 **Resolution (every service reads the same):**
 
-**Default:** the workspace lives at `<repo>/workspace/` (in-repo). To override, edit `sutando.config.local.json` (per-clone, gitignored) — see [`docs/workspace-config.md`](docs/workspace-config.md). The `$SUTANDO_WORKSPACE` env var is no longer honored for workspace resolution as of v0.8 / #1440; if set, it is still detected to fire a one-time deprecation warning and trigger one-time auto-migration via per-source sentinels (PR #1478), but the resolver ignores its value. Historic anti-pattern: bridges fell back to the script's repo root via `Path(__file__).resolve().parent.parent`, which polluted `git status` and — when invoked from an app-bundled `src/` symlink — stranded owner DMs in a bundle-tasks/ dir while the watcher polled workspace-tasks/.
+**Default:** the workspace lives at `<repo>/workspace/` (in-repo). To override, edit `sutando.config.local.json` (per-clone, gitignored). `$SUTANDO_WORKSPACE` is no longer honored as of v0.8 / #1440 — see [`docs/workspace-config.md`](docs/workspace-config.md) for its deprecation behaviour and the repo-root fallback anti-pattern.
 
 **Use the helper, don't reinvent the fallback:**
 - Python: `from workspace_default import resolve_workspace` → returns a `Path`.
@@ -122,10 +128,14 @@ If `PERSONAL_CLAUDE.md` exists, read and follow it. It contains user-specific ru
 Signal your work status to the workspace `core-status.json` so the web UI and `health-check.py` can display it. Write the **absolute** workspace path: the session cwd is the repo, so a bare `state/core-status.json` lands in `<repo>/state/` — where no reader looks. Readers resolve `<workspace>/state/core-status.json` via `status_read_path` (`src/workspace_default.py`), where `<workspace>` = the M0 canonical (`<repo>/workspace/` by default; env-overridable as the legacy escape).
 
 ```bash
-CORE_STATUS="$(bash scripts/sutando-config.sh workspace)/state/core-status.json"
-echo '{"status":"running","step":"<description>","ts":<epoch>}' > "$CORE_STATUS"   # start of significant work
-echo '{"status":"idle","ts":<epoch>}' > "$CORE_STATUS"                            # when done
+bash scripts/core-status.sh running "<description>"   # start of significant work
+bash scripts/core-status.sh idle                      # when done
 ```
+
+**Use the wrapper, not a `>` redirect.** A redirect truncates before it writes, so a reader polling
+in that window sees a zero-length file — graceful-restart's `busy()` gate read that as "idle" and
+authorised a kill (#3156). `scripts/core-status.sh` writes via temp-file + `os.replace`, so the swap
+is atomic, and it stamps `ts` itself so a caller cannot omit or misformat it.
 
 This applies to all work — proactive loop passes, voice tasks, user requests, code changes.
 
@@ -185,19 +195,7 @@ Readers prefer canonical paths and fall back to legacy for ~30 days post-migrate
 
 ## Durable per-host install state: `state/auth/`
 
-`<workspace>/state/auth/` holds **per-host install/identity state**
-that survives across upgrades and MUST NOT be wiped by transient-state cleanup
-jobs (or by clear-on-restart logic that targets `state/*.json` generically).
-Current contents:
-- `cloud-auth.json` — per-host cloud-side auth credentials
-- `device.json` — per-host device identity (UUID + provisioning metadata)
-
-Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
-were loose at workspace root, mistreated as transient JSON snapshots and
-sometimes wiped. Treat `state/auth/` like `state/cores/<hostname>.alive` —
-per-host, structural, never overwritten by newest-mtime resolution across
-sources. Codex + Mini confirmed the destination + the exemption from cleanup
-in #design 2026-06-02.
+`<workspace>/state/auth/` holds per-host install/identity state (`cloud-auth.json`, `device.json`) that survives upgrades and MUST NOT be wiped by transient-state cleanup or by clear-on-restart logic targeting `state/*.json` generically. Rationale + history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md).
 
 ## Core memory
 
@@ -207,9 +205,14 @@ Full core-memory index: `<workspace>/.claude-sutando/projects/<slug>/memory/MEMO
 
 Key files:
 - User profile: `<workspace>/.claude-sutando/projects/<slug>/memory/user_profile.md`
-- Feedback (response style): `<workspace>/.claude-sutando/projects/<slug>/memory/feedback_response_style.md`
-- Feedback (operating principle): `<workspace>/.claude-sutando/projects/<slug>/memory/feedback_minimal_cost_max_value.md`
 - Build log (what's built, what's next): `<workspace>/build_log.md`
+
+Everything else is reached through `MEMORY.md` above, not named here. The repo seeds no memory
+file, so no filename is guaranteed present on any install — `MEMORY.md` is the index maintained on
+every write. `user_profile.md` stays pinned because the voice prompt builder reads it by that literal
+name (`src/voice-context.ts`); the same code also reads `feedback_response_style.md` and
+`feedback_minimal_cost_max_value.md` by literal name — memories written under those slugs feed the
+voice prompt directly, and absent files are skipped silently.
 
 Read relevant core-memory files when user preferences or history would improve task quality. Write new core memory when you learn something durable about the user or the project.
 
@@ -301,7 +304,7 @@ Tasks arrive from multiple channels via the same file bridge:
 MUST obtain marker grammar from `src/result_markers.py` (`parse_markers()`), and derive
 attachments from actions whose `kind == "attach"`. **Do not add a new private parser.**
 
-Attachment-path authorization is owned by `src/send_allowlist.py` before the upload sink. Migration status + the no-leak guard history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md). The dependency direction is one-way:
+Attachment-path authorization is owned by `src/policy/egress/attachment.py` before the upload sink. Migration status + the no-leak guard history: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md). The dependency direction is one-way:
 
     parse_markers()  ->  send_allowlist.is_path_sendable()  ->  transport upload
 
@@ -314,7 +317,7 @@ delivered to the owner as literal text. Guarded by `tests/bridge-marker-no-leak.
 
 **Always go through the typed key constructor** (`phoneCallKey` in TS, `phone_call_key` in Python) — both the writer and the scanning consumer must agree on the prefix. The per-consumer prefix is code-enforced (single helper, single source of truth) so cross-consumer namespace collisions are impossible regardless of what ID format a future consumer adopts.
 
-Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/result_channel_key.py` (Python).
+Existing consumers (`discord-bridge.py`, `telegram-bridge.py`, `slack-bridge.py`, `task-bridge.ts`, `agent-api.py`) all key off the legacy `task-{id}.txt` shape — specific tracked task_id or `task-*` glob — so a `<key>.task-{id}.txt` filename slides past them. The matching scan inside `skills/phone-conversation/scripts/conversation-server.ts` reads-and-deletes the file, then injects its body into the live Gemini session via the same `transport.sendContent` path the work-tool result drain uses. Helper: `src/result-channel-key.ts` (TS) / `src/delivery/channel_key.py` (Python).
 
 **IMPORTANT:** On session start, ensure a task watcher is running. Use the `Monitor` tool to stream `bash src/watch-tasks-stream.sh` — it never exits during normal operation and emits `TASK_FILE: <name>` per new task as a per-event notification. When a notification arrives, Read the named file, process it, and write a result to `results/`. The stream watcher replaces the older one-shot `watch-tasks.sh` (retired 2026-05-14) — no more restart-on-event cycles.
 
@@ -377,6 +380,8 @@ This also starts the screen capture server (needs terminal for Screen Recording 
 ## Skills
 
 Use skills available to the active runtime and under this repo's `skills/` directory when available. Prefer existing skills over writing new code from scratch.
+
+**Coordinating with a person or agent — recruiting a reviewer, delegating, escalating, resolving an identity — starts by invoking [`skills/collaboration-intelligence/`](skills/collaboration-intelligence/SKILL.md).** It derives *whom to ask* from the map, not recall: a memory answering "who do I ask?" fires first and is one past situation's cached answer, so treat it as a candidate and invoke the skill anyway. Feed the map back from real use — record who actually answered, owned, or reviewed, and correct it when a routing guess turns out wrong; a map only used and never updated decays into the recall it replaced. The same applies **after every PR update that changes the diff**, not only at recruitment: a push re-notifies no one, so re-solicit each reviewer through their stand-in. A base-merge that only clears BEHIND is not such an update.
 
 **Updating a skill mid-session.** Runtime behavior differs. For the Claude runtime, `skills/install.sh` places symlinks under its configured skills directory; after `git pull`, run `bash skills/refresh-skill.sh <name>` (or `--all`) to force its live watcher to re-read them. For the Codex runtime, `refresh-skill.sh` does not update Codex's skill cache; restart the core with `bash src/agent/start-cli.sh --restart` so Codex reloads its configured skill directories. Manifest-loaded `config`/`tools` and `src/` agent code require a service restart via `src/restart.sh`.
 

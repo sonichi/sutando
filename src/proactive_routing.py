@@ -30,6 +30,7 @@ duplicate to every configured bridge.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 # Channels whose bridges actually deliver `proactive-*.txt` files.
@@ -103,3 +104,115 @@ def should_claim_proactive(state_file_path: Path, this_channel: str) -> bool:
     # most recently interacted on a surface that doesn't deliver DMs.
     # Default Discord rather than strand the proactive file.
     return this_channel == "discord"
+
+
+# The .to-<channel> tag rides between stem and suffix (globs/claims keep it).
+# Unlike the [channel:] BODY marker (room redirect), it selects WHICH BRIDGE.
+
+# Slack is deliberately a destination but NOT a BRIDGE_CHANNEL: it races
+# without activity routing — aimable, never the undestined-activity winner.
+PROACTIVE_DESTINATIONS = frozenset(BRIDGE_CHANNELS | {"slack"})
+
+_DESTINATION_RE = re.compile(r"\.to-([a-z0-9_-]+)\.txt\Z")
+
+
+def proactive_filename(ts, channel: "str | None" = None) -> str:
+    """Typed constructor — the only way to spell a destined proactive name.
+    Writer and every claiming reader share this grammar (phone-key precedent:
+    a private spelling on either side re-creates the cross-bridge race)."""
+    if channel is None:
+        return f"proactive-{ts}.txt"
+    if channel not in PROACTIVE_DESTINATIONS:
+        raise ValueError(f"unknown proactive destination {channel!r}")
+    return f"proactive-{ts}.to-{channel}.txt"
+
+
+def proactive_destination(name) -> "str | None":
+    """The declared destination, or None for legacy/undestined names. An
+    unrecognized tag still reads as a destination: a file aimed at a channel
+    this install lacks must strand visibly, never fall into another
+    bridge's race."""
+    m = _DESTINATION_RE.search(Path(name).name)
+    return m.group(1) if m else None
+
+
+def should_claim_proactive_file(name, state_file_path: Path,
+                                this_channel: str) -> bool:
+    """Per-FILE claim decision: destination outranks activity routing."""
+    dest = proactive_destination(name)
+    if dest is not None:
+        return dest == this_channel
+    return should_claim_proactive(state_file_path, this_channel)
+
+
+def fallback_claims_name(name, this_channel: str) -> bool:
+    """Per-file gate for a channel's catch-all fallback (no activity routing):
+    a foreign or unknown .to-<channel> tag is never claimed — an explicit
+    destination strands visibly rather than falling into another channel's
+    fallback sweep."""
+    return proactive_destination(name) in (None, this_channel)
+
+
+# The [channel:] BODY marker names a channel but IMPLIES a bridge, and that
+# implication is what each adapter re-derived — two of them Discord-only.
+
+# Discord snowflake / Matrix room-or-alias / Slack channel id. Anchored whole:
+# a substring match would classify `#room:server` off its leading character.
+_TARGET_KINDS = (
+    ("discord", re.compile(r"\d{17,20}\Z")),
+    ("ag2space", re.compile(r"[!#][^\s:]+:[^\s:]+\Z")),
+    ("slack", re.compile(r"[CDG][A-Z0-9]{6,}\Z")),
+)
+
+
+def target_channel_kind(target) -> "str | None":
+    """The bridge a resolved `[channel:]` target belongs to, or None.
+
+    None means "not recognised as any bridge's address" — deliberately NOT
+    "foreign". See body_claimable_by for why that distinction is load-bearing.
+
+    Telegram is absent by decision, not omission: its bridge DROPS a `[channel:]`
+    redirect outright, so classifying a telegram chat id would route the file to
+    a bridge guaranteed never to deliver it — the strand this module prevents.
+    """
+    value = str(target or "").strip()
+    for kind, pattern in _TARGET_KINDS:
+        if pattern.fullmatch(value):
+            return kind
+    return None
+
+
+def body_target_channel(body) -> "str | None":
+    """The bridge the body addresses, or None when no redirect will EXECUTE.
+
+    Reads the shared parser's redirect action rather than matching the text: a
+    private regex sees `[channel:]` that `[dm-only]` has already disarmed, and
+    routing on a disarmed address strands the file at a bridge that will not
+    deliver it. Re-deriving the grammar here is the defect this module fixes.
+    """
+    from result_markers import parse_markers  # noqa: PLC0415 — see module note
+    redirect = next(
+        (a for a in parse_markers(str(body or "")).actions if a.kind == "redirect"),
+        None)
+    return target_channel_kind(redirect.value) if redirect is not None else None
+
+
+def body_claimable_by(body, this_channel: str) -> bool:
+    """False only when the body names ANOTHER bridge's address.
+
+    An unrecognised target stays claimable, which is the pre-existing behaviour
+    of every body-marker gate and is deliberately not changed here: stranding a
+    briefing on a malformed target is a worse failure than delivering it with a
+    stray marker line, and it is a separate judgement from this one.
+    """
+    kind = body_target_channel(body)
+    return kind is None or kind == this_channel
+
+
+def redirect_target_is_foreign(target, this_channel: str) -> bool:
+    """Strict form: anything not POSITIVELY this bridge's address is foreign.
+
+    The default destination uses this — an unrecognised target must not fall
+    into the default's delivery, or every malformed marker lands in one DM.
+    """
+    return target_channel_kind(target) != this_channel

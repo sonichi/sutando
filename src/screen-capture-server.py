@@ -202,6 +202,108 @@ def _notify_capture():
     _last_notify_ts = now
     threading.Thread(target=_notify_capture_blocking, daemon=True).start()
 
+
+MAX_PROBED_DISPLAYS = 8
+
+
+def _profiler_display_names() -> list[dict]:
+    """Display names + point sizes from system_profiler. Never raises."""
+    try:
+        out = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if out.returncode != 0:
+            return []
+        found = []
+        for gpu in (json.loads(out.stdout).get("SPDisplaysDataType") or []):
+            for mon in (gpu.get("spdisplays_ndrvs") or []):
+                res = mon.get("_spdisplays_resolution") or mon.get("spdisplays_pixelresolution") or ""
+                w = h = 0
+                parts = str(res).replace("x", " ").split()
+                nums = [p for p in parts if p.isdigit()]
+                if len(nums) >= 2:
+                    w, h = int(nums[0]), int(nums[1])
+                found.append({
+                    "name": mon.get("_name") or "Display",
+                    "aspect": (w / h) if w and h else 0.0,
+                    "is_main": mon.get("spdisplays_main") == "spdisplays_yes",
+                })
+        return found
+    except Exception:
+        return []
+
+
+NAME_ASPECT_TOLERANCE = 0.08  # tighter than the 16:10 (1.60) vs 16:9 (1.78) gap
+
+
+def _attach_name(entry: dict, names: list[dict], used: set[int]) -> None:
+    """Decorate a probed display with the closest unclaimed profiler name.
+
+    Matched on aspect ratio, not size: the profiler reports points while the
+    probe returns backing pixels, so a Retina panel's numbers differ by 2x.
+    An unmatched display keeps its index and size and simply has no name.
+    """
+    aspect = (entry["width"] / entry["height"]) if entry.get("width") and entry.get("height") else 0.0
+    if not aspect:
+        return
+    best, best_delta = None, NAME_ASPECT_TOLERANCE
+    for i, cand in enumerate(names):
+        if i in used or not cand["aspect"]:
+            continue
+        delta = abs(cand["aspect"] - aspect)
+        if delta < best_delta:
+            best, best_delta = i, delta
+    if best is None:
+        return
+    used.add(best)
+    entry["name"] = names[best]["name"]
+    entry["is_main"] = names[best]["is_main"]
+
+
+def list_displays() -> list[dict]:
+    """Probe `screencapture -D<n>` and return one entry per attached display.
+
+    The probe is authoritative for `index` because that is the argument the
+    capture routes take; profiler names are best-effort decoration.
+    """
+    names = _profiler_display_names()
+    used: set[int] = set()
+    displays: list[dict] = []
+    for n in range(1, MAX_PROBED_DISPLAYS + 1):
+        path = _os.path.join(DIR, f"displayprobe-{n}.png")
+        try:
+            r = subprocess.run(
+                ["screencapture", "-x", "-t", "png", f"-D{n}", path],
+                timeout=10, capture_output=True,
+            )
+            ok = r.returncode == 0 and _os.path.exists(path) and _os.path.getsize(path) > 0
+            if not ok:
+                break  # first gap is the end of the display list
+            width, height = _png_size(path)
+            entry = {"index": n, "width": width, "height": height}
+            _attach_name(entry, names, used)
+            displays.append(entry)
+        finally:
+            try:
+                _os.unlink(path)
+            except Exception:
+                pass
+    return displays
+
+
+def _png_size(path: str) -> tuple[int, int]:
+    """Width/height from the PNG IHDR, so listing costs no image library."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+        if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n":
+            return 0, 0
+        return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+    except Exception:
+        return 0, 0
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
@@ -249,6 +351,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._handle_capture()
         elif self.path.startswith("/capture-video"):
             self._handle_capture_video()
+        elif self.path.startswith("/displays"):
+            self._handle_displays()
         elif self.path == "/ping":
             self.send_response(200)
             self.end_headers()
@@ -256,6 +360,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _handle_displays(self) -> None:
+        """List attached displays by their `screencapture -D<n>` index.
+
+        The index is what every capture route actually takes, so it is probed
+        rather than inferred: `system_profiler` order is not documented to match
+        it. Names come from the profiler and are matched back by aspect ratio,
+        because that survives a resolution the profiler reports in points while
+        the capture returns backing pixels.
+        """
+        if not self._require_capture_token():
+            return
+        try:
+            self._send_json(200, {"status": "ok", "displays": list_displays()})
+        except Exception as e:  # noqa: BLE001 - never take the server down for a listing
+            self._send_json(500, {"status": "error", "error": f"display enumeration failed: {e}"})
 
     def _handle_capture(self) -> None:
         # Reject if no valid token — a browser page on loopback cannot set a

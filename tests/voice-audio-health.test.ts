@@ -220,6 +220,21 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		assert.equal(ev.lastAboveFloorAt, 10_300);
 	});
 
+	it('retains the utterance onset after the hangover (30s matrix window needs the FIRST sample)', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		const s = fakeSession();
+		led.wrapSession(s);
+		s.handleAudioFromClient(pcm(0.3));
+		now.t += 300;
+		s.handleAudioFromClient(pcm(0.25));
+		now.t += 20_000; // utterance long over; live onset erased by decay
+		const ev = led.getSpeechEvidence();
+		assert.equal(ev.active, false);
+		assert.equal(ev.onsetAt, null, 'live onset is hangover-scoped');
+		assert.equal(ev.lastOnsetAt, 10_000, 'retained onset survives for the evidence window');
+	});
+
 	it('quiet PCM is not speech', () => {
 		const led = makeLedger({ t: 10_000 });
 		const s = fakeSession();

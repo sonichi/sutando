@@ -393,6 +393,46 @@ with tempfile.TemporaryDirectory() as t:
     check("beyond-the-cut entry still FAILS (scope unchanged)",
           r and r["status"] == "fail", str(r))
 
+# 7) A COMPACTED index (`f:`/`r:`/`p:` prefixes) still counts as indexed. The
+#    corpus large enough to abbreviate is the one this probe most needs to read.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text(
+        "# Index\nExpand `f:`->`feedback_`, `r:`->`reference_`, `p:`->`project_`.\n"
+        "- f:pronoun_she_her - r:discord_channels - p:room_apps_platform\n")
+    for n in ("feedback_pronoun_she_her.md", "reference_discord_channels.md",
+              "project_room_apps_platform.md"):
+        (mem / n).write_text("body")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("abbreviated index → ok (not 3 false orphans)",
+          r and r["status"] == "ok", str(r))
+
+# 7b) The fix must not blind the probe: a file absent from an abbreviated index
+#     is still reported, and reported BY NAME.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text("# Index\n- f:pronoun_she_her\n")
+    (mem / "feedback_pronoun_she_her.md").write_text("body")
+    (mem / "feedback_never_written_down.md").write_text("genuinely stranded")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("genuinely-missing file still warns", r and r["status"] == "warn", str(r))
+    check("and is named", r and "feedback_never_written_down.md" in r["detail"], str(r))
+
+# 7c) The abbreviation is matched at a boundary: `f:foo` in the index must not
+#     satisfy `feedback_foo_bar.md`, or one entry laundered a whole family.
+with tempfile.TemporaryDirectory() as t:
+    mem = make_tree(Path(t))
+    (mem / "MEMORY.md").write_text("# Index\n- f:pronoun\n")
+    (mem / "feedback_pronoun.md").write_text("body")
+    (mem / "feedback_pronoun_she_her.md").write_text("distinct memory, NOT indexed")
+    hc.MEMORY_DIR = mem
+    r = hc.check_memory_index_integrity()
+    check("prefix does not launder a longer sibling",
+          r and r["status"] == "warn"
+          and "feedback_pronoun_she_her.md" in r["detail"], str(r))
+
 print()
 if _failed:
     print(f"FAIL — {_failed} check(s) failed"); sys.exit(1)

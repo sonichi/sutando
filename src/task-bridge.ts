@@ -15,7 +15,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
 	emitTaskProcessed,
@@ -85,16 +85,18 @@ const _ZWSP = '​';
 // Kept in lockstep with local_task_protocol.KNOWN_HEADER_KEYS (the Python
 // guard's source of truth). TS can't import the Python tuple, so this list is
 // the mirror; injection-guard-sweep asserts parity so drift fails CI. Synced to
-// the full 34-key set on the 2026-07-13 main merge (main widened the Python side
-// from 14 → 34; the TS guard must defang the same keys or forged interaction_type:
+// the full 38-key set on the 2026-07-13 main merge (main widened the Python side
+// from 14 → 38; the TS guard must defang the same keys or forged interaction_type:
 // / attachments: / media_form: lines slip through here).
 const _HEADER_KEYS = [
-	'id', 'timestamp', 'task', 'source', 'access_tier', 'user_id',
+	'id', 'timestamp', 'session_scope', 'task', 'source', 'access_tier', 'user_id',
 	'channel_id', 'priority', 'interaction_type', 'source_message_id',
 	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
 	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
 	'thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
+	'receiving_instance',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
+	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
@@ -767,8 +769,9 @@ function startRelayResultWatcher(onResult: (result: string) => void): void {
 				if (!result) continue;
 				_deliveredResults.add(file);
 				_pendingTasks.delete(taskId);
-				const skip = /^\s*\[(deduped:[^\]]*|no-send|REPLIED)\]/.exec(result);
-				if (!skip) {
+				// Was a third private copy that drifted: no /i, and `[^\]]*` accepted
+				// an empty `[deduped:]` Python rejects. One predicate now.
+				if (!bodyIsSkipMarked(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
 				}
@@ -926,31 +929,8 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
 					continue;
 				}
-				// Deduped-marker result: agent consolidated this task's reply
-				// into another task's result file. Mark this task done silently
-				// and archive — no Discord post, no voice narration, no timeout.
-				// Format: first line is "[deduped: <other-task-id>]" (rest of
-				// file optional, displayed as the result body in the UI).
-				if (file.startsWith('task-') && /^\s*\[deduped:\s*task-/i.test(result)) {
-					console.log(`${ts()} [TaskBridge] ${taskId} is deduped marker; archiving silently`);
-					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
-					_deliveredResults.add(file);
-					_pendingTasks.delete(taskId);
-					try {
-						fetch('http://localhost:7843/task-done', {
-							method: 'POST',
-							headers: _apiHeaders(),
-							body: JSON.stringify({ taskId, result }),
-						}).catch(() => {});
-					} catch {}
-					setTimeout(() => {
-						archiveFile(path, 'results', taskId);
-						const taskFile = join(TASK_DIR, `${taskId}.txt`);
-						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
-					}, 5_000);
-					continue;
-				}
-				// Skip markers: [no-send] / [REPLIED] — archive silently with no voice narration.
+				// [no-send] / [REPLIED] / [deduped: <id>] — archive silently, no voice.
+				// deduped had its own branch above this one, bypassing the ownership gate.
 				// These are set by the core agent when delivery already happened via another path
 				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
 				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor

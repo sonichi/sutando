@@ -98,7 +98,11 @@ def main() -> int:
           f"unconditional unlink at line(s) {bad_after}")
     check("no unlink inside an exception handler", not bad_handler,
           f"unlink at line(s) {bad_handler}")
-    check("at least one unlink remains on a SUCCESS path", bool(good),
+    # Post-5b the success-path cleanup is the fence's confirm() (behaviorally
+    # pinned in its suite); the bad_* checks still guard any raw unlinks.
+    confirms = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute) and n.func.attr == "confirm"]
+    check("at least one success-path cleanup remains", bool(good or confirms),
           "the file is never cleaned up — every proactive message would re-send forever")
 
     # The failure path must actively preserve the file, not merely skip the

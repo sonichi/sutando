@@ -120,6 +120,29 @@ with tempfile.TemporaryDirectory() as td:
     check(any(a.kind == "skip" for a in m.parse_markers(other_notice).actions),
           "a different thread is also kept out of the shared room")
 
+    # Explicit opt-out skips secret detection, while marker controls remain guarded.
+    write_task(
+        tasks, "task-team-filter-off", "team",
+        collaborator="true", sensitive_data_filter="false")
+    bundled_filter_enabled = m._team_guard_fns()[3]
+    missing_task = tasks / "missing-task.txt"
+    task_directory = tasks / "task-directory"
+    task_directory.mkdir()
+    check(bundled_filter_enabled(missing_task, "team"),
+          "a missing bundled task file fails closed to scanning enabled")
+    check(bundled_filter_enabled(task_directory, "team"),
+          "a directory in place of a bundled task file fails closed")
+    check(not bundled_filter_enabled(tasks / "task-team-filter-off.txt", "team"),
+          "a readable paired bundled task still disables scanning")
+    plain, plain_withheld = m._guarded_result_body(
+        "task-team-filter-off", "intentional ghp_" + "a" * 36)
+    check(plain_withheld is None and plain.startswith("intentional ghp_"),
+          "an explicit filter opt-out passes token-like result text")
+    controlled, controlled_withheld = m._guarded_result_body(
+        "task-team-filter-off", BODY_WITH_MARKERS)
+    check(controlled_withheld is not None and controlled != BODY_WITH_MARKERS,
+          "filter opt-out does not disable delivery-control protection")
+
     # Absence is NOT owner provenance — a month-archived Team task is exactly
     # the case that would otherwise fall open.
     for _baseline in ("owner", "team"):
@@ -217,10 +240,16 @@ with tempfile.TemporaryDirectory() as td:
 # --- the drain must call the guard before the parser, in source order.
 src = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
        / "remote_gateway_bridge.py").read_text()
-drain = src[src.find("    for tid in list(inflight):"):]
-gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body)")
-check(gi != -1 and pi != -1 and gi < pi,
-      "in the drain, _guarded_result_body precedes parse_markers")
+# Line-bounded: a deeper-indented loop contains the bare literal, and an
+# absent anchor slices src[-1:] — both misreport a guard-ordering violation.
+anchor = "\n    for tid in list(inflight):\n"
+i = src.find(anchor)
+check(i != -1, "the drain anchor is still present in remote_gateway_bridge.py")
+if i != -1:
+    drain = src[i:]
+    gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body)")
+    check(gi != -1 and pi != -1 and gi < pi,
+          "in the drain, _guarded_result_body precedes parse_markers")
 
 if fail:
     print("FAIL: sparrow result guard")
@@ -327,7 +356,9 @@ def drain_two_pass():
         if path != "/v1/results":
             return {}
         attempts["n"] += 1
-        if attempts["n"] == 1:
+        # The drain's idempotent re-send retries ambiguity once IN-pass, so a
+        # genuinely failed pass must fail both the send and its re-send.
+        if attempts["n"] <= 2:
             raise urllib.error.URLError("transient")
         posted.append(payload)
         return {}

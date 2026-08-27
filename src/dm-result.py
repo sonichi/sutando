@@ -51,12 +51,20 @@ USAGE = "Usage: python3 src/dm-result.py 'text' | --file path"
 # roots that discord-bridge had; the shared import fixes that drift.
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
-from send_allowlist import (  # noqa: E402
+from policy.egress.attachment import (  # noqa: E402
     is_path_sendable as _is_path_sendable,
     SEND_ALLOWED_PREFIXES as _SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS as _SEND_ALLOWED_ROOTS,
 )
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; was a 4th private copy)
+from channels.discord.post_gate import make_client  # noqa: E402  — shared transport + injected post-gate
+from outbox import DeliveryOutcome  # noqa: E402
+
+
+def _client(token):
+    # Seam for test stubs. timeout=30 preserves the retired multipart cap;
+    # on a single-attempt send a longer timeout only delays the verdict.
+    return make_client(token, timeout=30)
 
 
 
@@ -98,100 +106,6 @@ def _load_token() -> str:
     return tok or legacy
 
 
-def _discord_api(method, path, token, body=None):
-    """Small wrapper around urllib for Discord's REST API. Returns parsed JSON
-    on 2xx, raises on other statuses. No retries — caller handles failure."""
-    url = f"https://discord.com/api/v10{path}"
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "Sutando/1.0",
-        },
-        method=method,
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        raw = resp.read()
-        return json.loads(raw) if raw else None
-
-
-def _send_message_with_files(channel_id: str, token: str, content: str,
-                             file_paths: "list[str]"):
-    """POST a message to a channel as multipart/form-data with attached
-    files. Used by `send_dm()` when an agent-emitted result body
-    contains `[file:|send:|attach:]` markers — the WS-connected live
-    bridge calls `discord.File(path)` directly; this REST path needs
-    to assemble the same multipart payload by hand.
-
-    `content` may be empty (file-only message). `file_paths` are the
-    already-allowlisted absolute paths. Raises on non-2xx; caller
-    handles per-file errors.
-
-    Discord docs: POST /channels/{id}/messages with
-    multipart/form-data, parts named `payload_json` (the message body)
-    and `files[0]`, `files[1]`, ... each with a `filename=` in the
-    `Content-Disposition`.
-    """
-    # Random boundary that won't appear in any payload we send. uuid is
-    # already imported (used for outbox_log); reuse here.
-    import uuid
-    boundary = f"----SutandoBoundary{uuid.uuid4().hex}"
-    parts: list[bytes] = []
-    # payload_json part
-    payload = {"content": content} if content else {}
-    parts.append(
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="payload_json"\r\n'
-        f"Content-Type: application/json\r\n\r\n".encode()
-    )
-    parts.append(json.dumps(payload).encode())
-    parts.append(b"\r\n")
-    # files[N] parts
-    for i, fpath in enumerate(file_paths):
-        filename = os.path.basename(fpath)
-        # Sanitize filename header — same shape as
-        # discord-bridge.py's _safe_attachment_basename (PR #1022). A
-        # filename containing CR/LF here would let the file inject its
-        # own headers into the multipart envelope.
-        safe_name = (
-            filename
-            .replace("\r", "_")
-            .replace("\n", "_")
-            .replace('"', "_")
-        )[:80] or f"file-{i}"
-        parts.append(
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="files[{i}]"; '
-            f'filename="{safe_name}"\r\n'
-            f"Content-Type: application/octet-stream\r\n\r\n".encode()
-        )
-        with open(fpath, "rb") as fh:
-            parts.append(fh.read())
-        parts.append(b"\r\n")
-    parts.append(f"--{boundary}--\r\n".encode())
-    body = b"".join(parts)
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Content-Length": str(len(body)),
-            "User-Agent": "Sutando/1.0",
-        },
-        method="POST",
-    )
-    # 30s timeout — multipart uploads can be slower than JSON; cap to
-    # bound the dm-result.py invocation time.
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read()
-        return json.loads(raw) if raw else None
-
-
 def _resolve_owner_id(token):
     """Return the Discord user ID for the human owner.
 
@@ -231,9 +145,10 @@ def _resolve_owner_id(token):
     # this step (REST-bound). The first non-bot wins. If lookups all fail
     # (rate limit, network, bad token), fall through to allow[0] as a
     # degraded default so send_dm() produces an honest error later.
+    client = _client(token)
     for uid in allow:
         try:
-            user = _discord_api("GET", f"/users/{uid}", token)
+            user = client.get_user(uid)
             if isinstance(user, dict) and not user.get("bot", False):
                 return str(uid)
         except Exception:
@@ -242,18 +157,27 @@ def _resolve_owner_id(token):
 
 
 def _open_dm_channel(owner_id: str, token: str) -> str:
-    """Create/open a DM channel between this bot and owner_id. Returns the
-    channel ID. Per Discord docs this endpoint is idempotent: if a DM already
-    exists between the bot and the user, it returns that channel rather than
-    creating a new one, so repeated calls are cheap."""
-    resp = _discord_api("POST", "/users/@me/channels", token, {"recipient_id": owner_id})
-    if isinstance(resp, dict) and "id" in resp:
-        return str(resp["id"])
-    raise RuntimeError(f"unexpected /users/@me/channels response: {resp!r}")
+    """Create/open a DM channel between this bot and owner_id (idempotent
+    server-side; the shared client owns the bounded-retry semantics)."""
+    cid = _client(token).create_dm_channel(owner_id)
+    if cid:
+        return cid
+    raise RuntimeError("unexpected /users/@me/channels response (no id)")
 
 
 def send_dm(text: str) -> bool:
     """Send text to the resolved owner's Discord DM."""
+    # This sender only ever opens the owner's DM, so a [channel:] redirect names a
+    # destination it cannot reach; refusing beats misrouting the body silently.
+    redirects = [a.value for a in parse_markers(text).actions if a.kind == "redirect"]
+    if redirects:
+        print(
+            f"dm-result: body carries a [channel: {redirects[0]}] redirect, "
+            "which this sender cannot honor (owner DM only). Not sending.",
+            file=sys.stderr,
+        )
+        return False
+
     token = _load_token()
     if not token:
         print("dm-result: DISCORD_BOT_TOKEN not found in .env", file=sys.stderr)
@@ -272,8 +196,7 @@ def send_dm(text: str) -> bool:
 
     # Extract [file:|send:|attach:] markers. The WS-connected live
     # bridge calls `discord.File(path)` for each marker; this REST
-    # path now builds the equivalent multipart upload (see
-    # `_send_message_with_files`). Each marker path is allowlist-
+    # path uploads via the shared client. Each marker path is allowlist-
     # checked against `_is_path_sendable` — same policy as
     # discord-bridge.py to bound exfil if an attacker-controlled marker
     # ever reaches a result body.
@@ -340,13 +263,16 @@ def send_dm(text: str) -> bool:
 
     # Chunk text into Discord-safe pieces, preserving code fences
     # across boundaries.
+    client = _client(token)
     chunks = list(_chunk_for_discord(clean_text)) if clean_text else []
     for i, chunk in enumerate(chunks):
-        try:
-            _discord_api("POST", f"/channels/{channel_id}/messages", token, {"content": chunk})
-        except Exception as e:
+        receipt = client.send_message(channel_id, {"content": chunk})
+        if receipt.outcome is not DeliveryOutcome.CONFIRMED:
+            # OUTCOME_UNKNOWN means the chunk MAY have arrived — say so; a
+            # blind resend from here is the duplicate-send machine.
             print(
-                f"dm-result: failed to send DM chunk {i+1}/{len(chunks)} to channel {channel_id}: {e}",
+                f"dm-result: chunk {i+1}/{len(chunks)} not confirmed "
+                f"({receipt.outcome.value}: {receipt.detail}) — aborting",
                 file=sys.stderr,
             )
             return False
@@ -357,13 +283,29 @@ def send_dm(text: str) -> bool:
     DISCORD_FILES_PER_MESSAGE = 10
     for batch_start in range(0, len(sendable_files), DISCORD_FILES_PER_MESSAGE):
         batch = sendable_files[batch_start : batch_start + DISCORD_FILES_PER_MESSAGE]
+        blobs = []
         try:
-            _send_message_with_files(channel_id, token, "", batch)
-        except Exception as e:
+            for fpath in batch:
+                with open(fpath, "rb") as fh:
+                    blobs.append((os.path.basename(fpath), fh.read()))
+        except OSError as e:
+            # Allowlisted files can vanish between the check and this read.
             print(
-                f"dm-result: failed to upload file batch "
+                f"dm-result: file batch "
                 f"{batch_start // DISCORD_FILES_PER_MESSAGE + 1} "
-                f"({len(batch)} file(s)) to channel {channel_id}: {e}",
+                f"unreadable before upload ({e.__class__.__name__}: "
+                f"{os.path.basename(str(getattr(e, 'filename', '') or '?'))})"
+                f" — aborting",
+                file=sys.stderr,
+            )
+            return False
+        receipt = client.upload_files(channel_id, {"content": ""}, blobs)
+        if receipt.outcome is not DeliveryOutcome.CONFIRMED:
+            print(
+                f"dm-result: file batch "
+                f"{batch_start // DISCORD_FILES_PER_MESSAGE + 1} "
+                f"({len(batch)} file(s)) not confirmed "
+                f"({receipt.outcome.value}: {receipt.detail}) — aborting",
                 file=sys.stderr,
             )
             return False

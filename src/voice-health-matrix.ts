@@ -75,18 +75,35 @@ export interface MatrixInput {
   now: number;
 }
 
-/** Upstream observations as FACTS (design §1.5): the watchdog integration
+/** Verdict-independent observations (design §1.5): the watchdog integration
  *  reads only facts, never verdict strings, so verdict-independence holds
- *  under every coverage mode. Every field is false whenever the window
+ *  under every coverage mode. Every field is false/null whenever the window
  *  cannot prove it (unobserved upstream, no valid baseline, early
- *  structural returns). A type alias, not an interface, so it satisfies
- *  Record<string, boolean> consumers structurally. */
+ *  structural returns).
+ *
+ *  Two fact families live here. The upstream-send family is coverage-blind
+ *  by construction; the ACTIVE-silence family (design
+ *  design-voice-active-silence-recovery.md §Trigger (a)) additionally needs
+ *  a same-epoch baseline, which `factsAvailable` reports.
+ *
+ *  `factsAvailable` says the data existed, never that acting is safe:
+ *  consumers of the ACTIVE-silence family own their own structural gating. */
 export type MatrixFacts = {
   attemptedAudioAdvanced: boolean;
   queuedAudioAdvanced: boolean;
   losslessWindowWithSpeechQueued: boolean;
   transportGenerationChanged: boolean;
   echoSuppressedAdvanced: boolean;
+  /** Same-epoch baseline + heartbeat existed this tick; false ⇒ every
+   *  ACTIVE-silence fact below is false/null. */
+  factsAvailable: boolean;
+  speechInWindow: boolean;
+  /** Monotonic timestamp of the retained speech observation's first
+   *  above-floor sample; non-null exactly when speechInWindow. The one
+   *  non-boolean member — ledger consumers widen accordingly. */
+  speechObservedAt: number | null;
+  ingressAdvanced: boolean;
+  modelSilentFor15s: boolean;
 };
 
 export interface MatrixResult {
@@ -200,6 +217,9 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
     speech.lastAboveFloorAt !== null &&
     au.lastQueuedAt >= speech.lastAboveFloorAt;
   const lossless = dAttemptedAudio >= dDelivered && dQueuedAudio === dAttemptedAudio;
+  // The ACTIVE-silence family needs the same-epoch baseline the structural
+  // early returns below bail on; without it every member fails closed.
+  const factsAvailable = hb != null && winPrev !== null;
   const facts: MatrixFacts = {
     attemptedAudioAdvanced: dAttemptedAudio > 0,
     queuedAudioAdvanced: dQueuedAudio > 0,
@@ -212,6 +232,15 @@ export function evaluateMatrix(input: MatrixInput): MatrixResult {
       dEchoSuppressed === 0,
     transportGenerationChanged: genChanged,
     echoSuppressedAdvanced: dEchoSuppressed > 0,
+    factsAvailable,
+    speechInWindow: factsAvailable && speechInWindow,
+    speechObservedAt:
+      factsAvailable && speechInWindow
+        ? (speech.onsetAt ?? speech.lastOnsetAt ?? speech.lastAboveFloorAt)
+        : null,
+    ingressAdvanced: factsAvailable && dDelivered > 0,
+    modelSilentFor15s:
+      factsAvailable && input.lastModelEventAt != null && now - input.lastModelEventAt > 15_000,
   };
   // What the EVALUATOR may claim from the window — the only coverage-gated half.
   const upstreamWindowValid = observesUpstreamSend(coverage) && upstreamWindowObserved;

@@ -195,13 +195,9 @@ core_runtime="$(resolve_startup_core_runtime)"
 # successful `claude-sutando --migrate`. Mirrors src/agent/claude/cli/start-cli.sh
 # (Sutando.app's tmux-wrapped CLI launcher) — same machine-spawn pattern.
 #
-# Defense in depth (matches start-cli):
-#   - Helper missing → silent fallback (legacy install).
-#   - Helper present + config valid → export.
-#   - Helper present + config invalid → refuse to start (don't scatter state).
-if [ -x "$REPO/scripts/sutando-config.sh" ]; then
-  _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
-  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+# Resolve-or-refuse is shared with start-cli; only the credential seeding is ours.
+source "$REPO/src/claude_config_dir.sh"
+if _ccd="$(resolve_claude_config_dir "$REPO" startup)"; then
     mkdir -p "$_ccd"
     # NOTE: the claude core-agent launcher + the `claude-sutando` config-dir
     # onboarding alias now live under src/agent/claude/ (start-cli.sh /
@@ -299,13 +295,12 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
     fi
     fi
     export CLAUDE_CONFIG_DIR="$_ccd"
-  else
-    echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
-    cat "$_ccd_err" >&2
-    rm -f "$_ccd_err"
-    exit 1
-  fi
-  rm -f "$_ccd_err"
+else
+  _ccd_rc=$?
+  # 2 = caller already scoped the config dir; nothing to seed, and the services
+  # below still reach the intended credential store.
+  [ "$_ccd_rc" = "2" ] || exit 1
+  echo "  ~ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 fi
 
 # Boot gate (#2396): verify the SELECTED core can boot authenticated BEFORE any
@@ -484,12 +479,8 @@ bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 # dark whenever a session restarts without an explicit /schedule-crons invocation.
 bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
 
-# Re-inject PERSONAL_CLAUDE.md after context compaction (SessionStart
-# "compact" matcher). CLAUDE.md + the memory index survive compaction via the
-# system prompt; PERSONAL_CLAUDE.md only enters context via an explicit Read,
-# which compaction summarizes away — so long sessions silently lose per-user
-# rules. Idempotent — safe to run on every start.
-bash "$REPO/scripts/install-personal-claude-hook.sh" 2>&1 || true
+# PERSONAL_CLAUDE.md compaction-reinject hook is Claude-only policy — wired
+# at src/agent/claude/cli/start-cli.sh, the Claude launch chokepoint, not here.
 
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
@@ -604,13 +595,27 @@ else
 fi
 
 # Check Accessibility (needed for context drop shortcut)
-if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
-  echo "  ⚠ Accessibility not granted"
-  echo "    → System Settings → Privacy & Security → Accessibility"
-  echo "    → Add Terminal.app or Shortcuts.app"
-else
-  echo "  ✓ Accessibility"
+# $REPO is overridable, so fall back to alongside this script: an unguarded
+# source under `set -e` aborts the whole run.
+__probe="$REPO/src/accessibility_probe.sh"
+[ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
+# 125 = could not check. NOT 0: a missing probe would otherwise print
+# "✓ Accessibility", asserting a grant on a run where nothing was probed.
+acc_rc=125
+if [ -f "$__probe" ]; then
+  # `|| rc=$?` keeps this exempt from `set -e`; a bare non-zero call aborts.
+  source "$__probe"
+  acc_rc=0; accessibility_probe || acc_rc=$?
 fi
+case $acc_rc in
+  0)   echo "  ✓ Accessibility" ;;
+  125) echo "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked" ;;
+  124) echo "  ⚠ Accessibility UNKNOWN — probe timed out after ${ACCESSIBILITY_PROBE_TIMEOUT_S}s"
+       echo "    This session cannot answer the prompt (headless/SSH); the grant may be fine." ;;
+  *)   echo "  ⚠ Accessibility not granted"
+       echo "    → System Settings → Privacy & Security → Accessibility"
+       echo "    → Add Terminal.app or Shortcuts.app" ;;
+esac
 echo ""
 
 # Install Claude Code skills (runs every startup, idempotent)
@@ -1007,11 +1012,41 @@ _vault_scanner_check() {
   fi
 }
 
+# Prefer one launchd job per configured channel bridge. A loaded job is not
+# necessarily a running bridge: when a token is removed, the wrapper stays as
+# an idle launchd sentinel. Kickstart that state after credentials return, and
+# only report success once the actual bridge process exists.
+channel_bridge_supervised() {
+  local channel="$1"
+  local label="com.sutando.$channel-bridge"
+  local service="gui/$(id -u)/$label"
+  local installer="$REPO/src/install-channel-bridge-launchd.sh"
+  local template="$REPO/src/launchd/com.sutando.channel-bridge.plist"
+  local pattern="src/$channel-bridge\\.py$"
+
+  [ -f "$installer" ] && [ -f "$template" ] || return 1
+  if launchctl print "$service" >/dev/null 2>&1; then
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+      return 0
+    fi
+    launchctl kickstart -k "$service" >/dev/null 2>&1 || return 1
+  else
+    bash "$installer" "$channel" >/dev/null 2>&1 || return 1
+  fi
+  for _ in $(seq 1 12); do
+    pgrep -f "$pattern" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
 # 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN, skip with SKIP_TELEGRAM=1)
 if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
   echo "  ~ telegram bridge (skipped via SKIP_TELEGRAM)"
 elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/telegram/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has TELEGRAM_BOT_TOKEN --env-file "$_TG_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_TG_ENV" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$_TG_ENV" 2>/dev/null; fi; then
-  if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
+  if channel_bridge_supervised telegram; then
+    echo "  ✓ telegram bridge (launchd-supervised)"
+  elif ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
     # Pick an interpreter that can actually verify TLS. A cert-less framework
     # python (e.g. /Library/Frameworks/.../3.13 without certifi) resolves first
@@ -1042,102 +1077,13 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# Remote gateway bridge (optional channel — generic, same shape as the discord/
-# telegram/slack blocks below). Config + token live in the channel .env, resolved
-# via the same claude-home-path helper; the bridge itself ships in src/ (provider-
-# neutral, like the others). Relay protocol: docs/remote-gateway-protocol.md.
-# Deliberately silent when unconfigured — a Sutando-only user never sees it.
-# Back-compat: also detect/honor a legacy AG2_REMOTE_* token written to the repo
-# .env by older onboarding, so existing agents keep reconnecting after this lands
-# (until they re-onboard onto channels/ag2space/.env).
-if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
-   { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
-   || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
-  [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
-  # Tell the bridge where the durable token lives so auth-rejection recovery
-  # (revoked/expired key) can re-read it after the connect flow rewrites it —
-  # hot-swap instead of a supervisor crash-loop. Only when the file exists:
-  # env-only onboarding has no file to watch and keeps the FATAL-exit path.
-  [ -f "$_RELAY_ENV" ] && export REMOTE_TASK_TOKEN_FILE="$_RELAY_ENV"
-  # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
-  # legacy token may be the combined "url|secret" form, which the bridge splits.
-  REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-  # Default tier is "owner" for the personal-agent model (2026-07-08): a user's
-  # own gateway authenticates with their own owner bearer and the broker
-  # owner-scopes every pull, so its tasks are the owner's own (e.g. voice
-  # delegations). Must match the bridge's own default — otherwise startup.sh
-  # would export a value and the bridge's default never fires. A shared /
-  # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
-  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-  # AG2 Space's gateway tags inbound image/file markers `ag2space-media` (its
-  # media-proxy at {gateway}/v1/media/...). The provider-neutral bridge defaults
-  # its marker tag to `remote-media`, so without this the marker never matches and
-  # the media URL lands in the task body unresolved — the core can't see the image
-  # (owner-reported 2026-07-25). Default it to the AG2 tag here, in the AG2-specific
-  # launch block, so the generic package carries no provider string. Explicit
-  # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins.
-  REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
-  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
-  # Always spawn; the bridge's own unsuffixed singleton lock self-defers a
-  # duplicate. The previous `pgrep -f remote-gateway-bridge` guard was a P1
-  # (john, PR review 2026-08-02): every named-instance bridge shares the SAME
-  # argv, so a live secondary satisfied the pgrep and suppressed restart of a
-  # DEAD primary indefinitely. Instance identity lives only in env, which
-  # pgrep cannot see — the lock (role `gateway-bridge`, per-instance suffixed)
-  # is the only process-identity source that can arbitrate this.
-  # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
-  # the redirect below); the bridge stamps launched_via into gateway-status
-  # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-  if [ -n "$PY" ]; then
-    SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
-    echo "  ✓ gateway bridge (self-defers if already running)"
-  else
-    echo "  ⊘ gateway bridge skipped — no runnable python3"
-  fi
-
-  # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in
-  # the environment launches one extra bridge for that gateway (e.g.
-  # AG2_REMOTE_TOKEN_DEV → instance "dev" against the dev homeserver). Each
-  # instance gets its own lock role + state files via GATEWAY_INSTANCE, and
-  # deliberately inherits NO REMOTE_PROACTIVE_ROOM — proactive nudges stay with
-  # the primary (owner-DM) gateway only.
-  # No pgrep dedupe here (env vars are invisible to pgrep -f): the bridge's own
-  # per-instance singleton lock (role gateway-bridge.<inst>) makes a duplicate
-  # launch self-defer and exit, so always-spawn is safe and simpler.
-  for _gw_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
-    _gw_inst="$(printf '%s' "${_gw_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
-    # The guard must wrap the WHOLE command. `VAR=1 [ -n "$PY" ] && cmd` applies
-    # the assignments to `[` and runs cmd with NONE of them — so the named
-    # gateway launched without GATEWAY_INSTANCE / its own REMOTE_TASK_TOKEN /
-    # the REMOTE_PROACTIVE_ROOM= scoping, collapsing onto the primary gateway's
-    # credentials (CR #2599, @qingyun-wu).
-    # The ✓ belongs INSIDE the branch too. Fixing the guard shape here while
-    # leaving the success line outside it still reported a launch that never
-    # happened — per named instance, on a configured remote-control surface.
-    if [ -n "$PY" ]; then
-      # REMOTE_TASK_CHANNEL_DIR isolates this instance's channel config
-      # (.env fallback + access.json). Without it the named instance defaults
-      # to channels/ag2space/ and inherits PROD's credentials and tier map —
-      # the exact failure #2701 exists to prevent (review P1, bassil).
-      # Convention: instance "dev" → channels/dev-ag2space/; anything else →
-      # channels/<inst>-ag2space/ unless the operator overrides via
-      # REMOTE_TASK_CHANNEL_DIR_<INST>.
-      _gw_chdir_var="REMOTE_TASK_CHANNEL_DIR_${_gw_var#AG2_REMOTE_TOKEN_}"
-      _gw_chdir="${!_gw_chdir_var:-${_gw_inst}-ag2space}"
-      _gw_token_file_var="REMOTE_TASK_TOKEN_FILE_${_gw_var#AG2_REMOTE_TOKEN_}"
-      _gw_token_file="${!_gw_token_file_var:-$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels "$_gw_chdir" .env)}"
-      [ -f "$_gw_token_file" ] || _gw_token_file=""
-      SUTANDO_SUPERVISED=1 GATEWAY_INSTANCE="$_gw_inst" REMOTE_TASK_TOKEN="${!_gw_var}" \
-        REMOTE_TASK_URL= REMOTE_TASK_TOKEN_FILE="$_gw_token_file" \
-        REMOTE_TASK_CHANNEL_DIR="$_gw_chdir" \
-        REMOTE_PROACTIVE_ROOM= \
-        "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.$_gw_inst.log" 2>&1 &
-      echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
-    else
-      echo "  ⊘ gateway bridge ($_gw_inst) skipped — no runnable python3"
-    fi
-  done
-fi
+# Remote gateway bridge (optional channel — primary + every named secondary
+# lane). Defined as start_gateway_lanes() in startup-runtime.sh so it can also
+# be invoked standalone via scripts/restart-gateway-lanes.sh, without the rest
+# of this boot sequence (in particular without reap_stale_task_watcher above —
+# see that function's call site for why re-running the whole of startup.sh
+# just to reconnect a dropped lane is unsafe mid-session).
+start_gateway_lanes
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
 #
@@ -1180,6 +1126,8 @@ elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
   fi
   if [ -z "$PYTHON_WITH_DISCORD" ]; then
     echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
+  elif channel_bridge_supervised discord; then
+    echo "  ✓ discord bridge (launchd-supervised)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
     PYTHONUNBUFFERED=1 "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
@@ -1217,6 +1165,8 @@ elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
   done
   if [ -z "$PYTHON_WITH_SLACK" ]; then
     echo "  ~ slack bridge (no python with slack_bolt — run: /opt/homebrew/bin/pip3 install slack_bolt)"
+  elif channel_bridge_supervised slack; then
+    echo "  ✓ slack bridge (launchd-supervised)"
   elif ! pgrep -f "slack-bridge" > /dev/null 2>&1; then
     echo "  Starting Slack bridge with $PYTHON_WITH_SLACK..."
     # Source the env file so SLACK_BOT_TOKEN / SLACK_APP_TOKEN reach the child.
@@ -1291,7 +1241,29 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
         echo "  ✓ ngrok ($NGROK_URL — reserved domain, no Twilio update needed)"
       else
         echo "  ✓ ngrok ($NGROK_URL)"
-        echo "  ⚠ Update Twilio webhook to: $NGROK_URL"
+        # Trailing slash is stripped because conversation-server.ts strips it
+        # before binding WEBHOOK_BASE_URL; comparing unnormalised reads as drift.
+        TWILIO_CFG_URL=$(grep -E '^TWILIO_WEBHOOK_URL=' .env 2>/dev/null | head -1 \
+          | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs | sed 's:/*$::')
+        NGROK_CMP="${NGROK_URL%/}"
+        if [ -z "$TWILIO_CFG_URL" ]; then
+          echo "  ⚠ Point the Twilio webhook at: $NGROK_URL (no TWILIO_WEBHOOK_URL recorded)"
+        elif [ "$TWILIO_CFG_URL" = "$NGROK_CMP" ]; then
+          :
+        elif ! printf '%s' "$TWILIO_CFG_URL" | grep -qE '\.ngrok(-free)?\.(app|io)$'; then
+          # A non-ngrok tunnel (e.g. Funnel) is authoritative: the phone server
+          # binds it and never starts ngrok, so this ngrok is not its tunnel.
+          :
+        else
+          # The server binds WEBHOOK_BASE_URL from this var, so a stale value
+          # leaves TwiML and <Stream> pointing at a tunnel that no longer exists.
+          echo "  ⚠ ngrok URL moved — BOTH sides are stale:"
+          echo "      was: $TWILIO_CFG_URL"
+          echo "      now: $NGROK_URL"
+          echo "      1. update the Twilio console webhook to the new URL"
+          echo "      2. set TWILIO_WEBHOOK_URL=$NGROK_URL in .env and restart the"
+          echo "         phone conversation server — it binds this at startup"
+        fi
       fi
     else
       echo "  ✗ ngrok (failed to start)"
@@ -1308,7 +1280,12 @@ echo ""
 # Verify services actually started (wait a moment, then check ports)
 sleep 3
 echo "Verifying services..."
-VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
+VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api"
+# Only verify 7845 when we actually tried to start it. Same condition as the start
+# branch: a deliberate skip must not render as a crash pointing at an empty log.
+if [ "${PERM_OK:-0}" = "1" ]; then
+  VERIFY_PORTS="$VERIFY_PORTS 7845:screen-capture"
+fi
 if [ "${SKIP_VOICE:-}" != "1" ]; then
   VERIFY_PORTS="9900:voice-agent $VERIFY_PORTS"
 fi
@@ -1318,11 +1295,26 @@ fi
 if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
+# A single probe races a service still binding, so retry briefly. The deadline is
+# GLOBAL: per-port it would serialise to ports x settle seconds before core launch.
+VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
+verify_deadline=$(( $(date +%s) + VERIFY_SETTLE_S ))
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
+  # COUNT SLEEPS, never two `date` samples: at 1s granularity the two can
+  # straddle a boundary and report 1s for a port that never waited at all.
+  waited=0
+  while ! lsof -i :"$port" > /dev/null 2>&1 && [ "$(date +%s)" -lt "$verify_deadline" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
   if lsof -i :"$port" > /dev/null 2>&1; then
-    echo "  ✓ $name (port $port)"
+    if [ "$waited" -gt 0 ]; then
+      echo "  ✓ $name (port $port, after ${waited}s)"
+    else
+      echo "  ✓ $name (port $port)"
+    fi
   else
     echo "  ✗ $name (port $port) — check $LOGS_DIR/${name}.log"
   fi
