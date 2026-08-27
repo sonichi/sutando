@@ -27,6 +27,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
+- **`channel_env_containment.py`** — Shared containment policy for a channel's `.env` credential file.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
 - **`chat_redaction.py`** — The chat-body redaction CHAIN, owned in one place.
@@ -138,6 +139,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`send_failure_policy.py`** — Classify an outbound-send failure as transient (retry) or permanent (park).
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
+- **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
