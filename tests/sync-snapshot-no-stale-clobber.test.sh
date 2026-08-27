@@ -93,9 +93,18 @@ _snapshot_per_host_config
 check "diverged unrecorded copy is preserved, not adopted or overwritten" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "independent content" ]'
 check "no-provenance refusal names the ACTUAL condition, not a second writer" \
-      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO provenance record"'
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "provenance record"'
 check "...and does NOT tell the operator to archive a copy (the message that did)" \
       '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+
+# keweichen on #3198: [ -z "$_rec" ] is ALSO true for an EMPTY or unreadable sig
+# file, so the branch must not claim the file is merely missing.
+: > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"     # exists, but empty
+check "an EMPTY provenance file takes the same no-usable-record branch" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
+check "...and an empty record is still not called an independent writer" \
+      '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 echo "keep it that way" >> "$WORKSPACE_DIR/build_log.md"
 echo "per-host went live" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
 

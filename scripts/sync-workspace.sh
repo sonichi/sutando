@@ -902,9 +902,9 @@ _snapshot_per_host_config() {
             fi
         elif ! cmp -s "$_src" "$_dst" 2>/dev/null; then
             if [ -z "$_rec" ]; then
-                # No sha file at all: the dest predates provenance recording, so
-                # nothing here evidences a second writer.
-                warn_operator "snapshot refused: hosts/$(_host)/build_log.md has NO provenance record (the recorded-sha file does not exist, so this copy predates provenance tracking) — this is NOT evidence of an independent writer; do not archive either copy on the strength of this message"
+                # _rec is empty for absent, empty AND unreadable sig files alike;
+                # none of the three evidences a second writer.
+                warn_operator "snapshot refused: hosts/$(_host)/build_log.md has NO USABLE provenance record (the recorded-sha file is absent, empty, or unreadable — the copy predates provenance tracking or its record was lost) — this is NOT evidence of an independent writer; do not archive either copy on the strength of this message"
             else
                 warn_operator "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
             fi
