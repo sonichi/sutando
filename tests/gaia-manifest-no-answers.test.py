@@ -8,6 +8,7 @@ distinguish a leaked answer from a common English word in the fixed preamble.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import re
@@ -19,6 +20,9 @@ MANIFEST = ROOT / "benchmarks" / "gaia-100.manifest.json"
 ALLOWED_KEYS = {"schema", "name", "description", "source", "prompt_preamble",
                 "excluded", "case_ids"}
 CASE_ID = re.compile(r"gaia-l[123]-[0-9a-f]{8}\Z")
+
+# Changing the preamble is a deliberate act: update this digest in the same commit.
+PREAMBLE_SHA256 = "609ad2dca3d13a6c652903c463f6f85d56540fbfbfe4a43f3441b146b85fc625"
 
 failures: list[str] = []
 ran = 0
@@ -51,11 +55,14 @@ def main() -> int:
                        if k not in ("case_ids", "excluded", "prompt_preamble")})
     check("equals" not in blob, "no expect/equals structure in manifest metadata")
 
+    # Pinned by digest, not by shape. Shape predicates constrained only the TAIL,
+    # so any text BEFORE "Question: " passed -- and a GAIA answer is a short
+    # declarative string, exactly what a punctuation heuristic misses.
     pre = m["prompt_preamble"]
+    check(hashlib.sha256(pre.encode()).hexdigest() == PREAMBLE_SHA256,
+          "preamble is byte-identical to the pinned text (no smuggled content)")
     check(pre.endswith("Question: "),
-          "preamble ends at the question boundary (carries no case content)")
-    check(not any(c in pre for c in ("?", "\t")) and pre.count("\n") == 2,
-          "preamble is fixed prose, not an embedded case")
+          "preamble ends at the question boundary")
 
     print(f"\n{'ALL PASS' if not failures else 'FAILED: ' + '; '.join(failures)}"
           f" ({ran - len(failures)}/{ran})")
