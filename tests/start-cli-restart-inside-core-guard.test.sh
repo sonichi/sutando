@@ -1,13 +1,9 @@
-#!/bin/bash
-# Tests the in-session --restart guard in src/agent/claude/cli/start-cli.sh.
-# The script's HAZARD note says --restart must never be invoked from inside the
-# sutando-core session (kill-session terminates the agent running it); this
-# asserts the guard that ENFORCES it, in both directions:
-#   refuses  when the CALLER inherited SUTANDO_CORE_SESSION=1
-#   proceeds when it did not (and when the documented override is set)
-# Stubbed tmux/pgrep/ps/claude on PATH — no real tmux, core, or session touched.
-#
-# Run: bash tests/start-cli-restart-inside-core-guard.test.sh   (0 pass, 1 fail)
+#!/usr/bin/env bash
+# Asserts the in-session --restart guard in src/agent/claude/cli/start-cli.sh,
+# both directions: refuses on an inherited SUTANDO_CORE_SESSION=1, else proceeds.
+
+# Stubs tmux/pgrep/ps/claude on PATH — no real tmux, core or session is touched.
+# Run: bash tests/start-cli-restart-inside-core-guard.test.sh
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,11 +46,10 @@ EOF
 printf '#!/bin/bash\nexit 0\n' > "$BIN/claude"
 chmod +x "$BIN"/*
 
-# $1 = flag ("--restart"/"--force-restart"/""), rest = extra env assignments.
-# Sets rc / out (stdout) / err (stderr) / both. Always starts from "session +
-# core alive" so the non-refusing path has something to kill and says so.
-# SUTANDO_TEST_MODE + SUTANDO_WORKSPACE keep every write inside $TD, and a
-# caller-set ANTHROPIC_BASE_URL skips the launcher's ~10s proxy-bind wait.
+# $1 = flag; rest = extra env. Sets rc/out/err/both, always from "session + core
+# alive" so the non-refusing path has something to kill.
+
+# TEST_MODE+WORKSPACE keep writes in $TD; ANTHROPIC_BASE_URL skips a ~10s bind wait.
 run_launcher() {
   local flag="$1"; shift
   : > "$SESS_MARK"; : > "$CORE_MARK"
