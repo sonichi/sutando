@@ -14,7 +14,10 @@ Save it as `sutando.config.local.json`, then run:
 
 > **Never run `--restart` from inside the sutando-core session** — it kills the canonical
 > session, which is the agent running the command. Run it from a terminal outside the core,
-> or have the owner type `restart core` in chat. This is a rule to keep, not a guard that
+> or have the owner type `restart core` in a **Discord** DM — that is the only adapter wired
+> to it (`src/discord-bridge.py:3032`; slack and telegram do not import
+> `core_restart_intent`), and it needs Sutando.app running to consume the intent.
+> This is a rule to keep, not a guard that
 > keeps it: the Codex launcher exports `SUTANDO_CORE_SESSION=1` unconditionally
 > (`src/agent/codex/cli/start-cli.sh:39`) and its `--restart` branch (`:242-244`) does no
 > inherited-marker check, so the call is not refused on this path.
