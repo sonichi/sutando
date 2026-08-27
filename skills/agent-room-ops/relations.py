@@ -7,15 +7,16 @@ Pure: no I/O, no gateway, no env.
 
 Wire contract, from the gateway's op:message handler:
 
-  - `reply_to`    -> m.relates_to.m.in_reply_to  (a rich reply). Supported today.
-  - `thread_root` -> m.relates_to rel_type m.thread. NOT supported by the gateway
-    yet; an unknown field is dropped, so a thread_root post degrades to the rich
-    reply carried alongside it rather than vanishing. That fallback is the reason
-    `thread_root` always emits a `reply_to` too.
+  - `reply_to`    -> m.relates_to.m.in_reply_to. A rich reply, which stays in the
+    MAIN TIMELINE — it is a citation, not thread membership. Supported today.
+  - `thread_root` -> m.relates_to with rel_type m.thread. Only this makes an event
+    part of a thread. NOT supported by the gateway yet; an unknown field is
+    dropped, so a thread_root post lands as the rich reply carried alongside it.
 
-The Matrix thread shape wants in_reply_to to name the LATEST event in the thread,
-falling back to the root when the caller has nothing newer — which is what a
-caller passing thread_root alone means.
+`thread_root` always emits a `reply_to` because the thread shape carries an
+in_reply_to fallback for clients that do not render threads. It should name the
+latest message-like event in the thread (never a reaction or an edit); the root
+is the correct value when the caller has nothing newer.
 """
 from __future__ import annotations
 
