@@ -721,8 +721,12 @@ def case_u_peer_boot_does_not_suppress_local_recovery():
     fails = []
     ws = pathlib.Path(tempfile.mkdtemp())
     (ws / "state" / "cores").mkdir(parents=True)
-    (ws / "state" / "cores" / "peer-host.alive").write_text(
-        _json.dumps({"started_at": 1_000_000}))          # fresh mtime, peer JUST booted
+    import os as _os
+    _peer = ws / "state" / "cores" / "peer-host.alive"
+    _peer.write_text(_json.dumps({"started_at": 1_000_000}))
+    # heartbeat_is_fresh is two-sided, so a real wall-clock mtime reads as
+    # future-dated against now=1_000_100 and the peer is skipped.
+    _os.utime(_peer, (1_000_100, 1_000_100))
 
     if not hc._core_started_within(300, workspace=ws, now=1_000_100):
         fails.append("u) precondition: the fleet guard should see the peer's boot")
