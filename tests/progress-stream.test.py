@@ -382,7 +382,8 @@ with tempfile.TemporaryDirectory() as d:
     _db.STATE_DIR = ws / "state"
     _db.TASKS_DIR = ws / "tasks"
 
-# --- resolve_team_collaborator: the hoist (liususan091219's blocker) ---
+# --- resolve_team_collaborator: the hoist ---
+
 # Collaborator status must not depend on WHICH arm produced team tier: the
 # globally-allowlisted arm never ran the old arm-local check.
 _ACC = {"groups": {"123": {"allowFrom": ["u1"], "collaborators": ["u1"]}}}
