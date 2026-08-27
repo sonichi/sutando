@@ -526,7 +526,7 @@ _compose_exclude_content() {
     # Reserved snapshot temp. Cleanup only runs when control RETURNS from the
     # replace, so a process killed mid-stage leaves one under a carried
     # hosts/*/ path and every later `git add -A` would carry it into the vault.
-    echo "*.snap.??????"
+    echo "build_log.md.snap.??????"
     echo ".env*"
     echo "*.heartbeat"
     echo "*.alive"
@@ -842,7 +842,7 @@ _snapshot_per_host_config() {
     # repeated interrupted ticks would accumulate full build-log copies. Only
     # this host's own reserved pattern, and only leftovers older than the
     # grace window, so a temp a CONCURRENT sync is mid-write is never removed.
-    find "$_host_dir" -maxdepth 1 -type f -name '*.snap.??????' \
+    find "$_host_dir" -maxdepth 1 -type f -name 'build_log.md.snap.??????' \
         -mmin +"${SYNC_SNAP_TMP_GRACE_MIN:-10}" -delete 2>/dev/null || true
 
     if [ -f "$_cfg/settings.json" ]; then

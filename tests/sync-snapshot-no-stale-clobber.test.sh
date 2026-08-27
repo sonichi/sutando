@@ -184,11 +184,26 @@ touch -t 202601010000 "$_orphan"
 _snapshot_per_host_config
 check "an AGED reserved temp is swept on the next tick" '[ ! -f "$_orphan" ]'
 
+# --- control 7: the sweep must not reach past the temp this function OWNS ---
+# The owned temp is build_log.md.snap.XXXXXX. A bare *.snap.?????? also matches
+# unrelated user files under the carried hosts/ path and deletes them. Aged, so
+# the grace window cannot be what spares it.
+_bystander="$WORKSPACE_DIR/hosts/testhost/report.snap.AB12cd"
+printf 'a user file that merely resembles the reserved temp\n' > "$_bystander"
+touch -t 202601010000 "$_bystander"
+_snapshot_per_host_config
+check "an aged UNRELATED file is NOT swept (sweep scoped to the owned temp)" \
+      '[ -f "$_bystander" ]'
+
 # The staging guard, independent of the sweep: a leftover inside the grace
 # window must still be denied by the composed exclude set.
 _excl="$(sed -n '/^_compose_exclude_content()/,/^}/p' "$REPO/scripts/sync-workspace.sh")"
 check "the composed exclude set denies the reserved snapshot temp" \
-      'printf %s "$_excl" | grep -q "snap\.??????"'
+      'printf %s "$_excl" | grep -q "build_log\.md\.snap\.??????"'
+# The deny must be ANCHORED to the owned name. A bare *.snap.?????? would also
+# hide unrelated user files from the vault, so the un-anchored form must be absent.
+check "control: the exclude set does NOT carry an un-anchored *.snap pattern" \
+      '! printf %s "$_excl" | grep -q "echo \"\*\.snap\.??????\""'
 # Control: the same probe must be able to say NO, or it is matching noise.
 check "control: the exclude set does NOT deny an unrelated invented pattern" \
       '! printf %s "$_excl" | grep -q "snap\.ZZZZZZZ"' 
