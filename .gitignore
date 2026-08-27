@@ -142,8 +142,8 @@ coverage.xml
 diff-cover.md
 coverage-summary.md
 
-# A vim swap of .env carries the same live secrets, and `.env` never matches
-# them. Vim walks .swp down to .saa; unanchored would swallow real .svg/.sql.
+# A vim swap of .env carries the same live secrets. Vim's deep range .saa-.swp
+# contains real extensions (.svg .sql .sas), so the deep rule is scoped to env.
 *.sw[a-p]
-.*.s[a-v][a-z]
+*.env*.s[a-w][a-z]
 *~

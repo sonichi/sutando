@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# A vim swap of .env holds the same live secrets. Vim's deep swap range overlaps
+# real 3-char extensions, so both directions are asserted, not just the first.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+FIXTURE="$(mktemp -d -t gitignore-swap-test.XXXXXX)"
+trap 'rm -rf "$FIXTURE"' EXIT
+
+git init -q "$FIXTURE"
+cp "$REPO/.gitignore" "$FIXTURE/.gitignore"
+cd "$FIXTURE"
+
+pass=0
+fail=0
+
+check_ignored() {
+    local path="$1" desc="$2"
+    if git check-ignore -q "$path" 2>/dev/null; then
+        echo "OK: $desc"; pass=$((pass + 1))
+    else
+        echo "FAIL: $desc — '$path' is NOT ignored, so \`add -A\` would stage a secret"
+        fail=$((fail + 1))
+    fi
+}
+refute_ignored() {
+    local path="$1" desc="$2"
+    if git check-ignore -q "$path" 2>/dev/null; then
+        echo "FAIL: $desc — '$path' IS ignored; the rule over-denied and hides a real file"
+        fail=$((fail + 1))
+    else
+        echo "OK: $desc"; pass=$((pass + 1))
+    fi
+}
+
+# Shallow range: what vim reaches first, and what actually happened here.
+for f in .env.swp .env.swo .env.swn .env.swa; do
+    check_ignored "$f" "$f (shallow vim range) is ignored"
+done
+
+# Deep range: vim decrements past .swa to .svz and on down to .saa.
+for f in .env.svz .env.saa .env.local.swp .env.production.saa; do
+    check_ignored "$f" "$f (deep vim range) is ignored"
+done
+
+# The collision the deep range creates. Every 3-char extension starting with `s`
+# lives inside .saa-.swp, so a shape-matched rule silently hides real files.
+for f in .foo.svg .schema.sql .data.sas .x.svc .theme.sty; do
+    refute_ignored "$f" "hidden $f stays trackable"
+done
+for f in logo.svg query.sql style.scss run.sh app.swift; do
+    refute_ignored "$f" "$f stays trackable"
+done
+
+echo
+if [ "$fail" -gt 0 ]; then
+    echo "gitignore-editor-swap-files: $fail failure(s), $pass passed"
+    exit 1
+fi
+echo "gitignore-editor-swap-files: all $pass checks passed"
