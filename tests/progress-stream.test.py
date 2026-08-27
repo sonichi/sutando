@@ -382,6 +382,18 @@ with tempfile.TemporaryDirectory() as d:
     _db.STATE_DIR = ws / "state"
     _db.TASKS_DIR = ws / "tasks"
 
+# --- resolve_team_collaborator: the hoist (liususan091219's blocker) ---
+# Collaborator status must not depend on WHICH arm produced team tier: the
+# globally-allowlisted arm never ran the old arm-local check.
+_ACC = {"groups": {"123": {"allowFrom": ["u1"], "collaborators": ["u1"]}}}
+check("hoist: globally-allowlisted team sender IS collaborator",
+      _db.resolve_team_collaborator(_ACC, "team", "u1", 123) is True)
+check("hoist: owner/other/guest never collaborate",
+      not any(_db.resolve_team_collaborator(_ACC, t_, "u1", 123)
+              for t_ in ("owner", "other", "guest", "ambient")))
+check("hoist: unlisted team sender is NOT collaborator",
+      _db.resolve_team_collaborator(_ACC, "team", "u2", 123) is False)
+
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")
     sys.exit(1)
