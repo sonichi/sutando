@@ -160,6 +160,12 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"  # ellipsis
 
 
+def step_visible_in(channel_is_private: bool) -> bool:
+    """The tier gate answers who SENT the task, never who can SEE the channel, so only
+    a known-private chat may publish the step."""
+    return bool(channel_is_private)
+
+
 def format_progress(step: Optional[str], elapsed_s: float, max_len: int = 180) -> str:
     """Render the live placeholder body.
 

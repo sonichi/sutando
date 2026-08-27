@@ -161,7 +161,8 @@ class SayCliDispatchTests(unittest.TestCase):
                 rc = room_ops._main(["say", ROOM, "hi there"])
         self.assertEqual(rc, 0)
         # say() takes (message, room_id); the CLI takes (room_id, message).
-        m.assert_called_once_with("hi there", ROOM, None)
+        # reply_to rides as a keyword and is None when --reply-to is not given.
+        m.assert_called_once_with("hi there", ROOM, None, reply_to=None)
 
 
 class SayNetworkFailureTests(unittest.TestCase):
