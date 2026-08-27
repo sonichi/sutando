@@ -45,6 +45,12 @@ for f in .env.svz .env.saa .env.local.swp .env.production.saa; do
     check_ignored "$f" "$f (deep vim range) is ignored"
 done
 
+# DELIBERATELY SACRIFICED, pinned so it is a decision and not a surprise. A vim
+# swap of .env is spelled exactly like a real .env.<3-char> file; secrets win here.
+for f in .env.svg .env.sql .env.sas .env.sty .env.svc .env.local.svg; do
+    check_ignored "$f" "$f is ignored — .env* namespace traded for swap safety"
+done
+
 # The collision the deep range creates. Every 3-char extension starting with `s`
 # lives inside .saa-.swp, so a shape-matched rule silently hides real files.
 for f in .foo.svg .schema.sql .data.sas .x.svc .theme.sty; do

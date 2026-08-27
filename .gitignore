@@ -142,8 +142,8 @@ coverage.xml
 diff-cover.md
 coverage-summary.md
 
-# A vim swap of .env carries the same live secrets. Vim's deep range .saa-.swp
-# contains real extensions (.svg .sql .sas), so the deep rule is scoped to env.
+# A vim swap of .env holds the same live secrets and is spelled identically to a
+# real .env.<3-char> file, so the whole `.env*.s??` namespace is given up here.
 *.sw[a-p]
 *.env*.s[a-w][a-z]
 *~
