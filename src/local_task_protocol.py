@@ -620,6 +620,14 @@ def iter_archived_tasks(tasks_dir: Path, *,
     default order puts the oldest month first, so a bounded consumer sees
     only the least recent tasks. Both orders stay lazy — a caller that stops
     at N never stats the rest of the archive.
+
+    Either order is a HEURISTIC about where a corpus keeps its recent tasks,
+    never a guarantee: `newest_first` assumes the flat legacy files are older
+    than every month partition, and a host whose flat tail holds recent tasks
+    defeats it (measured: first non-owner task at index 590 under
+    `newest_first` vs index 1 under the default). A bounded caller must
+    therefore treat exhausting its cap as UNKNOWN rather than absence — the
+    cap is a bound on work, not a tuning knob for accuracy.
     """
     archive_root = tasks_dir / "archive"
     if not archive_root.is_dir():
