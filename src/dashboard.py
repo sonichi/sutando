@@ -37,6 +37,7 @@ from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 import dashboard_schedules  # noqa: E402
+import quota_projection  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -179,6 +180,14 @@ def get_quota_status() -> dict:
         if reset_7d:
             data["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).strftime("%H:%M %b %d")
         data.update(_quota_freshness(data, quota_file))
+        # Feed the history the chart reads; value-dedup'd, so the 15s refresh
+        # costs nothing while quota stands still. Never let it break the panel.
+        try:
+            quota_projection.record_sample(
+                data, WORKSPACE_DIR / "state" / "quota-history.jsonl",
+                datetime.now().timestamp())
+        except OSError:
+            pass
         return data
     except Exception:
         return {"available": True}
@@ -702,6 +711,42 @@ def render_dashboard() -> str:
         '(→ prompt_skill) or free text (→ prompt).</div></div>'
     )
 
+    # Quota chart — usage vs even pace, one equal-width segment per reset span.
+    # All drawing is client-side from /api/quota-chart; this card is inert HTML.
+    cards.append("""<div class="card full">
+<h2>Quota — usage vs even pace</h2>
+<div style="display:flex;gap:16px;flex-wrap:wrap">
+<div style="flex:1;min-width:260px"><div style="font-size:10px;color:#555;margin-bottom:4px">5h window</div><svg id="qc-5h" width="100%" height="120" viewBox="0 0 400 120" preserveAspectRatio="none"></svg></div>
+<div style="flex:1;min-width:260px"><div style="font-size:10px;color:#555;margin-bottom:4px">7d window</div><svg id="qc-7d" width="100%" height="120" viewBox="0 0 400 120" preserveAspectRatio="none"></svg></div>
+</div>
+<div style="font-size:9px;color:#444;margin-top:4px">Solid: measured use. Diagonal: even pace between resets (each reset span drawn equal width). Dashed: projection at current pace. <span style="color:#4ecca3">green = under pace</span> · <span style="color:#e94560">red = over pace</span>.</div>
+<div id="qc-empty" style="font-size:10px;color:#555;display:none">Collecting history — the chart fills in as samples accumulate.</div>
+<script>
+(async()=>{try{
+const d=await (await fetch('/api/quota-chart')).json();
+for(const[k,el]of[['5h','qc-5h'],['7d','qc-7d']]){
+  const svg=document.getElementById(el),W=400,H=120,segs=d.windows[k].segments;
+  if(!segs.length){document.getElementById('qc-empty').style.display='block';continue}
+  const sw=W/segs.length;let out='';
+  segs.forEach((s,i)=>{
+    const x0=i*sw,X=f=>x0+f*sw,Y=u=>H-Math.min(u,1.2)/1.2*H;
+    out+=`<line x1="${x0}" y1="0" x2="${x0}" y2="${H}" stroke="#1e1e30"/>`;
+    out+=`<line x1="${X(0)}" y1="${Y(0)}" x2="${X(1)}" y2="${Y(1)}" stroke="#555" stroke-dasharray="2,3"/>`;
+    if(s.points.length){
+      const pts=s.points.map(pt=>`${X(pt.x)},${Y(pt.y)}`).join(' ');
+      const last=s.points[s.points.length-1];
+      const over=last.y>last.x;
+      out+=`<polyline points="${pts}" fill="none" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.6"/>`;
+      out+=`<circle cx="${X(last.x)}" cy="${Y(last.y)}" r="2.5" fill="${over?'#e94560':'#4ecca3'}"/>`;
+      if(s.current&&s.projected_end!==undefined)
+        out+=`<line x1="${X(last.x)}" y1="${Y(last.y)}" x2="${X(1)}" y2="${Y(s.projected_end)}" stroke="${s.projected_end>1?'#e94560':'#4ecca3'}" stroke-dasharray="3,3"/>`;
+    }
+  });
+  out+=`<line x1="0" y1="${H-1/1.2*H}" x2="${W}" y2="${H-1/1.2*H}" stroke="#e94560" stroke-opacity="0.25"/>`;
+  svg.innerHTML=out;
+}}catch(e){}})();
+</script></div>""")
+
     # Quick links
     cards.append("""<div class="card full">
 <h2>Quick Links</h2>
@@ -858,6 +903,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
+        elif urlparse(self.path).path == "/api/quota-chart":
+            payload = quota_projection.chart_payload(
+                WORKSPACE_DIR / "state" / "quota-history.jsonl",
+                datetime.now().timestamp())
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
         elif urlparse(self.path).path == "/json":
             data = {
                 "score": get_score(),
