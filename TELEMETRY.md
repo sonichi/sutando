@@ -13,11 +13,22 @@ Only bucketed / categorical **product events**:
 | `core_started` | `interval_s` | Count active installs (OSS + desktop) |
 | `feature_used` | `feature` (snake_case, e.g. `morning_briefing`, `skill:<name>`) | Which features matter |
 | `task_processed` | `source` (`discord`/`telegram`/`slack`; more surfaces as wired) | Activation — whether installs process any tasks after launch, and via which surface |
-| `skill_invoked` | `skill` | Skill adoption |
-| `voice_session` | `duration_bucket` (`<30s` / `30-120s` / `>120s`) | Voice usage |
-| `error` | `type` | Reliability (type only) |
 
-*(Later events are added as they are wired in; this table is the source of truth.)*
+Skill adoption arrives through `feature_used` as `skill:<name>`, emitted for every
+skill by `hooks/skill-usage-telemetry.py` — there is no separate skill event.
+
+### Documented but NOT wired
+
+These were drafted ahead of implementation and **emit nothing today**. Verify
+with a call-site grep before citing them anywhere:
+
+| Event | Intended properties | Status |
+|-------|--------------------|--------|
+| `voice_session` | `duration_bucket` (`<30s` / `30-120s` / `>120s`) | no call site |
+| `error` | `type` | no call site |
+
+*(The first table is the source of truth for what is emitted. Move a row up only
+in the same change that adds its call site.)*
 
 ## What is NEVER collected
 
