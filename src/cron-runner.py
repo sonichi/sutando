@@ -101,7 +101,6 @@ MAX_EMIT_LATENESS_SECONDS = 15 * 60
 MAX_EMIT_LATENESS_CAP_SECONDS = 60 * 60
 # Two fires of a weekly job can be ~13 days apart when today is midweek.
 PERIOD_SCAN_MAX_SECONDS = 15 * 24 * 3600
-_PERIOD_CACHE: dict = {}
 CORE_ALIVE_MAX_AGE_SECONDS = 90
 
 
@@ -171,8 +170,6 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
     """
     # Scan BACKWARD and stop at two hits: a daily job has at most one fire in a
     # 24h window, so a forward MAX_CATCHUP_SECONDS scan can never measure it.
-    if expr in _PERIOD_CACHE:
-        return _PERIOD_CACHE[expr]
     fires = []
     m = (now_epoch // 60) * 60
     floor = now_epoch - PERIOD_SCAN_MAX_SECONDS
@@ -180,10 +177,8 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
         if cron_matches(expr, time.localtime(m)):
             fires.append(m)
             if len(fires) == 2:
-                _PERIOD_CACHE[expr] = fires[0] - fires[1]
-                return _PERIOD_CACHE[expr]
+                return fires[0] - fires[1]
         m -= 60
-    _PERIOD_CACHE[expr] = None
     return None
 
 
