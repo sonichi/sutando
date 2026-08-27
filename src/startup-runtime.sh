@@ -403,6 +403,23 @@ reap_stale_task_watcher() {
 # reach this block, which reaped a live, mid-session watcher as a side effect.
 # scripts/restart-gateway-lanes.sh calls only this function.
 #
+# Default-lane foreign-suffix fence: every configured named lane <inst> serves
+# rooms on :<inst>.ag2.space (the same convention that maps <inst> to
+# channels/<inst>-ag2space/ below), so those suffixes are foreign to the
+# default lane. Operator-set GATEWAY_FOREIGN_SUFFIXES wins verbatim.
+derive_foreign_suffixes() {
+  if [ -n "${GATEWAY_FOREIGN_SUFFIXES:-}" ]; then
+    printf '%s' "$GATEWAY_FOREIGN_SUFFIXES"
+    return 0
+  fi
+  local _dfs_out="" _dfs_var _dfs_inst
+  for _dfs_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
+    _dfs_inst="$(printf '%s' "${_dfs_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
+    _dfs_out="${_dfs_out:+$_dfs_out,}:${_dfs_inst}.ag2.space"
+  done
+  printf '%s' "$_dfs_out"
+}
+
 # Requires REPO, PY (resolved via scripts/python-binary.sh) and LOGS_DIR set
 # by the caller — same contract as every other block in startup.sh.
 start_gateway_lanes() {
@@ -489,7 +506,8 @@ start_gateway_lanes() {
     # the redirect below); the bridge stamps launched_via into gateway-status
     # and skips its own bare-launch file log. See remote_gateway_bridge._log.
     if [ -n "$PY" ]; then
-      SUTANDO_SUPERVISED=1 "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      SUTANDO_SUPERVISED=1 GATEWAY_FOREIGN_SUFFIXES="$(derive_foreign_suffixes)" \
+        "$PY" "$REPO/src/remote-gateway-bridge.py" >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
       echo "  ✓ gateway bridge (self-defers if already running)"
     else
       echo "  ⊘ gateway bridge skipped — no runnable python3"
