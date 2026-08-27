@@ -1279,6 +1279,141 @@ class AcceptanceRunnerArgTests(EnvCase):
                           "--mode", "taskify", "--task-dir", "/tmp/t"])
 
 
+# ----- reply citation (relations, say, mention) ----- #
+import say as sy, relations as rl  # noqa: E401,E402
+
+OTHER = "$evt2"
+
+
+class RelationFieldsTests(unittest.TestCase):
+    def test_none_is_uncited(self):
+        self.assertEqual(rl.relation_fields(), {})
+
+    def test_reply_to_becomes_the_field(self):
+        self.assertEqual(rl.relation_fields(reply_to=EV), {"reply_to": EV})
+
+    def test_malformed_ids_raise(self):
+        for bad in ("evt1", "$", "root", "  ", "  $ok"[:3]):
+            with self.assertRaises(rl.RelationError):
+                rl.relation_fields(reply_to=bad)
+
+    def test_empty_string_means_no_citation(self):
+        # Distinct from malformed: "" is the flag not being given at all.
+        self.assertEqual(rl.relation_fields(reply_to=""), {})
+
+    def test_whitespace_is_stripped(self):
+        self.assertEqual(rl.relation_fields(reply_to="  $evt1  "), {"reply_to": EV})
+
+    def test_no_thread_surface_is_offered(self):
+        # The gateway cannot honour a thread relation, so asking for one must be
+        # impossible rather than silently downgraded to this citation.
+        with self.assertRaises(TypeError):
+            rl.relation_fields(thread_root=EV)
+
+
+class SayCitationTests(EnvCase):
+    def _post(self, **kwargs):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {}))[1]):
+            res = sy.say("hi", ROOM, HS, gate=None, **kwargs)
+        return res, cap
+
+    def test_plain_say_cites_nothing(self):
+        res, cap = self._post()
+        self.assertTrue(res["ok"])
+        self.assertNotIn("reply_to", cap["payload"])
+
+    def test_reply_to_rides_the_payload(self):
+        res, cap = self._post(reply_to=EV)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["reply_to"], EV)
+        # The body and op are untouched by the citation field.
+        self.assertEqual(cap["payload"]["body"], "hi")
+        self.assertEqual(cap["payload"]["op"], "message")
+
+    def test_no_thread_relation_is_ever_sent(self):
+        # Pins the review's requirement: nothing on this path may claim thread
+        # membership the gateway cannot deliver.
+        _res, cap = self._post(reply_to=EV)
+        self.assertNotIn("thread_root", cap["payload"])
+        self.assertNotIn("m.relates_to", cap["payload"])
+
+    def test_bad_id_refuses_before_the_network(self):
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            res = sy.say("hi", ROOM, HS, gate=None, reply_to="evt1")
+        self.assertFalse(res["ok"])
+        self.assertIn("event id", res["reason"])
+        self.assertEqual(called, [])   # no post — control below proves the mock fires
+
+    def test_control_good_id_does_post(self):
+        # Pairs with the test above: proves the empty call list there is the
+        # refusal, not a mock that never fires.
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            sy.say("hi", ROOM, HS, gate=None, reply_to=EV)
+        self.assertEqual(len(called), 1)
+
+
+class MentionCitationTests(EnvCase):
+    AGENTS = [{"id": "@peer:hs", "label": "peer"}]
+
+    def test_citation_rides_the_payload(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(mn, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {}))[1]):
+            res = mn.mention("peer", "ping", ROOM, HS, gate=None, agents=self.AGENTS,
+                             reply_to=OTHER)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["reply_to"], OTHER)
+        self.assertEqual(cap["payload"]["mentions"], ["@peer:hs"])
+
+    def test_bad_id_refuses_before_resolve_and_network(self):
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(mn, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            res = mn.mention("peer", "ping", ROOM, HS, gate=None, agents=self.AGENTS,
+                             reply_to="root")
+        self.assertFalse(res["ok"])
+        self.assertEqual(called, [])
+
+
+class CitationCLITests(EnvCase):
+    def test_say_flag_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "hi", "--reply-to", EV])
+        self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_mention_flag_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._mention, "mention",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["mention", "peer", "ping", ROOM, "--reply-to", EV])
+        self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_help_says_a_citation_is_not_a_thread(self):
+        # The surface a caller hits first must carry the limitation, not only
+        # the module docstring and the skill doc.
+        for verb in ("say", "mention"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                room_ops._main([verb, "--help"])
+            text = out.getvalue()
+            self.assertIn("CITATION", text)
+            self.assertIn("does NOT put", text)
+
 
 class ChannelEnvLocatorTests(unittest.TestCase):
     """Exercise the REAL _channel_env_file() — every other test shadows it.
