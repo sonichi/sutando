@@ -545,9 +545,8 @@ def get_schedules() -> list[dict]:
     return out
 
 
-# Quota pace sparklines: plain string (NOT an f-string) — brace-heavy JS.
-# Draws the CURRENT window curve vs the even-pace diagonal inside the two
-# existing stat cells; no layout change, no extra vertical space.
+# Sparklines for the two quota stat cells: current window vs even-pace
+# diagonal. Plain string, NOT an f-string — the inline JS is brace-heavy.
 _QUOTA_SPARK_JS = """<script>
 (async()=>{try{
 const d=await (await fetch('/api/quota-chart')).json();

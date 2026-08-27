@@ -73,9 +73,9 @@ class RecordSample(unittest.TestCase):
     def test_a_torn_tail_line_is_skipped_not_fatal(self):
         qp.record_sample(state(), self.path, now=1.0)
         with self.path.open("a") as f:
-            f.write('{"ts": 2.0, "u5": 0.3')  # crash mid-write
-        # Dedup keys on the last GOOD line; the changed sample must then
-        # survive a fresh read (torn tail repaired, not concatenated onto).
+            f.write('{"ts": 2.0, "u5": 0.3')
+        # Crash-torn tail: dedup keys on the last GOOD line, and the changed
+        # sample must survive a fresh read (tail repaired, not appended onto).
         self.assertFalse(qp.record_sample(state(), self.path, now=3.0))
         self.assertTrue(qp.record_sample(state(u5="0.30"), self.path, now=4.0))
         recs = qp._read_history(self.path)
