@@ -23,6 +23,7 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 from task_archive import _move_without_clobbering  # noqa: E402
 
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
+HEARTBEAT_FUTURE_TOLERANCE_S = 5.0
 
 _UNASSIGNED_RE = re.compile(
     r"^task-(?!.*\.(?:assigned|claimed)-)([A-Za-z0-9._~-]+)\.txt$")
@@ -32,14 +33,13 @@ _CLAIMED_RE = re.compile(
 
 
 def lead_alive(state_dir, lead_label: str, now_fn=time.time) -> bool:
-    """False on a missing OR future-dated beat — clock skew must degrade,
-    never keep followers deferring to a lead that is not really there."""
+    """False on missing, stale, or implausibly future-dated beats."""
     f = Path(state_dir) / "cores" / f"{lead_label}.alive"
     try:
         age = now_fn() - f.stat().st_mtime
     except OSError:
         return False
-    return 0 <= age < LEAD_STALE_S
+    return -HEARTBEAT_FUTURE_TOLERANCE_S <= age < LEAD_STALE_S
 
 
 def _claim_assignment(tasks_dir: Path, f: Path, instance: str) -> "Path | None":

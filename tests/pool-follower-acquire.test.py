@@ -77,6 +77,13 @@ class AcquireTests(unittest.TestCase):
         got = pf.acquire_work(self.tasks, self.state, "me", "lead")
         self.assertEqual(got.name, "task-free.claimed-me.txt")
 
+    def test_small_future_skew_keeps_live_lead_in_control(self):
+        self._beat(age=-0.5)
+        (self.tasks / "task-free.txt").write_text("task: t\n")
+        got = pf.acquire_work(self.tasks, self.state, "me", "lead")
+        self.assertIsNone(got)
+        self.assertTrue((self.tasks / "task-free.txt").exists())
+
     def test_assignments_still_honored_in_fallback_mode(self):
         (self.tasks / "task-mine.assigned-me.txt").write_text("x")
         (self.tasks / "task-free.txt").write_text("task: t\n")

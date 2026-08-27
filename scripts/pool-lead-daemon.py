@@ -2,7 +2,7 @@
 """Production lead driver (L3): binds PoolLead to the live workspace.
 
 Followers = state/cores/<inst>.alive files matching the pool prefix; alive =
-mtime within LEAD_STALE_S bounds (future-dated = dead, same rule everywhere).
+mtime within the shared pool heartbeat bounds.
 The lead stamps its own `pool-lead.alive` each sweep so followers can detect
 lead loss and degrade (pool_follower.lead_alive reads it).
 
@@ -27,7 +27,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "src"))
 sys.path.insert(0, str(_HERE.parent / "src" / "runtime-api"))
 
-from pool_follower import LEAD_STALE_S
+from pool_follower import HEARTBEAT_FUTURE_TOLERANCE_S, LEAD_STALE_S
 from pool_lead import PoolLead
 from pool_metrics import PoolMetrics
 from pool_status import PoolStatusWriter
@@ -40,6 +40,14 @@ def _workspace() -> Path:
         ["bash", str(_HERE / "sutando-config.sh"), "workspace"],
         capture_output=True, text=True, timeout=10)
     return Path(out.stdout.strip())
+
+
+def _heartbeat_alive(cores: Path, instance: str, now_fn=time.time) -> bool:
+    try:
+        age = now_fn() - (cores / f"{instance}.alive").stat().st_mtime
+    except OSError:
+        return False
+    return -HEARTBEAT_FUTURE_TOLERANCE_S <= age < LEAD_STALE_S
 
 
 def main() -> int:
@@ -59,11 +67,7 @@ def main() -> int:
             return []
 
     def alive(inst: str) -> bool:
-        try:
-            age = time.time() - (cores / f"{inst}.alive").stat().st_mtime
-        except OSError:
-            return False
-        return 0 <= age < LEAD_STALE_S
+        return _heartbeat_alive(cores, inst)
 
     lead = PoolLead(tasks, state, followers, alive,
                     metrics=PoolMetrics(state))
