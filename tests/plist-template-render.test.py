@@ -70,6 +70,41 @@ print("== renderer: the specific silent-corruption case ==")
 arg, _ = rendered_paths("/tmp/a&b")
 check("ampersand does not re-emit the token", "__REPO__" not in arg, f"got {arg!r}")
 
+print("== SHIPPED plist: --recover-core must stay OUT of the default args ==")
+# The property is documented in the template's own #2246 note ("--recover-core was
+# REMOVED from the default args") and, until now, defended by nobody: re-arming it
+# would land green and make a deliberately-stopped core relaunchable.
+# The raw template is not well-formed XML until its tokens are substituted, so this
+# renders the REAL committed file rather than parsing it directly or re-testing the
+# inline TEMPLATE above -- an assertion against the fixture would certify nothing
+# about what ships.
+SHIPPED = REPO / "src" / "launchd" / "com.sutando.health-check-fallback.plist"
+
+
+def shipped_program_arguments():
+    with tempfile.TemporaryDirectory() as td:
+        dest = pathlib.Path(td) / "out.plist"
+        rpt.render_to_file(str(SHIPPED), str(dest), {
+            "REPO": "/tmp/r", "WORKSPACE": "/tmp/r/ws", "PYTHON": "/usr/bin/python3",
+            "CLAUDE_CONFIG_DIR": "/tmp/r/.claude", "HOMEBREW_BIN": "/opt/homebrew/bin",
+        })
+        # The committed template's own doc-comment contains `--emit-task`,
+        # `--recover-core` etc, and XML forbids `--` inside a comment, so expat
+        # (plistlib) rejects the file at line 24 while macOS `plutil -lint` accepts
+        # it. That asymmetry is why the shipped file was never asserted against.
+        # Strip comments first -- portable, and does not depend on Apple's parser.
+        xml = re.sub(rb"<!--.*?-->", b"", dest.read_bytes(), flags=re.S)
+        return plistlib.loads(xml)["ProgramArguments"]
+
+
+_args = shipped_program_arguments()
+check("shipped fallback plist renders and yields args", bool(_args), f"got {_args!r}")
+check("--recover-core absent from shipped ProgramArguments",
+      "--recover-core" not in _args, f"got {_args!r}")
+# Control: the check must be able to FAIL. A test that cannot go red certifies nothing.
+check("control: the assertion detects the flag when present",
+      "--recover-core" in (_args + ["--recover-core"]), "negative control did not fire")
+
 print("== renderer: refuses to publish a bad render ==")
 with tempfile.TemporaryDirectory() as td:
     tpl = pathlib.Path(td) / "t.plist"
