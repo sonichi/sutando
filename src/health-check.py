@@ -5890,11 +5890,13 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     # rglob, not glob: delivered results are archived into MONTH buckets
     # (results/archive/YYYY-MM/), so the durable copies sit two levels down.
     for f in results.rglob(f"{stem}-20*"):
-        m = re.match(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})", f.name)
+        # Both date spellings are in live use and the compact one dominates;
+        # matching only YYYY-MM-DD discards the majority of real artifacts.
+        m = re.match(rf"{re.escape(stem)}-(\d{{4}})-?(\d{{2}})-?(\d{{2}})", f.name)
         if not m:
             continue
         lt = datetime.fromtimestamp(f.stat().st_mtime)
-        out.append((m.group(1), lt.hour * 60 + lt.minute))
+        out.append(("-".join(m.groups()), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
 
@@ -5979,10 +5981,17 @@ def check_daily_cron_punctuality() -> dict:
         declared = str(e.get("artifact") or "").strip()
         stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
         launchd = bool(e.get("launchd"))
-        # The launchd lane publishes no dated results file; its completion
-        # sentinel is the only dated record that it finished.
+        # Each lane is a preference, not a restriction: `launchd` says how a job is
+        # SCHEDULED, which does not determine what dated evidence it leaves behind.
         arts = (_daily_completion_minutes(ws / "state", jname) if launchd
                 else _daily_artifact_minutes(ws / "results", stem))
+        used_artifact_lane = not launchd
+        # Both directions, so neither lane's absence reads as the job's silence:
+        # without the launchd arm a daily artifact reports "no dated artifact" forever.
+        if not arts:
+            arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
+                    else _daily_completion_minutes(ws / "state", jname))
+            used_artifact_lane = bool(arts) and launchd
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         newest = max((d for d, _ in arts), default=None)
@@ -6000,7 +6009,7 @@ def check_daily_cron_punctuality() -> dict:
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
             # `artifact` names a results file, so it cannot vouch for a sentinel:
             # only an observed history makes a missing sentinel today actionable.
-            "stem": stem, "stem_declared": bool(declared) and not launchd,
+            "stem": stem, "stem_declared": bool(declared) and used_artifact_lane,
             # Renders only when new input exists, so a quiet day produces nothing
             # and absence is evidence of nothing rather than of a miss.
             "conditional": bool(e.get("conditional")),
