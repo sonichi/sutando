@@ -58,20 +58,14 @@ for f in .foo.svg .schema.sql .data.sas .x.svc .theme.sty; do
 done
 # .swf is inside Vim's shallow range but is also a real extension; the range
 # deliberately skips it, so a real Flash asset must stay trackable.
-# keweichen, #3445 review: the prior *.sw[a-eg-p] range also ate these.
+for f in movie.swf intro.swf; do
+    refute_ignored "$f" "$f stays trackable — .swf excluded from the swap range"
+done
+
+# Same class as .swf: real extensions the earlier sw-range consumed wholesale.
 for f in interface.swg audio.swa firmware.swi; do
     : > "$f"
     refute_ignored "$f" "$f stays trackable — real extension inside the old sw range"
-done
-
-# And the canonical [._]*.s[a-w][a-z] over-denies these hidden ones.
-for f in .foo.svg .schema.sql .data.sas .x.svc .theme.sty; do
-    : > "$f"
-    refute_ignored "$f" "hidden $f stays trackable — s[a-w][a-z] would over-deny"
-done
-
-for f in movie.swf intro.swf; do
-    refute_ignored "$f" "$f stays trackable — .swf excluded from the swap range"
 done
 
 for f in logo.svg query.sql style.scss run.sh app.swift; do
