@@ -66,6 +66,62 @@ def gate_allows(agent_mxid, room_id, gate):
 # --------------------------------------------------------------------------- #
 # Gateway coordinates + HTTP
 # --------------------------------------------------------------------------- #
+def _core_src_on_path():
+    """Put the core `src/` on sys.path so shared helpers import. False if absent."""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        cand = os.path.join(cur, "src")
+        if os.path.isfile(os.path.join(cand, "channel_token.py")):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+
+
+def _channel_env_file():
+    """Path to the ag2space channel `.env`, or None when it cannot be located.
+
+    room-ops IS the ag2space transport, so its credential lives beside the other
+    providers' — `channel_token.py` states the rule: each bridge reads its own
+    `channels/<name>/.env`. Returned rather than inlined so tests can shadow this
+    boundary the way they already shadow the vault.
+    """
+    try:
+        if not _core_src_on_path():
+            return None
+        from util_paths import claude_home_path
+        p = claude_home_path("channels", "ag2space", ".env")
+        return p if os.path.isfile(p) else None
+    except Exception:
+        return None
+
+
+def _from_channel_env(names, env_file=None):
+    """First non-empty value among `names` in the channel `.env`; '' if none.
+
+    Sits between the process env and the vault, so an exported value still wins
+    and a stored one still loses.
+    """
+    try:
+        env_file = _channel_env_file() if env_file is None else env_file
+        if env_file is None:
+            return ""
+        if not _core_src_on_path():
+            return ""
+        from channel_token import token_from_env_file
+        from pathlib import Path
+        for var in names:
+            got = token_from_env_file(var, Path(env_file))
+            if got:
+                return got
+        return ""
+    except Exception:
+        return ""
+
+
 def _token_from_vault(vault_get=None):
     """Vault fallback for the gateway bearer — parity with the channel bridges
     (sonichi#2638) and the sparrow bridge.
@@ -88,20 +144,8 @@ def _token_from_vault(vault_get=None):
     obligation).
     """
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
-        if not src:
+        if not _core_src_on_path():
             return ""
-        if src not in sys.path:
-            sys.path.insert(0, src)
         from channel_token import token_from_vault
     except Exception:
         return ""
@@ -149,9 +193,13 @@ def gateway():
     raw, _name = gc.resolve_alias_precedence(
         os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
     if not raw:
+        raw = _from_channel_env(("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN"))
+    if not raw:
         raw = _token_from_vault()
     explicit_url, _ = gc.resolve_alias_precedence(
         os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+    if not explicit_url:
+        explicit_url = _from_channel_env(("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
     creds = gc.normalize_credentials(raw, explicit_url=explicit_url,
                                      source="resolved" if raw else "none")
     headers = {"User-Agent": "sutando-room-ops/1"}
