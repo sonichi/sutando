@@ -71,12 +71,46 @@ WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
 mkdir -p "$STATE_DIR" "$WORKSPACE/results"
 MARKER="$STATE_DIR/$CHANNEL.started"
+# One alert per flap EPISODE, plus one escalation per window. Unbounded alerting
+# turned a crashloop into ~945 owner DMs in five days, which retires the alert.
+FLAP_STATE="$STATE_DIR/$CHANNEL.flap"
+FLAP_QUIET="${SUTANDO_CHANNEL_BRIDGE_FLAP_QUIET:-900}"
+FLAP_ESCALATE="${SUTANDO_CHANNEL_BRIDGE_FLAP_ESCALATE:-1800}"
+
+_deliver_alert() {
+  # Unique or a same-second pair silently overwrites: one alert would be LOST.
+  _i=0
+  while :; do
+    RESULT="$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$(date +%s)-$$-$_i.txt"
+    [ -e "$RESULT" ] || break
+    _i="$((_i + 1))"
+  done
+  printf '%s\n' "$1" > "$RESULT"
+  osascript -e "display notification \"$1\" with title \"Sutando\"" >/dev/null 2>&1 || true
+}
+
 emit_restart_alert() {
   NOW="$(date +%s)"
-  RESULT="$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$NOW.txt"
+  # stderr is per-restart and unthrottled on purpose: the log keeps every event,
+  # only the owner-facing channel is rate limited.
   echo "[$CHANNEL-bridge-wrapper] previous process exited; automatically restarting" >&2
-  printf '%s\n' "⚠️ The $CHANNEL bridge exited and was automatically restarted." > "$RESULT"
-  osascript -e "display notification \"The $CHANNEL bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
+  _first=0; _count=0; _lastr=0; _lasta=0
+  if [ -f "$FLAP_STATE" ]; then
+    read -r _first _count _lastr _lasta < "$FLAP_STATE" 2>/dev/null || true
+  fi
+  case "$_first$_count$_lastr$_lasta" in *[!0-9]*|"") _first=0; _count=0; _lastr=0; _lasta=0;; esac
+  if [ "$_lastr" -eq 0 ] || [ "$((NOW - _lastr))" -ge "$FLAP_QUIET" ]; then
+    printf '%s %s %s %s\n' "$NOW" 1 "$NOW" "$NOW" > "$FLAP_STATE"
+    _deliver_alert "⚠️ The $CHANNEL bridge exited and was automatically restarted."
+    return
+  fi
+  _count="$((_count + 1))"
+  if [ "$((NOW - _lasta))" -ge "$FLAP_ESCALATE" ]; then
+    printf '%s %s %s %s\n' "$_first" "$_count" "$NOW" "$NOW" > "$FLAP_STATE"
+    _deliver_alert "⚠️ The $CHANNEL bridge is FLAPPING — $_count restarts over $(( (NOW - _first) / 60 )) min. It is not recovering on its own."
+    return
+  fi
+  printf '%s %s %s %s\n' "$_first" "$_count" "$NOW" "$_lasta" > "$FLAP_STATE"
 }
 if [ -f "$MARKER" ]; then emit_restart_alert; fi
 date +%s > "$MARKER"
