@@ -76,10 +76,10 @@ print("== SHIPPED plist: --recover-core must stay OUT of the default args ==")
 SHIPPED = REPO / "src" / "launchd" / "com.sutando.health-check-fallback.plist"
 
 
-def shipped_program_arguments():
+def program_arguments(template):
     with tempfile.TemporaryDirectory() as td:
         dest = pathlib.Path(td) / "out.plist"
-        rpt.render_to_file(str(SHIPPED), str(dest), {
+        rpt.render_to_file(str(template), str(dest), {
             "REPO": "/tmp/r", "WORKSPACE": "/tmp/r/ws", "PYTHON": "/usr/bin/python3",
             "CLAUDE_CONFIG_DIR": "/tmp/r/.claude", "HOMEBREW_BIN": "/opt/homebrew/bin",
         })
@@ -89,13 +89,23 @@ def shipped_program_arguments():
         return plistlib.loads(xml)["ProgramArguments"]
 
 
-_args = shipped_program_arguments()
+_args = program_arguments(SHIPPED)
 check("shipped fallback plist renders and yields args", bool(_args), f"got {_args!r}")
 check("--recover-core absent from shipped ProgramArguments",
       "--recover-core" not in _args, f"got {_args!r}")
-# Control: the check must be able to FAIL. A test that cannot go red certifies nothing.
-check("control: the assertion detects the flag when present",
-      "--recover-core" in (_args + ["--recover-core"]), "negative control did not fire")
+
+# Control: plant the flag in a real template and drive the SAME loader, so the
+# absence assertion is proven able to go red rather than true by construction.
+with tempfile.TemporaryDirectory() as _td:
+    _planted = pathlib.Path(_td) / "planted.plist"
+    _src = SHIPPED.read_text()
+    _open = _src.index("<array>", _src.index("<key>ProgramArguments</key>")) + len("<array>")
+    _planted.write_text(_src[:_open] + "\n        <string>--recover-core</string>" + _src[_open:])
+    _planted_args = program_arguments(_planted)
+check("control: the loader sees a planted --recover-core",
+      "--recover-core" in _planted_args, f"got {_planted_args!r}")
+check("control: the absence assertion would FAIL on the planted template",
+      not ("--recover-core" not in _planted_args), "absence check did not go red")
 
 print("== renderer: refuses to publish a bad render ==")
 with tempfile.TemporaryDirectory() as td:
