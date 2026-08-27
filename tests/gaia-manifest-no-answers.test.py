@@ -22,7 +22,7 @@ ALLOWED_KEYS = {"schema", "name", "description", "source", "prompt_preamble",
 CASE_ID = re.compile(r"gaia-l[123]-[0-9a-f]{8}\Z")
 
 # Changing the preamble is a deliberate act: update this digest in the same commit.
-METADATA_SHA256 = "9d909dc43928055d2e3ae231d317b65aca74e2ad6fc5037499581c6d8ada4980"
+METADATA_SHA256 = "c13773d5b4bcbd3c8268e6dd3620d68ef36530698179a0cdbdf7d0c261d0290e"
 PREAMBLE_SHA256 = "609ad2dca3d13a6c652903c463f6f85d56540fbfbfe4a43f3441b146b85fc625"
 
 failures: list[str] = []
@@ -52,7 +52,10 @@ def main() -> int:
     # EVERY free-text field is pinned, not just the preamble. name/description/
     # source are fixed for this suite too, so a substring predicate over them
     # would miss a smuggled answer exactly as the preamble shape check did.
+    # excluded.reason is free text too -- the only part of `excluded` that is not
+    # an identifier list, so it is pinned alongside the rest of the metadata.
     meta = {k: v for k, v in m.items() if k not in ("case_ids", "excluded")}
+    meta["excluded.reason"] = m["excluded"]["reason"]
     meta_digest = hashlib.sha256(
         json.dumps(meta, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     check(meta_digest == METADATA_SHA256,
