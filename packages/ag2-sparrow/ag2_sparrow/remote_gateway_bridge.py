@@ -215,13 +215,20 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
 # Optional fence for instanced lanes: claim only rooms on this suffix
 GATEWAY_ROOM_SUFFIX = (os.environ.get("GATEWAY_ROOM_SUFFIX") or "").strip()
+# Rooms on these suffixes belong to a foreign lane; the default lane's gateway
+# 403s them, and the failure policy then parks deliverable work as undeliverable.
+GATEWAY_FOREIGN_SUFFIXES = tuple(
+    s.strip() for s in (os.environ.get("GATEWAY_FOREIGN_SUFFIXES") or "").split(",")
+    if s.strip())
 
 
 def _instance_may_claim(peek_room: "str | None") -> bool:
     """Unaddressed proactives default to the owner's primary surface, which
     only the DEFAULT lane serves — an instanced lane must never claim them."""
     if not GATEWAY_INSTANCE:
-        return True
+        if peek_room is None:
+            return True
+        return not any(peek_room.endswith(s) for s in GATEWAY_FOREIGN_SUFFIXES)
     if peek_room is None:
         return False
     return not GATEWAY_ROOM_SUFFIX or peek_room.endswith(GATEWAY_ROOM_SUFFIX)
