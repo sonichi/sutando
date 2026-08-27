@@ -18,7 +18,9 @@ import json
 import pathlib
 import sys
 
-MANIFEST = pathlib.Path(__file__).resolve().parent.parent / "benchmarks" / "gaia-100.manifest.json"
+# Repo-relative data, not workspace state: the manifest ships beside this script.
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+MANIFEST = REPO_ROOT / "benchmarks" / "gaia-100.manifest.json"
 
 
 def case_id(row: dict) -> str:
@@ -66,7 +68,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gaia-root", required=True, type=pathlib.Path)
     ap.add_argument("--out", type=pathlib.Path,
-                    default=pathlib.Path(__file__).resolve().parent.parent / "benchmarks" / "gaia-100.json")
+                    default=REPO_ROOT / "benchmarks" / "gaia-100.json")
     args = ap.parse_args()
 
     suite = build(args.gaia_root)
