@@ -141,3 +141,9 @@ ag2-onboarding.txt
 coverage.xml
 diff-cover.md
 coverage-summary.md
+
+# Editor swap/backup files: a vim swap of .env carries the same live secrets,
+# and `.env` alone does not match `.env.swp`.
+*.swp
+*.swo
+*~
