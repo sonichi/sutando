@@ -3801,7 +3801,7 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
-        except Exception:
+        except Exception:  # pragma: no cover — handler glue; unreadable config leaves the guest tier
             pass
     # Collaborator status is orthogonal to WHICH arm resolved team tier — a
     # globally-allowlisted team sender can be a serving-channel collaborator.
