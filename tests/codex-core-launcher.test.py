@@ -46,6 +46,10 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
             "src/local_task_protocol.py",
+            # local_task_protocol resolves results through the readiness owner, so
+            # the fake repo must carry it or the workstream lookup fails closed.
+            "src/delivery/__init__.py",
+            "src/delivery/readiness.py",
             "src/result_markers.py",
             "src/task_priority.py",
             "src/task_workstreams.py",
