@@ -57,8 +57,8 @@ class RecordSample(unittest.TestCase):
                                "u7": 0.55, "r7": 1299000})
 
     def test_identical_values_do_not_grow_the_file(self):
-        qp.record_sample(state(), self.path, now=1.0)
-        self.assertFalse(qp.record_sample(state(), self.path, now=2.0))
+        qp.record_sample(state(), self.path)
+        self.assertFalse(qp.record_sample(state(), self.path))
         self.assertEqual(len(self.path.read_text().splitlines()), 1)
 
     def test_a_changed_utilization_is_a_new_sample(self):
@@ -143,6 +143,34 @@ class RecordSample(unittest.TestCase):
         self.assertTrue(qp.record_sample(state(u5="0.30", obs=1700000600.0), self.path))
         self.assertEqual([r["ts"] for r in qp._read_history(self.path)],
                          [1700000000.0, 1700000600.0])
+
+    def test_a_correlated_absurd_row_cannot_freeze_the_writer(self):
+        # 6th-round control: ts=r5=r7=1e100 is self-consistent under float
+        # precision (1e100-18000 == 1e100); the caller's clock refuses it.
+        import json as js
+        self.path.write_text(js.dumps(
+            {"ts": 1e100, "u5": 0.25, "r5": 1e100, "u7": 0.55, "r7": 1e100}) + "\n")
+        self.assertTrue(qp.record_sample(state(obs=1700000000.0), self.path))
+        self.assertTrue(qp.record_sample(state(u5="0.30", obs=1700000600.0), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)],
+                         [1700000000.0, 1700000600.0])
+
+    def test_the_writer_never_acknowledges_a_row_its_reader_refuses(self):
+        # 6th-round idempotence contract: a fractional reset cannot
+        # canonicalize losslessly -> refuse, never a True with empty read-back.
+        ok = qp.record_sample(
+            state(obs=1000.5, r5="1000.9", r7="1000.9"), self.path)
+        self.assertFalse(ok)
+        self.assertFalse(self.path.exists())
+
+    def test_an_overflowing_integer_is_invalid_not_fatal(self):
+        # json.loads accepts arbitrarily huge ints; float() raises
+        # OverflowError on them — that must read as invalid, not crash.
+        import json as js
+        self.path.write_text(
+            '{"ts": ' + "9" * 400 + ', "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 1000000}\n')
+        self.assertTrue(qp.record_sample(state(obs=5000.0), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [5000.0])
 
     def test_fully_nonfinite_utilization_records_nothing(self):
         # Qingyun's control: NaN/Inf utilization in every window -> False,
@@ -372,6 +400,29 @@ class DashboardAdapter(unittest.TestCase):
             self.assertEqual(len(body["windows"]["5h"]["segments"]), 1)
         finally:
             dashboard.WORKSPACE_DIR = old_ws
+
+    def test_a_nonfinite_payload_yields_500_not_an_empty_200(self):
+        # 6th-round control: strict-JSON failure must surface BEFORE headers.
+        import http.client
+        import http.server
+        import threading
+        import json as js
+        import dashboard
+        real = dashboard.quota_projection.chart_payload
+        dashboard.quota_projection.chart_payload = lambda *a, **k: {"x": float("nan")}
+        try:
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            c = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+            c.request("GET", "/api/quota-chart")
+            r = c.getresponse()
+            body = r.read().decode()
+            httpd.shutdown()
+            self.assertEqual(r.status, 500)
+            self.assertNotIn("NaN", body)
+            js.loads(body)  # the error body itself is strict JSON
+        finally:
+            dashboard.quota_projection.chart_payload = real
 
     def test_a_poisoned_history_file_still_serves_strict_json(self):
         # A hand-poisoned bare-NaN row must never reach the wire: the

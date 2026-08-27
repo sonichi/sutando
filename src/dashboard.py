@@ -899,14 +899,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
         elif urlparse(self.path).path == "/api/quota-chart":
-            payload = quota_projection.chart_payload(
-                WORKSPACE_DIR / "state" / "quota-history.jsonl",
-                datetime.now().timestamp())
-            self.send_response(200)
+            # Serialize BEFORE any status is sent: a strict-JSON failure must
+            # surface as a 500, never a 200 with an empty body.
+            try:
+                payload = quota_projection.chart_payload(
+                    WORKSPACE_DIR / "state" / "quota-history.jsonl",
+                    datetime.now().timestamp())
+                body = json.dumps(payload, allow_nan=False).encode()
+                code = 200
+            except ValueError:
+                body = b'{"error": "non-finite value in chart payload"}'
+                code = 500
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            # Strict wire JSON: a bare NaN would fail the browser's parse.
-            self.wfile.write(json.dumps(payload, allow_nan=False).encode())
+            self.wfile.write(body)
         elif urlparse(self.path).path == "/json":
             data = {
                 "score": get_score(),

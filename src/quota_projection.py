@@ -47,63 +47,74 @@ _WINDOW_KEYS = {"5h": ("u5", "r5"), "7d": ("u7", "r7")}
 _HDR = "anthropic-ratelimit-unified-{w}-{f}"
 
 
+# Furthest into the future an observation stamp may plausibly sit. Bounds are
+# judged against the caller-injected clock, never a row's own claims.
+MAX_FUTURE_SKEW_S = 3600.0
+
+
 def _finite(v) -> float | None:
     try:
         f = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return f if math.isfinite(f) else None
 
 
-def _sample_from_state(state: dict) -> dict | None:
+def _sample_from_state(state: dict, now: float) -> dict | None:
     """One history sample; each window parsed INDEPENDENTLY.
 
     The proxy may write any non-empty header subset, so a valid 5h-only or
     7d-only observation persists its window rather than vanishing. Non-finite
     values invalidate only their own window. No valid window -> no sample.
+    Bounds are validated on the CANONICAL (persisted) values, so the writer
+    never acknowledges a row its own reader would refuse.
     """
     headers = state.get("headers") or {}
     ts = _observation_ts(state)
-    if ts is None:
+    if ts is None or ts > now + MAX_FUTURE_SKEW_S:
         return None
     sample: dict = {"ts": ts}
     for w, (uk, rk) in _WINDOW_KEYS.items():
         u = _finite(headers.get(_HDR.format(w=w, f="utilization")))
         r = _finite(headers.get(_HDR.format(w=w, f="reset")))
-        if u is None or r is None:
-            continue
-        if not (r - WINDOW_SPANS[w] <= ts <= r):
+        if u is None or r is None or r != int(r):
+            continue  # a fractional reset cannot canonicalize losslessly
+        ri = int(r)
+        if not (ri - WINDOW_SPANS[w] <= ts <= ri):
             continue  # an observation outside its own window is inconsistent
-        sample[uk], sample[rk] = u, int(r)
+        sample[uk], sample[rk] = u, ri
     if len(sample) == 1:
         return None
-    return sample
+    return sample if _valid_row(sample, now) == sample else None
 
 
-def _valid_row(rec: dict) -> dict | None:
+def _valid_row(rec: dict, now: float) -> dict | None:
     """Canonical form of one stored row, or None if unusable.
 
-    A row needs a finite ts and at least one internally consistent window
-    (finite utilization, finite reset, ts inside [reset-span, reset]); an
-    inconsistent window is stripped rather than sinking the row.
+    A row needs a finite ts no further than the skew bound past `now`, and at
+    least one internally consistent window (finite utilization, losslessly
+    integer reset, ts inside [reset-span, reset]); an inconsistent window is
+    stripped rather than sinking the row. Window checks alone cannot refuse a
+    correlated absurdity like ts=reset=1e100 — the caller's clock does.
     """
     if not isinstance(rec, dict):
         return None
     ts = _finite(rec.get("ts"))
-    if ts is None:
+    if ts is None or ts > now + MAX_FUTURE_SKEW_S:
         return None
     out = {"ts": ts}
     for w, (uk, rk) in _WINDOW_KEYS.items():
         u, r = _finite(rec.get(uk)), _finite(rec.get(rk))
-        if u is None or r is None:
+        if u is None or r is None or r != int(r):
             continue
-        if not (r - WINDOW_SPANS[w] <= ts <= r):
+        ri = int(r)
+        if not (ri - WINDOW_SPANS[w] <= ts <= ri):
             continue
-        out[uk], out[rk] = u, int(r)
+        out[uk], out[rk] = u, ri
     return out if len(out) > 1 else None
 
 
-def _canonical_history(history_path: Path) -> tuple[list[dict], bool]:
+def _canonical_history(history_path: Path, now: float) -> tuple[list[dict], bool]:
     """Validated rows in strictly increasing ts, plus a physical-dirty flag.
 
     dirty=True whenever the file holds anything the canonical view dropped —
@@ -122,7 +133,7 @@ def _canonical_history(history_path: Path) -> tuple[list[dict], bool]:
         except ValueError:
             dirty = True
             continue
-        row = _valid_row(rec)
+        row = _valid_row(rec, now)
         if row is None:
             dirty = True
             continue
@@ -135,9 +146,10 @@ def _canonical_history(history_path: Path) -> tuple[list[dict], bool]:
     return rows, dirty
 
 
-def _read_history(history_path: Path) -> list[dict]:
+def _read_history(history_path: Path, now: float | None = None) -> list[dict]:
     """Chart-facing view: the canonical rows only."""
-    return _canonical_history(history_path)[0]
+    import time
+    return _canonical_history(history_path, time.time() if now is None else now)[0]
 
 
 def record_sample(state: dict, history_path: Path, now: float | None = None) -> bool:
@@ -148,7 +160,9 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
     under the lock the moment any write decision is made. Wire JSON is
     strict (allow_nan=False) end to end.
     """
-    sample = _sample_from_state(state)
+    import time
+    clock = time.time() if now is None else now
+    sample = _sample_from_state(state, clock)
     if sample is None:
         return False
 
@@ -163,7 +177,7 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
         return all(rec.get(k) == sample.get(k) for k in keys)
 
     with _LOCK:
-        history, dirty = _canonical_history(history_path)
+        history, dirty = _canonical_history(history_path, clock)
         if history:
             last = history[-1]
             if float(sample["ts"]) <= float(last["ts"]):
@@ -238,7 +252,7 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
 
 def chart_payload(history_path: Path, now: float, max_windows: int = 4) -> dict:
     """Everything the chart needs, for both windows."""
-    history = _read_history(history_path)
+    history = _read_history(history_path, now)
     return {
         "now": now,
         "windows": {
