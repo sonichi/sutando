@@ -14,8 +14,15 @@ Only bucketed / categorical **product events**:
 | `feature_used` | `feature` (snake_case, e.g. `morning_briefing`, `skill:<name>`) | Which features matter |
 | `task_processed` | `source` (`discord`/`telegram`/`slack`; more surfaces as wired) | Activation — whether installs process any tasks after launch, and via which surface |
 
-Skill adoption arrives through `feature_used` as `skill:<name>`, emitted for every
-skill by `hooks/skill-usage-telemetry.py` — there is no separate skill event.
+Skill adoption arrives through `feature_used` as `skill:<name>`, emitted by
+`hooks/skill-usage-telemetry.py` for every skill invoked **through the `Skill`
+tool**, on installs where that hook is registered. A skill run some other way,
+or an install without the hook, emits nothing. There is no separate skill event.
+
+Nothing emitted is undocumented: the only subprocess emit path
+(`src/telemetry.py` `_cli_main`) allowlists exactly `task_processed` and
+`feature_used` and exits non-zero on anything else, so the table above cannot be
+bypassed from the CLI.
 
 ### Documented but NOT wired
 
