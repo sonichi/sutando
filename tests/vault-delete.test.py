@@ -228,5 +228,29 @@ class TestVaultCliDeleteDispatch(unittest.TestCase):
         self.assertIn("delete KEY", buf.getvalue())
 
 
+class TestKeychainDeleteFailure(_FakeVaultBase):
+    """rc 44 means already-absent and is success; any OTHER non-zero may leave the
+    item live, so the manifest entry must survive rather than strand the secret."""
+
+    def test_a_locked_keychain_raises_and_keeps_the_manifest_entry(self):
+        vault_intercept.set_vault_key("LOCKED_KEY", "still-live")
+        # errSecInteractionNotAllowed: the launchd-teardown case. The 0/44 stub
+        # cannot produce it, which is why nothing previously exercised this path.
+        with patch("vault_intercept.subprocess.run",
+                   return_value=MagicMock(returncode=25308, stdout=b"", stderr=b"locked")):
+            with self.assertRaises(RuntimeError):
+                vault_intercept.delete_vault_key("LOCKED_KEY")
+        self.assertIn("LOCKED_KEY", vault_intercept.list_vault_keys(),
+                      "a failed Keychain delete must not deregister the key")
+
+    def test_item_not_found_is_still_success(self):
+        # The discriminating control: same code path, rc 44 instead, still deletes.
+        vault_intercept.set_vault_key("GONE_KEY", "x")
+        with patch("vault_intercept.subprocess.run",
+                   return_value=MagicMock(returncode=44, stdout=b"", stderr=b"not found")):
+            vault_intercept.delete_vault_key("GONE_KEY")
+        self.assertNotIn("GONE_KEY", vault_intercept.list_vault_keys())
+
+
 if __name__ == "__main__":
     unittest.main()

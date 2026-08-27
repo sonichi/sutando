@@ -239,13 +239,21 @@ def _deregister_key(key: str) -> None:
     os.replace(tmp, path)
 
 
+_ERRSEC_ITEM_NOT_FOUND = 44  # errSecItemNotFound
+
+
 def _delete_from_keychain(key: str) -> None:
-    # `security delete-generic-password` returns non-zero when already gone; the
-    # code is NOT inspected. Manifest drop is unconditional, so half-states reconcile.
-    subprocess.run(
+    # rc 44 is errSecItemNotFound — already gone, so the manifest drop proceeds.
+    # Any other non-zero may leave the item LIVE; dropping it then strands a secret.
+    result = subprocess.run(
         ["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
         capture_output=True,
     )
+    if result.returncode not in (0, _ERRSEC_ITEM_NOT_FOUND):
+        raise RuntimeError(
+            f"vault: failed to delete '{key}' from Keychain "
+            f"(rc={result.returncode}); manifest entry kept so the secret is not stranded"
+        )
     _deregister_key(key)
 
 
@@ -256,7 +264,8 @@ def delete_vault_key(key: str) -> None:
     one of {Keychain item, manifest entry} survives, is SUCCESS, not an error —
     the desktop T2.8 teardown re-runs and must not fail on an already-gone key.
     Raises ValueError on an invalid key name (the same rule set_vault_key
-    enforces — not loosened here).
+    enforces — not loosened here), and RuntimeError when the Keychain delete
+    fails for any reason other than the item already being absent.
     """
     if not _ENV_KEY_RE.match(key or ""):
         raise ValueError(f"vault: invalid key name '{key}' (want [A-Za-z_][A-Za-z0-9_]*)")
