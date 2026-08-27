@@ -63,6 +63,9 @@ SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 # `exec claude` fallback inherits it directly; injected into the tmux launch
 # branches via `new-session -e` (below) since tmux runs the command under the
 # server's environment, not necessarily this shell's.
+# Snapshot what we INHERITED before the export below overwrites it: the
+# in-session restart guard must not read the marker this script sets itself.
+CALLER_CORE_SESSION="${SUTANDO_CORE_SESSION:-}"
 export SUTANDO_CORE_SESSION=1
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
@@ -480,6 +483,26 @@ log_restart_attempt() {
     "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
     >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
 }
+# Enforces the HAZARD above: a --restart from inside sutando-core kill-sessions
+# the very agent running this command. Refuse, and name the paths that do work.
+if [ -n "$RESTART_REQUESTED" ] && [ "$CALLER_CORE_SESSION" = "1" ] \
+   && [ "${SUTANDO_ALLOW_INSESSION_RESTART:-}" != "1" ]; then
+  {
+    echo "start-cli: refusing --restart from inside the sutando-core session."
+    echo "  kill-session would terminate the agent that is running this command."
+    echo "  Use one of these instead:"
+    echo "    1. owner types 'restart core' in chat -> the bridge writes a restart"
+    echo "       intent that Sutando.app consumes and relaunches in the GUI login session."
+    echo "    2. dead core: the launchd health-check fallback recovers it out-of-session."
+    echo "    3. a human in a terminal OUTSIDE the core, or the Sutando.app menu."
+    echo "  NOT --emit-task: that queues work for the core to consume, and a core"
+    echo "  that needs restarting is exactly the one that cannot consume it."
+    echo "  Out-of-session automation launched from a core shell inherits"
+    echo "  SUTANDO_CORE_SESSION; it can override with SUTANDO_ALLOW_INSESSION_RESTART=1."
+  } >&2
+  log_restart_attempt "refused: inherited SUTANDO_CORE_SESSION=1 (in-session self-kill), no override set"
+  exit 1
+fi
 if [ -n "$RESTART_REQUESTED" ]; then
   log_restart_attempt "begin (session=$(tmux_session_exists && echo up || echo none) core=$(core_claude_running && echo up || echo none))"
   if tmux_session_exists || core_claude_running; then
