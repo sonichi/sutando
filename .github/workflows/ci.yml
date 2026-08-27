@@ -278,27 +278,10 @@ jobs:
           # Per-file cap: without it one hung suite burns the job budget and
           # the job is CANCELED mid-suite.
 
-          # Bare integers: `xargs -I{}` rewrites a tab in the replaced string
-          # to a space, so a delimiter scheme stops splitting silently.
-          # One worktree per worker: suites share the resolved workspace otherwise
-          # and race on it. A worktree resolves to its own tree by path.
-          WTDIR="$(mktemp -d)"
-          for w in $(seq 1 "$WORKERS"); do
-            git worktree add --detach -q "$WTDIR/$w" HEAD
-          done
-          trap 'for w in $(seq 1 "$WORKERS"); do git worktree remove --force "$WTDIR/$w" 2>/dev/null || true; done; rm -rf "$WTDIR" "$RECDIR"' EXIT
-          export WTDIR WORKERS
-
-          seq 1 "$N" | xargs -P "$WORKERS" -I{} bash -c '
-            idx="$1"
-            f="$(sed -n "${idx}p" "$RECDIR/files")"
-            rec="$RECDIR/$idx"
-            # Round-robin a worker slot; $f is repo-relative so it resolves in the worktree.
-            wt="$WTDIR/$(( (idx - 1) % WORKERS + 1 ))"
-            out="$(cd "$wt" && timeout -k 5 120 python3 "$f" 2>&1)" && rc=0 || rc=$?
-            printf "%s" "$out" > "$rec.out"
-            printf "%s\n" "$rc" > "$rec.rc"
-          ' _ {}
+          # Shared scheduler: one SERIAL worker per worktree, so a slot can never
+          # hold two suites — and the regression drives this same script.
+          bash scripts/parallel-suite-lane.sh "$WORKERS" "$RECDIR/files" "$RECDIR" \
+            timeout -k 5 120 python3
           _idx=0
           while IFS= read -r f; do
             echo "→ $f"

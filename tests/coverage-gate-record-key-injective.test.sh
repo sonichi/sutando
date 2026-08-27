@@ -17,15 +17,17 @@ fi
 
 # Strip comments first: both files describe the defect in prose, which a naive
 # grep would flag as the defect itself.
-for f in "$here/scripts/coverage-gate.sh" "$here/.github/workflows/ci.yml"; do
+for f in "$here/scripts/coverage-gate.sh" "$here/.github/workflows/ci.yml" \
+         "$here/scripts/parallel-suite-lane.sh"; do
     code="$(sed 's/#.*$//' "$f")"
     if printf '%s' "$code" | grep -q 'tr "/\.\|tr .\/\.'; then
         echo "  FAIL: $(basename "$f") derives the record key from the path — not injective"; fail=1
     else
         echo "  OK: $(basename "$f") does not key records by path name (comments excluded)"
     fi
-    printf '%s' "$code" | grep -q 'sed -n "${idx}p"' \
-        || { echo "  FAIL: $(basename "$f") worker does not resolve its path by index"; fail=1; }
+    # A lane either resolves by index itself or delegates to the shared scheduler.
+    printf '%s' "$code" | grep -qE 'sed -n "\$\{idx\}p"|parallel-suite-lane\.sh' \
+        || { echo "  FAIL: $(basename "$f") neither keys by index nor calls the scheduler"; fail=1; }
 done
 
 # --- 3. BEHAVIOURAL: colliding pair, one fails, one passes -> failure reported ---
@@ -37,8 +39,8 @@ RECDIR="$tmp/rec"; mkdir -p "$RECDIR"; export RECDIR
 ( cd "$tmp" && find tests -name '*.test.py' | sort > "$RECDIR/files" )
 n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
 
-# Same worker shape as the loops under test: bare integers, since `xargs -I{}`
-# rewrites a tab in the replaced string to a space.
+# Fixture harness (production now schedules via parallel-suite-lane.sh);
+# bare integers since `xargs -I{}` rewrites a tab to a space.
 ( cd "$tmp" && seq 1 "$n" | xargs -P 4 -I{} bash -c '
     idx="$1"; f="$(sed -n "${idx}p" "$RECDIR/files")"
     rc=0; out="$(python3 "$f" 2>&1)" || rc=$?
