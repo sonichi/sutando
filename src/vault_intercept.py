@@ -225,9 +225,8 @@ def set_vault_key(key: str, value: str) -> None:
 
 
 def _deregister_key(key: str) -> None:
-    # Reverse of _register_key: drop KEY from the manifest index. Absent key is
-    # a no-op (no write) so a re-run doesn't churn the file — idempotent by
-    # construction. Atomic write, same as _register_key, for the present case.
+    # Reverse of _register_key. Absent key is a no-op (no write), so a re-run
+    # does not churn the file. Atomic write, same as _register_key.
     manifest = _read_manifest()
     if key not in manifest:
         return
@@ -241,12 +240,8 @@ def _deregister_key(key: str) -> None:
 
 
 def _delete_from_keychain(key: str) -> None:
-    # Reverse of _store_in_keychain. `security delete-generic-password` returns
-    # non-zero (errSecItemNotFound) when the item is already gone; we don't
-    # inspect the code — an absent item is success for an idempotent delete. The
-    # manifest entry is dropped UNCONDITIONALLY afterwards (not gated on the
-    # Keychain result), so a half-state — manifest lists a key whose Keychain
-    # item is gone, or vice versa — is reconciled rather than left ghosting.
+    # `security delete-generic-password` returns non-zero when already gone; the
+    # code is NOT inspected. Manifest drop is unconditional, so half-states reconcile.
     subprocess.run(
         ["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
         capture_output=True,

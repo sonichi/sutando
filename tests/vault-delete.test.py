@@ -85,9 +85,7 @@ class _FakeVaultBase(unittest.TestCase):
         self._tmp.cleanup()
 
 
-# ---------------------------------------------------------------------------
-# vault_intercept.delete_vault_key — the helper
-# ---------------------------------------------------------------------------
+# --- vault_intercept.delete_vault_key — the helper ---
 
 
 class TestDeleteVaultKeyHelper(_FakeVaultBase):
@@ -111,9 +109,8 @@ class TestDeleteVaultKeyHelper(_FakeVaultBase):
         self.assertEqual(vault_intercept.list_vault_keys(), [])
 
     def test_half_state_manifest_ghost_is_reconciled(self):
-        # A key registered in the manifest whose Keychain item is gone (the
-        # "ghost" vault_list would otherwise report). delete must scrub the
-        # manifest entry rather than error on the missing Keychain item.
+        # Manifest-registered key whose Keychain item is gone (the "ghost").
+        # delete must scrub the manifest, not error on the missing item.
         vault_intercept._register_key("GHOST")
         self.assertIn("GHOST", vault_intercept.list_vault_keys())
         self.assertNotIn("GHOST", self.keychain)  # no Keychain half
@@ -122,9 +119,8 @@ class TestDeleteVaultKeyHelper(_FakeVaultBase):
         self.assertNotIn("GHOST", vault_intercept.list_vault_keys())
 
     def test_half_state_orphan_keychain_item_is_reconciled(self):
-        # The mirror image: a Keychain item with no manifest entry. delete must
-        # remove the Keychain item (so a later get fails) without erroring on
-        # the missing manifest entry.
+        # Mirror image: Keychain item, no manifest entry. delete must remove the
+        # item (a later get fails) without erroring on the absent manifest entry.
         self.keychain["ORPHAN"] = "leftover"
         self.assertNotIn("ORPHAN", vault_intercept.list_vault_keys())
 
@@ -181,9 +177,7 @@ class TestDeleteKeyNameValidation(_FakeVaultBase):
         vault_intercept.delete_vault_key("VALID_KEY")
 
 
-# ---------------------------------------------------------------------------
-# secret-vault.py — the `delete` CLI subcommand
-# ---------------------------------------------------------------------------
+# --- secret-vault.py — the `delete` CLI subcommand ---
 
 
 class TestVaultCliDelete(unittest.TestCase):
@@ -203,9 +197,8 @@ class TestVaultCliDelete(unittest.TestCase):
         self.assertEqual(cm.exception.code, 1)
 
     def test_absent_key_exits_0(self):
-        # The teardown contract at the CLI layer: deleting an absent key is a
-        # clean exit 0 (main returns without raising SystemExit). The helper is
-        # stubbed to a no-op success, standing in for an already-gone key.
+        # CLI teardown contract: deleting an absent key exits 0 (no SystemExit).
+        # Helper stubbed to a no-op success, standing in for an already-gone key.
         with patch("vault.delete_vault_key", return_value=None):
             with patch("vault.sys.argv", ["secret-vault.py", "delete", "GONE_KEY"]):
                 with redirect_stdout(io.StringIO()):

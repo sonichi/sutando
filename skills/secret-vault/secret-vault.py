@@ -63,10 +63,8 @@ def cmd_set(key: str) -> None:
 
 
 def cmd_delete(key: str) -> None:
-    # Reverse of cmd_set: remove the Keychain item AND the manifest entry.
-    # delete_vault_key is idempotent — an already-gone key is not an error — so
-    # the desktop teardown can re-run without failing on a key it already
-    # deleted. Only an invalid key name raises (ValueError), same as cmd_set.
+    # Reverse of cmd_set: Keychain item AND manifest entry. Idempotent — an
+    # already-gone key is not an error; only an invalid name raises, as in cmd_set.
     try:
         delete_vault_key(key)
     except ValueError as e:
