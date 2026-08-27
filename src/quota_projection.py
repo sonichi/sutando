@@ -10,6 +10,7 @@ quota-state dict; nothing here touches workspace resolution or HTTP.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -116,7 +117,7 @@ def _valid_row(rec: dict, now: float) -> dict | None:
     return out if len(out) > 1 else None
 
 
-def _canonical_history(history_path: Path, now: float) -> tuple[list[dict], bool]:
+def _canonical_history(history_path: Path, now: float) -> "tuple[list[dict], bool, bool]":
     """Validated rows in strictly increasing ts, plus a physical-dirty flag.
 
     dirty=True whenever the file holds anything the canonical view dropped —
@@ -125,8 +126,12 @@ def _canonical_history(history_path: Path, now: float) -> tuple[list[dict], bool
     """
     try:
         lines = history_path.read_text().splitlines()
+    except FileNotFoundError:
+        return [], False, True   # genuinely empty
     except OSError:
-        return [], False
+        # An EXISTING but unreadable file is not an empty history; saying so
+        # would let a transient error fork the record.
+        return [], False, False
     rows: list[dict] = []
     dirty = False
     for line in lines:
@@ -145,7 +150,7 @@ def _canonical_history(history_path: Path, now: float) -> tuple[list[dict], bool
             dirty = True  # out-of-order physical line never joins the canon
             continue
         rows.append(row)
-    return rows, dirty
+    return rows, dirty, True
 
 
 def _read_history(history_path: Path, now: float | None = None) -> list[dict]:
@@ -154,70 +159,130 @@ def _read_history(history_path: Path, now: float | None = None) -> list[dict]:
     return _canonical_history(history_path, time.time() if now is None else now)[0]
 
 
-def record_sample(state: dict, history_path: Path, now: float | None = None) -> bool:
-    """Append one sample if it says something new; True when appended.
+def _latest_path(history_path: Path) -> Path:
+    return history_path.with_name(history_path.name + ".latest.json")
 
-    Everything is judged against the CANONICAL history: malformed lines,
-    invalid rows, stripped windows and order violations are compacted away
-    under the lock the moment any write decision is made. Wire JSON is
-    strict (allow_nan=False) end to end.
+
+def _write_latest(history_path: Path, sample: dict, ts: float) -> None:
+    """The newest producer observation, per window; null is a TOMBSTONE.
+
+    The chart's "current" is defined by THIS record alone — an old segment can
+    never present as current just because its reset sits furthest out.
+    """
+    latest = {"ts": ts, "windows": {}}
+    for w, (uk, rk) in _WINDOW_KEYS.items():
+        if uk in sample:
+            latest["windows"][w] = {"u": sample[uk], "r": sample[rk]}
+        else:
+            latest["windows"][w] = None
+    fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(latest, allow_nan=False))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _latest_path(history_path))
+
+
+def _read_latest(history_path: Path, now: float) -> dict | None:
+    try:
+        d = json.loads(_latest_path(history_path).read_text())
+    except (OSError, ValueError):
+        return None
+    ts = _finite(d.get("ts")) if isinstance(d, dict) else None
+    if ts is None or not (0 < ts <= now + MAX_FUTURE_SKEW_S):
+        return None
+    return d
+
+
+def record_sample(state: dict, history_path: Path, now: float | None = None) -> bool:
+    """Append one sample if it says something new; True when durably appended.
+
+    Contract (reviewer-driven): the writer owns the physical cap on EVERY
+    path, atomicity is cross-process (flock on a sibling), success is durable
+    (fsync before the ack), an unreadable existing history refuses the write,
+    and every accepted observation refreshes the latest-observation sidecar —
+    including a fully-invalid one, which writes per-window TOMBSTONES so the
+    chart can never keep presenting a stale window as current.
     """
     import time
     clock = time.time() if now is None else now
-    sample = _sample_from_state(state, clock)
-    if sample is None:
+    ts = _observation_ts(state)
+    if ts is None or not (0 < ts <= clock + MAX_FUTURE_SKEW_S):
         return False
+    sample = _sample_from_state(state, clock)
 
-    def _rewrite(rows):
+    def _cap(rows):
+        if len(rows) <= MAX_LINES:
+            return rows
+        return rows[len(rows) - MAX_LINES:]
+
+    def _commit(rows):
+        rows = _cap(rows)
         fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
         with os.fdopen(fd, "w") as f:
             f.write("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, history_path)
 
     def _same(rec):
         keys = [k for pair in _WINDOW_KEYS.values() for k in pair]
         return all(rec.get(k) == sample.get(k) for k in keys)
 
+    lock_path = history_path.with_name(history_path.name + ".lock")
     with _LOCK:
-        history, dirty = _canonical_history(history_path, clock)
-        if history:
-            last = history[-1]
-            if float(sample["ts"]) <= float(last["ts"]):
-                # A delayed or re-read snapshot no newer than the canonical
-                # tail never lands: ordering is canonical by producer time.
-                if dirty:
-                    _rewrite(history)
-                return False
-            if _same(last):
-                # Unchanged run: keep its FIRST endpoint, advance its LAST.
-                if len(history) >= 2 and _same(history[-2]):
-                    history[-1] = {**last, "ts": sample["ts"]}
-                    _rewrite(history)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            try:
+                history, dirty, readable = _canonical_history(history_path, clock)
+                if not readable:
+                    return False  # never fork an unreadable record
+                latest = _read_latest(history_path, clock)
+                newer = latest is None or ts > float(latest.get("ts", 0))
+                if sample is None:
+                    # Valid observation time, no valid window: tombstone both
+                    # so the chart stops presenting anything as current.
+                    if newer:
+                        _write_latest(history_path, {"ts": ts}, ts)
                     return False
-                # Only the run's start exists — append its trailing endpoint.
-        if dirty:
-            _rewrite(history)
-        if len(history) + 1 > MAX_LINES:
-            keep = history[-(MAX_LINES - 1):] + [sample]
-            _rewrite(keep)
-            return True
-        # A crash can leave a newline-less torn tail; appending onto it would
-        # concatenate and lose this acknowledged sample on the next read.
-        needs_nl = False
-        try:
-            raw = history_path.read_bytes()
-            needs_nl = bool(raw) and not raw.endswith(b"\n")
-        except OSError:
-            pass
-        with history_path.open("a") as f:
-            if needs_nl:
-                f.write("\n")
-            f.write(json.dumps(sample, allow_nan=False) + "\n")
-        return True
+                if newer:
+                    _write_latest(history_path, sample, ts)
+                if history:
+                    last = history[-1]
+                    if float(sample["ts"]) <= float(last["ts"]):
+                        if dirty or len(history) > MAX_LINES:
+                            _commit(history)
+                        return False
+                    if _same(last):
+                        if len(history) >= 2 and _same(history[-2]):
+                            history[-1] = {**last, "ts": sample["ts"]}
+                            _commit(history)
+                            return False
+                        # Only the run's start exists — append its end below.
+                if dirty or len(history) + 1 > MAX_LINES:
+                    _commit(history + [sample])
+                    return True
+                needs_nl = False
+                try:
+                    raw = history_path.read_bytes()
+                    needs_nl = bool(raw) and not raw.endswith(b"\n")
+                except OSError:
+                    pass
+                with history_path.open("a") as f:
+                    if needs_nl:
+                        f.write("\n")
+                    f.write(json.dumps(sample, allow_nan=False) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                return True
+            finally:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 def _window_segments(history: list[dict], u_key: str, r_key: str,
-                     span: float, now: float, max_windows: int) -> dict:
+                     span: float, now: float, max_windows: int,
+                     live_reset: "int | None") -> dict:
     """Normalize samples into per-reset segments of equal width.
 
     Segment k (0-based, oldest first) holds points (x, y): x = fraction of
@@ -240,7 +305,9 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
     segments = []
     for reset in sorted(by_reset)[-max_windows:]:
         pts = sorted(by_reset[reset], key=lambda p: p["x"])
-        current = reset > now
+        # Current = the latest observation's window (resets can shrink; a
+        # stale segment must not out-shout it). Tombstoned -> nothing current.
+        current = live_reset is not None and reset == live_reset
         seg = {"reset": reset, "current": current, "points": pts}
         if current and pts:
             # Projection extends only from the last VERIFIED observation; a
@@ -255,10 +322,20 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
 def chart_payload(history_path: Path, now: float, max_windows: int = 4) -> dict:
     """Everything the chart needs, for both windows."""
     history = _read_history(history_path, now)
+    latest = _read_latest(history_path, now) or {}
+    wins = latest.get("windows") or {}
+
+    def _live_reset(w):
+        rec = wins.get(w)
+        r = _finite(rec.get("r")) if isinstance(rec, dict) else None
+        return int(r) if r is not None else None
+
     return {
         "now": now,
         "windows": {
-            "5h": _window_segments(history, "u5", "r5", WINDOW_SPANS["5h"], now, max_windows),
-            "7d": _window_segments(history, "u7", "r7", WINDOW_SPANS["7d"], now, max_windows),
+            "5h": _window_segments(history, "u5", "r5", WINDOW_SPANS["5h"], now,
+                                   max_windows, _live_reset("5h")),
+            "7d": _window_segments(history, "u7", "r7", WINDOW_SPANS["7d"], now,
+                                   max_windows, _live_reset("7d")),
         },
     }

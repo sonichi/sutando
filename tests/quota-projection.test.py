@@ -176,6 +176,88 @@ class RecordSample(unittest.TestCase):
         self.assertEqual([r["ts"] for r in qp._read_history(self.path)],
                          [1700000000.0, 1700000600.0])
 
+    def test_the_cap_holds_on_the_refresh_path_too(self):
+        # Reviewer control: an over-cap file + a newer same-value observation
+        # took the early-return and left the file over cap.
+        import json as js
+        old_max = qp.MAX_LINES
+        qp.MAX_LINES = 5
+        try:
+            R = 1000000
+            rows = [{"ts": 990000.0 + i, "u5": round(0.1 + i * 0.01, 3),
+                     "r5": R, "u7": 0.5, "r7": R} for i in range(7)]
+            rows[-1]["u5"] = rows[-2]["u5"]     # last two form an unchanged run
+            self.path.write_text("".join(js.dumps(r) + "\n" for r in rows))
+            st = state(u5=str(rows[-1]["u5"]), r5=R, u7="0.5", r7=R,
+                       obs=rows[-1]["ts"] + 60)
+            self.assertFalse(qp.record_sample(st, self.path))  # refresh path
+            n = len(self.path.read_text().splitlines())
+            self.assertLessEqual(n, qp.MAX_LINES, f"file still over cap: {n}")
+        finally:
+            qp.MAX_LINES = old_max
+
+    def test_max_lines_one_keeps_exactly_one(self):
+        old_max = qp.MAX_LINES
+        qp.MAX_LINES = 1
+        try:
+            for i in range(3):
+                qp.record_sample(state(u5=f"0.{10 + i}", obs=1000.0 + i), self.path)
+            self.assertEqual(len(self.path.read_text().splitlines()), 1)
+        finally:
+            qp.MAX_LINES = old_max
+
+    def test_cross_process_acks_all_survive(self):
+        # Reviewer control: six PROCESSES (not threads) write concurrently;
+        # every acked sample must be in the final file (cap not in play).
+        import subprocess
+        import sys as _sys
+        procs = []
+        for i in range(6):
+            code = (
+                "import sys; sys.path.insert(0, %r)\n"
+                "import quota_projection as qp\n"
+                "from pathlib import Path\n"
+                "import tests_helper_state as h\n"
+            ) % str(REPO / "src")
+            # inline the state builder instead of a helper import
+            code = (
+                "import sys, json; sys.path.insert(0, %r)\n"
+                "import quota_projection as qp\n"
+                "from pathlib import Path\n"
+                "from datetime import datetime, timezone\n"
+                "obs = 1000.0 + %d\n"
+                "lc = datetime.fromtimestamp(obs, timezone.utc).isoformat().replace('+00:00','Z')\n"
+                "st = {'last_checked': lc, 'headers': {\n"
+                " 'anthropic-ratelimit-unified-5h-utilization': '0.%d',\n"
+                " 'anthropic-ratelimit-unified-5h-reset': str(int(obs+9000)),\n"
+                " 'anthropic-ratelimit-unified-7d-utilization': '0.5',\n"
+                " 'anthropic-ratelimit-unified-7d-reset': str(int(obs+300000))}}\n"
+                "print(int(qp.record_sample(st, Path(%r))))\n"
+            ) % (str(REPO / "src"), i, 20 + i, str(self.path))
+            procs.append(subprocess.Popen([_sys.executable, "-c", code],
+                                          stdout=subprocess.PIPE, text=True))
+        acks = []
+        for i, pr in enumerate(procs):
+            out, _ = pr.communicate(timeout=60)
+            if out.strip() == "1":
+                acks.append(i)
+        recs = qp._read_history(self.path)
+        kept_ts = {r["ts"] for r in recs}
+        for i in acks:
+            self.assertIn(1000.0 + i, kept_ts,
+                          f"acked sample {i} missing — ack was not durable")
+
+    def test_an_unreadable_existing_history_refuses_the_write(self):
+        import os as _os
+        qp.record_sample(state(obs=1000.0), self.path)
+        _os.chmod(self.path, 0)
+        try:
+            got = qp.record_sample(state(u5="0.9", obs=2000.0), self.path)
+        finally:
+            _os.chmod(self.path, 0o600)
+        self.assertFalse(got, "an unreadable history must refuse, not fork")
+        self.assertEqual(len(qp._read_history(self.path)), 1)
+
     def test_the_writer_never_acknowledges_a_row_its_reader_refuses(self):
         # 6th-round idempotence contract: a fractional reset cannot
         # canonicalize losslessly -> refuse, never a True with empty read-back.
@@ -362,13 +444,60 @@ class ChartSeries(unittest.TestCase):
             qp.chart_payload(self.path, now=float(reset + 100))["windows"]["5h"]["segments"], [])
 
     def test_current_window_carries_a_pace_projection(self):
+        # Through the WRITER, so the latest-observation sidecar defines current.
         now = 1000000.0
         reset = int(now + SPAN5 // 2)          # halfway through, still current
-        ts = int(now)                          # x = 0.5
-        self.write([{"ts": ts, "u5": 0.4, "r5": reset, "u7": 0.1, "r7": reset}])
+        qp.record_sample(state(u5="0.4", r5=reset, u7="0.1", r7=int(now + 300000),
+                               obs=now), self.path)
         seg = qp.chart_payload(self.path, now=now)["windows"]["5h"]["segments"][0]
         self.assertTrue(seg["current"])
         self.assertAlmostEqual(seg["projected_end"], 0.8)  # 0.4 / 0.5
+
+    def test_history_alone_is_never_current(self):
+        # Direct-written rows with no latest-observation sidecar: rendered as
+        # history, but nothing is current and nothing projects.
+        now = 1000000.0
+        reset = int(now + SPAN5 // 2)
+        self.write([{"ts": int(now), "u5": 0.4, "r5": reset, "u7": 0.1, "r7": reset}])
+        seg = qp.chart_payload(self.path, now=now)["windows"]["5h"]["segments"][0]
+        self.assertFalse(seg["current"])
+        self.assertNotIn("projected_end", seg)
+
+    def test_a_tombstoned_window_has_nothing_current(self):
+        # Reviewer control: newer observation with NaN 5h + valid 7d — the old
+        # 5h curve must stop presenting as current; 7d stays live.
+        now0 = 1000000.0
+        r5 = int(now0 + 9000); r7 = int(now0 + 300000)
+        qp.record_sample(state(u5="0.8", r5=r5, u7="0.35", r7=r7, obs=now0), self.path)
+        qp.record_sample(state(u5="NaN", r5=r5, u7="0.4", r7=r7, obs=now0 + 60), self.path)
+        pay = qp.chart_payload(self.path, now=now0 + 120)
+        cur5 = [s for s in pay["windows"]["5h"]["segments"] if s["current"]]
+        cur7 = [s for s in pay["windows"]["7d"]["segments"] if s["current"]]
+        self.assertEqual(cur5, [], "stale 5h presented as current past its tombstone")
+        self.assertEqual(len(cur7), 1)
+        self.assertNotIn("projected_end", pay["windows"]["5h"]["segments"][0])
+
+    def test_a_fully_invalid_observation_tombstones_both_windows(self):
+        now0 = 1000000.0
+        qp.record_sample(state(obs=now0), self.path)
+        self.assertFalse(qp.record_sample(
+            state(u5="NaN", u7="NaN", obs=now0 + 60), self.path))
+        pay = qp.chart_payload(self.path, now=now0 + 120)
+        for w in ("5h", "7d"):
+            self.assertEqual([s for s in pay["windows"][w]["segments"] if s["current"]], [])
+
+    def test_current_follows_the_newer_observation_when_resets_shrink(self):
+        # Reviewer control: old ts with a FURTHER reset must not out-shout a
+        # newer observation whose reset is nearer.
+        now0 = 1000000.0
+        qp.record_sample(state(u5="0.8", r5=int(now0 + 11000), u7="0.1",
+                               r7=int(now0 + 300000), obs=now0), self.path)
+        qp.record_sample(state(u5="0.1", r5=int(now0 + 5000), u7="0.1",
+                               r7=int(now0 + 300000), obs=now0 + 100), self.path)
+        segs = qp.chart_payload(self.path, now=now0 + 200)["windows"]["5h"]["segments"]
+        cur = [s for s in segs if s["current"]]
+        self.assertEqual(len(cur), 1)
+        self.assertEqual(cur[0]["reset"], int(now0 + 5000))
 
     def test_max_windows_keeps_the_newest(self):
         resets = [1000000 + i * SPAN5 for i in range(6)]
