@@ -142,6 +142,18 @@ class SilentRefusal(unittest.TestCase):
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_the_remedy_hint_still_matches_what_room_ops_emits(self):
+        # The hint keys on room_ops' own prose, and run_send stubs that same
+        # string — so only a producer-side check can catch a reword.
+        emitters = sorted((REPO / "skills" / "agent-room-ops").glob("*.py"))
+        self.assertTrue(emitters, "no room-ops modules found — check the path")
+        emitting = [p.name for p in emitters
+                    if "no gateway configured" in p.read_text()]
+        self.assertTrue(
+            emitting,
+            "no room-ops module emits 'no gateway configured' any more; the "
+            "remedy hint in notify_reviewers.py is now dead and must be updated")
+
     def test_success_still_reports_the_event_id(self):
         p = run_send('{"ok": true, "event_id": "$abc123"}')
         self.assertEqual(p.returncode, 0)
