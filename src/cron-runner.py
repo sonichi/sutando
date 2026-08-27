@@ -144,6 +144,15 @@ def cron_matches(expr: str, t: time.struct_time) -> bool:
         return False
     if t.tm_hour not in _parse_field(hour, 0, 23):
         return False
+    return _day_matches(dom, month, dow, t)
+
+
+def _day_matches(dom: str, month: str, dow: str, t: time.struct_time) -> bool:
+    """True if the date part of ``t`` satisfies the dom/month/dow fields.
+
+    Split out so the period scan can reject a whole day with one test instead
+    of re-deriving DOM/DOW semantics — two copies of this would drift.
+    """
     if t.tm_mon not in _parse_field(month, 1, 12):
         return False
     # Standard cron DOM/DOW semantics: when both are restricted (not '*'), a
@@ -171,17 +180,39 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
     Derived from the expression itself rather than declared, so it stays right
     when a schedule is edited. Bounded by MAX_CATCHUP_SECONDS like the scan below.
     """
-    # Scan BACKWARD and stop at two hits: a daily job has at most one fire in a
-    # 24h window, so a forward MAX_CATCHUP_SECONDS scan can never measure it.
-    fires = []
-    m = (now_epoch // 60) * 60
+    # Walk BACKWARD by DAY, not by minute: a whole day is rejected with one
+    # date test, and only a matching day expands its hour x minute candidates.
+    fields = expr.split()
+    if len(fields) != 5:
+        raise ValueError(f"cron expression must have 5 fields: {expr!r}")
+    minute_f, hour_f, dom_f, month_f, dow_f = fields
+    hours = sorted(_parse_field(hour_f, 0, 23), reverse=True)
+    minutes = sorted(_parse_field(minute_f, 0, 59), reverse=True)
+    if not hours or not minutes:
+        return None
+
     floor = now_epoch - PERIOD_SCAN_MAX_SECONDS
-    while m >= floor:
-        if cron_matches(expr, time.localtime(m)):
-            fires.append(m)
-            if len(fires) == 2:
-                return fires[0] - fires[1]
-        m -= 60
+    fires = []
+    cur = time.localtime(now_epoch)
+    y, mo, d = cur.tm_year, cur.tm_mon, cur.tm_mday
+    for _ in range(PERIOD_SCAN_MAX_SECONDS // 86400 + 2):
+        # Anchor on noon: midnight can be skipped or repeated by a DST shift.
+        noon = time.mktime((y, mo, d, 12, 0, 0, 0, 0, -1))
+        if _day_matches(dom_f, month_f, dow_f, time.localtime(noon)):
+            for h in hours:
+                for m in minutes:
+                    epoch = int(time.mktime((y, mo, d, h, m, 0, 0, 0, -1)))
+                    if epoch > now_epoch:
+                        continue
+                    # Candidates only descend, so the first one under the
+                    # floor means no second fire exists inside the window.
+                    if epoch < floor:
+                        return None
+                    fires.append(epoch)
+                    if len(fires) == 2:
+                        return fires[0] - fires[1]
+        prev = time.localtime(noon - 86400)
+        y, mo, d = prev.tm_year, prev.tm_mon, prev.tm_mday
     return None
 
 

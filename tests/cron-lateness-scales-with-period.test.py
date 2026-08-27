@@ -80,27 +80,60 @@ _elapsed = time.perf_counter() - _t0
 # 4 exprs x 5 fields = at most 20 distinct parses, however many minutes are scanned.
 ok(f"parse count bounded by fields, not minutes ({_info.misses} misses)",
    _info.misses <= 20)
-ok(f"cache actually serves the scan ({_info.hits} hits)", _info.hits > 1000)
-# Generous bound: measured ~0.03s locally; 2s still catches an O(n) parse regression,
-# which costs seconds per call, without flaking on a loaded CI box.
-ok(f"4 worst-case period scans stay bounded ({_elapsed:.3f}s)", _elapsed < 2.0)
+ok(f"the cache still serves the scan ({_info.hits} hits / {_info.misses} misses)",
+   _info.hits > _info.misses)
+# Wall clock is NOT the bound: libc time conversion costs 0.25us on one host and
+# ~400us on another, so a seconds threshold flakes by machine, not by regression.
+_lt, _mk = time.localtime, time.mktime
+_calls = []
 
-# Control: the parse-count assertion must be able to FAIL. Bypassing the cache
-# restores the O(minutes) behaviour the assertion exists to forbid.
-_uncached = cr._parse_field.__wrapped__
-_misses_uncached = 0
-_orig_pf = cr._parse_field
+
+def _counted_localtime(*a):
+    _calls.append(1)
+    return _lt(*a)
+
+
+def _counted_mktime(*a):
+    _calls.append(1)
+    return _mk(*a)
+
+
+cr.time.localtime, cr.time.mktime = _counted_localtime, _counted_mktime
 try:
-    def _counting(field, lo, hi):
-        global _misses_uncached
-        _misses_uncached += 1
-        return _uncached(field, lo, hi)
-    cr._parse_field = _counting
-    cr.cron_period_seconds("7 16 * * 5", NOW)
+    cr._parse_field.cache_clear()
+    for _e in ("43 8 * * *", "7 16 * * 5", "0 10 * * 1", "23 9 7 8 *"):
+        cr.cron_period_seconds(_e, NOW)
 finally:
-    cr._parse_field = _orig_pf
-ok(f"control: uncached parsing IS O(minutes) ({_misses_uncached} calls)",
-   _misses_uncached > 1000)
+    cr.time.localtime, cr.time.mktime = _lt, _mk
+
+# Day-stepping: ~1 date test per day over the window plus a few candidates.
+# The minute-stepping scan this replaced needed 55,465 for the same four.
+ok(f"period scan is O(days), not O(minutes) ({len(_calls)} libc time calls)",
+   len(_calls) < 1000)
+ok(f"4 worst-case period scans stay bounded ({_elapsed:.3f}s)", _elapsed < 60.0)
+
+# Control: the call-count bound must track DAYS. Doubling the window doubles a
+# day-stepping scan and multiplies a minute-stepping one by 1440x per day.
+def _time_calls(window_s):
+    calls = []
+    lt, mk = time.localtime, time.mktime
+    cr.time.localtime = lambda *a: (calls.append(1), lt(*a))[1]
+    cr.time.mktime = lambda *a: (calls.append(1), mk(*a))[1]
+    prev = cr.PERIOD_SCAN_MAX_SECONDS
+    cr.PERIOD_SCAN_MAX_SECONDS = window_s
+    try:
+        cr.cron_period_seconds("23 9 7 8 *", NOW)
+    finally:
+        cr.PERIOD_SCAN_MAX_SECONDS = prev
+        cr.time.localtime, cr.time.mktime = lt, mk
+    return len(calls)
+
+
+_c15 = _time_calls(15 * 24 * 3600)
+_c30 = _time_calls(30 * 24 * 3600)
+ok(f"control: doubling the window ~doubles the calls ({_c15} -> {_c30})",
+   _c30 < _c15 * 4)
+ok(f"control: the counter can move at all ({_c30} > {_c15})", _c30 > _c15)
 
 if FAILS:
     print(f"cron-lateness: {FAILS} failure(s)")
