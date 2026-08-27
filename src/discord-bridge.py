@@ -360,6 +360,11 @@ from policy.egress.attachment import (  # noqa: E402
     SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS,
     is_path_sendable as _is_path_sendable_shared,
+    classify_attachment as _classify_attachment,
+    ATTACH_SEND as _ATTACH_SEND,
+    ATTACH_MISSING as _ATTACH_MISSING,
+    ATTACH_EMPTY as _ATTACH_EMPTY,
+    ATTACH_REFUSED as _ATTACH_REFUSED,
 )
 
 
@@ -5092,16 +5097,17 @@ def _queued_task_count():
         return 0
 
 
-def _render_progress_content(now, elapsed):
-    """Placeholder body for poll_progress: the live core step normally, or the
-    honest outage copy (frozen status + stale heartbeat + queue depth) when the
-    core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
-    class: never narrate progress the core is not making)."""
+def _render_progress_content(now, elapsed, channel_is_private=False):
+    """`channel_is_private` gates the STEP TEXT and defaults False, so a caller that
+    has not established the audience posts the placeholder without a step."""
     status = progress_stream.read_core_status(STATE_DIR)
     if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
         return progress_stream.format_outage(
             progress_stream.status_age_s(status, now), _queued_task_count())
-    return progress_stream.format_progress(progress_stream.current_step(status), elapsed)
+    step = progress_stream.current_step(status)
+    if not progress_stream.step_visible_in(channel_is_private):
+        step = None
+    return progress_stream.format_progress(step, elapsed)
 
 
 async def poll_progress():
@@ -5163,7 +5169,7 @@ async def poll_progress():
                     if progress_stream.should_edit(now, info["last_edit"]):
                         try:
                             await info["msg"].edit(
-                                content=_render_progress_content(now, elapsed)
+                                content=_render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                             )
                             info["last_edit"] = now
                         except Exception:
@@ -5193,7 +5199,7 @@ async def poll_progress():
                 if progress_stream.should_post_placeholder(elapsed):
                     try:
                         msg = await channel.send(
-                            _render_progress_content(now, elapsed)
+                            _render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                         )
                         _progress_msgs[task_id] = {
                             "msg": msg,
@@ -5439,13 +5445,33 @@ async def poll_proactive():
                                             _redirect_text, f.stem,
                                             _chunk_for_discord)
                                     for fpath in files:
-                                        fpath = os.path.expanduser(fpath.strip())
-                                        if _is_path_sendable(fpath):
+                                        _outcome, fpath = _classify_attachment(fpath)
+                                        if _outcome == _ATTACH_SEND:
                                             await _target_ch.send(file=discord.File(fpath))
-                                        elif not os.path.isfile(fpath):
+                                            print(
+                                                f"  [proactive channel-redirect] sent file: {fpath}",
+                                                flush=True,
+                                            )
+                                        elif _outcome == _ATTACH_MISSING:
                                             print(
                                                 f"  [proactive channel-redirect] file marker, "
                                                 f"file not found: {fpath}",
+                                                flush=True,
+                                            )
+                                        elif _outcome == _ATTACH_EMPTY:
+                                            await _target_ch.send(
+                                                "(a file marker in this reply had no path"
+                                                " — nothing attached)")
+                                            print("  [proactive channel-redirect] file marker "
+                                                  "with EMPTY path — malformed, surfaced",
+                                                  flush=True)
+                                        elif _outcome == _ATTACH_REFUSED:
+                                            # Authorization denial, not absence: silence
+                                            # here reads as a successful attach.
+                                            await _target_ch.send(f"(file not allowed: {fpath})")
+                                            print(
+                                                f"  [proactive channel-redirect] REJECTED file "
+                                                f"(not in allowlist): {fpath}",
                                                 flush=True,
                                             )
                                     try:
@@ -5803,13 +5829,22 @@ async def poll_dm_fallback():
                                 except Exception:
                                     pass
                             for fpath in file_list:
-                                fpath = os.path.expanduser(fpath.strip())
-                                if _is_path_sendable(fpath):
+                                _outcome, fpath = _classify_attachment(fpath)
+                                if _outcome == _ATTACH_SEND:
                                     await target_channel.send(file=discord.File(fpath))
                                     print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
-                                elif not os.path.isfile(fpath):
+                                elif _outcome == _ATTACH_MISSING:
                                     # See poll_results — log only, no user noise.
                                     print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
+                                elif _outcome == _ATTACH_EMPTY:
+                                    await target_channel.send(
+                                        "(a file marker in this reply had no path"
+                                        " — nothing attached)")
+                                    print("  [dm-fallback channel-redirect] file marker with "
+                                          "EMPTY path — malformed, surfaced", flush=True)
+                                elif _outcome == _ATTACH_REFUSED:
+                                    await target_channel.send(f"(file not allowed: {fpath})")
+                                    print(f"  [dm-fallback channel-redirect] REJECTED file (not in allowlist): {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
                             if _task_file.exists():

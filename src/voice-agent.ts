@@ -32,7 +32,8 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { inlineTools } from './inline-tools.js';
+import { inlineTools, personalSkillSetups } from './inline-tools.js';
+import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
@@ -1504,6 +1505,11 @@ async function main() {
 		userHasInterrupted = true;
 		console.log(`${ts()} [VoiceSession] user interrupt detected — userHasInterrupted=true`);
 	});
+
+	// Give each skill's setup() the live session so it registers handlers without
+	// importing core. Guarded: a buggy setup must not break session bootstrap.
+	runSkillSetups(personalSkillSetups, { session, injectText },
+		(msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is
 	// producing audio, so the deck ducks the active slide video under the
