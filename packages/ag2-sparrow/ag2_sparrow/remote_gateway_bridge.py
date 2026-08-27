@@ -1274,6 +1274,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_i
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
                 "addressed_to",
+                # Ingress only: the backend inherits the route by task id, so a
+                # reply echoing these back could name a thread it was not asked in.
+                "thread_root", "source_room_id",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
