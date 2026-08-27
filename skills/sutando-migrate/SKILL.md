@@ -23,7 +23,7 @@ Run `bash scripts/sutando-migrate.sh scan --json`. Parse the JSON for:
 - Total unique relpaths across A+B+C+dest
 - Per-source byte counts
 - Cross-source collision triage: `identical_content` (byte-verified drop-dup, no action) + `mtime_only_diff` (commit's newest-mtime auto-resolves) + `size_mismatch` and `proxy_identical_divergent` (REAL content conflicts — owner attention; the latter is equal mtime+size with PROVEN-different bytes, both hashes read OK) + `identity_unverified` (hash failed on an unreadable entry — actionable: fix permissions, re-scan; per-collision `byte_identical` is tri-state true/false/null)
-- Notable actionable entries — anything with `byte_identical: false` (build_log, conversation.log, hosts/*, state/* divergences)
+- Notable actionable entries — anything with `byte_identical: false` (proven divergence) **or `byte_identical: null`** (unverified: the hash could not be read — surface the relpath + source so the owner can fix permissions BEFORE greenlight, or commit may partially write then abort)
 
 Present a concise 4–6 line summary to owner via:
 - Discord DM (text)

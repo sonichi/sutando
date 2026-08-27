@@ -207,6 +207,42 @@ elif ! "$REAL_PY" -c 'import json,sys;raw=open(sys.argv[1]).read();d=json.JSONDe
 fi
 [ "$fail_stub" -eq 0 ] && echo "  OK: both report paths ran on \$SUTANDO_PY with PATH python3 shadowed"
 
+echo
+echo "==== TEST: scan leaves no residue in TMPDIR (verdict tempfile cleanup) ===="
+# Two probes: GNU mktemp honors $TMPDIR (isolated dir discriminates on Linux);
+# macOS ignores it, so the named-template count in the real temp root gates there.
+ISO_TMP="$TMP/iso-tmpdir"
+mkdir -p "$ISO_TMP"
+REAL_T="$(dirname "$(mktemp -u)")"
+PRE_VERDICTS="$(ls "$REAL_T" 2>/dev/null | grep -c "sutando-migrate-verdicts" || true)"
+TMPDIR="$ISO_TMP" RUN_MIGRATE scan --source A,B,C --json > /dev/null 2>&1
+TMPDIR="$ISO_TMP" RUN_MIGRATE scan --source A,B,C > /dev/null 2>&1
+LEFTOVER="$(ls -A "$ISO_TMP")"
+POST_VERDICTS="$(ls "$REAL_T" 2>/dev/null | grep -c "sutando-migrate-verdicts" || true)"
+if [ -n "$LEFTOVER" ]; then
+    echo "  FAIL: scan left files in isolated TMPDIR: $LEFTOVER"
+    fail_stub=1
+elif [ "$POST_VERDICTS" != "$PRE_VERDICTS" ]; then
+    echo "  FAIL: verdict tempfiles accumulated in $REAL_T ($PRE_VERDICTS -> $POST_VERDICTS)"
+    fail_stub=1
+else
+    echo "  OK: no scan residue (isolated TMPDIR empty; verdict count stable $PRE_VERDICTS)"
+fi
+
+echo
+echo "==== TEST: python-binary.sh owns require_python (no shadow) ===="
+# The sourced helper is the single loud-failure owner; a local redefinition
+# shadows it and its subshell memoization silently never caches.
+if [ "$(grep -cE '^require_python\(\)' "$REPO/scripts/sutando-migrate.sh")" != "0" ]; then
+    echo "  FAIL: sutando-migrate.sh redefines require_python (shadows python-binary.sh)"
+    fail_stub=1
+elif ! grep -q 'python-binary.sh' "$REPO/scripts/sutando-migrate.sh"; then
+    echo "  FAIL: sutando-migrate.sh no longer sources python-binary.sh"
+    fail_stub=1
+else
+    echo "  OK: single require_python owner (sourced from python-binary.sh)"
+fi
+
 # Restore the unreadable fixture before commit — its scan job is done, and the
 # commit-phase copy semantics for unreadable sources are a separate contract.
 chmod 644 "$A/notes/unreadable.md"

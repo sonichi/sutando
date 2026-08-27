@@ -284,19 +284,8 @@ if [ ! -x "$HELPER" ] && [ ! -f "$HELPER" ]; then
     exit 2
 fi
 
-# Scan reports need a real interpreter; resolve_python refuses Apple's CLT stub,
-# so a miss dies loudly here instead of raising the stub's modal dialog.
-_SUTANDO_PY_RESOLVED=""
-require_python() {
-    if [ -z "$_SUTANDO_PY_RESOLVED" ]; then
-        _SUTANDO_PY_RESOLVED="$(resolve_python "$REPO_DIR")"
-        if [ -z "$_SUTANDO_PY_RESOLVED" ]; then
-            echo "sutando-migrate: no runnable python3 — set SUTANDO_PY or install the Command Line Tools" >&2
-            exit 2
-        fi
-    fi
-    printf '%s' "$_SUTANDO_PY_RESOLVED"
-}
+# Interpreter resolution: python-binary.sh's require_python is the single
+# loud-failure owner — never redefine it here (it shadows the sourced contract).
 # Dest resolution deferred to after arg parsing so --respect-env can take effect.
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -392,7 +381,7 @@ declare -a REPORT_LINES
 # >1 source (cross-source collisions per-source scan misses — e.g. build_log.md
 # in A AND C bound for the same dest path).
 XSRC_INDEX="$(mktemp -t sutando-migrate-xsrc.XXXXXX)"
-trap 'rm -f "$XSRC_INDEX"' EXIT INT TERM
+trap 'rm -f "$XSRC_INDEX" "${_VERDICTS_TMP:-}"' EXIT INT TERM
 # Also include dest's existing files (tag "DEST") so we surface dest-collisions
 # uniformly with cross-source collisions.
 
@@ -790,7 +779,7 @@ index_dest_for_collisions() {
 # Single owner of content-identity policy for BOTH renderers (human + JSON):
 # per-relpath verdict identical|divergent|unverified over the XSRC index.
 xsrc_identity_verdicts() {
-    local py; py="$(require_python)"
+    local py; py="$(require_python "$REPO_DIR" "hash cross-source collisions")" || exit 2
     "$py" - "$XSRC_INDEX" <<'PYIDENT'
 import sys, json, hashlib
 from collections import defaultdict
@@ -849,9 +838,10 @@ report_cross_source() {
 
     # Verdicts come from the single identity owner (xsrc_identity_verdicts);
     # an unreadable entry is UNVERIFIED — never certified, never called divergent.
-    local verdicts total_identical total_unverified
+    local verdicts total_identical total_unverified count_py
     verdicts="$(xsrc_identity_verdicts)"
-    read -r total_identical total_unverified <<<"$("$(require_python)" -c \
+    count_py="$(require_python "$REPO_DIR" "count identity verdicts")" || exit 2
+    read -r total_identical total_unverified <<<"$("$count_py" -c \
 'import sys,json;v=json.load(sys.stdin);print(sum(1 for x in v.values() if x=="identical"), sum(1 for x in v.values() if x=="unverified"))' <<<"$verdicts")"
 
     REPORT_LINES+=("  of which identical-content (byte-verified):  $total_identical (commit will pick one canonical + skip rest)")
@@ -2192,7 +2182,10 @@ rollback_main() {
 emit_json() {
     # Machine-readable JSON for downstream tooling. Identity verdicts come from
     # xsrc_identity_verdicts (single policy owner shared with the human report).
-    local py vf; py="$(require_python)"; vf="$(mktemp)"
+    local py vf; py="$(require_python "$REPO_DIR" "emit the scan JSON")" || exit 2
+    # Named template like XSRC_INDEX: auditable, and countable by the cleanup
+    # regression on macOS, whose mktemp ignores $TMPDIR for placement.
+    vf="$(mktemp -t sutando-migrate-verdicts.XXXXXX)"; _VERDICTS_TMP="$vf"
     xsrc_identity_verdicts > "$vf"
     "$py" - "$DEST_REAL" "$A_REAL_OK" "$B_REAL_OK" "$C_REAL_OK" "$XSRC_INDEX" "$vf" <<'PY'
 import json, sys, os
@@ -2276,6 +2269,7 @@ out = {
 json.dump(out, sys.stdout, indent=2)
 print()
 PY
+    rm -f "$vf"; _VERDICTS_TMP=""
 }
 
 explain_main() {
