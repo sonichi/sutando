@@ -94,12 +94,8 @@ failed=0
 skipped_total=0
 fully_skipped=()
 partly_skipped=()
-# Each file already runs as its own `coverage run` process writing its own
-# .coverage.* fragment (`parallel = True` in .coveragerc, merged by the
-# `coverage combine` below), so running them concurrently changes SCHEDULING,
-# not the data model. Measured on 150 files: serial 146s vs -P4 42s (3.5x),
-# with 5 failures both ways and all 5 failing standalone — 0 introduced by
-# concurrency.
+# Each file writes its own .coverage.* fragment (`parallel = True`), merged
+# by the `coverage combine` below.
 COVGATE_WORKERS="${COVERAGE_GATE_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 RECDIR="$(mktemp -d)"
 trap 'rm -rf "$RECDIR"' EXIT
@@ -118,20 +114,13 @@ fi
 export RECDIR COVGATE_TIMEOUT
 
 find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
-# Record key is the LINE INDEX, which is injective by construction. A
-# name-derived key is not: `tr "/." "__"` maps `tests/a/b.test.py` and
-# `tests/a_b.test.py` to the same record, so two workers write one pair of
-# files and the last writer wins — a failing test can be reported with a
-# passing worker's rc and the job exits 0. Today's 625 names happen not to
-# collide; one nested or dotted addition is enough.
+# Key on the LINE INDEX: a name-derived key collides (`tr "/." "__"` maps
+# tests/a/b and tests/a_b alike), letting a failing rc be overwritten.
 _covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
 
-# Worker: one record per file. Aggregation stays SERIAL below, over the sorted
-# list, so log order and the skip accounting are byte-identical to the old loop.
 # shellcheck disable=SC2016
-# Feed BARE INTEGERS: `xargs -I{}` rewrites a tab inside the replaced string
-# to a space, so any delimiter-in-argument scheme silently stops splitting.
-# The worker resolves its own path from the shared sorted list instead.
+# Feed BARE INTEGERS: `xargs -I{}` rewrites a tab in the replaced string to a
+# space, so a delimiter-in-argument scheme silently stops splitting.
 seq 1 "$_covgate_n" | xargs -P "$COVGATE_WORKERS" -I{} bash -c '
     idx="$1"
     f="$(sed -n "${idx}p" "$RECDIR/files")"

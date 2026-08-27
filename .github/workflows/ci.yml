@@ -263,12 +263,8 @@ jobs:
       # log compact across 32+ test files. Non-zero exit on any failure.
       - name: Run Python standalone tests
         run: |
-          # Parallel: these files are independent processes with no shared
-          # state, so this is a scheduling change. Measured on 150 of them:
-          # serial 146s vs -P4 42s (3.5x), 5 failures either way and all 5
-          # failing standalone — 0 introduced by concurrency. Records are
-          # collected per file and REPLAYED SERIALLY in sorted order below, so
-          # the log stays readable and `failed_files` keeps its order.
+          # Records are collected per file and replayed SERIALLY in sorted
+          # order below, so `failed_files` keeps its order.
           failed=0
           failed_files=()
           WORKERS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
