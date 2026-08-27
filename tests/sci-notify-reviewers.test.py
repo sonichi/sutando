@@ -80,7 +80,7 @@ class NotifyReviewers(unittest.TestCase):
         self.assertIn("mention @sutando-rui:x", p.stdout)  # rui still planned
         self.assertIn("OFF-ALLOWLIST 'mini'", p.stderr)
 
-def run_send(stub_payload, roster=None):
+def run_send(stub_payload, roster=None, stub_stderr=""):
     """Drive --send against a STUB room_ops. The script resolves room_ops as
     parents[3] of its own path, so the copy must sit in a matching tree."""
     root = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name))
@@ -91,6 +91,7 @@ def run_send(stub_payload, roster=None):
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
         f"sys.stdout.write({stub_payload!r})\n"
+        f"sys.stderr.write({stub_stderr!r})\n"
         "sys.exit(0)\n")          # rc 0 + empty stderr: the real refusal shape
     rp = root / "roster.json"
     rp.write_text(json.dumps(roster or GOOD))
@@ -121,6 +122,13 @@ class SilentRefusal(unittest.TestCase):
         p = run_send('{"ok": false}')
         self.assertEqual(p.returncode, 1)
         self.assertIn("no reason reported", p.stderr)
+
+    def test_a_real_stderr_survives_an_unusable_payload(self):
+        # The placeholder must not occupy `reason` — a caller debugging a crash
+        # needs the traceback, not our generic word for "did not parse".
+        p = run_send('boom', stub_stderr="ConnectionRefusedError: [Errno 61]")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("ConnectionRefusedError", p.stderr)
 
     def test_unparseable_output_is_not_reported_as_success(self):
         p = run_send('not json at all')

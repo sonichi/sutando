@@ -116,18 +116,21 @@ def main() -> int:
             payload = None
         # A non-object payload has no .get, and a non-string event_id breaks the
         # slice below — both crash the notifier instead of reporting.
+        # An unusable payload must not OCCUPY `reason`: a truthy placeholder
+        # there wins the `or` below and discards a real traceback on stderr.
         if isinstance(payload, dict):
             ok = bool(payload.get("ok"))
             event = str(payload.get("event_id") or "")
             reason = str(payload.get("reason") or "")
+            fallback = "no reason reported"
         else:
-            reason = "unparseable room_ops output"
+            fallback = "unparseable room_ops output"
         # room_ops reports refusals in-band: rc 0, empty stderr, ok:false + reason.
         # Printing stderr alone renders every such refusal as a blank line.
         if ok:
             print(f"{t['name']}: ok=True event={event[:24]}")
         else:
-            detail = reason or p.stderr.strip()[:120] or "no reason reported"
+            detail = reason or p.stderr.strip()[:120] or fallback
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
             failures += 1
     if failures:
