@@ -36,6 +36,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -197,6 +198,35 @@ class CodexDelegationConsumer(unittest.TestCase):
         with patch.object(hc, "_codex_runtime_selected", return_value=False):
             self.assertIsNone(hc._codex_delegation_consumer(
                 tasks_dir=tasks, channels_dir=channels, scan_cap=5))
+
+    def test_unreadable_task_is_skipped_not_counted_as_evidence(self):
+        """A task the probe cannot read is not evidence either way — the
+        non-owner sibling beside it must still be found."""
+        tasks, channels = self._dirs()
+        (tasks / "task-unreadable.txt").mkdir()
+        self._task(tasks, "3", "team")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            why = hc._codex_delegation_consumer(tasks_dir=tasks, channels_dir=channels)
+        self.assertIsNotNone(why)
+        self.assertIn("team", why)
+
+    def test_unreadable_task_alone_yields_no_consumer(self):
+        tasks, channels = self._dirs()
+        (tasks / "task-unreadable.txt").mkdir()
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
+
+    def test_unimportable_protocol_yields_no_consumer(self):
+        """The probe must not break the health run when its delegate is absent —
+        and must not invent a tier vocabulary of its own to carry on with."""
+        tasks, channels = self._dirs()
+        self._access(channels, "discord", {"tierMap": {"u1": "team"}})
+        self._task(tasks, "4", "guest")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False), \
+                patch.dict(sys.modules, {"local_task_protocol": None}):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
 
 
 if __name__ == "__main__":
