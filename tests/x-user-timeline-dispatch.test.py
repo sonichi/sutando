@@ -10,8 +10,9 @@ credentials.
 
 This version loads a fresh copy of the module per case, replaces
 `get_user_timeline` and `get_auth` with recorders, and asserts what was invoked,
-with which arguments, and with which exit status. No network, no subprocess, no
-.env influence on the outcome.
+with which arguments, and with which exit status. No network and no .env
+influence on the outcome; the single subprocess is the temp-cleanup probe,
+which must observe a run that has already exited.
 
 Pins:
   * 5 and 100 reach get_user_timeline exactly once, with the parsed arguments,
@@ -141,6 +142,10 @@ check("--exclude: dispatched exactly once",
 check("--exclude forwarded verbatim",
       len(calls["timeline"]) == 1 and calls["timeline"][0][1].get("exclude") == "retweets,replies",
       f"calls={calls['timeline']}")
+if calls["timeline"]:
+    _a, _k = calls["timeline"][0]
+    check("--exclude call still carries username and limit",
+          _a[:1] == ("Chi_Wang_",) and _k.get("max_results") == 5, f"args={_a} kwargs={_k}")
 check("--exclude case exits 0", code == 0, f"rc={code}, out={out[:60]!r}")
 
 # --- the DEFAULT limit is part of the contract ------------------------------
@@ -194,7 +199,7 @@ else:
 
 
 # --- completion is pinned: a case dropped or an early abort fails here -----
-EXPECTED = 35
+EXPECTED = 36
 check(f"all {EXPECTED} checks ran (guards against a silent early exit)",
       checked + 1 == EXPECTED, f"ran {checked + 1}")
 
