@@ -166,7 +166,7 @@ class SilentRefusal(unittest.TestCase):
 
 
 
-def run_room(members_payload, *extra, roster=None):
+def run_room(members_payload, *extra, roster=None, env_overrides=None):
     """Drive the room-scoped path against a stub room_ops that answers `members`
     and `mention` DIFFERENTLY — the single-payload stub above cannot express a
     roster read and a send in one run."""
@@ -183,7 +183,7 @@ def run_room(members_payload, *extra, roster=None):
         "sys.exit(0)\n")
     rp = root / "roster.json"
     rp.write_text(json.dumps(roster or GOOD))
-    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
+    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp), **(env_overrides or {})}
     return subprocess.run([sys.executable, str(copy), "--send",
                            "--reviewers", "rui", "--message", "m", *extra],
                           capture_output=True, text=True, timeout=30, env=env)
@@ -321,6 +321,21 @@ class RoomScopedPresence(unittest.TestCase):
         p = run_room('{"members": [{"user_id": "@other:x"}]}')
         self.assertNotIn("ABSENT from", p.stderr)
         self.assertIn("UNVERIFIED", p.stderr)
+
+    def test_child_interpreter_does_not_come_from_PATH(self):
+        # `python3` resolves through PATH; sys.executable does not. On a clean
+        # macOS host the bare name can hit the Xcode CLT stub, which raises an
+        # install modal and makes the probe fail OPEN as unverified.
+        p = run_room(_PRESENT, env_overrides={"PATH": "/nonexistent"})
+        self.assertIn("ok=True", p.stdout)          # the send still resolved
+        self.assertNotIn("UNVERIFIED", p.stderr)    # ...and the probe still read the roster
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_absence_is_still_detected_with_no_python_on_PATH(self):
+        # Companion: the probe must still be able to say NO, not just yes.
+        p = run_room(_ABSENT, env_overrides={"PATH": "/nonexistent"})
+        self.assertIn("ABSENT from", p.stderr)
+        self.assertNotEqual(p.returncode, 0)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

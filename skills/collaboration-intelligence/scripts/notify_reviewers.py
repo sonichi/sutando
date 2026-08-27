@@ -32,6 +32,9 @@ import sys
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[3]
+# Bare `python3` can resolve to the Xcode CLT stub on a clean macOS host, which
+# raises an install modal and makes the probe fail open. Reuse this interpreter.
+_PY = sys.executable or "python3"
 sys.path.insert(0, str(_REPO / "src"))
 
 
@@ -94,7 +97,7 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     from a delivered mention. Returns (present, reason); an UNVERIFIABLE roster is
     not treated as absent — we refuse to send only on a positive absence.
     """
-    argv = ["python3", str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
+    argv = [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
             "members", target["room"]]
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
@@ -125,7 +128,7 @@ def command_for(target: dict, message: str) -> "list[str]":
     body = message
     if target.get("human") and target["human"] not in body:
         body = f"{body} (cc {target['human']})"
-    return ["python3", str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
+    return [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
             "mention", target["stand"], body, target["room"]]
 
 
