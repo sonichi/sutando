@@ -33,6 +33,7 @@ never a backlog storm.
 from __future__ import annotations
 
 import fcntl
+import functools
 import json
 import os
 import re
@@ -105,7 +106,8 @@ CORE_ALIVE_MAX_AGE_SECONDS = 90
 
 
 # --- minimal 5-field cron matcher (no external deps) ------------------------
-def _parse_field(field: str, lo: int, hi: int) -> set[int]:
+@functools.lru_cache(maxsize=512)
+def _parse_field(field: str, lo: int, hi: int) -> frozenset[int]:
     """Expand one cron field into the set of matching integers.
 
     Supports ``*``, ``*/N``, ``A``, ``A,B``, ``A-B``, and ``A-B/N`` — the full
@@ -128,7 +130,8 @@ def _parse_field(field: str, lo: int, hi: int) -> set[int]:
         for v in range(start, end + 1, step):
             if lo <= v <= hi:
                 result.add(v)
-    return result
+    # Frozen: the lru_cache hands every caller the SAME object.
+    return frozenset(result)
 
 
 def cron_matches(expr: str, t: time.struct_time) -> bool:

@@ -65,6 +65,43 @@ ok("unmeasurable period falls back to the floor",
    cr.cron_period_seconds("23 9 7 8 *", NOW) is None
    and b("23 9 7 8 *") == cr.MAX_EMIT_LATENESS_SECONDS)
 
+
+# --- Bounded runtime + call-count controls ---
+
+# The scan is O(minutes) by design; field parsing must not be. Count parses
+# so slow hardware cannot flake and fast hardware cannot hide a regression.
+_t0 = time.perf_counter()
+cr._parse_field.cache_clear()
+for _e in ("43 8 * * *", "7 16 * * 5", "0 10 * * 1", "23 9 7 8 *"):
+    cr.cron_period_seconds(_e, NOW)
+_info = cr._parse_field.cache_info()
+_elapsed = time.perf_counter() - _t0
+
+# 4 exprs x 5 fields = at most 20 distinct parses, however many minutes are scanned.
+ok(f"parse count bounded by fields, not minutes ({_info.misses} misses)",
+   _info.misses <= 20)
+ok(f"cache actually serves the scan ({_info.hits} hits)", _info.hits > 1000)
+# Generous bound: measured ~0.03s locally; 2s still catches an O(n) parse regression,
+# which costs seconds per call, without flaking on a loaded CI box.
+ok(f"4 worst-case period scans stay bounded ({_elapsed:.3f}s)", _elapsed < 2.0)
+
+# Control: the parse-count assertion must be able to FAIL. Bypassing the cache
+# restores the O(minutes) behaviour the assertion exists to forbid.
+_uncached = cr._parse_field.__wrapped__
+_misses_uncached = 0
+_orig_pf = cr._parse_field
+try:
+    def _counting(field, lo, hi):
+        global _misses_uncached
+        _misses_uncached += 1
+        return _uncached(field, lo, hi)
+    cr._parse_field = _counting
+    cr.cron_period_seconds("7 16 * * 5", NOW)
+finally:
+    cr._parse_field = _orig_pf
+ok(f"control: uncached parsing IS O(minutes) ({_misses_uncached} calls)",
+   _misses_uncached > 1000)
+
 if FAILS:
     print(f"cron-lateness: {FAILS} failure(s)")
     sys.exit(1)
