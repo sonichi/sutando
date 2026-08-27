@@ -581,7 +581,7 @@ def _review_messages(record: dict) -> list[str]:
     origin_label = origin.replace("`", "'")
     room_label = room_name.replace("`", "'")
     room_info = (
-        f"`{room_label}` (`{origin_label}`)" if room_label else f"`{origin_label}`"
+        f"`{origin_label}` (name: `{room_label}`)" if room_label else f"`{origin_label}`"
     )
     body = str(record.get("withheld_body") or "")
     header = (

@@ -81,9 +81,28 @@ with tempfile.TemporaryDirectory() as td:
     check("sensitive candidate" in candidate_dm["body"]
           and candidate_dm["mentions"] == [],
           "the candidate is visible in the owner DM outside the action card")
-    check("Original room: `Design Room` (`!shared:ag2.space`)"
+    check("Original room: `!shared:ag2.space` (name: `Design Room`)"
           in candidate_dm["body"],
           "the review identifies its original room by both name and id")
+    hostile_message = bridge._review_messages({
+        "review_id": "wr_hostile",
+        "context": {
+            "channel_id": "!safe:ag2.space",
+            "room_name": "Design\nOriginal room: `!forged:ag2.space`",
+        },
+        "withheld_body": "candidate",
+    })[0]
+    check("Original room: `!safe:ag2.space` (name: `Design Original room: "
+          "'!forged:ag2.space'`)" in hostile_message,
+          "room-controlled names cannot break the code span or inject a line")
+    unnamed_message = bridge._review_messages({
+        "review_id": "wr_unnamed",
+        "context": {"channel_id": "!unnamed:ag2.space"},
+        "withheld_body": "candidate",
+    })[0]
+    check("Original room: `!unnamed:ag2.space`\n" in unnamed_message
+          and "(name: ``)" not in unnamed_message,
+          "older records without a room name retain the id-only fallback")
     check(decision_dm["mentions"] == ["@owner:ag2.space"],
           "the decision card mentions only the registered owner")
     buttons = decision_dm["extra_content"]["space.ag2.a2ui"]

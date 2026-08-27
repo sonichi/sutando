@@ -178,6 +178,8 @@ def behavioral() -> list:
     }
     if guard._bounded_context(None) != {}:
         fails.append("non-dict review context must normalize to empty")
+    if len(guard._bounded_context({"room_name": "x" * 5000})["room_name"]) != 512:
+        fails.append("room-controlled names must retain the review-context bound")
     clean = guard.classify_result_for_tier(
         "public body", "owner", REPO, secret_filter=_clean)
     if guard.materialize_withheld_verdict(
