@@ -81,5 +81,26 @@ else
 fi
 rm -rf "$rec" "$probe2" "$caller"
 
+# --- 5. Portable fragments end-to-end: after the lane's worktrees are GONE,
+# `coverage combine` + `coverage xml` must still succeed at the caller's cwd.
+if python3 -c "import coverage" 2>/dev/null; then
+    rec="$(mktemp -d)"; covwork="$(mktemp -d)"
+    printf 'tests/room-ops-say.test.py\n' > "$rec/files"
+    ( cd "$here" && bash "$LANE" 1 "$rec/files" "$rec" \
+        python3 -m coverage run --rcfile=.coveragerc ) >/dev/null 2>&1
+    # Relative fragments must combine at a cwd that HOLDS the sources — the
+    # caller's checkout, exactly as coverage-gate.sh does.
+    ( cd "$here" && COVERAGE_FILE="$covwork/.coverage" python3 -m coverage combine --quiet . 2>/dev/null
+      cd "$here" && COVERAGE_FILE="$covwork/.coverage" python3 -m coverage xml -o "$covwork/cov.xml" --quiet )
+    if [ -s "$covwork/cov.xml" ]; then
+        echo "  ok   combine + xml succeed after worker cleanup (portable paths)"
+    else
+        echo "  FAIL: coverage xml died after worktree cleanup — fragment paths not portable"; fail=1
+    fi
+    rm -rf "$rec" "$covwork"
+else
+    echo "  skip coverage not importable — end-to-end combine check ran only in the gate job"
+fi
+
 [ "$fail" -eq 0 ] && echo "Parallel-lane workspace isolation holds."
 exit "$fail"
