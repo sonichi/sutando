@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""The emit-lateness budget must scale with a job's own period.
+
+A FLAT budget spends half a period on a 30-minute job and 1/96th of one on a
+daily job, so the same delay costs the daily job an entire day. Measured on a
+live host: `money-autopilot-scan` (43 8 * * *) was dropped at 2485s and 1988s
+late on consecutive days while its sub-hourly peers recovered immediately.
+
+Run: python3 tests/cron-lateness-scales-with-period.test.py
+"""
+import importlib.util
+import pathlib
+import sys
+import time
+
+_SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "cron-runner.py"
+_spec = importlib.util.spec_from_file_location("cron_runner", _SRC)
+cr = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(cr)
+
+FAILS = 0
+
+
+def ok(name, cond):
+    global FAILS
+    if cond:
+        print(f"  ok   {name}")
+    else:
+        FAILS += 1
+        print(f"  FAIL {name}")
+
+
+NOW = int(time.time())
+b = lambda e: cr.emit_lateness_budget(e, NOW)
+
+# No job may become STRICTER than the shipped constant.
+for expr in ("*/5 * * * *", "*/30 * * * *", "0 * * * *", "43 8 * * *",
+             "7 16 * * 5", "23 9 7 8 *"):
+    ok(f"never below the old floor: {expr}", b(expr) >= cr.MAX_EMIT_LATENESS_SECONDS)
+
+# Sub-hourly jobs keep EXACTLY the old budget — this change is not a loosening
+# for the jobs the constant was tuned for.
+ok("every 5 min unchanged", b("*/5 * * * *") == cr.MAX_EMIT_LATENESS_SECONDS)
+ok("every 30 min unchanged", b("*/30 * * * *") == cr.MAX_EMIT_LATENESS_SECONDS)
+ok("hourly unchanged", b("0 * * * *") == cr.MAX_EMIT_LATENESS_SECONDS)
+
+# Low-frequency jobs get more, bounded by the cap so none runs "hours late".
+ok("daily gets more than the floor", b("43 8 * * *") > cr.MAX_EMIT_LATENESS_SECONDS)
+ok("weekly gets more than the floor", b("7 16 * * 5") > cr.MAX_EMIT_LATENESS_SECONDS)
+for expr in ("43 8 * * *", "7 16 * * 5", "4 6 */3 * *"):
+    ok(f"never above the cap: {expr}", b(expr) <= cr.MAX_EMIT_LATENESS_CAP_SECONDS)
+
+# The live regression: both real drops fall inside the new daily budget.
+ok("2485s-late daily slot would now run", 2485 <= b("43 8 * * *"))
+ok("1988s-late daily slot would now run", 1988 <= b("43 8 * * *"))
+# ...and the control: something genuinely stale still does NOT.
+ok("a 6h-late daily slot is still dropped", 6 * 3600 > b("43 8 * * *"))
+
+# Period detection: measured from the expression, not declared.
+ok("daily period ~24h", cr.cron_period_seconds("43 8 * * *", NOW) == 24 * 3600)
+ok("30-min period", cr.cron_period_seconds("*/30 * * * *", NOW) == 1800)
+ok("weekly period ~7d", cr.cron_period_seconds("7 16 * * 5", NOW) == 7 * 24 * 3600)
+# Unmeasurable period must fail SAFE (old constant), not open.
+ok("unmeasurable period falls back to the floor",
+   cr.cron_period_seconds("23 9 7 8 *", NOW) is None
+   and b("23 9 7 8 *") == cr.MAX_EMIT_LATENESS_SECONDS)
+
+if FAILS:
+    print(f"cron-lateness: {FAILS} failure(s)")
+    sys.exit(1)
+print("cron-lateness controls OK: floor held, cap held, the measured drops now run")

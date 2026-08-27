@@ -489,7 +489,9 @@ def test_run_drops_stale_catchup_slot():
         cr.CRONS_FILE = root / "crons.json"
         cr.STATE_FILE = root / "state" / "cron-runner-state.json"
         fire = _epoch(2026, 7, 2, 6, 0)
-        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        # Past THIS job's budget, not a flat constant: the budget scales with the
+        # period, so hard-coding the floor stops exercising the drop path.
+        now = fire + cr.emit_lateness_budget("0 6 * * *", fire) + 60
         cr.CRONS_FILE.write_text(json.dumps([
             {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
         ]))
@@ -522,7 +524,9 @@ def test_drop_line_is_timestamped():
         cr.CRONS_FILE = root / "crons.json"
         cr.STATE_FILE = root / "state" / "cron-runner-state.json"
         fire = _epoch(2026, 7, 2, 6, 0)
-        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        # Past THIS job's budget, not a flat constant: the budget scales with the
+        # period, so hard-coding the floor stops exercising the drop path.
+        now = fire + cr.emit_lateness_budget("0 6 * * *", fire) + 60
         cr.CRONS_FILE.write_text(json.dumps([
             {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
         ]))

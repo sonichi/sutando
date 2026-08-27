@@ -95,7 +95,13 @@ REPO_ROOT = SRC_DIR.parent
 MAX_CATCHUP_SECONDS = 24 * 3600
 # A short core restart may recover a recent slot, but a morning briefing or
 # other time-sensitive task must not execute hours after its intended time.
+# FLOOR: sub-hourly jobs keep exactly the old budget, so none gets stricter.
 MAX_EMIT_LATENESS_SECONDS = 15 * 60
+# CAP: honours the "never hours late" intent above, whatever the period is.
+MAX_EMIT_LATENESS_CAP_SECONDS = 60 * 60
+# Two fires of a weekly job can be ~13 days apart when today is midweek.
+PERIOD_SCAN_MAX_SECONDS = 15 * 24 * 3600
+_PERIOD_CACHE: dict = {}
 CORE_ALIVE_MAX_AGE_SECONDS = 90
 
 
@@ -155,6 +161,44 @@ def cron_matches(expr: str, t: time.struct_time) -> bool:
     if dom_restricted and dow_restricted:
         return dom_ok or dow_ok
     return dom_ok and dow_ok
+
+
+def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
+    """Seconds between the two most recent fire-minutes of ``expr``, or None.
+
+    Derived from the expression itself rather than declared, so it stays right
+    when a schedule is edited. Bounded by MAX_CATCHUP_SECONDS like the scan below.
+    """
+    # Scan BACKWARD and stop at two hits: a daily job has at most one fire in a
+    # 24h window, so a forward MAX_CATCHUP_SECONDS scan can never measure it.
+    if expr in _PERIOD_CACHE:
+        return _PERIOD_CACHE[expr]
+    fires = []
+    m = (now_epoch // 60) * 60
+    floor = now_epoch - PERIOD_SCAN_MAX_SECONDS
+    while m >= floor:
+        if cron_matches(expr, time.localtime(m)):
+            fires.append(m)
+            if len(fires) == 2:
+                _PERIOD_CACHE[expr] = fires[0] - fires[1]
+                return _PERIOD_CACHE[expr]
+        m -= 60
+    _PERIOD_CACHE[expr] = None
+    return None
+
+
+def emit_lateness_budget(expr: str, now_epoch: int) -> int:
+    """How late a slot of ``expr`` may be and still run.
+
+    A FLAT budget spends a half-period on a 30-minute job and 1/96th of one on a
+    daily job, so an equal delay costs the daily job an entire day. Scale with the
+    period, never below the old constant, never above the cap.
+    """
+    period = cron_period_seconds(expr, now_epoch)
+    if period is None:
+        return MAX_EMIT_LATENESS_SECONDS
+    return min(max(MAX_EMIT_LATENESS_SECONDS, period // 8),
+               MAX_EMIT_LATENESS_CAP_SECONDS)
 
 
 def latest_due_since(expr: str, last_epoch: int, now_epoch: int) -> Optional[int]:
@@ -496,7 +540,8 @@ def run(now_epoch: Optional[int] = None) -> list:
                     continue
                 else:
                     lateness = now_epoch - due_epoch
-                    if lateness <= MAX_EMIT_LATENESS_SECONDS:
+                    budget = emit_lateness_budget(expr, now_epoch)
+                    if lateness <= budget:
                         emit_task(name, entry)
                         emitted.append(name)
                     else:
@@ -505,7 +550,7 @@ def run(now_epoch: Optional[int] = None) -> list:
                         _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                         print(
                             f"{_ts} cron-runner: dropping stale slot for {name} "
-                            f"({lateness}s late)",
+                            f"({lateness}s late, budget {budget}s)",
                             file=sys.stderr,
                         )
             state[name] = now_epoch
