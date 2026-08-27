@@ -135,6 +135,34 @@ ok(f"control: doubling the window ~doubles the calls ({_c15} -> {_c30})",
    _c30 < _c15 * 4)
 ok(f"control: the counter can move at all ({_c30} > {_c15})", _c30 > _c15)
 
+
+# --- the three guard branches of the day-walk scan ---
+
+# A malformed expression must RAISE, not silently score as unmeasurable: a
+# 4-field entry is a config error, and None would quietly grant the floor budget.
+try:
+    cr.cron_period_seconds("0 9 * *", NOW)
+    ok("malformed expression raises", False)
+except ValueError as _e:
+    ok(f"malformed expression raises ({str(_e)[:34]}...)", "5 fields" in str(_e))
+
+# An inverted range expands to the EMPTY set, so the expression can never fire.
+ok("empty field set -> unmeasurable, not a crash",
+   cr.cron_period_seconds("5-3 9 * * *", NOW) is None)
+ok("control: the inverted range really is empty", not cr._parse_field("5-3", 0, 59))
+
+# Second fire outside the window -> None (the floor early-return), with the full
+# window as the control so this proves the floor path, not a broken expression.
+_prev = cr.PERIOD_SCAN_MAX_SECONDS
+cr.PERIOD_SCAN_MAX_SECONDS = 72000
+try:
+    _short = cr.cron_period_seconds("43 8 * * *", NOW)
+finally:
+    cr.PERIOD_SCAN_MAX_SECONDS = _prev
+_full = cr.cron_period_seconds("43 8 * * *", NOW)
+ok(f"second fire below the floor -> None (got {_short})", _short is None)
+ok(f"control: same expression measures {_full}s on the full window", _full == 86400)
+
 if FAILS:
     print(f"cron-lateness: {FAILS} failure(s)")
     sys.exit(1)
