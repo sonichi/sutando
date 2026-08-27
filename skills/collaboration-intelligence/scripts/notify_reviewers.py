@@ -112,10 +112,15 @@ def main() -> int:
         ok, event, reason = False, "", ""
         try:
             payload = json.loads(p.stdout)
-            ok = bool(payload.get("ok"))
-            event = payload.get("event_id") or ""
-            reason = payload.get("reason") or ""
         except ValueError:
+            payload = None
+        # A non-object payload has no .get, and a non-string reason breaks the
+        # substring test below — both crash the notifier instead of reporting.
+        if isinstance(payload, dict):
+            ok = bool(payload.get("ok"))
+            event = str(payload.get("event_id") or "")
+            reason = str(payload.get("reason") or "")
+        else:
             reason = "unparseable room_ops output"
         # room_ops reports refusals in-band: rc 0, empty stderr, ok:false + reason.
         # Printing stderr alone renders every such refusal as a blank line.

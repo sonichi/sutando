@@ -19,16 +19,19 @@ SCRIPT = (REPO / "skills" / "collaboration-intelligence" / "scripts"
           / "notify_reviewers.py")
 
 
+# One managed root for every fixture; NamedTemporaryFile(delete=False) leaked
+# one roster JSON per call, six per run, for the lifetime of the machine.
+_TMP = tempfile.TemporaryDirectory()
+
+
 def run(roster: "dict | None", *args):
     env = {**os.environ}
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    path = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name)) / "roster.json"
     if roster is not None:
-        json.dump(roster, tmp)
-        tmp.flush()
-        env["SUTANDO_SCI_ROSTER"] = tmp.name
+        path.write_text(json.dumps(roster))
+        env["SUTANDO_SCI_ROSTER"] = str(path)
     else:
-        env["SUTANDO_SCI_ROSTER"] = tmp.name + ".missing"
-    tmp.close()
+        env["SUTANDO_SCI_ROSTER"] = str(path) + ".missing"
     return subprocess.run([sys.executable, str(SCRIPT), *args],
                           capture_output=True, text=True, timeout=30, env=env)
 
@@ -80,7 +83,7 @@ class NotifyReviewers(unittest.TestCase):
 def run_send(stub_payload, roster=None):
     """Drive --send against a STUB room_ops. The script resolves room_ops as
     parents[3] of its own path, so the copy must sit in a matching tree."""
-    root = pathlib.Path(tempfile.mkdtemp())
+    root = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name))
     (root / "skills" / "collaboration-intelligence" / "scripts").mkdir(parents=True)
     (root / "skills" / "agent-room-ops").mkdir(parents=True)
     copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
@@ -120,6 +123,24 @@ class SilentRefusal(unittest.TestCase):
         p = run_send('not json at all')
         self.assertEqual(p.returncode, 1)
         self.assertIn("unparseable", p.stderr)
+
+    def test_non_object_payloads_do_not_crash_the_notifier(self):
+        # room_ops should never emit these; a notifier that dies on one reports
+        # nothing at all, which is the failure this PR exists to remove.
+        for payload in ('[]', '"hello"', 'null', '{"reason": 1}'):
+            with self.subTest(payload=payload):
+                p = run_send(payload)
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertIn("ok=False", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_a_non_string_reason_is_still_reported(self):
+        # The bare "reason=1" assertion passes even unfixed: the line prints
+        # before the substring test raises. Only the exit + traceback discriminate.
+        p = run_send('{"ok": false, "reason": 1}')
+        self.assertIn("reason=1", p.stderr)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
 
     def test_success_still_reports_the_event_id(self):
         p = run_send('{"ok": true, "event_id": "$abc123"}')
