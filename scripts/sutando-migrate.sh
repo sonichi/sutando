@@ -284,9 +284,8 @@ if [ ! -x "$HELPER" ] && [ ! -f "$HELPER" ]; then
     exit 2
 fi
 
-# Interpreter resolution: python-binary.sh's require_python is the single
-# loud-failure owner — never redefine it here (it shadows the sourced contract).
-# Dest resolution deferred to after arg parsing so --respect-env can take effect.
+# python-binary.sh's require_python is the single loud-failure owner — never
+# redefine it here. Dest resolution waits for arg parsing, so --respect-env works.
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Source detection
@@ -1011,14 +1010,16 @@ any_source_sentinel() {
     ls "$DEST_REAL/state/.migrated-from-$1-"* >/dev/null 2>&1
 }
 
-# Atomic per-file copy preserving mtime. Returns 0 on success.
-# `cp -p` carries a FILE's mode; `mkdir -p` parents take umask, so a 0700 source
-# dir would land 0755. The dest takes the INTERSECTION — it never widens.
+# `cp -p` carries a FILE's mode, but `mkdir -p` parents take umask, so a 0700
+# source dir lands 0755. The dest takes the INTERSECTION — it never widens.
 mirror_dir_modes() {
     local s d
     s="$(dirname "$1")"; d="$(dirname "$2")"
     local -a sd=() dd=()
     while [ "$s" != "/" ] && [ "$d" != "/" ] && [ "$(basename "$s")" = "$(basename "$d")" ]; do
+        # Bound to paths STRICTLY inside the dest root. Basename agreement alone
+        # lets the walk climb past it and chmod ancestors outside the rollback.
+        [ -n "${DEST_REAL:-}" ] && [ "${d#"$DEST_REAL"/}" != "$d" ] || break
         sd+=("$s"); dd+=("$d")
         s="$(dirname "$s")"; d="$(dirname "$d")"
     done
@@ -1032,6 +1033,7 @@ mirror_dir_modes() {
     done
 }
 
+# Atomic per-file copy preserving mtime. Returns 0 on success.
 copy_preserving_mtime() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"

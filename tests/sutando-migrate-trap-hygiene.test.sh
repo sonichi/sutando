@@ -15,7 +15,7 @@ rc=$?
 check "--help exits 0 with an inherited _VERDICTS_TMP" "$rc" "0"
 check "the inherited path SURVIVES (trap must not delete what it did not create)" \
   "$( [ -f "$victim" ] && echo alive || echo deleted )" "alive"
-# non-JSON path variant of the same control (the finding asked for one).
+# non-JSON path variant of the same control.
 victim2="$(mktemp -t trap-hygiene-victim2.XXXXXX).txt"
 printf 'plain text\n' > "$victim2"
 _VERDICTS_TMP="$victim2" bash scripts/sutando-migrate.sh --help >/dev/null 2>&1
