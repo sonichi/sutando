@@ -174,6 +174,22 @@ def _day_matches(dom: str, month: str, dow: str, t: time.struct_time) -> bool:
     return dom_ok and dow_ok
 
 
+def _local_epochs(y: int, mo: int, d: int, h: int, mi: int) -> "list[int]":
+    """Every real epoch whose local wall-clock is this minute, newest first.
+
+    A DST fall-back repeats an hour so an ambiguous minute has TWO epochs and
+    isdst=-1 collapses them; a skipped minute round-trips wrong and has none.
+    """
+    out = []
+    for isdst in (0, 1):
+        e = int(time.mktime((y, mo, d, h, mi, 0, 0, 0, isdst)))
+        lt = time.localtime(e)
+        if (lt.tm_year, lt.tm_mon, lt.tm_mday,
+                lt.tm_hour, lt.tm_min) == (y, mo, d, h, mi) and e not in out:
+            out.append(e)
+    return sorted(out, reverse=True)
+
+
 def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
     """Seconds between the two most recent fire-minutes of ``expr``, or None.
 
@@ -199,18 +215,20 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
         # Anchor on noon: midnight can be skipped or repeated by a DST shift.
         noon = time.mktime((y, mo, d, 12, 0, 0, 0, 0, -1))
         if _day_matches(dom_f, month_f, dow_f, time.localtime(noon)):
+            day = []
             for h in hours:
-                for m in minutes:
-                    epoch = int(time.mktime((y, mo, d, h, m, 0, 0, 0, -1)))
-                    if epoch > now_epoch:
-                        continue
-                    # Candidates only descend, so the first one under the
-                    # floor means no second fire exists inside the window.
-                    if epoch < floor:
-                        return None
-                    fires.append(epoch)
-                    if len(fires) == 2:
-                        return fires[0] - fires[1]
+                for mi in minutes:
+                    day.extend(_local_epochs(y, mo, d, h, mi))
+            # A repeated hour interleaves two UTC offsets, so the h/m walk no
+            # longer descends on its own and the floor test needs a real sort.
+            for epoch in sorted(day, reverse=True):
+                if epoch > now_epoch:
+                    continue
+                if epoch < floor:
+                    return None
+                fires.append(epoch)
+                if len(fires) == 2:
+                    return fires[0] - fires[1]
         prev = time.localtime(noon - 86400)
         y, mo, d = prev.tm_year, prev.tm_mon, prev.tm_mday
     return None

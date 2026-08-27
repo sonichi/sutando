@@ -9,6 +9,7 @@ late on consecutive days while its sub-hourly peers recovered immediately.
 Run: python3 tests/cron-lateness-scales-with-period.test.py
 """
 import importlib.util
+import os
 import pathlib
 import sys
 import time
@@ -162,6 +163,54 @@ finally:
 _full = cr.cron_period_seconds("43 8 * * *", NOW)
 ok(f"second fire below the floor -> None (got {_short})", _short is None)
 ok(f"control: same expression measures {_full}s on the full window", _full == 86400)
+
+# --- DST transition equivalence (the optimized scan vs cron_matches) ---
+
+# The day walk reconstructs epochs from local wall-clock, so a repeated hour
+# (fall-back) has TWO real epochs per minute and a skipped hour (spring) none.
+_tz_prev = os.environ.get("TZ")
+os.environ["TZ"] = "America/Los_Angeles"
+time.tzset()
+try:
+    def _ref(expr, now, horizon=3 * 86400):
+        """Two most recent fires by walking real epochs, the slow way."""
+        seen = []
+        for back in range(0, horizon, 60):
+            e = now - back
+            if cr.cron_matches(expr, time.localtime(e)):
+                seen.append(e)
+            if len(seen) == 2:
+                return seen[0] - seen[1]
+        return None
+
+    _fb = int(time.mktime((2025, 11, 2, 3, 0, 0, 0, 0, -1)))
+    # isdst=0 pins the SECOND pass through the repeated hour; a `now` after the
+    # transition never scans the ambiguous minutes and cannot see their ordering.
+    _fb_in = int(time.mktime((2025, 11, 2, 1, 30, 0, 0, 0, 0)))
+    _sf = int(time.mktime((2025, 3, 9, 5, 0, 0, 0, 0, -1)))
+    for _label, _now in (("fall-back", _fb), ("inside repeated hour", _fb_in),
+                         ("spring-forward", _sf)):
+        for _e in ("30 1 * * *", "*/15 * * * *", "45 1,2 * * *"):
+            _got, _want = cr.cron_period_seconds(_e, _now), _ref(_e, _now)
+            ok(f"{_label} {_e!r}: scan={_got} matches={_want}", _got == _want)
+
+    # The bug this guards: isdst=-1 collapsed the repeated 01:30 to one epoch,
+    # returning the 25-hour gap to the previous day instead of the real hour.
+    ok("fall-back 01:30 measures one hour, not the 25-hour day",
+       cr.cron_period_seconds("30 1 * * *", _fb) == 3600)
+    ok("control: an ambiguous local minute really has two epochs",
+       len(cr._local_epochs(2025, 11, 2, 1, 30)) == 2)
+    ok("control: a skipped local minute has none",
+       cr._local_epochs(2025, 3, 9, 2, 30) == [])
+    ok("control: an ordinary local minute has exactly one",
+       len(cr._local_epochs(2025, 6, 1, 1, 30)) == 1)
+finally:
+    if _tz_prev is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = _tz_prev
+    time.tzset()
+
 
 if FAILS:
     print(f"cron-lateness: {FAILS} failure(s)")
