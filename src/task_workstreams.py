@@ -234,11 +234,8 @@ def scan_task_history(workspace: Path) -> list[TaskRecord]:
             continue
         access_tier = str(headers.get("access_tier") or "owner").lower()
         invoked = _parse_timestamp(str(headers.get("timestamp") or ""), mtime)
-        # Durable history reads through the readiness owner, not a private index.
-        # `errors="replace"` here rendered a torn body as a done answer with a
-        # replacement char, and the private stem-keyed index missed flat-layout
-        # results entirely. resolve_result() covers both: it never lossy-decodes,
-        # and its candidate list is the layout union.
+        # Through the readiness owner, not a private index: errors="replace" made a
+        # torn body look done, and a stem-keyed index missed the archive layouts.
         state, result_path, body = local_task_protocol.resolve_result(
             results_dir, task_id)
         result = (body or "")[:MAX_RESULT_CHARS].strip() if state == "ready" else ""

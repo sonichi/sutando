@@ -58,9 +58,8 @@ def _read(path):
         # UnicodeDecodeError is a ValueError, so a torn holder escaped `except
         # OSError`; errors="replace" would decode it into a false non-skip answer.
         return UNREADABLE if path.exists() else None
-    # Empty/whitespace-only is NOT-READY, not an answer. delivery/readiness.py
-    # already says so; treating it as a body here takes a terminal requeue on a
-    # holder that is mid-write and completes moments later.
+    # Empty/whitespace is NOT-READY, not an answer (delivery/readiness.py says so):
+    # treating it as a body takes a terminal requeue on a mid-write holder.
     return body if body.strip() else UNREADABLE
 
 
