@@ -142,8 +142,11 @@ coverage.xml
 diff-cover.md
 coverage-summary.md
 
-# `f` is skipped: .swf is a real extension, and losing every Flash asset costs
-# more than the 11th concurrent swap slot. .env* gives up its whole .s?? space.
-*.sw[a-eg-p]
+# Two discriminators, both needed: dot/underscore prefix and the sw prefix —
+# either alone over-denies .swf/.swg or .foo.svg/.schema.sql.
+[._]*.sw[a-p]
+[._]sw[a-p]
+# .env* alone gives up its whole .s?? space: any .env.s?? is a swap of a secrets
+# file, so the deep vim range is worth more there than the extensions it costs.
 *.env*.s[a-w][a-z]
 *~
