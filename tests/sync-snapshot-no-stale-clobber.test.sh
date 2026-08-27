@@ -163,5 +163,35 @@ check "and it stays OUT of the operator stream (not every failure is an action)"
 check "provenance is not stamped for a swap that did not happen" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")" = "$_sig_before" ]'
 
+
+# --- control 6: an INTERRUPTED stage must not survive into the next tick ---
+# Cleanup only runs when control RETURNS from the replace, so a process killed
+# after staging cannot clean up after itself. Two independent guards: the
+# leftover is never STAGED (the vault harm) and it is SWEPT (the disk harm).
+printf 'root advanced again\n' > "$WORKSPACE_DIR/build_log.md"
+printf 'ours2\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+_orphan="$WORKSPACE_DIR/hosts/testhost/build_log.md.snap.AB12cd"
+printf 'a full build-log copy left by a killed process\n' > "$_orphan"
+check "precondition: the orphan exists before the next tick" '[ -f "$_orphan" ]'
+
+# A FRESH leftover must SURVIVE — a concurrent sync may be mid-write. Without
+# this the sweep would be indistinguishable from an unconditional rm.
+_snapshot_per_host_config
+check "a FRESH reserved temp is left alone (a concurrent writer may own it)" \
+      '[ -f "$_orphan" ]'
+
+touch -t 202601010000 "$_orphan"
+_snapshot_per_host_config
+check "an AGED reserved temp is swept on the next tick" '[ ! -f "$_orphan" ]'
+
+# The staging guard, independent of the sweep: a leftover inside the grace
+# window must still be denied by the composed exclude set.
+_excl="$(sed -n '/^_compose_exclude_content()/,/^}/p' "$REPO/scripts/sync-workspace.sh")"
+check "the composed exclude set denies the reserved snapshot temp" \
+      'printf %s "$_excl" | grep -q "snap\.??????"'
+# Control: the same probe must be able to say NO, or it is matching noise.
+check "control: the exclude set does NOT deny an unrelated invented pattern" \
+      '! printf %s "$_excl" | grep -q "snap\.ZZZZZZZ"' 
+
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

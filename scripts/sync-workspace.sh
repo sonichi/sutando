@@ -523,6 +523,10 @@ _compose_exclude_content() {
 
     echo ""
     echo "# Hard-deny credentials regardless of carrier set"
+    # Reserved snapshot temp. Cleanup only runs when control RETURNS from the
+    # replace, so a process killed mid-stage leaves one under a carried
+    # hosts/*/ path and every later `git add -A` would carry it into the vault.
+    echo "*.snap.??????"
     echo ".env*"
     echo "*.heartbeat"
     echo "*.alive"
@@ -833,6 +837,13 @@ _snapshot_per_host_config() {
     _cfg="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-sutando-config-dir)" || return 0
     local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
     mkdir -p "$_host_dir" 2>/dev/null || return 0
+
+    # Next-tick sweep: an interrupted stage cannot clean up after itself, so
+    # repeated interrupted ticks would accumulate full build-log copies. Only
+    # this host's own reserved pattern, and only leftovers older than the
+    # grace window, so a temp a CONCURRENT sync is mid-write is never removed.
+    find "$_host_dir" -maxdepth 1 -type f -name '*.snap.??????' \
+        -mmin +"${SYNC_SNAP_TMP_GRACE_MIN:-10}" -delete 2>/dev/null || true
 
     if [ -f "$_cfg/settings.json" ]; then
         cp -p "$_cfg/settings.json" "$_host_dir/settings.json" 2>/dev/null || true
