@@ -16,7 +16,11 @@ equivalent `msvcrt.locking` byte-range lock on Windows. It auto-releases
 on process death (OS closes all FDs), so no explicit cleanup is needed.
 The FD is kept in `_held_fds` to prevent CPython's GC from closing it early.
 
-Exit behavior: exits 0 (not 1) on lock contention so launchd's KeepAlive
+Exit behavior: exits EXIT_STANDDOWN (75) on lock contention. NOT 0 -- a
+supervisor cannot distinguish an inferred stand-down from a bridge whose
+main loop merely returned, and treating the latter as deliberate leaves it
+silently down. 75 cannot be reached by falling off __main__.
+Historically 0, to stop launchd's KeepAlive
 doesn't restart-loop when it's simply the second instance.
 """
 from __future__ import annotations
@@ -29,6 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from file_lock import lock_fd  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
+# Distinct from 0 so a supervisor can tell a deliberate stand-down from a main
+# loop that simply returned. 75 == EX_TEMPFAIL.
+EXIT_STANDDOWN = 75
+
 _held_fds: list[int] = []  # keep refs so GC doesn't close them
 
 
@@ -36,7 +44,7 @@ def acquire(name: str) -> None:
     """Acquire an exclusive non-blocking lock for `name`.
 
     If another process already holds the lock, prints a one-line message
-    to stderr and exits 0. Otherwise returns normally; caller continues.
+    to stderr and exits EXIT_STANDDOWN. Otherwise returns; caller continues.
     """
     lock_dir = resolve_workspace() / "state" / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
@@ -62,4 +70,4 @@ def _exit_contended(fd: int, name: str) -> None:
         f"[{name}] another instance already holds the lock — exiting cleanly.",
         file=sys.stderr, flush=True,
     )
-    os._exit(0)  # exit(0) so launchd KeepAlive doesn't restart-loop
+    os._exit(EXIT_STANDDOWN)

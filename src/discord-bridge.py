@@ -361,6 +361,11 @@ from policy.egress.attachment import (  # noqa: E402
     SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS,
     is_path_sendable as _is_path_sendable_shared,
+    classify_attachment as _classify_attachment,
+    ATTACH_SEND as _ATTACH_SEND,
+    ATTACH_MISSING as _ATTACH_MISSING,
+    ATTACH_EMPTY as _ATTACH_EMPTY,
+    ATTACH_REFUSED as _ATTACH_REFUSED,
 )
 
 
@@ -5441,13 +5446,33 @@ async def poll_proactive():
                                             _redirect_text, f.stem,
                                             _chunk_for_discord)
                                     for fpath in files:
-                                        fpath = os.path.expanduser(fpath.strip())
-                                        if _is_path_sendable(fpath):
+                                        _outcome, fpath = _classify_attachment(fpath)
+                                        if _outcome == _ATTACH_SEND:
                                             await _target_ch.send(file=discord.File(fpath))
-                                        elif not os.path.isfile(fpath):
+                                            print(
+                                                f"  [proactive channel-redirect] sent file: {fpath}",
+                                                flush=True,
+                                            )
+                                        elif _outcome == _ATTACH_MISSING:
                                             print(
                                                 f"  [proactive channel-redirect] file marker, "
                                                 f"file not found: {fpath}",
+                                                flush=True,
+                                            )
+                                        elif _outcome == _ATTACH_EMPTY:
+                                            await _target_ch.send(
+                                                "(a file marker in this reply had no path"
+                                                " — nothing attached)")
+                                            print("  [proactive channel-redirect] file marker "
+                                                  "with EMPTY path — malformed, surfaced",
+                                                  flush=True)
+                                        elif _outcome == _ATTACH_REFUSED:
+                                            # Authorization denial, not absence: silence
+                                            # here reads as a successful attach.
+                                            await _target_ch.send(f"(file not allowed: {fpath})")
+                                            print(
+                                                f"  [proactive channel-redirect] REJECTED file "
+                                                f"(not in allowlist): {fpath}",
                                                 flush=True,
                                             )
                                     try:
@@ -5805,13 +5830,22 @@ async def poll_dm_fallback():
                                 except Exception:
                                     pass
                             for fpath in file_list:
-                                fpath = os.path.expanduser(fpath.strip())
-                                if _is_path_sendable(fpath):
+                                _outcome, fpath = _classify_attachment(fpath)
+                                if _outcome == _ATTACH_SEND:
                                     await target_channel.send(file=discord.File(fpath))
                                     print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
-                                elif not os.path.isfile(fpath):
+                                elif _outcome == _ATTACH_MISSING:
                                     # See poll_results — log only, no user noise.
                                     print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
+                                elif _outcome == _ATTACH_EMPTY:
+                                    await target_channel.send(
+                                        "(a file marker in this reply had no path"
+                                        " — nothing attached)")
+                                    print("  [dm-fallback channel-redirect] file marker with "
+                                          "EMPTY path — malformed, surfaced", flush=True)
+                                elif _outcome == _ATTACH_REFUSED:
+                                    await target_channel.send(f"(file not allowed: {fpath})")
+                                    print(f"  [dm-fallback channel-redirect] REJECTED file (not in allowlist): {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
                             if _task_file.exists():

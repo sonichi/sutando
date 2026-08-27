@@ -2,7 +2,7 @@
 
 Covers:
   (a) acquire() succeeds when no other holder — lock file written with PID.
-  (b) Second acquire() from a new process exits 0 (launchd-safe).
+  (b) Second acquire() from a new process exits 75 (EXIT_STANDDOWN).
   (c) Lock releases when the holder process dies — next acquire() wins.
   (d) acquire() on two different names is independent (no cross-lock).
 
@@ -82,14 +82,11 @@ class TestSingleInstance(unittest.TestCase):
         pid_in_file = int(lock_path.read_text().strip())
         self.assertEqual(pid_in_file, os.getpid())
 
-    # (b) Second process attempting the same lock exits 0.
-    def test_second_process_exits_zero(self):
+    # (b) A contender stands down with 75 so supervisors can distinguish it.
+    def test_second_process_exits_standdown_code(self):
         mod = self._load(self.workspace)
         mod.acquire("test-second")
-        # Spawn a child process that tries to acquire the same lock.
-        # It should exit 0 (not 1) because we hold it in this process.
-        # Pass paths via env (NOT interpolated into source) so Windows
-        # backslash paths don't break the child's string literals.
+        # Pass paths via env so Windows backslashes stay out of source literals.
         child_env = {**os.environ, "SUTANDO_WORKSPACE": str(self.workspace)}
         child = subprocess.run(
             [
@@ -102,7 +99,8 @@ class TestSingleInstance(unittest.TestCase):
             timeout=10,
             env={**child_env, "SI_ROOT": str(ROOT)},
         )
-        self.assertEqual(child.returncode, 0, "contending process should exit 0")
+        self.assertEqual(child.returncode, 75,
+                         "contending process should exit EXIT_STANDDOWN (75)")
         self.assertIn(b"already holds the lock", child.stderr)
 
     # (c) Lock releases after holder dies — next acquire wins.
@@ -131,7 +129,7 @@ class TestSingleInstance(unittest.TestCase):
         holder.wait(timeout=5)
         # Now this process should be able to acquire.
         mod = self._load(self.workspace)
-        # If lock still held, acquire() would call os._exit(0) — but since
+        # If lock still held, acquire() would call os._exit(75) — but since
         # holder died, the OS released the flock and we should proceed normally.
         try:
             mod.acquire("test-release")
@@ -152,6 +150,25 @@ class TestSingleInstance(unittest.TestCase):
         for name in ("bridge-alpha", "bridge-beta"):
             lock_path = self.workspace / "state" / "locks" / f"{name}.lock"
             self.assertTrue(lock_path.exists(), f"{name} lock file missing")
+
+
+    # In-process so coverage records the stand-down line: the sibling test's
+    # child runs in another interpreter, where coverage cannot see it.
+    def test_standdown_exits_with_the_declared_constant(self):
+        import os as _os
+        mod = self._load(self.workspace)
+        calls = []
+        real_exit = _os._exit
+        _os._exit = lambda code: (calls.append(code), (_ for _ in ()).throw(SystemExit(code)))[0]
+        try:
+            mod.acquire("coverage-standdown-probe")      # first holder: returns
+            with self.assertRaises(SystemExit):
+                mod.acquire("coverage-standdown-probe")  # contender: stands down
+        finally:
+            _os._exit = real_exit
+        self.assertEqual(calls, [mod.EXIT_STANDDOWN],
+                         "acquire() must stand down with EXIT_STANDDOWN, not a bare 0")
+        self.assertEqual(mod.EXIT_STANDDOWN, 75)
 
 
 if __name__ == "__main__":
