@@ -39,9 +39,7 @@ mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
 # TASKS_DIR resolves to the LIVE workspace at import, so the temp tree above is not
-# isolation on its own: `_write_task` dropped two real `access_tier: owner` files into
-# the operator's queue on every run, where cron-gate reads them as pending owner work
-# and defers every gated cron. The sibling suite already redirects it; this one did not.
+# isolation on its own and `_write_task` writes real owner tasks into the real queue.
 TASKS_DIR = Path(_tmp) / "tasks"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 mod.TASKS_DIR = TASKS_DIR
