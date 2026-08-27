@@ -129,10 +129,6 @@ def main() -> int:
         else:
             detail = reason or p.stderr.strip()[:120] or "no reason reported"
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
-            if "no gateway configured" in reason:
-                print("  -> the ag2space env is not loaded in this process. Run:\n"
-                      '     set -a; . "$CLAUDE_CONFIG_DIR/channels/ag2space/.env"; set +a',
-                      file=sys.stderr)
             failures += 1
     if failures:
         return 1
