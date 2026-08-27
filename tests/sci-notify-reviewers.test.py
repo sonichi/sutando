@@ -227,6 +227,24 @@ class RoomScopedPresence(unittest.TestCase):
                 p = run_room(payload)
                 self.assertNotIn("ABSENT from", p.stderr)
                 self.assertIn("ok=True", p.stdout)
+                # ...and it must NOT read as a checked send.
+                self.assertIn("UNVERIFIED", p.stderr)
+
+    def test_room_arg_on_an_unreadable_roster_relocates_but_says_UNVERIFIED(self):
+        # The fifth outcome: --room is passed to GET a presence guarantee, so an
+        # unread roster must not print the verified-send line.
+        for payload in ("[]", "null", "not json"):
+            with self.subTest(payload=payload):
+                p = run_room(payload, "--room", "!elsewhere:x")
+                self.assertIn("UNVERIFIED for !elsewhere:x", p.stderr)
+                self.assertNotIn("NOT REACHABLE", p.stderr)
+                self.assertIn("ok=True", p.stdout)
+
+    def test_a_verified_present_send_carries_NO_unverified_label(self):
+        # Control for the two above: the label must not be unconditional.
+        p = run_room(_PRESENT, "--room", "!elsewhere:x")
+        self.assertNotIn("UNVERIFIED", p.stderr)
+        self.assertIn("ok=True", p.stdout)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

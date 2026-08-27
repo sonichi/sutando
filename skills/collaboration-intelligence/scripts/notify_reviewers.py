@@ -152,8 +152,17 @@ def main() -> int:
                       "or route via the human. Not sending.", file=sys.stderr)
                 refusal_rc = max(refusal_rc, 5)
                 continue
+            if why.startswith("unverified"):
+                # Distinct from a checked PLAN: relocating on an unread roster is
+                # a guess, and it must not print the same line as a verified send.
+                print(f"{t['name']}: UNVERIFIED for {a.room} ({why}) — sending anyway; "
+                      "presence could not be checked, so this is not a confirmation.",
+                      file=sys.stderr)
             t = {**t, "room": a.room}   # reachable here: address them HERE, not elsewhere
         present, why = stand_present_in_room(t)
+        if present and why.startswith("unverified"):
+            print(f"{t['name']}: UNVERIFIED for {t['room']} ({why}) — sending unchecked.",
+                  file=sys.stderr)
         if not present:
             # Positive absence: sending would resolve to nothing and report ok.
             print(f"{t['name']}: ABSENT from {t['room']} ({why}) — "
