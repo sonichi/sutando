@@ -196,9 +196,13 @@ def get_waiting_questions():
             # that blank line and a start-anchored slice comes back empty.
             line_start = content.rfind("\n", 0, m.end()) + 1
             line_end = content.find("\n", m.end())
-            body = content[line_start:line_end if line_end != -1 else len(content)].strip()
+            stop = line_end if line_end != -1 else len(content)
+            body = content[line_start:stop].strip()
+            # The DM renders `snippet`, not `body`; an empty one delivered the
+            # bracketed label alone, so options and defaults never reached anyone.
+            ask = content[m.end():stop].strip().lstrip("*").strip()
             questions.append({"id": title[:40], "title": title,
-                              "snippet": "", "body": body or title})
+                              "snippet": ask[:120], "body": body or title})
     return questions
 
 
