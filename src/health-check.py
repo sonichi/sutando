@@ -58,6 +58,7 @@ from util_paths import _host_label, channel_access_path, claude_home_path, claud
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
+import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -5901,6 +5902,31 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     return out[-limit:]
 
 
+def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-finished) from `results/task-cron-<job>-<epoch>.txt`.
+
+    The one completion record needing no per-job config: every job emitted by
+    `cron-runner.py` leaves one. Session crons registered via CronCreate do not
+    pass through that writer, so this lane does not observe them.
+    """
+    from datetime import datetime
+    out = []
+    if not results.is_dir():
+        return out
+    # The epoch in the NAME is emit time; mtime is the finish, as for sentinels.
+
+    # The writer slugifies the job name, so match its contract rather than the
+    # raw name; a raw name in the glob would also inject path/wildcard chars.
+    anchored = cron_task_id.record_matcher(job)
+    for f in results.rglob(cron_task_id.DISCOVERY_GLOB):
+        if not f.is_file() or not anchored.match(f.name):
+            continue
+        lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
 def _daily_completion_minutes(state: Path, job: str, limit: int = 7) -> list:
     """(date, minute-of-day-finished) from `state/<job>-YYYY-MM-DD.sentinel`.
 
@@ -5992,6 +6018,11 @@ def check_daily_cron_punctuality() -> dict:
             arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
                     else _daily_completion_minutes(ws / "state", jname))
             used_artifact_lane = bool(arts) and launchd
+        # Last resort, and the only lane needing no per-job config: a job that
+        # publishes nothing dated still leaves a task-cron result when it finishes.
+        if not arts:
+            arts = _daily_task_record_minutes(ws / "results", jname)
+            used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         newest = max((d for d, _ in arts), default=None)
