@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Asserts the in-session --restart guard in src/agent/claude/cli/start-cli.sh,
-# both directions: refuses on an inherited SUTANDO_CORE_SESSION=1, else proceeds.
+# Asserts the in-session --restart guard in BOTH runtime launchers, which share
+# src/agent/restart-guard.sh: refuse on an inherited marker, else proceed.
 
 # Stubs tmux/pgrep/ps/claude on PATH — no real tmux, core or session is touched.
 # Run: bash tests/start-cli-restart-inside-core-guard.test.sh
@@ -136,6 +136,41 @@ if [ -n "$live_ws" ] && [ "$live_ws" != "$TD/workspace" ]; then
     && say ok "no stub run appended to the live workspace log" \
     || say FAIL "a stub run appended to $live_ws/logs/restart-attempts.log"
 fi
+
+# --- the CODEX launcher shares the same policy ----------------------------
+# No codex stub on PATH: an unrefused run falls through to the "not installed"
+# error, which is the positive control that the guard is what stopped case 1.
+CODEX="$REPO/src/agent/codex/cli/start-cli.sh"
+run_codex() {
+  : > "$SESS_MARK"; : > "$CORE_MARK"
+  env -i PATH="$BIN:/usr/bin:/bin" HOME="$TD" \
+      SESS_MARK="$SESS_MARK" CORE_MARK="$CORE_MARK" \
+      SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$TD/workspace" \
+      SUTANDO_TMUX_SOCKET="$TD/sock" "$@" \
+      /bin/bash "$CODEX" --restart > "$TD/cout" 2> "$TD/cerr" < /dev/null
+  crc=$?
+  cerr="$(cat "$TD/cerr")"
+}
+
+run_codex SUTANDO_CORE_SESSION=1
+[ "$crc" -ne 0 ] && say ok "codex: in-session --restart exits non-zero (rc=$crc)" \
+  || say FAIL "codex: in-session --restart exited 0"
+case "$cerr" in *"$REFUSAL"*) say ok "codex: refusal reaches the caller" ;;
+  *) say FAIL "codex: no refusal on stderr" ;; esac
+case "$cerr" in *"NOT --emit-task"*) say ok "codex: shares the claude message body" ;;
+  *) say FAIL "codex: message body diverged from the shared helper" ;; esac
+[ -f "$SESS_MARK" ] && say ok "codex: never reaches kill-session" \
+  || say FAIL "codex: kill-session ran despite the refusal"
+
+run_codex
+case "$cerr" in *"$REFUSAL"*) say FAIL "codex: out-of-session --restart was refused" ;;
+  *) say ok "codex: out-of-session --restart is not refused" ;; esac
+case "$cerr" in *codex*) say ok "codex: unrefused run reached the codex check" ;;
+  *) say FAIL "codex: unrefused run stopped somewhere unexpected: $cerr" ;; esac
+
+run_codex SUTANDO_CORE_SESSION=1 SUTANDO_ALLOW_INSESSION_RESTART=1
+case "$cerr" in *"$REFUSAL"*) say FAIL "codex: override did not release the guard" ;;
+  *) say ok "codex: SUTANDO_ALLOW_INSESSION_RESTART=1 releases the guard" ;; esac
 
 [ "$fails" -eq 0 ] && echo "PASS  in-session --restart is refused; out-of-session is not." \
   || echo "FAIL  $fails assertion(s)"

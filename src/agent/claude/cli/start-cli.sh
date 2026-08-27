@@ -19,6 +19,8 @@ set -e
 # This script lives at src/agent/claude/cli/ — four levels under the repo root.
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
+# Shared with the codex launcher: one owner for the in-session restart policy.
+. "$REPO/src/agent/restart-guard.sh"
 
 # Resolve the Python interpreter (same policy as scripts/sutando-config.sh). On a
 # fresh Mac there is NO system python3 — bare `python3` resolves to Apple's
@@ -483,24 +485,11 @@ log_restart_attempt() {
     "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
     >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
 }
-# Enforces the HAZARD above: a --restart from inside sutando-core kill-sessions
-# the very agent running this command. Refuse, and name the paths that do work.
-if [ -n "$RESTART_REQUESTED" ] && [ "$CALLER_CORE_SESSION" = "1" ] \
-   && [ "${SUTANDO_ALLOW_INSESSION_RESTART:-}" != "1" ]; then
-  {
-    echo "start-cli: refusing --restart from inside the sutando-core session."
-    echo "  kill-session would terminate the agent that is running this command."
-    echo "  Use one of these instead:"
-    echo "    1. owner types 'restart core' in chat -> the bridge writes a restart"
-    echo "       intent that Sutando.app consumes and relaunches in the GUI login session."
-    echo "    2. dead core: the launchd health-check fallback recovers it out-of-session."
-    echo "    3. a human in a terminal OUTSIDE the core, or the Sutando.app menu."
-    echo "  NOT --emit-task: that queues work for the core to consume, and a core"
-    echo "  that needs restarting is exactly the one that cannot consume it."
-    echo "  Out-of-session automation launched from a core shell inherits"
-    echo "  SUTANDO_CORE_SESSION; it can override with SUTANDO_ALLOW_INSESSION_RESTART=1."
-  } >&2
-  log_restart_attempt "refused: inherited SUTANDO_CORE_SESSION=1 (in-session self-kill), no override set"
+# Enforces the HAZARD above; the decision and its message are shared with
+# the codex launcher, this adapter keeps only its own attempt logging.
+if [ -n "$RESTART_REQUESTED" ] && sutando_restart_guard_refuses "$CALLER_CORE_SESSION"; then
+  sutando_restart_guard_explain
+  log_restart_attempt "$SUTANDO_RESTART_GUARD_REASON"
   exit 1
 fi
 if [ -n "$RESTART_REQUESTED" ]; then
