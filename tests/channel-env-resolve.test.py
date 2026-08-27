@@ -21,6 +21,8 @@ Run: python3 tests/channel-env-resolve.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import shutil
 import subprocess
@@ -148,6 +150,47 @@ class TestNonEmptyToken(_Base):
         (chan / "a-client.env").write_text('REMOTE_TASK_TOKEN="a"\n')
         self.assertEqual(m.resolve_channel_env(channels, "ag2space"),
                          chan / "a-client.env")
+
+
+class TestCli(_Base):
+    """`main()` in-process. The wrapper cases below cover the same paths through
+    bash, but only as a subprocess — which no coverage run can see."""
+
+    def _main(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = m.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_wrong_arity_is_usage_error(self):
+        rc, out, err = self._main(["channel_env_resolve.py", "only-one"])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+        self.assertEqual(out, "")
+
+    def test_missing_channel_dir_exits_one_and_names_the_path(self):
+        channels, _ = self._channel()
+        rc, out, err = self._main(["x", str(channels), "nosuch"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no channel dir", err)
+        self.assertEqual(out, "")
+
+    def test_no_qualifying_candidate_exits_one_and_names_both_vars(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text("REMOTE_TASK_TOKEN=\n")
+        rc, out, err = self._main(["x", str(channels), "ag2space"])
+        self.assertEqual(rc, 1)
+        self.assertIn("REMOTE_TASK_TOKEN", err)
+        self.assertIn("AG2_REMOTE_TOKEN", err)
+        self.assertEqual(out, "", "stdout must stay empty — the caller sources it")
+
+    def test_success_prints_only_the_path(self):
+        channels, chan = self._channel()
+        (chan / ".env").write_text(TOKEN_LINE)
+        rc, out, err = self._main(["x", str(channels), "ag2space"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), str(chan / ".env"))
+        self.assertEqual(err, "")
 
 
 class TestShellWrapper(_Base):
