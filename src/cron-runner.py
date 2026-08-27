@@ -3,7 +3,7 @@
 
 Why this exists
 ---------------
-Sutando's recurring prompts (morning briefing, daily insight, the loop-eng
+Sutando's recurring prompts (morning briefing, the loop-eng
 digest, etc.) were scheduled purely as in-session ``CronCreate`` jobs. Those
 are best-effort: they only fire while the Claude REPL is idle at the fire
 minute, they carry scheduler jitter, and they die with the session. On
