@@ -204,11 +204,8 @@ describe('task-bridge — [deduped:] is a skip marker under the same ownership r
 		assert.equal(mayRetireSkipMarked(`${OWN}.txt`, '[deduped: task-123]', owns, origin), true);
 	});
 
-	// The grammar test above proves the PREDICATE. This proves the CONSEQUENCE:
-	// composing the result-loop's own gate order (task-bridge.ts:938-961) shows
-	// both empty spellings take the silent-archive `continue`, so neither can
-	// reach logConversation()/onResult() at :1037-1058. Kept separate because a
-	// correct predicate with the branches composed wrongly still leaks.
+	// A correct predicate still leaks if the branches compose wrongly, so this
+	// composes the result-loop's gate order rather than re-testing the grammar.
 	it('neither empty spelling reaches the fallthrough — result-loop gate order', () => {
 		const owns = () => true;              // this bridge dispatched it
 		const origin = () => undefined;       // no foreign origin recorded
@@ -232,9 +229,8 @@ describe('task-bridge — [deduped:] is a skip marker under the same ownership r
 			['[DEDUPED: task-123]',         true ],  // case-insensitive
 			['  [deduped:task-123]',        true ],
 			['[deduped: ]',                 true ],  // whitespace target
-			// Both empty spellings parse alike. Measured against the shared parser:
-			// '[deduped: ]' and '[deduped:]' BOTH -> skip(deduped, extra=''). The
-			// old `false` here pinned the `+` bug as if it were the contract.
+			// Both empty spellings must parse alike: the shared Python parser maps
+			// '[deduped: ]' and '[deduped:]' alike to skip(deduped, extra='').
 			['[deduped:]',                  true ],
 		];
 		for (const [body, want] of py) {
