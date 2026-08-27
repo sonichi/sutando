@@ -7480,14 +7480,77 @@ def _probe_codex_task_notifier(target: dict) -> dict:
     }
 
 
-def check_codex_presence(which=shutil.which) -> dict:
-    """Report a missing `codex` binary. Every non-owner task is required to run
-    via `codex exec --sandbox read-only` with no permitted fallback, so losing
-    the binary disables sandboxed delegation and nothing else reports it."""
+def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int = 500):
+    """Why this host would need `codex`, or None if nothing here consumes it.
+
+    Neither available signal is sufficient alone, so both are consulted:
+    configuration is predictive but under-detects (a host can take non-owner
+    traffic with no tierMap entry at all), while received traffic is exact but
+    lags — it cannot see a host that will get its first guest task tomorrow.
+    Tier vocabulary and task parsing are delegated, not restated here.
+    """
+    if _codex_runtime_selected():
+        return "core runtime is codex"
+
+    try:
+        from local_task_protocol import (ACCESS_TIERS, iter_archived_tasks,
+                                         parse_task_headers_trusted)
+    except Exception:  # noqa: BLE001 — a probe never breaks the run
+        return None
+    non_owner = frozenset(ACCESS_TIERS) - {"owner"}
+
+    if channels_dir is None:
+        channels_dir = claude_home_path("channels")
+    channels_dir = Path(channels_dir)
+    if channels_dir.is_dir():
+        for access_file in sorted(channels_dir.glob("*/access.json")):
+            try:
+                data = json.loads(access_file.read_text())
+            except Exception:  # noqa: BLE001 — an unreadable record is not a consumer
+                continue
+            tiers = {str(v) for v in (data.get("tierMap") or {}).values()}
+            named = sorted(tiers & non_owner)
+            if named:
+                return (f"{access_file.parent.name}/access.json maps sender(s) to "
+                        f"tier {', '.join(named)}")
+
+    if tasks_dir is None:
+        tasks_dir = WORKSPACE_DIR / "tasks"
+    tasks_dir = Path(tasks_dir)
+    scanned = 0
+    live = sorted(tasks_dir.glob("task-*.txt")) if tasks_dir.is_dir() else []
+    for task_file in [*live, *iter_archived_tasks(tasks_dir)]:
+        if scanned >= scan_cap:
+            break
+        scanned += 1
+        try:
+            tier = parse_task_headers_trusted(task_file.read_text()).get("access_tier")
+        except Exception:  # noqa: BLE001 — an unreadable task is not evidence
+            continue
+        if tier in non_owner:
+            return f"this host has already received {tier}-tier task(s)"
+    return None
+
+
+def check_codex_presence(which=shutil.which, consumer=None) -> dict:
+    """Report a missing `codex` binary WHERE IT WOULD BE USED. Every non-owner
+    task must run via `codex exec --sandbox read-only` with no permitted
+    fallback — but an owner-only install never takes that path, so keying only
+    on PATH turned an absent optional capability into an unclearable fault."""
     name = "codex-presence"
     resolved = which("codex")
     if resolved:
         return {"name": name, "status": "ok", "detail": f"codex resolves to {resolved}"}
+
+    why = _codex_delegation_consumer() if consumer is None else consumer()
+    if not why:
+        return {
+            "name": name,
+            "status": "ok",
+            "detail": ("codex is not on PATH, and nothing on this host delegates to it — "
+                       "no non-owner ingress configured, no non-owner task ever received, "
+                       "and the core runtime is not codex. Absent and unused, not a fault."),
+        }
 
     # Config surviving a vanished binary is the engine-update signature: the
     # update replaces the tree, and a tree-local `npm -g` install goes with it.
@@ -7504,6 +7567,7 @@ def check_codex_presence(which=shutil.which) -> dict:
         if wiped else
         f"{config} is absent too, so codex was likely never installed on this host."
     )
+    detail += f" This host needs it: {why}."
     return {"name": name, "status": "warn", "detail": detail}
 
 
