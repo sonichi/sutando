@@ -68,6 +68,23 @@ for f in interface.swg audio.swa firmware.swi; do
     refute_ignored "$f" "$f stays trackable — real extension inside the old sw range"
 done
 
+# The cross-product cell the suite was missing, and the one that mattered: a
+# dot/underscore prefix AND a real sw extension satisfies BOTH discriminators,
+# so the prefix controls above (.foo.svg, .schema.sql) could never catch it —
+# their extensions cannot match sw* at all. These can, and did.
+for f in .interface.swg _interface.swg .audio.swa _firmware.swi .audio.swi _lib.swg; do
+    : > "$f"
+    refute_ignored "$f" "$f stays trackable — prefix plus a real sw extension"
+done
+
+# Positive control for the pair above: the same prefixes with a REAL vim swap
+# extension must still be ignored, or the narrowing went too far and the
+# refutations above would pass for the wrong reason.
+for f in .notes.swp _notes.swp .notes.swo _draft.swn; do
+    : > "$f"
+    check_ignored "$f" "$f is ignored — prefixed vim swap still caught"
+done
+
 for f in logo.svg query.sql style.scss run.sh app.swift; do
     refute_ignored "$f" "$f stays trackable"
 done

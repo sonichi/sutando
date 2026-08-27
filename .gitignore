@@ -142,10 +142,15 @@ coverage.xml
 diff-cover.md
 coverage-summary.md
 
-# Two discriminators, both needed: dot/underscore prefix and the sw prefix —
-# either alone over-denies .swf/.swg or .foo.svg/.schema.sql.
-[._]*.sw[a-p]
-[._]sw[a-p]
+# Two discriminators (dot/underscore prefix AND sw) are necessary but not
+# sufficient: `.interface.swg` satisfies both. The range is therefore the third
+# discriminator — sw[n-p] is vim's first three fallbacks (.swp/.swo/.swn) and
+# collides with no real extension. The deep range .swm..swa is NOT covered here
+# on purpose; for the credential case the env-scoped rule below covers it in
+# full, and outside that case a 4th-concurrent-swap file is not worth hiding
+# .swa/.swg/.swi assets.
+[._]*.sw[n-p]
+[._]sw[n-p]
 # .env* alone gives up its whole .s?? space: any .env.s?? is a swap of a secrets
 # file, so the deep vim range is worth more there than the extensions it costs.
 *.env*.s[a-w][a-z]
