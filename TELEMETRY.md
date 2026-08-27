@@ -19,10 +19,15 @@ Skill adoption arrives through `feature_used` as `skill:<name>`, emitted by
 tool**, on installs where that hook is registered. A skill run some other way,
 or an install without the hook, emits nothing. There is no separate skill event.
 
-Nothing emitted is undocumented: the only subprocess emit path
-(`src/telemetry.py` `_cli_main`) allowlists exactly `task_processed` and
-`feature_used` and exits non-zero on anything else, so the table above cannot be
-bypassed from the CLI.
+**Verified at `528e67a6`: no `capture()` call site emits an event outside this
+table.** That is a measurement at a commit, not a guarantee — the two emit paths
+are bounded differently:
+
+* The **CLI path cannot** add one: `_cli_main` allowlists exactly
+  `task_processed` and `feature_used` and exits non-zero on anything else.
+* **In-process `capture()` calls are bounded by nothing but review** — the
+  function does not inspect the event name. So adding a `capture()` means adding
+  a row here in the same change.
 
 ### Documented but NOT wired
 
