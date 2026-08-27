@@ -17,6 +17,12 @@ Save it as `sutando.config.local.json`, then run:
 > or have the owner type `restart core` in a **Discord** DM — that is the only adapter wired
 > to it (`src/discord-bridge.py:3032`; slack and telegram do not import
 > `core_restart_intent`), and it needs Sutando.app running to consume the intent.
+>
+> The intent *policy* itself lives in two places, not one: `src/core_restart_intent.py` and a
+> hand-written Swift mirror in `src/Sutando/main.swift` (`:427`, `:2661` — "mirror
+> core_restart_intent.py exactly": consume-before-act, 10-minute staleness drop). They are kept
+> in sync by comment, so a change to one is a change owed to the other.
+>
 > This is a rule to keep, not a guard that
 > keeps it: the Codex launcher exports `SUTANDO_CORE_SESSION=1` unconditionally
 > (`src/agent/codex/cli/start-cli.sh:39`) and its `--restart` branch (`:242-244`) does no
