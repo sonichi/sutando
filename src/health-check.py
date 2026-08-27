@@ -5890,11 +5890,13 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     # rglob, not glob: delivered results are archived into MONTH buckets
     # (results/archive/YYYY-MM/), so the durable copies sit two levels down.
     for f in results.rglob(f"{stem}-20*"):
-        m = re.match(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})", f.name)
+        # Both date spellings are in live use and the compact one dominates;
+        # matching only YYYY-MM-DD discards the majority of real artifacts.
+        m = re.match(rf"{re.escape(stem)}-(\d{{4}})-?(\d{{2}})-?(\d{{2}})", f.name)
         if not m:
             continue
         lt = datetime.fromtimestamp(f.stat().st_mtime)
-        out.append((m.group(1), lt.hour * 60 + lt.minute))
+        out.append(("-".join(m.groups()), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
 

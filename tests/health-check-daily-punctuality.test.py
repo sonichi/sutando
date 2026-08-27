@@ -476,5 +476,45 @@ class TestCollectorMarksStaleNaming(unittest.TestCase):
         self.assertIn(r["status"], ("ok", "warn"))
 
 
+
+class ArtifactDateSpellingTests(unittest.TestCase):
+    """`<stem>-YYYYMMDD` and `<stem>-YYYY-MM-DD` are both in live use, and the
+    compact form is the majority; matching only the hyphenated one reports a
+    job that writes an artifact every day as having produced nothing."""
+
+    def _minutes(self, names):
+        with tempfile.TemporaryDirectory() as d:
+            r = Path(d)
+            for n in names:
+                (r / n).write_text("x")
+            return hc._daily_artifact_minutes(r, "widget-report")
+
+    def test_compact_dates_are_found(self):
+        got = self._minutes(["widget-report-20260825.txt", "widget-report-20260826.txt"])
+        self.assertEqual([d for d, _ in got], ["2026-08-25", "2026-08-26"],
+                         "compact YYYYMMDD artifacts must be seen, and normalised to ISO")
+
+    def test_hyphenated_dates_still_work(self):
+        got = self._minutes(["widget-report-2026-08-25.txt"])
+        self.assertEqual([d for d, _ in got], ["2026-08-25"])
+
+    def test_both_spellings_coexist_in_one_directory(self):
+        got = self._minutes(["widget-report-20260824.txt", "widget-report-2026-08-25.txt"])
+        self.assertEqual([d for d, _ in got], ["2026-08-24", "2026-08-25"],
+                         "a directory carrying both conventions must yield both")
+
+    def test_a_non_date_suffix_is_still_rejected(self):
+        # The control that can fail: widening the date match must not turn the
+        # matcher into a prefix match on the stem.
+        self.assertEqual(self._minutes(["widget-report-2026notadate.txt"]), [])
+        self.assertEqual(self._minutes(["widget-report-summary.txt"]), [])
+
+    def test_the_returned_date_parses_as_the_caller_expects(self):
+        # The caller does strptime(newest, "%Y-%m-%d") and compares against
+        # now.strftime("%Y-%m-%d"); a raw 20260826 would raise there.
+        (d, _), = self._minutes(["widget-report-20260826.txt"])
+        datetime.strptime(d, "%Y-%m-%d")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
