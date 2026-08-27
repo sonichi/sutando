@@ -14,12 +14,13 @@ printf '#!/bin/sh\necho hi\n' > "$tmp/a.sh"; chmod 0755 "$tmp/a.sh"
 printf '#!/bin/sh\necho hi\n' > "$tmp/b.sh"; chmod 0644 "$tmp/b.sh"
 printf '#!/bin/sh\necho hi\n' > "$tmp/c.sh"; chmod 0755 "$tmp/c.sh"
 helpers="$tmp/helpers.sh"
-sed -n '/^mode_of() {/,/^}/p; /^identity_match() {/,/^}/p; /^sha_match() {/,/^}/p' scripts/sutando-migrate.sh > "$helpers"
+sed -n '/^_stat() {/,/^}/p; /^mode_of() {/,/^}/p; /^identity_match() {/,/^}/p; /^sha_match() {/,/^}/p' scripts/sutando-migrate.sh > "$helpers"
 # shellcheck disable=SC1090
 . "$helpers"
 # A failed extraction must fail loudly HERE: command-not-found inside a
 # yes/no capture reads as a clean "no" and false-passes the no-expecting checks.
 type identity_match >/dev/null 2>&1 || { echo "FAIL  helper extraction produced no identity_match"; exit 1; }
+type _stat >/dev/null 2>&1 || { echo "FAIL  helper extraction produced no _stat (mode_of would return empty and every identity check would false-pass)"; exit 1; }
 check "same bytes + same mode IS identical" "$(identity_match "$tmp/a.sh" "$tmp/c.sh" && echo yes || echo no)" "yes"
 check "same bytes + different mode is NOT identical (exec bit must survive)" \
   "$(identity_match "$tmp/a.sh" "$tmp/b.sh" && echo yes || echo no)" "no"
