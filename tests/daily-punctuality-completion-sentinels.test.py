@@ -232,7 +232,8 @@ check("stem_declared cannot change the verdict when artifacts is empty",
 
 # Every cron job leaves results/task-cron-<name>-<epoch>.txt when its result is
 # written, whatever else it publishes; mtime is the finish, as with sentinels.
-def _task_record_ws(days=5, include_today=True, name="ghost-job", finish=(6, 3)):
+def _task_record_ws(days=5, include_today=True, name="ghost-job", finish=(6, 3),
+                    file_name=None):
     ws = Path(tempfile.mkdtemp(prefix="punct-tc-"))
     (ws / "hosts" / "H").mkdir(parents=True)
     (ws / "state").mkdir()
@@ -244,7 +245,7 @@ def _task_record_ws(days=5, include_today=True, name="ghost-job", finish=(6, 3))
         if i == 0 and not include_today:
             continue
         d = today - datetime.timedelta(days=i)
-        f = ws / "results" / f"task-cron-{name}-{1787000000000 + i}.txt"
+        f = ws / "results" / f"task-cron-{file_name or name}-{1787000000000 + i}.txt"
         f.write_text("x")
         os.utime(f, (time.time(),
                      datetime.datetime.combine(d, datetime.time(*finish)).timestamp()))
@@ -282,6 +283,40 @@ r = run(ws)
 _d = r.get("detail") or ""
 check("another job's records do NOT make this one observable",
       "ghost-job" in _d and ("UNCHECKED" in _d or "unverifiable" in _d), f"got {_d!r}")
+
+
+# `cron-runner` writes task-cron-<SLUG>-<stamp>; globbing the RAW name finds nothing.
+import cron_task_id  # noqa: E402
+
+for _raw, _slug in [("Money scan", "Money-scan"), ("a/b", "a-b"), ("...", "unnamed"),
+                    ("daily.report.job", "daily-report-job"), ("mo*ney", "mo-ney")]:
+    check(f"slug contract: {_raw!r} -> {_slug}", cron_task_id.sanitize_name(_raw) == _slug,
+          f"got {cron_task_id.sanitize_name(_raw)!r}")
+
+    # Configured under the RAW name, recorded under the SLUG: the regression.
+    _r = run(_task_record_ws(name=_raw, file_name=_slug))
+    _det = _r.get("detail") or ""
+    check(f"a job named {_raw!r} is found under its written slug",
+          _raw not in _det and _slug not in _det, f"got {_det!r}")
+
+# The decoys must still be refused after the contract change.
+_ws = _task_record_ws(name="Money scan", file_name="Money-scan")
+for _i in range(5):
+    _d0 = datetime.date.today() - datetime.timedelta(days=_i)
+    for _decoy in (f"task-cron-Money-scan-extra-{1787000000000 + _i}.txt",
+                   f"task-cron-Money-scanner-{1787000000000 + _i}.txt"):
+        _f = _ws / "results" / _decoy
+        _f.write_text("x")
+        os.utime(_f, (time.time(),
+                      datetime.datetime.combine(_d0, datetime.time(6, 3)).timestamp()))
+_matcher = cron_task_id.record_matcher("Money scan")
+check("neighbour suffix is refused", not _matcher.match("task-cron-Money-scan-extra-123.txt"))
+check("bare-prefix neighbour is refused", not _matcher.match("task-cron-Money-scanner-123.txt"))
+check("the job's own record is accepted", bool(_matcher.match("task-cron-Money-scan-123.txt")))
+check("task_id spells the writer's filename",
+      cron_task_id.task_id("Money scan", 123) == "task-cron-Money-scan-123")
+check("discovery glob carries no job name", "*" == cron_task_id.DISCOVERY_GLOB[-1]
+      and "task-cron-" == cron_task_id.DISCOVERY_GLOB[:-1])
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

@@ -58,6 +58,7 @@ from util_paths import _host_label, channel_access_path, claude_home_path, claud
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
+import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -5912,10 +5913,10 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
         return out
     # The epoch in the NAME is emit time; mtime is the finish, as for sentinels.
 
-    # Anchored: a bare `{job}-*` glob also matches `{job}-extra-...`, so a
-    # neighbouring job's records would otherwise vouch for this one.
-    anchored = re.compile(rf"task-cron-{re.escape(job)}-\d+")
-    for f in results.rglob(f"task-cron-{job}-*"):
+    # The writer slugifies the job name, so match its contract rather than the
+    # raw name; a raw name in the glob would also inject path/wildcard chars.
+    anchored = cron_task_id.record_matcher(job)
+    for f in results.rglob(cron_task_id.DISCOVERY_GLOB):
         if not f.is_file() or not anchored.match(f.name):
             continue
         lt = datetime.fromtimestamp(f.stat().st_mtime)
