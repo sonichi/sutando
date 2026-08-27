@@ -20,10 +20,8 @@ chmod +x "$SCRIPT_PARENT/scripts/sutando-config.sh"
 _host() { echo testhost; }
 eval "$(sed -n '/^_snapshot_per_host_config() {/,/^}$/p' "$REPO/scripts/sync-workspace.sh")"
 
-# Load the REAL logging trio, do not substitute it. A test that replaces log()
-# with echo asserts on its own substitute: production log() writes only to
-# $LOG and emits nothing, so a `| grep` over the function's stdout passes in
-# the test and proves nothing about what an operator sees.
+# Load the REAL logging trio: production log() writes only to $LOG and emits
+# nothing, so a substituted echo makes a stdout grep pass and prove nothing.
 LOG="$SB/sync-workspace.log"; : > "$LOG"
 eval "$(sed -n '/^log() {/,/^}$/p'           "$REPO/scripts/sync-workspace.sh")"
 eval "$(sed -n '/^warn_operator() {/,/^}$/p' "$REPO/scripts/sync-workspace.sh")"
@@ -152,10 +150,8 @@ _out9="$(_snapshot_per_host_config 2>&1)"
 unset -f mv
 check "no orphan temp is left behind for the vault to carry" \
       '[ -z "$(ls "$WORKSPACE_DIR/hosts/testhost"/build_log.md.snap.* 2>/dev/null)" ]'
-# Log-only BY DESIGN: the temp was removed and nothing was lost, so this is a
-# diagnostic rather than an operator action. It is asserted against $LOG for
-# exactly that reason — grepping the function's stdout passed before only
-# because the test had replaced log() with echo.
+# Log-only BY DESIGN: the temp was removed and nothing lost, so it is a
+# diagnostic, not an operator action. Asserted against $LOG for that reason.
 check "the failed replace is recorded in \$LOG, not swallowed" \
       'grep -qi "atomic replace of" "$LOG"'
 check "and it stays OUT of the operator stream (not every failure is an action)" \
@@ -165,9 +161,7 @@ check "provenance is not stamped for a swap that did not happen" \
 
 
 # --- control 6: an INTERRUPTED stage must not survive into the next tick ---
-# Cleanup only runs when control RETURNS from the replace, so a process killed
-# after staging cannot clean up after itself. Two independent guards: the
-# leftover is never STAGED (the vault harm) and it is SWEPT (the disk harm).
+# Two guards: the leftover is never STAGED (vault harm) and is SWEPT (disk harm).
 printf 'root advanced again\n' > "$WORKSPACE_DIR/build_log.md"
 printf 'ours2\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
 _orphan="$WORKSPACE_DIR/hosts/testhost/build_log.md.snap.AB12cd"
@@ -185,9 +179,7 @@ _snapshot_per_host_config
 check "an AGED reserved temp is swept on the next tick" '[ ! -f "$_orphan" ]'
 
 # --- control 7: the sweep must not reach past the temp this function OWNS ---
-# The owned temp is build_log.md.snap.XXXXXX. A bare *.snap.?????? also matches
-# unrelated user files under the carried hosts/ path and deletes them. Aged, so
-# the grace window cannot be what spares it.
+# A bare *.snap.?????? also matches unrelated user files; aged, so grace can't spare it.
 _bystander="$WORKSPACE_DIR/hosts/testhost/report.snap.AB12cd"
 printf 'a user file that merely resembles the reserved temp\n' > "$_bystander"
 touch -t 202601010000 "$_bystander"
@@ -206,12 +198,10 @@ check "control: the exclude set does NOT carry an un-anchored *.snap pattern" \
       '! printf %s "$_excl" | grep -q "echo \"\*\.snap\.??????\""'
 # Control: the same probe must be able to say NO, or it is matching noise.
 check "control: the exclude set does NOT deny an unrelated invented pattern" \
-      '! printf %s "$_excl" | grep -q "snap\.ZZZZZZZ"' 
+      '! printf %s "$_excl" | grep -q "snap\.ZZZZZZZ"'
 
 # --- control 12: the ignore rule must be BEHAVIOURALLY scoped to hosts/*/ ---
-# A gitignore pattern with no slash matches at EVERY depth, so the source-text
-# greps above pass while `notes/build_log.md.snap.XXXXXX` is silently dropped
-# from backup. Ask git's own resolver instead of reading the string.
+# A no-slash gitignore pattern matches at EVERY depth, so source-text greps pass.
 _gi="$(mktemp -d)"; ( cd "$_gi" && git init -q . )
 mkdir -p "$_gi/hosts/testhost" "$_gi/notes"
 : > "$_gi/hosts/testhost/build_log.md.snap.AB12cd"

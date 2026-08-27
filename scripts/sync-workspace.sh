@@ -253,9 +253,8 @@ LOG="${SYNC_WORKSPACE_LOG:-${TMPDIR:-/tmp}/sync-workspace.log}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
-# A refusal the OPERATOR must act on: durable in the log AND visible on stderr.
 # log() alone writes only to $LOG and the caller returns success, so a refusal
-# that stops backups indefinitely is indistinguishable from a clean sync.
+# that stops backups indefinitely looks identical to a clean sync.
 warn_operator() { log "$1"; color_warn "$1"; }
 
 color_warn() {
@@ -523,9 +522,8 @@ _compose_exclude_content() {
 
     echo ""
     echo "# Hard-deny credentials regardless of carrier set"
-    # Reserved snapshot temp. Cleanup only runs when control RETURNS from the
-    # replace, so a process killed mid-stage leaves one under a carried
-    # hosts/*/ path and every later `git add -A` would carry it into the vault.
+    # Cleanup runs only when control RETURNS from the replace, so a mid-stage kill
+    # leaves one under a carried hosts/*/ path that `git add -A` would vault.
     echo "hosts/*/build_log.md.snap.??????"
     echo ".env*"
     echo "*.heartbeat"
@@ -838,10 +836,8 @@ _snapshot_per_host_config() {
     local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
     mkdir -p "$_host_dir" 2>/dev/null || return 0
 
-    # Next-tick sweep: an interrupted stage cannot clean up after itself, so
-    # repeated interrupted ticks would accumulate full build-log copies. Only
-    # this host's own reserved pattern, and only leftovers older than the
-    # grace window, so a temp a CONCURRENT sync is mid-write is never removed.
+    # An interrupted stage cannot clean up after itself. Scoped to this host's own
+    # pattern and past the grace window, so a concurrent sync's temp is never hit.
     find "$_host_dir" -maxdepth 1 -type f -name 'build_log.md.snap.??????' \
         -mmin +"${SYNC_SNAP_TMP_GRACE_MIN:-10}" -delete 2>/dev/null || true
 
