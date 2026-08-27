@@ -272,16 +272,14 @@ jobs:
           trap 'rm -rf "$RECDIR"' EXIT
           export RECDIR
           find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
-          # Key on the LINE INDEX: injective by construction. A name-derived key
-          # is not — `tr "/." "__"` maps tests/a/b.test.py and tests/a_b.test.py
-          # to one record, so two workers share a file and the last writer wins,
-          # which can report a failing test with a passing rc.
+          # Key on the LINE INDEX: `tr "/." "__"` maps tests/a/b and tests/a_b
+          # alike, letting one worker's failing rc be overwritten.
           N="$(wc -l < "$RECDIR/files" | tr -d ' ')"
-          # `timeout -k 5 120` is unchanged and still per-file: without it one
-          # hanging suite burns the job's whole timeout-minutes budget and the
-          # job is CANCELED mid-suite.
-          # Bare integers: `xargs -I{}` rewrites a tab inside the replaced
-          # string to a space, so a delimiter scheme stops splitting silently.
+          # Per-file cap: without it one hung suite burns the job budget and
+          # the job is CANCELED mid-suite.
+
+          # Bare integers: `xargs -I{}` rewrites a tab in the replaced string
+          # to a space, so a delimiter scheme stops splitting silently.
           seq 1 "$N" | xargs -P "$WORKERS" -I{} bash -c '
             idx="$1"
             f="$(sed -n "${idx}p" "$RECDIR/files")"

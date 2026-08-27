@@ -14,6 +14,7 @@ else
 fi
 
 # --- 2. Neither loop may reintroduce a name-derived key ---
+
 # Strip comments first: both files describe the defect in prose, which a naive
 # grep would flag as the defect itself.
 for f in "$here/scripts/coverage-gate.sh" "$here/.github/workflows/ci.yml"; do

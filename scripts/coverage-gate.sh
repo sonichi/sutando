@@ -100,11 +100,11 @@ COVGATE_WORKERS="${COVERAGE_GATE_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/nul
 RECDIR="$(mktemp -d)"
 trap 'rm -rf "$RECDIR"' EXIT
 
-# Per-file cap, mirroring ci.yml's twin loop. Without it ONE hung file burns
-# the job's whole timeout-minutes budget and the job is CANCELED mid-suite —
-# indistinguishable, from outside, from a suite that is merely slow.
-# `timeout` is coreutils and absent on a stock macOS, where this script is
-# also run by hand; degrade to no cap rather than failing the local path.
+# Per-file cap, mirroring ci.yml: without it one hung file burns the job
+# budget and the job is CANCELED mid-suite.
+
+# `timeout` is coreutils and absent on stock macOS, where this also runs by
+# hand; degrade to no cap rather than failing the local path.
 COVGATE_TIMEOUT=""
 if command -v timeout >/dev/null 2>&1; then
     COVGATE_TIMEOUT="timeout -k 5 ${COVERAGE_GATE_FILE_TIMEOUT:-120}"
