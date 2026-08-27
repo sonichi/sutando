@@ -83,7 +83,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import DEFER, plan_dedup_recovery  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -538,8 +538,11 @@ def _set_pending_reply(task_id: str, info: dict) -> None:
         _atomic_write_pending_replies(dict(pending_replies))
 
 
-def _dedup_recover(task_id: str, holder_id, target) -> None:
-    """Route the shared dedup-recovery plan; Slack owns only the send."""
+def _dedup_recover(task_id: str, holder_id, target) -> str:
+    """Route the shared dedup-recovery plan; Slack owns only the send.
+
+    Returns the action so the caller can hold the route and result on `defer`
+    rather than archiving an answer it has not managed to read yet."""
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
@@ -551,8 +554,10 @@ def _dedup_recover(task_id: str, holder_id, target) -> None:
             _send_reply(target["channel"], target.get("thread_ts"), payload,
                         task_id=task_id, access_tier=target.get("access_tier", "unknown"))
             print(f"  [dedup] unresolved for {task_id}", flush=True)
+        return action
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+    return "honour"
 
 
 def _pop_pending_reply(task_id: str):
@@ -1566,8 +1571,12 @@ def result_watcher():
                 _skip_parsed = parse_markers(reply_text)
                 _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
                 if _skip_action is not None:
-                    if _skip_action.value == "deduped":
-                        _dedup_recover(task_id, _skip_action.extra, target)
+                    if (_skip_action.value == "deduped"
+                            and _dedup_recover(task_id, _skip_action.extra,
+                                               target) == DEFER):
+                        # Holder unreadable: the route is still in
+                        # pending_replies and both files stay put for a retry.
+                        continue
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     # §7 audit ledger: skip-marked results are resolved deliveries
                     # (no_send / deduped), not silent voids. One line per result.

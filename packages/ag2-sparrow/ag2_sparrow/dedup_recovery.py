@@ -32,7 +32,11 @@ except ImportError:  # pragma: no cover - flat src/ import path
     )
     from task_archive import find_task_file
 
-__all__ = ["plan_dedup_recovery", "REPORT_TEMPLATE"]
+__all__ = ["plan_dedup_recovery", "REPORT_TEMPLATE", "DEFER"]
+
+# Adapters compare against this rather than the literal: a defer that an
+# adapter cannot name is one it archives through, losing route and result.
+DEFER = "defer"
 
 REPORT_TEMPLATE = (
     "⚠️ This was folded into `{holder}`, which delivered nothing, and "
