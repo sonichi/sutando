@@ -5905,7 +5905,9 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
 def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
     """(date, minute-of-day-finished) from `results/task-cron-<job>-<epoch>.txt`.
 
-    The one completion record needing no per-job config: every cron job leaves it.
+    The one completion record needing no per-job config: every job emitted by
+    `cron-runner.py` leaves one. Session crons registered via CronCreate do not
+    pass through that writer, so this lane does not observe them.
     """
     from datetime import datetime
     out = []
