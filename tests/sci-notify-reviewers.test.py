@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import pathlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,6 +76,56 @@ class NotifyReviewers(unittest.TestCase):
         self.assertEqual(p.returncode, 4)          # refusal still visible
         self.assertIn("mention @sutando-rui:x", p.stdout)  # rui still planned
         self.assertIn("OFF-ALLOWLIST 'mini'", p.stderr)
+
+def run_send(stub_payload, roster=None):
+    """Drive --send against a STUB room_ops. The script resolves room_ops as
+    parents[3] of its own path, so the copy must sit in a matching tree."""
+    root = pathlib.Path(tempfile.mkdtemp())
+    (root / "skills" / "collaboration-intelligence" / "scripts").mkdir(parents=True)
+    (root / "skills" / "agent-room-ops").mkdir(parents=True)
+    copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
+    copy.write_text(SCRIPT.read_text())
+    (root / "skills/agent-room-ops/room_ops.py").write_text(
+        "import sys\n"
+        f"sys.stdout.write({stub_payload!r})\n"
+        "sys.exit(0)\n")          # rc 0 + empty stderr: the real refusal shape
+    rp = root / "roster.json"
+    rp.write_text(json.dumps(roster or GOOD))
+    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
+    return subprocess.run([sys.executable, str(copy), "--send",
+                           "--reviewers", "rui", "--message", "m"],
+                          capture_output=True, text=True, timeout=30, env=env)
+
+
+class SilentRefusal(unittest.TestCase):
+    """room_ops reports refusals IN-BAND: rc 0, empty stderr, ok:false+reason.
+    Printing stderr alone renders every such refusal as a blank line."""
+
+    def test_in_band_reason_is_surfaced_not_swallowed(self):
+        p = run_send('{"ok": false, "members": [], "reason": "no gateway configured"}')
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no gateway configured", p.stderr)
+        self.assertNotIn("STDERR=\n", p.stderr)
+
+    def test_the_gateway_reason_names_its_remedy(self):
+        p = run_send('{"ok": false, "reason": "no gateway configured"}')
+        self.assertIn("channels/ag2space/.env", p.stderr)
+
+    def test_a_reasonless_failure_still_says_something(self):
+        p = run_send('{"ok": false}')
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no reason reported", p.stderr)
+
+    def test_unparseable_output_is_not_reported_as_success(self):
+        p = run_send('not json at all')
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("unparseable", p.stderr)
+
+    def test_success_still_reports_the_event_id(self):
+        p = run_send('{"ok": true, "event_id": "$abc123"}')
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("ok=True", p.stdout)
+        self.assertIn("$abc123", p.stdout)
 
 
 if __name__ == "__main__":

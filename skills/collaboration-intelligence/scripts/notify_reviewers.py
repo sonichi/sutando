@@ -109,16 +109,25 @@ def main() -> int:
             print("PLAN:", " ".join(argv))
             continue
         p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-        ok, event = False, ""
+        ok, event, reason = False, "", ""
         try:
             payload = json.loads(p.stdout)
-            ok, event = bool(payload.get("ok")), payload.get("event_id") or ""
+            ok = bool(payload.get("ok"))
+            event = payload.get("event_id") or ""
+            reason = payload.get("reason") or ""
         except ValueError:
-            pass
-        # ok:false with rc 0 is the documented silent-fail — never trust rc
-        print(f"{t['name']}: ok={ok} event={event[:24]}"
-              + ("" if ok else f" STDERR={p.stderr[:120]}"))
-        if not ok:
+            reason = "unparseable room_ops output"
+        # room_ops reports refusals in-band: rc 0, empty stderr, ok:false + reason.
+        # Printing stderr alone renders every such refusal as a blank line.
+        if ok:
+            print(f"{t['name']}: ok=True event={event[:24]}")
+        else:
+            detail = reason or p.stderr.strip()[:120] or "no reason reported"
+            print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
+            if "no gateway configured" in reason:
+                print("  -> the ag2space env is not loaded in this process. Run:\n"
+                      '     set -a; . "$CLAUDE_CONFIG_DIR/channels/ag2space/.env"; set +a',
+                      file=sys.stderr)
             failures += 1
     if failures:
         return 1
