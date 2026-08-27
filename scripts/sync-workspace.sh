@@ -588,6 +588,12 @@ _exclude_rules_only() {
     grep -vE '^[[:space:]]*(#|$)' "$1" | sort
 }
 
+# Built-in deny rules this script owns and may migrate into an existing generated
+# file. Deliberately explicit: anything listed is adopted without operator review.
+_adoptable_builtin_denies() {
+    printf '%s\n' 'hosts/*/build_log.md.snap.??????'
+}
+
 # A previously-generated exclude whose ONLY difference is carve-outs the shipped
 # config now adds is safe to refresh: no operator-authored rule is lost.
 _is_safe_carveout_addition() {
@@ -606,7 +612,9 @@ _is_safe_carveout_addition() {
         [ -n "$path" ] || continue
         shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
     done <<<"$shipped"
-    shipped="$shipped_rules"
+    # An owned built-in deny is also a safe addition: it only ever excludes MORE,
+    # and without it an upgraded workspace stages the temp the rule exists to hide.
+    shipped="$shipped_rules"$'\n'"$(_adoptable_builtin_denies)"
     rc=0
     # Refuse if the refresh would DROP any rule the existing file carries.
     if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ]; then

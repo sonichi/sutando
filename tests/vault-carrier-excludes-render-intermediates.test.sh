@@ -319,6 +319,51 @@ check "...the real generate_exclude accepts the refresh (rc=0)" \
 check "...and both carve-outs are now present (migration actually reaches it)" \
     test "$(carveouts_in "$UPG")" -eq 4
 
+# An OWNED BUILT-IN deny (not a vault.sync.exclude carve-out) must migrate too, or
+# an upgraded workspace stages the crash temp the rule exists to keep out.
+BI_RULE='hosts/*/build_log.md.snap.??????'
+builtin_in() { grep -cxF "$BI_RULE" "$1/.git/info/exclude" || true; }
+
+check "the composer emits the owned built-in deny (fixture is representative)" \
+    test "$(compose_rules | grep -cxF "$BI_RULE")" -eq 1
+
+UPG_BI="$TEST_ROOT/upgrade-builtin-deny"
+seed_older_install "$UPG_BI" "$BI_RULE"
+check "an older GENERATED install starts without the owned built-in deny" \
+    test "$(builtin_in "$UPG_BI")" -eq 0
+check "...the real generate_exclude ACCEPTS the refresh (rc=0)" \
+    test "$(upgrade_rc "$UPG_BI")" -eq 0
+check "...and the built-in deny is now present (migration actually reaches it)" \
+    test "$(builtin_in "$UPG_BI")" -eq 1
+
+# The rule landing is not the point; NOT STAGING the temp is. Drive the real
+# generate_exclude in a real repo, then the real `git add -A`.
+STG="$TEST_ROOT/upgrade-builtin-staging"
+seed_older_install "$STG" "$BI_RULE"
+git init -q "$STG"
+mkdir -p "$STG/hosts/H"
+printf 'log\n'  > "$STG/hosts/H/build_log.md"
+printf 'temp\n' > "$STG/hosts/H/build_log.md.snap.AB12cd"
+check "before migration the crash temp IS staged (the defect being fixed)" \
+    test "$( (cd "$STG" && git add -A >/dev/null 2>&1; git -C "$STG" ls-files --cached hosts/H/build_log.md.snap.AB12cd | wc -l) )" -eq 1
+git -C "$STG" rm -q --cached -r . >/dev/null 2>&1 || true
+# Bare call: under `set -e` a refusing generate_exclude would abort the suite and
+# silently skip the two assertions below — the ones that actually discriminate.
+upgrade_rc "$STG" >/dev/null || true
+check "after migration a real git add -A does NOT stage the crash temp" \
+    test "$( (cd "$STG" && git add -A >/dev/null 2>&1; git -C "$STG" ls-files --cached hosts/H/build_log.md.snap.AB12cd | wc -l) )" -eq 0
+check "control: ...while the real build_log beside it IS still staged" \
+    test "$(git -C "$STG" ls-files --cached hosts/H/build_log.md | wc -l)" -eq 1
+
+# Control: widening to built-ins must not weaken the operator guard.
+UPG_BI_OP="$TEST_ROOT/upgrade-builtin-operator-edited"
+seed_older_install "$UPG_BI_OP" "$BI_RULE"
+echo '!operator/keeps/this' >> "$UPG_BI_OP/.git/info/exclude"
+check "control: an operator-edited file is STILL refused even for a built-in (rc=1)" \
+    test "$(upgrade_rc "$UPG_BI_OP")" -eq 1
+check "control: ...and the built-in was not force-added behind the refusal" \
+    test "$(builtin_in "$UPG_BI_OP")" -eq 0
+
 UPG_OP="$TEST_ROOT/upgrade-operator-edited"
 seed_older_install "$UPG_OP" 'notes/generated/' 'notes/media/'
 echo '!my/operator/rule' >> "$UPG_OP/.git/info/exclude"
