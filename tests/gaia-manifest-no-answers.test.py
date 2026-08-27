@@ -62,7 +62,7 @@ def check_collision_guard() -> None:
     try:
         bg.build(pathlib.Path("/nonexistent"))
     except SystemExit as exc:
-        refused = "case-id collision" in str(exc)
+        refused = bg.COLLISION_ERROR in str(exc)
     check(refused, "colliding 8-char derived ids are refused, not silently displaced")
 
 

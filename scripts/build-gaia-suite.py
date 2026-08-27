@@ -22,6 +22,9 @@ import sys
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANIFEST = REPO_ROOT / "benchmarks" / "gaia-100.manifest.json"
 
+# Read by tests to assert the refusal REASON; reword here, not at either call site.
+COLLISION_ERROR = "case-id collision"
+
 
 def case_id(row: dict) -> str:
     return f"gaia-l{row['Level']}-{row['task_id'][:8]}"
@@ -52,7 +55,7 @@ def build(gaia_root: pathlib.Path) -> dict:
         rows[cid] = r
     if collisions:
         detail = "; ".join(f"{c} <- {', '.join(ids)}" for c, ids in sorted(collisions.items()))
-        sys.exit(f"case-id collision: derived ids are not injective over this GAIA copy: {detail}")
+        sys.exit(f"{COLLISION_ERROR}: derived ids are not injective over this GAIA copy: {detail}")
 
     missing = [cid for cid in manifest["case_ids"] if cid not in rows]
     if missing:
