@@ -545,46 +545,30 @@ def get_schedules() -> list[dict]:
     return out
 
 
-# Quota pace chart markup: plain string (NOT an f-string) because the inline
-# JS is brace-heavy; embedded into the System card by concatenation.
-_QUOTA_CHART_HTML = """<div style="margin-top:10px;border-top:1px solid #1a1a2a;padding-top:8px">
-<div style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">Usage vs even pace</div>
-<div style="display:flex;gap:16px;flex-wrap:wrap">
-<div style="flex:1;min-width:260px"><div style="font-size:10px;color:#555;margin-bottom:4px">5h window</div><svg id="qc-5h" width="100%" height="120" viewBox="0 0 400 120" preserveAspectRatio="none"></svg></div>
-<div style="flex:1;min-width:260px"><div style="font-size:10px;color:#555;margin-bottom:4px">7d window</div><svg id="qc-7d" width="100%" height="120" viewBox="0 0 400 120" preserveAspectRatio="none"></svg></div>
-</div>
-<div style="font-size:9px;color:#444;margin-top:4px">Solid: measured use. Diagonal: even pace between resets (each reset span drawn equal width). Dashed: projection at current pace. <span style="color:#4ecca3">green = under pace</span> · <span style="color:#e94560">red = over pace</span>.</div>
-<div id="qc-empty" style="font-size:10px;color:#555;display:none">Collecting history — the chart fills in as samples accumulate.</div>
-<script>
+# Quota pace sparklines: plain string (NOT an f-string) — brace-heavy JS.
+# Draws the CURRENT window curve vs the even-pace diagonal inside the two
+# existing stat cells; no layout change, no extra vertical space.
+_QUOTA_SPARK_JS = """<script>
 (async()=>{try{
 const d=await (await fetch('/api/quota-chart')).json();
-for(const[k,el]of[['5h','qc-5h'],['7d','qc-7d']]){
-  const svg=document.getElementById(el),W=400,H=120,segs=d.windows[k].segments;
-  if(!segs.length){document.getElementById('qc-empty').style.display='block';continue}
-  const sw=W/segs.length;let out='';
-  segs.forEach((s,i)=>{
-    const x0=i*sw,X=f=>x0+f*sw,Y=u=>H-Math.min(u,1.2)/1.2*H;
-    out+=`<line x1="${x0}" y1="0" x2="${x0}" y2="${H}" stroke="#1e1e30"/>`;
-    out+=`<line x1="${X(0)}" y1="${Y(0)}" x2="${X(1)}" y2="${Y(1)}" stroke="#555" stroke-dasharray="2,3"/>`;
-    if(s.points.length){
-      // Color each stretch by its own pace so a hot start cannot hide behind
-      // a tame finish: midpoint above the diagonal = over pace, red.
-      for(let j=1;j<s.points.length;j++){
-        const a=s.points[j-1],b=s.points[j];
-        const over=(a.y+b.y)/2>(a.x+b.x)/2;
-        out+=`<line x1="${X(a.x)}" y1="${Y(a.y)}" x2="${X(b.x)}" y2="${Y(b.y)}" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.6"/>`;
-      }
-      const last=s.points[s.points.length-1];
-      out+=`<circle cx="${X(last.x)}" cy="${Y(last.y)}" r="2.5" fill="${last.y>last.x?'#e94560':'#4ecca3'}"/>`;
-      if(s.current&&s.projected_end!==undefined)
-        out+=`<line x1="${X(last.x)}" y1="${Y(last.y)}" x2="${X(1)}" y2="${Y(s.projected_end)}" stroke="${s.projected_end>1?'#e94560':'#4ecca3'}" stroke-dasharray="3,3"/>`;
-    }
-  });
-  out+=`<line x1="0" y1="${H-1/1.2*H}" x2="${W}" y2="${H-1/1.2*H}" stroke="#e94560" stroke-opacity="0.25"/>`;
+for(const[k,el]of[['5h','qs-5h'],['7d','qs-7d']]){
+  const svg=document.getElementById(el);if(!svg)continue;
+  const segs=d.windows[k].segments.filter(s=>s.current);
+  if(!segs.length)continue;
+  const s=segs[segs.length-1],W=54,H=22,X=f=>f*W,Y=u=>H-Math.min(u,1.2)/1.2*H;
+  let out=`<line x1="0" y1="${Y(0)}" x2="${W}" y2="${Y(1)}" stroke="#555" stroke-dasharray="2,2"/>`;
+  for(let j=1;j<s.points.length;j++){
+    const a=s.points[j-1],b=s.points[j];
+    const over=(a.y+b.y)/2>(a.x+b.x)/2;
+    out+=`<line x1="${X(a.x)}" y1="${Y(a.y)}" x2="${X(b.x)}" y2="${Y(b.y)}" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.5"/>`;
+  }
+  const last=s.points[s.points.length-1];
+  out+=`<circle cx="${X(last.x)}" cy="${Y(last.y)}" r="2" fill="${last.y>last.x?'#e94560':'#4ecca3'}"/>`;
+  if(s.projected_end!==undefined)
+    out+=`<line x1="${X(last.x)}" y1="${Y(last.y)}" x2="${X(1)}" y2="${Y(s.projected_end)}" stroke="${s.projected_end>1?'#e94560':'#4ecca3'}" stroke-dasharray="2,2"/>`;
   svg.innerHTML=out;
 }}catch(e){}})();
-</script>
-</div>"""
+</script>"""
 
 
 def render_dashboard() -> str:
@@ -623,9 +607,9 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
 <div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
 <div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
-<div class="stat"><div class="stat-val">{(str(int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
-<div class="stat"><div class="stat-val">{(str(int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
-</div>""" + _QUOTA_CHART_HTML + """</div>""")
+<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:6px"><span>{(str(int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</span><svg id="qs-5h" width="54" height="22" viewBox="0 0 54 22" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
+<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:6px"><span>{(str(int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</span><svg id="qs-7d" width="54" height="22" viewBox="0 0 54 22" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
+</div>""" + _QUOTA_SPARK_JS + """</div>""")
 
     # Services (ports + daemons only)
     services = [c for c in health if "port" in c.get("detail", "") or "running" in c.get("detail", "") or c.get("name", "").startswith("com.sutando.")]
