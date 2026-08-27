@@ -167,7 +167,7 @@ class TestArtifactDiscovery(unittest.TestCase):
 class TestCollector(unittest.TestCase):
     """The collector's FILTERING is where a job silently drops out of scope."""
 
-    def _run(self, entries, artifacts=()):
+    def _run(self, entries, artifacts=(), sentinels=()):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
             (ws / "hosts" / "H").mkdir(parents=True)
@@ -179,6 +179,13 @@ class TestCollector(unittest.TestCase):
                 f = res / name
                 f.write_text("x")
                 os.utime(f, (time.time(), time.mktime(when)))
+            if sentinels:
+                st = ws / "state"
+                st.mkdir(exist_ok=True)
+                # Body format is production's: morning-briefing.py writes
+                # `datetime.now().isoformat()` into state/<job>-<date>.sentinel.
+                for name, stamp in sentinels:
+                    (st / name).write_text(stamp)
             with mock.patch.object(hc, "WORKSPACE_DIR", ws), \
                  mock.patch.object(hc, "_host_label", lambda: "H"):
                 return hc.check_daily_cron_punctuality()
@@ -273,6 +280,57 @@ class TestCollector(unittest.TestCase):
         r = self._run(json.dumps({"crons": [entry]}), ())
         self.assertNotIn("no output today", r["detail"])
         self.assertIn("UNCHECKED", r["detail"])
+
+
+class TestSentinelFallbackForSessionOwnedJobs(unittest.TestCase):
+    """`launchd` conflates two properties: "runs under launchd" and "publishes
+    no dated results file". A session-owned job can be the second without the
+    first, and then it reports UNCHECKED forever while its dated completion
+    sentinels sit unread in state/."""
+
+    _run = TestCollector._run
+
+    @staticmethod
+    def _week(job, hour, minute):
+        # range must include TODAY: a window ending yesterday reads as missed-today.
+        days = [datetime.now().date() - timedelta(days=k) for k in range(6, -1, -1)]
+        return [(f"{job}-{d.isoformat()}.sentinel",
+                 datetime(d.year, d.month, d.day, hour, minute, 1).isoformat())
+                for d in days]
+
+    def test_a_session_owned_job_is_scored_from_its_completion_sentinel(self):
+        r = self._run(
+            json.dumps([{"name": "morning-briefing", "cron": "57 6 * * *"}]),
+            sentinels=self._week("morning-briefing", 7, 0),
+        )
+        self.assertNotIn("UNCHECKED", r["detail"],
+                         "7 dated sentinels exist; the job is observable")
+        self.assertIn("1 of 1 daily job(s) observable", r["detail"])
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_results_artifacts_still_win_when_present(self):
+        """The fallback fires only on an EMPTY results/ glob, so a job that does
+        publish there keeps its existing source and cannot be double-read."""
+        days = [datetime.now().date() - timedelta(days=k) for k in range(6, -1, -1)]
+        arts = [(f"insight-{d.isoformat()}.txt",
+                 (d.year, d.month, d.day, 6, 51, 0, 0, 0, -1)) for d in days]
+        r = self._run(
+            json.dumps([{"name": "daily-insight", "cron": "50 6 * * *"}]),
+            artifacts=arts,
+            sentinels=self._week("daily-insight", 23, 59),
+        )
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertNotIn("late", r["detail"],
+                         "scored from results/ (+1 min), not the 23:59 sentinels")
+
+    def test_a_launchd_job_is_unaffected(self):
+        """It already took the sentinel branch; the fallback must not re-read it."""
+        r = self._run(
+            json.dumps([{"name": "digest", "cron": "0 6 * * *", "launchd": True}]),
+            sentinels=self._week("digest", 6, 1),
+        )
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertIn("1 of 1 daily job(s) observable", r["detail"])
 
 
 class TestConditionalProducers(unittest.TestCase):

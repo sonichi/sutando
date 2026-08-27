@@ -23,6 +23,10 @@ on:
       - '.github/workflows/python39-compat.yml'
 
 # Tests must never emit product telemetry (no PostHog writes from CI).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   SUTANDO_TELEMETRY: "0"
 

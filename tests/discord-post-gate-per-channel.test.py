@@ -149,5 +149,18 @@ try:
 finally:
     os.environ.pop("SUTANDO_DISCORD_POST_GATE", None)
 
+# A key selects WHICH policy runs (#3389): an untrimmed one silently routes its
+# channel to `*` — still gated, but by the wrong and usually laxer policy.
+for _key in (" 111", "111 ", "\t111"):
+    _v = resolve({_key: str(D / "refuse.py"), "*": str(D / "star.py")})
+    check(f"whitespace key {_key!r} still reaches its own policy",
+          _v("111", P) == "refused-by-A", repr(_v("111", P)))
+_v = resolve({"111": str(D / "refuse.py"), "*": str(D / "star.py")})
+check("control — a clean key behaves identically", _v("111", P) == "refused-by-A", repr(_v("111", P)))
+check("control — an unlisted channel still falls through to `*`",
+      _v("999", P) == "refused-by-STAR", repr(_v("999", P)))
+_v = resolve({" * ": str(D / "star.py")})
+check("`*` itself survives key stripping", _v("999", P) == "refused-by-STAR", repr(_v("999", P)))
+
 print(("\nFAILED: " + ", ".join(FAILS)) if FAILS else "\nAll per-channel post-gate checks passed.")
 sys.exit(1 if FAILS else 0)
