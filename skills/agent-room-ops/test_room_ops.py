@@ -65,7 +65,7 @@ class EnvCase(unittest.TestCase):
         # setUp clears every token var, so an unshadowed gateway() would fall
         # through and read the operator's REAL channels/ag2space/.env.
         self._env_file_patch = mock.patch.object(
-            _gateway, "_channel_env_file", staticmethod(lambda: None))
+            _gateway, "_channel_env_file", lambda: None)
         self._env_file_patch.start()
         self.addCleanup(self._env_file_patch.stop)
 
@@ -1331,7 +1331,7 @@ class ChannelEnvTierTests(EnvCase):
         f = self._write_env("REMOTE_TASK_URL=https://gw.example\n"
                             "REMOTE_TASK_TOKEN=sekret\n")
         with mock.patch.object(_gateway, "_channel_env_file",
-                               staticmethod(lambda: f)):
+                               lambda: f):
             base, headers = _gateway.gateway()
         self.assertEqual(base, "https://gw.example")
         self.assertEqual(headers.get("Authorization"), "Bearer sekret")
@@ -1342,7 +1342,7 @@ class ChannelEnvTierTests(EnvCase):
         os.environ["GATEWAY_URL"] = "https://env.example"
         os.environ["GATEWAY_TOKEN"] = "from-env"
         with mock.patch.object(_gateway, "_channel_env_file",
-                               staticmethod(lambda: f)):
+                               lambda: f):
             base, headers = _gateway.gateway()
         self.assertEqual(base, "https://env.example")
         self.assertEqual(headers.get("Authorization"), "Bearer from-env")
@@ -1353,7 +1353,7 @@ class ChannelEnvTierTests(EnvCase):
         _VAULT_STORE["REMOTE_TASK_TOKEN"] = "https://vault.example|from-vault"
         self.addCleanup(_VAULT_STORE.pop, "REMOTE_TASK_TOKEN", None)
         with mock.patch.object(_gateway, "_channel_env_file",
-                               staticmethod(lambda: f)):
+                               lambda: f):
             base, headers = _gateway.gateway()
         self.assertEqual(headers.get("Authorization"), "Bearer from-file")
         self.assertEqual(base, "https://file.example")
@@ -1370,14 +1370,14 @@ class ChannelEnvTierTests(EnvCase):
         f = self._write_env("REMOTE_TASK_URL=https://gw.example\n"
                             "AG2_REMOTE_TOKEN=legacy-secret\n")
         with mock.patch.object(_gateway, "_channel_env_file",
-                               staticmethod(lambda: f)):
+                               lambda: f):
             base, headers = _gateway.gateway()
         self.assertEqual(headers.get("Authorization"), "Bearer legacy-secret")
         self.assertEqual(base, "https://gw.example")
 
     def test_missing_path_is_not_an_error(self):
         with mock.patch.object(_gateway, "_channel_env_file",
-                               staticmethod(lambda: "/nope/does/not/exist/.env")):
+                               lambda: "/nope/does/not/exist/.env"):
             base, _ = _gateway.gateway()
         self.assertEqual(base, "")
 
