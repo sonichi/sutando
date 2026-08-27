@@ -63,6 +63,9 @@ def check_collision_guard() -> None:
         bg.build(pathlib.Path("/nonexistent"))
     except SystemExit as exc:
         refused = bg.COLLISION_ERROR in str(exc)
+    # An empty constant would make `in str(exc)` match any exit, restoring the
+    # bare-except hole through one indirection (qingyun-001, #3455).
+    check(bool(bg.COLLISION_ERROR), "the collision reason constant is non-empty")
     check(refused, "colliding 8-char derived ids are refused, not silently displaced")
 
 
