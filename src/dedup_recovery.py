@@ -58,9 +58,9 @@ def _read(path):
         # UnicodeDecodeError is a ValueError, so a torn holder escaped `except
         # OSError`; errors="replace" would decode it into a false non-skip answer.
         return UNREADABLE if path.exists() else None
-    # Empty/whitespace is NOT-READY, not an answer (delivery/readiness.py says so):
-    # treating it as a body takes a terminal requeue on a mid-write holder.
-    return body if body.strip() else UNREADABLE
+    # Empty decodes cleanly and means the holder delivered nothing, so the
+    # question is re-asked; a torn holder fails to decode and defers above.
+    return body
 
 
 def plan_dedup_recovery(
