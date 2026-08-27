@@ -98,13 +98,37 @@ class RecordSample(unittest.TestCase):
         self.assertAlmostEqual(seg["points"][-1]["x"], 0.1, places=3)
         self.assertAlmostEqual(seg["projected_end"], 2.0)  # capped: over at observation
 
+    def test_order_is_judged_against_the_last_valid_predecessor(self):
+        # 4th-round control: [ts=2000, ts="bad"] + matching obs at 1500 —
+        # drop the corrupt row, reject 1500 against the valid 2000.
+        import json as js
+        rows = [
+            {"ts": 2000.0, "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000},
+            {"ts": "bad", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000},
+        ]
+        self.path.write_text("".join(js.dumps(r) + "\n" for r in rows))
+        self.assertFalse(qp.record_sample(state(obs=1500.0), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [2000.0])
+        # a later CHANGED sample behind the valid tail is also refused
+        self.assertFalse(qp.record_sample(state(u5="0.30", obs=1700.0), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [2000.0])
+        # and one genuinely newer lands normally
+        self.assertTrue(qp.record_sample(state(u5="0.30", obs=2100.0), self.path))
+
+    def test_an_infinite_trailing_timestamp_cannot_poison_the_future(self):
+        import json as js
+        self.path.write_text(js.dumps(
+            {"ts": "Infinity", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000}) + "\n")
+        self.assertTrue(qp.record_sample(state(obs=3000.0), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [3000.0])
+
     def test_a_corrupt_final_timestamp_is_repaired_not_fatal(self):
         # Reviewer control (#3464, 2nd round): a final row with ts="bad" and
         # matching values must never raise out of the sampler; it is repaired.
         import json as js
         self.path.write_text(js.dumps(
             {"ts": "bad", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000}) + "\n")
-        self.assertFalse(qp.record_sample(state(obs=5000.0), self.path))
+        self.assertTrue(qp.record_sample(state(obs=5000.0), self.path))
         recs = qp._read_history(self.path)
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[-1]["ts"], 5000.0)

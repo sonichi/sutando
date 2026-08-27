@@ -556,10 +556,16 @@ for(const[k,el]of[['5h','qs-5h'],['7d','qs-7d']]){
   if(!segs.length)continue;
   const s=segs[segs.length-1],W=54,H=22,X=f=>f*W,Y=u=>H-Math.min(u,1.2)/1.2*H;
   let out=`<line x1="0" y1="${Y(0)}" x2="${W}" y2="${Y(1)}" stroke="#555" stroke-dasharray="2,2"/>`;
+  const stroke=(p,q,over)=>{out+=`<line x1="${X(p.x)}" y1="${Y(p.y)}" x2="${X(q.x)}" y2="${Y(q.y)}" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.5"/>`;};
   for(let j=1;j<s.points.length;j++){
     const a=s.points[j-1],b=s.points[j];
-    const over=(a.y+b.y)/2>(a.x+b.x)/2;
-    out+=`<line x1="${X(a.x)}" y1="${Y(a.y)}" x2="${X(b.x)}" y2="${Y(b.y)}" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.5"/>`;
+    const d0=a.y-a.x,d1=b.y-b.x;
+    if((d0>0)!==(d1>0)&&d0!==d1){
+      const f=d0/(d0-d1),c={x:a.x+f*(b.x-a.x),y:a.y+f*(b.y-a.y)};
+      stroke(a,c,d0>0);stroke(c,b,d1>0);
+    }else{
+      stroke(a,b,(d0+d1)/2>0);
+    }
   }
   const last=s.points[s.points.length-1];
   out+=`<circle cx="${X(last.x)}" cy="${Y(last.y)}" r="2" fill="${last.y>last.x?'#e94560':'#4ecca3'}"/>`;

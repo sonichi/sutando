@@ -11,6 +11,7 @@ quota-state dict; nothing here touches workspace resolution or HTTP.
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -95,22 +96,28 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
     def _same(rec):
         return all(rec.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7"))
 
+    def _valid_ts(rec):
+        try:
+            v = float(rec.get("ts"))
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
     with _LOCK:
         history = _read_history(history_path)
+        # Drop malformed trailing rows FIRST: ordering is judged against the
+        # last VALID committed observation, never a corrupt or infinite ts.
+        dirty = False
+        while history and _valid_ts(history[-1]) is None:
+            history.pop()
+            dirty = True
         if history:
             last = history[-1]
-            try:
-                stored_ts = float(last.get("ts", 0))
-            except (TypeError, ValueError):
-                stored_ts = None
-            if stored_ts is None and _same(last):
-                # Corrupt trailing row with matching values: repair in place.
-                history[-1] = {**last, "ts": sample["ts"]}
-                _rewrite(history)
-                return False
-            if stored_ts is not None and float(sample["ts"]) <= stored_ts:
+            if float(sample["ts"]) <= _valid_ts(last):
                 # A delayed or re-read snapshot no newer than the committed
                 # tail never lands: ordering is canonical by producer time.
+                if dirty:
+                    _rewrite(history)
                 return False
             if _same(last):
                 # Unchanged run: keep its FIRST endpoint, advance its LAST.
@@ -119,6 +126,8 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                     _rewrite(history)
                     return False
                 # Only the run's start exists — append its trailing endpoint.
+        if dirty:
+            _rewrite(history)
         if len(history) + 1 > MAX_LINES:
             keep = history[-(MAX_LINES - 1):] + [sample]
             fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
