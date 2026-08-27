@@ -41,6 +41,10 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
   PY="$(resolve_python "$REPO")"
 fi
 
+# Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent.
+# Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
+bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.

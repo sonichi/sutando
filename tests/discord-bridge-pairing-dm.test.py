@@ -37,6 +37,11 @@ spec = importlib.util.spec_from_file_location("discordbridge_pair", REPO / "src"
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
+
+# ACCESS_BACKUP_FILE resolves under the LIVE workspace at import, so the temp tree
+# above is not isolation: _backup_access_to_disk() overwrites the real durable file.
+mod.ACCESS_BACKUP_FILE = Path(tempfile.mkdtemp(prefix="acl-bk-")) / "discord-access-backup.json"
+
 # CLAUDE_CONFIG_DIR alone is not isolation: channel_access_path() falls back to
 # the real legacy access.json when the fresh canonical path does not exist.
 mod.ACCESS_FILE = Path(tempfile.mkdtemp(prefix="pair-acl-")) / "channels" / "discord" / "access.json"

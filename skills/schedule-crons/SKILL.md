@@ -75,6 +75,24 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 
    **Do not gate on the sentinel alone.** `watch-tasks-stream.sh` writes it once at startup, so an absent file means "no watcher" OR "a live watcher whose file was removed" — indistinguishable. Measured 2026-08-07 on a live core: `_watcher_trees()` returned `{'12631': ['12631']}` (functioning — it emitted `TASK_FILE:` for a probe) with the sentinel absent from disk. Gating on the sentinel there would have started a **second** watcher, and both then emit every task, so every task is processed twice. `_watcher_trees()` is also what makes the `pgrep` warning below unnecessary to re-solve: it drops its own pid and matches on argv shape. Don't use `pgrep -f watch-tasks-stream`: pgrep's `-f` argument matches the literal string `watch-tasks-stream` against full argv, which matches the bash wrapper invoking this very pgrep call (the wrapper's argv contains the search string), producing a transient self-match that returns a PID for a subshell that's already gone by the next `ps`. Same PID-stamp + `kill -0` pattern as the catchup sentinel in step 0 — single anti-pattern, single fix. Documented as F5 in `workspace/build_log.md` 2026-06-03T00:02Z validation pass; replayed on the very next session bootstrap (07:25Z) — Sutando.app's checkWatcher Timer caught the gap and sent a `watcher` keystroke, but two owner DMs were silently held in `tasks/` for ~5 min first. Don't kick off `bash src/watch-tasks.sh` (retired 2026-05-14).
 
+1.6. **Arm the registration watchdog, then handle tasks freely — registration is guarded by a mechanism, not by deferral.** Because step 1.5 arms the watcher before the registration loop, a `TASK_FILE` notification (the startup sweep's, or a live arrival) can land while steps 2-4 are still running. Without a rule here the agent improvises under the general "process notifications when they arrive" instruction, pivots to the task, and may never finish registration — losing the `/proactive-loop` fallback, the one thing that guarantees the session has a recurring work driver (that silent loss is the incident class this step exists to close). The old cure was a deferral rule ("finish registration first"), which cost a waiting user the whole registration window before any answer. This step replaces discipline with a watchdog: immediately after step 1.5, before touching any task, arm ONE Monitor:
+
+   ```
+   Monitor tool — description "schedule-crons watchdog", timeout_ms 3600000, command:
+   cd "$(git -C . rev-parse --show-toplevel 2>/dev/null || echo .)" 2>/dev/null || true
+   T0=$(date +%s); WS="$(bash scripts/sutando-config.sh workspace)"
+   STAMP="$WS/hosts/$(bash scripts/sutando-config.sh host-label)/schedule-crons-stamp.json"
+   [ -n "$WS" ] || { echo "CRONS-WATCHDOG-INERT: workspace did not resolve — guard not armed"; exit 1; }
+   sleep 90
+   while [ "$(stat -f %m "$STAMP" 2>/dev/null || echo 0)" -lt "$T0" ]; do
+     echo "CRONS-UNREGISTERED: schedule-crons has not stamped this boot — return and register now"
+     sleep 60
+   done
+   echo "CRONS-STAMPED: registration complete"
+   ```
+
+   Then respond to task notifications as they land: send the fail-open progress ack first (`python3 skills/task-progress/scripts/notify.py ...` — one subprocess, no state mutation, cannot derail anything), and use judgment on handling — a short waiting owner task may simply be served before registration continues; anything substantial gets the ack and is handled when the agent is next free. Either way registration cannot be silently dropped: if it slips, the watchdog emits a nag every 60s until step 5.7's completion stamp lands, and the terminal `CRONS-STAMPED` line confirms the guard saw the stamp — which is also why that stamp write is not optional bookkeeping; it is what releases the watchdog. The 90s grace means a normal boot never hears from it, and the 1-hour cap bounds noise if a boot dies (an unregistered state dies with its session). Detection and re-prompt share one source of truth: the same stamp `health-check.py`'s `session-crons` probe already reads. `stat -f %m` is the darwin form; swap for a `python3 -c` mtime read on linux. **Resolve the workspace INSIDE the command** — a Monitor is a fresh shell and the loop's `WORKSPACE` is a per-command local that is never exported, so an inherited `$WORKSPACE` is empty there and the stamp path silently becomes `/hosts/<label>/...`, which never exists: the guard would then nag on every healthy boot (~58 times before the cap) and never print `CRONS-STAMPED`. That failure looks like the watchdog working hard, which is why the empty-`WS` refusal above is loud instead: an unarmed guard must announce itself rather than pass as a busy one.
+
 2. Check existing cron jobs with CronList
 3. For each job in the config:
    - Skip entries carrying a `monitor` object — they are Monitors, not crons (no `cron`, no prompt to register); step 5.4 owns their arming, and a `CronCreate` attempt on one is invalid.
@@ -143,7 +161,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    WS="$(bash scripts/sutando-config.sh workspace)"
    H="$(bash scripts/sutando-config.sh host-label)"
    mkdir -p "$WS/hosts/$H"
-   DIGESTS="$(python3 "$(git -C . rev-parse --show-toplevel)/src/cron_entry_digest.py" "$WS/hosts/$H/crons.json")"
+   DIGESTS="$(python3 src/cron_entry_digest.py "$WS/hosts/$H/crons.json")"
    echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>, \"config_digests\": $DIGESTS}" > "$WS/hosts/$H/schedule-crons-stamp.json"
    ```
    `health-check.py`'s `session-crons` probe compares this host-owned stamp against the same host's core heartbeat `started_at`: a stamp older than the boot means session crons died with a previous session and were never re-registered (the silent 2/18 failure observed on a peer instance 2026-07-23). Do not skip the stamp on re-runs — a fresh stamp is what keeps the guard quiet.
@@ -190,7 +208,7 @@ python3 skills/schedule-crons/ensure-cron-room.py \
 
 `ensure-cron-room.py` is **idempotent**: for each `"room": "auto"` entry it creates one room (`Sutando · <cron>`), invites the owner, posts a self-identifying first message, and **rewrites `room` to the concrete `!id:ag2.space`**. Entries that already hold a `!id` are skipped — re-running never makes duplicate rooms (the failure mode of ad-hoc creation). If no gateway token resolves, it exits 0 having done nothing. The cron's own prompt then posts output to its `room` id via the gateway op:message path ([[reference_gateway_op_message_room_post]]).
 
-**Which crons opt in:** only *output-producing* crons (pr-shepherd, roadmap-driver, friction-room-sweep, disk-hygiene, ai-frontline-today, morning-briefing). Silent/internal crons (main-loop, sync-memory, briefing-fallback, daily-insight) stay room-less — a room each would be clutter.
+**Which crons opt in:** only *output-producing* crons (pr-shepherd, roadmap-driver, friction-room-sweep, disk-hygiene, ai-frontline-today, morning-briefing). Silent/internal crons (main-loop, sync-memory, briefing-fallback) stay room-less — a room each would be clutter.
 
 **Known gateway constraints (2026-07-11), baked into the helper's design:**
 - **No room-list API** (`GET /v1/rooms` 404; `op:list` unknown) → the `room` id recorded in `crons.json` is the *only* handle on a created room. Never create without writing the id back (the helper writes after each create so a mid-batch hang can't orphan a room).
