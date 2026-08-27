@@ -22,6 +22,7 @@ ALLOWED_KEYS = {"schema", "name", "description", "source", "prompt_preamble",
 CASE_ID = re.compile(r"gaia-l[123]-[0-9a-f]{8}\Z")
 
 # Changing the preamble is a deliberate act: update this digest in the same commit.
+METADATA_SHA256 = "9d909dc43928055d2e3ae231d317b65aca74e2ad6fc5037499581c6d8ada4980"
 PREAMBLE_SHA256 = "609ad2dca3d13a6c652903c463f6f85d56540fbfbfe4a43f3441b146b85fc625"
 
 failures: list[str] = []
@@ -48,12 +49,14 @@ def main() -> int:
     check(all(CASE_ID.match(c) for c in m["excluded"]["case_ids"]),
           "every excluded id is a bare identifier")
 
-    # An answer would have to ride in some free-text field. The preamble is the
-    # only one that varies with the suite, and it must be case-INDEPENDENT --
-    # that is what makes a substring hit inside it meaningless.
-    blob = json.dumps({k: v for k, v in m.items()
-                       if k not in ("case_ids", "excluded", "prompt_preamble")})
-    check("equals" not in blob, "no expect/equals structure in manifest metadata")
+    # EVERY free-text field is pinned, not just the preamble. name/description/
+    # source are fixed for this suite too, so a substring predicate over them
+    # would miss a smuggled answer exactly as the preamble shape check did.
+    meta = {k: v for k, v in m.items() if k not in ("case_ids", "excluded")}
+    meta_digest = hashlib.sha256(
+        json.dumps(meta, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    check(meta_digest == METADATA_SHA256,
+          "all manifest metadata is byte-identical to the pinned text")
 
     # Pinned by digest, not by shape. Shape predicates constrained only the TAIL,
     # so any text BEFORE "Question: " passed -- and a GAIA answer is a short
