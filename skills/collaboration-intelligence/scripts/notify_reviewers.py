@@ -85,6 +85,40 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     return out, worst
 
 
+def stand_present_in_room(target: dict) -> "tuple[bool, str]":
+    """Is this stand actually a member of the room we are about to mention it in?
+
+    A Stand mxid is scoped to a ROOM, not to a person — the same human can hold a
+    different Stand per room. room_ops has no unknown-handle branch, so mentioning
+    an absent mxid resolves to nothing and reports ok, which is indistinguishable
+    from a delivered mention. Returns (present, reason); an UNVERIFIABLE roster is
+    not treated as absent — we refuse to send only on a positive absence.
+    """
+    argv = ["python3", str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
+            "members", target["room"]]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return True, f"unverified ({type(exc).__name__})"
+    if p.returncode != 0:
+        return True, f"unverified (members rc={p.returncode})"
+    try:
+        payload = json.loads(p.stdout)
+    except ValueError:
+        return True, "unverified (unparseable members)"
+    # A non-object payload has no .get — the same shape the refusal-reason fix
+    # guards downstream. An unusable roster is UNVERIFIED, never an absence.
+    if not isinstance(payload, dict):
+        return True, "unverified (non-object members payload)"
+    members = payload.get("members")
+    if not isinstance(members, list):
+        return True, "unverified (members not a list)"
+    ids = {m.get("user_id") for m in members if isinstance(m, dict)}
+    if not ids:
+        return True, "unverified (empty roster)"
+    return target["stand"] in ids, f"{len(ids)} members"
+
+
 def command_for(target: dict, message: str) -> "list[str]":
     body = message
     if target.get("human") and target["human"] not in body:
@@ -99,11 +133,34 @@ def main() -> int:
                     help="comma-separated roster keys")
     ap.add_argument("--message", required=True)
     ap.add_argument("--send", action="store_true")
+    ap.add_argument("--room", default=None,
+                    help="room the conversation is actually in. When given, a reviewer whose "
+                         "Stand is not a member THERE is REFUSED rather than silently notified "
+                         "in their recorded room — correctly addressed, wrong venue.")
     a = ap.parse_args()
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
     failures = 0
     for t in targets:
+        if a.room and t["room"] != a.room:
+            # Not an error: the pair is valid, but the Stand does not live in
+            # THIS room, and sending would relocate the thread and report ok.
+            here, why = stand_present_in_room({"stand": t["stand"], "room": a.room})
+            if not here:
+                print(f"{t['name']}: NOT REACHABLE in {a.room} ({why}) — "
+                      f"{t['stand']} lives in {t['room']}. Post there deliberately, "
+                      "or route via the human. Not sending.", file=sys.stderr)
+                refusal_rc = max(refusal_rc, 5)
+                continue
+            t = {**t, "room": a.room}   # reachable here: address them HERE, not elsewhere
+        present, why = stand_present_in_room(t)
+        if not present:
+            # Positive absence: sending would resolve to nothing and report ok.
+            print(f"{t['name']}: ABSENT from {t['room']} ({why}) — "
+                  f"{t['stand']} is not a member; a mention here reaches nobody. "
+                  "Resolve the room's own Stand for this person.", file=sys.stderr)
+            failures += 1
+            continue
         argv = command_for(t, a.message)
         if not a.send:
             print("PLAN:", " ".join(argv))

@@ -165,5 +165,68 @@ class SilentRefusal(unittest.TestCase):
         self.assertIn("$abc123", p.stdout)
 
 
+
+def run_room(members_payload, *extra, roster=None):
+    """Drive the room-scoped path against a stub room_ops that answers `members`
+    and `mention` DIFFERENTLY — the single-payload stub above cannot express a
+    roster read and a send in one run."""
+    root = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name))
+    (root / "skills" / "collaboration-intelligence" / "scripts").mkdir(parents=True)
+    (root / "skills" / "agent-room-ops").mkdir(parents=True)
+    copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
+    copy.write_text(SCRIPT.read_text())
+    (root / "skills/agent-room-ops/room_ops.py").write_text(
+        "import sys\n"
+        "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        f"sys.stdout.write({members_payload!r} if cmd == 'members' "
+        "else '{\"ok\": true, \"event_id\": \"$e\"}')\n"
+        "sys.exit(0)\n")
+    rp = root / "roster.json"
+    rp.write_text(json.dumps(roster or GOOD))
+    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
+    return subprocess.run([sys.executable, str(copy), "--send",
+                           "--reviewers", "rui", "--message", "m", *extra],
+                          capture_output=True, text=True, timeout=30, env=env)
+
+
+_PRESENT = '{"ok": true, "members": [{"user_id": "@sutando-rui:x"}, {"user_id": "@other:x"}]}'
+_ABSENT  = '{"ok": true, "members": [{"user_id": "@other:x"}, {"user_id": "@third:x"}]}'
+
+
+class RoomScopedPresence(unittest.TestCase):
+    """A Stand mxid is scoped to a ROOM. room_ops has no unknown-handle branch,
+    so mentioning an absent mxid resolves to nothing and still reports ok."""
+
+    def test_absent_from_its_own_recorded_room_refuses_instead_of_sending(self):
+        p = run_room(_ABSENT)
+        self.assertIn("ABSENT from", p.stderr)
+        self.assertNotEqual(p.returncode, 0)
+
+    def test_present_in_its_own_room_still_sends(self):
+        # Control: the guard must not refuse the ordinary case.
+        p = run_room(_PRESENT)
+        self.assertNotIn("ABSENT from", p.stderr)
+        self.assertIn("ok=True", p.stdout)
+
+    def test_room_arg_naming_a_room_the_stand_is_absent_from_refuses_and_says_where(self):
+        p = run_room(_ABSENT, "--room", "!elsewhere:x")
+        self.assertIn("NOT REACHABLE in !elsewhere:x", p.stderr)
+        self.assertIn("!triage:x", p.stderr)          # names where they DO live
+        self.assertEqual(p.returncode, 5)             # distinct from other refusals
+
+    def test_room_arg_where_the_stand_is_present_addresses_them_there(self):
+        p = run_room(_PRESENT, "--room", "!elsewhere:x")
+        self.assertNotIn("NOT REACHABLE", p.stderr)
+        self.assertIn("ok=True", p.stdout)
+
+    def test_unusable_members_payload_is_UNVERIFIED_not_an_absence(self):
+        # Fail-open by design: a broken/absent gateway must not convert
+        # "this mention reaches nobody" into "nothing reaches anybody".
+        for payload in ("[]", '"hello"', "null", "not json"):
+            with self.subTest(payload=payload):
+                p = run_room(payload)
+                self.assertNotIn("ABSENT from", p.stderr)
+                self.assertIn("ok=True", p.stdout)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
