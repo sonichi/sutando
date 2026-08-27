@@ -212,8 +212,19 @@ migrate_root_status_to_state() {
 # migrator would have skipped the move silently. Both cases now require
 # explicit invocation of `bash scripts/sutando-migrate.sh`.
 legacy_state_notice() {
-  local notice_sentinel="$WORKSPACE/.legacy-notice-printed"
+  # Under state/: the workspace root is reserved for top-level directories.
+  local notice_sentinel="$WORKSPACE/state/.legacy-notice-printed"
+  local legacy_sentinel="$WORKSPACE/.legacy-notice-printed"
+  # Migrate an already-printed install rather than only honouring it: leaving the
+  # root file in place keeps workspace-root-tidy warning forever (review, #3205).
+  if [ -f "$legacy_sentinel" ] && [ ! -f "$notice_sentinel" ]; then
+    mkdir -p "$(dirname "$notice_sentinel")" 2>/dev/null && : > "$notice_sentinel" 2>/dev/null
+  fi
   if [ -f "$notice_sentinel" ]; then
+    rm -f "$legacy_sentinel" 2>/dev/null   # best-effort; metadata only
+    return 0
+  fi
+  if [ -f "$legacy_sentinel" ]; then
     return 0
   fi
   local found=()
@@ -239,7 +250,7 @@ legacy_state_notice() {
       echo "    Auto-migration is disabled as of #1169 (option B)."
       echo "    Run \`bash scripts/sutando-migrate.sh --dry-run\` to preview, then \`--commit\` to relocate."
     } >&2
-    : > "$notice_sentinel"
+    mkdir -p "$(dirname "$notice_sentinel")" && : > "$notice_sentinel"
   fi
 }
 
@@ -371,10 +382,28 @@ preflight() {
     log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant the app running this terminal, then quit + relaunch it)"
     perms_warn=1
   fi
-  if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
-    log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
-    perms_warn=1
+  # $REPO is overridable (tests point it at a scratch dir), so fall back to
+  # alongside this script — an unguarded source under `set -e` aborts the run.
+  local __probe="$REPO/src/accessibility_probe.sh"
+  [ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
+  # 125 = could not check. acc_rc=0 here would BE the granted verdict, which
+  # is exactly the invention the old comment claimed to avoid.
+  local acc_rc=125
+  if [ -f "$__probe" ]; then
+    # `|| rc=$?` keeps this exempt from `set -e`: a bare non-zero call would
+    # abort init.sh before it ever emits its [Preflight] summary.
+    source "$__probe"
+    acc_rc=0; accessibility_probe || acc_rc=$?
   fi
+  case $acc_rc in
+    0)   : ;;
+    125) log "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked"
+         perms_warn=1 ;;
+    124) log "  ⚠ Accessibility UNKNOWN — probe timed out (headless session cannot answer)"
+         perms_warn=1 ;;
+    *)   log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
+         perms_warn=1 ;;
+  esac
 
   # One-line summary regardless of mode (this is the value-add)
   local cli_str="all-ok"

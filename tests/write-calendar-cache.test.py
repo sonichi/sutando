@@ -169,6 +169,30 @@ def test_nonempty_payload_no_usable_events_preserves_prior() -> None:
            rc != 0 and not cache.exists(), f"rc={rc} exists={cache.exists()}")
 
 
+def test_missing_start_warns_and_present_start_is_quiet() -> None:
+    """A payload with no `start` silently costs the briefing two lines, so the
+    producer says so; a payload that carries one must stay quiet."""
+    with tempfile.TemporaryDirectory() as td:
+        for label, events, want in (
+            ("no start", [{"raw": "09:00 Standup", "calendar": "primary"}], True),
+            ("with start", [{"raw": "09:00 Standup", "calendar": "primary",
+                             "start": "2026-08-25T09:00:00-07:00"}], False),
+        ):
+            err = io.StringIO()
+            with unittest.mock.patch("sys.stderr", err):
+                wcc.write_cache(events, path=Path(td) / f"{want}.json")
+            warned = "carry no" in err.getvalue()
+            ok(f"write_cache warns iff start missing ({label})", warned is want,
+               f"stderr={err.getvalue()!r}")
+        # The count must name the events that lack a start, not the whole list.
+        err = io.StringIO()
+        with unittest.mock.patch("sys.stderr", err):
+            wcc.write_cache([{"raw": "A", "calendar": "", "start": "2026-08-25T09:00:00-07:00"},
+                             {"raw": "B", "calendar": ""}], path=Path(td) / "mixed.json")
+        ok("warning counts only the events missing a start",
+           "1 of 2 event(s)" in err.getvalue(), err.getvalue())
+
+
 def test_cache_path_default_location() -> None:
     """The real (un-mocked) cache_path resolves under <workspace>/state/."""
     p = wcc.cache_path()
@@ -186,6 +210,7 @@ test_cli_events_json_flag()
 test_cli_stdin_events()
 test_cli_error_paths()
 test_nonempty_payload_no_usable_events_preserves_prior()
+test_missing_start_warns_and_present_start_is_quiet()
 test_cache_path_default_location()
 
 # --- `--from-gws`: the calendar is UNKNOWN on failure, never empty ------------
@@ -449,6 +474,97 @@ def test_event_to_raw_shapes():
     ok("an accepted invite is NOT marked declined", "[DECLINED]" not in wcc.event_to_raw(acc))
 
 
+def test_unrendered_api_object_is_refused():
+    """A caller that pipes the calendar API event straight through must fail loudly.
+
+    Observed 2026-08-09: `str()` on the API dict yields its repr, which passed the
+    non-empty check and was delivered as
+    `One meeting today: {'id': '35s817...', 'status': 'confirmed', ...}`.
+    """
+    api_event = {"id": "35s817abc", "status": "confirmed", "summary": "Standup",
+                 "start": {"dateTime": "2026-08-20T08:30:00-07:00"},
+                 "end": {"dateTime": "2026-08-20T09:30:00-07:00"}}
+    raised = False
+    try:
+        wcc.normalize_events([{"raw": api_event, "calendar": "work"}])
+    except TypeError:
+        raised = True
+    ok("an unrendered API dict as `raw` raises instead of shipping its repr", raised)
+
+    raised_list = False
+    try:
+        wcc.normalize_events([{"raw": [api_event], "calendar": "work"}])
+    except TypeError:
+        raised_list = True
+    ok("a LIST of events as `raw` is refused too", raised_list)
+
+    # The rendered form the real producer emits must still pass untouched.
+    rendered = wcc.event_to_raw(api_event)
+    out = wcc.normalize_events([{"raw": rendered, "calendar": "work"}])
+    ok("the rendered string the producer emits still normalizes",
+       out == [{"raw": rendered, "calendar": "work"}], out)
+    ok("and it is a real display string, not a repr", "8:30am" in rendered and "{" not in rendered,
+       rendered)
+
+
+def test_outer_element_shape_is_enforced():
+    """The sibling branch: a non-dict OUTER element was `str()`-ified unchecked.
+
+    The dict branch guarded `raw`, so the same connector object shipped its repr
+    by arriving one level out — `[[api_event]]` — or as a bare scalar.
+    """
+    api_event = {"id": "35s817abc", "status": "confirmed", "summary": "Standup",
+                 "start": {"dateTime": "2026-08-20T08:30:00-07:00"}}
+    for label, payload in (
+        ("a nested connector list", [[api_event]]),
+        ("a bare dict-free scalar (int)", [7]),
+        ("a bare bool", [True]),
+    ):
+        raised = False
+        try:
+            wcc.normalize_events(payload)
+        except TypeError:
+            raised = True
+        ok(f"{label} as an outer element is refused", raised)
+
+    for label, payload in (
+        ("`raw`", [{"raw": 7}]),
+        ("`calendar`", [{"raw": "8:30am Standup", "calendar": {"id": "x"}}]),
+        ("`start`", [{"raw": "8:30am Standup", "start": [1]}]),
+    ):
+        raised = False
+        try:
+            wcc.normalize_events(payload)
+        except TypeError:
+            raised = True
+        ok(f"a non-string {label} is refused", raised)
+
+    # Both documented shapes, and the drop-the-blanks behaviour, must survive.
+    out = wcc.normalize_events(["9am Standup", {"raw": "12:30 Sync", "calendar": "work"},
+                                {"raw": "  "}, {}, "  "])
+    ok("documented string+dict elements still normalize, blanks still dropped",
+       out == [{"raw": "9am Standup", "calendar": ""},
+               {"raw": "12:30 Sync", "calendar": "work"}], out)
+
+
+def test_cli_refuses_nested_connector_list_and_keeps_prior_cache():
+    """CLI level: the refusal must exit nonzero, not traceback, and certify nothing."""
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "calendar-today.json"
+        prior = json.dumps({"date": "1999-01-01", "events": [{"raw": "OLD", "calendar": ""}]})
+        cache.write_text(prior)
+        nested = json.dumps([[{"id": "35s817abc", "status": "confirmed", "summary": "Standup"}]])
+        err = io.StringIO()
+        with unittest.mock.patch.object(wcc, "cache_path", lambda: cache), \
+             unittest.mock.patch("sys.stderr", err):
+            rc = wcc.main(["--events-json", nested])
+        ok("a nested connector list exits nonzero at the CLI", rc != 0, f"rc={rc}")
+        ok("and it does so by message, not an uncaught traceback",
+           "must be a display string" in err.getvalue(), err.getvalue())
+        ok("and the prior cache is left byte-identical",
+           cache.read_text() == prior, f"cache was rewritten to {cache.read_text()}")
+
+
 test_from_gws_binary_missing_raises()
 test_from_gws_nonzero_raises()
 test_from_gws_api_error_object_raises()
@@ -466,6 +582,9 @@ test_cancelled_events_are_dropped_and_location_is_rendered()
 test_from_gws_success_path_writes_the_cache_and_exits_zero()
 test_from_gws_cli_failure_leaves_prior_cache_untouched()
 test_event_to_raw_shapes()
+test_unrendered_api_object_is_refused()
+test_outer_element_shape_is_enforced()
+test_cli_refuses_nested_connector_list_and_keeps_prior_cache()
 
 print()
 if _failed:

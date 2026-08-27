@@ -2340,6 +2340,9 @@ var _visionCanvas = null;            // hidden canvas reused for toBlob
 // Capped to prevent thrashing if recovery genuinely fails.
 var _visionRearmInFlight = false;
 var _visionRearmCount = 0;
+// Latched when the server reports a terminal stop; cleared only by a fresh
+// user-initiated start, so no recovery path can undo that decision.
+var _visionTerminalStop = false;
 var _VISION_REARM_LIMIT = 3;
 
 function applyVisionState(state) {
@@ -2364,7 +2367,13 @@ function applyVisionState(state) {
   // is gone, just tear down our side.
   var ourSideStale = _visionPushActive && (!streaming || state.source !== 'browser');
   if (ourSideStale) {
-    if (_visionStream && _visionStream.active) {
+    // A terminal stop is a decision, not a glitch — re-arming would restart the
+    // capture the server just stopped, and the voice session it fed is gone.
+    if (state.stoppedReason === 'no-client') {
+      console.log('[Vision] server stopped push mode: no voice client — tearing down');
+      _visionTerminalStop = true;
+      teardownPushSession();
+    } else if (_visionStream && _visionStream.active) {
       rearmPushMode();
     } else {
       teardownPushSession();
@@ -2381,6 +2390,9 @@ function applyVisionState(state) {
 // _VISION_REARM_LIMIT consecutive attempts to prevent thrashing if
 // recovery genuinely fails (e.g., voice session is gone).
 function rearmPushMode() {
+  // A terminal stop is a decision. Re-arming would restart the capture the
+  // server just stopped, so it outranks every recovery guard below.
+  if (_visionTerminalStop) return;
   if (_visionRearmInFlight || _visionRearmCount >= _VISION_REARM_LIMIT) return;
   if (!_visionStream || !_visionStream.active) return;
   _visionRearmInFlight = true;
@@ -2501,7 +2513,16 @@ function _postVisionBlob(blob) {
         // 409 means the server's pushMode flag is false (voice-agent
         // restart) — try to re-arm without waiting for the 2s state poll.
         if (r.status === 409 && _visionPushActive) {
-          rearmPushMode();
+          // The 2s poll usually loses this race at >=1fps, so read the reason
+          // off the rejection itself rather than waiting for the next poll.
+          r.clone().json().then(function(d) {
+            if (d && d.stoppedReason === 'no-client') {
+              _visionTerminalStop = true;
+              teardownPushSession();
+            } else {
+              rearmPushMode();
+            }
+          }).catch(function() { rearmPushMode(); });
         }
         // Surface the first rejection so the user sees why Sutando doesn't
         // see frames (e.g. push mode not active because voice isn't ready).
@@ -2579,6 +2600,7 @@ async function startWatch() {
     pollVisionState();
     return;
   }
+  _visionTerminalStop = false;   // a user-initiated start supersedes it
   _visionPushActive = true;
   _visionFrameCount = 0;
   updateVisionPreviewStats();

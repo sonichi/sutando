@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {
 	createAudioHealthLedger,
 	parseHeartbeat,
+	type AudioHealthSnapshot,
 	type HealthRow,
 } from '../src/voice-audio-health.js';
+import { evaluateMatrix } from '../src/voice-health-matrix.js';
 
 /** Int16LE PCM buffer at a constant normalized amplitude. */
 function pcm(amplitude: number, samples = 682): Buffer {
@@ -216,6 +218,21 @@ describe('P7 D7.1 engine ledger — ingress speech tracker (canonical evidence)'
 		ev = led.getSpeechEvidence();
 		assert.equal(ev.active, false, 'hangover elapsed with no above-floor frame');
 		assert.equal(ev.lastAboveFloorAt, 10_300);
+	});
+
+	it('retains the utterance onset after the hangover (30s matrix window needs the FIRST sample)', () => {
+		const now = { t: 10_000 };
+		const led = makeLedger(now);
+		const s = fakeSession();
+		led.wrapSession(s);
+		s.handleAudioFromClient(pcm(0.3));
+		now.t += 300;
+		s.handleAudioFromClient(pcm(0.25));
+		now.t += 20_000; // utterance long over; live onset erased by decay
+		const ev = led.getSpeechEvidence();
+		assert.equal(ev.active, false);
+		assert.equal(ev.onsetAt, null, 'live onset is hangover-scoped');
+		assert.equal(ev.lastOnsetAt, 10_000, 'retained onset survives for the evidence window');
 	});
 
 	it('quiet PCM is not speech', () => {
@@ -500,5 +517,279 @@ describe('P7 round-3 ledger fixes', () => {
 		led.ingestHeartbeat(wireHb('nnnnnnnn', { ep: [[1, 'g', 0, 1200]] }));
 		assert.ok(!led.anomalies(false).reasons.some((r) => r.startsWith('episodes:')));
 		assert.ok(led.anomalies(true).reasons.some((r) => r.startsWith('episodes:')));
+	});
+});
+
+describe('P7 Tranche B — lineage, context occupancy, up= segment', () => {
+	function upstreamSample(over: Record<string, unknown> = {}) {
+		const slot = {
+			attempted: 0,
+			queued: 0,
+			skippedNoSession: 0,
+			threw: 0,
+			attemptedRawBytes: 0,
+			queuedRawBytes: 0,
+			attemptedWireBytesEstimate: 0,
+			queuedWireBytesEstimate: 0,
+			lastAttemptedAt: null,
+			lastQueuedAt: null,
+			lastSkippedAt: null,
+			lastThrewAt: null,
+		};
+		return {
+			upstream: {
+				audio: { ...slot, queued: 235, queuedWireBytesEstimate: 400_000, ...over },
+				video: { ...slot, unsupportedMime: 0 },
+				text: { ...slot, skippedEmpty: 0 },
+			},
+			transportGeneration: 1,
+			echoSuppressed: 0,
+		};
+	}
+
+	it('lineage: minted on a handle-less setup-ok; resumed keeps it; suspected-sever is terminal', () => {
+		const ledger = createAudioHealthLedger({ sessionId: 's' });
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'att_1', handleSupplied: false });
+		ledger.noteLifecycleEvent({ kind: 'setup-ok', connectAttemptId: 'att_1', transportGeneration: 1 });
+		let s = ledger.getSnapshot(true);
+		assert.equal(s.logicalSessionId, 1);
+		assert.equal(s.lineageState, 'fresh');
+
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'att_2', handleSupplied: true });
+		ledger.noteLifecycleEvent({ kind: 'setup-ok', connectAttemptId: 'att_2', transportGeneration: 2 });
+		s = ledger.getSnapshot(true);
+		assert.equal(s.logicalSessionId, 1, 'a resumed setup keeps the lineage');
+		assert.equal(s.lineageState, 'resumed');
+
+		// Handle-accepted 1008 close: suspected-sever, and TERMINAL — a later
+		// resumed setup-ok must not silently clear the suspicion.
+		ledger.noteLifecycleEvent({
+			kind: 'generation-close',
+			connectAttemptId: 'att_2',
+			transportGeneration: 2,
+			code: 1008,
+			reason: 'Requested entity was not found.',
+		});
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'att_3', handleSupplied: true });
+		ledger.noteLifecycleEvent({ kind: 'setup-ok', connectAttemptId: 'att_3', transportGeneration: 3 });
+		s = ledger.getSnapshot(true);
+		assert.equal(s.lineageState, 'suspected-sever');
+
+		// Only a FRESH (handle-less) lineage exits the state, by minting a new id.
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'att_4', handleSupplied: false });
+		ledger.noteLifecycleEvent({ kind: 'setup-ok', connectAttemptId: 'att_4', transportGeneration: 4 });
+		s = ledger.getSnapshot(true);
+		assert.equal(s.logicalSessionId, 2);
+		assert.equal(s.lineageState, 'fresh');
+	});
+
+	it('a setup failure on a supplied handle is suspected-sever', () => {
+		const ledger = createAudioHealthLedger({ sessionId: 's' });
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'att_1', handleSupplied: true });
+		ledger.noteLifecycleEvent({ kind: 'setup-failed', connectAttemptId: 'att_1', reason: 'timeout' });
+		assert.equal(ledger.getSnapshot(true).lineageState, 'suspected-sever');
+	});
+
+	it('context occupancy latches per lineage and resets on a fresh one', () => {
+		const t = 1_000_000;
+		const ledger = createAudioHealthLedger({ sessionId: 's', nowFn: () => t });
+		ledger.noteUsageMetadata(41_200);
+		let s = ledger.getSnapshot(true);
+		assert.equal(s.contextTokens, 41_200);
+		assert.equal(s.contextTokensAt, 1_000_000);
+		ledger.noteUsageMetadata(Number.NaN); // garbage never overwrites a reading
+		assert.equal(ledger.getSnapshot(true).contextTokens, 41_200);
+
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'a', handleSupplied: false });
+		ledger.noteLifecycleEvent({ kind: 'setup-ok', connectAttemptId: 'a', transportGeneration: 1 });
+		s = ledger.getSnapshot(true);
+		assert.equal(s.contextTokens, null, 'a fresh lineage starts with unknown occupancy');
+	});
+
+	it('healthSegments renders up= from diagnostics deltas, and ctx= when usage was seen', () => {
+		let t = 1_000_000;
+		const diag = upstreamSample();
+		const ledger = createAudioHealthLedger({
+			sessionId: 's',
+			nowFn: () => t,
+			getSessionDiagnostics: () => diag,
+		});
+		ledger.noteUsageMetadata(9_000);
+		ledger.healthSegments(true); // first tick establishes the window
+		t += 30_000;
+		diag.upstream.audio.queued += 705; // 23.5/s over 30 s
+		diag.upstream.audio.queuedWireBytesEstimate += 705 * 1364;
+		const line = ledger.healthSegments(true);
+		assert.match(line, /up=\{aQ\/s:23\.5,/);
+		assert.match(line, /ctx=\{tok:9000,age:30\.0s\}/);
+	});
+
+	it('a transport-generation change renders that tick from zero, never a negative rate', () => {
+		let t = 1_000_000;
+		const diag = upstreamSample();
+		const ledger = createAudioHealthLedger({
+			sessionId: 's',
+			nowFn: () => t,
+			getSessionDiagnostics: () => diag,
+		});
+		ledger.healthSegments(true);
+		t += 30_000;
+		// Reconnect: counters reset, generation bumps, small new count.
+		diag.transportGeneration = 2;
+		diag.upstream.audio.queued = 10;
+		diag.upstream.audio.queuedWireBytesEstimate = 14_000;
+		const line = ledger.healthSegments(true);
+		assert.match(line, /up=\{aQ\/s:0\.3,/, 'renders the new generation from zero');
+	});
+
+	it('up= stays n/a when diagnostics are unobserved or throw', () => {
+		const none = createAudioHealthLedger({ sessionId: 's' });
+		assert.match(none.healthSegments(true), /up=n\/a/);
+		const throwing = createAudioHealthLedger({
+			sessionId: 's',
+			getSessionDiagnostics: () => {
+				throw new Error('boom');
+			},
+		});
+		assert.match(throwing.healthSegments(true), /up=n\/a/);
+	});
+
+	it('the persisted row carries every evaluator input (replayable — design §1.6)', () => {
+		let persisted: HealthRow | null = null;
+		const diag = upstreamSample({ attempted: 300, queued: 235, lastQueuedAt: 999_500 });
+		const ledger = createAudioHealthLedger({
+			sessionId: 's',
+			nowFn: () => 1_000_000,
+			getSessionDiagnostics: () => diag,
+			persist: (row) => {
+				persisted = row;
+				return true;
+			},
+		});
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'a', handleSupplied: false });
+		ledger.noteLifecycleEvent({ kind: 'setup-ok', connectAttemptId: 'a', transportGeneration: 1 });
+		ledger.noteUsageMetadata(4_096);
+		ledger.persistTick('timer', true);
+		assert.ok(persisted, 'row persisted');
+		const full = JSON.parse((persisted as HealthRow).payload);
+		assert.equal(full.logicalSessionId, 1);
+		assert.equal(full.transportGeneration, 1);
+		assert.equal(full.contextTokens, 4_096);
+		assert.equal(full.upstream.audio.attempted, 300);
+		assert.equal(full.upstream.audio.lastQueuedAt, 999_500);
+	});
+
+	it('a missed diagnostics sample never fabricates an up= rate (baselining tick)', () => {
+		// codex round-5 #5 repro: a missed sample, then 900 cumulative queues —
+		// rendering 30.0/s from one 30 s dt would be a fabricated window.
+		let t = 1_000_000;
+		let observable = true;
+		const diag = upstreamSample();
+		const ledger = createAudioHealthLedger({
+			sessionId: 's',
+			nowFn: () => t,
+			getSessionDiagnostics: () => (observable ? diag : null),
+		});
+		assert.match(ledger.healthSegments(true), /up=n\/a\(baselining\)/, 'first observed tick');
+		t += 30_000;
+		assert.match(ledger.healthSegments(true), /up=\{aQ\/s:0\.0,/, 'window established');
+		t += 30_000;
+		observable = false; // missed sample invalidates the baseline
+		assert.match(ledger.healthSegments(true), /up=n\/a/);
+		t += 30_000;
+		observable = true;
+		diag.upstream.audio.queued += 900;
+		assert.match(
+			ledger.healthSegments(true),
+			/up=n\/a\(baselining\)/,
+			'no adjacent baseline — never 30.0/s',
+		);
+		t += 30_000;
+		diag.upstream.audio.queued += 30;
+		assert.match(ledger.healthSegments(true), /up=\{aQ\/s:1\.0,/, 'rates resume next tick');
+	});
+
+	it('lineage commits and re-labels emit §1.1 reconciliation records (reason: lineage)', () => {
+		const rows: HealthRow[] = [];
+		const ledger = createAudioHealthLedger({
+			sessionId: 's',
+			nowFn: () => 1_000_000,
+			persist: (row) => {
+				rows.push(row);
+				return true;
+			},
+		});
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'att_1', handleSupplied: false });
+		ledger.noteLifecycleEvent({ kind: 'setup-ok', connectAttemptId: 'att_1', transportGeneration: 1 });
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'att_2', handleSupplied: true });
+		ledger.noteLifecycleEvent({ kind: 'setup-failed', connectAttemptId: 'att_2', reason: 'timeout' });
+		const recs = rows.filter((r) => r.reason === 'lineage').map((r) => JSON.parse(r.payload));
+		assert.equal(recs.length, 2, 'one record per commit/re-label');
+		assert.deepEqual(recs[0], {
+			connectAttemptId: 'att_1',
+			transportGeneration: 1,
+			logicalSessionId: 1,
+			lineageState: 'fresh',
+		});
+		assert.deepEqual(recs[1], {
+			connectAttemptId: 'att_2',
+			transportGeneration: null,
+			logicalSessionId: 1,
+			lineageState: 'suspected-sever',
+		});
+		// A handle-less setup failure never commits — no record (lineage stays provisional).
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'att_3', handleSupplied: false });
+		ledger.noteLifecycleEvent({ kind: 'setup-failed', connectAttemptId: 'att_3' });
+		assert.equal(rows.filter((r) => r.reason === 'lineage').length, 2);
+	});
+
+	it('the per-modality context breakdown latches and resets with the lineage (§1.4)', () => {
+		const ledger = createAudioHealthLedger({ sessionId: 's', nowFn: () => 1_000_000 });
+		ledger.noteUsageMetadata(1000, [
+			{ modality: 'VIDEO', tokenCount: 600 },
+			{ modality: 'AUDIO', tokenCount: 300 },
+			{ modality: 'AUDIO', tokenCount: 50 }, // duplicate modalities accumulate
+			{ tokenCount: 7 }, // malformed entries are ignored
+		]);
+		let s = ledger.getSnapshot(true);
+		assert.deepEqual(s.contextTokensDetails, { VIDEO: 600, AUDIO: 350 });
+		ledger.noteLifecycleEvent({ kind: 'attempt', connectAttemptId: 'a', handleSupplied: false });
+		ledger.noteLifecycleEvent({ kind: 'setup-ok', connectAttemptId: 'a', transportGeneration: 1 });
+		s = ledger.getSnapshot(true);
+		assert.equal(s.contextTokensDetails, null, 'breakdown belongs to the lineage, like the scalar');
+	});
+
+	it('a REDUCED row still replays: snapshot-shaped evaluator inputs + recorded decision (§1.6)', () => {
+		const now = { t: 10_000 };
+		const rows: HealthRow[] = [];
+		const led = makeLedger(now, (row) => {
+			rows.push(row);
+			return true;
+		});
+		led.onClientConnected();
+		led.noteMatrixVerdict('healthy-idle', { attemptedAudioAdvanced: true }, ['r1']);
+		for (let k = 0; k < 80; k++) {
+			const ep = Array.from({ length: 8 }, (_, i) => [10_000_000 + k * 8 + i, 'g', 9_999_999, 9_999_999]);
+			led.ingestHeartbeat(wireHb('nnnnnnnn', { q: k, ep }));
+		}
+		led.persistTick('timer', true);
+		const full = led.getSnapshot(true);
+		const parsed = JSON.parse(rows[0].payload) as AudioHealthSnapshot & { truncated?: boolean };
+		assert.equal(parsed.truncated, true, 'this fixture exercises the REDUCED form');
+		// The recorded decision rides (§1.6 option 2).
+		assert.equal(parsed.lastMatrixVerdict, 'healthy-idle');
+		assert.deepEqual(parsed.lastMatrixFacts, { attemptedAudioAdvanced: true });
+		assert.deepEqual(parsed.lastMatrixReasons, ['r1']);
+		// Replayable (§1.6 option 1): the evaluator sees full and reduced rows
+		// IDENTICALLY — same baseline (every diff source), same verdict, same facts.
+		const evalOn = (snapshot: AudioHealthSnapshot, prev: null | ReturnType<typeof evaluateMatrix>['baseline'], at: number) =>
+			evaluateMatrix({ sessionState: 'ACTIVE', clientConnected: true, snapshot, prev, now: at });
+		const rFull = evalOn(full, null, now.t);
+		const rRed = evalOn(parsed, null, now.t);
+		assert.deepEqual(rRed.baseline, rFull.baseline, 'every evaluator diff source survives reduction');
+		const r2Full = evalOn(full, rFull.baseline, now.t + 30_000);
+		const r2Red = evalOn(parsed, rFull.baseline, now.t + 30_000);
+		assert.equal(r2Red.verdict, r2Full.verdict);
+		assert.deepEqual(r2Red.facts, r2Full.facts);
 	});
 });

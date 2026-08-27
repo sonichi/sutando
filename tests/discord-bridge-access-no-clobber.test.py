@@ -116,7 +116,7 @@ class TestPairingBranchBailsOnCorruption(unittest.TestCase):
         re-reads access.json via load_channel_config) saw a partial file → parse
         fail → (pre-guard) an empty-allowFrom clobber + pairing-code leak."""
         seed = self.src.find("access = read_access_for_seed(ACCESS_FILE)")
-        end = self.src.find('await message.channel.send(f"Pairing required', seed)
+        end = self.src.find("route = await _deliver_pairing_prompt(", seed)
         self.assertNotEqual(end, -1, "could not locate the pairing branch end")
         branch = self.src[seed:end]
         self.assertIn("os.replace(tmp_path, ACCESS_FILE)", branch,

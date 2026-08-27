@@ -61,18 +61,30 @@ def resolve_prefix_tuples(text: str) -> dict:
     return out
 
 
+def _gates_in(block, prefixes_by_name) -> list:
+    found = [m.group(2) for m in
+             re.finditer(r'startswith\((["\'])([^"\']+)\1\)', block)]
+    for name, vals in prefixes_by_name.items():
+        if re.search(rf"startswith\(.*\b{re.escape(name)}\b", block) or \
+                re.search(rf"\bin\s+{re.escape(name)}\b", block):
+            found.extend(vals)
+    return found
+
+
 def gates_before(lines, claim_idx, prefixes_by_name) -> "list | None":
     """Prefix strings gating the nearest enclosing results-dir loop, or None."""
     for i in range(claim_idx, max(0, claim_idx - 80), -1):
         if re.search(r"for\s+\w+\s+in\s+.*(RESULTS_DIR|results_dir)", lines[i]):
-            block = "\n".join(lines[i:claim_idx + 1])
-            found = [m.group(2) for m in
-                     re.finditer(r'startswith\((["\'])([^"\']+)\1\)', block)]
-            for name, vals in prefixes_by_name.items():
-                if re.search(rf"startswith\(.*\b{re.escape(name)}\b", block) or \
-                        re.search(rf"\bin\s+{re.escape(name)}\b", block):
-                    found.extend(vals)
-            return found
+            return _gates_in("\n".join(lines[i:claim_idx + 1]), prefixes_by_name)
+    return None
+
+
+def func_body_gates(lines, claim_idx, prefixes_by_name) -> "list | None":
+    """Inline gate inside the enclosing function (a method claim site like the
+    5b fence, called via attribute so caller resolution cannot see it)."""
+    for i in range(claim_idx, max(0, claim_idx - 80), -1):
+        if re.match(r"\s*def\s+\w+", lines[i]):
+            return _gates_in("\n".join(lines[i:claim_idx + 1]), prefixes_by_name)
     return None
 
 
@@ -157,6 +169,10 @@ for py in sorted(SRC.glob("*.py")):
                 gates = [g for c in callers for g in c[2]]
                 label = f"{py.name} (via {len(callers)} caller(s) of {fn}())"
                 delegating_callers += len(callers)
+            elif not callers:
+                # Method claim sites are invoked via attribute calls, which the
+                # Name-based caller scan cannot see; their gate must be inline.
+                gates = func_body_gates(lines, lineno - 1, prefixes)
         claim_sites.append((label, lineno, gates))
 
 # A zero-site run would make every assertion below vacuously true. Centralising

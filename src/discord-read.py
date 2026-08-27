@@ -4,131 +4,44 @@
 Exits after printing — never starts a persistent bot connection.
 
 Usage:
-    python3 src/discord-read.py <channel_id> [--limit N] [--after MSG_ID]
+    python3 src/discord-read.py <channel_id> [--limit N] [--after MSG_ID] [--serving CH]
+
+One of --serving or --operator is REQUIRED (exit 3 otherwise, nothing
+fetched). --serving <origin_channel_id> runs the contextNotFrom gate BEFORE any
+fetch (exit 2 on block) — same contract as read_discord_channel.py; pass the
+task's origin channel when serving a task. --operator is the explicit
+privileged mode for the core's own monitoring (no serving context exists);
+choosing it is visible in the invocation, not a silent default.
 
 Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env or env var.
 """
 import argparse
-import os
 import sys
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path  # noqa: E402
-from discord_http import request_json  # noqa: E402
+import policy.context.discord as discord_context_policy  # noqa: E402
+from channels.discord.http import request_json  # noqa: E402
 
-# Runaway backstop only (not a depth target — depth is governed by --until):
-# 200 pages * 100 = 20k messages before we refuse to loop forever.
-MAX_PAGES = 200
-
-# Ordinary messages are clipped so a long scroll stays scannable; FORWARDS are
-# exempt (see _render) because a forward is usually the substance, not chatter.
-CLIP = 200
-# Reply targets are clipped harder than bodies: the point is to identify WHICH
-# message is being answered, not to re-read it.
-REPLY_CLIP = 110
-
-
-def _load_token(env):
-    """Populate DISCORD_BOT_TOKEN from the channel .env (if present) and return it."""
-    for line in (env.read_text().splitlines() if env.exists() else []):
-        k, _, v = line.partition("=")
-        if k.strip() == "DISCORD_BOT_TOKEN" and v.strip():
-            os.environ.setdefault("DISCORD_BOT_TOKEN", v.strip())
-    return os.environ.get("DISCORD_BOT_TOKEN", "")
+# Shared implementations, bound as module globals so tests patch them per-CLI.
+import channels.discord.reader as _reader  # noqa: E402
+from channels.discord.reader import (  # noqa: E402,F401
+    CLIP, MAX_PAGES, REPLY_CLIP,
+    _at_or_before_boundary, _redact, _render, _reply_context,
+    _strictly_older_than_boundary,
+)
 
 
 def _fetch(extra, channel_id, page, headers):
-    p = {"limit": str(page)}
-    p.update({k: v for k, v in extra.items() if v})
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages?" + urllib.parse.urlencode(p)
-    req = urllib.request.Request(url, headers=headers)
-    # request_json honors 429 Retry-After + retries transient 5xx, so a rate
-    # limit mid-pagination no longer aborts the read (2026-07-24 truncation fix).
-    return request_json(req, timeout=10)
+    # rj resolves through THIS module's global at call time (patchable per-CLI).
+    return _reader._fetch(extra, channel_id, page, headers, rj=request_json)
 
 
-def _reply_context(msg, clip=REPLY_CLIP):
-    """The message this one is REPLYING to, or None.
-
-    A terse reply is uninterpretable without its target. Measured 2026-08-04 in
-    the owner channel: `2 merge` and `2y\n3 I didn't delete it.` are both
-    replies, and both rendered here as bare text with nothing indicating what
-    they answered. Read from the channel alone they are unreadable; they only
-    parsed because the task file happened to carry a `[Replying to ...]` block,
-    which exists only when a message becomes a task.
-
-    That matters because this is the reader `context-reconstruct` runs on every
-    pass — the same reason the forward bug above was worth fixing. A peer hit
-    the consequence directly: it re-asked an owner the same question twice after
-    missing that a bare `2` was the answer to an enumerated question.
-
-    LABELLED, never inlined — for the same reason forwards are labelled:
-    attributing a quoted message to the replier is its own misreading.
-    """
-    ref = msg.get("referenced_message")
-    if not isinstance(ref, dict):
-        return None
-    author = (ref.get("author") or {}).get("username", "?")
-    body = " ".join((_render(ref, clip) or "").split())
-    return f"\u21b3 replying to {author}: {body[:clip] if clip is not None else body}" if body else \
-           f"\u21b3 replying to {author}: (no readable body)"
-
-
-def _render(msg, clip=CLIP):
-    """One message's readable body, INCLUDING forwarded content.
-
-    A Discord *forward* carries empty top-level `content` and puts the real
-    payload in `message_snapshots[0].message` (the bridge already knows this —
-    `discord-bridge.py` reads it, `discord_addressee.py` documents it). This
-    reader did not, so every forwarded message rendered as a BLANK LINE — and
-    this is the reader the context-reconstruct step runs on every pass.
-
-    Measured 2026-07-31: two forwards in #research-eval printed as empty while
-    holding the only record of a live AMA failure (a 1,602-char transcript plus
-    the reporter's own words). They were nearly deleted on the strength of that
-    blank output — see feedback_forwarded_discord_msgs_hide_content_in_message_snapshots.
-
-    The forward is LABELLED rather than silently inlined: attributing a quoted
-    message to the forwarder is its own misreading. Forwards are also exempt
-    from the 200-char clip — the clip exists to keep ordinary chatter scannable,
-    and a forward is usually carrying the substance someone moved deliberately.
-    """
-    body = (msg.get("content") or "").strip()
-    snaps = msg.get("message_snapshots") or []
-    if not snaps:
-        return body[:clip] if clip is not None else body
-    fwd = (snaps[0].get("message") or {})
-    fwd_body = (fwd.get("content") or "").strip()
-    extra = []
-    for a in fwd.get("attachments") or []:
-        extra.append(f"<attachment: {a.get('filename', '?')}>")
-    for e in fwd.get("embeds") or []:
-        extra.append(f"<embed: {e.get('title') or e.get('type') or '?'}>")
-    inner = " ".join(x for x in (fwd_body, *extra) if x) or "(forward with no readable body)"
-    prefix = f"{body} " if body else ""
-    return f"{prefix}[forwarded] {inner}"
-
-
-def _at_or_before_boundary(msg, until):
-    """True once a message is at/older-than --until (id or ISO prefix)."""
-    if until.isdigit():
-        try:
-            return int(msg["id"]) <= int(until)
-        except (KeyError, ValueError):
-            return False
-    return (msg.get("timestamp", "") or "")[:len(until)] <= until
-
-
-def _strictly_older_than_boundary(msg, until):
-    if until.isdigit():
-        try:
-            return int(msg["id"]) < int(until)
-        except (KeyError, ValueError):
-            return False
-    return (msg.get("timestamp", "") or "")[:len(until)] < until
+def _load_token(env):
+    """Resolve DISCORD_BOT_TOKEN via the shared policy: env -> `env` file -> vault."""
+    from channel_token import resolve_channel_token
+    return resolve_channel_token("DISCORD_BOT_TOKEN", env_file=env)
 
 
 def _parse_args(argv):
@@ -140,6 +53,11 @@ def _parse_args(argv):
     parser.add_argument("--full", action="store_true",
                         help="Do not clip bodies. Use when the read is a VERIFICATION instrument ('did my message land?') rather than a scan: a grep past the 200-char clip returns 0 for text that WAS delivered, and a false negative there causes a duplicate send.")
     parser.add_argument("--until", default=None, help="Snowflake ID or ISO date/time (e.g. 2026-06-24T23:25) — page BACKWARD until reaching this boundary, then stop. Condition-based depth, NOT a message count: use to reconstruct context however far back the referent / conversational boundary is.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--serving", default=None,
+                      help="Origin channel_id of the task being served. Runs the contextNotFrom gate BEFORE any fetch; exit 2 on block.")
+    mode.add_argument("--operator", action="store_true",
+                      help="Explicit operator mode: no serving context (core monitoring). Mutually exclusive with --serving.")
     return parser.parse_args(argv)
 
 
@@ -151,6 +69,20 @@ def main(argv=None):
         return 1
 
     args = _parse_args(argv)
+
+    if not args.serving and not args.operator:
+        print("Refusing: pass --serving <origin_channel_id> (task-serving read, "
+              "gated) or --operator (explicit privileged read). A bare read was "
+              "the contextNotFrom bypass. Nothing was fetched.", file=sys.stderr)
+        return 3
+
+    if args.serving:
+        reason = discord_context_policy.gate(args.serving, args.channel_id, token)
+        if reason is not None:
+            print(f"BLOCKED: {reason}. Refusing to add its content to context "
+                  f"(contextNotFrom rule). Nothing was fetched.")
+            return 2
+
     headers = {"Authorization": f"Bot {token}", "User-Agent": "Sutando-reader/1.0"}
     page = min(max(args.limit, 1), 100)
 

@@ -698,6 +698,84 @@ def test_concurrent_inheritance_keeps_every_assignment() -> None:
     assert all(child in assignments for child in children)
 
 
+def test_classifier_task_is_envelope_stamped() -> None:
+    """#3014's writer census listed task-workstream-grouping unsigned: the
+    classifier emit builds its own header block, so it needs an edge stamp."""
+    import task_envelope
+    workspace = fixture_workspace()
+    result = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert result.enqueued
+    text = (workspace / "tasks" / f"{result.task_id}.txt").read_text()
+    assert task_envelope.verify_text(text, workspace)["verdict"] == "verified"
+    assert text.splitlines()[0].startswith("id:")
+    assert text.rstrip().endswith("[no-send].")
+    assert (workspace / "state" / "auth" / "task-hmac.key").is_file()
+
+
+def test_classifier_task_survives_a_raising_stamper() -> None:
+    """Fail-open is the contract: a stamping error must cost the stamp, never
+    the maintenance tick. Without the guard this test loses the task."""
+    import task_envelope
+    workspace = fixture_workspace()
+    original = task_envelope.stamp_text
+
+    def boom(*_a, **_k):
+        raise RuntimeError("keychain on fire")
+
+    task_envelope.stamp_text = boom
+    try:
+        result = workstreams.maybe_enqueue_classifier_task(workspace)
+    finally:
+        task_envelope.stamp_text = original
+    assert result.enqueued
+    text = (workspace / "tasks" / f"{result.task_id}.txt").read_text()
+    assert "$task-workstream-grouping" in text
+    assert "envelope_hmac:" not in text
+
+
+def test_reused_workstream_id_does_not_require_a_redundant_name() -> None:
+    workspace = fixture_workspace()
+
+    # Seed a stored workstream, so reuse is exercised WITHOUT a prior apply — a prior
+    # apply would review the whole snapshot and leave no candidates behind.
+    reused_id = workstreams._workstream_id("Sutando task management")
+    store_path = workspace / "data" / "task-workstreams.json"
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {reused_id: {
+            "title": "Sutando task management",
+            "summary": "group and display related tasks",
+            "created_at": "2026-08-03T09:00:00+00:00",
+            "updated_at": "2026-08-03T09:00:00+00:00",
+        }},
+        "assignments": {},
+        "reviews": {},
+        "context_history": {},
+    }))
+    assert reused_id in workstreams.load_workstream_store(workspace)["workstreams"]
+
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    result = workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [
+            # No `name`: the stored workstream already carries its title.
+            {"workstream_id": reused_id, "confidence": 0.9, "task_ids": ["task-a1"]},
+            # An unknown id with no name has no title to fall back on, so it still skips.
+            {"workstream_id": "workstream-does-not-exist", "confidence": 0.9,
+             "task_ids": ["task-b1"]},
+        ],
+    })
+    assert result.assigned == 1, f"reuse without a name was dropped: {result}"
+    assert result.skipped == 1, f"nameless unknown id should skip exactly once: {result}"
+    assert result.workstreams_created == 0, f"reuse minted a new workstream: {result}"
+
+    store = workstreams.load_workstream_store(workspace)
+    assert store["assignments"]["task-a1"]["workstream_id"] == reused_id
+    assert "task-b1" not in store["assignments"]
+    assert store["workstreams"][reused_id]["title"] == "Sutando task management"
+
+
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
@@ -705,6 +783,8 @@ def main() -> None:
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
+        test_classifier_task_is_envelope_stamped,
+        test_classifier_task_survives_a_raising_stamper,
         test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
         test_stale_classifier_is_archived_before_replacement,
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
@@ -713,6 +793,7 @@ def main() -> None:
         test_remembered_context_history_keeps_only_the_newest_entries,
         test_workstream_context_index_fail_open_edges,
         test_concurrent_inheritance_keeps_every_assignment,
+        test_reused_workstream_id_does_not_require_a_redundant_name,
     ]
     for test in tests:
         test()

@@ -17,6 +17,15 @@ Machine-readable ownership and lifecycle metadata lives in
 - [External runtime dependencies](runtime-dependencies.md) — what must be
   installed, what only a feature needs, and what to vendor when embedding.
 
+## Agent instruction detail (relocated from CLAUDE.md, 2026-08-17 context diet)
+
+- [Channel access control](access-control.md) — per-channel tier rules and gates.
+- [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
+- [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
+- [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
+- [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
+- [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
+
 ## Guides and examples
 
 - [Community use cases](community-use-cases/README.md)
@@ -31,6 +40,8 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Per-host carried-path rules](workspace-per-host-paths.md)
 - [State-sync allowlist design](state-sync-allowlist.md)
 - [Testing and coverage](testing-coverage.md)
+- [Black-box benchmarks](benchmarking.md)
+  - [Comprehensive benchmark: revision `3a73e03`, 2026-08-24](benchmark-reports/2026-08-24-3a73e03.md)
 - [Voice-agent test framework](voice-agent-test-framework.md)
 
 ## Reference
@@ -44,6 +55,9 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Architecture and decisions
 
 - [Architecture boundaries](architecture-boundaries.md)
+- [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
+- [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
+- [The file delivery protocol as a formal state machine](delivery-protocol.md)
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)

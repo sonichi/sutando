@@ -49,6 +49,114 @@ class TestIsTransient(unittest.TestCase):
 
         self.assertTrue(sfp.is_transient(ServerDisconnectedError()))
 
+    def test_a_subclass_of_a_listed_transient_is_transient(self):
+        # aiohttp raises ClientConnectorDNSError(ClientConnectorError) for a DNS
+        # failure, so the concrete name is NOT the listed one. Matching only the
+        # concrete class parked an owner's DM permanently on the first blip —
+        # the retry budget was never spent because the branch was never entered.
+        class ClientConnectorError(Exception):
+            pass
+
+        class ClientConnectorDNSError(ClientConnectorError):
+            pass
+
+        exc = ClientConnectorDNSError(
+            "Cannot connect to host discord.com:443 ssl:default "
+            "[nodename nor servname provided, or not known]")
+        self.assertNotIn(type(exc).__name__, sfp._TRANSIENT_EXC_NAMES)
+        self.assertTrue(sfp.is_transient(exc))
+        self.assertTrue(sfp.should_retry(exc, 0))
+
+    def test_an_unlisted_hierarchy_still_parks(self):
+        # The MRO walk must not turn "any exception" into a retry: only a listed
+        # ancestor counts.
+        class SomeLibraryError(Exception):
+            pass
+
+        class MalformedPayloadError(SomeLibraryError):
+            pass
+
+        self.assertFalse(sfp.is_transient(MalformedPayloadError("bad body")))
+
+    def test_a_tls_failure_parks_even_though_its_parent_is_listed(self):
+        # The MRO walk widens the transient set to everything under
+        # ClientConnectorError, which on aiohttp 3.13.5 pulls in three TLS types.
+        # A bad cert, wrong CA or pin mismatch is a misconfiguration: retrying
+        # only burns the 5-attempt budget before parking anyway.
+        class ClientConnectorError(Exception):
+            pass
+
+        class ClientSSLError(ClientConnectorError):
+            pass
+
+        class ClientConnectorCertificateError(ClientSSLError):
+            pass
+
+        class ClientConnectorSSLError(ClientSSLError):
+            pass
+
+        for cls in (ClientSSLError, ClientConnectorCertificateError,
+                    ClientConnectorSSLError):
+            exc = cls("certificate verify failed")
+            self.assertFalse(sfp.is_transient(exc), cls.__name__)
+            self.assertFalse(sfp.should_retry(exc, 0), cls.__name__)
+
+    def test_a_pinned_fingerprint_mismatch_parks_via_a_different_ancestor(self):
+        # ServerFingerprintMismatch is a TLS pin failure that reaches the
+        # transient set through ServerConnectionError, NOT ClientSSLError — so
+        # excluding the SSL branch alone would still have retried it.
+        class ClientConnectionError(Exception):
+            pass
+
+        class ServerConnectionError(ClientConnectionError):
+            pass
+
+        class ServerFingerprintMismatch(ServerConnectionError):
+            pass
+
+        self.assertTrue(sfp.is_transient(ServerConnectionError("dropped")),
+                        "the parent stays transient")
+        self.assertFalse(sfp.is_transient(ServerFingerprintMismatch("pin")))
+
+    def test_the_permanent_set_does_not_swallow_its_transient_siblings(self):
+        # ClientProxyConnectionError and ClientConnectorDNSError descend from
+        # ClientConnectorError WITHOUT passing through ClientSSLError, so the
+        # exclusion must not reach them.
+        class ClientConnectorError(Exception):
+            pass
+
+        class ClientProxyConnectionError(ClientConnectorError):
+            pass
+
+        class ClientConnectorDNSError(ClientConnectorError):
+            pass
+
+        self.assertTrue(sfp.is_transient(ClientProxyConnectionError("proxy down")))
+        self.assertTrue(sfp.is_transient(ClientConnectorDNSError("dns")))
+
+    def test_urlerror_wrapper_classified_by_its_reason(self):
+        # urllib wraps the real failure; the wrapper alone reads as permanent.
+        import socket
+        import urllib.error
+        for inner in (TimeoutError("t"), ConnectionRefusedError(),
+                      socket.gaierror(8, "nodename nor servname")):
+            self.assertTrue(sfp.is_transient(urllib.error.URLError(inner)), inner)
+        self.assertFalse(sfp.is_transient(urllib.error.URLError("not an exception")))
+
+    def test_nested_reason_chain_unwraps_but_is_bounded(self):
+        import urllib.error
+        nested = urllib.error.URLError(urllib.error.URLError(TimeoutError("t")))
+        self.assertTrue(sfp.is_transient(nested))
+        # deeper than the unwrap bound: parks rather than loops
+        deep = ValueError("leaf")
+        for _ in range(6):
+            deep = urllib.error.URLError(deep)
+        self.assertFalse(sfp.is_transient(deep))
+        # cyclic .reason must not hang
+        cyc = urllib.error.URLError("x")
+        cyc.reason = cyc
+        self.assertFalse(sfp.is_transient(cyc))
+
     def test_unknown_failure_parks(self):
         # Parking an unknown error loses nothing — quarantine preserves the body and
         # health-check reports it — while retrying forever would bury the log.

@@ -10,6 +10,7 @@ import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statS
 import { join, extname, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { requirePython } from './python-binary.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
 import { presenterModeActive } from './presenter-mode.js';
@@ -38,6 +39,7 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+import { keystrokeOutcome } from './osascript-setup-hint.js';
 import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
 // Vision: one-shot frame + start/stop live screen-to-Gemini video.
@@ -214,14 +216,14 @@ export const pressKeyTool: ToolDefinition = {
 			try {
 				execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeKey}"${modStr}`], { timeout: 3_000 });
 			} catch (err) {
-				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 			}
 		} else {
 			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
 			try {
 				execFileSync('osascript', ['-e', `tell application "System Events" to key code ${keyCode}${modStr}`], { timeout: 3_000 });
 			} catch (err) {
-				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 			}
 		}
 		console.log(`${ts()} [PressKey] ${app ? `(${app}) ` : ''}${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
@@ -378,7 +380,7 @@ export const typeTextTool: ToolDefinition = {
 				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
 			} catch (err) {
-				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('Paste', err instanceof Error ? err.message : String(err));
 			}
 		}
 		// Single-line short text: use keystroke
@@ -397,7 +399,7 @@ export const typeTextTool: ToolDefinition = {
 			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
-			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
+			return keystrokeOutcome('Type', err instanceof Error ? err.message : String(err));
 		}
 	},
 };
@@ -438,6 +440,98 @@ export const volumeTool: ToolDefinition = {
 	},
 };
 
+// The smooth ramp lands within a rounding step of the request; wider than that
+// means the display did not take the change.
+const BRIGHTNESS_TOLERANCE_PCT = 2;
+
+// Identifies the target display before choosing a mechanism: DisplayServices
+// drives the built-in panel only, and external panels need DDC over I2C. Prints
+// "<kind> <level>" so the caller can report which path ran; exits 2 for an
+// external display, which it cannot drive itself.
+const BRIGHTNESS_PY = `
+import ctypes, ctypes.util, sys, time
+cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+cg.CGMainDisplayID.restype = ctypes.c_uint32
+cg.CGDisplayIsBuiltin.argtypes = [ctypes.c_uint32]
+did = cg.CGMainDisplayID()
+if not cg.CGDisplayIsBuiltin(did):
+    # Report how many displays are attached: the caller cannot safely pick one
+    # for DDC when several are, so it refuses rather than driving the wrong panel.
+    n = ctypes.c_uint32()
+    arr = (ctypes.c_uint32 * 16)()
+    cg.CGGetActiveDisplayList(16, arr, ctypes.byref(n))
+    print("external", n.value)
+    sys.exit(2)
+ds = ctypes.CDLL("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices")
+ds.DisplayServicesGetBrightness.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
+ds.DisplayServicesSetBrightnessSmooth.argtypes = [ctypes.c_uint32, ctypes.c_float]
+before = ctypes.c_float()
+if ds.DisplayServicesGetBrightness(did, ctypes.byref(before)) != 0:
+    sys.exit(1)
+if ds.DisplayServicesSetBrightnessSmooth(did, ctypes.c_float(float(sys.argv[1]) - before.value)) != 0:
+    sys.exit(1)
+time.sleep(0.6)
+after = ctypes.c_float()
+if ds.DisplayServicesGetBrightness(did, ctypes.byref(after)) != 0:
+    sys.exit(1)
+print("builtin", after.value, before.value)
+`;
+
+/**
+ * DDC brightness for a single external panel, 0-100. Both tools address a
+ * display by their own index, which no CoreGraphics id maps onto, so this
+ * refuses when more than one display is attached rather than guessing which
+ * panel `display 1` denotes.
+ *
+ * Reads the level back where the tool supports it. DDC is widely half-implemented
+ * in monitor firmware, so a command can be accepted and ignored — reporting the
+ * REQUESTED level here would reproduce the silent-success bug this file exists to
+ * fix, on the one path that cannot be hardware-tested. When no readback is
+ * available the result says `requested`, never `set`.
+ */
+type ExternalResult =
+	| { status: 'set' | 'partial' | 'requested'; method: string; level: number; requested: number; verified: boolean }
+	| { error: string };
+
+function setExternalBrightness(level: number, displayCount: number): ExternalResult {
+	if (displayCount > 1) {
+		return { error: `${displayCount} displays attached — refusing to guess which external panel to dim. Set it on the monitor, or attach one display.` };
+	}
+	const failures: string[] = [];
+	for (const [bin, setArgs, getArgs] of [
+		['m1ddc', ['display', '1', 'set', 'luminance', String(level)], ['display', '1', 'get', 'luminance']],
+		['ddcctl', ['-d', '1', '-b', String(level)], null],
+	] as const) {
+		try {
+			execFileSync(bin, [...setArgs], { timeout: 5_000, stdio: ['ignore', 'ignore', 'pipe'] });
+		} catch (err) {
+			// ENOENT (absent) and a non-zero exit (present but refused) are different
+			// diagnoses; collapsing them tells a user who HAS the tool to install it.
+			const e = err as { code?: string; stderr?: Buffer; status?: number };
+			if (e?.code === 'ENOENT') continue;
+			failures.push(`${bin} exited ${e?.status ?? '?'}: ${String(e?.stderr ?? '').trim() || 'no stderr'}`);
+			continue;
+		}
+		if (getArgs) {
+			try {
+				const out = execFileSync(bin, [...getArgs], { timeout: 5_000, encoding: 'utf8' });
+				const actual = parseInt(out.trim(), 10);
+				if (Number.isFinite(actual)) {
+					return Math.abs(actual - level) <= BRIGHTNESS_TOLERANCE_PCT
+						? { status: 'set', method: bin, level: actual, requested: level, verified: true }
+						: { status: 'partial', method: bin, level: actual, requested: level, verified: true };
+				}
+			} catch { /* readback unsupported by this panel — fall through unverified */ }
+		}
+		return { status: 'requested', method: bin, level, requested: level, verified: false };
+	}
+	return {
+		error: failures.length
+			? `External display: DDC command failed — ${failures.join('; ')}`
+			: 'External display needs a DDC tool. Install one with: brew install m1ddc',
+	};
+}
+
 export const brightnessTool: ToolDefinition = {
 	name: 'brightness',
 	description:
@@ -450,22 +544,48 @@ export const brightnessTool: ToolDefinition = {
 		let { level } = args as { level: number };
 		// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 		if (level <= 1 && level > 0) level = Math.round(level * 100);
+		level = Math.max(0, Math.min(100, level));
 		const bLevel = (level / 100).toFixed(2);
 		try {
-			execFileSync('brightness', [bLevel], { timeout: 5_000 });
-			console.log(`${ts()} [Brightness] set to ${level}%`);
-			return { status: 'set', level };
-		} catch {
-			// Fallback: use AppleScript key codes
+			// DisplayServicesSetBrightnessSmooth takes a RELATIVE delta and persists;
+			// the absolute setter is reverted by the display daemon within ~30s.
+			const out = execFileSync(requirePython(), ['-c', BRIGHTNESS_PY, bLevel], { timeout: 5_000, encoding: 'utf8' });
+			const [, afterRaw, beforeRaw] = out.trim().split(/\s+/);
+			const actual = Math.round(parseFloat(afterRaw) * 100);
+			const before = Math.round(parseFloat(beforeRaw) * 100);
+			if (!Number.isFinite(actual) || !Number.isFinite(before)) throw new Error(`unreadable brightness: ${out.trim()}`);
+			// A readback alone cannot tell "set" from "did nothing" — that was the
+			// original silent-success bug. Require the display to have reached the
+			// target, or at least moved toward it.
+			if (Math.abs(actual - level) > BRIGHTNESS_TOLERANCE_PCT) {
+				const moved = actual !== before;
+				console.log(`${ts()} [Brightness] builtin: requested ${level}%, reads ${actual}% (was ${before}%) — ${moved ? 'partial' : 'no movement'}`);
+				return moved
+					? { status: 'partial', level: actual, requested: level, was: before, display: 'builtin' }
+					: { error: `Brightness did not move: still ${actual}% after requesting ${level}%.` };
+			}
+			console.log(`${ts()} [Brightness] builtin: requested ${level}%, display reads ${actual}%`);
+			return { status: 'set', level: actual, requested: level, display: 'builtin' };
+		} catch (err) {
+			// Exit 2 means the probe identified an EXTERNAL main display, which
+			// DisplayServices cannot drive at all — route to DDC rather than retrying.
+			if ((err as { status?: number })?.status === 2) {
+				const count = parseInt(String((err as { stdout?: string }).stdout ?? '').trim().split(/\s+/)[1] ?? '1', 10);
+				const outcome = setExternalBrightness(level, Number.isFinite(count) ? count : 1);
+				if ('error' in outcome) return outcome;
+				console.log(`${ts()} [Brightness] external: requested ${level}% via ${outcome.method} — ${outcome.verified ? `display reads ${outcome.level}%` : 'NOT verified (no readback)'}`);
+				return { ...outcome, display: 'external' };
+			}
+			// Last resort when the probe itself could not run. nriley/brightness has no
+			// readback we use here, so this reports `requested`, never `set` — the same
+			// rule the external path follows, and the reason the review found this
+			// class in the first place.
 			try {
-				const steps = Math.round(level / 100 * 16);
-				// Reset to 0 then go up
-				for (let i = 0; i < 16; i++) execFileSync('osascript', ['-e', 'tell application "System Events" to key code 107'], { timeout: 1_000 }); // brightness down
-				for (let i = 0; i < steps; i++) execFileSync('osascript', ['-e', 'tell application "System Events" to key code 113'], { timeout: 1_000 }); // brightness up
-				console.log(`${ts()} [Brightness] set to ~${level}% via key codes`);
-				return { status: 'set', level, method: 'key_codes' };
-			} catch (err) {
-				return { error: `Brightness failed: ${err instanceof Error ? err.message : err}` };
+				execFileSync('brightness', [bLevel], { timeout: 5_000 });
+				console.log(`${ts()} [Brightness] requested ${level}% via brightness CLI — NOT verified`);
+				return { status: 'requested', level, requested: level, method: 'cli', verified: false };
+			} catch (e) {
+				return { error: `Brightness failed: ${e instanceof Error ? e.message : e}` };
 			}
 		}
 	},
@@ -1103,7 +1223,12 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // Split by manifest `access_tier` so phone-conversation can include
 // owner-tier tools only when the caller is the verified owner. Manifest
 // access_tier values: "owner" (default if omitted) | "any_caller".
-async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
+// OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
+// session so the skill registers session handlers without importing core.
+export type { SkillSetupCtx, SkillSetup } from './skill-setup-runner.js';
+import type { SkillSetup } from './skill-setup-runner.js';
+
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[] }> {
 	// Scan the public-repo `skills/` dir, the per-user workspace
 	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
@@ -1135,6 +1260,9 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];
 	const anyCaller: ToolDefinition[] = [];
+	// Keyed by skill identity (manifest.name || dirName), not tool name: the same
+	// skill scanned from two roots must attach its handler ONCE, last-write-wins.
+	const setups = new Map<string, SkillSetup>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1167,6 +1295,12 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
+				if (typeof mod.setup === 'function') {
+					// DISCOVERY, not registration: a skill in N roots hits this line N times
+					// but registers once. The authoritative count is logged after the scan.
+					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
+					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
+				}
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
@@ -1183,7 +1317,9 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		for (const t of arr) byName.set(t.name, t);
 		return [...byName.values()];
 	};
-	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller) };
+	// One authoritative line for what actually got registered, after dedupe.
+	if (setups.size) console.log(`[skill-loader] registered ${setups.size} setup() hook(s): ${[...setups.keys()].join(', ')}`);
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()] };
 }
 const personalTools = await loadSkillManifestTools();
 // Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
@@ -1199,6 +1335,9 @@ const personalAllTools = (() => {
 export const envDependentToolNames: ReadonlySet<string> = new Set([
 	...personalAllTools.map(t => t.name), 'slide_control', 'fullscreen',
 ]);
+// voice-agent invokes each once per session with {session, injectText}.
+// Empty when no skill exports setup().
+export const personalSkillSetups: SkillSetup[] = personalTools.setups;
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,

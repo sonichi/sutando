@@ -264,12 +264,19 @@ describe('voice-agent duplicate-instance + fail-closed lock (integration)', () =
 
 	it('duplicate spawn: loser exits 7 with the FATAL line; winner keeps a structured lock', async () => {
 		const ws = makeWorkspace('dup');
-		const pidfile = join(ws, '.voice-agent.pid');
+		const pidfile = join(ws, 'state', 'locks', 'voice-agent.pid');
+		// #2722 self-healing migration: a pre-move root copy is retired on acquisition.
+		writeFileSync(join(ws, '.voice-agent.pid'), '{"stale":"pre-move"}');
 		const winner = spawnAgent(ws, 19931, 19932);
 		// The lock is written before any side effect — poll for it, then race
 		// the loser against the SAME workspace (different ports: the loser must
 		// die at the LOCK, not at the port bind).
 		await waitFor(() => existsSync(pidfile), 90_000, 'winner lock file');
+		assert.equal(
+			existsSync(join(ws, '.voice-agent.pid')),
+			false,
+			'legacy root copy retired on acquisition (#2722 shim)',
+		);
 		const lock = JSON.parse(readFileSync(pidfile, 'utf-8'));
 		assert.equal(lock.v, 1, 'lock is structured schema v1');
 		// `npx tsx` spawns a worker: the lock names the WORKER (the process
@@ -312,7 +319,7 @@ describe('voice-agent duplicate-instance + fail-closed lock (integration)', () =
 		// the loser's own (now stale) lock stays for the supervisor to replace
 		// under the guard — identical crash-only rules on both fatal paths.
 		assert.equal(
-			existsSync(join(wsB, '.voice-agent.pid')),
+			existsSync(join(wsB, 'state', 'locks', 'voice-agent.pid')),
 			true,
 			'main().catch fatal must NOT release the lock (amendment R1)',
 		);
@@ -336,7 +343,7 @@ describe('voice-agent duplicate-instance + fail-closed lock (integration)', () =
 		assert.equal(typeof rec.pid, 'number');
 		// R1: the acquired lock is left in place (release helper suppressed).
 		assert.equal(
-			existsSync(join(ws, '.voice-agent.pid')),
+			existsSync(join(ws, 'state', 'locks', 'voice-agent.pid')),
 			true,
 			'fatal main() exit must NOT release the lock (amendment R1)',
 		);
@@ -354,7 +361,7 @@ describe('voice-agent duplicate-instance + fail-closed lock (integration)', () =
 		assert.equal(existsSync(join(ws, 'logs', 'voice-agent.crash.json')), false, 'duplicate-instance exit writes no crash record');
 		// And the fatal flag suppresses the exit-time release here too (R1).
 		assert.equal(
-			existsSync(join(ws, '.voice-agent.pid')),
+			existsSync(join(ws, 'state', 'locks', 'voice-agent.pid')),
 			true,
 			'uncaught fatal must NOT release the lock (amendment R1)',
 		);
@@ -374,6 +381,6 @@ describe('voice-agent duplicate-instance + fail-closed lock (integration)', () =
 		assert.equal(code, 1, `fail-closed exit is 1, got ${code}; stderr: ${agent.stderr()}`);
 		assert.match(agent.stderr(), /fail closed/i);
 		assert.match(agent.stderr(), /python/i);
-		assert.equal(existsSync(join(ws, '.voice-agent.pid')), false, 'no unguarded legacy lock writer (amendment R3)');
+		assert.equal(existsSync(join(ws, 'state', 'locks', 'voice-agent.pid')), false, 'no unguarded legacy lock writer (amendment R3)');
 	});
 });

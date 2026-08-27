@@ -17,9 +17,10 @@ echo "Stopping Sutando services..."
 # never signal without validation.
 if _VOICE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)"; then
     _VOICE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
-    if [ -n "$_VOICE_WS" ] && [ -f "$_VOICE_WS/.voice-agent.pid" ]; then
+    _VOICE_PIDFILE="$(bash "$REPO/scripts/sutando-config.sh" voice-pidfile "$_VOICE_WS" 2>/dev/null || true)"
+    if [ -n "$_VOICE_WS" ] && [ -n "$_VOICE_PIDFILE" ] && [ -f "$_VOICE_PIDFILE" ]; then
         "$_VOICE_PY" "$REPO/scripts/voice-lock.py" takeover \
-            --pidfile "$_VOICE_WS/.voice-agent.pid" \
+            --pidfile "$_VOICE_PIDFILE" \
             --guard "$_VOICE_WS/.voice-agent.lock.guard" \
             --workspace "$_VOICE_WS" \
             --mode adopted --port 9900 \
@@ -98,6 +99,25 @@ for _ in $(seq 1 30); do
     [ $still -eq 0 ] && break
     sleep 0.1
 done
+
+# Relaunch what line 73 killed. This belongs here, not in startup.sh: that file
+# is guarded headless (tests/startup-headless.test.sh) and owns no desktop UI.
+APP_BIN="$REPO/src/Sutando/Sutando"
+if pgrep -x Sutando > /dev/null 2>&1; then
+    echo "  ✓ Sutando.app (already running)"
+elif [ -x "$APP_BIN" ]; then
+    nohup "$APP_BIN" > /tmp/sutando-app.log 2>&1 &
+    sleep 1
+    # `pgrep -x`, never `-f`: -f matches this script's own argv and would report
+    # a launch that did not happen. The ✓ stays inside the verified branch.
+    if pgrep -x Sutando > /dev/null 2>&1; then
+        echo "  ✓ Sutando.app relaunched"
+    else
+        echo "  ✗ Sutando.app — launched but not running; see /tmp/sutando-app.log"
+    fi
+else
+    echo "  ⊘ Sutando.app skipped — no binary at $APP_BIN"
+fi
 
 echo "Starting..."
 exec bash "$REPO/src/startup.sh"

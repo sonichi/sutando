@@ -48,7 +48,8 @@ def check_pending_questions():
     pending-questions.md is free-form: sections start with ## Title and
     may or may not carry **Status:** markers. Per the #1265 / #1404
     convention: a section is open unless it is explicitly resolved.
-    Sections above a `# Resolved` divider are ignored entirely.
+    Only text ABOVE a `# Resolved` divider is scanned; the archive below it
+    is ignored (this calls active_region(), which returns text up to the divider).
     """
     pq = Path(personal_path("pending-questions.md", WORKSPACE))
     if not pq.exists():

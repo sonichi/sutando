@@ -149,12 +149,21 @@ class TestProbeDegradesAlone(unittest.TestCase):
         """Reach the plistlib import: proxy up, core routed, config dir set, plist
         present. Routing is stated explicitly rather than inherited from the host
         — a developer machine whose core IS proxy-routed would otherwise pass
-        these for the wrong reason."""
+        these for the wrong reason.
+
+        The listener's environment is pinned UNREADABLE for the same reason.
+        Since #2896 the running process is consulted before the plist, so a
+        readable one answers first and the plist path — the only path that
+        needs plistlib — is never reached: these cases stopped exercising what
+        they exist to guard, and read the developer's live proxy while doing it.
+        """
         with mock.patch.dict(os.environ,
                              {"CLAUDE_CONFIG_DIR": "/tmp/x/.claude-sutando",
                               "ANTHROPIC_BASE_URL": "http://localhost:7846"},
                              clear=False), \
              mock.patch.object(mod.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(mod, "_proxy_config_dir_from_process",
+                               return_value=mod._PROXY_ENV_UNREADABLE), \
              mock.patch.object(mod, "_runtime_may_skip_proxy", return_value=False):
             return mod.check_quota_account_identity("ok", core_env_prober=lambda: True)
 

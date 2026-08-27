@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for src/discord_http.py request_json() — 429 Retry-After + 5xx backoff.
+"""Tests for src/channels/discord/http.py request_json() — 429 Retry-After + 5xx backoff.
 
 The Discord reader scripts had no rate-limit handling; a 429 mid-pagination
 raised HTTPError and aborted the read (2026-07-24 30-day-history truncation).
@@ -21,7 +21,7 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(SRC))
 
-import discord_http  # noqa: E402
+import channels.discord.http as discord_http  # noqa: E402
 
 
 def _http_error(code: int, *, retry_after_header=None, body_bytes=b"{}"):

@@ -50,6 +50,17 @@ echo '{"new":"snapshot"}' > "$A/state/contextual-chips.json"
 touch -t 202606010600 "$C/state/contextual-chips.json"
 touch -t 202606012130 "$A/state/contextual-chips.json"
 
+# Fixture union-json-array: a newer EMPTY allow-set must not erase an older
+# populated one; schemaVersion is the control that must survive from the newer file.
+cat > "$C/state/slack-allowed-recipients.json" <<'JSON'
+{"allowFrom": ["U_OLD_ONE", "U_SHARED"], "schemaVersion": 1}
+JSON
+cat > "$A/state/slack-allowed-recipients.json" <<'JSON'
+{"allowFrom": [], "schemaVersion": 2}
+JSON
+touch -t 202606010600 "$C/state/slack-allowed-recipients.json"   # older, populated
+touch -t 202606012130 "$A/state/slack-allowed-recipients.json"   # newer, empty
+
 # --- Fixture: in-flight task (newer than 60s guard, must be skipped) ---
 mkdir -p "$C/tasks"
 echo "id: live-task" > "$C/tasks/task-now.txt"  # mtime = now → inflight
@@ -79,6 +90,29 @@ echo "vault content" > "$C/obsidian-vault/daily.md"
 echo "loose ts file" > "$C/repro-bug.ts"
 mkdir -p "$B/personal-src"
 echo "personal lib" > "$B/personal-src/lib.py"
+
+# Newly-canonical surfaces (#3036): B/C scripts/ + agent config tree must
+# MIGRATE, not quarantine; repo-root Source A scripts/ is code, stays excluded.
+mkdir -p "$B/scripts" "$C/scripts" "$A/scripts"
+echo "B tool v1" > "$B/scripts/my-tool.sh"
+echo "C tool v2" > "$C/scripts/my-tool.sh"
+touch -t 202605011000 "$B/scripts/my-tool.sh"   # older — loses the collision
+touch -t 202606011000 "$C/scripts/my-tool.sh"   # newer — canonical
+# (#3036 P1) A workspace may legitimately OWN scripts/sutando-config.sh without
+# being a repo checkout. B carries it plus a B-only tool: the tool must survive.
+echo "# workspace-owned helper" > "$B/scripts/sutando-config.sh"
+echo "B only tool" > "$B/scripts/b-only-tool.sh"
+echo "repo code, not data" > "$A/scripts/repo-code.sh"
+# The repo marker lives in the very dir being excluded — matches a real
+# checkout, and flips IS_SUTANDO_REPO=1 so SOURCE_A_EXCLUDE actually applies.
+# Source A is a real checkout: the repo-only resolver module is the marker.
+# (scripts/sutando-config.sh alone must NOT count — see 6e-bis.)
+mkdir -p "$A/src"
+echo "# repo resolver" > "$A/src/sutando_config.py"
+echo "# repo marker" > "$A/scripts/sutando-config.sh"
+mkdir -p "$C/.claude-sutando/skills/custom" "$C/.claude-sutando/hooks"
+echo "custom skill body" > "$C/.claude-sutando/skills/custom/SKILL.md"
+echo "print('hook')" > "$C/.claude-sutando/hooks/pre-task.py"
 
 echo "==== TEST: scan ===="
 RUN_MIGRATE scan --source A,B,C 2>&1 \
@@ -125,7 +159,7 @@ if [ ! -f "$DEST/notes/divergent.md" ]; then
 else
     body="$(cat "$DEST/notes/divergent.md")"
     # Sidecar uses glob: divergent.md.legacy-prior-from-A-<timestamp>
-    sidecar_path="$(ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null | head -1)"
+    sidecar_path="$( { ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null || true; } | head -1 )"
     if [ -z "$sidecar_path" ]; then
         echo "  FAIL: .legacy-prior-from-A-<ts> sidecar missing"; fail=1
     elif [ "$body" != "divergent A-version" ]; then
@@ -159,8 +193,8 @@ fi
 # 3b. 3-way collision (Mini #3): ALL 3 versions preserved uniquely.
 # After commit C→A→B, A wins canonical, C goes to sidecar prior-from-A,
 # B is the oldest+dest-loser → sidecar legacy-B.
-side_a="$(ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null | head -1)"
-side_b="$(ls "$DEST/notes/divergent.md.legacy-B-"*-p* 2>/dev/null | head -1)"
+side_a="$( { ls "$DEST/notes/divergent.md.legacy-prior-from-A-"* 2>/dev/null || true; } | head -1 )"
+side_b="$( { ls "$DEST/notes/divergent.md.legacy-B-"*-p* 2>/dev/null || true; } | head -1 )"
 if [ -z "$side_a" ] || [ -z "$side_b" ]; then
     echo "  FAIL: 3-way collision: missing one of the sidecars (prior-from-A=$side_a, legacy-B=$side_b)"
     fail=1
@@ -203,6 +237,152 @@ elif [ ! -f "$DEST/tasks/archive/B/task-stale.txt" ]; then
     echo "  FAIL: stale task not routed to archive/B/"; fail=1
 else
     echo "  OK: stale task routed to tasks/archive/B/ (no watcher re-fire)"
+fi
+
+# 6d. (#3036) B/C custom scripts/ MIGRATE to dest — canonical newest wins,
+# conflicting version preserved (collision-keep-both), nothing quarantined.
+if [ ! -f "$DEST/scripts/my-tool.sh" ]; then
+    echo "  FAIL: scripts/my-tool.sh not at dest (quarantined? #3036 surface regression)"; fail=1
+elif [ "$(cat "$DEST/scripts/my-tool.sh")" != "C tool v2" ]; then
+    echo "  FAIL: scripts/my-tool.sh should hold C's newer version, got: $(cat "$DEST/scripts/my-tool.sh")"; fail=1
+else
+    tool_sidecar="$( { ls "$DEST/scripts/my-tool.sh.legacy-"* 2>/dev/null || true; } | head -1 )"
+    if [ -z "$tool_sidecar" ]; then
+        echo "  FAIL: scripts/my-tool.sh conflicting B version not preserved (no legacy sidecar)"; fail=1
+    elif [ "$(cat "$tool_sidecar")" != "B tool v1" ]; then
+        echo "  FAIL: scripts sidecar should hold B's version, got: $(cat "$tool_sidecar")"; fail=1
+    else
+        echo "  OK: scripts/ migrates; collision keeps both (canonical=C, sidecar=B)"
+    fi
+fi
+if [ -e "$DEST/legacy/B/quarantine/scripts" ] || [ -e "$DEST/legacy/C/quarantine/scripts" ]; then
+    echo "  FAIL: B/C scripts/ was quarantined — must migrate to dest (#3036)"; fail=1
+fi
+
+# 6e. (#3036) nested agent config tree lands at its canonical relpath
+for f in "$DEST/.claude-sutando/skills/custom/SKILL.md" \
+         "$DEST/.claude-sutando/hooks/pre-task.py"; do
+    if [ ! -f "$f" ]; then
+        echo "  FAIL: agent-config file not migrated: $f (#3036 surface regression)"; fail=1
+    fi
+done
+if [ -e "$DEST/legacy/C/quarantine/.claude-sutando" ]; then
+    echo "  FAIL: .claude-sutando was quarantined — breaks hooks/skills/memory (#3036)"; fail=1
+fi
+[ "$fail" = "0" ] && echo "  OK: .claude-sutando nested skill+hook migrated to canonical relpaths"
+
+# 6e-bis. (#3036 P1) a workspace-owned scripts/sutando-config.sh must NOT make
+# B look like a repo checkout and swallow its scripts/ surface.
+if [ ! -f "$DEST/scripts/b-only-tool.sh" ]; then
+    echo "  FAIL: B scripts/b-only-tool.sh dropped — workspace-owned sutando-config.sh triggered the repo exclusion (#3036 P1)"; fail=1
+elif [ "$(cat "$DEST/scripts/b-only-tool.sh")" != "B only tool" ]; then
+    echo "  FAIL: B scripts/b-only-tool.sh content wrong: $(cat "$DEST/scripts/b-only-tool.sh")"; fail=1
+else
+    echo "  OK: workspace-owned sutando-config.sh does not exclude B scripts/"
+fi
+
+# 6f. (#3036) repo-root Source A scripts/ is CODE — excluded, not migrated, not quarantined
+if [ -f "$DEST/scripts/repo-code.sh" ]; then
+    echo "  FAIL: Source A repo scripts/ leaked into dest (SOURCE_A_EXCLUDE regression)"; fail=1
+elif [ -e "$DEST/legacy/A/quarantine/scripts" ]; then
+    echo "  FAIL: Source A repo scripts/ was quarantined — should be excluded entirely"; fail=1
+else
+    echo "  OK: Source A repo scripts/ excluded from migration"
+fi
+
+# 6g. newer-empty + older-populated must yield a POPULATED active file — the
+# reported bug; newest-mtime and structural both fail it, neither merges in-file.
+UJ="$DEST/state/slack-allowed-recipients.json"
+if [ ! -f "$UJ" ]; then
+    echo "  FAIL: $UJ missing"; fail=1
+else
+    union_check="$(python3 - "$UJ" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+got = d.get("allowFrom")
+problems = []
+if sorted(got or []) != ["U_OLD_ONE", "U_SHARED"]:
+    problems.append(f"allowFrom={got!r}, expected the union of both sources")
+if len(got or []) != len(set(map(repr, got or []))):
+    problems.append(f"duplicate entries in allowFrom: {got!r}")
+if d.get("schemaVersion") != 2:
+    problems.append(f"schemaVersion={d.get('schemaVersion')!r}, expected 2 from the newer file")
+print("; ".join(problems) if problems else "OK")
+PY
+)"
+    if [ "$union_check" = "OK" ]; then
+        echo "  OK: allow-set unioned (grants survive a newer empty file; unrelated fields kept)"
+    else
+        echo "  FAIL: union-json-array — $union_check"; fail=1
+    fi
+fi
+
+# 6i. Three-source accumulation: the scalar winner must be the NEWEST source, not
+# whichever ran last — the union rewrites dest and resets its mtime, hiding this.
+U3="$TMP/union3"
+mkdir -p "$U3"
+printf '{"schemaVersion":1,"allowFrom":["U_C"]}\n' > "$U3/C.json"
+printf '{"schemaVersion":2,"allowFrom":["U_A"]}\n' > "$U3/A.json"
+printf '{"schemaVersion":3,"allowFrom":["U_B"]}\n' > "$U3/B.json"
+touch -t 202601010000 "$U3/C.json"
+touch -t 202601020000 "$U3/A.json"
+touch -t 202601030000 "$U3/B.json"
+cp "$U3/C.json" "$U3/dst.json"; touch -t 202601010000 "$U3/dst.json"
+# Call the production writer itself, not a reimplementation of the rule.
+u3_fn="$TMP/union_fn.sh"
+python3 - "$MIGRATE" "$u3_fn" "$REPO" <<'PYX'
+import sys
+src, out, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
+i = s.index("union_json_arrays_into() {")
+j = s.index("\n}\n", i) + 3
+open(out, "w").write(
+    f'SCRIPT_DIR="{repo}/scripts"\nREPO_DIR="{repo}"\n'
+    f'. "{repo}/scripts/python-binary.sh"\n\n' + s[i:j])
+PYX
+u3_check="$(
+  . "$u3_fn"
+  union_json_arrays_into "$U3/A.json" "$U3/dst.json" || echo "union A failed"
+  union_json_arrays_into "$U3/B.json" "$U3/dst.json" || echo "union B failed"
+  python3 - "$U3/dst.json" <<'PYX'
+import json, sys
+d = json.load(open(sys.argv[1]))
+problems = []
+if d.get("schemaVersion") != 3:
+    problems.append(f"schemaVersion={d.get('schemaVersion')!r}, expected 3 from the newest source")
+if sorted(d.get("allowFrom") or []) != ["U_A", "U_B", "U_C"]:
+    problems.append(f"allowFrom={d.get('allowFrom')!r}, expected all three accumulated")
+print("; ".join(problems) if problems else "OK")
+PYX
+)"
+if [ "$u3_check" = "OK" ]; then
+    echo "  OK: three-source union keeps the newest scalar and accumulates every array"
+else
+    echo "  FAIL: three-source union — $u3_check"; fail=1
+fi
+
+# 6h. Idempotency against the REAL script, not a reimplementation: a second pass
+# over an already-unioned dest must not duplicate entries or drop fields.
+IDEM_DEST="$TMP/dest-idem"
+mkdir -p "$IDEM_DEST/state"
+cp -p "$UJ" "$IDEM_DEST/state/slack-allowed-recipients.json"
+before_idem="$(cat "$IDEM_DEST/state/slack-allowed-recipients.json")"
+SUTANDO_MIGRATE_SRC_C="$C" SUTANDO_MIGRATE_DEST="$IDEM_DEST" \
+    bash "$MIGRATE" commit --source C --no-confirm >/dev/null 2>&1 || true
+after_idem="$(python3 - "$IDEM_DEST/state/slack-allowed-recipients.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(json.dumps({"allowFrom": sorted(d.get("allowFrom") or []),
+                  "schemaVersion": d.get("schemaVersion")}, sort_keys=True))
+PY
+)"
+expected_idem='{"allowFrom": ["U_OLD_ONE", "U_SHARED"], "schemaVersion": 2}'
+if [ "$after_idem" = "$expected_idem" ]; then
+    echo "  OK: union is idempotent (second pass adds no duplicates, keeps fields)"
+else
+    echo "  FAIL: union not idempotent — got $after_idem, expected $expected_idem"
+    echo "        (before: $before_idem)"
+    fail=1
 fi
 
 # 7. Per-source sentinels exist

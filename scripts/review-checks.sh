@@ -124,12 +124,41 @@ fi
 # --- scan ADDED FILE PATHS for PR-draft artifacts at the repo root -----------
 # Separate scanner: a stray root file is a diff HEADER, so the content scan
 # above cannot see it whatever its patterns.
+PROSE_CAP="$(sed -n 's/^ *prose_cap: *//p' "$GUIDE" | head -1)"
+PROSE_CAP="${PROSE_CAP:-2}"
+# Read from the guide like every other check. Hardcoding it made REVIEW.md's
+# declaration decorative: a guide naming .ts still only ever got .py scanned.
+PROSE_EXTS="$(sed -n 's/^ *prose_exts: *//p' "$GUIDE" 2>/dev/null | head -1 | tr -d "[]\"' ")"
+[[ -n "$PROSE_EXTS" ]] || PROSE_EXTS="$(parse_list prose_exts | tr '\n' ',' | sed 's/,$//')"
+PROSE_EXTS="${PROSE_EXTS:-.py}"
 ROOT_HITS="$(printf '%s' "$DIFF" | RC_ROOT_ARTIFACT_GLOBS="$ROOT_GLOBS" python3 "$HERE/review-checks-root-artifacts.py")"
 ROOT_RC=$?
 if [[ $ROOT_RC -ne 0 ]]; then
     echo "review-checks: ERROR — root-artifacts scanner failed to run (exit $ROOT_RC); failing closed (NOT a pass)." >&2
     exit 2
 fi
+
+# --- scan ADDED lines for prose blocks over the physical-line cap -----------
+# Separate scanner: COMMENT runs only, classified by tokenize over the post-image.
+# Docstrings are out of scope — the written contract caps code comments.
+PROSE_ERR="$(mktemp -t review-checks-prose.XXXXXX)"
+trap 'rm -f "$PROSE_ERR"' EXIT
+PROSE_HITS="$(printf '%s' "$DIFF" | RC_PROSE_CAP="$PROSE_CAP" RC_PROSE_EXTS="$PROSE_EXTS" python3 "$HERE/review-checks-prose-cap.py" 2>"$PROSE_ERR")"
+PROSE_RC=$?
+cat "$PROSE_ERR" >&2
+# A diff detached from its tree (`gh pr diff`) leaves prose-cap nothing to read.
+# Not a failure, but the verdict TOKEN must carry it — readers key on the first word.
+PROSE_SCOPE="hardcoded-paths + root-artifacts + prose-cap clean"
+VERDICT="PASS"
+if grep -q '^prose-cap: SKIPPED' "$PROSE_ERR"; then
+    PROSE_SCOPE="hardcoded-paths + root-artifacts clean; prose-cap SKIPPED — no post-image"
+    VERDICT="PARTIAL"
+elif grep -q '^prose-cap: no in-scope files' "$PROSE_ERR"; then
+    PROSE_SCOPE="hardcoded-paths + root-artifacts clean; prose-cap had no in-scope files"
+    VERDICT="PARTIAL"
+fi
+# Fail-closed is asserted AFTER the other scanners report. Exiting here would
+# suppress real hardcoded-path/root-artifact findings already in hand.
 
 FAILED=0
 if [[ "$HITS" =~ [^[:space:]] ]]; then
@@ -144,6 +173,16 @@ if [[ "$ROOT_HITS" =~ [^[:space:]] ]]; then
     echo "review-checks: $(printf '%s\n' "$ROOT_HITS" | grep -c '') artifact(s) at the repo root. Delete them from the branch, or add the name to root-artifacts in REVIEW.md if it is genuinely source." >&2
     FAILED=1
 fi
+if [[ "$PROSE_HITS" =~ [^[:space:]] ]]; then
+    echo "review-checks: FAIL — prose-cap:" >&2
+    printf '%s\n' "$PROSE_HITS" >&2
+    echo "review-checks: $(printf '%s\n' "$PROSE_HITS" | grep -c '') block(s) over the cap. Keep the constraint in the code and move the narrative to the PR body." >&2
+    FAILED=1
+fi
+if [[ $PROSE_RC -ne 0 ]]; then
+    echo "review-checks: ERROR — prose-cap scanner failed to run (exit $PROSE_RC); failing closed (NOT a pass)." >&2
+    exit 2
+fi
 [[ $FAILED -eq 1 ]] && exit 1
-echo "review-checks: PASS (hardcoded-paths + root-artifacts clean)"
+echo "review-checks: $VERDICT ($PROSE_SCOPE)"
 exit 0

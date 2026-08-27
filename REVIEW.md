@@ -16,7 +16,8 @@ and loads whichever repo it reviews.
 
 > **Single source of truth.** These lessons live here in `REVIEW.md` only — they are
 > **not** duplicated in `CLAUDE.md`. They reach reviewers three ways: `review-preflight.py`
-> reads this file and prints the criteria on every pre-review run (for the core agent);
+> (**run it before reviewing**: `python3 scripts/review-preflight.py <PR>`) reads this file and
+> prints the criteria on every pre-review run (for the core agent);
 > `scripts/review-checks.sh` runs the machine `checks:` block below in CI; and Claude Code's
 > managed GitHub-App reviewer reads this file directly. (The in-session `/code-review` reads
 > only `CLAUDE.md`, not this file — but it is not part of our review flow.) Add or edit a
@@ -51,7 +52,10 @@ and loads whichever repo it reviews.
    Sutando's users from this PR, and how do we mitigate it?"** (Chi 2026-07-25.) Concretely
    check: opt-in vs always-on; on-disk state-format/migration compatibility across the
    rolling-upgrade window; new hard-required config that breaks current installs;
-   process-global patches with wide blast radius; and — per #1898 — for any auto-action,
+   removal or rename of a path, command or flag that something outside the repo invokes —
+   a registered cron, plist or saved prompt holds its own copy, so an in-repo grep answers
+   about the wrong population (#3005); process-global patches with wide blast radius;
+   and — per #1898 — for any auto-action,
    *what code or state does it act on* (does it verify the target is canonical, or run
    whatever's there?). A PR is not merge-ready until that worst case is named and mitigated.
    *Grounded by:* #1898 itself — the live test verified the claimed behavior, but the
@@ -144,10 +148,122 @@ and loads whichever repo it reviews.
     The tell that you are in this pattern: your test suite grows by exactly one case per
     round, and each new case is the previous one with a single field changed.
 
+11. **A change that removes a capability must relocate it, not just delete it — and one
+    deployment's requirement is never a global default.** If a PR turns behaviour off for
+    everyone to satisfy one environment, ask for the flag instead: the environment that
+    wants the change carries it, and every other install is untouched. Then check the
+    *teardown* side — code that stops, kills, or cleans up the removed thing usually
+    survives the deletion and becomes a one-way operation. And check whether any existing
+    opt-in path depended on the deleted code to produce its inputs.
+    *Grounded by:* #2677 — "keep the open-source core headless" deleted the menu-bar app's
+    build and launch from `startup.sh` (−100 lines) and shipped no replacement script, so
+    every OSS install silently lost the app and the documented alternative became "run
+    `swiftc` by hand". Three knock-on effects, none visible in the diff: `restart.sh:73`
+    still `pkill`s the app while nothing starts it, making a restart a permanent stop;
+    `install-sutando-app-launchd.sh` (#1294) still points at
+    `src/Sutando/Sutando.app/Contents/MacOS/Sutando`, a bundle `startup.sh` was the only
+    thing that built, so the pre-existing opt-in supervisor was silently disabled; and the
+    PR's own new test asserted the removed strings appear *nowhere* in `startup.sh`, which
+    made the previous default unrestorable without deleting the guard. Pin behaviour under
+    the flag, never the absence of a string.
+
+12. **Cut the diff against the merge-base, not against `main`.** `git diff origin/main <pr>`
+    on a branch that is behind renders `main`'s own newer commits as *removals* by the PR,
+    so a reviewer reads deletions the author never wrote. Use
+    `git diff $(git merge-base origin/main <pr>) <pr>`, and for a stacked PR review the
+    child-only commit as well as the cumulative result — the child layer is what this PR
+    is being asked to add.
+    *Grounded by:* #3020 (2026-08-17). Diffing it against `main` showed ~20 removed lines
+    in `check_cron_runner`, a function the PR does not touch; the topic diff against its
+    merge-base is 2 files, +105/-4. Verify a stated stack rather than trusting the body:
+    `git merge-base --is-ancestor <parent-head> <child>` confirmed #2995's head really is
+    an ancestor, which is what makes "merge the parent first" load-bearing rather than
+    a courtesy — and what makes `--delete-branch` on the parent dangerous while the child
+    is open.
+
+13. **An unknown must not render as a value in the slot a measurement occupies.** When a
+    field can be absent, unreadable, or unmeasurable, printing a number there is worse
+    than printing nothing: the reader has no way to tell a measurement from a default, and
+    the plausible ones are never questioned. Ask of any patch that formats a quantity:
+    what does this print when the input is missing, zero-as-sentinel, or negative — and is
+    that distinguishable from a real reading? The fix is always the same shape: carry the
+    unknown (`None`) to the render site and say so there, rather than substituting a value
+    upstream.
+    *Grounded by:* five instances in one week, each found by a different reviewer and each
+    resolved identically. (a) #2991 — a negative age rendered `-0.2h ago`; impossible, but
+    it has the shape of a measurement, so nothing flags it. (b) #2994 — `age or 0.0`
+    collapsed an unknown claim age into `oldest 0.0h`, one line above a formatter that
+    cannot represent anything under 3.6 minutes anyway. (c) #3000 — a freshness guard
+    existed only on the *exhausted* branch, so the reassuring reading was stated as current
+    at any age; the guard sat where the author felt risk, and the branch without it was the
+    one that lied. (d) #3020 — `int(data.get("updated_at", 0) or 0)` made an absent
+    timestamp the whole unix epoch, printing `as of 1786962010s ago` (~56 years) on both
+    the warn line *and* the all-satisfied line, which is the one a reader is least likely
+    to question. (e) #3027 — `analyze_dev_activity` returned `None` for three distinct
+    conditions, only one documented, with `subprocess.TimeoutExpired` invisible inside a
+    generic `SubprocessError` handler; the same file already handled a sibling field
+    correctly (`if landed is None: # Cannot tell what landed, so do not use the word`).
+    The tell: the same expression supplies both the default and the measurement, usually as
+    `x or 0`, `.get(k, 0)`, or an `except` that returns the empty case.
+
+14. **Never assert on source text as a stand-in for a behavioral claim.** When a module
+    cannot be imported by tests (import-time side effects, heavy SDK deps), extract the
+    decision into an importable unit and test THAT — do not regex the file. A source-text
+    assertion fails in both directions: it stays green when the behavior is disabled
+    outright (guard the call with `if (false && …)` and every token the regex matches is
+    still present), and it goes red on a rename that changes nothing. Worked examples of
+    the extraction convention already in-tree: `src/channel_token.py` (token-resolution
+    policy extracted from four script consumers, tested behaviorally) and
+    `src/result_markers.py` (marker grammar extracted from per-bridge private parsers,
+    driven behaviorally by the bridge-marker-no-leak and dedup suites). When only content emitted verbatim is being pinned (an
+    instruction template, a doc line), say so explicitly — that is a data pin, and it
+    must be labeled as one, not passed off as a behavior test.
+    Second exception: a source assertion is legitimate when the property is *structural*
+    — a policy must not be duplicated, a path literal must not appear — because behavior
+    cannot observe a duplicate that currently agrees (two copies in sync pass every
+    behavioral test; the defect IS the duplication). This covers negative scans (no
+    private parser, no `json.loads` in an adapter) and positive delegation pins (the
+    adapter calls the shared owner — the form CLAUDE.md's "pin every adapter's
+    delegation" already mandates), and it is what this file's own `checks:` block does.
+    Pair it with the behavioral test of the extracted unit; never let it substitute
+    for one.
+    *Grounded by:* three independent instances across unrelated subsystems in one evening
+    (2026-08-18) — the #3088 scroll-reporting test asserted on `browser-tools.ts` source
+    text, and disabling the fix outright left its suite 5/5 green (verified via the
+    if-false control during review); the same construct had just been found blocking a
+    team-guard follow-up and in one earlier review the same night. Three authors, one
+    evening: a missing convention, not a personal habit. (Lesson: air + 001.)
+15. **A live-path PR is not approvable on harness proof alone — require a real
+    post-restart round trip.** When a diff touches a bridge, the network/delivery loop,
+    or startup, unit and harness tests can pass while the shipped path stays broken — a
+    bridge that reconnects but drops the first message, a delivery claim that never
+    releases, a watcher that respawns wedged. Before **approving**, require evidence that
+    a real message or task flowed *through the restarted service* end-to-end. This is the
+    same witness `CONTRIBUTING.md` already demands at merge time ("Live path (bridge /
+    network / delivery loop / startup)? Include a real post-restart round trip, not just
+    unit tests"); this lesson makes it a **review-time** gate so `review-preflight.py`
+    surfaces it on every review, not only at the merge decision. A reviewer who has seen
+    only green unit tests has not seen the behavior the PR changes. The witness is the
+    author's to run; if it needs an owner-scheduled service window, that is an ASK with
+    its cost named (which service goes down, for how long, whether inbound is replayed) —
+    never grounds to approve without it, and never a disclosure footnote on an approval.
+    *Grounded by:* #3174 (`fix(discord): suppress recreated task results after delivery`)
+    — a Discord delivery-path change approved on its unit suite, then blocked back to
+    CHANGES_REQUESTED on review because the delivery path had no post-restart witness. The
+    approval read clean on every cheap signal (tests green, diff sensible); only exercising
+    the restarted delivery loop end-to-end could have shown whether a recreated result is
+    actually suppressed after a real delivery.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
 checks:
+  prose-cap:
+    # Added COMMENT runs may not exceed this many PHYSICAL lines. Docstrings are
+    # out of scope: CLAUDE.md caps "code comments" and never says "docstring".
+    prose_cap: 2
+    prose_exts: ['.py']
+
   root-artifacts:
     # Added files at the REPO ROOT matching these are PR-draft leftovers. Root
     # only; omitting the key uses these defaults rather than disabling the check.
@@ -206,6 +322,13 @@ checks:
       - '/usr/fake'
       - '/tmp/'
       - 'example.com'
+      # The send-allowlist's OWN policy data, not a host path a helper could
+      # resolve: is_path_sendable compares realpaths and macOS resolves /tmp to
+      # /private/tmp, so both spellings must be listed or the prefix never
+      # matches. Token-specific on purpose — a bare '/private/tmp/' allow would
+      # also hide unrelated findings under that root.
+      - '/private/tmp/sutando-'
+      - '/private/tmp/echo-'
     # Tokens allowed ONLY when the SAME added line also carries a companion path
     # for the SAME binary — i.e. the portable candidate-list shape, never a naked
     # literal. Encoded as 'TOKEN_PREFIX :: COMPANION_PREFIX'.

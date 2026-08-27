@@ -72,6 +72,10 @@ class FileAttachTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _result(self, tid: str, body: str) -> None:
+        # Provenance is explicit: the drain guards non-owner output, so a
+        # fixture with no task file is a guarded one, not an owner one.
+        (self.mod.TASKS_DIR / f"{tid}.txt").write_text(
+            f"id: {tid}\naccess_tier: owner\ntask: fixture\n")
         (self.mod.RESULTS_DIR / f"{tid}.txt").write_text(body)
 
     # Skip markers still POST to close the lease; the server suppresses their

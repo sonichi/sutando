@@ -236,5 +236,40 @@ with tempfile.TemporaryDirectory() as td:
     ok("a failed publish leaves no scratch file behind",
        list(Path(td).iterdir()) == [])
 
+
+# notify_key: the COOLDOWN discriminator, distinct from the collapse id. Every
+# consumer renders an ORDERED prefix, which the order-free set hash cannot see.
+
+def _qs(*titles):
+    return [{"title": t} for t in titles]
+
+
+_BASE = _qs("a", "b", "c", "d", "e", "f", "g")
+_PROMOTED = _qs("a", "b", "z", "c", "d", "e", "f")
+_SWAP_TOP = _qs("a", "c", "b", "d", "e", "f", "g")
+_SWAP_DEEP = _qs("a", "b", "c", "d", "e", "g", "f")
+_PLUS_ONE = _qs("a", "b", "c", "d", "e", "f", "g", "h")
+
+ok("collapse id stays order-independent (the proactive filename must not move)",
+   _mod.questions_key(_BASE) == _mod.questions_key(_SWAP_TOP))
+
+ok("reorder INSIDE the rendered prefix changes notify_key",
+   _mod.notify_key(_BASE) != _mod.notify_key(_SWAP_TOP))
+
+# The control: "hash the whole ordered list" also passes the case above, then
+# re-notifies on shuffles the owner cannot see. This is what rejects it.
+ok("reorder BELOW the rendered prefix does NOT change notify_key",
+   _mod.notify_key(_BASE) == _mod.notify_key(_SWAP_DEEP))
+
+ok("a membership change still changes notify_key (this can only widen)",
+   _mod.notify_key(_BASE) != _mod.notify_key(_PLUS_ONE))
+
+ok("notify_key is deterministic",
+   _mod.notify_key(_BASE) == _mod.notify_key(_BASE))
+
+ok("promotion into the prefix is caught even when the set also changed",
+   _mod.notify_key(_BASE) != _mod.notify_key(_PROMOTED))
+
+
 print(f"\n{_passed} passed, {_failed} failed")
 sys.exit(0 if _failed == 0 else 1)

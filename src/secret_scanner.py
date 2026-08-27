@@ -22,11 +22,30 @@ per-type pattern against the source line and replaces the full secret span.
 """
 
 import re
+import sys
 from dataclasses import dataclass
 from typing import Iterable
 
-from detect_secrets.core.scan import _process_line_based_plugins
-from detect_secrets.settings import transient_settings
+# Guarded: a module-scope import let detect-secrets' ABSENCE disable the
+# repo-local rules written to cover its blind spots (issue #3100).
+try:
+    from detect_secrets.core.scan import _process_line_based_plugins
+    from detect_secrets.settings import transient_settings
+    DETECT_SECRETS_ACTIVE = True
+except ModuleNotFoundError as e:
+    # Only true package ABSENCE degrades; a broken installed graph (missing
+    # submodule or transitive dep) must surface, never read as intentional.
+    if e.name != "detect_secrets":
+        raise
+    _process_line_based_plugins = None
+    transient_settings = None
+    DETECT_SECRETS_ACTIVE = False
+
+# Loud ONLY when degraded (healthy paths stay silent — repo convention,
+# pinned by DegradedRedactorAnnouncesItself.test_the_healthy_path_is_silent).
+if not DETECT_SECRETS_ACTIVE:
+    print("[secret-scanner] mode: DEGRADED — detect-secrets missing; "
+          "repo-local whole-line rules only", file=sys.stderr)
 
 
 # Plugins enabled for the scan. detect-secrets v1.5+ ships these out of the
@@ -125,14 +144,16 @@ def scan_secrets(text: str) -> list[SecretHit]:
     # lines. The public scan_line() enables eager search and flags ordinary
     # words such as "works" as entropy secrets; this pipeline preserves the
     # production filters without writing raw chat text to a temporary file.
-    with transient_settings({"plugins_used": _PLUGINS_CONFIG}):
-        hits = [
-            SecretHit(secret_type=secret.type, line_number=secret.line_number)
-            for secret in _process_line_based_plugins(
-                lines=list(enumerate(text.split("\n"), start=1)),
-                filename="adhoc-string-scan",
-            )
-        ]
+    hits: list[SecretHit] = []
+    if DETECT_SECRETS_ACTIVE:
+        with transient_settings({"plugins_used": _PLUGINS_CONFIG}):
+            hits = [
+                SecretHit(secret_type=secret.type, line_number=secret.line_number)
+                for secret in _process_line_based_plugins(
+                    lines=list(enumerate(text.split("\n"), start=1)),
+                    filename="adhoc-string-scan",
+                )
+            ]
 
     for stype, pattern in _WHOLE_LINE_PATTERNS.items():
         for i, line in enumerate(text.split("\n"), start=1):

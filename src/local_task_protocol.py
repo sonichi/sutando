@@ -132,13 +132,22 @@ ACCESS_TIERS = ("owner", "team", "guest", "other", "ambient")
 #   can survive undefanged in user-supplied content.
 # Adding a producer header = add it here; the guard follows automatically.
 KNOWN_HEADER_KEYS = (
-    "id", "timestamp", "task", "source", "access_tier", "user_id",
+    "id", "timestamp", "session_scope", "task", "source", "access_tier", "user_id",
     "channel_id", "priority", "interaction_type", "source_message_id",
     "channel_name", "guild_name", "attempts", "sender_name", "room_name",
     "parent_message_id", "reply_chain_ids", "reminder", "author_name",
     "author_id", "chat_id",
-    "thread_ts", "reply_to_event", "reply_to_me", "callSid", "caller",
+    # Reply addressing: header status means only the trusted bridge writes
+    # them, and the guard defangs forged body copies of the same names.
+    "thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
+    "addressed_to", "callSid", "caller",
+    # Which instance took delivery. Same namespace as the addressee in the body, so a
+    # non-addressed core can tell; header status defangs a forged body copy.
+    "receiving_instance",
     "from", "call_sid", "hint", "instructions", "transcript",
+    # Durable schedule identity (#2723): the codex scheduler stamps which
+    # schedule and which slot produced the task.
+    "schedule_name", "schedule_slot",
     # interaction-model 4D, step 1.5 — structured media metadata. Listing them
     # here promotes them to headers AND (via the guard's shared import) defangs
     # them in untrusted bodies, so a forged `attachments:` body line can never
@@ -160,8 +169,11 @@ _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # the archive lookup gate below: live API/task-result routes still key off
 # the canonical `task-*` namespace even though historic archives contain
 # additional gateway-safe producer ids like `ask-*`.
-TASK_ID_RE = re.compile(r"^task-[A-Za-z0-9][A-Za-z0-9-]{0,120}$")
-ARCHIVE_LOOKUP_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+# \Z, not $: $ under .match() also accepts a terminal newline.
+TASK_ID_RE = re.compile(r"^task-[A-Za-z0-9][A-Za-z0-9-]{0,120}\Z")
+# `~` and 128 chars cover the gateway's named-instance ids
+# (`task-<inst>~<broker-id>`); neither is a traversal character.
+ARCHIVE_LOOKUP_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,128}\Z")
 
 
 def valid_task_id(tid: str) -> bool:
@@ -649,6 +661,30 @@ def serialize_task_last(headers: "Iterable[tuple[str, str]]", task_body: str) ->
     return "\n".join(lines) + "\n"
 
 
+_TASK_STAMPER = None
+
+
+def apply_task_stamper(text: str) -> str:
+    """Run the host-injected stamper over serialized task text; fail-open —
+    a raising stamper must never lose the task. EVERY producer that persists
+    task text calls this (write_task_file AND the live gateway _write_task)."""
+    if _TASK_STAMPER is None:
+        return text
+    try:
+        return _TASK_STAMPER(text)
+    except Exception:
+        return text
+
+
+def set_task_stamper(fn) -> None:
+    """Host-injected transform applied to the serialized task text just
+    before persist (e.g. Sutando's HMAC envelope stamp). Provider-neutral
+    seam: sparrow never names a concrete stamper; the adapter edge does.
+    Fail-open by contract — a raising stamper must not lose the task."""
+    global _TASK_STAMPER
+    _TASK_STAMPER = fn
+
+
 def write_task_file(tasks_dir: "Path | str", task_id: str,
                     headers: "Iterable[tuple[str, str]]", task_body: str) -> Path:
     """Write `<tasks_dir>/<task_id>.txt` in the task-last shape. The task
@@ -666,5 +702,5 @@ def write_task_file(tasks_dir: "Path | str", task_id: str,
     d = Path(tasks_dir)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{task_id}.txt"
-    path.write_text(serialize_task_last(hdrs, task_body))
+    path.write_text(apply_task_stamper(serialize_task_last(hdrs, task_body)))
     return path

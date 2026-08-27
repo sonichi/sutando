@@ -22,7 +22,7 @@
  */
 
 import { z } from 'zod';
-import { writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { writeFileSync, renameSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -68,6 +68,38 @@ const PRESETS: Record<'search' | 'no-search', VoiceConfigPreset> = {
 
 const ts = () => new Date().toISOString().slice(11, 23);
 
+/** Read the live config as raw JSON. An absent, unreadable, or corrupt file
+ *  is not a reason to refuse a switch — the caller falls back to defaults. */
+export function readConfigRaw(path: string): unknown {
+	try {
+		return existsSync(path) ? JSON.parse(readFileSync(path, 'utf-8')) : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * What the switch writes: defaults fill gaps, **the user's own file is
+ * preserved**, and only the preset's keys are overlaid.
+ *
+ * The previous form was `{...VOICE_CONFIG_DEFAULTS, ...preset}` — it never
+ * read the file, so every switch REPLACED it. That silently deleted session
+ * tuning (`compressionConfig`, `mediaResolution`), their explicit
+ * `null`/`false` off-switches, and any future key, with a restart right
+ * behind it so the loss left no trace. Preserving raw is also what makes a
+ * fleet-wide defaults revert reach devices whose user has used the switch.
+ */
+export function nextSwitchConfig(
+	existingRaw: unknown,
+	preset: Pick<VoiceConfig, 'model' | 'googleSearch'>,
+): VoiceConfig {
+	const existing =
+		existingRaw && typeof existingRaw === 'object' && !Array.isArray(existingRaw)
+			? (existingRaw as Partial<VoiceConfig>)
+			: {};
+	return { ...VOICE_CONFIG_DEFAULTS, ...existing, ...preset };
+}
+
 export const switchVoiceConfigTool: ToolDefinition = {
 	name: 'switch_voice_config',
 	description:
@@ -102,8 +134,7 @@ export const switchVoiceConfigTool: ToolDefinition = {
 		const tmpPath = `${configPath}.tmp-${process.pid}`;
 		try {
 			mkdirSync(join(resolveWorkspace(), 'config'), { recursive: true });
-			// Merge with defaults so the on-disk file is complete + auditable.
-			const next: VoiceConfig = { ...VOICE_CONFIG_DEFAULTS, ...cfg };
+			const next = nextSwitchConfig(readConfigRaw(configPath), cfg);
 			writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
 			renameSync(tmpPath, configPath);
 			console.log(`${ts()} [SwitchVoiceConfig] wrote ${configPath} → preset=${preset} (model=${cfg.model}, search=${cfg.googleSearch})`);

@@ -16,13 +16,24 @@ the part an instruction alone can't guarantee, since a raw curl bypasses an inst
 
 ### Deploy (per node)
 
+`~/.claude` is NOT always the config dir. Claude Code honours `$CLAUDE_CONFIG_DIR`, and the
+Sutando core sets it (e.g. to `<workspace>/.claude-sutando`). Registering into
+`~/.claude/settings.json` on such a node edits a file the core never reads — the JSON is valid,
+the hook is present, and the guard is still not armed. Resolve the dir first:
+
 ```bash
-cp hooks/context-source-guard.py ~/.claude/hooks/
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/hooks"
+cp hooks/context-source-guard.py "$CFG/hooks/"
 # register under BOTH the Bash and Read PreToolUse matchers:
-python3 - <<'PY'
-import json, os
-sp = os.path.expanduser("~/.claude/settings.json"); s = json.load(open(sp))
-cmd = "python3 ~/.claude/hooks/context-source-guard.py"
+CFG="$CFG" python3 - <<'PY'
+import json, os, shlex
+cfg = os.environ["CFG"]
+sp = os.path.join(cfg, "settings.json")
+s = json.load(open(sp)) if os.path.isfile(sp) else {}
+# Quote: the stored command is re-parsed as a shell word list, and this
+# recipe's target dirs routinely contain a space (e.g. Application Support).
+cmd = f"python3 {shlex.quote(os.path.join(cfg, 'hooks', 'context-source-guard.py'))}"
 pre = s.setdefault("hooks", {}).setdefault("PreToolUse", [])
 for m in ("Bash", "Read"):
     blk = next((b for b in pre if b.get("matcher") == m), None)
@@ -31,6 +42,31 @@ for m in ("Bash", "Read"):
 json.dump(s, open(sp, "w"), indent=2)
 PY
 ```
+
+Verify. Registration is the only thing that proves the guard is armed — the file being
+present in `hooks/` does not. And registration alone does not prove it *runs*: the
+command is stored as a string and re-parsed by a shell, so an unquoted path splits on
+the space in `Application Support` and the hook dies before reading its input. Execute
+what is registered, don't just look for it:
+
+```bash
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" python3 - <<'PY'
+import json, os, subprocess
+h = json.load(open(os.path.join(os.environ["CFG"], "settings.json"))).get("hooks", {})
+cmds = [k["command"] for m in h.get("PreToolUse", []) for k in m.get("hooks", [])
+        if "context-source-guard" in k.get("command", "")]
+print("registered:", len(cmds))
+for c in cmds:
+    # The guard fail-opens on a Read event, so 0 is the expected exit. A split
+    # path exits 2 — which is PreToolUse's BLOCK code, so the broken recipe
+    # denies every Bash and Read call rather than merely failing to guard.
+    r = subprocess.run(c, shell=True, input='{"tool_name":"Read","tool_input":{}}',
+                       text=True, capture_output=True)
+    print(f"exit {r.returncode}  {'OK' if r.returncode == 0 else 'BROKEN: ' + r.stderr.strip()[:90]}")
+PY
+```
+
+Both matchers must appear (`Bash` and `Read`), and every line must read `exit 0`.
 
 `settings.json` registration is read at **session start**; once registered, the script
 file itself is executed fresh on every tool call, so updating `context-source-guard.py`

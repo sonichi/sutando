@@ -3,7 +3,7 @@
 
 Why this exists
 ---------------
-Sutando's recurring prompts (morning briefing, daily insight, the loop-eng
+Sutando's recurring prompts (morning briefing, the loop-eng
 digest, etc.) were scheduled purely as in-session ``CronCreate`` jobs. Those
 are best-effort: they only fire while the Claude REPL is idle at the fire
 minute, they carry scheduler jitter, and they die with the session. On
@@ -57,6 +57,7 @@ sys.path.insert(0, str(SRC_DIR))
 # (same guard the channel bridges apply). Belt-and-suspenders with `task:` being
 # last: confine_user_content() neutralizes forged fields even in a multi-line body.
 from task_body_guard import confine_user_content  # noqa: E402
+import cron_task_id  # noqa: E402
 
 try:
     from workspace_default import resolve_workspace  # type: ignore
@@ -242,12 +243,9 @@ def _atomic_write_text(path: Path, body: str) -> None:
 def _sanitize_name(name: str) -> str:
     """Slugify a cron name for use in a task ID and filename.
 
-    Replaces any character that is not alphanumeric, '-', or '_' with '-',
-    then collapses consecutive '-' and strips leading/trailing '-'.
+    Delegates so readers can bind the same contract instead of re-deriving it.
     """
-    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name)
-    slug = re.sub(r"-{2,}", "-", slug).strip("-")
-    return slug or "unnamed"
+    return cron_task_id.sanitize_name(name)
 
 
 def _shell_log_path() -> Path:
@@ -377,7 +375,7 @@ def emit_task(name: str, entry: dict) -> Path:
     else:
         body_task = entry.get("prompt", "")
     safe_name = _sanitize_name(name)
-    task_id = f"task-cron-{safe_name}-{now_ms}"
+    task_id = cron_task_id.task_id(name, now_ms)
     # Defang forged header/fence lines in the (config-supplied) body, then place
     # `task:` last so a multi-line prompt body cannot forge the structured
     # header fields above it (source, user_id, access_tier, priority).
@@ -403,7 +401,7 @@ def emit_task(name: str, entry: dict) -> Path:
     # collide with a future fire's unique id. The suffix.isdigit() guard keeps
     # the sweep from matching a different entry whose slug shares this prefix
     # (e.g. cleaning "sync" must not delete "sync-workspace"'s pending task).
-    prefix = f"task-cron-{safe_name}-"
+    prefix = f"{cron_task_id.TASK_PREFIX}{safe_name}-"
     for stale in TASKS_DIR.glob(f"{prefix}*.txt"):
         if stale.name[len(prefix):-4].isdigit():
             try:
@@ -411,6 +409,13 @@ def emit_task(name: str, entry: dict) -> Path:
             except OSError:
                 pass
     path = TASKS_DIR / f"{task_id}.txt"
+    # HMAC envelope (#3014 writer census): stamp at this writer's edge, fail-open
+    # so a stamping error costs the stamp and never the fire.
+    try:
+        from task_envelope import stamp_text  # sibling module (src/ on sys.path)
+        body = stamp_text(body, WORKSPACE)
+    except Exception:
+        pass
     path.write_text(body)
     _emit_cron_telemetry()
     return path
@@ -493,8 +498,11 @@ def run(now_epoch: Optional[int] = None) -> list:
                         emit_task(name, entry)
                         emitted.append(name)
                     else:
+                        # The drop is the only record a slot was skipped; undated,
+                        # it cannot be tied to a sleep window or counted per day.
+                        _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                         print(
-                            f"cron-runner: dropping stale slot for {name} "
+                            f"{_ts} cron-runner: dropping stale slot for {name} "
                             f"({lateness}s late)",
                             file=sys.stderr,
                         )
@@ -508,4 +516,5 @@ def run(now_epoch: Optional[int] = None) -> list:
 if __name__ == "__main__":
     names = run()
     if names:
-        print("cron-runner emitted: " + ", ".join(names))
+        _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"{_ts} cron-runner emitted: " + ", ".join(names))

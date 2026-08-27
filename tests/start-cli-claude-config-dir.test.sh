@@ -145,6 +145,8 @@ EOF
   # resolve claude_sutando_config_dir
   # (sutando-config.sh stays under scripts/ — start-cli calls $REPO/scripts/...).
   cp "$REAL_REPO/src/agent/claude/cli/start-cli.sh" "$REPO_FAKE/src/agent/claude/cli/"
+  # start-cli sources the shared resolve-or-refuse policy from $REPO/src/.
+  cp "$REAL_REPO/src/claude_config_dir.sh" "$REPO_FAKE/src/"
   cp "$REAL_REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO_FAKE/src/agent/claude/cli/"
   cp "$REAL_REPO/hooks/skip-ask-user-question.py" "$REPO_FAKE/hooks/"
 
@@ -173,28 +175,56 @@ cleanup_sandbox() {
 REAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ----------------------------------------------------------------------
-# 1. M0 helper MISSING → silent fallback, start-cli still launches claude,
-#    CLAUDE_CONFIG_DIR is NOT set (or set to default from the parent env).
+# 1. M0 helper MISSING → refuse to start. An unset CLAUDE_CONFIG_DIR selects
+#    ~/.claude — a different credential store, surfacing as a 401 loop.
 # ----------------------------------------------------------------------
-test_helper_missing_silent_fallback() {
+test_helper_missing_refuses_to_start() {
   setup_sandbox "no" "(unused)"
-  # Run start-cli; should reach claude stub without erroring on missing helper.
+  err_log="$SANDBOX/helper-missing.err"
+  bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null >/dev/null 2>"$err_log"
+  rc=$?
+  if [ "$rc" = "0" ]; then
+    echo "  FAIL: start-cli exit 0 — it fell back silently instead of refusing"
+    cleanup_sandbox; return 1
+  fi
+  # The spawn must not happen: a core that started is a core reading the wrong
+  # credential store, which is the whole failure this refuses to produce.
+  if [ -f "$ENV_DUMP" ]; then
+    echo "  FAIL: claude was spawned anyway (env dump exists) — refusal did not gate the spawn"
+    cleanup_sandbox; return 1
+  fi
+  # Refusing silently would be its own trap: the operator needs to know why.
+  if ! grep -q "sutando-config.sh missing or unreadable" "$err_log"; then
+    echo "  FAIL: refusal message absent from stderr — operator gets an unexplained exit"
+    cat "$err_log"
+    cleanup_sandbox; return 1
+  fi
+  cleanup_sandbox
+  return 0
+}
+
+# ----------------------------------------------------------------------
+# 1b. M0 helper MISSING but the CALLER exported CLAUDE_CONFIG_DIR → start and
+#     pass it through: that value already reaches the right credential store.
+# ----------------------------------------------------------------------
+test_helper_missing_honours_caller_config_dir() {
+  setup_sandbox "no" "(unused)"
+  caller_ccd="$SANDBOX/caller-scoped-config"
+  export CLAUDE_CONFIG_DIR="$caller_ccd"
   bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null >/dev/null 2>&1
   rc=$?
+  unset CLAUDE_CONFIG_DIR
   if [ "$rc" != "0" ]; then
-    echo "  FAIL: start-cli exit $rc (expected 0 — helper-missing should be silent fallback)"
+    echo "  FAIL: start-cli exit $rc — refused despite a caller-provided CLAUDE_CONFIG_DIR"
     cleanup_sandbox; return 1
   fi
   if [ ! -f "$ENV_DUMP" ]; then
-    echo "  FAIL: claude stub never ran — start-cli didn't reach the spawn"
+    echo "  FAIL: claude stub never ran"
     cleanup_sandbox; return 1
   fi
-  # CLAUDE_CONFIG_DIR should NOT be set by start-cli (the helper-present
-  # block was skipped). If the parent env had one, it'd pass through, but
-  # we cleared the test env.
-  if grep -q "^CLAUDE_CONFIG_DIR=" "$ENV_DUMP"; then
-    echo "  FAIL: CLAUDE_CONFIG_DIR was set even though helper is absent"
-    grep "^CLAUDE_CONFIG_DIR=" "$ENV_DUMP"
+  got="$(grep '^CLAUDE_CONFIG_DIR=' "$ENV_DUMP" | head -1)"
+  if [ "$got" != "CLAUDE_CONFIG_DIR=$caller_ccd" ]; then
+    echo "  FAIL: caller value not passed through — got '${got:-<unset>}', want 'CLAUDE_CONFIG_DIR=$caller_ccd'"
     cleanup_sandbox; return 1
   fi
   cleanup_sandbox
@@ -266,12 +296,12 @@ test_block_present_in_start_cli() {
     echo "  FAIL: src/agent/claude/cli/start-cli.sh no longer references CLAUDE_CONFIG_DIR"
     return 1
   fi
-  if ! grep -qF 'claude-sutando-config-dir' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
-    echo "  FAIL: src/agent/claude/cli/start-cli.sh no longer calls the M0 helper subcommand"
+  if ! grep -qF 'resolve_claude_config_dir "$REPO"' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
+    echo "  FAIL: src/agent/claude/cli/start-cli.sh no longer delegates to the shared resolver"
     return 1
   fi
-  if ! grep -qF 'refusing to start core' "$REAL_REPO/src/agent/claude/cli/start-cli.sh"; then
-    echo "  FAIL: src/agent/claude/cli/start-cli.sh dropped the fail-loud branch on invariant violation"
+  if ! grep -qF 'refusing to start' "$REAL_REPO/src/claude_config_dir.sh"; then
+    echo "  FAIL: src/claude_config_dir.sh dropped the fail-loud branch"
     return 1
   fi
   return 0
@@ -281,10 +311,11 @@ test_block_present_in_start_cli() {
 echo "tests/start-cli-claude-config-dir.test.sh — running"
 echo
 
-run_test "1. helper missing → silent fallback"              test_helper_missing_silent_fallback
+run_test "1. helper missing → refuses to start"              test_helper_missing_refuses_to_start
+run_test "1b. helper missing + caller-set dir → honoured"     test_helper_missing_honours_caller_config_dir
 run_test "2. helper + valid config → env exported"          test_valid_config_exports_env
 run_test "3. helper + invalid config → refuses to start"    test_invalid_config_refuses_to_start
-run_test "4. source-tied guard: block present in script"    test_block_present_in_start_cli
+run_test "4. source-tied guard: delegation present in script" test_block_present_in_start_cli
 
 echo
 echo "----------------------------------------"

@@ -9,12 +9,17 @@ gws calendar +agenda --week              # this week
 gws calendar +agenda --days 7 --format json   # next 7 days, JSON for parsing
 ```
 
-**Screen capture** — see what's on the user's screen. The screen-capture server runs on port 7845 (started by `src/startup.sh`):
+**Screen capture** — see what's on the user's screen. The screen-capture server runs on port 7845 (started by `src/startup.sh`). Every capture route requires the startup token in `X-Sutando-Capture-Token` — without it the server answers `403 {"status":"error","error":"forbidden"}`:
 ```bash
-curl -s http://localhost:7845/capture | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
+TOKEN="$(cat ~/.config/sutando/screen-capture-token)"
+curl -s -H "X-Sutando-Capture-Token: $TOKEN" http://localhost:7845/capture \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
 # Multi-display: add ?all=true to capture every display, or ?display=N for a specific one.
+# /capture-video takes the same header — it is the other capture route, gated identically.
 ```
 Then use the Read tool on the returned path to view the screenshot. Use this for any screen-related question: "what am I looking at", "help me with this", "what's on my screen", etc.
+
+A `forbidden` response means the header was missing or stale, **not** that capture is unavailable — re-read the token file rather than restarting the server.
 
 `/capture` returns the display's native resolution — on a Retina screen that is
 megabyte-class per frame. Frames entering a live voice session (the Watch/vision
@@ -65,7 +70,7 @@ imsg messages --chat "+14155551234" --limit 10    # read messages
 ```
 Always confirm message content with user before sending.
 
-**WhatsApp** — send messages via WhatsApp (requires `wacli auth` first; full reference in `skills/whatsapp/SKILL.md`):
+**WhatsApp** — send messages via WhatsApp (unpaired? use the guided connect flow — `skills/whatsapp/scripts/guided_connect.py`, pairing from chat, no terminal; full reference in `skills/whatsapp/SKILL.md`):
 ```bash
 wacli send text --to "+14155551234" --message "Hello!"
 wacli chats list --limit 20

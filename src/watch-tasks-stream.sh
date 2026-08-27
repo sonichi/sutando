@@ -18,6 +18,10 @@
 # arrive — no need to inline file contents in stdout (Monitor's 200ms
 # batching window would group multi-line content awkwardly).
 
+# fd 9 is a stable dup of the real stdout, taken before anything can rebind fd 1.
+# A shutdown emit invoked one $( ) deep writes to the capture pipe, not to stdout.
+exec 9>&1
+
 set -u
 
 if [ "${1:-}" = "--handler-runner" ]; then
@@ -46,6 +50,8 @@ fi
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=watcher_sentinel.sh
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
+# shellcheck source=task-emit.sh
+source "$__SCRIPT_DIR/task-emit.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -246,7 +252,7 @@ finish_handler_task() {
         1)
           printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
           echo "watch-tasks-stream: optional task handler failed for $filename (exit $rc); falling back to live core (possible at-least-once retry)" >&2
-          printf 'TASK_FILE: %s\n' "$filename" || true
+          emit_fallback_task_file "$filename"
           ;;
         *)
           echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -263,7 +269,7 @@ finish_handler_task() {
 }
 
 handler_result_exists() {
-  # Readiness is result_ready's contract (rejects whitespace-only too) and the
+  # Readiness is delivery/readiness's contract (rejects whitespace-only too) and the
   # live-then-archive lookup is local_task_protocol's; this must not re-decide either.
   local filename="$1" task_id="${filename%.txt}"
   [ -n "$SUTANDO_PY_BIN" ] || return 1
@@ -271,7 +277,7 @@ handler_result_exists() {
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "src"))
 from local_task_protocol import find_result
-from result_ready import read_ready_result
+from delivery.readiness import read_ready_result
 found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
 raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
 PYEOF
@@ -497,7 +503,7 @@ fallback_outstanding_handlers() {
           1)
             printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
             echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-            printf 'TASK_FILE: %s\n' "$filename" || true
+            emit_task_file "$filename"
             ;;
           *)
             echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -533,7 +539,7 @@ fallback_outstanding_handlers() {
       1)
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
         echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        printf 'TASK_FILE: %s\n' "$filename" || true
+        emit_task_file "$filename"
         ;;
       *)
         echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -592,6 +598,11 @@ fallback_outstanding_handlers() {
 cleanup() {
   [ "${CLEANING_UP:-0}" -eq 0 ] || return
   CLEANING_UP=1
+  # FIRST, before any release/kill/sweep work: the drain and queue guards read
+  # this file, so anything they do before it exists can still promote a worker.
+  if [ -n "${DISPATCH_DIR:-}" ] && [ -d "$DISPATCH_DIR" ]; then
+    : > "$DISPATCH_DIR/shutting-down"
+  fi
   # EXIT and signal traps share this function. Disarm EXIT before spawning
   # cleanup helpers so a subshell cannot recursively re-enter the trap.
   trap - EXIT

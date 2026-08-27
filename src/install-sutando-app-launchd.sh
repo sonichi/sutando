@@ -99,7 +99,23 @@ case "$cmd" in
         # instance exits cleanly via singleton-detection; kickstart forces
         # launchd to take ownership so KeepAlive applies. Idempotent.
         launchctl kickstart "$SERVICE" >/dev/null 2>&1 || true
-        echo "  Loaded via $SERVICE"
+        # kickstart's status is swallowed above because it is idempotent-noisy,
+        # so supervision must be proven by a live pid, never assumed from it.
+        _sup_pid=""
+        for _ in $(seq 1 50); do
+            _sup_pid="$(launchctl print "$SERVICE" 2>/dev/null \
+                | awk '/^[[:space:]]*pid[[:space:]]*=/{print $3; exit}')"
+            [ -n "$_sup_pid" ] && [ "$_sup_pid" != "0" ] && break
+            _sup_pid=""
+            sleep 0.1
+        done
+        if [ -z "$_sup_pid" ]; then
+            echo "  ✗ $SERVICE is registered but launchd owns no running process." >&2
+            echo "    Not reporting supervision — KeepAlive cannot restart what never started." >&2
+            echo "    Inspect with: launchctl print $SERVICE" >&2
+            exit 1
+        fi
+        echo "  Loaded via $SERVICE (launchd-owned pid $_sup_pid)"
         echo
         echo "Sutando.app is now launchd-supervised."
         echo "  • Crashes auto-restart within ~10s"

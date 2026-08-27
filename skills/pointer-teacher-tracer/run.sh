@@ -11,10 +11,10 @@ cd "$(dirname "$0")"
 Q="${*:-where do I commit here?}"
 
 # 1. build overlay if needed
-if [ ! -x ./pointer-overlay ] || [ pointer-overlay.swift -nt ./pointer-overlay ]; then
-  echo "· building overlay…"
-  swiftc pointer-overlay.swift -o pointer-overlay
-fi
+# swift build is incremental and build.sh is idempotent, so this is a no-op on an
+# up-to-date tree — a hand-rolled staleness test could only get the rule wrong.
+echo "· building overlay…"
+bash build.sh
 
 # 2. ensure overlay running
 if ! pgrep -f "pointer-teacher-tracer/pointer-overlay" >/dev/null 2>&1; then
