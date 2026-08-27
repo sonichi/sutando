@@ -18,6 +18,7 @@ never touched.
 import os
 import plistlib
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -258,7 +259,8 @@ class LeadWrapperTest(unittest.TestCase):
             daemon = td / "scripts" / "pool-lead-daemon.py"
             daemon.write_text("sleep 60\n")
             # A live process whose argv carries this checkout's daemon path.
-            other = subprocess.Popen(["bash", str(daemon)])
+            other = subprocess.Popen(
+                ["bash", str(daemon)], start_new_session=True)
             marker = td / "ran"
             try:
                 r = self.run_wrapper(td, marker)
@@ -267,7 +269,7 @@ class LeadWrapperTest(unittest.TestCase):
                                  "two leads from one checkout would both sweep")
                 self.assertIn("standing down", r.stdout)
             finally:
-                other.kill()
+                os.killpg(other.pid, signal.SIGKILL)
                 other.wait(timeout=10)
 
 
