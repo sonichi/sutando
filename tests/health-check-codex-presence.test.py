@@ -242,6 +242,63 @@ class CodexDelegationConsumer(unittest.TestCase):
         self.assertIsNotNone(why)
         self.assertIn("allowlists", why)
 
+    def test_telegram_owner_only_record_is_not_a_consumer(self):
+        """Telegram is owner-only (`telegram-bridge` assigns "owner" outright and
+        never reads a tierMap), and its normal record carries no tierMap key. The
+        allowlist rule must not turn that into a permanent unclearable warning."""
+        tasks, channels = self._dirs()
+        self._access(channels, "telegram",
+                     {"allowFrom": ["owner-id"], "tofuOwner": "owner-id"})
+        self._task(tasks, "1", "owner")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
+
+    def test_absent_tiermap_key_differs_from_a_present_map_missing_a_user(self):
+        """Key ABSENT is grandfathered to owner by `_ensure_tier_map_seeded`;
+        key PRESENT but missing the sender fails closed to "other". The two must
+        not collapse — one is a consumer and one is not."""
+        tasks, channels = self._dirs()
+        self._access(channels, "slack", {"allowFrom": ["u1"], "tofuOwner": "u1"})
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
+        self._access(channels, "slack", {"allowFrom": ["u1"], "tierMap": {}})
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNotNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                               channels_dir=channels))
+
+    def test_malformed_tiermap_degrades_instead_of_aborting_the_run(self):
+        """`check_codex_presence` is appended with no per-probe exception
+        boundary, so a raise here costs every later probe its result."""
+        tasks, channels = self._dirs()
+        self._access(channels, "slack",
+                     {"allowFrom": ["owner-id"], "tierMap": "not-a-map"})
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            why = hc._codex_delegation_consumer(tasks_dir=tasks, channels_dir=channels)
+        self.assertIsNotNone(why)
+        self.assertIn("cannot be ruled out", why)
+
+    def test_malformed_allowfrom_does_not_count_characters_as_senders(self):
+        """A string allowFrom iterates per character, inventing senders."""
+        tasks, channels = self._dirs()
+        self._access(channels, "slack", {"allowFrom": "U123", "tierMap": {}})
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            why = hc._codex_delegation_consumer(tasks_dir=tasks, channels_dir=channels)
+        self.assertIsNotNone(why)
+        self.assertIn("cannot be ruled out", why)
+        self.assertNotIn("4 sender", why)
+
+    def test_non_object_access_document_is_not_a_consumer(self):
+        """Valid JSON that is not an object must not reach `.get`."""
+        tasks, channels = self._dirs()
+        (channels / "slack").mkdir(parents=True, exist_ok=True)
+        (channels / "slack" / "access.json").write_text(json.dumps(["not", "a", "record"]))
+        self._task(tasks, "1", "owner")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
+
     def test_allowlist_of_only_the_mapped_owner_is_not_a_consumer(self):
         """Positive control: the allowlist rule must not fire on an owner-only
         host, which is the false positive the whole PR exists to remove."""

@@ -7510,17 +7510,35 @@ def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int 
                 data = json.loads(access_file.read_text())
             except Exception:  # noqa: BLE001 — an unreadable record is not a consumer
                 continue
-            tier_map = {str(k): str(v) for k, v in (data.get("tierMap") or {}).items()}
+            if not isinstance(data, dict):
+                continue  # valid JSON, but not an access record
+            channel = access_file.parent.name
+            raw_map = data.get("tierMap")
+            mapped = "tierMap" in data
+            if mapped and not isinstance(raw_map, dict):
+                return (f"{channel}/access.json has a tierMap of type "
+                        f"{type(raw_map).__name__} — non-owner ingress cannot be "
+                        f"ruled out from a malformed record")
+            tier_map = {str(k): str(v) for k, v in (raw_map or {}).items()}
             named = sorted(set(tier_map.values()) & non_owner)
             if named:
-                return (f"{access_file.parent.name}/access.json maps sender(s) to "
+                return (f"{channel}/access.json maps sender(s) to "
                         f"tier {', '.join(named)}")
-            # Allowlisted but absent from tierMap is not unconfigured: adapters
-            # resolve it non-owner (slack-bridge fails closed to "other").
-            unmapped = [s for s in (str(u) for u in (data.get("allowFrom") or []))
+            if not mapped:
+                # Key absent != map missing a user: the seed grandfathers a
+                # legacy allowFrom to owner, and telegram reads no tierMap.
+                continue
+            allow = data.get("allowFrom")
+            if allow is not None and not isinstance(allow, list):
+                return (f"{channel}/access.json has an allowFrom of type "
+                        f"{type(allow).__name__} — non-owner ingress cannot be "
+                        f"ruled out from a malformed record")
+            # Present map missing an allowlisted sender IS non-owner: the
+            # adapter fails closed to "other" (slack-bridge.resolve_access_tier).
+            unmapped = [s for s in (str(u) for u in (allow or []))
                         if tier_map.get(s) != "owner"]
             if unmapped:
-                return (f"{access_file.parent.name}/access.json allowlists "
+                return (f"{channel}/access.json allowlists "
                         f"{len(unmapped)} sender(s) tierMap does not map to owner — "
                         f"adapters resolve those as non-owner")
 
