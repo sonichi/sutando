@@ -381,9 +381,8 @@ declare -a REPORT_LINES
 # >1 source (cross-source collisions per-source scan misses — e.g. build_log.md
 # in A AND C bound for the same dest path).
 XSRC_INDEX="$(mktemp -t sutando-migrate-xsrc.XXXXXX)"
-# Shadow any INHERITED value before the trap installs: without this, an
-# environment-supplied _VERDICTS_TMP is rm -f'd on EXIT — even by --help —
-# so cleanup could delete an arbitrary writable path this process never made.
+# Shadow any inherited value before the trap installs, or cleanup rm -f's
+# an arbitrary environment-supplied path this process never created.
 _VERDICTS_TMP=""
 trap 'rm -f "$XSRC_INDEX" "${_VERDICTS_TMP:-}"' EXIT INT TERM
 # Also include dest's existing files (tag "DEST") so we surface dest-collisions
@@ -1180,15 +1179,11 @@ mode_of() {
     stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"
 }
 
-# The ONE identity decision (kewei review, blocker 2): equal bytes alone must
-# never certify a duplicate — copy_preserving_mtime preserves MODE, and these
-# classes include owner scripts and hooks, so a dropped 0755 source against a
-# 0644 dest silently loses the exec bit with no backup carrying it. Identity
-# is bytes AND mode, and scan/commit/verify/delete all use this same test.
+# Identity is bytes AND mode, at every decision site: dropping a 0755 source
+# against a byte-equal 0644 dest silently loses the exec bit, unrecoverably.
 identity_match() {
-    # FAIL CLOSED on an unreadable mode: with both probes failing, a bare
-    # comparison sees "" = "" and certifies identity with mode UNKNOWN —
-    # re-opening the destructive drop/delete path on a transient stat error.
+    # Fail closed on an unreadable mode: both probes failing would
+    # blank-compare "" = "" and certify identity with mode unknown.
     local ma mb
     ma="$(mode_of "$1")" || return 1
     mb="$(mode_of "$2")" || return 1
@@ -1241,11 +1236,8 @@ commit_one() {
         structural|collision-keep-both)
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
-                # Identity (bytes AND mode) → identical-drop. mtime+size alone
-                # certified equal-mtime/equal-size DIFFERENT bytes as identical,
-                # and bytes alone dropped a 0755 source against a 0644 dest.
-                # A mode-only difference falls through to keep-both below, so
-                # the source's mode survives in whichever file carries it.
+                # Identical requires bytes AND mode; a mode-only difference
+                # falls through to keep-both so the source's mode survives.
                 local src_mt dst_mt
                 src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
                 dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
@@ -2262,11 +2254,8 @@ def has_size_mismatch(entries):
     return len({e["size"] for e in entries}) > 1
 def has_mtime_mismatch(entries):
     return len({e["mtime"] for e in entries}) > 1
-# Actionability sort keys on the VERDICT first: every divergent (False) and
-# unverified (None) entry outranks every byte-identical (True) one, whatever
-# the mtimes — the old shape put identical-with-differing-mtimes in the same
-# bucket as verified mtime-only divergence, so 50 ignorable entries could
-# push the one actionable entry past the render cap.
+# Sort on the VERDICT first: divergent/unverified outrank byte-identical,
+# else ignorable entries can push the one actionable one past the render cap.
 def sort_key(item):
     k, v = item
     if ident_verdict[k] is not True:

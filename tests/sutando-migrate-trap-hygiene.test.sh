@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# The cleanup trap must only ever remove paths THIS process created.
-# Regression (review finding on #3418): the EXIT trap referenced
-# _VERDICTS_TMP before the script initialized it, so an inherited
-# environment value was rm -f'd on every exit — including `--help`.
+# The cleanup trap must only remove paths THIS process created — reading
+# _VERDICTS_TMP before init rm -f's an inherited value even on --help.
 set -u
 cd "$(dirname "$0")/.."
 fails=0
@@ -11,7 +9,7 @@ check() { if [ "$2" = "$3" ]; then echo "  ok  $1"; else echo "FAIL  $1 — got 
 victim="$(mktemp -t trap-hygiene-victim.XXXXXX)"
 echo "precious" > "$victim"
 
-# kewei's exact repro shape: inherited var + a non-mutating command.
+# Repro shape: inherited var + a non-mutating command.
 _VERDICTS_TMP="$victim" bash scripts/sutando-migrate.sh --help >/dev/null 2>&1
 rc=$?
 check "--help exits 0 with an inherited _VERDICTS_TMP" "$rc" "0"

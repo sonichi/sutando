@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
-# Identity = bytes AND mode, uniformly (kewei review on #3418, blockers 2+3).
-# Three controls the review asked for:
-#   1. same-bytes/different-mode commit path — the 0755 source must NOT be
-#      dropped against a 0644 dest (the exec bit used to vanish unrecoverably);
-#   2. 51-collision summary — 50 byte-identical mtime-differing entries must
-#      not push the one divergent entry past the render cap;
-#   3. unreadable-only — an unverified collision is NOT a genuine conflict.
+# Identity = bytes AND mode, uniformly: mode-only differences are divergence,
+# ignorable entries never outrank actionable ones, unverified is never genuine.
 set -u
 cd "$(dirname "$0")/.."
 fails=0
@@ -22,16 +17,15 @@ helpers="$tmp/helpers.sh"
 sed -n '/^mode_of() {/,/^}/p; /^identity_match() {/,/^}/p; /^sha_match() {/,/^}/p' scripts/sutando-migrate.sh > "$helpers"
 # shellcheck disable=SC1090
 . "$helpers"
-# A failed extraction must fail HERE, loudly — command-not-found inside a
-# $(... && echo yes || echo no) capture reads as a clean "no" and false-passes
-# exactly the checks that expect "no" (measured on this test's first run).
+# A failed extraction must fail loudly HERE: command-not-found inside a
+# yes/no capture reads as a clean "no" and false-passes the no-expecting checks.
 type identity_match >/dev/null 2>&1 || { echo "FAIL  helper extraction produced no identity_match"; exit 1; }
 check "same bytes + same mode IS identical" "$(identity_match "$tmp/a.sh" "$tmp/c.sh" && echo yes || echo no)" "yes"
 check "same bytes + different mode is NOT identical (exec bit must survive)" \
   "$(identity_match "$tmp/a.sh" "$tmp/b.sh" && echo yes || echo no)" "no"
 check "different bytes never identical whatever the mode" \
   "$(printf 'other\n' > "$tmp/d.sh"; chmod 0755 "$tmp/d.sh"; identity_match "$tmp/a.sh" "$tmp/d.sh" && echo yes || echo no)" "no"
-# reviewer control (exact-head finding at beeec419): a failing mode probe
+# a failing mode probe
 # must FAIL the identity, never blank-compare into a false duplicate.
 mode_of() { return 1; }
 check "both mode probes failing -> NOT identical (fail closed)" \
@@ -48,13 +42,10 @@ bare="$(grep -cE 'if (\[ -f "\$(cand|g)" \] && )?sha_match ' scripts/sutando-mig
 check "no decision site bypasses the mode check (bare sha_match ifs)" "$bare" "0"
 
 # --- controls 2+3: the summary logic, driven through the real python block ---
-# The summary python lives inline; exercise its logic via a faithful driver
-# that imports the same rules by regenerating verdicts/sort from fixtures.
 summary_out="$(python3 - <<'PYEOF'
 import json, os, tempfile, hashlib, subprocess, re, sys
-# Extract the inline summary python from the shipped script and run it against
-# a synthetic collision index: 50 identical(mtime-diff) + 1 divergent + the
-# unreadable-only variant.
+# Run the shipped summary python against a synthetic index:
+# 50 identical(mtime-diff) + 1 divergent + the unreadable-only variant.
 src = open("scripts/sutando-migrate.sh").read()
 m = re.search(r"_MAP = \{\"identical\": True.*?json\.dump\(out, sys\.stdout, indent=2\)", src, re.S)
 assert m, "summary block not found"
