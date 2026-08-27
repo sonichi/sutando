@@ -68,18 +68,15 @@ for f in interface.swg audio.swa firmware.swi; do
     refute_ignored "$f" "$f stays trackable — real extension inside the old sw range"
 done
 
-# The cross-product cell the suite was missing, and the one that mattered: a
-# dot/underscore prefix AND a real sw extension satisfies BOTH discriminators,
-# so the prefix controls above (.foo.svg, .schema.sql) could never catch it —
-# their extensions cannot match sw* at all. These can, and did.
+# The cross-product cell: prefix AND a real sw extension satisfies BOTH
+# discriminators, so the prefix-only controls above cannot catch it.
 for f in .interface.swg _interface.swg .audio.swa _firmware.swi .audio.swi _lib.swg; do
     : > "$f"
     refute_ignored "$f" "$f stays trackable — prefix plus a real sw extension"
 done
 
-# Positive control for the pair above: the same prefixes with a REAL vim swap
-# extension must still be ignored, or the narrowing went too far and the
-# refutations above would pass for the wrong reason.
+# Positive control: without this, the refutations above pass for the wrong
+# reason if the narrowing went too far.
 for f in .notes.swp _notes.swp .notes.swo _draft.swn; do
     : > "$f"
     check_ignored "$f" "$f is ignored — prefixed vim swap still caught"
@@ -87,6 +84,19 @@ done
 
 for f in logo.svg query.sql style.scss run.sh app.swift; do
     refute_ignored "$f" "$f stays trackable"
+done
+
+# `.env` as a bare substring is not a dotenv boundary: these carry no secret and
+# must stay trackable.
+for f in diagram.environment.svg schema.environment.sql service.envoy.svc environment.sql env.svc; do
+    : > "$f"
+    refute_ignored "$f" "$f stays trackable — .env substring is not a dotenv boundary"
+done
+
+# Positive control for the pair above: real dotenv swap images, at the boundary.
+for f in .env.swp .env.swo .env.local.saa secrets.env.swb myapp.env.swa; do
+    : > "$f"
+    check_ignored "$f" "$f is ignored — dotenv swap image at a real boundary"
 done
 
 echo
