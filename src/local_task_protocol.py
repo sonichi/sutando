@@ -601,7 +601,10 @@ def resolve_result(results_dir: Path, task_id: str,
     is stranded. An authoritative pending must outrank any cache.
     """
     if reader is None:
-        from delivery.readiness import read_ready_result  # noqa: PLC0415
+        try:  # vendored as ag2_sparrow.result_ready; flat delivery/ in src/
+            from .result_ready import read_ready_result  # noqa: PLC0415
+        except ImportError:
+            from delivery.readiness import read_ready_result  # noqa: PLC0415
         reader = read_ready_result
     for candidate in iter_result_candidates(results_dir, task_id):
         body = reader(candidate)
