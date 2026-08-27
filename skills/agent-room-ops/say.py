@@ -26,11 +26,11 @@ def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
 
 
 def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
-        *, reply_to: str | None = None, thread_root: str | None = None) -> dict:
+        *, reply_to: str | None = None) -> dict:
     """Post `message` into `room_id` verbatim, mentioning no one.
 
-    `reply_to` / `thread_root` place the post in a reply chain or thread — see
-    relations.relation_fields for the wire contract and the degrade behaviour.
+    `reply_to` cites the message being replied to; the post stays in the main
+    timeline. See relations.relation_fields.
 
     Returns {ok, room_id, event_id, reason}. Refuses before any network call when
     the room is missing, the body is empty, or the client gate denies the room.
@@ -43,9 +43,9 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
         return _result(False, room_id=room_id, reason="message required")
 
     # Before the gate and the network: a bad event id is the caller's typo, and
-    # posting it unrelated would land the message outside the thread silently.
+    # posting it unrelated would cite the wrong message silently.
     try:
-        rel = relation_fields(reply_to=reply_to, thread_root=thread_root)
+        rel = relation_fields(reply_to=reply_to)
     except RelationError as e:
         return _result(False, room_id=room_id, reason=str(e))
 
