@@ -17,6 +17,7 @@ class InstanceScope(unittest.TestCase):
     def tearDown(self):
         rgb.GATEWAY_INSTANCE = ""
         rgb.GATEWAY_ROOM_SUFFIX = ""
+        rgb.GATEWAY_FOREIGN_SUFFIXES = ()
 
     def test_default_lane_claims_everything(self):
         rgb.GATEWAY_INSTANCE = ""
@@ -37,6 +38,32 @@ class InstanceScope(unittest.TestCase):
         self.assertTrue(rgb._instance_may_claim("!r:dev.ag2.space"))
         self.assertFalse(rgb._instance_may_claim("!r:ag2.space"))
         self.assertFalse(rgb._instance_may_claim(None))
+
+    def test_default_lane_skips_foreign_suffix_rooms(self):
+        rgb.GATEWAY_INSTANCE = ""
+        rgb.GATEWAY_FOREIGN_SUFFIXES = (":dev.ag2.space",)
+        self.assertFalse(rgb._instance_may_claim("!r:dev.ag2.space"))
+        self.assertTrue(rgb._instance_may_claim("!r:ag2.space"))
+        self.assertTrue(rgb._instance_may_claim(None))
+
+    def test_default_lane_without_config_claims_everything(self):
+        rgb.GATEWAY_INSTANCE = ""
+        rgb.GATEWAY_FOREIGN_SUFFIXES = ()
+        self.assertTrue(rgb._instance_may_claim("!r:dev.ag2.space"))
+
+    def test_foreign_suffixes_env_parsing(self):
+        # exercises the module's own env read, not a copy of it
+        import importlib
+        import os
+        os.environ["GATEWAY_FOREIGN_SUFFIXES"] = " :dev.ag2.space , :stage.ag2.space ,"
+        try:
+            m = importlib.reload(rgb)
+            self.assertEqual(
+                m.GATEWAY_FOREIGN_SUFFIXES, (":dev.ag2.space", ":stage.ag2.space"))
+            self.assertFalse(m._instance_may_claim("!r:stage.ag2.space"))
+        finally:
+            del os.environ["GATEWAY_FOREIGN_SUFFIXES"]
+            importlib.reload(rgb)
 
     def test_claim_loop_calls_the_predicate(self):
         # wiring pin: the pre-claim gate must consult the predicate
