@@ -144,6 +144,27 @@ class RecordSample(unittest.TestCase):
         self.assertEqual([r["ts"] for r in qp._read_history(self.path)],
                          [1700000000.0, 1700000600.0])
 
+    def test_negative_utilization_never_reaches_the_wire(self):
+        # 7th-round control: u5=-1e308 forged projected_end=-inf and a 500.
+        # A negative utilization now invalidates its window at ingest.
+        self.assertFalse(qp.record_sample(
+            state(u5="-1e308", u7=None, obs=2000.0), self.path))
+        self.assertFalse(self.path.exists())
+        # and a stored negative row is refused by the reader
+        import json as js
+        self.path.write_text(js.dumps(
+            {"ts": 2000.0, "u5": -0.2, "r5": 9000, "u7": 0.55, "r7": 300000}) + "\n")
+        recs = qp._read_history(self.path, now=3000.0)
+        self.assertEqual([k for r in recs for k in r if k == "u5"], [])
+
+    def test_the_clock_bound_is_two_sided(self):
+        # 7th-round control: ts=r5=-1e100 was still a canonical row.
+        import json as js
+        self.path.write_text(js.dumps(
+            {"ts": -1e100, "u5": 0.25, "r5": -1e100, "u7": 0.55, "r7": -1e100}) + "\n")
+        self.assertTrue(qp.record_sample(state(obs=1700000000.0), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [1700000000.0])
+
     def test_a_correlated_absurd_row_cannot_freeze_the_writer(self):
         # 6th-round control: ts=r5=r7=1e100 is self-consistent under float
         # precision (1e100-18000 == 1e100); the caller's clock refuses it.
@@ -423,6 +444,47 @@ class DashboardAdapter(unittest.TestCase):
             js.loads(body)  # the error body itself is strict JSON
         finally:
             dashboard.quota_projection.chart_payload = real
+
+    def test_a_bad_5h_reset_never_sinks_the_valid_7d_panel(self):
+        # 7th-round control: bad 5h reset + valid 7d degraded the whole panel
+        # to {"available": True}; now only the bad window goes unknown.
+        import tempfile as tf
+        import json as js
+        import dashboard
+        tmp = Path(tf.mkdtemp()); (tmp / "state").mkdir()
+        from datetime import datetime, timezone
+        lc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        (tmp / "state" / "quota-state.json").write_text(js.dumps({
+            "available": True, "last_checked": lc,
+            "headers": {
+                "anthropic-ratelimit-unified-5h-utilization": "0.25",
+                "anthropic-ratelimit-unified-5h-reset": "oops",
+                "anthropic-ratelimit-unified-7d-utilization": "0.55",
+                "anthropic-ratelimit-unified-7d-reset": "1900000000"}}))
+        old_ws = dashboard.WORKSPACE_DIR
+        dashboard.WORKSPACE_DIR = tmp
+        try:
+            q = dashboard.get_quota_status()
+        finally:
+            dashboard.WORKSPACE_DIR = old_ws
+        self.assertTrue(q.get("headers"), "panel data must survive one bad reset")
+        self.assertIn("reset_7d", q)
+        self.assertNotIn("reset_5h", q)
+
+    def test_tiles_render_unknown_not_zero_or_crash(self):
+        # 7th-round control: a 5h-only reading showed 7d as 0%; NaN/oops in a
+        # utilization crashed the whole page render.
+        import dashboard
+        base = {"available": True, "headers": {
+            "anthropic-ratelimit-unified-5h-utilization": "0.26"}}
+        self.assertEqual(dashboard._quota_tile_pct(base, "5h"), "26%")
+        self.assertEqual(dashboard._quota_tile_pct(base, "7d"), "—")
+        for bad in ("NaN", "Infinity", "oops", "-0.5", None):
+            poisoned = {"available": True, "headers": {
+                "anthropic-ratelimit-unified-5h-utilization": bad,
+                "anthropic-ratelimit-unified-7d-utilization": "0.55"}}
+            self.assertEqual(dashboard._quota_tile_pct(poisoned, "5h"), "—", bad)
+            self.assertEqual(dashboard._quota_tile_pct(poisoned, "7d"), "55%", bad)
 
     def test_a_poisoned_history_file_still_serves_strict_json(self):
         # A hand-poisoned bare-NaN row must never reach the wire: the

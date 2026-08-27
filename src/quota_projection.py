@@ -71,13 +71,13 @@ def _sample_from_state(state: dict, now: float) -> dict | None:
     """
     headers = state.get("headers") or {}
     ts = _observation_ts(state)
-    if ts is None or ts > now + MAX_FUTURE_SKEW_S:
+    if ts is None or not (0 < ts <= now + MAX_FUTURE_SKEW_S):
         return None
     sample: dict = {"ts": ts}
     for w, (uk, rk) in _WINDOW_KEYS.items():
         u = _finite(headers.get(_HDR.format(w=w, f="utilization")))
         r = _finite(headers.get(_HDR.format(w=w, f="reset")))
-        if u is None or r is None or r != int(r):
+        if u is None or u < 0 or r is None or r != int(r):
             continue  # a fractional reset cannot canonicalize losslessly
         ri = int(r)
         if not (ri - WINDOW_SPANS[w] <= ts <= ri):
@@ -100,12 +100,14 @@ def _valid_row(rec: dict, now: float) -> dict | None:
     if not isinstance(rec, dict):
         return None
     ts = _finite(rec.get("ts"))
-    if ts is None or ts > now + MAX_FUTURE_SKEW_S:
+    if ts is None or not (0 < ts <= now + MAX_FUTURE_SKEW_S):
         return None
     out = {"ts": ts}
     for w, (uk, rk) in _WINDOW_KEYS.items():
         u, r = _finite(rec.get(uk)), _finite(rec.get(rk))
-        if u is None or r is None or r != int(r):
+        # Domain bound u >= 0; no upper bound needed — every consumer
+        # clamps (Y() at 1.2, projected_end at 2.0), keeping output finite.
+        if u is None or u < 0 or r is None or r != int(r):
             continue
         ri = int(r)
         if not (ri - WINDOW_SPANS[w] <= ts <= ri):

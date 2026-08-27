@@ -172,13 +172,14 @@ def get_quota_status() -> dict:
     try:
         data = json.loads(quota_file.read_text())
         headers = data.get("headers", {})
-        # Parse reset timestamps
-        reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
-        reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
-        if reset_5h:
-            data["reset_5h"] = datetime.fromtimestamp(int(reset_5h)).strftime("%H:%M %b %d")
-        if reset_7d:
-            data["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).strftime("%H:%M %b %d")
+        # Parse reset timestamps PER WINDOW: one malformed value degrades
+        # its own tile to unknown, never the sibling or the whole panel.
+        for w in ("5h", "7d"):
+            raw = headers.get(f"anthropic-ratelimit-unified-{w}-reset", "")
+            try:
+                data[f"reset_{w}"] = datetime.fromtimestamp(int(raw)).strftime("%H:%M %b %d")
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
         data.update(_quota_freshness(data, quota_file))
         # Feed the history the chart reads; value-dedup'd, so the 15s refresh
         # costs nothing while quota stands still. Never let it break the panel.
@@ -240,6 +241,26 @@ def _quota_has_data(quota: dict) -> bool:
 # Glyph is a THREE-way split, not two: no reading -> "—", a reading the API
 # refused -> "✗", a good reading -> "✓". Collapsing the last two hides a real
 # rate-limit behind a check.
+
+
+def _quota_tile_pct(quota: dict, window: str) -> str:
+    """One tile's percentage, or an em dash for unknown.
+
+    Per-window on purpose: a missing, non-finite, negative or unparseable
+    value degrades ITS tile to unknown; the sibling window still renders.
+    """
+    import math as _math
+    raw = quota.get(f"utilization_{window}")
+    if raw in (None, "", 0):
+        raw = (quota.get("headers") or {}).get(
+            f"anthropic-ratelimit-unified-{window}-utilization")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+    if not _math.isfinite(v) or v < 0:
+        return "—"
+    return f"{int(v * 100)}%"
 
 
 def _quota_age_label(quota: dict) -> str:
@@ -612,8 +633,8 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
 <div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
 <div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
-<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:6px"><span>{(str(int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</span><svg id="qs-5h" width="54" height="22" viewBox="0 0 54 22" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
-<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:6px"><span>{(str(int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)) + "%") if _quota_has_data(stats["quota"]) else "—"}</span><svg id="qs-7d" width="54" height="22" viewBox="0 0 54 22" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
+<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:6px"><span>{_quota_tile_pct(stats["quota"], "5h") if _quota_has_data(stats["quota"]) else "—"}</span><svg id="qs-5h" width="54" height="22" viewBox="0 0 54 22" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
+<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:6px"><span>{_quota_tile_pct(stats["quota"], "7d") if _quota_has_data(stats["quota"]) else "—"}</span><svg id="qs-7d" width="54" height="22" viewBox="0 0 54 22" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
 </div>""" + _QUOTA_SPARK_JS + """</div>""")
 
     # Services (ports + daemons only)
