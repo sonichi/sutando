@@ -785,7 +785,7 @@ index_dest_for_collisions() {
 xsrc_identity_verdicts() {
     local py; py="$(require_python "$REPO_DIR" "hash cross-source collisions")" || exit 2
     "$py" - "$XSRC_INDEX" <<'PYIDENT'
-import sys, json, hashlib
+import sys, os, json, hashlib
 from collections import defaultdict
 by_rel = defaultdict(list)
 try:
@@ -805,14 +805,24 @@ def sha(path):
         return h.hexdigest()
     except OSError:
         return None
+def ident_key(path):
+    # Identity is bytes AND mode — same rule as the shell's identity_match, so
+    # the scan's "identical" can never promise a drop commit would not honor.
+    h = sha(path)
+    if h is None:
+        return None
+    try:
+        return (h, oct(os.stat(path).st_mode & 0o7777))
+    except OSError:
+        return None
 out = {}
 for rel, paths in by_rel.items():
     if len(paths) < 2:
         continue
-    hs = [sha(p) for p in paths]
-    if None in hs:
+    ks = [ident_key(p) for p in paths]
+    if None in ks:
         out[rel] = "unverified"
-    elif len(set(hs)) == 1:
+    elif len(set(ks)) == 1:
         out[rel] = "identical"
     else:
         out[rel] = "divergent"
@@ -1165,6 +1175,20 @@ preflight_summary() {
 }
 
 # SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
+# Permission bits only (no file-type prefix): BSD %Lp and GNU %a agree.
+mode_of() {
+    stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"
+}
+
+# The ONE identity decision (kewei review, blocker 2): equal bytes alone must
+# never certify a duplicate — copy_preserving_mtime preserves MODE, and these
+# classes include owner scripts and hooks, so a dropped 0755 source against a
+# 0644 dest silently loses the exec bit with no backup carrying it. Identity
+# is bytes AND mode, and scan/commit/verify/delete all use this same test.
+identity_match() {
+    sha_match "$1" "$2" && [ "$(mode_of "$1")" = "$(mode_of "$2")" ]
+}
+
 sha_match() {
     local a="$1" b="$2"
     local ha hb
@@ -1192,7 +1216,7 @@ commit_one() {
                 echo "copied"
                 return 0
             fi
-            if sha_match "$src_file" "$dst_path"; then
+            if identity_match "$src_file" "$dst_path"; then
                 echo "identical-drop"
                 return 0
             fi
@@ -1210,12 +1234,15 @@ commit_one() {
         structural|collision-keep-both)
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
-                # Identical content (sha) → identical-drop. mtime+size alone
-                # certified equal-mtime/equal-size DIFFERENT bytes as identical.
+                # Identity (bytes AND mode) → identical-drop. mtime+size alone
+                # certified equal-mtime/equal-size DIFFERENT bytes as identical,
+                # and bytes alone dropped a 0755 source against a 0644 dest.
+                # A mode-only difference falls through to keep-both below, so
+                # the source's mode survives in whichever file carries it.
                 local src_mt dst_mt
                 src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
                 dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
-                if sha_match "$src_file" "$dst_path"; then
+                if identity_match "$src_file" "$dst_path"; then
                     echo "identical-drop"
                     return 0
                 fi
@@ -1678,7 +1705,7 @@ commit_source() {
                 "$DEST_REAL/$rel_d" \
                 "$DEST_REAL/legacy/$tag/$rel_d" \
                 "$DEST_REAL/legacy/$tag/quarantine/$rel_d"; do
-                if [ -f "$cand" ] && sha_match "$file" "$cand"; then
+                if [ -f "$cand" ] && identity_match "$file" "$cand"; then
                     matched="$cand"; break
                 fi
             done
@@ -1688,7 +1715,7 @@ commit_source() {
             if [ -z "$matched" ]; then
                 local g
                 for g in "$DEST_REAL/$rel_d.legacy-"*; do
-                    if [ -f "$g" ] && sha_match "$file" "$g"; then
+                    if [ -f "$g" ] && identity_match "$file" "$g"; then
                         matched="$g"; break
                     fi
                 done
@@ -1698,7 +1725,7 @@ commit_source() {
             if [ -z "$matched" ] && [ "$cls_d" = "rehome-state" ]; then
                 local b="$(basename "$rel_d")"
                 for cand in "$DEST_REAL/state/auth/$b" "$DEST_REAL/state/$b"; do
-                    if [ -f "$cand" ] && sha_match "$file" "$cand"; then
+                    if [ -f "$cand" ] && identity_match "$file" "$cand"; then
                         matched="$cand"; break
                     fi
                 done
@@ -2068,7 +2095,7 @@ verify_main() {
         done
         for cand in "${cands[@]}"; do
             if [ -f "$cand" ]; then
-                if sha_match "$src_file" "$cand"; then
+                if identity_match "$src_file" "$cand"; then
                     landed="$cand"; break
                 fi
             fi
@@ -2217,7 +2244,9 @@ _MAP = {"identical": True, "divergent": False, "unverified": None}
 ident_verdict = {k: _MAP[_verdicts.get(k, "unverified")] for k in collisions}
 identical = sum(1 for x in ident_verdict.values() if x is True)
 unverified = sum(1 for x in ident_verdict.values() if x is None)
-genuine = len(collisions) - identical
+# Proven divergence ONLY: unverified stays its own class — unknown must never
+# be published as genuine conflict (they already surface as identity_unverified).
+genuine = sum(1 for x in ident_verdict.values() if x is False)
 by_class = defaultdict(int)
 for v in collisions.values():
     by_class[v[0]["class"]] += 1
@@ -2226,24 +2255,31 @@ def has_size_mismatch(entries):
     return len({e["size"] for e in entries}) > 1
 def has_mtime_mismatch(entries):
     return len({e["mtime"] for e in entries}) > 1
-# Actionability sort: size-mismatch, verified-divergent-with-agreeing-proxies,
-# and unverified first; then mtime-only; byte-identical (drop-dup) last.
+# Actionability sort keys on the VERDICT first: every divergent (False) and
+# unverified (None) entry outranks every byte-identical (True) one, whatever
+# the mtimes — the old shape put identical-with-differing-mtimes in the same
+# bucket as verified mtime-only divergence, so 50 ignorable entries could
+# push the one actionable entry past the render cap.
 def sort_key(item):
     k, v = item
-    if has_size_mismatch(v) or ident_verdict[k] is None or (
-            ident_verdict[k] is False and not has_mtime_mismatch(v)):
+    if ident_verdict[k] is not True:
         prio = 0
-    elif has_mtime_mismatch(v):
+    elif has_mtime_mismatch(v) or has_size_mismatch(v):
         prio = 1
     else:
         prio = 2
     return (prio, v[0]["class"], k)
-notable = [{"class": v[0]["class"], "rel": k,
-            "byte_identical": ident_verdict[k],
-            "size_mismatch": has_size_mismatch(v),
-            "mtime_mismatch": has_mtime_mismatch(v),
-            "entries": [{"tag": e["tag"], "mtime": e["mtime"], "size": e["size"]} for e in v]}
-           for k, v in sorted(collisions.items(), key=sort_key)]
+_rows = [{"class": v[0]["class"], "rel": k,
+          "byte_identical": ident_verdict[k],
+          "size_mismatch": has_size_mismatch(v),
+          "mtime_mismatch": has_mtime_mismatch(v),
+          "entries": [{"tag": e["tag"], "mtime": e["mtime"], "size": e["size"]} for e in v]}
+         for k, v in sorted(collisions.items(), key=sort_key)]
+# The cap may only ever trim IGNORABLE rows: every actionable entry (verdict
+# False or None) is retained even when there are more than 50 of them.
+_actionable = [r for r in _rows if r["byte_identical"] is not True]
+_ignorable = [r for r in _rows if r["byte_identical"] is True]
+notable = _actionable + _ignorable[: max(0, 50 - len(_actionable))]
 size_diff = sum(1 for v in collisions.values() if has_size_mismatch(v))
 mtime_only = sum(1 for k, v in collisions.items() if not has_size_mismatch(v)
                  and has_mtime_mismatch(v) and ident_verdict[k] is False)
@@ -2264,11 +2300,11 @@ out = {
         "proxy_identical_divergent": proxy_identical_divergent,
         # Actionable — hash failed (unreadable entry); fix permissions, re-scan.
         "identity_unverified": unverified,
-        "genuine_conflicts": genuine,   # collisions - byte-identical (incl. unverified)
+        "genuine_conflicts": genuine,   # verified-divergent only; unverified is separate
 
         "by_class": dict(by_class),
     },
-    "notable_collisions": notable[:50],
+    "notable_collisions": notable,
 }
 json.dump(out, sys.stdout, indent=2)
 print()
