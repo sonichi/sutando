@@ -70,6 +70,16 @@ class AlreadyAdmitted(unittest.TestCase):
         other = provider_task_id("dc1", "43")
         self.assertFalse(already_admitted(other, self.tasks, self.results))
 
+    def test_a_longer_id_sharing_the_prefix_is_not_a_replay(self):
+        # A pending file for a LONGER id must not admit the shorter one: the
+        # glob is anchored to the id's "." delimiter, not a bare prefix (john #3316).
+        longer = self.tid + "extra"
+        (self.tasks / f"{longer}.txt").write_text("x")
+        self.assertFalse(already_admitted(self.tid, self.tasks, self.results))
+        # positive control: the exact-id file still admits
+        (self.tasks / f"{self.tid}.txt").write_text("x")
+        self.assertTrue(already_admitted(self.tid, self.tasks, self.results))
+
 
 class BridgeWiring(unittest.TestCase):
     """One wiring pin per bridge: the mint site delegates to the policy."""

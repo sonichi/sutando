@@ -24,7 +24,9 @@ def already_admitted(task_id: str, tasks_dir: Path, results_dir: Path,
                      archive_probe: "Callable[[str], bool] | None" = None) -> bool:
     """True when the task exists pending/claimed, has a result, or the
     adapter's archive_probe finds it archived."""
-    if any(tasks_dir.glob(f"{task_id}*.txt")):
+    # "." delimiter anchors the exact id (forms are all dot-led); a bare `{id}*`
+    # also matches a LONGER id sharing this prefix — a different event dropped.
+    if any(tasks_dir.glob(f"{task_id}.*")):
         return True
     if (results_dir / f"{task_id}.txt").exists():
         return True
