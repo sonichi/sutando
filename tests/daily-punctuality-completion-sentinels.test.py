@@ -313,6 +313,23 @@ _matcher = cron_task_id.record_matcher("Money scan")
 check("neighbour suffix is refused", not _matcher.match("task-cron-Money-scan-extra-123.txt"))
 check("bare-prefix neighbour is refused", not _matcher.match("task-cron-Money-scanner-123.txt"))
 check("the job's own record is accepted", bool(_matcher.match("task-cron-Money-scan-123.txt")))
+# Numeric-prefix neighbour: `ghost-job-2` is its own configured job, so its
+# record must not vouch for `ghost-job`. The stamp has to END the slug.
+_gj = cron_task_id.record_matcher("ghost-job")
+check("numeric-suffix neighbour is refused",
+      not _gj.match("task-cron-ghost-job-2-1787000000000.txt"))
+check("numeric-suffix neighbour is refused with a trailing marker too",
+      not _gj.match("task-cron-ghost-job-2-1787000000000-late-duplicate.txt"))
+check("control: the neighbour still claims its own record",
+      bool(cron_task_id.record_matcher("ghost-job-2")
+           .match("task-cron-ghost-job-2-1787000000000.txt")))
+# Real filename shapes that MUST keep matching — measured against 2050 live
+# task-cron-* files: 2041 `.txt`, 8 `-late-duplicate.txt`, 1 `.no-task.<n>.txt`.
+check("own record, plain", bool(_gj.match("task-cron-ghost-job-1787000000000.txt")))
+check("own record, -late-duplicate marker",
+      bool(_gj.match("task-cron-ghost-job-1787000000000-late-duplicate.txt")))
+check("own record, .no-task.<stamp> marker",
+      bool(_gj.match("task-cron-ghost-job-1787801434542.no-task.1787803712.txt")))
 check("task_id spells the writer's filename",
       cron_task_id.task_id("Money scan", 123) == "task-cron-Money-scan-123")
 check("discovery glob carries no job name", "*" == cron_task_id.DISCOVERY_GLOB[-1]

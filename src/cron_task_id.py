@@ -40,6 +40,11 @@ def record_matcher(name: str) -> "re.Pattern[str]":
 
     Anchored on both ends: a bare `<slug>-` prefix test also accepts
     `<slug>-extra-<stamp>`, so a neighbouring job would vouch for this one.
+
+    The stamp must end the slug, so what follows is `.` or `-<non-digit>`.
+    A `-<digit>` boundary means the digits were the neighbour's slug tail.
     """
     slug = re.escape(sanitize_name(name))
-    return re.compile(rf"^{re.escape(TASK_PREFIX)}{slug}-\d+(?:\D.*)?$")
+    return re.compile(
+        rf"^{re.escape(TASK_PREFIX)}{slug}-\d+(?:(?:\.|-(?!\d)).*)?$"
+    )
