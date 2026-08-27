@@ -91,9 +91,8 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
         if history:
             last = history[-1]
             if all(last.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7")):
-                # Same values: a NEWER observation stamp is real evidence (the
-                # producer re-measured) and advances the stored ts; a reread of
-                # the same snapshot is a no-op.
+                # Newer stamp + same values = the producer re-measured: advance
+                # the stored ts. A reread of the same snapshot is a no-op.
                 if float(sample["ts"]) > float(last.get("ts", 0)):
                     history[-1] = {**last, "ts": sample["ts"]}
                     fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
