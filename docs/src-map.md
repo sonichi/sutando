@@ -50,7 +50,6 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
 - **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
-- **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
@@ -142,6 +141,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
+- **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.

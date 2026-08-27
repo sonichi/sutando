@@ -52,8 +52,6 @@ class SrcDirWiring(unittest.TestCase):
     def setUp(self):
         self._real = mb._SRC_DIR
         mb._SRC_DIR = ABSENT
-        # get_daily_insight returns TODAY'S SENTINEL before it ever builds a
-        # script path, so without this the builder below is never reached.
         self._real_state = mb.STATE_DIR
         mb.STATE_DIR = ABSENT
 
@@ -65,30 +63,11 @@ class SrcDirWiring(unittest.TestCase):
         """`hc = _SRC_DIR / "health-check.py"` — reverting it finds the real script."""
         self.assertIsNone(mb.get_health_issues())
 
-    def test_daily_insight_path_follows_src_dir(self):
-        """Asserts the SUBPROCESS is never reached, not the return value.
-
-        `get_daily_insight` has two routes to None — the absent-script guard,
-        and a run whose sentinel never appears — so `assertIsNone` passes with
-        the builder reverted and proves nothing. (Verified: it did.) Reaching
-        `subprocess.run` at all means the builder found a real script, i.e. it
-        did not read the stubbed `_SRC_DIR`.
-        """
-        calls = []
-        real_run = mb.subprocess.run
-        mb.subprocess.run = lambda *a, **k: calls.append(a) or real_run(*a, **k)
-        try:
-            self.assertIsNone(mb.get_daily_insight())
-        finally:
-            mb.subprocess.run = real_run
-        self.assertEqual(calls, [], "builder resolved a real script — it ignored _SRC_DIR")
-
     def test_reminders_path_follows_src_dir(self):
         """Uses `_SRC_DIR.parent` — the one builder that walks UP, so a wrong
         root here fails differently from the two above.
 
-        Asserts the SUBPROCESS is never reached, for the same reason as
-        `daily_insight`: a reverted builder finds the real script and then
+        Asserts the SUBPROCESS is never reached: a reverted builder finds the real script and then
         returns None anyway when Reminders.app does not answer inside the 10s
         timeout, so `assertIsNone` passes with the builder reverted. (Verified:
         it did, taking 10.006s — the timeout, not the guard.)
