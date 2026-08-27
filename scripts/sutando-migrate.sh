@@ -513,7 +513,7 @@ scan_source() {
         # state/<basename>, not the original relpath, so we index under the
         # re-homed path so re-home collisions surface correctly.
         case "$cls" in
-            structural|append|newest-mtime|collision-keep-both)
+            structural|append|newest-mtime|collision-keep-both|union-json-array)
                 record_xsrc "$tag" "$rel" "$cls" "$file"
                 ;;
             rehome-state)
@@ -772,7 +772,7 @@ index_dest_for_collisions() {
         local cls
         cls="$(classify "$rel")"
         case "$cls" in
-            structural|append|newest-mtime|collision-keep-both|rehome-state)
+            structural|append|newest-mtime|collision-keep-both|union-json-array|rehome-state)
                 record_xsrc "DEST" "$rel" "existing" "$file"
                 ;;
         esac
@@ -1064,6 +1064,13 @@ with open(tmp, "w", encoding="utf-8") as fh:
 # the next source compares against "now" and its scalars can never win.
 win = max(os.path.getmtime(src), os.path.getmtime(dst))
 os.utime(tmp, (win, win))
+# The temp is created fresh, so without this the process umask decides the
+# result and a 0600 destination silently becomes world-readable. Intersect
+# instead: the union may narrow permissions, never widen either input's.
+import stat as _stat
+_s = _stat.S_IMODE(os.stat(src).st_mode)
+_d = _stat.S_IMODE(os.stat(dst).st_mode)
+os.chmod(tmp, _s & _d)
 PY
     then
         mv -f "$tmp" "$dst"
