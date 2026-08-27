@@ -191,6 +191,40 @@ def run_room(members_payload, *extra, roster=None):
 
 _PRESENT = '{"ok": true, "members": [{"user_id": "@sutando-rui:x"}, {"user_id": "@other:x"}]}'
 _ABSENT  = '{"ok": true, "members": [{"user_id": "@other:x"}, {"user_id": "@third:x"}]}'
+_EMPTY_OK = '{"ok": true, "members": []}'
+_DEGRADED = '{"ok": false, "reason": "no gateway configured"}'
+
+
+def run_room_per_room(per_room: dict, default, *extra, roster=None):
+    """Like run_room, but the stub answers `members <room>` DIFFERENTLY per room.
+    The single-payload stub cannot express "absent here, present there", so a test
+    written on it passes whether or not the recorded room was ever queried."""
+    root = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name))
+    (root / "skills" / "collaboration-intelligence" / "scripts").mkdir(parents=True)
+    (root / "skills" / "agent-room-ops").mkdir(parents=True)
+    copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
+    copy.write_text(SCRIPT.read_text())
+    seen = root / "queried.txt"
+    (root / "skills/agent-room-ops/room_ops.py").write_text(
+        "import sys\n"
+        f"PER = {per_room!r}\n"
+        f"DEFAULT = {default!r}\n"
+        "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        "if cmd == 'members':\n"
+        "    room = sys.argv[2] if len(sys.argv) > 2 else ''\n"
+        f"    open({str(seen)!r}, 'a').write(room + chr(10))\n"
+        "    sys.stdout.write(PER.get(room, DEFAULT))\n"
+        "else:\n"
+        "    sys.stdout.write('{\"ok\": true, \"event_id\": \"$e\"}')\n"
+        "sys.exit(0)\n")
+    rp = root / "roster.json"
+    rp.write_text(json.dumps(roster or GOOD))
+    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
+    proc = subprocess.run([sys.executable, str(copy), "--send",
+                           "--reviewers", "rui", "--message", "m", *extra],
+                          capture_output=True, text=True, timeout=30, env=env)
+    proc.queried = seen.read_text().split() if seen.exists() else []
+    return proc
 
 
 class RoomScopedPresence(unittest.TestCase):
@@ -209,9 +243,13 @@ class RoomScopedPresence(unittest.TestCase):
         self.assertIn("ok=True", p.stdout)
 
     def test_room_arg_naming_a_room_the_stand_is_absent_from_refuses_and_says_where(self):
-        p = run_room(_ABSENT, "--room", "!elsewhere:x")
+        # Absent in the requested room, PRESENT in the recorded one — and the
+        # recorded room must actually have been queried before it is recommended.
+        p = run_room_per_room({"!elsewhere:x": _ABSENT, "!triage:x": _PRESENT}, _ABSENT,
+                              "--room", "!elsewhere:x")
         self.assertIn("NOT REACHABLE in !elsewhere:x", p.stderr)
-        self.assertIn("!triage:x", p.stderr)          # names where they DO live
+        self.assertIn("IS a member of !triage:x", p.stderr)
+        self.assertIn("!triage:x", p.queried)         # verified, not asserted
         self.assertEqual(p.returncode, 5)             # distinct from other refusals
 
     def test_room_arg_where_the_stand_is_present_addresses_them_there(self):
@@ -245,6 +283,44 @@ class RoomScopedPresence(unittest.TestCase):
         p = run_room(_PRESENT, "--room", "!elsewhere:x")
         self.assertNotIn("UNVERIFIED", p.stderr)
         self.assertIn("ok=True", p.stdout)
+
+    def test_absent_from_BOTH_rooms_does_not_recommend_the_recorded_room(self):
+        # The blind spot: with the Stand absent everywhere, naming the recorded
+        # room sends the operator to a second room that also reaches nobody.
+        p = run_room_per_room({"!elsewhere:x": _ABSENT, "!triage:x": _ABSENT}, _ABSENT,
+                              "--room", "!elsewhere:x")
+        self.assertIn("NOT REACHABLE in !elsewhere:x", p.stderr)
+        self.assertIn("absent from its recorded room !triage:x too", p.stderr)
+        self.assertNotIn("post there deliberately", p.stderr)
+        self.assertEqual(p.returncode, 5)
+
+    def test_unreadable_recorded_room_is_not_recommended_either(self):
+        p = run_room_per_room({"!elsewhere:x": _ABSENT, "!triage:x": "not json"}, _ABSENT,
+                              "--room", "!elsewhere:x")
+        self.assertIn("could not be checked", p.stderr)
+        self.assertNotIn("post there deliberately", p.stderr)
+        self.assertEqual(p.returncode, 5)
+
+    def test_successful_EMPTY_membership_is_an_absence_not_unverified(self):
+        # ok:true with members:[] is a positive absence. Treating it as an
+        # unreadable instrument sends a mention that resolves to nobody.
+        p = run_room(_EMPTY_OK)
+        self.assertIn("ABSENT from", p.stderr)
+        self.assertNotIn("UNVERIFIED", p.stderr)
+        self.assertNotEqual(p.returncode, 0)
+
+    def test_degraded_ok_false_is_unverified_not_an_absence(self):
+        # The other half: ok:false is the instrument failing, so fail OPEN.
+        p = run_room(_DEGRADED)
+        self.assertNotIn("ABSENT from", p.stderr)
+        self.assertIn("UNVERIFIED", p.stderr)
+        self.assertIn("ok=True", p.stdout)
+
+    def test_a_members_list_without_ok_is_unverified(self):
+        # A list alone is not the contract; `ok` is what licenses reading it.
+        p = run_room('{"members": [{"user_id": "@other:x"}]}')
+        self.assertNotIn("ABSENT from", p.stderr)
+        self.assertIn("UNVERIFIED", p.stderr)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

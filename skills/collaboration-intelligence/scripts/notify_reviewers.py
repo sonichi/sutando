@@ -110,12 +110,14 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     # guards downstream. An unusable roster is UNVERIFIED, never an absence.
     if not isinstance(payload, dict):
         return True, "unverified (non-object members payload)"
+    # `ok` is the instrument's own verdict. Only a true one licenses reading the
+    # list as fact; without it an empty list is a failure, not an empty room.
+    if payload.get("ok") is not True:
+        return True, f"unverified (room_ops ok={payload.get('ok')!r})"
     members = payload.get("members")
     if not isinstance(members, list):
         return True, "unverified (members not a list)"
     ids = {m.get("user_id") for m in members if isinstance(m, dict)}
-    if not ids:
-        return True, "unverified (empty roster)"
     return target["stand"] in ids, f"{len(ids)} members"
 
 
@@ -147,9 +149,24 @@ def main() -> int:
             # THIS room, and sending would relocate the thread and report ok.
             here, why = stand_present_in_room({"stand": t["stand"], "room": a.room})
             if not here:
-                print(f"{t['name']}: NOT REACHABLE in {a.room} ({why}) — "
-                      f"{t['stand']} lives in {t['room']}. Post there deliberately, "
-                      "or route via the human. Not sending.", file=sys.stderr)
+                # Naming the recorded room as a fallback is itself a presence
+                # claim; check it, or this refusal redirects to a second nobody.
+                there, why2 = stand_present_in_room(t)
+                # Order matters: the probe fails OPEN, so `there` is True for an
+                # unreadable roster too. Test unverified FIRST or the refusal
+                # asserts presence it never measured — the bug it is fixing.
+                if why2.startswith("unverified"):
+                    where = (f"{t['stand']}'s recorded room {t['room']} could not be "
+                             f"checked ({why2}) — do not assume they are reachable there")
+                elif there:
+                    where = (f"{t['stand']} IS a member of {t['room']} ({why2}) — "
+                             "post there deliberately, or route via the human")
+                else:
+                    where = (f"{t['stand']} is absent from its recorded room {t['room']} "
+                             f"too ({why2}) — the roster entry is stale; resolve this "
+                             "person's Stand before addressing them anywhere")
+                print(f"{t['name']}: NOT REACHABLE in {a.room} ({why}) — {where}. "
+                      "Not sending.", file=sys.stderr)
                 refusal_rc = max(refusal_rc, 5)
                 continue
             if why.startswith("unverified"):
