@@ -5901,6 +5901,29 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     return out[-limit:]
 
 
+def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-finished) from `results/task-cron-<job>-<epoch>.txt`.
+
+    The one completion record needing no per-job config: every cron job leaves it.
+    """
+    from datetime import datetime
+    out = []
+    if not results.is_dir():
+        return out
+    # The epoch in the NAME is emit time; mtime is the finish, as for sentinels.
+
+    # Anchored: a bare `{job}-*` glob also matches `{job}-extra-...`, so a
+    # neighbouring job's records would otherwise vouch for this one.
+    anchored = re.compile(rf"task-cron-{re.escape(job)}-\d+")
+    for f in results.rglob(f"task-cron-{job}-*"):
+        if not f.is_file() or not anchored.match(f.name):
+            continue
+        lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
 def _daily_completion_minutes(state: Path, job: str, limit: int = 7) -> list:
     """(date, minute-of-day-finished) from `state/<job>-YYYY-MM-DD.sentinel`.
 
@@ -5992,6 +6015,11 @@ def check_daily_cron_punctuality() -> dict:
             arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
                     else _daily_completion_minutes(ws / "state", jname))
             used_artifact_lane = bool(arts) and launchd
+        # Last resort, and the only lane needing no per-job config: a job that
+        # publishes nothing dated still leaves a task-cron result when it finishes.
+        if not arts:
+            arts = _daily_task_record_minutes(ws / "results", jname)
+            used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         newest = max((d for d, _ in arts), default=None)

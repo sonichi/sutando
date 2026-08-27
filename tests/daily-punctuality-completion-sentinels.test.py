@@ -228,5 +228,60 @@ _outs = [hc._interpret_daily_punctuality([dict(_base, stem_declared=sd)]).get("d
 check("stem_declared cannot change the verdict when artifacts is empty",
       _outs[0] == _outs[1], f"got {_outs}")
 
+# ── the task-cron lane: the only completion record needing no per-job config ──
+
+# Every cron job leaves results/task-cron-<name>-<epoch>.txt when its result is
+# written, whatever else it publishes; mtime is the finish, as with sentinels.
+def _task_record_ws(days=5, include_today=True, name="ghost-job", finish=(6, 3)):
+    ws = Path(tempfile.mkdtemp(prefix="punct-tc-"))
+    (ws / "hosts" / "H").mkdir(parents=True)
+    (ws / "state").mkdir()
+    (ws / "results").mkdir()
+    (ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+        [{"name": name, "cron": "0 6 * * *"}]))
+    today = datetime.date.today()
+    for i in range(days):
+        if i == 0 and not include_today:
+            continue
+        d = today - datetime.timedelta(days=i)
+        f = ws / "results" / f"task-cron-{name}-{1787000000000 + i}.txt"
+        f.write_text("x")
+        os.utime(f, (time.time(),
+                     datetime.datetime.combine(d, datetime.time(*finish)).timestamp()))
+    return ws
+
+
+r = run(_task_record_ws())
+check("a job with only task-cron records is OBSERVABLE",
+      "ghost-job" not in (r.get("detail") or ""), f"got {r.get('detail')!r}")
+check("...and a punctual record history is not reported late",
+      r.get("status") == "ok", f"got {r.get('status')}: {r.get('detail')}")
+
+r = run(_task_record_ws(include_today=False))
+check("a task-cron history that stops TODAY surfaces as a named miss",
+      "ghost-job" in (r.get("detail") or "") and "no output today" in (r.get("detail") or ""),
+      f"got {r.get('detail')!r}")
+
+# The control that can fail: no records in ANY lane must stay UNCHECKED, so the
+# fallback cannot manufacture observability out of nothing.
+r = run(_task_record_ws(days=0))
+_d = r.get("detail") or ""
+check("no evidence in any of the three lanes stays UNCHECKED",
+      "ghost-job" in _d and ("UNCHECKED" in _d or "unverifiable" in _d), f"got {_d!r}")
+
+# Records for a DIFFERENT job must not vouch for this one — the glob is anchored
+# on the full job name, so a prefix-sharing neighbour cannot bleed across.
+ws = _task_record_ws(days=0)
+for i in range(5):
+    d = datetime.date.today() - datetime.timedelta(days=i)
+    f = ws / "results" / f"task-cron-ghost-job-extra-{1787000000000 + i}.txt"
+    f.write_text("x")
+    os.utime(f, (time.time(),
+                 datetime.datetime.combine(d, datetime.time(6, 3)).timestamp()))
+r = run(ws)
+_d = r.get("detail") or ""
+check("another job's records do NOT make this one observable",
+      "ghost-job" in _d and ("UNCHECKED" in _d or "unverifiable" in _d), f"got {_d!r}")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
