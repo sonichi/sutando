@@ -49,6 +49,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
+- **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
 - **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
