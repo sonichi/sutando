@@ -374,6 +374,45 @@ class RecordSample(unittest.TestCase):
                          [(round(reset - span + span * 0.6), 0.30)])
 
 
+    def test_sidecar_loss_cannot_regress_current_to_an_older_window(self):
+        # Reviewer control: no sidecar (every pre-upgrade history), a delayed
+        # older observation must not claim "current" over the newer tail.
+        import json as js
+        rows = [{"ts": 900000.0, "u5": 0.20, "r5": 909000, "u7": 0.5, "r7": 909000},
+                {"ts": 900100.0, "u5": 0.30, "r5": 909100, "u7": 0.5, "r7": 909100}]
+        self.path.write_text("".join(js.dumps(r) + "\n" for r in rows))
+        self.assertFalse(qp._latest_path(self.path).exists())
+        delayed = state(u5="0.20", r5=909000, u7="0.5", r7=909000, obs=900000.0)
+        self.assertFalse(qp.record_sample(delayed, self.path, now=900200.0))
+        segs = qp.chart_payload(self.path, now=900200.0)["windows"]["5h"]["segments"]
+        cur = [s["reset"] for s in segs if s["current"]]
+        self.assertNotIn(909000, cur, f"older window presented as current: {cur}")
+        self.assertEqual([s["reset"] for s in segs], [909000, 909100])
+        fresh = state(u5="0.31", r5=909200, u7="0.5", r7=909200, obs=900150.0)
+        self.assertTrue(qp.record_sample(fresh, self.path, now=900200.0))
+        segs = qp.chart_payload(self.path, now=900200.0)["windows"]["5h"]["segments"]
+        self.assertEqual([s["reset"] for s in segs if s["current"]][0], 909200)
+
+    def test_a_fully_invalid_observation_still_applies_the_cap(self):
+        # Reviewer control: the writer owns the physical cap on EVERY path,
+        # including the early return for an observation with no valid window.
+        import json as js
+        old_max = qp.MAX_LINES
+        qp.MAX_LINES = 5
+        try:
+            rows = [{"ts": 990000.0 + i, "u5": round(0.1 + i * 0.01, 3),
+                     "r5": 1000000, "u7": 0.5, "r7": 1000000} for i in range(7)]
+            self.path.write_text("".join(js.dumps(r) + "\n" for r in rows))
+            obs = 990066.0
+            bad = state(u5="0.3", r5=int(obs) - 1, u7="0.5", r7=int(obs) - 1, obs=obs)
+            self.assertFalse(qp.record_sample(bad, self.path, now=obs))
+            n = len(self.path.read_text().splitlines())
+            self.assertLessEqual(n, qp.MAX_LINES, f"file still over cap: {n}")
+            self.assertEqual([r["ts"] for r in qp._read_history(self.path, obs)],
+                             [990002.0, 990003.0, 990004.0, 990005.0, 990006.0])
+        finally:
+            qp.MAX_LINES = old_max
+
     def test_concurrent_writers_lose_no_acknowledged_sample(self):
         # Production-writer concurrency at the cap boundary: every thread
         # whose record_sample returned True must find its sample in the file.

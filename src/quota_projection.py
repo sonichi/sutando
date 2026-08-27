@@ -200,9 +200,10 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
     Contract (reviewer-driven): the writer owns the physical cap on EVERY
     path, atomicity is cross-process (flock on a sibling), success is durable
     (fsync before the ack), an unreadable existing history refuses the write,
-    and every accepted observation refreshes the latest-observation sidecar —
-    including a fully-invalid one, which writes per-window TOMBSTONES so the
-    chart can never keep presenting a stale window as current.
+    and an observation newer than BOTH the sidecar and the canonical history
+    tail refreshes the latest-observation sidecar — including a fully-invalid
+    one, which writes per-window TOMBSTONES so the chart can never keep
+    presenting a stale window as current.
     """
     import time
     clock = time.time() if now is None else now
@@ -239,21 +240,31 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                 if not readable:
                     return False  # never fork an unreadable record
                 latest = _read_latest(history_path, clock)
-                newer = latest is None or ts > float(latest.get("ts", 0))
+                tail_ts = float(history[-1]["ts"]) if history else None
+                # A replacement candidate must beat BOTH records: a lost or
+                # corrupt sidecar must never let an older window read current.
+                newer = ((latest is None or ts > float(latest.get("ts", 0)))
+                         and (tail_ts is None or ts > tail_ts))
+
+                def _refuse():
+                    # The cap and compaction are owed on every path, including
+                    # the ones that acknowledge nothing.
+                    if dirty or len(history) > MAX_LINES:
+                        _commit(history)
+                    return False
+
                 if sample is None:
                     # Valid observation time, no valid window: tombstone both
                     # so the chart stops presenting anything as current.
                     if newer:
                         _write_latest(history_path, {"ts": ts}, ts)
-                    return False
+                    return _refuse()
                 if newer:
                     _write_latest(history_path, sample, ts)
                 if history:
                     last = history[-1]
                     if float(sample["ts"]) <= float(last["ts"]):
-                        if dirty or len(history) > MAX_LINES:
-                            _commit(history)
-                        return False
+                        return _refuse()
                     if _same(last):
                         if len(history) >= 2 and _same(history[-2]):
                             history[-1] = {**last, "ts": sample["ts"]}
