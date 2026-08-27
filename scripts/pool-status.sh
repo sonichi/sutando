@@ -27,6 +27,8 @@ WORKSPACE="${WORKSPACE/#\~/$HOME}"
 CORES_DIR="$WORKSPACE/state/cores"
 LOG_DIR="$WORKSPACE/logs"
 TASKS_DIR="$WORKSPACE/tasks"
+HEARTBEAT_STALE_S=90
+HEARTBEAT_FUTURE_TOLERANCE_S=5
 
 # Header helper — visually separates sections without depending on color.
 hdr() { printf "\n=== %s ===\n" "$1"; }
@@ -51,7 +53,11 @@ if [ -d "$CORES_DIR" ]; then
     mtime="$(stat -f %m "$f" 2>/dev/null || echo 0)"
     age=$(( now - mtime ))
     status="alive"
-    if [ "$age" -gt 90 ]; then status="STALE (>90s)"; fi
+    if [ "$age" -lt "$((-HEARTBEAT_FUTURE_TOLERANCE_S))" ]; then
+      status="FUTURE (<-${HEARTBEAT_FUTURE_TOLERANCE_S}s)"
+    elif [ "$age" -ge "$HEARTBEAT_STALE_S" ]; then
+      status="STALE (>=${HEARTBEAT_STALE_S}s)"
+    fi
     printf "  %-22s age=%ds  %s\n" "$base" "$age" "$status"
   done
   shopt -u nullglob

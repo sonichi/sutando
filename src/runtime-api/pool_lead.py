@@ -154,7 +154,7 @@ class PoolLead:
         return out
 
     # ── crash recovery ──────────────────────────────────────────────────────
-    def _host_gap_defers_reclaim(self) -> bool:
+    def _advance_reclaim_guard(self) -> bool:
         """Use wall-vs-monotonic skew to distinguish host sleep from a slow
         daemon. Once opened, the grace expires by time rather than a sibling's
         heartbeat so staggered beats cannot expose a live claimant."""
@@ -181,7 +181,7 @@ class PoolLead:
         """Return dead followers' assignments to the unassigned pool.
         Claimed files are NOT touched here — a claim means work may have
         side-effected; that recovery keeps the done-flag path (L2)."""
-        if self._host_gap_defers_reclaim():
+        if self._advance_reclaim_guard():
             return []
         reclaimed = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.assigned-(.+)\.txt$")
@@ -218,7 +218,7 @@ class PoolLead:
         deliver (sweep skips it). The reachable crash residue is a result
         with no done-flag — finish_task writes the result first — and that
         work is COMPLETE, so it must not be repooled for re-execution."""
-        if self._host_gap_defers_reclaim():
+        if self._advance_reclaim_guard():
             return []
         out = []
         pat = re.compile(r"^(task-[A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
