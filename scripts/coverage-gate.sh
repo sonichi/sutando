@@ -121,12 +121,22 @@ _covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
 # shellcheck disable=SC2016
 # Feed BARE INTEGERS: `xargs -I{}` rewrites a tab in the replaced string to a
 # space, so a delimiter-in-argument scheme silently stops splitting.
+# One worktree per worker: suites share the resolved workspace otherwise and
+# race on it. A worktree resolves to its own tree by path.
+WTDIR="$(mktemp -d)"
+for _w in $(seq 1 "$COVGATE_WORKERS"); do
+    git worktree add --detach -q "$WTDIR/$_w" HEAD
+done
+trap 'for _w in $(seq 1 "$COVGATE_WORKERS"); do git worktree remove --force "$WTDIR/$_w" 2>/dev/null || true; done; rm -rf "$WTDIR" "$RECDIR"' EXIT
+export WTDIR COVGATE_WORKERS
+
 seq 1 "$_covgate_n" | xargs -P "$COVGATE_WORKERS" -I{} bash -c '
     idx="$1"
     f="$(sed -n "${idx}p" "$RECDIR/files")"
     rec="$RECDIR/$idx"
     rc=0
-    out="$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1)" || rc=$?
+    wt="$WTDIR/$(( (idx - 1) % COVGATE_WORKERS + 1 ))"
+    out="$(cd "$wt" && SUTANDO_TEST_SUBPROCESS_COVERAGE=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1)" || rc=$?
     printf "%s" "$out" > "$rec.out"
     printf "%s\n" "$rc" > "$rec.rc"
 ' _ {}
