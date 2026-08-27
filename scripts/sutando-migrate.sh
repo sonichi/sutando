@@ -1013,9 +1013,33 @@ any_source_sentinel() {
 }
 
 # Atomic per-file copy preserving mtime. Returns 0 on success.
+# Mirror source directory modes onto the destination chain. `cp -p` carries a
+# FILE's mode; parents created by `mkdir -p` would otherwise take umask, so a
+# 0700 source dir lands 0755 and exposes its contents to other local accounts.
+# Never widens: the dest dir takes the INTERSECTION, the same non-widening rule
+# the union-json path already applies to files.
+mirror_dir_modes() {
+    local s d
+    s="$(dirname "$1")"; d="$(dirname "$2")"
+    local -a sd=() dd=()
+    while [ "$s" != "/" ] && [ "$d" != "/" ] && [ "$(basename "$s")" = "$(basename "$d")" ]; do
+        sd+=("$s"); dd+=("$d")
+        s="$(dirname "$s")"; d="$(dirname "$d")"
+    done
+    local i sm dm
+    for (( i=${#sd[@]}-1; i>=0; i-- )); do
+        [ -d "${sd[$i]}" ] && [ -d "${dd[$i]}" ] || continue
+        sm="$(mode_of "${sd[$i]}")"; dm="$(mode_of "${dd[$i]}")"
+        [ -n "$sm" ] && [ -n "$dm" ] || continue
+        [ "$sm" = "$dm" ] && continue
+        chmod "$(printf '%o' $(( 0$sm & 0$dm )))" "${dd[$i]}" 2>/dev/null || true
+    done
+}
+
 copy_preserving_mtime() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"
+    mirror_dir_modes "$src" "$dst"
     # Atomic: cp -p to sibling tmp then mv. -p preserves mtime + mode.
     local tmp="$dst.tmp.$$"
     cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"

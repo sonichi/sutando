@@ -233,5 +233,23 @@ check "  ...and the sentinel is actually reported" \
       "$(printf '%s\n' "$_out" | grep -c 'prior partial migration sentinels')" "1"
 rm -rf "$_e2e"
 
+# --- control 7: newly migrated directories keep their SOURCE mode ---
+# `cp -p` carries a file's mode; parents from `mkdir -p` take umask, so a 0700
+# source dir landed 0755 and exposed protected personal/relay notes to other
+# local accounts. Drives the real commit path end to end.
+_dm_probe() {  # $1=src hosts mode  $2=pre-existing dest mode ("" = none) -> "hosts:Test-Host:file"
+  local S D; S="$(mktemp -d)"; D="$(mktemp -d)"
+  mkdir -p "$S/hosts/Test-Host"; printf 'x\n' > "$S/hosts/Test-Host/PERSONAL_CLAUDE.md"
+  chmod 0644 "$S/hosts/Test-Host/PERSONAL_CLAUDE.md"
+  chmod "$1" "$S/hosts" "$S/hosts/Test-Host"
+  if [ -n "$2" ]; then mkdir -p "$D/hosts/Test-Host"; chmod "$2" "$D/hosts" "$D/hosts/Test-Host"; fi
+  env SUTANDO_WORKSPACE="$S" SUTANDO_MIGRATE_DEST="$D" bash scripts/sutando-migrate.sh commit --source C >/dev/null 2>&1
+  printf '%s:%s:%s' "$(mode_of "$D/hosts")" "$(mode_of "$D/hosts/Test-Host")" "$(mode_of "$D/hosts/Test-Host/PERSONAL_CLAUDE.md")"
+  rm -rf "$S" "$D"
+}
+check "a 0700 source dir does NOT land world-readable"        "$(_dm_probe 0700 '')"     "700:700:644"
+check "non-widening: a 0755 source never opens a 0700 dest"   "$(_dm_probe 0755 0700)"   "700:700:644"
+check "control: an ordinary 0755 source stays 0755"           "$(_dm_probe 0755 '')"     "755:755:644"
+
 if [ "$fails" -gt 0 ]; then echo "$fails FAILURE(S)"; exit 1; fi
 echo "ALL PASS"
