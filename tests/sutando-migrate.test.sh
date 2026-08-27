@@ -217,7 +217,9 @@ REAL_T="$(dirname "$(mktemp -u)")"
 PRE_VERDICTS="$(ls "$REAL_T" 2>/dev/null | grep -c "sutando-migrate-verdicts" || true)"
 TMPDIR="$ISO_TMP" RUN_MIGRATE scan --source A,B,C --json > /dev/null 2>&1
 TMPDIR="$ISO_TMP" RUN_MIGRATE scan --source A,B,C > /dev/null 2>&1
-LEFTOVER="$(ls -A "$ISO_TMP")"
+# Scope to the tempfiles THIS script creates. Any-file-is-a-leak is wrong on a
+# Command-Line-Tools host, where Apple's xcrun caches `xcrun_db` into $TMPDIR.
+LEFTOVER="$(ls -A "$ISO_TMP" 2>/dev/null | grep '^sutando-migrate-verdicts' || true)"
 POST_VERDICTS="$(ls "$REAL_T" 2>/dev/null | grep -c "sutando-migrate-verdicts" || true)"
 if [ -n "$LEFTOVER" ]; then
     echo "  FAIL: scan left files in isolated TMPDIR: $LEFTOVER"
@@ -228,6 +230,29 @@ elif [ "$POST_VERDICTS" != "$PRE_VERDICTS" ]; then
 else
     echo "  OK: no scan residue (isolated TMPDIR empty; verdict count stable $PRE_VERDICTS)"
 fi
+
+# Controls for the narrowed probe: it must still SEE a real leak, and must NOT
+# fire on foreign tooling residue. Without the first, narrowing could have made
+# the assertion unable to fail at all.
+_ctl="$TMP/leak-ctl"; mkdir -p "$_ctl"
+: > "$_ctl/sutando-migrate-verdicts.abc123"
+_pos="$(ls -A "$_ctl" 2>/dev/null | grep '^sutando-migrate-verdicts' || true)"
+if [ -n "$_pos" ]; then
+    echo "  OK: control — the narrowed probe still CATCHES a real verdict tempfile"
+else
+    echo "  FAIL: control — narrowed probe cannot see a real leak; it can no longer fail"
+    fail_stub=1
+fi
+rm -f "$_ctl/sutando-migrate-verdicts.abc123"
+: > "$_ctl/xcrun_db"
+_neg="$(ls -A "$_ctl" 2>/dev/null | grep '^sutando-migrate-verdicts' || true)"
+if [ -z "$_neg" ]; then
+    echo "  OK: control — foreign tooling residue (xcrun_db) is correctly ignored"
+else
+    echo "  FAIL: control — probe fired on foreign residue: $_neg"
+    fail_stub=1
+fi
+rm -rf "$_ctl"
 
 echo
 echo "==== TEST: python-binary.sh owns require_python (no shadow) ===="
