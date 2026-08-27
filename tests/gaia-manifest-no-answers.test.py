@@ -167,6 +167,62 @@ def check_builder_paths() -> None:
           "main() writes the built suite to --out")
 
 
+def check_load_validation_reads() -> None:
+    """load_validation's own body: CI has no GAIA copy and every other test
+    stubs this function, so the pyarrow import and the read stayed unexecuted."""
+    import importlib.util as iu
+    import tempfile
+    import types
+    spec = iu.spec_from_file_location("bg3", ROOT / "scripts" / "build-gaia-suite.py")
+    bg = iu.module_from_spec(spec)
+    spec.loader.exec_module(bg)
+
+    root = pathlib.Path(tempfile.mkdtemp())
+    meta = root / "2023" / "validation" / "metadata.parquet"
+    meta.parent.mkdir(parents=True)
+    meta.write_bytes(b"")  # presence is all load_validation checks before reading
+
+    want = [{"task_id": "cccccccc-3333", "Level": 1}]
+    seen = {}
+
+    class _Table:
+        def to_pylist(self):
+            return want
+
+    fake_pq = types.ModuleType("pyarrow.parquet")
+    def _read_table(path):
+        seen["path"] = path
+        return _Table()
+    fake_pq.read_table = _read_table
+    fake_root = types.ModuleType("pyarrow")
+    fake_root.parquet = fake_pq
+
+    saved = {k: sys.modules.get(k) for k in ("pyarrow", "pyarrow.parquet")}
+    try:
+        sys.modules["pyarrow"] = fake_root
+        sys.modules["pyarrow.parquet"] = fake_pq
+        got = bg.load_validation(root)
+        # Assert the ARGUMENT, not just that a call happened: a stub whose
+        # return ignores its input would prove the call and not the content.
+        check(seen.get("path") == meta, "load_validation reads the metadata.parquet it resolved")
+        check(got == want, "load_validation returns the parquet rows verbatim")
+
+        # A None entry makes `import pyarrow.parquet` raise ImportError.
+        sys.modules["pyarrow.parquet"] = None
+        refused = False
+        try:
+            bg.load_validation(root)
+        except SystemExit as exc:
+            refused = "pyarrow" in str(exc)
+        check(refused, "a missing pyarrow is refused with an install hint, not a traceback")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
 def main() -> int:
     m = json.loads(MANIFEST.read_text())
 
@@ -199,6 +255,7 @@ def main() -> int:
     check_collision_guard()
     check_excluded_subtree_pinned()
     check_builder_paths()
+    check_load_validation_reads()
 
     print(f"\n{'ALL PASS' if not failures else 'FAILED: ' + '; '.join(failures)}"
           f" ({ran - len(failures)}/{ran})")
