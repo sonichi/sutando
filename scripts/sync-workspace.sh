@@ -253,6 +253,11 @@ LOG="${SYNC_WORKSPACE_LOG:-${TMPDIR:-/tmp}/sync-workspace.log}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
+# A refusal the OPERATOR must act on: durable in the log AND visible on stderr.
+# log() alone writes only to $LOG and the caller returns success, so a refusal
+# that stops backups indefinitely is indistinguishable from a clean sync.
+warn_operator() { log "$1"; color_warn "$1"; }
+
 color_warn() {
     if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
         printf '\033[1;31m%s\033[0m\n' "$1" >&2
@@ -875,13 +880,13 @@ _snapshot_per_host_config() {
                     fi
                 else
                     rm -f "$_tmp" 2>/dev/null || true
-                    log "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
+                    warn_operator "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
                 fi
             else
                 [ -n "$_tmp" ] && rm -f "$_tmp" 2>/dev/null || true
             fi
         elif ! cmp -s "$_src" "$_dst" 2>/dev/null; then
-            log "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
+            warn_operator "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
         fi
     fi
     return 0

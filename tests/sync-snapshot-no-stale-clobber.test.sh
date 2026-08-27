@@ -20,7 +20,21 @@ chmod +x "$SCRIPT_PARENT/scripts/sutando-config.sh"
 _host() { echo testhost; }
 eval "$(sed -n '/^_snapshot_per_host_config() {/,/^}$/p' "$REPO/scripts/sync-workspace.sh")"
 
-log() { echo "log: $*"; }
+# Load the REAL logging trio, do not substitute it. A test that replaces log()
+# with echo asserts on its own substitute: production log() writes only to
+# $LOG and emits nothing, so a `| grep` over the function's stdout passes in
+# the test and proves nothing about what an operator sees.
+LOG="$SB/sync-workspace.log"; : > "$LOG"
+eval "$(sed -n '/^log() {/,/^}$/p'           "$REPO/scripts/sync-workspace.sh")"
+eval "$(sed -n '/^warn_operator() {/,/^}$/p' "$REPO/scripts/sync-workspace.sh")"
+eval "$(sed -n '/^color_warn() {/,/^}$/p'    "$REPO/scripts/sync-workspace.sh")"
+
+# Control: the real log() must be SILENT on stdout+stderr, or every "loud"
+# assertion below is satisfied by the logger rather than by the refusal.
+check "the real log() is silent on stdout/stderr (control)" \
+      '[ -z "$(log "control probe" 2>&1)" ]'
+check "...and is durable in \$LOG (so the control is not silence-by-breakage)" \
+      'grep -q "control probe" "$LOG"'
 
 echo "1. reviewer's control: per-host written independently, stale root TOUCHED LATER"
 echo "stale relic" > "$WORKSPACE_DIR/build_log.md"
@@ -30,8 +44,10 @@ touch "$WORKSPACE_DIR/build_log.md"   # root now strictly NEWER than the live pe
 _snapshot_per_host_config
 check "independent per-host writer survives a later-touched root" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "per-host live entry" ]'
-check "the refusal is loud, not silent" \
-      '_snapshot_per_host_config | grep -q "independent writer"'
+check "the refusal reaches the OPERATOR on stderr, not just the log" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "independent writer"'
+check "and it is still recorded durably in \$LOG" \
+      'grep -q "independent writer" "$LOG"'
 
 echo "2. reverse ordering: per-host newer than root — still refused, still loud"
 touch "$WORKSPACE_DIR/hosts/testhost/build_log.md"
@@ -136,8 +152,14 @@ _out9="$(_snapshot_per_host_config 2>&1)"
 unset -f mv
 check "no orphan temp is left behind for the vault to carry" \
       '[ -z "$(ls "$WORKSPACE_DIR/hosts/testhost"/build_log.md.snap.* 2>/dev/null)" ]'
-check "the failed replace is logged, not swallowed" \
-      'printf %s "$_out9" | grep -qi "replace"'
+# Log-only BY DESIGN: the temp was removed and nothing was lost, so this is a
+# diagnostic rather than an operator action. It is asserted against $LOG for
+# exactly that reason — grepping the function's stdout passed before only
+# because the test had replaced log() with echo.
+check "the failed replace is recorded in \$LOG, not swallowed" \
+      'grep -qi "atomic replace of" "$LOG"'
+check "and it stays OUT of the operator stream (not every failure is an action)" \
+      '[ -z "$(printf %s "$_out9")" ]'
 check "provenance is not stamped for a swap that did not happen" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")" = "$_sig_before" ]'
 
