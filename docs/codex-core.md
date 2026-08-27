@@ -12,6 +12,10 @@ this gitignored per-clone override:
 
 Save it as `sutando.config.local.json`, then run:
 
+> `--restart` is refused from inside the sutando-core session (it would terminate the
+> agent running it). Run it from a terminal outside the core, or have the owner type
+> `restart core` in chat.
+
 ```bash
 codex login status
 bash src/agent/start-cli.sh --restart
