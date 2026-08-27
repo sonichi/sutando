@@ -126,11 +126,7 @@ seq 1 "$_covgate_n" | xargs -P "$COVGATE_WORKERS" -I{} bash -c '
     f="$(sed -n "${idx}p" "$RECDIR/files")"
     rec="$RECDIR/$idx"
     rc=0
-    # Per-worker workspace: concurrent suites otherwise share the resolved tree
-    # and race on it. SUTANDO_TEST_MODE is the resolver test hatch.
-    ws="$(mktemp -d)"
-    out="$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$ws" $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1)" || rc=$?
-    rm -rf "$ws"
+    out="$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1)" || rc=$?
     printf "%s" "$out" > "$rec.out"
     printf "%s\n" "$rc" > "$rec.rc"
 ' _ {}

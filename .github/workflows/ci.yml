@@ -286,11 +286,7 @@ jobs:
             idx="$1"
             f="$(sed -n "${idx}p" "$RECDIR/files")"
             rec="$RECDIR/$idx"
-            # Per-worker workspace: concurrent suites otherwise share the resolved
-            # tree and race on it. SUTANDO_TEST_MODE is the resolver test hatch.
-            ws="$(mktemp -d)"
-            out="$(SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$ws" timeout -k 5 120 python3 "$f" 2>&1)" && rc=0 || rc=$?
-            rm -rf "$ws"
+            out="$(timeout -k 5 120 python3 "$f" 2>&1)" && rc=0 || rc=$?
             printf "%s" "$out" > "$rec.out"
             printf "%s\n" "$rc" > "$rec.rc"
           ' _ {}
