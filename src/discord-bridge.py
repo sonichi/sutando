@@ -199,6 +199,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    pending_task_collab.pop(task_id, None)
     await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
     archive_file(result_file, "results", task_id)
     # Archive the SOURCE TASK too. Without this the task file sits in tasks/
@@ -4753,6 +4754,7 @@ async def poll_results():
                 # "unknown" — never "owner" — so a lost/absent tier can't
                 # silently upgrade a non-owner reply in tier accounting.
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
+                pending_task_collab.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -5230,6 +5232,7 @@ async def poll_progress():
                                 continue
                     _progress_msgs.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
+                    pending_task_collab.pop(task_id, None)
         except Exception as e:
             print(f"  [progress] poll_progress tick error: {e}", flush=True)
         await asyncio.sleep(3)
