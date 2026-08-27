@@ -445,6 +445,31 @@ class DashboardAdapter(unittest.TestCase):
         finally:
             dashboard.quota_projection.chart_payload = real
 
+    def test_a_huge_finite_utilization_cannot_sink_the_page(self):
+        # 8th-round control: v=1e308 is finite and nonnegative; v*100 is inf
+        # and int(inf) raised through render_dashboard, taking the whole page.
+        import tempfile as tf
+        import json as js
+        import dashboard
+        tmp = Path(tf.mkdtemp()); (tmp / "state").mkdir()
+        from datetime import datetime, timezone
+        lc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        (tmp / "state" / "quota-state.json").write_text(js.dumps({
+            "available": True, "last_checked": lc,
+            "headers": {
+                "anthropic-ratelimit-unified-5h-utilization": "1e308",
+                "anthropic-ratelimit-unified-5h-reset": "1900000000",
+                "anthropic-ratelimit-unified-7d-utilization": "0.55",
+                "anthropic-ratelimit-unified-7d-reset": "1900000000"}}))
+        old_ws = dashboard.WORKSPACE_DIR
+        dashboard.WORKSPACE_DIR = tmp
+        try:
+            html = dashboard.render_dashboard()  # the ACTIVATED path, unguarded before
+        finally:
+            dashboard.WORKSPACE_DIR = old_ws
+        self.assertIn("999%+", html)
+        self.assertIn("55%", html)
+
     def test_a_bad_5h_reset_never_sinks_the_valid_7d_panel(self):
         # 7th-round control: bad 5h reset + valid 7d degraded the whole panel
         # to {"available": True}; now only the bad window goes unknown.

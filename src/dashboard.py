@@ -260,7 +260,12 @@ def _quota_tile_pct(quota: dict, window: str) -> str:
         return "—"
     if not _math.isfinite(v) or v < 0:
         return "—"
-    return f"{int(v * 100)}%"
+    pct = v * 100.0
+    # The module leaves utilization unbounded; THIS consumer's clamp is the
+    # triple-digit cap, so a huge finite value can never overflow int().
+    if pct > 999:
+        return "999%+"
+    return f"{int(pct)}%"
 
 
 def _quota_age_label(quota: dict) -> str:
