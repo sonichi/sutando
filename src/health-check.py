@@ -10172,10 +10172,8 @@ def notify_gateway_for_failures(
 # no work is lost. 1M therefore stays the DEFAULT — we never disable it.
 #
 # Heavily guarded, because auto-restarting a 24/7 agent is consequential:
-#   - Fires on either (a) a CONFIRMED, SUSTAINED wedge: core process alive AND
-#     the oldest queued task older than RECOVER_WEDGE_SEC AND the core didn't
-#     just boot; or (b) a DEAD core: no fresh heartbeat AND not just-booted.
-#     Both observed on two passes ≥ RECOVER_CONFIRM_SEC apart. Never a blip.
+#   - Fires on a CONFIRMED wedge (alive + oldest task > RECOVER_WEDGE_SEC + not
+#     just-booted) or a DEAD core, each seen twice ≥ RECOVER_CONFIRM_SEC apart.
 #   - Identity + progress gating (so a legitimately long-running single task is
 #     not killed mid-work): the SAME oldest task must persist across the window
 #     (a draining queue surfaces a different oldest each pass → resets) AND
