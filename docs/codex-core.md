@@ -12,9 +12,12 @@ this gitignored per-clone override:
 
 Save it as `sutando.config.local.json`, then run:
 
-> `--restart` is refused from inside the sutando-core session (it would terminate the
-> agent running it). Run it from a terminal outside the core, or have the owner type
-> `restart core` in chat.
+> **Never run `--restart` from inside the sutando-core session** — it kills the canonical
+> session, which is the agent running the command. Run it from a terminal outside the core,
+> or have the owner type `restart core` in chat. This is a rule to keep, not a guard that
+> keeps it: the Codex launcher exports `SUTANDO_CORE_SESSION=1` unconditionally
+> (`src/agent/codex/cli/start-cli.sh:39`) and its `--restart` branch (`:242-244`) does no
+> inherited-marker check, so the call is not refused on this path.
 
 ```bash
 codex login status
