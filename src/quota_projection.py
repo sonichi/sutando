@@ -32,89 +32,142 @@ def _observation_ts(state: dict) -> float | None:
     A dashboard read proves nothing about when quota was measured; only the
     credential proxy's own stamp does. No stamp -> no recordable observation.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
     raw = state.get("last_checked")
     if not raw:
         return None
     try:
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+    return ts if math.isfinite(ts) else None
+
+
+_WINDOW_KEYS = {"5h": ("u5", "r5"), "7d": ("u7", "r7")}
+_HDR = "anthropic-ratelimit-unified-{w}-{f}"
+
+
+def _finite(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _sample_from_state(state: dict) -> dict | None:
-    """Extract one history sample from a quota-state dict; None if unusable."""
+    """One history sample; each window parsed INDEPENDENTLY.
+
+    The proxy may write any non-empty header subset, so a valid 5h-only or
+    7d-only observation persists its window rather than vanishing. Non-finite
+    values invalidate only their own window. No valid window -> no sample.
+    """
     headers = state.get("headers") or {}
     ts = _observation_ts(state)
     if ts is None:
         return None
-    try:
-        return {
-            "ts": ts,
-            "u5": float(headers["anthropic-ratelimit-unified-5h-utilization"]),
-            "r5": int(headers["anthropic-ratelimit-unified-5h-reset"]),
-            "u7": float(headers["anthropic-ratelimit-unified-7d-utilization"]),
-            "r7": int(headers["anthropic-ratelimit-unified-7d-reset"]),
-        }
-    except (KeyError, TypeError, ValueError):
+    sample: dict = {"ts": ts}
+    for w, (uk, rk) in _WINDOW_KEYS.items():
+        u = _finite(headers.get(_HDR.format(w=w, f="utilization")))
+        r = _finite(headers.get(_HDR.format(w=w, f="reset")))
+        if u is None or r is None:
+            continue
+        if not (r - WINDOW_SPANS[w] <= ts <= r):
+            continue  # an observation outside its own window is inconsistent
+        sample[uk], sample[rk] = u, int(r)
+    if len(sample) == 1:
         return None
+    return sample
 
 
-def _read_history(history_path: Path) -> list[dict]:
+def _valid_row(rec: dict) -> dict | None:
+    """Canonical form of one stored row, or None if unusable.
+
+    A row needs a finite ts and at least one internally consistent window
+    (finite utilization, finite reset, ts inside [reset-span, reset]); an
+    inconsistent window is stripped rather than sinking the row.
+    """
+    if not isinstance(rec, dict):
+        return None
+    ts = _finite(rec.get("ts"))
+    if ts is None:
+        return None
+    out = {"ts": ts}
+    for w, (uk, rk) in _WINDOW_KEYS.items():
+        u, r = _finite(rec.get(uk)), _finite(rec.get(rk))
+        if u is None or r is None:
+            continue
+        if not (r - WINDOW_SPANS[w] <= ts <= r):
+            continue
+        out[uk], out[rk] = u, int(r)
+    return out if len(out) > 1 else None
+
+
+def _canonical_history(history_path: Path) -> tuple[list[dict], bool]:
+    """Validated rows in strictly increasing ts, plus a physical-dirty flag.
+
+    dirty=True whenever the file holds anything the canonical view dropped —
+    unparseable lines, invalid rows, stripped windows, or order violations —
+    so the writer knows a compaction rewrite is owed.
+    """
     try:
         lines = history_path.read_text().splitlines()
     except OSError:
-        return []
-    out = []
+        return [], False
+    rows: list[dict] = []
+    dirty = False
     for line in lines:
         try:
             rec = json.loads(line)
         except ValueError:
-            continue  # a torn tail line must not poison the series
-        if isinstance(rec, dict) and "ts" in rec:
-            out.append(rec)
-    return out
+            dirty = True
+            continue
+        row = _valid_row(rec)
+        if row is None:
+            dirty = True
+            continue
+        if isinstance(rec, dict) and set(rec) != set(row):
+            dirty = True  # a window was stripped
+        if rows and row["ts"] <= rows[-1]["ts"]:
+            dirty = True  # out-of-order physical line never joins the canon
+            continue
+        rows.append(row)
+    return rows, dirty
+
+
+def _read_history(history_path: Path) -> list[dict]:
+    """Chart-facing view: the canonical rows only."""
+    return _canonical_history(history_path)[0]
 
 
 def record_sample(state: dict, history_path: Path, now: float | None = None) -> bool:
     """Append one sample if it says something new; True when appended.
 
-    Dedup is value-based (same utilizations and resets as the last line), so
-    a dashboard polling every 15s does not grow the file while quota stands
-    still. The cap rewrite goes through a temp file + os.replace so a reader
-    never sees a truncated file.
+    Everything is judged against the CANONICAL history: malformed lines,
+    invalid rows, stripped windows and order violations are compacted away
+    under the lock the moment any write decision is made. Wire JSON is
+    strict (allow_nan=False) end to end.
     """
     sample = _sample_from_state(state)
     if sample is None:
         return False
+
     def _rewrite(rows):
         fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
         with os.fdopen(fd, "w") as f:
-            f.write("".join(json.dumps(r) + "\n" for r in rows))
+            f.write("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
         os.replace(tmp, history_path)
 
     def _same(rec):
-        return all(rec.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7"))
-
-    def _valid_ts(rec):
-        try:
-            v = float(rec.get("ts"))
-        except (TypeError, ValueError):
-            return None
-        return v if math.isfinite(v) else None
+        keys = [k for pair in _WINDOW_KEYS.values() for k in pair]
+        return all(rec.get(k) == sample.get(k) for k in keys)
 
     with _LOCK:
-        history = _read_history(history_path)
-        # Drop malformed trailing rows FIRST: ordering is judged against the
-        # last VALID committed observation, never a corrupt or infinite ts.
-        dirty = False
-        while history and _valid_ts(history[-1]) is None:
-            history.pop()
-            dirty = True
+        history, dirty = _canonical_history(history_path)
         if history:
             last = history[-1]
-            if float(sample["ts"]) <= _valid_ts(last):
-                # A delayed or re-read snapshot no newer than the committed
+            if float(sample["ts"]) <= float(last["ts"]):
+                # A delayed or re-read snapshot no newer than the canonical
                 # tail never lands: ordering is canonical by producer time.
                 if dirty:
                     _rewrite(history)
@@ -130,10 +183,7 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
             _rewrite(history)
         if len(history) + 1 > MAX_LINES:
             keep = history[-(MAX_LINES - 1):] + [sample]
-            fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
-            with os.fdopen(fd, "w") as f:
-                f.write("".join(json.dumps(r) + "\n" for r in keep))
-            os.replace(tmp, history_path)
+            _rewrite(keep)
             return True
         # A crash can leave a newline-less torn tail; appending onto it would
         # concatenate and lose this acknowledged sample on the next read.
@@ -146,7 +196,7 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
         with history_path.open("a") as f:
             if needs_nl:
                 f.write("\n")
-            f.write(json.dumps(sample) + "\n")
+            f.write(json.dumps(sample, allow_nan=False) + "\n")
         return True
 
 

@@ -905,7 +905,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(payload).encode())
+            # Strict wire JSON: a bare NaN would fail the browser's parse.
+            self.wfile.write(json.dumps(payload, allow_nan=False).encode())
         elif urlparse(self.path).path == "/json":
             data = {
                 "score": get_score(),

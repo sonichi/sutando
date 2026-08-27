@@ -20,16 +20,26 @@ SPAN5 = qp.WINDOW_SPANS["5h"]
 SPAN7 = qp.WINDOW_SPANS["7d"]
 
 
-def state(u5="0.25", r5=1000000, u7="0.55", r7=2000000, obs=999000.0):
-    """A quota-state dict whose `last_checked` IS the observation time (obs)."""
+def state(u5="0.25", r5=None, u7="0.55", r7=None, obs=999000.0):
+    """A quota-state dict whose `last_checked` IS the observation time (obs).
+
+    Resets default to mid-window relative to obs — the validator refuses an
+    observation outside its own window, so fixtures stay self-consistent.
+    """
     from datetime import datetime, timezone
     lc = datetime.fromtimestamp(obs, timezone.utc).isoformat().replace("+00:00", "Z")
-    return {"last_checked": lc, "headers": {
-        "anthropic-ratelimit-unified-5h-utilization": u5,
-        "anthropic-ratelimit-unified-5h-reset": str(r5),
-        "anthropic-ratelimit-unified-7d-utilization": u7,
-        "anthropic-ratelimit-unified-7d-reset": str(r7),
-    }}
+    if r5 is None:
+        r5 = int(obs + 9000)
+    if r7 is None:
+        r7 = int(obs + 300000)
+    h = {}
+    if u5 is not None:
+        h["anthropic-ratelimit-unified-5h-utilization"] = u5
+        h["anthropic-ratelimit-unified-5h-reset"] = str(r5)
+    if u7 is not None:
+        h["anthropic-ratelimit-unified-7d-utilization"] = u7
+        h["anthropic-ratelimit-unified-7d-reset"] = str(r7)
+    return {"last_checked": lc, "headers": h}
 
 
 class RecordSample(unittest.TestCase):
@@ -43,8 +53,8 @@ class RecordSample(unittest.TestCase):
     def test_appends_a_parsed_sample(self):
         self.assertTrue(qp.record_sample(state(), self.path, now=999000.0))
         rec = json.loads(self.path.read_text().splitlines()[0])
-        self.assertEqual(rec, {"ts": 999000.0, "u5": 0.25, "r5": 1000000,
-                               "u7": 0.55, "r7": 2000000})
+        self.assertEqual(rec, {"ts": 999000.0, "u5": 0.25, "r5": 1008000,
+                               "u7": 0.55, "r7": 1299000})
 
     def test_identical_values_do_not_grow_the_file(self):
         qp.record_sample(state(), self.path, now=1.0)
@@ -102,32 +112,72 @@ class RecordSample(unittest.TestCase):
         # 4th-round control: [ts=2000, ts="bad"] + matching obs at 1500 —
         # drop the corrupt row, reject 1500 against the valid 2000.
         import json as js
+        R = 1000000
         rows = [
-            {"ts": 2000.0, "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000},
-            {"ts": "bad", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000},
+            {"ts": 995000.0, "u5": 0.25, "r5": R, "u7": 0.55, "r7": R},
+            {"ts": "bad", "u5": 0.25, "r5": R, "u7": 0.55, "r7": R},
         ]
         self.path.write_text("".join(js.dumps(r) + "\n" for r in rows))
-        self.assertFalse(qp.record_sample(state(obs=1500.0), self.path))
-        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [2000.0])
+        self.assertFalse(qp.record_sample(state(obs=990000.0, r5=R, r7=R), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [995000.0])
         # a later CHANGED sample behind the valid tail is also refused
-        self.assertFalse(qp.record_sample(state(u5="0.30", obs=1700.0), self.path))
-        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [2000.0])
+        self.assertFalse(qp.record_sample(state(u5="0.30", obs=993000.0, r5=R, r7=R), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [995000.0])
         # and one genuinely newer lands normally
-        self.assertTrue(qp.record_sample(state(u5="0.30", obs=2100.0), self.path))
+        self.assertTrue(qp.record_sample(state(u5="0.30", obs=998000.0, r5=R, r7=R), self.path))
 
     def test_an_infinite_trailing_timestamp_cannot_poison_the_future(self):
         import json as js
         self.path.write_text(js.dumps(
-            {"ts": "Infinity", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000}) + "\n")
+            {"ts": "Infinity", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 1000000}) + "\n")
         self.assertTrue(qp.record_sample(state(obs=3000.0), self.path))
         self.assertEqual([r["ts"] for r in qp._read_history(self.path)], [3000.0])
+
+    def test_an_absurd_finite_timestamp_cannot_freeze_the_writer(self):
+        # 5th-round control: ts=1e100 is finite but outside every window it
+        # claims — it is an invalid row, never a canonical tail.
+        import json as js
+        self.path.write_text(js.dumps(
+            {"ts": 1e100, "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 1000000}) + "\n")
+        self.assertTrue(qp.record_sample(state(obs=1700000000.0), self.path))
+        self.assertTrue(qp.record_sample(state(u5="0.30", obs=1700000600.0), self.path))
+        self.assertEqual([r["ts"] for r in qp._read_history(self.path)],
+                         [1700000000.0, 1700000600.0])
+
+    def test_fully_nonfinite_utilization_records_nothing(self):
+        # Qingyun's control: NaN/Inf utilization in every window -> False,
+        # nothing written, and the file never grows on re-poll.
+        for bad in ("NaN", "Infinity", "-Infinity"):
+            self.assertFalse(qp.record_sample(
+                state(u5=bad, u7=bad, obs=1000.0), self.path))
+        self.assertFalse(self.path.exists())
+
+    def test_a_poisoned_window_does_not_sink_the_valid_one(self):
+        # Per-window persistence (5th round): NaN in 5h leaves a valid 7d-only
+        # row; the stored JSON is strict (no bare NaN anywhere).
+        self.assertTrue(qp.record_sample(
+            state(u5="NaN", u7="0.55", obs=2000.0), self.path))
+        raw = self.path.read_text()
+        self.assertNotIn("NaN", raw)
+        rec = qp._read_history(self.path)[0]
+        self.assertNotIn("u5", rec)
+        self.assertEqual(rec["u7"], 0.55)
+
+    def test_a_single_window_observation_persists_its_window(self):
+        # The proxy may write any non-empty header subset; a 5h-only
+        # observation must not vanish.
+        self.assertTrue(qp.record_sample(
+            state(u5="0.25", u7=None, obs=3000.0), self.path))
+        rec = qp._read_history(self.path)[0]
+        self.assertEqual(rec["u5"], 0.25)
+        self.assertNotIn("u7", rec)
 
     def test_a_corrupt_final_timestamp_is_repaired_not_fatal(self):
         # Reviewer control (#3464, 2nd round): a final row with ts="bad" and
         # matching values must never raise out of the sampler; it is repaired.
         import json as js
         self.path.write_text(js.dumps(
-            {"ts": "bad", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000}) + "\n")
+            {"ts": "bad", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 1000000}) + "\n")
         self.assertTrue(qp.record_sample(state(obs=5000.0), self.path))
         recs = qp._read_history(self.path)
         self.assertEqual(len(recs), 1)
@@ -320,6 +370,35 @@ class DashboardAdapter(unittest.TestCase):
             httpd.shutdown()
             self.assertEqual(r.status, 200)
             self.assertEqual(len(body["windows"]["5h"]["segments"]), 1)
+        finally:
+            dashboard.WORKSPACE_DIR = old_ws
+
+    def test_a_poisoned_history_file_still_serves_strict_json(self):
+        # A hand-poisoned bare-NaN row must never reach the wire: the
+        # canonical reader drops it and the route stays parseable JSON.
+        import http.client
+        import http.server
+        import threading
+        import tempfile as tf
+        import json as js
+        import dashboard
+        tmp = Path(tf.mkdtemp()); (tmp / "state").mkdir()
+        (tmp / "state" / "quota-history.jsonl").write_text(
+            '{"ts": 999000.0, "u5": NaN, "r5": 1008000, "u7": 0.55, "r7": 1299000}\n'
+            + js.dumps({"ts": 999100.0, "u5": 0.3, "r5": 1008000, "u7": 0.55, "r7": 1299000}) + "\n")
+        old_ws = dashboard.WORKSPACE_DIR
+        dashboard.WORKSPACE_DIR = tmp
+        try:
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            c = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+            c.request("GET", "/api/quota-chart")
+            r = c.getresponse()
+            body = r.read().decode()
+            httpd.shutdown()
+            self.assertEqual(r.status, 200)
+            self.assertNotIn("NaN", body)
+            js.loads(body)  # strict parse must succeed
         finally:
             dashboard.WORKSPACE_DIR = old_ws
 
