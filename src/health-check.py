@@ -5986,9 +5986,8 @@ def check_daily_cron_punctuality() -> dict:
         arts = (_daily_completion_minutes(ws / "state", jname) if launchd
                 else _daily_artifact_minutes(ws / "results", stem))
         used_artifact_lane = not launchd
-        # Both fallbacks, so neither lane's absence is read as the job's silence.
-        # Without the launchd arm, a launchd job that publishes a dated artifact
-        # every day still reports "no dated artifact" forever.
+        # Both directions, so neither lane's absence reads as the job's silence:
+        # without the launchd arm a daily artifact reports "no dated artifact" forever.
         if not arts:
             arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
                     else _daily_completion_minutes(ws / "state", jname))

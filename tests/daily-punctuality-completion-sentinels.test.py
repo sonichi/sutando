@@ -161,9 +161,9 @@ check("missing state dir returns empty",
       hc._daily_completion_minutes(Path(tempfile.mkdtemp()) / "nope", "x") == [])
 
 # ── a launchd job that publishes a dated ARTIFACT but stamps no sentinel ─────
-# `launchd` says how a job is SCHEDULED; it does not determine what dated
-# evidence the job leaves. Without the fallback such a job reports "no dated
-# artifact" forever while writing one every single day.
+
+# `launchd` says how a job is SCHEDULED, not what dated evidence it leaves; without
+# the fallback such a job reports "no dated artifact" while writing one every day.
 def _launchd_artifact_ws(days=5, include_today=True, name="digest-job", stem="digest-job"):
     ws = Path(tempfile.mkdtemp(prefix="punct-la-"))
     (ws / "hosts" / "H").mkdir(parents=True)
