@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import pathlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,16 +19,19 @@ SCRIPT = (REPO / "skills" / "collaboration-intelligence" / "scripts"
           / "notify_reviewers.py")
 
 
+# One managed root for every fixture; NamedTemporaryFile(delete=False) leaked
+# one roster JSON per call, six per run, for the lifetime of the machine.
+_TMP = tempfile.TemporaryDirectory()
+
+
 def run(roster: "dict | None", *args):
     env = {**os.environ}
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    path = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name)) / "roster.json"
     if roster is not None:
-        json.dump(roster, tmp)
-        tmp.flush()
-        env["SUTANDO_SCI_ROSTER"] = tmp.name
+        path.write_text(json.dumps(roster))
+        env["SUTANDO_SCI_ROSTER"] = str(path)
     else:
-        env["SUTANDO_SCI_ROSTER"] = tmp.name + ".missing"
-    tmp.close()
+        env["SUTANDO_SCI_ROSTER"] = str(path) + ".missing"
     return subprocess.run([sys.executable, str(SCRIPT), *args],
                           capture_output=True, text=True, timeout=30, env=env)
 
@@ -75,6 +79,90 @@ class NotifyReviewers(unittest.TestCase):
         self.assertEqual(p.returncode, 4)          # refusal still visible
         self.assertIn("mention @sutando-rui:x", p.stdout)  # rui still planned
         self.assertIn("OFF-ALLOWLIST 'mini'", p.stderr)
+
+def run_send(stub_payload, roster=None, stub_stderr=""):
+    """Drive --send against a STUB room_ops. The script resolves room_ops as
+    parents[3] of its own path, so the copy must sit in a matching tree."""
+    root = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name))
+    (root / "skills" / "collaboration-intelligence" / "scripts").mkdir(parents=True)
+    (root / "skills" / "agent-room-ops").mkdir(parents=True)
+    copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
+    copy.write_text(SCRIPT.read_text())
+    (root / "skills/agent-room-ops/room_ops.py").write_text(
+        "import sys\n"
+        f"sys.stdout.write({stub_payload!r})\n"
+        f"sys.stderr.write({stub_stderr!r})\n"
+        "sys.exit(0)\n")          # rc 0 + empty stderr: the real refusal shape
+    rp = root / "roster.json"
+    rp.write_text(json.dumps(roster or GOOD))
+    env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
+    return subprocess.run([sys.executable, str(copy), "--send",
+                           "--reviewers", "rui", "--message", "m"],
+                          capture_output=True, text=True, timeout=30, env=env)
+
+
+class SilentRefusal(unittest.TestCase):
+    """room_ops reports refusals IN-BAND: rc 0, empty stderr, ok:false+reason.
+    Printing stderr alone renders every such refusal as a blank line."""
+
+    def test_in_band_reason_is_surfaced_not_swallowed(self):
+        p = run_send('{"ok": false, "members": [], "reason": "no gateway configured"}')
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no gateway configured", p.stderr)
+        self.assertNotIn("STDERR=\n", p.stderr)
+
+    def test_the_gateway_reason_is_surfaced_verbatim(self):
+        # Surfaced, not interpreted: the producer emits this whenever the base
+        # URL is empty and says nothing about why, so we must not name a cause.
+        p = run_send('{"ok": false, "reason": "no gateway configured"}')
+        self.assertIn("reason=no gateway configured", p.stderr)
+        self.assertNotIn("env is not loaded", p.stderr)
+
+    def test_a_reasonless_failure_still_says_something(self):
+        p = run_send('{"ok": false}')
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("no reason reported", p.stderr)
+
+    def test_a_real_stderr_survives_an_unusable_payload(self):
+        # The placeholder must not occupy `reason` — a caller debugging a crash
+        # needs the traceback, not our generic word for "did not parse".
+        p = run_send('boom', stub_stderr="ConnectionRefusedError: [Errno 61]")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("ConnectionRefusedError", p.stderr)
+
+    def test_unparseable_output_is_not_reported_as_success(self):
+        p = run_send('not json at all')
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("unparseable", p.stderr)
+
+    def test_non_object_payloads_do_not_crash_the_notifier(self):
+        # room_ops should never emit these; a notifier that dies on one reports
+        # nothing at all, which is the failure this PR exists to remove.
+        for payload in ('[]', '"hello"', 'null', '{"reason": 1}'):
+            with self.subTest(payload=payload):
+                p = run_send(payload)
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertIn("ok=False", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_a_non_string_event_id_does_not_crash_the_success_path(self):
+        # `event[:24]` slices, so a non-string id raises here and nowhere else —
+        # this is the coercion that is load-bearing now the hint is gone.
+        p = run_send('{"ok": true, "event_id": 12345}')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("12345", p.stdout)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_a_non_string_reason_is_still_reported(self):
+        p = run_send('{"ok": false, "reason": 1}')
+        self.assertIn("reason=1", p.stderr)
+        self.assertEqual(p.returncode, 1, p.stderr)
+
+    def test_success_still_reports_the_event_id(self):
+        p = run_send('{"ok": true, "event_id": "$abc123"}')
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("ok=True", p.stdout)
+        self.assertIn("$abc123", p.stdout)
 
 
 if __name__ == "__main__":
