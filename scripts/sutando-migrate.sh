@@ -421,8 +421,7 @@ scan_source() {
         REPORT_LINES+=("  prior partial migration sentinels:")
         while IFS= read -r s; do
             local sm
-            sm="$(stat -c '%y' "$s" 2>/dev/null | cut -d' ' -f1)"
-            [ -n "$sm" ] || sm="$(stat -f '%Sm' -t '%Y-%m-%d' "$s" 2>/dev/null)"
+            sm="$(mtime_date "$s")"
             REPORT_LINES+=("    $(basename "$s")  ($sm)")
         done <<<"$sentinels"
     fi
@@ -1201,6 +1200,15 @@ _stat() {
 # delegate here silently yields an empty mode and every identity check passes.
 mode_of() {
     _stat %a %Lp "$1"
+}
+
+# BSD needs -t for a formatted date and GNU needs a cut, so this cannot use
+# _stat's two-format shape; each probe is guarded so failure reaches the next.
+mtime_date() {
+    local d=""
+    d="$(stat -c %y "$1" 2>/dev/null | cut -d' ' -f1)" || d=""
+    [ -n "$d" ] || d="$(stat -f %Sm -t %Y-%m-%d "$1" 2>/dev/null)" || d=""
+    printf '%s' "$d"
 }
 
 # Identity is bytes AND mode, at every decision site: dropping a 0755 source
