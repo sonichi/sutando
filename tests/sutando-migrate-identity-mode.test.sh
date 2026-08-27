@@ -132,5 +132,59 @@ check "the pre-existing entry survives the union" \
 check "the destination was actually rewritten (control: not an untouched file)" \
   "$(grep -c 'a@example.org' "$DEST/$REL" | tr -d ' ')" "1"
 
+
+# --- control 5: byte_identical is a claim about BYTES, through the real JSON ---
+# Reviewer input: equal bytes, equal mtime, modes 0755 vs 0644 previously reported
+# byte_identical=False and proxy_identical_divergent=1 — no byte differed. Bytes
+# and mode are now two fields; every DECISION still uses both, so drop-safety is
+# unchanged and only the reporting was split.
+j5="$(mktemp -d -t migrate-json5.XXXXXX)"
+_scan_case() {  # $1=bytes_differ(0|1) $2=srcmode $3=dstmode -> prints compact json
+    local w="$j5/$RANDOM$RANDOM"; mkdir -p "$w/A/notes" "$w/dest/notes"
+    # SAME LENGTH as the destination on purpose: proxy_identical_divergent means
+    # equal size + equal mtime + PROVEN different bytes, so a shorter variant
+    # would be a size_mismatch instead and never exercise that counter.
+    if [ "$1" = "1" ]; then printf 'IDENTICAL BYTES\n' > "$w/A/notes/same.md"
+    else printf 'identical bytes\n' > "$w/A/notes/same.md"; fi
+    printf 'identical bytes\n' > "$w/dest/notes/same.md"
+    chmod "$2" "$w/A/notes/same.md"; chmod "$3" "$w/dest/notes/same.md"
+    touch -t 202606010000 "$w/A/notes/same.md" "$w/dest/notes/same.md"
+    SUTANDO_MIGRATE_SRC_A="$w/A" SUTANDO_MIGRATE_DEST="$w/dest" \
+        bash scripts/sutando-migrate.sh scan --json --source A 2>/dev/null \
+        | python3 -c 'import sys,json;d=sys.stdin.read();j=json.loads(d[d.index("{"):]);r={x["rel"]:x for x in j["notable_collisions"]}.get("notes/same.md",{});print("%s|%s|%s|%s"%(r.get("byte_identical"),r.get("mode_conflict"),j["totals"]["proxy_identical_divergent"],j["totals"]["identical_content"]))'
+}
+_m="$(_scan_case 0 0755 0644)"
+check "mode-only difference: byte_identical is True (no byte differs)" "$(echo "$_m" | cut -d'|' -f1)" "True"
+check "mode-only difference: mode_conflict is True" "$(echo "$_m" | cut -d'|' -f2)" "True"
+check "mode-only difference is NOT proven byte divergence" "$(echo "$_m" | cut -d'|' -f3)" "0"
+check "mode-only difference is NOT drop-safe (identical_content stays 0)" "$(echo "$_m" | cut -d'|' -f4)" "0"
+# Control: real byte divergence must still report as such, or the split above
+# could be satisfied by a scan that simply stopped detecting divergence.
+_d="$(_scan_case 1 0644 0644)"
+check "control: real byte divergence still reports byte_identical False" "$(echo "$_d" | cut -d'|' -f1)" "False"
+check "control: real byte divergence still counts as proven divergence" "$(echo "$_d" | cut -d'|' -f3)" "1"
+# Control: the only drop-safe shape still reads drop-safe.
+_i="$(_scan_case 0 0644 0644)"
+check "control: equal bytes AND equal modes remain drop-safe" "$(echo "$_i" | cut -d'|' -f4)" "1"
+# A mode-only difference must remain ACTIONABLE, not merely reported. Presence in
+# notable_collisions cannot show that — the cap admits ignorable rows too — but
+# ORDER can: actionable rows sort to the front. The names are chosen so that
+# alphabetical order is the OPPOSITE of the expected order, otherwise this check
+# would pass on the tie-break alone and prove nothing.
+w6="$j5/ordering"; mkdir -p "$w6/A/notes" "$w6/dest/notes"
+printf 'identical bytes\n' > "$w6/A/notes/aaa-drop-safe.md"
+printf 'identical bytes\n' > "$w6/dest/notes/aaa-drop-safe.md"
+chmod 0644 "$w6/A/notes/aaa-drop-safe.md" "$w6/dest/notes/aaa-drop-safe.md"
+printf 'identical bytes\n' > "$w6/A/notes/zzz-mode-only.md"
+printf 'identical bytes\n' > "$w6/dest/notes/zzz-mode-only.md"
+chmod 0755 "$w6/A/notes/zzz-mode-only.md"; chmod 0644 "$w6/dest/notes/zzz-mode-only.md"
+touch -t 202606010000 "$w6/A/notes"/*.md "$w6/dest/notes"/*.md
+_first="$(SUTANDO_MIGRATE_SRC_A="$w6/A" SUTANDO_MIGRATE_DEST="$w6/dest" \
+    bash scripts/sutando-migrate.sh scan --json --source A 2>/dev/null \
+    | python3 -c 'import sys,json;d=sys.stdin.read();j=json.loads(d[d.index("{"):]);print(j["notable_collisions"][0]["rel"])')"
+check "a mode-only difference still outranks a drop-safe row (stays ACTIONABLE)" \
+      "$_first" "notes/zzz-mode-only.md"
+rm -rf "$j5"
+
 if [ "$fails" -gt 0 ]; then echo "$fails FAILURE(S)"; exit 1; fi
 echo "ALL PASS"
