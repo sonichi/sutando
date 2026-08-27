@@ -22,7 +22,7 @@ ALLOWED_KEYS = {"schema", "name", "description", "source", "prompt_preamble",
 CASE_ID = re.compile(r"gaia-l[123]-[0-9a-f]{8}\Z")
 
 # Changing the preamble is a deliberate act: update this digest in the same commit.
-METADATA_SHA256 = "c13773d5b4bcbd3c8268e6dd3620d68ef36530698179a0cdbdf7d0c261d0290e"
+METADATA_SHA256 = "5453699cf57649e6091e3e36fde126b67e0c696a69ea3642bfbf7a3d547d2292"
 PREAMBLE_SHA256 = "609ad2dca3d13a6c652903c463f6f85d56540fbfbfe4a43f3441b146b85fc625"
 
 failures: list[str] = []
@@ -64,6 +64,85 @@ def check_collision_guard() -> None:
     check(refused, "colliding 8-char derived ids are refused, not silently displaced")
 
 
+def check_excluded_subtree_pinned() -> None:
+    """A nested key under `excluded` must move the digest. Naming fields to add
+    back is an enumeration; it missed exactly this (qingyun-wu, #3455)."""
+    import copy
+    m = json.loads(MANIFEST.read_text())
+
+    def digest(man):
+        meta = {k: v for k, v in man.items() if k != "case_ids"}
+        meta["excluded"] = {k: v for k, v in man["excluded"].items() if k != "case_ids"}
+        return hashlib.sha256(
+            json.dumps(meta, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    base = digest(m)
+    injected = copy.deepcopy(m)
+    injected["excluded"]["answers"] = ["SECRET-GAIA-ANSWER"]
+    check(digest(injected) != base,
+          "a nested key under excluded changes the digest (no silent answer path)")
+
+    # Control: the identifier list is deliberately out of the digest, so
+    # reordering it must NOT trip the guard.
+    reordered = copy.deepcopy(m)
+    reordered["excluded"]["case_ids"] = list(reversed(reordered["excluded"]["case_ids"]))
+    check(digest(reordered) == base,
+          "reordering excluded.case_ids does not trip the digest (control)")
+
+
+def check_builder_paths() -> None:
+    """Exercise the builder without a GAIA copy: CI has none, so every path
+    here is stubbed at load_validation."""
+    import importlib.util as iu
+    import json as _json
+    import tempfile
+    spec = iu.spec_from_file_location("bg2", ROOT / "scripts" / "build-gaia-suite.py")
+    bg = iu.module_from_spec(spec)
+    spec.loader.exec_module(bg)
+
+    check(bg.case_id({"Level": 2, "task_id": "abcdef12-3456"}) == "gaia-l2-abcdef12",
+          "case_id derives level and the 8-char prefix")
+
+    rows = [{"task_id": "aaaaaaaa-1111", "Level": 1, "Question": "Q1",
+             "Final answer": "A1", "file_name": ""},
+            {"task_id": "bbbbbbbb-2222", "Level": 3, "Question": "Q2",
+             "Final answer": "A2", "file_name": ""}]
+    bg.load_validation = lambda root: rows
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        _json.dump({"schema": 1, "name": "n", "prompt_preamble": "P: ",
+                    "case_ids": ["gaia-l1-aaaaaaaa", "gaia-l3-bbbbbbbb"],
+                    "excluded": {"reason": "r", "case_ids": []}}, fh)
+        bg.MANIFEST = pathlib.Path(fh.name)
+    suite = bg.build(pathlib.Path("/nonexistent"))
+    check([c["id"] for c in suite["cases"]] == ["gaia-l1-aaaaaaaa", "gaia-l3-bbbbbbbb"],
+          "build preserves manifest order")
+    check(suite["cases"][0]["prompt"] == "P: Q1"
+          and suite["cases"][0]["expect"] == {"equals": "A1"},
+          "build applies the preamble and wraps expect")
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        _json.dump({"schema": 1, "name": "n", "prompt_preamble": "P: ",
+                    "case_ids": ["gaia-l1-cccccccc"],
+                    "excluded": {"reason": "r", "case_ids": []}}, fh)
+        bg.MANIFEST = pathlib.Path(fh.name)
+    missing = False
+    try:
+        bg.build(pathlib.Path("/nonexistent"))
+    except SystemExit:
+        missing = True
+    check(missing, "a manifest case absent from the GAIA copy is refused")
+
+    # Fresh module: load_validation is stubbed above, so the stub would answer.
+    fresh = iu.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    absent = False
+    try:
+        fresh.load_validation(pathlib.Path(tempfile.mkdtemp()))
+    except SystemExit:
+        absent = True
+    check(absent, "a GAIA root without metadata.parquet is refused")
+
+
 def main() -> int:
     m = json.loads(MANIFEST.read_text())
 
@@ -78,8 +157,10 @@ def main() -> int:
 
     # Every free-text field is pinned, not just the preamble: a substring
     # predicate over them misses a smuggled short declarative answer.
-    meta = {k: v for k, v in m.items() if k not in ("case_ids", "excluded")}
-    meta["excluded.reason"] = m["excluded"]["reason"]
+    # Pin EVERY key except the two identifier lists. Naming the fields to add
+    # back is an enumeration, and it missed excluded's other nested keys.
+    meta = {k: v for k, v in m.items() if k != "case_ids"}
+    meta["excluded"] = {k: v for k, v in m["excluded"].items() if k != "case_ids"}
     meta_digest = hashlib.sha256(
         json.dumps(meta, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     check(meta_digest == METADATA_SHA256,
@@ -94,6 +175,8 @@ def main() -> int:
           "preamble ends at the question boundary")
 
     check_collision_guard()
+    check_excluded_subtree_pinned()
+    check_builder_paths()
 
     print(f"\n{'ALL PASS' if not failures else 'FAILED: ' + '; '.join(failures)}"
           f" ({ran - len(failures)}/{ran})")
