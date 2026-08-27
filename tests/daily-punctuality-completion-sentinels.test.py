@@ -203,5 +203,30 @@ check("no sentinel and no artifact stays UNCHECKED",
       f"got {r.get('detail')!r}")
 
 
+# ── declared artifact, zero evidence in EITHER lane (yixuan-ag2 on #3440) ────
+
+# `used_artifact_lane` flips here vs the old `not launchd`, but the interpret
+# layer `continue`s on empty artifacts before the stem_declared gate is read.
+ws = Path(tempfile.mkdtemp(prefix="punct-none-"))
+(ws / "hosts" / "H").mkdir(parents=True)
+(ws / "state").mkdir()
+(ws / "results").mkdir()
+(ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+    [{"name": "never-ran", "cron": "0 6 * * *", "artifact": "never-ran"}]))
+r = run(ws)
+_d = r.get("detail") or ""
+check("a job with no evidence in either lane is UNCHECKED, not a miss",
+      "never-ran" in _d and "past due" not in _d and "no output today" not in _d,
+      f"got {_d!r}")
+
+# The same property at the interpret layer, holding everything but the flag
+# fixed — it must not matter which value stem_declared carries.
+_base = dict(name="j", hour=6, minute=0, artifacts=[], today_seen=False,
+             minutes_since_due=999, conditional=False)
+_outs = [hc._interpret_daily_punctuality([dict(_base, stem_declared=sd)]).get("detail") or ""
+         for sd in (True, False)]
+check("stem_declared cannot change the verdict when artifacts is empty",
+      _outs[0] == _outs[1], f"got {_outs}")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
