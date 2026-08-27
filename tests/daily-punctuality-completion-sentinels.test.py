@@ -160,5 +160,73 @@ for nm, body in (("z", f"{aware:%Y-%m-%dT%H:%M:%S}Z"),
 check("missing state dir returns empty",
       hc._daily_completion_minutes(Path(tempfile.mkdtemp()) / "nope", "x") == [])
 
+# ── a launchd job that publishes a dated ARTIFACT but stamps no sentinel ─────
+
+# `launchd` says how a job is SCHEDULED, not what dated evidence it leaves; without
+# the fallback such a job reports "no dated artifact" while writing one every day.
+def _launchd_artifact_ws(days=5, include_today=True, name="digest-job", stem="digest-job"):
+    ws = Path(tempfile.mkdtemp(prefix="punct-la-"))
+    (ws / "hosts" / "H").mkdir(parents=True)
+    (ws / "state").mkdir()
+    (ws / "results").mkdir()
+    (ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+        [{"name": name, "cron": "0 6 * * *", "launchd": True, "artifact": stem}]))
+    today = datetime.date.today()
+    for i in range(days):
+        if i == 0 and not include_today:
+            continue
+        d = today - datetime.timedelta(days=i)
+        f = ws / "results" / f"{stem}-{d:%Y%m%d}.txt"
+        f.write_text("x")
+        os.utime(f, (time.time(),
+                     datetime.datetime.combine(d, datetime.time(6, 4)).timestamp()))
+    return ws
+
+
+r = run(_launchd_artifact_ws())
+check("launchd + dated artifact is OBSERVABLE, not UNCHECKED",
+      "digest-job" not in (r.get("detail") or ""), f"got {r.get('detail')!r}")
+check("...and a punctual artifact history is not reported late",
+      r.get("status") == "ok", f"got {r.get('status')}: {r.get('detail')}")
+
+r = run(_launchd_artifact_ws(include_today=False))
+check("a launchd artifact history that stops TODAY surfaces as a named miss",
+      "digest-job" in (r.get("detail") or "") and "no output today" in (r.get("detail") or ""),
+      f"got {r.get('detail')!r}")
+
+# The control that can fail: with NO evidence in either lane the job must stay
+# UNCHECKED, so the fallback cannot manufacture observability out of nothing.
+r = run(_launchd_artifact_ws(days=0))
+check("no sentinel and no artifact stays UNCHECKED",
+      "digest-job" in (r.get("detail") or "")
+      and ("UNCHECKED" in (r.get("detail") or "") or "unverifiable" in (r.get("detail") or "")),
+      f"got {r.get('detail')!r}")
+
+
+# ── declared artifact, zero evidence in EITHER lane (yixuan-ag2 on #3440) ────
+
+# `used_artifact_lane` flips here vs the old `not launchd`, but the interpret
+# layer `continue`s on empty artifacts before the stem_declared gate is read.
+ws = Path(tempfile.mkdtemp(prefix="punct-none-"))
+(ws / "hosts" / "H").mkdir(parents=True)
+(ws / "state").mkdir()
+(ws / "results").mkdir()
+(ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+    [{"name": "never-ran", "cron": "0 6 * * *", "artifact": "never-ran"}]))
+r = run(ws)
+_d = r.get("detail") or ""
+check("a job with no evidence in either lane is UNCHECKED, not a miss",
+      "never-ran" in _d and "past due" not in _d and "no output today" not in _d,
+      f"got {_d!r}")
+
+# The same property at the interpret layer, holding everything but the flag
+# fixed — it must not matter which value stem_declared carries.
+_base = dict(name="j", hour=6, minute=0, artifacts=[], today_seen=False,
+             minutes_since_due=999, conditional=False)
+_outs = [hc._interpret_daily_punctuality([dict(_base, stem_declared=sd)]).get("detail") or ""
+         for sd in (True, False)]
+check("stem_declared cannot change the verdict when artifacts is empty",
+      _outs[0] == _outs[1], f"got {_outs}")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
