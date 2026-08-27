@@ -114,8 +114,8 @@ def main() -> int:
             payload = json.loads(p.stdout)
         except ValueError:
             payload = None
-        # A non-object payload has no .get, and a non-string reason breaks the
-        # substring test below — both crash the notifier instead of reporting.
+        # A non-object payload has no .get, and a non-string event_id breaks the
+        # slice below — both crash the notifier instead of reporting.
         if isinstance(payload, dict):
             ok = bool(payload.get("ok"))
             event = str(payload.get("event_id") or "")

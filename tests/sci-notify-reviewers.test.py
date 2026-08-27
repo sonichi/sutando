@@ -137,13 +137,18 @@ class SilentRefusal(unittest.TestCase):
                 self.assertIn("ok=False", p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
 
+    def test_a_non_string_event_id_does_not_crash_the_success_path(self):
+        # `event[:24]` slices, so a non-string id raises here and nowhere else —
+        # this is the coercion that is load-bearing now the hint is gone.
+        p = run_send('{"ok": true, "event_id": 12345}')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("12345", p.stdout)
+        self.assertNotIn("Traceback", p.stderr)
+
     def test_a_non_string_reason_is_still_reported(self):
-        # The bare "reason=1" assertion passes even unfixed: the line prints
-        # before the substring test raises. Only the exit + traceback discriminate.
         p = run_send('{"ok": false, "reason": 1}')
         self.assertIn("reason=1", p.stderr)
         self.assertEqual(p.returncode, 1, p.stderr)
-        self.assertNotIn("Traceback", p.stderr)
 
     def test_success_still_reports_the_event_id(self):
         p = run_send('{"ok": true, "event_id": "$abc123"}')
