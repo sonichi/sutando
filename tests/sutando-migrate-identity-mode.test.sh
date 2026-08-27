@@ -198,8 +198,10 @@ _stubdir="$(mktemp -d -t migrate-stub.XXXXXX)"
 
 _mk_stub() {  # $1 = gnu|bsd|none
   case "$1" in
-    gnu)  printf '%s\n' '#!/bin/bash' 'if [ "$1" = "-c" ]; then exec /usr/bin/stat -f "%Sm" -t "%Y-%m-%d 00:00:00" "${@:3}"; fi' 'if [ "$1" = "-f" ]; then echo "  File: fs-info"; exit 1; fi' 'exec /usr/bin/stat "$@"' > "$_stubdir/stat" ;;
-    bsd)  printf '%s\n' '#!/bin/bash' 'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi' 'exec /usr/bin/stat "$@"' > "$_stubdir/stat" ;;
+    # HERMETIC: emit fixed output rather than delegating to the host's stat.
+    # Shelling out to /usr/bin/stat made these probes pass on BSD and fail on GNU.
+    gnu)  printf '%s\n' '#!/bin/bash' 'if [ "$1" = "-c" ]; then echo "2026-01-01 00:00:00.000000000 +0000"; exit 0; fi' 'if [ "$1" = "-f" ]; then echo "  File: fs-info"; exit 1; fi' 'exit 1' > "$_stubdir/stat" ;;
+    bsd)  printf '%s\n' '#!/bin/bash' 'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi' 'if [ "$1" = "-f" ]; then echo "2026-01-01"; exit 0; fi' 'exit 1' > "$_stubdir/stat" ;;
     none) printf '%s\n' '#!/bin/bash' 'exit 1' > "$_stubdir/stat" ;;
   esac
   chmod +x "$_stubdir/stat"
