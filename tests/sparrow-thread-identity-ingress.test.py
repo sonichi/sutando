@@ -28,6 +28,28 @@ from ag2_sparrow.local_task_protocol import (  # noqa: E402
     KNOWN_HEADER_KEYS, parse_task_headers)
 
 THREAD_FIELDS = ("thread_root", "source_room_id")
+ROOM = "!room:ag2.space"
+ROOT = "$thread_root"
+INNER = "$specific_message"
+TRIGGER = "$trigger"
+
+
+def _drive_gateway_writer(task: dict) -> "str | None":
+    """Run the REAL remote_gateway_bridge._write_task against a temp tasks dir
+    and return the file it wrote. Imported lazily: the module reads config at
+    import time, so the temp dir must be in place first."""
+    import importlib
+    import tempfile
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    sys.modules.pop("ag2_sparrow.remote_gateway_bridge", None)
+    rgb = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
+    rgb.TASKS_DIR = tmp
+    tid = rgb._write_task(task)
+    if not tid:
+        return None
+    hits = list(tmp.glob(f"{tid}*.txt"))
+    return hits[0].read_text() if hits else None
+
 
 _FAILED: list[str] = []
 _RAN: list[str] = []
@@ -45,18 +67,32 @@ def main() -> None:
     for f in THREAD_FIELDS:
         check(f"KNOWN_HEADER_KEYS carries {f}", f in KNOWN_HEADER_KEYS)
 
-    src = (_ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow"
-           / "remote_gateway_bridge.py").read_text()
-    start = src.index("_TASK_FIELDS = (")
-    # end at the tuple's closing paren (start of a line), not the first ")"
-    # in the block — several appear inside its comments.
-    task_fields_block = src[start:src.index("\n\n", start)]
-    for f in THREAD_FIELDS:
-        check(f"_TASK_FIELDS serializes {f}", f'"{f}"' in task_fields_block)
-    # Control: the block matched really is the serialization whitelist, so a
-    # stray match elsewhere in the file cannot make the two checks above pass.
-    check("CONTROL: the matched block is the real whitelist",
-          '"reply_to_event"' in task_fields_block and '"channel_id"' in task_fields_block)
+    # 1b) Drive the REAL writer: a source-text assertion on _TASK_FIELDS passes
+    # even if the writer filters the values later, which is the defect itself.
+    written = _drive_gateway_writer({
+        "id": "task-thr1", "task": "in-thread ask", "source": "ag2space",
+        "channel_id": ROOM, "user_id": "@qingyun:ag2.space",
+        "source_message_id": TRIGGER, "reply_to_event": INNER,
+        "thread_root": ROOT, "source_room_id": ROOM,
+    })
+    if written is None:
+        check("gateway writer produced a task file", False)
+    else:
+        w = dict(ln.split(": ", 1) for ln in written.splitlines() if ": " in ln)
+        for f, want in (("thread_root", ROOT), ("source_room_id", ROOM)):
+            check(f"WRITER emits {f} into the task file", w.get(f) == want)
+        check("WRITER keeps the three ids distinct",
+              (w.get("source_message_id"), w.get("thread_root"),
+               w.get("reply_to_event")) == (TRIGGER, ROOT, INNER))
+        # Control: the same writer, same call, with the fields absent — proves
+        # the assertions above track the input rather than always passing.
+        plain = _drive_gateway_writer({
+            "id": "task-thr2", "task": "top-level ask", "source": "ag2space",
+            "channel_id": ROOM, "user_id": "@qingyun:ag2.space",
+        })
+        check("CONTROL: a top-level task file carries neither field",
+              plain is not None
+              and "thread_root:" not in plain and "source_room_id:" not in plain)
 
     # 2) a written task file round-trips them as HEADERS, not body text
     task_file = (
