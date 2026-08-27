@@ -150,3 +150,6 @@ coverage-summary.md
 # file, so the deep vim range is worth more there than the extensions it costs.
 *.env*.s[a-w][a-z]
 *~
+
+# Built locally from a GAIA copy; carries the answer key -- never commit.
+benchmarks/gaia-100.json

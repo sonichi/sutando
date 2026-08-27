@@ -299,6 +299,40 @@ def get_timeline(auth, max_results=10):
         print()
 
 
+def get_user_timeline(username, max_results=10, exclude=None):
+    """Another account's recent tweets, over app-only bearer auth.
+
+    `timeline` resolves `users/me`, which is OAuth1-only, so a bearer-only host
+    could not read ANY timeline — including public ones the same endpoint serves.
+
+    `exclude=replies` drops replies to OTHERS and keeps self-replies (thread
+    continuations), so an author's own thread still appears. Measured, not assumed.
+    """
+    import urllib.parse
+    handle = username.lstrip("@")
+    u = _bearer_get(
+        f"https://api.twitter.com/2/users/by/username/{urllib.parse.quote(handle)}")
+    user_id = ((u or {}).get("data") or {}).get("id")
+    if not user_id:
+        print(f"No such user: @{handle}")
+        sys.exit(1)
+    url = (f"https://api.twitter.com/2/users/{user_id}/tweets"
+           f"?max_results={max_results}&{TWEET_FIELDS}")
+    if exclude:
+        url += f"&exclude={urllib.parse.quote(exclude)}"
+    data = (_bearer_get(url) or {}).get("data", [])
+    if not data:
+        print(f"No tweets returned for @{handle}.")
+        return
+    print(f"@{handle} — {len(data)} tweet(s)")
+    for t in data:
+        metrics = t.get("public_metrics", {})
+        print(f"[{t['created_at'][:10]}] {t['text'][:120]}")
+        print(f"  likes:{metrics.get('like_count',0)} rt:{metrics.get('retweet_count',0)} views:{metrics.get('impression_count',0)}")
+        print(f"  https://x.com/i/status/{t['id']}")
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="X (Twitter) CLI")
     sub = parser.add_subparsers(dest="command")
@@ -318,6 +352,11 @@ def main():
     sub.add_parser("mentions", help="Recent mentions")
     sub.add_parser("timeline", help="Your recent tweets")
 
+    p_utl = sub.add_parser("user-timeline", help="Another account's recent tweets")
+    p_utl.add_argument("username", help="Handle, with or without @")
+    p_utl.add_argument("--limit", type=int, default=10)
+    p_utl.add_argument("--exclude", help="Comma-separated: retweets,replies")
+
     p_eng = sub.add_parser("engagement", help="Check engagement on a tweet")
     p_eng.add_argument("tweet_id", help="Tweet ID")
 
@@ -326,9 +365,23 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # Read-only commands that app-only bearer auth can handle. Skip OAuth1
-    # setup (and its `requests`/`oauthlib` install) so X_BEARER_TOKEN-only
-    # environments don't need pip.
+    # Settled before get_auth(): that call loads the optional OAuth deps, so a
+    # clean host would report a pip problem for a missing-bearer failure.
+    if args.command == "user-timeline":
+        if not BEARER_TOKEN:
+            print("'user-timeline' needs X_BEARER_TOKEN (app-only auth); OAuth1 "
+                  "credentials cannot serve it. Set X_BEARER_TOKEN in .env.",
+                  file=sys.stderr)
+            sys.exit(2)
+        # 5..100 is THIS endpoint's bound, measured against it. `search`
+        # rejects below 10; applying that here refused valid requests.
+        if not 5 <= args.limit <= 100:
+            print(f"--limit must be between 5 and 100 (got {args.limit})")
+            sys.exit(2)
+        get_user_timeline(args.username, max_results=args.limit,
+                          exclude=args.exclude)
+        return
+
     if args.command in ("search", "read") and BEARER_TOKEN:
         if args.command == "search":
             search_tweets(args.query, auth=None, max_results=args.limit)
@@ -351,6 +404,10 @@ def main():
         get_timeline(auth)
     elif args.command == "engagement":
         read_tweet(args.tweet_id, auth)  # same output, includes metrics
+    else:
+        # A command with no arm here would otherwise exit 0 silently.
+        print(f"'{args.command}' is not handled by this dispatch.", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

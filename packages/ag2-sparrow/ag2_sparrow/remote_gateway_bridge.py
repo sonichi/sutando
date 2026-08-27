@@ -573,13 +573,22 @@ def _owner_review_dm(owner: str) -> str:
 
 def _review_messages(record: dict) -> list[str]:
     rid = str(record.get("review_id") or "")
-    origin = str((record.get("context") or {}).get("channel_id") or "")
+    context = record.get("context") or {}
+    origin = _one_line(context.get("channel_id") or "").strip()
+    room_name = _one_line(context.get("room_name") or "").strip()
+    # Keep room-controlled values in code spans and neutralize backticks so
+    # room metadata cannot alter the review message's Markdown structure.
+    origin_label = origin.replace("`", "'")
+    room_label = room_name.replace("`", "'")
+    room_info = (
+        f"`{origin_label}` (name: `{room_label}`)" if room_label else f"`{origin_label}`"
+    )
     body = str(record.get("withheld_body") or "")
     header = (
         f"**Private result review `{rid}`**\n\n"
         "This result was withheld from the shared room because it may contain "
         "sensitive information or delivery-control markers.\n\n"
-        f"Original room: `{origin}`\n\n")
+        f"Original room: {room_info}\n\n")
     decision = (
         "Reply directly to this message with **Yes** to confirm it should stay "
         "private, or **No** to mark it as a false positive and publish it to the "
@@ -903,7 +912,8 @@ def _guarded_result_body(tid: str, body: str):
             headers = local_task_protocol.parse_task_headers_trusted(
                 tfile.read_text(encoding="utf-8", errors="replace")).headers
             context = {key: headers.get(key, "") for key in (
-                "source", "channel_id", "reply_to_event", "source_message_id", "user_id")}
+                "source", "channel_id", "room_name", "reply_to_event",
+                "source_message_id", "user_id")}
         except OSError:
             pass
     verdict = classify(
