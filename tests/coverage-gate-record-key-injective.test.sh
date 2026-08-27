@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
-# The parallel loops key each worker's record by SORTED LINE INDEX, not by a
-# name-derived string. `tr "/." "__"` is not injective:
-#
-#     tests/a/b.test.py  -> tests_a_b_test_py
-#     tests/a_b.test.py  -> tests_a_b_test_py
-#
-# Two workers then write one pair of .out/.rc files and the last writer wins, so
-# a FAILING test can be aggregated with a PASSING worker's rc and the required
-# job exits 0. Today's 625 names do not collide — which is why this needs a test
-# rather than an observation: the defect is latent, and one nested or dotted
-# test file is enough to arm it.
+# Workers must key records by sorted LINE INDEX: `tr "/." "__"` maps
+# tests/a/b.test.py and tests/a_b.test.py alike, so a failing rc is overwritten.
 set -uo pipefail
 fail=0
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,9 +14,8 @@ else
 fi
 
 # --- 2. Neither loop may reintroduce a name-derived key ---
-# Strip comments first: both files DESCRIBE the defect in prose, and a naive
-# grep flags the explanation as the bug — an assertion that cannot tell a claim
-# from a citation of that claim inside its own retraction.
+# Strip comments first: both files describe the defect in prose, which a naive
+# grep would flag as the defect itself.
 for f in "$here/scripts/coverage-gate.sh" "$here/.github/workflows/ci.yml"; do
     code="$(sed 's/#.*$//' "$f")"
     if printf '%s' "$code" | grep -q 'tr "/\.\|tr .\/\.'; then
@@ -46,9 +36,8 @@ RECDIR="$tmp/rec"; mkdir -p "$RECDIR"; export RECDIR
 ( cd "$tmp" && find tests -name '*.test.py' | sort > "$RECDIR/files" )
 n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
 
-# Same worker shape as the loops under test: BARE INTEGERS, path resolved from
-# the shared list. A tab-delimited argument does not survive `xargs -I{}` —
-# it is rewritten to a space, and the split then silently never happens.
+# Same worker shape as the loops under test: bare integers, since `xargs -I{}`
+# rewrites a tab in the replaced string to a space.
 ( cd "$tmp" && seq 1 "$n" | xargs -P 4 -I{} bash -c '
     idx="$1"; f="$(sed -n "${idx}p" "$RECDIR/files")"
     rc=0; out="$(python3 "$f" 2>&1)" || rc=$?
