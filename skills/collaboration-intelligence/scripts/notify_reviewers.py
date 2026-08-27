@@ -152,9 +152,8 @@ def main() -> int:
                 # Naming the recorded room as a fallback is itself a presence
                 # claim; check it, or this refusal redirects to a second nobody.
                 there, why2 = stand_present_in_room(t)
-                # Order matters: the probe fails OPEN, so `there` is True for an
-                # unreadable roster too. Test unverified FIRST or the refusal
-                # asserts presence it never measured — the bug it is fixing.
+                # The probe fails OPEN, so `there` is True for an unreadable roster:
+                # test unverified FIRST or this asserts presence it never measured.
                 if why2.startswith("unverified"):
                     where = (f"{t['stand']}'s recorded room {t['room']} could not be "
                              f"checked ({why2}) — do not assume they are reachable there")
