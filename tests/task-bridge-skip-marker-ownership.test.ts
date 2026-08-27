@@ -204,6 +204,26 @@ describe('task-bridge — [deduped:] is a skip marker under the same ownership r
 		assert.equal(mayRetireSkipMarked(`${OWN}.txt`, '[deduped: task-123]', owns, origin), true);
 	});
 
+	// The grammar test above proves the PREDICATE. This proves the CONSEQUENCE:
+	// composing the result-loop's own gate order (task-bridge.ts:938-961) shows
+	// both empty spellings take the silent-archive `continue`, so neither can
+	// reach logConversation()/onResult() at :1037-1058. Kept separate because a
+	// correct predicate with the branches composed wrongly still leaks.
+	it('neither empty spelling reaches the fallthrough — result-loop gate order', () => {
+		const owns = () => true;              // this bridge dispatched it
+		const origin = () => undefined;       // no foreign origin recorded
+		for (const body of ['[deduped:]', '[deduped: ]']) {
+			const file = `${OWN}.txt`;
+			assert.equal(isSkipMarked(file, body), true,
+				`loop gate 1 missed ${JSON.stringify(body)} — falls through to onResult()`);
+			assert.equal(mayRetireSkipMarked(file, body, owns, origin), true,
+				`loop gate 2 refused ${JSON.stringify(body)} — result would be left unarchived`);
+		}
+		// Negative control: an ordinary body must NOT take the silent branch,
+		// or the guard would swallow every real reply.
+		assert.equal(isSkipMarked(`${OWN}.txt`, 'an ordinary reply'), false);
+	});
+
 	it('matches result_markers.py exactly on the grammar edges', () => {
 		const py: [string, boolean][] = [
 			['[deduped: task-123]',         true ],
@@ -211,8 +231,11 @@ describe('task-bridge — [deduped:] is a skip marker under the same ownership r
 			['[deduped: phone-abc.task-9]', true ],  // any target, not just task-*
 			['[DEDUPED: task-123]',         true ],  // case-insensitive
 			['  [deduped:task-123]',        true ],
-			['[deduped: ]',                 true ],  // whitespace target: Python accepts
-			['[deduped:]',                  false],  // empty: Python rejects
+			['[deduped: ]',                 true ],  // whitespace target
+			// Both empty spellings parse alike. Measured against the shared parser:
+			// '[deduped: ]' and '[deduped:]' BOTH -> skip(deduped, extra=''). The
+			// old `false` here pinned the `+` bug as if it were the contract.
+			['[deduped:]',                  true ],
 		];
 		for (const [body, want] of py) {
 			assert.equal(isSkipMarked(`${OWN}.txt`, body), want,
