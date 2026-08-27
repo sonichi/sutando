@@ -190,14 +190,67 @@ class CodexDelegationConsumer(unittest.TestCase):
             self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=root / "nope",
                                                             channels_dir=root / "nope2"))
 
-    def test_scan_is_bounded(self):
-        """An owner-only host with a large archive must not scan without limit."""
+    def test_scan_is_bounded_and_truncation_is_unknown_not_absence(self):
+        """The cap must hold, and hitting it must NOT read as "no consumer" —
+        that is the false negative that disables delegation silently."""
         tasks, channels = self._dirs()
         for i in range(20):
             self._task(tasks, str(i), "owner")
         with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            why = hc._codex_delegation_consumer(
+                tasks_dir=tasks, channels_dir=channels, scan_cap=5)
+        self.assertIsNotNone(why)
+        self.assertIn("scan bound", why)
+
+    def test_owner_only_host_within_the_bound_is_still_not_a_consumer(self):
+        """Control for the case above: under the cap, owner-only stays None."""
+        tasks, channels = self._dirs()
+        for i in range(3):
+            self._task(tasks, str(i), "owner")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
             self.assertIsNone(hc._codex_delegation_consumer(
-                tasks_dir=tasks, channels_dir=channels, scan_cap=5))
+                tasks_dir=tasks, channels_dir=channels, scan_cap=50))
+
+    def test_recent_non_owner_task_survives_an_archive_full_of_owner_tasks(self):
+        """The reviewer's exact case: the default archive order is oldest-first,
+        so a cap over it discarded the recent task carrying the evidence."""
+        tasks, channels = self._dirs()
+        old_month = tasks / "archive" / "2026-06"
+        new_month = tasks / "archive" / "2026-08"
+        old_month.mkdir(parents=True)
+        new_month.mkdir(parents=True)
+        for i in range(60):
+            (old_month / f"task-old{i:03d}.txt").write_text(
+                f"id: task-old{i:03d}\ntask: old\nsource: discord\naccess_tier: owner\n")
+        # The evidence sits in the RECENT month, behind the older one.
+        (new_month / "task-recent.txt").write_text(
+            "id: task-recent\ntask: recent\nsource: discord\naccess_tier: guest\n")
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            why = hc._codex_delegation_consumer(
+                tasks_dir=tasks, channels_dir=channels, scan_cap=10)
+        self.assertIsNotNone(why)
+        self.assertIn("guest", why)
+
+    def test_allowlisted_sender_absent_from_tiermap_is_a_consumer(self):
+        """The reviewer's exact case: every adapter resolves an allowlisted
+        sender missing from a present tierMap as non-owner (slack fails closed
+        to "other"), so it is configured delegation, not an unconfigured host."""
+        tasks, channels = self._dirs()
+        self._access(channels, "slack", {"allowFrom": ["new-user"], "tierMap": {}})
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            why = hc._codex_delegation_consumer(tasks_dir=tasks, channels_dir=channels)
+        self.assertIsNotNone(why)
+        self.assertIn("allowlists", why)
+
+    def test_allowlist_of_only_the_mapped_owner_is_not_a_consumer(self):
+        """Positive control: the allowlist rule must not fire on an owner-only
+        host, which is the false positive the whole PR exists to remove."""
+        tasks, channels = self._dirs()
+        self._access(channels, "slack",
+                     {"allowFrom": ["u1"], "tierMap": {"u1": "owner"}})
+        with patch.object(hc, "_codex_runtime_selected", return_value=False):
+            self.assertIsNone(hc._codex_delegation_consumer(tasks_dir=tasks,
+                                                            channels_dir=channels))
 
     def test_unreadable_task_is_skipped_not_counted_as_evidence(self):
         """A task the probe cannot read is not evidence either way — the

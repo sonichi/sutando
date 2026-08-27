@@ -7493,6 +7493,8 @@ def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int 
         return "core runtime is codex"
 
     try:
+        import itertools
+
         from local_task_protocol import (ACCESS_TIERS, iter_archived_tasks,
                                          parse_task_headers_trusted)
     except Exception:  # noqa: BLE001 — a probe never breaks the run
@@ -7508,20 +7510,34 @@ def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int 
                 data = json.loads(access_file.read_text())
             except Exception:  # noqa: BLE001 — an unreadable record is not a consumer
                 continue
-            tiers = {str(v) for v in (data.get("tierMap") or {}).values()}
-            named = sorted(tiers & non_owner)
+            tier_map = {str(k): str(v) for k, v in (data.get("tierMap") or {}).items()}
+            named = sorted(set(tier_map.values()) & non_owner)
             if named:
                 return (f"{access_file.parent.name}/access.json maps sender(s) to "
                         f"tier {', '.join(named)}")
+            # Allowlisted but absent from tierMap is not unconfigured: adapters
+            # resolve it non-owner (slack-bridge fails closed to "other").
+            unmapped = [s for s in (str(u) for u in (data.get("allowFrom") or []))
+                        if tier_map.get(s) != "owner"]
+            if unmapped:
+                return (f"{access_file.parent.name}/access.json allowlists "
+                        f"{len(unmapped)} sender(s) tierMap does not map to owner — "
+                        f"adapters resolve those as non-owner")
 
     if tasks_dir is None:
         tasks_dir = WORKSPACE_DIR / "tasks"
     tasks_dir = Path(tasks_dir)
+    live = sorted(tasks_dir.glob("task-*.txt"), reverse=True) if tasks_dir.is_dir() else []
+    # Newest-first and LAZY. The default archive order is oldest-first, so a cap
+    # over it discarded exactly the recent tasks that carry the evidence.
+    stream = itertools.chain(live, iter_archived_tasks(tasks_dir, newest_first=True))
     scanned = 0
-    live = sorted(tasks_dir.glob("task-*.txt")) if tasks_dir.is_dir() else []
-    for task_file in [*live, *iter_archived_tasks(tasks_dir)]:
+    for task_file in stream:
         if scanned >= scan_cap:
-            break
+            # Truncated without a hit: this is UNKNOWN, not "no consumer". Saying
+            # unused here is the failure that disables delegation silently.
+            return ("task history exceeds the scan bound — non-owner traffic "
+                    "cannot be ruled out")
         scanned += 1
         try:
             tier = parse_task_headers_trusted(task_file.read_text()).get("access_tier")
