@@ -40,7 +40,19 @@ def load_validation(gaia_root: pathlib.Path) -> list[dict]:
 
 def build(gaia_root: pathlib.Path) -> dict:
     manifest = json.loads(MANIFEST.read_text())
-    rows = {case_id(r): r for r in load_validation(gaia_root)}
+    validation = load_validation(gaia_root)
+    rows: dict[str, dict] = {}
+    collisions: dict[str, list[str]] = {}
+    for r in validation:
+        cid = case_id(r)
+        if cid in rows:
+            # Derived ids truncate task_id to 8 hex chars; a collision would let
+            # one row silently displace another's question and answer.
+            collisions.setdefault(cid, [rows[cid]["task_id"]]).append(r["task_id"])
+        rows[cid] = r
+    if collisions:
+        detail = "; ".join(f"{c} <- {', '.join(ids)}" for c, ids in sorted(collisions.items()))
+        sys.exit(f"case-id collision: derived ids are not injective over this GAIA copy: {detail}")
 
     missing = [cid for cid in manifest["case_ids"] if cid not in rows]
     if missing:

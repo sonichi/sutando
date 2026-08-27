@@ -37,6 +37,33 @@ def check(cond: bool, label: str) -> None:
         failures.append(label)
 
 
+def check_collision_guard() -> None:
+    """Derived ids truncate task_id to 8 hex chars; without a guard a collision
+    lets one row silently displace another's question and answer."""
+    import importlib.util as iu
+    import json
+    import tempfile
+    spec = iu.spec_from_file_location("bg", ROOT / "scripts" / "build-gaia-suite.py")
+    bg = iu.module_from_spec(spec)
+    spec.loader.exec_module(bg)
+    coll = [{"task_id": "deadbeef-1111-4000-8000-000000000001", "Level": 1,
+             "Question": "Q-FIRST", "Final answer": "A-FIRST", "file_name": ""},
+            {"task_id": "deadbeef-2222-4000-8000-000000000002", "Level": 1,
+             "Question": "Q-SECOND", "Final answer": "A-SECOND", "file_name": ""}]
+    bg.load_validation = lambda root: coll
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump({"schema": 1, "name": "x", "prompt_preamble": "P: ",
+                   "case_ids": ["gaia-l1-deadbeef"],
+                   "excluded": {"reason": "r", "case_ids": []}}, fh)
+        bg.MANIFEST = pathlib.Path(fh.name)
+    refused = False
+    try:
+        bg.build(pathlib.Path("/nonexistent"))
+    except SystemExit:
+        refused = True
+    check(refused, "colliding 8-char derived ids are refused, not silently displaced")
+
+
 def main() -> int:
     m = json.loads(MANIFEST.read_text())
 
@@ -49,11 +76,8 @@ def main() -> int:
     check(all(CASE_ID.match(c) for c in m["excluded"]["case_ids"]),
           "every excluded id is a bare identifier")
 
-    # EVERY free-text field is pinned, not just the preamble. name/description/
-    # source are fixed for this suite too, so a substring predicate over them
-    # would miss a smuggled answer exactly as the preamble shape check did.
-    # excluded.reason is free text too -- the only part of `excluded` that is not
-    # an identifier list, so it is pinned alongside the rest of the metadata.
+    # Every free-text field is pinned, not just the preamble: a substring
+    # predicate over them misses a smuggled short declarative answer.
     meta = {k: v for k, v in m.items() if k not in ("case_ids", "excluded")}
     meta["excluded.reason"] = m["excluded"]["reason"]
     meta_digest = hashlib.sha256(
@@ -61,14 +85,15 @@ def main() -> int:
     check(meta_digest == METADATA_SHA256,
           "all manifest metadata is byte-identical to the pinned text")
 
-    # Pinned by digest, not by shape. Shape predicates constrained only the TAIL,
-    # so any text BEFORE "Question: " passed -- and a GAIA answer is a short
-    # declarative string, exactly what a punctuation heuristic misses.
+    # Pinned by digest, not shape: shape predicates constrained only the tail,
+    # so any text before "Question: " passed.
     pre = m["prompt_preamble"]
     check(hashlib.sha256(pre.encode()).hexdigest() == PREAMBLE_SHA256,
           "preamble is byte-identical to the pinned text (no smuggled content)")
     check(pre.endswith("Question: "),
           "preamble ends at the question boundary")
+
+    check_collision_guard()
 
     print(f"\n{'ALL PASS' if not failures else 'FAILED: ' + '; '.join(failures)}"
           f" ({ran - len(failures)}/{ran})")
