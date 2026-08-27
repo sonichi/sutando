@@ -184,10 +184,72 @@ class ChartSeries(unittest.TestCase):
                                 max_windows=4)["windows"]["5h"]["segments"]
         self.assertEqual([s["reset"] for s in segs], resets[-4:])
 
+    def test_a_malformed_record_is_skipped_not_fatal(self):
+        reset = 1000000
+        self.write([
+            {"ts": "not-a-number", "u5": 0.5, "r5": reset, "u7": 0.1, "r7": reset},
+            {"ts": reset - 100, "u5": 0.4, "r5": reset, "u7": 0.1, "r7": reset},
+        ])
+        segs = qp.chart_payload(self.path, now=float(reset + 1))["windows"]["5h"]["segments"]
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(len(segs[0]["points"]), 1)
+
     def test_missing_history_file_yields_empty_windows(self):
         payload = qp.chart_payload(self.path, now=1.0)
         self.assertEqual(payload["windows"]["5h"]["segments"], [])
         self.assertEqual(payload["windows"]["7d"]["segments"], [])
+
+
+class DashboardAdapter(unittest.TestCase):
+    """The live route and the sampler's failure swallow, on the real handler."""
+
+    def test_quota_chart_route_serves_the_payload(self):
+        import http.client
+        import http.server
+        import threading
+        import tempfile as tf
+        import json as js
+        import dashboard
+        tmp = Path(tf.mkdtemp()); (tmp / "state").mkdir()
+        (tmp / "state" / "quota-history.jsonl").write_text(
+            js.dumps({"ts": 999000, "u5": 0.4, "r5": 1000000, "u7": 0.2, "r7": 1000000}) + "\n")
+        old_ws = dashboard.WORKSPACE_DIR
+        dashboard.WORKSPACE_DIR = tmp
+        try:
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            c = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=5)
+            c.request("GET", "/api/quota-chart")
+            r = c.getresponse()
+            body = js.loads(r.read())
+            httpd.shutdown()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(len(body["windows"]["5h"]["segments"]), 1)
+        finally:
+            dashboard.WORKSPACE_DIR = old_ws
+
+    def test_sampler_failure_never_breaks_the_quota_panel(self):
+        import tempfile as tf
+        import json as js
+        import dashboard
+        tmp = Path(tf.mkdtemp())
+        (tmp / "state").mkdir()
+        (tmp / "state" / "quota-state.json").write_text(js.dumps({
+            "available": True, "last_checked": "2026-08-27T00:00:00.000Z",
+            "headers": {
+                "anthropic-ratelimit-unified-5h-utilization": "0.25",
+                "anthropic-ratelimit-unified-5h-reset": "1000000",
+                "anthropic-ratelimit-unified-7d-utilization": "0.55",
+                "anthropic-ratelimit-unified-7d-reset": "2000000"}}))
+        # history path unwritable: a FILE occupies the parent dir name
+        (tmp / "state" / "quota-history.jsonl").mkdir()  # open("a") -> IsADirectoryError(OSError)
+        old_ws = dashboard.WORKSPACE_DIR
+        dashboard.WORKSPACE_DIR = tmp
+        try:
+            q = dashboard.get_quota_status()
+            self.assertTrue(q.get("headers"), "panel data must survive a sampler OSError")
+        finally:
+            dashboard.WORKSPACE_DIR = old_ws
 
 
 class DashboardWiring(unittest.TestCase):
