@@ -462,11 +462,18 @@ class DashboardAdapter(unittest.TestCase):
                 "anthropic-ratelimit-unified-7d-utilization": "0.55",
                 "anthropic-ratelimit-unified-7d-reset": "1900000000"}}))
         old_ws = dashboard.WORKSPACE_DIR
+        old_stats = dashboard.get_system_stats
         dashboard.WORKSPACE_DIR = tmp
+        # Platform-neutral seam: stub the pmset/disk probes but keep the REAL
+        # get_quota_status call, so the quota path stays activated on Linux CI.
+        dashboard.get_system_stats = lambda: {
+            "disk_free": "1GB", "battery": "—", "charging": False,
+            "uptime": "00:00", "quota": dashboard.get_quota_status()}
         try:
             html = dashboard.render_dashboard()  # the ACTIVATED path, unguarded before
         finally:
             dashboard.WORKSPACE_DIR = old_ws
+            dashboard.get_system_stats = old_stats
         self.assertIn("999%+", html)
         self.assertIn("55%", html)
 
