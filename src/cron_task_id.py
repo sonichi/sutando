@@ -19,6 +19,11 @@ TASK_PREFIX = "task-cron-"
 DISCOVERY_GLOB = TASK_PREFIX + "*"
 
 
+# Measured over 2056 live+archived records: `.txt`, `-late-duplicate.txt`, and
+# `.no-task.<stamp>.txt`. An unknown suffix fails closed (record not counted).
+RECORD_SUFFIX = r"(?:-late-duplicate)?(?:\.no-task\.\d+)?\.txt"
+
+
 def sanitize_name(name: str) -> str:
     """Slugify a cron name for use in a task id and filename.
 
@@ -41,10 +46,10 @@ def record_matcher(name: str) -> "re.Pattern[str]":
     Anchored on both ends: a bare `<slug>-` prefix test also accepts
     `<slug>-extra-<stamp>`, so a neighbouring job would vouch for this one.
 
-    The stamp must end the slug, so what follows is `.` or `-<non-digit>`.
-    A `-<digit>` boundary means the digits were the neighbour's slug tail.
+    The post-stamp grammar is the three suffixes records actually carry, so a
+    neighbour like `<slug>-2-late` cannot pass its `2` off as this job's stamp.
     """
     slug = re.escape(sanitize_name(name))
     return re.compile(
-        rf"^{re.escape(TASK_PREFIX)}{slug}-\d+(?:(?:\.|-(?!\d)).*)?$"
+        rf"^{re.escape(TASK_PREFIX)}{slug}-\d+{RECORD_SUFFIX}$"
     )

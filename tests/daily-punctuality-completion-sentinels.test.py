@@ -330,6 +330,20 @@ check("own record, -late-duplicate marker",
       bool(_gj.match("task-cron-ghost-job-1787000000000-late-duplicate.txt")))
 check("own record, .no-task.<stamp> marker",
       bool(_gj.match("task-cron-ghost-job-1787801434542.no-task.1787803712.txt")))
+# Numeric-plus-text neighbour, built with BOTH production helpers so the writer
+# and the matcher are exercised against each other rather than a hand-typed name.
+for _nb in ("ghost-job-2", "ghost-job-2-late", "ghost-job-2-text",
+            "ghost-job-42-backfill"):
+    _fn = cron_task_id.task_id(_nb, 1787000000000) + ".txt"
+    check(f"neighbour {_nb!r} does not vouch for ghost-job",
+          not cron_task_id.record_matcher("ghost-job").match(_fn))
+    check(f"control: {_nb!r} still claims its own record",
+          bool(cron_task_id.record_matcher(_nb).match(_fn)))
+# The three suffixes records actually carry must keep matching.
+for _sfx in ("", "-late-duplicate", ".no-task.1787803712"):
+    _own = cron_task_id.task_id("ghost-job", 1787000000000) + _sfx + ".txt"
+    check(f"own record with suffix {_sfx!r} is accepted",
+          bool(cron_task_id.record_matcher("ghost-job").match(_own)))
 check("task_id spells the writer's filename",
       cron_task_id.task_id("Money scan", 123) == "task-cron-Money-scan-123")
 check("discovery glob carries no job name", "*" == cron_task_id.DISCOVERY_GLOB[-1]
