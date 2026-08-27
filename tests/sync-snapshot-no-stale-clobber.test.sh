@@ -92,6 +92,10 @@ echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
 _snapshot_per_host_config
 check "diverged unrecorded copy is preserved, not adopted or overwritten" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "independent content" ]'
+check "no-provenance refusal names the ACTUAL condition, not a second writer" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO provenance record"'
+check "...and does NOT tell the operator to archive a copy (the message that did)" \
+      '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
 echo "keep it that way" >> "$WORKSPACE_DIR/build_log.md"
 echo "per-host went live" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
 
