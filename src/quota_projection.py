@@ -91,9 +91,13 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
         if history:
             last = history[-1]
             if all(last.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7")):
-                # Newer stamp + same values = the producer re-measured: advance
-                # the stored ts. A reread of the same snapshot is a no-op.
-                if float(sample["ts"]) > float(last.get("ts", 0)):
+                # Newer stamp advances the stored ts; same stamp is a no-op;
+                # an unusable stored ts is repaired with the verified sample.
+                try:
+                    stored_ts = float(last.get("ts", 0))
+                except (TypeError, ValueError):
+                    stored_ts = None
+                if stored_ts is None or float(sample["ts"]) > stored_ts:
                     history[-1] = {**last, "ts": sample["ts"]}
                     fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
                     with os.fdopen(fd, "w") as f:

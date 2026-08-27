@@ -98,6 +98,44 @@ class RecordSample(unittest.TestCase):
         self.assertAlmostEqual(seg["points"][-1]["x"], 0.1, places=3)
         self.assertAlmostEqual(seg["projected_end"], 2.0)  # capped: over at observation
 
+    def test_a_corrupt_final_timestamp_is_repaired_not_fatal(self):
+        # Reviewer control (#3464, 2nd round): a final row with ts="bad" and
+        # matching values must never raise out of the sampler; it is repaired.
+        import json as js
+        self.path.write_text(js.dumps(
+            {"ts": "bad", "u5": 0.25, "r5": 1000000, "u7": 0.55, "r7": 2000000}) + "\n")
+        self.assertFalse(qp.record_sample(state(obs=5000.0), self.path))
+        recs = qp._read_history(self.path)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[-1]["ts"], 5000.0)
+
+    def test_a_corrupt_final_timestamp_survives_the_real_panel_path(self):
+        # Same control through get_quota_status(): the panel must keep its
+        # headers, and repeated polls must not repeat a failure.
+        import tempfile as tf
+        import json as js
+        import dashboard
+        tmp = Path(tf.mkdtemp()); (tmp / "state").mkdir()
+        from datetime import datetime, timezone
+        lc = datetime.fromtimestamp(1700000000.0, timezone.utc).isoformat().replace("+00:00", "Z")
+        (tmp / "state" / "quota-state.json").write_text(js.dumps({
+            "available": True, "last_checked": lc,
+            "headers": {
+                "anthropic-ratelimit-unified-5h-utilization": "0.25",
+                "anthropic-ratelimit-unified-5h-reset": "1700016200",
+                "anthropic-ratelimit-unified-7d-utilization": "0.55",
+                "anthropic-ratelimit-unified-7d-reset": "1700500000"}}))
+        (tmp / "state" / "quota-history.jsonl").write_text(js.dumps(
+            {"ts": "bad", "u5": 0.25, "r5": 1700016200, "u7": 0.55, "r7": 1700500000}) + "\n")
+        old_ws = dashboard.WORKSPACE_DIR
+        dashboard.WORKSPACE_DIR = tmp
+        try:
+            for _ in range(2):
+                q = dashboard.get_quota_status()
+                self.assertTrue(q.get("headers"), "one corrupt row must not blank the panel")
+        finally:
+            dashboard.WORKSPACE_DIR = old_ws
+
     def test_a_newer_identical_observation_advances_the_stored_time(self):
         # Same values with a LATER last_checked: the producer re-measured, so
         # the stored ts refreshes and the projection uses the verified 60%.
