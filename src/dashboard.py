@@ -733,11 +733,15 @@ for(const[k,el]of[['5h','qc-5h'],['7d','qc-7d']]){
     out+=`<line x1="${x0}" y1="0" x2="${x0}" y2="${H}" stroke="#1e1e30"/>`;
     out+=`<line x1="${X(0)}" y1="${Y(0)}" x2="${X(1)}" y2="${Y(1)}" stroke="#555" stroke-dasharray="2,3"/>`;
     if(s.points.length){
-      const pts=s.points.map(pt=>`${X(pt.x)},${Y(pt.y)}`).join(' ');
+      // Color each stretch by its own pace so a hot start cannot hide behind
+      // a tame finish: midpoint above the diagonal = over pace, red.
+      for(let j=1;j<s.points.length;j++){
+        const a=s.points[j-1],b=s.points[j];
+        const over=(a.y+b.y)/2>(a.x+b.x)/2;
+        out+=`<line x1="${X(a.x)}" y1="${Y(a.y)}" x2="${X(b.x)}" y2="${Y(b.y)}" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.6"/>`;
+      }
       const last=s.points[s.points.length-1];
-      const over=last.y>last.x;
-      out+=`<polyline points="${pts}" fill="none" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.6"/>`;
-      out+=`<circle cx="${X(last.x)}" cy="${Y(last.y)}" r="2.5" fill="${over?'#e94560':'#4ecca3'}"/>`;
+      out+=`<circle cx="${X(last.x)}" cy="${Y(last.y)}" r="2.5" fill="${last.y>last.x?'#e94560':'#4ecca3'}"/>`;
       if(s.current&&s.projected_end!==undefined)
         out+=`<line x1="${X(last.x)}" y1="${Y(last.y)}" x2="${X(1)}" y2="${Y(s.projected_end)}" stroke="${s.projected_end>1?'#e94560':'#4ecca3'}" stroke-dasharray="3,3"/>`;
     }
