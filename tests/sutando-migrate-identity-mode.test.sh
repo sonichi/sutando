@@ -120,7 +120,8 @@ check "the union collision is SURFACED by scan, not silently absent" \
   "$(printf '%s' "$_scan" | grep -c 'slack-allowed-recipients' | tr -d ' ')" "1"
 
 RUN_E2E commit --source A >/dev/null 2>&1
-_mode="$(stat -f '%Lp' "$DEST/$REL" 2>/dev/null || stat -c '%a' "$DEST/$REL")"
+# GNU first — see mode_of()'s note: BSD-first emits filesystem info AND the mode.
+_mode="$(stat -c '%a' "$DEST/$REL" 2>/dev/null || stat -f '%Lp' "$DEST/$REL" 2>/dev/null)"
 check "a 0644 source must NOT widen a 0600 destination through the union" "$_mode" "600"
 check "and the union still merged both allow-lists" \
   "$(grep -c 'a@example.org' "$DEST/$REL" | tr -d ' ')" "1"

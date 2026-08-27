@@ -1185,8 +1185,12 @@ preflight_summary() {
 
 # SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
 # Permission bits only (no file-type prefix): BSD %Lp and GNU %a agree.
+# GNU FIRST, and the order is load-bearing: GNU `stat -f` is --file-system, not
+# a format flag, so it prints a filesystem block to STDOUT and still exits
+# non-zero — a BSD-first `||` chain concatenates that block with the real mode.
+# BSD stat rejects `-c` outright, so GNU-first degrades cleanly the other way.
 mode_of() {
-    stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"
+    stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null
 }
 
 # Identity is bytes AND mode, at every decision site: dropping a 0755 source
