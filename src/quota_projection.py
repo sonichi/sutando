@@ -25,12 +25,31 @@ MAX_LINES = 10000  # ~2 weeks at the dashboard's 15s refresh; rewrite keeps the 
 _LOCK = threading.Lock()
 
 
-def _sample_from_state(state: dict, now: float) -> dict | None:
+def _observation_ts(state: dict) -> float | None:
+    """The producer's observation time (`last_checked`), never a reader's clock.
+
+    A dashboard read proves nothing about when quota was measured; only the
+    credential proxy's own stamp does. No stamp -> no recordable observation.
+    """
+    from datetime import datetime, timezone
+    raw = state.get("last_checked")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _sample_from_state(state: dict) -> dict | None:
     """Extract one history sample from a quota-state dict; None if unusable."""
     headers = state.get("headers") or {}
+    ts = _observation_ts(state)
+    if ts is None:
+        return None
     try:
         return {
-            "ts": now,
+            "ts": ts,
             "u5": float(headers["anthropic-ratelimit-unified-5h-utilization"]),
             "r5": int(headers["anthropic-ratelimit-unified-5h-reset"]),
             "u7": float(headers["anthropic-ratelimit-unified-7d-utilization"]),
@@ -56,7 +75,7 @@ def _read_history(history_path: Path) -> list[dict]:
     return out
 
 
-def record_sample(state: dict, history_path: Path, now: float) -> bool:
+def record_sample(state: dict, history_path: Path, now: float | None = None) -> bool:
     """Append one sample if it says something new; True when appended.
 
     Dedup is value-based (same utilizations and resets as the last line), so
@@ -64,7 +83,7 @@ def record_sample(state: dict, history_path: Path, now: float) -> bool:
     still. The cap rewrite goes through a temp file + os.replace so a reader
     never sees a truncated file.
     """
-    sample = _sample_from_state(state, now)
+    sample = _sample_from_state(state)
     if sample is None:
         return False
     with _LOCK:
@@ -72,6 +91,15 @@ def record_sample(state: dict, history_path: Path, now: float) -> bool:
         if history:
             last = history[-1]
             if all(last.get(k) == sample[k] for k in ("u5", "r5", "u7", "r7")):
+                # Same values: a NEWER observation stamp is real evidence (the
+                # producer re-measured) and advances the stored ts; a reread of
+                # the same snapshot is a no-op.
+                if float(sample["ts"]) > float(last.get("ts", 0)):
+                    history[-1] = {**last, "ts": sample["ts"]}
+                    fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
+                    with os.fdopen(fd, "w") as f:
+                        f.write("".join(json.dumps(r) + "\n" for r in history))
+                    os.replace(tmp, history_path)
                 return False
         if len(history) + 1 > MAX_LINES:
             keep = history[-(MAX_LINES - 1):] + [sample]
@@ -122,13 +150,9 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
         current = reset > now
         seg = {"reset": reset, "current": current, "points": pts}
         if current and pts:
-            # Dedup freezes stored x while usage stands still; carry the last
-            # utilization forward to now-elapsed and project from there.
-            x_now = min((now - (reset - span)) / span, 1.0)
+            # Projection extends only from the last VERIFIED observation; a
+            # quiet stretch after it is unknown, never rendered as measured.
             last = pts[-1]
-            if x_now > last["x"]:
-                last = {"x": x_now, "y": last["y"]}
-                pts.append(last)
             if last["x"] > 0:
                 seg["projected_end"] = min(last["y"] / last["x"], 2.0)
         segments.append(seg)

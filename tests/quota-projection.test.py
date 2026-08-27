@@ -20,8 +20,11 @@ SPAN5 = qp.WINDOW_SPANS["5h"]
 SPAN7 = qp.WINDOW_SPANS["7d"]
 
 
-def state(u5="0.25", r5=1000000, u7="0.55", r7=2000000):
-    return {"headers": {
+def state(u5="0.25", r5=1000000, u7="0.55", r7=2000000, obs=999000.0):
+    """A quota-state dict whose `last_checked` IS the observation time (obs)."""
+    from datetime import datetime, timezone
+    lc = datetime.fromtimestamp(obs, timezone.utc).isoformat().replace("+00:00", "Z")
+    return {"last_checked": lc, "headers": {
         "anthropic-ratelimit-unified-5h-utilization": u5,
         "anthropic-ratelimit-unified-5h-reset": str(r5),
         "anthropic-ratelimit-unified-7d-utilization": u7,
@@ -63,7 +66,7 @@ class RecordSample(unittest.TestCase):
         qp.MAX_LINES = 3
         try:
             for i in range(5):
-                qp.record_sample(state(u5=f"0.{10+i}"), self.path, now=float(i))
+                qp.record_sample(state(u5=f"0.{10+i}", obs=float(i)), self.path)
             lines = [json.loads(x) for x in self.path.read_text().splitlines()]
             self.assertEqual(len(lines), 3)
             self.assertEqual([r["ts"] for r in lines], [2.0, 3.0, 4.0])
@@ -71,32 +74,44 @@ class RecordSample(unittest.TestCase):
             qp.MAX_LINES = old_max
 
     def test_a_torn_tail_line_is_skipped_not_fatal(self):
-        qp.record_sample(state(), self.path, now=1.0)
+        qp.record_sample(state(obs=1.0), self.path)
         with self.path.open("a") as f:
             f.write('{"ts": 2.0, "u5": 0.3')
         # Crash-torn tail: dedup keys on the last GOOD line, and the changed
         # sample must survive a fresh read (tail repaired, not appended onto).
-        self.assertFalse(qp.record_sample(state(), self.path, now=3.0))
-        self.assertTrue(qp.record_sample(state(u5="0.30"), self.path, now=4.0))
+        self.assertFalse(qp.record_sample(state(obs=1.0), self.path))
+        self.assertTrue(qp.record_sample(state(u5="0.30", obs=4.0), self.path))
         recs = qp._read_history(self.path)
         self.assertEqual(recs[-1]["u5"], 0.30)
         self.assertEqual(recs[-1]["ts"], 4.0)
 
-    def test_stagnant_usage_projects_from_now_not_the_frozen_point(self):
-        # Reviewer's control: 25% @ 10% elapsed, same 25% re-polled at 60%
-        # (dedup'd), rendered — projection must be 0.25/0.6, never 0.25/0.1.
-        now0 = 1000000.0
+    def test_a_reread_of_the_same_snapshot_never_advances_the_observation(self):
+        # Reviewer control (#3464): 25% observed at 10% elapsed; the UNCHANGED
+        # file reread at 60% must keep fraction 0.10 — no observation happened.
         span = SPAN5
-        reset = int(now0 + span * 0.9)          # first poll at 10% elapsed
-        qp.record_sample(state(u5="0.25", r5=reset, u7="0.1", r7=reset),
-                         self.path, now=now0)
-        later = reset - span + span * 0.6       # 60% elapsed, usage unchanged
-        self.assertFalse(qp.record_sample(
-            state(u5="0.25", r5=reset, u7="0.1", r7=reset), self.path, now=later))
-        seg = qp.chart_payload(self.path, now=later)["windows"]["5h"]["segments"][0]
-        self.assertAlmostEqual(seg["projected_end"], 0.25 / 0.6, places=3)
+        reset = 1000000 + span
+        obs = reset - span + span * 0.1
+        st = state(u5="0.25", r5=reset, u7="0.1", r7=reset, obs=obs)
+        self.assertTrue(qp.record_sample(st, self.path))
+        self.assertFalse(qp.record_sample(st, self.path))  # same last_checked
+        seg = qp.chart_payload(self.path, now=reset - span + span * 0.6)["windows"]["5h"]["segments"][0]
+        self.assertAlmostEqual(seg["points"][-1]["x"], 0.1, places=3)
+        self.assertAlmostEqual(seg["projected_end"], 2.0)  # capped: over at observation
+
+    def test_a_newer_identical_observation_advances_the_stored_time(self):
+        # Same values with a LATER last_checked: the producer re-measured, so
+        # the stored ts refreshes and the projection uses the verified 60%.
+        span = SPAN5
+        reset = 1000000 + span
+        st1 = state(u5="0.25", r5=reset, u7="0.1", r7=reset, obs=reset - span + span * 0.1)
+        st2 = state(u5="0.25", r5=reset, u7="0.1", r7=reset, obs=reset - span + span * 0.6)
+        qp.record_sample(st1, self.path)
+        self.assertFalse(qp.record_sample(st2, self.path))  # no new line...
+        recs = qp._read_history(self.path)
+        self.assertEqual(len(recs), 1)                      # ...but ts advanced
+        seg = qp.chart_payload(self.path, now=float(reset - 1))["windows"]["5h"]["segments"][0]
         self.assertAlmostEqual(seg["points"][-1]["x"], 0.6, places=3)
-        self.assertAlmostEqual(seg["points"][-1]["y"], 0.25)
+        self.assertAlmostEqual(seg["projected_end"], 0.25 / 0.6, places=3)
 
     def test_concurrent_writers_lose_no_acknowledged_sample(self):
         # Production-writer concurrency at the cap boundary: every thread
@@ -106,12 +121,12 @@ class RecordSample(unittest.TestCase):
         qp.MAX_LINES = 8
         try:
             for i in range(7):                  # near the cap
-                qp.record_sample(state(u5=f"0.{100+i}"), self.path, now=float(i))
+                qp.record_sample(state(u5=f"0.{100+i}", obs=float(i)), self.path)
             acked = []
             lock = threading.Lock()
             def worker(i):
-                s = state(u5=f"0.{200+i}")
-                if qp.record_sample(s, self.path, now=float(100 + i)):
+                s = state(u5=f"0.{200+i}", obs=float(100 + i))
+                if qp.record_sample(s, self.path):
                     with lock:
                         acked.append(float(100 + i))
             threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
@@ -227,6 +242,35 @@ class DashboardAdapter(unittest.TestCase):
             self.assertEqual(len(body["windows"]["5h"]["segments"]), 1)
         finally:
             dashboard.WORKSPACE_DIR = old_ws
+
+    def test_recorded_time_is_the_producers_not_the_routes(self):
+        # Reviewer control through the REAL get_quota_status() path: the stored
+        # ts must equal last_checked; a reread of the same file adds nothing.
+        import tempfile as tf
+        import json as js
+        import dashboard
+        tmp = Path(tf.mkdtemp())
+        (tmp / "state").mkdir()
+        obs = 1700000000.0
+        from datetime import datetime, timezone
+        lc = datetime.fromtimestamp(obs, timezone.utc).isoformat().replace("+00:00", "Z")
+        (tmp / "state" / "quota-state.json").write_text(js.dumps({
+            "available": True, "last_checked": lc,
+            "headers": {
+                "anthropic-ratelimit-unified-5h-utilization": "0.25",
+                "anthropic-ratelimit-unified-5h-reset": str(int(obs + 16200)),
+                "anthropic-ratelimit-unified-7d-utilization": "0.55",
+                "anthropic-ratelimit-unified-7d-reset": str(int(obs + 500000))}}))
+        old_ws = dashboard.WORKSPACE_DIR
+        dashboard.WORKSPACE_DIR = tmp
+        try:
+            dashboard.get_quota_status()
+            dashboard.get_quota_status()  # reread, hours of route time later
+        finally:
+            dashboard.WORKSPACE_DIR = old_ws
+        recs = qp._read_history(tmp / "state" / "quota-history.jsonl")
+        self.assertEqual(len(recs), 1)
+        self.assertAlmostEqual(recs[0]["ts"], obs, places=1)
 
     def test_sampler_failure_never_breaks_the_quota_panel(self):
         import tempfile as tf
