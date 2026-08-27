@@ -216,6 +216,46 @@ describe('sutando_config loader', () => {
 		}
 	});
 
+	it('a scalar in an object-typed block throws naming the file and the key', () => {
+		// `{"workspace": "<path>"}` is the shape a user writes by hand. Before this
+		// guard the TS loader silently fell through to the baked-in default.
+		writeConfig(repo, 'sutando.config.local.json', { workspace: '/tmp/ws' } as never);
+		try {
+			assert.throws(() => loadConfig(repo), (err: unknown) => {
+				const msg = err instanceof Error ? err.message : String(err);
+				return (
+					msg.includes('sutando.config.local.json') &&
+					msg.includes("'workspace'") &&
+					msg.includes('string')
+				);
+			});
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('an array in an object-typed block is rejected too', () => {
+		writeConfig(repo, 'sutando.config.json', { vault: ['a'] } as never);
+		try {
+			assert.throws(() => loadConfig(repo), /'vault' must be a JSON object, got array/);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('leaves non-object-typed keys alone', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			stand: 'mbp',
+			core_config_dirs: [],
+			workspace: { path: '/tmp/w' },
+		} as never);
+		try {
+			assert.equal(loadConfig(repo).stand, 'mbp');
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
 	// ------------------------------------------------------------------ //
 	//  6. Empty / missing .local.json treated as {}                       //
 	// ------------------------------------------------------------------ //
