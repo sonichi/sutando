@@ -62,6 +62,18 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "stand",          # this instance's `Stand:` commit-trailer value
 }
 
+# Blocks every consumer reads with `.get()`. A scalar here is what the schema's
+# `"type": "object"` already forbids; _load_json enforces it at read time.
+_OBJECT_TOP_LEVEL_KEYS = {
+    "core",
+    "workspace",
+    "claude_sutando_config_dir",
+    "vault",
+    "migrate",
+    "health_check",
+    "bridges",
+}
+
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
 
 _DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
@@ -152,6 +164,17 @@ def _load_json(path: Path) -> Dict[str, Any]:
         raise RuntimeError(
             f"sutando config: {path} top-level must be a JSON object, got {type(data).__name__}"
         )
+    for key in sorted(_OBJECT_TOP_LEVEL_KEYS & set(data)):
+        # null is how every consumer already spells "absent" (`or {}`), so
+        # rejecting it would break configs that work on both loaders today.
+        if data[key] is None:
+            continue
+        if not isinstance(data[key], dict):
+            raise RuntimeError(
+                f"sutando config: {path} key {key!r} must be a JSON object, got "
+                f"{type(data[key]).__name__} {data[key]!r}. Did you mean "
+                f'{{"{key}": {{...}}}}?'
+            )
     return _strip_comments(data)
 
 
@@ -291,8 +314,8 @@ def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     are tolerated (defaults file optional too, in which case caller falls
     through to the hardcoded resolver default — see `resolve_workspace`).
 
-    Raises `RuntimeError` only for parse errors (malformed JSON) or
-    structurally-invalid top-level (non-object).
+    Raises `RuntimeError` for parse errors (malformed JSON), a non-object
+    top-level, or an object-typed block holding a scalar.
     """
     global _CACHE, _CACHE_REPO_ROOT
     if _CACHE is not None and (repo_root is None or repo_root == _CACHE_REPO_ROOT):
