@@ -323,9 +323,8 @@ class RoomScopedPresence(unittest.TestCase):
         self.assertIn("UNVERIFIED", p.stderr)
 
     def test_child_interpreter_does_not_come_from_PATH(self):
-        # `python3` resolves through PATH; sys.executable does not. On a clean
-        # macOS host the bare name can hit the Xcode CLT stub, which raises an
-        # install modal and makes the probe fail OPEN as unverified.
+        # `python3` resolves through PATH and can hit the Xcode CLT stub on a
+        # clean macOS host; sys.executable cannot.
         p = run_room(_PRESENT, env_overrides={"PATH": "/nonexistent"})
         self.assertIn("ok=True", p.stdout)          # the send still resolved
         self.assertNotIn("UNVERIFIED", p.stderr)    # ...and the probe still read the roster
