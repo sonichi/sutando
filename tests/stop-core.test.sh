@@ -12,6 +12,14 @@ SCRIPT="$REPO/src/agent/stop-core.sh"
 command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not available"; exit 0; }
 
 SOCK="$(mktemp -d)/t.sock"
+
+# Every stop-core.sh run now invokes core_heartbeat --mark-stopped, which
+# resolves the REAL workspace unless scoped — an unscoped run here wrote a
+# live tombstone into the checkout's workspace and flipped health-check's
+# default stopped_fn for every other suite in the same CI run. Scope the
+# whole file to a throwaway workspace; case 5 layers its own on top.
+WSDEF="$(mktemp -d)"
+export SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WSDEF" SUTANDO_HOST_LABEL=stoptest
 fails=0
 say() { echo "$1  $2"; [ "$1" = "FAIL" ] && fails=$((fails+1)); }
 cleanup() { tmux -S "$SOCK" kill-server 2>/dev/null; }
