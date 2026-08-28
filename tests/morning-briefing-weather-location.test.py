@@ -74,10 +74,21 @@ class TestWeatherLocation(unittest.TestCase):
         """The owner must be able to tell this is not their weather."""
         w = self._weather({})
         self.assertIn("San Francisco", w)
-        self.assertIn("WEATHER_LAT", w)
         # The reading itself is still reported.
         self.assertIn("59", w)
         self.assertIn("high of 73", w)
+
+    def test_spoken_string_carries_no_env_var_remedy(self):
+        """This sentence is spoken aloud (module header: "voice speaks it").
+
+        A voice user would hear "set weather underscore lat slash weather
+        underscore lon" mid-forecast. The label belongs in speech; the remedy
+        belongs in the log line, so keep the variable names out of the string.
+        """
+        w = self._weather({})
+        self.assertNotIn("WEATHER_LAT", w)
+        self.assertNotIn("WEATHER_LON", w)
+        self.assertNotIn("_", w)
 
     def test_configured_is_not_annotated(self):
         """A owner-set location is theirs; adding a caveat would be noise."""

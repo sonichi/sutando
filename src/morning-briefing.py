@@ -100,9 +100,9 @@ def get_weather() -> str:
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
         # Naming the fallback keeps an unconfigured install from stating a city
-        # the owner has never been in as if it were their own weather.
-        where = "" if configured else (
-            " in San Francisco (default location — set WEATHER_LAT/WEATHER_LON for yours)")
+        # the owner has never been in as if it were their own weather. Kept short
+        # because this sentence is spoken aloud; the remedy is logged, not read out.
+        where = "" if configured else " in San Francisco (default location)"
         return f"{temp}°F and {desc}{where}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
@@ -742,6 +742,9 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
+    import os as _os
+    if weather and not (_os.environ.get("WEATHER_LAT") and _os.environ.get("WEATHER_LON")):
+        print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
 
     events = get_calendar_events()
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
