@@ -660,6 +660,15 @@ INSERT INTO runtime_requests VALUES ('approval-old1','approval','t',NULL,
         check(dup.returncode != 0 and "refusing double start" in
               (dup.stderr + dup.stdout),
               "second server for the SAME instance exits loudly (lock held)")
+        # ...and its exit must not stamp the LIVE daemon's manifest. It was
+        # refused before registering, so it has no instance to stop.
+        _live = [json.loads(f.read_text())
+                 for f in (Path(TMP) / "instances").glob("*.json")
+                 if "test-agent" in f.name]
+        check(len(_live) == 1 and _live[0]["status"] == "running",
+              "a refused duplicate leaves the live manifest running")
+        check(cli("sutando", "info").get("agentId") == "@test-agent:example.org",
+              "...and the first daemon is still serving after the refusal")
     finally:
         daemon.terminate()
         try:
