@@ -133,8 +133,9 @@ check "the destination was actually rewritten (control: not an untouched file)" 
 
 
 # --- control 4b: VERIFY owns the manifest mode for a union entry ---
-# The bypass needs the union output to be BYTE-EQUAL to the source, so the
-# source must already carry the merged set in the writer's own serialization.
+
+# Byte-equal union output is the bypass precondition, so the source must
+# already carry the merged set in the writer's own serialization.
 _u="$e2e/u"; mkdir -p "$_u/s1/state" "$_u/d1/state"
 printf '{"allow": ["a@example.org", "b@example.org"]}\n' > "$_u/s1/$REL"
 printf '{"allow": ["b@example.org"]}\n'                  > "$_u/d1/$REL"
