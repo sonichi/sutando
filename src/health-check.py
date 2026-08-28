@@ -1514,13 +1514,13 @@ def check_env_split(repo_env: "Path | None" = None,
     if not candidates:
         return None
 
-    def _keys(path: Path) -> "set[str] | None":
-        # None (not empty set) on read failure: an unreadable file is an
-        # UNKNOWN key set, not an empty one — collapsing it silences the probe.
+    def _keys(path: Path) -> "tuple[set[str] | None, str | None]":
+        # (keys, reason). None keys is UNKNOWN, never an empty set — collapsing
+        # it silences the probe. reason separates cannot-read from cannot-parse.
         try:
             text = path.read_text(errors="replace")
         except OSError:
-            return None
+            return None, "unreadable"
         out = set()
         def _assign(word):
             name, sep, _ = word.partition("=")
@@ -1528,24 +1528,19 @@ def check_env_split(repo_env: "Path | None" = None,
                 return name
             return None
 
-        for line in text.splitlines():
-            try:
-                # comments=False: shlex ends a word at any `#`, but bash starts
-                # a comment only where `#` OPENS a word, so `a#b` is literal.
-                words = shlex.split(line, comments=False)
-            except ValueError:
-                return None  # unbalanced quote: UNKNOWN, never "absent"
-            for i, w in enumerate(words):
-                if w.startswith("#"):
-                    words = words[:i]
-                    break
+        # Only `;` and `&&` are split. `||` short-circuits after a successful
+        # assignment, and `|`/`&` run their side in a subshell — unmodelled.
+        SPLIT_OPS = {";", "&&", "\n"}
+        UNKNOWN_OPS = {"||", "|", "&", "(", ")", ";;", "|&"}
+
+        def _segment(words):
+            """One command's words -> (names it persists, was-pure-assignment)."""
             if not words:
-                continue
+                return set(), True
             if words[0] == "export":
-                # export's bare-name arguments only mark existing vars; every
+                # export's bare-name args only mark existing vars; every
                 # assignment among them persists, so no word ends the scan.
-                out.update(n for n in map(_assign, words[1:]) if n)
-                continue
+                return {n for n in map(_assign, words[1:]) if n}, True
             names, cmd_at = [], None
             for i, w in enumerate(words):
                 n = _assign(w)
@@ -1554,11 +1549,39 @@ def check_env_split(repo_env: "Path | None" = None,
                     break
                 names.append(n)
             if cmd_at is None:
-                out.update(names)          # a pure assignment line persists
-            elif words[cmd_at] == "export":
-                out.update(n for n in map(_assign, words[cmd_at + 1:]) if n)
-            # else: `A=1 cmd ...` is a command PREFIX -- nothing persists.
-        return out
+                return set(names), True            # pure assignment persists
+            if words[cmd_at] == "export":
+                return {n for n in map(_assign, words[cmd_at + 1:]) if n}, True
+            return set(), False                    # `A=1 cmd` is a PREFIX
+
+        for line in text.splitlines():
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            # bash opens a comment only where `#` STARTS a word, so `a#b` is
+            # literal; shlex's own commenter would cut the word instead.
+            lex.commenters = ""
+            try:
+                tokens = list(lex)
+            except ValueError:
+                return None, "unparseable"  # unbalanced quote: never "absent"
+
+            words, reachable = [], True
+            for tok in tokens + [";"]:
+                if tok in UNKNOWN_OPS:
+                    return None, "unparseable"
+                if tok not in SPLIT_OPS:
+                    if tok.startswith("#") and lex.punctuation_chars:
+                        break              # comment: the rest of the line is text
+                    words.append(tok)
+                    continue
+                if reachable:
+                    names, pure = _segment(words)
+                    out.update(names)
+                    # `&&` after a command prefix depends on that command's exit
+                    # status, which this probe does not model.
+                    reachable = pure if tok == "&&" else True
+                words = []
+        return out, None
 
     # The canonical resolver owns selection; a re-derivation drifts.
     from sutando_config import resolve_dotenv  # noqa: PLC0415
@@ -1582,22 +1605,35 @@ def check_env_split(repo_env: "Path | None" = None,
                 f"new tier."
             ),
         }
-    sel_keys, oth_keys = _keys(selected), _keys(other)
+    (sel_keys, sel_why), (oth_keys, oth_why) = _keys(selected), _keys(other)
     if sel_keys is None or oth_keys is None:
-        # A read failure on either side is an unknown outcome, not a clean
-        # comparison — WARN rather than fall through to a false "no missing".
-        unreadable = []
-        if sel_keys is None:
-            unreadable.append(f"selected {sel_name} .env ({selected})")
-        if oth_keys is None:
-            unreadable.append(f"unselected {oth_name} .env ({other})")
+        # Unknown outcome, not a clean comparison — WARN rather than fall
+        # through to a false "no missing".
+        blocked, causes = [], set()
+        for keys, why, label, path in (
+            (sel_keys, sel_why, f"selected {sel_name}", selected),
+            (oth_keys, oth_why, f"unselected {oth_name}", other),
+        ):
+            if keys is None:
+                blocked.append(f"{label} .env ({path}): {why}")
+                causes.add(why)
+        # Naming the wrong remedy sends the reader to file permissions for a
+        # quoting bug, so the fix has to follow the cause that actually fired.
+        fix = {
+            frozenset({"unreadable"}): "fix file permissions and re-run",
+            frozenset({"unparseable"}): (
+                "the file is readable but its shell syntax could not be "
+                "classified (unbalanced quote, or a list operator this probe "
+                "does not model) — fix the syntax or simplify the line"
+            ),
+        }.get(frozenset(causes), "resolve the reported causes and re-run")
         return {
             "name": "env-split",
             "status": "warn",
             "detail": (
-                f"env-split comparison could not be completed — unreadable: "
-                f"{'; '.join(unreadable)}. A missing/partial load cannot be ruled "
-                f"out; fix file permissions and re-run."
+                f"env-split comparison could not be completed — "
+                f"{'; '.join(blocked)}. A missing/partial load cannot be ruled "
+                f"out; {fix}."
             ),
         }
     from sutando_config import DEPRECATED_ENV_KEYS  # noqa: PLC0415

@@ -289,6 +289,14 @@ for _label, _line, _persists in [
     ("bare export argument", "export GEMINI_API_KEY DISCORD_BOT_TOKEN=old", True),
     ("command prefix does not persist", "GEMINI_API_KEY=r DISCORD_BOT_TOKEN=e true", False),
     ("assignment to the export command", "GEMINI_API_KEY=r export DISCORD_BOT_TOKEN=o", True),
+    # List operators. `;` and `&&` both reach the second assignment, so the
+    # stranded key must still be named; a QUOTED operator is one value.
+    ("semicolon list", "GEMINI_API_KEY=other;DISCORD_BOT_TOKEN=old", True),
+    ("and-list", "GEMINI_API_KEY=other&&DISCORD_BOT_TOKEN=old", True),
+    ("quoted operator is a value, not a split",
+     "GEMINI_API_KEY='other;DISCORD_BOT_TOKEN=old'", False),
+    ("export segment then command prefix",
+     "export GEMINI_API_KEY=other ; DISCORD_BOT_TOKEN=ephemeral true", False),
 ]:
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -313,6 +321,36 @@ with tempfile.TemporaryDirectory() as td:
         _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
     check("command prefix in the SELECTED file leaves the other key stranded",
           _r is not None and "DISCORD_BOT_TOKEN" in _r["detail"], True)
+
+# 9. `||` short-circuits after a SUCCESSFUL assignment, so bash never reaches
+# the right side. Rather than model exit status, the probe answers UNKNOWN.
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir(); (td / "ws").mkdir()
+    _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+    _re_.write_text("GEMINI_API_KEY=real\n")
+    _we_.write_text("GEMINI_API_KEY=other || DISCORD_BOT_TOKEN=old\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+        _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    check("unmodelled operator warns UNKNOWN rather than inventing a key",
+          _r is not None and "unparseable" in _r["detail"], True)
+    check("...and does not name a key bash never sets",
+          _r is not None and "DISCORD_BOT_TOKEN" in _r["detail"], False)
+
+# A parse failure must not be reported as a permissions problem — the reader
+# would go fix file modes for a quoting bug.
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir(); (td / "ws").mkdir()
+    _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+    _re_.write_text("GEMINI_API_KEY=real\n")
+    _we_.write_text("GEMINI_API_KEY='unbalanced\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+        _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    check("unbalanced quote names the parse cause", 
+          _r is not None and "unparseable" in _r["detail"], True)
+    check("unbalanced quote does NOT advise fixing permissions",
+          _r is not None and "file permissions" in _r["detail"], False)
 
 if fails:
     print(f"FAIL ({len(fails)})")
