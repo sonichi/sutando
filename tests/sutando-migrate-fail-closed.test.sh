@@ -278,6 +278,12 @@ check "the manifest carries the union's private scalar (so its mode matters)" \
 check "the commit recorded the expected union mode" \
     bash -c "grep -q '__union_modes__' '$MODE_MANIFEST'"
 rc=0; RUN --verify > "$TMP/modes-verify.log" 2>&1 || rc=$?
+# This one fails on Linux only, so its log has to travel to CI: a bare FAIL
+# line says nothing a macOS run can reproduce.
+[ "$rc" -eq 0 ] || { echo "--- verify log (rc=$rc) ---"; cat "$TMP/modes-verify.log"; \
+    echo "--- observed modes ---"; \
+    echo "dst=$(_mode "$MODE_DST") manifest=$(_mode "$MODE_MANIFEST")"; \
+    echo "--- manifest ---"; cat "$MODE_MANIFEST"; echo "---"; }
 check "a pristine private union passes verify" [ "$rc" -eq 0 ]
 # The recorded mode is load-bearing: widening the dest must FAIL verification
 # even though every scalar and array still matches.
