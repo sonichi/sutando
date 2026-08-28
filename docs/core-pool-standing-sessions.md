@@ -118,8 +118,23 @@ carry the group:
 tasks/task-X.assigned-<instance>.g-<group>.txt
 ```
 
-Group-busy is then a glob (`*.g-<group>.txt`), re-derived from the same files
-that ARE the assignments. No second store can fall out of sync with them, and a
+Group-busy is then a glob, re-derived from the same files
+that ARE the assignments. **Anchor it on the assignment segment:**
+
+```
+*.assigned-*.g-<group>.txt          <- correct
+*.g-<group>.txt                     <- WRONG: also matches the reclaimed name
+```
+
+The unanchored form keeps matching after `reclaim_dead()` renames the file back,
+so the group reads busy forever. Anchoring makes that unrepresentable rather than
+contingent on the strip being right.
+
+**`<group>` needs a typed key constructor, not string interpolation.** Group ids
+are room ids like `!cAAaogVSFcIYaNmohw:ag2.space` — `pool_lead.py` already notes
+at its filename regex that "ids legitimately contain dots". This repo mandates
+exactly this shape for `phoneCallKey` / `phone_call_key`; the group token needs
+its own, so writer and glob cannot disagree about where the segment ends. No second store can fall out of sync with them, and a
 lead restart re-derives the busy set from disk rather than trusting memory it no
 longer has.
 
@@ -131,16 +146,57 @@ longer has.
 | task completes | assignment file consumed | released by the same disappearance |
 | **lead** dies holding no file state | unaffected | re-derived on restart from the glob |
 
-The group is released by exactly the event that releases the task, so there is
-no path where G stays busy with nothing running — the failure a separate
-group-lock with its own lifetime would introduce.
+The group is released by exactly the event that releases the task. **The
+accurate claim is therefore narrow: no group-specific stranding beyond what the
+task lease already has.** Coupling INHERITS the task lease's liveness; it does
+not improve on it, and an earlier draft of this section overclaimed "no path".
+
+The composition that falsifies the absolute (review, 2026-08-28): `reclaim_dead()`
+is not unconditional — it opens `if self._advance_reclaim_guard(): return []`,
+and that guard arms a `LEAD_STALE_S` (90 s) window on host-sleep skew or on a cold
+lead whose followers have not re-beaten. So rows 1 and 3 compose: a follower
+holding G dies, the lead restarts, an unproven follower arms the window, the
+rename never happens, and the glob reads G busy with nothing running for up to
+90 s. Each row is true alone; the sequence is what the table did not cover.
+
+Bounded, and the guard is right to exist — but it is the task lease's bound, which
+is the whole point of the narrower claim.
 
 **The alternative I did not take**, for the record: a distinct group-scoped
 atomic object (`group-<G>.lease-<inst>`, acquired before executing any task in
 G). It is more robust to multiple assigners, and correspondingly it is the right
 choice only if the single-assigner property above ever stops holding. It costs a
-second lock with its own reclaim path; lead serialization costs a filename
-suffix. If #3314 ever admits a second assigner, this decision must be revisited
+second lock with its own reclaim path.
+
+**Lead serialization does NOT cost "a filename suffix" — that comparison was
+wrong, and it is the one selecting this design, so it has to be checkable.**
+Tested against #3314's three live parsers, the suffix does not work at either
+position without editing them:
+
+```
+task-X.assigned-<inst>.g-<group>.txt   the reclaim regex captures the instance
+                                       as (.+) — GREEDY — so it swallows
+                                       ".g-<group>" and asks alive_fn() about a
+                                       name with no .alive file. Reads DEAD, and
+                                       reclaims assignments from LIVE followers
+                                       mid-task: the exact failure this decision
+                                       exists to prevent, via its own mechanism.
+                                       _load() anchors on \.assigned-<inst>\.txt$
+                                       and matches nothing, so every follower
+                                       reports load 0 and AFFINITY_BUSY_MAX never
+                                       trips.
+
+task-X.g-<group>.assigned-<inst>.txt   instance parses, but the rename target
+                                       task-X.g-<group>.txt still matches an
+                                       unanchored busy glob — permanently busy,
+                                       unbounded.
+```
+
+**True cost: the reclaim regex, the `_load` pattern, and an anchored busy-glob.**
+The decision still survives that — it is cheaper than a second lock with its own
+reclaim path — but the reader has to be able to check it rather than take it.
+
+If #3314 ever admits a second assigner, this decision must be revisited
 rather than patched.
 
 The **binding** cannot use the same mechanism, because decision 4 requires it to
