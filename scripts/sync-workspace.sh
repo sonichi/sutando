@@ -987,7 +987,30 @@ PY
         if [ -f "$_dst" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
             # Equal content is safe to re-own: repair a missing or stale sha so an
             # interrupted publish self-heals. Nothing to propagate.
-            [ "$_cur" != "$_rec" ] && printf '%s\n' "$_cur" > "$_sig" 2>/dev/null || true
+            #
+            # The repair goes through the SAME durable contract as a publish —
+            # temp, fsync, atomic rename, fsync — because an in-place write here
+            # is exactly the partial signature the promote path refuses to risk,
+            # and a swallowed failure leaves that partial record authoritative.
+            if [ "$_cur" != "$_rec" ]; then
+                local _rtmp
+                _rtmp="$(mktemp "${_sig}.repair.XXXXXX" 2>/dev/null)" || _rtmp=""
+                if [ -z "$_rtmp" ]; then
+                    log "snapshot: could not stage a signature repair for hosts/$(_host)/build_log.md; provenance left unchanged"
+                elif ! printf '%s\n' "$_cur" > "$_rtmp" 2>/dev/null ||
+                    ! _fsync_path_and_dir "$_rtmp"; then
+                    rm -f "$_rtmp" 2>/dev/null || true
+                    log "snapshot: signature repair not confirmed durable before promotion; provenance left unchanged"
+                elif ! mv -f "$_rtmp" "$_sig" 2>/dev/null; then
+                    rm -f "$_rtmp" 2>/dev/null || true
+                    log "snapshot: could not promote a signature repair for hosts/$(_host)/build_log.md; provenance left unchanged"
+                elif ! _fsync_path_and_dir "$_sig"; then
+                    # The content already matches, so there is nothing to
+                    # recover TO — a re-created intent would describe the state
+                    # that already holds. Say it is unconfirmed and stop.
+                    log "snapshot: repaired signature for hosts/$(_host)/build_log.md is not confirmed durable; it will be re-checked next tick"
+                fi
+            fi
         elif [ ! -f "$_dst" ] || { [ -n "$_rec" ] && [ "$_cur" = "$_rec" ]; }; then
             # Ours or absent -> stage beside the dest, swap only if the dest still
             # matches. The recorded sha comes from the temp, never a post-swap read.

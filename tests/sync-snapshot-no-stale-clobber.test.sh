@@ -490,5 +490,47 @@ check "...and it actually runs under the poisoned PATH" '[ "$?" -eq 0 ]'
 check "...without the stub ever being invoked" '[ ! -f "$_pylog" ]'
 rm -rf "$_pyd"
 
+echo "14. #3198 P1: the equal-content REPAIR obeys the durable publish contract"
+# The repair branch (dest == root, signature missing or stale) used to write the
+# signature in place with its failure swallowed. That is the partial-signature
+# risk the promote path refuses by using rename-only, reachable through repair.
+
+_arm_stale_sig_equal_content() {
+    printf 'same on both sides\n' > "$WORKSPACE_DIR/build_log.md"
+    printf 'same on both sides\n' > "$_DST"
+    printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$_SIG"
+    rm -f "$_INT"
+}
+
+# (a) happy path: a stale signature over equal content is repaired to the truth.
+_arm_stale_sig_equal_content
+_want="$(shasum -a 256 "$_DST" | cut -d' ' -f1)"
+_snapshot_per_host_config >/dev/null 2>&1
+check "a) a stale signature over equal content is repaired" \
+      '[ "$(cat "$_SIG" 2>/dev/null)" = "$_want" ]'
+check "...and no repair temp is left in the carried vault path" \
+      '[ -z "$(ls "$WORKSPACE_DIR/hosts/testhost"/.build_log.snapshot-sha.repair.* 2>/dev/null)" ]'
+
+# (b) the repair cannot be made durable BEFORE promotion -> the old record
+#     stands. An in-place write would already have overwritten it here.
+_arm_stale_sig_equal_content
+_stale="$(cat "$_SIG")"
+_fs="$(_fsync_shim ".snapshot-sha.repair")"
+SYNC_PY="$_fs/python3" _snapshot_per_host_config >/dev/null 2>&1
+rm -rf "$_fs"
+check "b) repair not durable: the previous signature is untouched" \
+      '[ "$(cat "$_SIG" 2>/dev/null)" = "$_stale" ]'
+check "...and the temp is cleaned up, not left to be committed" \
+      '[ -z "$(ls "$WORKSPACE_DIR/hosts/testhost"/.build_log.snapshot-sha.repair.* 2>/dev/null)" ]'
+check "...and the refusal is recorded durably rather than silently dropped" \
+      'grep -q "signature repair not confirmed durable" "$LOG"'
+
+# (c) the signature is never observed partial: whatever a reader finds is
+#     either the old record or the new one, never a truncated write.
+_arm_stale_sig_equal_content
+_snapshot_per_host_config >/dev/null 2>&1
+check "c) the promoted signature is a whole 64-hex record, never truncated" \
+      '[ "$(od -An -v -tx1 "$_SIG" | tr -d " \n" | sed "s/0a*$//" | wc -c | tr -d " ")" = "128" ]'
+
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1
