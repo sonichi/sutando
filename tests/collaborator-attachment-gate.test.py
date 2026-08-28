@@ -127,17 +127,36 @@ class BridgeWiring(unittest.TestCase):
         src = open("src/discord-bridge.py").read()
         self.assertIn("channel_allows_collaborator_attachments(", src)
         self.assertIn("allow_attach=_allow_attach", src)
-        # helper default-deny semantics, exercised directly
-        ns = {}
-        import re
-        m = re.search(r"def channel_allows_collaborator_attachments.*?(?=\ndef )", src, re.S)
-        exec(m.group(0), ns)
-        fn = ns["channel_allows_collaborator_attachments"]
+        # Imported, not exec'd from extracted source: an exec'd string is
+        # invisible to coverage, so the lines read as untested while passing.
+        _s = importlib.util.spec_from_file_location("dbridge", "src/discord-bridge.py")
+        _m = importlib.util.module_from_spec(_s)
+        _s.loader.exec_module(_m)
+        fn = _m.channel_allows_collaborator_attachments
         self.assertFalse(fn({}, "123"))
         self.assertFalse(fn({"groups": {"123": {"collaboratorAttachments": False}}}, "123"))
         self.assertFalse(fn({"groups": {"123": True}}, "123"))          # bool cfg, no dict
         self.assertTrue(fn({"groups": {"123": {"collaboratorAttachments": True}}}, "123"))
         self.assertFalse(fn({"groups": {"123": {"collaboratorAttachments": "yes"}}}, "123"))  # is True only
+
+
+class QuarantineRecord(unittest.TestCase):
+    def test_the_withheld_body_is_recorded_for_later_release(self):
+        d = tempfile.mkdtemp(prefix="qrec-")
+        ok = guard.journal_quarantined_attachment("body text", d, "task-1", now=1700000000)
+        self.assertTrue(ok)
+        files = list(pathlib.Path(d).rglob("*.json"))
+        self.assertEqual(len(files), 1)
+        rec = json.loads(files[0].read_text())
+        self.assertEqual(rec["status"], "withheld_attachment_pending")
+        self.assertEqual(rec["withheld_body"], "body text")
+        self.assertEqual(rec["task_id"], "task-1")
+
+    def test_an_unwritable_state_dir_costs_the_record_not_the_withhold(self):
+        # Best-effort by contract: a failed record must return False, never raise
+        # into the delivery loop that already withheld the attachment.
+        self.assertFalse(
+            guard.journal_quarantined_attachment("b", "/dev/null/nope", "task-2", now=1700000000))
 
 
 if __name__ == "__main__":
