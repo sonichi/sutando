@@ -135,6 +135,34 @@ def command_for(target: dict, message: str) -> "list[str]":
             "mention", target["stand"], body, target["room"]]
 
 
+def approval_gate(pr: str, repo: str, required: int = 2):
+    """Refuse recruitment for approvals a PR already has (owner-durable
+    2026-08-28: a widening chased an approval that existed for 90 minutes —
+    the ask ran from a stale mental model instead of the live review list).
+
+    Returns (met, detail). Latest DECISIVE review per login; COMMENTED never
+    counts. Fail-open on query error: an unreachable API must not block a
+    legitimate ask, so the gate only refuses on POSITIVE evidence."""
+    try:
+        out = subprocess.run(
+            ["gh", "api", f"repos/{repo}/pulls/{pr}/reviews", "--paginate",
+             "--jq", "[.[] | {u: .user.login, s: .state, t: .submitted_at}]"],
+            capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            return False, f"gate query failed ({out.stderr.strip()[:60]}) — proceeding"
+        latest: dict = {}
+        for r in json.loads(out.stdout or "[]"):
+            if r["s"] in ("APPROVED", "CHANGES_REQUESTED"):
+                latest[r["u"]] = r
+        approvers = [f"{u}@{r['t'][:16]}" for u, r in latest.items()
+                     if r["s"] == "APPROVED"]
+        if len(approvers) >= required:
+            return True, ", ".join(sorted(approvers))
+        return False, f"{len(approvers)}/{required} standing"
+    except Exception as exc:
+        return False, f"gate error ({exc}) — proceeding"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--reviewers", required=True,
@@ -145,7 +173,21 @@ def main() -> int:
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
                          "in their recorded room — correctly addressed, wrong venue.")
+    ap.add_argument("--pr", default=None,
+                    help="PR number this ask is recruiting for. When given, the live "
+                         "review list is read FIRST and the send is REFUSED if the "
+                         "approval bar is already met — recruiting an approval that "
+                         "exists is noise to the reviewer and a stale-model tell.")
+    ap.add_argument("--repo", default="sonichi/sutando")
+    ap.add_argument("--force-extra", action="store_true",
+                    help="send anyway when the bar is met (a deliberate extra ask)")
     a = ap.parse_args()
+    if a.pr and not a.force_extra:
+        met, detail = approval_gate(a.pr, a.repo)
+        if met:
+            print(f"REFUSED: #{a.pr} already has the required approvals ({detail}). "
+                  f"Re-read the review list; --force-extra only for a deliberate extra ask.")
+            return 5
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
     failures = 0
