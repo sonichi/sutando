@@ -9629,7 +9629,9 @@ def _local_core_alive(workspace: Optional[Path] = None,
         return None           # cannot identify this host -> UNKNOWN, not dead
     alive_file = workspace / "state" / "cores" / f"{label}.alive"
     try:
-        return (time.time() - alive_file.stat().st_mtime) < max_age_s
+        # heartbeat_is_fresh, not a one-sided age test: a future-dated mtime has a
+        # NEGATIVE age, which `< max_age_s` accepts as fresh forever (#2160 P1).
+        return heartbeat_is_fresh(alive_file.stat().st_mtime, time.time(), max_age_s)
     except FileNotFoundError:
         return False          # no heartbeat file at all == definitively dead
     except OSError:
@@ -10296,8 +10298,10 @@ def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
         return None
     alive_file = workspace / "state" / "cores" / f"{label}.alive"
     try:
-        if now - alive_file.stat().st_mtime >= 90.0:
-            return False          # stale heartbeat — readable, and not just-booted
+        # Two-sided: a future-dated mtime fails `>= 90.0` and would fall through
+        # to "just booted", suppressing the very recovery this path guards.
+        if not heartbeat_is_fresh(alive_file.stat().st_mtime, now):
+            return False          # stale or future-dated — not just-booted
         data = json.loads(alive_file.read_text())
     except FileNotFoundError:
         return False              # no heartbeat at all — nothing booted here
