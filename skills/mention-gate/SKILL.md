@@ -38,6 +38,15 @@ python3 skills/mention-gate/scripts/mention-gate.py status          # state + ho
 
 ## State + audit
 
+### Scope: PER-HOST, not fleet-wide
+
+The gate is stored under `<workspace>/state/`, which `vault.sync.exclude` lists
+explicitly — the vault runs in whitelist mode and carries only `notes/`,
+`talks/`, `hosts/` and the memory tree. `git ls-files state/mention-gate.json`
+returns nothing on a live host. So **toggling the gate changes only the host it
+was run on**; every other host keeps its own setting. Run the command once per
+host. There is currently no synced fleet-policy surface to store it on.
+
 - Gate state: `<workspace>/state/mention-gate.json` —
   `{"mentions_enabled": bool, "until": "<ISO-8601>"|null}` (`mentions_enabled`
   = this gate is on), written atomically (temp sibling + `os.replace`).

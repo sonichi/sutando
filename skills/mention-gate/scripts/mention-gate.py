@@ -56,28 +56,33 @@ def main(argv=None) -> int:
             until = expiry.strftime("%Y-%m-%dT%H:%M:%SZ")
         mention_gate.write_state(workspace, mentions_enabled=True, until=until)
         tail = f" until {until} (then back off)" if until else ""
-        print(f"mention-gate: ON — messages @-tagging the owner now count as bot "
-              f"mentions and are ingested{tail}.")
+        print(f"mention-gate: ON for THIS HOST — messages @-tagging the owner now "
+              f"count as bot mentions and are ingested{tail}.")
         print("Free-listen (requireMention:false) channels already ingest everything "
               "and are unaffected.")
+        print(f"Scope: this host only ({workspace}/state/ is per-host and is not "
+              "carried by vault sync). Other hosts keep their own setting — run "
+              "this command on each host you want changed.")
         return 0
 
     if args.command == "off":
         mention_gate.write_state(workspace, mentions_enabled=False, until=None)
-        print("mention-gate: OFF — today's behavior: owner-tagged messages without "
-              "a bot mention stay invisible to the fleet.")
+        print("mention-gate: OFF for THIS HOST — today's behavior: owner-tagged "
+              "messages without a bot mention are not ingested here.")
+        print("Scope: this host only. Another host with the gate ON still ingests "
+              "owner tags — run this command there too.")
         return 0
 
     state = mention_gate.read_state(workspace)
     active = mention_gate.owner_tag_triggers_ingest(workspace)
     if active:
         tail = f" until {state['until']}" if state["until"] else ""
-        print(f"mention-gate: ON — owner tags trigger ingestion{tail}.")
+        print(f"mention-gate: ON (this host) — owner tags trigger ingestion{tail}.")
     elif state["mentions_enabled"] and state["until"]:
         print(f"mention-gate: OFF (was on; expired at {state['until']}).")
     else:
-        print("mention-gate: OFF (default) — owner-tagged messages without a bot "
-              "mention are not ingested.")
+        print("mention-gate: OFF (default) on this host — owner-tagged messages "
+              "without a bot mention are not ingested.")
     print(f"pulled in so far: {mention_gate.gated_ingest_count(workspace)} message(s) "
           "(audit: state/mention-gate-ingested.jsonl).")
     return 0
