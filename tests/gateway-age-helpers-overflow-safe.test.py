@@ -153,6 +153,23 @@ for label, record in (
        raised is None and isinstance(r, dict) and r.get("status") in ("ok", "warn", "fail"),
        raised or f"returned {r!r}")
 
+print("\n=== a malformed ts must WARN, not fall through to ok ===")
+# This caller reads None as healthy, so nonneg=True on the age helper silenced a
+# negative ts that previously warned. The predicate restores the signal.
+for label, ts in (("ordinary negative", -1), ("NaN", float("nan")),
+                  ("+inf", float("inf")), ("huge int", HUGE)):
+    r, raised = _probe({"ts": ts, "connected": True, "last_ok_ts": _REAL})
+    ok(f"{label} ts -> warn (a garbage writer is an outage, not health)",
+       raised is None and isinstance(r, dict) and r.get("status") == "warn",
+       raised or f"returned {r!r}")
+
+ok("control: a valid FRESH record is not called malformed",
+   hc._gateway_status_ts_malformed(path=_sidecar({"ts": _REAL, "connected": True})) is False)
+ok("control: an ABSENT ts is not called malformed (no opinion, not garbage)",
+   hc._gateway_status_ts_malformed(path=_sidecar({"connected": True})) is False)
+ok("control: an unreadable file is not called malformed",
+   hc._gateway_status_ts_malformed(path=Path(tempfile.mkdtemp()) / "nope.json") is False)
+
 r, raised = _probe({"ts": _REAL, "connected": True, "last_ok_ts": _REAL})
 ok("positive control: a healthy sidecar still probes clean",
    raised is None and isinstance(r, dict) and r.get("status") == "ok",
