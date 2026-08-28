@@ -171,15 +171,19 @@ class TasksView:
         tracked yet — this lists ALL, not only un-fetched."""
         files = self._result_files()
         out = []
-        for f in files[:limit]:
+        truncated = False
+        for f in files:
             body = read_ready_result(f)
             if body is None:
                 continue  # not an answer yet; listed on a later call
+            if len(out) >= limit:
+                truncated = True  # a READY result exists past the window
+                break
             out.append({"taskId": f.name.removesuffix(".txt"),
                         "ts": int(f.stat().st_mtime),
                         "preview": body[:160]})
         return {"results": out,
-                **({"truncated": True} if len(files) > limit else {})}
+                **({"truncated": True} if truncated else {})}
 
     # ── task.details ────────────────────────────────────────────────────────
     def details(self, task_id: str) -> dict | None:
