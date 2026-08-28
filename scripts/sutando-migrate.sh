@@ -1383,6 +1383,13 @@ identity_match() {
     sha_match "$1" "$2" && [ "$ma" = "$mb" ]
 }
 
+# An identical drop keeps the destination bytes but must carry the newer
+# source's mtime, or a later OLDER source outranks it and its scalars win.
+identity_drop_keeping_newest() {
+    [ "$1" -nt "$2" ] || return 0
+    touch -r "$1" "$2"
+}
+
 # SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
 sha_match() {
     local a="$1" b="$2"
@@ -1409,15 +1416,18 @@ commit_one() {
             ensure_contained_destdir "$(dirname "$dst_path")" || { echo "write-failed"; return 1; }
             if [ ! -e "$dst_path" ]; then
                 copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
+                # Verify's mode check runs only where a manifest exists, so a
+                # fresh copy without one cannot be proven un-widened later.
+                record_union_scalars "$dst_path" "$rel" "$(union_scalar_manifest)" \
+                    || { echo "write-failed"; return 1; }
                 echo "copied"
                 return 0
             fi
             if identity_match "$src_file" "$dst_path"; then
-                # The union carries the winner's mtime forward; a drop must too,
-                # or a later OLDER source outranks it and its scalars win.
-                if [ "$src_file" -nt "$dst_path" ]; then
-                    touch -r "$src_file" "$dst_path"
-                fi
+                identity_drop_keeping_newest "$src_file" "$dst_path" \
+                    || { echo "write-failed"; return 1; }
+                record_union_scalars "$dst_path" "$rel" "$(union_scalar_manifest)" \
+                    || { echo "write-failed"; return 1; }
                 echo "identical-drop"
                 return 0
             fi
@@ -1446,6 +1456,8 @@ commit_one() {
                 src_mt="$(_stat %Y %m "$src_file")"
                 dst_mt="$(_stat %Y %m "$dst_path")"
                 if identity_match "$src_file" "$dst_path"; then
+                    identity_drop_keeping_newest "$src_file" "$dst_path" \
+                        || { echo "write-failed"; return 1; }
                     echo "identical-drop"
                     return 0
                 fi
