@@ -55,9 +55,9 @@ assert d['repo']=='$REPO_DIR', f\"repo {d['repo']} != $REPO_DIR\"
 assert d['brain']==d['workspace']+'/.claude-sutando', f\"brain {d['brain']}\"
 assert d['session']=='sutando-core', d['session']
 assert isinstance(d['alive'], bool), d['alive']
-# code = source-version identity block (git-derived; keys always present, values may be null off-git)
+# code = source-version identity block (Git or packaged build manifest)
 c=d['code']
-for k in ('commit','branch','describe','tree_sha','dirty'):
+for k in ('commit','revision','branch','describe','tree_sha','dirty','source','built_at','tree_digest'):
     assert k in c, f'code missing {k}'
 assert isinstance(c['dirty'], bool), c['dirty']
 "

@@ -19,6 +19,8 @@ set -e
 # This script lives at src/agent/claude/cli/ — four levels under the repo root.
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
+# Shared with the codex launcher: one owner for the in-session restart policy.
+. "$REPO/src/agent/restart-guard.sh"
 
 # Resolve the Python interpreter (same policy as scripts/sutando-config.sh). On a
 # fresh Mac there is NO system python3 — bare `python3` resolves to Apple's
@@ -41,6 +43,10 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
   PY="$(resolve_python "$REPO")"
 fi
 
+# Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent.
+# Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
+bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.
@@ -59,6 +65,9 @@ SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 # `exec claude` fallback inherits it directly; injected into the tmux launch
 # branches via `new-session -e` (below) since tmux runs the command under the
 # server's environment, not necessarily this shell's.
+# Snapshot what we INHERITED before the export below overwrites it: the
+# in-session restart guard must not read the marker this script sets itself.
+CALLER_CORE_SESSION="${SUTANDO_CORE_SESSION:-}"
 export SUTANDO_CORE_SESSION=1
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
@@ -383,7 +392,7 @@ else
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CORE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py")"
+  CORE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py")"
   if [ -n "$CORE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$CORE_SETTINGS_JSON")
     echo "core hooks: AskUserQuestion guard registered (PreToolUse deny — headless core can't answer it)"
@@ -476,6 +485,13 @@ log_restart_attempt() {
     "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
     >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
 }
+# Enforces the HAZARD above; the decision and its message are shared with
+# the codex launcher, this adapter keeps only its own attempt logging.
+if [ -n "$RESTART_REQUESTED" ] && sutando_restart_guard_refuses "$CALLER_CORE_SESSION"; then
+  sutando_restart_guard_explain
+  log_restart_attempt "$SUTANDO_RESTART_GUARD_REASON"
+  exit 1
+fi
 if [ -n "$RESTART_REQUESTED" ]; then
   log_restart_attempt "begin (session=$(tmux_session_exists && echo up || echo none) core=$(core_claude_running && echo up || echo none))"
   if tmux_session_exists || core_claude_running; then

@@ -69,13 +69,36 @@ python3 skills/x-twitter/x-post.py search "from:Chi_Wang_" --limit 5
 # Read a tweet
 python3 skills/x-twitter/x-post.py read 2040817066199195818
 
-# Mentions & timeline
+# Mentions & your own timeline (OAuth1 — resolves users/me)
 python3 skills/x-twitter/x-post.py mentions
 python3 skills/x-twitter/x-post.py timeline
+
+# ANOTHER account's timeline (bearer only — no OAuth1 needed)
+python3 skills/x-twitter/x-post.py user-timeline Chi_Wang_
+python3 skills/x-twitter/x-post.py user-timeline Chi_Wang_ --limit 100 --exclude retweets,replies
 
 # Engagement (likes, retweets, views)
 python3 skills/x-twitter/x-post.py engagement 2040817066199195818
 ```
+
+## Which auth each command needs
+
+`search`, `read` and `user-timeline` run on **`X_BEARER_TOKEN` alone** — app-only auth, stdlib
+urllib, no `requests`/`requests_oauthlib` install. `post`, `mentions` and `timeline` need the
+OAuth1 four (`X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET`).
+
+**`timeline` vs `user-timeline` is an auth distinction, not a scope one.** `timeline` resolves
+`users/me`, which is OAuth1-only; `user-timeline` takes a handle and reads the same endpoint
+(`users/{id}/tweets`) over bearer. On a bearer-only host `timeline` cannot run and
+`user-timeline` can.
+
+**`--limit` is 5..100 on `user-timeline`** — this endpoint's own bound. `search` rejects below
+10; different endpoints, different bounds. Outside the range the command refuses locally (rc=2)
+rather than letting X return a 400 that reads like an account problem.
+
+**`--exclude replies` keeps self-replies.** X drops replies to *others* and retains an author's
+own thread continuations, so `--exclude retweets,replies` can still return a tweet whose
+`in_reply_to_user_id` is the author. Measured, not assumed.
 
 ## Setup
 

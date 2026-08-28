@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "name": "smoke",
+  "description": "Small, read-only black-box check of Sutando's task queue, core reasoning, and result path.",
+  "cases": [
+    {
+      "id": "exact-token",
+      "category": "instruction-following",
+      "prompt": "Automated benchmark. Do not use tools or change any state. Reply with exactly SUTANDO_BENCH_OK and nothing else.",
+      "expect": {
+        "equals": "SUTANDO_BENCH_OK"
+      }
+    },
+    {
+      "id": "arithmetic",
+      "category": "reasoning",
+      "prompt": "Automated benchmark. Do not use tools or change any state. What is 37 multiplied by 19? Reply with only the integer.",
+      "expect": {
+        "regex": "^\\s*703\\s*$"
+      }
+    },
+    {
+      "id": "constraint-following",
+      "category": "instruction-following",
+      "prompt": "Automated benchmark. Do not use tools or change any state. Reply with a single line containing both words amber and cedar, in that order, using no more than 30 characters.",
+      "expect": {
+        "regex": "amber.*cedar",
+        "max_chars": 30
+      }
+    }
+  ]
+}
