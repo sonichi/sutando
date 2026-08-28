@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Commit must FAIL CLOSED: no sentinel and rc!=0 after any failed write, no
-# mutation outside the physically-resolved dest root, and a correct union must
-# pass mandatory verification. Controls mirror the #3418 review's injections.
+# Commit must FAIL CLOSED: no sentinel and rc!=0 after a failed write, no
+# mutation outside the resolved dest root, and a correct union must verify.
 
 set -euo pipefail
 
@@ -111,9 +110,8 @@ check "the escape is named in output" grep -q "escapes the dest root" "$TMP/syml
 echo "5. UNION_VERIFY: a correct union passes mandatory phase-three verification"
 new_case union
 mkdir -p "$CASE_A/state"
-# The SOURCE is the newer side (the reviewer's shape): its scalars win, and
-# the union stamps the dest with its mtime — which is what arms the
-# scalar-winner check in union_contains.
+# The SOURCE is the newer side, so its scalars win and the union stamps the
+# dest with its mtime, which is what arms the scalar-winner check.
 printf '{"users": ["alice", "bob"], "schemaVersion": 2}\n' > "$CASE_A/state/slack-allowed-recipients.json"
 printf '{"users": ["bob", "carol"], "schemaVersion": 1}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
 touch -t 202606011300 "$CASE_A/state/slack-allowed-recipients.json"
@@ -162,14 +160,14 @@ restore
 rc=0; RUN --verify > "$TMP/union-verify-restore.log" 2>&1 || rc=$?
 check "restored union verifies again (the controls are not wedged)" [ "$rc" -eq 0 ]
 
-# The reviewer's scalar repro: arrays fully intact, only the winning scalar
+# Scalar repro: arrays fully intact, only the winning scalar
 # altered to a value no input carried.
 corrupt "d['schemaVersion'] = 999"
 rc=0; RUN --verify > "$TMP/union-verify-scalar.log" 2>&1 || rc=$?
 check "a corrupted WINNING SCALAR fails verify (arrays all intact)" [ "$rc" -ne 0 ]
 
 echo "6. UNION_VERIFY dest-winner: the pre-union dest's scalars verify via the manifest"
-# The reviewer's paired control: when the DEST was newer, ITS scalars won and
+# Paired control: when the DEST was newer, ITS scalars won and
 # no source's mtime can vouch for them — only the commit-time manifest can.
 new_case destwin
 mkdir -p "$CASE_A/state"
@@ -233,10 +231,8 @@ printf '{"users": ["x"], "schemaVersion": 1}\n' > "$CASE_A/state/slack-allowed-r
 printf '{"users": ["y"], "schemaVersion": 2}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
 touch -t 202606011300 "$CASE_A/state/slack-allowed-recipients.json"
 touch -t 202606011200 "$CASE_DEST/state/slack-allowed-recipients.json"
-# pre-plant an invalid manifest for EVERY possible backup id? The id is minted
-# at run time — plant via the same glob shape the recorder writes and verify
-# reads... the recorder writes a NEW id, so instead assert on the direct
-# helper: drive record_union_scalars against an invalid manifest file.
+# The backup id is minted at run time, so a pre-planted manifest can never
+# match it; drive record_union_scalars against an invalid manifest instead.
 INVALID="$TMP/invalid-manifest.json"
 printf 'not json{' > "$INVALID"
 REC_FN="$TMP/record_fn.sh"
@@ -256,9 +252,8 @@ check "recorder REFUSES an invalid existing manifest (rc != 0)" [ "$rc" -ne 0 ]
 check "...and did not replace it with {}" bash -c "grep -q 'not json{' '$INVALID'"
 
 echo "8. MANIFEST MODE: the manifest is never wider than the union it describes"
-# keweichen on #3418: the writer used a plain open(), so under umask 0022 a
-# private (0600) union file's non-array state was duplicated into a 0644
-# manifest — the same disclosure, one file over.
+# A plain open() under umask 0022 duplicated a 0600 union's non-array state
+# into a 0644 manifest: the same disclosure, one file over.
 new_case modes
 mkdir -p "$CASE_A/state"
 printf '{"users": ["alice"], "schemaVersion": 1}\n' > "$CASE_A/state/slack-allowed-recipients.json"
