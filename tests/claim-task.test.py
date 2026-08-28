@@ -17,12 +17,16 @@ import os
 import sys
 import tempfile
 import time
+import contextlib
+import io
+import json
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+import claim_task  # noqa: E402
 from claim_task import claim_plain as claim  # noqa: E402
 
 
@@ -275,6 +279,117 @@ class ChannelAffinityTests(unittest.TestCase):
         # core-2 should be able to claim despite the malformed handler
         result = claim_with_affinity("a", "2", "ch-X", workspace=self.ws)
         self.assertIsNotNone(result)
+
+
+class DegradedInputsTests(unittest.TestCase):
+    """Every branch here is a fallback. A claimer that raises instead of
+    declining stops the core that called it, not just the one claim."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "state" / "cores").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        os.environ.pop("SUTANDO_CORE_IDLE_THRESHOLD_SEC", None)
+
+    def test_a_non_numeric_or_negative_idle_threshold_falls_back(self):
+        default = claim_task.DEFAULT_IDLE_THRESHOLD_SEC
+        for raw in ("not-a-number", "-5", "0"):
+            os.environ["SUTANDO_CORE_IDLE_THRESHOLD_SEC"] = raw
+            self.assertEqual(claim_task._idle_threshold_sec(), default, raw)
+        os.environ["SUTANDO_CORE_IDLE_THRESHOLD_SEC"] = "17"
+        self.assertEqual(claim_task._idle_threshold_sec(), 17,
+                         "a valid value must still be honoured")
+
+    def test_a_missing_heartbeat_reads_as_dead(self):
+        # Documented: missing means never-started or cleanly-shut-down, and
+        # both release the channel rather than pinning it to a ghost.
+        self.assertFalse(claim_task._is_alive(self.ws, "core-9", time.time()))
+
+    def test_an_unwritable_handler_path_is_swallowed(self):
+        # Losing the affinity note costs stickiness, never the claim.
+        d = self.ws / "state" / "cores"
+        d.chmod(0o500)
+        try:
+            claim_task._write_handler(d / "channel-x.handler", "core-1", 1000.0)
+        finally:
+            d.chmod(0o700)
+        self.assertFalse((d / "channel-x.handler").exists())
+
+
+
+class ClaimCliTests(unittest.TestCase):
+    """_main's exit codes are the contract every caller branches on, and a
+    subprocess run proves them while measuring none of these lines."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "state" / "cores").mkdir(parents=True)
+        self._real = claim_task.resolve_workspace
+        claim_task.resolve_workspace = lambda: self.ws
+
+    def tearDown(self):
+        claim_task.resolve_workspace = self._real
+        self.tmp.cleanup()
+
+    def _main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = claim_task._main(["claim_task.py", *argv])
+        return rc, out.getvalue().strip(), err.getvalue().strip()
+
+    def test_wrong_argument_count_is_a_usage_error(self):
+        rc, _, err = self._main("only-one")
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err)
+
+    def test_an_invalid_id_is_refused_rather_than_claimed(self):
+        rc, _, err = self._main("../escape", "core-1")
+        self.assertEqual(rc, 2)
+        self.assertIn("claim_task:", err)
+
+    def test_nothing_to_claim_is_exit_one_not_an_error(self):
+        rc, out, _ = self._main("absent", "core-1")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+
+    def test_a_won_claim_prints_the_renamed_path(self):
+        (self.ws / "tasks" / "task-t1.txt").write_text("x")
+        rc, out, _ = self._main("t1", "1")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.endswith("task-t1.claimed-core-1.txt"), out)
+
+    def test_the_affinity_path_is_reachable_from_the_cli(self):
+        (self.ws / "tasks" / "task-t2.txt").write_text("x")
+        rc, out, _ = self._main("t2", "1", "chan-a")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.endswith("task-t2.claimed-core-1.txt"), out)
+
+    def test_a_handler_with_no_core_id_is_treated_as_absent(self):
+        # Malformed note must degrade to a race-claim, not pin the channel.
+        (self.ws / "state" / "cores" / "channel-chan-b.handler").write_text(
+            json.dumps({"last_handled_at": time.time()}))
+        (self.ws / "tasks" / "task-t3.txt").write_text("x")
+        rc, out, _ = self._main("t3", "1", "chan-b")
+        self.assertEqual(rc, 0, out)
+
+    def test_an_unexpected_errno_is_reported_before_declining(self):
+        # A lost race and a core that can NEVER claim both return None, so the
+        # errno is the only thing separating them and it must be said aloud.
+        (self.ws / "tasks" / "task-t4.txt").write_text("x")
+        (self.ws / "tasks").chmod(0o500)
+        try:
+            rc, _, err = self._main("t4", "1")
+        finally:
+            (self.ws / "tasks").chmod(0o700)
+        self.assertEqual(rc, 1)
+        self.assertIn("unexpected errno", err)
+
 
 
 if __name__ == "__main__":
