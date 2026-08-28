@@ -205,5 +205,16 @@ with tempfile.TemporaryDirectory() as td:
     check("and so is .env.local (only the resolver's own name is sanctioned)",
           ".env.local" in (r13 or {}).get("detail", ""), True)
 
+    # 15. A write-once notice sentinel has NO destination: init.sh reads it AT
+    #     the root and nothing unlinks it, so flagging it is a permanent WARN.
+    td12 = Path(_tf.mkdtemp()); ws12 = td12 / "workspace"; (ws12 / "state").mkdir(parents=True)
+    (ws12 / ".legacy-notice-printed").write_text("")
+    (ws12 / ".voice-agent.pid").write_text("4242")
+    r14 = load(ws12).check_workspace_root_tidy()
+    d14 = (r14 or {}).get("detail", "")
+    check("the notice sentinel is not flagged", ".legacy-notice-printed" in d14, False)
+    check("the real deviant beside it still is", ".voice-agent.pid" in d14, True)
+    check("so the probe still fires rather than going silent", r14 is not None, True)
+
 print(("FAILED: " + ", ".join(fails)) if fails else "workspace-root-tidy: all checks passed")
 sys.exit(1 if fails else 0)

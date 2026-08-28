@@ -11,9 +11,16 @@ consumer that can deliver it, never sees the file. Observed twice on 2026-08-17:
       invalid literal for int() with base 10: '!PrxhizfLysTYrYDcnw:ag2.space'
     [proactive] send failure -> parked: proactive-1786941735.txt
 
-`slack-bridge.py` and `telegram-bridge.py` already gate on `\\d{17,20}` before
-claiming. This pins the same rule for Discord and the ordering that makes it work:
-the shape check has to run BEFORE the int().
+`slack-bridge.py` and `telegram-bridge.py` already gate before claiming. This pins
+the same rule for Discord and the ordering that makes it work: the shape check has
+to run BEFORE the int().
+
+The `\\d{17,20}` literal this file used to grep for now lives once, in
+`proactive_routing`: three adapters spelling it privately is exactly how two of
+them ended up recognising ONLY Discord, so a Matrix room read as unaddressed. The
+assertions moved to the delegation and every property they protected — existence,
+ordering, three-adapter parity — is still here, plus a behavioural check that the
+delegate is not a no-op and a scan that no private copy survived.
 """
 import pathlib
 import re
@@ -45,13 +52,19 @@ block = text[start:end]
 check("_proactive_fence().release" in block,
       "the proactive block can release a claim back to the polling stream")
 
-shape = re.search(r'fullmatch\(r"\\d\{17,20\}"', block) or re.search(r"\\d\{17,20\}", block)
-check(shape is not None,
-      "a Discord-id shape check exists in the proactive claim block")
+GATE = "redirect_target_is_foreign("
+check(GATE in block,
+      "a foreign-target check exists in the proactive claim block")
+# Behavioural, not merely present: a grep is satisfied by a no-op delegate.
+sys.path.insert(0, str(REPO / "src"))
+from proactive_routing import redirect_target_is_foreign  # noqa: E402
+check(redirect_target_is_foreign("!PrxhizfLysTYrYDcnw:ag2.space", "discord")
+      and not redirect_target_is_foreign("1022910063620390932", "discord"),
+      "and the delegate rejects a Matrix room while accepting a snowflake")
 
 # Ordering IS the fix: a check after owner resolution has already done work
 # for a file this bridge is not handling.
-gi = block.find(r"\d{17,20}")
+gi = block.find(GATE)
 ii = block.find("owner_id is None")
 check(gi != -1 and ii != -1 and gi < ii,
       "the shape check runs BEFORE owner resolution — a foreign file needs no owner")
@@ -62,11 +75,16 @@ foreign = block[gi:ii] if (gi != -1 and ii != -1) else ""
 check("_proactive_fence().release" in foreign and "continue" in foreign,
       "the foreign-target branch releases the claim and stops processing")
 
-# Parity: the rule is not new policy, it is what the sibling bridges already do.
-for sib in ("slack-bridge.py", "telegram-bridge.py"):
-    p = REPO / "src" / sib
-    check(p.is_file() and r"\d{17,20}" in p.read_text(),
-          f"{sib} already gates on the same shape (parity, not new policy)")
+# Parity: not new policy, and now through the SAME module, so the three adapters
+# cannot drift apart again — which is how two of them ended up Discord-only.
+PRIVATE = re.compile(r"\\d\{17,20\}")
+for sib, channel in (("slack-bridge.py", "slack"), ("telegram-bridge.py", "telegram")):
+    q = REPO / "src" / sib
+    src = q.read_text() if q.is_file() else ""
+    check(f'body_claimable_by(peek, "{channel}")' in src,
+          f"{sib} gates through proactive_routing (parity, not new policy)")
+    check(not PRIVATE.search(src),
+          f"{sib} keeps NO private copy of the id grammar")
 
 # release_claim must return the file to .txt — parking or unlinking would still
 # keep it away from the gateway.

@@ -23,6 +23,12 @@ Covers:
   f) non-numeric ts → fall back
   g) state_dir None → fall back (preserves the old call signature)
   h) the 90s threshold clears the bridge's worst-case write gap
+  i) connected:false WITH backoff_s and a recent last_ok_ts → alive (a
+     retryable transport blip, not a dead link). The 35s gap is measured from
+     a real capture: a 1s backoff still means a whole poll cycle since success,
+     so a grace window under ~35s would fail on live traffic.
+  j) auth rejection (backoff_s 0) stays down despite a recent last_ok_ts
+  k) a 4.9h outage stays down — backoff grows, last_ok_ts ages out
      (REMOTE_TASK_POLL_WAIT 25s + 10s request timeout)
 
 Run: python3 tests/core-input-watch-gateway-probe.test.py
@@ -159,6 +165,52 @@ def case_h_threshold_clears_poll_gap() -> list[str]:
     return []
 
 
+def case_i_transient_backoff_is_alive() -> list[str]:
+    # Values from a REAL captured blip, not invented: backoff_s 1 with the last
+    # success 35s back — a poll cycle (POLL_WAIT 25s + 10s timeout), not seconds.
+    v, pgrepped = with_status(
+        {"connected": False, "ts": time.time(), "backoff_s": 1,
+         "last_ok_ts": time.time() - 35,
+         "error": "network: The read operation timed out"},
+        pgrep_returns=False)
+    fails = []
+    if v is not True:
+        fails.append(f"i) a 1s retry with a 35s-old success should be alive, got {v!r}")
+    if pgrepped:
+        fails.append("i) the sidecar answered; pgrep must not be consulted")
+    return fails
+
+
+def case_j_auth_rejection_stays_down() -> list[str]:
+    # Auth rejection writes backoff_s 0 — it is not retryable and must stay down
+    # even though last_ok_ts is recent. Guards the case-b intent.
+    v, _ = with_status(
+        {"connected": False, "ts": time.time(), "backoff_s": 0,
+         "last_ok_ts": time.time() - 5, "error": "auth rejected HTTP 401"},
+        pgrep_returns=True)
+    return [] if v is False else [f"j) auth rejection must read down, got {v!r}"]
+
+
+def case_k_sustained_outage_stays_down() -> list[str]:
+    # The 2026-07-28 incident: 4.9h of connected:false reported as running. The
+    # backoff grows but last_ok_ts ages out, so the verdict must be False.
+    v, _ = with_status(
+        {"connected": False, "ts": time.time(), "backoff_s": 64,
+         "last_ok_ts": time.time() - 4.9 * 3600, "error": "network: no route"},
+        pgrep_returns=True)
+    return [] if v is False else [f"k) a 4.9h outage must read down, got {v!r}"]
+
+
+def case_l_never_connected_stays_down() -> list[str]:
+    # Never-connected: backoff_s grows, last_ok_ts ABSENT. Reads down only via
+    # isinstance(None, ...), so a `.get(..., time.time())` default would flip it.
+    v, _ = with_status(
+        {"connected": False, "ts": time.time(), "backoff_s": 4,
+         "error": "network: no route"},
+        pgrep_returns=True)
+    return [] if v is False else [f"l) never-connected must read down, got {v!r}"]
+
+
 def main() -> int:
     cases = [
         ("a", case_a_fresh_connected),
@@ -169,6 +221,10 @@ def main() -> int:
         ("f", case_f_non_numeric_ts_falls_back),
         ("g", case_g_no_state_dir_falls_back),
         ("h", case_h_threshold_clears_poll_gap),
+        ("i", case_i_transient_backoff_is_alive),
+        ("j", case_j_auth_rejection_stays_down),
+        ("k", case_k_sustained_outage_stays_down),
+        ("l", case_l_never_connected_stays_down),
     ]
     all_failures = []
     for label, fn in cases:

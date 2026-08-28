@@ -114,7 +114,9 @@ class ParseResult:
 _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^\s*\[no-send\]\s*", re.IGNORECASE), "no-send"),
     (re.compile(r"^\s*\[REPLIED\]\s*"), "REPLIED"),
-    (re.compile(r"^\s*\[deduped:\s*([^\]]+)\]\s*", re.IGNORECASE), "deduped"),
+    # `*` not `+`: `[deduped:]` and `[deduped: ]` differ only by a space and
+    # must parse alike, or one is audited and the other ships its own marker.
+    (re.compile(r"^\s*\[deduped:\s*([^\]]*)\]\s*", re.IGNORECASE), "deduped"),
 ]
 
 # Redirect marker — Discord channel IDs are 17-20 digits; Slack channel IDs
@@ -123,7 +125,7 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 # Note: used with `.match()` below, which always anchors at string start —
 # no MULTILINE flag needed (re.MULTILINE only affects `^`/`$` in scan-style
 # methods like `.search()` / `.finditer()`).
-_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]+)\]\s*\n?")
+_REDIRECT_RE = re.compile(r"^\s*\[channel:\s*([^\]]*)\]\s*\n?")
 
 # D7 reply-header pattern (owner directive 2026-05-19) — pool cores prepend
 # `**[core: N]**` plus an optional italic `_(...)_` sub-line to every
@@ -138,7 +140,7 @@ _D7_HEADER_RE = re.compile(
 
 # Attach markers — file/send/attach aliases. A marker inside markdown code is
 # being SHOWN, not issued; _code_lines and _SPAN_RE below mask those regions.
-_ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]+)\](?!`)")
+_ATTACH_RE = re.compile(r"(?<!`)\[(?:file|send|attach):\s*([^\]]*)\](?!`)")
 
 _FENCE_RE = re.compile(r"^\s{0,3}(?:```|~~~)")
 
@@ -255,8 +257,10 @@ def parse_markers(text: str) -> ParseResult:
     # private body stays in the owner's DM.
     redirect_match = _REDIRECT_RE.match(body)
     if redirect_match:
-        if not dm_only:
-            channel = redirect_match.group(1).strip()
+        channel = redirect_match.group(1).strip()
+        if not dm_only and channel:
+            # Empty target = no action: value="" release-loops at the default
+            # sink (claimable yet foreign) and int("")s in Discord conversion.
             actions.append(Action(kind="redirect", value=channel))
         body = body[redirect_match.end():]
 
@@ -435,3 +439,9 @@ def first_action(result: ParseResult, kind: ActionKind) -> Action | None:
         if a.kind == kind:
             return a
     return None
+
+
+def has_skip_action(actions) -> bool:
+    """True if `actions` (a ParseResult.actions list) carries a skip-kind
+    marker (`[no-send]`/`[REPLIED]`/`[deduped:...]`) — the body must never be sent."""
+    return any(a.kind == "skip" for a in actions)

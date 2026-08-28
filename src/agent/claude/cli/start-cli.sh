@@ -19,6 +19,8 @@ set -e
 # This script lives at src/agent/claude/cli/ — four levels under the repo root.
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
+# Shared with the codex launcher: one owner for the in-session restart policy.
+. "$REPO/src/agent/restart-guard.sh"
 
 # Resolve the Python interpreter (same policy as scripts/sutando-config.sh). On a
 # fresh Mac there is NO system python3 — bare `python3` resolves to Apple's
@@ -41,6 +43,10 @@ if [ -r "$REPO/scripts/python-binary.sh" ]; then
   PY="$(resolve_python "$REPO")"
 fi
 
+# Registers the PERSONAL_CLAUDE.md compaction-reinject hook, idempotent.
+# Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
+bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.
@@ -59,6 +65,9 @@ SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 # `exec claude` fallback inherits it directly; injected into the tmux launch
 # branches via `new-session -e` (below) since tmux runs the command under the
 # server's environment, not necessarily this shell's.
+# Snapshot what we INHERITED before the export below overwrites it: the
+# in-session restart guard must not read the marker this script sets itself.
+CALLER_CORE_SESSION="${SUTANDO_CORE_SESSION:-}"
 export SUTANDO_CORE_SESSION=1
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
@@ -202,18 +211,9 @@ fi
 # equivalent so the tmux-wrapped core process writes sessions / memory / state
 # into the workspace tree rather than the global ~/.claude/.
 #
-# Defense in depth:
-#   - M0 helper missing → silent fallback (legacy install, extracted tarball).
-#   - Helper present + config valid → export env for every claude invocation
-#     below (no-tmux fallback at L~75, TTY exec at L~115, no-TTY detached at
-#     L~120 all inherit it).
-#   - Helper present + config violates the workspace-sub-folder invariant →
-#     refuse to start. Silently falling back to ~/.claude/ would hide a real
-#     config error AND scatter state into a location the M2 vault sync engine
-#     doesn't include.
-if [ -x "$REPO/scripts/sutando-config.sh" ]; then
-  _ccd_err="$(mktemp -t start-cli-ccd.XXXXXX)"
-  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+# Resolve-or-refuse is shared with src/startup.sh; only the seeding is ours.
+source "$REPO/src/claude_config_dir.sh"
+if _ccd="$(resolve_claude_config_dir "$REPO" start-cli)"; then
     mkdir -p "$_ccd"
     export CLAUDE_CONFIG_DIR="$_ccd"
     echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
@@ -343,13 +343,12 @@ if changed:
         print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
 PY
     fi
-  else
-    echo "start-cli: claude_sutando_config_dir invalid — refusing to start core" >&2
-    cat "$_ccd_err" >&2
-    rm -f "$_ccd_err"
-    exit 1
-  fi
-  rm -f "$_ccd_err"
+else
+  _ccd_rc=$?
+  # 2 = caller already scoped the config dir; nothing to seed, and the core
+  # still reaches the intended credential store.
+  [ "$_ccd_rc" = "2" ] || exit 1
+  echo "  ✓ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 fi
 
 # NO --model flag: the core inherits the user's global model, so 1M stays the
@@ -486,6 +485,13 @@ log_restart_attempt() {
     "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
     >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
 }
+# Enforces the HAZARD above; the decision and its message are shared with
+# the codex launcher, this adapter keeps only its own attempt logging.
+if [ -n "$RESTART_REQUESTED" ] && sutando_restart_guard_refuses "$CALLER_CORE_SESSION"; then
+  sutando_restart_guard_explain
+  log_restart_attempt "$SUTANDO_RESTART_GUARD_REASON"
+  exit 1
+fi
 if [ -n "$RESTART_REQUESTED" ]; then
   log_restart_attempt "begin (session=$(tmux_session_exists && echo up || echo none) core=$(core_claude_running && echo up || echo none))"
   if tmux_session_exists || core_claude_running; then

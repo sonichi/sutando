@@ -319,7 +319,7 @@ reap_wedged_voice_agent() {
     return 0
   fi
   if out="$("$PY" "$REPO/scripts/voice-lock.py" takeover \
-      --pidfile "$WORKSPACE/.voice-agent.pid" \
+      --pidfile "$(bash "$REPO/scripts/sutando-config.sh" voice-pidfile "$WORKSPACE")" \
       --guard "$WORKSPACE/.voice-agent.lock.guard" \
       --workspace "$WORKSPACE" \
       --mode adopted --port "$port" \
@@ -432,9 +432,52 @@ start_gateway_lanes() {
     # the media URL lands in the task body unresolved — the core can't see the image
     # (owner-reported 2026-07-25). Default it to the AG2 tag here, in the AG2-specific
     # launch block, so the generic package carries no provider string. Explicit
-    # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins.
+    # REMOTE_MEDIA_MARKER (e.g. from the channel .env) still wins. The launchd
+    # wrapper defaults it too — launchd jobs never see this shell's exports.
     REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
     export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
+    # Prefer the launchd-supervised job (RunAtLoad + KeepAlive) so the bridge
+    # AUTO-RESTARTS on crash/kill instead of dying silently. Falls back to the
+    # bare launch below on checkouts lacking the template or if install fails.
+    local _gw_supervised=0
+    local _GW_LABEL="com.sutando.gateway-bridge"
+    local _GW_INSTALLER="$REPO/src/install-gateway-bridge-launchd.sh"
+    # Ask launchd about its OWN job, never argv: every named-instance bridge
+    # shares one argv and instance identity lives only in env, so a pgrep here
+    # reports a dead job as healthy whenever any other bridge is alive.
+    _gw_job_pid() {
+      launchctl list 2>/dev/null | awk -v l="$_GW_LABEL" '$3 == l && $1 ~ /^[0-9]+$/ { print $1; exit }'
+    }
+    if [ -f "$_GW_INSTALLER" ] && [ -f "$REPO/src/launchd/$_GW_LABEL.plist" ]; then
+      if launchctl print "gui/$(id -u)/$_GW_LABEL" > /dev/null 2>&1; then
+        if [ -n "$(_gw_job_pid)" ]; then
+          echo "  ✓ gateway bridge (launchd-supervised)"
+          _gw_supervised=1
+        else
+          # Loaded is not the same as running: the wrapper exits 0 when the token
+          # is removed, leaving an idle job. Bring it back when credentials return.
+          launchctl kickstart -k "gui/$(id -u)/$_GW_LABEL" > /dev/null 2>&1 || true
+          for _ in $(seq 1 12); do
+            [ -n "$(_gw_job_pid)" ] && { _gw_supervised=1; break; }
+            sleep 1
+          done
+          if [ "$_gw_supervised" = "1" ]; then
+            echo "  ✓ gateway bridge (launchd-supervised, recovered idle job)"
+          else
+            echo "  ⚠ gateway-bridge launchd job is loaded but idle — falling back to bare launch"
+          fi
+        fi
+      else
+        echo "  Installing launchd-supervised gateway bridge..."
+        if bash "$_GW_INSTALLER" install > /dev/null 2>&1; then
+          echo "  ✓ gateway bridge (launchd-supervised) — auto-restarts on death"
+          _gw_supervised=1
+        else
+          echo "  ⚠ gateway-bridge launchd install failed — falling back to bare launch"
+        fi
+      fi
+    fi
+    if [ "$_gw_supervised" = "0" ]; then
     # Always spawn; the bridge's own unsuffixed singleton lock self-defers a
     # duplicate. The previous `pgrep -f remote-gateway-bridge` guard was a P1
     # (john, PR review 2026-08-02): every named-instance bridge shares the SAME
@@ -450,6 +493,7 @@ start_gateway_lanes() {
       echo "  ✓ gateway bridge (self-defers if already running)"
     else
       echo "  ⊘ gateway bridge skipped — no runnable python3"
+    fi
     fi
 
     # Named secondary gateways (multi-gateway): every AG2_REMOTE_TOKEN_<INST> in

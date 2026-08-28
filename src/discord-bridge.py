@@ -149,10 +149,11 @@ def _is_discord_channel_id(value: str) -> bool:
     """A snowflake, so a Telegram chat id or a Matrix room id can never be
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
-from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
-from team_guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from team_result_guard import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
+from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
+from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
+
+from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -168,8 +169,9 @@ REPLY_CHAIN_MAX_DEPTH = 8
 # reached within this bound, an explicit truncation marker is emitted.
 REPLY_CHAIN_IDS_MAX_DEPTH = 64
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; _is_fence_open_line re-exported for existing tests)
-import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink; top-level so hooks carry no lazy import)
-import result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
+import result_audit  # noqa: E402  (Result Router S5 — §7 audit ledger sink)
+import discord_result_delivery as _drd  # noqa: E402  (top-level so hooks carry no lazy import)
+import delivery.router as result_router  # noqa: E402  (Result Router §9.3 — owner-visible delivery failures)
 
 #: Consecutive polls each result file has been present-but-empty. Bridge-owned
 #: state; threshold and wording live in result_router so the bridges cannot drift.
@@ -197,6 +199,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    pending_task_collab.pop(task_id, None)
     await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
     archive_file(result_file, "results", task_id)
     # Archive the SOURCE TASK too. Without this the task file sits in tasks/
@@ -354,10 +357,15 @@ OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
 # `src/dm-result.py`'s REST-fallback delivery (per liususan091219
 # review on PR #1029: keeping the policy as a copy in each file will
 # drift, even with "keep in sync" comments).
-from send_allowlist import (  # noqa: E402
+from policy.egress.attachment import (  # noqa: E402
     SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS,
     is_path_sendable as _is_path_sendable_shared,
+    classify_attachment as _classify_attachment,
+    ATTACH_SEND as _ATTACH_SEND,
+    ATTACH_MISSING as _ATTACH_MISSING,
+    ATTACH_EMPTY as _ATTACH_EMPTY,
+    ATTACH_REFUSED as _ATTACH_REFUSED,
 )
 
 
@@ -437,6 +445,14 @@ def _chunk_for_discord(
         preview.append(chunk)
         if len(preview) > max_chunks:
             break
+    if len(preview) > 1:
+        # Compose-side feedback: a multi-chunk delivery means the body failed
+        # the one-message cap. The composer never sees the split otherwise.
+        print(
+            f"  [delivery-gate] body needed {len(preview)} chunk(s) "
+            f"({len(text)} chars > {max_len}) — compose-side cap missed",
+            flush=True,
+        )
     if len(preview) <= max_chunks:
         yield from preview
         return
@@ -511,6 +527,29 @@ def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
     archive_file(task_file, "tasks", task_id)
     if gone:
         _clear_delivered(task_id)
+
+
+def _anchor_from_task_file(task_id: str):
+    """Recover the quote-reply anchor `pending_reply_anchors` lost to a restart.
+    By delivery time the task may be claimed or already archived, so try both."""
+    candidates = []
+    try:
+        live = find_task_file(TASKS_DIR, task_id)
+        if live is not None:
+            candidates.append(live)
+        for pattern in (f"*/{task_id}.txt", f"*/{task_id}.claimed-core-*.txt"):
+            candidates.extend(sorted(ARCHIVE_TASKS_DIR.glob(pattern)))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            for line in path.read_text(errors="replace").splitlines():
+                if line.startswith("source_message_id:"):
+                    raw = line.split(":", 1)[1].strip()
+                    return int(raw) if raw.isdigit() else None
+        except Exception:
+            continue
+    return None
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
@@ -2505,6 +2544,8 @@ pending_reply_anchors: dict[str, int] = {}
 # on restart; poll_progress fail-closes (skips streaming) when a task_id is
 # absent here, so a recovered task is never streamed without a known owner tier.
 pending_task_tiers: dict[str, str] = {}
+# Collaborators are engaged directly, so their tasks DO update core-status.
+pending_task_collab: dict[str, bool] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2551,6 +2592,16 @@ async def _deliver_pairing_prompt(channel, code, username, sender_id, allowed):
 
 client = discord.Client(intents=intents)
 _ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
+# RESUME is invisible to on_ready, so "no ready lines" cannot mean "no
+# reconnects" — these two counters are what make the classes distinguishable.
+_resume_count = 0
+_disconnect_count = 0
+
+def _reconnect_state() -> str:
+    """One shape for every reconnect-class line so the log stays greppable."""
+    return (f"gateway session #{_ready_count} "
+            f"(resume #{_resume_count}, disconnect #{_disconnect_count})")
+
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2643,6 +2694,23 @@ async def _supervise_loop(coro_fn, name):
 
 
 @client.event
+async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
+    global _resume_count
+    _resume_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge resumed: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
+async def on_disconnect():  # pragma: no cover — gateway callback
+    # Re-dispatched per retry while ready/resumed need success: the only outage line.
+    global _disconnect_count
+    _disconnect_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge disconnected: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
 async def on_ready():
     global _ready_count
     _ready_count += 1
@@ -2652,7 +2720,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
     # for Discord to infer it. Best-effort — presence must never break startup.
@@ -2966,6 +3034,14 @@ def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     except Exception:
         pass
     return False
+
+
+def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
+    """Collaborator status for a TEAM sender, however that tier was reached.
+    Global-allowlist members resolved to team by the tierMap are eligible too."""
+    if access_tier != "team":
+        return False
+    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
 
 
 def select_rulebook_key(access_tier, is_collaborator):
@@ -3752,13 +3828,14 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
-                # Per-channel collaborator check (pure helper — unit-tested):
-                # only the serving channel's own `collaborators` list grants
-                # engagement; membership elsewhere does not carry over.
-                # Handler-glue line: resolution logic is exercised via
-                # resolve_is_collaborator's unit tests; this async-handler branch
-                # is not independently invocable (cf. media_headers no-cover below).
-                is_collaborator = resolve_is_collaborator(data, sender_id, message.channel.id)  # noqa: E501  # pragma: no cover
+        except Exception:  # pragma: no cover — handler glue; unreadable config leaves the guest tier
+            pass
+    # Collaborator status is orthogonal to WHICH arm resolved team tier — a
+    # globally-allowlisted team sender can be a serving-channel collaborator.
+    if access_tier == "team" and not is_collaborator:
+        try:  # pragma: no cover — handler glue; logic in resolve_team_collaborator's tests
+            _acc = json.loads(ACCESS_FILE.read_text())
+            is_collaborator = resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id)  # noqa: E501
         except Exception:
             pass
 
@@ -4185,6 +4262,9 @@ async def _handle_discord_message(message, force=False):
             f"channel_name: {channel_name}\n"
             f"guild_name: {guild_name}\n"
             f"source_message_id: {message.id}\n"
+            # Same namespace as the addressee in the body (`<@id>`), so a non-addressed core
+            # can tell. Must stay above `task:` — later lines parse as untrusted body.
+            f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
             f"access_tier: {access_tier}\n"
@@ -4201,6 +4281,7 @@ async def _handle_discord_message(message, force=False):
         return
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
+    pending_task_collab[task_id] = bool(is_collaborator)
     # Observability: one inbound accepted-message event.
     _emit_channel(
         "discord", "in",
@@ -4702,6 +4783,10 @@ async def poll_results():
                 # messages instead of quote-replies. Caught by live test
                 # 2026-05-22 ~03:00 UTC: "it's not a quote reply".
                 source_message_anchor = pending_reply_anchors.pop(task_id, None)
+                if source_message_anchor is None:
+                    # Survives a bridge restart: the in-memory dict is gone but
+                    # the task file still carries source_message_id.
+                    source_message_anchor = _anchor_from_task_file(task_id)
                 # Clear the progress-streamer's tier map here (NOT only in
                 # poll_progress) so it's bounded even when the feature flag is
                 # OFF — otherwise this dict would leak one entry per task.
@@ -4710,6 +4795,7 @@ async def poll_results():
                 # "unknown" — never "owner" — so a lost/absent tier can't
                 # silently upgrade a non-owner reply in tier accounting.
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
+                pending_task_collab.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -4722,7 +4808,10 @@ async def poll_results():
                 if _guard_tier == "unknown":
                     _guard_tf = find_task_file(TASKS_DIR, task_id)
                     _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
-                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO)
+                # A Discord channel is a human surface: the suppression is journaled
+                # under STATE_DIR and closed silently rather than posted as prose.
+                reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO,
+                                                             suppress_journal=(STATE_DIR, task_id))
                 if _withheld:
                     print(f"  [team-guard] withheld result for {task_id} "
                           f"(tier={_guard_tier}): {_withheld}", flush=True)
@@ -4806,9 +4895,19 @@ async def poll_results():
                 # Avoids the double-delivery vector when the bridge
                 # restarts between channel.send() returning and
                 # archive_file() finishing. See DELIVERED_DIR docstring.
-                if _is_delivered(task_id):
-                    print(f"  Skipped (already delivered per sentinel): {task_id}", flush=True)
+                if _drd.is_delivered(RESULTS_DIR, task_id, DELIVERED_DIR):
+                    print(f"  Skipped (already delivered per outbox/sentinel): {task_id}", flush=True)
                     _archive_delivered_pair(result_file, task_id)
+                    continue
+                if _drd.is_parked(RESULTS_DIR, task_id):
+                    # terminal park recorded but a crash preceded the archive:
+                    # finish the archive now so the pair cannot loop forever
+                    print(f"  Parked (terminal) — archiving: {task_id}", flush=True)
+                    _archive_delivered_pair(result_file, task_id)
+                    continue
+                _send_tok = _drd.claim_for_send(RESULTS_DIR, task_id)
+                if _send_tok is None:
+                    # another incarnation holds the claim right now
                     continue
 
                 try:
@@ -4966,6 +5065,12 @@ async def poll_results():
                         if _is_path_sendable(fpath):
                             await channel.send(file=discord.File(fpath))
                             print(f"  Sent file: {fpath}")
+                        elif not fpath:
+                            # EMPTY target = malformed, not a prose quotation.
+                            # Unsurfaced, a file-only result retires with no output.
+                            await channel.send(
+                                "(a file marker in this reply had no path — nothing attached)")
+                            print("  [file marker with EMPTY path — malformed, surfaced]", flush=True)
                         elif not os.path.isfile(fpath):
                             # Prose-quoted `[file:/path]` substrings extract
                             # as markers but reference no real file. Log for
@@ -4981,7 +5086,8 @@ async def poll_results():
                     # triggers the skip-block above (archive + clear,
                     # no re-send). Without this, the result file
                     # would re-send on restart producing a duplicate.
-                    _mark_delivered(task_id)
+                    _drd.confirm(RESULTS_DIR, _send_tok,
+                                 str(getattr(channel, "id", "")))
                     print(f"  Replied: {reply_text[:80]}...", flush=True)
                     # Observability: one delivered-reply event.
                     _emit_channel(
@@ -4994,6 +5100,10 @@ async def poll_results():
                         },
                     )
                 except Exception as e:
+                    _ambiguous = isinstance(e, (TimeoutError,)) or \
+                        "timeout" in str(e).lower()
+                    (_drd.unknown if _ambiguous else _drd.failed_terminal)(
+                        RESULTS_DIR, _send_tok)
                     print(f"  Reply failed: {e}", flush=True)
                     await _report_delivery_failure(channel, task_id, _task_tier, e)
                 # Archive (not delete) so we can mine patterns later.
@@ -5028,16 +5138,17 @@ def _queued_task_count():
         return 0
 
 
-def _render_progress_content(now, elapsed):
-    """Placeholder body for poll_progress: the live core step normally, or the
-    honest outage copy (frozen status + stale heartbeat + queue depth) when the
-    core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
-    class: never narrate progress the core is not making)."""
+def _render_progress_content(now, elapsed, channel_is_private=False):
+    """`channel_is_private` gates the STEP TEXT and defaults False, so a caller that
+    has not established the audience posts the placeholder without a step."""
     status = progress_stream.read_core_status(STATE_DIR)
     if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
         return progress_stream.format_outage(
             progress_stream.status_age_s(status, now), _queued_task_count())
-    return progress_stream.format_progress(progress_stream.current_step(status), elapsed)
+    step = progress_stream.current_step(status)
+    if not progress_stream.step_visible_in(channel_is_private):
+        step = None
+    return progress_stream.format_progress(step, elapsed)
 
 
 async def poll_progress():
@@ -5099,7 +5210,7 @@ async def poll_progress():
                     if progress_stream.should_edit(now, info["last_edit"]):
                         try:
                             await info["msg"].edit(
-                                content=_render_progress_content(now, elapsed)
+                                content=_render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                             )
                             info["last_edit"] = now
                         except Exception:
@@ -5119,7 +5230,10 @@ async def poll_progress():
                 # entry closes that hole (red-team #2).
                 if task_id not in pending_task_tiers:
                     continue
-                if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+                # Poll branch not unit-invocable; decision covered in progress_stream.
+                if not progress_stream.should_stream_task(  # pragma: no cover
+                        pending_task_tiers.get(task_id),
+                        pending_task_collab.get(task_id, False)):
                     continue  # non-owner → no placeholder, no leak
                 try:
                     created = int(task_id.split("-")[1]) / 1000.0
@@ -5129,7 +5243,7 @@ async def poll_progress():
                 if progress_stream.should_post_placeholder(elapsed):
                     try:
                         msg = await channel.send(
-                            _render_progress_content(now, elapsed)
+                            _render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                         )
                         _progress_msgs[task_id] = {
                             "msg": msg,
@@ -5160,6 +5274,7 @@ async def poll_progress():
                                 continue
                     _progress_msgs.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
+                    pending_task_collab.pop(task_id, None)  # pragma: no cover
         except Exception as e:
             print(f"  [progress] poll_progress tick error: {e}", flush=True)
         await asyncio.sleep(3)
@@ -5174,10 +5289,10 @@ def _proactive_provider():
     client (and its 30s upload timeout pin)."""
     global _PROACTIVE_PROVIDER
     if _PROACTIVE_PROVIDER is None:
-        from discord_rest_client import DiscordRestClient
-        from discord_delivery_provider import DiscordDeliveryProvider
+        from channels.discord.post_gate import make_client
+        from channels.discord.delivery_provider import DiscordDeliveryProvider
         _PROACTIVE_PROVIDER = DiscordDeliveryProvider(
-            DiscordRestClient(TOKEN, timeout=30))
+            make_client(TOKEN, timeout=30))
     return _PROACTIVE_PROVIDER
 
 
@@ -5231,7 +5346,8 @@ async def poll_proactive():
             # decision rule (last-active channel from
             # state/last-owner-activity.json; default discord on missing
             # state).
-            from proactive_routing import should_claim_proactive_file  # noqa: E402
+            from proactive_routing import (  # noqa: E402
+                redirect_target_is_foreign, should_claim_proactive_file)
             for f in RESULTS_DIR.iterdir():
                 # Per-FILE decision: an explicit .to-<channel> destination
                 # outranks activity routing (see proactive_routing).
@@ -5262,10 +5378,16 @@ async def poll_proactive():
                     # Parse ONCE, here, and reuse below: a second grammar would
                     # miss what parse_markers peels (D7 `**[core: N]**` headers).
                     _pp = parse_markers(text)
+                    # Honor suppression markers, same as poll_dm_fallback —
+                    # else a skip-marked file still gets DM-attempted here.
+                    if has_skip_action(_pp.actions):
+                        print(f"  [proactive] skipped (suppression marker): {f.name}", flush=True)
+                        _proactive_fence().drop(f, "suppression marker (no-send/deduped/REPLIED)")
+                        continue
                     _early_redirect = next(
                         (a for a in _pp.actions if a.kind == "redirect"), None)
-                    if _early_redirect is not None and not re.fullmatch(
-                            r"\d{17,20}", str(_early_redirect.value).strip()):
+                    if _early_redirect is not None and redirect_target_is_foreign(
+                            _early_redirect.value, "discord"):
                         print(f"  [proactive] {f.name} targets "
                               f"{str(_early_redirect.value).strip()!r} — not a Discord "
                               f"channel id; releasing for its own bridge", flush=True)
@@ -5368,13 +5490,33 @@ async def poll_proactive():
                                             _redirect_text, f.stem,
                                             _chunk_for_discord)
                                     for fpath in files:
-                                        fpath = os.path.expanduser(fpath.strip())
-                                        if _is_path_sendable(fpath):
+                                        _outcome, fpath = _classify_attachment(fpath)
+                                        if _outcome == _ATTACH_SEND:
                                             await _target_ch.send(file=discord.File(fpath))
-                                        elif not os.path.isfile(fpath):
+                                            print(
+                                                f"  [proactive channel-redirect] sent file: {fpath}",
+                                                flush=True,
+                                            )
+                                        elif _outcome == _ATTACH_MISSING:
                                             print(
                                                 f"  [proactive channel-redirect] file marker, "
                                                 f"file not found: {fpath}",
+                                                flush=True,
+                                            )
+                                        elif _outcome == _ATTACH_EMPTY:
+                                            await _target_ch.send(
+                                                "(a file marker in this reply had no path"
+                                                " — nothing attached)")
+                                            print("  [proactive channel-redirect] file marker "
+                                                  "with EMPTY path — malformed, surfaced",
+                                                  flush=True)
+                                        elif _outcome == _ATTACH_REFUSED:
+                                            # Authorization denial, not absence: silence
+                                            # here reads as a successful attach.
+                                            await _target_ch.send(f"(file not allowed: {fpath})")
+                                            print(
+                                                f"  [proactive channel-redirect] REJECTED file "
+                                                f"(not in allowlist): {fpath}",
                                                 flush=True,
                                             )
                                     try:
@@ -5664,7 +5806,7 @@ async def poll_dm_fallback():
                 except OSError:
                     _peek = ""
                 _parsed_fb = parse_markers(_peek)
-                if any(a.kind == "skip" for a in _parsed_fb.actions):
+                if has_skip_action(_parsed_fb.actions):
                     print(f"  [dm-fallback] skipped (suppression marker): {f.name}", flush=True)
                     _task_id = f.stem
                     _task_file = find_task_file(TASKS_DIR, _task_id)
@@ -5732,13 +5874,22 @@ async def poll_dm_fallback():
                                 except Exception:
                                     pass
                             for fpath in file_list:
-                                fpath = os.path.expanduser(fpath.strip())
-                                if _is_path_sendable(fpath):
+                                _outcome, fpath = _classify_attachment(fpath)
+                                if _outcome == _ATTACH_SEND:
                                     await target_channel.send(file=discord.File(fpath))
                                     print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
-                                elif not os.path.isfile(fpath):
+                                elif _outcome == _ATTACH_MISSING:
                                     # See poll_results — log only, no user noise.
                                     print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
+                                elif _outcome == _ATTACH_EMPTY:
+                                    await target_channel.send(
+                                        "(a file marker in this reply had no path"
+                                        " — nothing attached)")
+                                    print("  [dm-fallback channel-redirect] file marker with "
+                                          "EMPTY path — malformed, surfaced", flush=True)
+                                elif _outcome == _ATTACH_REFUSED:
+                                    await target_channel.send(f"(file not allowed: {fpath})")
+                                    print(f"  [dm-fallback channel-redirect] REJECTED file (not in allowlist): {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
                             if _task_file.exists():
@@ -5846,25 +5997,28 @@ def _parse_send_argv(argv):
     return reply_to, argv
 
 
+def _rest_client(timeout: int = 10):
+    """The shared Discord REST chokepoint for the CLI send/edit paths. A test
+    binds a scripted transport through here so the PRODUCTION client stays in
+    the loop; make_client resolves the injected post-gate for this process."""
+    from channels.discord.post_gate import make_client
+    return make_client(TOKEN, timeout=timeout)
+
+
 def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
-    """Send a message via Discord REST API (no gateway connection).
+    """Send a message via the shared DiscordRestClient (no gateway connection).
 
     Chunks via `_chunk_for_discord` so messages over Discord's 2000-char
     limit render correctly without allowing one oversized payload to monopolize
     the bridge. Without chunking the API returns 400; without the delivery budget,
     a malformed result can produce hundreds of sequential POSTs.
     """
-    import urllib.request
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    headers = {
-        "Authorization": f"Bot {TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": "DiscordBot (sutando, 1.0)",
-    }
+    from outbox import DeliveryOutcome
     chunks = list(_chunk_for_discord(message))
     if not chunks:
         # Empty message — nothing to send. Treat as no-op rather than error.
         return
+    client = _rest_client()
     for i, chunk in enumerate(chunks, 1):
         payload = {"content": chunk}
         # First chunk only: on every chunk it renders N reply-headers for one
@@ -5872,26 +6026,20 @@ def _send_via_rest(channel_id: str, message: str, reply_to: str = ""):
         if reply_to and i == 1:
             payload["message_reference"] = {"message_id": str(reply_to),
                                             "fail_if_not_exists": False}
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=data, headers=headers)
-        # Transport only: once urlopen returns, the message is committed, so
-        # read() belongs below. Not a `with` — doubles are plain objects.
-        try:
-            resp = urllib.request.urlopen(req, timeout=10)
-        except Exception as e:
-            print(f"Send failed (chunk {i}/{len(chunks)}): {e}")
+        receipt, status, _body = client.send_message_with_response(channel_id, payload)
+        committed = status is not None and 200 <= status < 300
+        if receipt.outcome is not DeliveryOutcome.CONFIRMED and not committed:
+            # No 2xx reached us: refused, or genuinely unknown. Exiting nonzero
+            # matches the pre-client behavior for these transport failures.
+            print(f"Send failed (chunk {i}/{len(chunks)}): {receipt.detail}")
             sys.exit(1)
         # Best-effort, and emitted per chunk: buffering until every chunk lands
         # leaves an earlier delivered chunk unaddressable when a later one fails.
-        try:
-            body = json.loads(resp.read().decode())
-            mid = body.get("id") if isinstance(body, dict) else None
-            mid = str(mid) if isinstance(mid, (str, int)) and str(mid) else None
-        except Exception:
-            mid = None
-        if mid:
-            print(f"message_id {mid}")
+        if receipt.receipt_id:
+            print(f"message_id {receipt.receipt_id}")
         else:
+            # 2xx without a readable id: COMMITTED, so this must not report a
+            # failure — that invites the retry that duplicates the message.
             print(f"message_id unavailable (chunk {i}/{len(chunks)}) — sent, not addressable")
     suffix = "..." if len(message) > 80 else ""
     chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
@@ -5904,7 +6052,6 @@ def _edit_via_rest(channel_id: str, message_id: str, message: str):
     Refuses a body the chunker would split: an edit addresses ONE message, so a
     multi-chunk body cannot be applied without silently dropping the remainder.
     """
-    import urllib.request
     if not message.strip():
         print("ERROR: refusing to edit to an empty body")
         sys.exit(1)
@@ -5913,17 +6060,12 @@ def _edit_via_rest(channel_id: str, message_id: str, message: str):
         print(f"ERROR: body is {len(message)} chars — too long for one message. "
               "An edit cannot chunk; shorten it or send a new message.")
         sys.exit(1)
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}"
-    data = json.dumps({"content": message}).encode()
-    req = urllib.request.Request(url, data=data, method="PATCH", headers={
-        "Authorization": f"Bot {TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": "DiscordBot (sutando, 1.0)",
-    })
-    try:
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        print(f"Edit failed: {e}")
+    from outbox import DeliveryOutcome
+    receipt, status, _body = _rest_client().edit_message_with_response(
+        channel_id, message_id, {"content": message})
+    committed = status is not None and 200 <= status < 300
+    if receipt.outcome is not DeliveryOutcome.CONFIRMED and not committed:
+        print(f"Edit failed: {receipt.detail}")
         sys.exit(1)
     suffix = "..." if len(message) > 80 else ""
     print(f"Edited {channel_id}/{message_id}: {message[:80]}{suffix}")

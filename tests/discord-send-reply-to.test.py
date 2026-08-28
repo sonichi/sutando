@@ -49,22 +49,26 @@ def check(cond, label):
         failures.append(label)
 
 
+sys.path.insert(0, str(REPO / "src"))
+from channels.discord.client import DiscordRestClient  # noqa: E402
+
+
 def capture(message, **kw):
-    """Run _send_via_rest against a stubbed transport; return the POSTed payloads."""
-    import urllib.request as ur
+    """Run _send_via_rest through the PRODUCTION DiscordRestClient with a
+    scripted transport; return the POSTed payloads the client built."""
     posted = []
 
-    class FakeResp:
-        status = 200
-        def read(self): return b"{}"
+    def transport(req, timeout):
+        posted.append(json.loads(req.data))
+        return 200, {"id": "1"}
 
-    real_req, real_open = ur.Request, ur.urlopen
-    ur.Request = lambda url, data=None, headers=None: posted.append(json.loads(data)) or object()
-    ur.urlopen = lambda req, timeout=None: FakeResp()
+    real = bridge._rest_client
+    bridge._rest_client = lambda timeout=10: DiscordRestClient(
+        "test-token-not-real", transport=transport)
     try:
         bridge._send_via_rest("123", message, **kw)
     finally:
-        ur.Request, ur.urlopen = real_req, real_open
+        bridge._rest_client = real
     return posted
 
 

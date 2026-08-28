@@ -51,20 +51,20 @@ USAGE = "Usage: python3 src/dm-result.py 'text' | --file path"
 # roots that discord-bridge had; the shared import fixes that drift.
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
-from send_allowlist import (  # noqa: E402
+from policy.egress.attachment import (  # noqa: E402
     is_path_sendable as _is_path_sendable,
     SEND_ALLOWED_PREFIXES as _SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS as _SEND_ALLOWED_ROOTS,
 )
 from message_chunking import chunk_message, _is_fence_open_line  # noqa: E402  (Result Router S3 — shared fence-aware chunker; was a 4th private copy)
-from discord_rest_client import DiscordRestClient  # noqa: E402  — shared transport (PR 4)
+from channels.discord.post_gate import make_client  # noqa: E402  — shared transport + injected post-gate
 from outbox import DeliveryOutcome  # noqa: E402
 
 
 def _client(token):
     # Seam for test stubs. timeout=30 preserves the retired multipart cap;
     # on a single-attempt send a longer timeout only delays the verdict.
-    return DiscordRestClient(token, timeout=30)
+    return make_client(token, timeout=30)
 
 
 
@@ -167,6 +167,17 @@ def _open_dm_channel(owner_id: str, token: str) -> str:
 
 def send_dm(text: str) -> bool:
     """Send text to the resolved owner's Discord DM."""
+    # This sender only ever opens the owner's DM, so a [channel:] redirect names a
+    # destination it cannot reach; refusing beats misrouting the body silently.
+    redirects = [a.value for a in parse_markers(text).actions if a.kind == "redirect"]
+    if redirects:
+        print(
+            f"dm-result: body carries a [channel: {redirects[0]}] redirect, "
+            "which this sender cannot honor (owner DM only). Not sending.",
+            file=sys.stderr,
+        )
+        return False
+
     token = _load_token()
     if not token:
         print("dm-result: DISCORD_BOT_TOKEN not found in .env", file=sys.stderr)

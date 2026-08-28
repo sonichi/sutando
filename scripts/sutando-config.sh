@@ -81,6 +81,22 @@ from src.sutando_config import resolve_workspace
 print(resolve_workspace(), end='')
 "
     ;;
+  voice-pidfile)
+    # Single resolver for the voice-agent pid metadata file (#2722). Canonical
+    # lives under state/locks/; the root path is a ~30-day reader fallback so an
+    # agent started under pre-move code stays stoppable (docs/migration-transition-window.md).
+    # $2 (optional): an already-resolved workspace root — callers that hold one
+    # inject it so this cannot disagree with the tree they operate on.
+    if [ -n "${2:-}" ]; then _ws="$2"; else _ws="$(bash "$0" workspace)" || exit 1; fi
+    _canon="$_ws/state/locks/voice-agent.pid"
+    _legacy="$_ws/.voice-agent.pid"
+    if [ ! -f "$_canon" ] && [ -f "$_legacy" ]; then
+      echo "sutando-config: voice-pidfile using legacy $_legacy (pre-move agent; transition window per #2722)" >&2
+      printf '%s' "$_legacy"
+    else
+      printf '%s' "$_canon"
+    fi
+    ;;
 
   vault-enabled)
     py -c "
@@ -629,9 +645,11 @@ except Exception:
 # code: the source-version identity of the runtime — 'which Sutando is this,
 # behaviorally?' Prompts + skills + scripts in the repo determine behavior, so
 # the desktop app (and fleet tooling) wants this to reason about version-compat
-# and to spot a locally-modified core. All git-native + best-effort (None when
-# not a git checkout). tree_sha is the content hash of TRACKED files (version-
-# independent); dirty flags uncommitted edits. A stronger working-tree
+# and to spot a locally-modified core. Git is authoritative for checkouts;
+# packaged engines fall back to the build-authored ENGINE_MANIFEST beside the
+# copied repo. tree_sha is the content hash of TRACKED files (version-
+# independent); packaged consumers use tree_digest instead. dirty flags
+# uncommitted edits. A stronger working-tree
 # 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
 # follow-up alongside the identity block.
 # Resolve ONCE, before any spawn. Two gates, both required:
@@ -663,12 +681,45 @@ def _git(*a):
         return (r.stdout.strip() or None) if r.returncode == 0 else None
     except Exception:
         return None
+
+def _engine_manifest():
+    # Packaging authors the parent manifest; the in-repo path is compatibility-only.
+    for path in (os.path.join(os.path.dirname(repo), 'ENGINE_MANIFEST.json'),
+                 os.path.join(repo, 'ENGINE_MANIFEST.json')):
+        try:
+            with open(path) as f:
+                value = json.load(f)
+            if isinstance(value, dict):
+                return value
+        except (OSError, ValueError):
+            pass
+    return {}
+
+_git_revision = _git('rev-parse', 'HEAD')
+_manifest = {} if _git_revision else _engine_manifest()
+_manifest_revision = _manifest.get('sha')
+if not (isinstance(_manifest_revision, str) and len(_manifest_revision) >= 8
+        and all(c in '0123456789abcdefABCDEF' for c in _manifest_revision)):
+    _manifest_revision = None
+_revision = _git_revision or _manifest_revision
+_git_describe = _git('describe', '--tags', '--always', '--dirty')
+_manifest_branch = _manifest.get('branch')
+if not isinstance(_manifest_branch, str):
+    _manifest_branch = None
+_manifest_dirty = _manifest.get('dirty')
+if not isinstance(_manifest_dirty, bool):
+    _manifest_dirty = False
 code = {
-    'commit': _git('rev-parse', '--short', 'HEAD'),
-    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD'),
-    'describe': _git('describe', '--tags', '--always', '--dirty'),
+    'commit': _revision[:7] if _revision else None,
+    'revision': _revision,
+    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD') or _manifest_branch,
+    'describe': _git_describe or (_revision[:7] if _revision else None),
     'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
-    'dirty': bool(_git('status', '--porcelain')),
+    'dirty': bool(_git('status', '--porcelain')) if _git_revision else _manifest_dirty,
+    'source': 'git' if _git_revision else ('engine-manifest' if _manifest_revision else None),
+    'built_at': _manifest.get('built_at') if isinstance(_manifest.get('built_at'), str) else None,
+    'tree_digest': (_manifest.get('post_build_tree_digest')
+                    if isinstance(_manifest.get('post_build_tree_digest'), str) else None),
 }
 # run-dir + runtime-api socket: mirror #2325 rundir.py (same policy as the
 # run-dir / runtime-socket subcommands). This is a second copy of the chain (the

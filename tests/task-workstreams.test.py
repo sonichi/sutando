@@ -733,6 +733,49 @@ def test_classifier_task_survives_a_raising_stamper() -> None:
     assert "envelope_hmac:" not in text
 
 
+def test_reused_workstream_id_does_not_require_a_redundant_name() -> None:
+    workspace = fixture_workspace()
+
+    # Seed a stored workstream, so reuse is exercised WITHOUT a prior apply — a prior
+    # apply would review the whole snapshot and leave no candidates behind.
+    reused_id = workstreams._workstream_id("Sutando task management")
+    store_path = workspace / "data" / "task-workstreams.json"
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {reused_id: {
+            "title": "Sutando task management",
+            "summary": "group and display related tasks",
+            "created_at": "2026-08-03T09:00:00+00:00",
+            "updated_at": "2026-08-03T09:00:00+00:00",
+        }},
+        "assignments": {},
+        "reviews": {},
+        "context_history": {},
+    }))
+    assert reused_id in workstreams.load_workstream_store(workspace)["workstreams"]
+
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    result = workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [
+            # No `name`: the stored workstream already carries its title.
+            {"workstream_id": reused_id, "confidence": 0.9, "task_ids": ["task-a1"]},
+            # An unknown id with no name has no title to fall back on, so it still skips.
+            {"workstream_id": "workstream-does-not-exist", "confidence": 0.9,
+             "task_ids": ["task-b1"]},
+        ],
+    })
+    assert result.assigned == 1, f"reuse without a name was dropped: {result}"
+    assert result.skipped == 1, f"nameless unknown id should skip exactly once: {result}"
+    assert result.workstreams_created == 0, f"reuse minted a new workstream: {result}"
+
+    store = workstreams.load_workstream_store(workspace)
+    assert store["assignments"]["task-a1"]["workstream_id"] == reused_id
+    assert "task-b1" not in store["assignments"]
+    assert store["workstreams"][reused_id]["title"] == "Sutando task management"
+
+
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
@@ -750,6 +793,7 @@ def main() -> None:
         test_remembered_context_history_keeps_only_the_newest_entries,
         test_workstream_context_index_fail_open_edges,
         test_concurrent_inheritance_keeps_every_assignment,
+        test_reused_workstream_id_does_not_require_a_redundant_name,
     ]
     for test in tests:
         test()

@@ -67,17 +67,33 @@ class TestSlackBridgeChannelRedirectGuard(unittest.TestCase):
             "the file before checking its content.",
         )
 
-    def test_snowflake_regex_present(self):
-        """The guard must use a Discord snowflake regex (17-20 digits) to avoid
-        false-positive matches on Slack channel IDs (which start with C/D prefix,
-        not pure digits).
+    def test_guard_delegates_to_the_shared_classifier(self):
+        """The distinction this test has always been about — a Discord id is not a
+        Slack id — now lives in proactive_routing instead of a literal here.
+
+        The `\\d{17,20}` spelling recognised Discord and NOTHING else, so a Matrix
+        room id read as unaddressed and the file was claimable. Asserting the
+        literal pinned the implementation; asserting the delegate plus its
+        behaviour pins what the literal was for.
         """
         self.assertIn(
-            r"\d{17,20}",
-            SRC,
-            "Snowflake regex (\\d{17,20}) must be present to distinguish Discord "
-            "channel IDs from Slack channel IDs",
-        )
+            'body_claimable_by(peek, "slack")', SRC,
+            "the peek must delegate to proactive_routing, not spell its own grammar")
+        self.assertNotRegex(
+            SRC, r"\\d\{17,20\}",
+            "no private copy of the id grammar may survive in this adapter")
+
+        sys.path.insert(0, str(REPO / "src"))
+        from proactive_routing import body_claimable_by
+
+        # A grep is satisfied by a no-op; these are the discriminations the
+        # docstring above has always named, now actually exercised.
+        self.assertTrue(body_claimable_by("[channel: C0123ABCD]\nx", "slack"),
+                        "a Slack channel id is this bridge's own address")
+        self.assertFalse(body_claimable_by("[channel: 1530802402603700415]\nx", "slack"),
+                         "a Discord snowflake belongs to discord-bridge")
+        self.assertFalse(body_claimable_by("[channel: !Room:ag2.space]\nx", "slack"),
+                         "and a Matrix room to the gateway — the case the literal missed")
 
 
 if __name__ == "__main__":

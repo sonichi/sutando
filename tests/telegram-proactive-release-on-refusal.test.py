@@ -37,6 +37,11 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  FAIL {name} {detail}")
 
 
+sys.path.insert(0, str(REPO / "src"))
+# Imported before the stub replaces sys.modules: it hands back the real gate.
+from proactive_routing import body_claimable_by as _real_body_claimable_by  # noqa: E402
+
+
 class _Stop(Exception):
     """Breaks main()'s poll loop after the drain has run."""
 
@@ -78,6 +83,8 @@ def _run_one_drain(mod, results: Path, send_result: dict):
     routing.should_claim_proactive = lambda *_a, **_k: True
     routing.should_claim_proactive_file = lambda *_a, **_k: True
     routing.proactive_destination = lambda *_a, **_k: None
+    # Stubbed routing claims every file; body_claimable_by stays REAL.
+    routing.body_claimable_by = _real_body_claimable_by
     sys.modules["proactive_routing"] = routing
     mod.presenter_mode_active = lambda *_a, **_k: False
     t = threading.Thread(target=lambda: _swallow(mod.main), daemon=True)

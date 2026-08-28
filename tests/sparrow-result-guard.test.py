@@ -10,6 +10,7 @@ shared guard has to run first or a redirect/upload happens on unscanned text.
 Exercises the production `_guarded_result_body`, not a copy of its recipe.
 """
 import importlib
+import json
 import pathlib
 import sys
 import tempfile
@@ -87,6 +88,7 @@ with tempfile.TemporaryDirectory() as td:
     notice_fields = {
         "source": "ag2space",
         "channel_id": "!room:ag2.space",
+        "room_name": "Design Room",
         "reply_to_event": "$thread-root",
         "source_message_id": "$message-one",
         "user_id": "@requester:ag2.space",
@@ -99,6 +101,9 @@ with tempfile.TemporaryDirectory() as td:
           and any(a.kind == "skip" for a in m.parse_markers(first_notice).actions),
           "first withhold closes the lease without posting into the shared room")
     check(bool(review_files), "first withhold persists an owner-review artifact")
+    review_record = json.loads(review_files[0].read_text(encoding="utf-8"))
+    check(review_record.get("context", {}).get("room_name") == "Design Room",
+          "the bridge retains the human-readable room name for private review")
 
     retry_notice, _ = m._guarded_result_body("task-notice-one", BODY_WITH_MARKERS)
     check(retry_notice == first_notice,
@@ -240,10 +245,16 @@ with tempfile.TemporaryDirectory() as td:
 # --- the drain must call the guard before the parser, in source order.
 src = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
        / "remote_gateway_bridge.py").read_text()
-drain = src[src.find("    for tid in list(inflight):"):]
-gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body)")
-check(gi != -1 and pi != -1 and gi < pi,
-      "in the drain, _guarded_result_body precedes parse_markers")
+# Line-bounded: a deeper-indented loop contains the bare literal, and an
+# absent anchor slices src[-1:] — both misreport a guard-ordering violation.
+anchor = "\n    for tid in list(inflight):\n"
+i = src.find(anchor)
+check(i != -1, "the drain anchor is still present in remote_gateway_bridge.py")
+if i != -1:
+    drain = src[i:]
+    gi, pi = drain.find("_guarded_result_body"), drain.find("parse_markers(body)")
+    check(gi != -1 and pi != -1 and gi < pi,
+          "in the drain, _guarded_result_body precedes parse_markers")
 
 if fail:
     print("FAIL: sparrow result guard")
@@ -350,7 +361,9 @@ def drain_two_pass():
         if path != "/v1/results":
             return {}
         attempts["n"] += 1
-        if attempts["n"] == 1:
+        # The drain's idempotent re-send retries ambiguity once IN-pass, so a
+        # genuinely failed pass must fail both the send and its re-send.
+        if attempts["n"] <= 2:
             raise urllib.error.URLError("transient")
         posted.append(payload)
         return {}

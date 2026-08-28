@@ -39,6 +39,7 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+import { keystrokeOutcome } from './osascript-setup-hint.js';
 import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
 // Vision: one-shot frame + start/stop live screen-to-Gemini video.
@@ -215,14 +216,14 @@ export const pressKeyTool: ToolDefinition = {
 			try {
 				execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeKey}"${modStr}`], { timeout: 3_000 });
 			} catch (err) {
-				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 			}
 		} else {
 			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
 			try {
 				execFileSync('osascript', ['-e', `tell application "System Events" to key code ${keyCode}${modStr}`], { timeout: 3_000 });
 			} catch (err) {
-				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 			}
 		}
 		console.log(`${ts()} [PressKey] ${app ? `(${app}) ` : ''}${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
@@ -379,7 +380,7 @@ export const typeTextTool: ToolDefinition = {
 				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
 			} catch (err) {
-				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('Paste', err instanceof Error ? err.message : String(err));
 			}
 		}
 		// Single-line short text: use keystroke
@@ -398,7 +399,7 @@ export const typeTextTool: ToolDefinition = {
 			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
-			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
+			return keystrokeOutcome('Type', err instanceof Error ? err.message : String(err));
 		}
 	},
 };
@@ -1222,7 +1223,12 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // Split by manifest `access_tier` so phone-conversation can include
 // owner-tier tools only when the caller is the verified owner. Manifest
 // access_tier values: "owner" (default if omitted) | "any_caller".
-async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
+// OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
+// session so the skill registers session handlers without importing core.
+export type { SkillSetupCtx, SkillSetup } from './skill-setup-runner.js';
+import type { SkillSetup } from './skill-setup-runner.js';
+
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[] }> {
 	// Scan the public-repo `skills/` dir, the per-user workspace
 	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
@@ -1254,6 +1260,9 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];
 	const anyCaller: ToolDefinition[] = [];
+	// Keyed by skill identity (manifest.name || dirName), not tool name: the same
+	// skill scanned from two roots must attach its handler ONCE, last-write-wins.
+	const setups = new Map<string, SkillSetup>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1286,6 +1295,12 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
+				if (typeof mod.setup === 'function') {
+					// DISCOVERY, not registration: a skill in N roots hits this line N times
+					// but registers once. The authoritative count is logged after the scan.
+					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
+					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
+				}
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
@@ -1302,7 +1317,9 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		for (const t of arr) byName.set(t.name, t);
 		return [...byName.values()];
 	};
-	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller) };
+	// One authoritative line for what actually got registered, after dedupe.
+	if (setups.size) console.log(`[skill-loader] registered ${setups.size} setup() hook(s): ${[...setups.keys()].join(', ')}`);
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()] };
 }
 const personalTools = await loadSkillManifestTools();
 // Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
@@ -1318,6 +1335,9 @@ const personalAllTools = (() => {
 export const envDependentToolNames: ReadonlySet<string> = new Set([
 	...personalAllTools.map(t => t.name), 'slide_control', 'fullscreen',
 ]);
+// voice-agent invokes each once per session with {session, injectText}.
+// Empty when no skill exports setup().
+export const personalSkillSetups: SkillSetup[] = personalTools.setups;
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,

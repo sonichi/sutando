@@ -44,6 +44,19 @@ class TestSkipMarkers(unittest.TestCase):
         self.assertEqual(r.actions[0].value, "deduped")
         self.assertEqual(r.actions[0].extra, "task-1779164273868")
 
+    def test_deduped_empty_target_parses_like_its_spaced_twin(self):
+        # One space apart: the spaced form parsed, the bare one did not, so
+        # the bare one shipped its marker text and body to the channel.
+        for src in ("[deduped:]\nfull reply elsewhere",
+                    "[deduped: ]\nfull reply elsewhere"):
+            with self.subTest(src=src.splitlines()[0]):
+                r = parse_markers(src)
+                self.assertEqual(len(r.actions), 1, "must parse as exactly one skip")
+                self.assertEqual(r.actions[0].kind, "skip")
+                self.assertEqual(r.actions[0].value, "deduped")
+                self.assertEqual(r.actions[0].extra, "")
+                self.assertNotIn("[deduped", r.body)
+
     def test_skip_strips_leading_whitespace(self):
         r = parse_markers("  [no-send]\nbody")
         self.assertEqual(r.actions[0].kind, "skip")
@@ -206,6 +219,18 @@ class TestNoLeakInvariant(unittest.TestCase):
     in the parsed `body` field. Whatever a bridge passes through, the user
     sees clean output.
     """
+
+    def test_empty_target_markers_never_leak_in_any_family(self):
+        # Redirect expects NO action — empty target is not a target (pinned
+        # end-to-end in empty-redirect-target-default-route.test.py).
+        for src, kinds in (("[deduped:]\nbody", ["skip"]),
+                           ("[channel:]\nbody", []),
+                           ("[file:]\nbody", ["attach"])):
+            with self.subTest(src=src.splitlines()[0]):
+                r = parse_markers(src)
+                self.assertEqual([a.kind for a in r.actions], kinds)
+                for marker in ("[deduped:", "[channel:", "[file:"):
+                    self.assertNotIn(marker, r.body)
 
     def test_no_attach_marker_in_body(self):
         r = parse_markers("body [file: /a] [send: /b] [attach: /c] end")

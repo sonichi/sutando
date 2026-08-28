@@ -13,7 +13,10 @@ name: Coverage Gate
 
 on:
   pull_request:
-    branches: [main, staging-interaction-planes]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   coverage-gate:
