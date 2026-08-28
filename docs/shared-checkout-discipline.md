@@ -8,66 +8,24 @@ same repository sits next to it. Under those conditions a working tree is a
 shared mutable variable: its branch and its file content change between two of
 your own commands, without either command causing the change.
 
-Three failures on the same day share one root cause — no session pinned the tree
-state at the moment it acted on it.
+Three failures on the same day share one root cause — **no session had exclusive
+use of the tree it was mutating.** Each also shows an expired pin, but that is the
+mechanism by which the missing isolation surfaced, not the defect itself: a pin
+that never expired would still not have stopped a peer from writing.
 
 ## The rule
 
-### 1. Assert the branch immediately before each write
+### 1. Isolate the writer — exclusive mutation is the control
 
-Before `rebase`, `reset`, `checkout`, `commit`, or `push` — before each one, not
-once per pass — assert that `git branch --show-current` is the branch you intend
-to operate on. Do not infer it from what you last did, and do not carry an
-earlier answer forward.
+**No assertion fixes a shared tree, because there is no check-and-write pair a peer
+cannot interleave: `&&` sequences two processes, it does not lock the worktree.**
+Every mutating session gets its own worktree or clone, or every writer participates
+in one ownership lock. Sessions sharing the live tree are **read-only**.
 
-The per-pass form is the trap precisely because it does not look like one: it is
-a real check, it passes, and running it reads as compliance. But what it
-establishes is where the tree *was*. On a variable another session can write,
-that answer expires the moment control leaves your process.
+Everything below is what you do *inside* that boundary, or what you fall back to
+when you genuinely cannot have one. None of it substitutes for the boundary.
 
-**The primary rule is exclusive mutation, not a better check.** No assertion fixes
-this, because there is no check-and-write pair a peer cannot interleave: `&&`
-sequences two processes, it does not lock the worktree. Every mutating session gets
-its own worktree or clone (or every writer participates in one ownership lock);
-sessions sharing the live tree are **read-only**.
-
-A reviewer demonstrated the residual hole in the check-then-act form by forcing one
-switch after the branch read returned `intended`:
-
-```text
-branch-check-returned=intended
-raced-commit-branch=other
-remote-intended-equals-wrong-branch=yes
-```
-
-`git push origin HEAD:"$INTENDED"` names the *destination* and leaves the **source**
-ambient, so when `HEAD` had moved the push fast-forwarded remote `intended` to
-another branch's commit — the unreviewed-code path this document exists to close.
-
-Inside an exclusive boundary, these remain useful as defense-in-depth — never as the
-control itself. Name both ends, so the source cannot be supplied by ambient `HEAD`:
-
-```bash
-[ "$(git branch --show-current)" = "$INTENDED" ] && git commit -m "<message>"
-git push origin "$INTENDED:$INTENDED"   # both ends named; no ambient HEAD
-```
-
-### 2. Cite the ref when a conclusion rests on file content
-
-`grep -rn` over the working tree answers *what is on disk this instant*. In a
-shared checkout that is a different question from *what is in branch X*, and a
-third question from *what is process P running*. Read content through the ref you
-actually mean:
-
-```bash
-git show <ref>:<path>       # what is in branch X
-git grep <pattern> <ref>    # search branch X, not the tree
-```
-
-If you cannot name which of the three questions your measurement answered, you
-have not measured any of them.
-
-### 3. Report the OID, not just the ref — a ref is ambient too
+### 2. Measure against an immutable OID, and report it
 
 "Zero hits" is not a finding. But "zero hits in `origin/<branch>`" is not one
 either: **worktrees share refs**, so a fetch or a peer can move that ref after you
@@ -91,6 +49,59 @@ A bare value gives a reader no way to detect that it was measured against the
 wrong tree state, which is the failure this document exists for; a bare ref gives
 them no way to detect that the state moved underneath it. The obligation is
 heaviest when the report contradicts something the reader observed directly.
+
+**Superseded form — citing the ref alone.** An earlier version of this rule said to
+read content through the ref you mean, which is better than reading the tree but
+still ambient:
+
+`grep -rn` over the working tree answers *what is on disk this instant*. In a
+shared checkout that is a different question from *what is in branch X*, and a
+third question from *what is process P running*. Read content through the ref you
+actually mean:
+
+```bash
+git show <ref>:<path>       # what is in branch X
+git grep <pattern> <ref>    # search branch X, not the tree
+```
+
+If you cannot name which of the three questions your measurement answered, you
+have not measured any of them.
+
+Use it only to decide *which* ref you mean; resolve that ref to an OID before you
+measure, and report the OID.
+
+### 3. Assert the branch before each write — defense in depth, never the control
+
+Before `rebase`, `reset`, `checkout`, `commit`, or `push` — before each one, not
+once per pass — assert that `git branch --show-current` is the branch you intend
+to operate on. Do not infer it from what you last did, and do not carry an
+earlier answer forward.
+
+The per-pass form is the trap precisely because it does not look like one: it is
+a real check, it passes, and running it reads as compliance. But what it
+establishes is where the tree *was*. On a variable another session can write,
+that answer expires the moment control leaves your process.
+
+A reviewer demonstrated the residual hole in the check-then-act form by forcing one
+switch after the branch read returned `intended`:
+
+```text
+branch-check-returned=intended
+raced-commit-branch=other
+remote-intended-equals-wrong-branch=yes
+```
+
+`git push origin HEAD:"$INTENDED"` names the *destination* and leaves the **source**
+ambient, so when `HEAD` had moved the push fast-forwarded remote `intended` to
+another branch's commit — the unreviewed-code path this document exists to close.
+
+Inside an exclusive boundary, these remain useful as defense-in-depth — never as the
+control itself. Name both ends, so the source cannot be supplied by ambient `HEAD`:
+
+```bash
+[ "$(git branch --show-current)" = "$INTENDED" ] && git commit -m "<message>"
+git push origin "$INTENDED:$INTENDED"   # both ends named; no ambient HEAD
+```
 
 ## Corollary: a running process is not its file
 
@@ -258,11 +269,13 @@ rewritten or lost; the author cherry-picked the work onto its own branch as
 to leave it in place. The check here was run and was correct when it ran; it was
 simply a per-pass reading of a variable another session can write.
 
-The three are one defect in three positions: content trusted without pinning the
-ref, branch trusted without pinning it, and a pinned branch trusted after the pin
-had expired. None of them was carelessness about git — each session knew the
-commands it was running. All three came from treating a shared working tree as
-stable state.
+The three are one defect in three positions, and the defect is **an unisolated
+writer**: content trusted from a tree a peer could rewrite, a branch mutated in a
+tree a peer could switch, and a pin that expired because the tree kept moving after
+it was taken. The expired pin is the most tempting to read as "should have
+re-pinned"; it is not, because no re-pin interval closes a window a peer can enter.
+None of them was carelessness about git — each session knew the commands it was
+running. All three came from mutating a working tree nobody owned exclusively.
 
 ## Related
 
