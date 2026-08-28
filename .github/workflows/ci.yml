@@ -1,9 +1,8 @@
 name: CI
 
 on:
-  # No `branches:` filter. A pull_request run reads this file from the HEAD
-  # branch and matches the filter against the BASE, so a base filter here
-  # excludes every non-main base and CI never starts.
+  # A pull_request run reads this file from the HEAD branch but matches any
+  # `branches:` filter against the BASE, so a filter here excludes non-main bases.
   pull_request:
   push:
     branches: [main, staging-interaction-planes]
