@@ -13,10 +13,12 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
+//   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
+//                    PreToolUse for the Gmail MCP connector's write tools.
 //   arg3 (optional): path to hooks/skill-usage-telemetry.py — registered
 //                    UNCONDITIONALLY as PostToolUse[Skill]. Product telemetry
 //                    (anonymous per-skill feature counter, #2047/#2254) is NOT
@@ -90,4 +92,21 @@ if (skillTelemetryHook.trim()) {
 	};
 }
 
-process.stdout.write(JSON.stringify(mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings)));
+// Gmail connector write guard: always-on registration. The connector advertises
+// write tools whose scopes are broken, so the wrong affordance is visible at the
+// tool layer while the sanctioned IMAP/SMTP path is only prose — a deny that
+// names the right path is what closes that gap. The matcher mirrors
+// hooks/README.md; the hook re-checks the tool name and no-ops otherwise.
+const gmailWriteGuardHook = process.argv[5] || '';
+let gmailWriteGuardSettings = null;
+if (gmailWriteGuardHook.trim()) {
+	gmailWriteGuardSettings = {
+		hooks: {
+			PreToolUse: [{ matcher: 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', hooks: [{ type: 'command', command: `python3 ${shq(gmailWriteGuardHook)}` }] }],
+		},
+	};
+}
+
+process.stdout.write(
+	JSON.stringify(mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings)),
+);

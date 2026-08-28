@@ -12,13 +12,20 @@ const OBS_BUILDER = fileURLToPath(
 	new URL('../../../../src/observability/claude/hooks/build-hook-settings.mjs', import.meta.url),
 );
 
-function buildCore(guardPath: string, obsJson?: string, skillTelemetryHook?: string): any {
+function buildCore(
+	guardPath: string,
+	obsJson?: string,
+	skillTelemetryHook?: string,
+	gmailWriteGuardHook?: string,
+): any {
 	const args =
-		skillTelemetryHook === undefined
-			? obsJson === undefined
-				? [CORE_BUILDER, guardPath]
-				: [CORE_BUILDER, guardPath, obsJson]
-			: [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook];
+		gmailWriteGuardHook !== undefined
+			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook]
+			: skillTelemetryHook === undefined
+				? obsJson === undefined
+					? [CORE_BUILDER, guardPath]
+					: [CORE_BUILDER, guardPath, obsJson]
+				: [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook];
 	return JSON.parse(execFileSync('node', args, { encoding: 'utf8' }));
 }
 
@@ -35,6 +42,7 @@ function shellParsedPath(command: string): string {
 
 const GUARD = '/x/hooks/skip-ask-user-question.py';
 const SKILL_TELEMETRY = '/x/hooks/skill-usage-telemetry.py';
+const GMAIL_WRITE_GUARD = '/x/hooks/gmail-write-guard.py';
 
 describe('build-core-settings.mjs', () => {
 	it('always registers the AskUserQuestion guard (guard-only, obs off)', () => {
@@ -114,5 +122,42 @@ describe('build-core-settings.mjs', () => {
 		assert.throws(() =>
 			execFileSync('node', [CORE_BUILDER, GUARD, '{not json'], { encoding: 'utf8', stdio: 'pipe' }),
 		);
+	});
+
+	// The guard shipped for a year with no production registrar: it appeared only
+	// in hooks/README.md as a manual `cp`, so the connector's broken write tools
+	// stayed reachable on every install that never ran those steps by hand.
+	it('registers the Gmail write guard when its path is supplied', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
+		const blk = o.hooks.PreToolUse.find((b: any) =>
+			b.hooks.some((h: any) => h.command.includes('gmail-write-guard')),
+		);
+		assert.ok(blk, 'no PreToolUse block registers gmail-write-guard');
+		assert.equal(blk.matcher, 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*');
+		assert.equal(shellParsedPath(blk.hooks[0].command), GMAIL_WRITE_GUARD);
+	});
+
+	it('the Gmail matcher selects connector Gmail tools and nothing else', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
+		const blk = o.hooks.PreToolUse.find((b: any) =>
+			b.hooks.some((h: any) => h.command.includes('gmail-write-guard')),
+		);
+		const re = new RegExp(blk.matcher);
+		assert.ok(re.test('mcp__claude_ai_Gmail__create_draft'));
+		assert.ok(re.test('mcp__gmail__send_email'));
+		assert.ok(!re.test('mcp__claude_ai_Slack__slack_send_message'));
+		assert.ok(!re.test('Bash'));
+	});
+
+	it('omitting the Gmail guard path leaves the previous shape untouched', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY);
+		assert.equal(o.hooks.PreToolUse.length, 1);
+		assert.equal(o.hooks.PreToolUse[0].matcher, 'AskUserQuestion');
+	});
+
+	it('keeps the AskUserQuestion guard alongside the Gmail guard (concat, not replace)', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
+		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
+		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
 	});
 });
