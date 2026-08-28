@@ -53,6 +53,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from heartbeat_freshness import age_is_fresh  # noqa: E402
 
 
 def _validate_id(name: str, kind: str) -> str:
@@ -163,8 +164,8 @@ def _write_handler(path: Path, core_id: str, when: float) -> None:
 
 
 def _is_alive(ws: Path, core_id: str, now: float) -> bool:
-    """A core is alive if its .alive heartbeat mtime is younger than
-    ALIVE_THRESHOLD_SEC. If the file is missing, treat as dead — newly-started
+    """A core is alive if its .alive heartbeat age is inside
+    [-tolerance, ALIVE_THRESHOLD_SEC). If the file is missing, treat as dead — newly-started
     cores write the heartbeat before claiming, so a missing file means
     'never started' or 'cleanly shut down,' both of which release the channel."""
     p = _alive_path(ws, core_id)
@@ -172,7 +173,7 @@ def _is_alive(ws: Path, core_id: str, now: float) -> bool:
         mtime = p.stat().st_mtime
     except (FileNotFoundError, OSError):
         return False
-    return (now - mtime) < ALIVE_THRESHOLD_SEC
+    return age_is_fresh(now - mtime, ALIVE_THRESHOLD_SEC)
 
 
 def claim_with_affinity(
@@ -212,7 +213,7 @@ def claim_with_affinity(
     handler_is_fresh = (
         handler is not None
         and isinstance(handler.get("last_handled_at"), (int, float))
-        and (now - handler["last_handled_at"]) < idle_threshold
+        and age_is_fresh(now - handler["last_handled_at"], idle_threshold)
     )
 
     if handler_is_fresh:

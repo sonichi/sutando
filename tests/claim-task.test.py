@@ -166,13 +166,13 @@ class ChannelAffinityTests(unittest.TestCase):
         return p
 
     def _touch_alive(self, core_id: str, age_sec: float = 0) -> None:
-        """Write a fresh heartbeat for core <core_id>. age_sec lets the test
-        backdate the mtime to simulate a dead heartbeat."""
+        """Write a heartbeat for core <core_id>. POSITIVE age_sec backdates the
+        mtime (dead core); NEGATIVE forward-dates it (clock skew)."""
         p = self.ws / "state" / "cores" / f"core-{core_id}.alive"
         p.write_text(f'{{"core_id": "{core_id}"}}')
-        if age_sec > 0:
-            past = os.path.getmtime(p) - age_sec
-            os.utime(p, (past, past))
+        if age_sec:
+            when = os.path.getmtime(p) - age_sec
+            os.utime(p, (when, when))
 
     def test_first_task_claims_and_writes_handler(self):
         self._write_task("a")
@@ -233,6 +233,34 @@ class ChannelAffinityTests(unittest.TestCase):
         handler_p = self.ws / "state" / "cores" / "channel-ch-X.handler"
         import json as _json
         self.assertEqual(_json.loads(handler_p.read_text())["core_id"], "2")
+
+    def test_future_dated_handler_beat_releases_to_other_core(self):
+        # A one-sided `now - mtime < THRESHOLD` passes for ANY future stamp,
+        # so a dead core with a skewed clock would pin the channel forever.
+        self._write_task("a")
+        self._touch_alive("1")
+        self._touch_alive("2")
+        claim_with_affinity("a", "1", "ch-F", workspace=self.ws)
+        self._touch_alive("1", age_sec=-3600)      # 1h in the FUTURE
+        self._touch_alive("2")
+        self._write_task("b")
+        self.assertIsNotNone(
+            claim_with_affinity("b", "2", "ch-F", workspace=self.ws),
+            "a future-dated handler beat must not pin the channel")
+
+    def test_small_clock_jitter_does_not_evict_a_live_handler(self):
+        # Control: the lower bound is a TOLERANCE, not a ban on future stamps.
+        # Without this, rejecting every future mtime would also pass the above.
+        self._write_task("a")
+        self._touch_alive("1")
+        self._touch_alive("2")
+        claim_with_affinity("a", "1", "ch-J", workspace=self.ws)
+        self._touch_alive("1", age_sec=-2)         # inside the 5s tolerance
+        self._touch_alive("2")
+        self._write_task("b")
+        self.assertIsNone(
+            claim_with_affinity("b", "2", "ch-J", workspace=self.ws),
+            "2s of clock jitter must not evict a live handler")
 
     def test_idle_channel_releases_for_race(self):
         # core-1 handles ch-X, then the channel goes idle past IDLE_THRESHOLD.

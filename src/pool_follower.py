@@ -22,8 +22,11 @@ sys.path.insert(0, str(_HERE))
 from task_priority import sort_tasks_by_priority  # noqa: E402
 from task_archive import _move_without_clobbering  # noqa: E402
 
+# Re-exported: the daemon and its liveness test import the constant here.
+from heartbeat_freshness import (  # noqa: E402,F401
+    HEARTBEAT_FUTURE_TOLERANCE_S, age_is_fresh)
+
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
-HEARTBEAT_FUTURE_TOLERANCE_S = 5.0
 # The lead writes cores/<LEAD_LABEL>.alive and lead_alive() reads it; one
 # definition, imported by the daemon, so the two can never disagree.
 LEAD_LABEL = "pool-lead"
@@ -42,7 +45,7 @@ def lead_alive(state_dir, lead_label: str, now_fn=time.time) -> bool:
         age = now_fn() - f.stat().st_mtime
     except OSError:
         return False
-    return -HEARTBEAT_FUTURE_TOLERANCE_S <= age < LEAD_STALE_S
+    return age_is_fresh(age, LEAD_STALE_S)
 
 
 def _claim_assignment(tasks_dir: Path, f: Path, instance: str) -> "Path | None":
