@@ -41,8 +41,15 @@ When the arguments say `pass`, run one acquire-and-process sweep (steps below) a
 When the task watcher emits `TASK_FILE: <basename>` for a new task, **before** reading the task body, run the acquisition step. There is exactly one:
 
 ```bash
+WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
 python3 src/pool_follower.py acquire "$WORKSPACE/tasks" "core-$SUTANDO_CORE_ID"
 ```
+
+Resolve `WORKSPACE`; do not expect to inherit it. `pool-core-wrapper.sh` passes
+the child exactly `CLAUDE_CONFIG_DIR`, `SUTANDO_CORE_ID` and
+`SUTANDO_CORE_POOL_SIZE`, so an unset `$WORKSPACE` expands to empty and the
+command becomes `acquire "/tasks" ...`, which exits 2 and claims nothing. The
+resolver is cwd-relative and the wrapper starts the session in `POOL_REPO_DIR`.
 
 Exit codes are the contract:
 
@@ -118,4 +125,7 @@ step" above; do not invoke `acquire_work` a second way from here.
 Never claim unassigned tasks directly while the lead is alive. `acquire`
 enforces that for you: it honours your own lead assignments in priority order,
 and opens the unassigned pool only when `pool-lead.alive` is stale, absent or
-future-dated. Done-flags land before side effects, exactly as below.
+future-dated. Done-flags do NOT land before side effects — the only
+production writer runs after the result is published, so the at-most-once
+floor promised by that ordering does not exist yet (see Phase 2a known
+limitations above, and `docs/lead-follower-pool.md` step 4).

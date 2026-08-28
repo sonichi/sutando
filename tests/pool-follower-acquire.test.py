@@ -233,6 +233,49 @@ class AcquireCliTests(unittest.TestCase):
         self.assertNotIn("pool_follower (acquire_work).py", skill)
 
 
+class SkillContractTests(unittest.TestCase):
+    """SKILL.md is the follower's executable contract, so a sentence in it is
+    as load-bearing as a line of code."""
+
+    def _skill(self):
+        return (REPO / "skills" / "proactive-loop-pool" / "SKILL.md").read_text()
+
+    def test_documented_acquire_resolves_workspace_rather_than_inheriting_it(self):
+        # pool-core-wrapper.sh hands the child only CLAUDE_CONFIG_DIR,
+        # SUTANDO_CORE_ID and SUTANDO_CORE_POOL_SIZE.
+        wrapper = (REPO / "scripts" / "pool-core-wrapper.sh").read_text()
+        self.assertNotIn("WORKSPACE=", wrapper.split("--add-dir")[0],
+                         "wrapper now exports a workspace var; revisit SKILL.md")
+        skill = self._skill()
+        preamble = skill[:skill.index("pool_follower.py acquire")]
+        self.assertIn('WORKSPACE="$(bash scripts/sutando-config.sh workspace)"',
+                      preamble[-300:],
+                      'unset $WORKSPACE expands empty -> acquire "/tasks" -> exit 2')
+
+    def test_finish_writes_the_result_before_the_done_flag(self):
+        # Anchors the doc claim to observed behaviour: inject a failure at the
+        # done-flag write and the result is already on disk.
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            tasks = ws / "tasks"
+            results = ws / "results"
+            state = ws / "state"
+            tasks.mkdir()
+            results.mkdir()
+            state.mkdir()
+            claimed = tasks / "task-t1.claimed-core-9.txt"
+            claimed.write_text("id: task-t1\n")
+            state.chmod(0o500)
+            try:
+                with self.assertRaises(OSError):
+                    pf.finish_task(tasks, results, state, "core-9",
+                                   claimed, "task: t1\nthe answer\n")
+                self.assertTrue((results / "task-t1.txt").is_file(),
+                                "result absent -> the done flag came first")
+            finally:
+                state.chmod(0o700)
+
+
 class LeadLabelTests(unittest.TestCase):
     def test_daemon_imports_the_label_rather_than_redefining_it(self):
         src = (REPO / "scripts" / "pool-lead-daemon.py").read_text()
