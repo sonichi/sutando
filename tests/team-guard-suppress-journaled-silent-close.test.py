@@ -85,7 +85,7 @@ def main() -> int:
     for marker in ("[channel: 1530802402603700415]\nhi", "[file: /etc/passwd]\nhi"):
         got_e, _ = guard.guard_result_for_tier(
             marker, "team", REPO, suppress_journal=(state, "task-leak"))
-        check(got_e == guard.TEAM_LEAK_RESULT,
+        check(got_e == guard.TEAM_LEAK_RESULT_MARKER,
               f"e) {marker.split(chr(10))[0]} still LEAK, got {got_e[:34]!r}")
     check(not guard.suppressed_record_path(state, "task-leak").exists(),
           "e) and a leak is never journaled as a silent close")
