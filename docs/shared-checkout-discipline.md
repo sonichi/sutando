@@ -118,12 +118,24 @@ recorded OID naming a revision the process never ran. Treat a startup sha as
 CONTEXT; for a dirty tree or anything lazily imported, require a content or
 import-time witness.
 
-`runtime-identity` is stronger than a build sha alone, and that is the reason it
-works: `src/remote-gateway-bridge.py:117-120` records `loader_sha256` and
-`module_sha256` beside `build_sha`, so it hashes the artifacts it actually loads
-(`tests/gateway-runtime-identity.test.py:224-241` pins that same-HEAD byte drift
-is detected). The content digests are what make it provenance — and they attest
-only the files it hashes, not the whole tree.
+`runtime-identity` is stronger than a build sha alone: `src/remote-gateway-bridge.py:117-120`
+records `loader_sha256` and `module_sha256` beside `build_sha`, so a same-HEAD edit
+is visible where a build sha alone shows nothing
+(`tests/gateway-runtime-identity.test.py:224-241` pins that drift).
+
+**They are startup DISK SNAPSHOTS, not proof of the bytes running.** The loader
+hashes the file and then reads it a second time for `compile`, so a checkout
+switch between those reads leaves the digest describing bytes that were never
+executed. Kewei demonstrated it by interposing the second read: `alternate bytes
+executed = True, reported == disk = True, reported == compiled = False`, while
+the identity suite still passed. The loader's self-hash has the mirror gap —
+Python has already loaded the entrypoint before the path is re-read to hash it.
+
+So treat these digests as drift evidence, which is what they reliably are, and
+not as import provenance. Proving the imported bytes needs the buffer passed to
+`compile` to be the thing hashed, plus a witness taken at import time; that is a
+change to the loader, not to this document. And they attest only the files they
+hash, never the whole tree.
 
 The same holds for anything else that caches at load: config read once at
 startup, a resolved TypeScript module graph, a skill manifest folded into a tool
