@@ -293,7 +293,7 @@ def main() -> int:
         print(f"REFUSED: {why} Re-asking the same people is not escalation — "
               "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
         return 6
-    failures = 0
+    failures = unlogged = 0
     for t in targets:
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in
@@ -341,7 +341,20 @@ def main() -> int:
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        # Per-target boundary: a raise here would drop every remaining target
+        # AND skip the return, so the caller sees no asks and no failure code.
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            print(f"{t['name']}: ok=False reason=room_ops exceeded the 60s timeout",
+                  file=sys.stderr)
+            failures += 1
+            continue
+        except OSError as e:
+            print(f"{t['name']}: ok=False reason=could not run room_ops ({e})",
+                  file=sys.stderr)
+            failures += 1
+            continue
         ok, event, reason = False, "", ""
         try:
             payload = json.loads(p.stdout)
@@ -360,14 +373,27 @@ def main() -> int:
         # Printing stderr alone renders every such refusal as a blank line.
         if ok:
             print(f"{t['name']}: ok=True event={event[:24]}")
-            n_logged = record_asks(a.message, t["name"])
-            if n_logged:
-                print(f"  logged {n_logged} PR ask(s) for {t['name']}", file=sys.stderr)
+            # The ask already happened; a lost ledger write makes pr-unattended
+            # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
+            try:
+                n_logged = record_asks(a.message, t["name"])
+            except OSError as e:
+                unlogged += 1
+                print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
+                      f"({e}) — pr-unattended will under-report this PR as unasked",
+                      file=sys.stderr)
+            else:
+                if n_logged:
+                    print(f"  logged {n_logged} PR ask(s) for {t['name']}", file=sys.stderr)
         else:
             detail = reason or p.stderr.strip()[:120] or fallback
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
             failures += 1
-    if failures:
+    if unlogged:
+        print(f"{unlogged} ask(s) were delivered but not recorded — the ledger "
+              "under-reports and pr-unattended will read this PR as unasked",
+              file=sys.stderr)
+    if failures or unlogged:
         return 1
     return refusal_rc
 
