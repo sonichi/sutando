@@ -770,8 +770,8 @@ function startRelayResultWatcher(onResult: (result: string) => void): void {
 				if (!result) continue;
 				_deliveredResults.add(file);
 				_pendingTasks.delete(taskId);
-				// Was a third private copy that drifted: no /i, and `[^\]]*` accepted
-				// an empty `[deduped:]` Python rejects. One predicate now.
+				// Shared predicate, not a local regex: this grammar must stay identical to
+				// src/result_markers.py, which is case-insensitive and accepts `[deduped:]`.
 				if (!bodyIsSkipMarked(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
