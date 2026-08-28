@@ -95,13 +95,68 @@ class HostSleepDefersReclaim(WakeGuardBase):
                          [("task-d.claimed-core-2.txt", "repooled")])
 
 
+class ColdStartStaggeredWake(WakeGuardBase):
+    """A lead started cold has no skew to read. After a host resume the
+    ordinary shape is one follower re-beaten and one not yet, and reading the
+    second as dead repools a claim its owner is still executing."""
+
+    def _stagger(self):
+        self.alive = {"core-1": True, "core-2": False}
+
+    def test_stale_claimant_survives_the_first_tick(self):
+        claim = self.tasks / "task-s.claimed-core-2.txt"
+        claim.write_text("x")
+        self._stagger()
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        self.assertTrue(claim.exists())
+        self.assertFalse((self.tasks / "task-s.txt").exists())
+
+    def test_stale_assignment_survives_the_first_tick(self):
+        assignment = self.tasks / "task-t.assigned-core-2.txt"
+        assignment.write_text("x")
+        self._stagger()
+        self.assertEqual(self.lead.reclaim_dead(), [])
+        self.assertTrue(assignment.exists())
+
+    def test_rebeat_inside_the_window_keeps_the_claim(self):
+        claim = self.tasks / "task-u.claimed-core-2.txt"
+        claim.write_text("x")
+        self._stagger()
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        self.alive["core-2"] = True
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        self.assertTrue(claim.exists())
+
+    def test_a_follower_that_never_returns_is_recovered_after_the_window(self):
+        claim = self.tasks / "task-w.claimed-core-2.txt"
+        claim.write_text("x")
+        self._stagger()
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        out = self._tick_until(self.wall + LEAD_STALE_S + 4,
+                               self.lead.reclaim_claimed)
+        self.assertEqual(out, [("task-w.claimed-core-2.txt", "repooled")])
+
+    def test_all_fresh_first_tick_opens_no_window(self):
+        # Control: the deferral is caused by the stale follower, not by being
+        # the first tick. With every follower proven, a later death is
+        # recovered on the spot.
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        (self.tasks / "task-v.claimed-core-2.txt").write_text("x")
+        self.alive["core-2"] = False
+        self.wall += 300
+        self.mono += 300
+        self.assertEqual(self.lead.reclaim_claimed(),
+                         [("task-v.claimed-core-2.txt", "repooled")])
+
+
 class RecoveryStillRuns(WakeGuardBase):
-    def test_one_dead_follower_reclaims_immediately(self):
+    def test_one_dead_follower_is_recovered_after_the_cold_window(self):
         (self.tasks / "task-e.claimed-core-2.txt").write_text("x")
         self.alive["core-2"] = False
-        self.assertEqual(
-            self.lead.reclaim_claimed(),
-            [("task-e.claimed-core-2.txt", "repooled")])
+        self.assertEqual(self.lead.reclaim_claimed(), [])
+        out = self._tick_until(self.wall + LEAD_STALE_S + 4,
+                               self.lead.reclaim_claimed)
+        self.assertEqual(out, [("task-e.claimed-core-2.txt", "repooled")])
 
     def test_empty_pool_does_not_defer(self):
         (self.tasks / "task-f.claimed-core-9.txt").write_text("x")

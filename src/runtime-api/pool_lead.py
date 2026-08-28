@@ -157,7 +157,11 @@ class PoolLead:
     def _advance_reclaim_guard(self) -> bool:
         """Use wall-vs-monotonic skew to distinguish host sleep from a slow
         daemon. Once opened, the grace expires by time rather than a sibling's
-        heartbeat so staggered beats cannot expose a live claimant."""
+        heartbeat so staggered beats cannot expose a live claimant.
+
+        A cold lead has no skew to read, and a stale beat there is equally
+        consistent with death and with a follower that has not re-beaten yet,
+        so ANY unproven follower opens the window."""
         now = self.now()
         mono = self.mono()
         last = getattr(self, "_last_reclaim_tick", None)
@@ -172,7 +176,7 @@ class PoolLead:
                 followers = list(self.followers_fn())
             except Exception:  # noqa: BLE001 — resolver failure must not defer
                 return False
-            if followers and not any(self.alive_fn(f) for f in followers):
+            if followers and not all(self.alive_fn(f) for f in followers):
                 self._reclaim_defer_until = now + LEAD_STALE_S
         until = getattr(self, "_reclaim_defer_until", None)
         return until is not None and now < until

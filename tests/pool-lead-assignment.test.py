@@ -128,6 +128,9 @@ class PoolLeadTests(unittest.TestCase):
     def test_dead_follower_assignments_reclaimed_claims_kept(self):
         (self.tasks / "task-r1.assigned-core-a.txt").write_text("x")
         (self.tasks / "task-r2.claimed-core-a.txt").write_text("x")
+        # One tick with the pool proven alive first: a cold lead cannot tell a
+        # dead follower from one that has not re-beaten, so it defers.
+        self.assertEqual(self.lead.reclaim_dead(), [])
         self.alive["core-a"] = False
         reclaimed = self.lead.reclaim_dead()
         self.assertEqual(reclaimed, ["task-r1.assigned-core-a.txt"])

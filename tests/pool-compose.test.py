@@ -61,6 +61,9 @@ class ComposeTests(unittest.TestCase):
 
     def test_lead_reclaim_feeds_follower_fallback(self):
         (self.tasks / "task-r.assigned-f1.txt").write_text("task: t\n")
+        # A proven-alive tick first: a cold lead defers while any follower is
+        # unproven, so the death below has to be a transition it witnessed.
+        self.assertEqual(self.lead.reclaim_dead(), [])
         self.alive["f1"] = False
         self.lead.reclaim_dead()
         # lead dies too; surviving follower picks it up leaderless
@@ -85,6 +88,8 @@ class ComposeTests(unittest.TestCase):
         self.lead.metrics = m
         (self.tasks / "task-r1.assigned-f1.txt").write_text("x")
         (self.tasks / "task-r2.claimed-f1.txt").write_text("x")
+        # Proven-alive tick first (see the cold-lead guard); records nothing.
+        self.assertEqual(self.lead.reclaim_dead(), [])
         self.alive["f1"] = False
         self.lead.reclaim_dead()
         self.lead.reclaim_claimed()
