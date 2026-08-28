@@ -132,6 +132,35 @@ check "the destination was actually rewritten (control: not an untouched file)" 
   "$(grep -c 'a@example.org' "$DEST/$REL" | tr -d ' ')" "1"
 
 
+# --- control 4b: VERIFY owns the manifest mode for a union entry ---
+# The bypass needs the union output to be BYTE-EQUAL to the source, so the
+# source must already carry the merged set in the writer's own serialization.
+_u="$e2e/u"; mkdir -p "$_u/s1/state" "$_u/d1/state"
+printf '{"allow": ["a@example.org", "b@example.org"]}\n' > "$_u/s1/$REL"
+printf '{"allow": ["b@example.org"]}\n'                  > "$_u/d1/$REL"
+SUTANDO_MIGRATE_SRC_A="$_u/s1" SUTANDO_MIGRATE_DEST="$_u/d1" \
+  bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1
+
+mkdir -p "$_u/A/state" "$_u/dest/state"
+cp "$_u/d1/$REL" "$_u/A/$REL";                 chmod 0644 "$_u/A/$REL"
+printf '{"allow": ["b@example.org"]}\n' > "$_u/dest/$REL"; chmod 0600 "$_u/dest/$REL"
+_RUN_U() { SUTANDO_MIGRATE_SRC_A="$_u/A" SUTANDO_MIGRATE_DEST="$_u/dest" \
+           bash scripts/sutando-migrate.sh "$@" >/dev/null 2>&1; }
+_RUN_U commit --source A
+
+check "the union output is byte-equal to the source (the bypass precondition)" \
+  "$(cmp -s "$_u/A/$REL" "$_u/dest/$REL" && echo yes || echo no)" "yes"
+_um="$(stat -c '%a' "$_u/dest/$REL" 2>/dev/null || stat -f '%Lp' "$_u/dest/$REL")"
+check "commit still refuses to widen the 0600 destination" "$_um" "600"
+
+_v_rc=0; _RUN_U verify --source A || _v_rc=$?
+check "verify passes while the dest still holds its manifest mode" "$_v_rc" "0"
+
+chmod 0644 "$_u/dest/$REL"
+_v_widened=0; _RUN_U verify --source A || _v_widened=$?
+check "verify FAILS on a widened union dest, despite byte identity with the source" \
+  "$([ "$_v_widened" -ne 0 ] && echo failed || echo certified)" "failed"
+
 # --- control 5: byte_identical is a claim about BYTES, through the real JSON ---
 # Equal bytes, modes 0755 vs 0644 -> True; every DECISION still uses both fields.
 j5="$(mktemp -d -t migrate-json5.XXXXXX)"

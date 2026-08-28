@@ -2325,7 +2325,9 @@ verify_main() {
                 fi
             fi
         done
-        if [ -n "$landed" ]; then
+        # A union entry must clear union_contains, which owns the manifest mode
+        # check; byte identity with one input must never stand in for it.
+        if [ -n "$landed" ] && [ "$cls" != "union-json-array" ]; then
             pass=$((pass+1))
         elif [ "$cls" = "union-json-array" ] && [ -f "$dst_canonical" ] \
                 && union_contains "$src_file" "$dst_canonical" \
