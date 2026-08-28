@@ -106,6 +106,7 @@ MALFORMED = [
     ("ts is Infinity",                  {"ts": INF, "connected": True, "last_ok_ts": NOW}, None),
     ("last_ok_ts is NaN",               {"ts": NOW, "connected": True, "last_ok_ts": NAN}, False),
 ]
+malformed_checked = len(MALFORMED)
 for _label, _rec, _want in MALFORMED:
     _v = gs.verdict_from_record(_rec, now=NOW, max_age=300)
     _got = None if _v is None else _v.serving
@@ -117,11 +118,13 @@ for _label, _rec, _want in MALFORMED:
 _v = gs.verdict_from_record({"ts": NOW + 1, "connected": True, "last_ok_ts": NOW}, now=NOW, max_age=300)
 if _v is None or _v.serving is not True:
     failures.append("malformed: a record within the skew tolerance must still be serving")
+malformed_checked += 1
 
 # A bad backoff_s must not poison the serving verdict it has no part in.
 _v = gs.verdict_from_record({"ts": NOW, "connected": True, "last_ok_ts": NOW, "backoff_s": -5}, now=NOW, max_age=300)
 if _v is None or _v.serving is not True or _v.backoff_s is not None:
     failures.append("malformed: a negative backoff_s must be dropped, not change serving")
+malformed_checked += 1
 
 # ------------------------------------------ reader-specific edges preserved
 
@@ -144,5 +147,5 @@ if failures:
     for f in failures:
         print(f"FAIL: {f}")
     sys.exit(1)
-print(f"ok - {len(CONTRACT)} contract + {len(NO_OPINION) + 1} no-opinion + {len(MALFORMED) + 1} malformed cases, "
+print(f"ok - {len(CONTRACT)} contract + {len(NO_OPINION) + 1} no-opinion + {malformed_checked} malformed cases, "
       f"3 readers delegating, 3 reader-specific edges preserved")
