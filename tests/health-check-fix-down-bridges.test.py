@@ -188,12 +188,16 @@ def case_aa_gateway_plan_requires_a_token() -> list[str]:
     """No token → no plan → alert instead of a crash-looping spawn, matching the
     slack branch and startup.sh's labeled skip."""
     fails = []
-    with mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+    # Shut the vault off at channel_token, NOT hc.token_from_vault: the plan
+    # calls gateway_token() with no vault_get, so the real Keychain answers.
+    with mock.patch("channel_token.token_from_vault", return_value=""), \
+         mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
          mock.patch.object(hc, "_load_channel_env", return_value={}), \
          mock.patch.dict(os.environ, {}, clear=True):
         if hc._bridge_launch_plan("gateway-bridge") is not None:
             fails.append("aa) tokenless gateway must yield no launch plan")
-    with mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+    with mock.patch("channel_token.token_from_vault", return_value=""), \
+         mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
          mock.patch.object(hc, "_load_channel_env", side_effect=_channel_env), \
          mock.patch.dict(os.environ, {}, clear=True):
         plan = hc._bridge_launch_plan("gateway-bridge")
@@ -201,8 +205,9 @@ def case_aa_gateway_plan_requires_a_token() -> list[str]:
             fails.append("aa) gateway with a channel-env token must yield a plan")
         else:
             _, env = plan
+            # Never interpolate the value: on a leaky run this message is the leak.
             if env.get("REMOTE_TASK_TOKEN") != "gw-test-token":
-                fails.append(f"aa) plan must carry the resolved token, got {env.get('REMOTE_TASK_TOKEN')!r}")
+                fails.append("aa) plan must carry the resolved fixture token")
             if env.get("SUTANDO_SUPERVISED") != "1":
                 fails.append("aa) plan must mark the launch supervised")
     return fails
@@ -213,14 +218,15 @@ def case_ab_ag2_remote_token_alias_is_accepted() -> list[str]:
     so a host with only that alias must be launchable — otherwise the check warns
     forever about a bridge --fix structurally refuses to start."""
     fails = []
-    with mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+    with mock.patch("channel_token.token_from_vault", return_value=""), \
+         mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
          mock.patch.object(hc, "_load_channel_env", return_value={"AG2_REMOTE_TOKEN": "alias-tok"}), \
          mock.patch.dict(os.environ, {}, clear=True):
         plan = hc._bridge_launch_plan("gateway-bridge")
         if plan is None:
             fails.append("ab) AG2_REMOTE_TOKEN alone must yield a plan")
         elif plan[1].get("REMOTE_TASK_TOKEN") != "alias-tok":
-            fails.append(f"ab) alias must be normalised into REMOTE_TASK_TOKEN, got {plan[1].get('REMOTE_TASK_TOKEN')!r}")
+            fails.append("ab) alias must be normalised into REMOTE_TASK_TOKEN")
     return fails
 
 
