@@ -239,7 +239,7 @@ class DesignCClaimBackend:
             return False                    # forged: worker != the record's
         key = parts[0]
         # item_id must bind to the incarnation's key BEFORE any mutation: an
-        # inconsistent token would archive an unfindable receipt (round-4 P1).
+        # inconsistent token would archive an unfindable receipt.
         if _safe_key(token.item_id) != key:
             return False
         src = self.root / INFLIGHT / token.incarnation
@@ -395,7 +395,7 @@ class DesignCClaimBackend:
     @staticmethod
     def _record_is_terminal_proof(rec) -> bool:
         """The ONE total validator — shared by staged promotion, archive
-        retirement, and reads (divergent copies were round-4's P1 #2)."""
+        retirement, and reads. Divergent copies are the failure it prevents."""
         if not isinstance(rec, dict) or not _exact_int(rec.get("schema")) \
                 or rec.get("schema") != 1:
             return False
