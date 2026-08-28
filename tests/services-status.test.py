@@ -327,9 +327,8 @@ def test_gateway_connected_without_last_ok_is_offline():
 
 def test_gateway_sidecar_connected_is_running():
     now = time.time()
-    # last_ok_offset is required: this case pins "sidecar beats pgrep", and
-    # without a last_ok_ts the fixture is a never-polled lane (see
-    # test_gateway_connected_without_last_ok_is_offline).
+    # last_ok_offset is required: without it the fixture is a never-polled lane,
+    # not the "sidecar beats pgrep" case this test pins.
     p = _sidecar(True, ts_offset=-5, now=now, last_ok_offset=-5)
     status, detail, _ = ss.probe_gateway(p, "nope", now, pgrep=lambda pat: [])
     # pgrep says NO process, yet the sidecar says connected → sidecar wins.

@@ -287,9 +287,8 @@ def _gateway_status(state_dir):
         return None
     try:
         now = time.time()
-        # Freshness window and the reconnect grace below are this reader's; the
-        # serving verdict is gateway_serving's, shared with health-check and
-        # services_status. Stale -> None, so pgrep answers as before.
+        # Serving verdict is gateway_serving's; the freshness window and the
+        # reconnect grace below are this reader's. Stale -> None, as before.
         v = read_gateway_verdict(
             os.path.join(state_dir, "gateway-status.json"),
             now=now,
@@ -299,9 +298,8 @@ def _gateway_status(state_dir):
             return None
         if v.serving:
             return True
-        # Reconnect grace: a lane that HAS served and is now backing off stays
-        # alive until its last success ages out. A never-polled lane has no such
-        # success to age, so it does not qualify.
+        # Reconnect grace: a lane that HAS served and is backing off stays alive
+        # until its last success ages out. A never-polled lane has none to age.
         if v.backoff_s and v.last_ok_ts is not None:
             return now - v.last_ok_ts <= GATEWAY_OUTAGE_MAX_AGE_S
         return False

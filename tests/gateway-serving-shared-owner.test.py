@@ -89,8 +89,9 @@ for mod, name in ((hc, "health-check"), (ciw, "core-input-watch"), (ss, "service
         failures.append(f"delegation: {name} must bind gateway_serving.read_verdict")
 
 # ------------------------------------------ reader-specific edges preserved
-# core-input-watch keeps its reconnect grace: a lane that HAS served and is now
-# backing off stays alive. Delegation must not flatten this into the shared rule.
+
+# core-input-watch keeps its reconnect grace: a lane that HAS served and is
+# backing off stays alive. Delegation must not flatten it into the shared rule.
 p.write_text(json.dumps({"ts": NOW, "connected": False, "last_ok_ts": NOW - 1, "backoff_s": 5}))
 if ciw._gateway_status(d) is not True:
     failures.append("edge: core-input-watch must keep the reconnect grace for a recently-served lane")

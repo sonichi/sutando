@@ -170,9 +170,8 @@ def probe_gateway(
 
     Same precedence `core-input-watch.gateway_alive()` adopted in #2253.
     """
-    # The serving verdict is gateway_serving's, shared with health-check and
-    # core-input-watch; the TTL, the rendering and the pgrep fallback are this
-    # reader's.
+    # Serving verdict is gateway_serving's; the TTL, the rendering and the
+    # pgrep fallback are this reader's.
     v = read_gateway_verdict(path, now=now, max_age=ttl)
     if v is not None:
         if v.serving:
