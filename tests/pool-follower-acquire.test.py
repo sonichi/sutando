@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -231,6 +232,149 @@ class AcquireCliTests(unittest.TestCase):
         skill = (REPO / "skills" / "proactive-loop-pool" / "SKILL.md").read_text()
         self.assertIn("pool_follower.py acquire", skill)
         self.assertNotIn("pool_follower (acquire_work).py", skill)
+
+
+class DegradedFilesystemTests(unittest.TestCase):
+    """A follower must degrade on filesystem trouble, never crash: a raising
+    tick takes the whole session down and the queue stops draining."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        self.tasks = self.ws / "tasks"
+        self.state = self.ws / "state"
+        self.tasks.mkdir()
+        (self.state / "cores").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_lost_assignment_race_is_idle_not_an_error(self):
+        # The lead reclaimed it, or a restart raced us. Returning None lets the
+        # caller try the next file; raising would end the tick.
+        f = self.tasks / "task-gone.assigned-core-1.txt"
+        f.write_text("x")
+        f.unlink()
+        self.assertIsNone(pf._claim_assignment(self.tasks, f, "core-1"))
+
+    def test_an_unreadable_tasks_dir_yields_no_work_in_both_modes(self):
+        self.tasks.chmod(0o000)
+        try:
+            # live lead: the assignment scan fails, and the fallback pool is
+            # not opened at all, so the answer is None either way
+            beat = self.state / "cores" / f"{pf.LEAD_LABEL}.alive"
+            beat.write_text("{}")
+            self.assertIsNone(
+                pf.acquire_work(self.tasks, self.state, "core-1", pf.LEAD_LABEL))
+            beat.unlink()  # leaderless: the fallback scan is what now fails
+            self.assertIsNone(
+                pf.acquire_work(self.tasks, self.state, "core-1", pf.LEAD_LABEL))
+        finally:
+            self.tasks.chmod(0o700)
+
+    def test_a_lost_fallback_race_moves_on_to_the_next_candidate(self):
+        # Leaderless mode, two claimable files, the first rename loses.
+        (self.tasks / "task-a.txt").write_text("x")
+        (self.tasks / "task-b.txt").write_text("x")
+        real, seen = os.rename, []
+
+        def flaky(src, dst):
+            if not seen:
+                seen.append(src)
+                raise OSError("lost the race")
+            return real(src, dst)
+
+        with mock.patch.object(pf.os, "rename", side_effect=flaky):
+            got = pf.acquire_work(self.tasks, self.state, "core-1", pf.LEAD_LABEL)
+        self.assertIsNotNone(got, "one loss ended the sweep instead of continuing")
+        self.assertTrue(got.name.endswith(".claimed-core-1.txt"))
+
+
+class FinishCliTests(unittest.TestCase):
+    """Exit codes are the follower contract. Driven in-process: a subprocess
+    run proves the same behaviour but leaves the shipped lines unmeasured."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "results").mkdir()
+        (self.ws / "state").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _claimed(self):
+        p = self.ws / "tasks" / "task-t1.claimed-core-9.txt"
+        p.write_text("id: task-t1\n")
+        return p
+
+    def test_wrong_argument_count_is_a_usage_error(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(pf._finish_cli(["only-one"]), 2)
+        self.assertIn("usage:", err.getvalue())
+
+    def test_a_body_for_another_task_is_refused_not_written(self):
+        claimed = self._claimed()
+        err = io.StringIO()
+        with (contextlib.redirect_stderr(err),
+              mock.patch.object(sys, "stdin", io.StringIO("task: OTHER\nbody\n"))):
+            self.assertEqual(pf._finish_cli([str(claimed), "core-9"]), 2)
+        self.assertIn("refused", err.getvalue())
+        self.assertFalse((self.ws / "results" / "task-t1.txt").exists())
+
+    def test_a_paired_body_is_published_and_its_path_printed(self):
+        claimed = self._claimed()
+        out = io.StringIO()
+        with (contextlib.redirect_stdout(out),
+              mock.patch.object(sys, "stdin", io.StringIO("task: t1\nthe answer\n"))):
+            self.assertEqual(pf._finish_cli([str(claimed), "core-9"]), 0)
+        published = self.ws / "results" / "task-t1.txt"
+        # _finish_cli resolves its argument; on macOS /var is a symlink.
+        self.assertEqual(Path(out.getvalue().strip()).resolve(), published.resolve())
+        self.assertEqual(published.read_text(), "the answer\n")
+
+
+class FinishRefusalTests(unittest.TestCase):
+    """Every refusal writes nothing. A publish that half-happens is worse than
+    one that never starts, because the done flag and the archive follow it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        for d in ("tasks", "results", "state"):
+            (self.ws / d).mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _finish(self, name, body, instance="core-9", create=True):
+        claimed = self.ws / "tasks" / name
+        if create:
+            claimed.write_text("id: task-t1\n")
+        with self.assertRaises(ValueError) as caught:
+            pf.finish_task(self.ws / "tasks", self.ws / "results",
+                           self.ws / "state", instance, claimed, body)
+        self.assertFalse(any((self.ws / "results").iterdir()), "wrote on refusal")
+        return str(caught.exception)
+
+    def test_a_claim_another_instance_holds_is_refused(self):
+        msg = self._finish("task-t1.claimed-core-2.txt", "task: t1\nbody\n")
+        self.assertIn("not a claim held by", msg)
+
+    def test_a_vanished_claim_file_is_refused(self):
+        msg = self._finish("task-t1.claimed-core-9.txt", "task: t1\nbody\n",
+                           create=False)
+        self.assertIn("claimed file missing", msg)
+
+    def test_an_empty_body_is_refused(self):
+        msg = self._finish("task-t1.claimed-core-9.txt", "   \n")
+        self.assertIn("empty result body", msg)
+
+    def test_a_body_that_is_only_the_pairing_echo_is_refused(self):
+        msg = self._finish("task-t1.claimed-core-9.txt", "task: t1\n\n")
+        self.assertIn("only the pairing echo", msg)
 
 
 class SkillContractTests(unittest.TestCase):
