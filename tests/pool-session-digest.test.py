@@ -8,6 +8,7 @@ time.timezone rather than the DST-aware offset lands exactly one hour out, which
 is precisely the shape of "stale" an operator is looking for. The first version
 of this script shipped that bug and reported 3-second-old activity as 60m.
 """
+import calendar
 import contextlib
 import importlib.util
 import io
@@ -29,12 +30,43 @@ digest_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(digest_mod)
 
 
+# A fixed instant inside US daylight saving. The bug this suite pins is a
+# local-time parse, which is invisible whenever the runner's TZ offset is zero.
+FROZEN = calendar.timegm((2026, 7, 1, 12, 0, 0, 0, 0, 0))
+DST_TZ = "America/Los_Angeles"
+
+
 def utc_iso(offset_secs: int = 0) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
-                         time.gmtime(time.time() - offset_secs))
+                         time.gmtime(FROZEN - offset_secs))
 
 
 class AgeTest(unittest.TestCase):
+    def setUp(self):
+        # Ambient TZ decided whether the regression was detectable at all: the
+        # mutant passed the whole suite under TZ=UTC. Pin the zone and the clock.
+        prior = os.environ.get("TZ")
+        os.environ["TZ"] = DST_TZ
+        time.tzset()
+
+        def restore():
+            if prior is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prior
+            time.tzset()
+
+        self.addCleanup(restore)
+        patcher = unittest.mock.patch.object(time, "time", lambda: FROZEN)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_pinned_zone_actually_has_a_nonzero_dst_offset(self):
+        # Positive control: if the zone resolved to UTC the cases below would
+        # pass against the very bug they exist to catch.
+        self.assertNotEqual(time.localtime(FROZEN).tm_gmtoff, 0)
+        self.assertTrue(time.localtime(FROZEN).tm_isdst)
+
     def test_recent_utc_stamp_reads_as_seconds_not_hours(self):
         """A local-time parse of a UTC stamp is off by the whole UTC offset."""
         self.assertTrue(digest_mod.age(utc_iso(3)).endswith("s ago"),
