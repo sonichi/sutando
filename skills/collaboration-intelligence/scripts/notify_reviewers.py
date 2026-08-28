@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -135,12 +136,110 @@ def command_for(target: dict, message: str) -> "list[str]":
             "mention", target["stand"], body, target["room"]]
 
 
+_PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
+
+def ledger_path() -> Path:
+    from workspace_default import resolve_workspace
+    return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
+
+
+def record_asks(message: str, reviewer: str) -> int:
+    """Log a room ask so pr-unattended can see it. GitHub's timeline records only
+    review_requested events, and the owner's rule is to ask in the room and never
+    via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED."""
+    refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
+    if not refs:
+        return 0
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    p = ledger_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as fh:
+        for repo, num in sorted(refs):
+            fh.write(json.dumps({"repo": repo, "pr": num, "reviewer": reviewer,
+                                 "ts": ts, "channel": "room"}) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    return len(refs)
+
+
+def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
+    """(refuse, detail) — refuse re-asking the SAME non-responders after `minutes`.
+
+    The owner's rule is "if they didn't get back in 30min, ask OTHERS — do NOT
+    block". Re-requesting the same names is not escalation; the routing tool says
+    so about GitHub and it is equally true in-room. Enforced here because a rule
+    I have to remember is one I demonstrably do not: on sonichi#3511 I asked the
+    same two people twice, 8 minutes apart, and neither ever reviewed.
+
+    Fails OPEN on any uncertainty — a notifier that blocks on its own bug is
+    worse than one that over-notifies.
+    """
+    refs = _PR_URL.findall(message or "")
+    if not refs:
+        return False, ""
+    repo, num = refs[0]
+    ledger = ledger_path()
+    if not ledger.exists():
+        return False, ""
+    import json as _j, datetime as _dt
+    prior, earliest = set(), None
+    try:
+        for line in ledger.read_text().splitlines():
+            try:
+                d = _j.loads(line)
+            except ValueError:
+                continue
+            if str(d.get("pr")) != str(num) or d.get("repo") not in (repo, None):
+                continue
+            prior.add(d.get("reviewer"))
+            ts = d.get("ts") or ""
+            if ts and (earliest is None or ts < earliest):
+                earliest = ts
+    except OSError:
+        return False, ""
+    if not prior or earliest is None:
+        return False, ""
+    names = {x["name"] for x in targets}
+    if not names or not names.issubset(prior):
+        return False, ""            # at least one NEW name -> this IS widening
+    try:
+        age = (_dt.datetime.now(_dt.timezone.utc)
+               - _dt.datetime.fromisoformat(earliest.replace("Z", "+00:00")))
+    except ValueError:
+        return False, ""
+    if age.total_seconds() < minutes * 60:
+        return False, ""
+    # One human can hold several roster keys (jsun-m IS johnm-desktop). Listing
+    # both overstates the pool and re-asks one person under two names.
+    seen_actors, unasked = set(), []
+    for k, v in sorted((roster or {}).items()):
+        if not isinstance(v, dict) or k.startswith("_"):
+            continue
+        # same_actor_as links are MUTUAL (a<->b), so neither end is canonical;
+        # min() picks one deterministically for either direction of the pair.
+        actor = min(k, v.get("same_actor_as") or k)
+        if k in prior or k == "keweichen":
+            seen_actors.add(actor)
+            continue
+        if actor in seen_actors:
+            continue
+        seen_actors.add(actor)
+        unasked.append(k)
+    return True, (f"every target was already asked on {repo}#{num} "
+                  f"{int(age.total_seconds() // 60)} min ago and none has reviewed. "
+                  f"Not yet asked: {', '.join(unasked) or '<roster exhausted>'}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--reviewers", required=True,
                     help="comma-separated roster keys")
     ap.add_argument("--message", required=True)
     ap.add_argument("--send", action="store_true")
+    ap.add_argument("--allow-single", metavar="REASON", default="",
+                    help="deliberately notify ONE reviewer; requires a reason")
+    ap.add_argument("--widen-override", metavar="REASON", default="",
+                    help="deliberately re-ask the SAME reviewers after 30min")
     ap.add_argument("--room", default=None,
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
@@ -148,6 +247,20 @@ def main() -> int:
     a = ap.parse_args()
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
+    # Both gates run on RESOLVED targets and BEFORE any send: a partial batch that
+    # notified one person is the single-reviewer outcome the owner's rule forbids.
+    if len(targets) < 2 and not a.allow_single:
+        print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
+              "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
+              "or pass --allow-single '<reason>'.", file=sys.stderr)
+        return 5
+    if a.allow_single and len(targets) < 2:
+        print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
+    stale, why = _stale_repeat_ask(a.message, targets, load_roster())
+    if stale and not a.widen_override:
+        print(f"REFUSED: {why} Re-asking the same people is not escalation — "
+              "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
+        return 6
     failures = 0
     for t in targets:
         if a.room and t["room"] != a.room:
@@ -215,6 +328,9 @@ def main() -> int:
         # Printing stderr alone renders every such refusal as a blank line.
         if ok:
             print(f"{t['name']}: ok=True event={event[:24]}")
+            n_logged = record_asks(a.message, t["name"])
+            if n_logged:
+                print(f"  logged {n_logged} PR ask(s) for {t['name']}", file=sys.stderr)
         else:
             detail = reason or p.stderr.strip()[:120] or fallback
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
