@@ -3016,6 +3016,17 @@ def _reply_author_header(message) -> str:
     )
 
 
+def channel_allows_collaborator_attachments(access_data, channel_id) -> bool:
+    """Per-channel owner opt-in: a COLLABORATOR's result may carry [file:]/
+    [attach:] markers here. Path authorization stays with the transport
+    allowlist; [channel:] redirects stay blocked regardless. Default off."""
+    for section in ("groups", "channels"):
+        cfg = (access_data.get(section) or {}).get(str(channel_id))
+        if isinstance(cfg, dict):
+            return cfg.get("collaboratorAttachments") is True
+    return False
+
+
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     """True iff `sender_id` is listed under the SERVING channel's `collaborators`
     array in access.json.
@@ -4797,7 +4808,12 @@ async def poll_results():
                 # "unknown" — never "owner" — so a lost/absent tier can't
                 # silently upgrade a non-owner reply in tier accounting.
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
-                pending_task_collab.pop(task_id, None)
+                _task_collab = pending_task_collab.pop(task_id, None)
+                if _task_collab is None:
+                    # Restart-safe: the in-memory map is gone but the task file
+                    # carries the broker-written collaborator header.
+                    _tf_c = find_task_file(TASKS_DIR, task_id)
+                    _task_collab = bool(_tf_c) and "collaborator: true" in _tf_c.read_text(errors="replace")
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -4812,8 +4828,15 @@ async def poll_results():
                     _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
                 # A Discord channel is a human surface: the suppression is journaled
                 # under STATE_DIR and closed silently rather than posted as prose.
+                try:
+                    _aa_access = json.loads(ACCESS_FILE.read_text())
+                except Exception:
+                    _aa_access = {}   # unreadable config -> default deny
+                _allow_attach = bool(_task_collab) and channel_allows_collaborator_attachments(
+                    _aa_access, getattr(channel, "id", None))
                 reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO,
-                                                             suppress_journal=(STATE_DIR, task_id))
+                                                             suppress_journal=(STATE_DIR, task_id),
+                                                             allow_attach=_allow_attach)
                 if _withheld:
                     print(f"  [team-guard] withheld result for {task_id} "
                           f"(tier={_guard_tier}): {_withheld}", flush=True)
