@@ -92,11 +92,8 @@ if (skillTelemetryHook.trim()) {
 	};
 }
 
-// Gmail connector write guard: always-on registration. The connector advertises
-// write tools whose scopes are broken, so the wrong affordance is visible at the
-// tool layer while the sanctioned IMAP/SMTP path is only prose — a deny that
-// names the right path is what closes that gap. The matcher mirrors
-// hooks/README.md; the hook re-checks the tool name and no-ops otherwise.
+// Always-on: the connector's write scopes are broken, so the deny must reach the
+// caller. The hook re-checks the tool name, so the matcher is belt-and-braces.
 const gmailWriteGuardHook = process.argv[5] || '';
 let gmailWriteGuardSettings = null;
 if (gmailWriteGuardHook.trim()) {

@@ -124,9 +124,8 @@ describe('build-core-settings.mjs', () => {
 		);
 	});
 
-	// The guard shipped for a year with no production registrar: it appeared only
-	// in hooks/README.md as a manual `cp`, so the connector's broken write tools
-	// stayed reachable on every install that never ran those steps by hand.
+	// Regression: the guard had no production registrar, so it stayed inert on any
+	// install that never ran the README's manual cp by hand.
 	it('registers the Gmail write guard when its path is supplied', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const blk = o.hooks.PreToolUse.find((b: any) =>
