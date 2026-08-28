@@ -75,7 +75,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 
     # Prefer static base URL to prevent Host header injection bypass.
     # TWILIO_WEBHOOK_URL is the public ngrok/funnel URL Twilio sends webhooks to.
-    base_url = os.environ.get("TWILIO_WEBHOOK_URL", "")
+    base_url = config_get("TWILIO_WEBHOOK_URL", "")
     if base_url:
         url = base_url.rstrip("/") + handler.path
     else:
@@ -105,6 +105,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_config import config_get  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
@@ -1446,7 +1447,7 @@ def _resolve_local_ip() -> str:
 
 
 if __name__ == "__main__":
-    bind = os.environ.get("AGENT_API_BIND", "127.0.0.1")
+    bind = config_get("AGENT_API_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client stalled mid-request or a handler ran a slow subprocess/urlopen —
     # every later request hung on a port that still looked open to startup.sh's

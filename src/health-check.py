@@ -66,7 +66,7 @@ from gateway_serving import (  # noqa: E402
     safe_num as _gateway_num,
 )
 from task_archive import find_task_file  # noqa: E402
-
+from sutando_config import config_get  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
 # resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
@@ -100,17 +100,8 @@ def _default_memory_dir() -> str:
     slug = claude_project_slug(repo)
     return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
-# SUTANDO_MEMORY_DIR stays authoritative here, same as everywhere else that
-# resolves core memory (src/voice-agent.ts, src/voice-context.ts, and
-# CLAUDE.md/AGENTS.md all honor it). An earlier version of this fix made
-# ONLY this check ignore the override, on the theory that it was purely a
-# stale pre-#1454 workaround (see _default_memory_dir()'s docstring) — but
-# that broke the invariant that this check reports on the SAME directory the
-# rest of the runtime actually reads/writes, which is a worse failure mode
-# than the one being fixed (a health check silently diverging from ground
-# truth). If SUTANDO_MEMORY_DIR is a genuine leftover from that era, the
-# memory-dir-override check below flags the divergence instead of silently
-# redirecting.
+# SUTANDO_MEMORY_DIR is read via os.environ, not config_get: this check must
+# report on the same directory the runtime reads, so it opts out of #1724.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
 # How much of MEMORY.md a session actually loads. These are the RUNTIME's
@@ -9359,7 +9350,7 @@ def run_all_checks() -> list[dict]:
     if env_path.exists():
         env_content = env_path.read_text()
         has_twilio = twilio_configured(env_content)  # pragma: no cover — call-site in untested mega-function
-        skip_phone = "SKIP_PHONE=1" in env_content or os.environ.get("SKIP_PHONE") == "1"
+        skip_phone = "SKIP_PHONE=1" in env_content or config_get("SKIP_PHONE") == "1"  # pragma: no cover — call-site in untested mega-function
         if has_twilio and not skip_phone:
             c = check_port(3100, "conversation-server")
             if c["status"] != "ok":
@@ -9653,9 +9644,9 @@ def run_all_checks() -> list[dict]:
     # Stuck-loop / queue-pileup detection — consequence-level signals that
     # fire whether the watcher died, the proactive loop crashed mid-pass, or
     # both. Independent of which mechanism died.
-    loop_stale_sec = int(os.environ.get("SUTANDO_HEALTH_LOOP_STALE_SEC", "600"))
-    queue_age_sec = int(os.environ.get("SUTANDO_HEALTH_QUEUE_AGE_SEC", "300"))
-    queue_count = int(os.environ.get("SUTANDO_HEALTH_QUEUE_COUNT", "3"))
+    loop_stale_sec = int(config_get("SUTANDO_HEALTH_LOOP_STALE_SEC", "600"))
+    queue_age_sec = int(config_get("SUTANDO_HEALTH_QUEUE_AGE_SEC", "300"))
+    queue_count = int(config_get("SUTANDO_HEALTH_QUEUE_COUNT", "3"))
     checks.append(check_battery())
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
@@ -10266,10 +10257,12 @@ def notify_gateway_for_failures(
 # start-cli.sh has its own from-inside-core guard — two independent guarantees
 # the recovery never runs from within the session it would kill.
 
-RECOVER_WEDGE_SEC = int(os.environ.get("SUTANDO_RECOVER_WEDGE_SEC", "600"))        # task stuck this long = wedged
-RECOVER_CONFIRM_SEC = int(os.environ.get("SUTANDO_RECOVER_CONFIRM_SEC", "120"))    # wedge must persist across passes
-RECOVER_COOLDOWN_SEC = int(os.environ.get("SUTANDO_RECOVER_COOLDOWN_SEC", "1800")) # min gap between restarts
-RECOVER_MAX_PER_HOUR = int(os.environ.get("SUTANDO_RECOVER_MAX_PER_HOUR", "3"))
+# wedge = a task stuck this long; it must persist across passes before a
+# restart, and cooldown is the minimum gap between restarts.
+RECOVER_WEDGE_SEC = int(config_get("SUTANDO_RECOVER_WEDGE_SEC", "600"))
+RECOVER_CONFIRM_SEC = int(config_get("SUTANDO_RECOVER_CONFIRM_SEC", "120"))
+RECOVER_COOLDOWN_SEC = int(config_get("SUTANDO_RECOVER_COOLDOWN_SEC", "1800"))
+RECOVER_MAX_PER_HOUR = int(config_get("SUTANDO_RECOVER_MAX_PER_HOUR", "3"))
 
 
 def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple[str, int] | None":
