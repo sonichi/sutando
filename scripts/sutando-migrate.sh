@@ -1153,7 +1153,7 @@ union_contains() {
     local py; py="$(resolve_python "$REPO_DIR")"
     [ -n "$py" ] || return 1
     "$py" - "$src" "$dst" <<'PY'
-import json, sys
+import json, os, sys
 
 src, dst = sys.argv[1:3]
 try:
@@ -1161,18 +1161,27 @@ try:
         s = json.load(fh)
     with open(dst, encoding="utf-8") as fh:
         d = json.load(fh)
+    src_mt = os.path.getmtime(src)
+    dst_mt = os.path.getmtime(dst)
 except Exception:
     sys.exit(1)
 if not isinstance(s, dict) or not isinstance(d, dict):
     sys.exit(1)
+# The union stamps the dest with the WINNER's mtime, and the writer contract
+# says non-array fields come from that winner. So when THIS source's mtime
+# equals the dest's, its scalars won and must survive verbatim; a dest mtime
+# newer than every source means the pre-union dest won, whose content is not
+# recoverable per-source — arrays alone are checkable there.
+scalar_winner = src_mt == dst_mt
 for key, val in s.items():
-    if not isinstance(val, list):
-        continue
-    dv = d.get(key)
-    if not isinstance(dv, list):
-        sys.exit(1)
-    have = {json.dumps(e, sort_keys=True) for e in dv}
-    if any(json.dumps(e, sort_keys=True) not in have for e in val):
+    if isinstance(val, list):
+        dv = d.get(key)
+        if not isinstance(dv, list):
+            sys.exit(1)
+        have = {json.dumps(e, sort_keys=True) for e in dv}
+        if any(json.dumps(e, sort_keys=True) not in have for e in val):
+            sys.exit(1)
+    elif scalar_winner and (key not in d or d[key] != val):
         sys.exit(1)
 sys.exit(0)
 PY
