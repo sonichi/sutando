@@ -127,6 +127,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from signal_guest_handler import start_guest_deep_dive  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -1277,7 +1278,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.check_auth():
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.send_json(400, {"error": "invalid Content-Length"})
+            return
+        # Cap BEFORE reading into memory: an untrusted guest deep_dive could
+        # otherwise exhaust memory via Content-Length without taking a worker slot.
+        if length < 0 or length > 65536:
+            self.send_json(413, {"error": "task request too large"})
+            return
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
@@ -1287,6 +1297,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         from_agent = data.get("from", "unknown")
         task = data.get("task", "")
+        if not isinstance(task, str):
+            self.send_json(400, {"error": "task must be a string"})
+            return
         priority = data.get("priority", "normal")
 
         # Task-file header injection guard. `from_agent` lands on a single
@@ -1306,6 +1319,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if not task:
             self.send_json(400, {"error": "task is required"})
+            return
+
+        # guest = untrusted content, so it must never reach the owner core: sandboxed
+        # read-only worker, secret-scanned, never TASK_DIR. See signal_guest_handler.
+        if data.get("access_tier") == "guest":
+            # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
+            # results into the owner's voice session, so a guest result must not match.
+            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
+            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (guest, sandboxed)",
+            })
             return
 
         callback_url = data.get("callback_url", "")
