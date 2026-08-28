@@ -123,6 +123,15 @@ check "arbitrary foreign content in the sig file is equally unusable" \
 printf '%064d' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 check "a valid-shape stale sha is STILL an independent writer (control)" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+# Deliberate leniency, pinned: trailing NEWLINES after the sha are the shell's
+# \$() semantics, and the record still unambiguously decodes to one sha256 —
+# rejecting it would wedge a recoverable file. Trailing SPACES stay invalid.
+printf '%064d\n\n\n' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+check "a valid sha with trailing blank lines is still USABLE provenance" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+printf '%064d ' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+check "...but a trailing SPACE is malformed, not a writer" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
 rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 echo "keep it that way" >> "$WORKSPACE_DIR/build_log.md"
 echo "per-host went live" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
