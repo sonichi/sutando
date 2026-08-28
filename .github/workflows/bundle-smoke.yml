@@ -15,7 +15,7 @@ on:
       - 'package-lock.json'
       - '.github/workflows/bundle-smoke.yml'
   push:
-    branches: [main, staging-interaction-planes]
+    branches: [main]
     paths:
       - 'src/**'
       - 'skills/phone-conversation/scripts/conversation-server.ts'
@@ -25,6 +25,10 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/bundle-smoke.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   smoke:

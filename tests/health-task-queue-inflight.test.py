@@ -67,7 +67,9 @@ check(hc._tasks_held_by_a_worker("garbage\n\n   \n") == set(), "junk ps output d
 # task is accounted for by a live worker.
 src = (REPO / "src" / "health-check.py").read_text()
 i = src.index("def check_task_queue")
-body = src[i:i + 2600]
+# The function itself, not a byte count: a fixed window turns "someone added a
+# line" into a false failure on an assertion about wording.
+body = src[i:src.index("\ndef ", i + 1)]
 check("held_note" in body, "the probe threads the in-flight count into its detail")
 check("held_is_progress" in body,
       "suppression is gated on a single named predicate, not an inline comparison")

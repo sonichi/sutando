@@ -16,7 +16,11 @@ name: lint-sutando-home-path
 on:
   pull_request:
   push:
-    branches: [main, staging-workspace-revamp]
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint-sutando-home-path:
