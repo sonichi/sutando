@@ -22,8 +22,8 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
-from delivery.readiness import read_ready_result  # noqa: E402
-from local_task_protocol import find_result  # noqa: E402
+from delivery.readiness import read_ready_result
+from local_task_protocol import find_result
 from pool_follower import LEAD_STALE_S  # noqa: E402
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
