@@ -87,13 +87,19 @@ FLAGS_EXACT="$(parse_list flag_exact)"
 ALLOWS="$(parse_list allow)"
 ALLOW_PAIRED="$(parse_list allow_paired)"
 ROOT_GLOBS="$(parse_list root_artifact_glob)"
+SKIP_GLOB="$(parse_list skip_glob)"
 NOTE=""
 ROOT_NOTE=""
+SKIP_NOTE=""
 # Defaulted independently of the FLAGS fallback: the two go empty for different
 # reasons, and sharing a condition left this one silently unscanned.
 if [[ -z "${ROOT_GLOBS//[$' \t\r\n']/}" ]]; then
     ROOT_GLOBS=$'prbody*\npr-body*\npr_body*\nreply*.md\ncomment*.md\ndraft*.md\n*.patch\n*.diff\n*.orig\n*.rej\nnohup.out'
     ROOT_NOTE="no root_artifact_glob in ${GUIDE#$REPO/}; used generic root-artifact defaults"
+fi
+if [[ -z "${SKIP_GLOB//[$' \t\r\n']/}" ]]; then
+    SKIP_GLOB=$'*.patch\n*.diff'
+    SKIP_NOTE="no hardcoded-paths.skip_glob in ${GUIDE#$REPO/}; used generic patch/diff defaults"
 fi
 if [[ -z "${FLAGS//[$' \t\r\n']/}" ]]; then
     FLAGS=$'/Users/\n/home/'
@@ -109,7 +115,7 @@ fi
 # — so a large PR diff (~8MB) can't hit 'Argument list too long' and make the
 # scanner fail to launch while we blindly print PASS (#2281). `printf` is a bash
 # builtin, so piping the whole diff carries no exec-size limit.
-HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_FLAGS_EXACT="$FLAGS_EXACT" RC_ALLOWS="$ALLOWS" RC_ALLOW_PAIRED="$ALLOW_PAIRED" python3 "$HERE/review-checks.py")"
+HITS="$(printf '%s' "$DIFF" | RC_FLAGS="$FLAGS" RC_FLAGS_EXACT="$FLAGS_EXACT" RC_ALLOWS="$ALLOWS" RC_ALLOW_PAIRED="$ALLOW_PAIRED" RC_SKIP_GLOB="$SKIP_GLOB" python3 "$HERE/review-checks.py")"
 SCAN_RC=$?
 # Fail closed: if the scanner didn't run to completion (exec failure, crash),
 # its exit is non-zero. Do NOT interpret an empty stdout as "clean" — error out.
@@ -120,6 +126,7 @@ fi
 
 [[ -n "$NOTE" ]] && echo "review-checks: $NOTE" >&2
 [[ -n "$ROOT_NOTE" ]] && echo "review-checks: $ROOT_NOTE" >&2
+[[ -n "$SKIP_NOTE" ]] && echo "review-checks: $SKIP_NOTE" >&2
 
 # --- scan ADDED FILE PATHS for PR-draft artifacts at the repo root -----------
 # Separate scanner: a stray root file is a diff HEADER, so the content scan
