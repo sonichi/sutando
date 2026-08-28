@@ -151,10 +151,15 @@ exit 0
     def _wait_for_heartbeat_exit(self):
         pid_file = Path(self.tmp.name) / "heartbeat.pid"
         deadline = time.monotonic() + 5
-        while not pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(pid_file.exists(), "heartbeat stub did not record its pid")
-        pid = int(pid_file.read_text())
+        # Wait for parseable CONTENT, not existence: write_text() creates and
+        # truncates before writing, so exists() goes true while the file is empty.
+        pid = None
+        while pid is None and time.monotonic() < deadline:
+            try:
+                pid = int(pid_file.read_text())
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.01)
+        self.assertIsNotNone(pid, "heartbeat stub did not record its pid")
         while time.monotonic() < deadline:
             try:
                 os.kill(pid, 0)
