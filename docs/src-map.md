@@ -221,6 +221,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 ## `src/agent/`
 
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).

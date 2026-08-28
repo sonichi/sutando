@@ -154,7 +154,7 @@ from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -487,7 +487,9 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
                                    channel_id, f"task-{int(time.time() * 1000)}")
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
-        return "honour", None
+        # A planner that raised proved nothing about the asker being answered.
+        # "honour" archives; "defer" retains so a later pass can retry.
+        return "defer", None
 
 
 def archive_path(kind: str, task_id: str) -> "Path":
@@ -2592,6 +2594,16 @@ async def _deliver_pairing_prompt(channel, code, username, sender_id, allowed):
 
 client = discord.Client(intents=intents)
 _ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
+# RESUME is invisible to on_ready, so "no ready lines" cannot mean "no
+# reconnects" — these two counters are what make the classes distinguishable.
+_resume_count = 0
+_disconnect_count = 0
+
+def _reconnect_state() -> str:
+    """One shape for every reconnect-class line so the log stays greppable."""
+    return (f"gateway session #{_ready_count} "
+            f"(resume #{_resume_count}, disconnect #{_disconnect_count})")
+
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2684,6 +2696,23 @@ async def _supervise_loop(coro_fn, name):
 
 
 @client.event
+async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
+    global _resume_count
+    _resume_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge resumed: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
+async def on_disconnect():  # pragma: no cover — gateway callback
+    # Re-dispatched per retry while ready/resumed need success: the only outage line.
+    global _disconnect_count
+    _disconnect_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge disconnected: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
 async def on_ready():
     global _ready_count
     _ready_count += 1
@@ -2693,7 +2722,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
     # for Discord to infer it. Best-effort — presence must never break startup.
@@ -4800,18 +4829,29 @@ async def poll_results():
                     # own channel. Loop guard: a task that comes back
                     # cross-channel-deduped a SECOND time is not re-queued again
                     # — notify in-channel instead (owner-directed).
-                    if _skip.value == "deduped" and _skip.extra:
+                    if _skip.value == "deduped":
+                        _act, _delivered = "defer", None
                         try:
-                            _holder_file = find_task_file(TASKS_DIR, _skip.extra)
+                            # find_task_file globs unchecked; an id failing the
+                            # gate find_result applies is "holder not found".
+                            _holder_file = (
+                                find_task_file(TASKS_DIR, _skip.extra)
+                                if local_task_protocol.valid_archive_lookup_id(_skip.extra)
+                                else None)
                             _holder_text = _holder_file.read_text() if _holder_file else None
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
+                            # Cross-channel is an unconfirmed report: the asker is
+                            # only served once the notify or the re-queue lands.
                             _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
-                                         if not _target else ("honour", None))
+                                         if not _target else ("report", None))
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
                                 save_pending_replies()
-                            elif _act == "report":
+                            elif _act == "report" and not _target:
+                                # Cross-channel carries a None payload and is
+                                # delivered by the _target block below instead.
                                 await channel.send(_pl)
+                                _delivered = True
                             if _target:
                                 _orig_file = find_task_file(TASKS_DIR, task_id)
                                 _orig_text = _orig_file.read_text() if _orig_file else None
@@ -4829,6 +4869,7 @@ async def poll_results():
                                         f"even after a re-queue — flagging instead of looping. "
                                         f"This needs a direct answer here."
                                     )
+                                    _delivered = True
                                 else:
                                     # First time — reject + re-queue for an
                                     # in-channel answer.
@@ -4847,9 +4888,16 @@ async def poll_results():
                                         f"{_new_id} for in-channel answer",
                                         flush=True,
                                     )
+                                    _delivered = True
                         except Exception as e:
-                            # Best-effort; never block the archive of this result.
                             print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
+                        if report_disposition(_act, _delivered) == "retain":
+                            # Nobody was told. Keep the result AND the task so a
+                            # later pass retries; archiving loses the question.
+                            print(
+                                f"  [dedup] report not delivered for {task_id} — "
+                                f"retaining for retry", flush=True)
+                            continue
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     # §7 audit: skip-marked results are resolved deliveries, not
                     # silent voids — one line per resolved result per spec.
