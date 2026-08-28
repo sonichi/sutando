@@ -42,7 +42,8 @@ When the task watcher emits `TASK_FILE: <basename>` for a new task, **before** r
 
 ```bash
 WORKSPACE="$(bash scripts/sutando-config.sh workspace)"
-python3 src/pool_follower.py acquire "$WORKSPACE/tasks" "core-$SUTANDO_CORE_ID"
+PY="$(. scripts/python-binary.sh && resolve_python "$PWD")"
+"$PY" src/pool_follower.py acquire "$WORKSPACE/tasks" "core-$SUTANDO_CORE_ID"
 ```
 
 Resolve `WORKSPACE`; do not expect to inherit it. `pool-core-wrapper.sh` passes
@@ -68,7 +69,8 @@ Use the renamed `task-<id>.claimed-core-<n>.txt` path for all subsequent reads +
 **Completion step (required):** compose every result body starting with the line `task: <id>` (the id from your claimed file's name), then complete via the helper — one command replaces the manual write/flag/archive trio:
 
 ```bash
-python3 src/pool_follower.py finish tasks/task-<id>.claimed-core-<n>.txt core-<n> <<'EOF'
+PY="$(. scripts/python-binary.sh && resolve_python "$PWD")"
+"$PY" src/pool_follower.py finish tasks/task-<id>.claimed-core-<n>.txt core-<n> <<'EOF'
 task: <id>
 <result body>
 EOF
