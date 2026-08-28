@@ -403,22 +403,10 @@ reap_stale_task_watcher() {
 # reach this block, which reaped a live, mid-session watcher as a side effect.
 # scripts/restart-gateway-lanes.sh calls only this function.
 #
-# Default-lane foreign-suffix fence: every configured named lane <inst> serves
-# rooms on :<inst>.ag2.space (the same convention that maps <inst> to
-# channels/<inst>-ag2space/ below), so those suffixes are foreign to the
-# default lane. Operator-set GATEWAY_FOREIGN_SUFFIXES wins verbatim.
-derive_foreign_suffixes() {
-  if [ -n "${GATEWAY_FOREIGN_SUFFIXES:-}" ]; then
-    printf '%s' "$GATEWAY_FOREIGN_SUFFIXES"
-    return 0
-  fi
-  local _dfs_out="" _dfs_var _dfs_inst
-  for _dfs_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
-    _dfs_inst="$(printf '%s' "${_dfs_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
-    _dfs_out="${_dfs_out:+$_dfs_out,}:${_dfs_inst}.ag2.space"
-  done
-  printf '%s' "$_dfs_out"
-}
+# The derivation is shared with the launchd wrapper so both launch paths fence
+# identically; sourcing it here keeps `derive_foreign_suffixes` in scope.
+# shellcheck source=gateway-foreign-suffixes.sh
+. "$(dirname "${BASH_SOURCE[0]}")/gateway-foreign-suffixes.sh"
 
 # Requires REPO, PY (resolved via scripts/python-binary.sh) and LOGS_DIR set
 # by the caller — same contract as every other block in startup.sh.

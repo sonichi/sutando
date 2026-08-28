@@ -64,14 +64,39 @@ else
   bad "operator GATEWAY_FOREIGN_SUFFIXES wins verbatim over derivation" "got '$got'"
 fi
 
-# --- wiring: the default-lane spawn actually passes the derived value -------
-# The named-lane loop must NOT get it (instanced lanes fence by
-# GATEWAY_ROOM_SUFFIX; the foreign list is the default lane's mirror).
-spawn_lines="$(grep -n 'GATEWAY_FOREIGN_SUFFIXES="\$(derive_foreign_suffixes)"' "$REPO/src/startup-runtime.sh" | wc -l | tr -d ' ')"
-if [ "$spawn_lines" = 1 ]; then
-  ok "exactly one spawn site injects the derived value (default lane)"
+# --- wiring: BOTH launch paths carry the derived value ----------------------
+# Assert the claim, not a file-wide count: an `== 1` over the whole file is
+# stronger than the intent and fails on any second legitimate injection site.
+named_lane_block="$(awk '/GATEWAY_INSTANCE="\$_gw_inst"/,/remote-gateway-bridge\.py/' \
+  "$REPO/src/startup-runtime.sh")"
+if printf '%s' "$named_lane_block" | grep -q 'GATEWAY_FOREIGN_SUFFIXES'; then
+  bad "the named-lane spawn does not inject the foreign list" "found it in the lane block"
 else
-  bad "exactly one spawn site injects the derived value (default lane)" "found $spawn_lines"
+  ok "the named-lane spawn does not inject the foreign list"
+fi
+
+if grep -q 'GATEWAY_FOREIGN_SUFFIXES="\$(derive_foreign_suffixes)"' "$REPO/src/startup-runtime.sh"; then
+  ok "the bare default-lane spawn injects the derived value"
+else
+  bad "the bare default-lane spawn injects the derived value" "no injection site found"
+fi
+
+# The supervised path is the PREFERRED one, so a fence only on the fallback
+# leaves the same host behaving two ways depending on launchd health.
+wrapper="$REPO/src/launchd/gateway-bridge-wrapper.sh"
+if grep -q 'GATEWAY_FOREIGN_SUFFIXES="\$(derive_foreign_suffixes)"' "$wrapper" \
+   && grep -q 'export GATEWAY_FOREIGN_SUFFIXES' "$wrapper"; then
+  ok "the launchd wrapper derives and exports the value (supervised path)"
+else
+  bad "the launchd wrapper derives and exports the value (supervised path)" "not wired"
+fi
+
+# One derivation, not two copies that can drift.
+defs="$(grep -rl 'derive_foreign_suffixes() {' "$REPO/src" | wc -l | tr -d ' ')"
+if [ "$defs" = 1 ]; then
+  ok "exactly one definition of derive_foreign_suffixes in src/"
+else
+  bad "exactly one definition of derive_foreign_suffixes in src/" "found $defs"
 fi
 
 # --- negative control: the harness can fail ---------------------------------
