@@ -1079,10 +1079,8 @@ copy_preserving_mtime() {
     fi
 }
 
-# Unions top-level arrays; non-array fields follow the newer source.
-# Malformed input returns non-zero — a silent degrade is access loss.
-# Pure merge policy: containment is commit_one's concern and is NOT enforced
-# here, so standalone callers can drive it against arbitrary paths.
+# Unions top-level arrays; non-array fields follow the newer source. Malformed
+# input returns non-zero, and containment is commit_one's concern, not this.
 union_json_arrays_into() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"
@@ -1224,12 +1222,13 @@ if manifest and rel and os.path.exists(manifest):
     if not isinstance(m, dict) or rel not in m or not isinstance(m[rel], dict):
         sys.exit(1)
     expected = m[rel]
-    # A widened dest is a disclosure the scalar comparison cannot see. Absent
-    # on pre-key manifests: nothing to check there, which is not a failure.
+    # record_union_scalars writes the mode beside every rel it records, so a
+    # missing table or rel is damage; certifying an unknown mode is the leak.
     modes = m.get("__union_modes__")
-    if isinstance(modes, dict) and rel in modes:
-        if oct(stat.S_IMODE(os.stat(dst).st_mode)) != modes[rel]:
-            sys.exit(1)
+    if not isinstance(modes, dict) or rel not in modes:
+        sys.exit(1)
+    if oct(stat.S_IMODE(os.stat(dst).st_mode)) != modes[rel]:
+        sys.exit(1)
 if expected is not None:
     have = {k: v for k, v in d.items() if not isinstance(v, list)}
     if have != expected:
@@ -1414,6 +1413,11 @@ commit_one() {
                 return 0
             fi
             if identity_match "$src_file" "$dst_path"; then
+                # The union carries the winner's mtime forward; a drop must too,
+                # or a later OLDER source outranks it and its scalars win.
+                if [ "$src_file" -nt "$dst_path" ]; then
+                    touch -r "$src_file" "$dst_path"
+                fi
                 echo "identical-drop"
                 return 0
             fi
