@@ -122,8 +122,10 @@ Group-busy is then a glob, re-derived from the same files
 that ARE the assignments. **Anchor it on the assignment segment:**
 
 ```
-*.assigned-*.g-<group>.txt          <- correct
-*.g-<group>.txt                     <- WRONG: also matches the reclaimed name
+*.assigned-*.g-<group>.txt          <- use this
+*.g-<group>.txt                     <- see the truth table below; it is not
+                                       wrong for THIS layout, it is wrong for
+                                       the layout someone might switch to
 ```
 
 Truth table over both layouts, since "unrepresentable" is a strong claim:
