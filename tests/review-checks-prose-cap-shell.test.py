@@ -81,6 +81,12 @@ class ShellCommentLines(unittest.TestCase):
         p = self._w("# one\n# two\nx = 1  # trailing\n", name="f.py")
         self.assertEqual(self.m.comment_lines(p), {1, 2, 3})
 
+    def test_accepts_a_Path_not_only_a_str(self):
+        """The production caller passes PosixPath; a str-only fixture hides that."""
+        p = Path(self.tmp.name) / "viapath.sh"
+        p.write_text("cat <<EOF\n# data\nEOF\n# real\n")
+        self.assertEqual(self.m.comment_lines(p), {4})
+
     def test_shell_ext_is_now_supported(self):
         self.assertIn(".sh", self.m.SUPPORTED_EXTS)
         self.assertIn(".py", self.m.SUPPORTED_EXTS)

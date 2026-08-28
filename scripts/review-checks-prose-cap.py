@@ -29,7 +29,8 @@ _HEREDOC = re.compile(r"""(?<!<)<<(?!<)-?\s*(?:(['"])([A-Za-z_]\w*)\1|([A-Za-z_]
 
 def comment_lines(path):
     """Line numbers carrying a COMMENT, or None if the file cannot be classified."""
-    if path.endswith((".sh", ".bash")):
+    # Callers pass PosixPath as well as str; str() covers both.
+    if str(path).endswith((".sh", ".bash")):
         return _shell_comment_lines(path)
     try:
         with open(path, "rb") as fh:
