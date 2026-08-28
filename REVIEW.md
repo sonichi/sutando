@@ -274,11 +274,13 @@ and loads whichever repo it reviews.
     **This is one of two failure modes on a shared login, not the whole hazard.** On a third
     party's PR two reviews collapse into one, as above. On a PR that account itself authored,
     GitHub refuses only the *decisive* verdicts — the author login cannot APPROVE or request
-    changes — so `reviewDecision` stays empty however much review happened, and the PR reads
-    unreviewed. It can still submit COMMENT reviews, and other logins' reviews appear normally,
-    so `pulls/N/reviews` is **not** empty and "no reviews" is the wrong read: check
-    `reviewDecision`, and never take COMMENT volume for a decision. Same account, opposite
-    polarity: two-becomes-one there, no-decision-possible here.
+    changes, only COMMENT — so **the author's own reviews never move `reviewDecision`, however
+    many it files.** The field still reflects *other* logins: `REVIEW_REQUIRED` while none has
+    reviewed decisively, and `APPROVED` or `CHANGES_REQUESTED` once one has. So a self-authored
+    PR can look unreviewed while carrying real review, and `pulls/N/reviews` is **not** empty
+    either. Read `reviewDecision` for the decision and the reviews list for the substance, and
+    never take COMMENT volume for either. Same account, opposite polarity: two-becomes-one on
+    someone else's PR, no-decision-possible on your own.
     *Grounded by:* #3481 (2026-08-28) — approved without looking, twenty minutes after a
     peer had approved on the same account; the PR still read `REVIEW_REQUIRED` afterwards
     and the peer's conflict-of-interest disclosure was left in the superseded review. A
