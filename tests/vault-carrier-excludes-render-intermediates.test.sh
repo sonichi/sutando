@@ -408,6 +408,26 @@ check "...the owned deny LANDS" \
 check "...and the operator's comment survives beside it" \
     grep -qxF '# why we keep notes/raw: it is my scratch area' "$UPG_BOTH/.git/info/exclude"
 
+# keweichen's idempotency control: the preserved section is OURS, so a second
+# tick must not preserve its own marker under a fresh one. Two consecutive runs
+# on the settled file must be byte-identical, or the exclude grows every sync.
+_idem_before="$(cat "$UPG_BOTH/.git/info/exclude")"
+upgrade_rc "$UPG_BOTH" > /dev/null
+_idem_after="$(cat "$UPG_BOTH/.git/info/exclude")"
+check "idempotent: a second tick leaves the file byte-identical" \
+    test "$_idem_before" = "$_idem_after"
+check "...exactly ONE preserved marker, not one per tick" \
+    test "$(grep -cxF '# --- preserved from the previous exclude (sync-workspace) ---' \
+        "$UPG_BOTH/.git/info/exclude")" -eq 1
+upgrade_rc "$UPG_BOTH" > /dev/null
+upgrade_rc "$UPG_BOTH" > /dev/null
+check "...still one marker after four ticks total" \
+    test "$(grep -cxF '# --- preserved from the previous exclude (sync-workspace) ---' \
+        "$UPG_BOTH/.git/info/exclude")" -eq 1
+check "...and the operator note is still a single copy" \
+    test "$(grep -cxF '# why we keep notes/raw: it is my scratch area' \
+        "$UPG_BOTH/.git/info/exclude")" -eq 1
+
 check "the refusal chain consults the carve-out recognizer" \
     grep -qF '_is_safe_carveout_addition "$exclude_path" "$tmp_path"' <<< "$SYNC_CODE"
 

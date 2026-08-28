@@ -338,9 +338,8 @@ _DST="$WORKSPACE_DIR/hosts/testhost/build_log.md"
 # Inject a durability failure without a seam in production code: the fsync
 # helper runs `python3 - <path>`, so a shim that refuses exactly that path makes
 # the fsync fail while every other python3 call still works.
-# PATH injection no longer reaches the interpreter (section 12): the script
-# resolves an absolute binary. Inject through SYNC_PY, which it honours when
-# the file is real and executable — that is the seam a test may legitimately use.
+# PATH no longer reaches the interpreter (section 12), so inject through
+# SYNC_PY — the seam the resolver itself honours.
 _fsync_shim() {
     _fs="$(mktemp -d)"
     cat > "$_fs/python3" <<SHIM
@@ -411,9 +410,8 @@ rm -rf "$_shim"
 rm -f "$_INT"; rm -f "$_SIG"
 
 # ---- 12. the durable-publish path uses the REPO'S verified interpreter -------
-# A bare `python3` here can resolve to the Xcode-CLT stub from a LaunchAgent
-# PATH: the interpreter "exists", fails on exec, and raises an install dialog
-# every interval while the snapshot silently stays stale.
+# A bare `python3` can be the Xcode-CLT stub: it "exists", fails on exec, and
+# raises an install dialog every interval while the snapshot stays stale.
 echo "== 12. verified interpreter, not bare python3 =="
 
 check "no bare python3 survives in the script (comments aside)" \

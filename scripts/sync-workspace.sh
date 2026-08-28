@@ -126,10 +126,8 @@ SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 unset _self
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# The repo owns the safe-interpreter cascade (sutando-config.sh python-bin →
-# scripts/python-binary.sh). A bare `python3` here can reach the Xcode-CLT stub
-# from a LaunchAgent PATH, which raises an install dialog every interval.
-# Empty when nothing resolves; callers decide whether that is fatal.
+# A bare `python3` can be the Xcode-CLT stub on a LaunchAgent PATH; resolve
+# through the repo's cascade. Empty when nothing resolves — callers decide.
 SYNC_PY="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
 [ -n "$SYNC_PY" ] && [ -x "$SYNC_PY" ] || SYNC_PY=""
 
@@ -610,16 +608,19 @@ _adoptable_builtin_denies() {
 
 # A previously-generated exclude whose ONLY difference is carve-outs the shipped
 # config now adds is safe to refresh: no operator-authored rule is lost.
-# An operator's COMMENT is content, but refusing the whole refresh over one is
-# the wrong lever: a shipped header line that no longer ships is inert drift and
-# would block every upgrade. Carry the dropped comments forward instead, so the
-# owned rules refresh AND nothing the operator wrote is lost.
+# Refusing over a comment blocks every upgrade whose own header drifted. Carry
+# dropped comments forward instead: the rules refresh, the operator keeps theirs.
 _preserve_dropped_comments() {
+    # The marker is OURS: counting it as a dropped operator comment would preserve
+    # each tick's marker under a fresh one and grow the file forever. Local, not a
+    # top-level constant — the test harness eval's function bodies only.
+    local marker='# --- preserved from the previous exclude (sync-workspace) ---'
     local existing="$1" desired="$2" dropped
-    dropped="$(comm -23 <(_exclude_comments_only "$existing") <(_exclude_comments_only "$desired"))"
+    dropped="$(comm -23 <(_exclude_comments_only "$existing") <(_exclude_comments_only "$desired") \
+        | grep -vxF -- "$marker" || true)"
     [ -n "$dropped" ] || return 0
     {
-        printf '\n# --- preserved from the previous exclude (sync-workspace) ---\n'
+        printf '\n%s\n' "$marker"
         printf '%s\n' "$dropped"
     } >> "$desired"
 }
