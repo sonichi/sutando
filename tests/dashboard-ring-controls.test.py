@@ -45,6 +45,32 @@ setTimeout(() => {
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
+def _model_scoping_control() -> None:
+    """#3499 review P2: a newer transcript in a FOREIGN slug must not win."""
+    import importlib.util
+    import tempfile
+    import time
+    spec = importlib.util.spec_from_file_location("dash_mc", REPO / "src" / "dashboard.py")
+    m = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(m)
+    except SystemExit:
+        pass
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    core = tmp / ".claude-sutando" / "projects" / "-fake-repo"
+    core.mkdir(parents=True)
+    (core / "a.jsonl").write_text('{"model":"core-model"}\n')
+    time.sleep(0.05)
+    foreign = tmp / ".claude-sutando" / "projects" / "-reviewer-wt"
+    foreign.mkdir(parents=True)
+    (foreign / "b.jsonl").write_text('{"model":"reviewer-model"}\n')
+    m.WORKSPACE_DIR = tmp
+    m.REPO_DIR = pathlib.Path("/fake/repo")
+    got = m.get_current_model()
+    assert got == "core-model", f"foreign slug won: {got!r}"
+    print("model-scoping control: PASS — core slug beats newer foreign transcript")
+
+
 def main() -> None:
     if shutil.which("node") is None:
         print("dashboard-ring-controls: SKIP (node unavailable)")
@@ -87,28 +113,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
-def _model_scoping_control() -> None:
-    """#3499 review P2: a newer transcript in a FOREIGN slug must not win."""
-    import importlib.util
-    import tempfile
-    import time
-    spec = importlib.util.spec_from_file_location("dash_mc", REPO / "src" / "dashboard.py")
-    m = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(m)
-    except SystemExit:
-        pass
-    tmp = pathlib.Path(tempfile.mkdtemp())
-    core = tmp / ".claude-sutando" / "projects" / "-fake-repo"
-    core.mkdir(parents=True)
-    (core / "a.jsonl").write_text('{"model":"core-model"}\n')
-    time.sleep(0.05)
-    foreign = tmp / ".claude-sutando" / "projects" / "-reviewer-wt"
-    foreign.mkdir(parents=True)
-    (foreign / "b.jsonl").write_text('{"model":"reviewer-model"}\n')
-    m.WORKSPACE_DIR = tmp
-    m.REPO_DIR = pathlib.Path("/fake/repo")
-    got = m.get_current_model()
-    assert got == "core-model", f"foreign slug won: {got!r}"
-    print("model-scoping control: PASS — core slug beats newer foreign transcript")
