@@ -33,9 +33,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 MIGRATE = REPO / "scripts" / "sutando-migrate.sh"
 
-# SOURCE-relative. The classifier keys on the BARE name (`cloud-auth.json|rehome-state`,
-# sutando-migrate.sh:202); the already-homed path classifies `structural` and routes to the
-# COLLISION branch, so this test never reached the rehome branch it exists to guard.
+# SOURCE-relative: the classifier keys on the BARE name (migrate.sh:202). The
+# already-homed path classifies `structural` and routes to the COLLISION branch.
 REL = "cloud-auth.json"
 DEST_REL = "state/auth/cloud-auth.json"   # where rehome-state lands it
 REHOME_MARKER = "rehome-mtime-unavailable"
