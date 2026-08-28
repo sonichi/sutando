@@ -1162,10 +1162,14 @@ dst, rel, manifest = sys.argv[1:4]
 with open(dst, encoding="utf-8") as fh:
     d = json.load(fh)
 scalars = {k: v for k, v in d.items() if not isinstance(v, list)}
-try:
+if os.path.exists(manifest):
+    # An existing-but-invalid manifest is damage; silently replacing it would
+    # erase every prior rel's expectation. Fail so the commit fails closed.
     with open(manifest, encoding="utf-8") as fh:
         m = json.load(fh)
-except Exception:
+    if not isinstance(m, dict):
+        sys.exit(1)
+else:
     m = {}
 m[rel] = scalars
 tmp = manifest + ".tmp"
@@ -1205,12 +1209,18 @@ if not isinstance(s, dict) or not isinstance(d, dict):
 # scalars must survive verbatim; only when neither source of truth exists do
 # arrays alone remain checkable.
 expected = None
-if manifest and rel:
+if manifest and rel and os.path.exists(manifest):
+    # A present manifest is the AUTHORITY: parse/type failures and a missing
+    # rel entry are damage and must FAIL — degrading to the mtime fallback
+    # would let a dest-winner corruption pass by damaging the manifest.
     try:
         with open(manifest, encoding="utf-8") as fh:
-            expected = json.load(fh).get(rel)
+            m = json.load(fh)
     except Exception:
-        expected = None
+        sys.exit(1)
+    if not isinstance(m, dict) or rel not in m or not isinstance(m[rel], dict):
+        sys.exit(1)
+    expected = m[rel]
 if expected is not None:
     have = {k: v for k, v in d.items() if not isinstance(v, list)}
     if have != expected:
