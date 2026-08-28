@@ -568,9 +568,8 @@ done
 # 9. Idempotency: re-run commit, should detect sentinel + skip
 echo
 echo "==== TEST: verify (mandatory phase three — this suite claims scan→commit→verify) ===="
-# The fixture includes a divergent union (state/slack-allowed-recipients.json),
-# so this also pins class-aware semantic verification: a union result differs
-# from both inputs by design and must still verify.
+# The fixture's divergent union pins class-aware semantic verification: the
+# result differs from both inputs by design and must still verify.
 VERIFY_OUT="$(RUN_MIGRATE --verify 2>&1)" && verify_rc=0 || verify_rc=$?
 echo "$VERIFY_OUT" | grep -E "verify summary|verify:" | head -3
 if [ "$verify_rc" -ne 0 ]; then

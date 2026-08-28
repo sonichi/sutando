@@ -1042,11 +1042,8 @@ mirror_dir_modes() {
     return "$rc"
 }
 
-# Create (if needed) and physically validate the directory a dest write will
-# land in. A textual prefix test passes a symlinked component while the
-# mutation escapes the rollback boundary, so containment is proven on the
-# RESOLVED path — and the deepest existing ancestor is checked BEFORE mkdir,
-# so a symlink escape refuses without creating anything outside either.
+# Containment is proven on the RESOLVED path and BEFORE mkdir: a textual
+# prefix test passes a symlinked component that escapes the rollback root.
 ensure_contained_destdir() {
     local ddir="$1" probe real
     probe="$ddir"
@@ -1064,9 +1061,8 @@ ensure_contained_destdir() {
     esac
 }
 
-# Atomic per-file copy preserving mtime. Returns 0 on success; any mkdir,
-# containment, directory-mode, or copy failure returns non-zero so the commit
-# outcome can fail closed instead of certifying a write that did not happen.
+# Atomic per-file copy preserving mtime. Any mkdir/containment/mode/copy
+# failure returns non-zero, so commit fails closed instead of certifying it.
 copy_preserving_mtime() {
     local src="$1" dst="$2"
     ensure_contained_destdir "$(dirname "$dst")" || return 1
@@ -1085,9 +1081,8 @@ copy_preserving_mtime() {
 
 # Unions top-level arrays; non-array fields follow the newer source.
 # Malformed input returns non-zero — a silent degrade is access loss.
-# NB: pure merge policy — no dest-boundary enforcement here. Containment is
-# the COMMIT path's concern (commit_one), so standalone callers and the test
-# harness can drive the policy against arbitrary paths.
+# Pure merge policy: containment is commit_one's concern and is NOT enforced
+# here, so standalone callers can drive it against arbitrary paths.
 union_json_arrays_into() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"
@@ -1147,10 +1142,8 @@ PY
     return 1
 }
 
-# Record the union result's non-array fields so mandatory verification can
-# check the scalar winner even when the PRE-UNION DEST won (its content is
-# otherwise unrecoverable per-source). One manifest per backup id, keyed by
-# rel; the last union for a rel wins, matching the file's final state.
+# Records the union's non-array fields so verification can check the scalar
+# winner even when the PRE-UNION DEST won; last union for a rel wins.
 record_union_scalars() {
     local dst="$1" rel="$2" manifest="$3"
     local py; py="$(resolve_python "$REPO_DIR")"
@@ -1182,10 +1175,8 @@ union_mode = stat.S_IMODE(os.stat(dst).st_mode)
 modes = m.get(MODES_KEY)
 m[MODES_KEY] = ({} if not isinstance(modes, dict) else modes)
 m[MODES_KEY][rel] = oct(union_mode)
-# The manifest holds every union's non-array state, so it must be no wider than
-# the most restrictive file it describes — a 0600 source's scalars in a 0644
-# manifest is the same disclosure, one file over. Create at 0600 so it is never
-# briefly world-readable, then narrow to the intersection.
+# No wider than the most restrictive file it describes: a 0600 source's
+# scalars in a 0644 manifest disclose the same bytes. Create 0600, then narrow.
 want_mode = union_mode
 if os.path.exists(manifest):
     want_mode &= stat.S_IMODE(os.stat(manifest).st_mode)
@@ -1198,10 +1189,8 @@ os.replace(tmp, manifest)
 PY
 }
 
-# Semantic-verify companion to union_json_arrays_into: same element
-# fingerprint (sorted-key JSON). A union result differs from both inputs BY
-# DESIGN, so the per-source invariant is containment — every array element of
-# the source present in the dest — not byte identity.
+# Semantic companion to union_json_arrays_into, same sorted-key fingerprint:
+# the invariant is containment of every source element, not byte identity.
 union_contains() {
     local src="$1" dst="$2" manifest="${3:-}" rel="${4:-}"
     local py; py="$(resolve_python "$REPO_DIR")"
@@ -1221,17 +1210,12 @@ except Exception:
     sys.exit(1)
 if not isinstance(s, dict) or not isinstance(d, dict):
     sys.exit(1)
-# Scalars, strongest evidence first: the commit-time manifest holds the
-# union result's non-array fields whichever side won, so the dest must match
-# it exactly. Without a manifest entry, fall back to the mtime invariant: the
-# union stamps the dest with the WINNER's mtime, so an mtime-equal source's
-# scalars must survive verbatim; only when neither source of truth exists do
-# arrays alone remain checkable.
+# Scalars, strongest evidence first: the commit-time manifest, else the
+# union's WINNER-mtime invariant, else arrays alone.
 expected = None
 if manifest and rel and os.path.exists(manifest):
-    # A present manifest is the AUTHORITY: parse/type failures and a missing
-    # rel entry are damage and must FAIL — degrading to the mtime fallback
-    # would let a dest-winner corruption pass by damaging the manifest.
+    # A present manifest is AUTHORITATIVE: parse/type failure or a missing rel
+    # is damage and must FAIL, or damaging it would buy the weaker fallback.
     try:
         with open(manifest, encoding="utf-8") as fh:
             m = json.load(fh)
@@ -1240,9 +1224,8 @@ if manifest and rel and os.path.exists(manifest):
     if not isinstance(m, dict) or rel not in m or not isinstance(m[rel], dict):
         sys.exit(1)
     expected = m[rel]
-    # The commit recorded what the union's mode should be; a widened dest is a
-    # disclosure the scalar comparison cannot see. Absent for manifests written
-    # before this key existed — then there is nothing to check, not a failure.
+    # A widened dest is a disclosure the scalar comparison cannot see. Absent
+    # on pre-key manifests: nothing to check there, which is not a failure.
     modes = m.get("__union_modes__")
     if isinstance(modes, dict) and rel in modes:
         if oct(stat.S_IMODE(os.stat(dst).st_mode)) != modes[rel]:
@@ -1841,9 +1824,8 @@ commit_source() {
             n_skipped=$((n_skipped+1)); continue
         fi
         cls="$(classify "$rel")"
-        # || true: the failure signal is the outcome string; the tally below
-        # decides the source's fate, so one bad file cannot abort the walk
-        # half-committed with no summary and no verdict.
+        # || true: the outcome string is the failure signal and the tally
+        # below judges, so one bad file cannot abort the walk with no verdict.
         outcome="$(commit_one "$file" "$rel" "$tag" "$cls")" || true
         # Per-file progress on stderr — visible feedback during the copy walk
         # so long migrations don't feel like a hang. Skipped when PROGRESS_TOTAL
@@ -2333,9 +2315,8 @@ verify_main() {
                 && union_contains "$src_file" "$dst_canonical" \
                     "$(ls -t "$DEST_REAL/state/.migration-union-scalars-"*.json 2>/dev/null | head -1)" \
                     "$rel"; then
-            # A union result is byte-different from both inputs by design;
-            # the per-source invariant is array containment, checked through
-            # the union policy owner's own element fingerprint.
+            # A union result differs from both inputs by design, so the
+            # invariant is containment via the union owner's fingerprint.
             pass=$((pass+1))
         elif [ -f "$dst_canonical" ] || [ -f "$dst_sidecar_legacy" ]; then
             # A dest path exists but sha doesn't match — content mismatch.
