@@ -105,12 +105,13 @@ These steps run independently per session. Quota / active-engagement / presenter
 
 ## Phase 2a known limitations
 
-This skill ships in Phase 2a of #880. Two pieces are NOT yet wired in:
+This skill ships in Phase 2a of #880. One piece is NOT yet wired in:
 
 - **Done-flag side-effect gate** (Phase 2b). Without it, the rare crash-then-replay window can fire a side effect twice. Mitigation today: rare crashes within the few-second window between claim and side-effect-completion.
-- **Boot-time orphan watchdog** (Phase 2b). If a pool session crashes after claiming but before processing, the claim file is stranded until owner manually renames it back. Mitigation today: `launchctl bootout <core> && launchctl bootstrap <core>` re-runs the session which won't re-claim a stale file (but won't release it either — manual rename needed).
 
-For "let me try it tonight" the limitations above are acceptable. Phase 2b ships the watchdog + done-flag gate.
+The orphan watchdog that used to sit here has shipped — do NOT rename a stranded claim by hand. A claim held by a dead instance is restored to its canonical name by the lead's `reclaim_claimed()` and reassigned by the next `sweep()`, both driven every interval by `scripts/pool-lead-daemon.py`. Reclaim is lead-driven, so a pool whose lead is dead stops reclaiming until a lead returns.
+
+For "let me try it tonight" the limitation above is acceptable. Keep the pool off queues with irreversible side effects until the done-flag gate lands.
 
 ## Disabling the pool
 
