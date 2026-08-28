@@ -520,27 +520,33 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
     return base / "archive" / iso_timestamp[:7]
 
 
-def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
-    """Locate an archived result across BOTH layouts in use.
+def iter_result_candidates(results_dir: Path, task_id: str,
+                           include_live: bool = True) -> "Iterable[Path]":
+    """Every path this task's result can occupy, best-first.
 
-    The messaging bridges archive as `archive/<YYYY-MM>/<id>.txt` via
-    `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`.
-    A locator that knows only one silently returns None for the other, which
-    reads as "this task never delivered" — the wrong answer for any caller
-    deciding whether a delivery happened.
+    Ordered live, `archive/<id>.txt`, `archive/<YYYY-MM>/` newest month first,
+    then the gateway's flat `archive/<id>-<epoch>.txt` newest first. Bridges use
+    the month layout and the gateway the flat one; a locator knowing only one
+    returns None for the other, which reads as "never delivered".
 
-    Month scan mirrors `find_archived_task`: scandir, filter on NAME before
-    asking is_dir, newest month first. Rejects malformed ids rather than
-    globbing with them (traversal gate).
+    One enumeration so a readiness-aware caller and a first-hit caller can never
+    disagree about which files exist. Rejects malformed ids rather than globbing
+    with them (traversal gate).
     """
     if not valid_archive_lookup_id(task_id):
-        return None
-    archive = Path(results_dir) / "archive"
+        return
+    results = Path(results_dir)
     fname = f"{task_id}.txt"
 
+    if include_live:
+        live = results / fname
+        if live.is_file():
+            yield live
+
+    archive = results / "archive"
     direct = archive / fname
     if direct.is_file():
-        return direct
+        yield direct
 
     try:
         with os.scandir(archive) as entries:
@@ -552,7 +558,7 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     for month in months:
         candidate = archive / month / fname
         if candidate.is_file():
-            return candidate
+            yield candidate
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
@@ -561,18 +567,44 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     # to this id; only the documented numeric epoch suffix is this task's.
     flat = sorted(p for p in archive.glob(f"{glob.escape(prefix)}*.txt")
                   if _EPOCH_SUFFIX_RE.match(p.name[len(prefix):-len(".txt")]))
-    return flat[-1] if flat else None
+    for candidate in reversed(flat):
+        yield candidate
+
+
+def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
+    """First archived result path, ignoring the live dir."""
+    return next(iter(iter_result_candidates(results_dir, task_id,
+                                            include_live=False)), None)
 
 
 def find_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate a task's result: live dir first, then archive. Archival trails
-    delivery, so an archive-only lookup reads a fresh result as never delivered."""
-    if not valid_archive_lookup_id(task_id):
-        return None
-    live = Path(results_dir) / f"{task_id}.txt"
-    if live.is_file():
-        return live
-    return find_archived_result(results_dir, task_id)
+    delivery, so an archive-only lookup reads a fresh result as never delivered.
+
+    EXISTENCE only. To decide whether an answer was produced, use
+    `find_ready_result` — an unready live file here hides a ready archived one.
+    """
+    return next(iter(iter_result_candidates(results_dir, task_id)), None)
+
+
+def find_ready_result(results_dir: Path, task_id: str) -> Path | None:
+    """First candidate holding a READY answer, or None.
+
+    `find_result` stops at the first path that exists, so an empty or
+    half-written live file masked an already-delivered archived result and the
+    task was repooled after its answer had gone out. Readiness must be tested
+    per candidate, and the search must continue past an unready one.
+    """
+    # Function-local: at module scope this becomes a hard dependency of every
+    # consumer. The relative arm is the ag2-sparrow name (MAP flattens it).
+    try:
+        from .result_ready import read_ready_result
+    except ImportError:
+        from delivery.readiness import read_ready_result
+    for candidate in iter_result_candidates(results_dir, task_id):
+        if read_ready_result(candidate) is not None:
+            return candidate
+    return None
 
 
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:

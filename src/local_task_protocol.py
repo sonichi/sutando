@@ -595,10 +595,10 @@ def find_ready_result(results_dir: Path, task_id: str) -> Path | None:
     task was repooled after its answer had gone out. Readiness must be tested
     per candidate, and the search must continue past an unready one.
     """
-    # Imported here, not at module scope: a top-level import makes `delivery`
-    # a hard dependency of every consumer of this module.
+    # Function-local: at module scope this becomes a hard dependency of every
+    # consumer. The relative arm is the ag2-sparrow name (MAP flattens it).
     try:
-        from .delivery.readiness import read_ready_result
+        from .result_ready import read_ready_result
     except ImportError:
         from delivery.readiness import read_ready_result
     for candidate in iter_result_candidates(results_dir, task_id):

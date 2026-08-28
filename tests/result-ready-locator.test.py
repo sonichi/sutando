@@ -112,6 +112,27 @@ class LeadDispositionTests(Fixture):
                          "re-executed a task after its answer was delivered")
 
 
+class VendoredCopyTests(unittest.TestCase):
+    """ag2-sparrow-drift compares TEXT. Identical text still raises there if an
+    import does not resolve under the package's flattened module names."""
+
+    def test_vendored_locator_runs_in_the_package(self):
+        prog = (
+            "import sys,tempfile,pathlib\n"
+            f"sys.path.insert(0,{str(REPO / 'packages' / 'ag2-sparrow')!r})\n"
+            "from ag2_sparrow.local_task_protocol import find_ready_result\n"
+            "t=pathlib.Path(tempfile.mkdtemp()); (t/'archive'/'2026-08').mkdir(parents=True)\n"
+            "(t/'archive'/'2026-08'/'task-x.txt').write_text('answer\\n')\n"
+            "(t/'task-x.txt').write_text('')\n"
+            "g=find_ready_result(t,'task-x')\n"
+            "print(g.parent.name if g else 'NONE')\n"
+        )
+        r = subprocess.run([sys.executable, "-c", prog], capture_output=True,
+                           text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "2026-08")
+
+
 class DelegationTests(unittest.TestCase):
     def test_watcher_uses_the_shared_locator_not_its_own_composition(self):
         s = (REPO / "src" / "watch-tasks-stream.sh").read_text()
