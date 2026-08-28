@@ -233,10 +233,8 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
-    # A pin names a LOCAL pid + lstart, so it is meaningless on another host and
-    # a union can never express the removal the cleanup contract prescribes.
-    # A complete mutable snapshot: absence from a newer `pins` array IS the
-    # release, so newest-mtime (never union, which resurrects a released pin).
+    # A pin is a LOCAL pid + lstart, meaningless on another host; absence from a
+    # newer `pins` array IS the release, so newest-mtime wins, never union.
     "state/process-pins.json|newest-mtime"
     # Accumulated grants, not a snapshot: newest-mtime drops the whole
     # allow-set when a fresh install writes an empty one first.
@@ -354,11 +352,11 @@ classify() {
     echo "unknown"
 }
 
-# Integer-second mtime orders two same-second writes by SCAN ORDER, which for a
-# newest-wins snapshot silently resurrects the older content. Emit nanoseconds.
-# One reader for every numeric stat field. GNU `-f` is --file-system: for a
-# valid operand it still prints a report to STDOUT and exits nonzero, so a bare
-# `bsd || gnu` substitution concatenates the report with the fallback's answer.
+# Integer-second mtime orders same-second writes by SCAN ORDER, resurrecting
+# older content under newest-wins. Emit nanoseconds.
+
+# GNU `-f` is --file-system: it prints a report to STDOUT and exits nonzero, so
+# a bare `bsd || gnu` substitution concatenates that report with the answer.
 _stat_field() {
     local kind="$1" f="$2" bsd gnu v
     case "$kind" in
@@ -372,10 +370,8 @@ _stat_field() {
         v="$(LC_ALL=C stat -c "$gnu" "$f" 2>/dev/null)" || v=""
         case "$v" in ''|*[!0-9]*) v="" ;; esac
     fi
-    # Exhaustion is NOT epoch 0 / size 0 -- empty stdout + nonzero, matching
-    # mtime_ns above. A real 0 still prints "0" and returns 0, so callers can
-    # tell "unknown" from "oldest/smallest possible". Callers under `set -e`
-    # must use `x="$(_stat_field ...)" || x=""` and decide explicitly.
+    # Exhaustion is empty stdout + nonzero, never epoch 0 / size 0, so a caller
+    # can tell unknown from oldest. Under `set -e`: x="$(...)" || x="".
     [ -n "$v" ] || return 1
     printf '%s' "$v"
 }
@@ -865,7 +861,10 @@ report_cross_source() {
     total_identical="$(awk -F'\t' '
         {
             n[$1]++
-            key = $1 SUBSEP $4 "|" $5
+            # An unknown field cannot witness equality: unavailable mtime + equal
+            # size is ambiguous, not identical. NR keeps such rows distinct.
+            if ($4 == "unknown" || $5 == "unknown") key = $1 SUBSEP "amb" NR
+            else key = $1 SUBSEP $4 "|" $5
             if (!(key in seen)) { seen[key]=1; pairs[$1]++ }
         }
         END {
@@ -1267,8 +1266,7 @@ commit_one() {
                 dst_mt="$(_stat_field mtime "$dst_path")" || dst_mt=""
                 dst_sz="$(_stat_field size "$dst_path")" || dst_sz=""
                 # Any unknown operand must never satisfy identical-drop: with
-                # ${v:-0} two failed stats compared 0==0 on BOTH fields and
-                # discarded the source as a duplicate. Unknown -> keep both.
+                # ${v:-0} two failed stats compare 0==0. Unknown -> keep both.
                 if [ -z "$src_mt" ] || [ -z "$dst_mt" ] || [ -z "$src_sz" ] || [ -z "$dst_sz" ]; then
                     :
                 elif [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
@@ -1286,11 +1284,8 @@ commit_one() {
                 # entropy from /dev/urandom-seeded bash PRNG) + $$ (pid) instead.
                 local ts_suffix
                 ts_suffix="$(date -u +%Y%m%dT%H%M%SZ)-p$$r$RANDOM"
-                # Mutation site: this picks which file keeps the canonical path
-                # and which becomes a sidecar. An unknown operand must not make
-                # that choice -- with `${v:-0}` it read as oldest, and with an
-                # empty string `[ -gt ]` errors and falls through to the else
-                # branch, so the winner is decided by a broken test either way.
+                # Mutation site: an unknown operand must not pick the canonical
+                # path -- ${v:-0} reads oldest, empty makes `[ -gt ]` error out.
                 if [ -z "$src_mt" ] || [ -z "$dst_mt" ]; then
                     echo "collision-mtime-unavailable" >&2
                     return 1
@@ -1378,10 +1373,8 @@ commit_one() {
                 local src_mt dst_mt
                 src_mt="$(_stat_field mtime "$src_file")" || src_mt=""
                 dst_mt="$(_stat_field mtime "$dst_path")" || dst_mt=""
-                # Fail closed BEFORE comparison, mutation or sentinel: an
-                # unknown operand read as 0 let an older source overwrite a
-                # newer dest, and let a newer source be discarded as older --
-                # both exiting 0 and stamping the sentinel, so the retry skips.
+                # Fail closed BEFORE comparison, mutation or sentinel: unknown
+                # read as 0 let an older source overwrite a newer dest, exit 0.
                 if [ -z "$src_mt" ] || [ -z "$dst_mt" ]; then
                     echo "rehome-mtime-unavailable" >&2
                     return 1
@@ -2298,8 +2291,12 @@ if os.path.exists(idx_path):
     with open(idx_path) as f:
         for line in f:
             rel, tag, cls, mt, sz = line.rstrip("\n").split("\t")
+            # unknown is a MISS, not a value: int("unknown") raised, and 0 would
+            # be a real mtime that compares equal to another miss.
+            def _num(v):
+                return int(v) if (v or "").isdigit() else None
             entries.append({"rel": rel, "tag": tag, "class": cls,
-                            "mtime": int(mt or 0), "size": int(sz or 0)})
+                            "mtime": _num(mt), "size": _num(sz)})
 by_rel = defaultdict(list)
 for e in entries:
     by_rel[e["rel"]].append(e)
