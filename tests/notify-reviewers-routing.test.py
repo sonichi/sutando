@@ -49,7 +49,9 @@ class RoutingTest(unittest.TestCase):
         cfg = config_with("222", ["111"])
         p = run({"r": DISCORD_OK}, "r", cfg)
         self.assertIn("PLAN:", p.stdout)
-        self.assertIn("--to 111", p.stdout)
+        # The channel that was validated, and the mention that triggers a Stand.
+        self.assertIn("222", p.stdout)
+        self.assertIn("<@111>", p.stdout)
 
     def test_refusals_name_the_missing_field_not_a_generic_shape(self):
         p = run({"a": MATRIX_NO_ROOM, "b": DISCORD_NO_CHANNEL, "c": NO_ROUTE}, "a,b,c")

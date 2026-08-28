@@ -168,9 +168,14 @@ def discord_reachable(target: dict) -> "tuple[bool, str]":
 
 
 def discord_command_for(target: dict, message: str) -> "list[str]":
-    """A mention is what triggers a Stand; a plain-text name reaches nobody."""
-    return [_PY, str(_REPO / "skills" / "bot2bot-post" / "post.py"),
-            "--to", str(target["discord_id"]), "ping", message]
+    """Post into the channel discord_reachable actually validated.
+
+    bot2bot-post always resolves the bot2bot channel and `--to` only picks the
+    mention, so routing through it validated one channel and delivered to another.
+    """
+    return [_PY, str(_REPO / "skills" / "collaboration-intelligence" / "scripts"
+                     / "send_channel_message.py"),
+            str(target["channel"]), f"<@{target['discord_id']}> {message}"]
 
 
 def command_for(target: dict, message: str) -> "list[str]":

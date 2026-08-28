@@ -122,11 +122,14 @@ class DiscordReachability(unittest.TestCase):
 
 
 class CommandShape(unittest.TestCase):
-    def test_discord_command_mentions_the_id(self):
+    def test_the_send_targets_the_channel_that_was_validated(self):
+        # The composition defect: discord_reachable validated home_channel and
+        # the sender resolved bot2bot, so the check guarded the wrong channel.
         argv = nr.discord_command_for({"discord_id": "111", "channel": "222"}, "hello")
-        self.assertIn("--to", argv)
-        self.assertIn("111", argv)
-        self.assertIn("hello", argv)
+        self.assertIn("222", argv)
+        self.assertTrue(any("send_channel_message.py" in a for a in argv))
+        self.assertFalse(any("bot2bot-post" in a for a in argv))
+        self.assertIn("<@111> hello", argv)
 
     def test_matrix_command_still_targets_room_ops(self):
         argv = nr.command_for({"stand": "@s:x", "room": "!r:x", "human": None}, "hi")
@@ -164,7 +167,8 @@ class MainDiscordBranch(unittest.TestCase):
         cfg = config_with({"groups": {"222": {"allowFrom": ["111"]}}})
         rc, out, _ = self._run({"d": DISCORD}, cfg)
         self.assertIn("PLAN:", out)
-        self.assertIn("--to", out)
+        self.assertIn("222", out)          # the validated channel, not bot2bot
+        self.assertIn("<@111>", out)
         self.assertEqual(rc, 0)
 
     def test_absent_from_channel_refuses_and_counts_a_failure(self):
@@ -221,6 +225,49 @@ class MainDiscordSend(unittest.TestCase):
         self.assertIn("SEND FAILED rc=3", err)
         self.assertIn("boom", err)
         self.assertNotEqual(rc, 0)
+
+
+class TwoChannelsDistinct(unittest.TestCase):
+    """The control qingyun asked for: home_channel and bot2bot are DIFFERENT.
+
+    Every earlier test used one channel, which is exactly the case that cannot
+    show the defect — the notifier validated home_channel and the sender
+    resolved bot2bot, so with one channel both halves agreed by accident.
+    """
+
+    def setUp(self):
+        self._argv, self._cfg = sys.argv[:], os.environ.get("CLAUDE_CONFIG_DIR")
+        self._roster, self._run = os.environ.get("SUTANDO_SCI_ROSTER"), nr.subprocess.run
+        self.seen = []
+        nr.subprocess.run = lambda a, **k: self.seen.append(a) or type(
+            "R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    def tearDown(self):
+        sys.argv[:] = self._argv
+        nr.subprocess.run = self._run
+        for k, v in (("CLAUDE_CONFIG_DIR", self._cfg), ("SUTANDO_SCI_ROSTER", self._roster)):
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+
+    def test_the_send_goes_to_home_channel_not_bot2bot(self):
+        # HOME=222 holds the reviewer; BOT2BOT=999 does not. Sending to 999
+        # would reach nobody, which is the failure this whole PR is about.
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {
+            "222": {"allowFrom": ["111"]},
+            "999": {"role": "bot2bot", "allowFrom": ["someone-else"]}}})
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"d": DISCORD}, f)
+        os.environ["SUTANDO_SCI_ROSTER"] = path
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m", "--send"]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = nr.main()
+        os.unlink(path)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.seen), 1)
+        argv = self.seen[0]
+        self.assertIn("222", argv, f"sent somewhere other than the validated channel: {argv}")
+        self.assertNotIn("999", argv, f"sent to bot2bot, which the reviewer is not in: {argv}")
 
 
 if __name__ == "__main__":
