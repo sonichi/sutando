@@ -57,6 +57,7 @@ export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
 
 # The supervised path must fence exactly like the bare launch in
 # startup-runtime.sh; without this the default lane claims named-lane rooms.
+
 # shellcheck source=../gateway-foreign-suffixes.sh
 . "$REPO/src/gateway-foreign-suffixes.sh"
 GATEWAY_FOREIGN_SUFFIXES="$(derive_foreign_suffixes)"

@@ -65,6 +65,7 @@ else
 fi
 
 # --- wiring: BOTH launch paths carry the derived value ----------------------
+
 # Assert the claim, not a file-wide count: an `== 1` over the whole file is
 # stronger than the intent and fails on any second legitimate injection site.
 named_lane_block="$(awk '/GATEWAY_INSTANCE="\$_gw_inst"/,/remote-gateway-bridge\.py/' \

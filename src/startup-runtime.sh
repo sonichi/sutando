@@ -405,6 +405,7 @@ reap_stale_task_watcher() {
 #
 # The derivation is shared with the launchd wrapper so both launch paths fence
 # identically; sourcing it here keeps `derive_foreign_suffixes` in scope.
+
 # shellcheck source=gateway-foreign-suffixes.sh
 . "$(dirname "${BASH_SOURCE[0]}")/gateway-foreign-suffixes.sh"
 
