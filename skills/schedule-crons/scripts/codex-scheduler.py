@@ -26,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
+from cron_execution_form import (  # noqa: E402
+    CODEX_FORMS, MALFORMED, SKILL, select_for_executor)
 
 
 LABEL = "com.sutando.codex-schedules"
@@ -210,7 +212,12 @@ def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dic
             ZoneInfo(entry.get("timezone", DEFAULT_TIMEZONE))
         except ZoneInfoNotFoundError as exc:
             raise ValueError(f"{name}: unknown timezone") from exc
-        if not isinstance(entry.get("prompt") or entry.get("prompt_skill"), str):
+        # Same selector every surface binds: a form this runner cannot execute
+        # must fail here, not fall through to whatever leg happens to be set.
+        kind, target = select_for_executor(entry, CODEX_FORMS)
+        if kind == MALFORMED:
+            raise ValueError(f"{name}: {target}")
+        if not target.strip():
             raise ValueError(f"{name}: prompt or prompt_skill is required")
         jobs.append(entry)
     return jobs
@@ -237,7 +244,9 @@ def _task_body(
     workspace: Path, job: dict[str, Any], slot: datetime, now: datetime, attempt: int = 1
 ) -> tuple[str, str]:
     task_id, _, result_path, proactive_path = _task_paths(workspace, job, slot, attempt)
-    prompt = confine_user_content(job.get("prompt") or f"/{job['prompt_skill']}")
+    _kind, _target = select_for_executor(job, CODEX_FORMS)
+    prompt = confine_user_content(
+        f"/{_target}" if _kind == SKILL else _target)
     if job.get("delivery") == "proactive":
         prompt += (
             f" Write the concise owner-facing result to {proactive_path}, then write "

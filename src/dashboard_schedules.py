@@ -33,7 +33,8 @@ from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cron_execution_form import (  # noqa: E402
-    MALFORMED, PROMPT, SHELL, SKILL, select_execution_form)
+    EXECUTOR_FORMS, LAUNCHD_FORMS, MALFORMED, PROMPT, SHELL, SKILL,
+    select_execution_form, select_for_executor)
 
 
 def cron_field_match(spec: str, value: int) -> bool:
@@ -174,9 +175,14 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
             next_str = f'{nxt.strftime("%a %H:%M")} ({rel})'
         else:
             next_str = ">7d" if expr else "invalid"
-        # One selector, shared with the runner: describing an entry the runner
-        # refuses to execute is how the two surfaces silently disagree.
-        kind, target = select_execution_form(job)
+        # Owner-aware, and shared with every executor: describing a form this
+        # entry's own scheduler cannot run is the silent disagreement.
+        owner = schedule_owner(job)
+        kind, raw_target = select_for_executor(
+            job, EXECUTOR_FORMS.get(owner, LAUNCHD_FORMS))
+        # The selector returns the payload verbatim so execution is exact;
+        # these are display fields, so they are the ones that may tidy it.
+        target = raw_target.strip()
         if job.get("description") and kind != MALFORMED:
             desc = job["description"]
         elif kind == SHELL:
@@ -193,7 +199,7 @@ def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
         out.append({"name": job.get("name", "?"), "cron": expr,
                     "kind": kind,
                     "prompt_or_skill": "" if kind == MALFORMED else target,
-                    "owner": schedule_owner(job),
+                    "owner": owner,
                     "description": desc,
                     "next_run": next_str,
                     "next_run_ts": int(nxt.timestamp()) if nxt else None})

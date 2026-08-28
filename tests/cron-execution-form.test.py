@@ -109,5 +109,33 @@ check(_runner_emits({"name": "j", "cron": "* * * * *", "launchd": True,
 
 check(sel("not-a-dict")[0] == cef.MALFORMED, "a non-dict entry is MALFORMED")
 
+# --- the payload is VERBATIM: whitespace decides, it never edits ------------
+
+# Exact bytes: a .strip() reintroduced anywhere in the selector fails here.
+check(sel({"prompt": "\n  preserve leading\ntrailing  \n\n"})
+      == (cef.PROMPT, "\n  preserve leading\ntrailing  \n\n"),
+      "prompt bytes survive the selector exactly")
+check(sel({"prompt_skill": " morning \n"}) == (cef.SKILL, " morning \n"),
+      "skill bytes survive the selector exactly")
+check(sel({"shell_command": " echo hi \n"}) == (cef.SHELL, " echo hi \n"),
+      "shell bytes survive the selector exactly")
+check(sel({"prompt_skill": "   \t \n"})[0] == cef.PROMPT,
+      "an all-whitespace skill is still not a skill")
+
+# --- per-executor contract: an unrunnable form is TERMINAL, not a fallback --
+mixed = {"shell_command": "echo hi", "prompt_skill": "fallback"}
+check(cef.select_for_executor(mixed, cef.LAUNCHD_FORMS) == (cef.SHELL, "echo hi"),
+      "launchd runs the shell leg of a mixed entry")
+k, why = cef.select_for_executor(mixed, cef.CODEX_FORMS)
+check(k == cef.MALFORMED and "not runnable" in why,
+      "codex refuses a mixed entry instead of running its fallback skill")
+k, _ = cef.select_for_executor({"shell_command": "   ", "prompt_skill": "fallback"},
+                               cef.CODEX_FORMS)
+check(k == cef.MALFORMED, "a blank shell never falls through to the skill leg")
+check(cef.select_for_executor({}, cef.CODEX_FORMS) == (cef.PROMPT, ""),
+      "emptiness is the executor's rule, not the form selector's")
+check(cef.select_for_executor({"prompt_skill": "fallback"}, cef.CODEX_FORMS)
+      == (cef.SKILL, "fallback"), "codex still runs an ordinary skill entry")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
