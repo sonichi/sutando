@@ -46,6 +46,10 @@ TASK_MINT_PIN = {
     ("agent-api.py", "handle_twilio_sms"): 1,
     ("agent-api.py", "handle_twilio_transcription"): 1,
     ("agent-api.py", "do_POST"): 1,
+    ("cron_task_id.py", "task_id"): 1,
+    # wall-clock mint behind a constant prefix, pre-existing; visible only
+    # since the scanner resolves module constants (this PR's widening).
+    ("task_workstreams.py", "_maybe_enqueue_classifier_task_locked"): 1,
     ("discord-bridge.py", "_dedup_recover"): 1,
     ("discord-bridge.py", "_handle_discord_message"): 1,
     ("discord-bridge.py", "poll_results"): 1,
@@ -89,6 +93,28 @@ def scan_task_mints(root: Path) -> dict:
             counts[(rel, "<unparseable>")] = 1
             return
         stack = ["<module>"]
+        # A mint literal can hide behind a module constant (TASK_PREFIX =
+        # "task-cron-"; f"{TASK_PREFIX}{...}") — resolve one level, or a
+        # delegating refactor makes the construction invisible and the
+        # removal rule prescribes deleting live coverage.
+        const_names = {
+            t.id for node in tree.body if isinstance(node, ast.Assign)
+            for t in node.targets if isinstance(t, ast.Name)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+            and node.value.value.startswith("task-")
+        }
+
+        def _leads_task(node) -> bool:
+            if _is_task_literal(node):
+                return True
+            if isinstance(node, ast.Name) and node.id in const_names:
+                return True
+            if (isinstance(node, ast.FormattedValue)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in const_names):
+                return True
+            return False
 
         def record():
             key = (rel, stack[-1])
@@ -102,7 +128,7 @@ def scan_task_mints(root: Path) -> dict:
             visit_AsyncFunctionDef = visit_FunctionDef
 
             def visit_JoinedStr(self, n):
-                if (n.values and _is_task_literal(n.values[0])
+                if (n.values and _leads_task(n.values[0])
                         and any(isinstance(v, ast.FormattedValue)
                                 for v in n.values)):
                     record()
@@ -117,7 +143,7 @@ def scan_task_mints(root: Path) -> dict:
 
             def visit_BinOp(self, n):
                 if (isinstance(n.op, (ast.Add, ast.Mod))
-                        and _is_task_literal(n.left)
+                        and _leads_task(n.left)
                         and not isinstance(n.right, ast.Constant)):
                     record()
                 self.generic_visit(n)
