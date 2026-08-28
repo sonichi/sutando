@@ -23,7 +23,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 from delivery.readiness import read_ready_result
-from local_task_protocol import find_result
+from local_task_protocol import find_ready_result
 from pool_follower import LEAD_STALE_S  # noqa: E402
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
@@ -211,15 +211,14 @@ class PoolLead:
     def _result_evidence(self, task_name: str) -> "str | None":
         """How an existing result was disposed of, or None when none is ready.
 
-        Locating and readiness are not this module's policy: `find_result`
-        already knows the live dir, `archive/YYYY-MM/` and the flat gateway
-        archive, and `read_ready_result` already knows that an empty or
-        half-written file is not an answer. Quarantine stays a distinct
-        disposition — it is evidence the work ran, not that it reached anyone.
+        Locating and readiness are not this module's policy: `find_ready_result`
+        owns both, and continues past an unready candidate — pairing a first-hit
+        locator with a readiness test let an empty live file mask a delivered
+        archived answer. Quarantine stays a distinct disposition: it is evidence
+        the work ran, not that it reached anyone.
         """
         stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
-        found = find_result(self.results_dir, stem)
-        if found is not None and read_ready_result(found) is not None:
+        if find_ready_result(self.results_dir, stem) is not None:
             return "delivered"
         quarantined = self.results_dir / "undelivered" / f"{stem}.txt"
         if read_ready_result(quarantined) is not None:

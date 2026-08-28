@@ -237,9 +237,9 @@ class DelegationTest(unittest.TestCase):
         for name, path in LOOKUP_CONSUMERS.items():
             with self.subTest(consumer=name):
                 src = path.read_text()
-                self.assertIn(
-                    "find_result", src,
-                    f"{name}: must use local_task_protocol.find_result",
+                self.assertTrue(
+                    "find_result" in src or "find_ready_result" in src,
+                    f"{name}: must use a local_task_protocol locator",
                 )
                 self.assertNotIn(
                     "find_archived_result", src,

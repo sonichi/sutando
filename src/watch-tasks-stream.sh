@@ -279,10 +279,9 @@ handler_result_exists() {
   "$SUTANDO_PY_BIN" - "$__REPO_ROOT" "$RESULTS_DIR" "$task_id" <<'PYEOF' 2>/dev/null
 import pathlib, sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "src"))
-from local_task_protocol import find_result
-from delivery.readiness import read_ready_result
-found = find_result(pathlib.Path(sys.argv[2]), sys.argv[3])
-raise SystemExit(0 if found is not None and read_ready_result(found) is not None else 1)
+from local_task_protocol import find_ready_result
+found = find_ready_result(pathlib.Path(sys.argv[2]), sys.argv[3])
+raise SystemExit(0 if found is not None else 1)
 PYEOF
 }
 
