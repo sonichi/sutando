@@ -88,16 +88,23 @@ def count_check_patterns(checks_section: str) -> "tuple[int, int]":
     return counts["flag"], counts["allow"]
 
 
-def prior_art(pr: str, runner=None) -> "list[str] | None":
-    """Reviews and non-COMMENTED activity already on the PR, oldest first.
+DECISIVE = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def prior_art(pr: str, runner=None) -> "tuple[list[str], list[str]] | None":
+    """(prose to read, decisive verdicts) already on the PR, oldest first.
 
     None means COULD NOT CHECK, which is not the same as "nothing there" — a
     reviewer told nothing and a reviewer told the check failed behave
     differently, so the two must never render alike.
+
+    The second list is latest-state-per-login and is NOT subject to the
+    display cap, so a verdict cannot be lost to prose or to truncation.
     """
     run = runner or (lambda a: subprocess.run(a, capture_output=True,
                                               text=True, timeout=20))
     out: "list[str]" = []
+    latest: "dict[str, tuple[str, str]]" = {}
     for kind, path, when, verdict in (
             ("review", f"pulls/{pr}/reviews", "submitted_at", "state"),
             ("comment", f"issues/{pr}/comments", "created_at", None)):
@@ -113,17 +120,35 @@ def prior_art(pr: str, runner=None) -> "list[str] | None":
             return None
         for row in rows:
             state = row.get(verdict) if verdict else None
-            # Skip on EMPTY, never on state: a COMMENTED review's body is in
-            # pulls/reviews and absent from issues/comments, so a state filter deletes it.
+            who = (row.get("user") or {}).get("login", "?")
+            ts = row.get(when, "?")
+            # An empty body is not an empty verdict, and the newest verdict
+            # wins by timestamp — arrival order is the endpoint's, not ours.
+            if (state or "").upper() in DECISIVE and ts >= latest.get(who, ("",))[0]:
+                latest[who] = (ts, state.upper())
             if not (row.get("body") or "").strip():
                 continue
-            who = (row.get("user") or {}).get("login", "?")
             label = kind if not state else f"{kind}, {state}"
-            out.append(f"{row.get(when, '?')}  {who} ({label})")
-    return sorted(out)
+            out.append(f"{ts}  {who} ({label})")
+    return sorted(out), sorted(
+        f"{ts}  {who}: {state}" for who, (ts, state) in latest.items())
 
 
 PRIOR_ART_SHOWN = 8
+
+
+def verdict_block(verdicts: "list[str] | None") -> "list[str]":
+    """Every login's current decisive state, uncapped and prose-independent.
+
+    Separate from the prose list because the two answer different questions:
+    what must I read, versus where does this PR actually stand.
+    """
+    if verdicts is None:
+        return ["DECISIVE STATE: *** COULD NOT CHECK *** — treat as unknown, not clean."]
+    if not verdicts:
+        return ["DECISIVE STATE: none — no APPROVED or CHANGES_REQUESTED on record."]
+    return (["DECISIVE STATE (latest per login; a bare verdict carries no prose to read):"]
+            + [f"  {v}" for v in verdicts])
 
 
 def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
@@ -133,7 +158,7 @@ def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
                 "the call failed. Read the thread yourself: an unchecked thread is not an",
                 "empty one."]
     if not seen:
-        return ["ALREADY ON THIS THREAD: nothing — no reviews or comments yet."]
+        return ["ALREADY ON THIS THREAD: nothing to read — no prose on the thread yet."]
     # Name the truncation: a bare count above a short list reads as the count
     # being wrong, not the list being cut.
     head = (f"ALREADY ON THIS THREAD — showing last {PRIOR_ART_SHOWN} of {len(seen)};"
@@ -152,7 +177,9 @@ def render(guide: Path, pr: str | None) -> str:
     out = [f"review-preflight: criteria from {guide}", ""]
     if pr:
         out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
-        out += prior_art_block(pr, prior_art(pr)) + [""]
+        got = prior_art(pr)
+        seen, verdicts = (None, None) if got is None else got
+        out += verdict_block(verdicts) + prior_art_block(pr, seen) + [""]
     out.append(lessons if lessons else
                "WARNING: no '## Lessons' section found — the guide's criteria could not be read.")
     n_flag, n_allow = count_check_patterns(checks)

@@ -264,7 +264,10 @@ and loads whichever repo it reviews.
     same mechanic lets the account contradict itself — an approve and a block on code that
     never changed — where whichever landed last silently becomes the verdict. Before
     reviewing, list that account's existing reviews on the PR, not just `reviewDecision`.
-    Judge the account's **current** decisive state, not its history. If a peer's APPROVED
+    Judge the account's **current** decisive state, not its history. The mandatory
+    preflight prints this for you as `DECISIVE STATE`: latest verdict per login, never
+    truncated, and independent of whether the review carried any prose — a bare APPROVED
+    is a verdict with nothing to read, and it used to render as an empty thread. If a peer's APPROVED
     is the latest decisive review, do not file another — a second approval moves the count
     by zero and buries theirs; carry what you verified in a COMMENT, or recruit an approver
     on a **different** login. But if the latest decisive review from that account is a
