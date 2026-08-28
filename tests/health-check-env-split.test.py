@@ -184,7 +184,7 @@ with tempfile.TemporaryDirectory() as td:
     repo_env.write_text("GEMINI_API_KEY=real\n")
     ws_env.write_text("GEMINI_API_KEY=real\nDISCORD_BOT_TOKEN=old\n")
     if _os.geteuid() != 0:
-        # unreadable UNSELECTED (the finding: it used to silence the probe)
+        # unreadable unselected input stays UNKNOWN, never absent
         ws_env.chmod(0o000)
         try:
             with _patch.object(sutando_config, "resolve_dotenv",
@@ -222,7 +222,10 @@ with tempfile.TemporaryDirectory() as td:
         r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
     check("deprecated-only diff never advises a merge",
           r is not None and "missing" not in r["detail"]
-          and "delete these, do not merge" in r["detail"], True)
+          and "do NOT merge" in r["detail"], True)
+    check("deprecated key carries its OWN remedy, not blanket delete advice",
+          r is not None
+          and sutando_config.DEPRECATED_ENV_KEY_REMEDIES[dep] in r["detail"], True)
     check("deprecated key is named as delete-not-merge",
           r is not None and dep in r["detail"], True)
     # mix: a real missing key AND a deprecated one -> both, correctly separated
@@ -232,7 +235,10 @@ with tempfile.TemporaryDirectory() as td:
     check("mix: real key advised as merge, deprecated as delete",
           r is not None and "DISCORD_BOT_TOKEN" in r["detail"]
           and "missing 1 key" in r["detail"]
-          and "delete these, do not merge" in r["detail"], True)
+          and "do NOT merge" in r["detail"], True)
+    check("a value-moving key is never advised as a bare delete",
+          "vault.remote_url" in
+          sutando_config.DEPRECATED_ENV_KEY_REMEDIES["SUTANDO_VAULT"], True)
 
 # 6. run_all_checks wiring: the call site is separate code from the probe
 # (same pattern as health-check-bridge-log-content's integration section).
@@ -242,6 +248,37 @@ _sentinel = {"name": "env-split", "status": "warn", "detail": "wiring-sentinel"}
 with patch.object(hc, "check_env_split", return_value=_sentinel):
     _rows = [c for c in hc.run_all_checks() if c.get("detail") == "wiring-sentinel"]
 check("run_all_checks carries the env-split row", len(_rows), 1)
+
+# 7. Multi-assignment lines. `set -a; . f` exports EVERY assignment word, so a
+# stranded key on a shared line must not read as absent.
+for _label, _line, _want_named in [
+    ("one per line", "GEMINI_API_KEY=real\nDISCORD_BOT_TOKEN=old\n", True),
+    ("two on one line", "GEMINI_API_KEY=real DISCORD_BOT_TOKEN=old\n", True),
+    ("export, two words", "export GEMINI_API_KEY=real DISCORD_BOT_TOKEN=old\n", True),
+    ("quoted value is ONE assignment", 'GEMINI_API_KEY="real DISCORD_BOT_TOKEN=old"\n', False),
+]:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "repo").mkdir(); (td / "ws").mkdir()
+        _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+        _re_.write_text("GEMINI_API_KEY=real\n")
+        _we_.write_text(_line)
+        with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+            _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+        _named = _r is not None and "DISCORD_BOT_TOKEN" in _r["detail"]
+        check(f"stranded key on a shared line is seen: {_label}", _named, _want_named)
+
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir(); (td / "ws").mkdir()
+    _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+    _re_.write_text("GEMINI_API_KEY=real\n")
+    _we_.write_text('DISCORD_BOT_TOKEN="unbalanced\n')
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+        _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    check("an unparseable line WARNs as incomplete, never as absent",
+          _r is not None and _r["status"] == "warn"
+          and "could not be completed" in _r["detail"], True)
 
 if fails:
     print(f"FAIL ({len(fails)})")

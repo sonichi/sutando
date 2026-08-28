@@ -1471,15 +1471,21 @@ def check_env_split(repo_env: "Path | None" = None,
             return None
         out = set()
         for line in text.splitlines():
-            line = line.strip()
-            # split(None) eats any space/tab run: `export   K=` and
-            # `export\tK=` must not silently drop the key.
-            parts = line.split(None, 1)
-            if parts and parts[0] == "export":
-                line = parts[1] if len(parts) == 2 else ""
-            name, sep, _ = line.partition("=")
-            if sep and name and not name.startswith("#")                     and name.replace("_", "").isalnum():
-                out.add(name)
+            # `A=1 B=2` is TWO assignments to `set -a` sourcing, so partitioning
+            # once swallows B; shlex splits words exactly as the shell does.
+            try:
+                words = shlex.split(line, comments=True)
+            except ValueError:
+                return None  # unbalanced quote: UNKNOWN, never "absent"
+            if words and words[0] == "export":
+                words = words[1:]
+            for word in words:
+                name, sep, _ = word.partition("=")
+                if not sep:
+                    break  # a non-assignment word ends the assignment prefix
+                if name and not name.startswith("#") \
+                        and name.replace("_", "").isalnum():
+                    out.add(name)
         return out
 
     # The canonical resolver owns selection; a re-derivation drifts.
@@ -1539,10 +1545,14 @@ def check_env_split(repo_env: "Path | None" = None,
             f"merged into {selected} (names compared only; values never read)."
         )
     if deprecated:
+        from sutando_config import DEPRECATED_ENV_KEY_REMEDIES  # noqa: PLC0415
+        fixes = "; ".join(
+            f"{k} — {DEPRECATED_ENV_KEY_REMEDIES[k]}" for k in deprecated
+        )
         parts.append(
-            f"The {oth_name} .env also carries {len(deprecated)} deprecated "
-            f"key(s) — {', '.join(deprecated)} — that the migration DELETES; "
-            f"delete these, do not merge them."
+            f"The {oth_name} .env also carries {len(deprecated)} key(s) the "
+            f"runtime no longer reads; do NOT merge them into {selected}. "
+            f"Each has its own remedy: {fixes}."
         )
     return {"name": "env-split", "status": "warn", "detail": " ".join(parts)}
 
