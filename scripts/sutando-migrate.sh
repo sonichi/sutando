@@ -372,7 +372,12 @@ _stat_field() {
         v="$(LC_ALL=C stat -c "$gnu" "$f" 2>/dev/null)" || v=""
         case "$v" in ''|*[!0-9]*) v="" ;; esac
     fi
-    printf '%s' "${v:-0}"
+    # Exhaustion is NOT epoch 0 / size 0 -- empty stdout + nonzero, matching
+    # mtime_ns above. A real 0 still prints "0" and returns 0, so callers can
+    # tell "unknown" from "oldest/smallest possible". Callers under `set -e`
+    # must use `x="$(_stat_field ...)" || x=""` and decide explicitly.
+    [ -n "$v" ] || return 1
+    printf '%s' "$v"
 }
 
 mtime_ns() {
@@ -410,7 +415,9 @@ age_safe() {
     local file="$1"
     local now mtime age
     now="$(date +%s)"
-    mtime="$(_stat_field mtime "$file")"
+    # Unknown mtime is not "infinitely old": with mtime=0 the age is ~now, which
+    # clears any guard and declares an unreadable file safe to migrate.
+    mtime="$(_stat_field mtime "$file")" || return 1
     age=$((now - mtime))
     [ "$age" -ge "$INFLIGHT_GUARD_SEC" ]
 }
@@ -435,8 +442,8 @@ record_xsrc() {
     # $1=tag, $2=relpath, $3=class, $4=abs-path
     local tag="$1" rel="$2" cls="$3" file="$4"
     local mt sz
-    mt="$(_stat_field mtime "$file")"
-    sz="$(_stat_field size "$file")"
+    mt="$(_stat_field mtime "$file")" || mt="unknown"
+    sz="$(_stat_field size "$file")" || sz="unknown"
     printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$tag" "$cls" "$mt" "$sz" >> "$XSRC_INDEX"
 }
 
@@ -551,7 +558,7 @@ scan_source() {
         esac
 
         cls="$(classify "$rel")"
-        size="$(_stat_field size "$file")"
+        size="$(_stat_field size "$file")" || size=0   # report only
         bytes_total=$((bytes_total + size))
 
         # Index for cross-source collision detection (only classes that
@@ -1255,11 +1262,16 @@ commit_one() {
                 # Same content (mtime+size) → identical-drop. Different →
                 # keep-both: rename source-incoming to <file>.legacy-<tag>.
                 local src_mt src_sz dst_mt dst_sz
-                src_mt="$(_stat_field mtime "$src_file")"
-                src_sz="$(_stat_field size "$src_file")"
-                dst_mt="$(_stat_field mtime "$dst_path")"
-                dst_sz="$(_stat_field size "$dst_path")"
-                if [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
+                src_mt="$(_stat_field mtime "$src_file")" || src_mt=""
+                src_sz="$(_stat_field size "$src_file")" || src_sz=""
+                dst_mt="$(_stat_field mtime "$dst_path")" || dst_mt=""
+                dst_sz="$(_stat_field size "$dst_path")" || dst_sz=""
+                # Any unknown operand must never satisfy identical-drop: with
+                # ${v:-0} two failed stats compared 0==0 on BOTH fields and
+                # discarded the source as a duplicate. Unknown -> keep both.
+                if [ -z "$src_mt" ] || [ -z "$dst_mt" ] || [ -z "$src_sz" ] || [ -z "$dst_sz" ]; then
+                    :
+                elif [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
                     echo "identical-drop"
                     return 0
                 fi
@@ -1274,6 +1286,15 @@ commit_one() {
                 # entropy from /dev/urandom-seeded bash PRNG) + $$ (pid) instead.
                 local ts_suffix
                 ts_suffix="$(date -u +%Y%m%dT%H%M%SZ)-p$$r$RANDOM"
+                # Mutation site: this picks which file keeps the canonical path
+                # and which becomes a sidecar. An unknown operand must not make
+                # that choice -- with `${v:-0}` it read as oldest, and with an
+                # empty string `[ -gt ]` errors and falls through to the else
+                # branch, so the winner is decided by a broken test either way.
+                if [ -z "$src_mt" ] || [ -z "$dst_mt" ]; then
+                    echo "collision-mtime-unavailable" >&2
+                    return 1
+                fi
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     # dest's content (whatever was there) goes to a sidecar.
                     # Name it .legacy-prior-<src_tag>-<ts> to convey "this is
@@ -1355,8 +1376,16 @@ commit_one() {
             # Per-mtime swap, identical-drop, or write-fresh.
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(_stat_field mtime "$src_file")"
-                dst_mt="$(_stat_field mtime "$dst_path")"
+                src_mt="$(_stat_field mtime "$src_file")" || src_mt=""
+                dst_mt="$(_stat_field mtime "$dst_path")" || dst_mt=""
+                # Fail closed BEFORE comparison, mutation or sentinel: an
+                # unknown operand read as 0 let an older source overwrite a
+                # newer dest, and let a newer source be discarded as older --
+                # both exiting 0 and stamping the sentinel, so the retry skips.
+                if [ -z "$src_mt" ] || [ -z "$dst_mt" ]; then
+                    echo "rehome-mtime-unavailable" >&2
+                    return 1
+                fi
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     commit_copy "$src_file" "$dst_path" "$rel" || return 1
                     echo "rehomed-newer"
@@ -1386,8 +1415,8 @@ commit_one() {
             dst_path="$DEST_REAL/logs/workspace-narrative.log"
             mkdir -p "$(dirname "$dst_path")"
             local src_mt src_sz
-            src_mt="$(_stat_field mtime "$src_file")"
-            src_sz="$(_stat_field size "$src_file")"
+            src_mt="$(_stat_field mtime "$src_file")" || src_mt="unknown"
+            src_sz="$(_stat_field size "$src_file")" || src_sz="unknown"
             # Mini #design 2026-06-02 08:10Z: an `{ ... } > tmp && mv ...`
             # compound on a single line is NOT covered by `set -e` for its
             # left-side failure — the compound returns non-zero but execution
@@ -1668,7 +1697,7 @@ commit_source() {
         # is 0 (delete-source phase-2 path; pre-flight didn't run).
         if [ "$PROGRESS_TOTAL" -gt 0 ]; then
             PROGRESS_N=$((PROGRESS_N + 1))
-            _fsize="$(_stat_field size "$file")"
+            _fsize="$(_stat_field size "$file")" || _fsize=0   # report only
             printf "  [%d/%d] %s (%s) → %s\n" \
                 "$PROGRESS_N" "$PROGRESS_TOTAL" "${rel:0:60}" \
                 "$(humanize_bytes "$_fsize")" "$outcome" >&2
@@ -2229,7 +2258,7 @@ rollback_main() {
     else
         : > "$tar_listing"  # empty backup: nothing to preserve, everything is "added since"
     fi
-    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(_stat_field size "$backup_path")" >&2
+    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(_stat_field size "$backup_path" || echo 0)" >&2
     local sd
     [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback walk: DEST_REAL=$DEST_REAL" >&2
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}" "${WORKSPACE_SURFACE_FILES[@]}"; do
