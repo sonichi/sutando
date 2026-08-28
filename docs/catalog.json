@@ -243,8 +243,8 @@
     "maintainers"
    ],
    "status": "active",
-   "canonical_for": "client-to-agent protocol spoken by src/runtime-api: methods, approval and elicitation flow, governed capabilities, idempotency",
-   "last_verified": "2026-08-28"
+   "canonical_for": "the v0 LOCAL Unix-socket client protocol spoken by src/runtime-api: methods, approval and elicitation flow, governed capabilities",
+   "last_verified": null
   },
   "docs/slack-bridge.md": {
    "title": "Slack bridge",
