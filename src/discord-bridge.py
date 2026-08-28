@@ -150,11 +150,12 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -199,6 +200,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    pending_task_collab.pop(task_id, None)
     await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
     archive_file(result_file, "results", task_id)
     # Archive the SOURCE TASK too. Without this the task file sits in tasks/
@@ -430,6 +432,69 @@ DISCORD_TRUNCATION_NOTICE = (
 )
 
 
+def _mention_gate_owner_ids() -> list:
+    """Owner ids the mention gate keys on. A PRESENT tierMap is authoritative,
+    including empty ({} = no owners, gate never triggers) — falling back to
+    allowFrom there would promote read-only members to owner for this gate.
+    allowFrom is consulted only when the tierMap key is ABSENT (legacy file)."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    if "tierMap" in data:
+        tier_map = data.get("tierMap")
+        if not isinstance(tier_map, dict):
+            return []
+        return [str(u) for u, t in tier_map.items() if t == "owner"]
+    allow = data.get("allowFrom")
+    return [str(u) for u in allow] if isinstance(allow, list) else []
+
+
+def _mention_gate_triggers_ingest(message) -> bool:
+    """ON-side gate (skills/mention-gate): while ON, a message @-tagging an
+    owner counts as a bot mention. Fail-closed: any error → today's rejection.
+    Verdict only — the audit is written by _mention_gate_log_admission AFTER
+    the task file exists, so an unauthorized sender can never inflate it."""
+    try:
+        owners = _mention_gate_owner_ids()
+        if not owners or str(message.author.id) in owners:
+            return False
+        mention_ids = [str(getattr(u, "id", ""))
+                       for u in (getattr(message, "mentions", None) or [])]
+        if not mention_gate.message_tags_owner(
+                mention_ids, getattr(message, "content", "") or "", owners):
+            return False
+        if not mention_gate.owner_tag_triggers_ingest(REPO):
+            return False
+        print(f"  [mention-gate] ON — owner-tagged msg {getattr(message, 'id', '?')} "
+              f"admitted as a mention (audit deferred to task write)", flush=True)
+        return True
+    except Exception as e:
+        print(f"  [mention-gate] check failed ({e}) — ordinary requireMention "
+              f"rejection stands", flush=True)
+        return False
+
+
+def _mention_gate_log_admission(message) -> None:
+    """Audit a gate admission AFTER its task file is durably written — a sender
+    the later authorization gates drop must leave no audit row. Best-effort:
+    the task already exists, so a failed append only logs, never retracts."""
+    try:
+        mention_gate.log_gated_ingest(REPO, {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "channel_id": str(getattr(message.channel, "id", "")),
+            "author_id": str(message.author.id),
+            "message_id": str(getattr(message, "id", "")),
+            "body": (getattr(message, "content", "") or "")[:120],
+        })
+        print(f"  [mention-gate] audited gated admission of msg "
+              f"{getattr(message, 'id', '?')}", flush=True)
+    except Exception as e:
+        print(f"  [mention-gate] audit append failed after task write: {e}", flush=True)
+
+
 def _chunk_for_discord(
     text: str,
     max_len: int = 1900,
@@ -486,7 +551,9 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
                                    channel_id, f"task-{int(time.time() * 1000)}")
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
-        return "honour", None
+        # A planner that raised proved nothing about the asker being answered.
+        # "honour" archives; "defer" retains so a later pass can retry.
+        return "defer", None
 
 
 def archive_path(kind: str, task_id: str) -> "Path":
@@ -2543,6 +2610,8 @@ pending_reply_anchors: dict[str, int] = {}
 # on restart; poll_progress fail-closes (skips streaming) when a task_id is
 # absent here, so a recovered task is never streamed without a known owner tier.
 pending_task_tiers: dict[str, str] = {}
+# Collaborators are engaged directly, so their tasks DO update core-status.
+pending_task_collab: dict[str, bool] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2589,6 +2658,16 @@ async def _deliver_pairing_prompt(channel, code, username, sender_id, allowed):
 
 client = discord.Client(intents=intents)
 _ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
+# RESUME is invisible to on_ready, so "no ready lines" cannot mean "no
+# reconnects" — these two counters are what make the classes distinguishable.
+_resume_count = 0
+_disconnect_count = 0
+
+def _reconnect_state() -> str:
+    """One shape for every reconnect-class line so the log stays greppable."""
+    return (f"gateway session #{_ready_count} "
+            f"(resume #{_resume_count}, disconnect #{_disconnect_count})")
+
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2681,6 +2760,23 @@ async def _supervise_loop(coro_fn, name):
 
 
 @client.event
+async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
+    global _resume_count
+    _resume_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge resumed: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
+async def on_disconnect():  # pragma: no cover — gateway callback
+    # Re-dispatched per retry while ready/resumed need success: the only outage line.
+    global _disconnect_count
+    _disconnect_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge disconnected: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
 async def on_ready():
     global _ready_count
     _ready_count += 1
@@ -2690,7 +2786,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
     # for Discord to infer it. Best-effort — presence must never break startup.
@@ -3006,6 +3102,14 @@ def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     return False
 
 
+def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
+    """Collaborator status for a TEAM sender, however that tier was reached.
+    Global-allowlist members resolved to team by the tierMap are eligible too."""
+    if access_tier != "team":
+        return False
+    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
+
+
 def select_rulebook_key(access_tier, is_collaborator):
     """Pick which `tier_instructions` rulebook a task gets.
 
@@ -3126,6 +3230,10 @@ async def _handle_discord_message(message, force=False):
             _update_dm_checkpoint(message.channel.id, message.id)
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
+
+    # Set only by the requireMention branch below; read after the task write so
+    # the audit binds to a DURABLE admission, not to the gate's verdict.
+    _mention_gate_admitted = False
 
     safe_log_text = redact_chat_body(text)   # the shared chain; see src/chat_redaction.py
     print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
@@ -3353,8 +3461,13 @@ async def _handle_discord_message(message, force=False):
             print(f"  [plugin-hook] early-path raised: {e}", flush=True)
 
         if require_mention and not bot_mentioned and not role_mentioned:
-            print(f"  [skip] not mentioned (requireMention=true)", flush=True)
-            return
+            # mention-gate ON side: an owner-tagged message counts as a mention
+            # of the bot; otherwise today's rejection stands (also on any error).
+            if _mention_gate_triggers_ingest(message):
+                _mention_gate_admitted = True  # audit only after the task write
+            else:
+                print(f"  [skip] not mentioned (requireMention=true)", flush=True)
+                return
 
         # Shared-channel addressee gate (require_mention=False, non-bot2bot).
         # Fixes owner-reported 2026-07-18: replies to OTHER agents and other
@@ -3790,13 +3903,14 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
-                # Per-channel collaborator check (pure helper — unit-tested):
-                # only the serving channel's own `collaborators` list grants
-                # engagement; membership elsewhere does not carry over.
-                # Handler-glue line: resolution logic is exercised via
-                # resolve_is_collaborator's unit tests; this async-handler branch
-                # is not independently invocable (cf. media_headers no-cover below).
-                is_collaborator = resolve_is_collaborator(data, sender_id, message.channel.id)  # noqa: E501  # pragma: no cover
+        except Exception:  # pragma: no cover — handler glue; unreadable config leaves the guest tier
+            pass
+    # Collaborator status is orthogonal to WHICH arm resolved team tier — a
+    # globally-allowlisted team sender can be a serving-channel collaborator.
+    if access_tier == "team" and not is_collaborator:
+        try:  # pragma: no cover — handler glue; logic in resolve_team_collaborator's tests
+            _acc = json.loads(ACCESS_FILE.read_text())
+            is_collaborator = resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id)  # noqa: E501
         except Exception:
             pass
 
@@ -4240,8 +4354,13 @@ async def _handle_discord_message(message, force=False):
     if not _write_task_file(task_file, _build_task_content, username, channel_name,
                             access_tier, message.id):
         return
+    if _mention_gate_admitted:
+        # Every authorization gate above passed and the task file exists — only
+        # now does a mention-gate admission earn its audit row.
+        _mention_gate_log_admission(message)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
+    pending_task_collab[task_id] = bool(is_collaborator)
     # Observability: one inbound accepted-message event.
     _emit_channel(
         "discord", "in",
@@ -4755,6 +4874,7 @@ async def poll_results():
                 # "unknown" — never "owner" — so a lost/absent tier can't
                 # silently upgrade a non-owner reply in tier accounting.
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
+                pending_task_collab.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -4786,18 +4906,29 @@ async def poll_results():
                     # own channel. Loop guard: a task that comes back
                     # cross-channel-deduped a SECOND time is not re-queued again
                     # — notify in-channel instead (owner-directed).
-                    if _skip.value == "deduped" and _skip.extra:
+                    if _skip.value == "deduped":
+                        _act, _delivered = "defer", None
                         try:
-                            _holder_file = find_task_file(TASKS_DIR, _skip.extra)
+                            # find_task_file globs unchecked; an id failing the
+                            # gate find_result applies is "holder not found".
+                            _holder_file = (
+                                find_task_file(TASKS_DIR, _skip.extra)
+                                if local_task_protocol.valid_archive_lookup_id(_skip.extra)
+                                else None)
                             _holder_text = _holder_file.read_text() if _holder_file else None
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
+                            # Cross-channel is an unconfirmed report: the asker is
+                            # only served once the notify or the re-queue lands.
                             _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
-                                         if not _target else ("honour", None))
+                                         if not _target else ("report", None))
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
                                 save_pending_replies()
-                            elif _act == "report":
+                            elif _act == "report" and not _target:
+                                # Cross-channel carries a None payload and is
+                                # delivered by the _target block below instead.
                                 await channel.send(_pl)
+                                _delivered = True
                             if _target:
                                 _orig_file = find_task_file(TASKS_DIR, task_id)
                                 _orig_text = _orig_file.read_text() if _orig_file else None
@@ -4815,6 +4946,7 @@ async def poll_results():
                                         f"even after a re-queue — flagging instead of looping. "
                                         f"This needs a direct answer here."
                                     )
+                                    _delivered = True
                                 else:
                                     # First time — reject + re-queue for an
                                     # in-channel answer.
@@ -4833,9 +4965,16 @@ async def poll_results():
                                         f"{_new_id} for in-channel answer",
                                         flush=True,
                                     )
+                                    _delivered = True
                         except Exception as e:
-                            # Best-effort; never block the archive of this result.
                             print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
+                        if report_disposition(_act, _delivered) == "retain":
+                            # Nobody was told. Keep the result AND the task so a
+                            # later pass retries; archiving loses the question.
+                            print(
+                                f"  [dedup] report not delivered for {task_id} — "
+                                f"retaining for retry", flush=True)
+                            continue
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     # §7 audit: skip-marked results are resolved deliveries, not
                     # silent voids — one line per resolved result per spec.
@@ -5189,7 +5328,10 @@ async def poll_progress():
                 # entry closes that hole (red-team #2).
                 if task_id not in pending_task_tiers:
                     continue
-                if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+                # Poll branch not unit-invocable; decision covered in progress_stream.
+                if not progress_stream.should_stream_task(  # pragma: no cover
+                        pending_task_tiers.get(task_id),
+                        pending_task_collab.get(task_id, False)):
                     continue  # non-owner → no placeholder, no leak
                 try:
                     created = int(task_id.split("-")[1]) / 1000.0
@@ -5230,6 +5372,7 @@ async def poll_progress():
                                 continue
                     _progress_msgs.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
+                    pending_task_collab.pop(task_id, None)  # pragma: no cover
         except Exception as e:
             print(f"  [progress] poll_progress tick error: {e}", flush=True)
         await asyncio.sleep(3)
