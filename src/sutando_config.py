@@ -57,6 +57,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "core_config_dirs",
     "vault",
     "migrate",
+    "env",
     "health_check",
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
@@ -70,6 +71,7 @@ _OBJECT_TOP_LEVEL_KEYS = {
     "claude_sutando_config_dir",
     "vault",
     "migrate",
+    "env",
     "health_check",
     "bridges",
 }
@@ -228,6 +230,7 @@ _CACHE_REPO_ROOT: Optional[Path] = None
 _LEGACY_ENV_WARN_PRINTED = False
 _DOTENV_DRIFT_WARN_PRINTED = False
 _UNKNOWN_KEYS_WARN_PRINTED = False
+_CONFIG_GET_WARNED: set = set()  # keys for which the env fallback warning was already printed
 _PROGRESS_STREAM_TYPE_WARN_PRINTED = False
 
 
@@ -295,12 +298,13 @@ def _reset_cache_for_tests() -> None:
     Production code never calls this. Importing in tests is intentional —
     keeps the public surface honest.
     """
-    global _CACHE, _CACHE_REPO_ROOT, _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED, _UNKNOWN_KEYS_WARN_PRINTED, _PROGRESS_STREAM_TYPE_WARN_PRINTED
+    global _CACHE, _CACHE_REPO_ROOT, _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED, _UNKNOWN_KEYS_WARN_PRINTED, _CONFIG_GET_WARNED, _PROGRESS_STREAM_TYPE_WARN_PRINTED
     _CACHE = None
     _CACHE_REPO_ROOT = None
     _LEGACY_ENV_WARN_PRINTED = False
     _DOTENV_DRIFT_WARN_PRINTED = False
     _UNKNOWN_KEYS_WARN_PRINTED = False
+    _CONFIG_GET_WARNED = set()
     _PROGRESS_STREAM_TYPE_WARN_PRINTED = False
 
 
@@ -820,6 +824,64 @@ def find_core_config_dir(
         if e.get("type") == type_:
             return e
     return None
+
+
+def config_get(
+    key: str,
+    default: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Optional[str]:
+    """Read a non-secret config value, preferring the config file over the env.
+
+    Resolution order (issue #1724 — "split .env into secrets vs config"):
+      1. `sutando.config.{json,local.json}` → `env.<key>` (deep-merged).
+      2. `os.environ[key]` — legacy fallback for one release; prints a one-time
+         per-key stderr deprecation nag so operators know to migrate.
+      3. `default` — returned as-is if neither source has the key.
+
+    The `env` stanza in config mirrors the flat env-var namespace so migration
+    is mechanical: `config_get("MY_KEY")` in code, `env: {MY_KEY: value}` in
+    `sutando.config.local.json`. Secrets (`DISCORD_BOT_TOKEN` etc.) must stay
+    in `.env` / vault and MUST NOT be moved to the config file.
+
+    `repo_root` is passed through to `load_config()`; only needed in tests.
+    """
+    global _CONFIG_GET_WARNED
+    cfg = load_config(repo_root)
+    env_stanza = cfg.get("env") or {}
+    if key in env_stanza:
+        return str(env_stanza[key])
+    env_val = os.environ.get(key)
+    if env_val is not None:
+        if key not in _CONFIG_GET_WARNED:
+            _CONFIG_GET_WARNED.add(key)
+            print(
+                _color_warn(
+                    f"sutando config: {key!r} is read from os.environ (legacy). "
+                    f"Migrate: add `env: {{\"{key}\": \"<value>\"}}` to "
+                    f"sutando.config.local.json to silence this warning."
+                ),
+                file=sys.stderr,
+            )
+        return env_val
+    return default
+
+
+def config_get_env_first(
+    key: str,
+    default: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Optional[str]:
+    """`config_get` with the precedence inverted — `os.environ` wins.
+
+    For documented escape hatches and bootstrap values only. An operator sets
+    these on the process to override a broken or stale config, so letting the
+    config file win would disable the very override they reached for.
+    """
+    val = os.environ.get(key)
+    if val is not None:
+        return val
+    return config_get(key, default, repo_root)
 
 
 def detect_env_workspace_in_dotenv(repo_root: Optional[Path] = None) -> Optional[str]:

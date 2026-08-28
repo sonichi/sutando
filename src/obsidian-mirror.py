@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from sutando_config import config_get
 import re
 import sys
 import time
@@ -267,7 +268,7 @@ def main(argv) -> int:
     p.add_argument("--vault", help="Override vault path.")
     args = p.parse_args(argv)
 
-    if not args.force and os.environ.get("SUTANDO_OBSIDIAN_MIRROR", "").lower() not in ("1", "true", "yes", "on"):
+    if not args.force and (config_get("SUTANDO_OBSIDIAN_MIRROR", "") or "").lower() not in ("1", "true", "yes", "on"):
         print(
             "[obsidian-mirror] not enabled — set SUTANDO_OBSIDIAN_MIRROR=1 in .env to opt in, "
             "or pass --force for an explicit one-shot run. Exiting.",
