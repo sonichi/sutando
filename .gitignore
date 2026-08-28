@@ -72,6 +72,8 @@ tests/**/htmlcov/
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/*.test.mjs
+tests/__pycache__/
 !tests/*.txt
 !tests/_helpers/
 !tests/_helpers/*.ts

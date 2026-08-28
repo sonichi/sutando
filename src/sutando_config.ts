@@ -41,6 +41,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 	'core',
 	'workspace',
 	'claude_sutando_config_dir',
+	'env',
 	'core_config_dirs',
 	'vault',
 	'migrate',
@@ -60,6 +61,7 @@ const OBJECT_TOP_LEVEL_KEYS = new Set([
 	'claude_sutando_config_dir',
 	'vault',
 	'migrate',
+	'env',
 	'health_check',
 	'bridges',
 ]);
