@@ -88,9 +88,8 @@ def behavioral() -> list:
             fails.append(f"{name}: expected withheld={expect}, got {withheld} ({why})")
             continue
         if withheld:
-            # Class-correct sentinel: a marker-triggered withhold names the
-            # marker class (no content claim); everything else stays generic.
-            # Suppression markers no longer withhold at all (post-#3184).
+            # A marker-triggered withhold names the marker class (no content
+            # claim); every other withhold reason stays generic.
             if why == "result delivery control marker":
                 sentinel = guard.TEAM_LEAK_RESULT_MARKER
             else:
