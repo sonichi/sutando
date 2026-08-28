@@ -200,6 +200,23 @@ def get_quota_status() -> dict:
 QUOTA_STALE_HOURS = 6.0
 
 
+def quota_chart_response() -> tuple[int, bytes]:
+    """The /api/quota-chart decision: (status, body).
+
+    Serializes BEFORE returning a status so a strict-JSON failure surfaces as
+    a 500, never a 200 with an empty body. `live` is the same observation the
+    quota tile renders, so the chart cannot publish a current point the tile
+    contradicts.
+    """
+    try:
+        payload = quota_projection.chart_payload(
+            WORKSPACE_DIR / "state" / "quota-history.jsonl",
+            datetime.now().timestamp(), live=get_quota_status())
+        return 200, json.dumps(payload, allow_nan=False).encode()
+    except ValueError:
+        return 500, b'{"error": "non-finite value in chart payload"}'
+
+
 def _quota_freshness(data: dict, quota_file) -> dict:
     """Age of the reading, from `last_checked` — falling back to file mtime.
 
@@ -925,17 +942,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
         elif urlparse(self.path).path == "/api/quota-chart":
-            # Serialize BEFORE any status is sent: a strict-JSON failure must
-            # surface as a 500, never a 200 with an empty body.
-            try:
-                payload = quota_projection.chart_payload(
-                    WORKSPACE_DIR / "state" / "quota-history.jsonl",
-                    datetime.now().timestamp())
-                body = json.dumps(payload, allow_nan=False).encode()
-                code = 200
-            except ValueError:
-                body = b'{"error": "non-finite value in chart payload"}'
-                code = 500
+            code, body = quota_chart_response()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()

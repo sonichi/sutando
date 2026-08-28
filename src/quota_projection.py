@@ -202,11 +202,19 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                 if not r.get("tomb") or i == len(rows) - 1]
         rows = _cap(rows)
         fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
-        with os.fdopen(fd, "w") as f:
-            f.write("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, history_path)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write("".join(json.dumps(r, allow_nan=False) + "\n" for r in rows))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, history_path)
+        except BaseException:
+            # A persistent I/O fault would otherwise leave one temp per attempt.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _same(rec):
         keys = [k for pair in _WINDOW_KEYS.values() for k in pair]
@@ -325,17 +333,33 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
     return {"span_s": span, "segments": segments}
 
 
-def chart_payload(history_path: Path, now: float, max_windows: int = 4) -> dict:
-    """Everything the chart needs, for both windows."""
+def chart_payload(history_path: Path, now: float, max_windows: int = 4,
+                  live: dict | None = None) -> dict:
+    """Everything the chart needs, for both windows.
+
+    `live` is the quota-state observation being rendered elsewhere on the page.
+    Nothing is published as current unless the canonical tail IS that
+    observation: a failed append leaves an older tail, and drawing it as
+    current shows the opposite pace from the tile. `live=None` therefore means
+    NO current — a permissive default would reintroduce the defect.
+    """
     history = _read_history(history_path, now)
     tail = history[-1] if history else None
+    live_sample = None
+    if isinstance(live, dict) and not live.get("stale"):
+        live_sample = _sample_from_state(live, now)
 
     def _live_reset(w):
-        # The tail row IS the latest observation; a tomb row or a stripped
-        # window means it was invalid then — nothing current until newer.
-        if tail is None or tail.get("tomb"):
+        # A tomb row or a stripped window was invalid when observed; a tail
+        # that differs from the live observation means the append never landed.
+        if tail is None or tail.get("tomb") or live_sample is None:
             return None
-        r = tail.get(_WINDOW_KEYS[w][1])
+        if tail.get("ts") != live_sample.get("ts"):
+            return None
+        uk, rk = _WINDOW_KEYS[w]
+        if tail.get(uk) != live_sample.get(uk) or tail.get(rk) != live_sample.get(rk):
+            return None
+        r = tail.get(rk)
         return int(r) if r is not None else None
 
     return {

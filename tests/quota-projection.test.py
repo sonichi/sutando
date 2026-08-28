@@ -43,6 +43,25 @@ def state(u5="0.25", r5=None, u7="0.55", r7=None, obs=999000.0):
     return {"last_checked": lc, "headers": h}
 
 
+def live_of(row):
+    """The quota-state observation a history ROW was parsed from.
+
+    Classes that write rows directly hold no state dict, so the reading the
+    chart renders has to be rebuilt from the row the scenario calls current.
+    """
+    from datetime import datetime, timezone
+    h = {}
+    for w, (uk, rk) in qp._WINDOW_KEYS.items():
+        if row.get(uk) is not None:
+            h[f"anthropic-ratelimit-unified-{w}-utilization"] = str(row[uk])
+            h[f"anthropic-ratelimit-unified-{w}-reset"] = str(row[rk])
+    lc = datetime.fromtimestamp(row["ts"], timezone.utc).isoformat().replace("+00:00", "Z")
+    st = {"last_checked": lc, "headers": h}
+    # An inexact ts round-trip would read as "not current" and quietly pass.
+    assert qp._sample_from_state(st, row["ts"] + 1)["ts"] == float(row["ts"])
+    return st
+
+
 class RecordSample(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -105,7 +124,8 @@ class RecordSample(unittest.TestCase):
         st = state(u5="0.25", r5=reset, u7="0.1", r7=reset, obs=obs)
         self.assertTrue(qp.record_sample(st, self.path))
         self.assertFalse(qp.record_sample(st, self.path))  # same last_checked
-        seg = qp.chart_payload(self.path, now=reset - span + span * 0.6)["windows"]["5h"]["segments"][0]
+        seg = qp.chart_payload(self.path, now=reset - span + span * 0.6,
+                               live=st)["windows"]["5h"]["segments"][0]
         self.assertAlmostEqual(seg["points"][-1]["x"], 0.1, places=3)
         self.assertAlmostEqual(seg["projected_end"], 2.0)  # capped: over at observation
 
@@ -362,7 +382,8 @@ class RecordSample(unittest.TestCase):
         recs = qp._read_history(self.path)
         self.assertEqual([round((r["ts"] - (reset - span)) / span, 2) for r in recs],
                          [0.1, 0.8])
-        seg = qp.chart_payload(self.path, now=float(reset - 1))["windows"]["5h"]["segments"][0]
+        seg = qp.chart_payload(self.path, now=float(reset - 1),
+                               live=st(0.8))["windows"]["5h"]["segments"][0]
         self.assertAlmostEqual(seg["points"][0]["x"], 0.1, places=2)
         self.assertAlmostEqual(seg["points"][-1]["x"], 0.8, places=2)
         self.assertAlmostEqual(seg["projected_end"], 0.25 / 0.8, places=3)
@@ -391,13 +412,16 @@ class RecordSample(unittest.TestCase):
         self.path.write_text("".join(js.dumps(r) + "\n" for r in rows))
         delayed = state(u5="0.20", r5=909000, u7="0.5", r7=909000, obs=900000.0)
         self.assertFalse(qp.record_sample(delayed, self.path, now=900200.0))
-        segs = qp.chart_payload(self.path, now=900200.0)["windows"]["5h"]["segments"]
+        segs = qp.chart_payload(self.path, now=900200.0,
+                                live=delayed)["windows"]["5h"]["segments"]
         cur = [s["reset"] for s in segs if s["current"]]
         self.assertNotIn(909000, cur, f"older window presented as current: {cur}")
+        self.assertEqual(cur, [], "a refused observation published something current")
         self.assertEqual([s["reset"] for s in segs], [909000, 909100])
         fresh = state(u5="0.31", r5=909200, u7="0.5", r7=909200, obs=900150.0)
         self.assertTrue(qp.record_sample(fresh, self.path, now=900200.0))
-        segs = qp.chart_payload(self.path, now=900200.0)["windows"]["5h"]["segments"]
+        segs = qp.chart_payload(self.path, now=900200.0,
+                                live=fresh)["windows"]["5h"]["segments"]
         self.assertEqual([s["reset"] for s in segs if s["current"]][0], 909200)
 
     def test_a_fully_invalid_observation_still_applies_the_cap(self):
@@ -497,9 +521,9 @@ class ChartSeries(unittest.TestCase):
         # Through the WRITER, so the latest-observation sidecar defines current.
         now = 1000000.0
         reset = int(now + SPAN5 // 2)          # halfway through, still current
-        qp.record_sample(state(u5="0.4", r5=reset, u7="0.1", r7=int(now + 300000),
-                               obs=now), self.path)
-        seg = qp.chart_payload(self.path, now=now)["windows"]["5h"]["segments"][0]
+        st = state(u5="0.4", r5=reset, u7="0.1", r7=int(now + 300000), obs=now)
+        qp.record_sample(st, self.path)
+        seg = qp.chart_payload(self.path, now=now, live=st)["windows"]["5h"]["segments"][0]
         self.assertTrue(seg["current"])
         self.assertAlmostEqual(seg["projected_end"], 0.8)  # 0.4 / 0.5
 
@@ -508,8 +532,10 @@ class ChartSeries(unittest.TestCase):
         # observation, so a valid open-window tail is current and projects.
         now = 1000000.0
         reset = int(now + SPAN5 // 2)
-        self.write([{"ts": int(now), "u5": 0.4, "r5": reset, "u7": 0.1, "r7": reset}])
-        seg = qp.chart_payload(self.path, now=now)["windows"]["5h"]["segments"][0]
+        row = {"ts": int(now), "u5": 0.4, "r5": reset, "u7": 0.1, "r7": reset}
+        self.write([row])
+        seg = qp.chart_payload(self.path, now=now,
+                               live=live_of(row))["windows"]["5h"]["segments"][0]
         self.assertTrue(seg["current"])
         self.assertIn("projected_end", seg)
 
@@ -519,8 +545,9 @@ class ChartSeries(unittest.TestCase):
         now0 = 1000000.0
         r5 = int(now0 + 9000); r7 = int(now0 + 300000)
         qp.record_sample(state(u5="0.8", r5=r5, u7="0.35", r7=r7, obs=now0), self.path)
-        qp.record_sample(state(u5="NaN", r5=r5, u7="0.4", r7=r7, obs=now0 + 60), self.path)
-        pay = qp.chart_payload(self.path, now=now0 + 120)
+        nan5 = state(u5="NaN", r5=r5, u7="0.4", r7=r7, obs=now0 + 60)
+        qp.record_sample(nan5, self.path)
+        pay = qp.chart_payload(self.path, now=now0 + 120, live=nan5)
         cur5 = [s for s in pay["windows"]["5h"]["segments"] if s["current"]]
         cur7 = [s for s in pay["windows"]["7d"]["segments"] if s["current"]]
         self.assertEqual(cur5, [], "stale 5h presented as current past its tombstone")
@@ -542,9 +569,11 @@ class ChartSeries(unittest.TestCase):
         now0 = 1000000.0
         qp.record_sample(state(u5="0.8", r5=int(now0 + 11000), u7="0.1",
                                r7=int(now0 + 300000), obs=now0), self.path)
-        qp.record_sample(state(u5="0.1", r5=int(now0 + 5000), u7="0.1",
-                               r7=int(now0 + 300000), obs=now0 + 100), self.path)
-        segs = qp.chart_payload(self.path, now=now0 + 200)["windows"]["5h"]["segments"]
+        newer = state(u5="0.1", r5=int(now0 + 5000), u7="0.1",
+                      r7=int(now0 + 300000), obs=now0 + 100)
+        qp.record_sample(newer, self.path)
+        segs = qp.chart_payload(self.path, now=now0 + 200,
+                                live=newer)["windows"]["5h"]["segments"]
         cur = [s for s in segs if s["current"]]
         self.assertEqual(len(cur), 1)
         self.assertEqual(cur[0]["reset"], int(now0 + 5000))
@@ -833,9 +862,9 @@ class Round12Controls(unittest.TestCase):
                 self.assertTrue(qp.record_sample(
                     state(10 + i, reset, None, None, float(ts)),
                     hp, now=now))
-            self.assertTrue(qp.record_sample(
-                state(30, 1600, None, None, 1550.0), hp, now=now))
-            payload = qp.chart_payload(hp, now=now)
+            newest = state(30, 1600, None, None, 1550.0)
+            self.assertTrue(qp.record_sample(newest, hp, now=now))
+            payload = qp.chart_payload(hp, now=now, live=newest)
             cur = [s for s in payload["windows"]["5h"]["segments"]
                    if s["current"]]
             self.assertEqual([s["reset"] for s in cur], [1600])
@@ -900,9 +929,9 @@ class Round12AcceptanceCriteria(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             hp = Path(d) / "h.jsonl"; now = 990400.0
             self._tombstone_sequence(hp, now)
-            self.assertTrue(qp.record_sample(
-                state(70, 999300, 50, 1200000, 990300), hp, now=now))
-            payload = qp.chart_payload(hp, now=now)
+            revived = state(70, 999300, 50, 1200000, 990300)
+            self.assertTrue(qp.record_sample(revived, hp, now=now))
+            payload = qp.chart_payload(hp, now=now, live=revived)
             cur = [s["reset"] for s in payload["windows"]["5h"]["segments"]
                    if s["current"]]
             self.assertEqual(cur, [999300])
@@ -935,15 +964,16 @@ class Round12AcceptanceCriteria(unittest.TestCase):
                      (19000, 1100), (19500, 1501))):
                 self.assertTrue(qp.record_sample(
                     state(10 + i, reset, None, None, float(ts)), hp, now=now))
-            self.assertTrue(qp.record_sample(
-                state(30, 1600, None, None, 1550.0), hp, now=now))
+            newest = state(30, 1600, None, None, 1550.0)
+            self.assertTrue(qp.record_sample(newest, hp, now=now))
             for mw in (4, 5):
-                payload = qp.chart_payload(hp, now=now, max_windows=mw)
+                payload = qp.chart_payload(hp, now=now, max_windows=mw, live=newest)
                 segs = payload["windows"]["5h"]["segments"]
                 self.assertEqual(
                     [s["reset"] for s in segs if s["current"]], [1600],
                     f"max_windows={mw}")
-            self.assertEqual(len(qp.chart_payload(hp, now=now, max_windows=5)
+            self.assertEqual(len(qp.chart_payload(hp, now=now, max_windows=5,
+                                                  live=newest)
                                  ["windows"]["5h"]["segments"]), 5)
 
     def test_an_open_window_still_projects(self):
@@ -951,9 +981,9 @@ class Round12AcceptanceCriteria(unittest.TestCase):
         # now < reset — exactly one current, projection present.
         with tempfile.TemporaryDirectory() as d:
             hp = Path(d) / "h.jsonl"
-            self.assertTrue(qp.record_sample(
-                state(72, 101000, None, None, 100000), hp, now=100001.0))
-            payload = qp.chart_payload(hp, now=100500.0)
+            open_obs = state(72, 101000, None, None, 100000)
+            self.assertTrue(qp.record_sample(open_obs, hp, now=100001.0))
+            payload = qp.chart_payload(hp, now=100500.0, live=open_obs)
             cur = [s for s in payload["windows"]["5h"]["segments"]
                    if s["current"]]
             self.assertEqual(len(cur), 1)
@@ -972,35 +1002,36 @@ class Round13Consistency(unittest.TestCase):
             hp = Path(d) / "h.jsonl"; now = 300.0
             self.assertTrue(qp.record_sample(
                 state("0.1", 9100, None, None, 100.0), hp, now=now))
+            newer = state("0.6", 9100, None, None, 200.0)
             os.chmod(hp, 0o444)
             try:
-                self.assertFalse(qp.record_sample(
-                    state("0.6", 9100, None, None, 200.0), hp, now=now))
+                self.assertFalse(qp.record_sample(newer, hp, now=now))
             finally:
                 os.chmod(hp, 0o644)
-            segs = qp.chart_payload(hp, now=now)["windows"]["5h"]["segments"]
-            cur = [seg for seg in segs if seg["current"]]
-            self.assertEqual([seg["points"][-1]["y"] for seg in cur], [0.1])
-            self.assertTrue(qp.record_sample(
-                state("0.6", 9100, None, None, 200.0), hp, now=now))
-            segs = qp.chart_payload(hp, now=now)["windows"]["5h"]["segments"]
-            cur = [seg for seg in segs if seg["current"]]
-            self.assertEqual([seg["points"][-1]["y"] for seg in cur], [0.6])
+            # The live reading is the one that FAILED to land, so nothing is
+            # current: drawing 0.1 shows the opposite pace from the tile.
+            segs = qp.chart_payload(hp, now=now, live=newer)["windows"]["5h"]["segments"]
+            self.assertTrue(segs, "history must survive the refusal")
+            self.assertEqual([s["points"][-1]["y"] for s in segs if s["current"]], [],
+                             "stale tail published as current after a failed append")
+            self.assertTrue(qp.record_sample(newer, hp, now=now))
+            segs = qp.chart_payload(hp, now=now, live=newer)["windows"]["5h"]["segments"]
+            self.assertEqual([s["points"][-1]["y"] for s in segs if s["current"]], [0.6])
 
     def test_a_malformed_sidecar_degrades_to_history_only(self):
         # Malformed sidecar shapes read as ABSENT: history-only render,
         # no current, no exception.
         with tempfile.TemporaryDirectory() as d:
             hp = Path(d) / "h.jsonl"; now = 300.0
-            self.assertTrue(qp.record_sample(
-                state("0.1", 9100, None, None, 100.0), hp, now=now))
+            obs = state("0.1", 9100, None, None, 100.0)
+            self.assertTrue(qp.record_sample(obs, hp, now=now))
             side = hp.with_name(hp.name + ".latest.json")
             for bad in ('{"ts": 100, "windows": "corrupt"}',
                         '{"ts": 100, "windows": {"5h": ["u", 1]}}',
                         'not json at all',
                         '{"ts": 100}'):
                 side.write_text(bad)
-                payload = qp.chart_payload(hp, now=now)
+                payload = qp.chart_payload(hp, now=now, live=obs)
                 segs = payload["windows"]["5h"]["segments"]
                 self.assertTrue(segs)
                 # the retired file is inert: current still derives from tail
@@ -1021,16 +1052,122 @@ class Round13Consistency(unittest.TestCase):
             hp = Path(d) / "h.jsonl"; now = 300.0
             self.assertTrue(qp.record_sample(
                 state("0.1", 9100, None, None, 100.0), hp, now=now))
+            durable = state("0.6", 9200, None, None, 200.0)
             os.chmod(d, 0o555)
             try:
-                self.assertTrue(qp.record_sample(
-                    state("0.6", 9200, None, None, 200.0), hp, now=now))
+                self.assertTrue(qp.record_sample(durable, hp, now=now))
             finally:
                 os.chmod(d, 0o755)
-            segs = qp.chart_payload(hp, now=now)["windows"]["5h"]["segments"]
+            segs = qp.chart_payload(hp, now=now, live=durable)["windows"]["5h"]["segments"]
             cur = [seg for seg in segs if seg["current"]]
             self.assertEqual([seg["reset"] for seg in cur], [9200])
             self.assertEqual([seg["points"][-1]["y"] for seg in cur], [0.6])
+
+
+class Round15LiveBinding(unittest.TestCase):
+    """kewei round-15 P1: a point is current only if the tail IS the live read.
+
+    A failed append leaves an older tail; published as current it draws the
+    opposite pace from the quota tile the page renders beside it.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "h.jsonl"
+        self.first = state("0.1", 9100, None, None, 100.0)
+        self.assertTrue(qp.record_sample(self.first, self.path, now=300.0))
+        # Same RESET, moved utilization: a reset-keyed identity check would
+        # still call the stale row current, which is the defect's real shape.
+        self.newer = state("0.6", 9100, None, None, 200.0)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _current(self, live):
+        segs = qp.chart_payload(self.path, now=300.0,
+                                live=live)["windows"]["5h"]["segments"]
+        self.assertTrue(segs, "history must render even when nothing is current")
+        return [s["points"][-1]["y"] for s in segs if s["current"]]
+
+    def test_a_same_reset_failed_write_publishes_no_current(self):
+        os.chmod(self.path, 0o444)
+        try:
+            self.assertFalse(qp.record_sample(self.newer, self.path, now=300.0))
+        finally:
+            os.chmod(self.path, 0o644)
+        self.assertEqual(self._current(self.newer), [])
+
+    def test_a_missing_quota_state_publishes_no_current(self):
+        self.assertEqual(self._current(None), [])
+
+    def test_a_stale_quota_state_publishes_no_current(self):
+        self.assertEqual(self._current({**self.first, "stale": True}), [])
+
+    def test_an_unstamped_quota_state_publishes_no_current(self):
+        # No `last_checked` -> no observation time -> no live sample.
+        self.assertEqual(self._current({"headers": self.first["headers"]}), [])
+
+    def test_the_matching_observation_is_current(self):
+        # Positive control: without this the four above pass by always-empty.
+        self.assertEqual(self._current(self.first), [0.1])
+
+    def test_a_landed_append_becomes_current(self):
+        self.assertTrue(qp.record_sample(self.newer, self.path, now=300.0))
+        self.assertEqual(self._current(self.newer), [0.6])
+
+
+class Round15TempCleanup(unittest.TestCase):
+    """kewei round-15 P2: a failed rewrite leaves no temp behind."""
+
+    def test_repeated_rewrite_failures_leave_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"
+            # A corrupt line makes the history DIRTY, which is what routes the
+            # writer through _commit's rewrite instead of the O_APPEND path.
+            hp.write_text(json.dumps({"ts": 100.0, "u5": 0.1, "r5": 9100}) +
+                          "\nnot json at all\n")
+            pre = tempfile.gettempprefix()
+            real = qp.os.replace
+            qp.os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("full"))
+            try:
+                for i, u in enumerate(("0.2", "0.3", "0.4")):
+                    self.assertFalse(qp.record_sample(
+                        state(u, 9100, None, None, 200.0 + i), hp, now=300.0))
+            finally:
+                qp.os.replace = real
+            self.assertEqual([f for f in os.listdir(d) if f.startswith(pre)], [],
+                             "one orphaned temp per failed rewrite")
+            # Positive control: the same writer succeeds once replace works.
+            self.assertTrue(qp.record_sample(
+                state("0.5", 9100, None, None, 400.0), hp, now=500.0))
+
+
+class Round15RouteContract(unittest.TestCase):
+    """kewei round-15 P2: the route dispatches; the endpoint owns behavior."""
+
+    def test_the_endpoint_returns_a_status_and_a_serialized_body(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import dashboard
+        code, body = dashboard.quota_chart_response()
+        self.assertEqual(code, 200)
+        self.assertIn("windows", json.loads(body))
+
+    def test_the_endpoint_passes_the_live_observation_the_tile_renders(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import dashboard
+        import inspect
+        self.assertIn("live=get_quota_status()",
+                      inspect.getsource(dashboard.quota_chart_response))
+
+    def test_the_route_branch_only_dispatches(self):
+        src = (REPO / "src" / "dashboard.py").read_text().splitlines()
+        i = next(k for k, ln in enumerate(src)
+                 if '== "/api/quota-chart"' in ln)
+        branch = src[i + 1:i + 6]
+        self.assertIn("quota_chart_response()", branch[0])
+        for ln in branch:
+            self.assertNotIn("json.dumps", ln,
+                             "serialization belongs to the endpoint, not the route")
 
 
 class CoverageArms(unittest.TestCase):
