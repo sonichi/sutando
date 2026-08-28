@@ -1283,10 +1283,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self.send_json(400, {"error": "invalid Content-Length"})
             return
-        # Cap the request BEFORE reading it into memory. A /task body is a task
-        # query, never a large payload; an untrusted guest deep_dive (reachable by
-        # room participants) must not be able to inflate Content-Length to exhaust
-        # server memory/threads without ever consuming a worker slot.
+        # Cap BEFORE reading into memory: an untrusted guest deep_dive could
+        # otherwise exhaust memory via Content-Length without taking a worker slot.
         if length < 0 or length > 65536:
             self.send_json(413, {"error": "task request too large"})
             return
@@ -1323,21 +1321,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "task is required"})
             return
 
-        # Signal Room `deep_dive` carries `access_tier: "guest"` (the host daemon
-        # stamps it; the untrusted article text rides in `task`). It researches
-        # UNTRUSTED content, so it must NEVER reach the owner core: route it to a
-        # code-enforced `codex --sandbox read-only` worker whose output is
-        # secret-scanned, and NEVER write it to TASK_DIR. Async: return a task_id;
-        # the worker writes RESULT_DIR/<id> when done (404 until then reads as
-        # pending). See signal_guest_handler.
+        # guest = untrusted content, so it must never reach the owner core: sandboxed
+        # read-only worker, secret-scanned, never TASK_DIR. See signal_guest_handler.
         if data.get("access_tier") == "guest":
-            # NOT a `task-` id, deliberately. The owner task-bridge's result-watcher
-            # injects any `task-*`/`voice-*`/`proactive-*` result into the OWNER's
-            # connected voice session (_shouldFallthrough), and owner tooling globs
-            # `task-*.txt`. A `signal-guest-` id is still readable via /result/<id>
-            # (exact filename; _safe_id permits it) but is rejected by all of those,
-            # so an untrusted guest research result can never surface in owner
-            # context. The crypto-random suffix also prevents result-path collision.
+            # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
+            # results into the owner's voice session, so a guest result must not match.
             task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
             start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
             self.send_json(200, {

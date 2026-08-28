@@ -108,8 +108,7 @@ def run() -> None:
         check("worker HOME pinned to the isolated home", env.get("HOME") == str(home))
         check("worker env does NOT leak an owner secret", "OWNER_SECRET" not in env)
 
-        # 3. Bounded fleet: with both slots held, a new request is told it's busy
-        #    (deterministic — exhaust the semaphore directly).
+        # 3. Bounded fleet: both slots held -> new request is told busy.
         g._slots.acquire(); g._slots.acquire()  # MAX_CONCURRENT == 2
         d3 = Path(tempfile.mkdtemp()) / "results"
         g.start_guest_deep_dive("task-busy", "dig into item 2", d3, lambda t: t)
@@ -135,9 +134,8 @@ def run() -> None:
         m = _re.search(r"function _shouldFallthrough[^{]*\{([^}]*)\}", tb)
         check("_shouldFallthrough gates on task-/voice-/proactive- and excludes signal-guest-",
               m is not None and "signal-guest" not in m.group(1) and "task-" in m.group(1))
-        # (The Content-Length cap + task validation are exercised at the handler
-        #  level in agent_api_task_guard.test.py — asserting 413/400, zero body
-        #  reads, and no guest dispatch, not just source text.)
+        # (Content-Length cap + task validation are asserted at handler level in
+        #  agent_api_task_guard.test.py — 413/400, zero body reads, no dispatch.)
     finally:
         shutil.which, subprocess.Popen = orig_which, orig_popen
         os.environ.pop("OWNER_SECRET", None)

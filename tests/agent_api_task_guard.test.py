@@ -14,9 +14,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-# resolve_workspace() ignores $SUTANDO_WORKSPACE (v0.8) UNLESS SUTANDO_TEST_MODE=1,
-# so the owner path below writes its task file into a per-test tempdir — never the
-# live workspace. Must be set BEFORE agent-api.py is imported.
+# SUTANDO_TEST_MODE=1 makes resolve_workspace() honour $SUTANDO_WORKSPACE, keeping the
+# owner path's task file in a tempdir. Must be set BEFORE agent-api.py is imported.
 _TEST_WS = tempfile.mkdtemp()
 os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ["SUTANDO_WORKSPACE"] = _TEST_WS
