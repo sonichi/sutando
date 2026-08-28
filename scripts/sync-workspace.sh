@@ -952,8 +952,19 @@ PY
                 log "snapshot: could not promote a verified intent; leaving it for the next tick"
                 return 0
             }
-            _fsync_path_and_dir "$_s" ||
-                log "snapshot: promoted intent not confirmed durable"
+            # The rename CONSUMED the only recovery record. If the signature is
+            # not durable, re-create the intent from the sha we still hold —
+            # otherwise a crash here leaves neither a durable signature nor
+            # anything for the next tick to recover from, and the completion
+            # line below would be a lie.
+            if ! _fsync_path_and_dir "$_s"; then
+                if printf '%s\n' "$_want" > "$_i" 2>/dev/null && _fsync_path_and_dir "$_i"; then
+                    log "snapshot: promoted signature not confirmed durable; intent re-created for the next tick"
+                else
+                    warn_operator "snapshot: promoted signature for hosts/$(_host)/build_log.md is NOT confirmed durable and the recovery intent could not be re-created; provenance may be lost on a crash"
+                fi
+                return 0
+            fi
             log "snapshot: completed an interrupted publish from its intent record"
         else
             # The move never landed (or landed as something else): the intent
@@ -1008,9 +1019,15 @@ PY
                             # Promotion is atomic-rename ONLY — an in-place write
                             # here would reintroduce the partial signature.
                             log "snapshot: could not promote the publish intent; intent left for recovery, signature unchanged"
-                        else
-                            _fsync_path_and_dir "$_sig" ||
-                                log "snapshot: signature promoted but not confirmed durable"
+                        elif ! _fsync_path_and_dir "$_sig"; then
+                            # Same asymmetry as the recovery path: the promote
+                            # rename consumed the intent, so a non-durable
+                            # signature must leave a fresh one behind.
+                            if printf '%s\n' "$_new" > "$_int" 2>/dev/null && _fsync_path_and_dir "$_int"; then
+                                log "snapshot: signature promoted but not confirmed durable; intent re-created for the next tick"
+                            else
+                                warn_operator "snapshot: signature for hosts/$(_host)/build_log.md is NOT confirmed durable and the recovery intent could not be re-created; provenance may be lost on a crash"
+                            fi
                         fi
                     else
                         # hosts/*/ is a carried vault path: a temp left here is

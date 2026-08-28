@@ -409,6 +409,56 @@ check "...and the intent survives for the next tick" '[ -f "$_INT" ]'
 rm -rf "$_shim"
 rm -f "$_INT"; rm -f "$_SIG"
 
+# (d) the SIGNATURE cannot be confirmed durable -> the promote rename has
+# already CONSUMED the intent, so a fresh one must be left behind. keweichen on
+# #3198: treating this last fsync as log-only spends the only recovery record
+# and still logs completion, so a crash here loses the provenance entirely.
+# The shim must match the signature and NOT the intent, so anchor on the end of
+# the path: `.snapshot-sha.next` must keep working while `.snapshot-sha` fails.
+_sig_only_shim() {
+    _fs="$(mktemp -d)"
+    cat > "$_fs/python3" <<SHIM
+#!/bin/sh
+case "\$2" in *.snapshot-sha) exit 1 ;; esac
+exec "$(command -v python3)" "\$@"
+SHIM
+    chmod +x "$_fs/python3"
+    printf '%s' "$_fs"
+}
+
+_arm_owned_snapshot
+_fs="$(_sig_only_shim)"
+_logmark_d="$(wc -c < "$LOG")"
+SYNC_PY="$_fs/python3" _snapshot_per_host_config >/dev/null 2>&1
+rm -rf "$_fs"
+check "d) signature not confirmed durable: a recovery intent is left behind" \
+      '[ -f "$_INT" ]'
+check "...and it records the sha that was being published" \
+      '[ "$(cat "$_INT")" = "$(shasum -a 256 "$_DST" | cut -d" " -f1)" ]'
+check "...and the log says the intent was re-created, not that it completed" \
+      'tail -c "+$((_logmark_d+1))" "$LOG" | grep -q "intent re-created for the next tick"'
+# ...and that leftover intent is recoverable: the next clean tick finishes it.
+_snapshot_per_host_config >/dev/null 2>&1
+check "...so the NEXT tick promotes it and clears the intent" \
+      '[ ! -f "$_INT" ] && [ "$(cat "$_SIG")" = "$(shasum -a 256 "$_DST" | cut -d" " -f1)" ]'
+rm -f "$_INT"; rm -f "$_SIG"
+
+# (e) same asymmetry on the RECOVERY path: recovery renames the intent onto the
+# signature, so a non-durable signature there must also re-create the intent.
+printf 'recovered body\n' > "$_DST"
+shasum -a 256 "$_DST" | cut -d' ' -f1 > "$_INT"
+printf 'stale-signature-value\n' > "$_SIG"
+cp "$_DST" "$WORKSPACE_DIR/build_log.md"
+_fs="$(_sig_only_shim)"
+_logmark_e="$(wc -c < "$LOG")"
+SYNC_PY="$_fs/python3" _snapshot_per_host_config >/dev/null 2>&1
+rm -rf "$_fs"
+check "e) recovery with a non-durable signature re-creates the intent" \
+      '[ -f "$_INT" ]'
+check "...and does NOT log the publish as completed" \
+      '! tail -c "+$((_logmark_e+1))" "$LOG" | grep -q "completed an interrupted publish"'
+rm -f "$_INT"; rm -f "$_SIG"
+
 # ---- 12. the durable-publish path uses the REPO'S verified interpreter -------
 # A bare `python3` can be the Xcode-CLT stub: it "exists", fails on exec, and
 # raises an install dialog every interval while the snapshot stays stale.
