@@ -163,6 +163,38 @@ def record_asks(message: str, reviewer: str) -> int:
     return len(refs)
 
 
+def _actor_map(roster) -> dict:
+    """key -> canonical actor, over the CONNECTED COMPONENT of same_actor_as.
+
+    The links are mutual (a<->b) and can chain (c->b), so neither end is canonical
+    and following one hop splits a chain: with a<->b and c->b, min() sends a,b to
+    `a` but c to `b`, and one human is listed twice. Union by smallest key over
+    the whole component instead.
+    """
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            parent[hi] = lo
+
+    for k, v in (roster or {}).items():
+        if not isinstance(v, dict) or k.startswith("_"):
+            continue
+        find(k)
+        other = v.get("same_actor_as")
+        if other:
+            union(k, other)
+    return {k: find(k) for k in parent}
+
 def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     """(refuse, detail) — refuse re-asking the SAME non-responders after `minutes`.
 
@@ -213,13 +245,12 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         return False, ""
     # One human can hold several roster keys (jsun-m IS johnm-desktop). Listing
     # both overstates the pool and re-asks one person under two names.
+    actor_of = _actor_map(roster)
     seen_actors, unasked = set(), []
     for k, v in sorted((roster or {}).items()):
         if not isinstance(v, dict) or k.startswith("_"):
             continue
-        # same_actor_as links are MUTUAL (a<->b), so neither end is canonical;
-        # min() picks one deterministically for either direction of the pair.
-        actor = min(k, v.get("same_actor_as") or k)
+        actor = actor_of.get(k, k)
         if k in prior or k == "keweichen":
             seen_actors.add(actor)
             continue
