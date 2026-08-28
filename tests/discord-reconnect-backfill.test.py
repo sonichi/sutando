@@ -43,6 +43,11 @@ REPO = Path(__file__).resolve().parent.parent
 # paths at module-load time.
 _WORKSPACE_TMP = tempfile.mkdtemp(prefix="sutando-reconnect-backfill-test-")
 os.environ["SUTANDO_WORKSPACE"] = _WORKSPACE_TMP
+# Hermetic-bridge-test lint: explicit config root, access.json seeded under it.
+_CFG = tempfile.mkdtemp(prefix="reconnect-backfill-test-cfg-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CFG
+(Path(_CFG) / "channels" / "discord").mkdir(parents=True, exist_ok=True)
+(Path(_CFG) / "channels" / "discord" / "access.json").write_text('{"allowFrom": []}')
 os.environ["SUTANDO_TEST_MODE"] = "1"  # v0.8: opt-in env-honor
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 (Path(_WORKSPACE_TMP) / "state").mkdir(parents=True, exist_ok=True)
