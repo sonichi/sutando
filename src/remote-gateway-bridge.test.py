@@ -451,6 +451,15 @@ def main() -> int:
     check("access_tier: guest" in guest_body
           and "codex exec --sandbox read-only" in guest_body,
           "guest task retains the established read-only Codex delegation")
+    # Separate check, not ANDed above: a compound assertion that fails cannot say
+    # which half broke, and this half has its own failure mode. Without the stdin
+    # redirect codex waits on stdin and can hang to a timeout having produced
+    # nothing, which reads as "codex unavailable" on the one path that has no
+    # permitted fallback.
+    check("< /dev/null" in guest_body,
+          "guest delegation prescribes a stdin-safe codex invocation")
+    check("exits 0" in guest_body,
+          "guest delegation warns that codex's exit code is not evidence of an answer")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
     # present, and a newline in a name can't forge an extra field line.
     rtc._write_task({**TASK, "id": "task-CTX", "room_name": "#design",
