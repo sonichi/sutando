@@ -702,6 +702,8 @@ function resetSessionGateState(): void {
 // `meetingActive` boolean (this module owns that state) into the pure
 // resolver function.
 import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
+
+import { wireSanitizerToTransport } from './output_sanitizer.js';
 function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
@@ -1445,6 +1447,27 @@ async function main() {
 			} catch { /* test-only */ }
 		}, 250);
 	}
+	// Native audio streams transcript and audio concurrently, so suppression reaches only
+	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
+	(() => {
+		// Wiring lives in output_sanitizer.ts so it has a test seam: this adapter
+		// path had none, which is the standing review blocker on this PR.
+		wireSanitizerToTransport({
+			transport: (session as any).transport,
+			subscribe: (ev, fn) => session.eventBus.subscribe(ev as any, fn),
+			beforeTranscriptFlush: (reset) => {
+				// bodhi flushes the transcript 2-4 lines BEFORE publishing turn.end
+				// (dist/index.js:3019/3106/3177), so a subscriber runs too late.
+				const tm = (session as any).transcriptManager;
+				if (!tm || typeof tm.flush !== 'function') return;
+				const origFlush = tm.flush.bind(tm);
+				tm.flush = () => { try { reset(); } catch {} origFlush(); };
+			},
+			onBlocked: (buffered) =>
+				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
+			log: (m) => console.log(`${ts()} ${m}`),
+		});
+	})();
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
 	try {
