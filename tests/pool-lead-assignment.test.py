@@ -17,6 +17,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
+import pool_lead  # noqa: E402
 from pool_lead import AFFINITY_IDLE_S, PoolLead  # noqa: E402
 
 
@@ -281,6 +282,69 @@ class AffinityBusyYieldTest(unittest.TestCase):
         self._new_task()
         out = dict(self.lead.sweep())
         self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+
+class ReclaimSurvivesLostRacesTests(unittest.TestCase):
+    """Reclaim walks a directory the followers are renaming under it. One lost
+    rename must skip that file, not abandon the sweep and strand the rest."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.tasks = root / "tasks"
+        self.state = root / "state"
+        self.tasks.mkdir()
+        self.state.mkdir()
+        self.alive = {"core-a": True}
+        self.lead = PoolLead(
+            self.tasks, self.state,
+            followers_fn=lambda: list(self.alive),
+            alive_fn=lambda i: self.alive.get(i, False),
+            now_fn=lambda: 1000.0)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _flaky_rename(self):
+        real, seen = os.rename, []
+
+        def flaky(src, dst):
+            if not seen:
+                seen.append(src)
+                raise OSError("the follower got there first")
+            return real(src, dst)
+        return flaky
+
+    def _prove_alive_then_kill(self, suffix):
+        for n in ("r1", "r2"):
+            (self.tasks / f"task-{n}.{suffix}-core-a.txt").write_text("x")
+        # A cold lead defers one tick; the pool must be seen alive first.
+        self.lead.reclaim_dead()
+        self.lead.reclaim_claimed()
+        self.alive["core-a"] = False
+
+    def test_a_lost_assigned_rename_does_not_strand_the_others(self):
+        self._prove_alive_then_kill("assigned")
+        with mock.patch.object(pool_lead.os, "rename",
+                               side_effect=self._flaky_rename()):
+            reclaimed = self.lead.reclaim_dead()
+        self.assertEqual(len(reclaimed), 1, "one loss ended the reclaim sweep")
+
+    def test_a_lost_claimed_rename_does_not_strand_the_others(self):
+        self._prove_alive_then_kill("claimed")
+        with mock.patch.object(pool_lead.os, "rename",
+                               side_effect=self._flaky_rename()):
+            out = self.lead.reclaim_claimed()
+        self.assertEqual(len(out), 1, "one loss ended the reclaim sweep")
+
+    def test_an_unreadable_dir_counts_zero_load_rather_than_raising(self):
+        # _load is only reachable through _pick, whose own scan fails first on
+        # the same directory, so the branch is driven directly and on purpose.
+        self.tasks.chmod(0o000)
+        try:
+            self.assertEqual(self.lead._load("core-a"), 0)
+        finally:
+            self.tasks.chmod(0o700)
 
 
 class LeadDegradesOnFilesystemTroubleTests(unittest.TestCase):
