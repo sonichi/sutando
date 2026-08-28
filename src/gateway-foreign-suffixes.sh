@@ -8,8 +8,13 @@ derive_foreign_suffixes() {
     return 0
   fi
   local _dfs_out="" _dfs_var _dfs_inst
-  for _dfs_var in $(env | grep -o '^AG2_REMOTE_TOKEN_[A-Za-z0-9_][A-Za-z0-9_]*' || true); do
-    _dfs_inst="$(printf '%s' "${_dfs_var#AG2_REMOTE_TOKEN_}" | tr '[:upper:]' '[:lower:]')"
+  # Iterate NAMES: parsing `env` output cannot tell a real variable from a
+  # value carrying a newline that looks like an assignment.
+  for _dfs_var in ${!AG2_REMOTE_TOKEN_@}; do
+    _dfs_inst="${_dfs_var#AG2_REMOTE_TOKEN_}"
+    # A bare AG2_REMOTE_TOKEN_ names no instance; :.ag2.space is not a lane.
+    [ -n "$_dfs_inst" ] || continue
+    _dfs_inst="$(printf '%s' "$_dfs_inst" | tr '[:upper:]' '[:lower:]')"
     _dfs_out="${_dfs_out:+$_dfs_out,}:${_dfs_inst}.ag2.space"
   done
   printf '%s' "$_dfs_out"
