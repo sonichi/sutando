@@ -38,9 +38,8 @@ _spec = importlib.util.spec_from_file_location("slack_bridge", REPO / "src" / "s
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
-# Isolate the task/results dirs (as bridge-skill-path-resolution already does):
-# without this the checkout's tasks/ dir accumulates admitted ids across runs
-# and already_admitted replay-drops later test writes.
+# Isolated dirs: the checkout's tasks/ accumulates admitted ids across runs
+# and already_admitted would replay-drop later test writes.
 mod.TASKS_DIR = Path(_tmp) / "tasks"
 mod.RESULTS_DIR = Path(_tmp) / "results"
 mod.TASKS_DIR.mkdir(parents=True, exist_ok=True)
