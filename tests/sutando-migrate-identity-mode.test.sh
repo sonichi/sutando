@@ -206,6 +206,64 @@ check "a widened dest with NO mode table is refused"       "$(_md_probe table)" 
 check "a widened dest with an empty mode table is refused" "$(_md_probe rel)"   "refused"
 check "control: an intact manifest still certifies"        "$(_md_probe none)"  "certified"
 
+# --- control 4e: the STRUCTURAL branch obeys the same provenance rule ---
+
+# Same three-input chain as 4c but on a non-JSON path, which takes the
+# structural branch. Before the shared owner existed only union promoted.
+_s="$e2e/s"; SREL="scripts/tool.sh"
+mkdir -p "$_s/A/scripts" "$_s/B/scripts" "$_s/dest/scripts"
+printf 'version=3\n' > "$_s/dest/$SREL"; touch -t 202608281100 "$_s/dest/$SREL"
+printf 'version=3\n' > "$_s/A/$SREL";    touch -t 202608281300 "$_s/A/$SREL"
+printf 'version=2\n' > "$_s/B/$SREL";    touch -t 202608281200 "$_s/B/$SREL"
+_RUN_S(){ SUTANDO_MIGRATE_SRC_A="$_s/A" SUTANDO_MIGRATE_SRC_B="$_s/B" \
+          SUTANDO_MIGRATE_DEST="$_s/dest" bash scripts/sutando-migrate.sh "$@" >/dev/null 2>&1; }
+_RUN_S commit --source A
+_RUN_S commit --source B
+check "structural: the newest source survives an identical drop" \
+  "$(cat "$_s/dest/$SREL")" "version=3"
+
+# --- control 4f: a failed mtime promotion is write-failed, not a silent drop ---
+
+# Shadow only `touch -r`; every other touch must still work or the fixture
+# itself cannot be built.
+_tf="$(mktemp -d)"; mkdir -p "$_tf/bin"
+cat > "$_tf/bin/touch" <<'STUB'
+#!/bin/sh
+[ "$1" = "-r" ] && exit 1
+exec /usr/bin/touch "$@"
+STUB
+chmod +x "$_tf/bin/touch"
+mkdir -p "$_tf/A/scripts" "$_tf/dest/scripts"
+printf 'version=3\n' > "$_tf/dest/$SREL"; touch -t 202608281100 "$_tf/dest/$SREL"
+printf 'version=3\n' > "$_tf/A/$SREL";    touch -t 202608281300 "$_tf/A/$SREL"
+_tf_out="$(PATH="$_tf/bin:$PATH" SUTANDO_MIGRATE_SRC_A="$_tf/A" \
+           SUTANDO_MIGRATE_DEST="$_tf/dest" \
+           bash scripts/sutando-migrate.sh commit --source A 2>&1)"; _tf_rc=$?
+check "a failed identity-drop mtime promotion is reported, not swallowed" \
+  "$([ "$_tf_rc" -ne 0 ] && echo reported || echo swallowed)" "reported"
+rm -rf "$_tf"
+
+# --- control 4g: every union-class outcome leaves a verifiable expectation ---
+
+# Verify's mode check runs only where a manifest exists, so an outcome without
+# one is unprovable rather than proven-good.
+_uc_probe() {  # $1=fresh|drop -> certified|refused after a widen
+  local w; w="$(mktemp -d)"; mkdir -p "$w/A/state" "$w/dest/state"
+  printf '{"schemaVersion": 3, "allow": ["a"]}\n' > "$w/A/$REL"; chmod 0600 "$w/A/$REL"
+  if [ "$1" = "drop" ]; then
+    printf '{"schemaVersion": 3, "allow": ["a"]}\n' > "$w/dest/$REL"; chmod 0600 "$w/dest/$REL"
+  fi
+  SUTANDO_MIGRATE_SRC_A="$w/A" SUTANDO_MIGRATE_DEST="$w/dest" \
+    bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1
+  chmod 0644 "$w/dest/$REL"
+  SUTANDO_MIGRATE_SRC_A="$w/A" SUTANDO_MIGRATE_DEST="$w/dest" \
+    bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1
+  local rc=$?; rm -rf "$w"
+  [ "$rc" -eq 0 ] && echo certified || echo refused
+}
+check "a widened FRESH union copy is refused"    "$(_uc_probe fresh)" "refused"
+check "a widened identical-drop dest is refused" "$(_uc_probe drop)"  "refused"
+
 # --- control 5: byte_identical is a claim about BYTES, through the real JSON ---
 # Equal bytes, modes 0755 vs 0644 -> True; every DECISION still uses both fields.
 j5="$(mktemp -d -t migrate-json5.XXXXXX)"
