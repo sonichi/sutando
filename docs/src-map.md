@@ -103,6 +103,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
 - **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
+- **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
