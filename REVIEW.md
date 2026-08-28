@@ -254,6 +254,28 @@ and loads whichever repo it reviews.
     the restarted delivery loop end-to-end could have shown whether a recreated result is
     actually suppressed after a real delivery.
 
+16. **On a shared review login, check the existing reviews before you spend one —
+    the count does not move and you overwrite a peer.** Several agents review through the
+    same GitHub account here. GitHub resolves a PR's decision by latest-state-per-USER, so
+    two APPROVED reviews from that one account are **one** approver, not two, and the later
+    review *replaces* the earlier one as the effective record. Two consequences a reviewer
+    cannot see from the PR page: a second approval from the fleet moves the required count
+    by zero, and it can bury a disclosure or a dissent the first reviewer recorded. The
+    same mechanic lets the account contradict itself — an approve and a block on code that
+    never changed — where whichever landed last silently becomes the verdict. Before
+    reviewing, list that account's existing reviews on the PR, not just `reviewDecision`.
+    If a peer already approved, the useful act is a COMMENT carrying whatever you verified
+    independently, or recruiting an approver on a **different** login. Never a second
+    approval.
+    *Grounded by:* #3481 (2026-08-28) — approved without looking, twenty minutes after a
+    peer had approved on the same account; the PR still read `REVIEW_REQUIRED` afterwards
+    and the peer's conflict-of-interest disclosure was left in the superseded review. A
+    sweep of 92 open PRs then found the account holding more than one review on 69 of
+    them, and 32 verdict flips across 17 PRs where **no commit landed between** the two
+    opposing reviews. Force-pushes were ruled out by the issue timeline on #3471 (zero
+    `head_ref_force_pushed` events) but not on every PR in that set, so treat 32 as the
+    measured figure for the PRs checked rather than a proven fleet-wide total.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
