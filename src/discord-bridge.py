@@ -4810,10 +4810,8 @@ async def poll_results():
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
                 _task_collab = pending_task_collab.pop(task_id, None)
                 if _task_collab is None:
-                    # Restart-safe re-read — HEADERS ONLY. A substring scan of the
-                    # whole file lets a Team sender forge `collaborator: true` in
-                    # their BODY (qingyun, #3500 P1); split at `\ntask:` exactly
-                    # like resolve_access_tier so body text can never escalate.
+                    # HEADERS ONLY: split at the task marker exactly like
+                    # resolve_access_tier, so body text can never escalate a tier.
                     _tf_c = find_task_file(TASKS_DIR, task_id)
                     _task_collab = False
                     if _tf_c:
