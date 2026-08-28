@@ -14,6 +14,7 @@ Run: `python3 tests/signal_guest_handler.test.py` (repo `src/` on the path).
 """
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -147,4 +148,200 @@ def run() -> None:
     print("\nall ok")
 
 
+def run_error_paths() -> None:
+    """The fail-closed branches. Each is a path where the worker must degrade to a
+    written result rather than raise into the API thread or leak a slot."""
+    import types
+
+    # _guard: scanner raises -> withhold, never pass the body through unverified.
+    fake = types.ModuleType("policy.egress.result")
+    fake.guard_result_for_tier = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    saved = sys.modules.get("policy.egress.result")
+    sys.modules["policy.egress.result"] = fake
+    try:
+        check("guard withholds the body when the secret scanner raises",
+              g._guard("hello") == "[deep_dive result withheld: could not verify it is free of secrets]")
+    finally:
+        if saved is not None:
+            sys.modules["policy.egress.result"] = saved
+        else:
+            sys.modules.pop("policy.egress.result", None)
+
+    # _write_result: an unwritable dir must not raise (a lost result reads as pending).
+    raised = False
+    try:
+        g._write_result(Path("/dev/null/nope"), "signal-guest-x", "text")
+    except Exception:
+        raised = True
+    check("write_result swallows an unwritable result dir", not raised)
+
+    # _run: Popen raising -> no output -> the no-result message, and the slot comes back.
+    d = Path(tempfile.mkdtemp())
+    orig_popen = subprocess.Popen
+    before = _slot_count()
+    try:
+        subprocess.Popen = lambda *a, **k: (_ for _ in ()).throw(OSError("no codex"))
+        g._slots.acquire()
+        g._run("signal-guest-p", "q", d, lambda s: s, "/tmp/ch")
+    finally:
+        subprocess.Popen = orig_popen
+    body = (d / "signal-guest-p.txt").read_text()
+    check("spawn failure yields the no-result message", body == "[deep_dive returned no result]")
+    check("spawn failure releases its slot", _slot_count() == before)
+
+    # _run: a hung process is killed by group and still publishes a result.
+    class _Hung:
+        pid = 424242
+        returncode = None
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout or 0)
+        def kill(self):
+            pass
+    killed = {}
+    orig_killpg, orig_getpgid = os.killpg, os.getpgid
+    d2 = Path(tempfile.mkdtemp())
+    before2 = _slot_count()
+    try:
+        subprocess.Popen = lambda *a, **k: _Hung()
+        os.getpgid = lambda pid: pid
+        os.killpg = lambda pgid, sig: killed.update(pgid=pgid, sig=sig)
+        g._slots.acquire()
+        g._run("signal-guest-t", "q", d2, lambda s: s, "/tmp/ch")
+    finally:
+        subprocess.Popen, os.killpg, os.getpgid = orig_popen, orig_killpg, orig_getpgid
+    check("a hung worker is killed by PROCESS GROUP, not just pid",
+          killed.get("pgid") == 424242 and killed.get("sig") == signal.SIGKILL)
+    check("a hung worker still publishes a result",
+          (d2 / "signal-guest-t.txt").read_text() == "[deep_dive returned no result]")
+    check("a hung worker releases its slot", _slot_count() == before2)
+
+    # start_guest_deep_dive: thread start failing must release the slot AND write.
+    d3 = Path(tempfile.mkdtemp())
+    orig_thread, orig_which2 = g.threading.Thread, shutil.which
+    orig_home = os.environ.get("SIGNAL_GUEST_CODEX_HOME")
+    before3 = _slot_count()
+    try:
+        os.environ["SIGNAL_GUEST_CODEX_HOME"] = tempfile.mkdtemp()
+        shutil.which = lambda n: "/usr/bin/codex"
+        class _BadThread:
+            def __init__(self, **kw): pass
+            def start(self): raise RuntimeError("no threads")
+        g.threading.Thread = lambda *a, **k: _BadThread()
+        g.start_guest_deep_dive("signal-guest-th", "q", d3, lambda s: s)
+    finally:
+        g.threading.Thread, shutil.which = orig_thread, orig_which2
+        if orig_home is None:
+            os.environ.pop("SIGNAL_GUEST_CODEX_HOME", None)
+        else:
+            os.environ["SIGNAL_GUEST_CODEX_HOME"] = orig_home
+    check("thread-start failure writes an unavailable result",
+          "could not start a research worker" in (d3 / "signal-guest-th.txt").read_text())
+    check("thread-start failure does NOT leak a slot", _slot_count() == before3)
+
+
+def run_fallback_paths() -> None:
+    """The fallbacks INSIDE the fallbacks: each is reached only when the first
+    recovery attempt itself fails, so none of them run in the happy timeout path."""
+    orig_popen = subprocess.Popen
+    orig_killpg, orig_getpgid, orig_unlink = os.killpg, os.getpgid, os.unlink
+
+    # returncode 0 but the output file is unreadable -> out stays "" (no crash).
+    class _OkProc:
+        pid, returncode = 1, 0
+        def wait(self, timeout=None): return 0
+    d = Path(tempfile.mkdtemp())
+    before = _slot_count()
+    try:
+        subprocess.Popen = lambda *a, **k: _OkProc()
+        orig_read = Path.read_text
+        Path.read_text = lambda self, *a, **k: (_ for _ in ()).throw(OSError("unreadable"))
+        try:
+            g._slots.acquire()
+            g._run("signal-guest-r", "q", d, lambda s: s, "/tmp/ch")
+        finally:
+            Path.read_text = orig_read
+    finally:
+        subprocess.Popen = orig_popen
+    check("an unreadable worker output degrades to the no-result message",
+          (d / "signal-guest-r.txt").read_text() == "[deep_dive returned no result]")
+    check("unreadable output releases its slot", _slot_count() == before)
+
+    # killpg itself failing must fall back to proc.kill() and still publish.
+    class _Hung2:
+        pid, returncode = 7, None
+        killed = False
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="codex", timeout=1)
+        def kill(self):
+            type(self).killed = True
+    d2 = Path(tempfile.mkdtemp())
+    before2 = _slot_count()
+    try:
+        subprocess.Popen = lambda *a, **k: _Hung2()
+        os.getpgid = lambda pid: pid
+        os.killpg = lambda *a: (_ for _ in ()).throw(ProcessLookupError("gone"))
+        g._slots.acquire()
+        g._run("signal-guest-k", "q", d2, lambda s: s, "/tmp/ch")
+    finally:
+        subprocess.Popen, os.killpg, os.getpgid = orig_popen, orig_killpg, orig_getpgid
+    check("when killpg fails the worker falls back to proc.kill()", _Hung2.killed)
+    check("a kill fallback still publishes a result",
+          (d2 / "signal-guest-k.txt").read_text() == "[deep_dive returned no result]")
+    check("a kill fallback releases its slot", _slot_count() == before2)
+
+    # the temp-file cleanup must never raise out of `finally`.
+    d3 = Path(tempfile.mkdtemp())
+    before3 = _slot_count()
+    try:
+        subprocess.Popen = lambda *a, **k: (_ for _ in ()).throw(OSError("nope"))
+        os.unlink = lambda p: (_ for _ in ()).throw(OSError("cannot unlink"))
+        g._slots.acquire()
+        g._run("signal-guest-u", "q", d3, lambda s: s, "/tmp/ch")
+    finally:
+        subprocess.Popen, os.unlink = orig_popen, orig_unlink
+    check("a failing temp-file cleanup does not escape the worker",
+          (d3 / "signal-guest-u.txt").read_text() == "[deep_dive returned no result]")
+    check("a failing cleanup still releases its slot", _slot_count() == before3)
+
+    # a failure BEFORE the spawn (prompt/mkstemp) hits the outer guard.
+    d4 = Path(tempfile.mkdtemp())
+    before4 = _slot_count()
+    orig_mkstemp = tempfile.mkstemp
+    try:
+        # ONLY the worker's own mkstemp may fail — _write_result uses it too, and
+        # breaking that would test the harness rather than the outer guard.
+        calls = {"n": 0}
+
+        def _once(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("no temp")
+            return orig_mkstemp(*a, **k)
+
+        tempfile.mkstemp = _once
+        g._slots.acquire()
+        g._run("signal-guest-o", "q", d4, lambda s: s, "/tmp/ch")
+    finally:
+        tempfile.mkstemp = orig_mkstemp
+    check("a pre-spawn failure is caught by the outer guard",
+          (d4 / "signal-guest-o.txt").read_text() == "[deep_dive returned no result]")
+    check("a pre-spawn failure releases its slot", _slot_count() == before4)
+
+
+def _slot_count() -> int:
+    """How many slots are currently free (drain-and-restore, no state change)."""
+    n = 0
+    while g._slots.acquire(blocking=False):
+        n += 1
+    for _ in range(n):
+        g._slots.release()
+    return n
+
+
 run()
+run_error_paths()
+run_fallback_paths()
+if failures:
+    print(f"\n{failures} failure(s)")
+    raise SystemExit(1)
+print("all ok (error paths)")
