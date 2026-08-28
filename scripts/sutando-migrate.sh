@@ -1251,7 +1251,9 @@ if expected is not None:
     have = {k: v for k, v in d.items() if not isinstance(v, list)}
     if have != expected:
         sys.exit(1)
-scalar_winner = src_mt == dst_mt
+# The manifest already proved the scalars above; re-deriving a winner from
+# mtime there rejects a valid destination-winner union when the two tie.
+scalar_winner = expected is None and src_mt == dst_mt
 for key, val in s.items():
     if isinstance(val, list):
         dv = d.get(key)

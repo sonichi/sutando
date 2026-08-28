@@ -12,10 +12,8 @@ MIGRATE="$REPO/scripts/sutando-migrate.sh"
 TMP="$(mktemp -d -t sutando-mig-failclosed.XXXXXX)"
 trap 'chmod -R u+w "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
 
-# Portable octal file mode. `stat -f %Lp` is the BSD/macOS spelling; on GNU
-# coreutils `-f` is --file-system, which EXITS 0 printing filesystem info — so
-# a `stat -f ... || stat -c ...` chain never reaches its fallback on Linux and
-# compares the wrong command's output. Ask python; it means the same on both.
+# Portable octal mode: GNU `stat -f` is --file-system and EXITS 0, so a
+# `stat -f ... || stat -c ...` chain never reaches its fallback on Linux.
 _mode() {
     python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$1"
 }
@@ -290,6 +288,26 @@ check "a pristine private union passes verify" [ "$rc" -eq 0 ]
 chmod 644 "$MODE_DST"
 rc=0; RUN --verify > "$TMP/modes-verify-widened.log" 2>&1 || rc=$?
 check "a WIDENED union fails verify though its content is untouched" [ "$rc" -ne 0 ]
+
+# 9. Equal mtimes, different scalars. With a manifest the winner is RECORDED, so
+# re-deriving one from mtime is what rejected a valid destination winner.
+new_case equal_mtime
+mkdir -p "$CASE_A/state"
+printf '{"users": ["alice"], "schemaVersion": 1}\n' > "$CASE_A/state/slack-allowed-recipients.json"
+printf '{"users": ["bob"], "schemaVersion": 2}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
+# The tie is the whole point: same stamp on both sides, to the second.
+touch -t 202601010000 "$CASE_A/state/slack-allowed-recipients.json" \
+    "$CASE_DEST/state/slack-allowed-recipients.json"
+EQ_SRC_MT="$(python3 -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$CASE_A/state/slack-allowed-recipients.json")"
+EQ_DST_MT="$(python3 -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$CASE_DEST/state/slack-allowed-recipients.json")"
+check "the fixture actually ties the mtimes" [ "$EQ_SRC_MT" = "$EQ_DST_MT" ]
+rc=0; RUN --commit > "$TMP/eqmt-commit.log" 2>&1 || rc=$?
+check "an equal-mtime union commits" [ "$rc" -eq 0 ]
+check "both sides' array entries survive the union" \
+    bash -c "grep -q alice '$CASE_DEST/state/slack-allowed-recipients.json' && grep -q bob '$CASE_DEST/state/slack-allowed-recipients.json'"
+rc=0; RUN --verify > "$TMP/eqmt-verify.log" 2>&1 || rc=$?
+[ "$rc" -eq 0 ] || { echo "--- eqmt verify log (rc=$rc) ---"; cat "$TMP/eqmt-verify.log"; echo "---"; }
+check "an equal-mtime union passes verify" [ "$rc" -eq 0 ]
 chmod 600 "$MODE_DST"
 
 echo ""
