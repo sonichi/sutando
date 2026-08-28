@@ -126,6 +126,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { throw 'file-lock.test.py failed' }
+          python tests/access-store-concurrency.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'access-store-concurrency.test.py failed' }
           python tests/task-workstreams.test.py
           if ($LASTEXITCODE -ne 0) { throw 'task-workstreams.test.py failed' }
           python tests/signal_guest_handler.test.py
