@@ -247,6 +247,19 @@ class PriorArtTest(unittest.TestCase):
         self.assertNotIn("early", shown, "precondition: prose list truncated it away")
         self.assertIn("early", "\n".join(pf.verdict_block(verdicts)))
 
+    def test_verdict_unknown_and_verdict_none_do_not_render_alike(self):
+        """The same load-bearing distinction the prose block already makes.
+
+        None means the lookup failed; [] means it succeeded and found no
+        decisive review. Rendering them alike would let a failed check read as
+        a clean one — the exact substitution lesson 16 tells a reviewer to
+        avoid, one layer down."""
+        unknown = "\n".join(pf.verdict_block(None))
+        none = "\n".join(pf.verdict_block([]))
+        self.assertIn("COULD NOT CHECK", unknown)
+        self.assertNotIn("COULD NOT CHECK", none)
+        self.assertNotEqual(unknown, none)
+
     def test_latest_verdict_per_login_regardless_of_row_order(self):
         """Newest wins even when the endpoint returns rows out of order."""
         run = self._runner(reviews='[{"submitted_at":"t9","user":{"login":"a"},'
