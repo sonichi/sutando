@@ -24,8 +24,7 @@ def load(d):
     # Either store may exist alone; a host with only reviewer-stands.json
     # must not crash here or sessions fall back to hand-rolled lookups.
     q, ents = {}, []
-    # Each store is loaded on its OWN existence check — either may exist alone,
-    # and shapes vary per host: wrapped {quick_lookup:}, flat {people:}, MALFORMED.
+    # Each store loads on its OWN existence check — either may exist alone.
     yp = d / "quick-lookup.yaml"
     if yp.exists():
         import yaml
