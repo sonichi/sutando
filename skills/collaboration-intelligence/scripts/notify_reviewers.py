@@ -126,8 +126,11 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
 
 def command_for(target: dict, message: str) -> "list[str]":
     body = message
-    if target.get("human") and target["human"] not in body:
-        body = f"{body} (cc {target['human']})"
+    # Roster "human" is a room handle for some entries and a structured record
+    # (discord id, username) for others; only the former is addressable here.
+    human = target.get("human")
+    if isinstance(human, str) and human and human not in body:
+        body = f"{body} (cc {human})"
     return [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
             "mention", target["stand"], body, target["room"]]
 
