@@ -76,7 +76,8 @@ def get_weather() -> str:
         )
         # Use lat/lon from env if set
         import os
-        if os.environ.get("WEATHER_LAT") and os.environ.get("WEATHER_LON"):
+        configured = bool(os.environ.get("WEATHER_LAT") and os.environ.get("WEATHER_LON"))
+        if configured:
             lat = float(os.environ["WEATHER_LAT"])
             lon = float(os.environ["WEATHER_LON"])
 
@@ -98,7 +99,11 @@ def get_weather() -> str:
         rain = day["precipitation_probability_max"][0]
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
-        return f"{temp}°F and {desc}, high of {high}, low of {low}{rain_note}"
+        # Naming the fallback keeps an unconfigured install from stating a city
+        # the owner has never been in as if it were their own weather.
+        where = "" if configured else (
+            " in San Francisco (default location — set WEATHER_LAT/WEATHER_LON for yours)")
+        return f"{temp}°F and {desc}{where}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
 
