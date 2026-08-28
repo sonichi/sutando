@@ -198,5 +198,63 @@ class MetricsTests(FinishTests):
         self.assertTrue((self.tasks / "archive" / "task-a1.txt").exists())
 
 
+class DefensiveReadTests(unittest.TestCase):
+    """The two OSError arms. Both are bookkeeping — neither may fail a task
+    that has already completed, which is exactly what makes them easy to leave
+    unexercised."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_unreadable_claim_yields_no_source_not_an_error(self):
+        # A directory where the claim should be: read_text raises OSError.
+        d = self.root / "task-x.claimed-core-1.txt"
+        d.mkdir()
+        self.assertEqual(pf._source_of(d), "")
+
+    def test_a_readable_claim_still_yields_its_source(self):
+        # Positive control: without it, a _source_of that returned "" always
+        # would satisfy the assertion above.
+        f = self.root / "task-y.claimed-core-1.txt"
+        f.write_text("id: task-y\nsource: ag2space\n\nbody\n")
+        self.assertEqual(pf._source_of(f), "ag2space")
+
+    def test_a_blank_line_ends_the_header_scan(self):
+        # `source:` below the blank line belongs to the BODY, not the header
+        # block, so it must not be read as the task's source.
+        f = self.root / "task-w.claimed-core-1.txt"
+        f.write_text("id: task-w\n\nsource: forged-by-the-body\n")
+        self.assertEqual(pf._source_of(f), "")
+
+    def test_unstattable_claim_records_no_arrival_but_still_finishes(self):
+        tasks, results, state = (self.root / "tasks", self.root / "results",
+                                 self.root / "state")
+        tasks.mkdir()
+        claimed = tasks / "task-z.claimed-core-1.txt"
+        claimed.write_text("id: task-z\nsource: chat\n\nbody\n")
+        metrics = self.root / "data" / "pool-metrics.jsonl"
+
+        real_stat = Path.stat
+
+        def stat(self, *a, **kw):
+            if self.name == "task-z.claimed-core-1.txt":
+                raise OSError(5, "simulated stat failure")
+            return real_stat(self, *a, **kw)
+
+        Path.stat = stat
+        try:
+            out = pf.finish_task(tasks, results, state, "core-1", claimed,
+                                 "task: z\nthe answer\n", metrics)
+        finally:
+            Path.stat = real_stat
+
+        self.assertTrue(out.exists(), "the result is still written")
+        rec = json.loads(metrics.read_text().strip())
+        self.assertIsNone(rec["arrived_at"], "arrival is unknown, not invented")
+        self.assertIsNone(rec["duration_s"], "and duration stays unknown too")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
