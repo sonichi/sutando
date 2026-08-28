@@ -508,6 +508,7 @@ def media_attachment_headers(attachment_refs: Iterable["AttachmentRef"], has_tex
 # ── Archive rules ────────────────────────────────────────────────────────────
 
 _MONTH_DIR_RE = re.compile(r"^\d{4}-\d{2}$")
+_RETENTION_DIR_RE = re.compile(r"^archive-\d{4}-\d{2}-\d{2}$")
 # The gateway's flat archive suffix is an epoch stamp and nothing else.
 _EPOCH_SUFFIX_RE = re.compile(r"^\d+$")
 
@@ -524,8 +525,11 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate an archived result across BOTH layouts in use.
 
     The messaging bridges archive as `archive/<YYYY-MM>/<id>.txt` via
-    `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`.
-    A locator that knows only one silently returns None for the other, which
+    `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`;
+    startup retention (`src/archive-stale-results.py`, run from `startup.sh`)
+    moves stale results to `archive-<YYYY-MM-DD>/<id>.txt`, a SIBLING of
+    `archive/` rather than a child of it.
+    A locator that knows only one silently returns None for the others, which
     reads as "this task never delivered" — the wrong answer for any caller
     deciding whether a delivery happened.
 
@@ -551,6 +555,20 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
         months = []
     for month in months:
         candidate = archive / month / fname
+        if candidate.is_file():
+            return candidate
+
+    # Retention dirs are SIBLINGS of archive/, so they need their own scan;
+    # newest day first, name-filtered before is_dir, as the month scan is.
+    try:
+        with os.scandir(Path(results_dir)) as entries:
+            days = sorted((e.name for e in entries
+                           if _RETENTION_DIR_RE.match(e.name) and e.is_dir()),
+                          reverse=True)
+    except (OSError, ValueError):
+        days = []
+    for day in days:
+        candidate = Path(results_dir) / day / fname
         if candidate.is_file():
             return candidate
 
