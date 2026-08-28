@@ -878,5 +878,86 @@ class Round12Controls(unittest.TestCase):
                 qp.MAX_LINES = old
 
 
+
+class Round12AcceptanceCriteria(unittest.TestCase):
+    """kewei's fixed acceptance shapes (2026-08-28): the tombstone is a
+    high-water mark, never a permanent seal, and it survives compaction;
+    truncation choice and current-hood are separate axes."""
+
+    def _tombstone_sequence(self, hp, now):
+        self.assertTrue(qp.record_sample(
+            state(50, 999000, 40, 1200000, 990000), hp, now=now))
+        self.assertFalse(qp.record_sample(
+            state(None, None, None, None, 990200.0), hp, now=now))
+        qp._latest_path(hp).unlink()
+        self.assertFalse(qp.record_sample(
+            state(60, 999100, 45, 1200000, 990100), hp, now=now))
+
+    def test_a_later_valid_sample_clears_the_tombstone(self):
+        # High-water, not a seal: 990300 after the reject sequence is a
+        # normal accept, and its window becomes current again.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 990400.0
+            self._tombstone_sequence(hp, now)
+            self.assertTrue(qp.record_sample(
+                state(70, 999300, 50, 1200000, 990300), hp, now=now))
+            payload = qp.chart_payload(hp, now=now)
+            cur = [s["reset"] for s in payload["windows"]["5h"]["segments"]
+                   if s["current"]]
+            self.assertEqual(cur, [999300])
+
+    def test_the_rejection_holds_after_compaction(self):
+        # Same sequence with the cap forcing a compaction rewrite first:
+        # compaction must not resurrect the pre-tombstone current.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 990400.0
+            old = qp.MAX_LINES
+            qp.MAX_LINES = 2
+            try:
+                self._tombstone_sequence(hp, now)
+                self.assertLessEqual(len(hp.read_text().splitlines()), 2)
+                self.assertFalse(qp.record_sample(
+                    state(60, 999100, 45, 1200000, 990100), hp, now=now))
+                payload = qp.chart_payload(hp, now=now)
+                self.assertEqual(
+                    [s for s in payload["windows"]["5h"]["segments"]
+                     if s["current"]], [])
+            finally:
+                qp.MAX_LINES = old
+
+    def test_widening_max_windows_does_not_change_current_identity(self):
+        # max_windows=5 shows one more HISTORY segment; current stays [1600].
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 1560.0
+            for i, (reset, ts) in enumerate(
+                    ((17500, 100), (18000, 200), (18500, 600),
+                     (19000, 1100), (19500, 1501))):
+                self.assertTrue(qp.record_sample(
+                    state(10 + i, reset, None, None, float(ts)), hp, now=now))
+            self.assertTrue(qp.record_sample(
+                state(30, 1600, None, None, 1550.0), hp, now=now))
+            for mw in (4, 5):
+                payload = qp.chart_payload(hp, now=now, max_windows=mw)
+                segs = payload["windows"]["5h"]["segments"]
+                self.assertEqual(
+                    [s["reset"] for s in segs if s["current"]], [1600],
+                    f"max_windows={mw}")
+            self.assertEqual(len(qp.chart_payload(hp, now=now, max_windows=5)
+                                 ["windows"]["5h"]["segments"]), 5)
+
+    def test_an_open_window_still_projects(self):
+        # Anti-overcorrection: same shape as the expired control but with
+        # now < reset — exactly one current, projection present.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"
+            self.assertTrue(qp.record_sample(
+                state(72, 101000, None, None, 100000), hp, now=100001.0))
+            payload = qp.chart_payload(hp, now=100500.0)
+            cur = [s for s in payload["windows"]["5h"]["segments"]
+                   if s["current"]]
+            self.assertEqual(len(cur), 1)
+            self.assertIn("projected_end", cur[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
