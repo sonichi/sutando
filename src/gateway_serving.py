@@ -27,7 +27,11 @@ def _num(v, *, nonneg: bool = False) -> float | None:
     isinstance(_, int) and would make `True` a valid timestamp."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    f = float(v)
+    # json parses ints of any size; float() raises OverflowError past ~1e308.
+    try:
+        f = float(v)
+    except OverflowError:
+        return None
     if f != f or f in (float("inf"), float("-inf")):
         return None
     if nonneg and f < 0:

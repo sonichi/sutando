@@ -35,6 +35,7 @@ import gateway_serving as gs  # noqa: E402
 
 NOW = time.time()
 NAN, INF = float("nan"), float("inf")
+HUGE = 10 ** 400  # valid JSON, unrepresentable as a float
 failures = []
 
 # ---------------------------------------------------------------- contract
@@ -105,6 +106,10 @@ MALFORMED = [
     ("ts is NaN",                       {"ts": NAN, "connected": True, "last_ok_ts": NOW}, None),
     ("ts is Infinity",                  {"ts": INF, "connected": True, "last_ok_ts": NOW}, None),
     ("last_ok_ts is NaN",               {"ts": NOW, "connected": True, "last_ok_ts": NAN}, False),
+    # json parses ints of any size; float() raises OverflowError, which is an
+    # ArithmeticError and so escapes read_verdict's ValueError/TypeError catch.
+    ("ts is a huge int",                {"ts": HUGE, "connected": True, "last_ok_ts": NOW}, None),
+    ("last_ok_ts is a huge int",        {"ts": NOW, "connected": True, "last_ok_ts": HUGE}, False),
 ]
 malformed_checked = len(MALFORMED)
 for _label, _rec, _want in MALFORMED:
@@ -124,6 +129,19 @@ malformed_checked += 1
 _v = gs.verdict_from_record({"ts": NOW, "connected": True, "last_ok_ts": NOW, "backoff_s": -5}, now=NOW, max_age=300)
 if _v is None or _v.serving is not True or _v.backoff_s is not None:
     failures.append("malformed: a negative backoff_s must be dropped, not change serving")
+malformed_checked += 1
+
+for _bad in (-5, HUGE, NAN):
+    _v = gs.verdict_from_record({"ts": NOW, "connected": True, "last_ok_ts": NOW, "backoff_s": _bad}, now=NOW, max_age=300)
+    if _v is None or _v.serving is not True or _v.backoff_s is not None:
+        failures.append(f"malformed: backoff_s={_bad!r} must be dropped without changing serving")
+    malformed_checked += 1
+
+# qingyun ran the overflow control through the FILE path, so pin that path too.
+_p = Path(tempfile.mkdtemp()) / "gw.json"
+_p.write_text('{"ts": ' + "1" + "0" * 400 + ', "connected": true, "last_ok_ts": 1}')
+if gs.read_verdict(_p, now=NOW, max_age=300) is not None:
+    failures.append("malformed: a huge int via read_verdict must be no opinion, not a raise")
 malformed_checked += 1
 
 # ------------------------------------------ reader-specific edges preserved
