@@ -6055,6 +6055,33 @@ def check_daily_cron_punctuality() -> dict:
     return _interpret_daily_punctuality(jobs)
 
 
+def _porcelain_z_tracked_paths(porcelain: str) -> "list[str]":
+    """Tracked-change paths from `git status --porcelain -z`.
+
+    Rename/copy records carry the destination first and the original as a
+    second NUL field; the destination is the path that exists on disk, so
+    returning it is what makes an age check possible.  The `-z` form is used
+    because the default rendering spells a rename `R  old -> new`, which is a
+    literal arrow in the middle of an unusable path.
+    """
+    out = []
+    fields = porcelain.split("\0")
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        i += 1
+        if not rec:
+            continue
+        xy, path = rec[:2], rec[3:]
+        if xy == "??" or not xy.strip():
+            continue
+        if "R" in xy or "C" in xy:
+            i += 1  # skip the original-path field this record also emitted
+        if path:
+            out.append(path)
+    return out
+
+
 def check_live_tree_drift(repo_root: "Path | None" = None,
                           behind_max: int = 30,
                           dirty_age_max_s: int = 86400) -> dict:
@@ -6082,15 +6109,14 @@ def check_live_tree_drift(repo_root: "Path | None" = None,
             rc2, n = _git("rev-list", "--count", f"HEAD..{up}")
             if rc2 == 0 and n.isdigit():
                 behind = int(n)
-        rc, porcelain = _git("status", "--porcelain")
+        rc, porcelain = _git("status", "--porcelain", "-z")
         if rc != 0:
             # A failed read yields empty stdout, which would read as a clean
             # tree -- the one verdict this probe exists to prevent.
             return {"name": name, "status": "warn",
                     "detail": "git status failed — the working tree is UNMEASURED, "
                               "not clean; a stale dirty checkout is invisible here"}
-        dirty = [l[3:] for l in porcelain.splitlines()
-                 if l[:2].strip() and not l.startswith("??")]
+        dirty = _porcelain_z_tracked_paths(porcelain)
         now = time.time()
         stale = []
         for rel in dirty:

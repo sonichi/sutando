@@ -145,6 +145,30 @@ class LiveTreeDrift(unittest.TestCase):
         self.assertNotIn("tracked dirty", r["detail"],
                          "reported a dirty count it never measured")
 
+    def test_old_staged_rename_warns(self):
+        _git(self.clone, "mv", "f.txt", "renamed.txt")
+        _git(self.clone, "add", "-A")
+        old = time.time() - 2 * 86400
+        os.utime(self.clone / "renamed.txt", (old, old))
+        r = hc.check_live_tree_drift(repo_root=self.clone)
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("renamed.txt", r["detail"], "named the arrow record, not the file")
+
+    def test_fresh_staged_rename_stays_ok(self):
+        # Control: without this, always-warn would satisfy the test above.
+        _git(self.clone, "mv", "f.txt", "renamed.txt")
+        _git(self.clone, "add", "-A")
+        r = hc.check_live_tree_drift(repo_root=self.clone)
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("1 tracked dirty", r["detail"])
+
+    def test_porcelain_z_returns_rename_destination(self):
+        # -z packs a rename as destination NUL original NUL; the destination is
+        # the path that exists on disk, so only it can be age-checked.
+        rec = hc._porcelain_z_tracked_paths("R  new.txt\x00old.txt\x00 M plain.txt\x00")
+        self.assertEqual(rec, ["new.txt", "plain.txt"])
+        self.assertEqual(hc._porcelain_z_tracked_paths("?? junk.txt\x00"), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
