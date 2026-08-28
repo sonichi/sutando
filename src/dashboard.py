@@ -642,9 +642,8 @@ def get_current_model() -> str:
     model actually answering. Empty string when unreadable — the tile shows
     nothing rather than a guess."""
     try:
-        # THIS core's project only — its slug is the repo path with "/" mapped
-        # to "-" (Claude Code's convention). Newest-across-all-slugs elects any
-        # later-writing reviewer worktree or subagent (#3499 review P2).
+        # THIS core's project only: the slug is the repo path with "/" mapped to "-".
+        # Newest-across-all-slugs would elect another worktree's or subagent's file.
         slug = str(REPO_DIR.resolve()).replace("/", "-")
         proj = WORKSPACE_DIR / ".claude-sutando" / "projects" / slug
         tr = max(proj.glob("*.jsonl"), key=lambda f: f.stat().st_mtime)
