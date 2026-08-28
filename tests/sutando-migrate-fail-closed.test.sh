@@ -196,6 +196,59 @@ PY
 rc=0; RUN --verify > "$TMP/destwin-verify-corrupt.log" 2>&1 || rc=$?
 check "a corrupted DEST-WINNER scalar fails verify (the reviewer's paired control)" [ "$rc" -ne 0 ]
 
+echo "7. MANIFEST AUTHORITY: a damaged manifest fails verify, never degrades to mtime"
+MANIFEST="$(ls "$CASE_DEST/state/.migration-union-scalars-"*.json | head -1)"
+GOOD_MANIFEST="$(cat "$MANIFEST")"
+# 7a. malformed manifest + corrupted dest-winner scalar -> must FAIL
+python3 - "$DW_DST" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+mt = os.path.getmtime(p)
+d = json.load(open(p))
+d["schemaVersion"] = 999
+json.dump(d, open(p, "w"), indent=2, sort_keys=True)
+os.utime(p, (mt, mt))
+PY
+printf 'not json{' > "$MANIFEST"
+rc=0; RUN --verify > "$TMP/manifest-malformed.log" 2>&1 || rc=$?
+check "malformed manifest + corrupt scalar FAILS verify (no mtime degrade)" [ "$rc" -ne 0 ]
+# 7b. entry deleted from an otherwise-valid manifest -> must FAIL
+printf '{}' > "$MANIFEST"
+rc=0; RUN --verify > "$TMP/manifest-missing-entry.log" 2>&1 || rc=$?
+check "missing rel entry in a present manifest FAILS verify" [ "$rc" -ne 0 ]
+# 7c. restore manifest, dest still corrupt -> still fails (via the entry)
+printf '%s' "$GOOD_MANIFEST" > "$MANIFEST"
+rc=0; RUN --verify > "$TMP/manifest-restored-corrupt.log" 2>&1 || rc=$?
+check "restored manifest still catches the corrupt scalar (control)" [ "$rc" -ne 0 ]
+# 7d. recorder refuses an invalid existing manifest instead of replacing it
+new_case recorder-guard
+mkdir -p "$CASE_A/state"
+printf '{"users": ["x"], "schemaVersion": 1}\n' > "$CASE_A/state/slack-allowed-recipients.json"
+printf '{"users": ["y"], "schemaVersion": 2}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
+touch -t 202606011300 "$CASE_A/state/slack-allowed-recipients.json"
+touch -t 202606011200 "$CASE_DEST/state/slack-allowed-recipients.json"
+# pre-plant an invalid manifest for EVERY possible backup id? The id is minted
+# at run time — plant via the same glob shape the recorder writes and verify
+# reads... the recorder writes a NEW id, so instead assert on the direct
+# helper: drive record_union_scalars against an invalid manifest file.
+INVALID="$TMP/invalid-manifest.json"
+printf 'not json{' > "$INVALID"
+REC_FN="$TMP/record_fn.sh"
+python3 - "$MIGRATE" "$REC_FN" "$REPO" <<'PYX'
+import sys
+src, out, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
+i = s.index("record_union_scalars() {")
+j = s.index("\n}\n", i) + 3
+open(out, "w").write(
+    f'SCRIPT_DIR="{repo}/scripts"\nREPO_DIR="{repo}"\n'
+    f'. "{repo}/scripts/python-binary.sh"\n\n' + s[i:j])
+PYX
+rc=0
+( . "$REC_FN"; record_union_scalars "$CASE_A/state/slack-allowed-recipients.json" "state/x.json" "$INVALID" ) || rc=$?
+check "recorder REFUSES an invalid existing manifest (rc != 0)" [ "$rc" -ne 0 ]
+check "...and did not replace it with {}" bash -c "grep -q 'not json{' '$INVALID'"
+
 echo ""
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
