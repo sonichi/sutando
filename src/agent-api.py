@@ -127,6 +127,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -188,13 +189,18 @@ def _task_display_fields_for_id(task_id: str) -> tuple[str, str]:
         return "", ""
     try:
         return _task_display_fields(task_file.read_text())
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Same pair readiness.py catches: a partial write mid-character raises
+        # UnicodeDecodeError, which is a ValueError and escapes bare OSError.
         return "", ""
 
 
 def _remember_done_result_file(result_file: Path) -> None:
     task_id = result_file.stem
-    result_content = result_file.read_text().strip()
+    # Existence is not doneness: a body still being written is not a result.
+    result_content = read_ready_result(result_file)
+    if result_content is None:
+        return
     task_line, source_line = _task_display_fields_for_id(task_id)
     display_text = task_line or (result_content.split('\n')[0][:80] if result_content else task_id)
 
@@ -359,29 +365,24 @@ def _active_task_rows() -> list[dict]:
         task_id = task_id_from_filename(task_file.name)
         if task_id is None:
             continue
-        content = task_file.read_text()
+        # Freshest-first over a dir a bridge is writing: never decode strictly.
+        content = task_file.read_text(errors="replace")
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
-        result_file = RESULT_DIR / f"{task_id}.txt"
         existing = task_history.get(task_id, {})
-        # Priority: live file, then in-memory history, then archive. The
-        # archive lookup is what survives a restart, when history is empty.
-        archived_file = None
-        for month_dir in (RESULT_DIR / "archive").glob("*/"):
-            candidate = month_dir / f"{task_id}.txt"
-            if candidate.exists():
-                archived_file = candidate
-                break
-        if result_file.exists():
+        # One owner for candidates AND readiness. An authoritative `pending`
+        # outranks the cache: cache and older candidates are both superseded.
+        state, _found, body = local_task_protocol.resolve_result(RESULT_DIR, task_id)
+        if state == "ready":
             status = "done"
-            result_text = result_file.read_text().strip()
+            result_text = body
+        elif state == "pending":
+            status = "working"
+            result_text = ""
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
-        elif archived_file is not None:
-            status = "done"
-            result_text = archived_file.read_text().strip()
         else:
             status = "working"
             result_text = ""
@@ -410,9 +411,10 @@ def _active_task_rows() -> list[dict]:
             continue
         task_file = TASK_DIR / f"{task_id}.txt"
         result_file = RESULT_DIR / f"{task_id}.txt"
-        if result_file.exists():
+        body = read_ready_result(result_file)
+        if body is not None:
             task_data["status"] = "done"
-            task_data["result"] = result_file.read_text().strip()
+            task_data["result"] = body
         elif not task_file.exists() and _time.time() - task_data.get("time", 0) > 300:
             stale_ids.append(task_id)
     for task_id in stale_ids:
@@ -613,22 +615,26 @@ def delegation_archive_result(data: dict):
 
 
 def get_task_result(task_id: str):
-    """Check if a task result exists."""
-    result_file = _safe_path(RESULT_DIR, task_id)
-    if result_file and result_file.exists():
-        return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
-    # Check archive — task-bridge archives results within seconds of delivery,
-    # so direct /result polls often arrive after the file has been moved.
+    """Check if a task result exists.
+
+    Candidates are consulted in priority order — live first, then newest
+    archive — mirroring local_task_protocol.find_result. The FIRST candidate
+    that exists but is not yet readable ENDS the search as `pending`: falling
+    past it to an older one answers `completed` with a superseded body, and
+    that is terminal, so the client stops polling and the newer answer is
+    stranded. `pending` is merely retryable.
+    """
     safe_id = _safe_id(task_id)
     if safe_id:
-        filename = f"{safe_id}.txt"
-        for month_dir in sorted((RESULT_DIR / "archive").glob("*/"), reverse=True):
-            candidate = month_dir / filename
-            if candidate.exists():
-                return {"task_id": safe_id, "status": "completed", "result": candidate.read_text()}
+        # Readiness, not existence: a body read mid-write decodes fatally.
+        state, _found, body = local_task_protocol.resolve_result(RESULT_DIR, safe_id)
+        if state == "ready":
+            return {"task_id": safe_id, "status": "completed", "result": body}
+        if state == "pending":
+            return {"task_id": safe_id, "status": "pending"}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
-        return {"task_id": _safe_id(task_id), "status": "pending"}
+        return {"task_id": safe_id, "status": "pending"}
     return None
 
 

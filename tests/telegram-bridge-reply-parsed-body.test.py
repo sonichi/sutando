@@ -41,12 +41,19 @@ class TestTelegramBridgeReplyParsedBody(unittest.TestCase):
         substring search for `.keys()` would find nothing at all, or could
         match the wrong location if the internals change again.
         """
-        start = SRC.find("for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):")
+        anchor = "for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):"
+        start = SRC.find(anchor)
         self.assertGreater(start, 0, "pending_replies loop not found in telegram-bridge.py")
-        # Grab a generous window covering the whole loop body (now includes the
-        # per-reply channel.telegram.out obs emit, so the confirmation print sits
-        # ~3.6k chars in). Still ends well before any unrelated code.
-        return SRC[start : start + 4500]
+        # End at the loop's own dedent, not a character count: a fixed window
+        # drops assertions off the end as the body grows, or overruns into other code.
+        lines = SRC[start:].splitlines(keepends=True)
+        indent = len(lines[0]) - len(lines[0].lstrip())
+        body = [lines[0]]
+        for line in lines[1:]:
+            if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+                break
+            body.append(line)
+        return "".join(body)
 
     def test_send_reply_uses_parsed_body_not_reply_text(self):
         """send_reply() must receive parsed.body, not the raw reply_text.

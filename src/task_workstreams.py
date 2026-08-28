@@ -209,33 +209,11 @@ def _task_paths(tasks_dir: Path):
         yield path
 
 
-def _result_index(results_dir: Path) -> dict[str, Path]:
-    found: dict[str, Path] = {}
-    roots = [results_dir]
-    try:
-        roots.extend(p for p in results_dir.iterdir() if p.is_dir() and p.name.startswith("archive"))
-    except OSError:
-        pass
-    for root in roots:
-        try:
-            paths = root.glob("task-*.txt") if root == results_dir else root.rglob("task-*.txt")
-            for path in paths:
-                old = found.get(path.stem)
-                try:
-                    if old is None or path.stat().st_mtime > old.stat().st_mtime:
-                        found[path.stem] = path
-                except OSError:
-                    continue
-        except OSError:
-            continue
-    return found
-
-
 def scan_task_history(workspace: Path) -> list[TaskRecord]:
     """Reconstruct canonical history from live and archived task records."""
     workspace = Path(workspace)
     tasks_dir = workspace / "tasks"
-    results = _result_index(workspace / "results")
+    results_dir = workspace / "results"
     rows: list[TaskRecord] = []
     for path in _task_paths(tasks_dir):
         task_id = path.stem
@@ -256,15 +234,15 @@ def scan_task_history(workspace: Path) -> list[TaskRecord]:
             continue
         access_tier = str(headers.get("access_tier") or "owner").lower()
         invoked = _parse_timestamp(str(headers.get("timestamp") or ""), mtime)
-        result_path = results.get(task_id)
-        result = ""
-        if result_path is not None:
-            try:
-                result = result_path.read_text(errors="replace")[:MAX_RESULT_CHARS].strip()
-            except OSError:
-                result = ""
+        # Through the readiness owner, not a private index: errors="replace" made a
+        # torn body look done, and a stem-keyed index missed the archive layouts.
+        state, result_path, body = local_task_protocol.resolve_result(
+            results_dir, task_id)
+        result = (body or "")[:MAX_RESULT_CHARS].strip() if state == "ready" else ""
         live = path.parent == tasks_dir
-        status = "working" if live and result_path is None else "done"
+        # An archived task with no readable result stays done — it was consumed.
+        # A LIVE task whose holder is pending is still working, not done-and-empty.
+        status = "working" if live and state != "ready" else "done"
         digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         rows.append(TaskRecord(
             id=task_id,
@@ -449,29 +427,15 @@ def _task_record_from_path(path: Path, result: str = "") -> Optional[TaskRecord]
 
 
 def _exact_result(workspace: Path, task_id: str) -> str:
-    """Read an exact-id result without enumerating result files."""
-    results_dir = workspace / "results"
-    filename = f"{task_id}.txt"
-    candidates = [results_dir / filename, results_dir / "archive" / filename]
-    for root in (results_dir / "archive", results_dir):
-        try:
-            with os.scandir(root) as entries:
-                directories = [
-                    Path(entry.path) for entry in entries
-                    if entry.is_dir() and (
-                        root.name == "archive" or entry.name.startswith("archive-")
-                    )
-                ]
-        except OSError:
-            directories = []
-        candidates.extend(directory / filename for directory in directories)
-    for path in candidates:
-        try:
-            if path.is_file():
-                return path.read_text(errors="replace")[:MAX_RESULT_CHARS].strip()
-        except OSError:
-            continue
-    return ""
+    """Read an exact-id result without enumerating result files.
+
+    Through the readiness owner: this consulted the right candidates but still
+    decoded them with `errors="replace"`, so a torn body came back as an answer
+    ending in U+FFFD. Using the union was only half the delegation.
+    """
+    state, _path, body = local_task_protocol.resolve_result(
+        workspace / "results", task_id)
+    return (body or "")[:MAX_RESULT_CHARS].strip() if state == "ready" else ""
 
 
 def _task_record_by_id(workspace: Path, task_id: str) -> Optional[TaskRecord]:

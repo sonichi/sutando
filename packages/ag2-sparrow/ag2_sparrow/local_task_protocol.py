@@ -554,15 +554,78 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     return flat[-1] if flat else None
 
 
+def iter_result_candidates(results_dir: Path, task_id: str) -> list[Path]:
+    """Every place a result for `task_id` can live, in consult order.
+
+    Three enumerators grew independently and no two covered the same layouts,
+    so a result was findable or not depending on which one you asked. This is
+    their union. Order is load-bearing for readiness: callers stop at the
+    first candidate that exists, so live must precede archive and newer
+    archive must precede older.
+    """
+    if not valid_archive_lookup_id(task_id):
+        return []
+    results_dir = Path(results_dir)
+    archive = results_dir / "archive"
+    fname = f"{task_id}.txt"
+
+    out = [results_dir / fname, archive / fname]
+
+    def _subdirs(root: Path, keep) -> list[str]:
+        try:
+            with os.scandir(root) as entries:
+                return sorted((e.name for e in entries if keep(e.name) and e.is_dir()),
+                              reverse=True)
+        except (OSError, ValueError):
+            return []
+
+    months = _subdirs(archive, _MONTH_DIR_RE.match)
+    out += [archive / m / fname for m in months]
+    # Non-month archive subdirs: get_task_result globbed every one, so omitting
+    # them here would silently regress that caller.
+    seen = set(months)
+    out += [archive / d / fname for d in _subdirs(archive, lambda n: n not in seen)]
+    # Sibling `results/archive-*/` dirs — only _exact_result knew these.
+    out += [results_dir / d / fname
+            for d in _subdirs(results_dir, lambda n: n.startswith("archive-"))]
+    # Flat gateway form `archive/<id>-<epoch>.txt`, newest last as before.
+    flat = sorted(archive.glob(f"{task_id}-*.txt"))
+    if flat:
+        out.append(flat[-1])
+    return out
+
+
+def resolve_result(results_dir: Path, task_id: str,
+                   reader=None) -> tuple[str, Path | None, str | None]:
+    """Readiness over the ordered candidates: ready / pending / missing.
+
+    The FIRST candidate that exists but is not readable ENDS the search as
+    pending. Falling past it to an older candidate answers `ready` with a
+    superseded body, and callers treat ready as terminal — so the newer answer
+    is stranded. An authoritative pending must outrank any cache.
+    """
+    if reader is None:
+        try:  # vendored as ag2_sparrow.result_ready; flat delivery/ in src/
+            from .result_ready import read_ready_result  # noqa: PLC0415
+        except ImportError:
+            from delivery.readiness import read_ready_result  # noqa: PLC0415
+        reader = read_ready_result
+    for candidate in iter_result_candidates(results_dir, task_id):
+        body = reader(candidate)
+        if body is not None:
+            return ("ready", candidate, body)
+        if candidate.exists():
+            return ("pending", candidate, None)
+    return ("missing", None, None)
+
+
 def find_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate a task's result: live dir first, then archive. Archival trails
     delivery, so an archive-only lookup reads a fresh result as never delivered."""
-    if not valid_archive_lookup_id(task_id):
-        return None
-    live = Path(results_dir) / f"{task_id}.txt"
-    if live.is_file():
-        return live
-    return find_archived_result(results_dir, task_id)
+    for candidate in iter_result_candidates(results_dir, task_id):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:

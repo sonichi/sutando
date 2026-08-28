@@ -154,7 +154,7 @@ from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import DEFER, plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -4834,6 +4834,12 @@ async def poll_results():
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
                             _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
                                          if not _target else ("honour", None))
+                            if _act == DEFER:
+                                # Holder unreadable: put the route back and
+                                # leave both files for a later pass to answer.
+                                pending_replies[task_id] = channel
+                                save_pending_replies()
+                                continue
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
                                 save_pending_replies()

@@ -59,7 +59,7 @@ import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import DEFER, plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
@@ -486,21 +486,25 @@ def _render_progress_text(elapsed: float, task_id: str) -> str:
     return progress_stream.format_progress(step, elapsed)
 
 
-def _dedup_recover(task_id: str, holder_id, chat_id) -> str | None:
-    """Route the shared dedup-recovery plan; returns a new task id to route."""
+def _dedup_recover(task_id: str, holder_id, chat_id) -> tuple[str, str | None]:
+    """Route the shared dedup-recovery plan; returns (action, new task id).
+
+    The action is returned, not just the id: `defer` and `honour` both yield no
+    id, and archiving a defer discards the route and the unread result."""
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
             f"task-{int(time.time() * 1000)}")
         if action == "requeue":
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
-            return payload
+            return action, payload
         if action == "report":
             send_reply(chat_id, payload, task_id=task_id)
             print(f"  [dedup] unresolved for {task_id}", flush=True)
+        return action, None
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
-    return None
+    return "honour", None
 
 
 def _clear_progress(task_id: str) -> None:
@@ -1161,7 +1165,12 @@ def main():  # pragma: no cover
                 if any(a.kind == "skip" for a in parsed.actions):
                     _sk = next(a for a in parsed.actions if a.kind == "skip")
                     if _sk.value == "deduped":
-                        _rq = _dedup_recover(task_id, _sk.extra, chat_id)
+                        _act, _rq = _dedup_recover(task_id, _sk.extra, chat_id)
+                        if _act == DEFER:
+                            # Holder unreadable: keep route, result and task so
+                            # a later pass can answer instead of re-asking.
+                            pending_replies[task_id] = chat_id
+                            continue
                         if _rq:
                             pending_replies[_rq] = chat_id
                     print(f"  Skipped (marker): {task_id}", flush=True)
