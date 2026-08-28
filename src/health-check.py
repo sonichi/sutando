@@ -58,6 +58,7 @@ from util_paths import _host_label, channel_access_path, claude_home_path, claud
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
+import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -5890,11 +5891,38 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     # rglob, not glob: delivered results are archived into MONTH buckets
     # (results/archive/YYYY-MM/), so the durable copies sit two levels down.
     for f in results.rglob(f"{stem}-20*"):
-        m = re.match(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})", f.name)
+        # Both date spellings are in live use and the compact one dominates;
+        # matching only YYYY-MM-DD discards the majority of real artifacts.
+        m = re.match(rf"{re.escape(stem)}-(\d{{4}})-?(\d{{2}})-?(\d{{2}})", f.name)
         if not m:
             continue
         lt = datetime.fromtimestamp(f.stat().st_mtime)
-        out.append((m.group(1), lt.hour * 60 + lt.minute))
+        out.append(("-".join(m.groups()), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-finished) from `results/task-cron-<job>-<epoch>.txt`.
+
+    The one completion record needing no per-job config: every job emitted by
+    `cron-runner.py` leaves one. Session crons registered via CronCreate do not
+    pass through that writer, so this lane does not observe them.
+    """
+    from datetime import datetime
+    out = []
+    if not results.is_dir():
+        return out
+    # The epoch in the NAME is emit time; mtime is the finish, as for sentinels.
+
+    # The writer slugifies the job name, so match its contract rather than the
+    # raw name; a raw name in the glob would also inject path/wildcard chars.
+    anchored = cron_task_id.record_matcher(job)
+    for f in results.rglob(cron_task_id.DISCOVERY_GLOB):
+        if not f.is_file() or not anchored.match(f.name):
+            continue
+        lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
 
@@ -5979,10 +6007,22 @@ def check_daily_cron_punctuality() -> dict:
         declared = str(e.get("artifact") or "").strip()
         stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
         launchd = bool(e.get("launchd"))
-        # The launchd lane publishes no dated results file; its completion
-        # sentinel is the only dated record that it finished.
+        # Each lane is a preference, not a restriction: `launchd` says how a job is
+        # SCHEDULED, which does not determine what dated evidence it leaves behind.
         arts = (_daily_completion_minutes(ws / "state", jname) if launchd
                 else _daily_artifact_minutes(ws / "results", stem))
+        used_artifact_lane = not launchd
+        # Both directions, so neither lane's absence reads as the job's silence:
+        # without the launchd arm a daily artifact reports "no dated artifact" forever.
+        if not arts:
+            arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
+                    else _daily_completion_minutes(ws / "state", jname))
+            used_artifact_lane = bool(arts) and launchd
+        # Last resort, and the only lane needing no per-job config: a job that
+        # publishes nothing dated still leaves a task-cron result when it finishes.
+        if not arts:
+            arts = _daily_task_record_minutes(ws / "results", jname)
+            used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         newest = max((d for d, _ in arts), default=None)
@@ -6000,7 +6040,7 @@ def check_daily_cron_punctuality() -> dict:
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
             # `artifact` names a results file, so it cannot vouch for a sentinel:
             # only an observed history makes a missing sentinel today actionable.
-            "stem": stem, "stem_declared": bool(declared) and not launchd,
+            "stem": stem, "stem_declared": bool(declared) and used_artifact_lane,
             # Renders only when new input exists, so a quiet day produces nothing
             # and absence is evidence of nothing rather than of a miss.
             "conditional": bool(e.get("conditional")),
@@ -6439,6 +6479,57 @@ def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
     return set(_worker_holdings(ps_output))
 
 
+_POOL_HELD_RE = re.compile(r"\.(assigned|claimed)-([^.]+)\.txt$")
+
+
+def _pool_held_note(pooled: "list") -> str:
+    """Who holds what, by follower — the pool's in-flight signal is the name."""
+    by: dict = {}
+    for f in pooled:
+        m = _POOL_HELD_RE.search(f.name)
+        key = f"{m.group(1)}:{m.group(2)}"
+        by[key] = by.get(key, 0) + 1
+    return ", ".join(f"{k}x{v}" for k, v in sorted(by.items()))
+
+
+def _split_pool_held(files: "list") -> tuple:
+    """(not-held-by-a-follower, held-by-a-follower)."""
+    held = [f for f in files if _POOL_HELD_RE.search(f.name)]
+    return [f for f in files if f not in held], held
+
+
+def _pool_note(pooled: "list") -> str:
+    if not pooled:
+        return ""
+    return f", {len(pooled)} held by pool followers ({_pool_held_note(pooled)})"
+
+
+def _pool_only_detail(pooled: "list") -> str:
+    return (f"{len(pooled)} task(s) held by pool followers ({_pool_held_note(pooled)}), "
+            f"0 unassigned — the pool is working, not stalled")
+
+
+def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
+    """Pool-held files old enough that no holder is plausibly still working.
+
+    Holding is a RENAME, so a file whose holder died keeps that name forever:
+    nothing on main reclaims it (`sweep-stranded-claims.sh` is a documented
+    one-shot, wired to no scheduler). Age, not the holder's
+    `state/cores/<holder>.alive`: nothing on main writes that file, and where a
+    pool wrapper does, it beats from a sidecar rather than the session — so a
+    follower wedged at its input layer stays "alive" while never finishing the
+    task, which is the stall this exists to catch. Age catches death and wedge.
+    """
+    out = []
+    for f in pooled:
+        try:
+            if now - f.stat().st_mtime >= stuck_age_sec:
+                out.append(f)
+        except OSError:
+            continue
+    return out
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -6452,7 +6543,19 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     files = _pending_task_files(tasks_dir)
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
+    # A follower holds by RENAMING, so argv-based holdings see none of it.
+    files, pooled = _split_pool_held(files)
     now = time.time()
+    if pooled and not files:
+        stuck = _pool_held_stuck(pooled, now, stuck_age_sec)
+        if stuck:
+            oldest_h = int(now - min(f.stat().st_mtime for f in stuck)) // 3600
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(stuck)} of {len(pooled)} pool-held task(s) have not moved "
+                              f"in over {stuck_age_sec // 60} min (oldest {oldest_h}h): "
+                              f"{_pool_held_note(stuck)}. A hold is a rename, so a dead holder "
+                              f"keeps the name forever — check those followers are alive"}
+        return {"name": name, "status": "ok", "detail": _pool_only_detail(pooled)}
     # An in-flight task looks exactly like a stalled one on disk; the worker's
     # argv is the only thing that tells them apart.
     holdings = _worker_holdings()
@@ -6478,13 +6581,14 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                    "cannot be established")
     held_verdict = (" — all held by a live worker, not stalled" if held_is_progress
                     else wedged_note if all_held else None)
+    pool_note = _pool_note(pooled)
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
             # ok, not warn: every `warn` is alertable (emit_task_for_failures /
             # notify_for_failures), so rewording alone still fires the false alert.
             "status": "ok" if held_is_progress else "warn",
-            "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
+            "detail": (f"{len(files)} unassigned task(s) queued{held_note}{pool_note}, oldest {oldest_age}s"
                        + (held_verdict or " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
@@ -6495,11 +6599,11 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
         return {
             "name": name,
             "status": "ok" if held_is_progress else "warn",
-            "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
+            "detail": (f"{len(files)} unassigned task(s) queued{held_note}{pool_note}, oldest {oldest_age}s"
                        + (held_verdict or f" — undrained past {stuck_age_sec}s")),
         }
     return {"name": name, "status": "ok",
-            "detail": f"{len(files)} task(s){held_note}, oldest {oldest_age}s"}
+            "detail": f"{len(files)} task(s){held_note}{pool_note}, oldest {oldest_age}s"}
 
 
 def check_orphaned_results(threshold_age_sec: int = 900) -> dict:

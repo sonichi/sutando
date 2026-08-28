@@ -185,7 +185,6 @@ class TestMainCalendarStatusLine(unittest.TestCase):
                  patch.object(mod, "get_calendar_events", return_value=None), \
                  patch.object(mod, "get_reminders", return_value=[]), \
                  patch.object(mod, "get_overnight_discord", return_value=[]), \
-                 patch.object(mod, "get_daily_insight", return_value=None), \
                  patch.object(mod, "get_pending_questions", return_value=[]), \
                  patch.object(mod, "get_health_issues", return_value=[]):
                 out = io.StringIO()

@@ -45,6 +45,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
+            "src/agent/restart-guard.sh",
             "src/local_task_protocol.py",
             # local_task_protocol resolves results through the readiness owner, so
             # the fake repo must carry it or the workstream lookup fails closed.
@@ -179,6 +180,9 @@ exit 0
     def run_launcher(self, *args, env_extra=None):
         env = dict(os.environ)
         env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
+        # A suite run from inside a core would otherwise inherit the marker
+        # and hit the in-session restart guard instead of the path under test.
+        env.pop("SUTANDO_CORE_SESSION", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -206,6 +210,9 @@ exit 0
     def run_launcher_with_tty(self, *args, env_extra=None):
         env = dict(os.environ)
         env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
+        # A suite run from inside a core would otherwise inherit the marker
+        # and hit the in-session restart guard instead of the path under test.
+        env.pop("SUTANDO_CORE_SESSION", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),

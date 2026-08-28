@@ -25,6 +25,18 @@ labels.
    - omit isolated, ambiguous, or low-confidence tasks so they remain
      ungrouped;
    - give every proposed group a confidence from 0 to 1.
+   - **when reusing an existing workstream, rank with `scripts/rank_workstreams.py`
+     rather than by eye.** `best_match(candidates, keywords)` returns the top id
+     only if it beats the runner-up by a margin, and `None` otherwise — on a tie
+     you must OMIT the task, not take the first candidate.
+
+     A ranking re-derived each pass cannot degrade gracefully: on a tie it falls
+     back to whatever order the candidates arrived in, which is the arbitrary
+     pick scoring was supposed to remove, and the printed shortlist makes it look
+     deliberate. Measured: a three-way tie assigned a cinny UI task to an
+     unrelated roadmap workstream, after five earlier passes had looked correct —
+     those five all had wide margins, so the streak was evidence about the
+     inputs, not about the method.
 4. Submit strict JSON to the validator:
 
    ```bash
