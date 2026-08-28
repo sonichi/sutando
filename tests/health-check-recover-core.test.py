@@ -237,7 +237,7 @@ def case_j_dead_core_relaunches() -> list[str]:
     return fails
 
 
-def case_k_deliberate_stop_never_relaunches() -> list[str]:
+def case_k2_deliberate_stop_never_relaunches() -> list[str]:
     """A graceful-stop tombstone gates the relaunch: a SIGTERM'd core reads
     dead but must NOT be restarted (relaunch would undo an intentional stop —
     john-the-dev, #2160). Control: same timeline without the tombstone still
@@ -259,6 +259,33 @@ def case_k_deliberate_stop_never_relaunches() -> list[str]:
         r = h.run(now=1_000_200, alive=False, age=5000, stopped=False)
         if not r or r.get("action") != "restarted" or h.restart_calls != [True]:
             fails.append(f"k) control without tombstone should still relaunch, got {r}, {h.restart_calls}")
+    return fails
+
+
+def case_k3_stopped_helper_reads_tombstone() -> list[str]:
+    """_local_core_stopped itself: tombstone present -> True, absent -> False,
+    and an unresolvable host label -> False (never suppress on uncertainty)."""
+    import sys as _sys
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        _sys.path.insert(0, str(Path(hc.__file__).resolve().parent))
+        import util_paths
+        label = util_paths._host_label()
+        if hc._local_core_stopped(ws):
+            fails.append("k3) no tombstone should read False")
+        cores = ws / "state" / "cores"
+        cores.mkdir(parents=True)
+        (cores / f"{label}.stopped").write_text("123.0")
+        if not hc._local_core_stopped(ws):
+            fails.append("k3) tombstone present should read True")
+        real = util_paths._host_label
+        try:
+            util_paths._host_label = lambda: (_ for _ in ()).throw(RuntimeError("no label"))
+            if hc._local_core_stopped(ws):
+                fails.append("k3) unresolvable host label must read False, not suppress")
+        finally:
+            util_paths._host_label = real
     return fails
 
 
@@ -802,6 +829,8 @@ def main() -> int:
         ("u", case_u_peer_boot_does_not_suppress_local_recovery),
         ("j2", case_j2_dead_core_before_after_output),
         ("k", case_k_draining_backlog_never_restarts),
+        ("k2", case_k2_deliberate_stop_never_relaunches),
+        ("k3", case_k3_stopped_helper_reads_tombstone),
         ("l", case_l_progress_resets_long_task),
         ("m", case_m_lock_prevents_concurrent_restart),
         ("n", case_n_failed_dm_still_restarts_and_records),
