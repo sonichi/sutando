@@ -205,9 +205,8 @@ try:
     ok("control: an ordinary local minute has exactly one",
        len(cr._local_epochs(2025, 6, 1, 1, 30)) == 1)
 
-    # Asia/Kathmandu (+05:45) raises OverflowError on the isdst=1 probe; that
-    # escaped _local_epochs and killed the whole tick. The two controls above
-    # are the over-reject side: they must still hold with the guard in place.
+    # Asia/Kathmandu (+05:45) raises OverflowError on the isdst=1 probe, which
+    # escaped _local_epochs and killed the tick. Controls above are the other side.
     os.environ["TZ"] = "Asia/Kathmandu"
     time.tzset()
     _crash = None
