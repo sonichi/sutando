@@ -316,8 +316,21 @@ def notice_class() -> list:
     out, reason = guard.guard_result_for_tier(
         "[channel: 123456789012345678]\nbody", "team", REPO, secret_filter=_clean)
     if reason != "result delivery control marker" or "delivery-control marker" not in out \
-            or "not because of its content" not in out:
-        fails.append(f"marker withhold does not name its class: {reason!r} / {out[:80]!r}")
+            or "content" in out.lower():
+        fails.append(f"marker notice must claim ONLY the marker: {reason!r} / {out[:80]!r}")
+    # qingyun round-2 cases: the marker raises before the scanner runs, so the
+    # notice must never assert a content conclusion on ANY marker path.
+    for name, kwargs, filt in (
+            ("marker+secret", {}, _leaky),
+            ("marker+scanner-failure", {}, _raises),
+            ("marker+scan-disabled", {"scan_sensitive_data": False}, _clean)):
+        o, r = guard.guard_result_for_tier(
+            "[channel: 123456789012345678]\nghp_" + "a" * 36, "team", REPO,
+            secret_filter=filt, **kwargs)
+        if o != guard.TEAM_LEAK_RESULT_MARKER or not r:
+            fails.append(f"{name}: expected the marker notice, got {o[:60]!r}")
+        if "content" in o.lower():
+            fails.append(f"{name}: notice asserts a content conclusion the guard never evaluated")
     out2, reason2 = guard.guard_result_for_tier(
         "the token is ghp_" + "a" * 36, "team", REPO, secret_filter=_leaky)
     if reason2 is None:

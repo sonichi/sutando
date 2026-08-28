@@ -39,8 +39,8 @@ TEAM_LEAK_RESULT = (
 # classes stay generic — naming those would confirm probe hits.
 TEAM_LEAK_RESULT_MARKER = (
     "I completed the Team task, but the response was withheld because it "
-    "carried a delivery-control marker, which non-owner results may not use — "
-    "not because of its content. The owner can review the work locally."
+    "carried a delivery-control marker, which non-owner results may not use. "
+    "The owner can review the work locally."
 )
 
 TEAM_LEAK_RESULT_UNSAVED = (
