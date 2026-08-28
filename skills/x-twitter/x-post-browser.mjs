@@ -160,15 +160,13 @@ function pidsForProfile() {
   let pgrepOut;
   try {
     pgrepOut = execFileSync('pgrep', ['-fl', 'Google Chrome for Testing'], { encoding: 'utf8' });
-  } catch {
-    return { known: true, pids: [] }; // pgrep exits 1 when nothing matches — confirmed empty
+  } catch (e) {
+    // Only exit 1 is "no match"; 2/3 and ENOENT mean pgrep could not answer.
+    if (e?.status !== 1) return { known: false, pids: [] };
+    return { known: true, pids: [] };
   }
-  // WHOSE profile a process holds is answered by open file descriptors, not by argv:
-  // `pgrep -fl` has flattened argv, so "--user-data-dir=/p --copy" is equally the single
-  // path "/p --copy", and guessing kills an unrelated browser (qingyun, #2133). `+D`
-  // scopes the search to this directory, so the kernel decides and nothing is parsed.
-  // `timeout` bounds the recursive directory walk so a stuck probe can't hang the
-  // lock-release cycle indefinitely (qingyun, #2133 P1).
+  // Flattened argv cannot say WHOSE profile a pid holds; `+D` lets the kernel answer.
+  // `timeout` bounds the recursive walk so a stuck probe can't hang lock release.
   let probe;
   try {
     const out = execFileSync('lsof', ['-w', '-F', 'pn', '+D', PROFILE_DIR], {
