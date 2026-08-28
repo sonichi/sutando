@@ -17,8 +17,6 @@
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
-//   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
-//                    PreToolUse for the Gmail MCP connector's write tools.
 //   arg3 (optional): path to hooks/skill-usage-telemetry.py — registered
 //                    UNCONDITIONALLY as PostToolUse[Skill]. Product telemetry
 //                    (anonymous per-skill feature counter, #2047/#2254) is NOT
@@ -27,6 +25,8 @@
 //                    emitted zero skill:* events in production (the obs blob is
 //                    only built when SUTANDO_OBS_ENDPOINT is set). The hook
 //                    script honors the telemetry opt-out on its own.
+//   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
+//                    PreToolUse for the Gmail MCP connector's write tools.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
