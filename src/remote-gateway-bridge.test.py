@@ -451,11 +451,8 @@ def main() -> int:
     check("access_tier: guest" in guest_body
           and "codex exec --sandbox read-only" in guest_body,
           "guest task retains the established read-only Codex delegation")
-    # Separate check, not ANDed above: a compound assertion that fails cannot say
-    # which half broke, and this half has its own failure mode. Without the stdin
-    # redirect codex waits on stdin and can hang to a timeout having produced
-    # nothing, which reads as "codex unavailable" on the one path that has no
-    # permitted fallback.
+    # Separate, not ANDed: a compound assertion cannot say which half broke, and
+    # without the redirect codex hangs on stdin — indistinguishable from absent.
     check("< /dev/null" in guest_body,
           "guest delegation prescribes a stdin-safe codex invocation")
     check("exits 0" in guest_body,
