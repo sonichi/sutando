@@ -199,6 +199,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    pending_task_collab.pop(task_id, None)
     await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
     archive_file(result_file, "results", task_id)
     # Archive the SOURCE TASK too. Without this the task file sits in tasks/
@@ -2543,6 +2544,8 @@ pending_reply_anchors: dict[str, int] = {}
 # on restart; poll_progress fail-closes (skips streaming) when a task_id is
 # absent here, so a recovered task is never streamed without a known owner tier.
 pending_task_tiers: dict[str, str] = {}
+# Collaborators are engaged directly, so their tasks DO update core-status.
+pending_task_collab: dict[str, bool] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2589,6 +2592,16 @@ async def _deliver_pairing_prompt(channel, code, username, sender_id, allowed):
 
 client = discord.Client(intents=intents)
 _ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
+# RESUME is invisible to on_ready, so "no ready lines" cannot mean "no
+# reconnects" — these two counters are what make the classes distinguishable.
+_resume_count = 0
+_disconnect_count = 0
+
+def _reconnect_state() -> str:
+    """One shape for every reconnect-class line so the log stays greppable."""
+    return (f"gateway session #{_ready_count} "
+            f"(resume #{_resume_count}, disconnect #{_disconnect_count})")
+
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2681,6 +2694,23 @@ async def _supervise_loop(coro_fn, name):
 
 
 @client.event
+async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
+    global _resume_count
+    _resume_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge resumed: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
+async def on_disconnect():  # pragma: no cover — gateway callback
+    # Re-dispatched per retry while ready/resumed need success: the only outage line.
+    global _disconnect_count
+    _disconnect_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge disconnected: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
 async def on_ready():
     global _ready_count
     _ready_count += 1
@@ -2690,7 +2720,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
     # for Discord to infer it. Best-effort — presence must never break startup.
@@ -3004,6 +3034,14 @@ def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     except Exception:
         pass
     return False
+
+
+def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
+    """Collaborator status for a TEAM sender, however that tier was reached.
+    Global-allowlist members resolved to team by the tierMap are eligible too."""
+    if access_tier != "team":
+        return False
+    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
 
 
 def select_rulebook_key(access_tier, is_collaborator):
@@ -3790,13 +3828,14 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
-                # Per-channel collaborator check (pure helper — unit-tested):
-                # only the serving channel's own `collaborators` list grants
-                # engagement; membership elsewhere does not carry over.
-                # Handler-glue line: resolution logic is exercised via
-                # resolve_is_collaborator's unit tests; this async-handler branch
-                # is not independently invocable (cf. media_headers no-cover below).
-                is_collaborator = resolve_is_collaborator(data, sender_id, message.channel.id)  # noqa: E501  # pragma: no cover
+        except Exception:  # pragma: no cover — handler glue; unreadable config leaves the guest tier
+            pass
+    # Collaborator status is orthogonal to WHICH arm resolved team tier — a
+    # globally-allowlisted team sender can be a serving-channel collaborator.
+    if access_tier == "team" and not is_collaborator:
+        try:  # pragma: no cover — handler glue; logic in resolve_team_collaborator's tests
+            _acc = json.loads(ACCESS_FILE.read_text())
+            is_collaborator = resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id)  # noqa: E501
         except Exception:
             pass
 
@@ -4242,6 +4281,7 @@ async def _handle_discord_message(message, force=False):
         return
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
+    pending_task_collab[task_id] = bool(is_collaborator)
     # Observability: one inbound accepted-message event.
     _emit_channel(
         "discord", "in",
@@ -4755,6 +4795,7 @@ async def poll_results():
                 # "unknown" — never "owner" — so a lost/absent tier can't
                 # silently upgrade a non-owner reply in tier accounting.
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
+                pending_task_collab.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -5189,7 +5230,10 @@ async def poll_progress():
                 # entry closes that hole (red-team #2).
                 if task_id not in pending_task_tiers:
                     continue
-                if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+                # Poll branch not unit-invocable; decision covered in progress_stream.
+                if not progress_stream.should_stream_task(  # pragma: no cover
+                        pending_task_tiers.get(task_id),
+                        pending_task_collab.get(task_id, False)):
                     continue  # non-owner → no placeholder, no leak
                 try:
                     created = int(task_id.split("-")[1]) / 1000.0
@@ -5230,6 +5274,7 @@ async def poll_progress():
                                 continue
                     _progress_msgs.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
+                    pending_task_collab.pop(task_id, None)  # pragma: no cover
         except Exception as e:
             print(f"  [progress] poll_progress tick error: {e}", flush=True)
         await asyncio.sleep(3)
