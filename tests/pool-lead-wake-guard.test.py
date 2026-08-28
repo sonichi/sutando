@@ -66,6 +66,55 @@ class WakeGuardBase(unittest.TestCase):
         return outs
 
 
+class SuspensionAfterTheEntryGuard(WakeGuardBase):
+    """The entry guard samples the clocks BEFORE scanning, so a suspension
+    that begins after it cannot be seen by it — yet the owner liveness read
+    that authorizes the rename happens later, and by then the owner reads
+    dead. Re-check the skew after that read, or the rename lands on a live
+    claim. Both destructive variants must be pinned, not just the claimed one."""
+
+    def _sleep_at_liveness_read(self, owner):
+        """alive_fn is what the daemon calls per entry; make the suspension
+        begin exactly there, which is the window the entry guard cannot cover."""
+        original = self.alive.copy()
+
+        def alive_fn(inst):
+            if inst == owner and self.alive.get(inst, False):
+                self._sleep_whole_host(968)   # clamshell opens mid-scan
+                return False
+            return self.alive.get(inst, False)
+        self.lead.alive_fn = alive_fn
+        return original
+
+    def test_claimed_variant_declines_after_a_mid_scan_suspension(self):
+        (self.tasks / "task-race.claimed-core-2.txt").write_text("x")
+        self.assertEqual(self.lead.reclaim_claimed(), [])      # baseline tick
+        self._sleep_at_liveness_read("core-2")
+        self.assertEqual(self.lead.reclaim_claimed(), [],
+                         "a live claim was repooled on a suspension the entry guard missed")
+        self.assertEqual(self._names(), ["task-race.claimed-core-2.txt"])
+
+    def test_assigned_variant_declines_after_a_mid_scan_suspension(self):
+        (self.tasks / "task-race.assigned-core-2.txt").write_text("x")
+        self.assertEqual(self.lead.reclaim_dead(), [])         # baseline tick
+        self._sleep_at_liveness_read("core-2")
+        self.assertEqual(self.lead.reclaim_dead(), [],
+                         "an assignment was repooled on a suspension the entry guard missed")
+        self.assertEqual(self._names(), ["task-race.assigned-core-2.txt"])
+
+    def test_a_genuinely_dead_owner_with_no_suspension_still_reclaims(self):
+        """Control: without the mid-scan clock jump the rename MUST happen,
+        so the re-check cannot be passing by simply never reclaiming."""
+        (self.tasks / "task-dead.claimed-core-2.txt").write_text("x")
+        self.assertEqual(self.lead.reclaim_claimed(), [])      # baseline tick
+        self.alive["core-2"] = False
+        self.clock += 2
+        self.mono += 2
+        self.assertEqual(self.lead.reclaim_claimed(),
+                         [("task-dead.claimed-core-2.txt", "repooled")])
+        self.assertEqual(self._names(), ["task-dead.txt"])
+
+
 class HostGapDefersReclaim(WakeGuardBase):
     def test_claim_of_live_core_survives_a_host_sleep(self):
         (self.tasks / "task-a.claimed-core-2.txt").write_text("x")

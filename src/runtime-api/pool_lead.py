@@ -306,6 +306,10 @@ class PoolLead:
             m = pat.match(f.name)
             if not m or self.alive_fn(m.group(2)):
                 continue
+            # Same post-liveness re-check as the claimed variant: the entry
+            # guard cannot see a suspension that begins after it sampled.
+            if self._host_gap_defers_reclaim():
+                return reclaimed
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
@@ -476,6 +480,10 @@ class PoolLead:
             m = pat.match(f.name)
             if not m or self.alive_fn(m.group(2)):
                 continue
+            # Suspension can begin BETWEEN the entry guard and this liveness
+            # read, which would make a live owner read dead. Re-check first.
+            if self._host_gap_defers_reclaim():
+                return out
             canonical = m.group(1) + ".txt"
             try:
                 os.rename(f, f.with_name(canonical))
