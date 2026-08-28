@@ -31,6 +31,7 @@ from pool_follower import LEAD_STALE_S
 from pool_lead import PoolLead
 from pool_metrics import PoolMetrics
 from pool_notify import PoolNotifier
+from pool_profiles import ProfileStore
 from pool_scale import ScaleLedger, decide as scale_decide, observe as scale_observe
 from pool_status import PoolStatusWriter
 
@@ -100,8 +101,11 @@ def main() -> int:
             return False
         return 0 <= age < LEAD_STALE_S
 
+    # The daemon resolves the store's path; the policy module never names it.
     lead = PoolLead(tasks, state, followers, alive,
-                    metrics=PoolMetrics(state))
+                    metrics=PoolMetrics(state),
+                    profiles=ProfileStore(state / "pool" / "profiles.json",
+                                          lead_label=LEAD_LABEL))
     status = PoolStatusWriter(tasks, state, followers, alive)
     notifier = PoolNotifier(tasks, state, _send_notice)
     ledger = ScaleLedger(state)
@@ -131,6 +135,8 @@ def main() -> int:
             print(f"reclaimed-claim {name} -> {disposition}", flush=True)
         for name in lead.reclaim_stuck_assignments():
             print(f"reclaimed-stuck {name}", flush=True)
+        for pid, core in lead.reconcile_seating():
+            print(f"seated {pid} -> {core or '(none)'}", flush=True)
         if time.time() - last_prune > 3600:
             n = lead.prune_done_flags()
             if n:
