@@ -22,7 +22,7 @@ from pathlib import Path
 FUTURE_SKEW_S = 5.0
 
 
-def _num(v, *, nonneg: bool = False) -> float | None:
+def safe_num(v, *, nonneg: bool = False) -> float | None:
     """The value as a finite float, or None. `bool` is rejected: it passes
     isinstance(_, int) and would make `True` a valid timestamp."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
@@ -74,7 +74,7 @@ def verdict_from_record(data, *, now: float, max_age: float) -> GatewayVerdict |
     """
     if not isinstance(data, dict):
         return None
-    ts = _num(data.get("ts"), nonneg=True)
+    ts = safe_num(data.get("ts"), nonneg=True)
     if ts is None:
         return None
     age = now - ts
@@ -86,7 +86,7 @@ def verdict_from_record(data, *, now: float, max_age: float) -> GatewayVerdict |
     # A non-bool is schema drift, not a value. Coercing it makes "false" true.
     if not isinstance(connected, bool):
         return None
-    last_ok = _num(data.get("last_ok_ts"), nonneg=True)
+    last_ok = safe_num(data.get("last_ok_ts"), nonneg=True)
     # A poll cannot have completed in the future; that is not evidence either.
     if last_ok is not None and last_ok - now > FUTURE_SKEW_S:
         last_ok = None
@@ -94,7 +94,7 @@ def verdict_from_record(data, *, now: float, max_age: float) -> GatewayVerdict |
         ts=ts,
         connected=connected,
         last_ok_ts=last_ok,
-        backoff_s=_num(data.get("backoff_s"), nonneg=True),
+        backoff_s=safe_num(data.get("backoff_s"), nonneg=True),
     )
 
 
