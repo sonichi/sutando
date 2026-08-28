@@ -182,7 +182,12 @@ def _local_epochs(y: int, mo: int, d: int, h: int, mi: int) -> "list[int]":
     """
     out = []
     for isdst in (0, 1):
-        e = int(time.mktime((y, mo, d, h, mi, 0, 0, 0, isdst)))
+        # A zone can make one isdst variant unrepresentable (Asia/Kathmandu
+        # raises OverflowError on isdst=1); skip it, do not fail the tick.
+        try:
+            e = int(time.mktime((y, mo, d, h, mi, 0, 0, 0, isdst)))
+        except (OverflowError, ValueError, OSError):
+            continue
         lt = time.localtime(e)
         if (lt.tm_year, lt.tm_mon, lt.tm_mday,
                 lt.tm_hour, lt.tm_min) == (y, mo, d, h, mi) and e not in out:

@@ -204,6 +204,21 @@ try:
        cr._local_epochs(2025, 3, 9, 2, 30) == [])
     ok("control: an ordinary local minute has exactly one",
        len(cr._local_epochs(2025, 6, 1, 1, 30)) == 1)
+
+    # Asia/Kathmandu (+05:45) raises OverflowError on the isdst=1 probe; that
+    # escaped _local_epochs and killed the whole tick. The two controls above
+    # are the over-reject side: they must still hold with the guard in place.
+    os.environ["TZ"] = "Asia/Kathmandu"
+    time.tzset()
+    _crash = None
+    try:
+        _kt = cr._local_epochs(2026, 8, 28, 10, 30)
+    except Exception as exc:
+        _kt, _crash = None, f"{type(exc).__name__}: {exc}"
+    ok("a zone with an unrepresentable isdst probe does not raise",
+       _crash is None)
+    ok("and that minute still resolves to its one real epoch",
+       _kt is not None and len(_kt) == 1)
 finally:
     if _tz_prev is None:
         os.environ.pop("TZ", None)
