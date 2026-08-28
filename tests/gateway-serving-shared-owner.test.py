@@ -144,6 +144,12 @@ if gs.read_verdict(_p, now=NOW, max_age=300) is not None:
     failures.append("malformed: a huge int via read_verdict must be no opinion, not a raise")
 malformed_checked += 1
 
+# A missing ts must be no opinion even when a defaulted 0.0 would look FRESH.
+# With a large now, "missing" and "stale" both yield None and are indistinguishable.
+if gs.verdict_from_record({"connected": True, "last_ok_ts": 5}, now=10, max_age=300) is not None:
+    failures.append("shape: a missing ts must be no opinion, not a defaulted epoch")
+malformed_checked += 1
+
 # ------------------------------------------ non-numeric ts shapes
 
 # NO_OPINION already covers a non-mapping record and a bool ts; these are the
