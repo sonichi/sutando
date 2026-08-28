@@ -897,6 +897,13 @@ function getDefaultWsUrl() {
   return protocol + '//' + hostname + ':' + WS_PORT;
 }
 
+// #bottom-panel is position:fixed and grows to 50vh, so a static body
+// padding-bottom cannot reserve its space — keep the two in sync.
+function syncBottomPad() {
+  const bp = $('bottom-panel');
+  if (bp) document.body.style.paddingBottom = (bp.offsetHeight + 12) + 'px';
+}
+
 // Set default WebSocket URL on page load + init Chrome STT
 // Descriptions are local UI copy keyed by the stable action name; the KEY
 // bindings come from /hotkeys (the app's published config) so they never drift.
@@ -924,6 +931,14 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Reserve bottom space equal to the fixed panel's height so the chat history
+  // never covers the dashboard (e.g. the Questions panel).
+  try {
+    const bp = $('bottom-panel');
+    if (bp && window.ResizeObserver) { new ResizeObserver(syncBottomPad).observe(bp); }
+    syncBottomPad();
+    window.addEventListener('resize', syncBottomPad);
+  } catch {}
   // Restore the chat transcript saved before the last reload, then watch for
   // new entries to persist.
   try { initTranscriptPersistence(); } catch {}
