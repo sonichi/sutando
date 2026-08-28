@@ -126,9 +126,23 @@ that ARE the assignments. **Anchor it on the assignment segment:**
 *.g-<group>.txt                     <- WRONG: also matches the reclaimed name
 ```
 
-The unanchored form keeps matching after `reclaim_dead()` renames the file back,
-so the group reads busy forever. Anchoring makes that unrepresentable rather than
-contingent on the strip being right.
+Truth table over both layouts, since "unrepresentable" is a strong claim:
+
+```
+                     *.assigned-*.g-G.txt   *.g-G.txt
+A assigned                   True              True
+A after reclaim              False             False
+B assigned                   False             False
+B after reclaim              False             True     <- permanent-busy
+```
+
+**The permanent-busy case is layout B's, not layout A's** — under A the reclaimed
+name is `task-X.txt` and neither glob matches it. So anchoring is not protecting
+the layout this document adopts against its own reclaim; it is making layout B's
+failure unrepresentable, and buying one more property: the anchored form also
+refuses layout B's *assigned* name, so B cannot be silently adopted later by
+someone editing only the filename. The glob stops matching rather than matching
+the wrong thing.
 
 **`<group>` needs a typed key constructor, not string interpolation.** Group ids
 are room ids like `!cAAaogVSFcIYaNmohw:ag2.space` — `pool_lead.py` already notes
