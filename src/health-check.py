@@ -5659,7 +5659,7 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
         return None
     # Same numeric policy as the shared verdict owner: a huge int raises on
     # float(), and NaN/inf would collapse to 0.0 here — "just polled".
-    last = _gateway_num(last)
+    last = _gateway_num(last, nonneg=True)
     if last is None:
         return None
     return max(0.0, (now - last) / 3600.0)
@@ -5791,7 +5791,8 @@ def _gateway_status_stale_age_s(path: "Path | None" = None,
         ts = json.loads(Path(p).read_text()).get("ts")
     except (OSError, ValueError, AttributeError, TypeError):
         return None
-    ts = _gateway_num(ts)
+    # nonneg matches the shared verdict owner: one field, one admissibility rule.
+    ts = _gateway_num(ts, nonneg=True)
     if ts is None:
         return None
     age = now - ts

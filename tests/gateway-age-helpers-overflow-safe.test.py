@@ -65,6 +65,7 @@ ok("float(10**400) raises, so a guard here is load-bearing", _raised is not None
 
 print("\n=== _gateway_status_stale_age_s ===")
 for label, ts in (("huge int", HUGE), ("negative huge int", -HUGE),
+                  ("ordinary negative", -1), ("zero-adjacent negative", -0.5),
                   ("NaN", float("nan")), ("+inf", float("inf"))):
     v, raised = _call(hc._gateway_status_stale_age_s, {"connected": True, "ts": ts, "last_ok_ts": 1})
     ok(f"{label} ts -> no opinion, no raise", raised is None and v is None, raised or f"returned {v!r}")
@@ -81,6 +82,7 @@ ok("positive control: a fresh ts still reports None", raised is None and v is No
 
 print("\n=== _gateway_last_ok_age_h ===")
 for label, last in (("huge int", HUGE), ("negative huge int", -HUGE),
+                    ("ordinary negative", -1), ("zero-adjacent negative", -0.5),
                     ("NaN", float("nan")), ("+inf", float("inf")), ("-inf", float("-inf"))):
     v, raised = _call(hc._gateway_last_ok_age_h, {"connected": True, "ts": NOW, "last_ok_ts": last})
     ok(f"{label} last_ok_ts -> no opinion, no raise", raised is None and v is None,
@@ -95,6 +97,12 @@ ok("positive control: a usable last_ok_ts still reports its age in hours",
 # max(0.0, -inf) is 0.0, so both read as "polled just now".
 ok("control: the pre-fix arithmetic really did read NaN as 0.0 hours",
    max(0.0, (NOW - float("nan")) / 3600.0) == 0.0 and math.isnan(float("nan")))
+
+# -10**400 degrades because CONVERSION overflows, not because it is negative, so the
+# overflow rows alone never exercised the sign rule. These do.
+ok("control: the negative-huge case really is decided by overflow, not by sign",
+   _call(hc._gateway_status_stale_age_s,
+         {"connected": True, "ts": -HUGE, "last_ok_ts": 1})[1] is None)
 
 print("\n=== full probe: check_gateway_bridge() over a real sidecar ===")
 
@@ -133,6 +141,15 @@ for label, record in (
 ):
     r, raised = _probe(record)
     ok(f"{label}: the whole probe degrades instead of aborting the run",
+       raised is None and isinstance(r, dict) and r.get("status") in ("ok", "warn", "fail"),
+       raised or f"returned {r!r}")
+
+for label, record in (
+    ("negative ts", {"ts": -1, "connected": True, "last_ok_ts": _REAL}),
+    ("negative last_ok_ts", {"ts": _REAL, "connected": True, "last_ok_ts": -1}),
+):
+    r, raised = _probe(record)
+    ok(f"{label}: the full probe degrades rather than reporting a fabricated age",
        raised is None and isinstance(r, dict) and r.get("status") in ("ok", "warn", "fail"),
        raised or f"returned {r!r}")
 
