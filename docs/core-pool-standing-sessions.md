@@ -348,5 +348,8 @@ subagent activity, or the pool will preempt exactly the cores doing the most wor
 and 5 are a third change that comes after both.
 
 The only thing needing a decision *now* is the one-line constraint in decision 3:
-keep pane ownership outside the follower. Cost nothing today, and it keeps every
-composition above available later.
+keep pane ownership outside the follower. Deciding it now costs nothing — but
+implementing it is not free: as established above, it requires coordinated
+changes to the reclaim parser, `_load`, the busy predicate, and group-key
+encoding. What the early decision buys is that none of those changes must be
+retrofitted under pressure later; every composition above stays available.
