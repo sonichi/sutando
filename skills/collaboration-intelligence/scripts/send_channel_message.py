@@ -4,17 +4,18 @@
 Separate from bot2bot-post because that tool always resolves the bot2bot
 channel: routing a reviewer notification through it validated one channel and
 delivered to another.
+
+Sends through the shared client, which is the repo's only sanctioned Discord
+sender — a hand-rolled one skips the post-gate validator the client applies.
 """
 from __future__ import annotations
 
-import json
 import os
 import pathlib
 import sys
-import urllib.request
 
-API = "https://discord.com/api/v10"
-UA = "Sutando (https://github.com/sonichi/sutando, 1.0)"
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src"))
+from channels.discord.client import DiscordRestClient  # noqa: E402
 
 
 def token() -> str:
@@ -25,14 +26,12 @@ def token() -> str:
     raise SystemExit("send_channel_message: DISCORD_BOT_TOKEN not found")
 
 
-def post(channel: str, body: str) -> dict:
-    req = urllib.request.Request(
-        f"{API}/channels/{channel}/messages", method="POST",
-        data=json.dumps({"content": body}).encode(),
-        headers={"Authorization": f"Bot {token()}", "Content-Type": "application/json",
-                 "User-Agent": UA})
-    with urllib.request.urlopen(req) as r:
-        return json.load(r)
+def send(channel: str, body: str, client=None):
+    """-> (receipt, posted_body). `client` is injectable so the tests drive
+    every outcome without a network."""
+    client = client or DiscordRestClient(token())
+    receipt, _status, posted = client.send_message_with_response(channel, {"content": body})
+    return receipt, posted
 
 
 def main(argv=None) -> int:
@@ -41,11 +40,15 @@ def main(argv=None) -> int:
         print("usage: send_channel_message.py <channel-id> <body>", file=sys.stderr)
         return 2
     channel, body = argv
-    posted = post(channel, body)
+    receipt, posted = send(channel, body)
+    if not getattr(receipt, "delivered", False):
+        print(f"send_channel_message: not delivered — {getattr(receipt, 'reason', receipt)}",
+              file=sys.stderr)
+        return 1
     # A mention is the delivery mechanism, and the API reports 200 either way.
     # Read it back from the POSTED body, never from the string we sent.
-    if not (posted.get("mentions") or []):
-        print(f"send_channel_message: posted {posted.get('id')} to {channel} but its "
+    if not ((posted or {}).get("mentions") or []):
+        print(f"send_channel_message: posted {(posted or {}).get('id')} to {channel} but its "
               "mentions array is EMPTY — it notified nobody", file=sys.stderr)
         return 3
     print(posted["id"])
