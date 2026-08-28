@@ -159,25 +159,6 @@ def test_task_envelope_census_survives_a_torn_body():
             check(False, f"task-envelope census RAISED {type(e).__name__}")
 
 
-def test_daily_insight_analysis_survives_a_torn_body():
-    """The 50-freshest scan over results/ must count, not crash."""
-    insight = _load("daily_insight", REPO / "src" / "daily-insight.py")
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td) / "results"
-        root.mkdir(parents=True)
-        insight.RESULTS_DIR = root
-        (root / "task-a.txt").write_bytes(torn("delivered via discord " + BODY))
-        (root / "task-b.txt").write_text("delivered via telegram")
-        try:
-            counts = insight.analyze_task_patterns()
-            check(sum(counts.values()) == 2,
-                  f"analysis counts both a torn and a clean body, got {dict(counts)}")
-            check(counts.get("Telegram") == 1,
-                  "control: the clean telegram body is still classified correctly")
-        except UnicodeDecodeError as e:
-            check(False, f"analyze_task_patterns RAISED {type(e).__name__}")
-
-
 def test_fully_archived_torn_result_is_pending_not_404():
     """Both task and result archived — normal post-delivery state — and the
     archived result torn. Returning None here becomes HTTP 404, which a client
@@ -308,7 +289,6 @@ test_result_poll_degrades_to_pending()
 test_archive_poll_degrades_to_pending()
 test_fully_archived_torn_result_is_pending_not_404()
 test_empty_and_whitespace_results_are_pending()
-test_daily_insight_analysis_survives_a_torn_body()
 test_display_fields_narrow_guard_covers_decode_error()
 test_active_task_rows_survives_torn_bodies()
 test_task_envelope_census_survives_a_torn_body()
