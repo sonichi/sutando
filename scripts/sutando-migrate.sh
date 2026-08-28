@@ -1026,6 +1026,16 @@ copy_preserving_mtime() {
     cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"
 }
 
+# The single commit-path copy boundary. Callers run inside conditional contexts
+# where errexit is disabled, so every failure must return explicitly.
+commit_copy() {
+    local src="$1" dst="$2" rel="$3"
+    if ! copy_preserving_mtime "$src" "$dst"; then
+        echo "FAILED: $rel — copy to $dst failed; source left in place" >&2
+        return 1
+    fi
+}
+
 # Unions top-level arrays; non-array fields follow the newer source.
 # Malformed input returns non-zero — a silent degrade is access loss.
 union_json_arrays_into() {
@@ -1220,7 +1230,7 @@ commit_one() {
         union-json-array)
             dst_path="$DEST_REAL/$rel"
             if [ ! -e "$dst_path" ]; then
-                copy_preserving_mtime "$src_file" "$dst_path"
+                commit_copy "$src_file" "$dst_path" "$rel" || return 1
                 echo "copied"
                 return 0
             fi
@@ -1269,17 +1279,17 @@ commit_one() {
                     # Name it .legacy-prior-<src_tag>-<ts> to convey "this is
                     # what was at dest before <src_tag> overwrote it" + the
                     # timestamp ensures 3-way collisions don't clobber.
-                    copy_preserving_mtime "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix"
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    commit_copy "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix" "$rel" || return 1
+                    commit_copy "$src_file" "$dst_path" "$rel" || return 1
                     echo "src-wins-newer"
                 else
                     # src loses; preserve under tagged + timestamped sidecar.
-                    copy_preserving_mtime "$src_file" "$dst_path.legacy-$tag-$ts_suffix"
+                    commit_copy "$src_file" "$dst_path.legacy-$tag-$ts_suffix" "$rel" || return 1
                     echo "dest-wins-newer"
                 fi
                 return 0
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                commit_copy "$src_file" "$dst_path" "$rel" || return 1
                 echo "copied"
                 return 0
             fi
@@ -1299,7 +1309,7 @@ commit_one() {
                     return 1
                 fi
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    commit_copy "$src_file" "$dst_path" "$rel" || return 1
                     echo "src-newer"
                 elif [ "$src_mt" -lt "$dst_mt" ]; then
                     echo "dest-newer"
@@ -1312,7 +1322,7 @@ commit_one() {
                     return 1
                 fi
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                commit_copy "$src_file" "$dst_path" "$rel" || return 1
                 echo "copied"
             fi
             return 0
@@ -1348,13 +1358,13 @@ commit_one() {
                 src_mt="$(_stat_field mtime "$src_file")"
                 dst_mt="$(_stat_field mtime "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    commit_copy "$src_file" "$dst_path" "$rel" || return 1
                     echo "rehomed-newer"
                 else
                     echo "rehomed-skip-older"
                 fi
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                commit_copy "$src_file" "$dst_path" "$rel" || return 1
                 echo "rehomed"
             fi
             return 0
@@ -1496,12 +1506,12 @@ commit_one() {
                     }
                     echo "merged"
                 else
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    commit_copy "$src_file" "$dst_path" "$rel" || return 1
                     echo "copied"
                 fi
             else
                 dst_path="$DEST_REAL/legacy/$tag/$rel"
-                copy_preserving_mtime "$src_file" "$dst_path"
+                commit_copy "$src_file" "$dst_path" "$rel" || return 1
                 echo "sidecar"
             fi
             return 0
@@ -1516,7 +1526,7 @@ commit_one() {
                 local subdir="${rel%%/*}"  # tasks or results
                 local file_base="${rel#*/}" # task-*.txt
                 dst_path="$DEST_REAL/$subdir/archive/$tag/$file_base"
-                copy_preserving_mtime "$src_file" "$dst_path"
+                commit_copy "$src_file" "$dst_path" "$rel" || return 1
                 echo "archived-stale"
             else
                 echo "skipped-inflight"
@@ -1529,7 +1539,7 @@ commit_one() {
             # experiments/, obsidian-vault/, personal-src/). Preserve under a
             # namespaced quarantine path rather than skip-unknown'ing it.
             dst_path="$DEST_REAL/legacy/$tag/quarantine/$rel"
-            copy_preserving_mtime "$src_file" "$dst_path"
+            commit_copy "$src_file" "$dst_path" "$rel" || return 1
             echo "quarantined"
             return 0
             ;;
