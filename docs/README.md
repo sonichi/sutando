@@ -32,6 +32,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Community use cases](community-use-cases/README.md)
   - [Self-healing install](community-use-cases/self-healing-install.md)
 - [Set up automatic wire-list regeneration](regen-wire-list-setup.md)
+- [GAIA-100 benchmark run (2026-08-26)](benchmarks/gaia-100-2026-08-26.md) — 76/100 blind-scored, and how to rebuild the suite.
 
 ## Operations
 
