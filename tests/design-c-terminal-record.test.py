@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.delivery_core.backend_c import (  # noqa: E402
-    SEP, TERMINAL_TAG, DesignCClaimBackend, _safe_component, _safe_key)
+    SEP, TERMINAL_TAG, TMP, DesignCClaimBackend, _safe_component, _safe_key)
 from ag2_sparrow.delivery_core.contract import DeliveryOutcome  # noqa: E402
 
 failures = []
@@ -641,6 +641,34 @@ with tempfile.TemporaryDirectory() as td:
           "terminal_record() returns the current cycle's destination")
     check([r["cycle"] for r in recs] == [1, 2],
           f"cycles are logical and monotonic ({[r.get('cycle') for r in recs]})")
+
+with tempfile.TemporaryDirectory() as td:
+    # A terminal record staged in tmp/ but not yet renamed into archive/ is
+    # already authoritative for ordering: a re-derived cycle must not reuse it.
+    bs = fresh(td, "staged")
+    bs.publish("item-stg", b"p")
+    tok_s = bs.claim("item-stg", "w-stg")
+    key_s = _safe_key("item-stg")
+    check(bs._next_cycle(key_s) == 1, "baseline cycle is 1 on an empty store")
+
+    staged = (bs._d(TMP)
+              / f"{TERMINAL_TAG}{SEP}{tok_s.incarnation}{SEP}1787850000000001.json")
+    staged.write_text(json.dumps({"cycle": 7, "incarnation": tok_s.incarnation}))
+    check(bs._next_cycle(key_s) == 8,
+          f"a cycle=7 record staged in tmp/ advances the next cycle to 8 "
+          f"(got {bs._next_cycle(key_s)})")
+
+    # Control: the scan is key-scoped, not a store-wide max — another item's
+    # staged record must not move this key's cycle.
+    bs.publish("item-other", b"p")
+    tok_o = bs.claim("item-other", "w-oth")
+    (bs._d(TMP) / f"{TERMINAL_TAG}{SEP}{tok_o.incarnation}{SEP}1787850000000002.json"
+     ).write_text(json.dumps({"cycle": 99, "incarnation": tok_o.incarnation}))
+    check(bs._next_cycle(key_s) == 8,
+          f"another key's staged cycle=99 does NOT move this key "
+          f"(got {bs._next_cycle(key_s)})")
+    check(bs._next_cycle(_safe_key("item-other")) == 100,
+          "...and it does move its own key")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
