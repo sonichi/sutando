@@ -55,8 +55,9 @@ CODEX_TIMEOUT_S = 240
 MAX_CONCURRENT = 2
 MAX_TASK_CHARS = 8000
 
-# The sutando source root — the egress guard loads its scanner relative to it.
-_REPO = Path(__file__).resolve().parent.parent
+# The sutando SOURCE root, not the workspace — the egress guard loads its scanner
+# relative to it, so this must follow the code and not the runtime state.
+_REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 
 # Only these reach the worker. NEVER the owner's full environment.
 _ENV_ALLOW = ("PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SSL_CERT_FILE", "SSL_CERT_DIR", "TERM")
