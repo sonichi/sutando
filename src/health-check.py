@@ -7086,8 +7086,12 @@ def check_task_watcher() -> dict:
         # parentage is ownerless for a stranger, absence of evidence for it.
         sentinel_reparented = (bool(sentinel_root)
                                and _pid_parent(sentinel_root, ps_out) == "1")
-        if sentinel_root is not None and not sentinel_reparented:
+        if (sentinel_root is not None and not sentinel_reparented
+                and sentinel_root in orphaned):
+            # Protected, but still partitioned: dropping it left the sentinel's
+            # root in no group, so the all-traced predicate never saw it.
             orphaned = [r for r in orphaned if r != sentinel_root]
+            unverified = sorted(unverified + [sentinel_root])
         sentinel_orphaned = sentinel_reparented
         keep = "" if sentinel_orphaned else f", keep the sentinel's ({pid})"
         if not orphaned and not unverified:

@@ -315,6 +315,45 @@ class TheSentinelsOwnTreeIsClassifiedToo(unittest.TestCase):
                    sentinel=100, sentinel_alive=True)
         self.assertIn("keep the sentinel's (100)", v["detail"])
 
+    def test_unreadable_sentinel_beside_an_OWNED_extra_is_not_called_legitimate(self):
+        """The reported blocker, and the case the sibling above cannot reach.
+
+        There the extra was reparented, so the stop branch ran and the dropped
+        sentinel stayed invisible. Give the extra a verified core parent and
+        every group empties, which takes the `not orphaned and not unverified`
+        branch and blesses a real duplicate as a legitimate pool.
+        """
+        v = _probe({"100": None, "200": "500", "500": "1"},
+                   roots=["100", "200"], core_pids={"500"},
+                   sentinel=100, sentinel_alive=True)
+        d = v["detail"]
+        self.assertNotIn("legitimate", d)
+        self.assertEqual(_groups(d)["unverified"], {"100"}, d)
+        self.assertEqual(_groups(d)["session-owned"], {"200"}, d)
+        self.assertIn("keep the sentinel's (100)", d)
+
+    def test_every_root_appears_in_exactly_one_group(self):
+        """Totality is what step 9 acts on: a root in no group is a watcher the
+        operator never sees. Asserted over every shape this class exercises."""
+        shapes = [
+            ({"100": None, "200": "500", "500": "1"}, {"500"}),
+            ({"100": None, "200": "1"}, {"500"}),
+            ({"100": "1", "200": "500", "500": "1"}, {"500"}),
+            ({"100": "700", "200": "500", "500": "1", "700": "1"}, {"500"}),
+            ({"100": "500", "200": "500", "500": "1"}, {"500"}),
+            ({"100": "500", "200": "1", "500": "1"}, {"500"}),
+        ]
+        for rows, cores in shapes:
+            with self.subTest(rows=rows):
+                d = _probe(rows, roots=["100", "200"], core_pids=cores,
+                           sentinel=100, sentinel_alive=True)["detail"]
+                g = _groups(d)
+                union = g["session-owned"] | g["unverified"] | g["ownerless"]
+                self.assertEqual(union, {"100", "200"}, d)
+                self.assertEqual(
+                    sum(len(g[k]) for k in ("session-owned", "unverified", "ownerless")),
+                    2, f"a root landed in two groups: {d!r}")
+
 
 class RepairDataAccompaniesTheRepairOffer(unittest.TestCase):
     def test_all_owned_no_sentinel_branch_supplies_the_restamp_pid(self):

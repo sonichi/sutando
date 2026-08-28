@@ -50,6 +50,7 @@ import io
 import json
 import shutil
 import os
+import re
 import sys
 import tempfile
 import time
@@ -600,8 +601,13 @@ def case_j_extra_tree_warns() -> list[str]:
         fails.append(f"j) an untracked extra tree should warn, got {r['status']}")
     if "9000" not in r["detail"]:
         fails.append(f"j) detail must name the untracked root, got {r['detail']!r}")
-    if "4200" in r["detail"]:
-        fails.append("j) must NOT list the sentinel's own tree as an extra")
+    # "not an extra" is the extras COUNT and the stoppable group, not a bare
+    # substring: the sentinel's root is now named in a protected group.
+    if "1 not tracked by the sentinel" not in r["detail"]:
+        fails.append(f"j) sentinel's tree inflated the extras count: {r['detail']!r}")
+    stoppable = re.search(r"ownerless \((\d+)\): ([^;]*)", r["detail"])
+    if stoppable and "4200" in stoppable.group(2):
+        fails.append("j) must NOT offer the sentinel's own tree for stopping")
     return fails
 
 
