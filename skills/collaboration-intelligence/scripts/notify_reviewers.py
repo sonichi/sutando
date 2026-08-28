@@ -257,8 +257,11 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
             continue
         seen_actors.add(actor)
         unasked.append(k)
+    # This reads the ledger only; it cannot know review state, and a refusal
+    # reason gets quoted onward as fact.
     return True, (f"every target was already asked on {repo}#{num} "
-                  f"{int(age.total_seconds() // 60)} min ago and none has reviewed. "
+                  f"{int(age.total_seconds() // 60)} min ago (review state not "
+                  f"checked here — read it before reporting anyone unresponsive). "
                   f"Not yet asked: {', '.join(unasked) or '<roster exhausted>'}")
 
 
