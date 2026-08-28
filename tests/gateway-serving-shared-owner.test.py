@@ -88,6 +88,30 @@ for mod, name in ((hc, "health-check"), (ciw, "core-input-watch"), (ss, "service
     if getattr(mod, "read_gateway_verdict", None) is not gs.read_verdict:
         failures.append(f"delegation: {name} must bind gateway_serving.read_verdict")
 
+# ------------------------------------------ malformed records never read healthy
+
+# Each of these returned serving=True before validation landed. A corrupt record
+# must yield no opinion or non-serving, never a false green.
+MALFORMED = [
+    ("connected is the string 'false'", {"ts": NOW, "connected": "false", "last_ok_ts": NOW}, None),
+    ("connected is 1, not True",        {"ts": NOW, "connected": 1, "last_ok_ts": NOW}, None),
+    ("ts is in the future",             {"ts": NOW + 3600, "connected": True, "last_ok_ts": NOW}, None),
+    ("ts is negative",                  {"ts": -1, "connected": True, "last_ok_ts": NOW}, None),
+    ("last_ok_ts is -1",                {"ts": NOW, "connected": True, "last_ok_ts": -1}, False),
+    ("last_ok_ts is in the future",     {"ts": NOW, "connected": True, "last_ok_ts": NOW + 3600}, False),
+]
+for _label, _rec, _want in MALFORMED:
+    _v = gs.verdict_from_record(_rec, now=NOW, max_age=300)
+    _got = None if _v is None else _v.serving
+    if _got is not _want:
+        failures.append(f"malformed: {_label}: want {_want}, got {_got}")
+
+# Control: the skew window must still ACCEPT a record a hair in the future, or
+# it is a stricter one-sided window rather than a two-sided one.
+_v = gs.verdict_from_record({"ts": NOW + 1, "connected": True, "last_ok_ts": NOW}, now=NOW, max_age=300)
+if _v is None or _v.serving is not True:
+    failures.append("malformed: a record within the skew tolerance must still be serving")
+
 # ------------------------------------------ reader-specific edges preserved
 
 # core-input-watch keeps its reconnect grace: a lane that HAS served and is
@@ -109,5 +133,5 @@ if failures:
     for f in failures:
         print(f"FAIL: {f}")
     sys.exit(1)
-print(f"ok - {len(CONTRACT)} contract + {len(NO_OPINION) + 1} no-opinion cases, "
+print(f"ok - {len(CONTRACT)} contract + {len(NO_OPINION) + 1} no-opinion + {len(MALFORMED) + 1} malformed cases, "
       f"3 readers delegating, 3 reader-specific edges preserved")

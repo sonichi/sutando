@@ -18,12 +18,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-def _num(v) -> float | None:
-    """The value as a float, or None. `bool` is rejected: it passes
+# A record stamped further ahead than this is not clock skew, it is corruption.
+FUTURE_SKEW_S = 5.0
+
+
+def _num(v, *, nonneg: bool = False) -> float | None:
+    """The value as a finite float, or None. `bool` is rejected: it passes
     isinstance(_, int) and would make `True` a valid timestamp."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    return float(v)
+    f = float(v)
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    if nonneg and f < 0:
+        return None
+    return f
 
 
 @dataclass(frozen=True)
@@ -61,14 +70,27 @@ def verdict_from_record(data, *, now: float, max_age: float) -> GatewayVerdict |
     """
     if not isinstance(data, dict):
         return None
-    ts = _num(data.get("ts"))
-    if ts is None or (now - ts) > max_age:
+    ts = _num(data.get("ts"), nonneg=True)
+    if ts is None:
         return None
+    age = now - ts
+    # Two-sided: a future record cannot describe a poll that has happened, and
+    # would otherwise read as fresh until the clock caught up.
+    if age > max_age or age < -FUTURE_SKEW_S:
+        return None
+    connected = data.get("connected")
+    # A non-bool is schema drift, not a value. Coercing it makes "false" true.
+    if not isinstance(connected, bool):
+        return None
+    last_ok = _num(data.get("last_ok_ts"), nonneg=True)
+    # A poll cannot have completed in the future; that is not evidence either.
+    if last_ok is not None and last_ok - now > FUTURE_SKEW_S:
+        last_ok = None
     return GatewayVerdict(
         ts=ts,
-        connected=bool(data.get("connected")),
-        last_ok_ts=_num(data.get("last_ok_ts")),
-        backoff_s=_num(data.get("backoff_s")),
+        connected=connected,
+        last_ok_ts=last_ok,
+        backoff_s=_num(data.get("backoff_s"), nonneg=True),
     )
 
 
