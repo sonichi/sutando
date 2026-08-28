@@ -337,6 +337,48 @@ def main() -> int:
         else:
             sys.modules["vault_intercept"] = _saved
 
+    # gateway_token must be SOURCE-first across both aliases: the bridge reads
+    # both spellings per tier, and an alias-outer loop inverted that.
+    def _envfile(**pairs):
+        f = tempfile.NamedTemporaryFile("w", suffix=".env", delete=False)
+        for k, v in pairs.items():
+            f.write(f"{k}={v}\n")
+        f.close()
+        return Path(f.name)
+
+    LEGACY, CANON = "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN"
+
+    # The two mixed-source cases the review measured as inverted.
+    ef = _envfile(**{CANON: "from-file"})
+    check("legacy in ENV beats canonical in FILE (env tier wins)",
+          ct.gateway_token(env_file=ef, environ={LEGACY: "from-env"},
+                           vault_get=lambda v: "") == "from-env")
+
+    ef2 = _envfile(**{LEGACY: "legacy-file"})
+    check("legacy in FILE beats canonical in VAULT (file tier wins)",
+          ct.gateway_token(env_file=ef2, environ={},
+                           vault_get=lambda v: "vault-canon"
+                           if v == CANON else "") == "legacy-file")
+
+    # Within one source the canonical spelling still wins — the alias order is
+    # preserved, only the tier order changed.
+    check("canonical beats legacy INSIDE the same source",
+          ct.gateway_token(environ={CANON: "canon-env", LEGACY: "legacy-env"},
+                           vault_get=lambda v: "") == "canon-env")
+
+    ef3 = _envfile(**{CANON: "canon-file", LEGACY: "legacy-file"})
+    check("canonical beats legacy inside the FILE too",
+          ct.gateway_token(env_file=ef3, environ={},
+                           vault_get=lambda v: "") == "canon-file")
+
+    # Controls: the vault tier still answers when nothing earlier does, and a
+    # host with nothing anywhere still yields '' rather than a stray value.
+    check("vault still answers when env and file are empty",
+          ct.gateway_token(environ={}, vault_get=lambda v: "vault-tok"
+                           if v == CANON else "") == "vault-tok")
+    check("no token in any source yields ''",
+          ct.gateway_token(environ={}, vault_get=lambda v: "") == "")
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")

@@ -136,10 +136,25 @@ def gateway_token(env_file: Path | None = None, environ=None,
     ONE resolver for every lifecycle gate. Launch, health and recovery each had
     their own env+file copy, so a vault-only host was configured for the bridge
     and invisible to the gates that install, watch and restart it.
+
+    SOURCE-first across both aliases, which is what the bridge does: it reads
+    both spellings from env, then both from the file, then both from the vault.
+    Looping aliases outermost instead made a canonical value in a LATER source
+    beat a legacy value in an EARLIER one, so this gate could hand recovery a
+    different bearer than the bridge would have chosen for itself.
     """
+    environ = os.environ if environ is None else environ
     for var in GATEWAY_TOKEN_VARS:
-        found = resolve_channel_token(var, env_file=env_file, environ=environ,
-                                      vault_get=vault_get)
+        found = _clean(environ.get(var, ""))
+        if found:
+            return found
+    if env_file is not None:
+        for var in GATEWAY_TOKEN_VARS:
+            found = token_from_env_file(var, env_file)
+            if found:
+                return found
+    for var in GATEWAY_TOKEN_VARS:
+        found = token_from_vault(var, vault_get=vault_get)
         if found:
             return found
     return ""
