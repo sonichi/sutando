@@ -118,7 +118,7 @@ def main() -> int:
         got_e, reason_e = guard.guard_result_for_tier(
             marker, "team", REPO, secret_filter=_clean,
             suppress_journal=(leak_state, f"task-leak-{n}"))
-        # Marker-triggered withholds name the marker CLASS (this PR), not the generic sentinel.
+        # Marker-triggered withholds name the marker CLASS, not the generic sentinel.
         check(got_e == guard.TEAM_LEAK_RESULT_MARKER and reason_e is not None,
               f"e) {marker.splitlines()[0]} still LEAK")
         check(not guard.suppressed_record_path(leak_state, f"task-leak-{n}").is_file(),

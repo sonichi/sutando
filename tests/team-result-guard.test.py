@@ -304,9 +304,7 @@ def structural() -> list:
 
 
 def notice_class() -> list:
-    """The notice names sender-attributable triggers only. Born of a real
-    misread: a generic notice was decoded into a false privacy story
-    (2026-08-28); marker withholds now say so, content withholds stay generic
+    """Marker withholds name the marker class; content withholds stay generic,
     so a probe hit is never confirmed to the sender."""
     fails = []
     out, reason = guard.guard_result_for_tier(
@@ -314,8 +312,8 @@ def notice_class() -> list:
     if reason != "result delivery control marker" or "delivery-control marker" not in out \
             or "content" in out.lower():
         fails.append(f"marker notice must claim ONLY the marker: {reason!r} / {out[:80]!r}")
-    # qingyun round-2 cases: the marker raises before the scanner runs, so the
-    # notice must never assert a content conclusion on ANY marker path.
+    # The marker raises before the scanner runs, so the notice must never
+    # assert a content conclusion on any marker path.
     for name, kwargs, filt in (
             ("marker+secret", {}, _leaky),
             ("marker+scanner-failure", {}, _raises),
