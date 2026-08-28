@@ -126,8 +126,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { throw 'file-lock.test.py failed' }
+          python tests/task-workstreams.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'task-workstreams.test.py failed' }
           python tests/voice-lock-windows.test.py
           if ($LASTEXITCODE -ne 0) { throw 'voice-lock-windows.test.py failed' }
+          python tests/quota-projection.test.py RecordSample.test_cross_process_acks_all_survive RecordSample.test_concurrent_writers_lose_no_acknowledged_sample
+          if ($LASTEXITCODE -ne 0) { throw 'quota-projection.test.py failed' }
+          python -c "import sys; sys.path.insert(0, 'src'); import quota_projection"
+          if ($LASTEXITCODE -ne 0) { throw 'quota_projection Windows import failed' }
           python -c "import sys; sys.path.insert(0, 'src'); import task_workstreams"
           if ($LASTEXITCODE -ne 0) { throw 'task_workstreams Windows import failed' }
 

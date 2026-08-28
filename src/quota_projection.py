@@ -10,13 +10,14 @@ quota-state dict; nothing here touches workspace resolution or HTTP.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import math
 import os
 import tempfile
 import threading
 from pathlib import Path
+
+from file_lock import lock_fd, unlock_fd
 
 # Window spans are fixed by the rate limiter, not configurable here.
 WINDOW_SPANS = {"5h": 5 * 3600, "7d": 7 * 24 * 3600}
@@ -224,7 +225,7 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
     with _LOCK:
         history_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "w") as lockf:
-            fcntl.flock(lockf, fcntl.LOCK_EX)
+            lock_fd(lockf.fileno())
             try:
                 history, dirty, readable = _canonical_history(history_path, clock)
                 if not readable:
@@ -285,7 +286,7 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                     return False
                 return True
             finally:
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+                unlock_fd(lockf.fileno())
 
 
 def _window_segments(history: list[dict], u_key: str, r_key: str,

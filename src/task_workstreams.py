@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 
 import local_task_protocol
@@ -779,11 +779,13 @@ def _source_directories(workspace: Path, state: dict, *, discover: bool) -> tupl
             for value in saved:
                 if not isinstance(value, str):
                     continue
-                path = Path(value)
-                if path.is_absolute() or ".." in path.parts:
+                normalized = value.replace("\\", "/")
+                path = PurePosixPath(normalized)
+                if (path.is_absolute() or PureWindowsPath(value).is_absolute()
+                        or ".." in path.parts):
                     continue
-                if value.startswith(("tasks/archive/", "results/archive")):
-                    directories.add(value)
+                if normalized.startswith(("tasks/archive/", "results/archive")):
+                    directories.add(normalized)
     if not discover:
         return tuple(sorted(directories))
 
@@ -807,7 +809,7 @@ def _source_directories(workspace: Path, state: dict, *, discover: bool) -> tupl
     for archive_root in archive_roots:
         for root, child_dirs, _files in os.walk(archive_root):
             try:
-                directories.add(str(Path(root).relative_to(workspace)))
+                directories.add(Path(root).relative_to(workspace).as_posix())
             except ValueError:
                 continue
             # Symlinked directories are not part of the result archive contract.
