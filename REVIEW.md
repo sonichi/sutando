@@ -275,12 +275,16 @@ and loads whichever repo it reviews.
     party's PR two reviews collapse into one, as above. On a PR that account itself authored,
     GitHub refuses only the *decisive* verdicts — the author login cannot APPROVE or request
     changes, only COMMENT — so **the author's own reviews never move `reviewDecision`, however
-    many it files.** The field still reflects *other* logins: `REVIEW_REQUIRED` while none has
-    reviewed decisively, and `APPROVED` or `CHANGES_REQUESTED` once one has. So a self-authored
-    PR can look unreviewed while carrying real review, and `pulls/N/reviews` is **not** empty
-    either. Read `reviewDecision` for the decision and the reviews list for the substance, and
-    never take COMMENT volume for either. Same account, opposite polarity: two-becomes-one on
-    someone else's PR, no-decision-possible on your own.
+    many it files.** So a self-authored PR can look unreviewed while carrying real review, and
+    `pulls/N/reviews` is **not** empty either. Read `reviewDecision` for the decision and the
+    reviews list for the substance, and never take COMMENT volume for either. Same account,
+    opposite polarity: two-becomes-one on someone else's PR, no-decision-possible on your own.
+    **And `reviewDecision` over *other* logins is a THRESHOLD, not a latest-verdict flag.** An
+    active block reads `CHANGES_REQUESTED`; approvals below the repo's required count still read
+    `REVIEW_REQUIRED`; only a met requirement reads `APPROVED`. One approval is not an approved
+    PR. Measured on #3482 with the head unchanged throughout: `john-the-dev` APPROVED at
+    12:14:45Z and the field read `REVIEW_REQUIRED` at 12:16:58Z; `sonichi` APPROVED at 12:51:36Z
+    and it read `APPROVED`.
     *Grounded by:* #3481 (2026-08-28) — approved without looking, twenty minutes after a
     peer had approved on the same account; the PR still read `REVIEW_REQUIRED` afterwards
     and the peer's conflict-of-interest disclosure was left in the superseded review. A
