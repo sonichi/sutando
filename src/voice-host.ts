@@ -79,6 +79,7 @@ function buildWorkTool(device: { deviceId?: string; label?: string },
 		parameters: z.object({
 			task: z.string().describe('What to do, self-contained and specific'),
 		}),
+		execution: 'inline',
 		execute: async ({ task }: { task: string }) => {
 			const id = `task-wearable-${Date.now()}`;
 			const body = [
