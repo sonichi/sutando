@@ -275,7 +275,9 @@ class PoolLead:
         self._last_reclaim_mono = mono
         if last is not None and last_mono is not None:
             if (now - last) - (mono - last_mono) > SLEEP_SKEW_S:
-                self._reclaim_defer_until = now + LEAD_STALE_S
+                # Deadline in MONOTONIC time: a backward wall correction must
+                # not stretch one stale window into hours of withheld recovery.
+                self._reclaim_defer_until = mono + LEAD_STALE_S
         elif last is None:
             # fresh lead + all-stale pool: indistinguishable from a
             # post-wake lead restart — grace one window
@@ -284,9 +286,9 @@ class PoolLead:
             except Exception:  # noqa: BLE001 — broken resolver must not defer
                 return False
             if followers and not any(self.alive_fn(f) for f in followers):
-                self._reclaim_defer_until = now + LEAD_STALE_S
+                self._reclaim_defer_until = mono + LEAD_STALE_S
         du = getattr(self, "_reclaim_defer_until", None)
-        return du is not None and now < du
+        return du is not None and mono < du
 
     def reclaim_dead(self) -> "list[str]":
         """Return dead followers' assignments to the unassigned pool.

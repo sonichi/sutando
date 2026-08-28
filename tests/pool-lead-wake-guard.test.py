@@ -262,6 +262,35 @@ class AwakeSlowDaemonIsNotSleep(unittest.TestCase):
                          "grace expired: reclaim resumes")
         self.assertFalse(claim.exists())
 
+    def test_grace_expires_on_monotonic_despite_a_backward_wall_step(self):
+        # The host clock is adjustable; a backward correction must not stretch
+        # one 90s stale window into hours of withheld recovery.
+        claim = self._claim_of_live_core()
+        self._baseline_tick(claim)
+        self.wall += 3600.0                      # a sleep opens grace
+        self.mono += 1.0
+        self.alive["core-2"] = False             # owner now reads dead
+        self.assertEqual(self.lead.reclaim_claimed(), [], "grace must open")
+        self.assertTrue(claim.exists())
+
+        self.mono += 91.0                        # past LEAD_STALE_S
+        self.wall -= 3600.0                      # ...and the wall steps BACK
+        self.assertEqual([r for r, _ in self.lead.reclaim_claimed()],
+                         ["task-w.claimed-core-2.txt"],
+                         "a wall correction must not extend the grace window")
+
+    def test_grace_still_holds_inside_the_monotonic_window(self):
+        # Control: the test above must not pass merely by never deferring.
+        claim = self._claim_of_live_core()
+        self._baseline_tick(claim)
+        self.wall += 3600.0
+        self.mono += 1.0
+        self.alive["core-2"] = False
+        self.assertEqual(self.lead.reclaim_claimed(), [], "grace must open")
+        self.mono += 10.0                        # well inside the window
+        self.assertEqual(self.lead.reclaim_claimed(), [], "still deferred")
+        self.assertTrue(claim.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
