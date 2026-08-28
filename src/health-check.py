@@ -61,6 +61,10 @@ from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from gateway_serving import (  # noqa: E402
+    read_verdict as read_gateway_verdict,
+    safe_num as _gateway_num,
+)
 from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
@@ -5624,6 +5628,14 @@ def check_gateway_bridge() -> "dict | None":
                 "messages may not be delivered"
             ),
         }
+    if _gateway_status_ts_malformed():
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": ("process running but its status sidecar carries an unusable "
+                       "timestamp — the writer is not reporting poll outcomes, so "
+                       "ag2.space mobile messages may not be delivered"),
+        }
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
@@ -5644,9 +5656,12 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
         last = json.loads(Path(p).read_text()).get("last_ok_ts")
     except (OSError, ValueError, AttributeError, TypeError):
         return None
-    if not isinstance(last, (int, float)) or isinstance(last, bool):
+    # Same numeric policy as the shared verdict owner: a huge int raises on
+    # float(), and NaN/inf would collapse to 0.0 here — "just polled".
+    last = _gateway_num(last, nonneg=True)
+    if last is None:
         return None
-    return max(0.0, (now - float(last)) / 3600.0)
+    return max(0.0, (now - last) / 3600.0)
 
 
 def check_runtime_identity(path: "Path | None" = None,
@@ -5775,10 +5790,26 @@ def _gateway_status_stale_age_s(path: "Path | None" = None,
         ts = json.loads(Path(p).read_text()).get("ts")
     except (OSError, ValueError, AttributeError, TypeError):
         return None
-    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+    # nonneg matches the shared verdict owner: one field, one admissibility rule.
+    ts = _gateway_num(ts, nonneg=True)
+    if ts is None:
         return None
     age = now - ts
     return age if age > GATEWAY_STATUS_MAX_AGE_S else None
+
+
+def _gateway_status_ts_malformed(path: "Path | None" = None) -> bool:
+    """Whether the sidecar carries a `ts` the shared rule rejects.
+
+    Separate from the age helper because its caller reads None as healthy: a
+    writer emitting garbage is an outage, and has no age to report.
+    """
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    try:
+        raw = json.loads(Path(p).read_text()).get("ts")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+    return raw is not None and _gateway_num(raw, nonneg=True) is None
 
 
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
@@ -5786,18 +5817,13 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
 
     True/False when the sidecar is present and fresh; None (no opinion) when it
     is absent, unreadable, malformed, or older than GATEWAY_STATUS_MAX_AGE_S.
-    Mirrors core-input-watch._gateway_status() (#2253)."""
+    The sidecar verdict itself is owned by gateway_serving; only the freshness
+    window is this reader's."""
     import time as _time
     p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
     now = _time.time() if now is None else now
-    try:
-        data = json.loads(Path(p).read_text())
-        ts = data.get("ts")
-        if not isinstance(ts, (int, float)) or (now - ts) > GATEWAY_STATUS_MAX_AGE_S:
-            return None
-        return bool(data.get("connected"))
-    except (OSError, ValueError, AttributeError, TypeError):
-        return None
+    v = read_gateway_verdict(p, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
+    return None if v is None else v.serving
 
 
 # Free-space thresholds. A full volume is not a slow degradation — it is a hard
