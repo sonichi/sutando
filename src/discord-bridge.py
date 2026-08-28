@@ -199,6 +199,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    pending_task_collab.pop(task_id, None)
     await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
     archive_file(result_file, "results", task_id)
     # Archive the SOURCE TASK too. Without this the task file sits in tasks/
@@ -360,6 +361,11 @@ from policy.egress.attachment import (  # noqa: E402
     SEND_ALLOWED_PREFIXES,
     SEND_ALLOWED_ROOTS,
     is_path_sendable as _is_path_sendable_shared,
+    classify_attachment as _classify_attachment,
+    ATTACH_SEND as _ATTACH_SEND,
+    ATTACH_MISSING as _ATTACH_MISSING,
+    ATTACH_EMPTY as _ATTACH_EMPTY,
+    ATTACH_REFUSED as _ATTACH_REFUSED,
 )
 
 
@@ -2538,6 +2544,8 @@ pending_reply_anchors: dict[str, int] = {}
 # on restart; poll_progress fail-closes (skips streaming) when a task_id is
 # absent here, so a recovered task is never streamed without a known owner tier.
 pending_task_tiers: dict[str, str] = {}
+# Collaborators are engaged directly, so their tasks DO update core-status.
+pending_task_collab: dict[str, bool] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -3026,6 +3034,14 @@ def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     except Exception:
         pass
     return False
+
+
+def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
+    """Collaborator status for a TEAM sender, however that tier was reached.
+    Global-allowlist members resolved to team by the tierMap are eligible too."""
+    if access_tier != "team":
+        return False
+    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
 
 
 def select_rulebook_key(access_tier, is_collaborator):
@@ -3812,13 +3828,14 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
-                # Per-channel collaborator check (pure helper — unit-tested):
-                # only the serving channel's own `collaborators` list grants
-                # engagement; membership elsewhere does not carry over.
-                # Handler-glue line: resolution logic is exercised via
-                # resolve_is_collaborator's unit tests; this async-handler branch
-                # is not independently invocable (cf. media_headers no-cover below).
-                is_collaborator = resolve_is_collaborator(data, sender_id, message.channel.id)  # noqa: E501  # pragma: no cover
+        except Exception:  # pragma: no cover — handler glue; unreadable config leaves the guest tier
+            pass
+    # Collaborator status is orthogonal to WHICH arm resolved team tier — a
+    # globally-allowlisted team sender can be a serving-channel collaborator.
+    if access_tier == "team" and not is_collaborator:
+        try:  # pragma: no cover — handler glue; logic in resolve_team_collaborator's tests
+            _acc = json.loads(ACCESS_FILE.read_text())
+            is_collaborator = resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id)  # noqa: E501
         except Exception:
             pass
 
@@ -4264,6 +4281,7 @@ async def _handle_discord_message(message, force=False):
         return
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
+    pending_task_collab[task_id] = bool(is_collaborator)
     # Observability: one inbound accepted-message event.
     _emit_channel(
         "discord", "in",
@@ -4777,6 +4795,7 @@ async def poll_results():
                 # "unknown" — never "owner" — so a lost/absent tier can't
                 # silently upgrade a non-owner reply in tier accounting.
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
+                pending_task_collab.pop(task_id, None)
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -5119,16 +5138,17 @@ def _queued_task_count():
         return 0
 
 
-def _render_progress_content(now, elapsed):
-    """Placeholder body for poll_progress: the live core step normally, or the
-    honest outage copy (frozen status + stale heartbeat + queue depth) when the
-    core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
-    class: never narrate progress the core is not making)."""
+def _render_progress_content(now, elapsed, channel_is_private=False):
+    """`channel_is_private` gates the STEP TEXT and defaults False, so a caller that
+    has not established the audience posts the placeholder without a step."""
     status = progress_stream.read_core_status(STATE_DIR)
     if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
         return progress_stream.format_outage(
             progress_stream.status_age_s(status, now), _queued_task_count())
-    return progress_stream.format_progress(progress_stream.current_step(status), elapsed)
+    step = progress_stream.current_step(status)
+    if not progress_stream.step_visible_in(channel_is_private):
+        step = None
+    return progress_stream.format_progress(step, elapsed)
 
 
 async def poll_progress():
@@ -5190,7 +5210,7 @@ async def poll_progress():
                     if progress_stream.should_edit(now, info["last_edit"]):
                         try:
                             await info["msg"].edit(
-                                content=_render_progress_content(now, elapsed)
+                                content=_render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                             )
                             info["last_edit"] = now
                         except Exception:
@@ -5210,7 +5230,10 @@ async def poll_progress():
                 # entry closes that hole (red-team #2).
                 if task_id not in pending_task_tiers:
                     continue
-                if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+                # Poll branch not unit-invocable; decision covered in progress_stream.
+                if not progress_stream.should_stream_task(  # pragma: no cover
+                        pending_task_tiers.get(task_id),
+                        pending_task_collab.get(task_id, False)):
                     continue  # non-owner → no placeholder, no leak
                 try:
                     created = int(task_id.split("-")[1]) / 1000.0
@@ -5220,7 +5243,7 @@ async def poll_progress():
                 if progress_stream.should_post_placeholder(elapsed):
                     try:
                         msg = await channel.send(
-                            _render_progress_content(now, elapsed)
+                            _render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                         )
                         _progress_msgs[task_id] = {
                             "msg": msg,
@@ -5251,6 +5274,7 @@ async def poll_progress():
                                 continue
                     _progress_msgs.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
+                    pending_task_collab.pop(task_id, None)  # pragma: no cover
         except Exception as e:
             print(f"  [progress] poll_progress tick error: {e}", flush=True)
         await asyncio.sleep(3)
@@ -5466,13 +5490,33 @@ async def poll_proactive():
                                             _redirect_text, f.stem,
                                             _chunk_for_discord)
                                     for fpath in files:
-                                        fpath = os.path.expanduser(fpath.strip())
-                                        if _is_path_sendable(fpath):
+                                        _outcome, fpath = _classify_attachment(fpath)
+                                        if _outcome == _ATTACH_SEND:
                                             await _target_ch.send(file=discord.File(fpath))
-                                        elif not os.path.isfile(fpath):
+                                            print(
+                                                f"  [proactive channel-redirect] sent file: {fpath}",
+                                                flush=True,
+                                            )
+                                        elif _outcome == _ATTACH_MISSING:
                                             print(
                                                 f"  [proactive channel-redirect] file marker, "
                                                 f"file not found: {fpath}",
+                                                flush=True,
+                                            )
+                                        elif _outcome == _ATTACH_EMPTY:
+                                            await _target_ch.send(
+                                                "(a file marker in this reply had no path"
+                                                " — nothing attached)")
+                                            print("  [proactive channel-redirect] file marker "
+                                                  "with EMPTY path — malformed, surfaced",
+                                                  flush=True)
+                                        elif _outcome == _ATTACH_REFUSED:
+                                            # Authorization denial, not absence: silence
+                                            # here reads as a successful attach.
+                                            await _target_ch.send(f"(file not allowed: {fpath})")
+                                            print(
+                                                f"  [proactive channel-redirect] REJECTED file "
+                                                f"(not in allowlist): {fpath}",
                                                 flush=True,
                                             )
                                     try:
@@ -5830,13 +5874,22 @@ async def poll_dm_fallback():
                                 except Exception:
                                     pass
                             for fpath in file_list:
-                                fpath = os.path.expanduser(fpath.strip())
-                                if _is_path_sendable(fpath):
+                                _outcome, fpath = _classify_attachment(fpath)
+                                if _outcome == _ATTACH_SEND:
                                     await target_channel.send(file=discord.File(fpath))
                                     print(f"  [dm-fallback channel-redirect] sent file: {fpath}", flush=True)
-                                elif not os.path.isfile(fpath):
+                                elif _outcome == _ATTACH_MISSING:
                                     # See poll_results — log only, no user noise.
                                     print(f"  [dm-fallback channel-redirect] file marker, file not found: {fpath}", flush=True)
+                                elif _outcome == _ATTACH_EMPTY:
+                                    await target_channel.send(
+                                        "(a file marker in this reply had no path"
+                                        " — nothing attached)")
+                                    print("  [dm-fallback channel-redirect] file marker with "
+                                          "EMPTY path — malformed, surfaced", flush=True)
+                                elif _outcome == _ATTACH_REFUSED:
+                                    await target_channel.send(f"(file not allowed: {fpath})")
+                                    print(f"  [dm-fallback channel-redirect] REJECTED file (not in allowlist): {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
                             if _task_file.exists():

@@ -854,6 +854,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(*delegation_read_result(
                     unquote(path[len("/delegation/results/"):])))
         elif path.startswith("/result/"):
+            # Owner data: gated like the write leg it belongs to (POST /task) —
+            # token checked when configured. NOT delegation's refuse-outright.
+            if not self.check_auth():
+                return
             task_id = path[len("/result/"):]
             result = get_task_result(task_id)
             if result:

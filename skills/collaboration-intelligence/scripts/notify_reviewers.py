@@ -32,6 +32,9 @@ import sys
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[3]
+# Bare `python3` can resolve to the Xcode CLT stub on a clean macOS host, which
+# raises an install modal and makes the probe fail open. Reuse this interpreter.
+_PY = sys.executable or "python3"
 sys.path.insert(0, str(_REPO / "src"))
 
 
@@ -85,11 +88,47 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     return out, worst
 
 
+def stand_present_in_room(target: dict) -> "tuple[bool, str]":
+    """Is this stand actually a member of the room we are about to mention it in?
+
+    A Stand mxid is scoped to a ROOM, not to a person — the same human can hold a
+    different Stand per room. room_ops has no unknown-handle branch, so mentioning
+    an absent mxid resolves to nothing and reports ok, which is indistinguishable
+    from a delivered mention. Returns (present, reason); an UNVERIFIABLE roster is
+    not treated as absent — we refuse to send only on a positive absence.
+    """
+    argv = [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
+            "members", target["room"]]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return True, f"unverified ({type(exc).__name__})"
+    if p.returncode != 0:
+        return True, f"unverified (members rc={p.returncode})"
+    try:
+        payload = json.loads(p.stdout)
+    except ValueError:
+        return True, "unverified (unparseable members)"
+    # A non-object payload has no .get — the same shape the refusal-reason fix
+    # guards downstream. An unusable roster is UNVERIFIED, never an absence.
+    if not isinstance(payload, dict):
+        return True, "unverified (non-object members payload)"
+    # `ok` is the instrument's own verdict. Only a true one licenses reading the
+    # list as fact; without it an empty list is a failure, not an empty room.
+    if payload.get("ok") is not True:
+        return True, f"unverified (room_ops ok={payload.get('ok')!r})"
+    members = payload.get("members")
+    if not isinstance(members, list):
+        return True, "unverified (members not a list)"
+    ids = {m.get("user_id") for m in members if isinstance(m, dict)}
+    return target["stand"] in ids, f"{len(ids)} members"
+
+
 def command_for(target: dict, message: str) -> "list[str]":
     body = message
     if target.get("human") and target["human"] not in body:
         body = f"{body} (cc {target['human']})"
-    return ["python3", str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
+    return [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
             "mention", target["stand"], body, target["room"]]
 
 
@@ -99,26 +138,83 @@ def main() -> int:
                     help="comma-separated roster keys")
     ap.add_argument("--message", required=True)
     ap.add_argument("--send", action="store_true")
+    ap.add_argument("--room", default=None,
+                    help="room the conversation is actually in. When given, a reviewer whose "
+                         "Stand is not a member THERE is REFUSED rather than silently notified "
+                         "in their recorded room — correctly addressed, wrong venue.")
     a = ap.parse_args()
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
     failures = 0
     for t in targets:
+        if a.room and t["room"] != a.room:
+            # Not an error: the pair is valid, but the Stand does not live in
+            # THIS room, and sending would relocate the thread and report ok.
+            here, why = stand_present_in_room({"stand": t["stand"], "room": a.room})
+            if not here:
+                # Naming the recorded room as a fallback is itself a presence
+                # claim; check it, or this refusal redirects to a second nobody.
+                there, why2 = stand_present_in_room(t)
+                # The probe fails OPEN, so `there` is True for an unreadable roster:
+                # test unverified FIRST or this asserts presence it never measured.
+                if why2.startswith("unverified"):
+                    where = (f"{t['stand']}'s recorded room {t['room']} could not be "
+                             f"checked ({why2}) — do not assume they are reachable there")
+                elif there:
+                    where = (f"{t['stand']} IS a member of {t['room']} ({why2}) — "
+                             "post there deliberately, or route via the human")
+                else:
+                    where = (f"{t['stand']} is absent from its recorded room {t['room']} "
+                             f"too ({why2}) — the roster entry is stale; resolve this "
+                             "person's Stand before addressing them anywhere")
+                print(f"{t['name']}: NOT REACHABLE in {a.room} ({why}) — {where}. "
+                      "Not sending.", file=sys.stderr)
+                refusal_rc = max(refusal_rc, 5)
+                continue
+            if why.startswith("unverified"):
+                # Distinct from a checked PLAN: relocating on an unread roster is
+                # a guess, and it must not print the same line as a verified send.
+                print(f"{t['name']}: UNVERIFIED for {a.room} ({why}) — sending anyway; "
+                      "presence could not be checked, so this is not a confirmation.",
+                      file=sys.stderr)
+            t = {**t, "room": a.room}   # reachable here: address them HERE, not elsewhere
+        present, why = stand_present_in_room(t)
+        if present and why.startswith("unverified"):
+            print(f"{t['name']}: UNVERIFIED for {t['room']} ({why}) — sending unchecked.",
+                  file=sys.stderr)
+        if not present:
+            # Positive absence: sending would resolve to nothing and report ok.
+            print(f"{t['name']}: ABSENT from {t['room']} ({why}) — "
+                  f"{t['stand']} is not a member; a mention here reaches nobody. "
+                  "Resolve the room's own Stand for this person.", file=sys.stderr)
+            failures += 1
+            continue
         argv = command_for(t, a.message)
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue
         p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-        ok, event = False, ""
+        ok, event, reason = False, "", ""
         try:
             payload = json.loads(p.stdout)
-            ok, event = bool(payload.get("ok")), payload.get("event_id") or ""
         except ValueError:
-            pass
-        # ok:false with rc 0 is the documented silent-fail — never trust rc
-        print(f"{t['name']}: ok={ok} event={event[:24]}"
-              + ("" if ok else f" STDERR={p.stderr[:120]}"))
-        if not ok:
+            payload = None
+        # A non-object payload has no .get and a non-string event_id breaks
+        # the slice; an unusable one must not occupy `reason` and hide stderr.
+        if isinstance(payload, dict):
+            ok = bool(payload.get("ok"))
+            event = str(payload.get("event_id") or "")
+            reason = str(payload.get("reason") or "")
+            fallback = "no reason reported"
+        else:
+            fallback = "unparseable room_ops output"
+        # room_ops reports refusals in-band: rc 0, empty stderr, ok:false + reason.
+        # Printing stderr alone renders every such refusal as a blank line.
+        if ok:
+            print(f"{t['name']}: ok=True event={event[:24]}")
+        else:
+            detail = reason or p.stderr.strip()[:120] or fallback
+            print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
             failures += 1
     if failures:
         return 1

@@ -345,5 +345,37 @@ class HistoricalBytesUseTheSAMEUnitsAsTheLimit(unittest.TestCase):
         self.assertNotIn("came within", note)
 
 
+class StaleDeadlineGuardCanActuallyFire(unittest.TestCase):
+    """The guard that says "this deadline is stale" must sample the FULL history.
+
+    It used to take the newest point >=0.5h back — the SHORTEST qualifying
+    window. But a short window with a gain is exactly what maximises gain/span
+    and wins `best_rate`, so the control was reading the same burst it was
+    meant to detect, and stayed silent in the one case it was written for.
+    Measured live 2026-08-26: the probe quoted "+146 B over 2.0h -> 17.7h of
+    remaining headroom" while the file's 224h history was net -102 B.
+    """
+
+    def test_recent_burst_on_a_flat_history_is_reported_as_stale(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            # net -110 B across the window, with a +146 B burst in the last hour
+            idx = _repo_with_sizes(Path(td), [23800, 23700, 23600, 23550, 23544, 23690])
+            note = m._index_growth_note(idx, 23690)
+        # the max window still quotes its deadline...
+        self.assertIn("of remaining headroom at that rate", note)
+        # ...and the control now contradicts it, which is the whole point
+        self.assertIn("deadline is stale", note)
+        self.assertIn("-110", note)
+
+    def test_sustained_growth_is_not_called_stale(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [23000, 23150, 23300, 23450, 23600, 23690])
+            note = m._index_growth_note(idx, 23690)
+        self.assertIn("of remaining headroom at that rate", note)
+        self.assertNotIn("deadline is stale", note)
+
+
 if __name__ == "__main__":
     unittest.main()
