@@ -21,13 +21,46 @@ def store() -> pathlib.Path:
     return pathlib.Path(ws) / "data" / "collaboration-intelligence"
 
 def load(d):
-    import yaml
-    q = yaml.safe_load((d / "quick-lookup.yaml").read_text())["quick_lookup"]
-    ents = []
-    p = d / "entities.yaml"
-    if p.exists():
-        ents = yaml.safe_load(p.read_text()).get("entities") or []
+    # Either store may exist alone: quick-lookup.yaml (the bounded hot set) or
+    # reviewer-stands.json (the reviewer roster). A host with only the roster
+    # used to crash here, so every session hand-rolled its own lookup — and a
+    # hand-rolled get(github_login) misses a roster keyed by short name.
+    q, ents = {}, []
+    yp = d / "quick-lookup.yaml"
+    if yp.exists():
+        import yaml
+        q = yaml.safe_load(yp.read_text())["quick_lookup"]
+        ep = d / "entities.yaml"
+        if ep.exists():
+            ents = yaml.safe_load(ep.read_text()).get("entities") or []
     return q, ents
+
+
+def load_roster(d):
+    """reviewer-stands.json rows, normalised to the quick-lookup row shape.
+
+    The roster is keyed by short name with the GitHub login in the `github`
+    FIELD; a key-equality lookup queries the wrong axis and reads a mapped
+    reviewer as absent (measured twice: 2026-08-27, 2026-08-28 — both times
+    `get("john-the-dev")` missed the entry keyed `rui`).
+    """
+    import json
+    p = d / "reviewer-stands.json"
+    if not p.exists():
+        return []
+    rows = []
+    for key, r in json.loads(p.read_text()).items():
+        if not isinstance(r, dict):
+            continue
+        rows.append({
+            "entity_id": key,
+            "agent_mxid": r.get("stand") or "",
+            "github": r.get("github") or "",
+            "human": r.get("human") or "",
+            "allowlisted": r.get("allowlisted"),
+            "one_line": f"github={r.get('github','')} human={r.get('human','')} stand={r.get('stand','')}",
+        })
+    return rows
 
 def match(rows, needle, ents=()):
     n = needle.lower().lstrip("@")
@@ -40,6 +73,8 @@ def match(rows, needle, ents=()):
     strong = [r for r in rows
               if n in str(r.get("entity_id", "")).lower()
               or n in str(r.get("agent_mxid", "")).lower()
+              or n == str(r.get("github", "")).lower()
+              or n in str(r.get("human", "")).lower()
               or r.get("entity_id") in by_ident]
     if strong:
         return strong
@@ -62,7 +97,11 @@ def main():
         print(f"MAP MISSING at {d}\n  -> persistence unavailable. Send anyway; say the identity is unverified.")
         return 0
     q, ents = load(d)
-    rows = q.get("recent_entities") or []
+    rows = (q.get("recent_entities") or []) + load_roster(d)
+    if not rows:
+        print(f"MAP EMPTY at {d} (no quick-lookup.yaml rows, no reviewer-stands.json)\n"
+              "  -> persistence unavailable. Send anyway; say the identity is unverified.")
+        return 0
 
     up = str(q.get("updated_at", "?"))
     try:
