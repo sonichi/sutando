@@ -151,14 +151,18 @@ telegram-bridge, slack-bridge, cron-runner, the workstream classifier
 | `src/agent-api.py` | `:1016`, `:1051`, `:1078`, `:1325`; answer-injection rewrite at `:1230` | writes `task_content` directly |
 | `src/github-webhook.py` | `:191` | external events, `access_tier: other` |
 | `src/web-client.ts` | `:4433` | owner-tier scan trigger from the web UI |
-| `skills/phone-conversation/scripts/conversation-server.ts` | `:421` | phone tasks, owner or other tier |
+| `skills/phone-conversation/scripts/conversation-server.ts` | `:422` delegated task; `:1171` call summary; `:1567` meeting approval | phone tasks, owner or other tier. Three separate writer edges in one file — none references the stamper |
 | `src/inline-tools.ts` | `:710` | voice `CANCEL_INSTRUCTION` writer, owner tier — the voice-agent process's remaining unsigned edge (ordinary voice delegation stamps via `task-delegation.ts`) |
 | `src/health-check.py` | `emit_task_for_failures` → `local_task_protocol.write_task_file` | the seam stamps only in a process that injected a stamper; only the gateway bridge does, so health tasks are unsigned |
-| `src/dedup_recovery.py` | `:90` | re-publishes a requeued task under a new id; the new bytes are unsigned |
+| `skills/schedule-crons/scripts/codex-scheduler.py` | `_enqueue()` `:264-269` | scheduled-cron tasks, owner tier. Installed and reconciled by `src/agent/codex/cli/start-cli.sh:226`, so it is live whenever the Codex runtime is selected |
+| `src/dedup_recovery.py` | `:90`, via `build_requeued_task` (`src/result_markers.py:393-430`) | re-publishes under a NEW id. The rewrite copies every unrecognised header through verbatim, so an existing `envelope_hmac:` is PRESERVED while `id:` changes. The MAC covers the whole text minus the stamp line (`task_envelope.py:115-117`), so a sealed original verifies `invalid`, not `unsigned` — only an unsigned original stays `unsigned`. Same rewrite reached from `src/discord-bridge.py`'s sibling re-ask path |
 | `src/Sutando/main.swift` | context-drop `writeTask` (~`:2020`) | desktop hotkey task; no Swift stamper implementation exists |
 
 Until each edge stamps (or is explicitly scoped out with a recorded
-rationale), tasks from those writers are `unsigned`. **Phase 1 is complete
+rationale), tasks from those writers are `unsigned` — except the
+re-publication edge above, which yields `invalid` whenever the original was
+sealed. `unsigned` and `invalid` are different telemetry facts and a census
+that reports only the first will undercount. **Phase 1 is complete
 when every in-scope writer edge stamps** — not when the PR trail has no open
 rows, and not when telemetry is running. Telemetry went live first; writer
 coverage is the incomplete half, and the census's unsigned count is its live
