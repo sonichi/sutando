@@ -487,9 +487,8 @@ def mark_stopped() -> None:
     canonical stop path kills tmux sessions and never signals the sidecar,
     so without this the sidecar's core-gone exit reads as a crash and
     recover-core may relaunch a deliberately stopped core (#2160)."""
-    # A stop can land before any beat created the directory; the sidecar's
-    # signal handler swallows errors best-effort, so mkdir here or the
-    # tombstone silently never exists on a fresh workspace.
+    # mkdir: a stop can precede the first beat, and the signal handler's
+    # best-effort except would swallow the miss — tombstone silently absent.
     CORES_DIR.mkdir(parents=True, exist_ok=True)
     _alive_path().with_suffix(".stopped").write_text(str(time.time()))
 
