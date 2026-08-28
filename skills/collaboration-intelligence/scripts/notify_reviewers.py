@@ -215,7 +215,6 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     if not ledger.exists():
         return False, ""
     import json as _j
-    import datetime as _dt
     prior, earliest = set(), None
     try:
         for line in ledger.read_text().splitlines():
@@ -237,8 +236,8 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     if not names or not names.issubset(prior):
         return False, ""            # at least one NEW name -> this IS widening
     try:
-        age = (_dt.datetime.now(_dt.timezone.utc)
-               - _dt.datetime.fromisoformat(earliest.replace("Z", "+00:00")))
+        age = (datetime.datetime.now(datetime.timezone.utc)
+               - datetime.datetime.fromisoformat(earliest.replace("Z", "+00:00")))
     except ValueError:
         return False, ""
     if age.total_seconds() < minutes * 60:
