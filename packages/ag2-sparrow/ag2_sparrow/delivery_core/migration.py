@@ -67,6 +67,20 @@ def _same_bytes(path: Path, payload: bytes) -> bool:
         return False
 
 
+def _reconcile_marker(c, marker: Path, payload: bytes, key: str,
+                      report: dict, conflicts: list, counter: str) -> None:
+    """Stage `payload` at `marker`, or reconcile with what is already there.
+    A marker holding DIFFERENT bytes is an earlier cycle's body, so skipping it
+    would fence C on the stale payload; that is a conflict, not a completed import."""
+    if not marker.exists():
+        _stage(c, marker, payload)
+        report[counter] += 1
+    elif _same_bytes(marker, payload):
+        report["skipped"] += 1
+    else:
+        conflicts.append(key)
+
+
 def _receipt_matches(records, rec) -> bool:
     """A terminal record proves THIS A record migrated only if it carries
     that record's receipt. Otherwise C is holding an earlier cycle's."""
@@ -231,6 +245,8 @@ def import_a_state(root: Path) -> dict:
         if f.is_symlink() or not f.is_file():
             key = _safe_key(f.stem)
             marker = c._d("undelivered") / f"{key}{SEP}import-invalid-file{SEP}import"
+            # Presence-only ON PURPOSE: the payload is a constant, so an existing
+            # marker cannot be holding a different cycle's body.
             if not marker.exists():
                 _stage(c, marker, b"")
                 report["unknown"] += 1
@@ -245,20 +261,15 @@ def import_a_state(root: Path) -> dict:
                 or not isinstance(rec["item_id"], str)):
             key = _safe_key(f.stem)
             marker = c._d("undelivered") / f"{key}{SEP}import-unreadable{SEP}import"
-            if marker.exists():
-                report["skipped"] += 1       # idempotent: one marker per record
-            else:
-                _stage(c, marker, f.read_bytes() if f.exists() else b"")
-                report["unknown"] += 1
+            _reconcile_marker(c, marker,
+                              f.read_bytes() if f.exists() else b"",
+                              key, report, conflicts, "unknown")
             continue
         if f.stem != _a_key(rec["item_id"]):
             key = _safe_key(f.stem)
             marker = c._d("undelivered") / f"{key}{SEP}import-name-mismatch{SEP}import"
-            if not marker.exists():
-                _stage(c, marker, f.read_bytes())
-                report["unknown"] += 1
-            else:
-                report["skipped"] += 1
+            _reconcile_marker(c, marker, f.read_bytes(),
+                              key, report, conflicts, "unknown")
             continue
         item_id = rec["item_id"]
         key = _safe_key(item_id)
@@ -297,11 +308,8 @@ def import_a_state(root: Path) -> dict:
                     if rec.get("provider") and rec.get("destination") else None)
             if classify_legacy_sentinel(_ref) is not DeliveryOutcome.CONFIRMED:
                 marker = c._d("undelivered") / f"{key}{SEP}outcome-unknown{SEP}import"
-                if marker.exists():
-                    report["skipped"] += 1
-                else:
-                    _stage(c, marker, payload)
-                    report["unknown"] += 1
+                _reconcile_marker(c, marker, payload,
+                                  key, report, conflicts, "unknown")
                 continue
             c._write_terminal(key, {
                 "schema": 1, "item_id": item_id, "outcome": "confirmed",
@@ -317,21 +325,12 @@ def import_a_state(root: Path) -> dict:
         elif status == "PARKED":
             reason = _safe_component(str(rec.get("reason") or "parked")[:40])
             marker = c._d("undelivered") / f"{key}{SEP}{reason}{SEP}import"
-            if marker.exists():
-                if _same_bytes(marker, payload):
-                    report["skipped"] += 1
-                else:
-                    conflicts.append(key)
-            else:
-                _stage(c, marker, payload)
-                report["parked"] += 1
+            _reconcile_marker(c, marker, payload,
+                              key, report, conflicts, "parked")
         elif claim is not None:
             marker = c._d("undelivered") / f"{key}{SEP}import-outcome-unknown{SEP}import"
-            if marker.exists():
-                report["skipped"] += 1
-            else:
-                _stage(c, marker, payload)
-                report["unknown"] += 1
+            _reconcile_marker(c, marker, payload,
+                              key, report, conflicts, "unknown")
         else:
             rp = c._d("ready") / key
             if rp.exists():
