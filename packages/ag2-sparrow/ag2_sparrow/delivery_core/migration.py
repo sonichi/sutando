@@ -67,6 +67,20 @@ def _same_bytes(path: Path, payload: bytes) -> bool:
         return False
 
 
+def _pseudo_incarnation(key: str) -> str:
+    """The import's stand-in for a claim incarnation, used for BOTH the record
+    field and the staging filename — they were two spellings of one value.
+
+    It must start with `key`: the staging name is `terminal~<incarnation>~<ns>`
+    and `_next_cycle` globs that by key, so a non-key-leading incarnation hides
+    its own staged record from the scan whose job is to see it.
+    """
+    # Function-local, matching this module's rule that backend_c names are not
+    # a hard dependency of every consumer.
+    from .backend_c import SEP, _safe_component
+    return f"{key}{SEP}{_safe_component('a-import')}"
+
+
 def _retire_budget(ap: Path) -> None:
     """A terminal ends the cycle, so its attempt budget dies with it — C does
     this on completion, and an imported terminal must not leave one live."""
@@ -326,8 +340,8 @@ def import_a_state(root: Path) -> dict:
                 # 2-part pseudo-incarnation: binds id+worker for the total
                 # validator, can never equal a real 5-part claim filename.
                 "attempts": n, "imported": True,
-                "incarnation": f"{key}{SEP}{_safe_component('a-import')}",
-            }, f"a-import{SEP}{key}")
+                "incarnation": _pseudo_incarnation(key),
+            }, _pseudo_incarnation(key))
             _retire_budget(ap)
             report["delivered"] += 1
         elif status == "PARKED":
