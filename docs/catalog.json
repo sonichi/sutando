@@ -157,7 +157,7 @@
       "last_verified": "2026-08-20"
     },
     "docs/runtime/claude-hook-contract-v1.md": {
-      "title": "Claude Code Hook Contract — v1",
+      "title": "Claude Code Hook Contract \u2014 v1",
       "audience": [
         "contributors",
         "maintainers"
@@ -341,7 +341,7 @@
       "last_verified": "2026-08-17"
     },
     "docs/sparrow-v1-contract.md": {
-      "title": "ag2-sparrow v1 — the frozen delivery contract",
+      "title": "ag2-sparrow v1 \u2014 the frozen delivery contract",
       "audience": [
         "contributors",
         "maintainers"
@@ -371,7 +371,7 @@
       "last_verified": "2026-08-22"
     },
     "docs/lead-follower-pool.md": {
-      "title": "Lead-follower agent pool — design",
+      "title": "Lead-follower agent pool \u2014 design",
       "audience": [
         "contributors",
         "maintainers"
@@ -381,7 +381,7 @@
       "last_verified": "2026-08-26"
     },
     "docs/server-and-identity.md": {
-      "title": "Sutando Server & the Agent ID card — design",
+      "title": "Sutando Server & the Agent ID card \u2014 design",
       "audience": [
         "contributors",
         "maintainers"

@@ -13,9 +13,8 @@ name: lint-src-map
 
 on:
   pull_request:
-    branches: [main, staging-interaction-planes]
   push:
-    branches: [main, staging-interaction-planes]
+    branches: [main]
 
 jobs:
   lint-src-map:
