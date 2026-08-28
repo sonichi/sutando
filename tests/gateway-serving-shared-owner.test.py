@@ -144,6 +144,15 @@ if gs.read_verdict(_p, now=NOW, max_age=300) is not None:
     failures.append("malformed: a huge int via read_verdict must be no opinion, not a raise")
 malformed_checked += 1
 
+# ------------------------------------------ non-numeric ts shapes
+
+# NO_OPINION already covers a non-mapping record and a bool ts; these are the
+# remaining shapes _num rejects, which nothing else exercises.
+for _label, _bad in [("a string", "1000"), ("None", None), ("a list", [1])]:
+    if gs.verdict_from_record({"ts": _bad, "connected": True, "last_ok_ts": NOW}, now=NOW, max_age=300) is not None:
+        failures.append(f"shape: ts of {_label} must be no opinion")
+    malformed_checked += 1
+
 # ------------------------------------------ the guard must not over-reject
 
 # Every rule above rejects something; each needs its nearest ACCEPTED neighbour,
