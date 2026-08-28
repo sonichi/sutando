@@ -50,7 +50,7 @@ class PushModeTests(unittest.IsolatedAsyncioTestCase):
         good, dead = _FakeWriter(), _FakeWriter(dead=True)
         self.srv._subscribers = {good, dead}
         (self.results / "task-rtapi-old.txt").write_text("old")     # pre-existing
-        seen = {f.name for f in self.tv._result_files()}            # seeded
+        seen = {f.name for f, _ts in self.tv._result_files()}            # seeded
 
         (self.results / "task-rtapi-new.txt").write_text("hello stream")  # new
         await self.srv._emit_new_results(self.tv, seen)
@@ -95,7 +95,7 @@ class PushModeTests(unittest.IsolatedAsyncioTestCase):
         # must NOT be pushed to runtime-api subscribers — the exact cross-channel
         good = _FakeWriter()
         self.srv._subscribers = {good}
-        seen = {f.name for f in self.tv._result_files()}
+        seen = {f.name for f, _ts in self.tv._result_files()}
         (self.results / "task-1234567890.txt").write_text("a room reply")
         await self.srv._emit_new_results(self.tv, seen)
         self.assertEqual(good.frames, [])  # not streamed
