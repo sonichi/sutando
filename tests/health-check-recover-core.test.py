@@ -40,7 +40,7 @@ class Harness:
         self.restart_calls.append(True)
         return self.restart_ok
 
-    def run(self, now, alive=True, age=900, key="t1", status_ts=None, booted=False):
+    def run(self, now, alive=True, age=900, key="t1", status_ts=None, booted=False, stopped=False):
         oldest = (key, age) if age is not None else None
         return hc.recover_core_if_wedged(
             state_file=self.state_file,
@@ -50,6 +50,7 @@ class Harness:
             status_ts_fn=lambda: status_ts,
             just_booted_fn=lambda: booted,
             restart_fn=self.restart,
+            stopped_fn=lambda: stopped,
             sender=self.sender,
         )
 
@@ -233,6 +234,31 @@ def case_j_dead_core_relaunches() -> list[str]:
         r = h.run(now=1_000_000, alive=False, age=5000, booted=True)  # dead but just booted
         if r is not None or h.restart_calls:
             fails.append(f"j) a just-booted core must NOT be relaunched: {r}, {h.restart_calls}")
+    return fails
+
+
+def case_k_deliberate_stop_never_relaunches() -> list[str]:
+    """A graceful-stop tombstone gates the relaunch: a SIGTERM'd core reads
+    dead but must NOT be restarted (relaunch would undo an intentional stop —
+    john-the-dev, #2160). Control: same timeline without the tombstone still
+    relaunches, so the gate can actually fail."""
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        h = Harness(Path(td) / "rec.json")
+        h.run(now=1_000_000, alive=False, age=5000, stopped=True)
+        r = h.run(now=1_000_200, alive=False, age=5000, stopped=True)
+        if not r or r.get("action") != "deliberate-stop":
+            fails.append(f"k) tombstoned dead core should report deliberate-stop, got {r}")
+        if h.restart_calls:
+            fails.append(f"k) tombstoned dead core must not restart, got {h.restart_calls}")
+        if h.sent:
+            fails.append(f"k) deliberate stop must not page, got {h.sent}")
+    with tempfile.TemporaryDirectory() as td:     # control: gate absent -> case j behavior
+        h = Harness(Path(td) / "rec.json")
+        h.run(now=1_000_000, alive=False, age=5000, stopped=False)
+        r = h.run(now=1_000_200, alive=False, age=5000, stopped=False)
+        if not r or r.get("action") != "restarted" or h.restart_calls != [True]:
+            fails.append(f"k) control without tombstone should still relaunch, got {r}, {h.restart_calls}")
     return fails
 
 

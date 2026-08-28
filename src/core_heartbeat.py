@@ -405,6 +405,12 @@ def _handle_signal(signum: int, frame) -> None:
     global _SHUTDOWN_REQUESTED
     _SHUTDOWN_REQUESTED = True
     try:
+        # Tombstone BEFORE the unlink: recover-core must not read a graceful
+        # stop as death and relaunch a core someone stopped on purpose (#2160).
+        _alive_path().with_suffix(".stopped").write_text(str(time.time()))
+    except Exception:  # pragma: no cover — best-effort
+        pass
+    try:
         _alive_path().unlink(missing_ok=True)
     except Exception:  # pragma: no cover — best-effort cleanup
         pass
@@ -428,6 +434,11 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     # a failed boot as healthy. Keep waiting (so a late core can still arm the
     # gate), but remove any stale prior record until the real core is observed.
     saw_core = False
+    try:
+        # A new run supersedes any prior graceful-stop tombstone.
+        _alive_path().with_suffix(".stopped").unlink(missing_ok=True)
+    except Exception:  # pragma: no cover — best-effort
+        pass
     absent_streak = 0
     while not _SHUTDOWN_REQUESTED:
         present = core_pid() is not None

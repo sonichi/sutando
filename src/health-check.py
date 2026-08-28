@@ -9702,6 +9702,24 @@ def _local_core_alive(workspace: Optional[Path] = None,
         return None           # exists but unreadable (permissions, I/O) -> UNKNOWN
 
 
+def _local_core_stopped(workspace: Optional[Path] = None) -> bool:
+    """True when THIS host's core wrote a graceful-stop tombstone (SIGTERM/
+    SIGINT path in core_heartbeat). Gates only the DESTRUCTIVE relaunch —
+    _local_core_alive's contract (False == no heartbeat) is untouched. The
+    tombstone is cleared by the next heartbeat run, so it cannot suppress
+    recovery of a core that actually came back and then died (#2160).
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from util_paths import _host_label
+        label = _host_label()
+    except Exception:
+        return False          # cannot identify host -> do not suppress
+    return (workspace / "state" / "cores" / f"{label}.stopped").exists()
+
+
 def _alerts_suppressed(check: dict) -> bool:
     """True when a check must NOT wake anyone, whatever its status says.
 
@@ -10431,6 +10449,7 @@ def recover_core_if_wedged(
     status_ts_fn=None,
     just_booted_fn=None,
     restart_fn=None,
+    stopped_fn=None,
     sender=None,
 ) -> "dict | None":
     """Auto-restart the core when it is alive-but-wedged. Returns a dict
@@ -10451,6 +10470,7 @@ def recover_core_if_wedged(
     # LOCAL, not fleet-wide: a peer's heartbeat must not suppress a relaunch on
     # THIS host. Queue-gating call sites keep `_any_core_alive` — that IS fleet-wide.
     alive_fn = alive_fn or _local_core_alive
+    stopped_fn = stopped_fn or _local_core_stopped
     oldest_task_fn = oldest_task_fn or (lambda: _oldest_pending_task(now))
     status_ts_fn = status_ts_fn or _core_status_ts
     # LOCAL boot guard, matching the liveness check: fleet-wide, a PEER's boot
@@ -10593,6 +10613,10 @@ def recover_core_if_wedged(
         # DM fails we still restart (recovery > notification — don't leave the
         # core wedged because Slack is down), but we record dm_sent=False and log
         # to stderr/launchd so the restart is never invisible.
+        if dead and stopped_fn():
+            # Graceful-stop tombstone: someone stopped this core ON PURPOSE.
+            # Relaunching would undo a deliberate act (john-the-dev, #2160).
+            return {"action": "deliberate-stop"}
         if dead:
             dm_ok = send(
                 ":skull: *Sutando core is down* — no heartbeat (the session exited, "
