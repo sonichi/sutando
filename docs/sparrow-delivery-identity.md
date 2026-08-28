@@ -67,12 +67,27 @@ post-reconciliation RE-SEND (the successor in R2's table) is a NEW delivery of
 the SAME side-effect; an operator REQUEUE of a parked item resumes the old
 delivery and replaces neither.
 
-**Shipped key rule, which this document does NOT override:**
+**Key rule, which this document does NOT override:**
 `delivery_core/core.py` defines the key as `f"{item_id}#{resend_epoch}"`, and
 `resend_epoch` "changes only on a DELIBERATE operator re-send". A
-post-reconciliation re-send IS deliberate, so on the shipped path the successor
-**advances `resend_epoch` and therefore carries a NEW key** — it is not
-provider-deduplicated against its predecessor. Same-key succession would be a
+post-reconciliation re-send IS deliberate, so the successor **carries a NEW
+key** — it is not provider-deduplicated against its predecessor. A successor is
+therefore a NEW intended external side-effect, not a retry of the old one.
+
+**The shipped path does not advance that epoch today, and this document must not
+claim it does.** `delivery_core/core.py:92` calls `idempotency_key(item_id)`
+with the default epoch on every drain, and no production caller passes a
+nonzero one. Measured on the real backend and core, republishing after a final
+`CONFIRMED`:
+
+```text
+key_republish_after_delivered=True
+key_values=['task-X#0', 'task-X#0']   key_changed=False
+```
+
+So the NEW-key rule above is the **intent being frozen**, and epoch persistence
+and propagation are **slice-2 work**. Until that lands, a successor reuses its
+predecessor's key on the shipped path. Same-key succession would be a
 *change* to `docs/sparrow-v1-contract.md:24-28`, not a definition, and slice 2
 must not assume it until that contract is amended.
 Today's shipped approximations:
@@ -115,7 +130,7 @@ The operations are distinct, and each declares its identity semantics:
 |---|---|---|---|
 | pre-terminal retry / crash recovery | outbox claim recovery | preserved | preserved |
 | `PARKED` → operator requeue | `src/outbox.py` requeue (`PARKED → QUEUED`, same key) | preserved | preserved |
-| post-reconciliation re-send | successor after a final disposition | NEW, with lineage to predecessor | **NEW** (`resend_epoch` advances — shipped rule above) |
+| post-reconciliation re-send | successor after a final disposition | NEW, with lineage to predecessor | **NEW** (`resend_epoch` advances — the frozen intent; not yet on the shipped path, see above) |
 
 `PARKED` is therefore a SUSPENDED disposition in this model, not a terminal
 one: requeue resumes the same delivery, matching the shipped same-key
@@ -133,6 +148,32 @@ with no `delivery_id` gets one by a **pure function of its stable content**
 (e.g. its `task_id` plus boundary name) — the same file always maps to the same
 `delivery_id`, on every read, on every host. Minting a random or time-seeded id
 at read time is forbidden: it would make one legacy delivery look like many.
+
+**R3 governs `delivery_id` minting only, and explicitly does NOT govern the
+proactive leg's `item_id`.** `ProactiveClaimFence._item_id` is
+`filename#mtime_ns` (`src/proactive_claim_fence.py`), and its mtime scoping is
+deliberate rather than debt — the code says so: *"a re-written body is a fresh
+delivery cycle, never a continuation of the consumed one's attempt history."*
+That is the opposite of R3's rule, on purpose, because for that leg a rewritten
+file IS a new delivery.
+
+The boundary has to be written down because the two are trivially confused, and
+the confusion is measurable. Driving the real `ProactiveClaimFence` and
+`DesignAClaimBackend` with **unchanged bytes and only the mtime moved**:
+
+```text
+live_body='unchanged'
+live_first_id=proactive-same.txt#1000000000
+live_second_id=proactive-same.txt#2000000000
+live_record_count=2          attempts reset to 0
+r3_reset_mtime_control=True  (restoring the mtime restores the first id)
+```
+
+So a metadata-only touch remints that delivery and resets its attempt history.
+Under R3 that would be a violation; under the proactive leg's own rule it is the
+intended behaviour. **Slice 2 must not apply R3 to this leg**, and if the
+proactive rule is ever to change, that is a deliberate change to the fence, not
+a consequence of this freeze.
 
 ## Relationship to shipped code (what this freezes, what it does not)
 
