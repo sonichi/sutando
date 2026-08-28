@@ -148,8 +148,10 @@ coverage-summary.md
 [._]sw[n-p]
 # Deep range, but only at a real dotenv boundary — `.env` as a bare substring
 # would hide `diagram.environment.svg` and `service.envoy.svc`.
-*.env.s[a-w][a-z]
-*.env.*.s[a-w][a-z]
+*.env.s[a-v][a-z]
+*.env.sw[a-p]
+*.env.*.s[a-v][a-z]
+*.env.*.sw[a-p]
 *~
 
 # Built locally from a GAIA copy; carries the answer key -- never commit.

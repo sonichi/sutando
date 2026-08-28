@@ -45,6 +45,12 @@ for f in .env.svz .env.saa .env.local.swp .env.production.saa; do
     check_ignored "$f" "$f (deep vim range) is ignored"
 done
 
+# Upper bound: vim decrements .swp down to .swa, then .svz down to .saa, so it
+# never writes .swq-.swz. A wider range would hide a real file under those names.
+for f in .env.swq .env.swz .env.local.swq .env.production.swz; do
+    refute_ignored "$f" "$f is NOT a vim swap name — must stay trackable"
+done
+
 # DELIBERATELY SACRIFICED, pinned so it is a decision and not a surprise. A vim
 # swap of .env is spelled exactly like a real .env.<3-char> file; secrets win here.
 for f in .env.svg .env.sql .env.sas .env.sty .env.svc .env.local.svg; do
