@@ -249,6 +249,37 @@ rc=0
 check "recorder REFUSES an invalid existing manifest (rc != 0)" [ "$rc" -ne 0 ]
 check "...and did not replace it with {}" bash -c "grep -q 'not json{' '$INVALID'"
 
+echo "8. MANIFEST MODE: the manifest is never wider than the union it describes"
+# keweichen on #3418: the writer used a plain open(), so under umask 0022 a
+# private (0600) union file's non-array state was duplicated into a 0644
+# manifest — the same disclosure, one file over.
+new_case modes
+mkdir -p "$CASE_A/state"
+printf '{"users": ["alice"], "schemaVersion": 1}\n' > "$CASE_A/state/slack-allowed-recipients.json"
+printf '{"users": ["bob"], "schemaVersion": 2}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
+chmod 600 "$CASE_A/state/slack-allowed-recipients.json"
+chmod 600 "$CASE_DEST/state/slack-allowed-recipients.json"
+rc=0; RUN --commit > "$TMP/modes-commit.log" 2>&1 || rc=$?
+check "private-input union commit succeeds" [ "$rc" -eq 0 ]
+MODE_DST="$CASE_DEST/state/slack-allowed-recipients.json"
+MODE_MANIFEST="$(ls "$CASE_DEST/state/.migration-union-scalars-"*.json | head -1)"
+check "the union file is still private" \
+    bash -c "[ \"\$(stat -f '%Lp' '$MODE_DST' 2>/dev/null || stat -c '%a' '$MODE_DST')\" = 600 ]"
+check "the manifest is no wider than the union it describes" \
+    bash -c "[ \"\$(stat -f '%Lp' '$MODE_MANIFEST' 2>/dev/null || stat -c '%a' '$MODE_MANIFEST')\" = 600 ]"
+check "the manifest carries the union's private scalar (so its mode matters)" \
+    bash -c "grep -q schemaVersion '$MODE_MANIFEST'"
+check "the commit recorded the expected union mode" \
+    bash -c "grep -q '__union_modes__' '$MODE_MANIFEST'"
+rc=0; RUN --verify > "$TMP/modes-verify.log" 2>&1 || rc=$?
+check "a pristine private union passes verify" [ "$rc" -eq 0 ]
+# The recorded mode is load-bearing: widening the dest must FAIL verification
+# even though every scalar and array still matches.
+chmod 644 "$MODE_DST"
+rc=0; RUN --verify > "$TMP/modes-verify-widened.log" 2>&1 || rc=$?
+check "a WIDENED union fails verify though its content is untouched" [ "$rc" -ne 0 ]
+chmod 600 "$MODE_DST"
+
 echo ""
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

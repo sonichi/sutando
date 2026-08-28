@@ -1156,7 +1156,9 @@ record_union_scalars() {
     local py; py="$(resolve_python "$REPO_DIR")"
     [ -n "$py" ] || return 1
     "$py" - "$dst" "$rel" "$manifest" <<'PY'
-import json, os, sys
+import json, os, stat, sys
+
+MODES_KEY = "__union_modes__"
 
 dst, rel, manifest = sys.argv[1:4]
 with open(dst, encoding="utf-8") as fh:
@@ -1171,10 +1173,27 @@ if os.path.exists(manifest):
         sys.exit(1)
 else:
     m = {}
+if rel == MODES_KEY:
+    # A rel can never be this key, but if one ever were, its scalars would be
+    # read back as the mode table. Refuse rather than corrupt the manifest.
+    sys.exit(1)
 m[rel] = scalars
+union_mode = stat.S_IMODE(os.stat(dst).st_mode)
+modes = m.get(MODES_KEY)
+m[MODES_KEY] = ({} if not isinstance(modes, dict) else modes)
+m[MODES_KEY][rel] = oct(union_mode)
+# The manifest holds every union's non-array state, so it must be no wider than
+# the most restrictive file it describes — a 0600 source's scalars in a 0644
+# manifest is the same disclosure, one file over. Create at 0600 so it is never
+# briefly world-readable, then narrow to the intersection.
+want_mode = union_mode
+if os.path.exists(manifest):
+    want_mode &= stat.S_IMODE(os.stat(manifest).st_mode)
 tmp = manifest + ".tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
     json.dump(m, fh, indent=1, sort_keys=True)
+os.chmod(tmp, want_mode)
 os.replace(tmp, manifest)
 PY
 }
@@ -1188,7 +1207,7 @@ union_contains() {
     local py; py="$(resolve_python "$REPO_DIR")"
     [ -n "$py" ] || return 1
     "$py" - "$src" "$dst" "$manifest" "$rel" <<'PY'
-import json, os, sys
+import json, os, stat, sys
 
 src, dst, manifest, rel = sys.argv[1:5]
 try:
@@ -1221,6 +1240,13 @@ if manifest and rel and os.path.exists(manifest):
     if not isinstance(m, dict) or rel not in m or not isinstance(m[rel], dict):
         sys.exit(1)
     expected = m[rel]
+    # The commit recorded what the union's mode should be; a widened dest is a
+    # disclosure the scalar comparison cannot see. Absent for manifests written
+    # before this key existed — then there is nothing to check, not a failure.
+    modes = m.get("__union_modes__")
+    if isinstance(modes, dict) and rel in modes:
+        if oct(stat.S_IMODE(os.stat(dst).st_mode)) != modes[rel]:
+            sys.exit(1)
 if expected is not None:
     have = {k: v for k, v in d.items() if not isinstance(v, list)}
     if have != expected:
