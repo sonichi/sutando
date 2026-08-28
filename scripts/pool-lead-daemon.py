@@ -15,6 +15,7 @@ from __future__ import annotations
 # flake8: noqa: E402 — imports follow the sys.path bootstrap
 
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -50,6 +51,41 @@ def _heartbeat_alive(cores: Path, instance: str, now_fn=time.time) -> bool:
     return -HEARTBEAT_FUTURE_TOLERANCE_S <= age < LEAD_STALE_S
 
 
+def acquire_singleton(cores: Path):
+    """Exclusive for this daemon's lifetime, or None when a lead already holds it.
+
+    The boundary lives here, not in the wrapper: a pgrep-then-exec check lets two
+    starts pass simultaneously, and startup.sh can launch a lead without the
+    wrapper at all. KEEP THE RETURNED HANDLE OPEN — flock is tied to the open file
+    description, so closing it releases the lock while the daemon still runs."""
+    cores.mkdir(parents=True, exist_ok=True)
+    handle = open(cores / f"{LEAD_LABEL}.lock", "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def release_beat(beat: Path, pid: int) -> bool:
+    """Remove the heartbeat only if it still names `pid`.
+
+    An unconditional unlink lets a losing or exiting instance delete the LIVE
+    lead's beat, and every follower then degrades to leaderless claiming."""
+    try:
+        record = json.loads(beat.read_text())
+    except (OSError, ValueError):
+        return False
+    if record.get("pid") != pid:
+        return False
+    try:
+        beat.unlink()
+    except OSError:
+        return False
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=2.0)
@@ -68,6 +104,12 @@ def main() -> int:
 
     def alive(inst: str) -> bool:
         return _heartbeat_alive(cores, inst)
+
+    lock = acquire_singleton(cores)
+    if lock is None:
+        print("pool-lead: another lead holds the singleton lock — standing down",
+              flush=True)
+        return 0
 
     lead = PoolLead(tasks, state, followers, alive,
                     metrics=PoolMetrics(state))
@@ -94,10 +136,7 @@ def main() -> int:
             print(f"reclaimed-claim {name} -> {disposition}", flush=True)
         status.maybe_write()
         time.sleep(a.interval)
-    try:
-        beat.unlink()  # followers degrade NOW, not after the stale window
-    except OSError:
-        pass
+    release_beat(beat, os.getpid())  # degrade followers NOW, not after the stale window
     print("pool-lead: stopped", flush=True)
     return 0
 

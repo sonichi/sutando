@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""The lead is a singleton, and only its own writer clears its heartbeat.
+
+Before this, scripts/pool-lead-wrapper.sh decided by pgrep-then-exec, so two
+concurrent starts both crossed into the daemon; and the daemon unlinked the
+shared beat unconditionally on exit, so a losing instance deleted the LIVE
+lead's heartbeat and every follower degraded to leaderless claiming.
+
+Run: python3 tests/pool-lead-singleton.test.py   (stdlib only)
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+_spec = importlib.util.spec_from_file_location(
+    "pool_lead_daemon", REPO / "scripts" / "pool-lead-daemon.py")
+dm = importlib.util.module_from_spec(_spec)
+sys.modules["pool_lead_daemon"] = dm
+_spec.loader.exec_module(dm)
+
+
+class SingletonTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cores = Path(self.tmp.name) / "cores"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_second_holder_in_this_process_is_refused(self):
+        first = dm.acquire_singleton(self.cores)
+        self.assertIsNotNone(first)
+        # Same process, a DIFFERENT open file description — flock is per-OFD, so
+        # this is a real second holder, not the same one re-entering.
+        self.assertIsNone(dm.acquire_singleton(self.cores))
+        first.close()
+
+    def test_concurrent_starts_yield_exactly_one_winner(self):
+        # The real race: two independent processes, no shared handle. Each holds
+        # the lock ~1s so their attempts genuinely overlap.
+        prog = (
+            "import importlib.util,sys,time,pathlib\n"
+            f"s=importlib.util.spec_from_file_location('d', {str(REPO / 'scripts' / 'pool-lead-daemon.py')!r})\n"
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+            "h=m.acquire_singleton(pathlib.Path(sys.argv[1]))\n"
+            "print('WON' if h else 'LOST')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(1.0)\n"
+        )
+        procs = [subprocess.Popen([sys.executable, "-c", prog, str(self.cores)],
+                                  stdout=subprocess.PIPE, text=True)
+                 for _ in range(2)]
+        outs = [p.communicate(timeout=60)[0].strip() for p in procs]
+        self.assertEqual(outs.count("WON"), 1,
+                         f"expected exactly one winner, got {outs}")
+
+    def test_lock_frees_when_the_holder_exits(self):
+        first = dm.acquire_singleton(self.cores)
+        self.assertIsNotNone(first)
+        first.close()
+        second = dm.acquire_singleton(self.cores)
+        self.assertIsNotNone(second, "a released lock must be re-acquirable")
+        second.close()
+
+
+class BeatOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cores = Path(self.tmp.name) / "cores"
+        self.cores.mkdir(parents=True)
+        self.beat = self.cores / f"{dm.LEAD_LABEL}.alive"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, pid):
+        self.beat.write_text(json.dumps({"role": "pool-lead", "pid": pid, "ts": 1.0}))
+
+    def test_writer_clears_its_own_beat(self):
+        self._write(os.getpid())
+        self.assertTrue(dm.release_beat(self.beat, os.getpid()))
+        self.assertFalse(self.beat.exists())
+
+    def test_a_different_instance_must_not_clear_the_live_beat(self):
+        self._write(os.getpid() + 1)          # the LIVE lead
+        self.assertFalse(dm.release_beat(self.beat, os.getpid()))
+        self.assertTrue(self.beat.exists(), "a loser deleted the live lead's beat")
+
+    def test_absent_or_corrupt_beat_is_not_an_error(self):
+        self.assertFalse(dm.release_beat(self.beat, os.getpid()))
+        self.beat.write_text("{not json")
+        self.assertFalse(dm.release_beat(self.beat, os.getpid()))
+        self.assertTrue(self.beat.exists())
+
+
+class WrapperTests(unittest.TestCase):
+    def test_wrapper_does_not_claim_to_be_the_boundary(self):
+        s = (REPO / "scripts" / "pool-lead-wrapper.sh").read_text()
+        self.assertIn("NOT the singleton boundary", s)
+
+    def test_wrapper_is_valid_shell(self):
+        r = subprocess.run(["bash", "-n", str(REPO / "scripts" / "pool-lead-wrapper.sh")],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

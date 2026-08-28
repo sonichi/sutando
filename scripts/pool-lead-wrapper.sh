@@ -6,9 +6,8 @@ set -u
 
 DAEMON="$POOL_REPO_DIR/scripts/pool-lead-daemon.py"
 
-# One lead per install. A lead already running from this checkout (e.g. the
-# unsupervised startup.sh fallback) keeps ownership; KeepAlive retries us after
-# ThrottleInterval, so supervision resumes as soon as that one exits.
+# Fast path only — NOT the singleton boundary. Two wrappers can pass this check
+# at once; the daemon's flock decides, and a loser exits 0 on its own.
 if pgrep -f "$DAEMON" > /dev/null 2>&1; then
   echo "pool-lead: a lead from this checkout is already running — standing down"
   sleep "${SUTANDO_POOL_LEAD_DEFER_S:-30}"
