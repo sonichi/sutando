@@ -90,6 +90,16 @@ def host_slug() -> str:
 
 CRONS_FILE = WORKSPACE / "hosts" / host_slug() / "crons.json"
 TASKS_DIR = WORKSPACE / "tasks"
+
+
+def tasks_dir() -> Path:
+    """Resolved per CALL, honoring SUTANDO_TASKS_DIR like task-notifier.sh.
+    A module constant binds at import, so a caller setting it later is ignored.
+    """
+    override = os.environ.get("SUTANDO_TASKS_DIR")
+    if override:
+        return Path(override).expanduser()
+    return TASKS_DIR
 STATE_FILE = WORKSPACE / "state" / "cron-runner-state.json"
 CORE_ALIVE_FILE = WORKSPACE / "state" / "cores" / f"{host_slug()}.alive"
 REPO_ROOT = SRC_DIR.parent
@@ -393,7 +403,8 @@ def emit_task(name: str, entry: dict) -> Path:
         f"priority: low\n"
         f"task: {body_task}\n"
     )
-    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    _td = tasks_dir()
+    _td.mkdir(parents=True, exist_ok=True)
     # Coalesce pending fires: if a prior emission for this same entry is still
     # unconsumed (the core was down or busy), remove it before writing the new
     # one, so a long outage leaves exactly ONE task per entry — the newest —
@@ -406,13 +417,13 @@ def emit_task(name: str, entry: dict) -> Path:
     # the sweep from matching a different entry whose slug shares this prefix
     # (e.g. cleaning "sync" must not delete "sync-workspace"'s pending task).
     prefix = f"task-cron-{safe_name}-"
-    for stale in TASKS_DIR.glob(f"{prefix}*.txt"):
+    for stale in _td.glob(f"{prefix}*.txt"):
         if stale.name[len(prefix):-4].isdigit():
             try:
                 stale.unlink()
             except OSError:
                 pass
-    path = TASKS_DIR / f"{task_id}.txt"
+    path = _td / f"{task_id}.txt"
     # HMAC envelope (#3014 writer census): stamp at this writer's edge, fail-open
     # so a stamping error costs the stamp and never the fire.
     try:
