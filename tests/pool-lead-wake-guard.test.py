@@ -341,5 +341,69 @@ class AwakeSlowDaemonIsNotSleep(unittest.TestCase):
         self.assertTrue(claim.exists())
 
 
+
+class RestartedLeadInheritsWakeEvidence(WakeGuardBase):
+    """A lead that restarts across a host sleep has no in-process clock
+    sample, so tick 1 must read its predecessor's. Ordering matters: if a
+    sibling re-beats before the claim owner does, a liveness-only rule sees
+    a live pool and repools a claim whose owner is merely still waking."""
+
+    def _restart_lead(self):
+        """Same state dir, new instance — what launchd does on respawn."""
+        return PoolLead(self.tasks, self.state,
+                        followers_fn=lambda: list(self.pool),
+                        alive_fn=lambda i: self.alive.get(i, False),
+                        now_fn=lambda: self.clock,
+                        mono_fn=lambda: self.mono,
+                        results_dir=self.results)
+
+    def _daemon_order(self, lead):
+        """scripts/pool-lead-daemon.py:143-148 — reclaim_dead, then
+        reclaim_claimed, then reclaim_stuck_assignments."""
+        return (lead.reclaim_dead(), lead.reclaim_claimed(),
+                lead.reclaim_stuck_assignments())
+
+    def test_sibling_first_wake_does_not_repool_a_live_claim(self):
+        (self.tasks / "task-restart.claimed-core-2.txt").write_text("x")
+        self.lead.reclaim_claimed()          # pre-sleep tick, persists evidence
+        self._sleep_whole_host(968)          # wall jumps, monotonic does not
+        self.alive["core-1"] = True          # the sibling re-beats FIRST
+        self.alive["core-2"] = False         # the claim owner has not yet
+        dead, claimed, stuck = self._daemon_order(self._restart_lead())
+        self.assertEqual((dead, claimed, stuck), ([], [], []),
+                         "a restarted lead repooled a live claim on a sibling-first wake")
+        self.assertEqual(self._names(), ["task-restart.claimed-core-2.txt"])
+
+    def test_control_no_predecessor_evidence_keeps_the_old_behaviour(self):
+        """Nothing persisted: the all-stale fallback still decides, so this
+        change adds a path rather than replacing one."""
+        (self.tasks / "task-restart.claimed-core-2.txt").write_text("x")
+        for inst in self.pool:
+            self.alive[inst] = False
+        lead = self._restart_lead()          # never ticked; no file on disk
+        self.assertIsNone(lead._load_wake_evidence())
+        self.assertEqual(lead.reclaim_claimed(), [])
+
+    def test_control_a_restart_without_a_sleep_still_reclaims_a_dead_owner(self):
+        """The discriminating case: inherited evidence must not become a
+        blanket deferral. Lead restarts with NO wall/monotonic skew, so a
+        genuinely dead owner is reclaimed on tick 1."""
+        (self.tasks / "task-restart.claimed-core-2.txt").write_text("x")
+        self.lead.reclaim_claimed()          # persists evidence
+        self.clock += 2
+        self.mono += 2                       # awake: both advance together
+        self.alive["core-2"] = False         # owner genuinely gone
+        _, claimed, _ = self._daemon_order(self._restart_lead())
+        self.assertEqual(claimed, [("task-restart.claimed-core-2.txt", "repooled")])
+        self.assertEqual(self._names(), ["task-restart.txt"])
+
+    def test_control_a_reboot_discards_the_inherited_sample(self):
+        """Monotonic is boot-relative: after a reboot the stored value is
+        ahead of ours, which is unusable rather than evidence of a sleep."""
+        (self.tasks / "task-restart.claimed-core-2.txt").write_text("x")
+        self.lead.reclaim_claimed()
+        self.mono -= 400                     # monotonic reset by the reboot
+        self.assertIsNone(self._restart_lead()._load_wake_evidence())
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

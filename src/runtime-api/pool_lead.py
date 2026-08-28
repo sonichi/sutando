@@ -257,6 +257,37 @@ class PoolLead:
         return out
 
     # ── crash recovery ──────────────────────────────────────────────────────
+    def _wake_evidence_path(self) -> Path:
+        return self.state_dir / "pool" / "lead-tick.json"
+
+    def _load_wake_evidence(self) -> "tuple[float, float] | None":
+        """Previous lead's last (wall, mono) sample, or None if unusable.
+
+        monotonic is BOOT-relative, so a predecessor's sample is
+        differenceable here; a reboot resets it, which shows up as a stored
+        value ahead of ours and is discarded.
+        """
+        try:
+            d = json.loads(self._wake_evidence_path().read_text())
+            w, m = float(d["wall"]), float(d["mono"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        if m > self.mono():
+            return None
+        return w, m
+
+    def _save_wake_evidence(self, wall: float, mono: float) -> None:
+        # Best-effort: losing the sample costs one grace window, while
+        # raising here would abort the reclaim sweep that called us.
+        try:
+            p = self._wake_evidence_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"wall": wall, "mono": mono}))
+            os.replace(tmp, p)
+        except OSError:
+            pass
+
     def _host_gap_defers_reclaim(self) -> bool:
         """Host-sleep evidence is wall-vs-monotonic SKEW across the lead's
         own tick, not mere tick-gap size: the monotonic clock pauses through
@@ -271,8 +302,15 @@ class PoolLead:
         mono = self.mono()
         last = getattr(self, "_last_reclaim_tick", None)
         last_mono = getattr(self, "_last_reclaim_mono", None)
+        if last is None:
+            # A restarted lead has no in-process sample, but its predecessor
+            # left one: seed from it so the skew test below covers tick 1.
+            seeded = self._load_wake_evidence()
+            if seeded is not None:
+                last, last_mono = seeded
         self._last_reclaim_tick = now
         self._last_reclaim_mono = mono
+        self._save_wake_evidence(now, mono)
         if last is not None and last_mono is not None:
             if (now - last) - (mono - last_mono) > SLEEP_SKEW_S:
                 # Deadline in MONOTONIC time: a backward wall correction must
