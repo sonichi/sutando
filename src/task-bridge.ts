@@ -616,10 +616,15 @@ export function getRecentConversation(count = 10): string {
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
 const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
 
-/** claim_task.py renames on claim, so both spellings are one task. Key any
- *  task-identity state on this, never the raw basename. */
+/** Mirrors `_ID_STATE` in task_archive.py. The instance label is interpolated
+ *  with re.escape, so it is opaque — never assume `core-<digits>`. */
+const TASK_STATE_SUFFIX = /^(task-.+?)\.(?:assigned|claimed)-.+?\.txt$/;
+
+/** The lead renames on assign and claim_task.py on claim, so all three spellings
+ *  are one task. Key task-identity state on this, never the raw basename. */
 export function logicalTaskName(basename: string): string {
-	return basename.replace(/\.claimed-core-\d+\.txt$/, '.txt');
+	const m = basename.match(TASK_STATE_SUFFIX);
+	return m ? `${m[1]}.txt` : basename;
 }
 
 /** Anchored, so `context-drop-replay` does not match. Shared by the scan and the
@@ -643,7 +648,8 @@ export function findTaskFile(dir: string, taskId: string): string | null {
 	if (existsSync(bare)) return bare;
 	try {
 		const names = readdirSync(dir).sort();
-		const claimed = names.filter((n) => n.startsWith(`${taskId}.claimed-core-`) && n.endsWith('.txt'));
+		// Compare the captured id, not a name prefix: task-1 must not claim task-10's file.
+		const claimed = names.filter((n) => n.match(TASK_STATE_SUFFIX)?.[1] === taskId);
 		if (claimed.length) return join(dir, claimed[0]);
 		// Quarantined last, matching find_task_file in task_archive.py: it is the
 		// task's only surviving header block, and routing needs those headers.

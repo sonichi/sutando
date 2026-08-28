@@ -162,10 +162,26 @@ describe('claim rename is the same logical task', () => {
 		assert.equal(logicalTaskName('task-X.claimed-core-12.txt'), 'task-X.txt');
 	});
 
-	it('does not collapse names that merely look similar', () => {
-		// Not a claim suffix: no digits, or trailing text after it.
-		assert.equal(logicalTaskName('task-X.claimed-core-.txt'), 'task-X.claimed-core-.txt');
-		assert.equal(logicalTaskName('task-X.claimed-core-1.bak.txt'), 'task-X.claimed-core-1.bak.txt');
+	// The lead's rename, which this function was blind to: `.assigned-<core>` is
+	// a real on-disk spelling (remote_gateway_bridge globs it), so treating it as
+	// a new name re-injects a drop that was already handed to the session.
+	it('collapses the assigned spelling too', () => {
+		assert.equal(logicalTaskName('task-X.assigned-core-3.txt'), 'task-X.txt');
+		assert.equal(logicalTaskName('task-X.assigned-follower-7.txt'), 'task-X.txt');
+	});
+
+	// The instance label is interpolated with re.escape, so it is opaque. Any
+	// grammar assuming `core-<digits>` misses real names — the Python side pins
+	// these same three in test_instance_label_is_opaque.
+	it('treats the instance label as opaque, not core-<digits>', () => {
+		assert.equal(logicalTaskName('task-X.claimed-core-x.txt'), 'task-X.txt');
+		assert.equal(logicalTaskName('task-X.claimed-core-2.local.txt'), 'task-X.txt');
+		assert.equal(logicalTaskName('task-X.claimed-worker-a1.txt'), 'task-X.txt');
+	});
+
+	it('does not collapse names that carry no state suffix at all', () => {
+		assert.equal(logicalTaskName('task-X.bak.txt'), 'task-X.bak.txt');
+		assert.equal(logicalTaskName('task-X.claimedish-core-1.txt'), 'task-X.claimedish-core-1.txt');
 	});
 
 	it('production scan: a body completed between polls injects the WHOLE body', () => {
@@ -287,6 +303,23 @@ describe('findTaskFile locates both spellings', () => {
 	it('finds the claimed file when the bare one is gone', () => {
 		write('task-E.claimed-core-1.txt', 'id: task-E\ntask: x\n');
 		assert.equal(findTaskFile(dir, 'task-E'), join(dir, 'task-E.claimed-core-1.txt'));
+	});
+
+	it('finds the assigned file — the lead renames before any claim', () => {
+		write('task-AS.assigned-core-3.txt', 'id: task-AS\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-AS'), join(dir, 'task-AS.assigned-core-3.txt'));
+	});
+
+	it('finds a claimed file whose instance label is not core-<digits>', () => {
+		write('task-OP.claimed-worker-a1.txt', 'id: task-OP\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-OP'), join(dir, 'task-OP.claimed-worker-a1.txt'));
+	});
+
+	// A name prefix would let the shorter id claim the longer one's file.
+	it('does not let task-1 match task-10s state file', () => {
+		write('task-10.claimed-core-1.txt', 'id: task-10\ntask: x\n');
+		assert.equal(findTaskFile(dir, 'task-1'), null);
+		assert.equal(findTaskFile(dir, 'task-10'), join(dir, 'task-10.claimed-core-1.txt'));
 	});
 
 	it('returns null when neither exists', () => {
