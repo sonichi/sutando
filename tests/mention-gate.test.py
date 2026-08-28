@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Mention-gate (ON side) contract: while ON, a message @-tagging the owner in
-a requireMention channel counts as a bot mention and is ingested + audit-
-logged; OFF and missing/malformed state keep today's behavior (fail-CLOSED —
-the feature adds ingestion, so every failure reads OFF); expiry flips ON→OFF
-automatically; bot-mention messages are unaffected in both states. Plus the
-Discord delegation pins: the production `_mention_gate_triggers_ingest`
-chokepoint and an AST pin that the requireMention rejection branch consults it.
+a requireMention channel counts as a bot mention and is ingested; OFF and
+missing/malformed state keep today's behavior (fail-CLOSED). Review controls
+pinned (#3473 @qingyun-wu): (1) an explicitly EMPTY tierMap yields an EMPTY
+owner set — no allowFrom fallback escalation; (2) the audit row binds to the
+DURABLY WRITTEN task, not the gate verdict — an unauthorized sender leaves no
+audit row and no task. Includes full-handler behavioral drives plus the
+production-helper delegation pins and AST placement pins.
 
 Run: python3 tests/mention-gate.test.py
 """
 from __future__ import annotations
 
 import ast
+import asyncio
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -53,11 +57,13 @@ def _load(name: str, rel: str):
 
 mg = _load("mention_gate", "src/mention_gate.py")
 db = _load("db_mention_gate", "src/discord-bridge.py")
+import discord  # noqa: E402  — the bridge imported it (or re-exec'd), so it resolves here
 
 OWNERS = ["111222333", "999888777"]
+STRANGER = "123456789012345678"
 
 
-def _msg(author_id="123456789012345678", content="", mention_ids=(),
+def _msg(author_id=STRANGER, content="", mention_ids=(),
          channel_id="555666777", message_id="424242"):
     return NS(
         author=NS(id=author_id),
@@ -66,6 +72,20 @@ def _msg(author_id="123456789012345678", content="", mention_ids=(),
         channel=NS(id=channel_id, name="general"),
         id=message_id,
     )
+
+
+def _audit_rows():
+    path = _WS / "state" / "mention-gate-ingested.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
+
+
+def _reset_ws_gate():
+    for name in ("mention-gate.json", "mention-gate-ingested.jsonl"):
+        p = _WS / "state" / name
+        if p.exists():
+            p.unlink()
 
 
 class GateStatePolicy(unittest.TestCase):
@@ -96,18 +116,40 @@ class GateStatePolicy(unittest.TestCase):
         self.assertTrue(mg.owner_tag_triggers_ingest(self.ws, now=before))
         self.assertFalse(mg.owner_tag_triggers_ingest(self.ws, now=after))
 
+    def test_naive_until_and_naive_now_are_treated_as_utc(self):
+        mg.write_state(self.ws, mentions_enabled=True,
+                       until="2026-01-01T00:00:00")  # no timezone
+        self.assertTrue(mg.owner_tag_triggers_ingest(
+            self.ws, now=datetime(2025, 12, 31, 23, 0)))  # naive now
+        self.assertFalse(mg.owner_tag_triggers_ingest(
+            self.ws, now=datetime(2026, 1, 1, 0, 0, 1)))
+
     def test_unparseable_until_fails_closed(self):
         mg.write_state(self.ws, mentions_enabled=True, until="whenever")
+        self.assertFalse(mg.owner_tag_triggers_ingest(self.ws))
+
+    def test_empty_string_until_fails_closed(self):
+        # "" is a str, so read_state keeps it; the expiry parse must not treat
+        # it as "no expiry" and leave the gate open-endedly ON.
+        mg.write_state(self.ws, mentions_enabled=True, until="")
         self.assertFalse(mg.owner_tag_triggers_ingest(self.ws))
 
     def test_malformed_state_fails_closed(self):
         state = self.ws / "state" / "mention-gate.json"
         state.parent.mkdir(parents=True)
-        for garbage in ("not json {", '{"mentions_enabled": "yes"}', ""):
+        for garbage in ("not json {", '{"mentions_enabled": "yes"}', "", "[1, 2]"):
             state.write_text(garbage, encoding="utf-8")
             self.assertEqual(mg.read_state(self.ws),
                              {"mentions_enabled": False, "until": None}, garbage)
             self.assertFalse(mg.owner_tag_triggers_ingest(self.ws), garbage)
+
+    def test_non_string_until_reads_as_none(self):
+        state = self.ws / "state" / "mention-gate.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"mentions_enabled": true, "until": 12345}')
+        self.assertEqual(mg.read_state(self.ws),
+                         {"mentions_enabled": True, "until": None})
+        self.assertTrue(mg.owner_tag_triggers_ingest(self.ws))
 
     def test_write_is_atomic_temp_plus_replace(self):
         with mock.patch("os.replace", wraps=os.replace) as rep:
@@ -123,6 +165,14 @@ class GateStatePolicy(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()),
                          {"mentions_enabled": True, "until": None})
         self.assertEqual([p.name for p in path.parent.iterdir()], [path.name])
+        # Double fault: even the temp cleanup failing must re-raise the ORIGINAL
+        # error, and the previous state still survives.
+        with mock.patch("os.replace", side_effect=OSError("disk full")), \
+                mock.patch("os.unlink", side_effect=OSError("gone")):
+            with self.assertRaises(OSError):
+                mg.write_state(self.ws, mentions_enabled=False)
+        self.assertEqual(json.loads(path.read_text()),
+                         {"mentions_enabled": True, "until": None})
 
 
 class TaggingDetection(unittest.TestCase):
@@ -158,29 +208,88 @@ class AuditLog(unittest.TestCase):
         self.assertEqual([r["message_id"] for r in rows], ["0", "1", "2"])
 
 
+class OwnerIdResolution(unittest.TestCase):
+    """#3473 P1 control: a PRESENT tierMap is authoritative, even empty."""
+
+    def _ids(self, doc: str):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "access.json"
+            p.write_text(doc, encoding="utf-8")
+            with mock.patch.object(db, "ACCESS_FILE", p):
+                return db._mention_gate_owner_ids()
+
+    def test_reviewers_control_empty_tiermap_yields_no_owners(self):
+        # qingyun's exact control: {"allowFrom":["111222333"],"tierMap":{}}
+        # returned ['111222333'] before the fix — allowFrom escalation.
+        self.assertEqual(
+            self._ids('{"allowFrom": ["111222333"], "tierMap": {}}'), [])
+
+    def test_present_tiermap_owner_entries_win_over_allowfrom(self):
+        self.assertEqual(
+            self._ids('{"allowFrom": ["111222333"],'
+                      ' "tierMap": {"999888777": "owner", "111222333": "team"}}'),
+            ["999888777"])
+
+    def test_absent_tiermap_falls_back_to_allowfrom(self):
+        self.assertEqual(self._ids('{"allowFrom": ["111222333"]}'), ["111222333"])
+
+    def test_non_dict_tiermap_fails_closed(self):
+        self.assertEqual(
+            self._ids('{"allowFrom": ["111222333"], "tierMap": "owner"}'), [])
+
+    def test_non_dict_document_fails_closed(self):
+        self.assertEqual(self._ids('["111222333"]'), [])
+
+    def test_unreadable_file_fails_closed(self):
+        with mock.patch.object(db, "ACCESS_FILE", Path("/nonexistent/access.json")):
+            self.assertEqual(db._mention_gate_owner_ids(), [])
+
+    def test_empty_tiermap_means_the_gate_never_triggers(self):
+        mg.write_state(_WS, mentions_enabled=True)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "access.json"
+                p.write_text('{"allowFrom": ["111222333"], "tierMap": {}}')
+                with mock.patch.object(db, "ACCESS_FILE", p):
+                    m = _msg(content="<@111222333> hi", mention_ids=["111222333"])
+                    self.assertFalse(db._mention_gate_triggers_ingest(m))
+        finally:
+            mg.write_state(_WS, mentions_enabled=False, until=None)
+
+
 class DiscordTriggerPin(unittest.TestCase):
-    """The production chokepoint — not a copy — applies the shared policy."""
+    """The production chokepoint — not a copy — applies the shared policy.
+    #3473 P1 (2): the VERDICT never writes the audit; only
+    _mention_gate_log_admission does, and the handler calls it post-write."""
 
     def setUp(self):
         self.assertEqual(db.REPO, _WS)  # pins hold only against the isolated workspace
-        for name in ("mention-gate.json", "mention-gate-ingested.jsonl"):
-            p = _WS / "state" / name
-            if p.exists():
-                p.unlink()
+        _reset_ws_gate()
 
     def tearDown(self):
         mg.write_state(_WS, mentions_enabled=False, until=None)
 
-    def test_on_owner_tagged_no_bot_mention_is_admitted_and_audited(self):
+    def test_on_owner_tagged_verdict_is_true_but_writes_no_audit(self):
         mg.write_state(_WS, mentions_enabled=True)
         m = _msg(content="<@111222333> look at this", mention_ids=["111222333"])
         self.assertTrue(db._mention_gate_triggers_ingest(m))
-        self.assertEqual(mg.gated_ingest_count(_WS), 1)
-        path = _WS / "state" / "mention-gate-ingested.jsonl"
-        row = json.loads(path.read_text().splitlines()[0])
-        self.assertEqual(row["message_id"], "424242")
-        self.assertEqual(row["channel_id"], "555666777")
-        self.assertIn("look at this", row["body"])
+        self.assertEqual(mg.gated_ingest_count(_WS), 0)  # audit binds to the write
+
+    def test_log_admission_writes_exactly_one_row(self):
+        m = _msg(content="<@111222333> look at this", mention_ids=["111222333"])
+        db._mention_gate_log_admission(m)
+        rows = _audit_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["message_id"], "424242")
+        self.assertEqual(rows[0]["channel_id"], "555666777")
+        self.assertIn("look at this", rows[0]["body"])
+
+    def test_log_admission_failure_never_raises(self):
+        m = _msg(content="<@111222333> hi", mention_ids=["111222333"])
+        with mock.patch.object(db.mention_gate, "log_gated_ingest",
+                               side_effect=OSError("disk full")):
+            db._mention_gate_log_admission(m)  # best-effort: must not raise
+        self.assertEqual(mg.gated_ingest_count(_WS), 0)
 
     def test_on_text_only_owner_token_is_still_caught(self):
         mg.write_state(_WS, mentions_enabled=True)
@@ -213,17 +322,16 @@ class DiscordTriggerPin(unittest.TestCase):
                  mention_ids=["111222333"])
         self.assertFalse(db._mention_gate_triggers_ingest(m))
 
-    def test_fail_closed_when_audit_logging_breaks(self):
+    def test_verdict_fails_closed_on_any_error(self):
         mg.write_state(_WS, mentions_enabled=True)
         m = _msg(content="<@111222333> hi", mention_ids=["111222333"])
-        with mock.patch.object(db.mention_gate, "log_gated_ingest",
-                               side_effect=OSError("disk full")):
+        with mock.patch.object(db.mention_gate, "message_tags_owner",
+                               side_effect=RuntimeError("boom")):
             self.assertFalse(db._mention_gate_triggers_ingest(m))  # rejection stands
 
     def test_require_mention_branch_consults_the_gate(self):
-        """AST pin: the `require_mention and not bot_mentioned and not
-        role_mentioned` rejection consults the gate before returning, and only
-        there — bot-mention messages never reach it in either state."""
+        """AST pins: the requireMention rejection consults the gate; the audit
+        call sits AFTER the task write; the verdict helper never audits."""
         src = (REPO / "src" / "discord-bridge.py").read_text()
         tree = ast.parse(src)
         handler = next(n for n in tree.body
@@ -245,12 +353,137 @@ class DiscordTriggerPin(unittest.TestCase):
                 if calls_gate and has_return:
                     hits.append(node.lineno)
         self.assertTrue(hits, "the requireMention rejection no longer consults the gate")
-        write_line = next(
-            n.lineno for n in ast.walk(handler)
-            if isinstance(n, ast.Call)
-            and getattr(n.func, "id", getattr(n.func, "attr", None)) == "_write_task_file")
+
+        def _call_line(name):
+            return next(
+                (n.lineno for n in ast.walk(handler)
+                 if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", getattr(n.func, "attr", None)) == name),
+                None)
+
+        write_line = _call_line("_write_task_file")
+        audit_line = _call_line("_mention_gate_log_admission")
+        self.assertIsNotNone(write_line)
+        self.assertIsNotNone(audit_line, "handler no longer audits gate admissions")
         self.assertLess(hits[0], write_line,
                         "gate must run at the accept decision, before the task write")
+        self.assertLess(write_line, audit_line,
+                        "audit must bind to the DURABLE write, never precede it")
+
+        verdict_fn = next(n for n in tree.body
+                          if isinstance(n, ast.FunctionDef)
+                          and n.name == "_mention_gate_triggers_ingest")
+        audits_in_verdict = [
+            n for n in ast.walk(verdict_fn)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "attr", getattr(n.func, "id", None)) == "log_gated_ingest"]
+        self.assertEqual(audits_in_verdict, [],
+                         "the verdict helper must not write the audit (#3473 P1)")
+
+
+class _FakeChannel:
+    def __init__(self, cid=555666777):
+        self.id = cid
+        self.name = "general"
+        self.sent = []
+
+    async def send(self, *a, **k):
+        self.sent.append(a[0] if a else k)
+
+
+class _FakeMsg:
+    def __init__(self, content, author_id=STRANGER, mention_ids=("111222333",)):
+        self.content = content
+        self.channel = _FakeChannel()
+        self.author = NS(id=int(author_id), bot=False,
+                         __str__=lambda self_: "stranger#0001")
+        self.mentions = [NS(id=int(m)) for m in mention_ids]
+        self.role_mentions = []
+        self.embeds = []
+        self.attachments = []
+        self.message_snapshots = []
+        self.type = discord.MessageType.default
+        self.reference = None
+        self.guild = None
+        self.id = 987654321
+
+
+class HandlerBehavior(unittest.TestCase):
+    """Full-handler drives: gate ON admits an authorized owner-tagged message
+    (task written, ONE audit row after it); gate OFF/default rejects; an
+    unauthorized sender yields neither task nor audit (#3473 control inversion)."""
+
+    def setUp(self):
+        _reset_ws_gate()
+        self._td = tempfile.TemporaryDirectory()
+        self.tasks = Path(self._td.name) / "tasks"
+        self.tasks.mkdir()
+
+    def tearDown(self):
+        mg.write_state(_WS, mentions_enabled=False, until=None)
+        self._td.cleanup()
+
+    def _drive(self, msg, channel_allow=None):
+        """Run the production _handle_discord_message; return (stdout, tasks)."""
+        fake_client = NS(user=object())
+        cfg = (True, channel_allow if channel_allow is not None else set())
+        buf = io.StringIO()
+
+        async def _noop(*a, **k):
+            return None
+
+        with mock.patch.object(db, "client", fake_client), \
+                mock.patch.object(db, "_observe_for_mod", _noop), \
+                mock.patch.object(db, "TASKS_DIR", self.tasks), \
+                mock.patch.object(db, "load_channel_config", lambda cid: cfg), \
+                contextlib.redirect_stdout(buf):
+            try:
+                asyncio.run(db._handle_discord_message(msg))
+            except Exception:
+                # Write + audit precede the live wait-for-result leg, whose
+                # deps the fakes lack; assertions key on the durable artifacts.
+                pass
+        return buf.getvalue(), sorted(p.name for p in self.tasks.glob("task-*.txt"))
+
+    def test_gate_on_authorized_tagged_message_writes_task_then_one_audit_row(self):
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._drive(_FakeMsg("<@111222333> please look at the build"))
+        self.assertEqual(len(written), 1, out)
+        body = (self.tasks / written[0]).read_text()
+        self.assertIn("please look at the build", body)
+        rows = _audit_rows()
+        self.assertEqual(len(rows), 1, out)
+        self.assertEqual(rows[0]["message_id"], "987654321")
+
+    def test_gate_off_same_message_is_not_ingested(self):
+        mg.write_state(_WS, mentions_enabled=False)
+        out, written = self._drive(_FakeMsg("<@111222333> please look at the build"))
+        self.assertEqual(written, [], out)
+        self.assertIn("[skip] not mentioned", out)
+        self.assertEqual(_audit_rows(), [])
+
+    def test_default_missing_state_same_message_is_not_ingested(self):
+        out, written = self._drive(_FakeMsg("<@111222333> please look at the build"))
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+    def test_unauthorized_sender_leaves_neither_task_nor_audit(self):
+        # Reviewer's control inversion: the gate ADMITS past requireMention,
+        # but the channel allowlist rejects — no task, and audit unchanged.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._drive(
+            _FakeMsg("<@111222333> please look at the build"),
+            channel_allow={"444555666"})  # sender not listed, not global-allowed
+        self.assertIn("not in channel allowlist", out)
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+
+# Subprocess-coverage opt-in (same pattern as tests/census-d1-anchors.test.py):
+# the coverage gate sets this so CLI lines exercised via subprocess still count.
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
 
 
 class CliRoundTrip(unittest.TestCase):
@@ -258,7 +491,7 @@ class CliRoundTrip(unittest.TestCase):
 
     def _run(self, ws, *args):
         env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
-        return subprocess.run([sys.executable, str(self.CLI), *args],
+        return subprocess.run([*PYBASE, str(self.CLI), *args],
                               capture_output=True, text=True, env=env, timeout=60)
 
     def test_default_status_is_off_then_on_for_then_off(self):
@@ -281,6 +514,75 @@ class CliRoundTrip(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             # A refused command must not have flipped the gate on.
             self.assertFalse(mg.read_state(Path(td))["mentions_enabled"])
+
+    def test_status_reports_an_expired_on_window(self):
+        with tempfile.TemporaryDirectory() as td:
+            mg.write_state(Path(td), mentions_enabled=True,
+                           until="2020-01-01T00:00:00Z")
+            out = self._run(td, "status").stdout
+            self.assertIn("expired at 2020-01-01T00:00:00Z", out)
+
+
+class WitnessRunner(unittest.TestCase):
+    """The live-witness helper's verdicts, driven hermetically (input stubbed)."""
+
+    wit = _load("mention_gate_witness",
+                "skills/mention-gate/scripts/witness.py")
+
+    def _in_ws(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        ws = Path(td.name)
+        env = mock.patch.dict(os.environ, {"SUTANDO_WORKSPACE": str(ws)})
+        env.start()
+        self.addCleanup(env.stop)
+        (ws / "tasks").mkdir(parents=True)
+        return ws
+
+    def test_precondition_mismatch_exits_2(self):
+        self._in_ws()  # gate reads OFF; case2 needs ON
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.wit.main(["case2", "--marker", "m1"]), 2)
+
+    def test_case1_gate_off_no_ingest_passes(self):
+        self._in_ws()
+        with mock.patch("builtins.input", return_value=""), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                self.wit.main(["case1", "--marker", "m2", "--timeout", "1"]), 0)
+
+    def test_case2_task_plus_audit_row_passes(self):
+        ws = self._in_ws()
+        mg.write_state(ws, mentions_enabled=True)
+        (ws / "tasks" / "task-1.txt").write_text("task: m3 please look\n")
+
+        def _sent(_prompt=""):
+            mg.log_gated_ingest(ws, {"message_id": "1"})  # the admission lands
+            return ""
+
+        with mock.patch("builtins.input", side_effect=_sent), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                self.wit.main(["case2", "--marker", "m3", "--timeout", "5"]), 0)
+
+    def test_marker_scan_skips_unreadable_task_files(self):
+        ws = self._in_ws()
+        (ws / "tasks" / "task-3.txt").write_text("task: m5 readable\n")
+        unreadable = ws / "tasks" / "task-4.txt"
+        unreadable.write_text("task: m5 secret\n")
+        unreadable.chmod(0o000)
+        self.addCleanup(unreadable.chmod, 0o600)
+        hits = self.wit._tasks_with_marker(ws, "m5")
+        self.assertEqual([p.name for p in hits], ["task-3.txt"])
+
+    def test_case3_unauthorized_ingest_would_fail(self):
+        ws = self._in_ws()
+        mg.write_state(ws, mentions_enabled=True)
+        (ws / "tasks" / "task-2.txt").write_text("task: m4 sneaky\n")  # ingested = bad
+        with mock.patch("builtins.input", return_value=""), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                self.wit.main(["case3", "--marker", "m4", "--timeout", "1"]), 1)
 
 
 if __name__ == "__main__":

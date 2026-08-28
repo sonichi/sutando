@@ -45,7 +45,10 @@ python3 skills/mention-gate/scripts/mention-gate.py status          # state + ho
   OFF.
 - Audit log: `<workspace>/state/mention-gate-ingested.jsonl` — one fsync'd
   JSON line per admitted message `{ts, channel_id, author_id, message_id,
-  body (first 120 chars)}`. `status` reports the count.
+  body (first 120 chars)}`. `status` reports the count. The row is appended
+  only AFTER the admitted task file is durably written — a sender the later
+  authorization gates (channel allowFrom, global allowlist) reject leaves no
+  audit row, so an unauthorized sender can never inflate the audit (#3473).
 
 ## Architecture
 
@@ -59,9 +62,14 @@ python3 skills/mention-gate/scripts/mention-gate.py status          # state + ho
   `require_mention and not bot_mentioned and not role_mentioned` branch):
   when it returns True the rejection is bypassed and the message continues
   down the existing pipeline; otherwise (including on any error) the ordinary
-  skip stands. Owner-tagging is detected from the platform `message.mentions`
-  array plus a `<@ID>`/`<@!ID>` text fallback; owner ids come from
-  `access.json` (tierMap owner entries, falling back to `allowFrom`).
+  skip stands. The helper returns a verdict only; the audit row is written by
+  `_mention_gate_log_admission` right after `_write_task_file` succeeds.
+  Owner-tagging is detected from the platform `message.mentions` array plus a
+  `<@ID>`/`<@!ID>` text fallback. Owner ids come from `access.json`: a
+  PRESENT `tierMap` is authoritative — only its explicit `owner` entries
+  count, and an empty map means no owners (the gate never triggers);
+  `allowFrom` is consulted only when the `tierMap` key is absent (legacy
+  file), so read-only members are never promoted to owner for this gate.
 - **ag2space/Matrix adapter (NOT wired — documented instead):** verified by
   reading the code: gateway messages become task files inside `_write_task` in
   `packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py`, which is
@@ -83,9 +91,22 @@ python3 skills/mention-gate/scripts/mention-gate.py status          # state + ho
 `tests/mention-gate.test.py` — fail-closed state contract (default/missing and
 malformed state read OFF, unparseable `until` reads OFF, atomic write),
 tagging detection (mentions array + text fallback), injected-now expiry
-flipping ON→OFF, the audit log (append order + count), the production
-chokepoint matrix on `_mention_gate_triggers_ingest` (ON + owner-tagged
-admits + audit-logs; OFF and default-state reject — the fail-closed control;
-tags-neither and bot-only-mention never trigger; owner-authored never
-triggers; a logging failure fails closed), an AST pin that the requireMention
-rejection branch consults the gate before returning, and a CLI round trip.
+flipping ON→OFF, audit-log order + count, owner-id resolution controls (an
+explicitly empty tierMap yields no owners and the gate never triggers; a
+present tierMap beats allowFrom; absent tierMap falls back), the production
+chokepoint matrix on `_mention_gate_triggers_ingest` (verdict-only — no audit
+at verdict time; OFF and default-state reject as the fail-closed control;
+tags-neither, bot-only-mention and owner-authored never trigger; any error
+fails closed), full-handler behavioral drives (gate ON + authorized → task
+written then exactly one audit row; gate OFF/default → neither; unauthorized
+sender → neither), AST pins (gate consulted in the requireMention rejection;
+audit call strictly after the task write; verdict helper contains no audit
+call), and a CLI round trip.
+
+## Live witness (post-restart)
+
+`skills/mention-gate/scripts/witness.py case1|case2|case3 --marker <unique>` —
+run on the host with the restarted bridge; the operator sends the test
+message from a non-owner account and the script verifies task + audit
+outcomes for: gate OFF rejects; gate ON admits an authorized tagged message;
+gate ON + unauthorized sender leaves neither task nor audit.
