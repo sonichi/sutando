@@ -206,6 +206,22 @@ class CapabilityRegistryEdges(unittest.TestCase):
         with self.assertRaises(ValueError):
             capreg._json_copy({"x": "y" * 4096}, "input", 128)
 
+    def test_deep_small_value_refuses_without_recursion_error(self):
+        value = None
+        for _ in range(capreg.MAX_JSON_DEPTH + 1):
+            value = [value]
+        with self.assertRaisesRegex(ValueError, "JSON depth limit"):
+            capreg._json_copy(value, "input", capreg.MAX_DESCRIPTOR_BYTES)
+
+    def test_depth_limit_keeps_the_boundary_value(self):
+        value = None
+        for _ in range(capreg.MAX_JSON_DEPTH):
+            value = [value]
+        clean, size = capreg._json_copy(
+            value, "input", capreg.MAX_DESCRIPTOR_BYTES)
+        self.assertEqual(clean, value)
+        self.assertLess(size, capreg.MAX_DESCRIPTOR_BYTES)
+
 
 
 class TasksViewArchiveAndRaces(unittest.TestCase):

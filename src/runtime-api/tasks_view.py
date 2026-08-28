@@ -27,6 +27,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
+from delivery.readiness import read_ready_result  # noqa: E402
 from local_task_protocol import (find_archived_task, find_result,  # noqa: E402
                                  parse_task_headers_lenient)
 sys.path.insert(0, str(_HERE.parent.parent / "packages" / "ag2-sparrow"))
@@ -116,8 +117,7 @@ class TasksView:
     def status(self, task_id: str) -> dict:
         if _checked_task_id(task_id) is None:
             return {"state": "not_found"}
-        result = self._result_path(task_id)
-        if result is not None:
+        if self._ready_result(task_id) is not None:
             return {"taskId": task_id, "state": "done"}
         live = find_task_file(self.tasks_dir, task_id)
         if live is not None:
@@ -139,24 +139,20 @@ class TasksView:
         # without typing a full task id (the friction this removes).
         if not task_id:
             return self._latest_result()
-        p = self._result_path(task_id)
-        if p is None:
+        ready = self._ready_result(task_id)
+        if ready is None:
             return None
-        try:
-            return {"taskId": task_id, "result": p.read_text()}
-        except OSError:
-            return None
+        return {"taskId": task_id, "result": ready[1]}
 
     def _latest_result(self) -> dict | None:
-        files = self._result_files()
-        if not files:
-            return None
-        p = files[0]  # newest first
-        try:
-            return {"taskId": p.name.removesuffix(".txt"),
-                    "result": p.read_text(), "latest": True}
-        except OSError:
-            return None
+        # Newest READY one: an unready newest file must not mask the answer
+        # behind it, and must not be returned as an empty result either.
+        for p in self._result_files():
+            body = read_ready_result(p)
+            if body is not None:
+                return {"taskId": p.name.removesuffix(".txt"),
+                        "result": body, "latest": True}
+        return None
 
     def _result_files(self) -> list[Path]:
         # Source isolation: this channel only streams `task-rtapi-` results
@@ -176,13 +172,12 @@ class TasksView:
         files = self._result_files()
         out = []
         for f in files[:limit]:
-            try:
-                body = f.read_text()
-            except OSError:
-                continue
+            body = read_ready_result(f)
+            if body is None:
+                continue  # not an answer yet; listed on a later call
             out.append({"taskId": f.name.removesuffix(".txt"),
                         "ts": int(f.stat().st_mtime),
-                        "preview": body.strip()[:160]})
+                        "preview": body[:160]})
         return {"results": out,
                 **({"truncated": True} if len(files) > limit else {})}
 
@@ -280,3 +275,17 @@ class TasksView:
         # Archive layouts (flat, monthly, epoch-suffixed) are owned by
         # local_task_protocol.find_result — never re-enumerated here.
         return find_result(self.results_dir, task_id)
+
+    def _ready_result(self, task_id: str) -> "tuple[Path, str] | None":
+        """The result file and its body, only once the body is deliverable.
+
+        Readiness belongs to delivery.readiness, which the push path already
+        uses: a result path exists before it holds an answer, so treating
+        existence as done reports a task complete while its reply is still
+        being written, and a client polling for a terminal state stops early.
+        Unready is not an error — the file stays, and a later call sees it."""
+        p = self._result_path(task_id)
+        if p is None:
+            return None
+        body = read_ready_result(p)
+        return None if body is None else (p, body)

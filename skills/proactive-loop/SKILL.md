@@ -215,6 +215,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    **Guardrails (all owner-corrected):** the surface is a non-blocking FYI footnote — NEVER a new wait-state ("awaiting your go" is not a reason to pause; keep doing the next unblocked thing). Don't spam: one signal per changed set / per work-shift, not per file. Presence is the discriminator: recently-active → never silent; genuinely-away → dedup-quiet is fine.
 
+6.7. **Failure closure = mechanism, never a filed lesson (owner-durable 2026-08-27: "why do I
+   need to keep reminding you to make durable fix").** Every report of a failure — your own or one
+   a reviewer/owner caught — ends with exactly one of: (a) the MECHANISM that makes the recurrence
+   structurally impossible (a gate, a generated row, a checker), linked; or (b) the explicit
+   sentence "no mechanism exists, because X." A lesson written to a log or memory is not a third
+   option: a memory loads when RECALLED, a mechanism runs unconditionally — and this file loads
+   every pass, which is why the rule lives HERE and not in the memory that first recorded it.
+   Measured the day it was written: two mechanisms (sutando-skills#440, #441) each existed within
+   an hour of the owner's prompt, so the cost was never the building — only the definition of done.
+
 7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
    **⚠ THEN ASSERT THE WRITE LANDED — three misses in one session, 2026-08-22.** The append

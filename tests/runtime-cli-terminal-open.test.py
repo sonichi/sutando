@@ -78,5 +78,71 @@ class PlanBuilding(unittest.TestCase):
         self.assertNotEqual(tab, win)
 
 
+# The registry preserves an identity verbatim and instance_key accepts shell
+# metacharacters, so everything below arrives from stored data, not a literal.
+INJECT = "agent;echo${IFS}OPEN_INJECTED"
+
+
+class IdentityIsDataNotCode(unittest.TestCase):
+    def _plan(self, terminal, agent=INJECT, **kw):
+        with mock.patch.object(to.shutil, "which", lambda _b: "/usr/bin/fake"):
+            return to.build_open_plan(agent, terminal, **kw)
+
+    def test_no_terminal_wraps_the_attach_in_a_shell(self):
+        for term in ("wezterm", "kitty"):
+            argv = self._plan(term)["argv"]
+            self.assertNotIn("sh", argv, term)
+            self.assertNotIn("-c", argv, term)
+
+    def test_the_identity_stays_one_argv_element(self):
+        for term in ("wezterm", "kitty"):
+            argv = self._plan(term)["argv"]
+            self.assertIn(INJECT, argv, term)
+            self.assertEqual(argv[-1], INJECT, term)
+
+    def test_instance_is_its_own_argv_element_too(self):
+        argv = self._plan("wezterm", agent="@a:x", instance=INJECT)["argv"]
+        self.assertEqual(argv[-2:], ["--instance", INJECT])
+
+    def test_the_shell_form_survives_a_real_shell(self):
+        # `do script` takes a command STRING, so this form is quoted, not argv.
+        # A fake `sutando` on PATH reports the argv a real shell handed it.
+        import os
+        import subprocess
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "sutando"
+            fake.write_text('#!/bin/sh\nprintf "ARGV:%s\\n" "$@"\n')
+            fake.chmod(0o755)
+            command = self._plan("apple_terminal")["command"]
+            env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}"}
+            got = subprocess.run(["sh", "-c", command], capture_output=True,
+                                 text=True, env=env, timeout=20)
+        # Exact dump: the id arrives as ONE argument and nothing else runs.
+        # Unquoted, `echo` prints a bare OPEN_INJECTED line of its own.
+        self.assertEqual(got.stdout, f"ARGV:attach\nARGV:{INJECT}\n")
+
+    def test_a_quote_cannot_end_the_applescript_literal(self):
+        plan = self._plan("apple_terminal", agent='a"x')
+        script = plan["script"]
+        body = script.split('do script "', 1)[1].rsplit('"', 1)[0]
+        # Every quote inside the literal is escaped, so none can terminate it.
+        self.assertNotIn('"', body.replace('\\"', ""))
+        self.assertIn('\\"', body)
+
+    def test_a_backslash_and_newline_are_escaped_too(self):
+        script = self._plan("apple_terminal", agent="a\\b\nc")["script"]
+        body = script.split('do script "', 1)[1].rsplit('"', 1)[0]
+        self.assertNotIn("\n", body)
+        self.assertIn("\\\\", body)
+
+    def test_control_an_ordinary_id_is_left_alone(self):
+        # Without this the assertions above would pass on a filter that
+        # mangled every id, which would break `open` for everyone.
+        plan = self._plan("wezterm", agent="@a:x")
+        self.assertEqual(plan["argv"][-1], "@a:x")
+        self.assertEqual(plan["command"], "sutando attach @a:x")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

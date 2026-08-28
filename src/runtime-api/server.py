@@ -130,6 +130,9 @@ class RuntimeServer:
         # request needs a human (the wearable's buzz-and-card trigger).
         self._request_subscribers: set[asyncio.StreamWriter] = set()
         self._state_dir = state_dir
+        # Set once this process owns the instance manifest. Gates the stop
+        # transition: a process that never registered has nothing to stop.
+        self._registered = False
         # Actor identity is resolved DAEMON-SIDE, here, and handed to the
         # dispatcher explicitly — a client parameter can never override it.
         self.actor_id = resolve_actor_id(state_dir)
@@ -197,10 +200,19 @@ class RuntimeServer:
                 instance=instance_id(), tmux_socket=tmux_socket, session=session,
                 config_dir=os.environ.get("CLAUDE_CONFIG_DIR"),
                 status="running")
+            self._registered = True
         except Exception as e:  # noqa: BLE001
             _log(f"instance-registry write failed (non-fatal): {e}")
 
     def mark_stopped(self) -> None:
+        """Only the process holding this instance may record it stopped.
+
+        `serve()` refuses a duplicate start before registering anything, but
+        `main()` runs this in `finally` regardless — so without the gate an
+        ordinary double launch overwrote the LIVE daemon's manifest with
+        `stopped`, destroying the crash-vs-clean-stop signal while it served."""
+        if not self._registered:
+            return
         try:
             instance_registry.mark_stopped(self.actor_id, instance_id())
         except Exception:  # noqa: BLE001
