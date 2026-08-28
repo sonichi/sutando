@@ -508,6 +508,7 @@ def media_attachment_headers(attachment_refs: Iterable["AttachmentRef"], has_tex
 # ── Archive rules ────────────────────────────────────────────────────────────
 
 _MONTH_DIR_RE = re.compile(r"^\d{4}-\d{2}$")
+_RETENTION_DIR_RE = re.compile(r"^archive-\d{4}-\d{2}-\d{2}$")
 # The gateway's flat archive suffix is an epoch stamp and nothing else.
 _EPOCH_SUFFIX_RE = re.compile(r"^\d+$")
 
@@ -525,9 +526,12 @@ def iter_result_candidates(results_dir: Path, task_id: str,
     """Every path this task's result can occupy, best-first.
 
     Ordered live, `archive/<id>.txt`, `archive/<YYYY-MM>/` newest month first,
-    then the gateway's flat `archive/<id>-<epoch>.txt` newest first. Bridges use
-    the month layout and the gateway the flat one; a locator knowing only one
-    returns None for the other, which reads as "never delivered".
+    `archive-<YYYY-MM-DD>/` newest day first, then the gateway's flat
+    `archive/<id>-<epoch>.txt` newest first. Bridges use the month layout, the
+    gateway the flat one, and startup retention (`src/archive-stale-results.py`,
+    run from `startup.sh`) the day layout — a SIBLING of `archive/`, not a child.
+    A locator knowing only one returns None for the others, which reads as
+    "never delivered".
 
     One enumeration so a readiness-aware caller and a first-hit caller can never
     disagree about which files exist. Rejects malformed ids rather than globbing
@@ -557,6 +561,20 @@ def iter_result_candidates(results_dir: Path, task_id: str,
         months = []
     for month in months:
         candidate = archive / month / fname
+        if candidate.is_file():
+            yield candidate
+
+    # Retention dirs are SIBLINGS of archive/, so they need their own scan;
+    # newest day first, name-filtered before is_dir, as the month scan is.
+    try:
+        with os.scandir(results) as entries:
+            days = sorted((e.name for e in entries
+                           if _RETENTION_DIR_RE.match(e.name) and e.is_dir()),
+                          reverse=True)
+    except (OSError, ValueError):
+        days = []
+    for day in days:
+        candidate = results / day / fname
         if candidate.is_file():
             yield candidate
 

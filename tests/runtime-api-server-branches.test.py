@@ -305,7 +305,7 @@ class EmitNewResults(unittest.TestCase):
         with mock.patch.object(srv, "read_ready_result", read_then_unlink):
             class _T:
                 def _result_files(self):
-                    return [f]
+                    return [(f, 1787000000)]
             run(s._emit_new_results(_T(), seen))
         joined = b"".join(live.frames).decode(errors="replace")
         self.assertIn("race body", joined)
@@ -333,7 +333,7 @@ class EmitNewResults(unittest.TestCase):
 
         class _Tasks:
             def _result_files(self):
-                return [good, bad]
+                return [(good, 1787000000), (bad, 1787000001)]
 
         live = _LiveWriter()
         dead = _DeadWriter()

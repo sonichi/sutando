@@ -288,7 +288,10 @@ class RuntimeServer:
             interval = float(os.environ.get("SUTANDO_RESULT_POLL_S") or 0.2)
         except ValueError:
             interval = 0.2
-        seen = {f.name for f in tasks._result_files()}
+        # Seed only COMPLETE backlog: an unready name must stay unseen so it
+        # is still pushed when it fills, matching _emit_new_results.
+        seen = {f.name for f, _ts in tasks._result_files()
+                if read_ready_result(f) is not None}
         while True:
             await asyncio.sleep(interval)
             await self._emit_new_results(tasks, seen)
@@ -421,17 +424,14 @@ class RuntimeServer:
             files = tasks._result_files()  # newest first
         except OSError:
             return
-        for f in reversed([f for f in files if f.name not in seen]):
+        for f, ts in reversed([p for p in files if p[0].name not in seen]):
             # readiness: unreadable/mid-write/empty = not-yet — the name only
             # enters `seen` after a ready read, so a transient race retries
             body = read_ready_result(f)
             if body is None:
                 continue
             seen.add(f.name)
-            try:
-                ts = int(f.stat().st_mtime)
-            except OSError:
-                ts = int(time.time())  # archived between read and stat
+            # `ts` is the enumeration mtime; no second stat to lose to archival.
             frame = notification_frame("task.result", {
                 "taskId": f.name.removesuffix(".txt"),
                 "result": body, "ts": ts})

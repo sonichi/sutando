@@ -50,7 +50,7 @@ class PushModeTests(unittest.IsolatedAsyncioTestCase):
         good, dead = _FakeWriter(), _FakeWriter(dead=True)
         self.srv._subscribers = {good, dead}
         (self.results / "task-rtapi-old.txt").write_text("old")     # pre-existing
-        seen = {f.name for f in self.tv._result_files()}            # seeded
+        seen = {f.name for f, _ts in self.tv._result_files()}            # seeded
 
         (self.results / "task-rtapi-new.txt").write_text("hello stream")  # new
         await self.srv._emit_new_results(self.tv, seen)
@@ -67,12 +67,35 @@ class PushModeTests(unittest.IsolatedAsyncioTestCase):
         await self.srv._emit_new_results(self.tv, seen)
         self.assertEqual(len(good.frames), 1)
 
+    async def test_boot_seed_skips_unready_and_still_suppresses_complete(self):
+        # Exercises the REAL seeding inside _results_watcher, not a hand-copy:
+        # an unready boot placeholder must stay pushable once it fills.
+        os.environ["SUTANDO_RESULT_POLL_S"] = "0.01"
+        self.addCleanup(os.environ.pop, "SUTANDO_RESULT_POLL_S", None)
+        w = _FakeWriter()
+        self.srv._subscribers = {w}
+        self.srv.dispatcher = type("_D", (), {"tasks": self.tv})()
+        (self.results / "task-rtapi-boot.txt").write_text("   ")      # unready
+        (self.results / "task-rtapi-done.txt").write_text("ALREADY DONE")
+        watcher = asyncio.create_task(self.srv._results_watcher())
+        await asyncio.sleep(0.05)                                     # seed runs
+        (self.results / "task-rtapi-boot.txt").write_text("BOOT ANSWER")
+        await asyncio.sleep(0.10)                                     # poll pass
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        ids = [json.loads(f)["params"]["taskId"] for f in w.frames]
+        self.assertIn("task-rtapi-boot", ids)      # filled placeholder pushed
+        self.assertNotIn("task-rtapi-done", ids)   # complete-at-boot suppressed
+
     async def test_room_result_does_not_leak_into_stream(self):
         # Source isolation: a result from ANOTHER channel (non task-rtapi- id)
         # must NOT be pushed to runtime-api subscribers — the exact cross-channel
         good = _FakeWriter()
         self.srv._subscribers = {good}
-        seen = {f.name for f in self.tv._result_files()}
+        seen = {f.name for f, _ts in self.tv._result_files()}
         (self.results / "task-1234567890.txt").write_text("a room reply")
         await self.srv._emit_new_results(self.tv, seen)
         self.assertEqual(good.frames, [])  # not streamed

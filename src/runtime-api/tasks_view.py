@@ -23,11 +23,12 @@ import re
 import sys
 import time
 import uuid
+import stat as stat_module
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result
 from local_task_protocol import (find_archived_task, find_result,  # noqa: E402
                                  parse_task_headers_lenient)
 sys.path.insert(0, str(_HERE.parent.parent / "packages" / "ag2-sparrow"))
@@ -147,22 +148,34 @@ class TasksView:
     def _latest_result(self) -> dict | None:
         # Newest READY one: an unready newest file must not mask the answer
         # behind it, and must not be returned as an empty result either.
-        for p in self._result_files():
+        for p, _ts in self._result_files():
             body = read_ready_result(p)
             if body is not None:
                 return {"taskId": p.name.removesuffix(".txt"),
                         "result": body, "latest": True}
         return None
 
-    def _result_files(self) -> list[Path]:
-        # Source isolation: this channel only streams `task-rtapi-` results
-        # (its own submissions); other sources' results must not leak in.
+    def _result_files(self) -> "list[tuple[Path, int]]":
+        """(path, mtime) newest first, for `task-rtapi-` results only — source
+        isolation: other sources' results must not leak into this channel.
+
+        Returns the mtime it already read rather than letting callers stat
+        again: archival unlinks a live name, so a second stat can raise on a
+        file that was present a moment earlier, and a caller that has already
+        read the body would lose an answer it holds.
+        """
         if not self.results_dir.is_dir():
             return []
-        files = [f for f in self.results_dir.glob(f"{TASK_PREFIX}*.txt")
-                 if f.is_file()]
-        files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-        return files
+        found = []
+        for f in self.results_dir.glob(f"{TASK_PREFIX}*.txt"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue  # archived mid-scan — absent, not an error
+            if stat_module.S_ISREG(st.st_mode):
+                found.append((f, int(st.st_mtime)))
+        found.sort(key=lambda pair: pair[1], reverse=True)
+        return found
 
     # ── task.list_results ────────────────────────────────────────────────────
     def list_results(self, limit: int = 50) -> dict:
@@ -171,15 +184,21 @@ class TasksView:
         tracked yet — this lists ALL, not only un-fetched."""
         files = self._result_files()
         out = []
-        for f in files[:limit]:
+        truncated = False
+        for f, ts in files:
             body = read_ready_result(f)
             if body is None:
                 continue  # not an answer yet; listed on a later call
+            if len(out) >= limit:
+                truncated = True  # a READY result exists past the window
+                break
+            # `ts` comes from enumeration, so archiving between the body read
+            # and here cannot turn a held answer into a FileNotFoundError.
             out.append({"taskId": f.name.removesuffix(".txt"),
-                        "ts": int(f.stat().st_mtime),
+                        "ts": ts,
                         "preview": body[:160]})
         return {"results": out,
-                **({"truncated": True} if len(files) > limit else {})}
+                **({"truncated": True} if truncated else {})}
 
     # ── task.details ────────────────────────────────────────────────────────
     def details(self, task_id: str) -> dict | None:

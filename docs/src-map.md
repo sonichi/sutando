@@ -354,6 +354,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`runtime_view.py`** — Runtime surface for THIS agent: runtime.health / runtime.details.
 - **`schedules_view.py`** — Schedule surface for the Sutando Server: schedule.list.
 - **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
+- **`state_records.py`** — Reading the workspace state records the runtime-API views project.
 - **`tasks_view.py`** — Task-pipeline surface for the Sutando Server: task.submit / task.status / task.get_result / task.details / task.cancel.
 
 ## `src/runtime-cli/`

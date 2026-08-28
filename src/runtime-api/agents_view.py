@@ -16,6 +16,8 @@ import json
 import time
 from pathlib import Path
 
+from state_records import read_record
+
 # Matches the documented cores-heartbeat contract: beats every 30s, readers
 # treat mtime younger than ~90s as alive.
 ALIVE_MAX_AGE_S = 90.0
@@ -54,10 +56,7 @@ class AgentsView:
             age = time.time() - f.stat().st_mtime
         except OSError:  # unlinked between glob and stat — offline
             return {"agentId": f.stem, "alive": False}
-        try:
-            payload = json.loads(f.read_text())
-        except (OSError, ValueError):
-            payload = {}
+        payload = read_record(f) or {}
         out = {
             "agentId": f.stem,
             "alive": 0 <= age < ALIVE_MAX_AGE_S,

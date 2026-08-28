@@ -14,6 +14,7 @@ import asyncio
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +88,34 @@ class TasksViewTests(unittest.TestCase):
         long_preview = next(r for r in self.view.list_results()["results"]
                             if r["taskId"] == "task-rtapi-a")["preview"]
         self.assertLessEqual(len(long_preview), 160)  # truncated
+
+    def test_list_results_window_is_spent_on_ready_answers_only(self):
+        # The window must be filled AFTER the readiness filter. Slicing first
+        # spends it on empty placeholders and hides an older real answer.
+        import os
+        self.results.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            f = self.results / f"task-rtapi-pending{i}.txt"
+            f.write_text("   ")                      # present but not an answer
+            os.utime(f, (9000 + i, 9000 + i))        # newest
+        ready = self.results / "task-rtapi-answer.txt"
+        ready.write_text("READY ANSWER")
+        os.utime(ready, (1000, 1000))                # oldest
+        got = self.view.list_results(limit=2)
+        self.assertEqual([r["taskId"] for r in got["results"]],
+                         ["task-rtapi-answer"])
+        self.assertNotIn("truncated", got)           # nothing was withheld
+
+    def test_list_results_truncated_counts_ready_not_files(self):
+        import os
+        self.results.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            f = self.results / f"task-rtapi-r{i}.txt"
+            f.write_text(f"ANSWER {i}")
+            os.utime(f, (5000 + i, 5000 + i))
+        got = self.view.list_results(limit=2)
+        self.assertEqual(len(got["results"]), 2)
+        self.assertTrue(got.get("truncated"))        # a 3rd READY one exists
 
     def test_submit_confines_newline_injection(self):
         # A hostile body must not be able to smuggle header lines or an
@@ -434,6 +463,57 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         self.assertEqual(self.view.status(tid)["state"], "done")
         self.assertIsNotNone(self.view.details(tid))
         self.assertIn(tid, [e["taskId"] for e in self.view.list_tasks()["tasks"]])
+
+
+class ArchivalRaceTests(unittest.TestCase):
+    """Archival unlinks a live result name. Enumeration and listing must
+    absorb that; a raise here reached asyncio.gather and ended the daemon."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.tasks = base / "tasks"
+        self.results = base / "results"
+        self.results.mkdir(parents=True)
+        self.view = TasksView(self.tasks, self.results, "@me:example.org")
+        self.f = self.results / "task-rtapi-race.txt"
+        self.f.write_text("READY BODY")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_positive_control_the_result_is_listed_normally(self):
+        # Without this the two race cases below could pass on an empty dir.
+        got = self.view.list_results()["results"]
+        self.assertEqual([e["taskId"] for e in got], ["task-rtapi-race"])
+        self.assertEqual(got[0]["preview"], "READY BODY")
+
+    def test_archived_during_enumeration_is_absent_not_an_error(self):
+        real_glob = Path.glob
+
+        def vanishing(self_dir, pattern):
+            for hit in real_glob(self_dir, pattern):
+                Path(hit).unlink()      # archived between scan and stat
+                yield hit
+
+        with unittest.mock.patch.object(Path, "glob", vanishing):
+            self.assertEqual(self.view._result_files(), [])
+            self.assertEqual(self.view.list_results()["results"], [])
+
+    def test_archived_after_the_ready_read_still_returns_the_answer(self):
+        import tasks_view as tv_mod
+        real_read = tv_mod.read_ready_result
+
+        def read_then_archive(f):
+            body = real_read(f)
+            Path(f).unlink()            # archived between read and report
+            return body
+
+        with unittest.mock.patch.object(tv_mod, "read_ready_result",
+                                        read_then_archive):
+            got = self.view.list_results()["results"]
+        self.assertEqual([e["taskId"] for e in got], ["task-rtapi-race"])
+        self.assertIsInstance(got[0]["ts"], int)
 
 
 if __name__ == "__main__":
