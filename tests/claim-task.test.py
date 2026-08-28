@@ -331,7 +331,7 @@ class ClaimCliTests(unittest.TestCase):
         (self.ws / "tasks").mkdir()
         (self.ws / "state" / "cores").mkdir(parents=True)
         self._real = claim_task.resolve_workspace
-        claim_task.resolve_workspace = lambda: self.ws
+        claim_task.resolve_workspace = lambda *a, **kw: self.ws
 
     def tearDown(self):
         claim_task.resolve_workspace = self._real
