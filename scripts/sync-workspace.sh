@@ -588,6 +588,13 @@ _exclude_rules_only() {
     grep -vE '^[[:space:]]*(#|$)' "$1" | sort
 }
 
+# Operator-authored COMMENTS are content too. The rule comparison cannot see
+# them, so a refresh that drops one looks safe while silently discarding the
+# operator's note — which is what a customized exclude file mostly is.
+_exclude_comments_only() {
+    grep -E '^[[:space:]]*#' "$1" | sort
+}
+
 # Built-in deny rules this script owns and may migrate into an existing generated
 # file. Deliberately explicit: anything listed is adopted without operator review.
 _adoptable_builtin_denies() {
@@ -616,8 +623,11 @@ _is_safe_carveout_addition() {
     shipped="$shipped_rules"$'\n'"$(_adoptable_builtin_denies)"
     [ -n "$(printf '%s' "$shipped" | grep -vE '^[[:space:]]*$')" ] || { rm -f "$widened"; return 1; }
     rc=0
-    # Refuse if the refresh would DROP any rule the existing file carries.
-    if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ]; then
+    # Refuse if the refresh would DROP any rule the existing file carries — or
+    # any COMMENT it carries. A customized file is usually customized by comment,
+    # and a rules-only comparison calls dropping one "safe".
+    if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ] ||
+        [ -n "$(comm -23 <(_exclude_comments_only "$existing") <(_exclude_comments_only "$desired"))" ]; then
         rc=1
     else
         # Every added rule must be a shipped carve-out, never an operator's line.
