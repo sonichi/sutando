@@ -107,16 +107,16 @@ class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
         return hc
 
     def test_pane_pids_from_the_default_socket(self):
-        hc = self._mod(0, "3951\n3952\n38058\n")
+        hc = self._mod(0, "core-1 3951\ncore-2 3952\ncore-3 38058\n")
         self.assertEqual(hc._local_core_pids(), {"3951", "3952", "38058"})
 
     def test_non_numeric_rows_are_dropped(self):
-        """`-F '#{pane_pid}'` on an old tmux can emit the format string itself."""
-        hc = self._mod(0, "3951\n#{pane_pid}\n\n")
+        """An old tmux can emit the format string itself instead of expanding it."""
+        hc = self._mod(0, "core-1 3951\n#{session_name} #{pane_pid}\n\n")
         self.assertEqual(hc._local_core_pids(), {"3951"})
 
     def test_the_runtime_socket_is_unioned_in(self):
-        hc = self._mod(0, "100\n", sock="/tmp/s.sock", sock_out="200\n")
+        hc = self._mod(0, "core-1 100\n", sock="/tmp/s.sock", sock_out="sutando-core 200\n")
         self.assertEqual(hc._local_core_pids(), {"100", "200"})
 
     def test_the_runtime_socket_is_queried_even_without_a_heartbeat(self):
@@ -124,11 +124,11 @@ class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
         runtime one, and `_local_core_socket()` is None without a fresh local
         heartbeat. Measured live: the main core's own watcher read as
         `unverified` because that socket was never asked."""
-        hc = self._mod(0, "3951\n")            # default socket: the pool
+        hc = self._mod(0, "core-1 3951\n")     # default socket: the pool
         seen = []
 
         class R:
-            returncode, stdout = 0, "31930\n"  # runtime socket: the main core
+            returncode, stdout = 0, "sutando-core 31930\n"  # runtime: main core
 
         hc._local_core_socket = lambda: None
         hc._run_tmux = lambda s, *a: (seen.append(s), R())[1]
@@ -143,6 +143,24 @@ class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
 
     def test_a_nonzero_exit_is_also_unverifiable(self):
         self.assertIsNone(self._mod(1, "")._local_core_pids())
+
+    def test_a_non_core_session_pane_confers_no_ownership(self):
+        """The blocker this scoping exists for. An unscoped census admitted
+        every pane on the host, so an ordinary shell parenting a stray watcher
+        made it read `session-owned` — i.e. legitimate, do not stop."""
+        hc = self._mod(0, "core-2 3952\nmy-editor 4100\nirc 4200\n")
+        self.assertEqual(hc._local_core_pids(), {"3952"})
+
+    def test_the_main_core_session_name_follows_the_launcher_env(self):
+        """`SUTANDO_TMUX_SESSION` renames the main core's session, and the
+        census has to follow it or that core's own watcher goes unverified."""
+        hc = self._mod(0, "sutando-core 10\nalt-core 20\n")
+        self.assertEqual(hc._local_core_pids(), {"10"})
+        hc.os.environ["SUTANDO_TMUX_SESSION"] = "alt-core"
+        try:
+            self.assertEqual(hc._local_core_pids(), {"20"})
+        finally:
+            del hc.os.environ["SUTANDO_TMUX_SESSION"]
 
     def test_tmux_running_with_no_panes_is_an_empty_set(self):
         """Positive control against the case above: tmux ANSWERED, so absence
@@ -254,6 +272,40 @@ class TheSentinelsOwnTreeIsClassifiedToo(unittest.TestCase):
         self.assertEqual(g["session-owned"], {"200"}, d)
         # The sentinel is the thing to clean up, so it must not be protected.
         self.assertNotIn("keep the sentinel's", d)
+
+    def test_sentinel_under_a_live_shell_is_classified_not_dropped(self):
+        """The blocker. Partitioning only `extras` and deciding the sentinel by
+        a bespoke PPID test left its root in NO group whenever its parent was a
+        live shell — not owned, not unverified, not ownerless — so the pid lists
+        step 9 acts on simply omitted it."""
+        v = _probe({"100": "700", "200": "500", "500": "1", "700": "1"},
+                   roots=["100", "200"], core_pids={"500"},
+                   sentinel=100, sentinel_alive=True)
+        d = v["detail"]
+        g = _groups(d)
+        self.assertEqual(g["unverified"], {"100"}, d)
+        self.assertEqual(g["session-owned"], {"200"}, d)
+        # Classified, but still not something to stop.
+        self.assertIn("keep the sentinel's (100)", d)
+
+    def test_owned_sentinel_is_named_in_its_own_group(self):
+        v = _probe({"100": "500", "200": "500", "500": "1"},
+                   roots=["100", "200"], core_pids={"500"},
+                   sentinel=100, sentinel_alive=True)
+        self.assertEqual(_groups(v["detail"])["session-owned"], {"100", "200"})
+
+    def test_unreadable_sentinel_parentage_is_not_an_orphan_claim(self):
+        """Mirror of the two above. For a stranger, unreadable parentage is
+        ownerless; for the tracked live watcher it is absence of evidence, so
+        the verdict must not offer its root for stopping."""
+        v = _probe({"100": None, "200": "1"},
+                   roots=["100", "200"], core_pids={"500"},
+                   sentinel=100, sentinel_alive=True)
+        d = v["detail"]
+        # 200 is genuinely reparented, so this IS the stop branch — which is
+        # what makes the sentinel's exemption observable rather than vacuous.
+        self.assertEqual(_groups(d)["ownerless"], {"200"}, d)
+        self.assertIn("keep the sentinel's (100)", d)
 
     def test_owned_sentinel_is_still_protected(self):
         """Mirror control: without it, a verdict that never protects the

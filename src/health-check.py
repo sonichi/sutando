@@ -6840,8 +6840,32 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
     return trees
 
 
+#: A core session is the main core's (env-overridable) or a pool follower's
+#: `core-<N>`; every other session on these sockets is a user shell.
+_POOL_SESSION_RE = re.compile(r"^core-\d+$")
+
+
+def _is_core_session(name: str) -> bool:
+    main = os.environ.get("SUTANDO_TMUX_SESSION", "sutando-core")
+    return name == main or bool(_POOL_SESSION_RE.match(name))
+
+
+def _core_pane_pids(stdout: str) -> set:
+    """Pane pids from `session_name pane_pid` lines, core sessions only."""
+    pids = set()
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit() and _is_core_session(parts[0]):
+            pids.add(parts[1])
+    return pids
+
+
 def _local_core_pids() -> "set | None":
     """PIDs of core sessions on THIS host, or None if that cannot be determined.
+
+    Scoped to sessions a Sutando launcher created. An unscoped census admits
+    every tmux pane on the host, so any user shell would confer ownership on a
+    watcher it happens to parent — which reports a stray duplicate as legitimate.
 
     Deliberately NOT from `state/cores/*.alive`: nothing prunes a record whose
     host LABEL has since changed, so that directory accumulates stale files from
@@ -6850,14 +6874,14 @@ def _local_core_pids() -> "set | None":
     dead since June). tmux is asked live, so it cannot go stale this way.
     """
     pids, saw_any = set(), False
-    fmt = "#{pane_pid}"
+    fmt = "#{session_name} #{pane_pid}"
     try:
         done = subprocess.run([_resolve_tmux_bin(), "list-panes", "-a", "-F", fmt],
                               env=_resolve_launch_env(), capture_output=True,
                               text=True, timeout=10)
         if done.returncode == 0:
             saw_any = True
-            pids.update(t for t in done.stdout.split() if t.isdigit())
+            pids.update(_core_pane_pids(done.stdout))
     except Exception:  # noqa: BLE001
         pass
     # The pool runs on tmux's DEFAULT socket; the main core runs on the runtime
@@ -6869,7 +6893,7 @@ def _local_core_pids() -> "set | None":
         done = _run_tmux(sock, "list-panes", "-a", "-F", fmt)
         if done is not None and done.returncode == 0:
             saw_any = True
-            pids.update(t for t in done.stdout.split() if t.isdigit())
+            pids.update(_core_pane_pids(done.stdout))
     return pids if saw_any else None
 
 
@@ -7053,13 +7077,18 @@ def check_task_watcher() -> dict:
     extras = sorted(r for r, members in trees.items() if str(pid) not in members)
     if extras:
         core_pids = _local_core_pids()
-        owned, unverified, orphaned = _split_by_core_ownership(extras, ps_out, core_pids)
-        # Surfaces only when DEFINITELY reparented: unknown parentage is absence
-        # of evidence, and the sentinel is the tracked live watcher by definition.
         sentinel_root = next((r for r, m in trees.items() if str(pid) in m), None)
-        sentinel_orphaned = bool(sentinel_root) and _pid_parent(sentinel_root, ps_out) == "1"
-        if sentinel_orphaned:
-            orphaned = sorted(orphaned + [sentinel_root])
+        # Every root is partitioned, the sentinel's included: splitting only
+        # `extras` left it in no group when its parent was a live shell.
+        all_roots = sorted(set(extras) | ({sentinel_root} if sentinel_root else set()))
+        owned, unverified, orphaned = _split_by_core_ownership(all_roots, ps_out, core_pids)
+        # Only a READ parent of 1 makes the sentinel stoppable: unreadable
+        # parentage is ownerless for a stranger, absence of evidence for it.
+        sentinel_reparented = (bool(sentinel_root)
+                               and _pid_parent(sentinel_root, ps_out) == "1")
+        if sentinel_root is not None and not sentinel_reparented:
+            orphaned = [r for r in orphaned if r != sentinel_root]
+        sentinel_orphaned = sentinel_reparented
         keep = "" if sentinel_orphaned else f", keep the sentinel's ({pid})"
         if not orphaned and not unverified:
             return {"name": name, "status": "warn",
