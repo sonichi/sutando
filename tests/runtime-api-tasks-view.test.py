@@ -374,6 +374,59 @@ class ForeignTaskOwnershipTests(unittest.TestCase):
         self.assertEqual(list(self.tasks.glob("task-rtapi-*")), [],
                          "a CANCEL_INSTRUCTION was written for a foreign task")
 
+    # ── readiness: a result path exists before it holds an answer ───────────
+    def _unready(self, body):
+        tid = self.view.submit("work in flight")["taskId"]
+        self.results.mkdir(parents=True, exist_ok=True)
+        p = self.results / f"{tid}.txt"
+        if isinstance(body, bytes):
+            p.write_bytes(body)
+        else:
+            p.write_text(body)
+        return tid, p
+
+    def test_empty_result_is_not_a_terminal_state(self):
+        tid, _ = self._unready("")
+        self.assertEqual(self.view.status(tid)["state"], "pending")
+        self.assertIsNone(self.view.get_result(tid))
+
+    def test_whitespace_only_result_is_not_a_terminal_state(self):
+        tid, _ = self._unready("   \n\t\n")
+        self.assertEqual(self.view.status(tid)["state"], "pending")
+        self.assertIsNone(self.view.get_result(tid))
+
+    def test_torn_utf8_result_is_not_a_terminal_state(self):
+        # A write observed mid-character; readable again on a later call.
+        tid, _ = self._unready(b"answer \xe4\xb8")
+        self.assertEqual(self.view.status(tid)["state"], "pending")
+        self.assertIsNone(self.view.get_result(tid))
+
+    def test_the_answer_landing_later_is_seen(self):
+        tid, p = self._unready("")
+        self.assertEqual(self.view.status(tid)["state"], "pending")
+        p.write_text("THE ANSWER\n")
+        self.assertEqual(self.view.status(tid)["state"], "done")
+        self.assertEqual(self.view.get_result(tid)["result"], "THE ANSWER")
+
+    def test_unready_result_is_not_listed(self):
+        tid, p = self._unready("  ")
+        self.assertNotIn(tid,
+                         [e["taskId"] for e in self.view.list_results()["results"]])
+        p.write_text("THE ANSWER\n")
+        self.assertIn(tid,
+                      [e["taskId"] for e in self.view.list_results()["results"]])
+
+    def test_unready_newest_does_not_mask_the_answer_behind_it(self):
+        import os
+        self.results.mkdir(parents=True, exist_ok=True)
+        (self.results / "task-rtapi-old.txt").write_text("REAL ANSWER")
+        (self.results / "task-rtapi-new.txt").write_text("")
+        os.utime(self.results / "task-rtapi-old.txt", (1000, 1000))
+        os.utime(self.results / "task-rtapi-new.txt", (2000, 2000))
+        got = self.view.get_result()
+        self.assertEqual(got["taskId"], "task-rtapi-old")
+        self.assertEqual(got["result"], "REAL ANSWER")
+
     def test_positive_control_own_task_is_still_visible_everywhere(self):
         tid = self.view.submit("my own work")["taskId"]
         (self.results / f"{tid}.txt").write_text("MY RESULT")
