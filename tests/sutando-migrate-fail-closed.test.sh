@@ -105,25 +105,62 @@ check "the escape is named in output" grep -q "escapes the dest root" "$TMP/syml
 echo "5. UNION_VERIFY: a correct union passes mandatory phase-three verification"
 new_case union
 mkdir -p "$CASE_A/state"
-printf '{"users": ["alice", "bob"]}\n' > "$CASE_A/state/slack-allowed-recipients.json"
-printf '{"users": ["bob", "carol"]}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
-touch -t 202606011200 "$CASE_A/state/slack-allowed-recipients.json"
-touch -t 202606011300 "$CASE_DEST/state/slack-allowed-recipients.json"
+# The SOURCE is the newer side (the reviewer's shape): its scalars win, and
+# the union stamps the dest with its mtime — which is what arms the
+# scalar-winner check in union_contains.
+printf '{"users": ["alice", "bob"], "schemaVersion": 2}\n' > "$CASE_A/state/slack-allowed-recipients.json"
+printf '{"users": ["bob", "carol"], "schemaVersion": 1}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
+touch -t 202606011300 "$CASE_A/state/slack-allowed-recipients.json"
+touch -t 202606011200 "$CASE_DEST/state/slack-allowed-recipients.json"
 rc=0; RUN --commit > "$TMP/union-commit.log" 2>&1 || rc=$?
 check "divergent union commit succeeds" [ "$rc" -eq 0 ]
-check "the union really merged both sides" \
+UNION_DST="$CASE_DEST/state/slack-allowed-recipients.json"
+check "the union merged both arrays and kept the newer scalar" \
     python3 -c "
 import json
-d = json.load(open('$CASE_DEST/state/slack-allowed-recipients.json'))
-import sys; sys.exit(0 if sorted(d['users']) == ['alice','bob','carol'] else 1)
+d = json.load(open('$UNION_DST'))
+import sys; sys.exit(0 if sorted(d['users']) == ['alice','bob','carol'] and d['schemaVersion'] == 2 else 1)
 "
 rc=0; RUN --verify > "$TMP/union-verify.log" 2>&1 || rc=$?
 check "verify passes the union result (rc 0)" [ "$rc" -eq 0 ]
 check "verify reports zero mismatches" grep -q "mismatch=0" "$TMP/union-verify.log"
-# Negative control: verify must still FAIL when the dest LOST a source element.
-printf '{"users": ["carol"]}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
+
+# Content-only corruptions from here on: every edit preserves the dest mtime,
+# and the pristine bytes are restored (with mtime) between controls.
+GOOD_UNION="$(cat "$UNION_DST")"
+corrupt() {  # $1 = python expression mutating dict d
+    python3 - "$UNION_DST" "$1" <<'PY'
+import json, os, sys
+p, expr = sys.argv[1], sys.argv[2]
+mt = os.path.getmtime(p)
+d = json.load(open(p))
+exec(expr)
+json.dump(d, open(p, "w"), indent=2, sort_keys=True)
+os.utime(p, (mt, mt))
+PY
+}
+restore() {
+    python3 - "$UNION_DST" <<PY
+import os, sys
+p = sys.argv[1]
+mt = os.path.getmtime(p)
+open(p, "w").write("""$GOOD_UNION""")
+os.utime(p, (mt, mt))
+PY
+}
+
+corrupt "d['users'] = ['carol']"
 rc=0; RUN --verify > "$TMP/union-verify-neg.log" 2>&1 || rc=$?
 check "a union that DROPPED an element still fails verify (control)" [ "$rc" -ne 0 ]
+restore
+rc=0; RUN --verify > "$TMP/union-verify-restore.log" 2>&1 || rc=$?
+check "restored union verifies again (the controls are not wedged)" [ "$rc" -eq 0 ]
+
+# The reviewer's scalar repro: arrays fully intact, only the winning scalar
+# altered to a value no input carried.
+corrupt "d['schemaVersion'] = 999"
+rc=0; RUN --verify > "$TMP/union-verify-scalar.log" 2>&1 || rc=$?
+check "a corrupted WINNING SCALAR fails verify (arrays all intact)" [ "$rc" -ne 0 ]
 
 echo ""
 echo "$pass passed, $fail failed"
