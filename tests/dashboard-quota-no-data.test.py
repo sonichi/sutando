@@ -48,11 +48,22 @@ def _tile(html: str, label: str) -> str:
     # "contains" every value and the assertion means nothing.
     # The quota tiles may carry an inline pace sparkline: a <span> around the
     # value and an <svg> after it, both bounded — never a dot-any capture.
+    # Two tile shapes: plain value (glyph tiles) and the quota ring, where the
+    # static value is the <text> fallback INSIDE the first svg (#3499). Both
+    # stay bounded — never a dot-any capture (see the note above).
     m = re.search(
-        r'<div class="stat-val"[^>]*>(?:<span>)?([^<]*)(?:</span>)?'
+        r'<div class="stat-val"[^>]*>(?:<span>)?([^<]+)(?:</span>)?'
         r'(?:<svg[^>]*>[^<]*(?:</?[a-z][^>]*>[^<]*)*</svg>)?\s*</div><div class="stat-label">'
         + re.escape(label),
         html)
+    if m is None:
+        m = re.search(
+            r'<div class="stat-val"[^>]*><svg[^>]*id="qr-[^"]*"[^>]*>'
+            r'(?:[^<]*(?:</?(?!text)[a-z][^>]*>[^<]*)*)'
+            r'<text[^>]*>([^<]*)</text>[^<]*</svg>'
+            r'(?:<svg[^>]*>[^<]*(?:</?[a-z][^>]*>[^<]*)*</svg>)?\s*</div><div class="stat-label">'
+            + re.escape(label),
+            html)
     assert m, f"tile {label!r} not found in rendered page"
     return m.group(1)
 
