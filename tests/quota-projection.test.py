@@ -389,7 +389,6 @@ class RecordSample(unittest.TestCase):
         rows = [{"ts": 900000.0, "u5": 0.20, "r5": 909000, "u7": 0.5, "r7": 909000},
                 {"ts": 900100.0, "u5": 0.30, "r5": 909100, "u7": 0.5, "r7": 909100}]
         self.path.write_text("".join(js.dumps(r) + "\n" for r in rows))
-        self.assertFalse(qp._latest_path(self.path).exists())
         delayed = state(u5="0.20", r5=909000, u7="0.5", r7=909000, obs=900000.0)
         self.assertFalse(qp.record_sample(delayed, self.path, now=900200.0))
         segs = qp.chart_payload(self.path, now=900200.0)["windows"]["5h"]["segments"]
@@ -504,15 +503,15 @@ class ChartSeries(unittest.TestCase):
         self.assertTrue(seg["current"])
         self.assertAlmostEqual(seg["projected_end"], 0.8)  # 0.4 / 0.5
 
-    def test_history_alone_is_never_current(self):
-        # Direct-written rows with no latest-observation sidecar: rendered as
-        # history, but nothing is current and nothing projects.
+    def test_the_canonical_tail_defines_current(self):
+        # One record by design (round 14): the history tail IS the latest
+        # observation, so a valid open-window tail is current and projects.
         now = 1000000.0
         reset = int(now + SPAN5 // 2)
         self.write([{"ts": int(now), "u5": 0.4, "r5": reset, "u7": 0.1, "r7": reset}])
         seg = qp.chart_payload(self.path, now=now)["windows"]["5h"]["segments"][0]
-        self.assertFalse(seg["current"])
-        self.assertNotIn("projected_end", seg)
+        self.assertTrue(seg["current"])
+        self.assertIn("projected_end", seg)
 
     def test_a_tombstoned_window_has_nothing_current(self):
         # Reviewer control: newer observation with NaN 5h + valid 7d — the old
@@ -813,7 +812,6 @@ class Round12Controls(unittest.TestCase):
                 state(50, 999000, 40, 1200000, 990000), hp, now=now))
             self.assertFalse(qp.record_sample(
                 state(None, None, None, None, 990200.0), hp, now=now))
-            qp._latest_path(hp).unlink()
             self.assertFalse(qp.record_sample(
                 state(60, 999100, 45, 1200000, 990100), hp, now=now))
             rows = qp._read_history(hp, now=now)
@@ -890,7 +888,9 @@ class Round12AcceptanceCriteria(unittest.TestCase):
             state(50, 999000, 40, 1200000, 990000), hp, now=now))
         self.assertFalse(qp.record_sample(
             state(None, None, None, None, 990200.0), hp, now=now))
-        qp._latest_path(hp).unlink()
+        # a stale retired sidecar on disk must be inert
+        hp.with_name(hp.name + ".latest.json").write_text(
+            '{"ts": 990000, "windows": {"5h": {"u": 50, "r": 999000}}}')
         self.assertFalse(qp.record_sample(
             state(60, 999100, 45, 1200000, 990100), hp, now=now))
 
@@ -978,11 +978,14 @@ class Round13Consistency(unittest.TestCase):
                     state("0.6", 9100, None, None, 200.0), hp, now=now))
             finally:
                 os.chmod(hp, 0o644)
-            latest = qp._read_latest(hp, now)
-            self.assertEqual(latest["ts"], 100.0)
+            segs = qp.chart_payload(hp, now=now)["windows"]["5h"]["segments"]
+            cur = [seg for seg in segs if seg["current"]]
+            self.assertEqual([seg["points"][-1]["y"] for seg in cur], [0.1])
             self.assertTrue(qp.record_sample(
                 state("0.6", 9100, None, None, 200.0), hp, now=now))
-            self.assertEqual(qp._read_latest(hp, now)["ts"], 200.0)
+            segs = qp.chart_payload(hp, now=now)["windows"]["5h"]["segments"]
+            cur = [seg for seg in segs if seg["current"]]
+            self.assertEqual([seg["points"][-1]["y"] for seg in cur], [0.6])
 
     def test_a_malformed_sidecar_degrades_to_history_only(self):
         # Malformed sidecar shapes read as ABSENT: history-only render,
@@ -991,17 +994,43 @@ class Round13Consistency(unittest.TestCase):
             hp = Path(d) / "h.jsonl"; now = 300.0
             self.assertTrue(qp.record_sample(
                 state("0.1", 9100, None, None, 100.0), hp, now=now))
+            side = hp.with_name(hp.name + ".latest.json")
             for bad in ('{"ts": 100, "windows": "corrupt"}',
                         '{"ts": 100, "windows": {"5h": ["u", 1]}}',
-                        '{"ts": 100, "windows": {"5h": {"u": -1, "r": 9100}}}',
+                        'not json at all',
                         '{"ts": 100}'):
-                qp._latest_path(hp).write_text(bad)
-                self.assertIsNone(qp._read_latest(hp, now))
+                side.write_text(bad)
                 payload = qp.chart_payload(hp, now=now)
                 segs = payload["windows"]["5h"]["segments"]
                 self.assertTrue(segs)
-                self.assertFalse(any(s["current"] for s in segs))
+                # the retired file is inert: current still derives from tail
+                self.assertEqual(
+                    [s["points"][-1]["y"] for s in segs if s["current"]],
+                    [0.1])
+            # and the writer sweeps the stale file on its next pass
+            self.assertTrue(qp.record_sample(
+                state("0.2", 9100, None, None, 150.0), hp, now=now))
+            self.assertFalse(side.exists())
 
+
+
+    def test_a_durable_append_is_current_with_no_second_publish(self):
+        # kewei round-14 repro, resolved by design: append durable while any
+        # sidecar write would fail — one record, current immediately.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 300.0
+            self.assertTrue(qp.record_sample(
+                state("0.1", 9100, None, None, 100.0), hp, now=now))
+            os.chmod(d, 0o555)
+            try:
+                self.assertTrue(qp.record_sample(
+                    state("0.6", 9200, None, None, 200.0), hp, now=now))
+            finally:
+                os.chmod(d, 0o755)
+            segs = qp.chart_payload(hp, now=now)["windows"]["5h"]["segments"]
+            cur = [seg for seg in segs if seg["current"]]
+            self.assertEqual([seg["reset"] for seg in cur], [9200])
+            self.assertEqual([seg["points"][-1]["y"] for seg in cur], [0.6])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -105,7 +105,7 @@ def _valid_row(rec: dict, now: float) -> dict | None:
         return None
     if rec.get("tomb") is True:
         # All-invalid observation: no chart data, but it advances the order
-        # guard so a delayed older sample cannot slip in after sidecar loss.
+        # guard, so a delayed older sample can never slip in behind it.
         return {"ts": ts, "tomb": True}
     out = {"ts": ts}
     for w, (uk, rk) in _WINDOW_KEYS.items():
@@ -163,51 +163,15 @@ def _read_history(history_path: Path, now: float | None = None) -> list[dict]:
     return _canonical_history(history_path, time.time() if now is None else now)[0]
 
 
-def _latest_path(history_path: Path) -> Path:
-    return history_path.with_name(history_path.name + ".latest.json")
+def _latest_path_cleanup(history_path: Path) -> None:
+    """Best-effort removal of the retired .latest.json sidecar.
 
-
-def _write_latest(history_path: Path, sample: dict, ts: float) -> None:
-    """The newest producer observation, per window; null is a TOMBSTONE.
-
-    The chart's "current" is defined by THIS record alone — an old segment can
-    never present as current just because its reset sits furthest out.
-    """
-    latest = {"ts": ts, "windows": {}}
-    for w, (uk, rk) in _WINDOW_KEYS.items():
-        if uk in sample:
-            latest["windows"][w] = {"u": sample[uk], "r": sample[rk]}
-        else:
-            latest["windows"][w] = None
-    fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
-    with os.fdopen(fd, "w") as f:
-        f.write(json.dumps(latest, allow_nan=False))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, _latest_path(history_path))
-
-
-def _read_latest(history_path: Path, now: float) -> dict | None:
-    """The sidecar, or None — a malformed shape is ABSENT, never an error."""
+    History (with tombstone rows) is the single record; a stale sidecar on
+    disk is inert but confusing, so sweep it when convenient."""
     try:
-        d = json.loads(_latest_path(history_path).read_text())
-    except (OSError, ValueError):
-        return None
-    ts = _finite(d.get("ts")) if isinstance(d, dict) else None
-    if ts is None or not (0 < ts <= now + MAX_FUTURE_SKEW_S):
-        return None
-    wins = d.get("windows")
-    if not isinstance(wins, dict):
-        return None
-    for rec in wins.values():
-        if rec is None:
-            continue
-        if not isinstance(rec, dict):
-            return None
-        u, r = _finite(rec.get("u")), _finite(rec.get("r"))
-        if u is None or u < 0 or r is None or r != int(r):
-            return None
-    return d
+        history_path.with_name(history_path.name + ".latest.json").unlink()
+    except OSError:
+        pass
 
 
 def record_sample(state: dict, history_path: Path, now: float | None = None) -> bool:
@@ -216,10 +180,9 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
     Contract (reviewer-driven): the writer owns the physical cap on EVERY
     path, atomicity is cross-process (flock on a sibling), success is durable
     (fsync before the ack), an unreadable existing history refuses the write,
-    and an observation newer than BOTH the sidecar and the canonical history
-    tail refreshes the latest-observation sidecar — including a fully-invalid
-    one, which writes per-window TOMBSTONES so the chart can never keep
-    presenting a stale window as current.
+    and the canonical history (tombstone rows included) is the ONE record:
+    "current" derives from its tail, so there is no second store to fall
+    out of sync with.
     """
     import time
     clock = time.time() if now is None else now
@@ -269,14 +232,9 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                     # No usable observation time: neither record moves, but
                     # the cap and compaction stay owed on the existing file.
                     return _refuse()
-                latest = _read_latest(history_path, clock)
-                tail_ts = float(history[-1]["ts"]) if history else None
-                # A replacement candidate must beat BOTH records: a lost or
-                # corrupt sidecar must never let an older window read current.
-                newer = ((latest is None or ts > float(latest.get("ts", 0)))
-                         and (tail_ts is None or ts > tail_ts))
-                # The sidecar advances only AFTER the observation lands in
-                # history: a failed append can never publish "current".
+                # One record: the canonical history tail is the sole
+                # ordering authority (tombstone rows included).
+                _latest_path_cleanup(history_path)
                 if sample is None:
                     tail = float(history[-1]["ts"]) if history else None
                     if tail is not None and ts <= tail:
@@ -285,8 +243,6 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                         _commit(history + [{"ts": ts, "tomb": True}])
                     except OSError:
                         return False
-                    if newer:
-                        _write_latest(history_path, {"ts": ts}, ts)
                     return False
                 if history:
                     last = history[-1]
@@ -299,8 +255,6 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                                 _commit(history)
                             except OSError:
                                 return False
-                            if newer:
-                                _write_latest(history_path, sample, ts)
                             return False
                         # Only the run's start exists — append its end below.
                 try:
@@ -321,8 +275,6 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                             os.fsync(f.fileno())
                 except OSError:
                     return False
-                if newer:
-                    _write_latest(history_path, sample, ts)
                 return True
             finally:
                 fcntl.flock(lockf, fcntl.LOCK_UN)
@@ -379,12 +331,14 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
 def chart_payload(history_path: Path, now: float, max_windows: int = 4) -> dict:
     """Everything the chart needs, for both windows."""
     history = _read_history(history_path, now)
-    latest = _read_latest(history_path, now) or {}
-    wins = latest.get("windows") or {}
+    tail = history[-1] if history else None
 
     def _live_reset(w):
-        rec = wins.get(w)
-        r = _finite(rec.get("r")) if isinstance(rec, dict) else None
+        # The tail row IS the latest observation; a tomb row or a stripped
+        # window means it was invalid then — nothing current until newer.
+        if tail is None or tail.get("tomb"):
+            return None
+        r = tail.get(_WINDOW_KEYS[w][1])
         return int(r) if r is not None else None
 
     return {
