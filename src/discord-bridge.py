@@ -2736,6 +2736,9 @@ async def on_ready():
     # does NOT replay `MESSAGE_CREATE` events that arrived during the
     # gap. See `_catchup_missed_dms` for the replay flow.
     client.loop.create_task(_catchup_missed_dms())
+    # Same replay guarantee for served guild channels/threads — watermarked
+    # separately in state/discord-last-seen.json.
+    client.loop.create_task(_backfill_missed_channel_messages())
     # Start polling loops EXACTLY ONCE. `on_ready` fires on every gateway
     # reconnect (RESUME-expiry, network blip, Discord-side reconnect), not
     # just first boot — so spawning these long-lived `while True` loops here
@@ -2755,6 +2758,14 @@ async def on_ready():
         client.loop.create_task(_supervise_loop(poll_dm_fallback, "poll_dm_fallback"))
         # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
         client.loop.create_task(_supervise_loop(_mod_flush_timer_loop, "_mod_flush_timer_loop"))
+
+
+@client.event
+async def on_resumed():
+    # A RESUME can be accepted after events were already dropped at the
+    # gateway boundary; one after=<watermark> sweep per channel is cheap.
+    client.loop.create_task(_catchup_missed_dms())
+    client.loop.create_task(_backfill_missed_channel_messages())
 
 
 def _message_mentions_bot(message):
@@ -3090,6 +3101,8 @@ async def _handle_discord_message(message, force=False):
                 _update_dm_checkpoint(message.channel.id, message.id)
             except Exception as e:
                 print(f"  [dm-checkpoint] self-message update failed: {e}", flush=True)
+        else:
+            _note_channel_message_seen(message)
         return
     # Ahead of EVERY content consumer, the mod observer included: a THREAD_CREATED
     # notice carries the thread NAME as content and must not be judged or actioned.
@@ -3101,6 +3114,8 @@ async def _handle_discord_message(message, force=False):
                 _update_dm_checkpoint(message.channel.id, message.id)
             except Exception as e:
                 print(f"  [dm-checkpoint] system-message update failed: {e}", flush=True)
+        else:
+            _note_channel_message_seen(message)
         print(f"  [skip] system message type={message.type}", flush=True)
         return
 
@@ -3137,6 +3152,8 @@ async def _handle_discord_message(message, force=False):
             _update_dm_checkpoint(message.channel.id, message.id)
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
+    elif hasattr(message, "id"):
+        _note_channel_message_seen(message)
 
     safe_log_text = redact_chat_body(text)   # the shared chain; see src/chat_redaction.py
     print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
@@ -4416,25 +4433,32 @@ async def poll_approved():
 # monotonic so `after=<id>` reliably returns only newer messages.
 DM_CHECKPOINT_FILE = REPO / "state" / "discord-dm-checkpoint.json"
 
-def _atomic_write_dm_checkpoint(data: dict) -> None:
-    """Write JSON atomically — same shape as _atomic_write_pending_replies."""
+# Guild-channel twin of the DM checkpoint: served channels/threads (access.json
+# `groups`) get the same reconnect backfill, watermarked in this file.
+LAST_SEEN_FILE = REPO / "state" / "discord-last-seen.json"
+
+# Bound on messages replayed per channel per backfill pass.
+CHANNEL_BACKFILL_MAX_MESSAGES = 50
+
+
+def _atomic_write_id_map(path: "Path", data: dict) -> None:
+    """Atomic tmp+replace write of a `{str: str}` watermark map; best-effort."""
     try:
-        DM_CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = DM_CHECKPOINT_FILE.with_suffix(".json.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data))
-        tmp.replace(DM_CHECKPOINT_FILE)
+        tmp.replace(path)
     except Exception:
         pass
 
 
-def _load_dm_checkpoint() -> dict:
-    """Read `state/discord-dm-checkpoint.json`. Maps
-    `channel_id (str) → last_processed_message_id (str)`. Returns
-    `{}` on missing/malformed file (fail-open)."""
+def _load_id_map(path: "Path") -> dict:
+    """Read a `{key (str) → id (str)}` watermark map. Fail-open: a missing or
+    malformed file yields `{}`; malformed entries are dropped individually."""
     try:
-        if not DM_CHECKPOINT_FILE.exists():
+        if not path.exists():
             return {}
-        data = json.loads(DM_CHECKPOINT_FILE.read_text())
+        data = json.loads(path.read_text())
         if not isinstance(data, dict):
             return {}
         return {
@@ -4446,20 +4470,147 @@ def _load_dm_checkpoint() -> dict:
         return {}
 
 
-def _update_dm_checkpoint(channel_id: int, message_id: int) -> None:
-    """Atomically advance the per-channel checkpoint to `message_id`.
-    Only writes if the new id is strictly greater (forward-only)."""
-    current = _load_dm_checkpoint()
-    new_id_str = str(message_id)
-    channel_str = str(channel_id)
-    old_id_str = current.get(channel_str, "0")
+def _advance_id_map(path: "Path", key, new_id) -> None:
+    """Advance one watermark atomically — forward-only, so an out-of-order
+    replay can never move a channel's checkpoint backwards."""
+    current = _load_id_map(path)
+    new_id_str = str(new_id)
+    key_str = str(key)
+    old_id_str = current.get(key_str, "0")
     try:
         if int(new_id_str) <= int(old_id_str):
             return
     except (ValueError, TypeError):
         pass
-    current[channel_str] = new_id_str
-    _atomic_write_dm_checkpoint(current)
+    current[key_str] = new_id_str
+    _atomic_write_id_map(path, current)
+
+
+def _atomic_write_dm_checkpoint(data: dict) -> None:
+    """Write JSON atomically — same shape as _atomic_write_pending_replies."""
+    _atomic_write_id_map(DM_CHECKPOINT_FILE, data)
+
+
+def _load_dm_checkpoint() -> dict:
+    """Read `state/discord-dm-checkpoint.json`. Maps
+    `channel_id (str) → last_processed_message_id (str)`. Returns
+    `{}` on missing/malformed file (fail-open)."""
+    return _load_id_map(DM_CHECKPOINT_FILE)
+
+
+def _update_dm_checkpoint(channel_id: int, message_id: int) -> None:
+    """Atomically advance the per-channel checkpoint to `message_id`.
+    Only writes if the new id is strictly greater (forward-only)."""
+    _advance_id_map(DM_CHECKPOINT_FILE, channel_id, message_id)
+
+
+def _load_last_seen() -> dict:
+    """Read `state/discord-last-seen.json` — the served-channel watermark map,
+    `channel_id (str) → last_seen_message_id (str)`. Fail-open to `{}`."""
+    return _load_id_map(LAST_SEEN_FILE)
+
+
+def _update_last_seen(channel_id, message_id) -> None:
+    """Forward-only advance of a served channel's watermark."""
+    _advance_id_map(LAST_SEEN_FILE, channel_id, message_id)
+
+
+def _note_channel_message_seen(message) -> None:
+    """Advance the served-channel watermark for any OBSERVED guild message.
+
+    Seen != processed (same contract as the DM checkpoint): the watermark
+    records what the gateway already delivered, whether or not downstream
+    gates dropped it, so backfill never re-fetches a live-delivered id.
+    Only channels the bridge serves (access.json `groups`) are tracked;
+    DMs advance the DM checkpoint instead. Never raises."""
+    try:
+        channel = getattr(message, "channel", None)
+        msg_id = getattr(message, "id", None)
+        channel_id = getattr(channel, "id", None)
+        if channel is None or msg_id is None or channel_id is None:
+            return
+        if isinstance(channel, discord.DMChannel):
+            return
+        if load_channel_config(str(channel_id)) is None:
+            return
+        _update_last_seen(channel_id, msg_id)
+    except Exception as e:
+        print(f"  [channel-watermark] update failed: {e}", flush=True)
+
+
+def _backfill_channel_ids() -> "list[str]":
+    """Channels the reconnect backfill serves: access.json `groups` keys with a
+    Discord snowflake shape (guild channels + seeded threads). DM channels are
+    the DM checkpoint's job — `_catchup_missed_dms` covers them."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+        groups = data.get("groups", {}) if isinstance(data, dict) else {}
+        return [str(cid) for cid in groups if _is_discord_channel_id(str(cid))]
+    except Exception:
+        return []
+
+
+async def _backfill_one_channel(channel_id_str: str) -> None:
+    """Replay one served channel's missed messages through the live handler.
+
+    No watermark yet → initialize it to the channel's newest message id
+    WITHOUT replaying, so a fresh watermark never turns channel history into
+    tasks. With a watermark → fetch `after=<watermark>` oldest-first (REST,
+    via the client's own authenticated session) and route every non-self
+    message through `_handle_discord_message` — the exact choke point live
+    messages take, so allowFrom/tierMap/requireMention/collaborator gates
+    apply identically."""
+    channel = client.get_channel(int(channel_id_str))
+    if channel is None:
+        channel = await client.fetch_channel(int(channel_id_str))
+    if isinstance(channel, discord.DMChannel):
+        return
+    watermark = _load_last_seen().get(channel_id_str)
+    if watermark is None:
+        async for msg in channel.history(limit=1):
+            _update_last_seen(channel_id_str, msg.id)
+        return
+    fetched = []
+    # One over the cap, so "exactly at the cap" and "cap binds" are tellable.
+    async for msg in channel.history(
+        after=discord.Object(id=int(watermark)),
+        limit=CHANNEL_BACKFILL_MAX_MESSAGES + 1,
+        oldest_first=True,
+    ):
+        fetched.append(msg)
+    if len(fetched) > CHANNEL_BACKFILL_MAX_MESSAGES:
+        print(
+            f"  [channel-backfill] WARN: channel {channel_id_str} has more than "
+            f"{CHANNEL_BACKFILL_MAX_MESSAGES} missed messages — replaying the oldest "
+            f"{CHANNEL_BACKFILL_MAX_MESSAGES}; the rest are fetched on the next reconnect",
+            flush=True,
+        )
+        fetched = fetched[:CHANNEL_BACKFILL_MAX_MESSAGES]
+    replayed = 0
+    for msg in fetched:
+        if getattr(msg, "author", None) == client.user:
+            _update_last_seen(channel_id_str, msg.id)
+            continue
+        try:
+            await _handle_discord_message(msg)
+            replayed += 1
+        except Exception as e:
+            print(f"  [channel-backfill] replay failed for msg {msg.id}: {e}", flush=True)
+        _update_last_seen(channel_id_str, msg.id)
+    if replayed:
+        print(f"  [channel-backfill] replayed {replayed} missed message(s) on channel {channel_id_str}", flush=True)
+
+
+async def _backfill_missed_channel_messages() -> None:
+    """Reconnect-safety for served guild channels/threads, mirroring
+    `_catchup_missed_dms`: the gateway does not replay MESSAGE_CREATE events
+    lost during a disconnect, so REST-fetch what the watermark says we missed.
+    One channel's failure logs and moves on — never the whole pass."""
+    for channel_id_str in _backfill_channel_ids():
+        try:
+            await _backfill_one_channel(channel_id_str)
+        except Exception as e:
+            print(f"  [channel-backfill] channel {channel_id_str} failed: {e}", flush=True)
 
 
 async def _catchup_missed_dms():
