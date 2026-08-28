@@ -153,6 +153,14 @@ class AcquireCliTests(unittest.TestCase):
         self.assertEqual(self._run("acquire", "/nope/nope", "core-1")[0], 2)
         self.assertEqual(self._run("bogus")[0], 2)
 
+    def test_exactly_one_acquisition_invocation_is_documented(self):
+        # Three ways to acquire, one claiming to supersede the others, made
+        # claiming depend on how far down the file a follower read.
+        skill = (REPO / "skills" / "proactive-loop-pool" / "SKILL.md").read_text()
+        self.assertEqual(skill.count("pool_follower.py acquire"), 1)
+        self.assertEqual(skill.count("from pool_follower import acquire_work"), 0)
+        self.assertEqual(skill.count("python3 src/claim_task.py"), 0)
+
     def test_skill_md_documents_a_command_that_actually_runs(self):
         # The defect this file exists for: the documented invocation named a
         # file that does not exist, so no follower could ever acquire.

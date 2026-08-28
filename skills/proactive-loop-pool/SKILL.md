@@ -110,19 +110,12 @@ To revert to single-core:
 2. Run `bash scripts/uninstall-core-pool.sh` to remove the launchd plists.
 3. `bash src/restart.sh` to restart the foreground core.
 
-## Lead-follower mode (L2+, supersedes raw claiming)
+## Lead-follower mode (L2+) — what acquisition guarantees
 
-Each pass, acquire work via the assignment loop — NEVER claim unassigned
-tasks directly while the lead is alive:
+This section explains the semantics. The command is the one in "The claim
+step" above; do not invoke `acquire_work` a second way from here.
 
-```python
-import sys; sys.path.insert(0, "src")
-from pool_follower import acquire_work
-got = acquire_work(WORKSPACE/"tasks", WORKSPACE/"state",
-                   f"core-{CORE_ID}", "pool-lead")
-```
-
-`acquire_work` returns your claimed task path or None. It honors lead
-assignments in priority order and degrades to leaderless claiming only when
-`pool-lead.alive` is stale/absent/future-dated. Done-flags before side
-effects, exactly as below.
+Never claim unassigned tasks directly while the lead is alive. `acquire`
+enforces that for you: it honours your own lead assignments in priority order,
+and opens the unassigned pool only when `pool-lead.alive` is stale, absent or
+future-dated. Done-flags land before side effects, exactly as below.
