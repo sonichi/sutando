@@ -86,6 +86,61 @@ class StoreShapes(unittest.TestCase):
             self.assertEqual(len(hits), 2)
             self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
 
+    def test_malformed_entities_yaml_degrades_to_empty(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people: []\n")
+            (d / "entities.yaml").write_text("entities:\n    broken [unclosed\n    no: colon here\n")
+            q, ents = lk.load(d)
+            self.assertEqual(ents, [])
+
+    def test_roster_absent_returns_empty_list(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people: []\n")
+            self.assertEqual(lk.load_roster(d), [])
+
+    def test_roster_non_dict_values_skipped(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = dict(ROSTER)
+            r["_merge_log"] = ["a merge event"]     # real shape: sync writes a list here
+            d = store(t, roster=r)
+            rows = lk.load_roster(d)
+            self.assertEqual([x["entity_id"] for x in rows], ["rui"])
+
+    def test_main_empty_store_prints_map_empty(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t) / "data" / "collaboration-intelligence"
+            d.mkdir(parents=True)                    # store dir exists, holds nothing
+            orig_store, orig_argv = lk.store, sys.argv
+            out = io.StringIO()
+            try:
+                lk.store = lambda: d
+                sys.argv = ["lookup.py", "anyone"]
+                with contextlib.redirect_stdout(out):
+                    rc = lk.main()
+            finally:
+                lk.store, sys.argv = orig_store, orig_argv
+            self.assertEqual(rc, 0)
+            self.assertIn("MAP EMPTY", out.getvalue())
+
+    def test_main_resolves_through_full_path(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=ROSTER)
+            orig_store, orig_argv = lk.store, sys.argv
+            out = io.StringIO()
+            try:
+                lk.store = lambda: d
+                sys.argv = ["lookup.py", "john-the-dev"]
+                with contextlib.redirect_stdout(out):
+                    rc = lk.main()
+            finally:
+                lk.store, sys.argv = orig_store, orig_argv
+            self.assertEqual(rc, 0)
+            self.assertIn("@sutando-rui:ag2.space", out.getvalue())
+
     def test_no_match_returns_empty_not_invented(self):
         with tempfile.TemporaryDirectory() as t:
             d = store(t, roster=ROSTER)
