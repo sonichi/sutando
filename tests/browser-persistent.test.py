@@ -11,6 +11,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "src" / "browser.mjs"
 HOOK = REPO / "tests" / "fixtures" / "browser-playwright-register.mjs"
+# Harness safety net, not an assertion: each deadline is asserted from in-Node
+# timestamps, so a slow runner must not read as a deadline leak.
+PROC_TIMEOUT = int(os.environ.get("SUTANDO_BROWSER_TEST_PROC_TIMEOUT", "30"))
 
 
 class PersistentBrowserTests(unittest.TestCase):
@@ -26,7 +29,7 @@ class PersistentBrowserTests(unittest.TestCase):
         )
         return env, log
 
-    def _wait_for_log(self, log, marker, timeout=5):
+    def _wait_for_log(self, log, marker, timeout=PROC_TIMEOUT):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if log.exists() and marker in log.read_text(encoding="utf-8"):
@@ -74,7 +77,7 @@ class PersistentBrowserTests(unittest.TestCase):
             env, log = self._fake_browser_env(tmp, "error")
             result = subprocess.run(
                 ["node", str(SCRIPT), "https://example.test/", "text"],
-                cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=PROC_TIMEOUT,
             )
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("fixture navigation failed", result.stderr)
@@ -85,7 +88,7 @@ class PersistentBrowserTests(unittest.TestCase):
             env, log = self._fake_browser_env(tmp, "hang")
             result = subprocess.run(
                 ["node", str(SCRIPT), "https://example.test/", "text", "--timeout=50"],
-                cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=PROC_TIMEOUT,
             )
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("timed out after 50ms", result.stderr)
@@ -96,7 +99,7 @@ class PersistentBrowserTests(unittest.TestCase):
             env, log = self._fake_browser_env(tmp, "late-launch")
             result = subprocess.run(
                 ["node", str(SCRIPT), "https://example.test/", "text", "--timeout=120"],
-                cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=PROC_TIMEOUT,
             )
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("timed out after 120ms", result.stderr)
@@ -113,7 +116,7 @@ class PersistentBrowserTests(unittest.TestCase):
             env, log = self._fake_browser_env(tmp, "success")
             result = subprocess.run(
                 ["node", str(SCRIPT), "https://example.test/", "text", "--timeout=60000"],
-                cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=PROC_TIMEOUT,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertGreater(self._recorded_int(log, "page.goto.timeout"), 30000)
@@ -125,7 +128,7 @@ class PersistentBrowserTests(unittest.TestCase):
                 env, log = self._fake_browser_env(tmp, "success")
                 result = subprocess.run(
                     ["node", str(SCRIPT), "https://example.test/", *actions],
-                    cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+                    cwd=REPO, env=env, capture_output=True, text=True, timeout=PROC_TIMEOUT,
                 )
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("exceeding the 45000ms command budget", result.stderr)
@@ -137,7 +140,7 @@ class PersistentBrowserTests(unittest.TestCase):
             env, log = self._fake_browser_env(tmp, "success")
             result = subprocess.run(
                 ["node", str(SCRIPT), "https://example.test/", "wait:60000", "--timeout=70000"],
-                cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=PROC_TIMEOUT,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Waited: 60000ms", result.stdout)
@@ -148,7 +151,7 @@ class PersistentBrowserTests(unittest.TestCase):
             env, log = self._fake_browser_env(tmp, "success")
             result = subprocess.run(
                 ["node", str(SCRIPT), "https://example.test/", "text", "--timeout=300001"],
-                cwd=REPO, env=env, capture_output=True, text=True, timeout=5,
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=PROC_TIMEOUT,
             )
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("cannot exceed 300000 milliseconds", result.stderr)

@@ -28,6 +28,8 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
+- **`channel_env_containment.py`** — Shared containment policy for a channel's `.env` credential file.
+- **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
 - **`chat_redaction.py`** — The chat-body redaction CHAIN, owned in one place.
@@ -49,7 +51,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
-- **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
+- **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
@@ -70,6 +72,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
+- **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
@@ -88,6 +91,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
+- **`mention_gate.py`** — Owner @-mention ingestion trigger: shared policy for whether a message that tags the OWNER counts as a mention of the bot.
 - **`message_chunking.py`** — Shared message chunking — one fence-aware chunker for every outbound surface.
 - **`migrate-plists-to-logs-dir.sh`** — Migrate ~/Library/LaunchAgents/com.sutando.*.plist StandardOutPath / StandardErrorPath entries from /Desktop/sutando/src/*.log to /Desktop/sutando/logs/*.log, matching PR #251's runtime-artifacts refactor.
 - **`migrate.sh`** — Sutando Migration Script — bundle current machine state for transfer to new Mac
@@ -101,6 +105,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
 - **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
+- **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
@@ -113,6 +118,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
+- **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
 - **`read_discord_channel.py`** — Gated Discord channel reader — compatibility wrapper over the shared reader and the shared contextNotFrom policy.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
@@ -139,7 +145,10 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`send_failure_policy.py`** — Classify an outbound-send failure as transient (retry) or permanent (park).
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
+- **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
+- **`signal_guest_handler.py`** — Signal Room guest-tier ``deep_dive`` handler (code-enforced sandboxing).
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
+- **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
@@ -217,6 +226,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 ## `src/agent/`
 
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).

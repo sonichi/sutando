@@ -4,6 +4,8 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 cd "$REPO"
+# Shared with the claude launcher: one owner for the in-session restart policy.
+. "$REPO/src/agent/restart-guard.sh"
 
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
@@ -36,8 +38,18 @@ open_visible_terminal() {
   open -a Terminal "$cmdfile" 2>/dev/null || true
 }
 NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
+# Snapshot what we INHERITED before the export below overwrites it: the
+# guard must not read the marker this script sets itself.
+CALLER_CORE_SESSION="${SUTANDO_CORE_SESSION:-}"
 export SUTANDO_CORE_SESSION=1
 export SUTANDO_CORE_RUNTIME=codex
+
+# Refuse BEFORE ensure_durable_schedules and the kill-sessions at the
+# --restart branch below; both mutate state this caller cannot survive.
+if [ "${1:-}" = "--restart" ] && sutando_restart_guard_refuses "$CALLER_CORE_SESSION"; then
+  sutando_restart_guard_explain
+  exit 1
+fi
 
 tmux_available() { command -v tmux >/dev/null 2>&1; }
 session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$1" 2>/dev/null; }
