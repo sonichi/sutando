@@ -159,6 +159,12 @@ ACCEPTED = [
      lambda v: v.serving is True),
     ("ts exactly at max_age",                   {"ts": NOW - 300, "connected": True, "last_ok_ts": NOW},
      lambda v: v.serving is True),
+    # The adjacent pair at float representability: 2**1023 converts, 2**1024
+    # does not. A guard one value too tight rejects the first and passes the rest.
+    ("backoff_s = 2**1023, the largest int that converts", {"ts": NOW, "connected": True, "last_ok_ts": NOW, "backoff_s": 2 ** 1023},
+     lambda v: v.backoff_s == float(2 ** 1023)),
+    ("last_ok_ts exactly at the skew boundary",  {"ts": NOW, "connected": True, "last_ok_ts": NOW + gs.FUTURE_SKEW_S},
+     lambda v: v.last_ok_ts is not None and v.serving is True),
 ]
 for _label, _rec, _ok in ACCEPTED:
     _v = gs.verdict_from_record(_rec, now=NOW, max_age=300)
