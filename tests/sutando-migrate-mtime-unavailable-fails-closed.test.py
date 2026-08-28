@@ -33,7 +33,12 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 MIGRATE = REPO / "scripts" / "sutando-migrate.sh"
 
-REL = "state/auth/cloud-auth.json"       # rehome-state: durable per-host identity
+# SOURCE-relative. The classifier keys on the BARE name (`cloud-auth.json|rehome-state`,
+# sutando-migrate.sh:202); the already-homed path classifies `structural` and routes to the
+# COLLISION branch, so this test never reached the rehome branch it exists to guard.
+REL = "cloud-auth.json"
+DEST_REL = "state/auth/cloud-auth.json"   # where rehome-state lands it
+REHOME_MARKER = "rehome-mtime-unavailable"
 SRC_BODY = '{"token": "OLDER-SOURCE"}\n'
 DEST_BODY = '{"token": "NEWER-DEST"}\n'
 
@@ -80,7 +85,7 @@ class MtimeUnavailableFailsClosed(unittest.TestCase):
         src.parent.mkdir(parents=True, exist_ok=True)
         src.write_text(SRC_BODY)
         os.utime(src, (now - 600, now - 600))
-        dst = self.tmp / "dest" / REL
+        dst = self.tmp / "dest" / DEST_REL
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(DEST_BODY)
         os.utime(dst, (now, now))
@@ -104,7 +109,7 @@ class MtimeUnavailableFailsClosed(unittest.TestCase):
             capture_output=True, text=True, env=env, timeout=180)
 
     def _dest(self):
-        p = self.tmp / "dest" / REL
+        p = self.tmp / "dest" / DEST_REL
         return p.read_text() if p.exists() else None
 
     def _sentinels(self):
@@ -125,7 +130,7 @@ class MtimeUnavailableFailsClosed(unittest.TestCase):
     # ---- reciprocal negatives -------------------------------------------
     def test_destination_mtime_unavailable_refuses(self) -> None:
         self._seed()
-        r = self._migrate(target="dest/" + REL)
+        r = self._migrate(target="dest/" + DEST_REL)
         self._assert_refused(r, "destination mtime unavailable")
 
     def test_source_mtime_unavailable_refuses(self) -> None:
@@ -147,6 +152,11 @@ class MtimeUnavailableFailsClosed(unittest.TestCase):
         self.assertEqual(self._sentinels(), [],
                          f"[{label}] a source sentinel was written, so the "
                          f"retry will skip this file:\n{out}")
+        # Without this the test passes from the COLLISION branch and silently
+        # stops covering the rehome path -- the defect it was written for.
+        self.assertIn(REHOME_MARKER, out,
+                      f"[{label}] refusal came from a branch other than rehome; "
+                      f"this regression is not covering :1376-1388:\n{out}")
         for tok in FORBIDDEN:
             self.assertNotIn(tok, out,
                              f"[{label}] output claims success ({tok!r}):\n{out}")

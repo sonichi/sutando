@@ -1197,9 +1197,8 @@ preflight_summary() {
     echo "$_total_files"
 }
 
-# SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
-# Print a validated SHA-256 digest for $1, or nothing. Non-empty is not the
-# test: a broken hasher prints a non-digest token for BOTH files and compares equal.
+# Print a VALIDATED sha256 digest for $1, or nothing. Non-empty is not the test:
+# a broken hasher prints the same non-digest token for both files and compares equal.
 _sha256_of() {
     local out rc
     if command -v shasum >/dev/null 2>&1; then
@@ -1857,10 +1856,8 @@ commit_main() {
         }
     done
 
-    # β rehome of source's .git → dest/.git is a SEPARATE step. See
-    # sutando-plus/scripts/sutando-migrate-sync.sh — runs AFTER this commit
-    # succeeds, only relevant to sutando-plus users who have a vault remote at
-    # the customized source location.
+    # β rehome of source's .git → dest/.git is a SEPARATE step, in
+    # sutando-plus/scripts/sutando-migrate-sync.sh, run AFTER this commit succeeds.
 
     # Auto-invoke Claude memory import — fixes Lucy's Maddy migration report
     # 2026-06-06: previously sutando-migrate set up the M2 directories but did
