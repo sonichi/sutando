@@ -137,9 +137,8 @@ class ColdStartStaggeredWake(WakeGuardBase):
         self.assertEqual(out, [("task-w.claimed-core-2.txt", "repooled")])
 
     def test_all_fresh_first_tick_opens_no_window(self):
-        # Control: the deferral is caused by the stale follower, not by being
-        # the first tick. With every follower proven, a later death is
-        # recovered on the spot.
+        # Control: the stale follower causes the deferral, not the first tick.
+        # Every follower proven -> a later death is recovered on the spot.
         self.assertEqual(self.lead.reclaim_claimed(), [])
         (self.tasks / "task-v.claimed-core-2.txt").write_text("x")
         self.alive["core-2"] = False
