@@ -17,7 +17,6 @@ name: lint-host-label
 
 on:
   pull_request:
-    branches: [main, staging-workspace-revamp]
   push:
     branches: [main, staging-workspace-revamp]
 
