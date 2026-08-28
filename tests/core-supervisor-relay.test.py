@@ -13,12 +13,16 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
+import sys
 import tempfile
 import contextlib
 import unittest
+from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "core-supervisor-relay.py")
+sys.path.insert(0, os.path.join(_HERE, "..", "src"))
 _spec = importlib.util.spec_from_file_location("core_supervisor_relay", _SRC)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
@@ -27,6 +31,8 @@ compose_message = _mod.compose_message
 run_cycle = _mod.run_cycle
 main = _mod.main
 resolve_active_target = _mod.resolve_active_target
+
+import channel_env_containment  # noqa: E402 — the shared module the probe delegates to
 
 _LOGIN = {"state": "blocked-human", "detail": "awaiting user: login",
           "prompt": "Login\nSelect login method:\n  1. Claude account", "kind": "login"}
@@ -462,6 +468,59 @@ class TestResolveActiveTarget(unittest.TestCase):
                 else:
                     os.environ["CLAUDE_CONFIG_DIR"] = old
 
+    def _with_env(self, **values):
+        """Set/unset env vars for one test; None means unset."""
+        saved = {k: os.environ.get(k) for k in values}
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
+
+    def _relocated_layout(self, source="ag2space"):
+        """$CLAUDE_CONFIG_DIR/channels/<source>/.env -> $APP/channels/<source>/.env,
+        the AG2 Space desktop-app layout (#3150/#3201). Returns (cfg, app)."""
+        cfg = tempfile.mkdtemp()
+        app = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, app, ignore_errors=True)
+        real_dir = os.path.join(app, "channels", source)
+        os.makedirs(real_dir)
+        with open(os.path.join(real_dir, ".env"), "w") as f:
+            f.write("REMOTE_TASK_TOKEN=x\n")
+        link_dir = os.path.join(cfg, "channels", source)
+        os.makedirs(link_dir)
+        os.symlink(os.path.join(real_dir, ".env"), os.path.join(link_dir, ".env"))
+        return cfg, app
+
+    def test_app_support_relocated_env_is_deliverable(self):
+        # notify.py accepts $SUTANDO_APP_SUPPORT/channels/<source>/.env as a
+        # second root (#3150/#3201); the probe must agree or the lane never routes.
+        with tempfile.TemporaryDirectory() as td:
+            cfg, app = self._relocated_layout("dev-ag2space")
+            self._with_env(CLAUDE_CONFIG_DIR=cfg, SUTANDO_APP_SUPPORT=app)
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:d"))
+
+    def test_same_shape_outside_app_support_is_not_deliverable(self):
+        # Containment, not a leaf-shape match: same layout with the var unset or
+        # pointed at another root is a symlink the sender refuses — so must the probe.
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as other:
+            cfg, _app = self._relocated_layout("dev-ag2space")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            self._with_env(CLAUDE_CONFIG_DIR=cfg, SUTANDO_APP_SUPPORT=None)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+            self._with_env(SUTANDO_APP_SUPPORT=other)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
     def test_claude_home_tier_is_honored(self):
         # notify.py resolves CLAUDE_CONFIG_DIR -> CLAUDE_HOME -> ~/.claude; the
         # probe must walk the SAME tiers (a CLAUDE_HOME-only env previously
@@ -498,6 +557,89 @@ class TestResolveActiveTarget(unittest.TestCase):
             self.assertEqual(resolve_active_target(self._write(td, "{bad json")), ("", ""))
             self.assertEqual(resolve_active_target(self._write(td, [1, 2, 3])), ("", ""))
 
+
+
+class TestChannelEnvContainmentDelegation(unittest.TestCase):
+    """The probe (_is_deliverable) must call the shared
+    src/channel_env_containment.py function, not carry its own copy of the
+    containment rule — the exact duplication CLAUDE.md's architecture rules
+    call out as the defect."""
+
+    def _reload(self):
+        """A fresh module instance, separate from the shared `_mod` every
+        other test class depends on, so patching the shared function's
+        binding here can't affect them."""
+        spec = importlib.util.spec_from_file_location("core_supervisor_relay_fresh", _SRC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_binds_the_shared_function_by_identity(self):
+        self.assertIs(_mod._channel_env_is_contained,
+                      channel_env_containment.channel_env_is_contained)
+
+    def test_containment_delegates_to_shared_module_not_a_copy(self):
+        """Stub the shared function to always refuse, reload the probe, and
+        confirm even an otherwise-deliverable app-support relocation is now
+        refused. If _is_deliverable carried its own copy of the rule, this
+        module-level stub would have no effect."""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = tempfile.mkdtemp()
+            app = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+            self.addCleanup(shutil.rmtree, app, ignore_errors=True)
+            real_dir = os.path.join(app, "channels", "dev-ag2space")
+            os.makedirs(real_dir)
+            with open(os.path.join(real_dir, ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            link_dir = os.path.join(cfg, "channels", "dev-ag2space")
+            os.makedirs(link_dir)
+            os.symlink(os.path.join(real_dir, ".env"), os.path.join(link_dir, ".env"))
+
+            p = os.path.join(td, "last-owner-activity.json")
+            with open(p, "w") as f:
+                json.dump({"channel": "dev-ag2space", "channel_id": "!r:d"}, f)
+
+            saved = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "SUTANDO_APP_SUPPORT")}
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            os.environ["SUTANDO_APP_SUPPORT"] = app
+            try:
+                with patch.object(channel_env_containment, "channel_env_is_contained",
+                                  return_value=False):
+                    fresh = self._reload()
+                    self.assertEqual(fresh.resolve_active_target(p), ("", ""))
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+    def test_load_channel_env_containment_fails_closed_when_import_fails(self):
+        """The fallback lambda itself, not just the already-bound result:
+        force the shared module's import to fail and confirm the returned
+        callable refuses even an otherwise-valid-looking containment case —
+        never silently widen the guard just because the import failed."""
+        import builtins
+        real_import = builtins.__import__
+
+        def boom(name, *a, **kw):
+            if name == "channel_env_containment":
+                raise ImportError("simulated: src/ not importable")
+            return real_import(name, *a, **kw)
+
+        fresh = self._reload()
+        with patch.object(builtins, "__import__", boom):
+            fallback = fresh._load_channel_env_containment()
+
+        with tempfile.TemporaryDirectory() as td:
+            channels_dir = os.path.join(td, "channels")
+            env_dir = os.path.join(channels_dir, "dev-ag2space")
+            os.makedirs(env_dir)
+            env_path = os.path.join(env_dir, ".env")
+            with open(env_path, "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            self.assertFalse(fallback(env_path, channels_dir, "dev-ag2space"))
 
 
 class TestBackendRecordContract(unittest.TestCase):

@@ -329,6 +329,23 @@ def _fmt_ms(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{value:.1f} ms"
 
 
+def _case_outcomes(run: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Per-case pass/fail folded across repetitions. A case counts as passing
+    only when every repetition passed — one flaky repetition is not a pass."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in run.get("cases") or []:
+        case_id = row.get("case_id")
+        if case_id is None:
+            continue
+        rec = out.setdefault(case_id, {"passed": 0, "total": 0})
+        rec["total"] += 1
+        if row.get("passed"):
+            rec["passed"] += 1
+    for rec in out.values():
+        rec["all_passed"] = rec["total"] > 0 and rec["passed"] == rec["total"]
+    return out
+
+
 def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     if baseline["suite"]["name"] != candidate["suite"]["name"]:
         raise ValueError("cannot compare runs from different suites")
@@ -343,6 +360,25 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
     c95 = cand["latency_ms"]["p95"]
     if b95 is not None and c95 is not None and c95 > b95 * 1.20:
         regressions.append("latency_p95")
+    base_cases = _case_outcomes(baseline)
+    cand_cases = _case_outcomes(candidate)
+    shared = sorted(set(base_cases) & set(cand_cases))
+    regressed = [c for c in shared
+                 if base_cases[c]["all_passed"] and not cand_cases[c]["all_passed"]]
+    recovered = [c for c in shared
+                 if not base_cases[c]["all_passed"] and cand_cases[c]["all_passed"]]
+    transitions = {
+        "pass_to_pass": sum(1 for c in shared if base_cases[c]["all_passed"]
+                            and cand_cases[c]["all_passed"]),
+        "pass_to_fail": len(regressed),
+        "fail_to_pass": len(recovered),
+        "fail_to_fail": sum(1 for c in shared if not base_cases[c]["all_passed"]
+                            and not cand_cases[c]["all_passed"]),
+    }
+    # An equal pass rate can hide one case breaking while another recovers, so
+    # a per-case regression gates independently of the aggregate.
+    if regressed:
+        regressions.append("cases_regressed")
     base_runtime = baseline["subject"].get("runtime")
     cand_runtime = candidate["subject"].get("runtime")
     attribution_warnings = []
@@ -376,6 +412,13 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
             "no_response": {"baseline": base["no_response"], "candidate": cand["no_response"]},
             "latency_p95_ms": {"baseline": b95, "candidate": c95},
         },
+        "cases": {
+            "transitions": transitions,
+            "regressed": regressed,
+            "recovered": recovered,
+            "only_in_baseline": sorted(set(base_cases) - set(cand_cases)),
+            "only_in_candidate": sorted(set(cand_cases) - set(base_cases)),
+        },
     }
     report = "\n".join([
         "# Sutando benchmark comparison", "",
@@ -387,6 +430,17 @@ def compare_runs(baseline: Dict[str, Any], candidate: Dict[str, Any]) -> Tuple[D
         f"| Pass rate | {base['pass_rate']:.1%} | {cand['pass_rate']:.1%} |",
         f"| No response | {base['no_response']} | {cand['no_response']} |",
         f"| Latency p95 | {_fmt_ms(b95)} | {_fmt_ms(c95)} |", "",
+        f"Cases compared: {len(shared)}", "",
+        "| Transition | Cases |", "|---|---:|",
+        f"| Pass -> pass | {transitions['pass_to_pass']} |",
+        f"| Pass -> FAIL | {transitions['pass_to_fail']} |",
+        f"| Fail -> pass | {transitions['fail_to_pass']} |",
+        f"| Fail -> fail | {transitions['fail_to_fail']} |", "",
+        "Regressed cases: " + (", ".join(f"`{c}`" for c in regressed)
+                               if regressed else "none"),
+        "Recovered cases: " + (", ".join(f"`{c}`" for c in recovered)
+                               if recovered else "none"),
+        "",
         "Regressions: " + (", ".join(regressions) if regressions else "none"),
         "Attribution warnings: " + (", ".join(attribution_warnings)
                                      if attribution_warnings else "none"),

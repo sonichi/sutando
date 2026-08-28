@@ -205,7 +205,10 @@ class TeamResultVerdict(NamedTuple):
 def _bounded_context(context) -> dict:
     if not isinstance(context, dict):
         return {}
-    keys = ("source", "channel_id", "reply_to_event", "source_message_id", "user_id")
+    keys = (
+        "source", "channel_id", "room_name", "reply_to_event",
+        "source_message_id", "user_id",
+    )
     return {key: str(context.get(key) or "")[:512] for key in keys}
 
 

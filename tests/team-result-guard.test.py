@@ -166,12 +166,15 @@ def behavioral() -> list:
     context = {
         "source": "ag2space",
         "channel_id": "!room:ag2.space",
+        "room_name": "Design Room",
         "reply_to_event": "$thread-root",
         "source_message_id": "$message-one",
         "user_id": "@requester:ag2.space",
     }
     if guard._bounded_context(None) != {}:
         fails.append("non-dict review context must normalize to empty")
+    if len(guard._bounded_context({"room_name": "x" * 5000})["room_name"]) != 512:
+        fails.append("room-controlled names must retain the review-context bound")
     clean = guard.classify_result_for_tier(
         "public body", "owner", REPO, secret_filter=_clean)
     if guard.materialize_withheld_verdict(
@@ -212,6 +215,8 @@ def behavioral() -> list:
             payload = json.loads(saved[0].read_text(encoding="utf-8"))
             if payload.get("withheld_body") != raw or payload.get("agent_id") != "@agent-one:ag2.space":
                 fails.append("review artifact must identify the agent and contain the withheld body")
+            if payload.get("context", {}).get("room_name") != "Design Room":
+                fails.append("review artifact must retain the human-readable room name")
             if payload.get("status") != "pending_dm" or not payload.get("review_id", "").startswith("wr_"):
                 fails.append("review artifact must carry a stable id and pending-DM state")
             if saved[0].stat().st_mode & 0o777 != 0o600:

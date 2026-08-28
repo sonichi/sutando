@@ -10,6 +10,7 @@ shared guard has to run first or a redirect/upload happens on unscanned text.
 Exercises the production `_guarded_result_body`, not a copy of its recipe.
 """
 import importlib
+import json
 import pathlib
 import sys
 import tempfile
@@ -145,6 +146,7 @@ with tempfile.TemporaryDirectory() as td:
     notice_fields = {
         "source": "ag2space",
         "channel_id": "!room:ag2.space",
+        "room_name": "Design Room",
         "reply_to_event": "$thread-root",
         "source_message_id": "$message-one",
         "user_id": "@requester:ag2.space",
@@ -157,6 +159,9 @@ with tempfile.TemporaryDirectory() as td:
           and any(a.kind == "skip" for a in m.parse_markers(first_notice).actions),
           "first withhold closes the lease without posting into the shared room")
     check(bool(review_files), "first withhold persists an owner-review artifact")
+    review_record = json.loads(review_files[0].read_text(encoding="utf-8"))
+    check(review_record.get("context", {}).get("room_name") == "Design Room",
+          "the bridge retains the human-readable room name for private review")
 
     retry_notice, _ = m._guarded_result_body("task-notice-one", BODY_WITH_MARKERS)
     check(retry_notice == first_notice,
