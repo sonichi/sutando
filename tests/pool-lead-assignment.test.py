@@ -342,9 +342,8 @@ class LeadDegradesOnFilesystemTroubleTests(unittest.TestCase):
             out = dict(self.lead.sweep())
         self.assertEqual(len(out), 1, "one lost rename ended the whole sweep")
 
-    # pool_lead.py:142-143 (stat racing the rename) is deliberately NOT covered.
-    # sort_tasks_by_priority stats the same file first and unguarded, so any
-    # patch broad enough to reach the lead's guard raises there instead.
+    # 142-143 uncovered: sort_tasks_by_priority stats the same file first and
+    # unguarded, so any patch reaching the lead's guard raises there instead.
 
 
 if __name__ == "__main__":
