@@ -41,7 +41,8 @@ def _read_when_nonempty(path, deadline):
     here truncates before it writes. Returns None rather than "" so a miss can
     never be mistaken for content -- an empty string still satisfies assertIn's
     and assertNotIn's argument contract, so a caller handed "" reports on data
-    it never observed.
+    it never observed. Returns the FIRST non-empty read, so a chunked writer can
+    still yield a prefix -- unchanged from the exists()-then-read it replaces.
     """
     while time.monotonic() < deadline:
         try:

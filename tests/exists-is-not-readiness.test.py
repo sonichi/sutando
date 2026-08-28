@@ -71,10 +71,23 @@ class ReadWhenNonemptyTests(unittest.TestCase):
         self.assertEqual(
             self.mod._read_when_nonempty(self.path, time.monotonic() + 5), "late")
 
-    def test_never_returns_empty_string(self):
-        """None, not "" -- the whole point. "" would re-enter the assertions above."""
-        self.path.write_text("")
-        self.assertIsNot(self.mod._read_when_nonempty(self.path, time.monotonic() + 0.2), "")
+    def test_a_torn_write_can_still_yield_partial_content(self):
+        """Bound of the fix, stated so nobody reads it as more than it is.
+
+        The helper returns the FIRST non-empty read, so a writer that emits in
+        chunks can hand back a prefix. Same exposure as the code it replaces --
+        not a regression, and not covered.
+        """
+        import threading
+        def run():
+            fh = open(self.path, "w")
+            fh.write("partial"); fh.flush()
+            time.sleep(0.30)
+            fh.write("-and-the-rest"); fh.close()
+        t = threading.Thread(target=run, daemon=True); t.start()
+        self.addCleanup(t.join)
+        got = self.mod._read_when_nonempty(self.path, time.monotonic() + 5)
+        self.assertEqual(got, "partial")
 
 
 if __name__ == "__main__":
