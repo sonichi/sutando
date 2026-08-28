@@ -367,8 +367,10 @@ class RestartedLeadInheritsWakeEvidence(WakeGuardBase):
         (self.tasks / "task-restart.claimed-core-2.txt").write_text("x")
         self.lead.reclaim_claimed()          # pre-sleep tick, persists evidence
         self._sleep_whole_host(968)          # wall jumps, monotonic does not
-        self.alive["core-1"] = True          # the sibling re-beats FIRST
-        self.alive["core-2"] = False         # the claim owner has not yet
+
+        # The ordering under test: sibling back first, claim owner still due.
+        self.alive["core-1"] = True
+        self.alive["core-2"] = False
         dead, claimed, stuck = self._daemon_order(self._restart_lead())
         self.assertEqual((dead, claimed, stuck), ([], [], []),
                          "a restarted lead repooled a live claim on a sibling-first wake")
