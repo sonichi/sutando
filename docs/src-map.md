@@ -89,6 +89,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
+- **`mention_gate.py`** — Owner @-mention ingestion trigger: shared policy for whether a message that tags the OWNER counts as a mention of the bot.
 - **`message_chunking.py`** — Shared message chunking — one fence-aware chunker for every outbound surface.
 - **`migrate-plists-to-logs-dir.sh`** — Migrate ~/Library/LaunchAgents/com.sutando.*.plist StandardOutPath / StandardErrorPath entries from /Desktop/sutando/src/*.log to /Desktop/sutando/logs/*.log, matching PR #251's runtime-artifacts refactor.
 - **`migrate.sh`** — Sutando Migration Script — bundle current machine state for transfer to new Mac
@@ -102,6 +103,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
 - **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
+- **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
