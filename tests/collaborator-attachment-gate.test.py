@@ -127,12 +127,14 @@ class BridgeWiring(unittest.TestCase):
         src = open("src/discord-bridge.py").read()
         self.assertIn("channel_allows_collaborator_attachments(", src)
         self.assertIn("allow_attach=_allow_attach", src)
-        # Imported, not exec'd from extracted source: an exec'd string is
-        # invisible to coverage, so the lines read as untested while passing.
-        _s = importlib.util.spec_from_file_location("dbridge", "src/discord-bridge.py")
-        _m = importlib.util.module_from_spec(_s)
-        _s.loader.exec_module(_m)
-        fn = _m.channel_allows_collaborator_attachments
+        # Compiled under the real filename at the real line offset, so coverage
+        # attributes these lines to the file; importing runs mkdir + subprocesses.
+        import re
+        _m = re.search(r"def channel_allows_collaborator_attachments.*?(?=\ndef )", src, re.S)
+        _pad = "\n" * src[:_m.start()].count("\n")
+        ns = {}
+        exec(compile(_pad + _m.group(0), "src/discord-bridge.py", "exec"), ns)
+        fn = ns["channel_allows_collaborator_attachments"]
         self.assertFalse(fn({}, "123"))
         self.assertFalse(fn({"groups": {"123": {"collaboratorAttachments": False}}}, "123"))
         self.assertFalse(fn({"groups": {"123": True}}, "123"))          # bool cfg, no dict
