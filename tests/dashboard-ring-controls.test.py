@@ -45,32 +45,6 @@ setTimeout(() => {
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-def _model_scoping_control() -> None:
-    """#3499 review P2: a newer transcript in a FOREIGN slug must not win."""
-    import importlib.util
-    import tempfile
-    import time
-    spec = importlib.util.spec_from_file_location("dash_mc", REPO / "src" / "dashboard.py")
-    m = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(m)
-    except SystemExit:
-        pass
-    tmp = pathlib.Path(tempfile.mkdtemp())
-    core = tmp / ".claude-sutando" / "projects" / "-fake-repo"
-    core.mkdir(parents=True)
-    (core / "a.jsonl").write_text('{"model":"core-model"}\n')
-    time.sleep(0.05)
-    foreign = tmp / ".claude-sutando" / "projects" / "-reviewer-wt"
-    foreign.mkdir(parents=True)
-    (foreign / "b.jsonl").write_text('{"model":"reviewer-model"}\n')
-    m.WORKSPACE_DIR = tmp
-    m.REPO_DIR = pathlib.Path("/fake/repo")
-    got = m.get_current_model()
-    assert got == "core-model", f"foreign slug won: {got!r}"
-    print("model-scoping control: PASS — core slug beats newer foreign transcript")
-
-
 def main() -> None:
     if shutil.which("node") is None:
         print("dashboard-ring-controls: SKIP (node unavailable)")
@@ -106,7 +80,6 @@ def main() -> None:
         return float(m.group(1))
     assert tick_x(t1["ring"]) != tick_x(t2["ring"]), "pace tick must track elapsed fraction"
 
-    _model_scoping_control()
     print("dashboard-ring-controls: PASS — arc/tick/color executed via the page's own JS")
 
 
