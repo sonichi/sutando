@@ -338,9 +338,8 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
     segments = []
     for reset in chosen:
         pts = sorted(by_reset[reset], key=lambda p: p["x"])
-        # Current = the latest observation's window (resets can shrink; a
-        # stale segment must not out-shout it), and only while the window is
-        # still open: an expired reset is history, never current or projected.
+        # Current = the latest observation's window, and only while it is
+        # open: an expired reset is history, never current or projected.
         current = (live_reset is not None and reset == live_reset
                    and now <= reset)
         seg = {"reset": reset, "current": current, "points": pts}
