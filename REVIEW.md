@@ -254,7 +254,7 @@ and loads whichever repo it reviews.
     the restarted delivery loop end-to-end could have shown whether a recreated result is
     actually suppressed after a real delivery.
 
-17. **On a shared review login, check the existing reviews before you spend one —
+16. **On a shared review login, check the existing reviews before you spend one —
     the count does not move and you overwrite a peer.** Several agents review through the
     same GitHub account here. GitHub resolves a PR's decision by latest-state-per-USER, so
     two APPROVED reviews from that one account are **one** approver, not two, and the later
@@ -264,9 +264,18 @@ and loads whichever repo it reviews.
     same mechanic lets the account contradict itself — an approve and a block on code that
     never changed — where whichever landed last silently becomes the verdict. Before
     reviewing, list that account's existing reviews on the PR, not just `reviewDecision`.
-    If a peer already approved, the useful act is a COMMENT carrying whatever you verified
-    independently, or recruiting an approver on a **different** login. Never a second
-    approval.
+    Judge the account's **current** decisive state, not its history. If a peer's APPROVED
+    is the latest decisive review, do not file another — a second approval moves the count
+    by zero and buries theirs; carry what you verified in a COMMENT, or recruit an approver
+    on a **different** login. But if the latest decisive review from that account is a
+    CHANGES_REQUESTED and you have verified the blocker fixed, an APPROVED (or a dismissal)
+    is exactly what clears it, and a comment would leave the block latched. "Never a second
+    approval" is wrong as a blanket rule for precisely that case.
+    **This is one of two failure modes on a shared login, not the whole hazard.** On a third
+    party's PR two reviews collapse into one, as above. On a PR that account itself authored,
+    GitHub permits no formal review at all, so `pulls/N/reviews` is empty *by construction*,
+    the PR reads unreviewed, and the entire review lives in `issues/N/comments`. Same account,
+    opposite polarity: two-becomes-one there, zero-possible here.
     *Grounded by:* #3481 (2026-08-28) — approved without looking, twenty minutes after a
     peer had approved on the same account; the PR still read `REVIEW_REQUIRED` afterwards
     and the peer's conflict-of-interest disclosure was left in the superseded review. A
