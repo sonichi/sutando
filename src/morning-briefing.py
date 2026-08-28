@@ -77,7 +77,8 @@ def get_weather() -> str:
         # Use lat/lon from config (env legacy fallback) if set
         from sutando_config import config_get
         _lat_cfg, _lon_cfg = config_get("WEATHER_LAT"), config_get("WEATHER_LON")
-        if _lat_cfg and _lon_cfg:
+        configured = bool(_lat_cfg and _lon_cfg)
+        if configured:
             lat = float(_lat_cfg)
             lon = float(_lon_cfg)
 
@@ -99,7 +100,9 @@ def get_weather() -> str:
         rain = day["precipitation_probability_max"][0]
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
-        return f"{temp}°F and {desc}, high of {high}, low of {low}{rain_note}"
+        # Spoken aloud, so the label stays short and the remedy goes to the log.
+        where = "" if configured else " in San Francisco (default location)"
+        return f"{temp}°F and {desc}{where}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
 
@@ -738,6 +741,9 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
+    import os as _os
+    if weather and not (_os.environ.get("WEATHER_LAT") and _os.environ.get("WEATHER_LON")):
+        print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
 
     events = get_calendar_events()
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
