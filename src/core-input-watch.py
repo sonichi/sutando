@@ -60,6 +60,11 @@ Usage:
 """
 from __future__ import annotations
 
+import os.path as _osp
+import sys as _sys
+_sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
+from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+
 import argparse
 import importlib.util
 import json
@@ -281,19 +286,24 @@ def _gateway_status(state_dir):
     if not state_dir:
         return None
     try:
-        p = os.path.join(state_dir, "gateway-status.json")
-        with open(p) as fh:
-            data = json.load(fh)
-        ts = data.get("ts")
-        if not isinstance(ts, (int, float)):
+        now = time.time()
+        # Freshness window and the reconnect grace below are this reader's; the
+        # serving verdict is gateway_serving's, shared with health-check and
+        # services_status. Stale -> None, so pgrep answers as before.
+        v = read_gateway_verdict(
+            os.path.join(state_dir, "gateway-status.json"),
+            now=now,
+            max_age=GATEWAY_STATUS_MAX_AGE_S,
+        )
+        if v is None:
             return None
-        if time.time() - ts > GATEWAY_STATUS_MAX_AGE_S:
-            return None      # stale — the bridge may be wedged; let pgrep answer
-        if data.get("connected"):
+        if v.serving:
             return True
-        last_ok = data.get("last_ok_ts")
-        if data.get("backoff_s") and isinstance(last_ok, (int, float)):
-            return time.time() - last_ok <= GATEWAY_OUTAGE_MAX_AGE_S
+        # Reconnect grace: a lane that HAS served and is now backing off stays
+        # alive until its last success ages out. A never-polled lane has no such
+        # success to age, so it does not qualify.
+        if v.backoff_s and v.last_ok_ts is not None:
+            return now - v.last_ok_ts <= GATEWAY_OUTAGE_MAX_AGE_S
         return False
     except Exception:
         return None

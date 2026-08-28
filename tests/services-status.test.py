@@ -313,9 +313,24 @@ def _sidecar(connected, ts_offset=0.0, now=None, last_ok_offset=None):
     return p
 
 
+def test_gateway_connected_without_last_ok_is_offline():
+    """`connected` with no completed poll is not serving. This is the shape a
+    dead bridge's own final write leaves behind — the dashboard rendered it
+    `running / connected` while nothing was delivered."""
+    now = time.time()
+    p = _sidecar(True, ts_offset=-5, now=now)          # deliberately no last_ok_ts
+    status, detail, since = ss.probe_gateway(p, "nope", now, pgrep=lambda pat: [])
+    assert status == "offline", (status, detail)
+    assert since is None, since
+    assert "no successful poll" in detail, detail
+
+
 def test_gateway_sidecar_connected_is_running():
     now = time.time()
-    p = _sidecar(True, ts_offset=-5, now=now)
+    # last_ok_offset is required: this case pins "sidecar beats pgrep", and
+    # without a last_ok_ts the fixture is a never-polled lane (see
+    # test_gateway_connected_without_last_ok_is_offline).
+    p = _sidecar(True, ts_offset=-5, now=now, last_ok_offset=-5)
     status, detail, _ = ss.probe_gateway(p, "nope", now, pgrep=lambda pat: [])
     # pgrep says NO process, yet the sidecar says connected → sidecar wins.
     assert status == "running", (status, detail)

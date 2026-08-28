@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""The gateway-status.json serving verdict has ONE owner, and all three readers
+delegate to it.
+
+Two halves, and both are needed:
+  * CONTRACT — gateway_serving decides freshness and serving.
+  * DELEGATION — health-check, core-input-watch and services_status agree with it
+    on the never-polled record. That is the half a per-reader test cannot cover:
+    the original bug was three copies drifting, not one copy being wrong.
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SRC = REPO / "src"
+sys.path.insert(0, str(SRC))
+
+
+def load(name, fname):
+    spec = importlib.util.spec_from_file_location(name, SRC / fname)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules[name] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+import gateway_serving as gs  # noqa: E402
+
+NOW = time.time()
+failures = []
+
+# ---------------------------------------------------------------- contract
+CONTRACT = [
+    ("connected + real last_ok_ts is serving", {"ts": NOW, "connected": True, "last_ok_ts": NOW - 5}, True),
+    ("connected + null last_ok_ts is NOT serving", {"ts": NOW, "connected": True, "last_ok_ts": None}, False),
+    ("connected + missing last_ok_ts is NOT serving", {"ts": NOW, "connected": True}, False),
+    ("connected + bool last_ok_ts is NOT serving", {"ts": NOW, "connected": True, "last_ok_ts": True}, False),
+    ("not connected is NOT serving", {"ts": NOW, "connected": False, "last_ok_ts": NOW - 9}, False),
+]
+for name, rec, want in CONTRACT:
+    v = gs.verdict_from_record(rec, now=NOW, max_age=180)
+    if v is None or v.serving != want:
+        failures.append(f"contract: {name}: want serving={want}, got {v and v.serving}")
+
+# No opinion, rather than a False that would look like a real outage.
+NO_OPINION = [
+    ("stale record", {"ts": NOW - 9999, "connected": True, "last_ok_ts": NOW}),
+    ("bool ts", {"ts": True, "connected": True, "last_ok_ts": NOW}),
+    ("missing ts", {"connected": True, "last_ok_ts": NOW}),
+    ("not a mapping", ["nope"]),
+]
+for name, rec in NO_OPINION:
+    if gs.verdict_from_record(rec, now=NOW, max_age=180) is not None:
+        failures.append(f"contract: {name}: want None (no opinion)")
+
+if gs.read_verdict(Path(tempfile.gettempdir()) / "definitely-absent-3471.json", now=NOW, max_age=180) is not None:
+    failures.append("contract: an absent file must be no opinion")
+
+# -------------------------------------------------------------- delegation
+# The record from the field: a lane asserting connection that never polled.
+NEVER_POLLED = {"ts": NOW, "connected": True, "last_ok_ts": None}
+d = tempfile.mkdtemp()
+p = Path(d) / "gateway-status.json"
+p.write_text(json.dumps(NEVER_POLLED))
+
+hc = load("hc_shared", "health-check.py")
+if hc._gateway_serving(p, NOW) is not False:
+    failures.append("delegation: health-check._gateway_serving must be False on never-polled")
+
+ciw = load("ciw_shared", "core-input-watch.py")
+if ciw._gateway_status(d) is not False:
+    failures.append("delegation: core-input-watch._gateway_status must be False on never-polled")
+
+ss = load("ss_shared", "services_status.py")
+state, detail, since = ss.probe_gateway(p, "no-such-pattern", NOW, lambda *a, **k: None)
+if state != "offline" or since is not None:
+    failures.append(f"delegation: services_status.probe_gateway must be offline/None, got {(state, detail, since)}")
+
+# Each reader must actually CALL the owner, not re-derive an agreeing answer.
+for mod, name in ((hc, "health-check"), (ciw, "core-input-watch"), (ss, "services_status")):
+    if getattr(mod, "read_gateway_verdict", None) is not gs.read_verdict:
+        failures.append(f"delegation: {name} must bind gateway_serving.read_verdict")
+
+# ------------------------------------------ reader-specific edges preserved
+# core-input-watch keeps its reconnect grace: a lane that HAS served and is now
+# backing off stays alive. Delegation must not flatten this into the shared rule.
+p.write_text(json.dumps({"ts": NOW, "connected": False, "last_ok_ts": NOW - 1, "backoff_s": 5}))
+if ciw._gateway_status(d) is not True:
+    failures.append("edge: core-input-watch must keep the reconnect grace for a recently-served lane")
+# ...but a never-polled lane has no success to age, so the grace must not apply.
+p.write_text(json.dumps({"ts": NOW, "connected": False, "last_ok_ts": None, "backoff_s": 5}))
+if ciw._gateway_status(d) is not False:
+    failures.append("edge: the reconnect grace must not rescue a lane that never polled")
+
+# services_status keeps its pgrep fallback when the sidecar has no opinion.
+p.write_text(json.dumps({"ts": NOW - 9999, "connected": True, "last_ok_ts": NOW}))
+if ss.probe_gateway(p, "pat", NOW, lambda *a, **k: "1234")[0] != "running":
+    failures.append("edge: services_status must fall back to pgrep on a stale sidecar")
+
+if failures:
+    for f in failures:
+        print(f"FAIL: {f}")
+    sys.exit(1)
+print(f"ok - {len(CONTRACT)} contract + {len(NO_OPINION) + 1} no-opinion cases, "
+      f"3 readers delegating, 3 reader-specific edges preserved")

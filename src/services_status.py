@@ -54,6 +54,7 @@ from pathlib import Path
 # a status file written to the wrong tree is invisible to every post-M0 reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 STATE_DIR = WORKSPACE / "state"
@@ -169,21 +170,22 @@ def probe_gateway(
 
     Same precedence `core-input-watch.gateway_alive()` adopted in #2253.
     """
-    try:
-        raw = json.loads(path.read_text())
-        ts = raw.get("ts")
-        if isinstance(ts, (int, float)) and (now - ts) <= ttl:
-            last_ok = raw.get("last_ok_ts")
-            since = last_ok if isinstance(last_ok, (int, float)) else None
-            if raw.get("connected"):
-                return ("running", "connected", since)
-            detail = "not serving"
-            if since:
-                detail = f"not serving — no successful poll for {int(now - since)}s"
-            return ("offline", detail, since)
-    except (OSError, ValueError, AttributeError):
-        pass  # absent/unreadable/malformed → fall through to the process probe
-    return probe_process(pattern, pgrep)
+    # The serving verdict is gateway_serving's, shared with health-check and
+    # core-input-watch; the TTL, the rendering and the pgrep fallback are this
+    # reader's.
+    v = read_gateway_verdict(path, now=now, max_age=ttl)
+    if v is not None:
+        if v.serving:
+            return ("running", "connected", v.last_ok_ts)
+        if v.never_polled:
+            # connected, but no completed poll to point at — the shape a dead
+            # bridge's own last write leaves behind.
+            return ("offline", "not serving — no successful poll yet", None)
+        detail = "not serving"
+        if v.last_ok_ts:
+            detail = f"not serving — no successful poll for {int(now - v.last_ok_ts)}s"
+        return ("offline", detail, v.last_ok_ts)
+    return probe_process(pattern, pgrep)  # absent/unreadable/malformed/stale
 
 
 def _real_pid_alive(pid: int) -> bool:

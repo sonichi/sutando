@@ -61,6 +61,7 @@ from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
@@ -5795,23 +5796,13 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
 
     True/False when the sidecar is present and fresh; None (no opinion) when it
     is absent, unreadable, malformed, or older than GATEWAY_STATUS_MAX_AGE_S.
-    Mirrors core-input-watch._gateway_status() (#2253)."""
+    The sidecar verdict itself is owned by gateway_serving; only the freshness
+    window is this reader's."""
     import time as _time
     p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
     now = _time.time() if now is None else now
-    try:
-        data = json.loads(Path(p).read_text())
-        ts = data.get("ts")
-        if not isinstance(ts, (int, float)) or (now - ts) > GATEWAY_STATUS_MAX_AGE_S:
-            return None
-        if not bool(data.get("connected")):
-            return False
-        # `connected` is a flag; `last_ok_ts` is the thing that ADVANCES. A lane
-        # that never completed a poll carries connected with last_ok_ts null.
-        last_ok = data.get("last_ok_ts")
-        return isinstance(last_ok, (int, float)) and not isinstance(last_ok, bool)
-    except (OSError, ValueError, AttributeError, TypeError):
-        return None
+    v = read_gateway_verdict(p, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
+    return None if v is None else v.serving
 
 
 # Free-space thresholds. A full volume is not a slow degradation — it is a hard
