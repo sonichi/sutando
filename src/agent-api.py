@@ -107,11 +107,19 @@ from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
+from task_archive import task_id_from_filename  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
 TASK_WORKSTREAM_GROUPING_SKILL = REPO_DIR / "skills" / "task-workstream-grouping" / "SKILL.md"
-PORT = 7843
+# Overridable so a live-path witness can run against an isolated instance
+# instead of restarting the owner's service; mirrors AGENT_API_BIND below.
+_PORT_ENV = os.environ.get("AGENT_API_PORT")
+if _PORT_ENV is not None and not _PORT_ENV.isdigit():
+    # Refusing rather than defaulting: 7843 is the live service, so a typo'd
+    # witness port must not silently collide with it.
+    raise ValueError(f"AGENT_API_PORT={_PORT_ENV!r} is not a port number")
+PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
@@ -119,6 +127,7 @@ PORT = 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from signal_guest_handler import start_guest_deep_dive  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -346,18 +355,22 @@ def _active_task_rows() -> list[dict]:
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )[:10]:
-        task_id = task_file.stem
+        # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
+        # the reply at results/{id}.txt — so key AND look up by the canonical id.
+        task_id = task_id_from_filename(task_file.name)
+        if task_id is None:
+            continue
         content = task_file.read_text()
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
-        result_file = RESULT_DIR / task_file.name
+        result_file = RESULT_DIR / f"{task_id}.txt"
         existing = task_history.get(task_id, {})
         # Priority: live file, then in-memory history, then archive. The
         # archive lookup is what survives a restart, when history is empty.
         archived_file = None
         for month_dir in (RESULT_DIR / "archive").glob("*/"):
-            candidate = month_dir / task_file.name
+            candidate = month_dir / f"{task_id}.txt"
             if candidate.exists():
                 archived_file = candidate
                 break
@@ -842,6 +855,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(*delegation_read_result(
                     unquote(path[len("/delegation/results/"):])))
         elif path.startswith("/result/"):
+            # Owner data: gated like the write leg it belongs to (POST /task) —
+            # token checked when configured. NOT delegation's refuse-outright.
+            if not self.check_auth():
+                return
             task_id = path[len("/result/"):]
             result = get_task_result(task_id)
             if result:
@@ -1261,7 +1278,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.check_auth():
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.send_json(400, {"error": "invalid Content-Length"})
+            return
+        # Cap BEFORE reading into memory: an untrusted guest deep_dive could
+        # otherwise exhaust memory via Content-Length without taking a worker slot.
+        if length < 0 or length > 65536:
+            self.send_json(413, {"error": "task request too large"})
+            return
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
@@ -1271,6 +1297,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         from_agent = data.get("from", "unknown")
         task = data.get("task", "")
+        if not isinstance(task, str):
+            self.send_json(400, {"error": "task must be a string"})
+            return
         priority = data.get("priority", "normal")
 
         # Task-file header injection guard. `from_agent` lands on a single
@@ -1290,6 +1319,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if not task:
             self.send_json(400, {"error": "task is required"})
+            return
+
+        # guest = untrusted content, so it must never reach the owner core: sandboxed
+        # read-only worker, secret-scanned, never TASK_DIR. See signal_guest_handler.
+        if data.get("access_tier") == "guest":
+            # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
+            # results into the owner's voice session, so a guest result must not match.
+            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
+            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (guest, sandboxed)",
+            })
             return
 
         callback_url = data.get("callback_url", "")

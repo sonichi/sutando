@@ -2,11 +2,9 @@
 
 JSON-RPC over a private Unix socket (see protocol.py) bridging a long-running
 agent to human collaboration: approval.request / elicitation.request /
-capability.execute, bounded ephemeral capability.list/read, plus
-request.get/wait/cancel. Approval, elicitation and execution requests are
-durable (request_store.py, SQLite); list/read are not. The approve/answer
-transport is the existing human-action card lifecycle (ha_adapter.py) — no new
-server API or UI in v0.
+capability.execute, plus request.get/wait/cancel. Requests are durable
+(request_store.py, SQLite) and the approve/answer transport is the existing
+human-action card lifecycle (ha_adapter.py) — no new server API or UI in v0.
 
 Identity: the actor is resolved DAEMON-SIDE from the environment
 (SUTANDO_AGENT_ID > AGENT_MXID > AGENT_ID), never from CLI-supplied params —
@@ -37,7 +35,6 @@ import stat
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
@@ -48,9 +45,6 @@ from request_store import RequestStore, TERMINAL  # noqa: E402
 from ha_adapter import HumanActionAdapter, ha_action_id  # noqa: E402
 from rundir import socket_path  # noqa: E402
 from dispatcher import RuntimeDispatcher  # noqa: E402
-from capability_registry import (EphemeralCapabilityRegistry,  # noqa: E402
-                                 compose_capability_registry)
-
 
 def _state_dir() -> Path:
     ws = os.environ.get("SUTANDO_RUNTIME_STATE")
@@ -68,8 +62,7 @@ def _log(msg: str) -> None:
 
 
 class RuntimeServer:
-    def __init__(self, socket_path: str, db_path: str, ha_dir: str,
-                 capability_registry: Optional[EphemeralCapabilityRegistry] = None):
+    def __init__(self, socket_path: str, db_path: str, ha_dir: str):
         self.socket_path = socket_path
         self.store = RequestStore(db_path)
         self.ha = HumanActionAdapter(ha_dir)
@@ -82,9 +75,7 @@ class RuntimeServer:
         # Request-domain orchestration (dispatch, approvals, governed
         # capabilities, idempotency, durable transitions, recovery) lives in
         # dispatcher.py. This class owns socket transport only.
-        self.dispatcher = RuntimeDispatcher(
-            self.store, self.ha, self.actor_id,
-            capability_registry=capability_registry)
+        self.dispatcher = RuntimeDispatcher(self.store, self.ha, self.actor_id)
 
     # ── transport ──────────────────────────────────────────────────────────
     async def client(self, reader: asyncio.StreamReader,
@@ -138,24 +129,17 @@ class RuntimeServer:
             await asyncio.gather(server.serve_forever(), self.dispatcher.resolver_loop())
 
 
-def build_runtime_server(provider_factories=(), *, state_dir=None,
-                         runtime_socket=None) -> RuntimeServer:
-    state = Path(state_dir) if state_dir is not None else _state_dir()
-    registry = compose_capability_registry(provider_factories)
-    return RuntimeServer(
+def main() -> None:
+    state = _state_dir()
+    srv = RuntimeServer(
         # Canonical shared resolution (rundir.py) — daemon and CLI must agree
         # on the same default socket, on every platform (review blocker).
-        socket_path=runtime_socket or socket_path(),
+        socket_path=socket_path(),
         db_path=os.environ.get("SUTANDO_RUNTIME_DB")
         or str(state / "runtime-state.sqlite"),
         ha_dir=os.environ.get("SUTANDO_HA_DIR")
         or str(state / "human-actions"),
-        capability_registry=registry,
     )
-
-
-def main(provider_factories=()) -> None:
-    srv = build_runtime_server(provider_factories)
     try:
         asyncio.run(srv.serve())
     except KeyboardInterrupt:

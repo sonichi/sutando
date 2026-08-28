@@ -89,9 +89,21 @@ for adapter in ("discord-bridge.py", "slack-bridge.py", "telegram-bridge.py"):
         if isinstance(node, ast.ImportFrom) and node.module == "proactive_recovery"
         for alias in node.names
     }
-    check(f"{adapter} imports shared recovery",
-          "recover_orphan_sending_files" in imported)
-    check(f"{adapter} wrapper delegates to shared recovery", delegates)
+    # discord delegates through the 5b fence, whose recover() calls the shared
+    # sweep (pinned here at source + behaviorally in the fence suite).
+    if adapter == "discord-bridge.py":
+        fence_src = (REPO / "src" / "proactive_claim_fence.py").read_text()
+        fence_delegates = (
+            ".recover()" in source
+            and "recover_orphan_sending_files" in fence_src
+        )
+        check(f"{adapter} imports shared recovery", fence_delegates)
+        check(f"{adapter} wrapper delegates to shared recovery",
+              delegates or fence_delegates)
+    else:
+        check(f"{adapter} imports shared recovery",
+              "recover_orphan_sending_files" in imported)
+        check(f"{adapter} wrapper delegates to shared recovery", delegates)
 
 
 if failures:

@@ -506,6 +506,42 @@ def test_run_drops_stale_catchup_slot():
         check(not cr.TASKS_DIR.exists(), "stale slot leaves no task file")
 
 
+def test_drop_line_is_timestamped():
+    """A drop is the ONLY record that a slot was skipped, so it must be datable.
+
+    The log carried no timestamps, so drops could be counted but never correlated
+    with a sleep window or attributed to a day — the gap #2754 and #3232 both hit.
+    """
+    import contextlib
+    import io
+    import json
+    import re
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        fire = _epoch(2026, 7, 2, 6, 0)
+        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"briefing": fire - 60}))
+        _mark_core_alive(root, now)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            cr.run(now_epoch=now)
+        line = stderr.getvalue()
+        check(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z cron-runner: dropping",
+                       line),
+              f"drop line starts with an ISO-8601 UTC stamp, got: {line[:60]!r}")
+        # The stamp is a PREFIX, not a replacement: the existing substring
+        # assertion above must keep passing.
+        check("dropping stale slot for briefing" in line,
+              "stamping preserves the searchable message")
+
+
 def test_run_executes_shell_command_without_core_or_task_file():
     import contextlib
     import io
@@ -585,6 +621,63 @@ def test_run_acquires_shared_state_lock():
         # And the tick still did its job once unblocked.
         files = list(cr.TASKS_DIR.glob("task-cron-*.txt"))
         check(len(files) == 1, "run() emits the due entry after acquiring the lock")
+
+
+def test_emit_task_stamps_the_hmac_envelope():
+    """#3014's writer census lists cron-runner as unstamped. It writes with a
+    bare `path.write_text`, so it needs an edge stamp, not the injected seam."""
+    import tempfile
+    sys.path.insert(0, str(REPO / "src"))
+    from task_envelope import verify_text
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        orig_ws, orig_tasks = cr.WORKSPACE, cr.TASKS_DIR
+        try:
+            cr.WORKSPACE = root
+            cr.TASKS_DIR = root / "tasks"
+            cr.TASKS_DIR.mkdir(parents=True)
+            path = cr.emit_task("probe", {"prompt": "hello"})
+            text = path.read_text()
+            check(verify_text(text, root)["verdict"] == "verified",
+                  "an emitted cron task verifies against the per-host key")
+            check(text.splitlines()[0].startswith("id:"),
+                  "the stamp is inserted AFTER id:, so task-last readers see a header")
+            check("\ntask:" in text and text.rstrip().endswith("hello"),
+                  "task: stays last and the body is unchanged")
+            # The key must land beside the tasks it signs, not via a second
+            # independent workspace resolution.
+            check((root / "state" / "auth" / "task-hmac.key").is_file(),
+                  "the key is created under the workspace cron-runner writes to")
+        finally:
+            cr.WORKSPACE, cr.TASKS_DIR = orig_ws, orig_tasks
+
+
+def test_emit_task_survives_a_raising_stamper():
+    """Fail-open is the contract: a stamping error must cost the stamp, never
+    the fire. Without the guard this test loses the task entirely."""
+    import tempfile
+    sys.path.insert(0, str(REPO / "src"))
+    import task_envelope
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        orig_ws, orig_tasks = cr.WORKSPACE, cr.TASKS_DIR
+        orig_stamp = task_envelope.stamp_text
+        def boom(*_a, **_k):
+            raise RuntimeError("keychain on fire")
+        try:
+            task_envelope.stamp_text = boom
+            cr.WORKSPACE = root
+            cr.TASKS_DIR = root / "tasks"
+            cr.TASKS_DIR.mkdir(parents=True)
+            path = cr.emit_task("probe", {"prompt": "hello"})
+            check(path.is_file(), "the task is still written when stamping raises")
+            body = path.read_text()
+            check("hello" in body, "the body survives a raising stamper intact")
+            check("envelope_hmac:" not in body,
+                  "no partial stamp is left behind")
+        finally:
+            task_envelope.stamp_text = orig_stamp
+            cr.WORKSPACE, cr.TASKS_DIR = orig_ws, orig_tasks
 
 
 def _run_all():

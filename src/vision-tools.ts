@@ -39,8 +39,16 @@ const execFileAsync = promisify(execFile);
 const ts = () => new Date().toISOString().slice(11, 23);
 
 const DEFAULT_FPS = 1;
-export const VISION_MIN_SEND_INTERVAL_MS = 900;
-const MAX_FPS = 1000 / VISION_MIN_SEND_INTERVAL_MS;
+// Push-path floor for the documented 1 fps cap: MAX_FPS below bounds only the
+// pull ticker (#3089 deferred this gate to #3090, which never landed it).
+export const VISION_MIN_SEND_INTERVAL_MS = 1000;
+// https://ai.google.dev/gemini-api/docs/live-api — video is sampled at 1 fps.
+// Cite it: the repo states this rate nowhere else, so an uncited literal here
+// would be unfalsifiable for the next reader.
+export const MAX_FPS = 1.0;
+// Floor is deliberately below any shipping default: sub-0.5 rates exist so the
+// cost/cadence experiments can run, not because they are a good user default.
+export const MIN_FPS = 0.1;
 const MIN_INTERVAL_MS = 250;
 // TODO(roadmap §5 Now: cost posture): A 720p JPEG q=0.6 ≈ 80–150KB. At 1 fps
 // continuous that's ~6–9MB/min into Gemini Live's video slot, plus context-
@@ -201,6 +209,61 @@ export async function ensureScreenCaptureServer(): Promise<void> {
 	}
 }
 
+/**
+ * Which `screencapture -D<n>` display this session watches. Chosen once and held
+ * for the session: a stream that follows the frontmost screen would silently
+ * change what the user is being watched on mid-conversation.
+ */
+let _sessionDisplay: number | null = null;
+
+export function getSessionDisplay(): number | null {
+	return _sessionDisplay;
+}
+
+/** Exported for tests; the session choice is otherwise set only via start_vision. */
+export function setSessionDisplay(display: number | null): void {
+	_sessionDisplay = display;
+}
+
+export type DisplayInfo = { index: number; width: number; height: number; name?: string; is_main?: boolean };
+
+/** Ask the capture server which displays are attached. Empty list on any failure. */
+export async function listDisplays(): Promise<DisplayInfo[]> {
+	await ensureScreenCaptureServer();
+	const tok = readCaptureToken();
+	const res = await fetch('http://localhost:7845/displays', tok ? { headers: { 'X-Sutando-Capture-Token': tok } } : {});
+	const data = (await res.json()) as { status?: string; displays?: DisplayInfo[] };
+	return data.status === 'ok' && Array.isArray(data.displays) ? data.displays : [];
+}
+
+/** "2: U28E510 3840x2160" — what the model reads back to the user. */
+export function describeDisplay(d: DisplayInfo): string {
+	const label = d.name ? `${d.name}` : `Display ${d.index}`;
+	return `${d.index}: ${label}${d.is_main ? ' (main)' : ''} ${d.width}x${d.height}`;
+}
+
+export type DisplayGate =
+	| { kind: 'use'; display: number | null }
+	| { kind: 'ask'; displays: DisplayInfo[] };
+
+/**
+ * Decide whether the user still has a display choice to make.
+ *
+ * Asking is only worth a turn when the answer can differ, so a single display
+ * (or an enumeration that failed, giving an empty list) resolves silently
+ * rather than blocking the stream on a question with one answer.
+ */
+export function decideDisplayGate(
+	sessionDisplay: number | null,
+	requested: number | undefined,
+	displays: DisplayInfo[],
+): DisplayGate {
+	if (requested !== undefined) return { kind: 'use', display: requested };
+	if (sessionDisplay !== null) return { kind: 'use', display: sessionDisplay };
+	if (displays.length > 1) return { kind: 'ask', displays };
+	return { kind: 'use', display: displays.length === 1 ? displays[0].index : null };
+}
+
 const screenSource: VisionSource = {
 	name: 'screen',
 	async capture() {
@@ -213,8 +276,11 @@ const screenSource: VisionSource = {
 		// own process (P7 D7.4: compression never competes with this event
 		// loop) to the ~720p/q0.6 budget before the file comes back.
 		const _capTok = readCaptureToken();
+		// Without this the server captures its default display, so on a multi-display
+		// Mac the stream shows a screen the user did not pick.
+		const _display = _sessionDisplay !== null ? `&display=${_sessionDisplay}` : '';
 		const res = await fetch(
-			`http://localhost:7845/capture?format=jpeg&silent=true&maxdim=${VISION_FRAME_MAX_DIM}&quality=${VISION_FRAME_JPEG_QUALITY}`,
+			`http://localhost:7845/capture?format=jpeg&silent=true&maxdim=${VISION_FRAME_MAX_DIM}&quality=${VISION_FRAME_JPEG_QUALITY}${_display}`,
 			_capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {},
 		);
 		const data = (await res.json()) as { status: string; path?: string; error?: string };
@@ -290,10 +356,8 @@ function resolveSource(name?: string): VisionSource {
 interface MinimalSession {
 	transport?: {
 		sendFile?: (base64: string, mimeType: string) => void;
-		// Inject a hidden conversation turn (no generation trigger when
-		// turnComplete=false) so the model sees a context update without
-		// the user hearing audio. Used to evict stale push frames from
-		// Gemini Live's context when screen sharing ends.
+		// turnComplete is IGNORED by the transport — it always sends realtime
+		// input, so the model may answer this injection aloud.
 		sendContent?: (turns: Array<{ role: 'user' | 'assistant'; text: string }>, turnComplete?: boolean) => void;
 		isConnected?: boolean;
 	};
@@ -483,6 +547,10 @@ export function setVisionSpeechEvidence(fn: (() => { active: boolean }) | null):
 	speechEvidenceFn = fn;
 }
 
+/** Why the last stop happened. 'no-client' is TERMINAL: the browser must tear
+ *  its push session down rather than treat the stop as a server-side glitch. */
+let lastStopReason: string | null = null;
+
 let bucketBytes = VISION_BUCKET_MAX_BYTES;
 let bucketRefillAt = Date.now();
 let lastFrameSentAt = 0;
@@ -668,6 +736,9 @@ export interface VisionState {
 	frames: number;
 	durationMs: number;
 	sessionReady: boolean;
+	/** Why streaming last stopped, when it was stopped deliberately. 'no-client'
+	 *  is terminal — a push driver seeing it must tear down, not re-arm. */
+	stoppedReason: string | null;
 	/** P7 D7.4 egress diagnostics: real sends vs gate/budget deferrals and
 	 *  displaced (dropped) slot frames. */
 	egress: {
@@ -692,6 +763,7 @@ export function getVisionState(): VisionState {
 		frames: frameCount,
 		durationMs: streaming && startedAt ? Date.now() - startedAt : 0,
 		sessionReady: getSendFile() !== null,
+		stoppedReason: streaming ? null : lastStopReason,
 		egress: getVisionEgressStats(),
 	};
 }
@@ -726,6 +798,7 @@ export function startStreaming(
 			// Push mode — caller (web-client, Mentra bridge, glasses webhook,
 			// etc.) captures frames and POSTs them to /vision/frame. No ticker.
 			stopStream();
+			lastStopReason = null; // a new push session supersedes any terminal stop
 			pushMode = true;
 			pushSourceName = lower;
 			frameCount = 0;
@@ -772,8 +845,9 @@ export function startStreaming(
 }
 
 /** Programmatic stop (used by the HTTP control server / button). */
-export function stopStreaming(): { status: 'stopped' | 'idle'; source: string | null; frames: number; durationMs: number } {
+export function stopStreaming(reason?: string): { status: 'stopped' | 'idle'; source: string | null; frames: number; durationMs: number } {
 	const r = stopStream();
+	if (r.wasRunning) lastStopReason = reason ?? null;
 	return { status: r.wasRunning ? 'stopped' : 'idle', source: r.source, frames: r.frames, durationMs: r.durationMs };
 }
 
@@ -800,13 +874,8 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 	// frame draining into a later session is exactly the backlog rule's target.
 	deferredSlot = null;
 	stopDrainTimer();
-	// Push-mode frames accumulate in Gemini Live's conversation context.
-	// Without this hint, "what do you see?" after the user stops sharing
-	// gets answered from the last frame still in context (model recalls
-	// from memory instead of calling send_vision_frame to grab a fresh
-	// view). Inject a silent user-role turn (turnComplete=false → no
-	// generation triggered) so the next user turn carries the context
-	// shift: visual frames are stale.
+	// Stale frames STAY in context — this only tells the model they are stale.
+	// turnComplete is ignored by the transport, so it may answer the hint aloud.
 	if (wasPush) {
 		const transport = sessionRef?.transport;
 		// Call as a method (not via an extracted reference) so `this` binds
@@ -934,7 +1003,8 @@ function noteFrameFailure(msg: string): void {
 }
 
 function startStream(source: VisionSource, fps: number): { fps: number; intervalMs: number } {
-	const clamped = Math.max(0.5, Math.min(MAX_FPS, fps));
+	lastStopReason = null; // a new stream supersedes any terminal stop
+	const clamped = Math.max(MIN_FPS, Math.min(MAX_FPS, fps));
 	const intervalMs = Math.max(MIN_INTERVAL_MS, Math.round(1000 / clamped));
 	if (ticker) clearInterval(ticker);
 	streamGen++;
@@ -996,11 +1066,12 @@ export const startVisionTool: ToolDefinition = {
 		'Prefer send_vision_frame for one-off "look at this" questions. Instant.',
 	parameters: z.object({
 		source: z.string().optional().describe("Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."),
-		fps: z.number().optional().describe('Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.'),
+		fps: z.number().optional().describe('Frames per second, 0.1–1.0 (Gemini Live caps video at 1 fps). Default 1. Webcam may not keep up above 0.5.'),
+		display: z.number().optional().describe('Which display to watch, as its index from the needs_display_choice list. Only for source=screen, and only needed on a multi-display Mac. Held for the rest of the session once set.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { source: sourceName, fps } = (args ?? {}) as { source?: string; fps?: number };
+		const { source: sourceName, fps, display } = (args ?? {}) as { source?: string; fps?: number; display?: number };
 		if (!getSendFile()) {
 			return { status: 'failed', error: 'No active voice session — vision streaming requires a connected session.' };
 		}
@@ -1021,8 +1092,34 @@ export const startVisionTool: ToolDefinition = {
 		}
 		try {
 			const source = resolveSource(sourceName);
+			if (source.name === 'screen') {
+				// Enumeration is best-effort: if it fails the gate sees an empty list
+				// and streams the default display rather than refusing to start.
+				const known = display === undefined && _sessionDisplay === null
+					? await listDisplays().catch(() => [] as DisplayInfo[])
+					: [];
+				const gate = decideDisplayGate(_sessionDisplay, display, known);
+				if (gate.kind === 'ask') {
+					return {
+						status: 'needs_display_choice',
+						displays: gate.displays,
+						note:
+							'This Mac has more than one display and screencapture would default to one of them. ' +
+							'Ask the user which to watch, then call start_vision again with display=<index>. ' +
+							'The choice is held for the rest of the session. Options — ' +
+							gate.displays.map(describeDisplay).join('; '),
+					};
+				}
+				_sessionDisplay = gate.display;
+			}
 			const info = startStream(source, fps ?? DEFAULT_FPS);
-			return { status: 'streaming', source: source.name, fps: info.fps, intervalMs: info.intervalMs };
+			return {
+				status: 'streaming',
+				source: source.name,
+				fps: info.fps,
+				intervalMs: info.intervalMs,
+				...(source.name === 'screen' && _sessionDisplay !== null ? { display: _sessionDisplay } : {}),
+			};
 		} catch (err) {
 			console.error(`${ts()} [Vision] startVisionTool threw: ${(err as Error)?.message ?? err}`);
 			return { status: 'failed', error: 'startStream failed' };
@@ -1101,7 +1198,10 @@ export function startVisionControlServer(port: number = DEFAULT_CONTROL_PORT): S
 				if (!buf) return respond(413, { status: 'failed', error: 'frame body too large' });
 				const mime = (req.headers['content-type'] as string | undefined) || 'image/jpeg';
 				const r = submitFrame(buf, mime);
-				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409, r.ok ? { status: 'sent' } : { status: 'failed', error: r.error });
+				// The 409 carries stoppedReason so the client can distinguish a
+				// terminal stop from a lost flag without awaiting the 2s poll.
+				respond(r.ok ? 200 : r.reason === 'frame-too-large' ? 413 : 409,
+					r.ok ? { status: 'sent' } : { status: 'failed', error: r.error, stoppedReason: lastStopReason });
 			});
 			return;
 		}

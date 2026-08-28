@@ -22,7 +22,10 @@
 # session after relocating the checkout gets empty REPO-rooted output (commits,
 # health, session-state). Validate before trusting. (-e not -d for .git:
 # submodule/worktree checkouts have a file, not a directory, at .git.)
-_repo_ok() { [ -f "$1/CLAUDE.md" ] && [ -d "$1/skills" ] && [ -e "$1/.git" ]; }
+# App-bundled engine checkouts ship WITHOUT .git, so requiring it rejected every
+# candidate and no handoff ran there at all (#2756). src/ is the alternate
+# checkout signal; CLAUDE.md + skills/ still carry the identification.
+_repo_ok() { [ -f "$1/CLAUDE.md" ] && [ -d "$1/skills" ] && { [ -e "$1/.git" ] || [ -d "$1/src" ]; }; }
 __SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || echo "")"
 if [ -n "${SUTANDO_REPO_DIR:-}" ] && _repo_ok "$SUTANDO_REPO_DIR"; then
     REPO="$SUTANDO_REPO_DIR"
@@ -98,6 +101,17 @@ WORKSPACE_DIR="$WORKSPACE"  # historical local name retained for the rest of thi
 STATE_FILE="$WORKSPACE_DIR/session-state.md"
 # Staged beside the destination so the publish is a same-filesystem rename.
 STATE_TMP="$(mktemp "${STATE_FILE}.tmp.XXXXXX" 2>/dev/null)" || STATE_TMP="${STATE_FILE}.tmp.$$"
+# An interrupted hook must not leave its stage behind. Opt-out, not blanket rm:
+# the publish-failure path below keeps the stage on purpose.
+_handoff_keep_stage=0
+_handoff_drop_stage() {
+  [ "$_handoff_keep_stage" = 1 ] || rm -f "$STATE_TMP" 2>/dev/null
+}
+# A signal trap REPLACES the default action, so cleaning up and returning would
+# let a cancelled hook run on; restore the default and re-raise to die correctly.
+trap '_handoff_drop_stage' EXIT
+trap '_handoff_drop_stage; trap - INT;  kill -INT  $$' INT
+trap '_handoff_drop_stage; trap - TERM; kill -TERM $$' TERM
 # Written last inside the capture block; the publish gate tests for it.
 CAPTURE_END_MARKER="<!-- session-handoff: capture complete -->"
 # A prior run killed before its rename leaves a stage behind; it is not state.
@@ -363,6 +377,7 @@ fi
 if ! mv "$STATE_TMP" "$STATE_FILE" 2>/dev/null; then
   # Stage is KEPT: it is the only copy of a capture that did complete, and the
   # destination still holds the last good snapshot.
+  _handoff_keep_stage=1
   echo "session-handoff: publish failed — $STATE_FILE unchanged, capture kept at $STATE_TMP" >&2
   exit 1
 fi

@@ -13,9 +13,10 @@
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
 	detectEnvWorkspaceInDotenv,
@@ -210,6 +211,46 @@ describe('sutando_config loader', () => {
 		writeConfig(repo, 'sutando.config.json', '[1, 2, 3]');
 		try {
 			assert.throws(() => loadConfig(repo), /must be a JSON object/);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('a scalar in an object-typed block throws naming the file and the key', () => {
+		// `{"workspace": "<path>"}` is the shape a user writes by hand. Before this
+		// guard the TS loader silently fell through to the baked-in default.
+		writeConfig(repo, 'sutando.config.local.json', { workspace: '/tmp/ws' } as never);
+		try {
+			assert.throws(() => loadConfig(repo), (err: unknown) => {
+				const msg = err instanceof Error ? err.message : String(err);
+				return (
+					msg.includes('sutando.config.local.json') &&
+					msg.includes("'workspace'") &&
+					msg.includes('string')
+				);
+			});
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('an array in an object-typed block is rejected too', () => {
+		writeConfig(repo, 'sutando.config.json', { vault: ['a'] } as never);
+		try {
+			assert.throws(() => loadConfig(repo), /'vault' must be a JSON object, got array/);
+		} finally {
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('leaves non-object-typed keys alone', () => {
+		writeConfig(repo, 'sutando.config.json', {
+			stand: 'mbp',
+			core_config_dirs: [],
+			workspace: { path: '/tmp/w' },
+		} as never);
+		try {
+			assert.equal(loadConfig(repo).stand, 'mbp');
 		} finally {
 			restoreEnvAndRepo();
 		}
@@ -483,6 +524,8 @@ describe('sutando_config loader', () => {
 		writeConfig(repo, 'sutando.config.json', {
 			workspace: { path: '/ws' },
 			vault: { enabled: false },
+			// health_check is a known key — the Python twin registers it, so no warning.
+			health_check: { down_bridge_action: 'restart' },
 		});
 		const writes: string[] = [];
 		const origWrite = process.stderr.write.bind(process.stderr);
@@ -494,6 +537,33 @@ describe('sutando_config loader', () => {
 			loadConfig(repo);
 			const combined = writes.join('');
 			assert.ok(!combined.includes('does not read'), 'stderr should be silent on the happy path');
+		} finally {
+			process.stderr.write = origWrite;
+			restoreEnvAndRepo();
+		}
+	});
+
+	it('the REPO-TRACKED sutando.config.json loads without an unknown-key warning', () => {
+		// A synthetic config cannot catch a key added to the shipped file but
+		// registered only in the Python loader; this reads the tracked file.
+		const trackedPath = resolve(
+			fileURLToPath(new URL('.', import.meta.url)), '..', 'sutando.config.json');
+		const tracked = JSON.parse(readFileSync(trackedPath, 'utf8'));
+		writeConfig(repo, 'sutando.config.json', tracked);
+
+		const writes: string[] = [];
+		const origWrite = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+			writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			loadConfig(repo);
+			const combined = writes.join('');
+			assert.ok(
+				!combined.includes('does not read'),
+				`tracked sutando.config.json emitted an unknown-key warning: ${combined}`,
+			);
 		} finally {
 			process.stderr.write = origWrite;
 			restoreEnvAndRepo();

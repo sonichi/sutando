@@ -64,7 +64,15 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
+from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+
+
+def _slack_claims_name(name: str) -> bool:
+    """Filename-level claim decision — the policy lives in proactive_routing;
+    this adapter only binds its channel."""
+    return fallback_claims_name(name, "slack")
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
+import slack_access  # noqa: E402
 
 # Observability: emit channel.slack.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -74,8 +82,8 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
-from result_ready import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from delivery.readiness import read_ready_result  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -162,7 +170,7 @@ if not BOT_TOKEN or not APP_TOKEN:
 # silently dropped files other bridges would send). Slack extends it with its
 # OWN inbound dir so an uploaded file can be echoed back; that root stays
 # Slack-local rather than becoming global.
-from send_allowlist import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
+from policy.egress.attachment import is_path_sendable as _is_path_sendable_canonical  # noqa: E402
 
 
 def _is_path_sendable(fpath: str) -> bool:
@@ -306,14 +314,12 @@ def load_allowed():
 
     None vs empty-set: file-missing means never-configured (TOFU-eligible);
     empty allowFrom means admin explicitly locked it down (no TOFU)."""
-    try:
-        data = json.loads(ACCESS_FILE.read_text())
-        _update_access_cache(data)
-        return set(data.get("allowFrom", []))
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return set()
+    access = slack_access.read_access(ACCESS_FILE)
+    # Only a record the shared reader accepted is worth caching; a malformed one
+    # would overwrite a good backup with a document nobody can authenticate from.
+    if access.record is not None:
+        _update_access_cache(access.record)
+    return access.allowed
 
 
 def load_tier_map() -> dict:
@@ -532,8 +538,13 @@ def _set_pending_reply(task_id: str, info: dict) -> None:
         _atomic_write_pending_replies(dict(pending_replies))
 
 
-def _dedup_recover(task_id: str, holder_id, target) -> None:
-    """Route the shared dedup-recovery plan; Slack owns only the send."""
+def _dedup_recover(task_id: str, holder_id, target) -> str:
+    """Route the shared dedup-recovery plan; Slack owns only the send.
+
+    Returns the shared disposition: "archive" once the exchange is terminal,
+    "retain" when the asker was never told and a later pass must retry.
+    """
+    action, delivered = "defer", None
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
@@ -542,11 +553,15 @@ def _dedup_recover(task_id: str, holder_id, target) -> None:
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
         elif action == "report" and target:
-            _send_reply(target["channel"], target.get("thread_ts"), payload,
-                        task_id=task_id, access_tier=target.get("access_tier", "unknown"))
+            # The boolean is the whole point: an unsent report tells the asker
+            # nothing, so retiring on the attempt loses the question.
+            delivered = bool(_send_reply(
+                target["channel"], target.get("thread_ts"), payload,
+                task_id=task_id, access_tier=target.get("access_tier", "unknown")))
             print(f"  [dedup] unresolved for {task_id}", flush=True)
-    except Exception as exc:  # noqa: BLE001 - never block the skip path
+    except Exception as exc:  # noqa: BLE001 - the disposition, not the raise, decides
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
+    return report_disposition(action, delivered)
 
 
 def _pop_pending_reply(task_id: str):
@@ -569,6 +584,13 @@ def _write_routed_task(task_file: Path, content: str, task_id: str, info: dict) 
     """Persist the Slack route before exposing its task file to the core."""
     _set_pending_reply(task_id, info)
     try:
+        # HMAC envelope (#3014 writer census): stamp at this writer's edge,
+        # fail-open so a stamping error costs the stamp and never the task.
+        try:
+            from task_envelope import stamp_text  # sibling module (src/ on sys.path)
+            content = stamp_text(content, REPO)
+        except Exception:
+            pass
         task_file.write_text(content)
     except Exception:
         _pop_pending_reply(task_id)
@@ -1554,7 +1576,11 @@ def result_watcher():
                 _skip_action = next((a for a in _skip_parsed.actions if a.kind == "skip"), None)
                 if _skip_action is not None:
                     if _skip_action.value == "deduped":
-                        _dedup_recover(task_id, _skip_action.extra, target)
+                        if _dedup_recover(task_id, _skip_action.extra,
+                                          target) == "retain":
+                            print(f"  [dedup] report not delivered for {task_id} "
+                                  f"— keeping for retry", flush=True)
+                            continue
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     # §7 audit ledger: skip-marked results are resolved deliveries
                     # (no_send / deduped), not silent voids. One line per result.
@@ -1593,16 +1619,16 @@ def result_watcher():
                         _record_skip_audit(delivery_id, "deduped")
                         f.unlink(missing_ok=True)
                         continue
-                    # Peek before claiming: skip Discord-targeted proactive files.
-                    # [channel: <17-20 digit snowflake>] is a Discord-only marker;
-                    # claiming it here dumps the literal text to Slack DM instead.
-                    # Leave it for discord-bridge to claim. (#1401)
+                    # Peek before claiming: a body addressed to another bridge
+                    # is delivered by that bridge, not dumped here as literal text.
                     try:
                         peek = f.read_text(errors="ignore").lstrip()
                     except OSError:
                         continue
-                    if peek.startswith("[channel:") and \
-                            re.match(r'\[channel:\s*\d{17,20}\]', peek):
+                    if not body_claimable_by(peek, "slack"):
+                        continue
+                    # Explicit filename destination outranks the race.
+                    if not _slack_claims_name(f.name):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

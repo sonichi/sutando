@@ -169,7 +169,9 @@ def collect() -> list[tuple[str, str]]:
         # Test files describe a test, not a module of the system.
         if ".test." in p.name:
             continue
-        rows.append((str(p.relative_to(REPO)), purpose(p)))
+        # POSIX separators, not the platform's: the artifact is diffed by CI on
+        # Linux, so a Windows run must not emit backslashes it can never match.
+        rows.append((p.relative_to(REPO).as_posix(), purpose(p)))
     return rows
 
 
@@ -188,8 +190,10 @@ def render(rows: list[tuple[str, str]]) -> str:
         "If an entry reads wrong, the file's header comment is wrong: fix the header",
         "and re-run `python3 scripts/gen-src-map.py`.",
         "",
-        f"{len(rows)} modules indexed"
-        + (f", {len(undocumented)} without a usable header comment." if undocumented else "."),
+        # The module total rewrote one line on every module change, so two PRs
+        # adding different numbers of modules conflicted on it. It is now stdout-only.
+        "One entry per agent-facing module."
+        + (f" {len(undocumented)} without a usable header comment." if undocumented else ""),
         "",
     ]
 
@@ -232,7 +236,11 @@ def main() -> int:
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(rendered, encoding="utf-8")
-    print(f"gen-src-map: wrote {OUT.relative_to(REPO)} ({len(rows)} modules)")
+    undocumented = sum(1 for _, d in rows if not d)
+    tally = f"{len(rows)} modules"
+    if undocumented:
+        tally += f", {undocumented} without a usable header comment"
+    print(f"gen-src-map: wrote {OUT.relative_to(REPO)} ({tally})")
     return 0
 
 

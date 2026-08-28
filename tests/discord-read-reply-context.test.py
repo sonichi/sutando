@@ -131,7 +131,7 @@ class ReplyContextReachesStdout(unittest.TestCase):
              mock.patch.object(dr, "_fetch",
                                lambda extra, channel_id, page, headers: list(messages)), \
              contextlib.redirect_stdout(buf):
-            rc = dr.main(["1507725277630042122"])
+            rc = dr.main(["1507725277630042122", "--operator"])
         yield rc, buf.getvalue()
 
     def test_the_reply_line_reaches_stdout(self):

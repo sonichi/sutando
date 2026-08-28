@@ -48,11 +48,20 @@ def _scoped(config_dir: str) -> str:
 
 
 class TestQuotaAccountIdentity(unittest.TestCase):
+    """The plist cases. Every one of them states the same premise — no listener
+    env is readable — because the plist is only consulted once that is true."""
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         (self.home / "Library/LaunchAgents").mkdir(parents=True)
         self.addCleanup(self._tmp.cleanup)
+        # Class-wide, not per-case: left real, every case here reads whatever
+        # proxy the developer's host is running and reports on that instead.
+        proc = mock.patch.object(hc, "_proxy_config_dir_from_process",
+                                 return_value=hc._PROXY_ENV_UNREADABLE)
+        proc.start()
+        self.addCleanup(proc.stop)
 
     def _routed_env(self, core_cfg, routed=True):
         """Env context that is HERMETIC about the routing gate.
@@ -354,15 +363,29 @@ class TestQuotaAccountIdentity(unittest.TestCase):
 
     def test_missing_plist_is_ok_not_an_error(self):
         """Proxy running but not launchd-managed (dev host, manual launch).
-        There is no plist to compare against; that is not a fault."""
+
+        A missing plist is not a fault. It is no longer the END of the check
+        either: the proxy's own environment is consulted instead, so this case
+        now pins only the degraded corner — env unreadable too, therefore
+        inactive rather than an error. The comparing behaviour lives in
+        TestNonLaunchdProxyIdentity.
+
+        `_proxy_config_dir_from_process` is STUBBED deliberately. Left real it
+        reads the developer's live proxy, and this case then passes or fails on
+        whatever that host happens to be running — the same escape the module
+        docstring records for `core_env_has_proxy_url`.
+        """
         core = "/Users/x/ws/.claude-sutando"
         with self._routed_env(core), \
              mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_proxy_config_dir_from_process",
+                               return_value=hc._PROXY_ENV_UNREADABLE), \
              mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False):
             out = hc.check_quota_account_identity(
                 "ok", core_env_prober=lambda: True)   # no plist written
         self.assertEqual(out["status"], "ok")
         self.assertIn("launchd", out["detail"])
+        self.assertIn("not evidence either way", out["detail"])
 
     def test_corrupt_plist_warns_rather_than_raising(self):
         """A truncated/garbage plist must degrade to a warn, not propagate an
@@ -443,6 +466,252 @@ class TestQuotaAccountIdentity(unittest.TestCase):
         argv = run.call_args_list[0].args[0]
         self.assertEqual(argv[:4], ["/usr/bin/plutil", "-convert", "json", "-o"])
         self.assertTrue(argv[-1].endswith("com.sutando.credential-proxy.plist"), argv)
+
+
+class TestNonLaunchdProxyIdentity(unittest.TestCase):
+    """The same divergence, on a proxy that launchd does not manage.
+
+    Before this, the check returned ok the moment the plist was absent —
+    "credential proxy is not launchd-managed on this host". That reads as the
+    accounts agreeing, but only says the one file the check knew how to read
+    was missing. A proxy started by startup.sh, the desktop supervisor, or by
+    hand carries a CLAUDE_CONFIG_DIR in its process environment and can name a
+    different directory than the core's just as easily.
+
+    `test_divergent_process_config_dirs_warn` is the load-bearing case: it
+    fails on the parent commit, which returns ok on this exact input.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        (self.home / "Library/LaunchAgents").mkdir(parents=True)   # no plist inside
+        self.addCleanup(self._tmp.cleanup)
+
+    def _run(self, core_cfg, proc_cfg, existing_services, routed=True):
+        """proc_cfg=hc._PROXY_ENV_UNREADABLE models an unreadable environment."""
+        env = {"CLAUDE_CONFIG_DIR": core_cfg, "ANTHROPIC_BASE_URL": "http://localhost:7846"}
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False), \
+             mock.patch.object(hc, "_proxy_config_dir_from_process", return_value=proc_cfg), \
+             mock.patch.object(hc, "_keychain_service_exists",
+                               side_effect=lambda s: s in existing_services):
+            return hc.check_quota_account_identity("ok", core_env_prober=lambda: routed)
+
+    def test_divergent_process_config_dirs_warn(self):
+        """Measured on a live host 2026-08-14: core resolved
+        `…-c225c1ed`, the proxy had inherited the in-repo default workspace and
+        resolved vanilla, and the proxy's log showed injection on every request
+        (no pass-through line ever emitted). The check reported ok throughout."""
+        core = "/Users/x/Library/Application Support/app/workspace/.claude-sutando"
+        proxy = "/Users/x/Library/Application Support/app/engine/sutando/workspace/.claude-sutando"
+        out = self._run(core, proxy, {_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "warn")
+        self.assertIn(_scoped(core), out["detail"])
+        self.assertIn(VANILLA, out["detail"])
+
+    def test_non_launchd_remediation_does_not_name_a_plist(self):
+        """A host with no plist must not be told to edit one. The fix there is
+        to restart the proxy with the right CLAUDE_CONFIG_DIR."""
+        core = "/Users/x/ws/.claude-sutando"
+        proxy = "/Users/x/other/.claude-sutando"
+        out = self._run(core, proxy, {_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "warn")
+        self.assertNotIn("LaunchAgents", out["detail"])
+        self.assertIn("no credential-proxy plist is installed", out["detail"].lower())
+        self.assertNotIn("KeepAlive", out["detail"])
+        self.assertIn("confirm that is the intended", out["detail"])
+
+    def test_matching_process_config_dirs_stay_ok(self):
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core, core, {_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("same keychain item", out["detail"])
+
+    def test_unreadable_process_env_is_inactive_not_agreement(self):
+        """Unreadable must not collapse into "" — that would assert the proxy
+        resolves vanilla on no evidence."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core, hc._PROXY_ENV_UNREADABLE, {_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("could not be read", out["detail"])
+        self.assertIn("not evidence either way", out["detail"])
+
+    def test_unrouted_core_still_silent_without_a_plist(self):
+        """The routing gate outranks this path: a core that does not route is
+        unaffected by whose login the proxy holds."""
+        core = "/Users/x/ws/.claude-sutando"
+        proxy = "/Users/x/other/.claude-sutando"
+        out = self._run(core, proxy, {_scoped(core), VANILLA}, routed=False)
+        self.assertEqual(out["status"], "ok")
+
+
+class TestStalePlistLosesToTheRunningProxy(unittest.TestCase):
+    """A plist that outlives its job, while a proxy started another way listens.
+
+    Reported by john-the-dev on #2891, measured on their host: the plist was
+    present (Jul 28) and named no CLAUDE_CONFIG_DIR, its launchd job was dead
+    (`pid=- exit=126`), and :7846 was held by a node process under a different
+    CLAUDE_CONFIG_DIR entirely. The check consulted the dead job's file.
+
+    Precedence was `plist if it exists, else the process` — a rule about which
+    FILE is present, standing in for a question about which PROCESS is running.
+    `test_present_plist_does_not_mask_a_divergent_running_proxy` fails on
+    d0776575 (the parent), which returns ok on this exact input.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        (self.home / "Library/LaunchAgents").mkdir(parents=True)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _write_plist(self, config_dir):
+        env = {"HOME": str(self.home)}
+        if config_dir is not None:
+            env["CLAUDE_CONFIG_DIR"] = config_dir
+        (self.home / "Library/LaunchAgents/com.sutando.credential-proxy.plist").write_bytes(
+            plistlib.dumps({"Label": "com.sutando.credential-proxy",
+                            "EnvironmentVariables": env}))
+
+    def _run(self, core_cfg, plist_cfg, proc_cfg, existing_services):
+        self._write_plist(plist_cfg)
+        env = {"CLAUDE_CONFIG_DIR": core_cfg, "ANTHROPIC_BASE_URL": "http://localhost:7846"}
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False), \
+             mock.patch.object(hc, "_proxy_config_dir_from_process", return_value=proc_cfg), \
+             mock.patch.object(hc, "_keychain_service_exists",
+                               side_effect=lambda s: s in existing_services):
+            return hc.check_quota_account_identity("ok", core_env_prober=lambda: True)
+
+    def test_present_plist_does_not_mask_a_divergent_running_proxy(self):
+        """The load-bearing case. The plist agrees with the core, so the old
+        precedence returns ok — while the process holding the port does not."""
+        core = "/Users/x/ws/.claude-sutando"
+        running = "/Users/x/engine/sutando/workspace/.claude-sutando"
+        out = self._run(core, plist_cfg=core, proc_cfg=running,
+                        existing_services={_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "warn")
+        self.assertIn(_scoped(core), out["detail"])
+
+    def test_remediation_does_not_claim_unmanaged_when_a_plist_exists(self):
+        """The process path is reached whenever the LISTENER's env is readable,
+        which says nothing about who started it. This asserted
+        "NOT launchd-managed" there — management state the code never checked —
+        and on a host where the job IS alive under KeepAlive the advice is
+        unfollowable: a bare restart is respawned with the plist's env.
+        """
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core, plist_cfg=core, proc_cfg="/Users/x/other/.claude-sutando",
+                        existing_services={_scoped(core), VANILLA})
+        self.assertNotIn("NOT launchd-managed", out["detail"])
+        self.assertIn("plist IS installed", out["detail"])
+        self.assertIn("LaunchAgents", out["detail"])
+        self.assertIn("KeepAlive", out["detail"])
+
+    def test_running_proxy_agreeing_is_ok_even_when_the_plist_diverges(self):
+        """The converse, and the reason this is a precedence change and not an
+        added warning: a stale plist naming a different dir is not a mismatch
+        when the proxy that is actually running resolves the core's item."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core, plist_cfg="/Users/x/stale/.claude-sutando", proc_cfg=core,
+                        existing_services={_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("same keychain item", out["detail"])
+
+    def test_unreadable_process_env_still_falls_back_to_the_plist(self):
+        """The fallback the change must not drop: with no readable listener env
+        the plist is the only evidence there is, and it is still read."""
+        core = "/Users/x/ws/.claude-sutando"
+        out = self._run(core, plist_cfg=None, proc_cfg=hc._PROXY_ENV_UNREADABLE,
+                        existing_services={_scoped(core), VANILLA})
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("LaunchAgents", out["detail"])
+
+    def test_no_listener_and_no_plist_is_inactive_not_agreement(self):
+        core = "/Users/x/ws/.claude-sutando"
+        env = {"CLAUDE_CONFIG_DIR": core, "ANTHROPIC_BASE_URL": "http://localhost:7846"}
+        with mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(hc.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(hc, "_runtime_may_skip_proxy", return_value=False), \
+             mock.patch.object(hc, "_proxy_config_dir_from_process",
+                               return_value=hc._PROXY_ENV_UNREADABLE), \
+             mock.patch.object(hc, "_keychain_service_exists",
+                               side_effect=lambda s: s in {_scoped(core), VANILLA}):
+            out = hc.check_quota_account_identity("ok", core_env_prober=lambda: True)
+        self.assertEqual(out["status"], "ok")
+        self.assertIn("not evidence either way", out["detail"])
+
+
+class TestProxyConfigDirFromProcess(unittest.TestCase):
+    """Parsing `ps eww` output — where the space in "Application Support" bites."""
+
+    def _ps(self, stdout, returncode=0):
+        return lambda pid: mock.Mock(stdout=stdout, returncode=returncode)
+
+    def test_value_with_spaces_is_captured_whole(self):
+        """A whitespace split truncates this at '…/Library/Application', which
+        hashes a different directory and invents a mismatch (or hides one)."""
+        cfg = "/Users/x/Library/Application Support/app/workspace/.claude-sutando"
+        out = f"  PID TTY\n 1 ?? node /srv/proxy.js HOME=/Users/x CLAUDE_CONFIG_DIR={cfg} PATH=/usr/bin"
+        got = hc._proxy_config_dir_from_process(
+            pid_finder=lambda: ["1"], ps_runner=self._ps(out))
+        self.assertEqual(got, cfg)
+
+    def test_trailing_variable_is_captured_to_end_of_output(self):
+        cfg = "/Users/x/Application Support/ws/.claude-sutando"
+        out = f"node /srv/proxy.js PATH=/usr/bin CLAUDE_CONFIG_DIR={cfg}"
+        got = hc._proxy_config_dir_from_process(
+            pid_finder=lambda: ["1"], ps_runner=self._ps(out))
+        self.assertEqual(got, cfg)
+
+    def test_argv_only_output_is_unreadable_not_absent(self):
+        """`ps eww` prints argv alone for a process whose env we may not read.
+        That is UNKNOWN, not "the proxy has no CLAUDE_CONFIG_DIR"."""
+        got = hc._proxy_config_dir_from_process(
+            pid_finder=lambda: ["1"], ps_runner=self._ps("node /srv/proxy.js --port 7846"))
+        self.assertIs(got, hc._PROXY_ENV_UNREADABLE)
+
+    def test_env_readable_but_variable_absent_is_empty_string(self):
+        """Distinct from unreadable: the proxy really has none, so it resolves
+        the vanilla item — a comparable answer."""
+        got = hc._proxy_config_dir_from_process(
+            pid_finder=lambda: ["1"], ps_runner=self._ps("node /srv/proxy.js HOME=/Users/x PATH=/usr/bin"))
+        self.assertEqual(got, "")
+
+    def test_ambiguous_or_missing_pid_is_unreadable(self):
+        for pids in ([], ["1", "2"]):
+            with self.subTest(pids=pids):
+                self.assertIs(
+                    hc._proxy_config_dir_from_process(
+                        pid_finder=lambda: pids, ps_runner=self._ps("X=1")),
+                    hc._PROXY_ENV_UNREADABLE)
+
+    def test_probe_failures_are_unreadable_not_raises(self):
+        def boom(*a, **k):
+            raise OSError("no lsof")
+        self.assertIs(
+            hc._proxy_config_dir_from_process(pid_finder=boom, ps_runner=self._ps("X=1")),
+            hc._PROXY_ENV_UNREADABLE)
+        self.assertIs(
+            hc._proxy_config_dir_from_process(pid_finder=lambda: ["1"], ps_runner=boom),
+            hc._PROXY_ENV_UNREADABLE)
+        self.assertIs(
+            hc._proxy_config_dir_from_process(
+                pid_finder=lambda: ["1"], ps_runner=self._ps("X=1", returncode=1)),
+            hc._PROXY_ENV_UNREADABLE)
+
+    def test_listener_selector_excludes_connected_clients(self):
+        """`lsof -ti:7846` alone also matches every client holding a connection,
+        and the routed core is always one — two pids on a healthy host, which the
+        exactly-one guard reads as ambiguous. Measured: pids 23294 (proxy) and
+        62679 (claude) on 2026-08-14."""
+        with mock.patch.object(hc.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout="23294\n", returncode=0)
+            hc._proxy_pids()
+        self.assertIn("-sTCP:LISTEN", run.call_args.args[0])
 
 
 if __name__ == "__main__":

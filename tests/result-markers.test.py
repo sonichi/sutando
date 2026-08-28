@@ -44,6 +44,19 @@ class TestSkipMarkers(unittest.TestCase):
         self.assertEqual(r.actions[0].value, "deduped")
         self.assertEqual(r.actions[0].extra, "task-1779164273868")
 
+    def test_deduped_empty_target_parses_like_its_spaced_twin(self):
+        # One space apart: the spaced form parsed, the bare one did not, so
+        # the bare one shipped its marker text and body to the channel.
+        for src in ("[deduped:]\nfull reply elsewhere",
+                    "[deduped: ]\nfull reply elsewhere"):
+            with self.subTest(src=src.splitlines()[0]):
+                r = parse_markers(src)
+                self.assertEqual(len(r.actions), 1, "must parse as exactly one skip")
+                self.assertEqual(r.actions[0].kind, "skip")
+                self.assertEqual(r.actions[0].value, "deduped")
+                self.assertEqual(r.actions[0].extra, "")
+                self.assertNotIn("[deduped", r.body)
+
     def test_skip_strips_leading_whitespace(self):
         r = parse_markers("  [no-send]\nbody")
         self.assertEqual(r.actions[0].kind, "skip")
@@ -207,6 +220,18 @@ class TestNoLeakInvariant(unittest.TestCase):
     sees clean output.
     """
 
+    def test_empty_target_markers_never_leak_in_any_family(self):
+        # Redirect expects NO action — empty target is not a target (pinned
+        # end-to-end in empty-redirect-target-default-route.test.py).
+        for src, kinds in (("[deduped:]\nbody", ["skip"]),
+                           ("[channel:]\nbody", []),
+                           ("[file:]\nbody", ["attach"])):
+            with self.subTest(src=src.splitlines()[0]):
+                r = parse_markers(src)
+                self.assertEqual([a.kind for a in r.actions], kinds)
+                for marker in ("[deduped:", "[channel:", "[file:"):
+                    self.assertNotIn(marker, r.body)
+
     def test_no_attach_marker_in_body(self):
         r = parse_markers("body [file: /a] [send: /b] [attach: /c] end")
         for marker in ("[file:", "[send:", "[attach:"):
@@ -335,6 +360,57 @@ class UnknownAttachKeywords(unittest.TestCase):
                     ["/tmp/sutando-x.png"],
                 )
                 self.assertNotIn(f"[{kw}:", r.body)
+
+
+class BacktickedMarkerIsProse(unittest.TestCase):
+    """A marker inside a markdown code span is prose ABOUT the feature.
+
+    Treating it as a directive strips it from the sentence and pushes an
+    invented path at the allowlist. Inline markers OUTSIDE backticks stay
+    directives -- that shape is relied on and pinned elsewhere in this file.
+    """
+
+    def _attach(self, body):
+        return [a.value for a in parse_markers(body).actions if a.kind == "attach"]
+
+    def test_backticked_marker_is_not_an_action(self):
+        self.assertEqual(self._attach("the `[file: /path]` marker uploads"), [])
+
+    def test_backticked_marker_survives_in_the_body(self):
+        body = "explain: `[attach: /p]` sends a file."
+        self.assertEqual(parse_markers(body).body, body)
+
+    def test_bare_inline_marker_is_still_a_directive(self):
+        self.assertEqual(self._attach("see this [file: /tmp/x.png] thanks"),
+                         ["/tmp/x.png"])
+
+    def test_standalone_marker_is_still_a_directive(self):
+        self.assertEqual(self._attach("text\n[send: /tmp/a.png]\n"), ["/tmp/a.png"])
+
+    def test_marker_in_the_middle_of_a_span_is_prose(self):
+        # Backtick-ADJACENCY is only a proxy for span membership: a marker that
+        # sits inside a longer span touches no backtick.
+        self.assertEqual(self._attach("run `foo [file: /p.png] bar` now"), [])
+        self.assertEqual(self._attach("run ``foo [file: /p.png] bar`` now"), [])
+
+    def test_fenced_block_is_prose(self):
+        # The commonest way to DOCUMENT the marker, so the case that matters most.
+        for fence in ("```", "~~~"):
+            self.assertEqual(
+                self._attach(f"example:\n{fence}\n[file: /p.png]\n{fence}\ndone"), [])
+
+    def test_indented_block_is_prose(self):
+        self.assertEqual(self._attach("example:\n\n    [file: /p.png]\n\ndone"), [])
+        self.assertEqual(self._attach("example:\n\n\t[file: /p.png]\n\ndone"), [])
+
+    def test_code_block_does_not_swallow_a_later_directive(self):
+        r = self._attach("```\nshown [file: /a.png]\n```\nreal:\n[file: /b.png]")
+        self.assertEqual(r, ["/b.png"])
+
+    def test_unmatched_backtick_does_not_disarm_a_directive(self):
+        # A stray backtick opens no span; failing the other way would silently
+        # drop a real attachment.
+        self.assertEqual(self._attach("a ` stray and [file: /b.png]"), ["/b.png"])
 
 
 if __name__ == "__main__":

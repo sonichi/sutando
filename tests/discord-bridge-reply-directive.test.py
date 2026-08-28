@@ -66,6 +66,12 @@ class _DMChannel: pass
 _discord_stub.Intents = _Intents
 _discord_stub.Client = _Client
 _discord_stub.AllowedMentions = _AllowedMentions
+class _Thread:
+    """The stub omitted Thread, so the thread branch was unreachable under
+    test and went uncovered."""
+
+
+_discord_stub.Thread = _Thread
 _discord_stub.MessageReference = _MessageReference
 _discord_stub.MessageType = types.SimpleNamespace(default=0, reply=1)
 _discord_stub.File = lambda *a, **kw: None
@@ -214,6 +220,10 @@ class _MockChannel:
             "allowed_mentions": allowed_mentions,
         })
         return types.SimpleNamespace(id=12345)
+
+
+class _MockThreadChannel(_MockChannel, _Thread):
+    """A channel that is a Discord thread."""
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +440,52 @@ def test_no_writes_reach_the_live_workspace(live_ws) -> int:
     return 0
 
 
+def _auto_thread_reference(task_id, channel):
+    """Drive one poll with an anchor registered and NO explicit directive."""
+    bridge.pending_reply_anchors.clear()
+    bridge.pending_reply_anchors[task_id] = 1500000000000000009
+    sent = asyncio.run(_run_one_poll_iteration(task_id, channel, "plain text reply"))
+    return sent
+
+
+def case_e_auto_thread_quotes_in_a_plain_channel():
+    """Anchor registered, no directive: the reply quotes what triggered it."""
+    fails = []
+    sent = _auto_thread_reference("test-task-e", _MockChannel(channel_id=111222333))
+    if not sent:
+        return ["e) no channel.send call observed"]
+    ref = sent[0]["reference"]
+    if ref is None or getattr(ref, "message_id", None) != 1500000000000000009:
+        fails.append(f"e) plain channel should quote the anchor, got {ref}")
+    return fails
+
+
+def case_f_auto_thread_quotes_inside_a_thread_too():
+    """A Discord THREAD gets the same quote: interleaved exchanges make
+    position stop identifying what a message answers."""
+    fails = []
+    sent = _auto_thread_reference("test-task-f", _MockThreadChannel(channel_id=444000111))
+    if not sent:
+        return ["f) no channel.send call observed"]
+    ref = sent[0]["reference"]
+    if ref is None:
+        fails.append("f) a thread reply carries NO reference — the skip is still in place")
+    elif getattr(ref, "message_id", None) != 1500000000000000009:
+        fails.append(f"f) thread reply quoted the wrong message: {ref}")
+    return fails
+
+
+def case_g_the_stub_can_actually_see_a_thread():
+    """Guard: an absent Thread class reads exactly like a non-thread channel,
+    so without this case f would pass for the wrong reason."""
+    fails = []
+    if getattr(bridge.discord, "Thread", None) is None:
+        fails.append("g) the stub exposes no Thread class, so case f proves nothing")
+    if not isinstance(_MockThreadChannel(), getattr(bridge.discord, "Thread", ())):
+        fails.append("g) _MockThreadChannel is not an instance of the stub's Thread")
+    return fails
+
+
 def main():
     # Baseline BEFORE any case runs, so the final check covers every write this
     # file triggers — not just the ones the regression itself makes.
@@ -444,6 +500,9 @@ def main():
         ("b-no-directive-no-reference", case_b_no_directive_no_reference),
         ("c-directive-only-first-chunk", case_c_directive_only_first_chunk),
         ("d-oversized-result-has-a-delivery-budget", case_d_oversized_result_has_a_delivery_budget),
+        ("e-auto-thread-quotes-in-a-plain-channel", case_e_auto_thread_quotes_in_a_plain_channel),
+        ("f-auto-thread-quotes-inside-a-thread-too", case_f_auto_thread_quotes_inside_a_thread_too),
+        ("g-the-stub-can-actually-see-a-thread", case_g_the_stub_can_actually_see_a_thread),
     ]
     failures = []
     with _bridge_writes_redirected() as (_tmp, _redirected):

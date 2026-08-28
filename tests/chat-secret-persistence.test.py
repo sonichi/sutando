@@ -136,7 +136,10 @@ class TestPersistenceWiring(unittest.TestCase):
 
     def test_discord_filters_logs_task_context_and_adds_cleanup_notice(self):
         source = (REPO / "src" / "discord-bridge.py").read_text()
-        self.assertIn("safe_log_text = redact_vault_commands(initial_secret_filter.text)", source)
+        # The composition moved into src/chat_redaction.py so the reader and this
+        # writer cannot drift; the log line calls the chain rather than half of it.
+        self.assertIn("safe_log_text = redact_chat_body(text)", source)
+        self.assertIn("from chat_redaction import redact_chat_body", source)
         self.assertIn("filtered_reply_context = filter_chat_secrets(reply_context)", source)
         self.assertIn("filtered_enriched = filter_chat_secrets(enriched)", source)
         self.assertIn('secret_handling_instruction("Discord"', source)

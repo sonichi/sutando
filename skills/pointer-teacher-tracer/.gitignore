@@ -1,2 +1,2 @@
-pointer-overlay
-*.o
+.build/
+/pointer-overlay

@@ -91,6 +91,12 @@ WORKSPACE_SURFACE_DIRS=(
     "docs"
     "email-drafts"
     "agent-inbox"
+    # Owner-custom tooling surface (report c8310df7): <workspace>/scripts is
+    # DATA. The repo's own scripts/ is code — excluded via SOURCE_A_EXCLUDE.
+    "scripts"
+    # Agent config tree (report 9de2a03d): skills, settings, hooks, memory.
+    # Quarantining it silently breaks every configured hook/skill path.
+    ".claude-sutando"
 )
 
 # Per `feedback_per_source_surface_lists` 2026-06-02: dirs in Mini's #7
@@ -105,6 +111,7 @@ SOURCE_A_EXCLUDE=(
     "docs"
     "email-drafts"
     "agent-inbox"
+    "scripts"
 )
 WORKSPACE_SURFACE_FILES=(
     "build_log.md"
@@ -226,6 +233,9 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
+    # Accumulated grants, not a snapshot: newest-mtime drops the whole
+    # allow-set when a fresh install writes an empty one first.
+    "state/slack-allowed-recipients.json|union-json-array"
     "state/*.json|newest-mtime"
     "state/*|structural"
     "notes/*|collision-keep-both"  # Mini #4: accretes cruft over N migrations;
@@ -240,6 +250,8 @@ CLASS_RULES=(
     "docs/*|structural"
     "email-drafts/*|structural"
     "agent-inbox/*|structural"
+    "scripts/*|collision-keep-both"  # owner-custom tools: user content, never drop a version
+    ".claude-sutando/*|structural"  # agent config tree: same relpath, never clobber dest
     # Catchall — per Lucy #design 2026-06-02 + owner direction: workspace
     # sources B+C may have user-custom dirs/files (experiments/, obsidian-vault/,
     # personal-src/, repro-*.ts, etc.) outside the canonical surface. Anything
@@ -257,6 +269,7 @@ CLASS_RULES=(
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$REPO_DIR/scripts/python-binary.sh"
 HELPER="$REPO_DIR/scripts/sutando-config.sh"
 
 if [ ! -x "$HELPER" ] && [ ! -f "$HELPER" ]; then
@@ -280,6 +293,10 @@ B_PATH="${SUTANDO_MIGRATE_SRC_B:-$HOME/.sutando/workspace}"
 
 # Source C — env override (env or .env)
 # (TEST hook: SUTANDO_MIGRATE_SRC_C overrides for E2E fixtures)
+# A source is a sutando CODE checkout only if it carries the repo-only resolver
+# module; scripts/sutando-config.sh alone is a tool a workspace may legitimately own.
+_is_sutando_repo() { [ -f "$1/src/sutando_config.py" ]; }
+
 detect_C() {
     local c=""
     if [ -n "${SUTANDO_MIGRATE_SRC_C:-}" ]; then
@@ -373,7 +390,7 @@ scan_source() {
     # NOTE on portability: --base is not portable; we use absolute paths only.
     # Walk every non-ignored regular file under src.
     local file rel cls dest_path collision_kind="" size mtime_iso
-    local n_structural=0 n_append=0 n_newest=0 n_rehome=0 n_skip=0 n_inflight=0 n_collision=0 n_unknown=0 n_quarantine=0
+    local n_structural=0 n_append=0 n_newest=0 n_rehome=0 n_skip=0 n_inflight=0 n_collision=0 n_unknown=0 n_quarantine=0 n_union=0
     local bytes_total=0
 
     REPORT_LINES+=("")
@@ -408,12 +425,12 @@ scan_source() {
     # source path IS a sutando repo checkout (by content, not by tag) — if
     # so, skip dirs that exist as repo code rather than workspace data
     # (docs/, agents/, etc.). Detection: presence of `src/sutando_config.py`
-    # (or the same-shape sutando-config.sh) at source root. Owner clarified
+    # at source root — NOT scripts/sutando-config.sh, which a workspace may own. Owner clarified
     # 2026-06-02 07:29: "We should only EXCLUDE them when they are in the
     # sutando repo root." A custom workspace path that happens to live
     # inside a sutando checkout should ALSO get the exclude.
     local IS_SUTANDO_REPO=0
-    if [ -f "$src/src/sutando_config.py" ] || [ -f "$src/scripts/sutando-config.sh" ]; then
+    if _is_sutando_repo "$src"; then
         IS_SUTANDO_REPO=1
     fi
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
@@ -530,6 +547,11 @@ scan_source() {
             newest-mtime)
                 n_newest=$((n_newest+1))
                 ;;
+            union-json-array)
+                # Reported separately: it resolves to no single file, so folding it
+                # in would make the dry-run describe the wrong action.
+                n_union=$((n_union+1))
+                ;;
             rehome-state)
                 # Target is <dest>/state/<basename>
                 n_rehome=$((n_rehome+1))
@@ -573,6 +595,7 @@ scan_source() {
     REPORT_LINES+=("    collision    (same path, diff content):$n_collision")
     REPORT_LINES+=("    append-merge (build_log/conv.log):    $n_append")
     REPORT_LINES+=("    newest-mtime (snapshots):             $n_newest")
+    REPORT_LINES+=("    union-json   (accumulated grant sets): $n_union")
     REPORT_LINES+=("    re-home      (loose JSON → state/):   $n_rehome")
     REPORT_LINES+=("    quarantine   (non-canonical → legacy/<src>/quarantine/): $n_quarantine")
     REPORT_LINES+=("    in-flight-skip (<${INFLIGHT_GUARD_SEC}s old):       $n_inflight")
@@ -943,6 +966,61 @@ copy_preserving_mtime() {
     cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"
 }
 
+# Unions top-level arrays; non-array fields follow the newer source.
+# Malformed input returns non-zero — a silent degrade is access loss.
+union_json_arrays_into() {
+    local src="$1" dst="$2"
+    mkdir -p "$(dirname "$dst")"
+    local tmp="$dst.tmp.$$"
+    local py; py="$(resolve_python "$REPO_DIR")"
+    [ -n "$py" ] || return 1
+    if "$py" - "$src" "$dst" "$tmp" <<'PY'
+import json, os, sys
+
+src, dst, tmp = sys.argv[1:4]
+
+
+def load(path):
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path}: top level is {type(doc).__name__}, expected object")
+    return doc
+
+
+src_doc, dst_doc = load(src), load(dst)
+# Non-array fields follow the newer file; only the arrays accumulate.
+newer = src_doc if os.path.getmtime(src) > os.path.getmtime(dst) else dst_doc
+merged = dict(newer)
+for key in set(src_doc) | set(dst_doc):
+    a, b = dst_doc.get(key), src_doc.get(key)
+    if not isinstance(a, list) and not isinstance(b, list):
+        continue
+    if (a is not None and not isinstance(a, list)) or (b is not None and not isinstance(b, list)):
+        raise ValueError(f"{key}: array in one file and {type(a if b is None else b).__name__} in the other")
+    seen, out = set(), []
+    for entry in (a or []) + (b or []):
+        fp = json.dumps(entry, sort_keys=True)
+        if fp not in seen:
+            seen.add(fp)
+            out.append(entry)
+    merged[key] = out
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(merged, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+# The union rewrites dst, so the result must carry the winner's mtime; otherwise
+# the next source compares against "now" and its scalars can never win.
+win = max(os.path.getmtime(src), os.path.getmtime(dst))
+os.utime(tmp, (win, win))
+PY
+    then
+        mv -f "$tmp" "$dst"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 # Human-readable byte size: 1234 → "1.2 KB", 5242880 → "5.0 MB", etc.
 humanize_bytes() {
     local b="$1"
@@ -1064,6 +1142,28 @@ commit_one() {
     local dst_path
 
     case "$cls" in
+        union-json-array)
+            dst_path="$DEST_REAL/$rel"
+            if [ ! -e "$dst_path" ]; then
+                copy_preserving_mtime "$src_file" "$dst_path"
+                echo "copied"
+                return 0
+            fi
+            if sha_match "$src_file" "$dst_path"; then
+                echo "identical-drop"
+                return 0
+            fi
+            # Both sides exist and differ: accumulate, never pick a winner.
+            # A malformed file aborts rather than silently dropping grants.
+            if ! union_json_arrays_into "$src_file" "$dst_path"; then
+                echo "ERROR: $rel — cannot union $src_file into $dst_path (malformed JSON" >&2
+                echo "       or a field that is an array in one file and not the other)." >&2
+                echo "       Refusing to fall back to newest-wins; that would drop grants." >&2
+                return 1
+            fi
+            echo "unioned"
+            return 0
+            ;;
         structural|collision-keep-both)
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
@@ -1382,12 +1482,12 @@ commit_source() {
     # source path IS a sutando repo checkout (by content, not by tag) — if
     # so, skip dirs that exist as repo code rather than workspace data
     # (docs/, agents/, etc.). Detection: presence of `src/sutando_config.py`
-    # (or the same-shape sutando-config.sh) at source root. Owner clarified
+    # at source root — NOT scripts/sutando-config.sh, which a workspace may own. Owner clarified
     # 2026-06-02 07:29: "We should only EXCLUDE them when they are in the
     # sutando repo root." A custom workspace path that happens to live
     # inside a sutando checkout should ALSO get the exclude.
     local IS_SUTANDO_REPO=0
-    if [ -f "$src/src/sutando_config.py" ] || [ -f "$src/scripts/sutando-config.sh" ]; then
+    if _is_sutando_repo "$src"; then
         IS_SUTANDO_REPO=1
     fi
     for sd in "${WORKSPACE_SURFACE_DIRS[@]}"; do
@@ -1475,7 +1575,7 @@ commit_source() {
             fi
         fi
         case "$outcome" in
-            copied|src-wins-newer|src-newer|rehomed|rehomed-newer|merged|archived-stale|copied-stale)
+            copied|src-wins-newer|src-newer|rehomed|rehomed-newer|merged|unioned|archived-stale|copied-stale)
                 n_copied=$((n_copied+1)) ;;
             dest-wins-newer|dest-newer|rehomed-skip-older|skipped-collision-dest)
                 n_kept=$((n_kept+1)) ;;
@@ -2149,6 +2249,7 @@ explain_main() {
                             *) dest_hint="<dest>/state/$base" ;;
                         esac
                         ;;
+                    union-json-array) dest_hint="<dest>/$rel  (accumulated: top-level arrays unioned across sources, other fields from the newer file; malformed input aborts rather than picking a winner)" ;;
                     rehome-dated-snapshot) dest_hint="<dest>/notes/archive/$(basename "$rel")" ;;
                     rehome-narrative-log) dest_hint="<dest>/logs/workspace-narrative.log  (renamed to dodge logs/conversation.log collision)" ;;
                     inflight-guard) dest_hint="<dest>/$rel  (if >${INFLIGHT_GUARD_SEC}s old)  OR  <dest>/${rel%%/*}/archive/<src-tag>/$(basename "$rel")  (route-to-archive)" ;;

@@ -504,7 +504,8 @@
    "description": "Start streaming live vision frames to you (Gemini) so you can see what the user is doing in real time. Use for: \"watch my screen\", \"look at what I'm doing\", \"follow along\", \"see me as I talk\". Frames flow at ~1 fps until stop_vision is called or the session ends. Source defaults to the user's screen; pass source='webcam' for the front camera, or any other registered source (e.g. 'glasses'). Prefer send_vision_frame for one-off \"look at this\" questions. Instant.",
    "execution": "inline",
    "params": {
-    "fps": "Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.",
+    "display": "Which display to watch, as its index from the needs_display_choice list. Only for source=screen, and only needed on a multi-display Mac. Held for the rest of the session once set.",
+    "fps": "Frames per second, 0.1–1.0 (Gemini Live caps video at 1 fps). Default 1. Webcam may not keep up above 0.5.",
     "source": "Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."
    }
   },
@@ -513,7 +514,8 @@
    "description": "Start streaming live vision frames to you (Gemini) so you can see what the user is doing in real time. Use for: \"watch my screen\", \"look at what I'm doing\", \"follow along\", \"see me as I talk\". Frames flow at ~1 fps until stop_vision is called or the session ends. Source defaults to the user's screen; pass source='webcam' for the front camera, or any other registered source (e.g. 'glasses'). Prefer send_vision_frame for one-off \"look at this\" questions. Instant.",
    "execution": "inline",
    "params": {
-    "fps": "Frames per second, 0.5–2. Default 1. Webcam may not keep up above 0.5.",
+    "display": "Which display to watch, as its index from the needs_display_choice list. Only for source=screen, and only needed on a multi-display Mac. Held for the rest of the session once set.",
+    "fps": "Frames per second, 0.1–1.0 (Gemini Live caps video at 1 fps). Default 1. Webcam may not keep up above 0.5.",
     "source": "Frame source. Default 'screen'. Built-in: 'screen', 'webcam'. External integrations may register more (e.g. 'glasses')."
    }
   },

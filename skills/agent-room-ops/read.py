@@ -8,6 +8,8 @@ gateway-side. See _gateway.py for the shared boundary + gate.
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_reason,
                     quote, urlencode, HTTPError, URLError)
@@ -47,13 +49,66 @@ def _result(ok, messages=None, reason=None, room_id=None, complete=None):
             "complete": complete}
 
 
+_REDACTOR = None
+
+
+def _log_fallback(msg):
+    """Announce a degraded redactor once, at selection.
+
+    Withheld bodies and genuinely-secret-laden ones look identical downstream,
+    and the choice is cached for the process, so without this an operator
+    cannot tell a broken install from a quiet room.
+    """
+    print("room-ops read: %s" % msg, file=sys.stderr)
+
+
+def _redactor():
+    """The WRITE path's own filter, resolved once — not a second implementation.
+
+    `remote_gateway_bridge` scrubs a pasted secret before the task file is
+    persisted; this reader returned the same message verbatim, so a secret the
+    bridge removed on the way in came back out on the same room. Delegating to
+    `src/chat_redaction` — the chain both paths now call — keeps them symmetric
+    by construction; a regex copied to this side would drift from its twin.
+    """
+    global _REDACTOR
+    if _REDACTOR is not None:
+        return _REDACTOR
+    src = str((Path(__file__).resolve().parents[2] / "src"))
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        # The shared chain, not one half of it: chat_secret_filter alone is blind
+        # to a vault-set value with no provider signature, at any length.
+        from chat_redaction import redact_chat_body
+        _REDACTOR = redact_chat_body
+    except Exception as exc:
+        try:
+            # Narrower, but the vault-set grammar is the case this reader was
+            # reported on, so a partial filter still beats passing it through.
+            from vault_set_grammar import redact_vault_commands
+            _REDACTOR = lambda s: redact_vault_commands(
+                s, placeholder="[VAULT-SET-REDACTED: filter unavailable]")
+            _log_fallback("chat_secret_filter unavailable (%s) — using the narrower "
+                          "vault_set_grammar; non-vault secrets are NOT filtered" % exc)
+        except Exception as exc2:
+            # Fail CLOSED: returning the raw body IS the defect, and both modules
+            # are tracked files, so absence means a broken install.
+            _REDACTOR = lambda s: "[REDACTION UNAVAILABLE — body withheld]" if s else s
+            _log_fallback("no redaction module importable (%s / %s) — WITHHOLDING every "
+                          "body; this is pinned for the life of the process" % (exc, exc2))
+    return _REDACTOR
+
+
 def _normalize(items):
     out = []
+    redact = _redactor()
     for m in items or []:
+        body = m.get("body") or m.get("text") or m.get("message")
         norm = {
             "sender": m.get("sender") or m.get("user_id") or m.get("from"),
             "ts": m.get("ts") or m.get("timestamp"),
-            "body": m.get("body") or m.get("text") or m.get("message"),
+            "body": redact(body) if isinstance(body, str) else body,
             "event_id": m.get("event_id") or m.get("id"),
             # The gateway annotates each message with its reactions (key + sender);
             # without carrying it through, a worker can't see the 👀 delivery-ack on

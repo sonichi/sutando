@@ -147,7 +147,36 @@ class TestWriteTaskFile(unittest.TestCase):
             bridge._write_task_file, p, lambda: "built: hello", "frank", "chan6", "owner", 205
         )
         self.assertTrue(ok)
-        self.assertEqual(p.read_text(), "built: hello")
+        # Envelope stamping (task_envelope) prepends its header line; the
+        # built content must survive byte-identically and the file verify.
+        import sys as _s
+        _s.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+        import task_envelope as _E
+        written = p.read_text()
+        stripped, mac = _E._strip_stamp(written)
+        self.assertEqual(stripped, "built: hello",
+                         "stamping must not alter the built content")
+        self.assertIsNotNone(mac, "bridge writes must be stamped")
+        self.assertIn("[task-write] wrote", out)
+
+    def test_raising_stamper_is_fail_open(self):
+        """A stamping error must never lose the message: content is written
+        unstamped and the call still succeeds (envelope fail-open arm)."""
+        p = Path(_tmp) / "tasks" / "task-test-stamper-boom.txt"
+        real = bridge.stamp_text
+
+        def boom(_):
+            raise RuntimeError("stamper exploded")
+        bridge.stamp_text = boom
+        try:
+            ok, out = self._capture(
+                bridge._write_task_file, p, "raw content", "gail", "chan9",
+                "owner", 208)
+        finally:
+            bridge.stamp_text = real
+        self.assertTrue(ok)
+        self.assertEqual(p.read_text(), "raw content",
+                         "unstamped passthrough on stamper failure")
         self.assertIn("[task-write] wrote", out)
 
     def test_builder_failure_returns_false_and_logs(self):
@@ -186,6 +215,9 @@ class TestHandleMessageCallSite(unittest.TestCase):
         self._orig_tasks_dir = bridge.TASKS_DIR
         self._int_dir = Path(_tmp) / "tasks_int"
         self._int_dir.mkdir(exist_ok=True)
+        # Shared across tests in this class; each must see only its own output.
+        for _stale in self._int_dir.glob("task-*.txt"):
+            _stale.unlink()
         bridge.TASKS_DIR = self._int_dir
 
         _discord = sys.modules["discord"]
@@ -261,6 +293,24 @@ class TestHandleMessageCallSite(unittest.TestCase):
         self.assertIn("source: discord", body)
         self.assertIn("access_tier: owner", body)
         self.assertIn("run health check please", body)
+
+    def test_task_header_carries_receiving_instance_id(self):
+        """The header must carry the LOGGED-IN client id, not any id."""
+        bridge.client.user = types.SimpleNamespace(id=987654321012345678)
+        asyncio.run(bridge._handle_discord_message(self._msg))
+        body = list(self._int_dir.glob("task-*.txt"))[0].read_text()
+        self.assertIn("receiving_instance: 987654321012345678\n", body)
+
+    def test_receiving_instance_precedes_task_line(self):
+        """A body-forged copy must not satisfy the header contract."""
+        bridge.client.user = types.SimpleNamespace(id=987654321012345678)
+        asyncio.run(bridge._handle_discord_message(self._msg))
+        body = list(self._int_dir.glob("task-*.txt"))[0].read_text()
+        self.assertIn("receiving_instance: 987654321012345678", body)
+        self.assertLess(
+            body.index("receiving_instance: 987654321012345678"),
+            body.index("task:"),
+            "receiving_instance must sit in the header, above task:")
 
     def test_write_failure_skips_pending_enqueue(self):
         """When _write_task_file returns False, pending_replies must not grow."""

@@ -81,26 +81,27 @@ class OverCapIsNamedAsLoss(unittest.TestCase):
 
 
 class FailsOpen(unittest.TestCase):
-    """A trend is a nicety; suppressing the level would be a regression."""
+    """Fails open — but SAYS SO (#2958). A trend is a nicety and suppressing the
+    level would be a regression; returning "" hid WHY there was no trend."""
 
-    def test_not_a_git_repo_returns_empty(self):
+    def test_not_a_git_repo_says_unavailable(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x" * 100)
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_single_commit_is_not_a_trend(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             idx = _repo_with_sizes(Path(td), [1000])
-            self.assertEqual(m._index_growth_note(idx, 1000), "")
+            self.assertEqual(m._index_growth_note(idx, 1000), m._TREND_UNAVAILABLE)
 
-    def test_missing_file_returns_empty(self):
+    def test_missing_file_says_unavailable(self):
         m = _hc()
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(
-                m._index_growth_note(Path(td) / "nope" / "MEMORY.md", 100), "")
+                m._index_growth_note(Path(td) / "nope" / "MEMORY.md", 100), m._TREND_UNAVAILABLE)
 
 
 class TheHelperCanActuallyFire(unittest.TestCase):
@@ -170,6 +171,40 @@ class DefensiveBranches(unittest.TestCase):
             self.stdout = out
             self.returncode = rc
 
+    def test_a_stopped_climb_is_named_so_the_deadline_is_not_read_as_live(self):
+        """The max window is the WORST one, by design — a compaction must not be
+        able to hide a climb. The cost is that `gain <= 0` discards every flat or
+        shrinking window, so once growth STOPS the only surviving evidence is the
+        old climb, and the note keeps quoting a deadline from a regime that ended.
+
+        Measured 2026-08-17 on the live index: writes were frozen at 09:5xZ and it
+        then FELL 273 B, while this note still read "+643 B over the last 10.9h,
+        ~15.3h of remaining headroom" off a window starting 05:39Z. Acting on that
+        urgency meant pre-empting a curation decision that was explicitly the
+        owner's to make.
+        """
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        # climbs 2000 B, then stops and gives some back — exactly the shape above
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(
+                Path(td), [cap - 3000, cap - 2000, cap - 1000, cap - 1200, cap - 1400])
+            note = m._index_growth_note(idx, cap - 1400)
+        self.assertIn("of remaining headroom at that rate", note)   # the old figure survives
+        self.assertIn("flat or shrinking", note)                    # and is qualified
+        self.assertIn("stale", note)
+
+    def test_a_still_climbing_history_carries_no_stale_caveat(self):
+        """The control. Without it the caveat could be unconditional, which would
+        mute the warning in exactly the case it is for."""
+        m = _hc()
+        cap = m.MEMORY_INDEX_LOAD_BYTES
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [cap - 3000, cap - 2000, cap - 1000])
+            note = m._index_growth_note(idx, cap - 1000)
+        self.assertIn("of remaining headroom at that rate", note)
+        self.assertNotIn("flat or shrinking", note)
+
     def test_unparsable_log_line_is_skipped(self):
         m = _hc()
         calls = {"n": 0}
@@ -188,7 +223,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_a_truncated_batch_stream_stops_cleanly(self):
         """`--batch` output that ends mid-record (a killed git, a short pipe).
@@ -206,7 +241,7 @@ class DefensiveBranches(unittest.TestCase):
                                       "SubprocessError": Exception})
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"; idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_an_object_cat_file_reports_missing_is_skipped(self):
         """`cat-file --batch-check` does NOT fail on a bad spec — it prints
@@ -231,10 +266,10 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            # both objects skipped -> 0 points -> ""
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            # both objects skipped -> 0 points -> the unavailable marker
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
-    def test_a_failing_batch_returns_empty(self):
+    def test_a_failing_batch_says_unavailable(self):
         m = _hc()
         state = {"first": True}
 
@@ -251,7 +286,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
     def test_git_unavailable_is_swallowed(self):
         m = _hc()
@@ -263,7 +298,7 @@ class DefensiveBranches(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             idx = Path(td) / "MEMORY.md"
             idx.write_text("x")
-            self.assertEqual(m._index_growth_note(idx, 100), "")
+            self.assertEqual(m._index_growth_note(idx, 100), m._TREND_UNAVAILABLE)
 
 
 class HistoricalBytesUseTheSAMEUnitsAsTheLimit(unittest.TestCase):
@@ -308,6 +343,38 @@ class HistoricalBytesUseTheSAMEUnitsAsTheLimit(unittest.TestCase):
                          "a comment-only revision is tiny to the runtime; claiming entries "
                          "were dropped there is a false claim of proven loss")
         self.assertNotIn("came within", note)
+
+
+class StaleDeadlineGuardCanActuallyFire(unittest.TestCase):
+    """The guard that says "this deadline is stale" must sample the FULL history.
+
+    It used to take the newest point >=0.5h back — the SHORTEST qualifying
+    window. But a short window with a gain is exactly what maximises gain/span
+    and wins `best_rate`, so the control was reading the same burst it was
+    meant to detect, and stayed silent in the one case it was written for.
+    Measured live 2026-08-26: the probe quoted "+146 B over 2.0h -> 17.7h of
+    remaining headroom" while the file's 224h history was net -102 B.
+    """
+
+    def test_recent_burst_on_a_flat_history_is_reported_as_stale(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            # net -110 B across the window, with a +146 B burst in the last hour
+            idx = _repo_with_sizes(Path(td), [23800, 23700, 23600, 23550, 23544, 23690])
+            note = m._index_growth_note(idx, 23690)
+        # the max window still quotes its deadline...
+        self.assertIn("of remaining headroom at that rate", note)
+        # ...and the control now contradicts it, which is the whole point
+        self.assertIn("deadline is stale", note)
+        self.assertIn("-110", note)
+
+    def test_sustained_growth_is_not_called_stale(self):
+        m = _hc()
+        with tempfile.TemporaryDirectory() as td:
+            idx = _repo_with_sizes(Path(td), [23000, 23150, 23300, 23450, 23600, 23690])
+            note = m._index_growth_note(idx, 23690)
+        self.assertIn("of remaining headroom at that rate", note)
+        self.assertNotIn("deadline is stale", note)
 
 
 if __name__ == "__main__":

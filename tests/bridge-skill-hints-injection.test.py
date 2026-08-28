@@ -124,10 +124,16 @@ check(
     "telegram: audio transcription command uses audio-transcribe skill",
     "audio-transcribe/scripts/transcribe.py" in telegram_src,
 )
+# The body is assembled into `_task_content` so the envelope can stamp it before
+# the write, so the hints must land there, not in write_text()'s argument list.
+_tg_assign = telegram_src.find("_task_content = (")
+_tg_hints_use = telegram_src.find('f"{tg_skill_hints}"')
+_tg_write = telegram_src.find("task_file.write_text(_task_content)")
 check(
-    "telegram: skill hints appended to task_file.write_text",
-    re.search(r'task_file\.write_text\(.*tg_skill_hints', telegram_src, re.DOTALL) is not None,
-    "tg_skill_hints not found inside write_text call",
+    "telegram: skill hints reach the content write_text consumes",
+    -1 not in (_tg_assign, _tg_hints_use, _tg_write)
+    and _tg_assign < _tg_hints_use < _tg_write,
+    "tg_skill_hints must be interpolated into _task_content before write_text(_task_content)",
 )
 check(
     "telegram: SKILL INSTRUCTIONS sentinel present",

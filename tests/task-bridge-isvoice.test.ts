@@ -1,9 +1,8 @@
-import { describe, it, afterEach } from 'node:test';
+import { describe, it, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { resolveWorkspace } from '../src/workspace_default.js';
-import { _isVoiceTask } from '../src/task-bridge.js';
 
 // Regression for the archive-path drift bug flagged by VasiliyRad 2026-05-06:
 // `archiveFile()` writes to `tasks/archive/YYYY-MM/<taskId>.txt`, but
@@ -15,10 +14,20 @@ import { _isVoiceTask } from '../src/task-bridge.js';
 // archive lookup all surface a voice task; non-voice content stays false; missing
 // task files stay false.
 
-// Task dir is wherever the bridge looks — `resolveWorkspace()/tasks/`. Was
-// `<REPO_ROOT>/tasks/` pre-#821, when the bridge fell back to repo root.
-const TASK_DIR = join(resolveWorkspace(), 'tasks');
+// Fixtures use a tmp workspace, never the live queue (#3035): SUTANDO_TEST_MODE=1
+// must be set before the source-ordered `await import` binds the bridge's paths.
+const TMP = mkdtempSync(join(tmpdir(), 'sutando-isvoice-archive-test-'));
+process.env.SUTANDO_WORKSPACE = TMP;
+process.env.SUTANDO_TEST_MODE = '1';
+const TASK_DIR = join(TMP, 'tasks');
 const ARCHIVE_DIR = join(TASK_DIR, 'archive');
+mkdirSync(TASK_DIR, { recursive: true });
+
+const { _isVoiceTask } = await import('../src/task-bridge.js');
+
+after(() => {
+	try { rmSync(TMP, { recursive: true, force: true }); } catch {}
+});
 
 // Field order: `task:` LAST, per the writer convention enforced in PR #1023.
 // `_isVoiceTask` stops scanning at the first `task:` line (closes the body-
@@ -59,8 +68,19 @@ function writeTask(path: string, body: string) {
 describe('_isVoiceTask — archive-path coverage', () => {
 	afterEach(() => {
 		for (const p of created.splice(0)) {
-			try { unlinkSync(p); } catch {}
+			try { rmSync(p, { force: true }); } catch {}
 		}
+	});
+
+	it('resolves against the redirected tmp workspace, not the live queue (#3035)', () => {
+		// If the resolver ever drops the test-mode hatch, fail HERE instead of
+		// silently leaking owner-tier fixtures back into a live core's watcher.
+		const id = 'task-isvoice-test-redirect-aaa';
+		writeTask(join(TASK_DIR, `${id}.txt`), VOICE_BODY);
+		assert.equal(_isVoiceTask(id), true,
+			'a fixture in the tmp workspace must be visible to _isVoiceTask');
+		assert.ok(TASK_DIR.startsWith(tmpdir()),
+			'fixture dir must live under the OS tmpdir');
 	});
 
 	it('returns true for a voice task in the live tasks/ dir', () => {
@@ -81,22 +101,14 @@ describe('_isVoiceTask — archive-path coverage', () => {
 		assert.equal(_isVoiceTask(id), true);
 	});
 
-	it('returns true for a voice task in legacy flat tasks/archive/', () => {
+	it('returns true for a voice task in the legacy flat archive', () => {
 		const id = 'task-isvoice-test-flat-aaa';
 		writeTask(join(ARCHIVE_DIR, `${id}.txt`), VOICE_BODY);
 		assert.equal(_isVoiceTask(id), true);
 	});
 
-	it('returns true for a voice task in month-partitioned tasks/archive/YYYY-MM/ — the bug fix', () => {
+	it('returns true for a voice task in month-partitioned archive (the drift bug)', () => {
 		const id = 'task-isvoice-test-month-aaa';
-		writeTask(join(ARCHIVE_DIR, '2026-05', `${id}.txt`), VOICE_BODY);
-		assert.equal(_isVoiceTask(id), true);
-	});
-
-	it('finds a voice task across multiple month subdirs', () => {
-		// The taskId may live in any historical month; the function must scan
-		// all month-shaped subdirs, not just the current month.
-		const id = 'task-isvoice-test-old-month-aaa';
 		writeTask(join(ARCHIVE_DIR, '2026-01', `${id}.txt`), VOICE_BODY);
 		assert.equal(_isVoiceTask(id), true);
 	});
@@ -108,9 +120,8 @@ describe('_isVoiceTask — archive-path coverage', () => {
 	});
 
 	it('ignores non-month-shaped subdirs (e.g. "done", "tmp")', () => {
-		// Stray subdirs under tasks/archive/ shouldn't trip the regex; they
-		// won't be scanned. Negative-control: a voice task placed under a
-		// non-month-shaped subdir is NOT found, confirming the regex gate.
+		// Negative-control: a voice task under a non-month-shaped subdir is
+		// NOT found, confirming the YYYY-MM regex gate.
 		const id = 'task-isvoice-test-stray-subdir-aaa';
 		writeTask(join(ARCHIVE_DIR, 'done', `${id}.txt`), VOICE_BODY);
 		assert.equal(_isVoiceTask(id), false);
@@ -118,5 +129,21 @@ describe('_isVoiceTask — archive-path coverage', () => {
 
 	it('returns false when the task file is missing entirely', () => {
 		assert.equal(_isVoiceTask('task-isvoice-test-no-such-file'), false);
+	});
+
+	it('leaves no fixture behind in the tmp workspace after cleanup', () => {
+		// afterEach already removed this describe-block's fixtures; the tmp
+		// tree should hold only the (possibly empty) dirs the tests created.
+		const leftover: string[] = [];
+		const walk = (d: string) => {
+			if (!existsSync(d)) return;
+			for (const e of readdirSync(d, { withFileTypes: true })) {
+				const p = join(d, e.name);
+				if (e.isDirectory()) walk(p);
+				else leftover.push(p);
+			}
+		};
+		walk(TASK_DIR);
+		assert.deepEqual(leftover, []);
 	});
 });

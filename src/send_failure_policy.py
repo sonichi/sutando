@@ -103,6 +103,16 @@ def should_retry(exc: BaseException, attempts: int,
     return is_transient(exc) and attempts < cap
 
 
+def decide_failed_send(exc: BaseException, tried: int,
+                       progressed: bool = False) -> str:
+    """The decision alone: "retry" or "park". Executors carry it out.
+
+    `progressed` means part of the body already reached the recipient; a
+    re-send from the start would repeat it, so partial delivery always parks.
+    """
+    return "retry" if (not progressed and should_retry(exc, tried)) else "park"
+
+
 def resolve_failed_send(claim: Path, exc: BaseException,
                         attempts: "dict[str, int]", progressed: bool = False,
                         *, body: "Path | None" = None,
@@ -118,9 +128,7 @@ def resolve_failed_send(claim: Path, exc: BaseException,
         body = claim.with_suffix(".txt")
     key = body.name
     tried = attempts.get(key, 0)
-    # `progressed` means part of the body already reached the recipient. Re-sending
-    # from the start would repeat it, so a partial delivery parks instead.
-    if not progressed and should_retry(exc, tried):
+    if decide_failed_send(exc, tried, progressed) == "retry":
         # release_claim refuses to clobber a `.txt` written since the claim, so a
         # False here means a newer body exists — park this one rather than drop it.
         # Bundled verbatim into ag2_sparrow, where siblings are package

@@ -81,6 +81,8 @@ export type AcquireResult =
 
 export interface LockCallOpts {
 	pidfile: string;
+	/** Pre-move root path (#2722): a live record there holds acquisition. */
+	legacyPidfile?: string;
 	guard: string;
 	pid: number;
 	pythonBin: string;
@@ -106,6 +108,7 @@ export function acquireVoiceLock(
 				'--pid', String(opts.pid),
 				'--entry', opts.entry,
 				'--workspace', opts.workspace,
+				...(opts.legacyPidfile ? ['--legacy-pidfile', opts.legacyPidfile] : []),
 			],
 			{ encoding: 'utf-8' },
 		);
