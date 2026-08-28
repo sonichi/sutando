@@ -172,6 +172,9 @@ def _build_thread_engage_to_gate_harness():
 _THREAD_HARNESS = _build_thread_harness()
 _PAIRING_HARNESS = _build_pairing_harness()
 _THREAD_TO_GATE_HARNESS = _build_thread_engage_to_gate_harness()
+# The sliced span now calls _mention_gate_triggers_ingest (added on main after
+# this branch); stub it fail-closed so the drop path stays the one under test.
+_THREAD_TO_GATE_HARNESS.__globals__["_mention_gate_triggers_ingest"] = lambda message: False
 
 
 class _FakeThread(discord.Thread):
