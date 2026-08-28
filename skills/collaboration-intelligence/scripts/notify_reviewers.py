@@ -71,19 +71,36 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             worst = max(worst, 2)
             continue
         stand, room = entry.get("stand"), entry.get("room")
-        if not stand or not room:
-            # a human id alone cannot be a target: person-mentions trigger no Stand
-            print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
-                  f"(human-only = not Stand addressing)", file=sys.stderr)
+        dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
+        channel = entry.get("home_channel")
+        if stand and room:
+            transport = "matrix"
+        elif dm_id and channel:
+            transport = "discord"
+        else:
+            # Distinguish NO ROUTE from A ROUTE THIS TOOL CANNOT DRIVE. Collapsing
+            # them made every refusal read as "this reviewer is unreachable".
+            if stand and not room:
+                detail = (f"has a Stand ({stand}) but no 'room' — a Stand mxid is "
+                          "room-scoped, so it cannot be addressed without one")
+            elif dm_id and not channel:
+                detail = (f"has a Discord id ({dm_id}) but no 'home_channel' — "
+                          "no channel to mention them in")
+            else:
+                detail = ("carries no addressable route at all (a human handle "
+                          "alone triggers no Stand)")
+            print(f"UNUSABLE entry '{name}': {detail}", file=sys.stderr)
             worst = max(worst, 3)
             continue
         if entry.get("allowlisted") is False:
-            print(f"OFF-ALLOWLIST '{name}': {stand} bounced a mention before —"
+            who = stand or dm_id
+            print(f"OFF-ALLOWLIST '{name}': {who} bounced a mention before —"
                   " route through the owner instead of re-sending",
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
-        out.append({"name": name, "stand": stand, "room": room,
+        out.append({"name": name, "transport": transport, "stand": stand,
+                    "room": room, "discord_id": dm_id, "channel": channel,
                     "human": entry.get("human")})
     return out, worst
 
@@ -124,6 +141,38 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     return target["stand"] in ids, f"{len(ids)} members"
 
 
+def discord_reachable(target: dict) -> "tuple[bool, str]":
+    """Is this id actually in the channel we are about to mention it in?
+
+    Same shape as stand_present_in_room and the same failure discipline: an
+    UNREADABLE access map is UNVERIFIED, never a positive absence, so a broken
+    config can never be reported as "this reviewer is unreachable".
+    """
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    base = Path(cfg_dir) if cfg_dir else Path.home() / ".claude"
+    access = base / "channels" / "discord" / "access.json"
+    try:
+        data = json.loads(access.read_text())
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return True, f"unverified ({type(exc).__name__})"
+    if not isinstance(data, dict):
+        return True, "unverified (non-object access map)"
+    for section in ("groups", "channels"):
+        entry = (data.get(section) or {}).get(str(target["channel"]))
+        if isinstance(entry, dict):
+            allowed = {str(x) for x in (entry.get("allowFrom") or [])}
+            if not allowed:
+                return True, f"unverified ({section} entry has no allowFrom)"
+            return str(target["discord_id"]) in allowed, f"{len(allowed)} in allowFrom"
+    return True, "unverified (channel not in the access map)"
+
+
+def discord_command_for(target: dict, message: str) -> "list[str]":
+    """A mention is what triggers a Stand; a plain-text name reaches nobody."""
+    return [_PY, str(_REPO / "skills" / "bot2bot-post" / "post.py"),
+            "--to", str(target["discord_id"]), "ping", message]
+
+
 def command_for(target: dict, message: str) -> "list[str]":
     body = message
     # Roster "human" is a room handle for some entries and a structured record
@@ -150,6 +199,31 @@ def main() -> int:
     targets, refusal_rc = resolve(names, load_roster())
     failures = 0
     for t in targets:
+        if t["transport"] == "discord":
+            # No room-relocation branch: a Discord mention is channel-scoped and
+            # --room names a Matrix room, so it cannot apply to this target.
+            here, why = discord_reachable(t)
+            if not here:
+                print(f"{t['name']}: ABSENT from channel {t['channel']} ({why}) — "
+                      f"{t['discord_id']} is not on its allowFrom; a mention there "
+                      "reaches nobody. Resolve this person's channel.", file=sys.stderr)
+                failures += 1
+                continue
+            if why.startswith("unverified"):
+                print(f"{t['name']}: UNVERIFIED for channel {t['channel']} ({why}) — "
+                      "sending unchecked; this is not a confirmation.", file=sys.stderr)
+            argv = discord_command_for(t, a.message)
+            if not a.send:
+                print("PLAN:", " ".join(argv))
+                continue
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+            if p.returncode == 0:
+                print(f"{t['name']}: SENT to channel {t['channel']}")
+            else:
+                print(f"{t['name']}: SEND FAILED rc={p.returncode} "
+                      f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
+                failures += 1
+            continue
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in
             # THIS room, and sending would relocate the thread and report ok.
