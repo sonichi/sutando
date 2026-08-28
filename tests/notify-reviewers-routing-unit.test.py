@@ -40,11 +40,9 @@ class Resolve(unittest.TestCase):
         self.assertEqual([t["transport"] for t in targets], ["matrix", "discord"])
 
     def test_each_missing_field_gets_its_own_reason(self):
-        roster = {
-            "a": {"stand": "@s:x"},                 # stand, no room
-            "b": {"discord_id": "9"},               # id, no channel
-            "c": {"human": "someone"},              # neither
-        }
+        # stand-without-room, id-without-channel, and neither
+        roster = {"a": {"stand": "@s:x"}, "b": {"discord_id": "9"},
+                  "c": {"human": "someone"}}
         targets, rc = nr.resolve(["a", "b", "c"], roster)
         self.assertEqual(targets, [])
         self.assertEqual(rc, 3)
@@ -93,9 +91,8 @@ class DiscordReachability(unittest.TestCase):
         os.environ["CLAUDE_CONFIG_DIR"] = config_with({"channels": {"222": {"allowFrom": ["111"]}}})
         self.assertTrue(nr.discord_reachable(self._target())[0])
 
-    # Each of these is a BROKEN INSTRUMENT, and a broken instrument must never
-    # report a reachable person as absent. Unreadable, unparseable, wrong shape,
-    # empty allowFrom and channel-not-present all fail toward UNVERIFIED.
+    # A broken instrument must never report a reachable person as absent:
+    # every unusable-config shape below fails toward UNVERIFIED, not absence.
     def test_unreadable_config_is_unverified_not_absent(self):
         os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="cfg-empty-")
         present, why = nr.discord_reachable(self._target())
