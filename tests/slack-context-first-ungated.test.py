@@ -38,11 +38,25 @@ _spec = importlib.util.spec_from_file_location("slack_bridge", REPO / "src" / "s
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
+# Isolate the task/results dirs (as bridge-skill-path-resolution already does):
+# without this the checkout's tasks/ dir accumulates admitted ids across runs
+# and already_admitted replay-drops later test writes.
+mod.TASKS_DIR = Path(_tmp) / "tasks"
+mod.RESULTS_DIR = Path(_tmp) / "results"
+mod.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+mod.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 class ContextFirstUngated(unittest.TestCase):
+    _seq = 0
+
     def _write(self, tier: str = "owner") -> str:
         uid = "U_OWNER"
-        event = {"user": uid, "channel": "CFAKE", "channel_type": "im", "ts": "1000.001"}
+        # Unique ts per call: the ingress replay-dedup (already_admitted) drops a
+        # second admission of the same provider ts, so a reused ts reads test 1's file.
+        ContextFirstUngated._seq += 1
+        event = {"user": uid, "channel": "CFAKE", "channel_type": "im",
+                 "ts": f"1000.{ContextFirstUngated._seq:03d}"}
         with patch.object(mod, "load_allowed", lambda: {uid}), \
              patch.object(mod, "_ensure_tier_map_seeded", lambda: True), \
              patch.object(mod, "load_tier_map", lambda: {uid: tier}), \
