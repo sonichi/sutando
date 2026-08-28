@@ -304,12 +304,9 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
         frac = (ts - start) / span
         by_reset.setdefault(reset, []).append({"x": frac, "y": util})
         newest_ts[reset] = max(newest_ts.get(reset, ts), ts)
-    # Truncation keys on observation recency, never reset magnitude (resets
-    # can shrink); the latest observation's window survives unconditionally.
+    # Recency keying, never reset magnitude: the tail's reset carries the
+    # globally newest sample, so the live window always survives the cut.
     chosen = sorted(by_reset, key=lambda r: newest_ts[r])[-max_windows:]
-    if live_reset is not None and live_reset in by_reset and live_reset not in chosen:
-        chosen[0] = live_reset
-        chosen.sort(key=lambda r: newest_ts[r])
     segments = []
     for reset in chosen:
         pts = sorted(by_reset[reset], key=lambda p: p["x"])

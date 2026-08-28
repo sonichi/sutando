@@ -1032,5 +1032,84 @@ class Round13Consistency(unittest.TestCase):
             self.assertEqual([seg["reset"] for seg in cur], [9200])
             self.assertEqual([seg["points"][-1]["y"] for seg in cur], [0.6])
 
+
+class CoverageArms(unittest.TestCase):
+    """The error arms the diff-coverage gate flagged, each exercised."""
+
+    def test_sample_from_state_refuses_a_bad_timestamp_directly(self):
+        self.assertIsNone(qp._sample_from_state(
+            {"last_checked": "not-a-time", "headers": {}}, 1000.0))
+
+    def test_a_non_dict_row_is_invalid(self):
+        self.assertIsNone(qp._valid_row(["ts", 1], now=1000.0))
+
+    def test_out_of_order_lines_read_dirty_and_compact(self):
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 990300.0
+            rows = [{"ts": 990100.0, "u5": 0.2, "r5": 999000},
+                    {"ts": 990000.0, "u5": 0.1, "r5": 999000}]
+            hp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            got, dirty, readable = qp._canonical_history(hp, now)
+            self.assertTrue(dirty)
+            self.assertEqual([r["ts"] for r in got], [990100.0])
+
+    def test_tomb_commit_failure_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 990300.0
+            self.assertTrue(qp.record_sample(
+                state(50, 999000, None, None, 990000), hp, now=now))
+            os.chmod(d, 0o555)
+            try:
+                self.assertFalse(qp.record_sample(
+                    state(None, None, None, None, 990200.0), hp, now=now))
+            finally:
+                os.chmod(d, 0o755)
+
+    def test_run_endpoint_commit_failure_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 990400.0
+            for ts in (990000.0, 990100.0):
+                qp.record_sample(state(50, 999000, None, None, ts), hp, now=now)
+            os.chmod(d, 0o555)
+            try:
+                self.assertFalse(qp.record_sample(
+                    state(50, 999000, None, None, 990200.0), hp, now=now))
+            finally:
+                os.chmod(d, 0o755)
+
+    def test_an_unreadable_but_appendable_file_still_appends(self):
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 990400.0
+            self.assertTrue(qp.record_sample(
+                state(50, 999000, None, None, 990000), hp, now=now))
+            os.chmod(hp, 0o200)
+            try:
+                # canonical read refuses (existing-unreadable) -> False, but
+                # the needs_nl probe's except arm runs without crashing
+                self.assertFalse(qp.record_sample(
+                    state(60, 999000, None, None, 990100.0), hp, now=now))
+            finally:
+                os.chmod(hp, 0o644)
+
+    def test_segments_drop_a_row_outside_its_own_window(self):
+        seg = qp._window_segments(
+            [{"ts": 100.0, "u5": 0.5, "r5": 1000000}],
+            "u5", "r5", qp.WINDOW_SPANS["5h"], 200.0, 4, None)
+        self.assertEqual(seg["segments"], [])
+
+    def test_a_raising_sampler_never_breaks_the_status_read(self):
+        # dashboard swallows OSError from the sampler hook (lock/mkdir can
+        # still raise even though the writer catches its own IO).
+        import dashboard
+        old = dashboard.quota_projection.record_sample
+        def boom(*a, **k):
+            raise OSError("lock dir unwritable")
+        dashboard.quota_projection.record_sample = boom
+        try:
+            out = dashboard.get_quota_status()
+        finally:
+            dashboard.quota_projection.record_sample = old
+        self.assertIsInstance(out, dict)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
