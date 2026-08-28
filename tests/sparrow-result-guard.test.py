@@ -23,6 +23,64 @@ m = importlib.import_module("ag2_sparrow.remote_gateway_bridge")
 fail = 0
 
 
+# Captured ONCE, before any helper rebinds m._STATE. Reading m._STATE at call
+# time fingerprints whichever tmpdir the last helper left behind, not the host.
+_OPERATOR_STATE_ROOT = pathlib.Path(m._STATE)
+
+# Rebinding _STATE alone is NOT enough: these are computed at IMPORT from the
+# module value, so they keep pointing at the operator's home afterwards.
+_STATE_DERIVED = ("INFLIGHT_FILE", "TASK_ROOMS_FILE", "DEDUP_ALIAS_FILE",
+                  "GATEWAY_STATUS_FILE", "OWNER_ACTIVITY_FILE",
+                  "_WITHHELD_DM_CACHE", "_WITHHELD_CONTROL_DIR")
+
+
+def _bind_state(root):
+    """Point _STATE and every import-time derived path at `root`. Returns undo()."""
+    saved = {"_STATE": m._STATE}
+    root = pathlib.Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    m._STATE = root
+    # Derived from _STATE.PARENT, so the _STATE_DERIVED loop below cannot reach
+    # them: without this the suite appends to the operator's real gateway log.
+    for name, value in (("_LOG_DIR", root.parent / "logs"),
+                        ("_LOG_FILE", root.parent / "logs" / "gateway-bridge.log"),
+                        ("_LOCK_WS", root.parent)):
+        if hasattr(m, name):
+            saved[name] = getattr(m, name)
+            setattr(m, name, value)
+    for name in _STATE_DERIVED:
+        if hasattr(m, name):
+            old = pathlib.Path(getattr(m, name))
+            saved[name] = old
+            setattr(m, name, root / old.name)
+
+    def undo():
+        for name, value in saved.items():
+            setattr(m, name, value)
+    return undo
+
+
+# `logs/` is a SIBLING of _STATE, so a fingerprint rooted at _STATE cannot see a
+# log write no matter how it walks -- the blind spot is the root, not the walk.
+_OPERATOR_WATCHED = (_OPERATOR_STATE_ROOT, _OPERATOR_STATE_ROOT.parent / "logs")
+
+
+def _operator_state_fingerprint():
+    """(path, size, mtime) for every file the module writes outside a tmpdir."""
+    out = []
+    for root in _OPERATOR_WATCHED:
+        if not root.exists():
+            continue
+        for f in sorted(root.rglob("*")):
+            if f.is_file():
+                st = f.stat()
+                out.append((str(f), st.st_size, st.st_mtime_ns))
+    return tuple(sorted(out))
+
+
+_OPERATOR_STATE_BEFORE = _operator_state_fingerprint()
+
+
 def check(cond, label):
     global fail
     print(("PASS: " if cond else "FAIL: ") + label)
@@ -172,28 +230,20 @@ with tempfile.TemporaryDirectory() as td:
     check(aowner == BODY_WITH_MARKERS and aowner_withheld is None,
           "a MONTH-ARCHIVED owner task still passes through byte-identical")
 
-    # Provenance is THIS PROCESS'S RECORD, not the bytes and not a file. Same
-    # body, opposite verdicts.
+    # A Team result closing its own lease is allowed by design now, so replay
+    # provenance no longer decides delivery. Made redundant, not removed.
     write_task(tasks, "task-replay", "team")
     m.RESULTS_DIR = results = pathlib.Path(td) / "results"
     results.mkdir(exist_ok=True)
 
     forged, forged_withheld = m._guarded_result_body(
         "task-replay", m.GATEWAY_REDELIVERY_RESULT)
-    check(forged_withheld is not None,
-          "a TEAM result emitting the replay bytes WITHOUT the record is withheld")
-    check(not any(a.kind == "skip" for a in m.parse_markers(forged).actions),
-          "and forged delivery-control bytes still cannot close their own lease")
-
-    # The collaborator path has full workspace write, so it can create any
-    # sidecar the guard reads: the OLD one must no longer buy anything.
-    (results / "task-replay.replay").write_text("")
-    spoof, spoof_withheld = m._guarded_result_body(
-        "task-replay", m.GATEWAY_REDELIVERY_RESULT)
-    check(spoof_withheld is not None,
-          "a collaborator-written .replay sidecar does NOT flip the verdict")
-    check(not any(a.kind == "skip" for a in m.parse_markers(spoof).actions),
-          "so a forged sidecar still cannot close the lease")
+    check(forged_withheld is None and forged == m.GATEWAY_REDELIVERY_RESULT,
+          "a TEAM result emitting the replay bytes WITHOUT the record is honoured")
+    check(any(a.kind == "skip" for a in m.parse_markers(forged).actions),
+          "and closes its own lease — suppression moves no data")
+    check(m._team_guard_fns()[4](m._STATE, "task-replay").is_file() is False,
+          "and it is not filed for private owner review")
 
     m._REDELIVERED.add("task-replay")
     real, real_withheld = m._guarded_result_body(
@@ -213,11 +263,15 @@ with tempfile.TemporaryDirectory() as td:
           "into a visible withheld notice on the retry")
     m._REDELIVERED.discard("task-replay")
 
-    # An agent-produced [no-send] on a Team task stays forbidden.
+    # Honoured AND recorded: the gateway binds the journal, so ag2space is not
+    # the adapter that closes a lease with no record of it.
     write_task(tasks, "task-mark", "team")
     ctrl, ctrl_withheld = m._guarded_result_body("task-mark", "[no-send]\n")
-    check(ctrl_withheld is not None,
-          "an AGENT-produced [no-send] on a Team task is still withheld")
+    check(ctrl == "[no-send]\n" and ctrl_withheld is None,
+          "an AGENT-produced [no-send] on a Team task is honoured verbatim")
+    from ag2_sparrow.team_result_guard import suppressed_record_path
+    check(suppressed_record_path(m._STATE, "task-mark").is_file(),
+          "and the gateway journals it — honoured is not the same as unrecorded")
 
     # Named instances emit `task-<inst>~<broker-id>`, which the archive lookup
     # rejected — so an archived owner task read as guest and got withheld.
@@ -297,6 +351,7 @@ def drain_once(tids, provenance=()):
     m.TASKS_DIR = tasks
     m.RESULTS_DIR = results
     m.ARCHIVE_RESULTS_DIR = results / "archive"
+    _undo_state = _bind_state(root / "state")
     m._REDELIVERED.clear()
     for tid in tids:
         write_task(tasks, tid, "team")
@@ -314,6 +369,7 @@ def drain_once(tids, provenance=()):
         return posted, inflight
     finally:
         m._req = real_req
+        _undo_state()
 
 
 # THE security property, post-#3108: a guarded tier may suppress its own
@@ -347,6 +403,7 @@ def drain_two_pass():
     m.TASKS_DIR = tasks
     m.RESULTS_DIR = results
     m.ARCHIVE_RESULTS_DIR = results / "archive"
+    _undo_two = _bind_state(root / "state")
     m._REDELIVERED.clear()
     tid = "task-retry"
     write_task(tasks, tid, "team")
@@ -378,6 +435,7 @@ def drain_two_pass():
         return first, second
     finally:
         m._req = real_req
+        _undo_two()
 
 
 first, second = drain_two_pass()
@@ -389,6 +447,14 @@ check(len(second[2]) == 1 and "[no-send]" in second[2][0]["body"],
       "the retry posts the bridge's OWN control, not the guard's notice")
 check(second[0] is False and second[1] is False,
       "the record retires only WITH the result, once the POST actually succeeds")
+
+# Two helpers leaked here before this guard existed. A census is a one-time act;
+# this is the invariant, so a third cannot reintroduce it quietly.
+_after = _operator_state_fingerprint()
+check(_after == _OPERATOR_STATE_BEFORE,
+      "HERMETIC: the operator's ~/.ag2-sparrow state/ AND logs/ are untouched")
+if _after != _OPERATOR_STATE_BEFORE:
+    print(f"       before={_OPERATOR_STATE_BEFORE}\n       after ={_after}")
 
 if fail:
     print("FAIL: sparrow result guard")
