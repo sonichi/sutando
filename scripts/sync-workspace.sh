@@ -908,8 +908,12 @@ PY
         [ -f "$_d" ] && _have="$(shasum -a 256 "$_d" 2>/dev/null | cut -d' ' -f1)"
         if [ -n "$_have" ] && [ "$_have" = "$_want" ]; then
             # The move landed; only the promote was lost. Finish it.
-            mv -f "$_i" "$_s" 2>/dev/null || return 1
-            _fsync_path_and_dir "$_s" || true
+            mv -f "$_i" "$_s" 2>/dev/null || {
+                log "snapshot: could not promote a verified intent; leaving it for the next tick"
+                return 0
+            }
+            _fsync_path_and_dir "$_s" ||
+                log "snapshot: promoted intent not confirmed durable"
             log "snapshot: completed an interrupted publish from its intent record"
         else
             # The move never landed (or landed as something else): the intent
@@ -946,13 +950,28 @@ PY
                     # Publish the INTENT first and make it durable: a crash after
                     # the swap then leaves a record the next tick can verify and
                     # complete, instead of a snapshot stranded with no provenance.
-                    printf '%s\n' "$_new" > "$_int" 2>/dev/null || true
-                    _fsync_path_and_dir "$_int" || true
-                    if mv -f "$_tmp" "$_dst" 2>/dev/null; then
-                        _fsync_path_and_dir "$_dst" || true
-                        # Promote atomically: the signature is never a partial write.
-                        mv -f "$_int" "$_sig" 2>/dev/null || printf '%s\n' "$_new" > "$_sig" 2>/dev/null || true
-                        _fsync_path_and_dir "$_sig" || true
+                    # Every step of the durability chain fails CLOSED: a
+                    # best-effort intent lets the destination be renamed with no
+                    # durable record of it, which is the stranding this exists to
+                    # prevent. No step may be skipped and continue.
+                    if ! printf '%s\n' "$_new" > "$_int" 2>/dev/null ||
+                        ! _fsync_path_and_dir "$_int"; then
+                        rm -f "$_tmp" "$_int" 2>/dev/null || true
+                        warn_operator "snapshot refused: could not durably record the publish intent for hosts/$(_host)/build_log.md; per-host copy and provenance left unchanged"
+                    elif mv -f "$_tmp" "$_dst" 2>/dev/null; then
+                        # The destination must be durable BEFORE the signature
+                        # claims it. If it is not, leave the intent: the next
+                        # tick verifies the bytes and completes or discards.
+                        if ! _fsync_path_and_dir "$_dst"; then
+                            log "snapshot: destination not confirmed durable; intent left for recovery, signature not promoted"
+                        elif ! mv -f "$_int" "$_sig" 2>/dev/null; then
+                            # Promotion is atomic-rename ONLY — an in-place write
+                            # here would reintroduce the partial signature.
+                            log "snapshot: could not promote the publish intent; intent left for recovery, signature unchanged"
+                        else
+                            _fsync_path_and_dir "$_sig" ||
+                                log "snapshot: signature promoted but not confirmed durable"
+                        fi
                     else
                         # hosts/*/ is a carried vault path: a temp left here is
                         # committed and pushed again on every subsequent sync.

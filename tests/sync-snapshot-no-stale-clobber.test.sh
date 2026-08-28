@@ -324,5 +324,85 @@ check "d) a second recovery pass changes nothing" \
       '[ "$(cat "$_SIG" 2>/dev/null)" = "$_sig_once" ] && [ ! -f "$_INT" ]'
 rm -f "$_INT" "$_SIG"
 
+echo "11. INJECTED write/fsync/rename failures: the chain fails closed, never half-published"
+# keweichen on #3198: a best-effort chain lets the destination be renamed with no
+# durable intent. Each injection asserts the destination and the signature are
+# left CONSISTENT — never a new destination with stale/absent provenance.
+_SIG="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+_INT="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha.next"
+_DST="$WORKSPACE_DIR/hosts/testhost/build_log.md"
+
+# Inject a durability failure without a seam in production code: the fsync
+# helper runs `python3 - <path>`, so a shim that refuses exactly that path makes
+# the fsync fail while every other python3 call still works.
+_fsync_shim() {
+    _fs="$(mktemp -d)"
+    cat > "$_fs/python3" <<SHIM
+#!/bin/sh
+case "\$2" in *"$1"*) exit 1 ;; esac
+exec "$(command -v python3)" "\$@"
+SHIM
+    chmod +x "$_fs/python3"
+    printf '%s' "$_fs"
+}
+
+_arm_owned_snapshot() {
+    # a clean, owned snapshot: dest == root and the signature records it
+    printf 'owned baseline\n' > "$WORKSPACE_DIR/build_log.md"
+    printf 'owned baseline\n' > "$_DST"
+    shasum -a 256 "$_DST" | cut -d' ' -f1 > "$_SIG"
+    rm -f "$_INT"
+    printf 'root moved on\n' > "$WORKSPACE_DIR/build_log.md"
+}
+
+# (a) the INTENT cannot be made durable -> the swap must not happen at all.
+_arm_owned_snapshot
+_before="$(cat "$_DST")"
+_fs="$(_fsync_shim ".snapshot-sha.next")"
+PATH="$_fs:$PATH" _snapshot_per_host_config >/dev/null 2>&1
+rm -rf "$_fs"
+check "a) intent not durable: the destination is NOT replaced" \
+      '[ "$(cat "$_DST")" = "$_before" ]'
+check "...and no intent is left behind" '[ ! -f "$_INT" ]'
+
+# (b) the DESTINATION cannot be confirmed durable -> the signature must NOT be
+# promoted; the intent survives so the next tick can verify and finish.
+_arm_owned_snapshot
+_sig_before="$(cat "$_SIG")"
+_fs="$(_fsync_shim "/build_log.md")"
+PATH="$_fs:$PATH" _snapshot_per_host_config > "$SB/b.out" 2>&1
+rm -rf "$_fs"
+check "b) destination not confirmed durable: the signature is NOT promoted" \
+      '[ "$(cat "$_SIG")" = "$_sig_before" ]'
+check "...and the intent is left for recovery" '[ -f "$_INT" ]'
+
+# ...and that leftover state is exactly what recovery is for: the next tick
+# verifies the destination's own bytes and completes the publish.
+_snapshot_per_host_config >/dev/null 2>&1
+_dst_now="$(shasum -a 256 "$_DST" | cut -d' ' -f1)"
+check "...so the NEXT tick completes it from the intent" \
+      '[ ! -f "$_INT" ] && [ "$(cat "$_SIG")" = "$_dst_now" ]'
+
+# (c) a non-atomic in-place signature write must not exist as a fallback: with
+# the promote rename failing, the signature must stay UNCHANGED rather than be
+# rewritten in place.
+_arm_owned_snapshot
+_sig_before="$(cat "$_SIG")"
+_shim="$(mktemp -d)"
+cat > "$_shim/mv" <<'SHIM'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in *.snapshot-sha) exit 1 ;; esac
+done
+exec /bin/mv "$@"
+SHIM
+chmod +x "$_shim/mv"
+PATH="$_shim:$PATH" _snapshot_per_host_config >/dev/null 2>&1
+check "c) promote rename fails: the signature is not rewritten in place" \
+      '[ "$(cat "$_SIG")" = "$_sig_before" ]'
+check "...and the intent survives for the next tick" '[ -f "$_INT" ]'
+rm -rf "$_shim"
+rm -f "$_INT"; rm -f "$_SIG"
+
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1
