@@ -145,6 +145,14 @@ sc._reset_cache_for_tests()
 
 # --- should_stream_task (owner-only) ---
 check("owner streams", ps.should_stream_task("owner") is True)
+check("collaborator streams despite team tier",
+      ps.should_stream_task("team", True) is True)
+check("team WITHOUT collaborator does not stream",
+      ps.should_stream_task("team", False) is False)
+check("collaborator flag defaults off (unchanged callers keep owner-only)",
+      ps.should_stream_task("team") is False)
+check("other tier never streams even as collaborator=False",
+      ps.should_stream_task("other") is False)
 check("owner streams (caps/space)", ps.should_stream_task("  Owner ") is True)
 check("None tier streams (legacy owner)", ps.should_stream_task(None) is True)
 check("team does NOT stream", ps.should_stream_task("team") is False)
@@ -394,6 +402,30 @@ with tempfile.TemporaryDirectory() as d:
     check("bridge: queue-count fail-soft -> 0", _db._queued_task_count() == 0)
     _db.STATE_DIR = ws / "state"
     _db.TASKS_DIR = ws / "tasks"
+
+# --- resolve_team_collaborator: the hoist ---
+
+# Collaborator status must not depend on WHICH arm produced team tier: the
+# globally-allowlisted arm never ran the old arm-local check.
+_ACC = {"groups": {"123": {"allowFrom": ["u1"], "collaborators": ["u1"]}}}
+check("hoist: globally-allowlisted team sender IS collaborator",
+      _db.resolve_team_collaborator(_ACC, "team", "u1", 123) is True)
+check("hoist: owner/other/guest never collaborate",
+      not any(_db.resolve_team_collaborator(_ACC, t_, "u1", 123)
+              for t_ in ("owner", "other", "guest", "ambient")))
+check("hoist: unlisted team sender is NOT collaborator",
+      _db.resolve_team_collaborator(_ACC, "team", "u2", 123) is False)
+
+# --- should_stream_task: the collaborator flag must not bypass the tier ---
+
+# The reviewer's exact table: with is_collaborator=True, only team streams
+# (owner streams via its own arm; None is the platform's missing-field=owner).
+for _tier, _want in [("owner", True), ("team", True), ("other", False),
+                     ("guest", False), ("ambient", False), (None, True)]:
+    check(f"tier-gate: collab flag with tier={_tier} -> {_want}",
+          ps.should_stream_task(_tier, is_collaborator=True) is _want)
+check("tier-gate: plain team (no flag) does NOT stream",
+      ps.should_stream_task("team") is False)
 
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")

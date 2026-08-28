@@ -211,8 +211,8 @@ def structural() -> list:
         fails.append("is_collaborator should default to False (fail-closed)")
 
     # Tier resolution calls the helper with the serving channel id.
-    if not re.search(r"is_collaborator\s*=\s*resolve_is_collaborator\(\s*data\s*,\s*sender_id\s*,\s*message\.channel\.id", src):
-        fails.append("tier resolution must call resolve_is_collaborator(data, sender_id, message.channel.id)")
+    if not re.search(r"is_collaborator\s*=\s*resolve_team_collaborator\(\s*_acc\s*,\s*access_tier\s*,\s*sender_id\s*,\s*message\.channel\.id", src):
+        fails.append("tier resolution must call resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id) — the hoisted, tier-gated wiring")
 
     # Codex-preamble + silent-escalate branches exclude collaborators.
     if not re.search(r'if\s+access_tier\s+in\s+\("team",\s*"other"\)\s+and\s+not\s+is_collaborator\s*:', src):
