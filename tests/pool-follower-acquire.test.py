@@ -7,6 +7,7 @@ Run: python3 tests/pool-follower-acquire.test.py   (stdlib only)
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -95,6 +96,77 @@ class AcquireTests(unittest.TestCase):
         (self.tasks / "task-y.assigned-peer.txt").write_text("x")
         self.assertIsNone(pf.acquire_work(self.tasks, self.state, "me", "lead"))
         self.assertEqual(len(list(self.tasks.iterdir())), 2)
+
+
+class AcquireCliTests(unittest.TestCase):
+    """The CLI is what SKILL.md tells a follower to run. acquire_work() being
+    correct proves nothing if no shipped entry point reaches it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "state" / "cores").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *argv):
+        out = subprocess.run(
+            [sys.executable, str(REPO / "src" / "pool_follower.py"), *argv],
+            capture_output=True, text=True, timeout=30)
+        return out.returncode, out.stdout.strip(), out.stderr.strip()
+
+    def _lead_beat(self):
+        f = self.ws / "state" / "cores" / f"{pf.LEAD_LABEL}.alive"
+        f.write_text("{}")
+        t = time.time()
+        os.utime(f, (t, t))
+
+    def test_acquire_claims_an_assignment_under_a_live_lead(self):
+        # The production shape: the lead assigned it, the follower must take it.
+        (self.ws / "tasks" / "task-demo.assigned-core-1.txt").write_text("hi")
+        self._lead_beat()
+        rc, out, _ = self._run("acquire", str(self.ws / "tasks"), "core-1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(out).name, "task-demo.claimed-core-1.txt")
+        self.assertTrue(Path(out).exists())
+
+    def test_default_lead_label_is_the_one_the_daemon_writes(self):
+        # A wrong default silently reads a missing beat, so the follower thinks
+        # the lead is dead and starts taking unassigned work it must not touch.
+        (self.ws / "tasks" / "task-free.txt").write_text("hi")
+        self._lead_beat()  # writes LEAD_LABEL.alive
+        rc, _, _ = self._run("acquire", str(self.ws / "tasks"), "core-1")
+        self.assertEqual(rc, 1, "a live lead owns the unassigned pool")
+        self.assertTrue((self.ws / "tasks" / "task-free.txt").exists())
+
+    def test_idle_is_exit_1_not_a_crash(self):
+        self._lead_beat()
+        rc, out, err = self._run("acquire", str(self.ws / "tasks"), "core-1")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertNotIn("Traceback", err)
+
+    def test_bad_usage_is_exit_2(self):
+        self.assertEqual(self._run("acquire")[0], 2)
+        self.assertEqual(self._run("acquire", "/nope/nope", "core-1")[0], 2)
+        self.assertEqual(self._run("bogus")[0], 2)
+
+    def test_skill_md_documents_a_command_that_actually_runs(self):
+        # The defect this file exists for: the documented invocation named a
+        # file that does not exist, so no follower could ever acquire.
+        skill = (REPO / "skills" / "proactive-loop-pool" / "SKILL.md").read_text()
+        self.assertIn("pool_follower.py acquire", skill)
+        self.assertNotIn("pool_follower (acquire_work).py", skill)
+
+
+class LeadLabelTests(unittest.TestCase):
+    def test_daemon_imports_the_label_rather_than_redefining_it(self):
+        src = (REPO / "scripts" / "pool-lead-daemon.py").read_text()
+        self.assertIn("LEAD_LABEL", src)
+        self.assertNotIn('LEAD_LABEL = "', src,
+                         "second definition drifts from pool_follower's")
 
 
 if __name__ == "__main__":

@@ -24,6 +24,9 @@ from task_archive import _move_without_clobbering  # noqa: E402
 
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
 HEARTBEAT_FUTURE_TOLERANCE_S = 5.0
+# The lead writes cores/<LEAD_LABEL>.alive and lead_alive() reads it; one
+# definition, imported by the daemon, so the two can never disagree.
+LEAD_LABEL = "pool-lead"
 
 _UNASSIGNED_RE = re.compile(
     r"^task-(?!.*\.(?:assigned|claimed)-)([A-Za-z0-9._~-]+)\.txt$")
@@ -151,9 +154,34 @@ def _finish_cli(argv: "list[str]") -> int:
     return 0
 
 
+_USAGE = ("usage: pool_follower.py acquire <tasks_dir> <instance> "
+          "[lead_label]\n"
+          "       pool_follower.py finish <claimed_path> <instance>")
+
+
+def _acquire_cli(argv: "list[str]") -> int:
+    """0 = claimed (path on stdout), 1 = nothing to claim, 2 = usage.
+
+    The exit codes ARE the follower contract in SKILL.md; 1 is an ordinary
+    idle tick, not an error, so callers must not treat non-zero as failure."""
+    if len(argv) not in (2, 3):
+        print(_USAGE, file=sys.stderr)
+        return 2
+    tasks = Path(argv[0]).resolve()
+    if not tasks.is_dir():
+        print(f"acquire: not a directory: {tasks}", file=sys.stderr)
+        return 2
+    got = acquire_work(tasks, tasks.parent / "state", argv[1],
+                       argv[2] if len(argv) == 3 else LEAD_LABEL)
+    if got is None:
+        return 1
+    print(got)
+    return 0
+
+
 if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1] == "finish":
-        sys.exit(_finish_cli(sys.argv[2:]))
-    print("usage: pool_follower.py finish <claimed_path> <instance>",
-          file=sys.stderr)
+    _CMDS = {"acquire": _acquire_cli, "finish": _finish_cli}
+    if len(sys.argv) >= 2 and sys.argv[1] in _CMDS:
+        sys.exit(_CMDS[sys.argv[1]](sys.argv[2:]))
+    print(_USAGE, file=sys.stderr)
     sys.exit(2)

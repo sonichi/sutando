@@ -38,29 +38,21 @@ When the arguments say `pass`, run one acquire-and-process sweep (steps below) a
 
 ## The claim step (what's different from /proactive-loop)
 
-When the task watcher emits `TASK_FILE: <basename>` for a new task, **before** reading the task body, run the claim step. There are two flavors:
+When the task watcher emits `TASK_FILE: <basename>` for a new task, **before** reading the task body, run the acquisition step. There is exactly one:
 
-### Plain claim (no channel affinity)
+```bash
+python3 src/pool_follower.py acquire "$WORKSPACE/tasks" "core-$SUTANDO_CORE_ID"
+```
 
-For voice / phone / un-channeled tasks, or as a fallback when the task body has no `channel_id:` field:
+Exit codes are the contract:
 
-1. Extract the task ID from the filename (`task-<id>.txt` → `<id>`).
-2. Run: `python3 src/pool_follower (acquire_work).py <id> $SUTANDO_CORE_ID`
-3. Exit 0 → claim won, read the printed path; Exit 1 → skip; Exit 2 → log and skip.
+- **0** — you hold the task. The claimed path is printed on stdout; read THAT path, not the name the watcher gave you (it has been renamed to `.claimed-core-<n>.txt`).
+- **1** — nothing for you this tick. An ordinary idle result, not an error: either a live lead has not assigned you anything, or another follower won the race. Skip and carry on.
+- **2** — usage or environment error. Log and skip.
 
-### Channel-affinity claim (Discord / Telegram / Slack)
+Do not extract the task id and do not peek at the body first. `acquire` scans the directory itself, honours your own assignments in priority order, and only opens the unassigned pool when the lead's heartbeat has gone stale. Reading before claiming is what lets two sessions execute the same task.
 
-For tasks with a `channel_id:` field in the body (`#884`):
-
-1. Extract the task ID from the filename.
-2. Peek at the task body (without claiming yet) to read the `channel_id:` line. (Use `head` / `grep` — don't run a full Read tool yet since other cores may grab the task first.)
-3. Run: `python3 src/claim_task.py <id> $SUTANDO_CORE_ID <channel_id>`
-4. Outcomes:
-   - **Exit 0** → claim won. Script prints the renamed path (`tasks/task-<id>.claimed-core-<n>.txt`). Read THIS path. Your core is now the channel's handler for the next 30 min (default `SUTANDO_CORE_IDLE_THRESHOLD_SEC`).
-   - **Exit 1** → respect-handler OR lost-race. Either another core is the channel's active handler, or another core won the race-claim. Skip this task entirely.
-   - **Exit 2** → validation error. Log and skip.
-
-The affinity machinery is **inside** `claim_task.py` — your only responsibility is to pass `channel_id` when present. The script reads `state/cores/channel-<id>.handler` and `state/cores/core-<n>.alive` to decide whether you're allowed to claim.
+**Channel affinity is the lead's job, not yours.** Under a live lead the assignment you receive has already had affinity applied, so there is no separate channel-affinity claim to make. `src/claim_task.py` is the pre-pool leaderless claimer; it does not recognise `.assigned-core-<n>` names and returns None for them, so calling it on an assignment silently does nothing.
 
 Use the renamed `task-<id>.claimed-core-<n>.txt` path for all subsequent reads + result writes.
 

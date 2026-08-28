@@ -27,12 +27,12 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "src"))
 sys.path.insert(0, str(_HERE.parent / "src" / "runtime-api"))
 
-from pool_follower import HEARTBEAT_FUTURE_TOLERANCE_S, LEAD_STALE_S
+from pool_follower import (HEARTBEAT_FUTURE_TOLERANCE_S, LEAD_LABEL,
+                           LEAD_STALE_S)
 from pool_lead import PoolLead
 from pool_metrics import PoolMetrics
 from pool_status import PoolStatusWriter
 
-LEAD_LABEL = "pool-lead"
 
 
 def _workspace() -> Path:
