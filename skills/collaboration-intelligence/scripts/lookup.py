@@ -27,10 +27,21 @@ def load(d):
     yp = d / "quick-lookup.yaml"
     if yp.exists():
         import yaml
-        q = yaml.safe_load(yp.read_text())["quick_lookup"]
+        # Three live store states: wrapped {quick_lookup:...}, flat {people:...},
+        # and MALFORMED (hand-edited/synced yaml) — degrade, never starve the roster.
+        try:
+            raw = yaml.safe_load(yp.read_text()) or {}
+        except Exception as e:
+            print(f"warning: {yp} unparseable ({type(e).__name__}) — using roster only",
+                  file=sys.stderr)
+            raw = {}
+        q = raw.get("quick_lookup") or raw if isinstance(raw, dict) else {}
         ep = d / "entities.yaml"
         if ep.exists():
-            ents = yaml.safe_load(ep.read_text()).get("entities") or []
+            try:
+                ents = yaml.safe_load(ep.read_text()).get("entities") or []
+            except Exception:
+                ents = []
     return q, ents
 
 
@@ -70,13 +81,18 @@ def match(rows, needle, ents=()):
     # other people and repos, so a hit there is about the subject, not the person.
     strong = [r for r in rows
               if n in str(r.get("entity_id", "")).lower()
+              or n in str(r.get("id", "")).lower()
               or n in str(r.get("agent_mxid", "")).lower()
               or n == str(r.get("github", "")).lower()
               or n in str(r.get("human", "")).lower()
               or r.get("entity_id") in by_ident]
     if strong:
-        return strong
-    return [r for r in rows if n in str(r.get("one_line", "")).lower()]
+        # Multi-host merges leave one person under several keys; a field-poor
+        # duplicate must not shadow the row that carries an addressable Stand.
+        return sorted(strong, key=lambda r: not str(r.get("agent_mxid") or "").strip())
+    return [r for r in rows
+            if n in str(r.get("one_line", "")).lower()
+            or n in str(r.get("who", "")).lower()]
 
 def ids_for(ents, entity_id):
     for e in ents:
@@ -95,7 +111,7 @@ def main():
         print(f"MAP MISSING at {d}\n  -> persistence unavailable. Send anyway; say the identity is unverified.")
         return 0
     q, ents = load(d)
-    rows = (q.get("recent_entities") or []) + load_roster(d)
+    rows = (q.get("recent_entities") or q.get("people") or []) + load_roster(d)
     if not rows:
         print(f"MAP EMPTY at {d} (no quick-lookup.yaml rows, no reviewer-stands.json)\n"
               "  -> persistence unavailable. Send anyway; say the identity is unverified.")
