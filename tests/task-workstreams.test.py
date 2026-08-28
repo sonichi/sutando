@@ -476,6 +476,29 @@ def test_a_vanished_predecessor_is_not_an_error() -> None:
     assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
 
 
+def test_a_directory_wearing_a_task_name_is_never_archived() -> None:
+    # find_task_file resolves by NAME, not type, so dropping the parent's
+    # is_file() would relocate a whole directory into the archive.
+    for suffix in ("", ".assigned-core-1"):
+        workspace = fixture_workspace()
+        first = workstreams.maybe_enqueue_classifier_task(workspace)
+        real = workspace / "tasks" / f"{first.task_id}.txt"
+        real.unlink()
+        impostor = workspace / "tasks" / f"{first.task_id}{suffix}.txt"
+        impostor.mkdir()
+        (impostor / "payload.txt").write_text("must survive")
+        state_path = workspace / "state" / "task-workstream-classifier.json"
+        state = json.loads(state_path.read_text())
+        state["enqueued_at"] = 0
+        state_path.write_text(json.dumps(state))
+
+        workstreams.maybe_enqueue_classifier_task(workspace)
+
+        assert impostor.is_dir(), f"directory {suffix or '(bare)'} was moved"
+        assert (impostor / "payload.txt").read_text() == "must survive"
+        assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+
+
 def test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors() -> None:
     workspace = fixture_workspace()
     stop = threading.Event()
@@ -871,6 +894,7 @@ def main() -> None:
         test_a_worker_held_classifier_claim_is_left_alone,
         test_an_assigned_and_claimed_pair_still_leaves_the_claim_alone,
         test_a_vanished_predecessor_is_not_an_error,
+        test_a_directory_wearing_a_task_name_is_never_archived,
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
         test_workstream_context_is_prior_owner_only_bounded_and_untrusted,
         test_workstream_context_has_a_total_serialized_byte_cap,

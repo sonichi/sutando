@@ -1080,7 +1080,9 @@ def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
     # lookup here misses and the supersede silently no-ops.
     tasks_dir = Path(workspace) / "tasks"
     task_path = find_task_file(tasks_dir, task_id)
-    if task_path is None:
+    # find_task_file resolves by name, not by type, so keep the parent's
+    # file-type guard: a same-named DIRECTORY must not be os.replace'd away.
+    if task_path is None or not task_path.is_file():
         return False
     # Ask whether ANY claimed variant exists, not whether the returned one is
     # claimed: find_task_file sorts, and `.assigned-` sorts before `.claimed-`.
