@@ -87,8 +87,15 @@ def behavioral() -> list:
         if withheld != expect:
             fails.append(f"{name}: expected withheld={expect}, got {withheld} ({why})")
             continue
-        if withheld and out != guard.TEAM_LEAK_RESULT:
-            fails.append(f"{name}: withheld but body was not the leak sentinel")
+        if withheld:
+            # A marker-triggered withhold names the marker class (no content
+            # claim); every other withhold reason stays generic.
+            if why == "result delivery control marker":
+                sentinel = guard.TEAM_LEAK_RESULT_MARKER
+            else:
+                sentinel = guard.TEAM_LEAK_RESULT
+            if out != sentinel:
+                fails.append(f"{name}: withheld but body was not the expected sentinel")
         if not withheld and out != body:
             fails.append(f"{name}: passed but body was altered")
 
@@ -106,7 +113,7 @@ def behavioral() -> list:
     out, why = guard.guard_result_for_tier(
         "[attach: /etc/passwd]", "team", REPO, secret_filter=_clean,
         scan_sensitive_data=False)
-    if out != guard.TEAM_LEAK_RESULT or not why:
+    if out != guard.TEAM_LEAK_RESULT_MARKER or not why:
         fails.append("delivery-control markers must stay guarded when scanning is off")
 
     with tempfile.TemporaryDirectory() as td:
@@ -296,12 +303,43 @@ def structural() -> list:
     return fails
 
 
+def notice_class() -> list:
+    """Marker withholds name the marker class; content withholds stay generic,
+    so a probe hit is never confirmed to the sender."""
+    fails = []
+    out, reason = guard.guard_result_for_tier(
+        "[channel: 123456789012345678]\nbody", "team", REPO, secret_filter=_clean)
+    if reason != "result delivery control marker" or "delivery-control marker" not in out \
+            or "content" in out.lower():
+        fails.append(f"marker notice must claim ONLY the marker: {reason!r} / {out[:80]!r}")
+    # The marker raises before the scanner runs, so the notice must never
+    # assert a content conclusion on any marker path.
+    for name, kwargs, filt in (
+            ("marker+secret", {}, _leaky),
+            ("marker+scanner-failure", {}, _raises),
+            ("marker+scan-disabled", {"scan_sensitive_data": False}, _clean)):
+        o, r = guard.guard_result_for_tier(
+            "[channel: 123456789012345678]\nghp_" + "a" * 36, "team", REPO,
+            secret_filter=filt, **kwargs)
+        if o != guard.TEAM_LEAK_RESULT_MARKER or not r:
+            fails.append(f"{name}: expected the marker notice, got {o[:60]!r}")
+        if "content" in o.lower():
+            fails.append(f"{name}: notice asserts a content conclusion the guard never evaluated")
+    out2, reason2 = guard.guard_result_for_tier(
+        "the token is ghp_" + "a" * 36, "team", REPO, secret_filter=_leaky)
+    if reason2 is None:
+        fails.append("secret control did not withhold at all (fixture broken)")
+    elif "delivery-control marker" in out2 or "may contain sensitive information" not in out2:
+        fails.append(f"secret withhold is not generic: {out2[:100]!r}")
+    return fails
+
+
 def main() -> int:
     for path in (BRIDGE,):
         if not path.exists():
             print(f"FAIL: missing {path}")
             return 1
-    fails = behavioral() + structural()
+    fails = behavioral() + notice_class() + structural()
     if fails:
         print("FAIL: team result guard has issues:")
         for f in fails:
