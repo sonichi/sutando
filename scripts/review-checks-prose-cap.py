@@ -18,19 +18,59 @@ INDEX = re.compile(r"^index [0-9a-f]+\.\.([0-9a-f]+)")
 # Fallbacks only. review-checks.sh normally supplies both from REVIEW.md.
 DEFAULT_CAP = 2
 DEFAULT_EXTS = (".py",)
-# Classification is `tokenize`, so only Python comment syntax is decidable here.
-# Any other extension yields zero COMMENT tokens — a clean PASS over unread text.
-SUPPORTED_EXTS = (".py", ".pyi")
+# Each extension needs a classifier that can tell a comment from a `#` in data.
+# Guessing is what this check exists to prevent, so an unlisted ext fails closed.
+SUPPORTED_EXTS = (".py", ".pyi", ".sh", ".bash")
+
+# `<<<` is a here-STRING, not a heredoc; guard BOTH sides or the match lands at
+# offset 1 of `<<<` and opens a heredoc that never terminates.
+_HEREDOC = re.compile(r"""(?<!<)<<(?!<)-?\s*(?:(['"])([A-Za-z_]\w*)\1|([A-Za-z_]\w*))""")
 
 
 def comment_lines(path):
-    """Line numbers carrying a COMMENT token, or None if the file cannot be tokenized."""
+    """Line numbers carrying a COMMENT, or None if the file cannot be classified."""
+    if path.endswith((".sh", ".bash")):
+        return _shell_comment_lines(path)
     try:
         with open(path, "rb") as fh:
             return {t.start[0] for t in tokenize.tokenize(fh.readline)
                     if t.type == tokenize.COMMENT}
     except (OSError, SyntaxError, tokenize.TokenError, UnicodeDecodeError):
         return None
+
+
+def _shell_comment_lines(path):
+    """Full-line shell comments, heredoc bodies excluded.
+
+    The cap counts runs of lines that are ENTIRELY comments, so a mid-line `#`
+    (`${v#pat}`, `"a#b"`) can never open one and needs no lexing. The live
+    hazard is a heredoc BODY line starting with `#`: 400 such lines across this
+    repo's .sh files would otherwise be miscounted as comments.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    out, term, tabs = set(), None, False
+    for n, line in enumerate(lines, 1):
+        if term is not None:
+            candidate = line.lstrip("\t") if tabs else line
+            if candidate.strip() == term:
+                term = None
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            if n != 1 or not stripped.startswith("#!"):
+                out.add(n)
+            continue
+        m = _HEREDOC.search(line)
+        if m:
+            term = m.group(2) or m.group(3)
+            tabs = "<<-" in line
+    # An unterminated heredoc means a `<<` we could not place (e.g. inside a
+    # string literal); from there on body and code are indistinguishable.
+    return None if term is not None else out
 
 
 def added_by_file(diff_text):
