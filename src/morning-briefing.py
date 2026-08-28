@@ -143,6 +143,21 @@ def _read_calendar_cache() -> list[dict] | None:
     return events
 
 
+def _google_cache_configured() -> bool:
+    """True when this host has a Google-calendar cache on disk (any date).
+
+    Reaching the local fallback means the cache was absent, stale or corrupt.
+    A cache that EXISTS but is not today's is evidence the owner's real
+    calendar lives in Google, so an empty local read is a blind source rather
+    than a verified-empty day.
+    """
+    try:
+        data = json.loads(CALENDAR_CACHE_FILE.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and "date" in data
+
+
 def _parse_start(ev: dict):
     """Return an aware datetime for `ev['start']`, or None if absent/unparseable.
 
@@ -200,7 +215,9 @@ def get_calendar_events() -> list[dict] | None:
       1. The Google-calendar cache (``state/calendar-today.json``) written by the
          core agent — the ONLY source that sees the owner's Google Workspace
          calendar, which a local macOS Calendar.app may not have subscribed.
-      2. Local macOS Calendar.app via AppleScript (fallback).
+      2. Local macOS Calendar.app via AppleScript (fallback). An EMPTY result
+         from this source is only trusted on hosts that have never written a
+         Google cache; where one exists, empty means blind, so None is returned.
 
     Returns a list of events ([] means verified empty) or None when the calendar
     could not be read — callers must not render None as "clear".
@@ -310,6 +327,14 @@ return output
             continue
         seen.add(key)
         events.append({"raw": event_str, "calendar": cal_name})
+    if not events and _google_cache_configured():
+        # Local Calendar.app carries none of the Google work account here, so
+        # an empty read is "I cannot see it", never "the day is clear".
+        print(
+            "  calendar: local read empty but this host has a Google cache — reporting unread",
+            file=sys.stderr,
+        )
+        return None
     return events
 
 
