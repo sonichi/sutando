@@ -634,6 +634,29 @@ for(const[k,el]of[['5h','qs-5h'],['7d','qs-7d']]){
 </script>"""
 
 
+def get_current_model() -> str:
+    """The core's active model, read from the newest session-transcript entry.
+
+    The credential proxy cannot supply this (it serves tokens, never API
+    bodies); the transcript is the one durable place the harness records the
+    model actually answering. Empty string when unreadable — the tile shows
+    nothing rather than a guess."""
+    try:
+        # newest transcript across ALL project dirs — the mtime-newest DIR can
+        # be a transcript-less worktree ghost (measured on this host)
+        tr = max((WORKSPACE_DIR / ".claude-sutando" / "projects").glob("*/*.jsonl"),
+                 key=lambda f: f.stat().st_mtime)
+        size = tr.stat().st_size
+        with open(tr, "rb") as f:
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode("utf-8", errors="replace")
+        import re as _re
+        hits = _re.findall(r'"model":"([^"]+)"', tail)
+        return hits[-1] if hits else ""
+    except Exception:
+        return ""
+
+
 def render_dashboard() -> str:
     health = get_health()
     activity = get_activity(5)
@@ -672,6 +695,7 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-5h" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "5h") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-5h" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
 <div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-7d" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "7d") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-7d" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
+<div class="stat"><div class="stat-val" style="font-size:13px;color:#a8a8d0">{get_current_model() or "—"}</div><div class="stat-label">Model</div></div>
 </div>""" + _QUOTA_SPARK_JS + """</div>""")
 
     # Services (ports + daemons only)
