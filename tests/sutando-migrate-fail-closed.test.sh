@@ -12,6 +12,14 @@ MIGRATE="$REPO/scripts/sutando-migrate.sh"
 TMP="$(mktemp -d -t sutando-mig-failclosed.XXXXXX)"
 trap 'chmod -R u+w "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
 
+# Portable octal file mode. `stat -f %Lp` is the BSD/macOS spelling; on GNU
+# coreutils `-f` is --file-system, which EXITS 0 printing filesystem info — so
+# a `stat -f ... || stat -c ...` chain never reaches its fallback on Linux and
+# compares the wrong command's output. Ask python; it means the same on both.
+_mode() {
+    python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$1"
+}
+
 pass=0
 fail=0
 check() {
@@ -98,7 +106,7 @@ ln -s "$OUTSIDE" "$CASE_DEST/hosts"
 rc=0; RUN --commit > "$TMP/symlink.log" 2>&1 || rc=$?
 check "commit exits non-zero" [ "$rc" -ne 0 ]
 check "nothing was created outside the dest root" [ -z "$(ls -A "$OUTSIDE")" ]
-check "the outside dir's mode is untouched" [ "$(/usr/bin/stat -f %Lp "$OUTSIDE" 2>/dev/null || /usr/bin/stat -c %a "$OUTSIDE")" = "755" ]
+check "the outside dir's mode is untouched" [ "$(_mode "$OUTSIDE")" = "755" ]
 check "NO sentinel was written" no_sentinel
 check "the escape is named in output" grep -q "escapes the dest root" "$TMP/symlink.log"
 
@@ -263,10 +271,8 @@ rc=0; RUN --commit > "$TMP/modes-commit.log" 2>&1 || rc=$?
 check "private-input union commit succeeds" [ "$rc" -eq 0 ]
 MODE_DST="$CASE_DEST/state/slack-allowed-recipients.json"
 MODE_MANIFEST="$(ls "$CASE_DEST/state/.migration-union-scalars-"*.json | head -1)"
-check "the union file is still private" \
-    bash -c "[ \"\$(stat -f '%Lp' '$MODE_DST' 2>/dev/null || stat -c '%a' '$MODE_DST')\" = 600 ]"
-check "the manifest is no wider than the union it describes" \
-    bash -c "[ \"\$(stat -f '%Lp' '$MODE_MANIFEST' 2>/dev/null || stat -c '%a' '$MODE_MANIFEST')\" = 600 ]"
+check "the union file is still private" [ "$(_mode "$MODE_DST")" = "600" ]
+check "the manifest is no wider than the union it describes" [ "$(_mode "$MODE_MANIFEST")" = "600" ]
 check "the manifest carries the union's private scalar (so its mode matters)" \
     bash -c "grep -q schemaVersion '$MODE_MANIFEST'"
 check "the commit recorded the expected union mode" \
