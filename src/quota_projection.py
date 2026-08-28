@@ -103,6 +103,10 @@ def _valid_row(rec: dict, now: float) -> dict | None:
     ts = _finite(rec.get("ts"))
     if ts is None or not (0 < ts <= now + MAX_FUTURE_SKEW_S):
         return None
+    if rec.get("tomb") is True:
+        # All-invalid observation: no chart data, but it advances the order
+        # guard so a delayed older sample cannot slip in after sidecar loss.
+        return {"ts": ts, "tomb": True}
     out = {"ts": ts}
     for w, (uk, rk) in _WINDOW_KEYS.items():
         u, r = _finite(rec.get(uk)), _finite(rec.get(rk))
@@ -208,9 +212,8 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
     import time
     clock = time.time() if now is None else now
     ts = _observation_ts(state)
-    if ts is None or not (0 < ts <= clock + MAX_FUTURE_SKEW_S):
-        return False
-    sample = _sample_from_state(state, clock)
+    ts_ok = ts is not None and (0 < ts <= clock + MAX_FUTURE_SKEW_S)
+    sample = _sample_from_state(state, clock) if ts_ok else None
 
     def _cap(rows):
         if len(rows) <= MAX_LINES:
@@ -218,6 +221,10 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
         return rows[len(rows) - MAX_LINES:]
 
     def _commit(rows):
+        # Only the tail tombstone is the high-water mark; strip superseded
+        # ones before the cap so markers never starve data rows of slots.
+        rows = [r for i, r in enumerate(rows)
+                if not r.get("tomb") or i == len(rows) - 1]
         rows = _cap(rows)
         fd, tmp = tempfile.mkstemp(dir=str(history_path.parent))
         with os.fdopen(fd, "w") as f:
@@ -239,13 +246,6 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                 history, dirty, readable = _canonical_history(history_path, clock)
                 if not readable:
                     return False  # never fork an unreadable record
-                latest = _read_latest(history_path, clock)
-                tail_ts = float(history[-1]["ts"]) if history else None
-                # A replacement candidate must beat BOTH records: a lost or
-                # corrupt sidecar must never let an older window read current.
-                newer = ((latest is None or ts > float(latest.get("ts", 0)))
-                         and (tail_ts is None or ts > tail_ts))
-
                 def _refuse():
                     # The cap and compaction are owed on every path, including
                     # the ones that acknowledge nothing.
@@ -253,12 +253,26 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                         _commit(history)
                     return False
 
+                if not ts_ok:
+                    # No usable observation time: neither record moves, but
+                    # the cap and compaction stay owed on the existing file.
+                    return _refuse()
+                latest = _read_latest(history_path, clock)
+                tail_ts = float(history[-1]["ts"]) if history else None
+                # A replacement candidate must beat BOTH records: a lost or
+                # corrupt sidecar must never let an older window read current.
+                newer = ((latest is None or ts > float(latest.get("ts", 0)))
+                         and (tail_ts is None or ts > tail_ts))
                 if sample is None:
-                    # Valid observation time, no valid window: tombstone both
-                    # so the chart stops presenting anything as current.
+                    # Valid time, no valid window: tombstone sidecar AND history
+                    # so the high-water mark survives sidecar loss.
                     if newer:
                         _write_latest(history_path, {"ts": ts}, ts)
-                    return _refuse()
+                    tail = float(history[-1]["ts"]) if history else None
+                    if tail is not None and ts <= tail:
+                        return _refuse()
+                    _commit(history + [{"ts": ts, "tomb": True}])
+                    return False
                 if newer:
                     _write_latest(history_path, sample, ts)
                 if history:
@@ -301,6 +315,7 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
     inside every segment is y = x, so above it is over-use, below under-use.
     """
     by_reset: dict[int, list[dict]] = {}
+    newest_ts: dict[int, float] = {}
     for rec in history:
         try:
             reset = int(rec[r_key])
@@ -313,12 +328,21 @@ def _window_segments(history: list[dict], u_key: str, r_key: str,
             continue  # a sample outside its own window is clock skew; drop it
         frac = (ts - start) / span
         by_reset.setdefault(reset, []).append({"x": frac, "y": util})
+        newest_ts[reset] = max(newest_ts.get(reset, ts), ts)
+    # Truncation keys on observation recency, never reset magnitude (resets
+    # can shrink); the latest observation's window survives unconditionally.
+    chosen = sorted(by_reset, key=lambda r: newest_ts[r])[-max_windows:]
+    if live_reset is not None and live_reset in by_reset and live_reset not in chosen:
+        chosen[0] = live_reset
+        chosen.sort(key=lambda r: newest_ts[r])
     segments = []
-    for reset in sorted(by_reset)[-max_windows:]:
+    for reset in chosen:
         pts = sorted(by_reset[reset], key=lambda p: p["x"])
         # Current = the latest observation's window (resets can shrink; a
-        # stale segment must not out-shout it). Tombstoned -> nothing current.
-        current = live_reset is not None and reset == live_reset
+        # stale segment must not out-shout it), and only while the window is
+        # still open: an expired reset is history, never current or projected.
+        current = (live_reset is not None and reset == live_reset
+                   and now <= reset)
         seg = {"reset": reset, "current": current, "points": pts}
         if current and pts:
             # Projection extends only from the last VERIFIED observation; a

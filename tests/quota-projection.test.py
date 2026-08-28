@@ -149,7 +149,8 @@ class RecordSample(unittest.TestCase):
         # A negative utilization now invalidates its window at ingest.
         self.assertFalse(qp.record_sample(
             state(u5="-1e308", u7=None, obs=2000.0), self.path))
-        self.assertFalse(self.path.exists())
+        # the observation lands only as a data-free tombstone marker
+        self.assertNotIn("u5", self.path.read_text())
         # and a stored negative row is refused by the reader
         import json as js
         self.path.write_text(js.dumps(
@@ -264,7 +265,9 @@ class RecordSample(unittest.TestCase):
         ok = qp.record_sample(
             state(obs=1000.5, r5="1000.9", r7="1000.9"), self.path)
         self.assertFalse(ok)
-        self.assertFalse(self.path.exists())
+        # read-back yields no window data; only the tombstone marker remains
+        recs = qp._read_history(self.path, now=2000.0)
+        self.assertEqual([k for r in recs for k in r if k not in ("ts", "tomb")], [])
 
     def test_an_overflowing_integer_is_invalid_not_fatal(self):
         # json.loads accepts arbitrarily huge ints; float() raises
@@ -281,7 +284,11 @@ class RecordSample(unittest.TestCase):
         for bad in ("NaN", "Infinity", "-Infinity"):
             self.assertFalse(qp.record_sample(
                 state(u5=bad, u7=bad, obs=1000.0), self.path))
-        self.assertFalse(self.path.exists())
+        # one tombstone marker from the first refusal; re-polls at the same
+        # ts add nothing, and no utilization value ever reaches the file
+        lines = self.path.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("u5", lines[0])
 
     def test_a_poisoned_window_does_not_sink_the_valid_one(self):
         # Per-window persistence (5th round): NaN in 5h leaves a valid 7d-only
@@ -408,8 +415,12 @@ class RecordSample(unittest.TestCase):
             self.assertFalse(qp.record_sample(bad, self.path, now=obs))
             n = len(self.path.read_text().splitlines())
             self.assertLessEqual(n, qp.MAX_LINES, f"file still over cap: {n}")
-            self.assertEqual([r["ts"] for r in qp._read_history(self.path, obs)],
-                             [990002.0, 990003.0, 990004.0, 990005.0, 990006.0])
+            rows = qp._read_history(self.path, obs)
+            # the marker takes the tail slot (correctness outranks one point)
+            self.assertEqual([r["ts"] for r in rows if not r.get("tomb")],
+                             [990003.0, 990004.0, 990005.0, 990006.0])
+            self.assertTrue(rows[-1].get("tomb"))
+            self.assertEqual(rows[-1]["ts"], obs)
         finally:
             qp.MAX_LINES = old_max
 
@@ -785,6 +796,86 @@ class DashboardWiring(unittest.TestCase):
             if "quota-history" in line:
                 self.assertIn("quota_projection.", src[max(0, src.index(line) - 200):src.index(line) + len(line)],
                               f"history path used outside the module call: {line.strip()}")
+
+
+
+class Round12Controls(unittest.TestCase):
+    """kewei round-9 P1s + qingyun's ts-refusal cap — each fails at 7e88ceec."""
+
+    def test_tombstone_survives_sidecar_loss(self):
+        # valid 990000 -> tombstone 990200 -> sidecar deleted -> delayed
+        # 990100 must be REJECTED: the marker row is the high-water mark.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"
+            now = 990300.0
+            self.assertTrue(qp.record_sample(
+                state(50, 999000, 40, 1200000, 990000), hp, now=now))
+            self.assertFalse(qp.record_sample(
+                state(None, None, None, None, 990200.0), hp, now=now))
+            qp._latest_path(hp).unlink()
+            self.assertFalse(qp.record_sample(
+                state(60, 999100, 45, 1200000, 990100), hp, now=now))
+            rows = qp._read_history(hp, now=now)
+            self.assertNotIn(990100.0, [r["ts"] for r in rows])
+            payload = qp.chart_payload(hp, now=now)
+            self.assertEqual(
+                [s for s in payload["windows"]["5h"]["segments"]
+                 if s["current"]], [])
+
+    def test_truncation_keeps_the_newest_smaller_reset(self):
+        # Five stale larger resets + a newer smaller one: magnitude-keyed
+        # truncation dropped reset 1600 (current=[]); recency keying keeps it.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"
+            now = 1560.0
+            fixtures = ((17500, 100), (18000, 200), (18500, 600),
+                        (19000, 1100), (19500, 1501))
+            for i, (reset, ts) in enumerate(fixtures):
+                self.assertTrue(qp.record_sample(
+                    state(10 + i, reset, None, None, float(ts)),
+                    hp, now=now))
+            self.assertTrue(qp.record_sample(
+                state(30, 1600, None, None, 1550.0), hp, now=now))
+            payload = qp.chart_payload(hp, now=now)
+            cur = [s for s in payload["windows"]["5h"]["segments"]
+                   if s["current"]]
+            self.assertEqual([s["reset"] for s in cur], [1600])
+
+    def test_an_expired_reset_is_never_current_or_projected(self):
+        # First sample lands long after its own reset passed: history yes,
+        # current/projection no.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"
+            self.assertTrue(qp.record_sample(
+                state(72, 101000, None, None, 100000), hp, now=100001.0))
+            payload = qp.chart_payload(hp, now=200000.0)
+            segs = payload["windows"]["5h"]["segments"]
+            self.assertTrue(segs)
+            self.assertFalse(any(s["current"] for s in segs))
+            self.assertFalse(any("projected_end" in s for s in segs))
+
+    def test_missing_timestamp_still_pays_the_cap(self):
+        # qingyun P1: the ts-refusal path owes the same locked cap/compaction.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"
+            now = 990100.0
+            rows = [json.dumps({"ts": 989000.0 + i, "u5": 1.0 + i,
+                                "r5": 990000 + i}) for i in range(7)]
+            hp.write_text("\n".join(rows) + "\n")
+            old = qp.MAX_LINES
+            qp.MAX_LINES = 5
+            try:
+                self.assertFalse(qp.record_sample(
+                    {"headers": {}}, hp, now=now))
+                self.assertLessEqual(
+                    len(hp.read_text().splitlines()), 5)
+                self.assertFalse(qp.record_sample(
+                    {"headers": {}, "last_checked": float("nan")}, hp,
+                    now=now))
+                self.assertLessEqual(
+                    len(hp.read_text().splitlines()), 5)
+            finally:
+                qp.MAX_LINES = old
 
 
 if __name__ == "__main__":
