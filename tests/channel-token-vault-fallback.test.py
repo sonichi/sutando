@@ -379,6 +379,20 @@ def main() -> int:
     check("no token in any source yields ''",
           ct.gateway_token(environ={}, vault_get=lambda v: "") == "")
 
+    # An undecodable .env is ABSENCE, never a mojibake bearer: errors="replace"
+    # turns unreadable bytes into a string that every caller reads as a token.
+    bf = tempfile.NamedTemporaryFile("wb", suffix=".env", delete=False)
+    bf.write(b"REMOTE_TASK_TOKEN=\xff\xfe\x00binary\n")
+    bf.close()
+    check("undecodable file reads as absence, not a garbage token",
+          ct.token_from_env_file(CANON, Path(bf.name)) == "")
+    # Positive control: the '' above is the FILE tier declining, not every tier
+    # failing — the vault still answers behind it.
+    check("gateway_token falls through an undecodable file to the vault",
+          ct.gateway_token(env_file=Path(bf.name), environ={},
+                           vault_get=lambda v: "vault-tok"
+                           if v == CANON else "") == "vault-tok")
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")

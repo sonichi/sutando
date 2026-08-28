@@ -72,10 +72,10 @@ def _clean(value: object) -> str:
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
     try:
-        # errors="replace": one non-UTF-8 byte would otherwise raise past the
-        # OSError guard and crash a caller that asked a yes/no question.
-        text = env_file.read_text(errors="replace")
-    except OSError:
+        # UnicodeDecodeError is not an OSError, so without it here an undecodable
+        # file raises past the guard instead of reading as the absence promised.
+        text = env_file.read_text()
+    except (OSError, UnicodeDecodeError):
         return ""
     for line in text.splitlines():
         line = line.strip()
