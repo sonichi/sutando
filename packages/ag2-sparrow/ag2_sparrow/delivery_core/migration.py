@@ -67,6 +67,12 @@ def _same_bytes(path: Path, payload: bytes) -> bool:
         return False
 
 
+def _retire_budget(ap: Path) -> None:
+    """A terminal ends the cycle, so its attempt budget dies with it — C does
+    this on completion, and an imported terminal must not leave one live."""
+    ap.unlink(missing_ok=True)
+
+
 def _reconcile_marker(c, marker: Path, payload: bytes, key: str,
                       report: dict, conflicts: list, counter: str) -> None:
     """Stage `payload` at `marker`, or reconcile with what is already there.
@@ -92,14 +98,13 @@ def _receipt_matches(records, rec) -> bool:
     return False
 
 
-def _attempts_intact(ap: Path) -> bool:
-    """An attempts file counts as written only if it parses as the integer
-    it is supposed to hold — a legacy truncated file must be repaired."""
+def _attempts_value(ap: Path) -> Optional[int]:
+    """The count an attempts file holds, or None when absent or unreadable.
+    A file that merely PARSES can still hold a previous cycle's number."""
     try:
-        int(ap.read_text(encoding="utf-8").strip())
+        return int(ap.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
-        return False
-    return True
+        return None
 
 
 def classify_legacy_sentinel(
@@ -276,12 +281,13 @@ def import_a_state(root: Path) -> dict:
         status = rec.get("status", "QUEUED")
         payload = rec.get("payload", "").encode("utf-8")
         n = int(rec.get("attempts", 0) or 0)
-        if n:
-            ap = c._attempts_path(key)
-            # Existence alone is not proof of a complete write: a pre-staging
-            # crash could leave a truncated file at the final name. Repair it.
-            if not _attempts_intact(ap):
-                _stage(c, ap, str(n).encode())
+        ap = c._attempts_path(key)
+        # Bind to A's CURRENT count, not to the file parsing: a stale or
+        # truncated file otherwise becomes this cycle's budget. Absent reads 0.
+        if not n:
+            ap.unlink(missing_ok=True)
+        elif _attempts_value(ap) != n:
+            _stage(c, ap, str(n).encode())
         from . import contract as _contract  # noqa: F401 — outcome names below
         import ag2_sparrow.outbox as _outbox
         claim = _outbox.read_delivery_claim(root, item_id)
@@ -295,6 +301,7 @@ def import_a_state(root: Path) -> dict:
                     # Presence proves SOME cycle imported this key, not
                     # THIS A record; a republish would serve the old receipt.
                     if _receipt_matches(_recs, rec):
+                        _retire_budget(ap)
                         report["skipped"] += 1
                     else:
                         conflicts.append(key)
@@ -321,6 +328,7 @@ def import_a_state(root: Path) -> dict:
                 "attempts": n, "imported": True,
                 "incarnation": f"{key}{SEP}{_safe_component('a-import')}",
             }, f"a-import{SEP}{key}")
+            _retire_budget(ap)
             report["delivered"] += 1
         elif status == "PARKED":
             reason = _safe_component(str(rec.get("reason") or "parked")[:40])
