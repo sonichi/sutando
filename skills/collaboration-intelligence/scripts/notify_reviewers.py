@@ -288,9 +288,9 @@ def main() -> int:
         print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
               "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
               "or pass --allow-single '<reason>'.", file=sys.stderr)
-        # A name that failed to resolve is WHY the count is short, and it is the
-        # actionable half; reporting 5 there sends the caller to add a reviewer.
-        return refusal_rc or 5
+        # A failed name is WHY the count is short and is the actionable half.
+        # `> 0` not `or`: refusal codes are positive, 0 means nothing refused.
+        return refusal_rc if refusal_rc > 0 else 5
     if a.allow_single and len(targets) < 2:
         print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
     stale, why = _stale_repeat_ask(a.message, targets, load_roster())
