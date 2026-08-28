@@ -9,10 +9,19 @@ allowlist (one owner: src/policy/egress/attachment.py).
 """
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
+
+# Hermetic: this file reads bridge source for the wiring pin; isolate the
+# channel-config root BEFORE anything bridge-adjacent resolves, so no test
+# can read the developer's real per-user allowlist.
+_ISOLATED_CONFIG = tempfile.mkdtemp(prefix="cfg-iso-")
+os.environ["CLAUDE_CONFIG_DIR"] = _ISOLATED_CONFIG
+pathlib.Path(_ISOLATED_CONFIG, "channels", "discord").mkdir(parents=True, exist_ok=True)
+pathlib.Path(_ISOLATED_CONFIG, "channels", "discord", "access.json").write_text("{}")
 
 sys.path.insert(0, "src")
 spec = importlib.util.spec_from_file_location("guard", "src/policy/egress/result.py")
