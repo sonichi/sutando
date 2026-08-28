@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import datetime
 import re
 import subprocess
 import sys
@@ -181,7 +182,8 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     ledger = ledger_path()
     if not ledger.exists():
         return False, ""
-    import json as _j, datetime as _dt
+    import json as _j
+    import datetime as _dt
     prior, earliest = set(), None
     try:
         for line in ledger.read_text().splitlines():
