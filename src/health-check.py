@@ -6083,6 +6083,12 @@ def check_live_tree_drift(repo_root: "Path | None" = None,
             if rc2 == 0 and n.isdigit():
                 behind = int(n)
         rc, porcelain = _git("status", "--porcelain")
+        if rc != 0:
+            # A failed read yields empty stdout, which would read as a clean
+            # tree -- the one verdict this probe exists to prevent.
+            return {"name": name, "status": "warn",
+                    "detail": "git status failed — the working tree is UNMEASURED, "
+                              "not clean; a stale dirty checkout is invisible here"}
         dirty = [l[3:] for l in porcelain.splitlines()
                  if l[:2].strip() and not l.startswith("??")]
         now = time.time()

@@ -135,6 +135,16 @@ class LiveTreeDrift(unittest.TestCase):
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("could not measure", r["detail"])
 
+    def test_failed_status_read_warns_instead_of_reporting_clean(self):
+        # A directory can never be opened as a file, whatever the uid, so this
+        # fails `status` while rev-parse/rev-list still succeed.
+        idx = self.clone / ".git" / "index"
+        idx.unlink(); idx.mkdir()
+        r = hc.check_live_tree_drift(repo_root=self.clone)
+        self.assertEqual(r["status"], "warn", r)
+        self.assertNotIn("tracked dirty", r["detail"],
+                         "reported a dirty count it never measured")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
