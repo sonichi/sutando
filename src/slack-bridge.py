@@ -83,6 +83,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
+from result_write import receipt_verifier, receipts_dir_for  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
@@ -108,6 +109,7 @@ except ImportError:
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
+RECEIPTS_DIR = receipts_dir_for(REPO)
 STATE_DIR = REPO / "state"
 INBOX_DIR = REPO / "slack-inbox"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
@@ -1551,7 +1553,9 @@ def result_watcher():
                 result_file = RESULTS_DIR / f"{task_id}.txt"
                 if not result_file.exists():
                     continue
-                reply_text = read_ready_result(result_file)
+                reply_text = read_ready_result(
+                    result_file,
+                    attests=receipt_verifier(RECEIPTS_DIR, task_id))
                 if reply_text is None:
                     continue
                 with pending_replies_lock:

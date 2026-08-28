@@ -59,6 +59,7 @@ import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
+from result_write import receipt_verifier, receipts_dir_for  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -74,6 +75,7 @@ from chat_secret_filter import filter_chat_secrets, secret_handling_instruction 
 REPO = resolve_workspace()
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
+RECEIPTS_DIR = receipts_dir_for(REPO)
 
 # Allowlist for paths that may be sent via Telegram [file: /path] markers.
 # Mirrors _is_path_sendable() in discord-bridge.py.
@@ -1148,7 +1150,9 @@ def main():  # pragma: no cover
         for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
-                reply_text = read_ready_result(result_file)
+                reply_text = read_ready_result(
+                    result_file,
+                    attests=receipt_verifier(RECEIPTS_DIR, task_id))
                 if reply_text is None:
                     continue
                 chat_id = pending_replies.pop(task_id)

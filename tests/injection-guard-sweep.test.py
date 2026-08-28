@@ -361,7 +361,21 @@ _GUARDED_PY_WRITERS = {
     "src/cron-runner.py",
 }
 
+# Membership asserts "does not write task files" — NOT "is guarded". A file
+# listed here that gains a task writer must move to _GUARDED_PY_WRITERS above.
+_NON_WRITER_TASK_FIELD_USES = {
+    # Writes results/task-<id>.txt, never tasks/; both matches are in
+    # strip_pairing_echo() and the id is normalized by task_id_from() first.
+    "src/result_write.py",
+}
+
 _TASK_FIELD_PATTERN = 'f"task: {'
+_check(
+    "exhaustive-scan: guarded-writer and non-writer sets are disjoint",
+    not (_GUARDED_PY_WRITERS & _NON_WRITER_TASK_FIELD_USES),
+    f"a path claims both guarded-writer and non-writer status: "
+    f"{sorted(_GUARDED_PY_WRITERS & _NON_WRITER_TASK_FIELD_USES)}",
+)
 for _pyf in sorted(
     list((REPO / "src").glob("*.py")) + list((REPO / "skills").rglob("*.py"))
 ):
@@ -374,7 +388,7 @@ for _pyf in sorted(
         continue
     _check(
         f"exhaustive-scan: {_rel} is a known-guarded task writer",
-        _rel in _GUARDED_PY_WRITERS,
+        _rel in _GUARDED_PY_WRITERS or _rel in _NON_WRITER_TASK_FIELD_USES,
         f"{_rel} contains an interpolated task: f-string but is not in "
         f"_GUARDED_PY_WRITERS.  Add confine_user_content() to its task body, "
         f"then add the path to _GUARDED_PY_WRITERS so future passes catch regressions.",

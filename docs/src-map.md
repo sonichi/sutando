@@ -130,6 +130,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every delivery consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the `src/dm-result.py` REST fallback).
 - **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
+- **`result_write.py`** — Paired result write — the one validating writer for `results/task-<id>.txt`.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).

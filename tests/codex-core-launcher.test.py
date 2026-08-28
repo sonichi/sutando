@@ -17,6 +17,20 @@ REAL_REPO = Path(os.environ.get(
 )).resolve()
 
 
+# tmux stubs stand in for the live core, so they must complete a task the way the
+# core is now told to: through the real writer, which is what mints the receipt.
+STUB_HEADER = r'''#!/bin/bash
+paired_result() {
+  local name="$1" id
+  id="${name%.txt}"; id="${id#task-}"
+  printf 'task: %s\nack\n' "$id" \
+    | python3 "$RESULT_WRITER" write "$name" \
+        --results-dir "$SUTANDO_RESULTS_DIR" \
+        --receipts-dir "$SUTANDO_RESULT_PAIRING_DIR" >/dev/null
+}
+'''
+
+
 def _read_count(path):
     """Read the supervisor's counter file, tolerating a mid-write empty read.
 
@@ -47,6 +61,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/start-cli.sh",
             "src/local_task_protocol.py",
             "src/result_markers.py",
+            "src/result_write.py",
             "src/task_priority.py",
             "src/task_workstreams.py",
             "src/util_paths.py",
@@ -141,6 +156,13 @@ exit 0
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _pairing_env(self, workspace):
+        return {
+            "RESULT_WRITER": str(self.root / "src" / "result_write.py"),
+            "SUTANDO_RESULT_PAIRING_DIR": str(
+                Path(workspace) / "state" / "result-pairing"),
+        }
 
     def _write_exe(self, name, body):
         path = self.bin / name
@@ -802,12 +824,12 @@ exit 0
         watcher.chmod(0o755)
         capture = Path(self.tmp.name) / "context.json"
         context_path = Path(self.tmp.name) / "context-path.txt"
-        self._write_exe("tmux", '''#!/bin/bash
+        self._write_exe("tmux", STUB_HEADER + '''
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  paired_result task-owner.txt
   exit 0
 fi
 if [ "${1:-}" = send-keys ]; then
@@ -835,6 +857,7 @@ exit 0
             SUTANDO_RESULTS_DIR=str(results),
             SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
             SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+            **self._pairing_env(workspace),
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
 
@@ -882,12 +905,12 @@ exit 0
         watcher = self.root / "src/watch-tasks-stream.sh"
         watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-unassigned.txt\\n'\n")
         watcher.chmod(0o755)
-        self._write_exe("tmux", '''#!/bin/bash
+        self._write_exe("tmux", STUB_HEADER + '''
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-unassigned.txt"
+  paired_result task-unassigned.txt
 fi
 exit 0
 ''')
@@ -901,6 +924,7 @@ exit 0
             SUTANDO_RESULTS_DIR=str(results),
             SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
             SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+            **self._pairing_env(workspace),
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         started = time.monotonic()
@@ -914,6 +938,114 @@ exit 0
         calls = self.log.read_text()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
+
+    def _managed_post_condition_run(self, stub_body, timeout="1"):
+        """One managed turn against a stub core; returns the finished process."""
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        results = workspace / "results"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        (workspace / "state" / "core-status.json").write_text(
+            '{"status":"idle","ts":1}\n'
+        )
+        (tasks / "task-owner.txt").write_text("priority: normal\ntask: do it\n")
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", STUB_HEADER + stub_body)
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT=timeout,
+            **self._pairing_env(workspace),
+        )
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        return subprocess.run(["/bin/bash", str(script)], env=env,
+                              capture_output=True, text=True, timeout=10)
+
+    def test_managed_notifier_fails_loudly_when_the_turn_produces_no_result(self):
+        """A silent turn used to return success; the queue then looked drained."""
+        result = self._managed_post_condition_run('''
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+exit 0
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("no result for task-owner.txt", result.stderr)
+
+    def test_managed_notifier_fails_loudly_on_a_result_it_cannot_pair(self):
+        """A file with the right NAME is not evidence it answers this task."""
+        result = self._managed_post_condition_run('''
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  printf 'hand-written, pairing unknown\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
+fi
+exit 0
+''', timeout="5")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        # The gate moved from presence to attestation; re-pointed rather than
+        # loosened, because a stale receipt also has to fail here.
+        self.assertIn("does not attest the bytes", result.stderr)
+        self.assertNotIn("no result for", result.stderr)
+
+    def test_managed_notifier_rejects_a_receipt_that_no_longer_matches(self):
+        """The case presence cannot see: the receipt IS there, minted by the
+        real writer, and the result was overwritten afterwards."""
+        result = self._managed_post_condition_run("""
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  paired_result task-owner.txt
+  printf 'a different answer\\n' > "$SUTANDO_RESULTS_DIR/task-owner.txt"
+fi
+exit 0
+""", timeout="5")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("does not attest the bytes", result.stderr)
+
+    def test_managed_notifier_accepts_a_result_written_through_the_helper(self):
+        """Positive control: the same harness passes when pairing is satisfied."""
+        result = self._managed_post_condition_run('''
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  paired_result task-owner.txt
+fi
+exit 0
+''', timeout="5")
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertNotIn("pairing receipt", result.stderr)
+        self.assertEqual(
+            (self.root / "workspace/results/task-owner.txt").read_text(), "ack\n")
+
+    def test_notifier_prompt_states_the_pairing_requirement(self):
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-123.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertIn("src/result_write.py write task-123.txt", calls)
+        self.assertIn("FIRST line exactly 'task: 123'", calls)
+        self.assertIn("Never hand-write that file", calls)
 
     def test_managed_notifier_waits_for_each_result_before_next_task(self):
         workspace = self.root / "workspace"
@@ -930,7 +1062,7 @@ exit 0
         watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-one.txt\\nTASK_FILE: task-two.txt\\n'\n")
         watcher.chmod(0o755)
         count = Path(self.tmp.name) / "submit-count"
-        self._write_exe("tmux", '''#!/bin/bash
+        self._write_exe("tmux", STUB_HEADER + '''
 printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
@@ -938,7 +1070,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   n=0; [ -f "$SUBMIT_COUNT" ] && n=$(cat "$SUBMIT_COUNT")
   n=$((n + 1)); printf '%s' "$n" > "$SUBMIT_COUNT"
   if [ "$n" = 1 ]; then name=task-one.txt; else name=task-two.txt; fi
-  (sleep 0.12; touch "$SUTANDO_RESULTS_DIR/$name") >/dev/null 2>&1 &
+  (sleep 0.12; paired_result "$name") >/dev/null 2>&1 &
 fi
 exit 0
 ''')
@@ -946,7 +1078,8 @@ exit 0
                    SUBMIT_COUNT=str(count), SUTANDO_TMUX_SOCKET="/tmp/test.sock",
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_RESULTS_DIR=str(results), SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
-                   SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="5")
+                   SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="5",
+                   **self._pairing_env(workspace))
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         started = time.monotonic()
         result = subprocess.run(["/bin/bash", str(script)], env=env,
@@ -983,7 +1116,7 @@ exit 0
         early = Path(self.tmp.name) / "submitted-while-busy"
         busy = Path(self.tmp.name) / "pane-busy"
         busy.touch()
-        self._write_exe("tmux", '''#!/bin/bash
+        self._write_exe("tmux", STUB_HEADER + '''
 printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
@@ -996,7 +1129,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
   prompt=$(grep 'Sutando task ready:' "$TMUX_LOG" | tail -1)
   name=${prompt#*Sutando task ready: }
   name=${name%%.*}.txt
-  touch "$SUTANDO_RESULTS_DIR/$name"
+  paired_result "$name"
 fi
 exit 0
 ''')
@@ -1006,7 +1139,8 @@ exit 0
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_RESULTS_DIR=str(results), SUTANDO_CORE_STATUS_FILE=str(status),
                    SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
-                   SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2")
+                   SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+                   **self._pairing_env(workspace))
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         process = subprocess.Popen(["/bin/bash", str(script)], env=env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1042,7 +1176,7 @@ exit 0
         watcher = self.root / "src/watch-tasks-stream.sh"
         watcher.write_text("#!/bin/bash\nprintf 'TASK_FILE: task-owner.txt\\n'\n")
         watcher.chmod(0o755)
-        self._write_exe("tmux", '''#!/bin/bash
+        self._write_exe("tmux", STUB_HEADER + '''
 printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = -S ] && shift 2
 if [ "${1:-}" = has-session ]; then exit 0; fi
@@ -1051,7 +1185,7 @@ if [ "${1:-}" = capture-pane ]; then
   exit 0
 fi
 if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
-  touch "$SUTANDO_RESULTS_DIR/task-owner.txt"
+  paired_result task-owner.txt
 fi
 exit 0
 ''')
@@ -1066,6 +1200,7 @@ exit 0
             SUTANDO_CORE_STATUS_FILE=str(status),
             SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
             SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+            **self._pairing_env(workspace),
         )
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(

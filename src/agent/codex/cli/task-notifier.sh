@@ -13,6 +13,8 @@ fi
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$(dirname "$TASKS_DIR")/results}"
 TASK_HANDLER_CLAIMS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-claims"
 TASK_HANDLER_FALLBACKS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-fallbacks"
+RESULT_PAIRING_DIR="${SUTANDO_RESULT_PAIRING_DIR:-$(dirname "$TASKS_DIR")/state/result-pairing}"
+RESULT_WRITER="$REPO/src/result_write.py"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
@@ -121,6 +123,30 @@ has_result() {
   return 1
 }
 
+task_id_of() {
+  local stem="${1%.txt}"
+  printf '%s\n' "${stem#task-}"
+}
+
+# The notifier holds the correct task id; the core holds the body. Nothing else
+# can tell whether the body that landed answers THIS task, so require a receipt.
+assert_result_paired() {
+  local filename="$1" task_id
+  if ! has_result "$filename"; then
+    echo "task-notifier: no result for $filename after ${COMPLETION_TIMEOUT}s; the task turn produced nothing" >&2
+    return 1
+  fi
+  task_id="$(task_id_of "$filename")"
+  # Attestation, not presence: an empty or stale receipt is exactly what a
+  # presence check cannot tell apart from a matching one.
+  if ! python3 "$REPO/src/result_write.py" attests "$task_id" \
+      --results-dir "$RESULTS_DIR" --receipts-dir "$RESULT_PAIRING_DIR" >/dev/null 2>&1; then
+    echo "task-notifier: the pairing receipt in $RESULT_PAIRING_DIR does not attest the bytes now in $filename; it was not written through src/result_write.py, or it was overwritten, so it may answer a different task" >&2
+    return 1
+  fi
+  return 0
+}
+
 core_pane_is_busy() {
   local pane
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -t "$SESSION:0" 2>/dev/null)" || return 0
@@ -205,21 +231,29 @@ PY
 }
 
 submit_task() {
-  local filename="$1" wait_for_result="${2:-0}" prompt started
+  local filename="$1" wait_for_result="${2:-0}" prompt started task_id
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
+  task_id="$(task_id_of "$filename")"
   # The stream watcher deliberately sweeps pre-existing task files after a
   # restart. Completed tasks remain in tasks/ for dashboard history, so do not
   # replay any task whose bridge result already exists.
   has_result "$filename" && return 0
-  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
+  # The prompt embeds a command Codex will RUN, so every path must survive a
+  # shell: an unquoted workspace containing spaces breaks every completion.
+  local q_writer q_file q_results q_receipts
+  printf -v q_writer   '%q' "$RESULT_WRITER"
+  printf -v q_file     '%q' "$filename"
+  printf -v q_results  '%q' "$RESULTS_DIR"
+  printf -v q_receipts '%q' "$RESULT_PAIRING_DIR"
+  prompt="Sutando task ready: $filename. Read $TASKS_DIR/$filename, follow AGENTS.md, complete the task, then write the result ONLY with: python3 $q_writer write $q_file --results-dir $q_results --receipts-dir $q_receipts — result body on stdin, its FIRST line exactly 'task: $task_id'. That line is a pairing check: the helper refuses with zero writes if it names a different task, which is what stops a reply reaching the wrong user; it strips the line and writes $RESULTS_DIR/$filename atomically. Never hand-write that file."
   if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
     exit 0
   fi
   # The managed queue path waits for completion, so a private temp file can
-  # safely live for exactly the task turn.  The diagnostic --event path keeps
-  # its original byte-for-byte prompt and remains fire-and-forget.
+  # safely live for exactly the task turn.  The diagnostic --event path takes
+  # the base prompt with no context suffix, and remains fire-and-forget.
   if [ "$wait_for_result" = "1" ]; then
     prepare_workstream_context "$filename"
     if [ -n "$workstream_context_file" ]; then
@@ -252,12 +286,14 @@ submit_task() {
       fi
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
         echo "task-notifier: timed out waiting for result: $filename" >&2
-        clear_workstream_context
-        return 0
+        break
       fi
       sleep "$POLL_INTERVAL"
     done
     clear_workstream_context
+    # A waited turn that produced no result, or one whose result nobody can pair
+    # to this task, is a failure — never report it as a completed delivery.
+    assert_result_paired "$filename" || return 1
   fi
 }
 
@@ -274,6 +310,7 @@ python3 -c \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
+notifier_rc=0
 while IFS= read -r event; do
   case "$event" in
     "TASK_FILE: "*)
@@ -284,7 +321,10 @@ while IFS= read -r event; do
       next_pending_task >/dev/null || continue
       wait_for_core_idle || exit 1
       filename="$(next_pending_task)" || continue
-      submit_task "$filename" 1
+      # Keep draining on a post-condition failure — the task stays durable on
+      # disk — but never exit 0 and let the supervisor log a clean restart.
+      submit_task "$filename" 1 || notifier_rc=1
       ;;
   esac
 done < "$event_dir/events"
+exit "$notifier_rc"

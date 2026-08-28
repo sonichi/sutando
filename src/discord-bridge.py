@@ -154,6 +154,7 @@ from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
+from result_write import receipt_verifier, receipts_dir_for  # noqa: E402
 from dedup_recovery import plan_dedup_recovery  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -347,6 +348,7 @@ if not TOKEN:
 
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
+RECEIPTS_DIR = receipts_dir_for(REPO)
 STATE_DIR = REPO / "state"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
@@ -4770,7 +4772,9 @@ async def poll_results():
             result_file = RESULTS_DIR / f"{task_id}.txt"
             if result_file.exists():
                 import re
-                reply_text = read_ready_result(result_file)
+                reply_text = read_ready_result(
+                    result_file,
+                    attests=receipt_verifier(RECEIPTS_DIR, task_id))
                 if reply_text is None:
                     await _note_empty_result(task_id, result_file)
                     continue
