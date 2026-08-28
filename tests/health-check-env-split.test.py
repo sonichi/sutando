@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory() as td:
     check("single .env stays silent",
           hc.check_env_split(repo_env=repo_env, ws_env=ws_env), None)
 
-# 5. unreadable selected file -> reads as empty, so the other's keys all warn
+# 5. an unreadable selected file is UNKNOWN, never absent
 # (chmod 000 does not block root, where read_text would succeed; skip there)
 import os
 
@@ -214,25 +214,25 @@ with tempfile.TemporaryDirectory() as td:
     (td / "repo").mkdir(); (td / "ws").mkdir()
     repo_env = td / "repo" / ".env"
     ws_env = td / "ws" / ".env"
-    dep = sorted(sutando_config.DEPRECATED_ENV_KEYS)[0]  # e.g. SUTANDO_WORKSPACE
-    # deprecated-only diff: must not read as a mergeable missing key
-    repo_env.write_text("GEMINI_API_KEY=real\n")
-    ws_env.write_text(f"GEMINI_API_KEY=real\n{dep}=/some/path\n")
-    with _patch.object(sutando_config, "resolve_dotenv", return_value=repo_env):
-        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
-    check("deprecated-only diff never advises a merge",
-          r is not None and "missing" not in r["detail"]
-          and "do NOT merge" in r["detail"], True)
-    check("deprecated key carries its OWN remedy, not blanket delete advice",
-          r is not None
-          and sutando_config.DEPRECATED_ENV_KEY_REMEDIES[dep] in r["detail"], True)
-    check("deprecated key is named as delete-not-merge",
-          r is not None and dep in r["detail"], True)
-    # mix: a real missing key AND a deprecated one -> both, correctly separated
-    ws_env.write_text(f"GEMINI_API_KEY=real\nDISCORD_BOT_TOKEN=old\n{dep}=/p\n")
-    with _patch.object(sutando_config, "resolve_dotenv", return_value=repo_env):
-        r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
-    check("mix: real key advised as merge, deprecated as delete",
+    for dep in sorted(sutando_config.DEPRECATED_ENV_KEYS):
+        # deprecated-only diff: must not read as a mergeable missing key
+        repo_env.write_text("GEMINI_API_KEY=real\n")
+        ws_env.write_text(f"GEMINI_API_KEY=real\n{dep}=/some/path\n")
+        with _patch.object(sutando_config, "resolve_dotenv", return_value=repo_env):
+            r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+        check("deprecated-only diff never advises a merge",
+              r is not None and "missing" not in r["detail"]
+              and "do NOT merge" in r["detail"], True)
+        check("deprecated key carries its OWN remedy, not blanket delete advice",
+              r is not None
+              and sutando_config.DEPRECATED_ENV_KEY_REMEDIES[dep] in r["detail"], True)
+        check("deprecated key is named as delete-not-merge",
+              r is not None and dep in r["detail"], True)
+        # mix: a real missing key AND a deprecated one -> both, correctly separated
+        ws_env.write_text(f"GEMINI_API_KEY=real\nDISCORD_BOT_TOKEN=old\n{dep}=/p\n")
+        with _patch.object(sutando_config, "resolve_dotenv", return_value=repo_env):
+            r = hc.check_env_split(repo_env=repo_env, ws_env=ws_env)
+        check("mix: real key advised as merge, deprecated as delete",
           r is not None and "DISCORD_BOT_TOKEN" in r["detail"]
           and "missing 1 key" in r["detail"]
           and "do NOT merge" in r["detail"], True)
@@ -279,6 +279,40 @@ with tempfile.TemporaryDirectory() as td:
     check("an unparseable line WARNs as incomplete, never as absent",
           _r is not None and _r["status"] == "warn"
           and "could not be completed" in _r["detail"], True)
+
+# 8. Loader-grammar shapes. Each expectation is what BASH itself does after
+# `set -a; . file`, not what a convenient parse would give.
+for _label, _line, _persists in [
+    ("plain two assignments", "GEMINI_API_KEY=real DISCORD_BOT_TOKEN=old", True),
+    ("literal hash inside a word", "GEMINI_API_KEY=a#b DISCORD_BOT_TOKEN=old", True),
+    ("real trailing comment", "GEMINI_API_KEY=real # DISCORD_BOT_TOKEN=old", False),
+    ("bare export argument", "export GEMINI_API_KEY DISCORD_BOT_TOKEN=old", True),
+    ("command prefix does not persist", "GEMINI_API_KEY=r DISCORD_BOT_TOKEN=e true", False),
+    ("assignment to the export command", "GEMINI_API_KEY=r export DISCORD_BOT_TOKEN=o", True),
+]:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "repo").mkdir(); (td / "ws").mkdir()
+        _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+        _re_.write_text("GEMINI_API_KEY=real\n")
+        _we_.write_text(_line + "\n")
+        with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+            _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    _named = _r is not None and "DISCORD_BOT_TOKEN" in _r["detail"]
+    check(f"loader grammar: {_label}", _named, _persists)
+
+# The SELECTED side obeys the same grammar: a command-prefix assignment there
+# does not persist, so the other file's copy is genuinely stranded.
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir(); (td / "ws").mkdir()
+    _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+    _re_.write_text("GEMINI_API_KEY=sel DISCORD_BOT_TOKEN=ephemeral true\n")
+    _we_.write_text("GEMINI_API_KEY=sel\nDISCORD_BOT_TOKEN=persistent\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+        _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    check("command prefix in the SELECTED file leaves the other key stranded",
+          _r is not None and "DISCORD_BOT_TOKEN" in _r["detail"], True)
 
 if fails:
     print(f"FAIL ({len(fails)})")

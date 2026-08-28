@@ -1470,22 +1470,42 @@ def check_env_split(repo_env: "Path | None" = None,
         except OSError:
             return None
         out = set()
+        def _assign(word):
+            name, sep, _ = word.partition("=")
+            if sep and name and name.replace("_", "").isalnum():
+                return name
+            return None
+
         for line in text.splitlines():
-            # `A=1 B=2` is TWO assignments to `set -a` sourcing, so partitioning
-            # once swallows B; shlex splits words exactly as the shell does.
             try:
-                words = shlex.split(line, comments=True)
+                # comments=False: shlex ends a word at any `#`, but bash starts
+                # a comment only where `#` OPENS a word, so `a#b` is literal.
+                words = shlex.split(line, comments=False)
             except ValueError:
                 return None  # unbalanced quote: UNKNOWN, never "absent"
-            if words and words[0] == "export":
-                words = words[1:]
-            for word in words:
-                name, sep, _ = word.partition("=")
-                if not sep:
-                    break  # a non-assignment word ends the assignment prefix
-                if name and not name.startswith("#") \
-                        and name.replace("_", "").isalnum():
-                    out.add(name)
+            for i, w in enumerate(words):
+                if w.startswith("#"):
+                    words = words[:i]
+                    break
+            if not words:
+                continue
+            if words[0] == "export":
+                # export's bare-name arguments only mark existing vars; every
+                # assignment among them persists, so no word ends the scan.
+                out.update(n for n in map(_assign, words[1:]) if n)
+                continue
+            names, cmd_at = [], None
+            for i, w in enumerate(words):
+                n = _assign(w)
+                if n is None:
+                    cmd_at = i
+                    break
+                names.append(n)
+            if cmd_at is None:
+                out.update(names)          # a pure assignment line persists
+            elif words[cmd_at] == "export":
+                out.update(n for n in map(_assign, words[cmd_at + 1:]) if n)
+            # else: `A=1 cmd ...` is a command PREFIX -- nothing persists.
         return out
 
     # The canonical resolver owns selection; a re-derivation drifts.

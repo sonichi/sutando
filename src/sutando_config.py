@@ -326,8 +326,9 @@ _HARDCODED_WORKSPACE_DEFAULT_REL = "workspace"  # relative to repo root
 
 # Env keys the migration contract deletes rather than honors (v0.8). Single
 # source of truth for deprecation-aware readers; advising a merge would misfire.
-# Keyed by remedy, not a bare set: deleting SUTANDO_VAULT without moving its
-# value leaves vault sync unconfigured and durability silently off.
+
+# Keyed by remedy: deleting SUTANDO_VAULT without moving its value leaves
+# vault sync unconfigured and durability silently off.
 DEPRECATED_ENV_KEY_REMEDIES = {
     "SUTANDO_WORKSPACE": (
         "delete it — the workspace resolves from `workspace.path` in "
