@@ -24,11 +24,11 @@ def load(d):
     # Either store may exist alone; a host with only reviewer-stands.json
     # must not crash here or sessions fall back to hand-rolled lookups.
     q, ents = {}, []
+    # Each store is loaded on its OWN existence check — either may exist alone,
+    # and shapes vary per host: wrapped {quick_lookup:}, flat {people:}, MALFORMED.
     yp = d / "quick-lookup.yaml"
     if yp.exists():
         import yaml
-        # Three live store states: wrapped {quick_lookup:...}, flat {people:...},
-        # and MALFORMED (hand-edited/synced yaml) — degrade, never starve the roster.
         try:
             raw = yaml.safe_load(yp.read_text()) or {}
         except Exception as e:
@@ -36,12 +36,13 @@ def load(d):
                   file=sys.stderr)
             raw = {}
         q = raw.get("quick_lookup") or raw if isinstance(raw, dict) else {}
-        ep = d / "entities.yaml"
-        if ep.exists():
-            try:
-                ents = yaml.safe_load(ep.read_text()).get("entities") or []
-            except Exception:
-                ents = []
+    ep = d / "entities.yaml"
+    if ep.exists():
+        import yaml
+        try:
+            ents = yaml.safe_load(ep.read_text()).get("entities") or []
+        except Exception:
+            ents = []
     return q, ents
 
 

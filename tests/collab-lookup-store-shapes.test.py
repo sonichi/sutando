@@ -86,6 +86,18 @@ class StoreShapes(unittest.TestCase):
             self.assertEqual(len(hits), 2)
             self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
 
+    def test_entities_yaml_alone_loads_without_quick_lookup(self):
+        # core-3's control: a host with entities.yaml and NO quick-lookup.yaml
+        # must still load entities — the read must not nest inside the other
+        # store's existence check.
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t)                             # writes NEITHER yaml
+            (d / "entities.yaml").write_text(
+                "entities:\n  - entity_id: solo\n    identities:\n"
+                "      - provider: github\n        provider_id: solo-login\n")
+            q, ents = lk.load(d)
+            self.assertEqual(len(ents), 1)
+
     def test_malformed_entities_yaml_degrades_to_empty(self):
         with tempfile.TemporaryDirectory() as t:
             d = store(t, "people: []\n")
