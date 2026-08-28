@@ -14,7 +14,7 @@ Setup:
 
 Usage:
   python3 src/github-webhook.py              # start server
-  python3 src/github-webhook.py --port 7848  # custom port
+  python3 src/github-webhook.py --port 7842  # custom port
 """
 
 import hashlib
