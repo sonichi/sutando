@@ -1004,6 +1004,9 @@ backup_dest() {
 source_sentinel() {
     echo "$DEST_REAL/state/.migrated-from-$1-$BACKUP_ID"
 }
+union_scalar_manifest() {
+    echo "$DEST_REAL/state/.migration-union-scalars-$BACKUP_ID.json"
+}
 any_source_sentinel() {
     # Any sentinel for this source tag (commit may have been run before with a
     # different backup id). Returns 0 if found.
@@ -1144,18 +1147,46 @@ PY
     return 1
 }
 
+# Record the union result's non-array fields so mandatory verification can
+# check the scalar winner even when the PRE-UNION DEST won (its content is
+# otherwise unrecoverable per-source). One manifest per backup id, keyed by
+# rel; the last union for a rel wins, matching the file's final state.
+record_union_scalars() {
+    local dst="$1" rel="$2" manifest="$3"
+    local py; py="$(resolve_python "$REPO_DIR")"
+    [ -n "$py" ] || return 1
+    "$py" - "$dst" "$rel" "$manifest" <<'PY'
+import json, os, sys
+
+dst, rel, manifest = sys.argv[1:4]
+with open(dst, encoding="utf-8") as fh:
+    d = json.load(fh)
+scalars = {k: v for k, v in d.items() if not isinstance(v, list)}
+try:
+    with open(manifest, encoding="utf-8") as fh:
+        m = json.load(fh)
+except Exception:
+    m = {}
+m[rel] = scalars
+tmp = manifest + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(m, fh, indent=1, sort_keys=True)
+os.replace(tmp, manifest)
+PY
+}
+
 # Semantic-verify companion to union_json_arrays_into: same element
 # fingerprint (sorted-key JSON). A union result differs from both inputs BY
 # DESIGN, so the per-source invariant is containment — every array element of
 # the source present in the dest — not byte identity.
 union_contains() {
-    local src="$1" dst="$2"
+    local src="$1" dst="$2" manifest="${3:-}" rel="${4:-}"
     local py; py="$(resolve_python "$REPO_DIR")"
     [ -n "$py" ] || return 1
-    "$py" - "$src" "$dst" <<'PY'
+    "$py" - "$src" "$dst" "$manifest" "$rel" <<'PY'
 import json, os, sys
 
-src, dst = sys.argv[1:3]
+src, dst, manifest, rel = sys.argv[1:5]
 try:
     with open(src, encoding="utf-8") as fh:
         s = json.load(fh)
@@ -1167,11 +1198,23 @@ except Exception:
     sys.exit(1)
 if not isinstance(s, dict) or not isinstance(d, dict):
     sys.exit(1)
-# The union stamps the dest with the WINNER's mtime, and the writer contract
-# says non-array fields come from that winner. So when THIS source's mtime
-# equals the dest's, its scalars won and must survive verbatim; a dest mtime
-# newer than every source means the pre-union dest won, whose content is not
-# recoverable per-source — arrays alone are checkable there.
+# Scalars, strongest evidence first: the commit-time manifest holds the
+# union result's non-array fields whichever side won, so the dest must match
+# it exactly. Without a manifest entry, fall back to the mtime invariant: the
+# union stamps the dest with the WINNER's mtime, so an mtime-equal source's
+# scalars must survive verbatim; only when neither source of truth exists do
+# arrays alone remain checkable.
+expected = None
+if manifest and rel:
+    try:
+        with open(manifest, encoding="utf-8") as fh:
+            expected = json.load(fh).get(rel)
+    except Exception:
+        expected = None
+if expected is not None:
+    have = {k: v for k, v in d.items() if not isinstance(v, list)}
+    if have != expected:
+        sys.exit(1)
 scalar_winner = src_mt == dst_mt
 for key, val in s.items():
     if isinstance(val, list):
@@ -1362,6 +1405,10 @@ commit_one() {
                 echo "write-failed"
                 return 1
             fi
+            # The manifest is what lets phase three verify the scalar winner
+            # when the pre-union dest won — failing to record it fails closed.
+            record_union_scalars "$dst_path" "$rel" "$(union_scalar_manifest)" \
+                || { echo "write-failed"; return 1; }
             echo "unioned"
             return 0
             ;;
@@ -2243,7 +2290,9 @@ verify_main() {
         if [ -n "$landed" ]; then
             pass=$((pass+1))
         elif [ "$cls" = "union-json-array" ] && [ -f "$dst_canonical" ] \
-                && union_contains "$src_file" "$dst_canonical"; then
+                && union_contains "$src_file" "$dst_canonical" \
+                    "$(ls -t "$DEST_REAL/state/.migration-union-scalars-"*.json 2>/dev/null | head -1)" \
+                    "$rel"; then
             # A union result is byte-different from both inputs by design;
             # the per-source invariant is array containment, checked through
             # the union policy owner's own element fingerprint.
