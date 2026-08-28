@@ -72,10 +72,10 @@ def _clean(value: object) -> str:
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
     try:
-        # UnicodeDecodeError is not an OSError, so without it here an undecodable
-        # file raises past the guard instead of reading as the absence promised.
-        text = env_file.read_text()
-    except (OSError, UnicodeDecodeError):
+        # Decode leniently: one stray byte ELSEWHERE must not hide a clean token
+        # line. The value itself is checked below, so nothing lossy is returned.
+        text = env_file.read_text(errors="replace")
+    except OSError:
         return ""
     for line in text.splitlines():
         line = line.strip()
@@ -83,7 +83,10 @@ def token_from_env_file(var: str, env_file: Path) -> str:
             continue
         key, _, value = line.partition("=")
         if key.strip() == var:
-            return _clean(value)
+            # A value that lost bytes to replacement is unreadable, not a token:
+            # returning it hands the caller mojibake every caller treats as real.
+            got = _clean(value)
+            return "" if "\ufffd" in got else got
     return ""
 
 
