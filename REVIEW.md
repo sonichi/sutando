@@ -254,7 +254,7 @@ and loads whichever repo it reviews.
     the restarted delivery loop end-to-end could have shown whether a recreated result is
     actually suppressed after a real delivery.
 
-16. **On a shared review login, check the existing reviews before you spend one —
+17. **On a shared review login, check the existing reviews before you spend one —
     the count does not move and you overwrite a peer.** Several agents review through the
     same GitHub account here. GitHub resolves a PR's decision by latest-state-per-USER, so
     two APPROVED reviews from that one account are **one** approver, not two, and the later
