@@ -188,6 +188,7 @@ def _write_latest(history_path: Path, sample: dict, ts: float) -> None:
 
 
 def _read_latest(history_path: Path, now: float) -> dict | None:
+    """The sidecar, or None — a malformed shape is ABSENT, never an error."""
     try:
         d = json.loads(_latest_path(history_path).read_text())
     except (OSError, ValueError):
@@ -195,6 +196,17 @@ def _read_latest(history_path: Path, now: float) -> dict | None:
     ts = _finite(d.get("ts")) if isinstance(d, dict) else None
     if ts is None or not (0 < ts <= now + MAX_FUTURE_SKEW_S):
         return None
+    wins = d.get("windows")
+    if not isinstance(wins, dict):
+        return None
+    for rec in wins.values():
+        if rec is None:
+            continue
+        if not isinstance(rec, dict):
+            return None
+        u, r = _finite(rec.get("u")), _finite(rec.get("r"))
+        if u is None or u < 0 or r is None or r != int(r):
+            return None
     return d
 
 
@@ -263,18 +275,19 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                 # corrupt sidecar must never let an older window read current.
                 newer = ((latest is None or ts > float(latest.get("ts", 0)))
                          and (tail_ts is None or ts > tail_ts))
+                # The sidecar advances only AFTER the observation lands in
+                # history: a failed append can never publish "current".
                 if sample is None:
-                    # Valid time, no valid window: tombstone sidecar AND history
-                    # so the high-water mark survives sidecar loss.
-                    if newer:
-                        _write_latest(history_path, {"ts": ts}, ts)
                     tail = float(history[-1]["ts"]) if history else None
                     if tail is not None and ts <= tail:
                         return _refuse()
-                    _commit(history + [{"ts": ts, "tomb": True}])
+                    try:
+                        _commit(history + [{"ts": ts, "tomb": True}])
+                    except OSError:
+                        return False
+                    if newer:
+                        _write_latest(history_path, {"ts": ts}, ts)
                     return False
-                if newer:
-                    _write_latest(history_path, sample, ts)
                 if history:
                     last = history[-1]
                     if float(sample["ts"]) <= float(last["ts"]):
@@ -282,24 +295,34 @@ def record_sample(state: dict, history_path: Path, now: float | None = None) -> 
                     if _same(last):
                         if len(history) >= 2 and _same(history[-2]):
                             history[-1] = {**last, "ts": sample["ts"]}
-                            _commit(history)
+                            try:
+                                _commit(history)
+                            except OSError:
+                                return False
+                            if newer:
+                                _write_latest(history_path, sample, ts)
                             return False
                         # Only the run's start exists — append its end below.
-                if dirty or len(history) + 1 > MAX_LINES:
-                    _commit(history + [sample])
-                    return True
-                needs_nl = False
                 try:
-                    raw = history_path.read_bytes()
-                    needs_nl = bool(raw) and not raw.endswith(b"\n")
+                    if dirty or len(history) + 1 > MAX_LINES:
+                        _commit(history + [sample])
+                    else:
+                        needs_nl = False
+                        try:
+                            raw = history_path.read_bytes()
+                            needs_nl = bool(raw) and not raw.endswith(b"\n")
+                        except OSError:
+                            pass
+                        with history_path.open("a") as f:
+                            if needs_nl:
+                                f.write("\n")
+                            f.write(json.dumps(sample, allow_nan=False) + "\n")
+                            f.flush()
+                            os.fsync(f.fileno())
                 except OSError:
-                    pass
-                with history_path.open("a") as f:
-                    if needs_nl:
-                        f.write("\n")
-                    f.write(json.dumps(sample, allow_nan=False) + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
+                    return False
+                if newer:
+                    _write_latest(history_path, sample, ts)
                 return True
             finally:
                 fcntl.flock(lockf, fcntl.LOCK_UN)

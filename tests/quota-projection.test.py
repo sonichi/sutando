@@ -8,6 +8,7 @@ dropped rather than plotted into a neighbouring segment.
 """
 import json
 import sys
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -957,6 +958,49 @@ class Round12AcceptanceCriteria(unittest.TestCase):
                    if s["current"]]
             self.assertEqual(len(cur), 1)
             self.assertIn("projected_end", cur[0])
+
+
+
+class Round13Consistency(unittest.TestCase):
+    """qingyun round-13: current-hood requires durability in BOTH records,
+    and a malformed sidecar is absent, never an exception."""
+
+    def test_a_failed_append_never_publishes_current(self):
+        # History read-only -> the newer sample is refused and the sidecar
+        # stays put; after permissions return the resubmit is a normal accept.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 300.0
+            self.assertTrue(qp.record_sample(
+                state("0.1", 9100, None, None, 100.0), hp, now=now))
+            os.chmod(hp, 0o444)
+            try:
+                self.assertFalse(qp.record_sample(
+                    state("0.6", 9100, None, None, 200.0), hp, now=now))
+            finally:
+                os.chmod(hp, 0o644)
+            latest = qp._read_latest(hp, now)
+            self.assertEqual(latest["ts"], 100.0)
+            self.assertTrue(qp.record_sample(
+                state("0.6", 9100, None, None, 200.0), hp, now=now))
+            self.assertEqual(qp._read_latest(hp, now)["ts"], 200.0)
+
+    def test_a_malformed_sidecar_degrades_to_history_only(self):
+        # Malformed sidecar shapes read as ABSENT: history-only render,
+        # no current, no exception.
+        with tempfile.TemporaryDirectory() as d:
+            hp = Path(d) / "h.jsonl"; now = 300.0
+            self.assertTrue(qp.record_sample(
+                state("0.1", 9100, None, None, 100.0), hp, now=now))
+            for bad in ('{"ts": 100, "windows": "corrupt"}',
+                        '{"ts": 100, "windows": {"5h": ["u", 1]}}',
+                        '{"ts": 100, "windows": {"5h": {"u": -1, "r": 9100}}}',
+                        '{"ts": 100}'):
+                qp._latest_path(hp).write_text(bad)
+                self.assertIsNone(qp._read_latest(hp, now))
+                payload = qp.chart_payload(hp, now=now)
+                segs = payload["windows"]["5h"]["segments"]
+                self.assertTrue(segs)
+                self.assertFalse(any(s["current"] for s in segs))
 
 
 if __name__ == "__main__":
