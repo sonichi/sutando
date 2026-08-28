@@ -5,6 +5,18 @@
   "license": "MIT",
   "stability": "stable",
   "description": "Post tweets, search, read mentions, and check engagement on X (Twitter) via API v2.",
+  "access_tier": "owner",
+  "enabled": true,
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "config": {
+    "X_BROWSER_PROFILE": "",
+    "X_LOGIN_DONE_SENTINEL": "/tmp/x-login-done",
+    "X_LOGIN_TIMEOUT_ITERS": "120"
+  },
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }
