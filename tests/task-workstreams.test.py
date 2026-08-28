@@ -396,6 +396,47 @@ def test_stale_classifier_is_archived_before_replacement() -> None:
     assert live == [workspace / "tasks" / f"{replacement.task_id}.txt"]
 
 
+def _stale_and_replace(workspace, rename_suffix: str):
+    """Mint one classifier task, optionally rename it the way the pool lead
+    does, expire the TTL, then mint its replacement."""
+    first = workstreams.maybe_enqueue_classifier_task(workspace)
+    path = workspace / "tasks" / f"{first.task_id}.txt"
+    if rename_suffix:
+        path = path.rename(
+            path.with_name(f"{first.task_id}{rename_suffix}.txt"))
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    state["enqueued_at"] = 0
+    state_path.write_text(json.dumps(state))
+    return first, path, workstreams.maybe_enqueue_classifier_task(workspace)
+
+
+def test_stale_classifier_is_archived_under_its_pool_assigned_name() -> None:
+    # The lead renames queued work to `.assigned-<inst>`. A bare-name lookup
+    # misses it, so every TTL expiry left a file behind and the queue grew.
+    workspace = fixture_workspace()
+    first, path, replacement = _stale_and_replace(workspace, ".assigned-core-1")
+
+    assert replacement.enqueued and replacement.task_id != first.task_id
+    assert not path.exists()
+    archived = list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+    assert len(archived) == 1, archived
+    live = sorted(
+        p.name for p in (workspace / "tasks").glob("task-workstream-grouping-*"))
+    assert live == [f"{replacement.task_id}.txt"], live
+
+
+def test_a_worker_held_classifier_claim_is_left_alone() -> None:
+    # Archiving out from under a running worker is worse than one duplicate
+    # proposal, so a `.claimed-` file must survive its own replacement.
+    workspace = fixture_workspace()
+    first, path, replacement = _stale_and_replace(workspace, ".claimed-core-1")
+
+    assert replacement.enqueued
+    assert path.exists(), "claimed file was archived while a worker held it"
+    assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+
+
 def test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors() -> None:
     workspace = fixture_workspace()
     stop = threading.Event()
@@ -787,6 +828,8 @@ def main() -> None:
         test_classifier_task_survives_a_raising_stamper,
         test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
         test_stale_classifier_is_archived_before_replacement,
+        test_stale_classifier_is_archived_under_its_pool_assigned_name,
+        test_a_worker_held_classifier_claim_is_left_alone,
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
         test_workstream_context_is_prior_owner_only_bounded_and_untrusted,
         test_workstream_context_has_a_total_serialized_byte_cap,
