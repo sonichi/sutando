@@ -7,6 +7,8 @@ Run: python3 tests/pool-follower-acquire.test.py   (stdlib only)
 from __future__ import annotations
 
 import os
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -96,6 +98,68 @@ class AcquireTests(unittest.TestCase):
         (self.tasks / "task-y.assigned-peer.txt").write_text("x")
         self.assertIsNone(pf.acquire_work(self.tasks, self.state, "me", "lead"))
         self.assertEqual(len(list(self.tasks.iterdir())), 2)
+
+
+class AcquireCliInProcessTests(unittest.TestCase):
+    """Calls _acquire_cli directly. The subprocess cases below prove the SHIPPED
+    entry point works; a subprocess runs outside the coverage instrumentation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "state" / "cores").mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _call(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pf._acquire_cli(list(argv))
+        return rc, out.getvalue().strip(), err.getvalue().strip()
+
+    def _lead_beat(self):
+        f = self.ws / "state" / "cores" / f"{pf.LEAD_LABEL}.alive"
+        f.write_text("{}")
+        t = time.time()
+        os.utime(f, (t, t))
+
+    def test_claims_its_own_assignment(self):
+        (self.ws / "tasks" / "task-a.assigned-core-1.txt").write_text("x")
+        self._lead_beat()
+        rc, out, _ = self._call(str(self.ws / "tasks"), "core-1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(Path(out).name, "task-a.claimed-core-1.txt")
+
+    def test_idle_is_1_with_no_output(self):
+        self._lead_beat()
+        rc, out, _ = self._call(str(self.ws / "tasks"), "core-1")
+        self.assertEqual((rc, out), (1, ""))
+
+    def test_live_lead_owns_the_unassigned_pool(self):
+        (self.ws / "tasks" / "task-free.txt").write_text("x")
+        self._lead_beat()
+        self.assertEqual(self._call(str(self.ws / "tasks"), "core-1")[0], 1)
+        self.assertTrue((self.ws / "tasks" / "task-free.txt").exists())
+
+    def test_explicit_lead_label_is_honoured(self):
+        (self.ws / "tasks" / "task-free.txt").write_text("x")
+        self._lead_beat()  # beats LEAD_LABEL, not "other-lead"
+        rc, out, _ = self._call(str(self.ws / "tasks"), "core-1", "other-lead")
+        self.assertEqual(rc, 0, "an absent beat for the NAMED lead means leaderless")
+        self.assertEqual(Path(out).name, "task-free.claimed-core-1.txt")
+
+    def test_wrong_arity_is_2_and_prints_usage(self):
+        rc, _, err = self._call(str(self.ws / "tasks"))
+        self.assertEqual(rc, 2)
+        self.assertIn("pool_follower.py acquire", err)
+        self.assertEqual(self._call("a", "b", "c", "d")[0], 2)
+
+    def test_missing_tasks_dir_is_2_not_a_crash(self):
+        rc, _, err = self._call(str(self.ws / "nope"), "core-1")
+        self.assertEqual(rc, 2)
+        self.assertIn("not a directory", err)
 
 
 class AcquireCliTests(unittest.TestCase):
