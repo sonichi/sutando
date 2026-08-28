@@ -437,6 +437,28 @@ def test_a_worker_held_classifier_claim_is_left_alone() -> None:
     assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
 
 
+def test_an_assigned_and_claimed_pair_still_leaves_the_claim_alone() -> None:
+    # find_task_file sorts its matches and `.assigned-` sorts first, so a guard
+    # that inspects only the returned path archives while a worker holds a claim.
+    workspace = fixture_workspace()
+    first = workstreams.maybe_enqueue_classifier_task(workspace)
+    base = workspace / "tasks" / f"{first.task_id}.txt"
+    claimed = base.with_name(f"{first.task_id}.claimed-core-1.txt")
+    base.rename(claimed)
+    assigned = base.with_name(f"{first.task_id}.assigned-core-2.txt")
+    assigned.write_text("id: " + first.task_id + "\n")
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    state["enqueued_at"] = 0
+    state_path.write_text(json.dumps(state))
+
+    workstreams.maybe_enqueue_classifier_task(workspace)
+
+    assert claimed.exists(), "archived while a worker held the claimed sibling"
+    assert assigned.exists(), "the assigned sibling went with it"
+    assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+
+
 def test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors() -> None:
     workspace = fixture_workspace()
     stop = threading.Event()
@@ -830,6 +852,7 @@ def main() -> None:
         test_stale_classifier_is_archived_before_replacement,
         test_stale_classifier_is_archived_under_its_pool_assigned_name,
         test_a_worker_held_classifier_claim_is_left_alone,
+        test_an_assigned_and_claimed_pair_still_leaves_the_claim_alone,
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
         test_workstream_context_is_prior_owner_only_bounded_and_untrusted,
         test_workstream_context_has_a_total_serialized_byte_cap,

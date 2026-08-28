@@ -1078,11 +1078,14 @@ def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
 
     # The lead renames queued work to `.assigned-<inst>`, so a bare-name
     # lookup here misses and the supersede silently no-ops.
-    task_path = find_task_file(Path(workspace) / "tasks", task_id)
+    tasks_dir = Path(workspace) / "tasks"
+    task_path = find_task_file(tasks_dir, task_id)
     if task_path is None:
         return False
-    if ".claimed-" in task_path.name:
-        return False  # a worker holds it; racing an active claim is worse
+    # Ask whether ANY claimed variant exists, not whether the returned one is
+    # claimed: find_task_file sorts, and `.assigned-` sorts before `.claimed-`.
+    if any(tasks_dir.glob(f"{task_id}.claimed-*")):
+        return False
     archive_dir = task_path.parent / "archive" / datetime.now(timezone.utc).strftime("%Y-%m")
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / task_path.name
