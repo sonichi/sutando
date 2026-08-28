@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat as statmod
 import sys
 import time
 from pathlib import Path
@@ -122,7 +123,15 @@ def finish_task(tasks_dir, results_dir, state_dir, instance: str,
     if m is None or m.group(2) != instance:
         raise ValueError(
             f"not a claim held by {instance!r}: {claimed.name}")
-    if not claimed.is_file():
+    # A stat that FAILS is not a file that is ABSENT, and only absence may
+    # discard a finished task. Path.is_file() swallows a per-version errno set.
+    try:
+        present = statmod.S_ISREG(os.stat(claimed).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        present = False
+    except OSError:
+        present = True
+    if not present:
         raise ValueError(f"claimed file missing: {claimed}")
     task_id = m.group(1)
     if not body or not body.strip():

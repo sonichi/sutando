@@ -236,20 +236,35 @@ class DefensiveReadTests(unittest.TestCase):
         claimed.write_text("id: task-z\nsource: chat\n\nbody\n")
         metrics = self.root / "data" / "pool-metrics.jsonl"
 
-        real_stat = Path.stat
+        # finish_task reaches the claim's metadata through TWO callers -
+        # os.stat for the presence guard, Path.stat for the arrival time.
+        real_path_stat, real_os_stat = Path.stat, pf.os.stat
+        hits = []
 
-        def stat(self, *a, **kw):
-            if self.name == "task-z.claimed-core-1.txt":
+        def _boom(name):
+            if str(name).endswith("task-z.claimed-core-1.txt"):
+                hits.append(str(name))
                 raise OSError(5, "simulated stat failure")
-            return real_stat(self, *a, **kw)
 
-        Path.stat = stat
+        def path_stat(self, *a, **kw):
+            _boom(self.name)
+            return real_path_stat(self, *a, **kw)
+
+        def os_stat(path, *a, **kw):
+            _boom(path)
+            return real_os_stat(path, *a, **kw)
+
+        Path.stat, pf.os.stat = path_stat, os_stat
         try:
             out = pf.finish_task(tasks, results, state, "core-1", claimed,
                                  "task: z\nthe answer\n", metrics)
         finally:
-            Path.stat = real_stat
+            Path.stat, pf.os.stat = real_path_stat, real_os_stat
 
+        # Without this the test can pass by never reaching the code it covers:
+        # Path.is_file() stopped routing through Path.stat after 3.12.
+        self.assertGreaterEqual(len(hits), 2,
+                                "the failure never reached both stat callers")
         self.assertTrue(out.exists(), "the result is still written")
         rec = json.loads(metrics.read_text().strip())
         self.assertIsNone(rec["arrived_at"], "arrival is unknown, not invented")
