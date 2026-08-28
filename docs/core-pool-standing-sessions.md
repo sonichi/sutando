@@ -75,25 +75,73 @@ Two workers must never drive one group's pane at once — which is a lock, and
 ### Where the lease lives — two structures, two lifetimes
 
 Raised in review: does the group-session lease ride the assignment filename, or
-the lead-held binding record? The answer decides whether decision 3 is free, and
-both readings were live in an earlier draft of this text.
+the lead-held binding record? Both readings were live in an earlier draft. The
+answer is below, and it is NOT the one this section originally reached: the task
+lease is free, the GROUP exclusion is not, and conflating them is what made an
+earlier draft claim decision 3 cost nothing.
 
 They are **different objects and must not be merged**:
 
 ```
 task lease      assignment FILENAME     dies with the assignment
                 task-X.assigned-<inst>  reclaim_dead()'s rename already releases it
-                                        -> genuinely free, no new mechanism
+                                        -> free FOR THE TASK ONLY; it grants no
+                                        exclusion over the task's GROUP
 
 group binding   lead-held RECORD        deliberately OUTLIVES the core
                                         restore-after-preempt requires exactly this
                                         -> reclaim_dead does NOT and must not touch it
 ```
 
-Decision 3's "extend the assignment key from *task* to *task + group-session
-lease*" means the **task-scoped** lease: two workers must not drive one group's
-pane *at the same instant*, and a rename-based lock expresses that correctly and
-for free.
+**Correction (review, 2026-08-28): Decision 3 is NOT free, and the paragraph
+this replaces was wrong.** It claimed the existing rename "expresses that
+correctly and for free". It does not. #3314 assigns by renaming
+`tasks/task-X.txt` -> `tasks/task-X.assigned-<instance>.txt` — the key is
+**task-X**. That rename is atomic *about that task* and says nothing about any
+other object. Two tasks belonging to the same context group therefore both
+rename successfully, and two followers drive one pane concurrently. Per-object
+atomicity on X is not mutual exclusion over Y; treating it as such is the whole
+defect.
+
+**The mechanism: lead serialization, because the lead is already the sole
+assigner.** #3314 states it outright — *"A follower executes only work the lead
+assigned to it"*, and the lead performs the rename. So exclusion does not need a
+second lock; it needs the lead to refuse to create the second assignment:
+
+> **At most one outstanding assignment per context group.** Before assigning
+> task-X to group G, the lead requires that G has no assignment outstanding.
+
+**Make group-busy derivable, not stored.** Extend the assignment filename to
+carry the group:
+
+```
+tasks/task-X.assigned-<instance>.g-<group>.txt
+```
+
+Group-busy is then a glob (`*.g-<group>.txt`), re-derived from the same files
+that ARE the assignments. No second store can fall out of sync with them, and a
+lead restart re-derives the busy set from disk rather than trusting memory it no
+longer has.
+
+**Crash and reclaim semantics, which the previous text never stated:**
+
+| event | task lease | group exclusion |
+|---|---|---|
+| follower dies mid-task | `reclaim_dead()` renames back | released, because the glob no longer matches |
+| task completes | assignment file consumed | released by the same disappearance |
+| **lead** dies holding no file state | unaffected | re-derived on restart from the glob |
+
+The group is released by exactly the event that releases the task, so there is
+no path where G stays busy with nothing running — the failure a separate
+group-lock with its own lifetime would introduce.
+
+**The alternative I did not take**, for the record: a distinct group-scoped
+atomic object (`group-<G>.lease-<inst>`, acquired before executing any task in
+G). It is more robust to multiple assigners, and correspondingly it is the right
+choice only if the single-assigner property above ever stops holding. It costs a
+second lock with its own reclaim path; lead serialization costs a filename
+suffix. If #3314 ever admits a second assigner, this decision must be revisited
+rather than patched.
 
 The **binding** cannot use the same mechanism, because decision 4 requires it to
 survive the core — a lease that dies with its holder is the one thing restore
