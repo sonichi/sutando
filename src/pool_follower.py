@@ -27,6 +27,7 @@ from heartbeat_freshness import (  # noqa: E402,F401
     HEARTBEAT_FUTURE_TOLERANCE_S, age_is_fresh)
 
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
+
 # The lead writes cores/<LEAD_LABEL>.alive and lead_alive() reads it; one
 # definition, imported by the daemon, so the two can never disagree.
 LEAD_LABEL = "pool-lead"
