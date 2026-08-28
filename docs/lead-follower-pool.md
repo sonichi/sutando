@@ -73,9 +73,15 @@ coordinator — the two tracks meet here.
 3. **Execution claim:** the assigned follower renames to
    `task-X.claimed-<instance>.txt` before working (existing claim shape —
    watchers/archivers keep matching `task-*`).
-4. **Done-flags:** unchanged from #884 — write
-   `state/cores/<instance>/done/task-X.flag` BEFORE any external side effect;
-   helpers check all instance dirs. At-most-once floor survives.
+4. **Done-flags:** the #884 shape is still there, but the pre-side-effect fence
+   is NOT WIRED — the only production writer runs AFTER the result is written,
+   so a crash between the side effect and the result leaves a completed effect
+   with no evidence, and recovery repools the task and reassigns it. **There is
+   no at-most-once floor today.** `skills/proactive-loop-pool/SKILL.md` says the
+   same under "Phase 2a known limitations"; this line used to claim the floor
+   survived, which is the sentence that would let someone enable the pool on an
+   owner queue. Phase 2b owes a durable ambiguity contract — recovery cannot
+   infer "no effect occurred" from a missing result.
 5. **Heartbeat/lease:** existing per-instance `.alive` (30s beat, 90s = dead).
    Lead reclaims assignments whose follower died; followers reclaim nothing
    from each other.
