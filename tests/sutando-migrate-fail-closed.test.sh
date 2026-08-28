@@ -162,6 +162,40 @@ corrupt "d['schemaVersion'] = 999"
 rc=0; RUN --verify > "$TMP/union-verify-scalar.log" 2>&1 || rc=$?
 check "a corrupted WINNING SCALAR fails verify (arrays all intact)" [ "$rc" -ne 0 ]
 
+echo "6. UNION_VERIFY dest-winner: the pre-union dest's scalars verify via the manifest"
+# The reviewer's paired control: when the DEST was newer, ITS scalars won and
+# no source's mtime can vouch for them — only the commit-time manifest can.
+new_case destwin
+mkdir -p "$CASE_A/state"
+printf '{"users": ["alice"], "schemaVersion": 1}\n' > "$CASE_A/state/slack-allowed-recipients.json"
+printf '{"users": ["bob"], "schemaVersion": 2}\n' > "$CASE_DEST/state/slack-allowed-recipients.json"
+touch -t 202606011200 "$CASE_A/state/slack-allowed-recipients.json"
+touch -t 202606011300 "$CASE_DEST/state/slack-allowed-recipients.json"
+rc=0; RUN --commit > "$TMP/destwin-commit.log" 2>&1 || rc=$?
+check "dest-newer union commit succeeds" [ "$rc" -eq 0 ]
+DW_DST="$CASE_DEST/state/slack-allowed-recipients.json"
+check "the dest's scalar won and both arrays merged" \
+    python3 -c "
+import json
+d = json.load(open('$DW_DST'))
+import sys; sys.exit(0 if sorted(d['users']) == ['alice','bob'] and d['schemaVersion'] == 2 else 1)
+"
+check "the commit recorded a union-scalars manifest" \
+    bash -c "ls '$CASE_DEST/state/.migration-union-scalars-'*.json >/dev/null 2>&1"
+rc=0; RUN --verify > "$TMP/destwin-verify.log" 2>&1 || rc=$?
+check "pristine dest-winner union passes verify" [ "$rc" -eq 0 ]
+python3 - "$DW_DST" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+mt = os.path.getmtime(p)
+d = json.load(open(p))
+d["schemaVersion"] = 999
+json.dump(d, open(p, "w"), indent=2, sort_keys=True)
+os.utime(p, (mt, mt))
+PY
+rc=0; RUN --verify > "$TMP/destwin-verify-corrupt.log" 2>&1 || rc=$?
+check "a corrupted DEST-WINNER scalar fails verify (the reviewer's paired control)" [ "$rc" -ne 0 ]
+
 echo ""
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
