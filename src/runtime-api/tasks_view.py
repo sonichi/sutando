@@ -27,7 +27,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result
 from local_task_protocol import (find_archived_task, find_result,  # noqa: E402
                                  parse_task_headers_lenient)
 sys.path.insert(0, str(_HERE.parent.parent / "packages" / "ag2-sparrow"))
