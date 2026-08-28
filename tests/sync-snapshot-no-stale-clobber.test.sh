@@ -13,7 +13,10 @@ mkdir -p "$WORKSPACE_DIR/hosts/testhost"
 # Stub SCRIPT_PARENT so the function's config-dir resolution succeeds.
 export SCRIPT_PARENT="$SB/parent"
 mkdir -p "$SCRIPT_PARENT/scripts" "$SB/cfg"
-printf '#!/bin/sh\necho "%s"\n' "$SB/cfg" > "$SCRIPT_PARENT/scripts/sutando-config.sh"
+# The stub must answer `python-bin` faithfully: the durable-publish path now
+# resolves its interpreter through it, and a wrong answer fails the fsync closed.
+printf '#!/bin/sh\ncase "$1" in python-bin) echo "%s" ;; *) echo "%s" ;; esac\n' \
+    "$(command -v python3)" "$SB/cfg" > "$SCRIPT_PARENT/scripts/sutando-config.sh"
 chmod +x "$SCRIPT_PARENT/scripts/sutando-config.sh"
 
 # Load ONLY the function under test, plus a _host stub.
@@ -335,6 +338,9 @@ _DST="$WORKSPACE_DIR/hosts/testhost/build_log.md"
 # Inject a durability failure without a seam in production code: the fsync
 # helper runs `python3 - <path>`, so a shim that refuses exactly that path makes
 # the fsync fail while every other python3 call still works.
+# PATH injection no longer reaches the interpreter (section 12): the script
+# resolves an absolute binary. Inject through SYNC_PY, which it honours when
+# the file is real and executable — that is the seam a test may legitimately use.
 _fsync_shim() {
     _fs="$(mktemp -d)"
     cat > "$_fs/python3" <<SHIM
@@ -359,7 +365,7 @@ _arm_owned_snapshot() {
 _arm_owned_snapshot
 _before="$(cat "$_DST")"
 _fs="$(_fsync_shim ".snapshot-sha.next")"
-PATH="$_fs:$PATH" _snapshot_per_host_config >/dev/null 2>&1
+SYNC_PY="$_fs/python3" _snapshot_per_host_config >/dev/null 2>&1
 rm -rf "$_fs"
 check "a) intent not durable: the destination is NOT replaced" \
       '[ "$(cat "$_DST")" = "$_before" ]'
@@ -370,7 +376,7 @@ check "...and no intent is left behind" '[ ! -f "$_INT" ]'
 _arm_owned_snapshot
 _sig_before="$(cat "$_SIG")"
 _fs="$(_fsync_shim "/build_log.md")"
-PATH="$_fs:$PATH" _snapshot_per_host_config > "$SB/b.out" 2>&1
+SYNC_PY="$_fs/python3" _snapshot_per_host_config > "$SB/b.out" 2>&1
 rm -rf "$_fs"
 check "b) destination not confirmed durable: the signature is NOT promoted" \
       '[ "$(cat "$_SIG")" = "$_sig_before" ]'
@@ -403,6 +409,38 @@ check "c) promote rename fails: the signature is not rewritten in place" \
 check "...and the intent survives for the next tick" '[ -f "$_INT" ]'
 rm -rf "$_shim"
 rm -f "$_INT"; rm -f "$_SIG"
+
+# ---- 12. the durable-publish path uses the REPO'S verified interpreter -------
+# A bare `python3` here can resolve to the Xcode-CLT stub from a LaunchAgent
+# PATH: the interpreter "exists", fails on exec, and raises an install dialog
+# every interval while the snapshot silently stays stale.
+echo "== 12. verified interpreter, not bare python3 =="
+
+check "no bare python3 survives in the script (comments aside)" \
+      '! grep -nE "(^|[^-[:alnum:]_/])python3\\b" "$REPO/scripts/sync-workspace.sh" | grep -v "^[0-9]*:[[:space:]]*#" | grep -qv SYNC_PY'
+check "the interpreter is resolved ONCE, through the repo's own cascade" \
+      'grep -q "python-bin" "$REPO/scripts/sync-workspace.sh"'
+check "the durability path FAILS CLOSED with no interpreter (never a silent no-fsync)" \
+      'grep -q "no durability guarantee" "$REPO/scripts/sync-workspace.sh"'
+
+# The live control: a PATH whose python3 is a failing stub, plus a good
+# SUTANDO_PY. The resolved binary must run and the stub must never be reached.
+_pyd="$(mktemp -d)"
+cat > "$_pyd/python3" <<'SHIM'
+#!/bin/sh
+echo called >> "$PYSHIM_LOG"
+exit 127
+SHIM
+chmod +x "$_pyd/python3"
+_pylog="$_pyd/called"; _pytarget="$_pyd/t"; echo x > "$_pytarget"
+_resolved="$(SUTANDO_PY="$(command -v python3)" PATH="$_pyd:/usr/bin:/bin" \
+    bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+check "the resolver refuses the stub and returns a working interpreter" \
+      '[ -n "$_resolved" ] && [ "$_resolved" != "$_pyd/python3" ]'
+PYSHIM_LOG="$_pylog" PATH="$_pyd:/usr/bin:/bin" "$_resolved" -c "import fcntl" 2>/dev/null
+check "...and it actually runs under the poisoned PATH" '[ "$?" -eq 0 ]'
+check "...without the stub ever being invoked" '[ ! -f "$_pylog" ]'
+rm -rf "$_pyd"
 
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

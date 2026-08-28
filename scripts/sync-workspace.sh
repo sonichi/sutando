@@ -126,6 +126,13 @@ SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
 unset _self
 SCRIPT_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# The repo owns the safe-interpreter cascade (sutando-config.sh python-bin →
+# scripts/python-binary.sh). A bare `python3` here can reach the Xcode-CLT stub
+# from a LaunchAgent PATH, which raises an install dialog every interval.
+# Empty when nothing resolves; callers decide whether that is fatal.
+SYNC_PY="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+[ -n "$SYNC_PY" ] && [ -x "$SYNC_PY" ] || SYNC_PY=""
+
 # Load .env from the sutando workspace early — non-interactive shells (cron,
 # launchd) don't run user shell startup.
 if [ -f "$SCRIPT_PARENT/.env" ]; then
@@ -886,7 +893,15 @@ _snapshot_per_host_config() {
     # fsync a path AND its directory: a rename is only durable once the parent
     # directory entry is on disk (keweichen's P1#3 acceptance condition).
     _fsync_path_and_dir() {
-        python3 - "$1" <<'PY' 2>/dev/null || return 1
+        # Resolve lazily too: this function is loaded standalone by its test, so
+        # it cannot assume the script-level SYNC_PY exists.
+        local _py="${SYNC_PY:-}"
+        if [ -z "$_py" ] || [ ! -f "$_py" ] || [ ! -x "$_py" ]; then
+            _py="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+        fi
+        # No verified interpreter -> no durability guarantee. Fail, never pretend.
+        [ -n "$_py" ] && [ -f "$_py" ] && [ -x "$_py" ] || return 1
+        "$_py" - "$1" <<'PY' 2>/dev/null || return 1
 import os, sys
 p = sys.argv[1]
 fd = os.open(p, os.O_RDONLY)
@@ -1694,9 +1709,9 @@ cmd_default_bidirectional() {
 _report_unmerged_conflicts() {
     local script="$REPO_DIR/scripts/sync-conflicts-report.py"
     [ -f "$script" ] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
+    [ -n "${SYNC_PY:-}" ] || return 0
     local out
-    out="$(python3 "$script" "$WORKSPACE_DIR" 2>&1)" || true
+    out="$("$SYNC_PY" "$script" "$WORKSPACE_DIR" 2>&1)" || true
     # Only speak up when there is something to merge back; the clean case is
     # silent so a 30-minute cron does not grow a nag nobody reads.
     case "$out" in
