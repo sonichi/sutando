@@ -17,6 +17,7 @@ import os
 
 from _gateway import gate_allows, load_gate, gateway, http_json, degrade_reason, HTTPError, URLError
 import receipt as _receipt
+from relations import RelationError, relation_fields
 
 
 def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
@@ -24,8 +25,12 @@ def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
             "reason": reason, "state": state or (_receipt.CONFIRMED if ok else _receipt.FAILED)}
 
 
-def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None) -> dict:
+def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
+        *, reply_to: str | None = None) -> dict:
     """Post `message` into `room_id` verbatim, mentioning no one.
+
+    `reply_to` cites the message being replied to; the post stays in the main
+    timeline. See relations.relation_fields.
 
     Returns {ok, room_id, event_id, reason}. Refuses before any network call when
     the room is missing, the body is empty, or the client gate denies the room.
@@ -36,6 +41,13 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None) ->
     # cheaper than asking a reader to interpret a blank line.
     if not message or not message.strip():
         return _result(False, room_id=room_id, reason="message required")
+
+    # Before the gate and the network: a bad event id is the caller's typo, and
+    # posting it unrelated would cite the wrong message silently.
+    try:
+        rel = relation_fields(reply_to=reply_to)
+    except RelationError as e:
+        return _result(False, room_id=room_id, reason=str(e))
 
     if agent_mxid is None:
         agent_mxid = os.environ.get("AGENT_MXID")
@@ -53,7 +65,7 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None) ->
         # caller wrote is theirs; this function never prepends one.
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
-            {"op": "message", "room_id": room_id, "body": message},
+            {"op": "message", "room_id": room_id, "body": message, **rel},
         )
     except HTTPError as e:
         return _result(False, room_id=room_id, reason=degrade_reason(e.code))
