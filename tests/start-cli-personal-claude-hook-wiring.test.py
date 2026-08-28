@@ -55,6 +55,14 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
             REPO / "scripts/python-binary.sh", self.root / "scripts/python-binary.sh"
         )
 
+        # The launcher sources this before the truncation point; without it the
+        # fixture aborts under `set -euo pipefail` before the installer call.
+        (self.root / "src/agent").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            REPO / "src/agent/restart-guard.sh",
+            self.root / "src/agent/restart-guard.sh",
+        )
+
         self.marker = self.root / "installer-ran.marker"
         installer = self.root / "scripts/install-personal-claude-hook.sh"
         installer.write_text(f"#!/usr/bin/env bash\necho ran >> '{self.marker}'\n")
