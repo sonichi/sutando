@@ -282,13 +282,15 @@ def main() -> int:
     a = ap.parse_args()
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
-    # Both gates run on RESOLVED targets and BEFORE any send: a partial batch that
-    # notified one person is the single-reviewer outcome the owner's rule forbids.
-    if len(targets) < 2 and not a.allow_single:
+    # Gates run on RESOLVED targets before any send, so no partial batch notifies
+    # one person; plan mode is exempt because only a real ASK can strand a PR.
+    if a.send and len(targets) < 2 and not a.allow_single:
         print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
               "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
               "or pass --allow-single '<reason>'.", file=sys.stderr)
-        return 5
+        # A name that failed to resolve is WHY the count is short, and it is the
+        # actionable half; reporting 5 there sends the caller to add a reviewer.
+        return refusal_rc or 5
     if a.allow_single and len(targets) < 2:
         print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
     stale, why = _stale_repeat_ask(a.message, targets, load_roster())
