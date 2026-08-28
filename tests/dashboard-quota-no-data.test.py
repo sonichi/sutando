@@ -46,8 +46,12 @@ def _tile(html: str, label: str) -> str:
     # [^<]* — not (.*?): a dot-any capture starts at the FIRST stat-val on the
     # page and swallows every tile until it reaches this label, so every tile
     # "contains" every value and the assertion means nothing.
+    # The quota tiles may carry an inline pace sparkline: a <span> around the
+    # value and an <svg> after it, both bounded — never a dot-any capture.
     m = re.search(
-        r'<div class="stat-val">([^<]*)</div><div class="stat-label">' + re.escape(label),
+        r'<div class="stat-val"[^>]*>(?:<span>)?([^<]*)(?:</span>)?'
+        r'(?:<svg[^>]*>[^<]*(?:</?[a-z][^>]*>[^<]*)*</svg>)?\s*</div><div class="stat-label">'
+        + re.escape(label),
         html)
     assert m, f"tile {label!r} not found in rendered page"
     return m.group(1)
