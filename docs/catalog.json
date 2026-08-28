@@ -188,13 +188,13 @@
    "last_verified": "2026-08-17"
   },
   "docs/lead-follower-pool.md": {
-   "title": "Lead-follower agent pool — design",
+   "title": "Lead–worker agent pool — design",
    "audience": [
     "contributors",
     "maintainers"
    ],
    "status": "canonical",
-   "canonical_for": "lead-follower multi-core pool architecture (assignment, claim, recovery)",
+   "canonical_for": "lead–worker pool architecture: one core, N workers (assignment, claim, recovery)",
    "last_verified": "2026-08-26"
   },
   "docs/migration-transition-window.md": {
