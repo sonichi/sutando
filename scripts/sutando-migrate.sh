@@ -1023,28 +1023,68 @@ mirror_dir_modes() {
         sd+=("$s"); dd+=("$d")
         s="$(dirname "$s")"; d="$(dirname "$d")"
     done
-    local i sm dm
+    local i sm dm want got rc=0
     for (( i=${#sd[@]}-1; i>=0; i-- )); do
         [ -d "${sd[$i]}" ] && [ -d "${dd[$i]}" ] || continue
         sm="$(mode_of "${sd[$i]}")"; dm="$(mode_of "${dd[$i]}")"
-        [ -n "$sm" ] && [ -n "$dm" ] || continue
+        # A failed probe on an EXISTING dir fails closed: committing under an
+        # unknown mode is a confidentiality window certified as success.
+        if [ -z "$sm" ] || [ -z "$dm" ]; then rc=1; continue; fi
         [ "$sm" = "$dm" ] && continue
-        chmod "$(printf '%o' $(( 0$sm & 0$dm )))" "${dd[$i]}" 2>/dev/null || true
+        want="$(printf '%o' $(( 0$sm & 0$dm )))"
+        if ! chmod "$want" "${dd[$i]}" 2>/dev/null; then rc=1; continue; fi
+        got="$(mode_of "${dd[$i]}")"
+        if [ -z "$got" ] || [ "$(( 0$got ))" -ne "$(( 0$want ))" ]; then rc=1; fi
     done
+    return "$rc"
 }
 
-# Atomic per-file copy preserving mtime. Returns 0 on success.
+# Create (if needed) and physically validate the directory a dest write will
+# land in. A textual prefix test passes a symlinked component while the
+# mutation escapes the rollback boundary, so containment is proven on the
+# RESOLVED path — and the deepest existing ancestor is checked BEFORE mkdir,
+# so a symlink escape refuses without creating anything outside either.
+ensure_contained_destdir() {
+    local ddir="$1" probe real
+    probe="$ddir"
+    while [ ! -d "$probe" ]; do probe="$(dirname "$probe")"; done
+    real="$(cd "$probe" 2>/dev/null && pwd -P)" || return 1
+    case "$real/" in
+        "$DEST_REAL"/*) ;;
+        *) echo "ERROR: dest path escapes the dest root: $ddir resolves via $real" >&2; return 1 ;;
+    esac
+    mkdir -p "$ddir" 2>/dev/null || return 1
+    real="$(cd "$ddir" 2>/dev/null && pwd -P)" || return 1
+    case "$real/" in
+        "$DEST_REAL"/*) return 0 ;;
+        *) echo "ERROR: dest path escapes the dest root: $ddir resolves to $real" >&2; return 1 ;;
+    esac
+}
+
+# Atomic per-file copy preserving mtime. Returns 0 on success; any mkdir,
+# containment, directory-mode, or copy failure returns non-zero so the commit
+# outcome can fail closed instead of certifying a write that did not happen.
 copy_preserving_mtime() {
     local src="$1" dst="$2"
-    mkdir -p "$(dirname "$dst")"
-    mirror_dir_modes "$src" "$dst"
+    ensure_contained_destdir "$(dirname "$dst")" || return 1
+    mirror_dir_modes "$src" "$dst" || {
+        echo "ERROR: directory-mode enforcement failed for $dst" >&2
+        return 1
+    }
     # Atomic: cp -p to sibling tmp then mv. -p preserves mtime + mode.
     local tmp="$dst.tmp.$$"
-    cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"
+    if ! { cp -p "$src" "$tmp" && mv -f "$tmp" "$dst"; }; then
+        rm -f "$tmp" 2>/dev/null
+        echo "ERROR: copy failed: $src -> $dst" >&2
+        return 1
+    fi
 }
 
 # Unions top-level arrays; non-array fields follow the newer source.
 # Malformed input returns non-zero — a silent degrade is access loss.
+# NB: pure merge policy — no dest-boundary enforcement here. Containment is
+# the COMMIT path's concern (commit_one), so standalone callers and the test
+# harness can drive the policy against arbitrary paths.
 union_json_arrays_into() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"
@@ -1102,6 +1142,40 @@ PY
     fi
     rm -f "$tmp"
     return 1
+}
+
+# Semantic-verify companion to union_json_arrays_into: same element
+# fingerprint (sorted-key JSON). A union result differs from both inputs BY
+# DESIGN, so the per-source invariant is containment — every array element of
+# the source present in the dest — not byte identity.
+union_contains() {
+    local src="$1" dst="$2"
+    local py; py="$(resolve_python "$REPO_DIR")"
+    [ -n "$py" ] || return 1
+    "$py" - "$src" "$dst" <<'PY'
+import json, sys
+
+src, dst = sys.argv[1:3]
+try:
+    with open(src, encoding="utf-8") as fh:
+        s = json.load(fh)
+    with open(dst, encoding="utf-8") as fh:
+        d = json.load(fh)
+except Exception:
+    sys.exit(1)
+if not isinstance(s, dict) or not isinstance(d, dict):
+    sys.exit(1)
+for key, val in s.items():
+    if not isinstance(val, list):
+        continue
+    dv = d.get(key)
+    if not isinstance(dv, list):
+        sys.exit(1)
+    have = {json.dumps(e, sort_keys=True) for e in dv}
+    if any(json.dumps(e, sort_keys=True) not in have for e in val):
+        sys.exit(1)
+sys.exit(0)
+PY
 }
 
 # Human-readable byte size: 1234 → "1.2 KB", 5242880 → "5.0 MB", etc.
@@ -1260,8 +1334,9 @@ commit_one() {
     case "$cls" in
         union-json-array)
             dst_path="$DEST_REAL/$rel"
+            ensure_contained_destdir "$(dirname "$dst_path")" || { echo "write-failed"; return 1; }
             if [ ! -e "$dst_path" ]; then
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "copied"
                 return 0
             fi
@@ -1275,6 +1350,7 @@ commit_one() {
                 echo "ERROR: $rel — cannot union $src_file into $dst_path (malformed JSON" >&2
                 echo "       or a field that is an array in one file and not the other)." >&2
                 echo "       Refusing to fall back to newest-wins; that would drop grants." >&2
+                echo "write-failed"
                 return 1
             fi
             echo "unioned"
@@ -1308,17 +1384,17 @@ commit_one() {
                     # Name it .legacy-prior-<src_tag>-<ts> to convey "this is
                     # what was at dest before <src_tag> overwrote it" + the
                     # timestamp ensures 3-way collisions don't clobber.
-                    copy_preserving_mtime "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix"
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    copy_preserving_mtime "$dst_path" "$dst_path.legacy-prior-from-$tag-$ts_suffix" || { echo "write-failed"; return 1; }
+                    copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                     echo "src-wins-newer"
                 else
                     # src loses; preserve under tagged + timestamped sidecar.
-                    copy_preserving_mtime "$src_file" "$dst_path.legacy-$tag-$ts_suffix"
+                    copy_preserving_mtime "$src_file" "$dst_path.legacy-$tag-$ts_suffix" || { echo "write-failed"; return 1; }
                     echo "dest-wins-newer"
                 fi
                 return 0
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "copied"
                 return 0
             fi
@@ -1330,13 +1406,13 @@ commit_one() {
                 src_mt="$(_stat %Y %m "$src_file")"
                 dst_mt="$(_stat %Y %m "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                     echo "src-newer"
                 else
                     echo "dest-newer"
                 fi
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "copied"
             fi
             return 0
@@ -1372,13 +1448,13 @@ commit_one() {
                 src_mt="$(_stat %Y %m "$src_file")"
                 dst_mt="$(_stat %Y %m "$dst_path")"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                     echo "rehomed-newer"
                 else
                     echo "rehomed-skip-older"
                 fi
             else
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "rehomed"
             fi
             return 0
@@ -1398,7 +1474,7 @@ commit_one() {
             # with a divider header carrying src-tag + mtime + size so the
             # downstream reader can split if needed.
             dst_path="$DEST_REAL/logs/workspace-narrative.log"
-            mkdir -p "$(dirname "$dst_path")"
+            ensure_contained_destdir "$(dirname "$dst_path")" || { echo "write-failed"; return 1; }
             local src_mt src_sz
             src_mt="$(_stat %Y %m "$src_file")"
             src_sz="$(_stat %s %z "$src_file")"
@@ -1484,7 +1560,7 @@ commit_one() {
             # --merge-append (Strategy B): concat with divider to <dest>/<rel>.
             if [ "$MERGE_APPEND" = "1" ]; then
                 dst_path="$DEST_REAL/$rel"
-                mkdir -p "$(dirname "$dst_path")"
+                ensure_contained_destdir "$(dirname "$dst_path")" || { echo "write-failed"; return 1; }
                 if [ -e "$dst_path" ]; then
                     # IMPORTANT: split the compound-redirect + mv + echo "merged"
                     # into separate statements with explicit error returns.
@@ -1520,12 +1596,12 @@ commit_one() {
                     }
                     echo "merged"
                 else
-                    copy_preserving_mtime "$src_file" "$dst_path"
+                    copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                     echo "copied"
                 fi
             else
                 dst_path="$DEST_REAL/legacy/$tag/$rel"
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "sidecar"
             fi
             return 0
@@ -1540,7 +1616,7 @@ commit_one() {
                 local subdir="${rel%%/*}"  # tasks or results
                 local file_base="${rel#*/}" # task-*.txt
                 dst_path="$DEST_REAL/$subdir/archive/$tag/$file_base"
-                copy_preserving_mtime "$src_file" "$dst_path"
+                copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 echo "archived-stale"
             else
                 echo "skipped-inflight"
@@ -1553,7 +1629,7 @@ commit_one() {
             # experiments/, obsidian-vault/, personal-src/). Preserve under a
             # namespaced quarantine path rather than skip-unknown'ing it.
             dst_path="$DEST_REAL/legacy/$tag/quarantine/$rel"
-            copy_preserving_mtime "$src_file" "$dst_path"
+            copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
             echo "quarantined"
             return 0
             ;;
@@ -1641,7 +1717,7 @@ commit_source() {
     esac
     [ ${#walk_paths[@]} -eq 0 ] && { echo "  (nothing on surface; skip)"; return 0; }
 
-    local n_copied=0 n_kept=0 n_skipped=0 n_sidecar=0 n_rehomed=0 n_identical=0 n_quarantined=0 n_other=0
+    local n_copied=0 n_kept=0 n_skipped=0 n_sidecar=0 n_rehomed=0 n_identical=0 n_quarantined=0 n_other=0 n_write_failed=0
     # Phase 2 mode skips the commit walk entirely.
     if [ "$DO_COMMIT_WALK" = "0" ]; then
         # Skip ahead to the delete block (it walks walk_paths independently).
@@ -1671,7 +1747,10 @@ commit_source() {
             n_skipped=$((n_skipped+1)); continue
         fi
         cls="$(classify "$rel")"
-        outcome="$(commit_one "$file" "$rel" "$tag" "$cls")"
+        # || true: the failure signal is the outcome string; the tally below
+        # decides the source's fate, so one bad file cannot abort the walk
+        # half-committed with no summary and no verdict.
+        outcome="$(commit_one "$file" "$rel" "$tag" "$cls")" || true
         # Per-file progress on stderr — visible feedback during the copy walk
         # so long migrations don't feel like a hang. Skipped when PROGRESS_TOTAL
         # is 0 (delete-source phase-2 path; pre-flight didn't run).
@@ -1701,6 +1780,8 @@ commit_source() {
                 n_quarantined=$((n_quarantined+1)) ;;
             skipped-class|skipped-inflight|skipped-fallthrough)
                 n_skipped=$((n_skipped+1)) ;;
+            write-failed|"")
+                n_write_failed=$((n_write_failed+1)) ;;
             *)
                 n_other=$((n_other+1)) ;;
         esac
@@ -1716,6 +1797,10 @@ commit_source() {
         echo "  skipped:     $n_skipped"
         [ "$n_other" -gt 0 ] && echo "  other:       $n_other"
 
+        if [ "$n_write_failed" -gt 0 ]; then
+            echo "  WRITE-FAILED: $n_write_failed — sentinel NOT written; source $tag is NOT committed" >&2
+            return 1
+        fi
         touch "$(source_sentinel "$tag")"
         echo "  sentinel:    $(source_sentinel "$tag")"
     fi
@@ -2147,6 +2232,12 @@ verify_main() {
             fi
         done
         if [ -n "$landed" ]; then
+            pass=$((pass+1))
+        elif [ "$cls" = "union-json-array" ] && [ -f "$dst_canonical" ] \
+                && union_contains "$src_file" "$dst_canonical"; then
+            # A union result is byte-different from both inputs by design;
+            # the per-source invariant is array containment, checked through
+            # the union policy owner's own element fingerprint.
             pass=$((pass+1))
         elif [ -f "$dst_canonical" ] || [ -f "$dst_sidecar_legacy" ]; then
             # A dest path exists but sha doesn't match — content mismatch.
