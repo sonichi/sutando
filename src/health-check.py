@@ -5804,7 +5804,12 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
         ts = data.get("ts")
         if not isinstance(ts, (int, float)) or (now - ts) > GATEWAY_STATUS_MAX_AGE_S:
             return None
-        return bool(data.get("connected"))
+        if not bool(data.get("connected")):
+            return False
+        # `connected` is a flag; `last_ok_ts` is the thing that ADVANCES. A lane
+        # that never completed a poll carries connected with last_ok_ts null.
+        last_ok = data.get("last_ok_ts")
+        return isinstance(last_ok, (int, float)) and not isinstance(last_ok, bool)
     except (OSError, ValueError, AttributeError, TypeError):
         return None
 
