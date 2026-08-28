@@ -91,5 +91,16 @@ with tempfile.TemporaryDirectory() as td:
     check(report.get("malformed_tokens"),
           "the bogus token is named in the report, not silently dropped")
 
+# kewei r? P3: str.isdigit() is a wider set than what the writer emits AND a
+# wider set than what int() accepts, and the two disagreements differ.
+_SUP2, _ARABIC3 = "\u00b2", "\u0663"
+check(not bc.is_producer_token(tok("k", "w", _SUP2, "1", "x")),
+      "a superscript-digit pid is rejected (isdigit true, int() raises)")
+check(not bc.is_producer_token(tok("k", "w", _ARABIC3, "1", "x")),
+      "a non-ASCII decimal pid is rejected (int() accepts it, the writer "
+      "cannot emit it)")
+check(bc.is_producer_token(tok("k", "w", "4242", "1", "x")),
+      "positive control: an ordinary pid is still a producer token")
+
 print(f"\n{'OK' if not failures else 'FAILED'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

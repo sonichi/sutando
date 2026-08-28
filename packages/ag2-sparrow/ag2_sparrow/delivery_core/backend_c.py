@@ -46,7 +46,10 @@ def is_producer_token(name: str) -> bool:
     caller that checks only arity calls a permanently-unrecoverable name valid.
     """
     parts = name.split(SEP)
-    return len(parts) == TOKEN_PARTS and parts[2].isdigit()
+    # isascii() too: isdigit alone admits '\u00b2' (int() raises in recover)
+    # and '\u0663' (int() accepts it; str(os.getpid()) cannot emit it).
+    return (len(parts) == TOKEN_PARTS
+            and parts[2].isascii() and parts[2].isdigit())
 
 _ACTIVATED: set[str] = set()
 _ACTIVATE_GUARD = threading.Lock()
