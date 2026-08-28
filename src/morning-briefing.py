@@ -99,9 +99,7 @@ def get_weather() -> str:
         rain = day["precipitation_probability_max"][0]
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
-        # Naming the fallback keeps an unconfigured install from stating a city
-        # the owner has never been in as if it were their own weather. Kept short
-        # because this sentence is spoken aloud; the remedy is logged, not read out.
+        # Spoken aloud, so the label stays short and the remedy goes to the log.
         where = "" if configured else " in San Francisco (default location)"
         return f"{temp}°F and {desc}{where}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
