@@ -144,6 +144,27 @@ if gs.read_verdict(_p, now=NOW, max_age=300) is not None:
     failures.append("malformed: a huge int via read_verdict must be no opinion, not a raise")
 malformed_checked += 1
 
+# ------------------------------------------ the guard must not over-reject
+
+# Every rule above rejects something; each needs its nearest ACCEPTED neighbour,
+# or a guard that refuses everything would pass the malformed suite unchanged.
+ACCEPTED = [
+    ("backoff_s = 0.0 is a value, not absence", {"ts": NOW, "connected": True, "last_ok_ts": NOW, "backoff_s": 0.0},
+     lambda v: v.backoff_s == 0.0),
+    ("backoff_s underflows to 0.0",             {"ts": NOW, "connected": True, "last_ok_ts": NOW, "backoff_s": json.loads("1e-400")},
+     lambda v: v.backoff_s == 0.0),
+    ("last_ok_ts = 0.0 is non-negative",        {"ts": NOW, "connected": True, "last_ok_ts": 0.0},
+     lambda v: v.last_ok_ts == 0.0 and v.serving is True),
+    ("ts exactly at the skew boundary",         {"ts": NOW + gs.FUTURE_SKEW_S, "connected": True, "last_ok_ts": NOW},
+     lambda v: v.serving is True),
+    ("ts exactly at max_age",                   {"ts": NOW - 300, "connected": True, "last_ok_ts": NOW},
+     lambda v: v.serving is True),
+]
+for _label, _rec, _ok in ACCEPTED:
+    _v = gs.verdict_from_record(_rec, now=NOW, max_age=300)
+    if _v is None or not _ok(_v):
+        failures.append(f"over-reject: {_label}: got {_v}")
+
 # ------------------------------------------ reader-specific edges preserved
 
 # core-input-watch keeps its reconnect grace: a lane that HAS served and is
@@ -165,5 +186,5 @@ if failures:
     for f in failures:
         print(f"FAIL: {f}")
     sys.exit(1)
-print(f"ok - {len(CONTRACT)} contract + {len(NO_OPINION) + 1} no-opinion + {malformed_checked} malformed cases, "
+print(f"ok - {len(CONTRACT)} contract + {len(NO_OPINION) + 1} no-opinion + {malformed_checked} malformed + {len(ACCEPTED)} accepted cases, "
       f"3 readers delegating, 3 reader-specific edges preserved")
