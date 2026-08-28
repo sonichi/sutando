@@ -610,6 +610,20 @@ _adoptable_builtin_denies() {
 
 # A previously-generated exclude whose ONLY difference is carve-outs the shipped
 # config now adds is safe to refresh: no operator-authored rule is lost.
+# An operator's COMMENT is content, but refusing the whole refresh over one is
+# the wrong lever: a shipped header line that no longer ships is inert drift and
+# would block every upgrade. Carry the dropped comments forward instead, so the
+# owned rules refresh AND nothing the operator wrote is lost.
+_preserve_dropped_comments() {
+    local existing="$1" desired="$2" dropped
+    dropped="$(comm -23 <(_exclude_comments_only "$existing") <(_exclude_comments_only "$desired"))"
+    [ -n "$dropped" ] || return 0
+    {
+        printf '\n# --- preserved from the previous exclude (sync-workspace) ---\n'
+        printf '%s\n' "$dropped"
+    } >> "$desired"
+}
+
 _is_safe_carveout_addition() {
     local existing="$1" desired="$2" shipped shipped_rules line path widened rc
     # Compare against the HOST-WIDENED existing content: the two safe migrations are
@@ -630,11 +644,9 @@ _is_safe_carveout_addition() {
     shipped="$shipped_rules"$'\n'"$(_adoptable_builtin_denies)"
     [ -n "$(printf '%s' "$shipped" | grep -vE '^[[:space:]]*$')" ] || { rm -f "$widened"; return 1; }
     rc=0
-    # Refuse if the refresh would DROP any rule the existing file carries — or
-    # any COMMENT it carries. A customized file is usually customized by comment,
-    # and a rules-only comparison calls dropping one "safe".
-    if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ] ||
-        [ -n "$(comm -23 <(_exclude_comments_only "$existing") <(_exclude_comments_only "$desired"))" ]; then
+    # Refuse if the refresh would DROP any RULE the existing file carries.
+    # Comments are not a refusal reason — _preserve_dropped_comments carries them.
+    if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ]; then
         rc=1
     else
         # Every added rule must be a shipped carve-out, never an operator's line.
@@ -708,9 +720,11 @@ generate_exclude() {
         if ! grep -qE '^[^#]' "$exclude_path" 2>/dev/null; then
             log "generate_exclude: existing $exclude_path is stock comments only; overwriting"
         elif _is_safe_legacy_host_scope_widening "$exclude_path" "$tmp_path"; then
+            _preserve_dropped_comments "$exclude_path" "$tmp_path"
             log "generate_exclude: safely widened legacy hosts/<label>/ carrier rules to hosts/*/"
             color_warn "sync-workspace: widened legacy hosts/<label>/ carrier rules to hosts/*/ so peer host state remains durable"
         elif _is_safe_carveout_addition "$exclude_path" "$tmp_path"; then
+            _preserve_dropped_comments "$exclude_path" "$tmp_path"
             log "generate_exclude: refreshed a previously-generated exclude with shipped carve-outs only"
             color_warn "sync-workspace: added shipped carve-out(s) to the existing exclude file; no operator rule was removed"
         elif [ "$FORCE_GITIGNORE" != "1" ]; then

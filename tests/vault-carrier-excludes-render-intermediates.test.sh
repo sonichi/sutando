@@ -390,6 +390,23 @@ check "comment-only drift does not block the refresh (rc=0)" \
     test "$(upgrade_rc "$UPG_CMT")" -eq 0
 check "...and the carve-outs landed despite the stale comment" \
     test "$(carveouts_in "$UPG_CMT")" -eq 4
+check "...and the operator's comment SURVIVES the refresh (preserved, not dropped)" \
+    grep -qxF '# an older header line that no longer ships' "$UPG_CMT/.git/info/exclude"
+
+# keweichen's acceptance case on #3198: the owned deny must LAND while an
+# operator comment beside it SURVIVES. Refusing the refresh preserved the
+# comment but left the deny out, which is how the crash temp became stageable.
+UPG_BOTH="$TEST_ROOT/upgrade-deny-and-comment"
+seed_older_install "$UPG_BOTH" 'notes/generated/' 'notes/media/'
+grep -vxF "$BI_RULE" "$UPG_BOTH/.git/info/exclude" > "$UPG_BOTH/.git/info/exclude.t" &&
+    mv "$UPG_BOTH/.git/info/exclude.t" "$UPG_BOTH/.git/info/exclude"
+printf '# why we keep notes/raw: it is my scratch area\n' >> "$UPG_BOTH/.git/info/exclude"
+check "deny+comment: the refresh is allowed (rc=0)" \
+    test "$(upgrade_rc "$UPG_BOTH")" -eq 0
+check "...the owned deny LANDS" \
+    test "$(builtin_in "$UPG_BOTH")" -eq 1
+check "...and the operator's comment survives beside it" \
+    grep -qxF '# why we keep notes/raw: it is my scratch area' "$UPG_BOTH/.git/info/exclude"
 
 check "the refusal chain consults the carve-out recognizer" \
     grep -qF '_is_safe_carveout_addition "$exclude_path" "$tmp_path"' <<< "$SYNC_CODE"
