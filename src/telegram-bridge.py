@@ -59,12 +59,13 @@ import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
+from sutando_config import config_get, config_get_env_first  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from task_archive import archive_file as _shared_archive_file  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
@@ -474,23 +475,41 @@ def _recover_orphan_sending_files() -> int:
 # swallowed so the real result still delivers.
 _progress_msgs: dict = {}        # task_id -> {message_id, chat_id, first, last_edit, last_text} | {"expired": True}
 pending_task_tiers: dict = {}    # task_id -> access_tier; in-memory ONLY → fail-closed on restart
+pending_task_private: dict = {}  # task_id -> chat audience is private; in-memory ONLY → fail-closed on restart
 
 
-def _dedup_recover(task_id: str, holder_id, chat_id) -> str | None:
-    """Route the shared dedup-recovery plan; returns a new task id to route."""
+def _render_progress_text(elapsed: float, task_id: str) -> str:
+    """The allowlist holds a USER id but that user can write from a group, so the gate
+    is the recorded chat audience; unknown (e.g. after a restart) means not-private."""
+    if not progress_stream.step_visible_in(pending_task_private.get(task_id, False)):
+        return progress_stream.format_progress(None, elapsed)
+    step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
+    return progress_stream.format_progress(step, elapsed)
+
+
+def _dedup_recover(task_id: str, holder_id, chat_id) -> tuple[str | None, str]:
+    """Route the shared dedup-recovery plan.
+
+    Returns ``(new_task_id_to_route, disposition)`` where disposition is the
+    shared "archive"/"retain" -- an undelivered report must not retire the ask.
+    """
+    action, delivered, requeued = "defer", None, None
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id, chat_id,
             f"task-{int(time.time() * 1000)}")
         if action == "requeue":
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
-            return payload
-        if action == "report":
-            send_reply(chat_id, payload, task_id=task_id)
+            requeued = payload
+        elif action == "report":
+            # send_reply already reports its own outcome; ignoring it archived
+            # a failed report as though the asker had been told.
+            delivered = bool((send_reply(chat_id, payload, task_id=task_id)
+                              or {}).get("ok"))
             print(f"  [dedup] unresolved for {task_id}", flush=True)
-    except Exception as exc:  # noqa: BLE001 - never block the skip path
+    except Exception as exc:  # noqa: BLE001 - the disposition, not the raise, decides
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
-    return None
+    return requeued, report_disposition(action, delivered)
 
 
 def _clear_progress(task_id: str) -> None:
@@ -498,6 +517,7 @@ def _clear_progress(task_id: str) -> None:
     Called when the result is delivered/skipped/given-up so the placeholder
     doesn't linger next to the real reply."""
     pending_task_tiers.pop(task_id, None)
+    pending_task_private.pop(task_id, None)
     info = _progress_msgs.pop(task_id, None)
     if info and info.get("message_id") and info.get("chat_id") is not None:
         try:
@@ -627,8 +647,7 @@ def poll_progress(pending_replies: dict) -> None:
                 _progress_msgs[task_id] = {"expired": True}  # terminal — never re-post
                 continue
             if progress_stream.should_edit(now, info["last_edit"]):
-                step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
-                text = progress_stream.format_progress(step, elapsed)
+                text = _render_progress_text(elapsed, task_id)
                 if text != info.get("last_text"):
                     try:
                         api("editMessageText", chat_id=chat_id, message_id=info["message_id"], text=text)
@@ -649,8 +668,7 @@ def poll_progress(pending_replies: dict) -> None:
         except (ValueError, IndexError):
             created = now
         if progress_stream.should_post_placeholder(now - created):
-            step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
-            text = progress_stream.format_progress(step, now - created)
+            text = _render_progress_text(now - created, task_id)
             resp = api("sendMessage", chat_id=chat_id, text=text)
             mid = (resp or {}).get("result", {}).get("message_id")
             if mid:
@@ -671,6 +689,9 @@ def poll_progress(pending_replies: dict) -> None:
     for tid in list(pending_task_tiers.keys()):
         if tid not in pending_replies:
             pending_task_tiers.pop(tid, None)
+    for tid in list(pending_task_private.keys()):
+        if tid not in pending_replies:
+            pending_task_private.pop(tid, None)
 
 
 def log_privacy_setting(get_me):
@@ -784,6 +805,9 @@ def main():  # pragma: no cover
                 sender_id = str(msg["from"]["id"])
                 username = msg["from"].get("username", sender_id)
                 chat_id = msg["chat"]["id"]
+                # The allowlist gates the SENDER, who may be writing from a group,
+                # so record the chat audience for the progress placeholder's gate.
+                chat_is_private = msg["chat"].get("type") == "private"
                 text = msg.get("text", "")
 
                 # Reload access list periodically
@@ -1009,6 +1033,7 @@ def main():  # pragma: no cover
                 task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
+                pending_task_private[task_id] = chat_is_private  # audience, not sender: gates the step text
                 # Observability: one inbound accepted-message event. Source the
                 # tier from the bridge's own assignment above (single source of
                 # truth) rather than re-asserting a literal here.
@@ -1075,7 +1100,7 @@ def main():  # pragma: no cover
                         # file out of the `*.txt` glob every peer bridge polls.
                         # `_resolve_proactive_owner_id` orders allowFrom explicitly; a
                         # bare `next(iter(set))` picked a hash-slot, not the first user.
-                        env_override = os.environ.get("SUTANDO_DM_OWNER_ID", "").strip()
+                        env_override = (config_get_env_first("SUTANDO_DM_OWNER_ID", "") or "").strip()
                         try:
                             access_data = json.loads(ACCESS_FILE.read_text())
                         except Exception:
@@ -1145,9 +1170,13 @@ def main():  # pragma: no cover
                 if any(a.kind == "skip" for a in parsed.actions):
                     _sk = next(a for a in parsed.actions if a.kind == "skip")
                     if _sk.value == "deduped":
-                        _rq = _dedup_recover(task_id, _sk.extra, chat_id)
+                        _rq, _disp = _dedup_recover(task_id, _sk.extra, chat_id)
                         if _rq:
                             pending_replies[_rq] = chat_id
+                        if _disp == "retain":
+                            print(f"  [dedup] report not delivered for {task_id} "
+                                  f"— keeping for retry", flush=True)
+                            continue
                     print(f"  Skipped (marker): {task_id}", flush=True)
                     _clear_progress(task_id)  # remove any progress placeholder + tier tracking
                     archive_file(result_file, "results", task_id)
