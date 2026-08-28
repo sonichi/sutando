@@ -150,6 +150,7 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
@@ -429,6 +430,51 @@ DISCORD_TRUNCATION_NOTICE = (
     "⚠️ Result truncated: additional content was suppressed to keep Discord "
     "responsive."
 )
+
+
+def _mention_gate_owner_ids() -> list:
+    """Owner ids the mention gate keys on: tierMap owner entries, else allowFrom."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception:
+        return []
+    tier_map = data.get("tierMap")
+    if isinstance(tier_map, dict):
+        owners = [str(u) for u, t in tier_map.items() if t == "owner"]
+        if owners:
+            return owners
+    allow = data.get("allowFrom")
+    return [str(u) for u in allow] if isinstance(allow, list) else []
+
+
+def _mention_gate_triggers_ingest(message) -> bool:
+    """ON-side gate (skills/mention-gate): while ON, a message @-tagging an
+    owner counts as a bot mention. Fail-closed: any error → today's rejection."""
+    try:
+        owners = _mention_gate_owner_ids()
+        if not owners or str(message.author.id) in owners:
+            return False
+        mention_ids = [str(getattr(u, "id", ""))
+                       for u in (getattr(message, "mentions", None) or [])]
+        if not mention_gate.message_tags_owner(
+                mention_ids, getattr(message, "content", "") or "", owners):
+            return False
+        if not mention_gate.owner_tag_triggers_ingest(REPO):
+            return False
+        mention_gate.log_gated_ingest(REPO, {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "channel_id": str(getattr(message.channel, "id", "")),
+            "author_id": str(message.author.id),
+            "message_id": str(getattr(message, "id", "")),
+            "body": (getattr(message, "content", "") or "")[:120],
+        })
+        print(f"  [mention-gate] ON — owner-tagged msg {getattr(message, 'id', '?')} "
+              f"admitted as a mention (audit-logged)", flush=True)
+        return True
+    except Exception as e:
+        print(f"  [mention-gate] check failed ({e}) — ordinary requireMention "
+              f"rejection stands", flush=True)
+        return False
 
 
 def _chunk_for_discord(
@@ -3391,8 +3437,11 @@ async def _handle_discord_message(message, force=False):
             print(f"  [plugin-hook] early-path raised: {e}", flush=True)
 
         if require_mention and not bot_mentioned and not role_mentioned:
-            print(f"  [skip] not mentioned (requireMention=true)", flush=True)
-            return
+            # mention-gate ON side: an owner-tagged message counts as a mention
+            # of the bot; otherwise today's rejection stands (also on any error).
+            if not _mention_gate_triggers_ingest(message):
+                print(f"  [skip] not mentioned (requireMention=true)", flush=True)
+                return
 
         # Shared-channel addressee gate (require_mention=False, non-bot2bot).
         # Fixes owner-reported 2026-07-18: replies to OTHER agents and other
