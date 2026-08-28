@@ -116,9 +116,17 @@ while [ "$STOPPING" = 0 ]; do
   CHILD_PID=$!
   set +e
   wait "$CHILD_PID"
+  CHILD_RC=$?
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
+  # 75 == single_instance.EXIT_STANDDOWN: a peer holds the lock. Gate on THAT,
+  # never on 0 -- a bridge whose main loop returns also exits 0, and treating
+  # that as deliberate would leave it down silently, with the alert suppressed.
+  # Clear the marker too: launchd KeepAlive is unconditional, so exiting hands
+  # the respawn back to launchd, which re-enters above and alerts off a marker
+  # this run left behind.
+  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
   emit_restart_alert
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!
