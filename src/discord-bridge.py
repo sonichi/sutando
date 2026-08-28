@@ -150,6 +150,7 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
@@ -429,6 +430,69 @@ DISCORD_TRUNCATION_NOTICE = (
     "⚠️ Result truncated: additional content was suppressed to keep Discord "
     "responsive."
 )
+
+
+def _mention_gate_owner_ids() -> list:
+    """Owner ids the mention gate keys on. A PRESENT tierMap is authoritative,
+    including empty ({} = no owners, gate never triggers) — falling back to
+    allowFrom there would promote read-only members to owner for this gate.
+    allowFrom is consulted only when the tierMap key is ABSENT (legacy file)."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    if "tierMap" in data:
+        tier_map = data.get("tierMap")
+        if not isinstance(tier_map, dict):
+            return []
+        return [str(u) for u, t in tier_map.items() if t == "owner"]
+    allow = data.get("allowFrom")
+    return [str(u) for u in allow] if isinstance(allow, list) else []
+
+
+def _mention_gate_triggers_ingest(message) -> bool:
+    """ON-side gate (skills/mention-gate): while ON, a message @-tagging an
+    owner counts as a bot mention. Fail-closed: any error → today's rejection.
+    Verdict only — the audit is written by _mention_gate_log_admission AFTER
+    the task file exists, so an unauthorized sender can never inflate it."""
+    try:
+        owners = _mention_gate_owner_ids()
+        if not owners or str(message.author.id) in owners:
+            return False
+        mention_ids = [str(getattr(u, "id", ""))
+                       for u in (getattr(message, "mentions", None) or [])]
+        if not mention_gate.message_tags_owner(
+                mention_ids, getattr(message, "content", "") or "", owners):
+            return False
+        if not mention_gate.owner_tag_triggers_ingest(REPO):
+            return False
+        print(f"  [mention-gate] ON — owner-tagged msg {getattr(message, 'id', '?')} "
+              f"admitted as a mention (audit deferred to task write)", flush=True)
+        return True
+    except Exception as e:
+        print(f"  [mention-gate] check failed ({e}) — ordinary requireMention "
+              f"rejection stands", flush=True)
+        return False
+
+
+def _mention_gate_log_admission(message) -> None:
+    """Audit a gate admission AFTER its task file is durably written — a sender
+    the later authorization gates drop must leave no audit row. Best-effort:
+    the task already exists, so a failed append only logs, never retracts."""
+    try:
+        mention_gate.log_gated_ingest(REPO, {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "channel_id": str(getattr(message.channel, "id", "")),
+            "author_id": str(message.author.id),
+            "message_id": str(getattr(message, "id", "")),
+            "body": (getattr(message, "content", "") or "")[:120],
+        })
+        print(f"  [mention-gate] audited gated admission of msg "
+              f"{getattr(message, 'id', '?')}", flush=True)
+    except Exception as e:
+        print(f"  [mention-gate] audit append failed after task write: {e}", flush=True)
 
 
 def _chunk_for_discord(
@@ -3167,6 +3231,10 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
+    # Set only by the requireMention branch below; read after the task write so
+    # the audit binds to a DURABLE admission, not to the gate's verdict.
+    _mention_gate_admitted = False
+
     safe_log_text = redact_chat_body(text)   # the shared chain; see src/chat_redaction.py
     print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
@@ -3393,8 +3461,13 @@ async def _handle_discord_message(message, force=False):
             print(f"  [plugin-hook] early-path raised: {e}", flush=True)
 
         if require_mention and not bot_mentioned and not role_mentioned:
-            print(f"  [skip] not mentioned (requireMention=true)", flush=True)
-            return
+            # mention-gate ON side: an owner-tagged message counts as a mention
+            # of the bot; otherwise today's rejection stands (also on any error).
+            if _mention_gate_triggers_ingest(message):
+                _mention_gate_admitted = True  # audit only after the task write
+            else:
+                print(f"  [skip] not mentioned (requireMention=true)", flush=True)
+                return
 
         # Shared-channel addressee gate (require_mention=False, non-bot2bot).
         # Fixes owner-reported 2026-07-18: replies to OTHER agents and other
@@ -4281,6 +4354,10 @@ async def _handle_discord_message(message, force=False):
     if not _write_task_file(task_file, _build_task_content, username, channel_name,
                             access_tier, message.id):
         return
+    if _mention_gate_admitted:
+        # Every authorization gate above passed and the task file exists — only
+        # now does a mention-gate admission earn its audit row.
+        _mention_gate_log_admission(message)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
     pending_task_collab[task_id] = bool(is_collaborator)
