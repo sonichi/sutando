@@ -19,6 +19,8 @@ import json
 import time
 from pathlib import Path
 
+from state_records import read_beat, read_record
+
 from agents_view import ALIVE_MAX_AGE_S
 
 
@@ -48,14 +50,13 @@ class IdentityView:
     # ── sutando.status ──────────────────────────────────────────────────────
     def status(self) -> dict:
         out: dict = {}
-        cs = self.state_dir / "core-status.json"
-        try:
-            payload = json.loads(cs.read_text())
+        payload = read_record(self.state_dir / "core-status.json")
+        if payload is None:
+            out["status"] = "unknown"
+        else:
             for k in ("status", "step", "ts"):
                 if payload.get(k) is not None:
                     out[k] = payload[k]
-        except (OSError, ValueError):
-            out["status"] = "unknown"
         beat = self._own_beat()
         if "beatAgeS" in beat:
             out["alive"] = 0 <= beat["beatAgeS"] < ALIVE_MAX_AGE_S
@@ -295,10 +296,4 @@ class IdentityView:
     def _own_beat(self) -> dict:
         if not self.host_label:
             return {}
-        f = self.state_dir / "cores" / f"{self.host_label}.alive"
-        try:
-            age = time.time() - f.stat().st_mtime
-            payload = json.loads(f.read_text())
-        except (OSError, ValueError):
-            return {}
-        return {**payload, "beatAgeS": round(age, 1)}
+        return read_beat(self.state_dir / "cores" / f"{self.host_label}.alive")

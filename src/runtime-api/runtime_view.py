@@ -20,6 +20,8 @@ import json
 import time
 from pathlib import Path
 
+from state_records import read_beat, read_record
+
 from agents_view import ALIVE_MAX_AGE_S
 
 # A beat older than this but younger than ALIVE_MAX_AGE_S means the writer is
@@ -60,18 +62,9 @@ class RuntimeView:
 
     # ── internals ───────────────────────────────────────────────────────────
     def _core_status(self) -> dict:
-        try:
-            return json.loads((self.state_dir / "core-status.json").read_text())
-        except (OSError, ValueError):
-            return {}
+        return read_record(self.state_dir / "core-status.json") or {}
 
     def _own_beat(self) -> dict:
         if not self.host_label:
             return {}
-        f = self.state_dir / "cores" / f"{self.host_label}.alive"
-        try:
-            age = time.time() - f.stat().st_mtime
-            payload = json.loads(f.read_text())
-        except (OSError, ValueError):
-            return {}
-        return {**payload, "beatAgeS": round(age, 1)}
+        return read_beat(self.state_dir / "cores" / f"{self.host_label}.alive")
