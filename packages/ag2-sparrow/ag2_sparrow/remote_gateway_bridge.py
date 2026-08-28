@@ -2423,7 +2423,7 @@ def _write_task(task: dict) -> str | None:
                 f"message, reconstruct the room thread — `python3 "
                 f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
                 f"reports no gateway configured, load the channel env first: `set -a; . "
-                f"\"$CLAUDE_CONFIG_DIR/channels/ag2space/.env\"; set +a`) — and read it "
+                f"\"$(bash scripts/channel-env.sh ag2space)\"; set +a`) — and read it "
                 "back (everyone's messages including your own prior replies) until this "
                 "message stands on its own, then answer from the reconstructed thread, "
                 "NOT from memory. Do this every time; do NOT skip it because the message "
@@ -2431,8 +2431,11 @@ def _write_task(task: dict) -> str | None:
                 "confidence is exactly the signal that fails. The only exception is a "
                 'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
             _step += 1
+            # Which channel file holds REMOTE_TASK_* differs per onboarding, so the
+            # prelude resolves it by content; notify.py's own guard can refuse a symlink.
             _skill.append(
-                f"{_step}. NOTIFY FIRST (if task takes >60s): python3 "
+                f"{_step}. NOTIFY FIRST (if task takes >60s): `set -a; . "
+                f"\"$(bash scripts/channel-env.sh ag2space)\"; set +a` then python3 "
                 f"skills/task-progress/scripts/notify.py --source ag2space "
                 f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
             _step += 1
