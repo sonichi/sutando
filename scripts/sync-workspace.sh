@@ -604,7 +604,6 @@ _is_safe_carveout_addition() {
     _widen_legacy_host_scope "$existing" > "$widened"
     existing="$widened"
     shipped="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" vault-sync-exclude 2>/dev/null || true)"
-    [ -n "$shipped" ] || { rm -f "$widened"; return 1; }
     # Compare against what the composer EMITS, not the raw config value: a
     # directory yields both `p/` and `p/**`, and a real older file lacks all of them.
     shipped_rules=""
@@ -614,7 +613,10 @@ _is_safe_carveout_addition() {
     done <<<"$shipped"
     # An owned built-in deny is also a safe addition: it only ever excludes MORE,
     # and without it an upgraded workspace stages the temp the rule exists to hide.
+    # Merged UNCONDITIONALLY: `vault.sync.exclude: []` is a supported value, and
+    # the script's own rules must not be gated on the operator's list (#3198 P1).
     shipped="$shipped_rules"$'\n'"$(_adoptable_builtin_denies)"
+    [ -n "$(printf '%s' "$shipped" | grep -vE '^[[:space:]]*$')" ] || { rm -f "$widened"; return 1; }
     rc=0
     # Refuse if the refresh would DROP any rule the existing file carries.
     if [ -n "$(comm -23 <(_exclude_rules_only "$existing") <(_exclude_rules_only "$desired"))" ]; then
@@ -871,6 +873,10 @@ _snapshot_per_host_config() {
         local _cur="" _rec=""
         [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
         [ -f "$_sig" ] && _rec="$(cat "$_sig" 2>/dev/null)"
+        # Usable provenance is exactly one full sha256. Anything else (a torn
+        # write, a stray copy, a manual edit) must not read as a second writer.
+        case "$_rec" in (*[!0-9a-f]*) _rec="" ;; esac
+        [ "${#_rec}" -eq 64 ] || _rec=""
         if [ -f "$_dst" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
             # Equal content is safe to re-own: repair a missing or stale sha so an
             # interrupted publish self-heals. Nothing to propagate.
@@ -902,9 +908,9 @@ _snapshot_per_host_config() {
             fi
         elif ! cmp -s "$_src" "$_dst" 2>/dev/null; then
             if [ -z "$_rec" ]; then
-                # _rec is empty for absent, empty AND unreadable sig files alike;
-                # none of the three evidences a second writer.
-                warn_operator "snapshot refused: hosts/$(_host)/build_log.md has NO USABLE provenance record (the recorded-sha file is absent, empty, or unreadable — the copy predates provenance tracking or its record was lost) — this is NOT evidence of an independent writer; do not archive either copy on the strength of this message"
+                # _rec is cleared for absent, empty, unreadable AND malformed sig
+                # files alike; none of the four evidences a second writer.
+                warn_operator "snapshot refused: hosts/$(_host)/build_log.md has NO USABLE provenance record (the recorded-sha file is absent, empty, unreadable, or not a single sha256 — the copy predates provenance tracking or its record was damaged) — this is NOT evidence of an independent writer; do not archive either copy on the strength of this message"
             else
                 warn_operator "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
             fi

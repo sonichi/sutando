@@ -104,6 +104,25 @@ check "an EMPTY provenance file takes the same no-usable-record branch" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
 check "...and an empty record is still not called an independent writer" \
       '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+
+echo "5d. present-but-MALFORMED signature is not usable provenance either"
+# keweichen + yixuan on #3198: a 63-char partial (a torn write, a stray copy,
+# a manual edit) is indistinguishable from a genuine record to an equality
+# test, and used to draw the archive-a-copy advice. Any non-sha256 content
+# must take the guarded branch.
+printf '%063d' 0 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+check "a 63-char partial signature takes the no-usable-record branch" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
+check "...and is NOT read as an independent writer" \
+      '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+printf 'not hex at all\n' > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+check "arbitrary foreign content in the sig file is equally unusable" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
+# Positive control for the validator: a VALID 64-hex stale sha must still be
+# read as a genuine independent writer — validation must not widen the guard.
+printf '%064d' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+check "a valid-shape stale sha is STILL an independent writer (control)" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
 rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 echo "keep it that way" >> "$WORKSPACE_DIR/build_log.md"
 echo "per-host went live" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
