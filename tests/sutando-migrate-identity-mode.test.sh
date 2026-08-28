@@ -162,6 +162,50 @@ _v_widened=0; _RUN_U verify --source A || _v_widened=$?
 check "verify FAILS on a widened union dest, despite byte identity with the source" \
   "$([ "$_v_widened" -ne 0 ] && echo failed || echo certified)" "failed"
 
+# --- control 4c: an identical drop must carry the winner's mtime ---
+
+# The union preserves max(mtime); a drop that skips it lets a later OLDER
+# source outrank the newest input and win the scalars.
+_m="$e2e/m"; mkdir -p "$_m/A/state" "$_m/B/state" "$_m/dest/state"
+printf '{"schemaVersion": 3, "allow": ["pre"]}\n' > "$_m/dest/$REL"; touch -t 202608281100 "$_m/dest/$REL"
+printf '{"schemaVersion": 3, "allow": ["pre"]}\n' > "$_m/A/$REL";    touch -t 202608281300 "$_m/A/$REL"
+printf '{"schemaVersion": 2, "allow": ["b"]}\n'   > "$_m/B/$REL";    touch -t 202608281200 "$_m/B/$REL"
+_RUN_M(){ SUTANDO_MIGRATE_SRC_A="$_m/A" SUTANDO_MIGRATE_SRC_B="$_m/B" \
+          SUTANDO_MIGRATE_DEST="$_m/dest" bash scripts/sutando-migrate.sh "$@" >/dev/null 2>&1; }
+_RUN_M commit --source A
+_RUN_M commit --source B
+check "the newest source wins the scalar even when its content is an identical drop" \
+  "$(python3 -c "import json;print(json.load(open('$_m/dest/$REL'))['schemaVersion'])")" "3"
+check "and the union still accumulated both arrays" \
+  "$(grep -c 'b' "$_m/dest/$REL" | tr -d ' ')" "1"
+
+# --- control 4d: a missing mode table cannot certify an unknown mode ---
+
+# record_union_scalars writes the mode beside every rel, so an absent table or
+# rel is damage; the pristine case below proves the check can still pass.
+_md_probe() {
+  local drop="$1" md; md="$(mktemp -d)"
+  mkdir -p "$md/A/state" "$md/dest/state"
+  printf '{"schemaVersion": 3, "allow": ["a"]}\n' > "$md/A/$REL";    chmod 0600 "$md/A/$REL"
+  printf '{"schemaVersion": 3, "allow": ["b"]}\n' > "$md/dest/$REL"; chmod 0600 "$md/dest/$REL"
+  SUTANDO_MIGRATE_SRC_A="$md/A" SUTANDO_MIGRATE_DEST="$md/dest" \
+    bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1
+  local man; man="$(ls -t "$md/dest/state/.migration-union-scalars-"*.json 2>/dev/null | head -1)"
+  if [ "$drop" = "table" ]; then
+    python3 -c "import json,sys;p=sys.argv[1];d=json.load(open(p));d.pop('__union_modes__',None);json.dump(d,open(p,'w'))" "$man"
+  elif [ "$drop" = "rel" ]; then
+    python3 -c "import json,sys;p=sys.argv[1];d=json.load(open(p));d.get('__union_modes__',{}).clear();json.dump(d,open(p,'w'))" "$man"
+  fi
+  [ "$drop" = "none" ] || chmod 0644 "$md/dest/$REL"
+  SUTANDO_MIGRATE_SRC_A="$md/A" SUTANDO_MIGRATE_DEST="$md/dest" \
+    bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1
+  local rc=$?; rm -rf "$md"
+  [ "$rc" -eq 0 ] && echo certified || echo refused
+}
+check "a widened dest with NO mode table is refused"       "$(_md_probe table)" "refused"
+check "a widened dest with an empty mode table is refused" "$(_md_probe rel)"   "refused"
+check "control: an intact manifest still certifies"        "$(_md_probe none)"  "certified"
+
 # --- control 5: byte_identical is a claim about BYTES, through the real JSON ---
 # Equal bytes, modes 0755 vs 0644 -> True; every DECISION still uses both fields.
 j5="$(mktemp -d -t migrate-json5.XXXXXX)"
