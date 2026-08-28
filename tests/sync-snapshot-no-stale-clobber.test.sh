@@ -273,5 +273,56 @@ check "the composed rule does NOT ignore an unrelated notes/ file of the same na
       '( cd "$_gi" && ! git check-ignore -q notes/build_log.md.snap.AB12cd )'
 rm -rf "$_gi"
 
+echo "10. an interrupted publish is recoverable at EVERY boundary, and fails closed"
+# The publish is intent -> mv -> promote. Each boundary is exercised by leaving
+# the on-disk state that boundary produces, then running the production function
+# and asserting what the NEXT tick does with it.
+_SIG="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+_INT="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha.next"
+_DST="$WORKSPACE_DIR/hosts/testhost/build_log.md"
+
+# (a) crash AFTER the swap, BEFORE the promote: dest already holds the new bytes
+# and the intent describes them -> the next tick completes the publish.
+printf 'published content\n' > "$_DST"
+printf '%s\n' "$(shasum -a 256 "$_DST" | cut -d' ' -f1)" > "$_INT"
+rm -f "$_SIG"
+_snapshot_per_host_config >/dev/null 2>&1
+check "a) post-swap interrupt: the intent is promoted to the signature" \
+      '[ ! -f "$_INT" ] && [ -f "$_SIG" ]'
+_dst_sha="$(shasum -a 256 "$_DST" | cut -d' ' -f1)"
+check "...and the promoted signature matches the destination on disk" \
+      '[ "$(cat "$_SIG")" = "$_dst_sha" ]'
+
+# (b) crash AFTER the intent, BEFORE the swap: the dest is still the OLD bytes,
+# so the intent describes content that is not there and must grant nothing.
+printf 'old destination\n' > "$_DST"
+printf '%s\n' "$(printf 'content that never landed\n' | shasum -a 256 | cut -d' ' -f1)" > "$_INT"
+rm -f "$_SIG"
+_snapshot_per_host_config >/dev/null 2>&1
+check "b) pre-swap interrupt: the stale intent is discarded" '[ ! -f "$_INT" ]'
+_never_sha="$(printf 'content that never landed\n' | shasum -a 256 | cut -d' ' -f1)"
+check "...and it never becomes the signature" \
+      '[ ! -f "$_SIG" ] || [ "$(cat "$_SIG")" != "$_never_sha" ]'
+
+# (c) a malformed intent is not provenance — same fail-closed rule as the sig.
+printf 'old destination\n' > "$_DST"
+printf 'not a sha\n' > "$_INT"
+rm -f "$_SIG"
+_snapshot_per_host_config >/dev/null 2>&1
+check "c) a malformed intent is discarded, not promoted" \
+      '[ ! -f "$_INT" ] && { [ ! -f "$_SIG" ] || [ "$(cat "$_SIG")" != "not a sha" ]; }'
+
+# (d) idempotent: recovery runs on every tick, so running it twice must be a
+# no-op rather than a second, different outcome.
+printf 'published content\n' > "$_DST"
+printf '%s\n' "$(shasum -a 256 "$_DST" | cut -d' ' -f1)" > "$_INT"
+rm -f "$_SIG"
+_snapshot_per_host_config >/dev/null 2>&1
+_sig_once="$(cat "$_SIG" 2>/dev/null)"
+_snapshot_per_host_config >/dev/null 2>&1
+check "d) a second recovery pass changes nothing" \
+      '[ "$(cat "$_SIG" 2>/dev/null)" = "$_sig_once" ] && [ ! -f "$_INT" ]'
+rm -f "$_INT" "$_SIG"
+
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

@@ -873,9 +873,57 @@ _snapshot_per_host_config() {
         printf '%s' "$_hex" | LC_ALL=C grep -qE '^(3[0-9]|6[1-6]){64}(0a)*$' || return 0
         tr -d '\n' < "$1" 2>/dev/null
     }
+    # fsync a path AND its directory: a rename is only durable once the parent
+    # directory entry is on disk (keweichen's P1#3 acceptance condition).
+    _fsync_path_and_dir() {
+        python3 - "$1" <<'PY' 2>/dev/null || return 1
+import os, sys
+p = sys.argv[1]
+fd = os.open(p, os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+d = os.open(os.path.dirname(p) or ".", os.O_RDONLY)
+try:
+    os.fsync(d)
+finally:
+    os.close(d)
+PY
+    }
+
+    # An interrupted publish leaves an INTENT beside the signature. Recovery
+    # never trusts it: the destination's own bytes must hash to the intent, or
+    # the intent is discarded. Malformed, stale and ambiguous all fail closed,
+    # and running this twice is a no-op.
+    _recover_snapshot_publish() {
+        local _d="$1" _s="$2" _i="$3" _want _have
+        [ -f "$_i" ] || return 0
+        _want="$(_usable_sig_record "$_i")"
+        if [ -z "$_want" ]; then
+            rm -f "$_i" 2>/dev/null || true
+            log "snapshot: discarded a malformed publish intent (no usable sha); provenance unchanged"
+            return 0
+        fi
+        [ -f "$_d" ] && _have="$(shasum -a 256 "$_d" 2>/dev/null | cut -d' ' -f1)"
+        if [ -n "$_have" ] && [ "$_have" = "$_want" ]; then
+            # The move landed; only the promote was lost. Finish it.
+            mv -f "$_i" "$_s" 2>/dev/null || return 1
+            _fsync_path_and_dir "$_s" || true
+            log "snapshot: completed an interrupted publish from its intent record"
+        else
+            # The move never landed (or landed as something else): the intent
+            # describes content that is not there, so it grants nothing.
+            rm -f "$_i" 2>/dev/null || true
+            log "snapshot: discarded a stale publish intent (destination does not match it)"
+        fi
+    }
+
     if [ -f "$WORKSPACE_DIR/build_log.md" ]; then
         local _src="$WORKSPACE_DIR/build_log.md"
         local _dst="$_host_dir/build_log.md" _sig="$_host_dir/.build_log.snapshot-sha"
+        local _int="$_host_dir/.build_log.snapshot-sha.next"
+        _recover_snapshot_publish "$_dst" "$_sig" "$_int"
         local _cur="" _rec=""
         [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
         # Validate raw bytes BEFORE any $(): substitution strips NULs, so a
@@ -895,12 +943,20 @@ _snapshot_per_host_config() {
                 _new="$(shasum -a 256 "$_tmp" 2>/dev/null | cut -d' ' -f1)"
                 [ -f "$_dst" ] && _now="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
                 if [ "$_now" = "$_cur" ]; then
+                    # Publish the INTENT first and make it durable: a crash after
+                    # the swap then leaves a record the next tick can verify and
+                    # complete, instead of a snapshot stranded with no provenance.
+                    printf '%s\n' "$_new" > "$_int" 2>/dev/null || true
+                    _fsync_path_and_dir "$_int" || true
                     if mv -f "$_tmp" "$_dst" 2>/dev/null; then
-                        printf '%s\n' "$_new" > "$_sig" 2>/dev/null || true
+                        _fsync_path_and_dir "$_dst" || true
+                        # Promote atomically: the signature is never a partial write.
+                        mv -f "$_int" "$_sig" 2>/dev/null || printf '%s\n' "$_new" > "$_sig" 2>/dev/null || true
+                        _fsync_path_and_dir "$_sig" || true
                     else
                         # hosts/*/ is a carried vault path: a temp left here is
                         # committed and pushed again on every subsequent sync.
-                        rm -f "$_tmp" 2>/dev/null || true
+                        rm -f "$_tmp" "$_int" 2>/dev/null || true
                         log "snapshot: atomic replace of hosts/$(_host)/build_log.md failed; temp removed, per-host copy and provenance left unchanged"
                     fi
                 else
