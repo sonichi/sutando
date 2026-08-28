@@ -400,6 +400,18 @@ class RestartedLeadInheritsWakeEvidence(WakeGuardBase):
         self.assertEqual(claimed, [("task-restart.claimed-core-2.txt", "repooled")])
         self.assertEqual(self._names(), ["task-restart.txt"])
 
+    def test_an_unwritable_state_dir_does_not_break_the_sweep(self):
+        """Persisting is best-effort: the sample is an optimisation, while
+        raising would abort the reclaim sweep that called it."""
+        (self.tasks / "task-restart.claimed-core-2.txt").write_text("x")
+        (self.state / "pool").write_text("not a directory")
+        self.alive["core-2"] = False
+        lead = self._restart_lead()
+        self.assertEqual(lead.reclaim_claimed(),
+                         [("task-restart.claimed-core-2.txt", "repooled")],
+                         "a failed evidence write must not stop recovery")
+        self.assertIsNone(lead._load_wake_evidence())
+
     def test_control_a_reboot_discards_the_inherited_sample(self):
         """Monotonic is boot-relative: after a reboot the stored value is
         ahead of ours, which is unusable rather than evidence of a sleep."""
