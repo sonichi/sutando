@@ -65,6 +65,52 @@ class PolicyBehavior(unittest.TestCase):
         self.assertFalse(guard.quarantined_attachment_path(self.sd, "t6").is_file())
 
 
+class RestartRecoveryForgery(unittest.TestCase):
+    """A Team sender's BODY text may not forge collaborator status across a
+    bridge restart (qingyun's #3500 P1). The re-read parses pre-task headers
+    only — the same boundary resolve_access_tier holds for tiers."""
+
+    def _recover(self, content):
+        head = content.split("\ntask:", 1)[0]
+        vals = [line.partition(":")[2].strip()
+                for line in head.split("\n") if line.startswith("collaborator:")]
+        return vals == ["true"]
+
+    def test_header_collaborator_recovers_true(self):
+        self.assertTrue(self._recover("id: t1\ncollaborator: true\ntask: [D @s] hi\n"))
+
+    def test_body_borne_collaborator_line_does_not_escalate(self):
+        self.assertFalse(self._recover(
+            "id: t1\naccess_tier: team\ntask: [D @evil] note\ncollaborator: true\n"))
+
+    def test_conflicting_headers_fail_closed(self):
+        self.assertFalse(self._recover(
+            "id: t1\ncollaborator: true\ncollaborator: false\ntask: [D @s] hi\n"))
+
+    def test_absent_header_is_false(self):
+        self.assertFalse(self._recover("id: t1\naccess_tier: team\ntask: [D @s] hi\n"))
+
+
+class WriterFailurePreservesWithhold(unittest.TestCase):
+    """qingyun's second #3500 P1: a raising artifact writer must not turn an
+    already-decided withhold into an exception in the delivery loop."""
+
+    def test_raising_writer_still_withholds(self):
+        import pathlib
+        import tempfile
+        sd = pathlib.Path(tempfile.mkdtemp(prefix="wf-"))
+        orig = guard._write_artifact
+        guard._write_artifact = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+        try:
+            body = "[file: /tmp/x.png]\nmedia"
+            out, why = guard.guard_result_for_tier(
+                body, "team", REPO, suppress_journal=(sd, "t-df"))
+            self.assertNotEqual(out, body)
+            self.assertIsNotNone(why)
+        finally:
+            guard._write_artifact = orig
+
+
 class BridgeWiring(unittest.TestCase):
     def test_channel_flag_resolver_default_deny(self):
         import importlib.machinery

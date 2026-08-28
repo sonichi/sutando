@@ -259,7 +259,12 @@ def journal_quarantined_attachment(body: str, state_dir: Path, task_id: str,
         "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
         "withheld_body": body,
     }
-    return _write_artifact(quarantined_attachment_path(state_dir, task_id), payload)
+    try:
+        return _write_artifact(quarantined_attachment_path(state_dir, task_id), payload)
+    except OSError:
+        # best-effort for real: a failed record costs the release option,
+        # never the already-decided withhold and never the delivery loop
+        return False
 
 
 def _write_artifact(path: Path, payload: dict) -> bool:

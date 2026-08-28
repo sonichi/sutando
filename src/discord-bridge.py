@@ -4810,10 +4810,20 @@ async def poll_results():
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
                 _task_collab = pending_task_collab.pop(task_id, None)
                 if _task_collab is None:
-                    # Restart-safe: the in-memory map is gone but the task file
-                    # carries the broker-written collaborator header.
+                    # Restart-safe re-read — HEADERS ONLY. A substring scan of the
+                    # whole file lets a Team sender forge `collaborator: true` in
+                    # their BODY (qingyun, #3500 P1); split at `\ntask:` exactly
+                    # like resolve_access_tier so body text can never escalate.
                     _tf_c = find_task_file(TASKS_DIR, task_id)
-                    _task_collab = bool(_tf_c) and "collaborator: true" in _tf_c.read_text(errors="replace")
+                    _task_collab = False
+                    if _tf_c:
+                        _tf_head = _tf_c.read_text(errors="replace").split("\ntask:", 1)[0]
+                        _cvals = [line.partition(":")[2].strip()
+                                  for line in _tf_head.split("\n")
+                                  if line.startswith("collaborator:")]
+                        # exactly one "true": conflicting or malformed stamps
+                        # fail CLOSED, same as resolve_access_tier's tier guard
+                        _task_collab = _cvals == ["true"]
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
