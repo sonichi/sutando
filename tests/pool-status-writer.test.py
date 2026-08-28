@@ -63,5 +63,18 @@ class PoolStatusWriterTest(unittest.TestCase):
         self.assertFalse(w.maybe_write())
 
 
+class PoolStatusDegradedTest(PoolStatusWriterTest):
+    def test_an_unreadable_tasks_dir_reports_no_in_flight_work(self):
+        # The writer runs on a timer beside a directory other processes rename
+        # under it. A raising snapshot would take the status file with it.
+        (self.tasks / "task-a.assigned-core-1.txt").write_text("x")
+        self.tasks.chmod(0o000)
+        try:
+            self.assertTrue(self.writer(["core-1"], {"core-1"}).maybe_write())
+            self.assertEqual(self.read()["in_flight"], {})
+        finally:
+            self.tasks.chmod(0o700)
+
+
 if __name__ == "__main__":
     unittest.main()

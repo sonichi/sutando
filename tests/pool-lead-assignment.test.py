@@ -6,11 +6,13 @@ Run: python3 tests/pool-lead-assignment.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
@@ -279,6 +281,73 @@ class AffinityBusyYieldTest(unittest.TestCase):
         self._new_task()
         out = dict(self.lead.sweep())
         self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+
+class LeadDegradesOnFilesystemTroubleTests(unittest.TestCase):
+    """The lead runs every few seconds against a directory other processes are
+    renaming under it. Every scan and every rename must degrade, not raise: an
+    exception here stops assignment for the whole pool, not one task."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.tasks = root / "tasks"
+        self.state = root / "state"
+        self.tasks.mkdir()
+        self.state.mkdir()
+        self.clock = [1000.0]
+        self.lead = PoolLead(
+            self.tasks, self.state,
+            followers_fn=lambda: ["core-a"],
+            alive_fn=lambda i: True,
+            now_fn=lambda: self.clock[0])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, name):
+        (self.tasks / name).write_text(f"id: {name[:-4]}\n")
+
+    def test_an_unreadable_tasks_dir_yields_empty_results_not_an_exception(self):
+        self._write("task-a.txt")
+        self.tasks.chmod(0o000)
+        try:
+            self.assertEqual(self.lead.sweep(), [])
+            self.assertEqual(self.lead.reclaim_dead(), [])
+            self.assertEqual(self.lead.reclaim_claimed(), [])
+        finally:
+            self.tasks.chmod(0o700)
+
+    def test_an_unreadable_task_body_is_treated_as_channel_less(self):
+        # _channel_of reads the head of the file; an unreadable one must fall
+        # back to no-affinity rather than aborting the sweep.
+        self._write("task-a.txt")
+        (self.tasks / "task-a.txt").chmod(0o000)
+        # no chmod back: sweep renames the file, so the original path is gone.
+        # Removal depends on the directory's mode, which is untouched.
+        self.assertEqual(dict(self.lead.sweep()).get("task-a.txt"), "core-a")
+
+    def test_a_rename_lost_to_another_writer_skips_only_that_task(self):
+        self._write("task-a.txt")
+        self._write("task-b.txt")
+        real, seen = os.rename, []
+
+        def flaky(src, dst):
+            if not seen:
+                seen.append(src)
+                raise OSError("another writer got there first")
+            return real(src, dst)
+
+        with mock.patch("pool_lead.os.rename", side_effect=flaky):
+            out = dict(self.lead.sweep())
+        self.assertEqual(len(out), 1, "one lost rename ended the whole sweep")
+
+    def test_a_task_whose_mtime_vanished_still_gets_assigned(self):
+        # stat() races the rename; falling back to now() keeps the assignment.
+        self._write("task-a.txt")
+        with mock.patch("pool_lead.Path.stat", side_effect=OSError("gone")):
+            out = dict(self.lead.sweep())
+        self.assertEqual(out.get("task-a.txt"), "core-a")
 
 
 if __name__ == "__main__":
