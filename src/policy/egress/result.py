@@ -41,6 +41,14 @@ TEAM_LEAK_RESULT = (
     "contain sensitive information. The owner can review the work locally."
 )
 
+# Safe to name: the marker is the sender's own construct. Content/secret
+# classes stay generic — naming those would confirm probe hits.
+TEAM_LEAK_RESULT_MARKER = (
+    "I completed the Team task, but the response was withheld because it "
+    "carried a delivery-control marker, which non-owner results may not use. "
+    "The owner can review the work locally."
+)
+
 TEAM_LEAK_RESULT_UNSAVED = (
     "I completed the Team task, but the response was withheld because it may "
     "contain sensitive information or delivery-control markers. Preparing the "
@@ -391,6 +399,8 @@ def classify_result_for_tier(body: str, tier, repo: Path,
                          allow_attach=allow_attach),
             None)
     except TeamResultLeakError as exc:
+        if str(exc) == "result delivery control marker":
+            return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_MARKER, str(exc))
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT, str(exc))
     except Exception as exc:
         # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
