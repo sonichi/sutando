@@ -2592,6 +2592,16 @@ async def _deliver_pairing_prompt(channel, code, username, sender_id, allowed):
 
 client = discord.Client(intents=intents)
 _ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
+# RESUME is invisible to on_ready, so "no ready lines" cannot mean "no
+# reconnects" — these two counters are what make the classes distinguishable.
+_resume_count = 0
+_disconnect_count = 0
+
+def _reconnect_state() -> str:
+    """One shape for every reconnect-class line so the log stays greppable."""
+    return (f"gateway session #{_ready_count} "
+            f"(resume #{_resume_count}, disconnect #{_disconnect_count})")
+
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2684,6 +2694,23 @@ async def _supervise_loop(coro_fn, name):
 
 
 @client.event
+async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
+    global _resume_count
+    _resume_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge resumed: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
+async def on_disconnect():  # pragma: no cover — gateway callback
+    # Re-dispatched per retry while ready/resumed need success: the only outage line.
+    global _disconnect_count
+    _disconnect_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge disconnected: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
 async def on_ready():
     global _ready_count
     _ready_count += 1
@@ -2693,7 +2720,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
     # for Discord to infer it. Best-effort — presence must never break startup.
