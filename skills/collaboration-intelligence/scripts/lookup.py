@@ -21,10 +21,8 @@ def store() -> pathlib.Path:
     return pathlib.Path(ws) / "data" / "collaboration-intelligence"
 
 def load(d):
-    # Either store may exist alone: quick-lookup.yaml (the bounded hot set) or
-    # reviewer-stands.json (the reviewer roster). A host with only the roster
-    # used to crash here, so every session hand-rolled its own lookup — and a
-    # hand-rolled get(github_login) misses a roster keyed by short name.
+    # Either store may exist alone; a host with only reviewer-stands.json
+    # must not crash here or sessions fall back to hand-rolled lookups.
     q, ents = {}, []
     yp = d / "quick-lookup.yaml"
     if yp.exists():
