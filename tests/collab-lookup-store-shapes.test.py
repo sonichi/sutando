@@ -87,9 +87,8 @@ class StoreShapes(unittest.TestCase):
             self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
 
     def test_entities_yaml_alone_loads_without_quick_lookup(self):
-        # core-3's control: a host with entities.yaml and NO quick-lookup.yaml
-        # must still load entities — the read must not nest inside the other
-        # store's existence check.
+        # core-3's control: entities.yaml with NO quick-lookup.yaml must still
+        # load — the read must not nest inside the other store's existence check.
         with tempfile.TemporaryDirectory() as t:
             d = store(t)                             # writes NEITHER yaml
             (d / "entities.yaml").write_text(
