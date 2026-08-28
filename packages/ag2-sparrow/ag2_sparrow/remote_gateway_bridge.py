@@ -573,13 +573,22 @@ def _owner_review_dm(owner: str) -> str:
 
 def _review_messages(record: dict) -> list[str]:
     rid = str(record.get("review_id") or "")
-    origin = str((record.get("context") or {}).get("channel_id") or "")
+    context = record.get("context") or {}
+    origin = _one_line(context.get("channel_id") or "").strip()
+    room_name = _one_line(context.get("room_name") or "").strip()
+    # Keep room-controlled values in code spans and neutralize backticks so
+    # room metadata cannot alter the review message's Markdown structure.
+    origin_label = origin.replace("`", "'")
+    room_label = room_name.replace("`", "'")
+    room_info = (
+        f"`{origin_label}` (name: `{room_label}`)" if room_label else f"`{origin_label}`"
+    )
     body = str(record.get("withheld_body") or "")
     header = (
         f"**Private result review `{rid}`**\n\n"
         "This result was withheld from the shared room because it may contain "
         "sensitive information or delivery-control markers.\n\n"
-        f"Original room: `{origin}`\n\n")
+        f"Original room: {room_info}\n\n")
     decision = (
         "Reply directly to this message with **Yes** to confirm it should stay "
         "private, or **No** to mark it as a false positive and publish it to the "
@@ -903,7 +912,8 @@ def _guarded_result_body(tid: str, body: str):
             headers = local_task_protocol.parse_task_headers_trusted(
                 tfile.read_text(encoding="utf-8", errors="replace")).headers
             context = {key: headers.get(key, "") for key in (
-                "source", "channel_id", "reply_to_event", "source_message_id", "user_id")}
+                "source", "channel_id", "room_name", "reply_to_event",
+                "source_message_id", "user_id")}
         except OSError:
             pass
     verdict = classify(
@@ -1264,6 +1274,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_i
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
                 "addressed_to",
+                # Ingress only: the backend inherits the route by task id, so a
+                # reply echoing these back could name a thread it was not asked in.
+                "thread_root", "source_room_id",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
@@ -2410,7 +2423,7 @@ def _write_task(task: dict) -> str | None:
                 f"message, reconstruct the room thread — `python3 "
                 f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
                 f"reports no gateway configured, load the channel env first: `set -a; . "
-                f"\"$CLAUDE_CONFIG_DIR/channels/ag2space/.env\"; set +a`) — and read it "
+                f"\"$(bash scripts/channel-env.sh ag2space)\"; set +a`) — and read it "
                 "back (everyone's messages including your own prior replies) until this "
                 "message stands on its own, then answer from the reconstructed thread, "
                 "NOT from memory. Do this every time; do NOT skip it because the message "
@@ -2418,8 +2431,11 @@ def _write_task(task: dict) -> str | None:
                 "confidence is exactly the signal that fails. The only exception is a "
                 'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
             _step += 1
+            # Which channel file holds REMOTE_TASK_* differs per onboarding, so the
+            # prelude resolves it by content; notify.py's own guard can refuse a symlink.
             _skill.append(
-                f"{_step}. NOTIFY FIRST (if task takes >60s): python3 "
+                f"{_step}. NOTIFY FIRST (if task takes >60s): `set -a; . "
+                f"\"$(bash scripts/channel-env.sh ag2space)\"; set +a` then python3 "
                 f"skills/task-progress/scripts/notify.py --source ag2space "
                 f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
             _step += 1

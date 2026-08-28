@@ -10,6 +10,9 @@
 
 [run]
 parallel = True
+# Workers run in per-worker git worktrees; relative paths keep their fragments
+# combinable after the worktrees are removed (parallel-suite-lane.sh).
+relative_files = True
 sigterm = True
 source =
     src
