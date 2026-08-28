@@ -459,6 +459,23 @@ def test_an_assigned_and_claimed_pair_still_leaves_the_claim_alone() -> None:
     assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
 
 
+def test_a_vanished_predecessor_is_not_an_error() -> None:
+    # Someone else archived or removed the previous mint. find_task_file returns
+    # None and the supersede must decline quietly, not raise or fabricate.
+    workspace = fixture_workspace()
+    first = workstreams.maybe_enqueue_classifier_task(workspace)
+    (workspace / "tasks" / f"{first.task_id}.txt").unlink()
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    state["enqueued_at"] = 0
+    state_path.write_text(json.dumps(state))
+
+    replacement = workstreams.maybe_enqueue_classifier_task(workspace)
+
+    assert replacement.enqueued and replacement.task_id != first.task_id
+    assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+
+
 def test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors() -> None:
     workspace = fixture_workspace()
     stop = threading.Event()
@@ -853,6 +870,7 @@ def main() -> None:
         test_stale_classifier_is_archived_under_its_pool_assigned_name,
         test_a_worker_held_classifier_claim_is_left_alone,
         test_an_assigned_and_claimed_pair_still_leaves_the_claim_alone,
+        test_a_vanished_predecessor_is_not_an_error,
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
         test_workstream_context_is_prior_owner_only_bounded_and_untrusted,
         test_workstream_context_has_a_total_serialized_byte_cap,
