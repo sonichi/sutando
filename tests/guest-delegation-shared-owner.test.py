@@ -49,6 +49,16 @@ class TestOwnerContract(unittest.TestCase):
         self.assertIn("SCOPE-SENTINEL", body)
         self.assertIn("< /dev/null", body)
 
+    def test_no_network_is_stated_and_declining_is_instructed(self):
+        """A delegate that cannot fetch the artifact writes a plausible summary
+        anyway — the same shape as exit-0-on-refusal, which this block already
+        covers. Raised on #3512 by two reviewers independently."""
+        self.assertIn("NO NETWORK", SANDBOXED_DELEGATION_CODEX)
+        self.assertIn("decline", SANDBOXED_DELEGATION_CODEX)
+        lines = sandboxed_delegation_lines(
+            "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
+        self.assertIn("NO NETWORK", "\n".join(lines))
+
     def test_scope_is_a_parameter_not_baked_in(self):
         """Slack's per-tier limits must not leak into the shared text."""
         self.assertNotIn("information-only", SANDBOXED_DELEGATION_CODEX)

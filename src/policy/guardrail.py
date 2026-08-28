@@ -75,7 +75,9 @@ SANDBOXED_DELEGATION_CODEX = (
     "-- \"$(cat <prompt-file>)\" < /dev/null`. The `< /dev/null` is REQUIRED — without it "
     "codex waits on stdin and can hang to a timeout having produced nothing. Then assert the "
     "OUTPUT is non-empty before writing it: codex exits 0 both when it refuses and on a usage "
-    "error, so the exit code is not evidence that an answer exists."
+    "error, so the exit code is not evidence that an answer exists. The sandbox also has NO "
+    "NETWORK: if the task needs something the sandbox cannot reach, say so and decline — never "
+    "describe an artifact you could not read."
 )
 
 
