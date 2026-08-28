@@ -112,6 +112,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 ## The numbered loop
 
 1. **Check for tasks.** Look in `tasks/` for voice / Discord / Telegram / phone tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`.
+   - **Only when no workers are installed.** With a worker pool installed the queue is routed and each task belongs to the worker it was routed to; executing one here would run it a second time, concurrently. `src/task-route.sh` enforces this — the watcher tells this session about nothing — so do not go around it by listing `tasks/` directly. A worker uses `/proactive-loop-pool`, which acquires before reading.
    - **Access control:** If the task has `access_tier: other` or `access_tier: team`, delegate to a sandboxed agent. Do NOT process non-owner tasks with your full capabilities. Write the sandboxed output to results.
    - Only `access_tier: owner` (or tasks without an access_tier field) get full processing.
    - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result. The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.

@@ -52,6 +52,9 @@ __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
 # shellcheck source=task-emit.sh
 source "$__SCRIPT_DIR/task-emit.sh"
+# shellcheck source=task-route.sh
+source "$__SCRIPT_DIR/task-route.sh"
+task_route_init
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
 # Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
@@ -370,6 +373,9 @@ queue_handler_task() {
 dispatch_task() {
   local task_path="$1" rc filename
   filename="$(basename "$task_path")"
+  if ! task_routed_here "$filename"; then
+    return 0
+  fi
   if [ -z "$DISPATCH_DIR" ]; then
     printf 'TASK_FILE: %s\n' "$filename" || exit 0
     return
