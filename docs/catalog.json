@@ -243,7 +243,7 @@
     "maintainers"
    ],
    "status": "active",
-   "canonical_for": "the v0 LOCAL Unix-socket client protocol spoken by src/runtime-api: methods, approval and elicitation flow, governed capabilities",
+   "canonical_for": "the v0 LOCAL Unix-socket transport and task methods spoken by src/runtime-api, and the task.update streaming contract",
    "last_verified": null
   },
   "docs/slack-bridge.md": {
