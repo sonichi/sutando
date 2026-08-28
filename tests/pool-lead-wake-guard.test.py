@@ -375,14 +375,15 @@ class RestartedLeadInheritsWakeEvidence(WakeGuardBase):
         self.assertEqual(self._names(), ["task-restart.claimed-core-2.txt"])
 
     def test_control_no_predecessor_evidence_keeps_the_old_behaviour(self):
-        """Nothing persisted: the all-stale fallback still decides, so this
-        change adds a path rather than replacing one."""
+        """Nothing persisted: the all-stale fallback still decides. Asserted
+        through behaviour, not the new helper, so it runs unchanged against
+        the parent — an equivalence control has to be able to."""
         (self.tasks / "task-restart.claimed-core-2.txt").write_text("x")
         for inst in self.pool:
             self.alive[inst] = False
         lead = self._restart_lead()          # never ticked; no file on disk
-        self.assertIsNone(lead._load_wake_evidence())
         self.assertEqual(lead.reclaim_claimed(), [])
+        self.assertEqual(self._names(), ["task-restart.claimed-core-2.txt"])
 
     def test_control_a_restart_without_a_sleep_still_reclaims_a_dead_owner(self):
         """The discriminating case: inherited evidence must not become a
