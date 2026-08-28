@@ -78,15 +78,21 @@ class TestLocalEmptyIsNotClear(unittest.TestCase):
             [{"raw": "9:00am Planning", "calendar": "Work"}],
         )
 
-    def test_corrupt_cache_is_not_evidence_of_a_google_host(self):
-        """Unparseable bytes say nothing about where the calendar lives."""
+    def test_corrupt_cache_is_blind_not_clear(self):
+        """A file that exists but will not parse is still evidence this host
+        writes one. Unreadable is a reason to distrust an empty local read."""
         self.cache.write_text("{not json")
-        self.assertEqual(self._run(), [])
+        self.assertIsNone(self._run())
 
-    def test_cache_without_a_date_key_is_not_evidence(self):
-        """A dict lacking `date` is not a calendar cache."""
+    def test_cache_without_a_date_key_is_blind_not_clear(self):
+        """Schema drift that drops `date` must not read as never-configured."""
         self.cache.write_text(json.dumps({"events": []}))
-        self.assertEqual(self._run(), [])
+        self.assertIsNone(self._run())
+
+    def test_an_empty_file_is_blind_not_clear(self):
+        """A crash mid-write leaves zero bytes: parses as nothing, exists."""
+        self.cache.write_text("")
+        self.assertIsNone(self._run())
 
     def test_rendering_differs_between_the_two_states(self):
         """Pin the user-visible property: one says clear, the other does not."""

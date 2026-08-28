@@ -145,18 +145,16 @@ def _read_calendar_cache() -> list[dict] | None:
 
 
 def _google_cache_configured() -> bool:
-    """True when this host has a Google-calendar cache on disk (any date).
+    """True when this host has a Google-calendar cache on disk, whatever it
+    holds.
 
-    Reaching the local fallback means the cache was absent, stale or corrupt.
-    A cache that EXISTS but is not today's is evidence the owner's real
-    calendar lives in Google, so an empty local read is a blind source rather
-    than a verified-empty day.
+    The fallback is reached when the cache is absent, stale OR corrupt, so
+    only ABSENCE is evidence the owner's calendar is not in Google. A file
+    that exists but cannot be parsed — truncated, half-written, or drifted
+    off the schema — means blind, and a blind source is never a clear day.
+    Parsing it to decide this inverted the answer on exactly those hosts.
     """
-    try:
-        data = json.loads(CALENDAR_CACHE_FILE.read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(data, dict) and "date" in data
+    return CALENDAR_CACHE_FILE.exists()
 
 
 def _parse_start(ev: dict):
