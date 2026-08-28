@@ -22,6 +22,8 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
+from delivery.readiness import read_ready_result  # noqa: E402
+from local_task_protocol import find_result  # noqa: E402
 from pool_follower import LEAD_STALE_S  # noqa: E402
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
@@ -206,15 +208,23 @@ class PoolLead:
             reclaimed.append(f.name)
         return reclaimed
 
-    def _result_evidence(self, task_name: str) -> bool:
-        """A result was produced: live in results/, or already consumed by a
-        bridge (archive/ and undelivered/ are the two consumer dispositions)."""
+    def _result_evidence(self, task_name: str) -> "str | None":
+        """How an existing result was disposed of, or None when none is ready.
+
+        Locating and readiness are not this module's policy: `find_result`
+        already knows the live dir, `archive/YYYY-MM/` and the flat gateway
+        archive, and `read_ready_result` already knows that an empty or
+        half-written file is not an answer. Quarantine stays a distinct
+        disposition — it is evidence the work ran, not that it reached anyone.
+        """
         stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
-        name = f"{stem}.txt"
-        return any(p.exists() for p in (
-            self.results_dir / name,
-            self.results_dir / "archive" / name,
-            self.results_dir / "undelivered" / name))
+        found = find_result(self.results_dir, stem)
+        if found is not None and read_ready_result(found) is not None:
+            return "delivered"
+        quarantined = self.results_dir / "undelivered" / f"{stem}.txt"
+        if read_ready_result(quarantined) is not None:
+            return "undelivered"
+        return None
 
     def reclaim_claimed(self) -> "list[tuple[str, str]]":
         """Recover claimed files whose claimer died. Delivered means result
@@ -239,8 +249,7 @@ class PoolLead:
                 os.rename(f, f.with_name(canonical))
             except OSError:
                 continue
-            done = self._result_evidence(canonical)
-            disposition = "delivered" if done else "repooled"
+            disposition = self._result_evidence(canonical) or "repooled"
             if self.metrics is not None:
                 self.metrics.reclaimed(f.name, m.group(2), disposition)
             out.append((f.name, disposition))
