@@ -63,12 +63,15 @@ def behavioral() -> list:
         ("team redirect MENTION passes", "see [channel: 123] in prose", "team", _clean, False),
         ("team attach withheld", "[attach: /etc/passwd]", "team", _clean, True),
         ("team attach inline still withheld", "see [file: /x] here", "team", _clean, True),
-        ("team no-send withheld", "[no-send]", "team", _clean, True),
-        ("team deduped withheld", "[deduped: task-1]", "team", _clean, True),
+        # Suppression moves no data, so it is honoured on every tier and
+        # passes through byte-identical; the record, not a refusal, is the control.
+        ("team no-send passes", "[no-send]", "team", _clean, False),
+        ("team deduped passes", "[deduped: task-1]", "team", _clean, False),
+        ("team malformed deduped passes", "[deduped: EVIL bytes]", "team", _clean, False),
         ("team no-send MENTION passes", "the [no-send] marker is documented", "team", _clean, False),
         # The parser peels a D7 header before reading skips, so the guard must
         # classify what parse_markers EXECUTES, not what body-start text shows.
-        ("team D7-headed no-send withheld", "**[core: 1]**\n[no-send]\nhide", "team", _clean, True),
+        ("team D7-headed no-send passes", "**[core: 1]**\n[no-send]\nhide", "team", _clean, False),
         ("team non-leading channel passes", "intro\n[channel: 123]\nquoted", "team", _clean, False),
         ("team dm-only passes", "text\n[dm-only]\nmore", "team", _clean, False),
         ("team dm-only suppressed redirect passes", "[dm-only]\n[channel: 123]\nboth", "team", _clean, False),
@@ -78,22 +81,14 @@ def behavioral() -> list:
         ("unknown tier guarded", "[channel: 9]\nx", "", _clean, True),
         ("None tier guarded", "[channel: 9]\nx", None, _clean, True),
     ]
-    # Suppressive markers get the HONEST notice; everything else the leak one.
-    _suppress_names = {"team no-send withheld", "team deduped withheld",
-                       "team D7-headed no-send withheld"}
     for name, body, tier, filt, expect in cases:
         out, why = guard.guard_result_for_tier(body, tier, REPO, secret_filter=filt)
         withheld = why is not None
         if withheld != expect:
             fails.append(f"{name}: expected withheld={expect}, got {withheld} ({why})")
             continue
-        if withheld:
-            sentinel = (guard.TEAM_SUPPRESS_RESULT if name in _suppress_names
-                        else guard.TEAM_LEAK_RESULT)
-            if out != sentinel:
-                fails.append(f"{name}: withheld but body was not the expected sentinel")
-            if name in _suppress_names and "sensitive" in out:
-                fails.append(f"{name}: suppress notice must not allege sensitive content")
+        if withheld and out != guard.TEAM_LEAK_RESULT:
+            fails.append(f"{name}: withheld but body was not the leak sentinel")
         if not withheld and out != body:
             fails.append(f"{name}: passed but body was altered")
 
@@ -344,40 +339,45 @@ def main() -> int:
     for body, tier, filt, kind in (
         ("plain reply", "team", _clean, guard.VERDICT_DELIVER),
         ("plain reply", "owner", _leaky, guard.VERDICT_DELIVER),
-        ("[no-send]\nhide", "team", _clean, guard.VERDICT_SUPPRESS),
-        ("**[core: 1]**\n[no-send]\nhide", "team", _clean, guard.VERDICT_SUPPRESS),
+        ("[no-send]\nhide", "team", _clean, guard.VERDICT_DELIVER),
+        ("**[core: 1]**\n[no-send]\nhide", "team", _clean, guard.VERDICT_DELIVER),
         ("[attach: /etc/passwd]", "team", _clean, guard.VERDICT_LEAK),
         ("secret text", "team", _leaky, guard.VERDICT_LEAK),
-        # Marker check precedes the secret scan: a secret-carrying skip body
-        # still SUPPRESSES — the leaky filter never gets a say on a stubbed body.
-        ("[no-send]\nsecret text", "team", _leaky, guard.VERDICT_SUPPRESS),
+        # Suppression short-circuits the scan: an undelivered body has nothing
+        # to leak, and a LEAK here is a notice the asking channel has to read.
+        ("[no-send]\nsecret text", "team", _leaky, guard.VERDICT_DELIVER),
     ):
         v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
         assert v.kind == kind, (body, tier, v)
         wrapped = guard.guard_result_for_tier(body, tier, REPO, secret_filter=filt)
         assert wrapped == (v.body, v.reason), (body, tier, "wrapper diverged from verdict")
-    # Every stub verdict must also be a suppress verdict, and no influenced
-    # bytes may ride in the stub (fixed literals + grammar-checked id only).
-    for body, tier, stub in (
-        ("[no-send]", "team", "[no-send]"),
-        ("[no-send]\nhidden content", "team", "[no-send]"),
-        ("[REPLIED]", "team", "[REPLIED]"),
-        ("[deduped: task-abc123]", "team", "[deduped: task-abc123]"),
-        ("[deduped: EVIL bytes]", "team", None),
-        ("[no-send]", "owner", None),
-        ("plain reply", "team", None),
-        ("[channel: 123]\nx", "team", None),
+    # is_suppression_only classifies; it must never validate a dedup target,
+    # and mixed markers must NOT read as suppression-only (redirect still leaks).
+    for body, expect in (
+        ("[no-send]", True),
+        ("[no-send]\nhidden content", True),
+        ("[REPLIED]", True),
+        ("[deduped: task-abc123]", True),
+        ("[deduped: EVIL bytes]", True),
+        ("plain reply", False),
+        ("", False),
+        ("[channel: 123]\nx", False),
+        ("[file: /etc/passwd]", False),
+        ("[dm-only]\n[no-send]\nx", False),
     ):
-        got = guard.suppression_stub_for_tier(body, tier)
-        assert got == stub, (body, tier, got)
-        if got is not None:
-            # stub⊆suppress holds regardless of filter: the marker check
-            # precedes the secret scan, so _leaky cannot flip a stub to LEAK.
-            for filt in (_clean, _leaky):
-                v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
-                assert v.kind == guard.VERDICT_SUPPRESS, (body, filt.__name__, "stub without suppress verdict")
-            assert got == body[:len(got)] or got.startswith("[deduped:"), body
-    print("  [stub] suppression_stub_for_tier: inert bytes only, subset of suppress")
+        assert guard.is_suppression_only(body) is expect, (body, expect)
+        if expect:
+            # Suppression is tier-blind and filter-blind: neither a guarded tier
+            # nor a leaky scanner may turn an honoured close into a withheld one.
+            for tier in ("owner", "team", "guest", "", None):
+                for filt in (_clean, _leaky):
+                    v = guard.classify_result_for_tier(body, tier, REPO, secret_filter=filt)
+                    assert v.kind == guard.VERDICT_DELIVER, (body, tier, filt.__name__)
+                    assert v.body == body, (body, tier, "suppression body was rewritten")
+    assert not hasattr(guard, "suppression_stub_for_tier"), (
+        "the stub minter must be gone, not merely unused — it is what parsed and "
+        "validated a dedup target inside the guard")
+    print("  [classify] is_suppression_only: no stub minted, no dedup target validated")
     print("  [verdict] classify_result_for_tier owns the three-way decision;")
     print("            guard_result_for_tier provably derives from it")
     print("  [behavioral] owner passes through; redirect/attach/no-send/secret withheld;")
