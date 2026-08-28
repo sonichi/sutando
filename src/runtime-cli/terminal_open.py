@@ -10,6 +10,7 @@ adapter choice is unit-tested without spawning anything.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 
@@ -29,35 +30,57 @@ def detect_terminal() -> str:
     return "unknown"
 
 
+def _applescript_literal(text: str) -> str:
+    """`text` as the body of an AppleScript string literal. Only a backslash,
+    a quote or a raw newline can end the literal and start AppleScript."""
+    return (text.replace("\\", "\\\\").replace('"', '\\"')
+                .replace("\r", "\\r").replace("\n", "\\n"))
+
+
 def applescript_for(command: str, window: bool = False) -> str:
     """AppleScript that runs `command` in a new Apple Terminal tab (default)
     or window. `do script` with no target opens a new window; targeting the
-    front window opens a tab."""
+    front window opens a tab.
+
+    `command` is embedded as an escaped literal, never concatenated raw: it
+    carries identity data the registry stores verbatim, and one `"` in it
+    would close the string and leave the rest as AppleScript to run."""
+    literal = _applescript_literal(command)
     if window:
         return (f'tell application "Terminal"\n  activate\n'
-                f'  do script "{command}"\nend tell')
+                f'  do script "{literal}"\nend tell')
     return (f'tell application "Terminal"\n  activate\n'
-            f'  do script "{command}" in front window\nend tell')
+            f'  do script "{literal}" in front window\nend tell')
+
+
+def _attach_argv(agent_id: str, instance: str | None = None) -> list:
+    argv = ["sutando", "attach", agent_id]
+    if instance and instance != "default":
+        argv += ["--instance", instance]
+    return argv
 
 
 def build_open_plan(agent_id: str, terminal: str, window: bool = False,
                     instance: str | None = None) -> dict:
-    """Decide how to open. Returns {"method": ..., ...} — never spawns."""
-    command = f"sutando attach {agent_id}"
-    if instance and instance != "default":
-        command += f" --instance {instance}"
+    """Decide how to open. Returns {"method": ..., ...} — never spawns.
+
+    Identity is passed as argv, so no shell parses it. Apple Terminal's `do
+    script` takes a command STRING, so that one form is shell-quoted first;
+    `command` is the same quoted string, safe to print or paste."""
+    argv = _attach_argv(agent_id, instance)
+    command = shlex.join(argv)
     if terminal == "apple_terminal":
         return {"method": "applescript",
                 "script": applescript_for(command, window=window),
                 "command": command}
     if terminal == "wezterm" and shutil.which("wezterm"):
         return {"method": "exec",
-                "argv": ["wezterm", "cli", "spawn", "--", "sh", "-c", command],
+                "argv": ["wezterm", "cli", "spawn", "--", *argv],
                 "command": command}
     if terminal == "kitty" and shutil.which("kitty"):
         return {"method": "exec",
                 "argv": ["kitty", "@", "launch", "--type",
-                         "window" if window else "tab", "sh", "-c", command],
+                         "window" if window else "tab", *argv],
                 "command": command}
     return {"method": "manual", "command": command}
 
