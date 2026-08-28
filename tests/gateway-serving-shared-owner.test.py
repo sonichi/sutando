@@ -34,6 +34,7 @@ def load(name, fname):
 import gateway_serving as gs  # noqa: E402
 
 NOW = time.time()
+NAN, INF = float("nan"), float("inf")
 failures = []
 
 # ---------------------------------------------------------------- contract
@@ -99,6 +100,11 @@ MALFORMED = [
     ("ts is negative",                  {"ts": -1, "connected": True, "last_ok_ts": NOW}, None),
     ("last_ok_ts is -1",                {"ts": NOW, "connected": True, "last_ok_ts": -1}, False),
     ("last_ok_ts is in the future",     {"ts": NOW, "connected": True, "last_ok_ts": NOW + 3600}, False),
+    # json.loads parses NaN/Infinity, so these are reachable sidecar values.
+    # NaN defeats both bounds silently: NaN > max_age and NaN < -skew are both False.
+    ("ts is NaN",                       {"ts": NAN, "connected": True, "last_ok_ts": NOW}, None),
+    ("ts is Infinity",                  {"ts": INF, "connected": True, "last_ok_ts": NOW}, None),
+    ("last_ok_ts is NaN",               {"ts": NOW, "connected": True, "last_ok_ts": NAN}, False),
 ]
 for _label, _rec, _want in MALFORMED:
     _v = gs.verdict_from_record(_rec, now=NOW, max_age=300)
@@ -111,6 +117,11 @@ for _label, _rec, _want in MALFORMED:
 _v = gs.verdict_from_record({"ts": NOW + 1, "connected": True, "last_ok_ts": NOW}, now=NOW, max_age=300)
 if _v is None or _v.serving is not True:
     failures.append("malformed: a record within the skew tolerance must still be serving")
+
+# A bad backoff_s must not poison the serving verdict it has no part in.
+_v = gs.verdict_from_record({"ts": NOW, "connected": True, "last_ok_ts": NOW, "backoff_s": -5}, now=NOW, max_age=300)
+if _v is None or _v.serving is not True or _v.backoff_s is not None:
+    failures.append("malformed: a negative backoff_s must be dropped, not change serving")
 
 # ------------------------------------------ reader-specific edges preserved
 
