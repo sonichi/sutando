@@ -64,10 +64,11 @@ class TasksViewTests(unittest.TestCase):
         # even-newer room result — that must not leak into this channel.
         self.assertEqual(latest["taskId"], "task-rtapi-b")
         self.assertTrue(latest.get("latest"))
-        # explicit id still fetches ANY result (incl. the room one) and is
-        # NOT flagged latest
-        one = self.view.get_result("task-9999")
-        self.assertEqual(one["result"], "A ROOM RESULT")
+        # An explicit id is the SAME ownership boundary as the latest filter:
+        # naming another channel's result must not fetch it (review P1).
+        self.assertIsNone(self.view.get_result("task-9999"))
+        one = self.view.get_result("task-rtapi-a")
+        self.assertEqual(one["result"], "older")
         self.assertNotIn("latest", one)
 
     def test_get_result_no_id_empty_is_none(self):
@@ -165,16 +166,52 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(view.status(tid)["state"], "pending")
 
     def test_status_unknown_task(self):
-        self.assertEqual(self.view.status("task-nope")["state"], "unknown")
+        self.assertEqual(self.view.status("task-rtapi-nope")["state"], "unknown")
 
     def test_get_result_live_and_archived(self):
         self.results.mkdir(parents=True)
-        (self.results / "task-a.txt").write_text("live result")
+        (self.results / "task-rtapi-a.txt").write_text("live result")
         (self.results / "archive").mkdir()
-        (self.results / "archive" / "task-b.txt").write_text("old result")
-        self.assertEqual(self.view.get_result("task-a")["result"], "live result")
-        self.assertEqual(self.view.get_result("task-b")["result"], "old result")
-        self.assertIsNone(self.view.get_result("task-c"))
+        (self.results / "archive" / "task-rtapi-b.txt").write_text("old result")
+        self.assertEqual(self.view.get_result("task-rtapi-a")["result"],
+                         "live result")
+        self.assertEqual(self.view.get_result("task-rtapi-b")["result"],
+                         "old result")
+        self.assertIsNone(self.view.get_result("task-rtapi-c"))
+
+    def test_get_result_monthly_and_gateway_archives(self):
+        # Both canonical archive layouts (find_result): bridge monthly
+        # archive/<YYYY-MM>/ and gateway epoch-suffixed archive/<id>-<epoch>.txt
+        month = self.results / "archive" / "2026-08"
+        month.mkdir(parents=True)
+        (month / "task-rtapi-archive.txt").write_text("monthly result")
+        (self.results / "archive" / "task-rtapi-gateway-123.txt").write_text(
+            "gateway result")
+        self.assertEqual(self.view.get_result("task-rtapi-archive")["result"],
+                         "monthly result")
+        self.assertEqual(self.view.status("task-rtapi-archive")["state"], "done")
+        self.assertEqual(self.view.get_result("task-rtapi-gateway")["result"],
+                         "gateway result")
+
+    def test_longer_task_ids_gateway_archive_is_not_this_task(self):
+        """A longer id's epoch-suffixed archive shares this id's prefix.
+        Reading it would report another task's result, and done, for a task
+        that never delivered — and would suppress its cancellation."""
+        (self.results / "archive").mkdir(parents=True)
+        (self.results / "archive"
+         / "task-rtapi-target-longer-1785976425.txt").write_text("OTHER TASK")
+        self.assertIsNone(self.view.get_result("task-rtapi-target"))
+        self.assertNotEqual(self.view.status("task-rtapi-target")["state"], "done")
+
+    def test_genuine_gateway_suffix_still_resolves_beside_the_longer_id(self):
+        (self.results / "archive").mkdir(parents=True)
+        (self.results / "archive"
+         / "task-rtapi-target-longer-1785976425.txt").write_text("OTHER TASK")
+        (self.results / "archive"
+         / "task-rtapi-target-1785976425.txt").write_text("MINE")
+        self.assertEqual(self.view.get_result("task-rtapi-target")["result"],
+                         "MINE")
+        self.assertEqual(self.view.status("task-rtapi-target")["state"], "done")
 
     def test_details_roundtrip(self):
         tid = self.view.submit("inspect me", priority="low")["taskId"]
@@ -217,13 +254,14 @@ class TasksViewTests(unittest.TestCase):
 
     def test_cancel_done_task_is_noop_and_unknown_raises(self):
         self.results.mkdir(parents=True)
-        (self.results / "task-done1.txt").write_text("r")
+        (self.results / "task-rtapi-done1.txt").write_text("r")
         self.tasks.mkdir(parents=True, exist_ok=True)
-        (self.tasks / "task-done1.txt").write_text("id: task-done1\ntask: x\n")
-        out = self.view.cancel("task-done1")
+        (self.tasks / "task-rtapi-done1.txt").write_text(
+            "id: task-rtapi-done1\ntask: x\n")
+        out = self.view.cancel("task-rtapi-done1")
         self.assertIs(out["cancelled"], False)
         with self.assertRaises(ValueError):
-            self.view.cancel("task-never-existed")
+            self.view.cancel("task-rtapi-never-existed")
 
 
 class DispatchTests(unittest.TestCase):
@@ -287,6 +325,62 @@ class TraversalGuardTests(unittest.TestCase):
         (Path(self.tmp.name) / "results" / "task-rtapi-abc12.txt").write_text("hi")
         out = self.view.get_result("task-rtapi-abc12")
         self.assertIn("hi", str(out))
+
+
+class ForeignTaskOwnershipTests(unittest.TestCase):
+    """Negative control for the `task-rtapi-` ownership boundary (review P1).
+
+    A well-formed id from ANOTHER channel is not a malformed id — it named
+    real, private work, and every per-id path plus enumeration returned it.
+    The positive control at the bottom proves the refusals are the boundary
+    firing and not a broken fixture."""
+
+    FOREIGN = "task-1699999999"          # a Discord/Telegram-shaped task id
+    PRIVATE = "PRIVATE DISCORD RESULT"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.tasks, self.results = base / "tasks", base / "results"
+        self.tasks.mkdir(parents=True)
+        self.results.mkdir(parents=True)
+        (self.results / f"{self.FOREIGN}.txt").write_text(self.PRIVATE)
+        (self.tasks / f"{self.FOREIGN}.txt").write_text(
+            f"id: {self.FOREIGN}\ntimestamp: 2026-08-23T00:00:00Z\n"
+            "task: book the private clinic appointment\n"
+            "source: telegram\nchannel_id: 42\naccess_tier: owner\n")
+        self.view = TasksView(self.tasks, self.results, "@me:example.org")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_foreign_result_is_not_readable_by_id(self):
+        self.assertIsNone(self.view.get_result(self.FOREIGN))
+
+    def test_foreign_task_status_reads_as_absent(self):
+        self.assertEqual(self.view.status(self.FOREIGN)["state"], "not_found")
+
+    def test_foreign_task_details_are_not_exposed(self):
+        self.assertIsNone(self.view.details(self.FOREIGN))
+
+    def test_foreign_task_is_not_enumerated(self):
+        listed = self.view.list_tasks()["tasks"]
+        self.assertEqual([e["taskId"] for e in listed], [],
+                         f"another source's task leaked into task.list: {listed}")
+
+    def test_foreign_task_cannot_be_cancelled(self):
+        out = self.view.cancel(self.FOREIGN)
+        self.assertIs(out["ok"], False)
+        self.assertEqual(list(self.tasks.glob("task-rtapi-*")), [],
+                         "a CANCEL_INSTRUCTION was written for a foreign task")
+
+    def test_positive_control_own_task_is_still_visible_everywhere(self):
+        tid = self.view.submit("my own work")["taskId"]
+        (self.results / f"{tid}.txt").write_text("MY RESULT")
+        self.assertEqual(self.view.get_result(tid)["result"], "MY RESULT")
+        self.assertEqual(self.view.status(tid)["state"], "done")
+        self.assertIsNotNone(self.view.details(tid))
+        self.assertIn(tid, [e["taskId"] for e in self.view.list_tasks()["tasks"]])
 
 
 if __name__ == "__main__":

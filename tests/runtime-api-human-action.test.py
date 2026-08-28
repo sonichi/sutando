@@ -25,6 +25,8 @@ from request_store import RequestStore  # noqa: E402
 from ha_adapter import HumanActionAdapter  # noqa: E402
 from protocol import ProtocolError  # noqa: E402
 
+SETTLE_METHODS = ("human_action.complete", "human_action.decline")
+
 
 class HumanActionTests(unittest.TestCase):
     def setUp(self):
@@ -33,6 +35,11 @@ class HumanActionTests(unittest.TestCase):
         self.store = RequestStore(str(base / "rt.sqlite"))
         self.ha = HumanActionAdapter(str(base / "ha"))
         self.d = RuntimeDispatcher(self.store, self.ha, "@agent:x", executors={})
+        # Settling is an authorized-device action, so the API-settle tests
+        # drive a GRANTED dispatcher; `self.d` stays ungranted like a Unix client.
+        self.granted = RuntimeDispatcher(
+            self.store, self.ha, "@agent:x", executors={},
+            granted_methods=frozenset(SETTLE_METHODS))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -65,8 +72,8 @@ class HumanActionTests(unittest.TestCase):
 
     def test_api_complete_resolves_request_and_closes_card(self):
         rid = self._request()
-        out = asyncio.run(self.d.handle("human_action.complete",
-                                        {"requestId": rid, "note": "signed"}))
+        out = asyncio.run(self.granted.handle("human_action.complete",
+                                              {"requestId": rid, "note": "signed"}))
         self.assertEqual(out["status"], "completed")
         self.assertEqual(self.store.get(rid)["result"], {"note": "signed"})
         card = self.ha.store.get(self.d._ha_of[rid])
@@ -74,26 +81,76 @@ class HumanActionTests(unittest.TestCase):
 
     def test_api_decline_and_terminal_is_idempotent_safe(self):
         rid = self._request()
-        out = asyncio.run(self.d.handle("human_action.decline", {"requestId": rid}))
+        out = asyncio.run(self.granted.handle("human_action.decline",
+                                              {"requestId": rid}))
         self.assertEqual(out["status"], "declined")
-        again = asyncio.run(self.d.handle("human_action.complete", {"requestId": rid}))
+        again = asyncio.run(self.granted.handle("human_action.complete",
+                                                {"requestId": rid}))
         self.assertTrue(again["alreadyTerminal"])
         self.assertEqual(again["status"], "declined")  # terminal state unchanged
 
     def test_complete_rejects_wrong_type_and_unknown(self):
         r = asyncio.run(self.d.handle("approval.request", {"action": "x"}))
-        with self.assertRaises(ProtocolError):
+        for rid in (r["requestId"], "nope"):
+            with self.assertRaises(ProtocolError) as cm:
+                asyncio.run(self.granted.handle("human_action.complete",
+                                                {"requestId": rid}))
+            # -32602 (bad param), NOT the -32601 grant refusal: the argument
+            # checks must still be reachable for an authorized caller.
+            self.assertEqual(cm.exception.code, -32602)
+
+    def test_ungranted_caller_cannot_settle_and_leaves_the_row_pending(self):
+        rid = self._request()
+        with self.assertRaises(ProtocolError) as cm:
             asyncio.run(self.d.handle("human_action.complete",
-                                      {"requestId": r["requestId"]}))
+                                      {"requestId": rid}))
+        self.assertEqual(cm.exception.code, -32601)
+        self.assertEqual(self.store.get(rid)["status"], "pending")
+        self.assertEqual(self.ha.store.get(self.d._ha_of[rid])["status"],
+                         "pending")
         with self.assertRaises(ProtocolError):
-            asyncio.run(self.d.handle("human_action.complete",
-                                      {"requestId": "nope"}))
+            asyncio.run(self.d.handle("human_action.decline", {"requestId": rid}))
+        self.assertEqual(self.store.get(rid)["status"], "pending")
 
     def test_status_returns_request_state(self):
         rid = self._request()
         st = asyncio.run(self.d.handle("human_action.status", {"requestId": rid}))
         self.assertEqual(st["status"], "pending")
         self.assertEqual(st["requestId"], rid)
+
+
+class ProductionComposedSettleTests(unittest.TestCase):
+    """The control that matters: the dispatcher the SHIPPED server composes,
+    reached the way `RuntimeServer.client()` reaches it. A hand-built
+    dispatcher could be given grants the real Unix transport never has."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        import server as rt  # noqa: PLC0415
+        self.srv = rt.RuntimeServer(socket_path=str(base / "s.sock"),
+                                    db_path=str(base / "rt.sqlite"),
+                                    ha_dir=str(base / "ha"))
+        self.d = self.srv.dispatcher
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_unix_transport_grants_nothing(self):
+        self.assertEqual(set(self.d.granted_methods), set())
+
+    def test_ungranted_unix_client_cannot_settle_its_own_request(self):
+        rid = asyncio.run(self.d.handle(
+            "human_action.request", {"action": "Sign the agreement"}))["requestId"]
+        for method in SETTLE_METHODS:
+            with self.assertRaises(ProtocolError) as cm:
+                asyncio.run(self.d.handle(method, {"requestId": rid}))
+            self.assertEqual(cm.exception.code, -32601)
+        rec = self.srv.store.get(rid)
+        self.assertEqual(rec["status"], "pending")
+        self.assertIsNone(rec.get("resolvedBy"))
+        self.assertEqual(self.srv.ha.store.get(self.d._ha_of[rid])["status"],
+                         "pending")
 
 
 if __name__ == "__main__":

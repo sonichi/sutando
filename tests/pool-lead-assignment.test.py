@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""PoolLead (L1): priority-ordered assignment, sticky affinity with idle
-rebalance, least-loaded fallback, dead-follower reclaim, no-follower inertness.
+"""PoolLead (L1): priority-ordered assignment, binding room affinity, least-loaded fallback, dead-follower reclaim, no-follower inertness.
 
 Run: python3 tests/pool-lead-assignment.test.py   (stdlib only)
 """
@@ -15,7 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
-from pool_lead import (AFFINITY_BUSY_MAX, AFFINITY_IDLE_S,  # noqa: E402
+from pool_lead import (AFFINITY_BUSY_MAX,  # noqa: E402
                        ASSIGN_STUCK_S, NOCLAIM_COOLDOWN_S, PoolLead)
 
 
@@ -117,17 +116,16 @@ class PoolLeadTests(unittest.TestCase):
         second = dict(self.lead.sweep())["task-c2.txt"]
         self.assertEqual(second, first)
 
-    def test_idle_channel_rebalances(self):
+    def test_idle_gap_does_not_move_the_room(self):
+        # binding: a week of silence must not lose the room's context core
         self._task("task-c1.txt", channel="C123")
         first = dict(self.lead.sweep())["task-c1.txt"]
         for f in list(self.tasks.iterdir()):
             f.unlink()  # handler finished everything
-        self.clock[0] += AFFINITY_IDLE_S + 1
+        self.clock[0] += 7 * 86400
         self._task("task-c2.txt", channel="C123")
         second = dict(self.lead.sweep())["task-c2.txt"]
-        self.assertIn(second, self.alive)
-        # no inequality assert: a rebalance may re-pick the same core by
-        # load; only the stickiness must be gone
+        self.assertEqual(second, first)
         row = self.lead._load_affinity()["C123"]
         self.assertEqual(row["ts"], self.clock[0])
 
@@ -250,7 +248,9 @@ class ReclaimClaimedTest(unittest.TestCase):
 
 
 class AffinityBusyYieldTest(unittest.TestCase):
-    """A backlogged affinity handler yields to the least-loaded follower."""
+    """Binding affinity (owner 2026-08-26): a room's home core keeps its
+    work while alive — load never moves a room, only death or an
+    unclaimed-reclaim does. Context continuity outranks latency."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -278,17 +278,100 @@ class AffinityBusyYieldTest(unittest.TestCase):
         f.write_text("id: task-fresh\nchannel_id: chan-A\n")
         return f
 
-    def test_busy_handler_yields_to_idle_follower(self):
-        self._backlog("core-2", 3)  # at AFFINITY_BUSY_MAX
-        self._new_task()
-        out = dict(self.lead.sweep())
-        self.assertEqual(out.get("task-fresh.txt"), "core-1")
-
-    def test_handler_below_threshold_keeps_channel(self):
-        self._backlog("core-2", 2)  # under AFFINITY_BUSY_MAX
+    def test_busy_home_core_keeps_the_room(self):
+        self._backlog("core-2", 5)  # far past any depth threshold
         self._new_task()
         out = dict(self.lead.sweep())
         self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+    def test_handler_below_threshold_keeps_channel(self):
+        self._backlog("core-2", 2)
+        self._new_task()
+        out = dict(self.lead.sweep())
+        self.assertEqual(out.get("task-fresh.txt"), "core-2")
+
+    def test_routine_assignment_never_rebinds_a_room(self):
+        # owner report 2026-08-26: a routine task tagged with a room stamped
+        # the lane core over the owner's binding, making the steal sticky.
+        (self.tasks / "task-r9.txt").write_text(
+            "id: task-r9\nchannel_id: chan-A\npriority: low\ntask: t\n")
+        self.lead.sweep()
+        row = self.lead._load_affinity()["chan-A"]
+        self.assertEqual(row["instance"], "core-2", "binding must survive")
+
+    def test_busy_core_keeps_unclaimed_assignments_and_its_rooms(self):
+        # busy != wedged: a mid-task core claims later; repooling moved
+        # bound rooms off their context core
+        (self.tasks / "task-w1.claimed-core-2.txt").write_text("x")
+        stuck = self.tasks / "task-w2.assigned-core-2.txt"
+        stuck.write_text("id: task-w2\nchannel_id: chan-A\n")
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=300)
+        self.assertEqual(out, [])
+        self.assertTrue(stuck.exists(), "assignment must stay put")
+        self.assertIn("chan-A", self.lead._load_affinity())
+
+    def test_wedged_busy_core_yields_at_the_deferral_cap(self):
+        # a claimed file is not proof of progress: past BUSY_DEFER_MAX_S the
+        # assignment repools even though the core still holds a claim
+        (self.tasks / "task-w3.claimed-core-2.txt").write_text("x")
+        stuck = self.tasks / "task-w4.assigned-core-2.txt"
+        stuck.write_text("id: task-w4\nchannel_id: chan-A\n")
+        import os as _os
+        _os.utime(stuck, (self.lead.now() - 1801.0,) * 2)
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 1801.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=300)
+        self.assertEqual(len(out), 1)
+        self.assertFalse(stuck.exists(), "past the cap the assignment repools")
+
+    def test_post_busy_grace_lets_the_core_claim_before_repool(self):
+        # a core that was busy through the whole window gets a fresh short
+        # claim grace when the busy spell ends, instead of an instant repool
+        busy = self.tasks / "task-g1.claimed-core-2.txt"
+        busy.write_text("x")
+        stuck = self.tasks / "task-g2.assigned-core-2.txt"
+        stuck.write_text("id: task-g2\nchannel_id: chan-A\n")
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
+        self.assertEqual(self.lead.reclaim_stuck_assignments(max_age_s=300), [])
+        ledger = self.lead._load_assign_ledger()
+        age = self.lead.now() - ledger[stuck.name]
+        self.assertLess(age, 300.0, "busy sweep must leave a claim grace")
+        busy.unlink()  # busy spell ends
+        self.assertEqual(self.lead.reclaim_stuck_assignments(max_age_s=300), [],
+                         "inside the grace window nothing repools")
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 361.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=300)
+        self.assertEqual(len(out), 1, "grace expired unclaimed: repool")
+
+    def test_stale_queued_task_still_gets_the_busy_cap_from_assignment(self):
+        # rename preserves arrival mtime; assignment must stamp its own time
+        # or a task queued > cap is repooled the moment the claim window ends
+        import os as _os
+        (self.tasks / "task-s1.claimed-core-2.txt").write_text("x")
+        old = self.tasks / "task-s2.txt"
+        old.write_text("id: task-s2\nsource: slack\nchannel_id: chan-A\n"
+                       "access_tier: owner\npriority: normal\ntask: hi\n")
+        _os.utime(old, (self.lead.now() - 7200.0,) * 2)  # queued two hours
+        self.lead.sweep()
+        stuck = self.tasks / "task-s2.assigned-core-2.txt"
+        self.assertTrue(stuck.exists())
+        self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
+        out = self.lead.reclaim_stuck_assignments(max_age_s=300)
+        self.assertEqual(out, [], "busy cap must measure from assignment")
+
+    def test_unclaimed_reclaim_releases_the_room_binding(self):
+        # home core heartbeats but never claims: reclaim must drop the row
+        # so the re-pick moves the room to a core that answers.
+        stuck = self.tasks / "task-stuck.assigned-core-2.txt"
+        stuck.write_text("id: task-stuck\nchannel_id: chan-A\n")
+        self.lead._save_assign_ledger({stuck.name: 0.0})
+        self.lead.reclaim_stuck_assignments(max_age_s=1)
+        self.assertNotIn("chan-A", self.lead._load_affinity())
+        out = dict(self.lead.sweep())
+        self.assertNotEqual(out.get("task-stuck.txt"), "core-2")
+        self.assertEqual(
+            self.lead._load_affinity()["chan-A"]["instance"],
+            out["task-stuck.txt"])  # new home re-stamped
 
 
 class RoutineLaneEscape(unittest.TestCase):

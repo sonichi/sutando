@@ -303,6 +303,56 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     check(bad_f.get("error", {}).get("code") == -32700,
           "serve(): malformed frame answers a parse error")
 
+    # ── negative control: an ordinary Unix client cannot approve its own ────
+    # governed action (P1 — the requester must never be its own approver)
+    async def drive_self_approval():
+        sdir = tempfile.mkdtemp(prefix="rt", dir="/tmp")
+        sock = f"{sdir}/g.sock"
+        side_effects = []
+        s6 = rt.RuntimeServer(socket_path=sock, db_path=str(tmp / "s6.sqlite"),
+                              ha_dir=str(tmp / "ha6"))
+        s6.dispatcher.executors = {
+            "message.send": lambda p: side_effects.append("SEND") or {"executed": True}}
+        task = asyncio.ensure_future(s6.serve())
+        await asyncio.sleep(0.3)
+        r, w = await asyncio.open_unix_connection(sock)
+
+        async def rpc(i, method, params):
+            w.write((json.dumps({"jsonrpc": "2.0", "id": i, "method": method,
+                                 "params": params}) + "\n").encode())
+            await w.drain()
+            return json.loads((await r.readline()).decode())
+
+        req = await rpc("g1", "approval.request", {"action": "message.send"})
+        rid = req["result"]["requestId"]
+        resp = await rpc("g2", "approval.respond",
+                         {"requestId": rid, "decision": "approve"})
+        execu = await rpc("g3", "capability.execute",
+                          {"action": "message.send",
+                           "resource": {"roomId": "!r:x"},
+                           "input": {"body": "hi"},
+                           "approvalRequestId": rid})
+        row = s6.store.get(rid)
+        w.close()
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        Path(sock).unlink(missing_ok=True)
+        return resp, execu, row, side_effects
+
+    resp_f, exec_f, row_f, effects = run(drive_self_approval())
+    check(resp_f.get("error", {}).get("code") == -32601
+          and "grant" in resp_f.get("error", {}).get("message", ""),
+          "unix client: approval.respond is not callable (no grant)")
+    check(row_f["status"] == "pending",
+          "unix client: the approval remains pending after the respond attempt")
+    check("error" in exec_f,
+          "unix client: governed execute without approval is refused")
+    check(effects == [],
+          "unix client: the executor is never called (no side effect)")
+
     # main() wiring (env → construction), run patched out
     os.environ["SUTANDO_RUNTIME_SOCKET"] = str(tmp / "m.sock")
     os.environ["SUTANDO_RUNTIME_DB"] = str(tmp / "m.sqlite")

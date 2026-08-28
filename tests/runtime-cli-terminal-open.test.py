@@ -63,6 +63,13 @@ class PlanBuilding(unittest.TestCase):
             plan = to.build_open_plan("@a:x", term)
             self.assertIn("@a:x", str(plan), term)
 
+    def test_non_default_instance_lands_in_the_attach_command(self):
+        plan = to.build_open_plan("@a:x", "unknown", instance="work")
+        self.assertEqual(plan["command"], "sutando attach @a:x --instance work")
+        # the default instance keeps the bare command (single-instance world)
+        plan = to.build_open_plan("@a:x", "unknown", instance="default")
+        self.assertEqual(plan["command"], "sutando attach @a:x")
+
     def test_applescript_tab_vs_window(self):
         tab = to.applescript_for("echo hi", window=False)
         win = to.applescript_for("echo hi", window=True)

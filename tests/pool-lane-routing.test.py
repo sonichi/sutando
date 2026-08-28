@@ -105,15 +105,15 @@ class LaneRoutingTests(LaneBase):
         self.assertEqual(self._assigned_to("task-r4"), "core-1")
         self.assertEqual(self._assigned_to("task-o4"), "core-1")
 
-    def test_owner_affinity_on_lane_core_is_not_honored(self):
-        # yesterday's handler was the lane core; fresh owner traffic must
-        # migrate to the owner lane rather than stick to the routine core
+    def test_explicit_binding_beats_lane_defaults(self):
+        # binding rows are always deliberate now (sweep cannot stamp the
+        # lane core) — honor them on ANY alive seat, incl. lane core/codex
         (self.state / "pool").mkdir(parents=True)
         (self.state / "pool" / "affinity.json").write_text(
             '{"C1": {"instance": "core-2", "ts": 999.0}}')
         self._write("task-o5.txt", owner_task(channel="C1"))
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-o5"), "core-1")
+        self.assertEqual(self._assigned_to("task-o5"), "core-2")
 
     def test_numeric_core_ordering(self):
         self.pool = ["core-2", "core-10"]
@@ -130,6 +130,69 @@ class LaneDetectionTests(LaneBase):
 
     def test_unreadable_fails_open_to_owner(self):
         self.assertEqual(_read_lane(self.tasks / "absent.txt"), "owner")
+
+
+class RuntimeAwareLaneTests(LaneBase):
+    """The routine lane skips codex: it has no watcher and sweeps on a timer,
+    so maintenance parked there waits for a poll."""
+
+    def _lead(self, runtimes):
+        self.pool = sorted(runtimes)
+        return PoolLead(self.tasks, self.state,
+                        followers_fn=lambda: list(self.pool),
+                        alive_fn=lambda i: True, now_fn=lambda: 1_000.0,
+                        runtime_fn=lambda i: runtimes[i])
+
+    def test_routine_skips_codex_for_the_highest_claude_core(self):
+        lead = self._lead({"core-1": "claude", "core-2": "claude",
+                           "core-3": "codex"})
+        self._write("task-r1.txt", routine_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-r1"), "core-2")
+
+    def test_owner_work_queues_on_claude_over_idle_codex(self):
+        # owner 2026-08-26: a codex seat is turnaround-slow, so owner work
+        # waits behind a lightly-loaded claude seat rather than landing there.
+        lead = self._lead({"core-1": "claude", "core-2": "claude",
+                           "core-3": "codex"})
+        self._occupy("core-1", 1)
+        self._write("task-o1.txt", owner_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-o1"), "core-1")
+
+    def test_all_codex_pool_still_has_a_lane(self):
+        lead = self._lead({"core-1": "codex", "core-2": "codex"})
+        self._write("task-r2.txt", routine_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-r2"), "core-2")
+
+    def test_explicit_binding_to_codex_is_honored(self):
+        lead = self._lead({"core-1": "claude", "core-2": "claude",
+                           "core-3": "codex"})
+        (self.state / "pool").mkdir(parents=True, exist_ok=True)
+        (self.state / "pool" / "affinity.json").write_text(
+            '{"C2": {"instance": "core-3", "ts": 999.0}}')
+        self._write("task-o6.txt", owner_task(channel="C2"))
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-o6"), "core-3")
+
+    def test_single_claude_with_codex_gets_owner_work(self):
+        # the sole claude doubles as lane core but must stay owner-eligible
+        lead = self._lead({"core-1": "claude", "core-4": "codex"})
+        self._write("task-o7.txt", owner_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-o7"), "core-1")
+
+    def test_single_claude_with_codex_gets_routine_work(self):
+        lead = self._lead({"core-1": "claude", "core-4": "codex"})
+        self._write("task-r6.txt", routine_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-r6"), "core-1")
+
+    def test_no_runtime_fn_keeps_the_pre_runtime_behaviour(self):
+        self._write("task-r3.txt", routine_task())
+        self.lead.sweep()
+        self.assertEqual(self._assigned_to("task-r3"), "core-2")
 
 
 class HeaderPastTheOldCap(LaneBase):

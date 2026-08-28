@@ -142,7 +142,7 @@ class InstanceRegistryTests(unittest.TestCase):
             return orig(*a, **kw)
         _sp.Popen = spy
         try:
-            reg.start_instance("agent-A", wait_s=1,
+            reg.start_instance("agent-A", wait_s=1, instance="inst-B",
                                _ready=lambda m: {"attachable": False, "stage": "x"})
         except Exception:
             pass
@@ -192,7 +192,7 @@ class InstanceRegistryTests(unittest.TestCase):
                            launcher={"type": "process", "executable": str(launcher),
                                      "args": [], "working_directory": self.tmp.name})
         # readiness true once the env dump exists
-        reg.start_instance("q-1", wait_s=5,
+        reg.start_instance("q-1", wait_s=5, instance="q-1",
                            _ready=lambda m: {"attachable": envdump.exists()})
         text = envdump.read_text()
         self.assertIn("SUTANDO_INSTANCE_ID=q-1", text)
@@ -204,6 +204,10 @@ class InstanceRegistryTests(unittest.TestCase):
         p = reg.write_manifest("../evil/../../id")
         self.assertEqual(p.parent, Path(self.tmp.name))
         self.assertNotIn("/", p.name.replace(".json", ""))
+
+    def test_empty_agent_id_is_refused(self):
+        with self.assertRaises(ValueError):
+            reg.write_manifest("")
 
 
 
@@ -257,7 +261,34 @@ class EdgeBranches(unittest.TestCase):
              "endpoint": {"path": str(Path(self.tmp.name) / "no.sock")}})
         self.assertFalse(out["attachable"])
 
-    def _stub_daemon(self, info_agent, health_state):
+    def test_registry_keys_compose_agent_and_instance(self):
+        # (1) two actors, both instance "default": the key is never the
+        # instance id alone — distinct manifests, no overwrite
+        pa = reg.write_manifest("@a:x", endpoint="/a.sock")
+        pb = reg.write_manifest("@b:x", endpoint="/b.sock")
+        self.assertNotEqual(pa, pb)
+        self.assertEqual(json.loads(pa.read_text())["endpoint"]["path"],
+                         "/a.sock")
+        # (2) one actor, two instances: independent manifests, desired state
+        # and lifecycle — a sibling can never mark or restore the other
+        p1 = reg.write_manifest("@a:x", endpoint="/a-work.sock",
+                                instance="work")
+        self.assertNotEqual(pa, p1)
+        self.assertEqual(json.loads(pa.read_text())["instance_id"], "default")
+        self.assertEqual(json.loads(p1.read_text())["instance_id"], "work")
+        reg.write_desired_state("@a:x", "paused", instance="work")
+        self.assertIsNone(reg.read_desired_state("@a:x"))
+        self.assertEqual(
+            reg.read_desired_state("@a:x", "work")["desired_state"], "paused")
+        reg.mark_stopped("@a:x", "work")
+        self.assertEqual(json.loads(p1.read_text())["status"], "stopped")
+        self.assertEqual(json.loads(pa.read_text())["status"], "running")
+        pairs = {(m.get("identity", {}).get("agent_id"), m.get("instance_id"))
+                 for m in reg.list_instances()}
+        self.assertEqual(pairs, {("@a:x", "default"), ("@a:x", "work"),
+                                 ("@b:x", "default")})
+
+    def _stub_daemon(self, info_agent, health_state, info_instance=None):
         import socket as _s
         import threading
         import uuid as _uuid
@@ -277,7 +308,9 @@ class EdgeBranches(unittest.TestCase):
                     if not data.strip():
                         continue
                     req = json.loads(data.splitlines()[0])
-                    r = ({"agentId": info_agent}
+                    r = ({"agentId": info_agent,
+                          **({"instanceId": info_instance}
+                             if info_instance else {})}
                          if req.get("method") == "sutando.info"
                          else {"state": health_state})
                     conn.sendall(json.dumps(
@@ -312,6 +345,20 @@ class EdgeBranches(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_attachable_rejects_sibling_instance_of_same_stand(self):
+        # (3) endpoint answers the RIGHT agentId but the WRONG instanceId —
+        # a stale/swapped socket must fail closed, never route work there
+        sock, srv = self._stub_daemon("@real:x", "online",
+                                      info_instance="other-install")
+        try:
+            out = reg.attachable({"identity": {"agent_id": "@real:x"},
+                                  "instance_id": "mine",
+                                  "endpoint": {"path": sock}})
+            self.assertFalse(out["attachable"])
+            self.assertEqual(out["stage"], "identity")
+        finally:
+            srv.close()
+
     def test_start_refuses_non_executable_launcher(self):
         plain = Path(self.tmp.name) / "not-exec.sh"
         plain.write_text("#!/bin/sh\n")
@@ -336,6 +383,79 @@ class EdgeBranches(unittest.TestCase):
                                  _ready=lambda m: {"attachable": True})
         self.assertTrue(out["ok"])
         self.assertEqual(out.get("state"), "already_running")
+
+
+class CompositeKeyInjectivity(unittest.TestCase):
+    """Distinct (agent_id, instance_id) tuples must never share a durable
+    filename. Two ways that broke: the delimiter could occur inside a
+    component, and a lossy sanitizer mapped different components onto one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["SUTANDO_INSTANCE_REGISTRY"] = self.tmp.name
+
+    def tearDown(self):
+        os.environ.pop("SUTANDO_INSTANCE_REGISTRY", None)
+        self.tmp.cleanup()
+
+    def _register(self, agent, instance, endpoint):
+        return reg.write_manifest(agent, instance=instance, endpoint=endpoint)
+
+    @staticmethod
+    def _key_mod():
+        import instance_key
+        return instance_key
+
+    def test_delimiter_inside_a_component_does_not_collide(self):
+        delim = self._key_mod().DELIM
+        first = self._register("agent", f"work{delim}er", "/one.sock")
+        second = self._register(f"agent{delim}work", "er", "/two.sock")
+        self.assertNotEqual(first, second)
+        rows = reg.list_instances()
+        self.assertEqual(len(rows), 2, f"a tuple was overwritten: {rows}")
+        self.assertEqual(
+            {(r["identity"]["agent_id"], r["instance_id"]) for r in rows},
+            {("agent", f"work{delim}er"), (f"agent{delim}work", "er")})
+
+    def test_legacy_double_dash_pair_does_not_collide(self):
+        first = self._register("agent", "worker", "/one.sock")
+        second = self._register("agent--worker", "default", "/two.sock")
+        self.assertNotEqual(first, second)
+        rows = reg.list_instances()
+        self.assertEqual(len(rows), 2, f"a tuple was overwritten: {rows}")
+        endpoints = {r["endpoint"]["path"] for r in rows}
+        self.assertEqual(endpoints, {"/one.sock", "/two.sock"})
+
+    def test_sanitizer_collision_pair_survives_as_two_rows(self):
+        first = self._register("blue/red", "default", "/one.sock")
+        second = self._register("blue_red", "default", "/two.sock")
+        self.assertNotEqual(first, second)
+        self.assertEqual(len(reg.list_instances()), 2)
+
+    def test_key_is_reversible_for_every_shape(self):
+        km = self._key_mod()
+        for agent, inst in (("agent", "default"), ("agent", "worker"),
+                            (f"agent{km.DELIM}work", "er"),
+                            ("blue/red", "default"), ("blue_red", "x y"),
+                            ("@a-1:ag2.space", "100%"), ("a%2Bb", "c")):
+            with self.subTest(agent=agent, instance=inst):
+                self.assertEqual(km.decode_key(km.instance_key(agent, inst)),
+                                 (agent, inst))
+
+    def test_delimiter_cannot_occur_inside_an_encoded_component(self):
+        km = self._key_mod()
+        self.assertNotIn(km.DELIM, km.encode_part(f"a{km.DELIM}b"))
+
+    def test_unusable_identity_is_rejected_not_silently_rewritten(self):
+        km = self._key_mod()
+        for agent in ("", None, ".", "..", "x\x00y", "a" * 129):
+            with self.subTest(agent=agent):
+                with self.assertRaises(ValueError):
+                    km.instance_key(agent, "default")
+
+    def test_default_instance_keeps_the_bare_actor_filename(self):
+        p = self._register("@a-1:ag2.space", None, "/one.sock")
+        self.assertEqual(p.name, "@a-1:ag2.space.json")
 
 
 if __name__ == "__main__":

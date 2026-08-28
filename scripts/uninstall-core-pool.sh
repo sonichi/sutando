@@ -20,25 +20,72 @@
 # Idempotent: safe to run when no pool is installed.
 #
 # Usage:
-#   bash scripts/uninstall-core-pool.sh
+#   bash scripts/uninstall-core-pool.sh [--only-core=<N>]
+#
+# --only-core removes ONE core and leaves the lead and every other core running.
+# Removing a core is three steps, not one: `launchctl bootout` alone leaves the
+# plist behind, and kick-pool revives any installed plist whose session is gone,
+# while a stale state/cores/core-<N>.alive keeps the lead assigning to a core
+# that no longer exists.
 
 set -euo pipefail
+
+ONLY_CORE=""
+for arg in "$@"; do
+  case "$arg" in
+    --only-core=*)
+      ONLY_CORE="${arg#--only-core=}"
+      case "$ONLY_CORE" in
+        ''|*[!0-9]*) echo "error: --only-core expects a positive integer; got '$ONLY_CORE'" >&2; exit 2 ;;
+      esac ;;
+    *) echo "error: unknown option '$arg'" >&2; exit 2 ;;
+  esac
+done
 
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 UID_VAL="$(id -u)"
 DOMAIN="gui/$UID_VAL"
+WORKSPACE="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
+WORKSPACE="${WORKSPACE/#\~/$HOME}"
 
-removed=0
-shopt -s nullglob
-for plist in "$LAUNCH_AGENTS"/com.sutando.core-[0-9]*.plist; do
+remove_core() {
+  local plist="$1" base label idx
   base="$(basename "$plist")"
   label="${base%.plist}"
   launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
   rm -f "$plist"
   # persistent-form follower session outlives the wrapper; end it too
   idx="${label#com.sutando.core-}"
-  case "$idx" in *[!0-9]*) ;; *) tmux kill-session -t "core-$idx" 2>/dev/null || true;; esac
+  case "$idx" in
+    *[!0-9]*) ;;
+    *)
+      tmux kill-session -t "core-$idx" 2>/dev/null || true
+      # A left-behind beat file keeps the lead assigning work to a dead core.
+      rm -f "$WORKSPACE/state/cores/core-$idx.alive" ;;
+  esac
   echo "removed: $base"
+}
+
+removed=0
+if [ -n "$ONLY_CORE" ]; then
+  PLIST="$LAUNCH_AGENTS/com.sutando.core-$ONLY_CORE.plist"
+  if [ -f "$PLIST" ]; then
+    remove_core "$PLIST"
+    removed=$((removed + 1))
+  else
+    # No plist, but the session and the .alive file can still be live.
+    tmux kill-session -t "core-$ONLY_CORE" 2>/dev/null || true
+    rm -f "$WORKSPACE/state/cores/core-$ONLY_CORE.alive"
+    echo "no plist for com.sutando.core-$ONLY_CORE; cleared its session and beat"
+  fi
+  echo
+  echo "Removed core-$ONLY_CORE (lead and other cores untouched)."
+  exit 0
+fi
+
+shopt -s nullglob
+for plist in "$LAUNCH_AGENTS"/com.sutando.core-[0-9]*.plist; do
+  remove_core "$plist"
   removed=$((removed + 1))
 done
 shopt -u nullglob

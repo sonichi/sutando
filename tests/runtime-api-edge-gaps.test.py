@@ -45,8 +45,8 @@ class TasksViewEdges(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_status_done_when_result_exists(self):
-        (self.results / "task-a1.txt").write_text("finished")
-        self.assertEqual(self.v.status("task-a1")["state"], "done")
+        (self.results / "task-rtapi-a1.txt").write_text("finished")
+        self.assertEqual(self.v.status("task-rtapi-a1")["state"], "done")
 
     def test_unreadable_task_file_degrades_to_absent_details(self):
         f = self.tasks / "task-b2.txt"
@@ -86,8 +86,8 @@ class TasksViewMoreEdges(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_archived_task_reads_done(self):
-        (self.tasks / "archive" / "task-old.txt").write_text("id: task-old\n")
-        self.assertEqual(self.v.status("task-old")["state"], "done")
+        (self.tasks / "archive" / "task-rtapi-old.txt").write_text("id: task-rtapi-old\n")
+        self.assertEqual(self.v.status("task-rtapi-old")["state"], "done")
 
     def test_latest_result_unreadable_is_none(self):
         f = self.results / "task-rtapi-new.txt"
@@ -107,12 +107,12 @@ class TasksViewMoreEdges(unittest.TestCase):
         self.assertNotIn('"B"', flat)
 
     def test_list_keeps_entry_when_headers_unreadable(self):
-        f = self.tasks / "task-h.txt"
-        f.write_text("id: task-h\nsource: chat\ntask: hi\n")
+        f = self.tasks / "task-rtapi-h.txt"
+        f.write_text("id: task-rtapi-h\nsource: chat\ntask: hi\n")
         f.chmod(0o000)
         flat = json.dumps(self.v.list_tasks() if hasattr(self.v, "list_tasks")
                           else self.v.list())
-        self.assertIn("task-h", flat)  # entry present, headers just absent
+        self.assertIn("task-rtapi-h", flat)  # entry present, headers just absent
 
 
 class AgentsViewEdges(unittest.TestCase):
@@ -224,8 +224,8 @@ class TasksViewArchiveAndRaces(unittest.TestCase):
 
     def test_archived_task_reports_done(self):
         (self.tasks / "archive").mkdir()
-        (self.tasks / "archive" / "task-old9.txt").write_text("id: task-old9\n")
-        self.assertEqual(self.v.status("task-old9")["state"], "done")
+        (self.tasks / "archive" / "task-rtapi-old9.txt").write_text("id: task-rtapi-old9\n")
+        self.assertEqual(self.v.status("task-rtapi-old9")["state"], "done")
 
     def test_latest_result_unreadable_is_none_not_crash(self):
         f = self.results / "task-rtapi-locked.txt"

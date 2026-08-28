@@ -191,13 +191,18 @@ class HelperFallbacks(unittest.TestCase):
             self.assertIsNone(srv._channels_dir())
 
     def test_host_label_resolves_via_repo_script(self):
+        import subprocess
         import unittest.mock as mock
-        with mock.patch.dict(os.environ, {}, clear=False):
+
+        def fake_run(argv, **kw):
+            assert argv[0] == "bash" and argv[-1] == "host-label"
+            return subprocess.CompletedProcess(argv, 0,
+                                               stdout="lab-host\n", stderr="")
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("subprocess.run", fake_run):
             os.environ.pop("SUTANDO_HOST_LABEL", None)
-            out = srv._host_label()
-        # repo script present: success path returns a label (or None if
-        # the script prints nothing) — must not raise
-        self.assertTrue(out is None or isinstance(out, str))
+            # exact value: the success path must surface the script's label
+            self.assertEqual(srv._host_label(), "lab-host")
 
     def test_watchers_fall_back_on_malformed_poll_interval(self):
         import unittest.mock as mock
@@ -228,12 +233,14 @@ class HelperFallbacks(unittest.TestCase):
             self.assertIsNone(srv._host_label())
 
     def test_enrolled_agent_id_absent_and_corrupt(self):
-        self.assertIsNone(srv._enrolled_agent_id(None))
+        # The reader moved to rundir.py so daemon, CLI and shell share it.
+        import rundir  # noqa: PLC0415
+        self.assertIsNone(rundir.enrolled_agent_id(None))
         with tempfile.TemporaryDirectory() as td:
-            self.assertIsNone(srv._enrolled_agent_id(td))
+            self.assertIsNone(rundir.enrolled_agent_id(td))
             (Path(td) / "auth").mkdir()
             (Path(td) / "auth" / "ag2space.json").write_text("{broken")
-            self.assertIsNone(srv._enrolled_agent_id(td))
+            self.assertIsNone(rundir.enrolled_agent_id(td))
 
 
 class RequestsWatcherStoreFailures(unittest.TestCase):

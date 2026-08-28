@@ -174,8 +174,15 @@ def drive(daemon):
     if rid:
         p = run_cli("human-action", "status", rid)
         check(p.returncode == 0, "human-action status exits 0")
+        # Settling is grant-gated, and the plain Unix socket grants nothing —
+        # the CLI must surface that refusal, not silently settle (review P1).
         p = run_cli("human-action", "decline", rid, "--note", "n/a")
-        check(p.returncode == 0, "human-action decline exits 0")
+        check(p.returncode == 1 and "authorized device grant" in p.stderr,
+              "ungranted human-action decline is refused with a reason")
+        p = run_cli("human-action", "status", rid)
+        check(p.returncode == 0
+              and json.loads(p.stdout).get("status") == "pending",
+              "the refused decline left the request pending")
 
     # ── instance group: list + start/attach on a missing agent ──
     p = run_cli("instance", "list")

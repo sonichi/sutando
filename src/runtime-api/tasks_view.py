@@ -27,7 +27,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))  # src/
-from local_task_protocol import (find_archived_task,  # noqa: E402
+from local_task_protocol import (find_archived_task, find_result,  # noqa: E402
                                  parse_task_headers_lenient)
 sys.path.insert(0, str(_HERE.parent.parent / "packages" / "ag2-sparrow"))
 from ag2_sparrow.task_archive import find_task_file  # noqa: E402
@@ -46,12 +46,17 @@ _WAITING_STATE = {"elicitation": "waiting_for_input",
                   "human_action": "waiting_for_human_action"}
 
 
-_SAFE_TASK_ID = __import__("re").compile(r"\Atask-[A-Za-z0-9._-]+\Z")
+# This channel OWNS `task-rtapi-` and nothing else. Other sources' tasks carry
+# other users' private text, so the prefix is an ownership boundary, not a name.
+TASK_PREFIX = "task-rtapi-"
+_SAFE_TASK_ID = re.compile(r"\Atask-rtapi-[A-Za-z0-9._-]+\Z")
 
 
 def _checked_task_id(task_id) -> "str | None":
-    """Confine client-supplied ids to the task namespace: no separators, no
-    traversal — a hostile id must read as absent, never as a path."""
+    """Confine client-supplied ids to the ids this channel owns: no
+    separators, no traversal, and no other source's task — a foreign or
+    hostile id must read as absent, never as a path or as someone else's
+    work."""
     tid = str(task_id or "")
     if ".." in tid or not _SAFE_TASK_ID.fullmatch(tid):
         return None
@@ -77,7 +82,7 @@ class TasksView:
             raise ValueError("task text is required")
         if priority not in ("urgent", "normal", "low"):
             raise ValueError("priority must be urgent|normal|low")
-        task_id = f"task-rtapi-{uuid.uuid4().hex[:12]}"
+        task_id = f"{TASK_PREFIX}{uuid.uuid4().hex[:12]}"
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         content = (f"id: {task_id}\n"
                    f"timestamp: {stamp}\n"
@@ -158,7 +163,7 @@ class TasksView:
         # (its own submissions); other sources' results must not leak in.
         if not self.results_dir.is_dir():
             return []
-        files = [f for f in self.results_dir.glob("task-rtapi-*.txt")
+        files = [f for f in self.results_dir.glob(f"{TASK_PREFIX}*.txt")
                  if f.is_file()]
         files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
         return files
@@ -207,11 +212,13 @@ class TasksView:
     def list_tasks(self, limit: int = 200) -> dict:
         """Enumerate LIVE tasks (pending / claimed / waiting) so a fresh
         client can render "what's waiting" without knowing any taskId — the
-        acceptance-test enumeration gap. Results/archive are deliberately not
-        walked: done work is fetched per-id, not listed."""
+        acceptance-test enumeration gap. Scoped to this channel's OWN tasks:
+        enumeration is the same ownership boundary as a per-id read, so other
+        sources' task text never appears here. Results/archive are
+        deliberately not walked: done work is fetched per-id, not listed."""
         entries = []
         if self.tasks_dir.is_dir():
-            files = [f for f in self.tasks_dir.glob("task-*.txt")
+            files = [f for f in self.tasks_dir.glob(f"{TASK_PREFIX}*.txt")
                      if f.is_file()]
             files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
             truncated = len(files) > limit
@@ -270,8 +277,6 @@ class TasksView:
     def _result_path(self, task_id: str) -> Path | None:
         if _checked_task_id(task_id) is None:
             return None
-        for p in (self.results_dir / f"{task_id}.txt",
-                  self.results_dir / "archive" / f"{task_id}.txt"):
-            if p.is_file():
-                return p
-        return None
+        # Archive layouts (flat, monthly, epoch-suffixed) are owned by
+        # local_task_protocol.find_result — never re-enumerated here.
+        return find_result(self.results_dir, task_id)

@@ -3,9 +3,12 @@
 records, M1 of the manifest spec (taxonomy part 4/5): Agent existence ≠ agent
 process existence.
 
-One JSON per instance under a well-known per-user dir:
-  darwin  ~/Library/Application Support/sutando/instances/<agent-id>.json
-  linux   $XDG_DATA_HOME|~/.local/share/sutando/instances/<agent-id>.json
+One JSON per instance under a well-known per-user dir, keyed by the composite
+(agent_id, instance_id) via the shared injective encoding in `instance_key.py`
+— `<agent>.json` for the default instance (pre-M2 name),
+`<agent>+<instance>.json` otherwise:
+  darwin  ~/Library/Application Support/sutando/instances/
+  linux   $XDG_DATA_HOME|~/.local/share/sutando/instances/
   any     $SUTANDO_INSTANCE_REGISTRY overrides
 
 The manifest is small, stable, human-readable, versioned, and NEVER carries
@@ -19,13 +22,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
 
+from instance_key import instance_key
+
 SCHEMA_VERSION = 1
-_SAFE_ID = re.compile(r"[^A-Za-z0-9._@:-]+")
 
 
 def registry_dir() -> Path:
@@ -42,8 +45,15 @@ def registry_dir() -> Path:
     return base / "sutando" / "instances"
 
 
-def _manifest_path(agent_id: str) -> Path:
-    return registry_dir() / f"{_SAFE_ID.sub('_', agent_id)}.json"
+def _key(agent_id: str, instance: str | None) -> str:
+    """Composite durable key: actor identity says WHO executes; instance
+    identity says WHICH installation. Neither substitutes for the other, and
+    the encoding is injective so two tuples can never share a manifest."""
+    return instance_key(agent_id, instance)
+
+
+def _manifest_path(agent_id: str, instance: str | None = None) -> Path:
+    return registry_dir() / f"{_key(agent_id, instance)}.json"
 
 
 def write_manifest(agent_id: str, *, workspace: str | None = None,
@@ -58,7 +68,7 @@ def write_manifest(agent_id: str, *, workspace: str | None = None,
     d = registry_dir()
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(d, 0o700)
-    p = _manifest_path(agent_id)
+    p = _manifest_path(agent_id, instance)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     installed_at = now
     try:
@@ -67,7 +77,8 @@ def write_manifest(agent_id: str, *, workspace: str | None = None,
         pass
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        **({"instance_id": instance} if instance else {}),
+        # always present: attachability/routing verify BOTH identity axes
+        "instance_id": instance or "default",
         "identity": {"agent_id": agent_id,
                      **({"owner": owner} if owner else {}),
                      **({"host_label": host_label} if host_label else {})},
@@ -90,10 +101,10 @@ def write_manifest(agent_id: str, *, workspace: str | None = None,
     return p
 
 
-def mark_stopped(agent_id: str) -> None:
+def mark_stopped(agent_id: str, instance: str | None = None) -> None:
     """Clean-shutdown transition. Deliberately a no-op if the manifest is
     missing — shutdown must never fail on registry state."""
-    p = _manifest_path(agent_id)
+    p = _manifest_path(agent_id, instance)
     try:
         m = json.loads(p.read_text())
     except (OSError, ValueError):
@@ -141,18 +152,19 @@ def list_instances() -> list:
 DESIRED_STATES = ("running", "stopped", "paused")
 
 
-def _desired_path(agent_id: str) -> Path:
-    return registry_dir() / f"{_SAFE_ID.sub('_', agent_id)}.desired.json"
+def _desired_path(agent_id: str, instance: str | None = None) -> Path:
+    return registry_dir() / f"{_key(agent_id, instance)}.desired.json"
 
 
 def write_desired_state(agent_id: str, state: str, *, reason: str | None = None,
-                        restore: dict | None = None) -> Path:
+                        restore: dict | None = None,
+                        instance: str | None = None) -> Path:
     if state not in DESIRED_STATES:
         raise ValueError(f"desired state must be one of {DESIRED_STATES}")
     d = registry_dir()
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(d, 0o700)
-    p = _desired_path(agent_id)
+    p = _desired_path(agent_id, instance)
     payload = {
         "desired_state": state,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -166,9 +178,9 @@ def write_desired_state(agent_id: str, state: str, *, reason: str | None = None,
     return p
 
 
-def read_desired_state(agent_id: str) -> dict | None:
+def read_desired_state(agent_id: str, instance: str | None = None) -> dict | None:
     try:
-        return json.loads(_desired_path(agent_id).read_text())
+        return json.loads(_desired_path(agent_id, instance).read_text())
     except (OSError, ValueError):
         return None
 
@@ -219,11 +231,15 @@ def attachable(manifest: dict) -> dict:
     socket file — or a socket answering with the wrong identity — is NOT
     attachable (that is exactly the 'start says ok, attach fails' trap)."""
     agent_id = (manifest.get("identity") or {}).get("agent_id")
+    inst = manifest.get("instance_id") or "default"
     endpoint = (manifest.get("endpoint") or {}).get("path")
     if not endpoint or not _socket_alive(endpoint):
         return {"attachable": False, "stage": "server", "endpoint": endpoint}
     info = _rpc_probe(endpoint, "sutando.info")
-    if not info or info.get("agentId") != agent_id:
+    # BOTH axes: a sibling instance of the same Stand answers with the right
+    # agentId but the wrong instanceId — routing there leaks to the wrong core.
+    if (not info or info.get("agentId") != agent_id
+            or (info.get("instanceId") or "default") != inst):
         return {"attachable": False, "stage": "identity", "endpoint": endpoint}
     health = _rpc_probe(endpoint, "runtime.health") or {}
     if health.get("state") not in ("online", "degraded"):
@@ -231,7 +247,8 @@ def attachable(manifest: dict) -> dict:
     return {"attachable": True, "endpoint": endpoint}
 
 
-def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> dict:
+def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable,
+                   instance: str | None = None) -> dict:
     """Start a registered instance via its manifest launcher and wait until it
     is ATTACHABLE (not merely socket-present). Idempotent, serialized by a
     per-instance start lock so two concurrent starts spawn ONE launcher. The
@@ -241,7 +258,7 @@ def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> di
     readiness probe (injectable for tests)."""
     import fcntl
     import subprocess
-    p = _manifest_path(agent_id)
+    p = _manifest_path(agent_id, instance)
     try:
         m = json.loads(p.read_text())
     except (OSError, ValueError):
@@ -275,7 +292,8 @@ def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> di
             return {"ok": True, "state": "already_running", "endpoint": endpoint}
 
         env = {**os.environ,
-               "SUTANDO_INSTANCE_ID": m.get("instance_id") or agent_id,
+               "SUTANDO_INSTANCE_ID": m.get("instance_id") or instance
+                                      or "default",
                # the child must serve the TARGET identity — the caller's
                # ambient SUTANDO_AGENT_ID takes precedence in server.py
                "SUTANDO_AGENT_ID":
@@ -310,7 +328,8 @@ def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> di
         while time.time() < deadline:
             r = _ready(m)
             if r.get("attachable"):
-                write_desired_state(agent_id, "running", reason="start verb")
+                write_desired_state(agent_id, "running", reason="start verb",
+                                    instance=m.get("instance_id") or instance)
                 return {"ok": True, "state": "started", "pid": proc.pid,
                         "endpoint": endpoint}
             last = r
@@ -351,8 +370,8 @@ def attach_command(manifest: dict) -> dict:
             "argv": ["tmux", "-S", sock, "attach-session", "-t", session]}
 
 
-def attach(agent_id: str) -> dict:
-    p = _manifest_path(agent_id)
+def attach(agent_id: str, instance: str | None = None) -> dict:
+    p = _manifest_path(agent_id, instance)
     try:
         m = json.loads(p.read_text())
     except (OSError, ValueError):

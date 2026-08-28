@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -100,8 +101,22 @@ def main() -> int:
             return False
         return 0 <= age < LEAD_STALE_S
 
+    def runtime_of(inst: str) -> str:
+        # The core's own plist is the only authority; unreadable or unstated
+        # means claude, matching every plist written before the runtime flag.
+        plist = (Path.home() / "Library/LaunchAgents"
+                 / f"com.sutando.{inst}.plist")
+        try:
+            body = plist.read_text(errors="replace")
+        except OSError:
+            return "claude"
+        m = re.search(r"<key>POOL_RUNTIME</key>\s*<string>([^<]*)</string>",
+                      body)
+        rt = (m.group(1).strip() if m else "") or "claude"
+        return rt if rt in ("claude", "codex") else "claude"
+
     lead = PoolLead(tasks, state, followers, alive,
-                    metrics=PoolMetrics(state))
+                    metrics=PoolMetrics(state), runtime_fn=runtime_of)
     status = PoolStatusWriter(tasks, state, followers, alive)
     notifier = PoolNotifier(tasks, state, _send_notice)
     ledger = ScaleLedger(state)

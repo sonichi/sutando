@@ -28,17 +28,14 @@ from pool_follower import LEAD_STALE_S  # noqa: E402
 # tick gap past one beat period = host sleep; shorter can't stale a beat
 SLEEP_SKEW_S = 5.0  # wall clock advances through host sleep; monotonic pauses
 
-# Sticky-channel window (#884 semantics): tasks from a channel follow its
-# handler until the channel has been idle this long, then rebalance.
-AFFINITY_IDLE_S = 30 * 60
-# Outstanding assigned+claimed before affinity yields. Env-tunable: 1 = yield
-# the moment the handler is busy (latency over continuity — owner preference).
+# Depth at which channelless work overflows to the idle lane core; room
+# affinity itself is binding and never yields on load (owner 2026-08-26).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
-# A repool pops the ledger entry, so "is it stuck right now" reads false on the
-# very next sweep — the follower must stay marked or the task returns to it.
-NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S
+BUSY_DEFER_MAX_S = 1800.0    # busy defers repool this long, then wedge rules apply
 DONE_FLAG_RETENTION_S = 7 * 86400
+BUSY_EXIT_GRACE_S = 60.0     # claim window left after a busy spell ends
+NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S  # repool pops ledger; keep follower marked non-claiming
 
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
 # assigned/claimed states explicitly rather than banning dots
@@ -78,10 +75,16 @@ def _read_lane(path: Path) -> str:
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
                  now_fn=time.time, metrics=None, results_dir=None,
-                 mono_fn=time.monotonic):
+                 mono_fn=time.monotonic, runtime_fn=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
-        production binder wires instance_registry + the .alive files."""
+        production binder wires instance_registry + the .alive files.
+        runtime_fn(instance) -> 'claude'|'codex'; absent means all-claude,
+        which is what every pool was before the runtime dimension existed."""
+        self.runtime_fn = runtime_fn or (lambda _inst: "claude")
+        # tie-break memory: an all-idle pool rotates instead of always
+        # handing every load-tie to the lexicographically-first follower
+        self._last_pick: "dict[str, float]" = {}
         self.tasks_dir = Path(tasks_dir)
         self.state_dir = Path(state_dir)
         self.results_dir = (Path(results_dir) if results_dir
@@ -110,10 +113,36 @@ class PoolLead:
         tmp.write_text(json.dumps(table))
         os.replace(tmp, p)
 
+    # ── liveness trace (change-driven; forensic aid for routing anomalies) ──
+    def _trace_path(self) -> Path:
+        return self.state_dir / "pool" / "liveness-trace.jsonl"
+
+    def _trace(self, event: dict) -> None:
+        """Append-only JSONL; a trace failure must never break assignment."""
+        try:
+            p = self._trace_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists() and p.stat().st_size > 5_000_000:
+                p.replace(p.with_suffix(".jsonl.1"))  # one-deep rotation
+            with open(p, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except OSError:
+            pass
+
     # ── pool state ──────────────────────────────────────────────────────────
     def _live_followers(self) -> "list[str]":
         return [f for f in self.followers_fn()
                 if _INST_RE.match(str(f)) and self.alive_fn(f)]
+
+    def _claimed_load(self, instance: str) -> int:
+        """Claims only — assigned-but-unclaimed files do not count. A core
+        with claims in flight is BUSY, which is not the same as wedged."""
+        pat = re.compile(rf"\.claimed-{re.escape(instance)}\.txt$")
+        try:
+            return sum(1 for f in self.tasks_dir.iterdir()
+                       if pat.search(f.name))
+        except OSError:
+            return 0
 
     def _load(self, instance: str) -> int:
         pat = re.compile(
@@ -124,35 +153,47 @@ class PoolLead:
         except OSError:
             return 0
 
+    def _lane_core_of(self, followers: "list[str]") -> "str | None":
+        """Highest CLAUDE core is the routine lane (owner 2026-08-25); a codex
+        follower sweeps on a timer, so maintenance there waits for a poll."""
+        eligible = [f for f in followers
+                    if self.runtime_fn(f) == "claude"] or followers
+        return (max(eligible, key=lambda f: (len(str(f)), str(f)))
+                if len(followers) > 1 else None)
+
     def _pick(self, channel: "str | None", followers: "list[str]",
               affinity: dict, lane: str = "owner") -> str:
-        # Soft lanes (owner 2026-08-23): the highest core is the routine lane;
-        # owner traffic stays off it except as saturated-pool overflow.
-        lane_core = (max(followers, key=lambda f: (len(str(f)), str(f)))
-                     if len(followers) > 1 else None)
-        # Same escape the owner side already has: pinned unconditionally, one
-        # wedged lane core absorbs every routine task and no other is offered.
+        # Soft lanes (owner 2026-08-23): owner traffic stays off the lane
+        # core except as saturated-pool overflow.
+        eligible = [f for f in followers
+                    if self.runtime_fn(f) == "claude"] or followers
+        lane_core = self._lane_core_of(followers)
+        # Wedge escape: the routine pin holds only while the lane core is
+        # below the busy cap and demonstrably claiming; else fall through.
         if (lane == "routine" and lane_core is not None
                 and self._load(lane_core) < AFFINITY_BUSY_MAX
                 and self._claiming(lane_core)):
             return lane_core
-        primary = [f for f in followers if f != lane_core] or followers
+        # owner prefers claude seats (codex wrapper polls, slow turnaround); a
+        # sole claude doubles as lane core yet stays owner-eligible
+        primary = [f for f in eligible if f != lane_core] or eligible
         # A repool drops the follower's load, so least-loaded actively PREFERS
         # the core that just failed to claim. Never narrow to empty.
         primary = [f for f in primary if self._claiming(f)] or primary
         if channel:
             row = affinity.get(channel)
-            if (isinstance(row, dict) and row.get("instance") in primary
-                    and self.now() - float(row.get("ts") or 0)
-                    < AFFINITY_IDLE_S
-                    # a backlogged handler serializes the whole channel;
-                    # parallelism outranks continuity past this depth
-                    and self._load(row["instance"]) < AFFINITY_BUSY_MAX):
+            # Binding: a live home core keeps its room; only death or an
+            # unclaimed-reclaim moves it. Explicit pins beat lane defaults.
+            if isinstance(row, dict) and row.get("instance") in followers:
+                self._last_pick[str(row["instance"])] = self.now()
                 return row["instance"]
-        pick = min(primary, key=lambda f: (self._load(f), str(f)))
+        # equal load -> least-recently-picked, so an idle pool round-robins
+        pick = min(primary, key=lambda f: (
+            self._load(f), self._last_pick.get(str(f), 0.0), str(f)))
         if (lane_core is not None and self._load(pick) >= AFFINITY_BUSY_MAX
                 and self._load(lane_core) == 0 and self._claiming(lane_core)):
-            return lane_core  # overflow: whole owner lane saturated, lane idle
+            pick = lane_core  # overflow: owner lane saturated, lane idle
+        self._last_pick[str(pick)] = self.now()
         return pick
 
     # ── the sweep ───────────────────────────────────────────────────────────
@@ -161,6 +202,11 @@ class PoolLead:
         Priority order first (urgent > normal > low, then mtime), so a
         burst never starves an urgent task behind low-priority backlog."""
         followers = self._live_followers()
+        live = sorted(str(f) for f in followers)
+        if getattr(self, "_last_live_set", None) != live:
+            self._trace({"ts": self.now(), "event": "live_set_changed",
+                         "alive": live, "prev": getattr(self, "_last_live_set", None)})
+            self._last_live_set = live
         if not followers:
             return []  # nothing to assign TO — leave tasks for fallback mode
         try:
@@ -176,7 +222,17 @@ class PoolLead:
                 # without-flag is COMPLETE; reassigning would re-execute it.
                 continue
             channel = _read_channel(f)
-            inst = self._pick(channel, followers, affinity, _read_lane(f))
+            lane = _read_lane(f)
+            bound = None
+            if channel and isinstance(affinity.get(channel), dict):
+                bound = affinity[channel].get("instance")
+            inst = self._pick(channel, followers, affinity, lane)
+            if lane == "owner" and (
+                    (inst == self._lane_core_of(followers) and inst != bound)
+                    or (bound is not None and bound not in followers)):
+                self._trace({"ts": self.now(), "event": "anomalous_owner_pick",
+                             "task": f.name, "inst": str(inst), "bound": bound,
+                             "channel": channel, "alive": live})
             target = f.with_name(
                 f.name[:-len(".txt")] + f".assigned-{inst}.txt")
             try:
@@ -185,9 +241,12 @@ class PoolLead:
                 arrived = self.now()
             try:
                 os.rename(f, target)  # atomic; a racing writer keeps its file
+                os.utime(target)  # stamp assignment time; rename keeps arrival mtime
             except OSError:
                 continue
-            if channel:
+            # Only an owner-lane pick off the lane core may (re)bind a room:
+            # a routine/overflow landing there must not become a sticky steal
+            if channel and lane == "owner" and inst != self._lane_core_of(followers):
                 affinity[channel] = {"instance": inst, "ts": self.now()}
             if self.metrics is not None:
                 self.metrics.assigned(f.name, inst, channel,
@@ -334,6 +393,16 @@ class PoolLead:
             if self.now() - float(ts) < max_age_s or not self.alive_fn(m.group(2)):
                 continue  # young, or dead (reclaim_dead owns that path)
             try:
+                assigned_age = self.now() - f.stat().st_mtime
+            except OSError:
+                assigned_age = self.now() - float(ts)
+            if (self._claimed_load(m.group(2)) > 0
+                    and assigned_age < BUSY_DEFER_MAX_S):
+                # busy pauses the clock and leaves a post-busy claim grace;
+                # the cap anchors to file age, so a wedged core still yields
+                ledger[f.name] = self.now() - max_age_s + BUSY_EXIT_GRACE_S
+                continue
+            try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
                 continue
@@ -341,6 +410,15 @@ class PoolLead:
             live.discard(f.name)
             self._mark_noclaim(m.group(2))
             out.append(f.name)
+            # The home core proved unresponsive: release the room's binding so
+            # the re-pick moves it (and re-stamps the new core as home).
+            ch = _read_channel(f.with_name(m.group(1) + ".txt"))
+            if ch:
+                aff = self._load_affinity()
+                row = aff.get(ch)
+                if isinstance(row, dict) and row.get("instance") == m.group(2):
+                    del aff[ch]
+                    self._save_affinity(aff)
         self._save_assign_ledger({k: v for k, v in ledger.items() if k in live})
         return out
 
