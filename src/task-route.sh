@@ -12,8 +12,13 @@
 # without one is not a pool member.
 task_route_init() {
 	POOL_WORKER="${SUTANDO_POOL_WORKER:-}"
-	if [ -z "$POOL_WORKER" ] && [ -n "${SUTANDO_CORE_ID:-}" ]; then
-		POOL_WORKER="core-${SUTANDO_CORE_ID}"
+	# NUMERIC only, matching the installer's com.sutando.core-<N> plists and the
+	# same gate in core-status.sh: a main core carries 'legacy', not a seat.
+	if [ -z "$POOL_WORKER" ]; then
+		case "${SUTANDO_CORE_ID-}" in
+			'' | *[!0-9]* ) ;;
+			* ) POOL_WORKER="core-${SUTANDO_CORE_ID}" ;;
+		esac
 	fi
 	# Same glob startup.sh uses to decide whether a lead is needed, and
 	# install-core-pool.sh to decide what to tear down — one signal, not a

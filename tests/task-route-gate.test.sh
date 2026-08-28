@@ -19,12 +19,16 @@ REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 WATCHER="$REPO/src/watch-tasks-stream.sh"
 ROUTER="$REPO/src/task-route.sh"
 
-fail=0
+# Failures are recorded in a FILE, not a variable: the env-isolation cases below
+# run in ( subshells ), so a `fail=1` there is discarded at the closing paren and
+# the suite exits 0 while printing FAIL.
+FAILLOG="$(mktemp)"
+trap 'rm -f "$FAILLOG"' EXIT
 check() {  # check <label> <expected> <actual>
 	if [ "$2" = "$3" ]; then
 		echo "  ok   $1"
 	else
-		echo "  FAIL $1: expected '$2', got '$3'"; fail=1
+		echo "  FAIL $1: expected '$2', got '$3'"; echo "$1" >> "$FAILLOG"
 	fi
 }
 
@@ -46,7 +50,7 @@ check "dispatch_task consults the gate" \
 source "$ROUTER"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP" "$FAILLOG"' EXIT
 mkdir -p "$TMP/agents"
 
 routed() {  # routed <filename> -> yes|no
@@ -97,6 +101,32 @@ check "single session still refuses an assignment" \
   check "plists present -> workers installed" "1" "$POOL_INSTALLED"
   check "SUTANDO_CORE_ID -> worker identity"  "core-3" "$POOL_WORKER" )
 
+# Multi-digit ids are real seats: the installer's glob is core-[0-9]*, so the
+# numeric gate must not be a single-digit test.
+( unset SUTANDO_POOL_WORKER
+  export SUTANDO_POOL_AGENTS_DIR="$TMP/agents" SUTANDO_CORE_ID=12
+  task_route_init
+  check "multi-digit id is still a worker" "core-12" "$POOL_WORKER" )
+
+# The MAIN core is documented to run with SUTANDO_CORE_ID=legacy. Deriving a
+# worker identity from any non-empty value made it 'core-legacy', which passes
+# the has-identity branch and takes unassigned work while the lead is assigning
+# that same work to a follower -- the duplicate-execution path this gate closes.
+# core-status.sh already draws this line numerically; both sites must agree.
+( unset SUTANDO_POOL_WORKER
+  export SUTANDO_POOL_AGENTS_DIR="$TMP/agents" SUTANDO_CORE_ID=legacy
+  task_route_init
+  check "main core (CORE_ID=legacy) is NOT a worker" "" "$POOL_WORKER"
+  check "...so it refuses unassigned work while workers exist" \
+    "no" "$(routed 'task-a.txt')"
+  check "...and refuses a follower's assignment" \
+    "no" "$(routed 'task-a.assigned-core-1.txt')" )
+
+# An explicit trusted stamp still wins: it is set deliberately, not derived.
+( export SUTANDO_POOL_AGENTS_DIR="$TMP/agents" SUTANDO_CORE_ID=legacy SUTANDO_POOL_WORKER=core-7
+  task_route_init
+  check "explicit SUTANDO_POOL_WORKER overrides the numeric gate" "core-7" "$POOL_WORKER" )
+
 # The narrower glob matters: com.sutando.core-agent.plist is the single-core
 # job, not a worker, and must not read as "a pool is installed".
 ( unset SUTANDO_CORE_ID SUTANDO_POOL_WORKER
@@ -106,9 +136,10 @@ check "single session still refuses an assignment" \
   task_route_init
   check "core-agent.plist is not a worker" "0" "$POOL_INSTALLED" )
 
-if [ "$fail" -eq 0 ]; then
+fail_count="$(wc -l < "$FAILLOG" | tr -d ' ')"
+if [ "$fail_count" -eq 0 ]; then
 	echo "PASS: task routing gate"
-else
-	echo "FAIL: task routing gate"
+	exit 0
 fi
-exit "$fail"
+echo "FAIL: task routing gate ($fail_count assertion(s))"
+exit 1
