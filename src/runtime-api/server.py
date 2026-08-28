@@ -288,7 +288,10 @@ class RuntimeServer:
             interval = float(os.environ.get("SUTANDO_RESULT_POLL_S") or 0.2)
         except ValueError:
             interval = 0.2
-        seen = {f.name for f in tasks._result_files()}
+        # Seed only COMPLETE backlog: an unready name must stay unseen so it
+        # is still pushed when it fills, matching _emit_new_results.
+        seen = {f.name for f in tasks._result_files()
+                if read_ready_result(f) is not None}
         while True:
             await asyncio.sleep(interval)
             await self._emit_new_results(tasks, seen)
