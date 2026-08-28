@@ -61,8 +61,12 @@ from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from gateway_serving import (  # noqa: E402
+    read_verdict as read_gateway_verdict,
+    safe_num as _gateway_num,
+)
 from task_archive import find_task_file  # noqa: E402
-
+from sutando_config import config_get  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
 # resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
@@ -96,17 +100,8 @@ def _default_memory_dir() -> str:
     slug = claude_project_slug(repo)
     return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
-# SUTANDO_MEMORY_DIR stays authoritative here, same as everywhere else that
-# resolves core memory (src/voice-agent.ts, src/voice-context.ts, and
-# CLAUDE.md/AGENTS.md all honor it). An earlier version of this fix made
-# ONLY this check ignore the override, on the theory that it was purely a
-# stale pre-#1454 workaround (see _default_memory_dir()'s docstring) — but
-# that broke the invariant that this check reports on the SAME directory the
-# rest of the runtime actually reads/writes, which is a worse failure mode
-# than the one being fixed (a health check silently diverging from ground
-# truth). If SUTANDO_MEMORY_DIR is a genuine leftover from that era, the
-# memory-dir-override check below flags the divergence instead of silently
-# redirecting.
+# SUTANDO_MEMORY_DIR is read via os.environ, not config_get: this check must
+# report on the same directory the runtime reads, so it opts out of #1724.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
 # How much of MEMORY.md a session actually loads. These are the RUNTIME's
@@ -5633,6 +5628,14 @@ def check_gateway_bridge() -> "dict | None":
                 "messages may not be delivered"
             ),
         }
+    if _gateway_status_ts_malformed():
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": ("process running but its status sidecar carries an unusable "
+                       "timestamp — the writer is not reporting poll outcomes, so "
+                       "ag2.space mobile messages may not be delivered"),
+        }
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
@@ -5653,9 +5656,12 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
         last = json.loads(Path(p).read_text()).get("last_ok_ts")
     except (OSError, ValueError, AttributeError, TypeError):
         return None
-    if not isinstance(last, (int, float)) or isinstance(last, bool):
+    # Same numeric policy as the shared verdict owner: a huge int raises on
+    # float(), and NaN/inf would collapse to 0.0 here — "just polled".
+    last = _gateway_num(last, nonneg=True)
+    if last is None:
         return None
-    return max(0.0, (now - float(last)) / 3600.0)
+    return max(0.0, (now - last) / 3600.0)
 
 
 def check_runtime_identity(path: "Path | None" = None,
@@ -5784,10 +5790,26 @@ def _gateway_status_stale_age_s(path: "Path | None" = None,
         ts = json.loads(Path(p).read_text()).get("ts")
     except (OSError, ValueError, AttributeError, TypeError):
         return None
-    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+    # nonneg matches the shared verdict owner: one field, one admissibility rule.
+    ts = _gateway_num(ts, nonneg=True)
+    if ts is None:
         return None
     age = now - ts
     return age if age > GATEWAY_STATUS_MAX_AGE_S else None
+
+
+def _gateway_status_ts_malformed(path: "Path | None" = None) -> bool:
+    """Whether the sidecar carries a `ts` the shared rule rejects.
+
+    Separate from the age helper because its caller reads None as healthy: a
+    writer emitting garbage is an outage, and has no age to report.
+    """
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    try:
+        raw = json.loads(Path(p).read_text()).get("ts")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+    return raw is not None and _gateway_num(raw, nonneg=True) is None
 
 
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
@@ -5795,18 +5817,13 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
 
     True/False when the sidecar is present and fresh; None (no opinion) when it
     is absent, unreadable, malformed, or older than GATEWAY_STATUS_MAX_AGE_S.
-    Mirrors core-input-watch._gateway_status() (#2253)."""
+    The sidecar verdict itself is owned by gateway_serving; only the freshness
+    window is this reader's."""
     import time as _time
     p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
     now = _time.time() if now is None else now
-    try:
-        data = json.loads(Path(p).read_text())
-        ts = data.get("ts")
-        if not isinstance(ts, (int, float)) or (now - ts) > GATEWAY_STATUS_MAX_AGE_S:
-            return None
-        return bool(data.get("connected"))
-    except (OSError, ValueError, AttributeError, TypeError):
-        return None
+    v = read_gateway_verdict(p, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
+    return None if v is None else v.serving
 
 
 # Free-space thresholds. A full volume is not a slow degradation — it is a hard
@@ -9333,7 +9350,7 @@ def run_all_checks() -> list[dict]:
     if env_path.exists():
         env_content = env_path.read_text()
         has_twilio = twilio_configured(env_content)  # pragma: no cover — call-site in untested mega-function
-        skip_phone = "SKIP_PHONE=1" in env_content or os.environ.get("SKIP_PHONE") == "1"
+        skip_phone = "SKIP_PHONE=1" in env_content or config_get("SKIP_PHONE") == "1"  # pragma: no cover — call-site in untested mega-function
         if has_twilio and not skip_phone:
             c = check_port(3100, "conversation-server")
             if c["status"] != "ok":
@@ -9627,9 +9644,9 @@ def run_all_checks() -> list[dict]:
     # Stuck-loop / queue-pileup detection — consequence-level signals that
     # fire whether the watcher died, the proactive loop crashed mid-pass, or
     # both. Independent of which mechanism died.
-    loop_stale_sec = int(os.environ.get("SUTANDO_HEALTH_LOOP_STALE_SEC", "600"))
-    queue_age_sec = int(os.environ.get("SUTANDO_HEALTH_QUEUE_AGE_SEC", "300"))
-    queue_count = int(os.environ.get("SUTANDO_HEALTH_QUEUE_COUNT", "3"))
+    loop_stale_sec = int(config_get("SUTANDO_HEALTH_LOOP_STALE_SEC", "600"))
+    queue_age_sec = int(config_get("SUTANDO_HEALTH_QUEUE_AGE_SEC", "300"))
+    queue_count = int(config_get("SUTANDO_HEALTH_QUEUE_COUNT", "3"))
     checks.append(check_battery())
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
@@ -10240,10 +10257,12 @@ def notify_gateway_for_failures(
 # start-cli.sh has its own from-inside-core guard — two independent guarantees
 # the recovery never runs from within the session it would kill.
 
-RECOVER_WEDGE_SEC = int(os.environ.get("SUTANDO_RECOVER_WEDGE_SEC", "600"))        # task stuck this long = wedged
-RECOVER_CONFIRM_SEC = int(os.environ.get("SUTANDO_RECOVER_CONFIRM_SEC", "120"))    # wedge must persist across passes
-RECOVER_COOLDOWN_SEC = int(os.environ.get("SUTANDO_RECOVER_COOLDOWN_SEC", "1800")) # min gap between restarts
-RECOVER_MAX_PER_HOUR = int(os.environ.get("SUTANDO_RECOVER_MAX_PER_HOUR", "3"))
+# wedge = a task stuck this long; it must persist across passes before a
+# restart, and cooldown is the minimum gap between restarts.
+RECOVER_WEDGE_SEC = int(config_get("SUTANDO_RECOVER_WEDGE_SEC", "600"))
+RECOVER_CONFIRM_SEC = int(config_get("SUTANDO_RECOVER_CONFIRM_SEC", "120"))
+RECOVER_COOLDOWN_SEC = int(config_get("SUTANDO_RECOVER_COOLDOWN_SEC", "1800"))
+RECOVER_MAX_PER_HOUR = int(config_get("SUTANDO_RECOVER_MAX_PER_HOUR", "3"))
 
 
 def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple[str, int] | None":
