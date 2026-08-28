@@ -135,6 +135,7 @@ The same measurement makes the weaker path explicit, and it is worth stating pla
 6. Update the record idempotently. Preserve contradictory evidence; do not silently overwrite it.
 7. Use the map to choose the smallest useful collaboration set. Prefer the responsible agent; cc its owner or relevant human when accountability, approval, ambiguity, or risk requires it.
 8. Report material changes: unfamiliar participants, ownership changes, conflicting identity claims, stale room purpose, or newly inferred sensitive relationships.
+9. **PR notification contract (owner rule 2026-08-23): every PR create or update ends with reviewers NOTIFIED, addressed to each reviewer's Sutando Stand.** A GitHub review request alone is not notification — the review-request queue is where PRs stall. "Addressed to" means an action that reaches the Stand and triggers it: an **explicit @-mention** in a channel that supports it (Matrix: the literal `@<agent-mxid>` string, e.g. `@sutando-rui:ag2.space` — resolver handles are unreliable, use the mxid; Discord: `<@numeric-id>`), or a **reply-to** on a message from that Stand. Plain-text names are not addressing (measured 2026-08-23: a plain "rui / Chi:" Triage post drew nothing; the agent-mxid mention produced two formal reviews within the hour). **Mentioning the HUMAN is also not addressing the Stand** — correct mention syntax with the person's id notifies the person and triggers nothing (second failure shape, owner-corrected 2026-08-23: `<@Chi> <@kewei>` in #game had to be re-sent as `<@Sutando-Mini> <@kewei-agent>`). And a mention that REACHES a Stand still only *triggers* it if the sender is on that Stand's allowlist (Sutando-Mini bounced an off-allowlist mention with an automated notice) — for action-triggering, confirm allowlist standing first or route through the owner. Route via the map: find each reviewer's Stand/agent identity and its supported channels there, not from recall; record who actually responded back into the map. **Use `scripts/notify_reviewers.py` for the send** — it resolves each reviewer through the roster (`<workspace>/data/collaboration-intelligence/reviewer-stands.json`) and refuses unknown names, human-only targets, and known-off-allowlist Stands, so the rule holds even when acted from momentum.
 
 ## Quick lookup index
 
@@ -225,6 +226,56 @@ Keep stable team relationships separate from short-lived work-item collaboration
 
 Never convert one interaction into a stable behavior claim. Require repeated observations or an explicit statement. Use neutral, operational wording such as “usually reviews backend delivery changes” rather than personality judgments.
 
+## Work with customers
+
+Customer collaboration needs a clear owner, a shared working surface, and a durable record. Track,
+per customer:
+
+- the customer organization and its key contacts
+- each contact's role: decision-maker, champion, technical owner, user, or procurement
+- the internal owner and the responsible agent
+- active scope, commitments, blockers, deadlines, and the next action
+- preferred channels, response expectations, and VIP/priority status
+
+### Use each venue for the right purpose
+
+| Venue | Purpose |
+|---|---|
+| Slack Connect, AG2 Space, WhatsApp | day-to-day coordination |
+| GitHub or issue tracker | technical work and delivery status |
+| Email, documents, contracts, CRM | formal decisions and commitments |
+| Meetings | synchronous discussion — record the outcome in a durable venue afterward |
+
+**Always identify the source of truth, and do not let an important decision exist only in chat.** A
+decision that lives in a message thread has no owner, no version, and no reader after scrollback.
+
+### Keep the work moving
+
+1. Acknowledge customer requests promptly.
+2. Clarify the desired outcome, the urgency, and who the decision-maker is.
+3. Assign one internal owner and one clear next action.
+4. Give progress updates **when the state changes**, and before an agreed update deadline **even if
+   the work is not finished** — an update whose content is "still working" is still a state report.
+5. Surface blockers with options and a recommendation, not only a problem statement.
+6. Close the loop: record the outcome and confirm completion with the customer.
+
+⇒ **A customer request must never remain "waiting on nobody."** If ownership is unclear, establish an
+internal owner *before* promising a result. An unowned internal item stalls quietly; an unowned
+customer item stalls while someone outside is waiting on an answer they were led to expect.
+
+### Protect the boundary
+
+- Treat customer-facing rooms as **external or mixed-audience** spaces.
+- Do not carry internal discussion, blame, private incidents, credentials, or personnel context into
+  them.
+- **Distinguish a customer request from an accepted commitment.** The two look alike in a chat log and
+  differ entirely in what they oblige.
+- Do not promise scope, dates, pricing, or policy exceptions without the appropriate authority.
+- Keep an internal backchannel for private coordination, **and keep the customer-facing status
+  accurate and consistent with it** — a backchannel that diverges from what the customer has been told
+  is worse than no backchannel.
+
+
 ## Handle VIP and priority participants
 
 - Apply VIP status only from an explicit owner/organization designation or an authoritative configured source. Record who designated it, why, its scope, and any expiry.
@@ -265,8 +316,137 @@ When help is needed:
 3. **Choose the person first, then choose where to reach them — they are separate decisions.** An identity existing is not the same as it being live: check `identities[].activity` for where that person is actually seen, and honour `exclusive: true` (some people are reachable on exactly one surface, and a message anywhere else reaches nobody). Defaulting to whichever surface you happen to be on is how a reachable person gets treated as unreachable. Prefer the room where the work already has context, subject to that.
    When customers or external collaborators are present, share only context appropriate to that relationship and work scope.
 4. Contact the responsible agent directly when it can act. Include its owner or a human when approval, escalation, or shared accountability is needed.
-5. Resolve ambiguous recipients before sending. Never guess among duplicate names or uncertain identity links.
+5. **Resolve the recipient before sending anything that carries a payload**, and never guess
+   among duplicate names or uncertain identity links to deliver one. When the identity is
+   imperfectly resolved, the message is not simply blocked — what you may send is governed by
+   *what it carries*, under **"When resolution is imperfect"** below: a bare solicitation may
+   go, anything the *least-privileged candidate* could not already access may not. That rule is
+   the only exception
+   to this step, and it does not license guessing for a payload-bearing message.
 6. State why each recipient is included and provide the minimum context, desired action, and expected handoff.
+
+**A request made on the work platform is not solicitation.** A GitHub review
+request, a ticket assignment, a "requested changes" — these change a field in a
+system the recipient may not be watching. They create a *record* that you asked;
+they do not create *knowledge* that you asked. **Filing one and stopping is
+indistinguishable, from the recipient's side, from never having asked.**
+
+So for every reviewer/assignee you name on a platform, also **message their agent
+where that person is actually reachable** — resolve the identity from this map
+first, then reply-to or @-mention. Two properties make this non-optional:
+
+- **Nothing chases it.** A platform request sits indefinitely and emits no
+  reminder. Measured: a PR sat one approval short of its ruleset with **no
+  reviewer queued at all** — not blocked on anything, simply unattended, and
+  invisible to every "is it blocked?" check because unattended is not blocked.
+  One @-mention produced the missing review within minutes.
+- **Resolve the identity from this map before sending — never derive an agent id
+  from a display name or by transforming a user id**, and treat colliding display
+  names as unresolved until evidence separates them.
+
+  **When resolution is imperfect, what you may send is decided by what the message
+  contains — not by how confident you feel.** The asymmetry that justifies sending
+  anyway is real and it is bounded: it holds for the *ask*, never for the payload.
+
+  - **Send it: a bare solicitation.** "Will you review PR #N?", plus a pointer to
+    something the recipient could already reach on their own. A wrong recipient
+    costs them one message they can ignore; reaching nobody leaves the item
+    unattended, and unattended is invisible to every "is it blocked?" check.
+    **Owner directive (2026-08-22): a false positive here is the more tolerable
+    error.** Say plainly why you think it is them, so a wrong recipient can correct
+    you in one line instead of silently absorbing the ask.
+  - **Withhold it until identity is established: anything the *least-privileged
+    candidate* could not already access.** Not "the recipient" — when the identity is
+    unresolved that phrase has no determinate subject and quietly resolves to *the
+    person you think it is*, which is the exact case this rule exists for. Score it
+    against the least-privileged identity still consistent with the evidence.
+    Concretely: private repository contents, incident detail, personnel matters,
+    credentials and anything adjacent to them, and context carried from a narrower
+    room. Here a wrong recipient is not one ignorable message — it is a
+    disclosure, and no correction takes it back. The asymmetry inverts, so the
+    default inverts with it.
+  - **When it is ambiguous, ask in the open instead of guessing in private.**
+    Address the candidates by name in a room they are both in, carrying the request
+    and none of the payload. That reaches the right person without betting private
+    context on a guess, and a wrong guess costs nothing.
+
+  **Evidence that establishes identity for the second case:** an owner-stated
+  mapping, a provider-native id resolved from this map and marked `verified`, or a
+  self-identification the person made in a channel you can read. **A display-name
+  match is never sufficient**, and neither is an id you derived by transforming
+  another id.
+
+Carry what the platform page cannot show: why them specifically, the real cost
+(size, conflicts, prerequisites) so they can decline cheaply, and any known
+blocker on their side. One message per person covering all their items, not one
+per item.
+
+**Soliciting is the start of the obligation, not the discharge of it.** An item
+you asked someone to move — a review, a decision, an approval — needs stewardship
+until it reaches a terminal state, and the platform will not do that for you.
+
+**The trigger to message is a state change the other party would want to know
+about — most often "I addressed your finding."** A push updates a branch and a
+comment updates a page; **neither reaches a person.** The reviewer who blocked you
+is not watching your branch, so from where they sit an addressed finding and an
+ignored one look the same until they happen to look again. That gap is measured in
+however long it takes them to re-scan, and it is the single commonest reason a
+resolved item sits.
+
+Other state changes worth a message: a blocker of theirs is now cleared; the thing
+they were waiting on landed; you have changed direction on something they reviewed;
+you are handing the item to someone else.
+
+**And the discipline that keeps this from becoming noise: never send a contentless
+nudge.** "Any update?" with nothing new on your side is what gets a channel muted, and
+a muted channel costs you every future nudge that mattered.
+
+**But what elapsed time disqualifies is repeating yourself — not asking whether the
+item still has a live owner.** Those are different messages and only the first is
+noise. So there are two tests before sending, and they key on different variables:
+
+- **Do I have something new to tell them?** New information, an addressed finding, a
+  changed direction. This is the trigger that matters most and the one most often
+  skipped.
+- **Does this item still have a live owner?** Ownership is not established once and
+  then trusted forever. A holder's attention can lapse, and **that is invisible from
+  your side by construction** — nothing of yours changes when it happens, so elapsed
+  time is the *only* signal that can surface it. Pick that horizon deliberately and
+  write it down with the ask — an unnamed "eventually" is how eleven days happen — and
+  when it arrives send a reassignment question, never an "any update?".
+
+If neither test fires, the item is correctly in their queue — leave it.
+
+Measured on this repo: a PR sat **eleven days** on a blocking review its author had
+answered within the hour, and **approvals kept arriving the entire time** — reviewer
+after reviewer read it, approved it, and changed nothing, because the block was never
+theirs to clear. Nothing had changed on the author's side after day one, and the item
+was unambiguously owned, so "has anything changed on my side?" returned *no* every
+single day, correctly, while every one of those approvals went unused.
+
+(**This sentence used to headline the approval count. Don't.** The item was still open,
+so the figure moved four → six → five → six *while this paragraph was under review* —
+and only the first of those was a counting error; the rest were the item accumulating
+underneath the measurement. A count of a live item goes stale faster than the document
+quoting it. Freeze it with an explicit "as of &lt;timestamp&gt;" or, better, state the
+invariant that cannot move: **approvals accumulated and the item did not.** The
+first wrong figure was the row count of a truncated terminal display, which is its own
+lesson — state which unit a count is in, or the next reader will invent one.)
+
+**And the ownership test has a floor beneath it: an item nobody was EVER asked to
+move.** There no holder's attention lapsed — none existed. Nothing of yours changes, by
+construction, and there is no one whose silence elapsed time could measure, so both
+tests stay quiet indefinitely. That item is not waiting, it is dropped, and the action
+is to solicit — not to ask a reassignment question about a holder who was never
+assigned. **Never-owned and owned-then-quiet are indistinguishable from outside and
+have different fixes: the first needs a name on it, the second needs the name changed.**
+
+Track, per party you are waiting on: what they hold, and what has changed since you
+last contacted them. **That pair has no home today** — the record schema in
+`references/schema.md` carries entities, rooms, relationships and evidenced facts, but
+no outstanding-ask record, and an issue tracker does not store it either. Keep it with
+whatever working state you already have for the item, and do not assume a lookup can
+answer "what do they hold".
 
 **Never a bare room post when you need someone to help.** The rule is scoped to
 *asking*, and the test before posting is not "is this addressed?" but **"am I

@@ -704,6 +704,17 @@ def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None
     _write_item(Path(root), item_id, d)
 
 
+def item_status(root: Path, item_id: str) -> Optional[str]:
+    """Public read of an item's lifecycle status (READY/CLAIMED/DELIVERED/
+    PARKED...); None when no record exists or the record is unreadable."""
+    try:
+        if not _item_path(Path(root), item_id).exists():
+            return None
+        return _read_item(Path(root), item_id).get("status")
+    except Exception:
+        return None
+
+
 def attempts_for(root: Path, item_id: str) -> int:
     return int(_read_item(Path(root), item_id).get("attempts", 0))
 

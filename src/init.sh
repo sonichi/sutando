@@ -382,10 +382,28 @@ preflight() {
     log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant the app running this terminal, then quit + relaunch it)"
     perms_warn=1
   fi
-  if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
-    log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
-    perms_warn=1
+  # $REPO is overridable (tests point it at a scratch dir), so fall back to
+  # alongside this script — an unguarded source under `set -e` aborts the run.
+  local __probe="$REPO/src/accessibility_probe.sh"
+  [ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
+  # 125 = could not check. acc_rc=0 here would BE the granted verdict, which
+  # is exactly the invention the old comment claimed to avoid.
+  local acc_rc=125
+  if [ -f "$__probe" ]; then
+    # `|| rc=$?` keeps this exempt from `set -e`: a bare non-zero call would
+    # abort init.sh before it ever emits its [Preflight] summary.
+    source "$__probe"
+    acc_rc=0; accessibility_probe || acc_rc=$?
   fi
+  case $acc_rc in
+    0)   : ;;
+    125) log "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked"
+         perms_warn=1 ;;
+    124) log "  ⚠ Accessibility UNKNOWN — probe timed out (headless session cannot answer)"
+         perms_warn=1 ;;
+    *)   log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
+         perms_warn=1 ;;
+  esac
 
   # One-line summary regardless of mode (this is the value-add)
   local cli_str="all-ok"

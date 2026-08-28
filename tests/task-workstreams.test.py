@@ -396,6 +396,109 @@ def test_stale_classifier_is_archived_before_replacement() -> None:
     assert live == [workspace / "tasks" / f"{replacement.task_id}.txt"]
 
 
+def _stale_and_replace(workspace, rename_suffix: str):
+    """Mint one classifier task, optionally rename it the way the pool lead
+    does, expire the TTL, then mint its replacement."""
+    first = workstreams.maybe_enqueue_classifier_task(workspace)
+    path = workspace / "tasks" / f"{first.task_id}.txt"
+    if rename_suffix:
+        path = path.rename(
+            path.with_name(f"{first.task_id}{rename_suffix}.txt"))
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    state["enqueued_at"] = 0
+    state_path.write_text(json.dumps(state))
+    return first, path, workstreams.maybe_enqueue_classifier_task(workspace)
+
+
+def test_stale_classifier_is_archived_under_its_pool_assigned_name() -> None:
+    # The lead renames queued work to `.assigned-<inst>`. A bare-name lookup
+    # misses it, so every TTL expiry left a file behind and the queue grew.
+    workspace = fixture_workspace()
+    first, path, replacement = _stale_and_replace(workspace, ".assigned-core-1")
+
+    assert replacement.enqueued and replacement.task_id != first.task_id
+    assert not path.exists()
+    archived = list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+    assert len(archived) == 1, archived
+    live = sorted(
+        p.name for p in (workspace / "tasks").glob("task-workstream-grouping-*"))
+    assert live == [f"{replacement.task_id}.txt"], live
+
+
+def test_a_worker_held_classifier_claim_is_left_alone() -> None:
+    # Archiving out from under a running worker is worse than one duplicate
+    # proposal, so a `.claimed-` file must survive its own replacement.
+    workspace = fixture_workspace()
+    first, path, replacement = _stale_and_replace(workspace, ".claimed-core-1")
+
+    assert replacement.enqueued
+    assert path.exists(), "claimed file was archived while a worker held it"
+    assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+
+
+def test_an_assigned_and_claimed_pair_still_leaves_the_claim_alone() -> None:
+    # find_task_file sorts its matches and `.assigned-` sorts first, so a guard
+    # that inspects only the returned path archives while a worker holds a claim.
+    workspace = fixture_workspace()
+    first = workstreams.maybe_enqueue_classifier_task(workspace)
+    base = workspace / "tasks" / f"{first.task_id}.txt"
+    claimed = base.with_name(f"{first.task_id}.claimed-core-1.txt")
+    base.rename(claimed)
+    assigned = base.with_name(f"{first.task_id}.assigned-core-2.txt")
+    assigned.write_text("id: " + first.task_id + "\n")
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    state["enqueued_at"] = 0
+    state_path.write_text(json.dumps(state))
+
+    workstreams.maybe_enqueue_classifier_task(workspace)
+
+    assert claimed.exists(), "archived while a worker held the claimed sibling"
+    assert assigned.exists(), "the assigned sibling went with it"
+    assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+
+
+def test_a_vanished_predecessor_is_not_an_error() -> None:
+    # Someone else archived or removed the previous mint. find_task_file returns
+    # None and the supersede must decline quietly, not raise or fabricate.
+    workspace = fixture_workspace()
+    first = workstreams.maybe_enqueue_classifier_task(workspace)
+    (workspace / "tasks" / f"{first.task_id}.txt").unlink()
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    state["enqueued_at"] = 0
+    state_path.write_text(json.dumps(state))
+
+    replacement = workstreams.maybe_enqueue_classifier_task(workspace)
+
+    assert replacement.enqueued and replacement.task_id != first.task_id
+    assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+
+
+def test_a_directory_wearing_a_task_name_is_never_archived() -> None:
+    # find_task_file resolves by NAME, not type, so dropping the parent's
+    # is_file() would relocate a whole directory into the archive.
+    for suffix in ("", ".assigned-core-1"):
+        workspace = fixture_workspace()
+        first = workstreams.maybe_enqueue_classifier_task(workspace)
+        real = workspace / "tasks" / f"{first.task_id}.txt"
+        real.unlink()
+        impostor = workspace / "tasks" / f"{first.task_id}{suffix}.txt"
+        impostor.mkdir()
+        (impostor / "payload.txt").write_text("must survive")
+        state_path = workspace / "state" / "task-workstream-classifier.json"
+        state = json.loads(state_path.read_text())
+        state["enqueued_at"] = 0
+        state_path.write_text(json.dumps(state))
+
+        workstreams.maybe_enqueue_classifier_task(workspace)
+
+        assert impostor.is_dir(), f"directory {suffix or '(bare)'} was moved"
+        assert (impostor / "payload.txt").read_text() == "must survive"
+        assert not list((workspace / "tasks" / "archive").glob(f"*/{first.task_id}*"))
+
+
 def test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors() -> None:
     workspace = fixture_workspace()
     stop = threading.Event()
@@ -733,6 +836,49 @@ def test_classifier_task_survives_a_raising_stamper() -> None:
     assert "envelope_hmac:" not in text
 
 
+def test_reused_workstream_id_does_not_require_a_redundant_name() -> None:
+    workspace = fixture_workspace()
+
+    # Seed a stored workstream, so reuse is exercised WITHOUT a prior apply — a prior
+    # apply would review the whole snapshot and leave no candidates behind.
+    reused_id = workstreams._workstream_id("Sutando task management")
+    store_path = workspace / "data" / "task-workstreams.json"
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {reused_id: {
+            "title": "Sutando task management",
+            "summary": "group and display related tasks",
+            "created_at": "2026-08-03T09:00:00+00:00",
+            "updated_at": "2026-08-03T09:00:00+00:00",
+        }},
+        "assignments": {},
+        "reviews": {},
+        "context_history": {},
+    }))
+    assert reused_id in workstreams.load_workstream_store(workspace)["workstreams"]
+
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    result = workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [
+            # No `name`: the stored workstream already carries its title.
+            {"workstream_id": reused_id, "confidence": 0.9, "task_ids": ["task-a1"]},
+            # An unknown id with no name has no title to fall back on, so it still skips.
+            {"workstream_id": "workstream-does-not-exist", "confidence": 0.9,
+             "task_ids": ["task-b1"]},
+        ],
+    })
+    assert result.assigned == 1, f"reuse without a name was dropped: {result}"
+    assert result.skipped == 1, f"nameless unknown id should skip exactly once: {result}"
+    assert result.workstreams_created == 0, f"reuse minted a new workstream: {result}"
+
+    store = workstreams.load_workstream_store(workspace)
+    assert store["assignments"]["task-a1"]["workstream_id"] == reused_id
+    assert "task-b1" not in store["assignments"]
+    assert store["workstreams"][reused_id]["title"] == "Sutando task management"
+
+
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
@@ -744,12 +890,18 @@ def main() -> None:
         test_classifier_task_survives_a_raising_stamper,
         test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
         test_stale_classifier_is_archived_before_replacement,
+        test_stale_classifier_is_archived_under_its_pool_assigned_name,
+        test_a_worker_held_classifier_claim_is_left_alone,
+        test_an_assigned_and_claimed_pair_still_leaves_the_claim_alone,
+        test_a_vanished_predecessor_is_not_an_error,
+        test_a_directory_wearing_a_task_name_is_never_archived,
         test_classifier_maintenance_runs_without_a_dashboard_and_survives_errors,
         test_workstream_context_is_prior_owner_only_bounded_and_untrusted,
         test_workstream_context_has_a_total_serialized_byte_cap,
         test_remembered_context_history_keeps_only_the_newest_entries,
         test_workstream_context_index_fail_open_edges,
         test_concurrent_inheritance_keeps_every_assignment,
+        test_reused_workstream_id_does_not_require_a_redundant_name,
     ]
     for test in tests:
         test()

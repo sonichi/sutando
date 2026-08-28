@@ -60,6 +60,7 @@ import signal
 import socket
 import sys
 import tempfile
+import select
 import threading
 import time
 import urllib.error
@@ -258,6 +259,19 @@ def _valid_local_tid(tid: str) -> bool:
         return True
     m = _LOCAL_TID_RE.fullmatch(tid)
     return bool(m) and m.group(1) not in (".", "..")
+
+
+def _task_pending(tid: str) -> bool:
+    """Is this task still live in tasks/, under ANY of its names?
+
+    A pooled task is renamed twice -- unassigned -> `.assigned-<core>` (lead
+    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
+    "is this still being worked?" must accept all three, so the question has
+    one owner: a state missed here reads as finished, which drops a reply
+    mid-flight or re-queues work another core already holds."""
+    return ((TASKS_DIR / f"{tid}.txt").exists()
+            or any(TASKS_DIR.glob(f"{tid}.assigned-*"))
+            or any(TASKS_DIR.glob(f"{tid}.claimed-*")))
 
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
@@ -484,6 +498,9 @@ def _team_guard_fns():
     """Load the BUNDLED guard; an installed wheel has no monorepo src/."""
     from .team_result_guard import (
         classify_result_for_tier,
+        is_guarded_tier,
+        is_suppression_only,
+        journal_suppressed_result,
         materialize_withheld_verdict,
         resolve_access_tier,
         sensitive_data_filter_enabled,
@@ -491,7 +508,8 @@ def _team_guard_fns():
     )
     return (classify_result_for_tier, materialize_withheld_verdict,
             resolve_access_tier, sensitive_data_filter_enabled,
-            withheld_review_path)
+            withheld_review_path, journal_suppressed_result,
+            is_suppression_only, is_guarded_tier)
 
 
 def _atomic_private_json(path: Path, payload: dict) -> None:
@@ -559,13 +577,22 @@ def _owner_review_dm(owner: str) -> str:
 
 def _review_messages(record: dict) -> list[str]:
     rid = str(record.get("review_id") or "")
-    origin = str((record.get("context") or {}).get("channel_id") or "")
+    context = record.get("context") or {}
+    origin = _one_line(context.get("channel_id") or "").strip()
+    room_name = _one_line(context.get("room_name") or "").strip()
+    # Keep room-controlled values in code spans and neutralize backticks so
+    # room metadata cannot alter the review message's Markdown structure.
+    origin_label = origin.replace("`", "'")
+    room_label = room_name.replace("`", "'")
+    room_info = (
+        f"`{origin_label}` (name: `{room_label}`)" if room_label else f"`{origin_label}`"
+    )
     body = str(record.get("withheld_body") or "")
     header = (
         f"**Private result review `{rid}`**\n\n"
         "This result was withheld from the shared room because it may contain "
         "sensitive information or delivery-control markers.\n\n"
-        f"Original room: `{origin}`\n\n")
+        f"Original room: {room_info}\n\n")
     decision = (
         "Reply directly to this message with **Yes** to confirm it should stay "
         "private, or **No** to mark it as a false positive and publish it to the "
@@ -874,7 +901,8 @@ def _guarded_result_body(tid: str, body: str):
     if tid in _WITHHELD_TASK_OUTPUT:
         return _WITHHELD_TASK_OUTPUT[tid]
     try:
-        classify, materialize, resolve, filter_enabled, review_path = _team_guard_fns()
+        (classify, materialize, resolve, filter_enabled, review_path,
+         journal_suppression, suppression_only, guarded_tier) = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
         return None, f"team_result_guard unavailable: {exc}"
@@ -889,7 +917,8 @@ def _guarded_result_body(tid: str, body: str):
             headers = local_task_protocol.parse_task_headers_trusted(
                 tfile.read_text(encoding="utf-8", errors="replace")).headers
             context = {key: headers.get(key, "") for key in (
-                "source", "channel_id", "reply_to_event", "source_message_id", "user_id")}
+                "source", "channel_id", "room_name", "reply_to_event",
+                "source_message_id", "user_id")}
         except OSError:
             pass
     verdict = classify(
@@ -900,6 +929,12 @@ def _guarded_result_body(tid: str, body: str):
     verdict = materialize(
         verdict, body, _STATE, tid, context=context, agent_id=agent_id,
         now=time.time())
+    if guarded_tier(tier) and suppression_only(body):
+        # Honouring a guarded close without recording it is the accountability
+        # gap the guard used to answer with a refusal.
+        verdict = journal_suppression(
+            verdict, body, _STATE, tid, context=context, agent_id=agent_id,
+            now=time.time())
     if is_leak:
         artifact = review_path(_STATE, tid)
         if not artifact.is_file():
@@ -984,6 +1019,19 @@ PROACTIVE_ROOM = (
 # Host-injected claim gate (Path -> bool), consulted per file before the claim
 # rename; None (standalone default) claims every routable file unchanged.
 PROACTIVE_CLAIM_GATE: Callable[[Path], bool] | None = None
+
+# Runtime self-report (#3279 verification layer 3): a host loader may inject
+# {build_sha, entrypoint} BEFORE exec'ing this source; standalone stays empty.
+RUNTIME_IDENTITY: dict = globals().get("RUNTIME_IDENTITY") or {}
+_ENGINE_COUNTS = {"core_confirmed": 0, "legacy_sends": 0}
+
+
+def _engine_desc() -> str:
+    c = _DELIVERY_CORE
+    if c is None:
+        return "DeliveryCore(unbuilt)"
+    return (f"DeliveryCore({type(c.backend).__name__}"
+            f"->{type(c.provider).__name__})")
 # Opt-in compat for brokers whose /v1/room answers {"ok": true} with no
 # event_id: trust the bare ok as delivered (at-least-once beats never).
 _PROACTIVE_TRUST_OK_ENV = os.environ.get("REMOTE_PROACTIVE_TRUST_OK")
@@ -1015,7 +1063,8 @@ def _outbound_worker(inflight: "set[str]") -> None:
         _OUTBOUND_WAKE.clear()
         if _OUTBOUND_STOP.is_set():
             break                        # graceful: stop taking new items
-        # tuple(), not list(): tests anchor the DRAIN on its distinct spelling.
+        # tuple(): kept distinct from the drain's test anchor — redundant once
+        # the anchor is line-bounded, load-bearing until then.
         for tid in tuple(inflight):
             rfile = RESULTS_DIR / f"{tid}.txt"
             if tid not in first_seen and rfile.exists():
@@ -1039,6 +1088,68 @@ def _start_outbound_worker(inflight: "set[str]") -> threading.Thread:
     t.start()
     _log(f"outbound worker started (scan {OUTBOUND_SCAN_S}s + wake-on-kick) — "
          "outbound no longer rides the inbound long-poll")
+    return t
+
+
+OUTBOUND_WATCHER = os.environ.get("REMOTE_OUTBOUND_WATCHER", "auto")  # auto|off
+
+
+def _start_results_watcher() -> "threading.Thread | None":
+    """Darwin kqueue doorbell on RESULTS_DIR: advisory wakeups only, never
+    delivery state. Correctness stays in the durable drain; the bounded scan
+    guarantees progress whenever this thread is degraded or absent."""
+    if OUTBOUND_WATCHER == "off" or not hasattr(select, "kqueue"):
+        return None
+
+    VNODE_GONE = (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+                  | select.KQ_NOTE_REVOKE)
+
+    def run():
+        backoff = 1.0
+        while not _OUTBOUND_STOP.is_set():
+            fd, kq = -1, None
+            try:
+                RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                # O_EVTONLY is absent on some supported pythons (Xcode 3.9);
+                # kqueue accepts an O_RDONLY fd — it just pins the mount.
+                fd = os.open(str(RESULTS_DIR),
+                             getattr(os, "O_EVTONLY", os.O_RDONLY))
+                kq = select.kqueue()
+                kq.control([select.kevent(
+                    fd, filter=select.KQ_FILTER_VNODE,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                    fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND
+                    | VNODE_GONE)], 0, 0)
+                backoff = 1.0
+                # Full sweep on every (re)registration: files that landed
+                # before the watch began are the first sweep's job.
+                wake_outbound()
+                while not _OUTBOUND_STOP.is_set():
+                    events = kq.control(None, 1, 1.0)
+                    if not events:
+                        continue
+                    wake_outbound()
+                    if events[0].fflags & VNODE_GONE:
+                        # Rate-cap rebuilds like the exception path: a flapping
+                        # dir must not spin the register loop.
+                        _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                        backoff = min(backoff * 2, 30.0)
+                        break            # dir vnode gone: rebuild registration
+            except Exception as e:  # noqa: BLE001 — degraded, never fatal
+                _log(f"results watcher degraded (scan remains the floor): {e}")
+                _OUTBOUND_STOP.wait(min(backoff, 30.0))
+                backoff = min(backoff * 2, 30.0)
+            finally:
+                try:
+                    if kq is not None:
+                        kq.close()
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+
+    t = threading.Thread(target=run, name="results-watcher", daemon=True)
+    t.start()
+    _log("results watcher started (kqueue doorbell — advisory; scan is the floor)")
     return t
 
 
@@ -1174,6 +1285,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_i
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
                 "addressed_to",
+                # Ingress only: the backend inherits the route by task id, so a
+                # reply echoing these back could name a thread it was not asked in.
+                "thread_root", "source_room_id",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
@@ -1709,11 +1823,12 @@ def _recover_auth(code: int) -> bool:
     cycle = 0
     while True:
         pending = _reenroll_state["code"]
+        # `backoff_s` means "retryable TRANSPORT backoff"; this loop is waiting on
+        # a human, so it stays 0 — the re-check cadence is not a reconnect estimate.
         _emit_gateway_status(False,
                              error=(f"auth rejected HTTP {code} — relink pending "
                                     f"(code {pending})" if pending else
-                                    f"auth rejected HTTP {code} — waiting for re-connect"),
-                             backoff_s=AUTH_RECHECK_INTERVAL)
+                                    f"auth rejected HTTP {code} — waiting for re-connect"))
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting for token rotation")
@@ -1883,6 +1998,8 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "gateway": _redact_url(URL),
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
+            "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
+                        **_ENGINE_COUNTS},
         }
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
@@ -2149,7 +2266,7 @@ def _write_task(task: dict) -> str | None:
     task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived.
-    if dest.exists() or any(TASKS_DIR.glob(f"{tid}.claimed-*")):
+    if _task_pending(tid):
         return tid
     # Relay redelivery of already-handled work: on reconnect the gateway replays
     # its unacked pool, including tasks this node long since processed (the
@@ -2317,7 +2434,7 @@ def _write_task(task: dict) -> str | None:
                 f"message, reconstruct the room thread — `python3 "
                 f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
                 f"reports no gateway configured, load the channel env first: `set -a; . "
-                f"\"$CLAUDE_CONFIG_DIR/channels/ag2space/.env\"; set +a`) — and read it "
+                f"\"$(bash scripts/channel-env.sh ag2space)\"; set +a`) — and read it "
                 "back (everyone's messages including your own prior replies) until this "
                 "message stands on its own, then answer from the reconstructed thread, "
                 "NOT from memory. Do this every time; do NOT skip it because the message "
@@ -2325,8 +2442,11 @@ def _write_task(task: dict) -> str | None:
                 "confidence is exactly the signal that fails. The only exception is a "
                 'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
             _step += 1
+            # Which channel file holds REMOTE_TASK_* differs per onboarding, so the
+            # prelude resolves it by content; notify.py's own guard can refuse a symlink.
             _skill.append(
-                f"{_step}. NOTIFY FIRST (if task takes >60s): python3 "
+                f"{_step}. NOTIFY FIRST (if task takes >60s): `set -a; . "
+                f"\"$(bash scripts/channel-env.sh ag2space)\"; set +a` then python3 "
                 f"skills/task-progress/scripts/notify.py --source ag2space "
                 f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
             _step += 1
@@ -2771,6 +2891,7 @@ def _post_proactive() -> None:
         except OSError:
             claim.unlink(missing_ok=True)
         _PROACTIVE_ATTEMPTS.pop(f.name, None)
+        _ENGINE_COUNTS["legacy_sends"] += 1
         _log(f"delivered proactive {f.name} to {dest_room}")
 
 
@@ -2836,6 +2957,19 @@ def _dedup_plan(tid: str, holder_id: str | None):
     return action, payload, room
 
 
+def _lease_close_body(skip) -> str:
+    """Canonical bytes for a lease close — the marker, never the sender's prose.
+
+    The guard decides THAT a result is suppressed; what rides this wire is the
+    transport's own choice, and nobody reads a suppressed body.
+    """
+    if skip.value == "deduped":
+        extra = (skip.extra or "").strip()
+        return (f"[deduped: {extra}]"
+                if local_task_protocol.valid_archive_lookup_id(extra) else "[no-send]")
+    return "[REPLIED]" if skip.value == "REPLIED" else "[no-send]"
+
+
 _DELIVERY_CORE: "DeliveryCore | None" = None
 
 
@@ -2883,6 +3017,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
              f"(attempts={core.backend.attempts(broker_tid)}) — will retry")
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
+        _ENGINE_COUNTS["core_confirmed"] += 1
         # A confirmed send was otherwise silent, so nothing on the happy path
         # told a live round trip apart from the legacy one it replaces.
         _log(f"result {tid} delivered via DeliveryCore "
@@ -2915,15 +3050,9 @@ def _post_ready_results(inflight: set[str]) -> None:
         raw = read_ready_result(rfile)
         if raw is None:
             continue
-        # The guard owns the suppression verdict; this journaled transport
-        # applies it as a canonical stub with no collaborator-controlled bytes.
-        _tier = _result_tier(tid)
-        stub = (team_result_guard.suppression_stub_for_tier(raw, _tier)
-                if _tier is not None else None)
-        if stub is not None:
-            body, _withheld = stub, None
-        else:
-            body, _withheld = _guarded_result_body(tid, raw)
+        # The guard honours suppression on every tier now, so there is no stub
+        # to pre-apply; the ordinary guarded path returns the body unchanged.
+        body, _withheld = _guarded_result_body(tid, raw)
         if body is None:
             _log(f"result guard unavailable for {tid} — leaving for retry")
             continue
@@ -2933,6 +3062,8 @@ def _post_ready_results(inflight: set[str]) -> None:
         # other bridges — no hand-rolled startswith checks.
         parsed = parse_markers(body)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
+        # Every dedup marker routes through the shared plan, malformed included:
+        # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
         if skip and skip.value == "deduped":
             action, payload, room = _dedup_plan(tid, skip.extra)
             if action == "defer":
@@ -2952,7 +3083,12 @@ def _post_ready_results(inflight: set[str]) -> None:
                     if not _deliver_result_payload(tid, _broker_tid(_delivery),
                                                   payload):
                         continue
-                _log(f"dedup {action} for {tid} (holder {skip.extra} delivered nothing)")
+                _holder = (skip.extra or "").strip()
+                # An out-of-grammar holder is sender-controlled; name its shape,
+                # never its bytes.
+                _shown = (_holder if local_task_protocol.valid_archive_lookup_id(_holder)
+                          else f"<malformed, {len(_holder)} chars>")
+                _log(f"dedup {action} for {tid} (holder {_shown} delivered nothing)")
                 _archive_result(rfile, tid)
                 inflight.discard(tid)
                 _forget_task_room(tid)
@@ -2968,7 +3104,8 @@ def _post_ready_results(inflight: set[str]) -> None:
             if _delivery is None:
                 _log(f"delivery deferred for {tid} — alias ledger unreadable")
                 continue
-            if not _deliver_result_payload(tid, _broker_tid(_delivery), body,
+            if not _deliver_result_payload(tid, _broker_tid(_delivery),
+                                           _lease_close_body(skip),
                                            no_send=True):
                 continue
             _archive_result(rfile, tid)
@@ -3042,8 +3179,7 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     instead of being raced. Returns the new suspects set for the next pass."""
     gone = {tid for tid in inflight
             if _valid_local_tid(tid)
-            and not (TASKS_DIR / f"{tid}.txt").exists()
-            and not any(TASKS_DIR.glob(f"{tid}.claimed-*"))
+            and not _task_pending(tid)
             and not (RESULTS_DIR / f"{tid}.txt").exists()
             and not _task_archived_recently(tid)}
     confirmed = gone & suspects
@@ -3186,12 +3322,20 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         # Genuinely undelivered: ONE labeled attempt — at-least-once by
         # design; the label makes the rare duplicate self-explaining.
-        body = read_ready_result(rfile)
-        if body is None:
+        raw = read_ready_result(rfile)
+        if raw is None:
             continue
         delivery = _delivery_tid(tid)
         if delivery is None:
             continue                            # alias ledger unreadable: retry later
+        # Recovery is still a delivery: the ordinary path's guard runs BEFORE
+        # any marker is interpreted, so tier + suppression cannot be skipped.
+        body, _withheld = _guarded_result_body(tid, raw)
+        if body is None:
+            _log(f"orphan sweep: result guard unavailable for {tid} — leaving for retry")
+            continue
+        if _withheld:
+            _log(f"orphan sweep: withheld non-owner result for {tid}: {_withheld}")
         parsed = parse_markers(body)
         if [a for a in parsed.actions if a.kind == "attach"]:
             # Delivering without the files would silently drop them — park
@@ -3207,31 +3351,31 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                 _log(f"orphan sweep: {tid} defers to its dedup holder — quarantined")
             continue
         if skip:
-            # Marker parity with _post_ready_results: original body goes up;
-            # the server suppresses user delivery and still closes the lease.
-            labeled = body
+            # A suppression marker moves no data: the canonical close rides the
+            # wire, not the sender's prose, and no_send gates delivery.
+            labeled = _lease_close_body(skip)
         else:
             labeled = ("(recovered result — original delivery was lost)\n"
                        + parsed.body)
             _r = next((a for a in parsed.actions if a.kind == "redirect"), None)
             if _r:
                 labeled = f"[channel: {_r.value}]\n{labeled}"
-        try:
-            _req("POST", "/v1/results",
-                 {"id": _broker_tid(delivery), "body": labeled})
-        except urllib.error.HTTPError as e:
-            if 400 <= e.code < 500:
-                # Lease long gone: no consumer will ever accept this POST.
-                if _quarantine_orphan(rfile, tid, "lease-gone"):
-                    _log(f"orphan sweep: {tid} lease gone (HTTP {e.code}) — quarantined")
-            else:
-                _log(f"orphan sweep: {tid} POST failed HTTP {e.code} — will retry")
+        # Same outcome owner as the live drain: a 2xx {"ok": false} is a
+        # refusal, and an unconfirmed close must keep its retryable result.
+        _btid = _broker_tid(delivery)
+        if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip)):
+            _archive_result(rfile, tid)
+            _log(f"orphan sweep: recovered + delivered {tid}")
             continue
-        except (urllib.error.URLError, TimeoutError) as e:
-            _log(f"orphan sweep: {tid} network error {e} — will retry")
+        _tries = _delivery_core().backend.attempts(_btid)
+        if _tries >= MAX_TRANSIENT_ATTEMPTS:
+            # Permanent disposition (lease gone or standing refusal): the
+            # bounded-attempts ceiling replaces the raw 4xx probe the core hides.
+            if _quarantine_orphan(rfile, tid, "undeliverable-after-retries"):
+                _log(f"orphan sweep: {tid} unconfirmed after {_tries} attempts "
+                     "— quarantined")
             continue
-        _archive_result(rfile, tid)
-        _log(f"orphan sweep: recovered + delivered {tid}")
+        _log(f"orphan sweep: {tid} close not confirmed (attempt {_tries}) — will retry")
 
 
 # ── MC1 per-workspace singleton (dual-poller guard) ─────────────────────────
@@ -3406,6 +3550,7 @@ def main() -> None:
     last_poll_ok = time.time()
     _emit_gateway_status(False, error="starting — not yet connected")
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
+    _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
     while True:
         try:
@@ -3416,6 +3561,8 @@ def main() -> None:
                      "— exiting to avoid dual-poll")
                 _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
                 _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
+                if _results_watcher is not None:
+                    _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
             _retry_pending_publications()

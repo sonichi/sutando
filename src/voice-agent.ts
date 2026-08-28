@@ -32,7 +32,8 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { inlineTools } from './inline-tools.js';
+import { inlineTools, personalSkillSetups } from './inline-tools.js';
+import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
@@ -157,7 +158,10 @@ const HOST = process.env.HOST || '127.0.0.1';
 // the file pipeline); the dual-use rationale is obsolete.
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
-const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
+// Canonical since #2722; the root `.voice-agent.pid` is the pre-move legacy
+// location, read by the shell side only via `sutando-config.sh voice-pidfile`.
+const PIDFILE = join(WORKSPACE_DIR, 'state', 'locks', 'voice-agent.pid');
+const LEGACY_PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
 
 /** Bounded primitive-only crash record — shared by BOTH fatal paths (the
  * uncaught handler and `main().catch`), which obey identical crash-only
@@ -241,8 +245,10 @@ function acquirePidLock(): void {
 		console.error(`${ts()} [Startup] Lock operations fail closed. Fix: install python3 (brew install python), set SUTANDO_PY to a working interpreter, or run xcode-select --install. Exiting.`);
 		process.exit(1);
 	}
+	try { mkdirSync(join(WORKSPACE_DIR, 'state', 'locks'), { recursive: true }); } catch { /* acquire fails closed below */ }
 	const res = acquireVoiceLock({
 		pidfile: PIDFILE,
+		legacyPidfile: LEGACY_PIDFILE,
 		guard,
 		pid: myPid,
 		entry,
@@ -1522,6 +1528,11 @@ async function main() {
 		userHasInterrupted = true;
 		console.log(`${ts()} [VoiceSession] user interrupt detected — userHasInterrupted=true`);
 	});
+
+	// Give each skill's setup() the live session so it registers handlers without
+	// importing core. Guarded: a buggy setup must not break session bootstrap.
+	runSkillSetups(personalSkillSetups, { session, injectText },
+		(msg, detail) => console.error(`${ts()} ${msg}`, detail));
 
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is
 	// producing audio, so the deck ducks the active slide video under the
