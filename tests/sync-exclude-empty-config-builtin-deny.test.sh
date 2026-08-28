@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# An owned built-in deny must be adoptable regardless of the operator's
-# carve-out config: `vault.sync.exclude: []` is supported, and gating the
-# script's own snap-temp deny on it leaves an upgraded workspace staging the
-# very temp the rule exists to hide.
+# The script-owned snap-temp deny must be adoptable under any operator
+# config, including the supported `vault.sync.exclude: []`.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

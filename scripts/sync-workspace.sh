@@ -611,10 +611,8 @@ _is_safe_carveout_addition() {
         [ -n "$path" ] || continue
         shipped_rules+="$(_emit_exclude_lines "$path")"$'\n'
     done <<<"$shipped"
-    # An owned built-in deny is also a safe addition: it only ever excludes MORE,
-    # and without it an upgraded workspace stages the temp the rule exists to hide.
-    # Merged UNCONDITIONALLY: `vault.sync.exclude: []` is a supported value, and
-    # the script's own rules must not be gated on the operator's list (#3198 P1).
+    # The script-owned deny merges unconditionally: it only ever excludes MORE,
+    # and `vault.sync.exclude: []` is a supported value that must not gate it.
     shipped="$shipped_rules"$'\n'"$(_adoptable_builtin_denies)"
     [ -n "$(printf '%s' "$shipped" | grep -vE '^[[:space:]]*$')" ] || { rm -f "$widened"; return 1; }
     rc=0
@@ -867,16 +865,22 @@ _snapshot_per_host_config() {
 
     # Ownership is provenance, never mtime. The re-hash before the swap refuses a
     # writer that CHANGED the file; a writer holding an open fd is undetectable.
+    # Prints the recorded sha only when FILE's on-disk bytes are exactly one
+    # 64-char lowercase-hex token plus optional trailing newlines.
+    _usable_sig_record() {
+        local _hex
+        _hex="$(od -An -v -tx1 -- "$1" 2>/dev/null | tr -d ' \n')"
+        printf '%s' "$_hex" | LC_ALL=C grep -qE '^(3[0-9]|6[1-6]){64}(0a)*$' || return 0
+        tr -d '\n' < "$1" 2>/dev/null
+    }
     if [ -f "$WORKSPACE_DIR/build_log.md" ]; then
         local _src="$WORKSPACE_DIR/build_log.md"
         local _dst="$_host_dir/build_log.md" _sig="$_host_dir/.build_log.snapshot-sha"
         local _cur="" _rec=""
         [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
-        [ -f "$_sig" ] && _rec="$(cat "$_sig" 2>/dev/null)"
-        # Usable provenance is exactly one full sha256. Anything else (a torn
-        # write, a stray copy, a manual edit) must not read as a second writer.
-        case "$_rec" in (*[!0-9a-f]*) _rec="" ;; esac
-        [ "${#_rec}" -eq 64 ] || _rec=""
+        # Validate raw bytes BEFORE any $(): substitution strips NULs, so a
+        # NUL-damaged record would collapse to 64 clean hex and gain authority.
+        [ -f "$_sig" ] && _rec="$(_usable_sig_record "$_sig")"
         if [ -f "$_dst" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
             # Equal content is safe to re-own: repair a missing or stale sha so an
             # interrupted publish self-heals. Nothing to propagate.

@@ -97,8 +97,8 @@ check "no-provenance refusal names the ACTUAL condition, not a second writer" \
 check "...and does NOT tell the operator to archive a copy (the message that did)" \
       '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
 
-# keweichen on #3198: [ -z "$_rec" ] is ALSO true for an EMPTY or unreadable sig
-# file, so the branch must not claim the file is merely missing.
+# [ -z "$_rec" ] is ALSO true for an EMPTY or unreadable sig file, so the
+# branch must not claim the file is merely missing.
 : > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"     # exists, but empty
 check "an EMPTY provenance file takes the same no-usable-record branch" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
@@ -106,10 +106,8 @@ check "...and an empty record is still not called an independent writer" \
       '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
 
 echo "5d. present-but-MALFORMED signature is not usable provenance either"
-# keweichen + yixuan on #3198: a 63-char partial (a torn write, a stray copy,
-# a manual edit) is indistinguishable from a genuine record to an equality
-# test, and used to draw the archive-a-copy advice. Any non-sha256 content
-# must take the guarded branch.
+# A 63-char partial (torn write, stray copy, manual edit) satisfies a bare
+# equality test; any non-sha256 content must take the guarded branch.
 printf '%063d' 0 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 check "a 63-char partial signature takes the no-usable-record branch" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
@@ -123,15 +121,34 @@ check "arbitrary foreign content in the sig file is equally unusable" \
 printf '%064d' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 check "a valid-shape stale sha is STILL an independent writer (control)" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
-# Deliberate leniency, pinned: trailing NEWLINES after the sha are the shell's
-# \$() semantics, and the record still unambiguously decodes to one sha256 —
-# rejecting it would wedge a recoverable file. Trailing SPACES stay invalid.
+# Pinned leniency: the writer itself emits a trailing newline, so newlines
+# after the sha must stay usable. Trailing SPACES stay invalid.
 printf '%064d\n\n\n' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 check "a valid sha with trailing blank lines is still USABLE provenance" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
 printf '%064d ' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 check "...but a trailing SPACE is malformed, not a writer" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
+
+echo "5e. NUL damage must be judged on the on-disk bytes, not post-\$() text"
+# Shell substitution strips NULs, so a NUL-damaged record collapses to 64
+# clean hex chars; the validator must reject the bytes before that happens.
+printf 'root stale\n' > "$WORKSPACE_DIR/build_log.md"
+printf 'per-host live entry\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+_live_sha="$(shasum -a 256 "$WORKSPACE_DIR/hosts/testhost/build_log.md" | cut -d' ' -f1)"
+printf '%s\0' "$_live_sha" > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+check "a trailing-NUL signature is NOT usable provenance" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
+check "...and the live destination survives (no overwrite authority)" \
+      'grep -q "per-host live entry" "$WORKSPACE_DIR/hosts/testhost/build_log.md"'
+check "...and NUL damage is not an independent writer" \
+      '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+printf '%.32s\0%.32s' "$_live_sha" "${_live_sha:32}" \
+    > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+check "an embedded-NUL signature is equally unusable" \
+      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
+check "...and the live destination still survives" \
+      'grep -q "per-host live entry" "$WORKSPACE_DIR/hosts/testhost/build_log.md"'
 rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 echo "keep it that way" >> "$WORKSPACE_DIR/build_log.md"
 echo "per-host went live" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
