@@ -93,10 +93,8 @@ def scan_task_mints(root: Path) -> dict:
             counts[(rel, "<unparseable>")] = 1
             return
         stack = ["<module>"]
-        # A mint literal can hide behind a module constant (TASK_PREFIX =
-        # "task-cron-"; f"{TASK_PREFIX}{...}") — resolve one level, or a
-        # delegating refactor makes the construction invisible and the
-        # removal rule prescribes deleting live coverage.
+        # A mint literal can hide behind a module constant (TASK_PREFIX = "task-cron-"),
+        # so resolve one level — else a delegating refactor hides the construction.
         const_names = {
             t.id for node in tree.body if isinstance(node, ast.Assign)
             for t in node.targets if isinstance(t, ast.Name)
