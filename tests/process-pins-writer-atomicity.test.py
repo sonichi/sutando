@@ -59,6 +59,23 @@ class WriterValidatesAndBounds(unittest.TestCase):
         self.assertEqual(process_pins.load_pins(self.path)[0]["service"],
                          "discord-bridge")
 
+    def test_non_dict_pin_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            process_pins.save_pins(self.path, ["not-a-dict"])
+
+    def test_oversize_field_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            process_pins.save_pins(self.path, [dict(GOOD, reason="x" * 501)])
+
+    def test_arm_on_wrong_shape_valid_json_RAISES(self) -> None:
+        # Valid JSON, wrong shape: json.loads succeeds, the shape check must raise.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text('{"pins": "nope"}')
+        with self.assertRaises(ValueError):
+            process_pins.arm_pin(self.path, "svc", "9", "l", "r",
+                                 "2026-12-31T00:00:00Z")
+        self.assertEqual(self.path.read_text(), '{"pins": "nope"}')
+
     def test_missing_field_raises(self) -> None:
         bad = dict(GOOD); del bad["lstart"]
         with self.assertRaises(ValueError):

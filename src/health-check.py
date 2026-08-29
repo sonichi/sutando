@@ -9972,16 +9972,12 @@ def run_all_checks() -> list[dict]:
             except OSError:
                 pass
 
-        # Non-ARMED pin findings survive every later check: an orphaned pin
-        # means the protected process is gone, and silence would discard that.
-        _pin_others = process_pins.other_notes(pin_results)
-        if _pin_others and _pin_others not in detail:
-            detail = f"{detail}{_pin_others}"
-            if status == "ok":
-                status = "warn"
         _bridge_row = {"name": name, "status": status, "detail": detail}
         if bridge_veto:
             _bridge_row["restart_veto"] = bridge_veto
+        # One composition at the ship point: non-ARMED findings survive every
+        # later check, and the veto rides the row even on the healthy path.
+        _apply_pin_findings(_bridge_row, pin_results)
         checks.append(_bridge_row)
 
     # ag2.space gateway bridge (mobile path); check_gateway_bridge() returns
