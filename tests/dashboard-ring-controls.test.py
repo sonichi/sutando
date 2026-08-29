@@ -91,6 +91,16 @@ def main() -> None:
         assert "NaN" not in r["ring"], f"{why} leaked NaN into the ring: {r['ring'][-90:]}"
         assert "\u2014" in r["ring"], f"{why} must render an em dash like the server tile"
 
+    # Fractional parity with the server tile. Every other fixture here is
+    # invariant under truncation vs rounding, so none of them can fail.
+    import dashboard
+    for u in (0.999, 0.9999, 0.307, 0.5, 0.019):
+        ring = _run_ring([{"x": 0.9, "y": u}], 1.0)["ring"]
+        want = dashboard._quota_tile_pct({"utilization_5h": u}, "5h")
+        assert f">{want}<" in ring, (
+            f"u={u}: hydrated ring must render {want} like _quota_tile_pct; "
+            f"got {ring[-90:]}")
+
     print("dashboard-ring-controls: PASS — arc/tick/color executed via the page's own JS")
 
 
