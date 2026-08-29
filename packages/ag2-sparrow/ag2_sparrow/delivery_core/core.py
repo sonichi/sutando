@@ -95,8 +95,10 @@ class DeliveryCore:
         key = idempotency_key(item_id)
         token = self.backend.claim(item_id, self.worker)
         if token is None:
-            # Another worker owns it. No provider call was made, so there is
-            # no external ambiguity to report — this is not an outcome.
+            # No provider call either way, so nothing external is ambiguous.
+            # Terminal is unclaimable forever; contention is not.
+            if self.backend.is_terminal(item_id):
+                return DrainResult(status=DrainStatus.TERMINAL)
             return DrainResult(status=DrainStatus.NOT_CLAIMED)
         outcome, destination = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
