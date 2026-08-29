@@ -151,9 +151,10 @@ def discord_reachable(target: dict) -> "tuple[bool, str]":
     membership, and the bridge also grants via a global superset this file
     cannot see. So an omission is not evidence of absence and never returns one.
     """
-    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    base = Path(cfg_dir) if cfg_dir else Path.home() / ".claude"
-    access = base / "channels" / "discord" / "access.json"
+    # Imported here, not at module scope: the probe must still run from a tree
+    # without src/, and a private rederivation would miss $CLAUDE_HOME.
+    from util_paths import claude_home_path
+    access = claude_home_path("channels", "discord", "access.json")
     try:
         data = json.loads(access.read_text())
     except Exception as exc:                     # noqa: BLE001 - probe must not raise
@@ -238,40 +239,68 @@ _NOT_AN_ASK = {"failed"}
 _DID_ASK = {"confirmed", "unknown"}
 
 
-def _raw_streams(led: Path) -> dict:
-    """(repo, pr, RAW spelling) -> the rows for that stream, in file order.
+#: Accepted row schema. A field of the wrong type is a malformed ROW, not a
+#: reason to crash a reader or to misattribute the stream it belongs to.
+def _row(d) -> "tuple | None":
+    """(repo, pr, identity, outcome, ts) for a well-formed record, else None."""
+    if not isinstance(d, dict):
+        return None                     # valid JSON, not a record
+    repo, pr = d.get("repo"), d.get("pr")
+    actor = d.get("actor")
+    if actor is not None and not (isinstance(actor, str) and actor):
+        return None                     # PRESENT but wrong: not an absent actor
+    who = actor or d.get("reviewer")
+    outcome, ts = d.get("outcome"), d.get("ts") or ""
+    if not isinstance(repo, (str, type(None))) or not isinstance(who, str) or not who:
+        return None
+    if not isinstance(pr, (str, int)) or isinstance(pr, bool):
+        return None
+    if not isinstance(outcome, (str, type(None))) or not isinstance(ts, str):
+        return None
+    return repo, str(pr), who, outcome, ts
 
-    THE one owner of the ledger's read contract: file access, malformed-JSON
-    skipping, `actor or reviewer` identity, key shape, and append order. Both
-    readers below are projections over this; two copies of it produced the park
-    and ask-history defects independently, which is the duplication itself.
+
+def _streams(led: Path) -> dict:
+    """(repo, pr, RAW spelling) -> compact state, folded line by line.
+
+    THE one owner of the ledger's read contract: file access, malformed-line and
+    malformed-ROW skipping, identity, key shape, and order. Retaining the rows
+    made memory grow with the ledger for a result of fixed size.
     """
-    streams = {}
+    out = {}
     if not led.exists():
-        return streams
+        return out
     for line in led.read_text().splitlines():
         try:
             d = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(d, dict):
-            continue                    # valid JSON, not a record: same skip
-        key = (d.get("repo"), str(d.get("pr")), d.get("actor") or d.get("reviewer"))
-        streams.setdefault(key, []).append(
-            (d.get("outcome"), d.get("ts") or ""))
-    return streams
+        row = _row(d)
+        if row is None:
+            continue                    # one bad row never hides a later good one
+        repo, pr, who, outcome, ts = row
+        st = out.setdefault((repo, pr, who),
+                            {"last": None, "first_ask": None, "n": 0})
+        st["last"] = (outcome, ts)
+        st["n"] += 1
+        # A row predating the outcome field records a send that happened:
+        # absence is legacy, not a claim that nothing was posted.
+        if (outcome is None or outcome in _DID_ASK) and (
+                st["first_ask"] is None or ts < st["first_ask"]):
+            st["first_ask"] = ts
+    return out
 
 
 def _fold(streams: dict, per_stream, combine, canonical=None) -> dict:
-    """Project each RAW stream, then fold the results onto the canonical actor.
+    """Project each RAW stream's state, then fold onto the canonical actor.
 
     Reducing before folding is the invariant both readers need: one alias's
     definite failure settles only its own reservation.
     """
     canon = canonical or (lambda w: w)
     out = {}
-    for (repo, num, who), rows in streams.items():
-        v = per_stream(rows)
+    for (repo, num, who), st in streams.items():
+        v = per_stream(st)
         if v is None:
             continue
         k = (repo, num, canon(who))
@@ -285,26 +314,22 @@ def _latest_outcomes(led: Path) -> dict:
     Raw keys only. Folding this onto a canonical actor is the defect the park
     was fixed for, so the API does not offer it rather than leaving it callable.
     """
-    return _fold(_raw_streams(led), lambda rows: rows[-1], lambda a, b: b)
+    return _fold(_streams(led), lambda st: st["last"], lambda a, b: b)
 
 
 def _first_ask(led: Path, canonical=None) -> dict:
     """(repo, pr, actor) -> earliest ts at which an ask actually reached them."""
-    def per_stream(rows):
-        asks = [ts for outcome, ts in rows
-                # A row predating the outcome field records a send that
-                # happened: absence is legacy, not "nothing was posted".
-                if outcome is None or outcome in _DID_ASK]
-        if asks:
-            return min(asks)
+    def per_stream(st):
+        if st["first_ask"] is not None:
+            return st["first_ask"]
         # A standing reservation may have posted, so it counts as an ask at its
         # own ts until it settles; a settled `failed` never posted.
-        return rows[-1][1] if rows[-1][0] == "pending" else None
+        return st["last"][1] if st["last"] and st["last"][0] == "pending" else None
 
     def earliest(a, b):
         return min(x for x in (a, b) if x) if (a and b) else (a or b)
 
-    return _fold(_raw_streams(led), per_stream, earliest, canonical=canonical)
+    return _fold(_streams(led), per_stream, earliest, canonical=canonical)
 
 
 def unknown_parked(message: str, reviewer: str, actor: str = None,

@@ -1104,11 +1104,9 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
 
 
 class OneOwnerForTheLedgerReadContract(unittest.TestCase):
-    """Both readers are projections over `_raw_streams`, not two copies of it.
+    """Both readers are projections over `_streams`, not two copies of it."""
 
-    Two independent implementations of this contract produced the park and
-    ask-history defects separately; a fix to one kept missing the other.
-    """
+    GOOD = {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "T", "outcome": "confirmed"}
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -1117,61 +1115,83 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def _write(self, *rows):
+        self.led.write_text("".join(
+            (r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows))
+
     def test_malformed_lines_are_skipped_not_fatal(self):
-        self.led.write_text("not json\n" + json.dumps(
-            {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "T", "outcome": "confirmed"}) + "\n")
-        self.assertEqual(list(nr._raw_streams(self.led)), [("o/r", "7", "k")])
-
-    def test_identity_prefers_actor_and_falls_back_to_reviewer(self):
-        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
-            {"repo": "o/r", "pr": 7, "reviewer": "spelling", "actor": "canon",
-             "ts": "T1", "outcome": "confirmed"},
-            {"repo": "o/r", "pr": 7, "reviewer": "legacy", "ts": "T2",
-             "outcome": "unknown"})))
-        self.assertEqual(sorted(k[2] for k in nr._raw_streams(self.led)),
-                         ["canon", "legacy"])
-
-    def test_a_stream_keeps_its_rows_in_file_order(self):
-        self.led.write_text("".join(json.dumps(
-            {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": t, "outcome": o}) + "\n"
-            for o, t in (("pending", "T1"), ("failed", "T2"))))
-        self.assertEqual(nr._raw_streams(self.led)[("o/r", "7", "k")],
-                         [("pending", "T1"), ("failed", "T2")])
-
-    def test_an_absent_ledger_is_empty_not_an_error(self):
-        self.assertEqual(nr._raw_streams(pathlib.Path(self.tmp) / "nope.jsonl"), {})
+        self._write("not json", self.GOOD)
+        self.assertEqual(list(nr._streams(self.led)), [("o/r", "7", "k")])
 
     def test_a_valid_json_line_that_is_not_a_record_is_skipped(self):
-        # Syntax was already handled; a bare list or string is valid JSON and
-        # crashed on .get. Semantic row failure belongs to the shared reader.
-        self.led.write_text('["not", "a", "record"]\n"a bare string"\n123\n'
-                            + json.dumps({"repo": "o/r", "pr": 7, "reviewer": "k",
-                                          "ts": "T", "outcome": "confirmed"}) + "\n")
-        self.assertEqual(list(nr._raw_streams(self.led)), [("o/r", "7", "k")])
+        self._write('["not","a","record"]', '"bare"', "123", "null", self.GOOD)
+        self.assertEqual(list(nr._streams(self.led)), [("o/r", "7", "k")])
 
-    def test_latest_outcomes_is_raw_keyed_and_offers_no_canonical_mode(self):
-        # Folding last-row-wins onto a canonical actor erases the globally
-        # latest possibly-landed outcome; the API must not expose it at all.
-        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
-            {"repo": "o/r", "pr": 7, "reviewer": "beta", "ts": "T1", "outcome": "pending"},
-            {"repo": "o/r", "pr": 7, "reviewer": "alpha", "ts": "T2", "outcome": "failed"},
-            {"repo": "o/r", "pr": 7, "reviewer": "beta", "ts": "T3", "outcome": "unknown"})))
-        got = {k[2]: v for k, v in nr._latest_outcomes(self.led).items()}
-        self.assertEqual(got, {"beta": ("unknown", "T3"), "alpha": ("failed", "T2")})
-        self.assertNotIn("canonical", nr._latest_outcomes.__code__.co_varnames,
-                         "the unsafe mode is still callable")
+    def test_identity_prefers_actor_and_falls_back_to_reviewer(self):
+        self._write(dict(self.GOOD, reviewer="spelling", actor="canon"),
+                    {"repo": "o/r", "pr": 7, "reviewer": "legacy", "ts": "T2",
+                     "outcome": "unknown"})
+        self.assertEqual(sorted(k[2] for k in nr._streams(self.led)),
+                         ["canon", "legacy"])
 
-    def test_both_readers_delegate_to_the_one_owner(self):
-        # The delegation, not the behaviour: a reader that re-implements the
-        # read contract passes every behavioural case and drifts anyway.
-        calls, orig = [], nr._raw_streams
-        nr._raw_streams = lambda led: (calls.append(led), orig(led))[1]
+    def test_an_absent_ledger_is_empty_not_an_error(self):
+        self.assertEqual(nr._streams(pathlib.Path(self.tmp) / "nope.jsonl"), {})
+
+    def test_a_malformed_field_value_never_crashes_a_reader(self):
+        # Every shape below is a valid JSON object with one field of the wrong
+        # type; each used to raise inside a reader or misattribute the stream.
+        for bad in ({"repo": []}, {"actor": ["k"]}, {"actor": []},
+                    {"outcome": ["unknown"]}, {"ts": 17}, {"pr": {}},
+                    {"pr": True}, {"reviewer": None}):
+            self._write(dict(self.GOOD, **bad))
+            self.assertEqual(nr._streams(self.led), {}, f"{bad} was accepted")
+            self.assertEqual(nr._latest_outcomes(self.led), {})
+            self.assertEqual(nr._first_ask(self.led), {})
+
+    def test_a_malformed_row_never_hides_a_later_unsafe_one(self):
+        # The consequence that matters: one bad record must not stop a later
+        # possibly-landed row from being seen, or the park silently clears.
+        self._write({"repo": [], "pr": 7, "reviewer": "k", "ts": "T1"},
+                    {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "T2",
+                     "outcome": "unknown"})
+        self.assertEqual(nr._latest_outcomes(self.led),
+                         {("o/r", "7", "k"): ("unknown", "T2")})
+
+    def test_state_is_bounded_per_stream_not_per_row(self):
+        # The structural bound: 500 rows for one stream must not retain 500
+        # anything — the result is per-stream and of fixed size.
+        self._write(*[dict(self.GOOD, ts=f"T{i:04d}", outcome="pending")
+                      for i in range(500)])
+        st = nr._streams(self.led)[("o/r", "7", "k")]
+        self.assertEqual(st["n"], 500, "the count is kept")
+        self.assertNotIn("rows", st)
+        sizes = [len(v) for v in st.values() if isinstance(v, (list, tuple, dict))]
+        self.assertTrue(all(n <= 2 for n in sizes), f"unbounded state: {st}")
+
+    def test_the_projections_read_first_and_last_of_the_same_stream(self):
+        # Order, without retaining rows: last-wins and earliest-ask must both
+        # come out of one line-by-line fold.
+        self._write(dict(self.GOOD, ts="T1", outcome="confirmed"),
+                    dict(self.GOOD, ts="T2", outcome="pending"),
+                    dict(self.GOOD, ts="T3", outcome="failed"))
+        self.assertEqual(nr._latest_outcomes(self.led),
+                         {("o/r", "7", "k"): ("failed", "T3")})
+        self.assertEqual(nr._first_ask(self.led), {("o/r", "7", "k"): "T1"})
+
+    def test_both_readers_derive_their_output_from_the_one_owner(self):
+        # A mutant called `_streams`, discarded it, re-read the file and stayed
+        # green. Feed a sentinel the file cannot produce, from a missing path.
+        sentinel = {("S/S", "99", "sent"): {"last": ("unknown", "TZ"),
+                                            "first_ask": "TA", "n": 1}}
+        missing = pathlib.Path(self.tmp) / "does-not-exist.jsonl"
+        orig = nr._streams
+        nr._streams = lambda led: sentinel
         try:
-            nr._latest_outcomes(self.led)
-            nr._first_ask(self.led)
+            self.assertEqual(nr._latest_outcomes(missing),
+                             {("S/S", "99", "sent"): ("unknown", "TZ")})
+            self.assertEqual(nr._first_ask(missing), {("S/S", "99", "sent"): "TA"})
         finally:
-            nr._raw_streams = orig
-        self.assertEqual(len(calls), 2, "a reader read the ledger on its own")
+            nr._streams = orig
 
 
 if __name__ == "__main__":
