@@ -32,6 +32,7 @@ import os
 import datetime
 import re
 import subprocess
+import threading
 import sys
 from pathlib import Path
 
@@ -410,13 +411,15 @@ def _rewrite(led: Path, streams: dict) -> int:
                                     "actor": who, "ts": ts, "channel": "room",
                                     "outcome": outcome}))
     tmp = led.with_suffix(led.suffix + ".compact")
-    mode = led.stat().st_mode & 0o777 if led.exists() else None
-    with open(tmp, "w") as fh:
+    mode = led.stat().st_mode & 0o777 if led.exists() else _LEDGER_MODE
+    # Opened at its final private mode: writing under umask and chmod-ing after
+    # leaves the payload readable for the whole write-and-fsync window.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as fh:
         fh.write("".join(r + "\n" for r in rows))
         fh.flush()
         os.fsync(fh.fileno())
-    if mode is not None:
-        os.chmod(tmp, mode)             # a new inode takes the umask, widening it
+    os.chmod(tmp, mode)                 # umask can still have narrowed the open
     os.replace(tmp, led)                # atomic: a reader sees one file or the other
     return len(rows)
 
@@ -504,27 +507,35 @@ def unknown_parked(message: str, reviewer: str, actor: str = None,
     return False
 
 
-#: flock is per-fd, so a nested take on a second fd deadlocks. Re-entrant by
-#: depth: claim_park holds it and calls the same public writer everyone uses.
-_LOCK_DEPTH = []
+#: The ledger holds who was asked about what; it is user state, not world
+#: readable. A fresh file under umask 022 would be 0644.
+_LEDGER_MODE = 0o600
+
+#: flock is per-fd, so a nested take deadlocks. Re-entrant PER THREAD AND PER
+#: LEDGER: a process-global counter let another thread skip flock entirely.
+_LOCK_STATE = threading.local()
 
 
 @contextlib.contextmanager
 def _ledger_lock(led: Path):
     """The ledger's ONE mutual-exclusion point. Every writer takes it, so an
     append can never land inside a compactor's snapshot-then-replace window."""
-    if _LOCK_DEPTH:
-        yield
+    held = getattr(_LOCK_STATE, "held", None)
+    if held is None:
+        held = _LOCK_STATE.held = set()
+    key = str(led.resolve() if led.exists() else led)
+    if key in held:
+        yield                           # this thread already holds THIS ledger
         return
     led.parent.mkdir(parents=True, exist_ok=True)
     lock = led.with_suffix(led.suffix + ".lock")
     with open(lock, "a") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        _LOCK_DEPTH.append(1)
+        held.add(key)
         try:
             yield
         finally:
-            _LOCK_DEPTH.pop()
+            held.discard(key)
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
@@ -539,7 +550,8 @@ def claim_park(message: str, reviewer: str, actor: str = None,
     who = actor or reviewer
     led = ledger_path()
     led.parent.mkdir(parents=True, exist_ok=True)
-    led.touch(exist_ok=True)
+    if not led.exists():
+        os.close(os.open(led, os.O_CREAT | os.O_WRONLY, _LEDGER_MODE))
     with _ledger_lock(led):
         if unknown_parked(message, reviewer, who, canonical=canonical):
             return None
@@ -568,9 +580,9 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
     refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
     if not refs:
         return 0
-    if outcome not in _KNOWN_OUTCOMES:
-        # The writer holds the reader's schema: an unwritable outcome must fail
-        # here, not be appended and silently ignored on the next read.
+    if not isinstance(outcome, str) or outcome not in _KNOWN_OUTCOMES:
+        # Type first: a list is unhashable and raised instead of validating.
+        # The writer holds the reader's schema, so an unwritable outcome fails.
         raise ValueError(f"outcome {outcome!r} is not one of {sorted(_KNOWN_OUTCOMES)}")
     ts = datetime.datetime.now(datetime.timezone.utc).strftime(_TS_FMT)
     p = ledger_path()
@@ -583,10 +595,17 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
             row["actor"] = actor
         if detail:
             row["detail"] = detail
+        # The COMPLETE row, through the reader's own validator: appending one
+        # the reader drops is a silent write, and a list outcome raised instead.
+        if _row(row) is None:
+            raise ValueError(f"refusing to append a row the reader rejects: {row!r}")
         payload += json.dumps(row) + "\n"
     # One write under O_APPEND: a reader never sees half a batch, and two
     # writers never interleave rows within one.
-    with open(p, "a") as fh:
+    # Created private: a fresh ledger under umask 022 is 0644, and this file
+    # records who was asked about what.
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _LEDGER_MODE)
+    with os.fdopen(fd, "a") as fh:
         fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
@@ -730,10 +749,19 @@ def main() -> int:
     # "At least TWO" means two PEOPLE, not two roster rows: `--reviewers d,d`
     # and two same_actor_as aliases share one endpoint and ping one Stand twice.
     _actors = _actor_map(roster)
-    targets = list({(_actors.get(t["name"], t["name"]),
-                     t.get("channel") or t.get("room"),
-                     t.get("discord_id") or t.get("stand")): t
-                    for t in targets}.values())
+    # EITHER axis is one person: a composite key collapses only when BOTH
+    # match, which is the easy case and not the one that pings a Stand twice.
+    _seen_actor, _seen_endpoint, _deduped = set(), set(), []
+    for t in targets:
+        actor = _actors.get(t["name"], t["name"])
+        endpoint = (t.get("channel") or t.get("room"),
+                    t.get("discord_id") or t.get("stand"))
+        if actor in _seen_actor or endpoint in _seen_endpoint:
+            continue
+        _seen_actor.add(actor)
+        _seen_endpoint.add(endpoint)
+        _deduped.append(t)
+    targets = _deduped
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
     # one person; plan mode is exempt because only a real ASK can strand a PR.
     if a.send and len(targets) < 2 and not a.allow_single:

@@ -1071,6 +1071,21 @@ class TheTwoReviewerGateCountsPeopleNotRows(unittest.TestCase):
         self.assertIn("at least TWO", err)
         self.assertEqual(sends, 0, "two spellings of one person passed the gate")
 
+    def test_one_axis_colliding_is_enough_to_be_one_person(self):
+        # A composite (actor, endpoint) key collapses only when BOTH match,
+        # which is the easy case; either axis alone is still one person.
+        same_actor = {"d": self.D,
+                      "e": {"discord_id": "999", "home_channel": "888",
+                            "same_actor_as": "d"}}
+        rc, sends, err = self._run_main(same_actor, "d,e")
+        self.assertIn("at least TWO", err)
+        self.assertEqual(sends, 0, "same actor, different endpoints, passed the gate")
+
+        same_endpoint = {"d": self.D, "g": dict(self.D)}
+        rc, sends, err = self._run_main(same_endpoint, "d,g")
+        self.assertIn("at least TWO", err)
+        self.assertEqual(sends, 0, "different actors, same endpoint, passed the gate")
+
     def test_two_real_people_still_pass(self):
         # The negative control: dedup must not refuse a legitimate pair.
         roster = {"d": self.D, "f": {"discord_id": "999", "home_channel": "222"}}

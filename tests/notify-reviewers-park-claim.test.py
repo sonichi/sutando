@@ -260,6 +260,55 @@ class CompactionIsIndistinguishableFromTheFullHistory(unittest.TestCase):
         self.nr.compact(self.led)
         self.assertEqual(_stat.S_IMODE(self.led.stat().st_mode), 0o600)
 
+    def test_a_second_thread_cannot_bypass_the_ledger_lock(self):
+        # The depth counter was process-global, so while one thread held the
+        # lock another read it as held and skipped flock entirely.
+        import threading
+        import time as _t
+        self.led.touch()
+        order = []
+
+        def holder():
+            with self.nr._ledger_lock(self.led):
+                order.append("holder-in")
+                _t.sleep(0.4)
+                order.append("holder-out")
+
+        def other():
+            _t.sleep(0.1)
+            with self.nr._ledger_lock(self.led):
+                order.append("other-in")
+
+        ts = [threading.Thread(target=holder), threading.Thread(target=other)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(order, ["holder-in", "holder-out", "other-in"],
+                         f"a second thread bypassed the lock: {order}")
+
+    def test_the_writer_refuses_a_row_its_own_reader_would_drop(self):
+        msg = "see https://github.com/o/r/pull/7"
+        for label, kw in (("reviewer", {"reviewer": []}),
+                          ("actor", {"actor": ["A"]}),
+                          ("outcome", {"outcome": ["unknown"]})):
+            with self.assertRaises(ValueError, msg=f"{label} was accepted"):
+                self.nr.record_asks(msg, kw.get("reviewer", "A"),
+                                    outcome=kw.get("outcome", "confirmed"),
+                                    actor=kw.get("actor"))
+
+    def test_a_fresh_ledger_is_created_private(self):
+        # Under umask 022 a new file is 0644, and this one records who was
+        # asked about what.
+        import stat as _stat
+        fresh = pathlib.Path(self.tmp) / "fresh.jsonl"
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(fresh)
+        self.nr.record_asks("see https://github.com/o/r/pull/7", "A",
+                            outcome="confirmed", actor="A")
+        self.assertEqual(_stat.S_IMODE(fresh.stat().st_mode), 0o600)
+        self.nr.compact(fresh)
+        self.assertEqual(_stat.S_IMODE(fresh.stat().st_mode), 0o600)
+
     def test_the_writer_refuses_an_outcome_the_reader_would_ignore(self):
         # Appending a row no reader accepts is a silent write; the writer holds
         # the same closed set the reader reads.
