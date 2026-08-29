@@ -217,6 +217,32 @@ def ledger_path() -> Path:
     return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
 
 
+def unknown_parked(message: str, reviewer: str) -> bool:
+    """True when this reviewer already has an UNKNOWN row for this PR.
+
+    The receipt is UNSAFE to retry, so the park is immediate and per-target —
+    an age window would still permit the duplicate it exists to prevent.
+    """
+    refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
+    led = ledger_path()
+    if not refs or not led.exists():
+        return False
+    try:
+        for line in led.read_text().splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("outcome") != "unknown" or d.get("reviewer") != reviewer:
+                continue
+            if any(d.get("repo") in (r, None) and str(d.get("pr")) == str(n)
+                   for r, n in refs):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def record_asks(message: str, reviewer: str, outcome: str = "confirmed") -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
@@ -395,7 +421,28 @@ def main() -> int:
             if not a.send:
                 print("PLAN:", " ".join(argv))
                 continue
-            p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+            if unknown_parked(a.message, t["name"]):
+                print(f"{t['name']}: PARKED — a previous send to them had an "
+                      "UNKNOWN outcome and is UNSAFE to retry; check the channel",
+                      file=sys.stderr)
+                unknowns += 1
+                continue
+            try:
+                p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                # A timeout is not a failure: the post may have landed, so it is
+                # recorded UNKNOWN and the batch continues to the next reviewer.
+                print(f"{t['name']}: UNKNOWN outcome ({type(e).__name__}) — the post "
+                      "may have landed; not retrying", file=sys.stderr)
+                unknowns += 1
+                try:
+                    if not record_asks(a.message, t["name"], outcome="unknown"):
+                        print(f"  WARNING: {t['name']}'s unknown was NOT recorded "
+                              "(no resolvable PR reference in the message)",
+                              file=sys.stderr)
+                except OSError as err:
+                    print(f"  WARNING: ledger write failed ({err})", file=sys.stderr)
+                continue
             if p.returncode == 0:
                 print(f"{t['name']}: SENT to channel {t['channel']}")
                 # Same bookkeeping as the Matrix path: without it a delivered
@@ -416,7 +463,12 @@ def main() -> int:
                 # UNSAFE to retry, so this is PARKED durably rather than failed.
                 unknowns += 1
                 try:
-                    record_asks(a.message, t["name"], outcome="unknown")
+                    # Claim recorded only when a row was written: a message with
+                    # no resolvable PR ref logs nothing and must not say it did.
+                    if not record_asks(a.message, t["name"], outcome="unknown"):
+                        print(f"  WARNING: {t['name']}'s unknown was NOT recorded "
+                              "(no resolvable PR reference) — a repeat may "
+                              "duplicate the ping", file=sys.stderr)
                 except OSError as e:
                     print(f"  WARNING: {t['name']} unknown-outcome send was NOT "
                           f"recorded ({e}) — a repeat may duplicate the ping",
@@ -532,12 +584,12 @@ def main() -> int:
         print(f"{unknowns} send(s) had an UNKNOWN outcome and are recorded as such — "
               "they may have landed; do not re-send without checking the channel",
               file=sys.stderr)
-    if failures or unlogged:
-        return 1
-    # An unknown is not a failure and not a success: distinct so a caller cannot
-    # read it as either, and so a retry loop cannot treat it as "send again".
+    # Unknown outranks a definite failure in a mixed batch: a failure is safe to
+    # retry and an unknown is not, so collapsing to 1 invites the duplicate.
     if unknowns:
         return 4
+    if failures or unlogged:
+        return 1
     return refusal_rc
 
 

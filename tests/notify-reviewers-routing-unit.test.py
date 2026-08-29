@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import sys
+import shutil
 import tempfile
 import unittest
 
@@ -453,6 +454,58 @@ class UnknownOutcomeIsParkedNotFailed(unittest.TestCase):
         rc, _, rows = self._run(3)
         self.assertEqual(rc, 1)
         self.assertEqual(rows, [])
+
+
+
+class UnknownIsParkedPerTargetImmediately(unittest.TestCase):
+    """An UNSAFE receipt must block the retry now, not after an age window."""
+
+    MSG = "re-review https://github.com/sonichi/sutando/pull/3509"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="park-")
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+        self._orig = nr.ledger_path
+        nr.ledger_path = lambda: self.led
+
+    def tearDown(self):
+        nr.ledger_path = self._orig
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_an_unknown_row_parks_that_target(self):
+        nr.record_asks(self.MSG, "keweichen", outcome="unknown")
+        self.assertTrue(nr.unknown_parked(self.MSG, "keweichen"))
+
+    def test_it_does_not_park_a_different_target(self):
+        # Without this the park would silence the whole batch, which is the
+        # opposite failure and just as expensive.
+        nr.record_asks(self.MSG, "keweichen", outcome="unknown")
+        self.assertFalse(nr.unknown_parked(self.MSG, "qingyun-wu"))
+
+    def test_a_confirmed_row_does_not_park(self):
+        nr.record_asks(self.MSG, "keweichen", outcome="confirmed")
+        self.assertFalse(nr.unknown_parked(self.MSG, "keweichen"))
+
+    def test_it_does_not_park_a_different_pr(self):
+        nr.record_asks(self.MSG, "keweichen", outcome="unknown")
+        other = "re-review https://github.com/sonichi/sutando/pull/3499"
+        self.assertFalse(nr.unknown_parked(other, "keweichen"))
+
+    def test_a_short_reference_records_nothing_and_says_so(self):
+        # record_asks matches full URLs only, so this writes no row; the caller
+        # must report that rather than claim the unknown was parked.
+        self.assertEqual(0, nr.record_asks("re-review #3303", "keweichen",
+                                           outcome="unknown"))
+        self.assertFalse(self.led.exists() and self.led.read_text().strip())
+
+
+class UnknownOutranksFailureInAMixedBatch(unittest.TestCase):
+    def test_the_unknown_check_precedes_the_failure_check(self):
+        # A failure is safe to retry and an unknown is not, so collapsing a
+        # mixed batch to rc 1 invites exactly the duplicate the park prevents.
+        src = pathlib.Path(nr.__file__).read_text()
+        self.assertLess(src.index("    if unknowns:\n        return 4"),
+                        src.index("    if failures or unlogged:\n        return 1"))
 
 
 if __name__ == "__main__":
