@@ -16,6 +16,7 @@ Run: python3 tests/roster-identity-migration.test.py
 """
 import importlib.util
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -458,6 +459,76 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         self.assertEqual(sorted(k for k in doc if k != "_schema"), ["rui"])
         self.assertEqual(doc["rui"]["human_discord_id"], HUMAN)
         self.assertEqual(doc["rui"]["stand_discord_id"], "1504316176686120980")
+
+    def test_a_hardlinked_destination_is_refused_and_the_input_survives(self):
+        # A hardlink resolves to a different NAME and the same inode, so a
+        # pathname check alone overwrites v1 and destroys the rollback.
+        src = self._roster({"x": {}})
+        link = Path(self.tmp) / "hard.json"
+        os.link(src, link)
+        rc = self._main("--roster", str(src), "--out", str(link))[0]
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(src.read_text()), {"x": {}})
+
+    def test_a_typed_ancestor_states_the_referent_at_any_depth(self):
+        SID = "1504316176686120980"
+        for doc, label in (({"y": {"stand_status": {"id": SID}}}, "direct"),
+                           ({"y": {"wrapper": {"stand_status": {"id": SID}}}}, "nested")):
+            src = self._roster(doc)
+            out = Path(self.tmp) / f"v2-{label}.json"
+            self._main("--roster", str(src), "--out", str(out))
+            self.assertEqual(json.loads(out.read_text())["y"]["stand_discord_id"], SID,
+                             f"{label} nesting changed the classification")
+
+    def test_container_shaped_opposing_evidence_attaches_to_the_id(self):
+        # str(container) attached the disagreement to a repr no reader matches,
+        # so the id it opposed kept its slot.
+        SID = "1504316176686120980"
+        src = self._roster({"x": {"stand_discord_id": SID}})
+        cfg = Path(self.tmp) / "cc2.json"
+        cfg.write_text(json.dumps({"people": {"x": {"discord": [SID]}}}))
+        out = Path(self.tmp) / "v2c.json"
+        rc = self._main("--roster", str(src), "--out", str(out), "--triage-config", str(cfg))[0]
+        rec = json.loads(out.read_text())["x"]
+        self.assertEqual(rc, 5)
+        self.assertIsNone(rec["stand_discord_id"])
+        self.assertEqual([u["id"] for u in rec["unresolved_discord_ids"]], [SID])
+
+    def test_a_case_only_local_key_collision_is_still_a_collision(self):
+        src = self._roster({"Rui": {"github": "john-the-dev",
+                                    "stand_discord_id": "1504316176686120980"}})
+        cfg = Path(self.tmp) / "cc3.json"
+        cfg.write_text(json.dumps({"people": {"rui": {"discord": HUMAN}}}))
+        out = Path(self.tmp) / "v2r.json"
+        rc = self._main("--roster", str(src), "--out", str(out), "--triage-config", str(cfg))[0]
+        rec = json.loads(out.read_text())["Rui"]
+        self.assertEqual(rc, 5, "a case-only collision was published as success")
+        self.assertIn(HUMAN, [u["id"] for u in rec["unresolved_discord_ids"]])
+
+    def test_conflicting_case_variant_triage_keys_are_refused(self):
+        src = self._roster({"rui": {"github": "John-The-Dev"}})
+        cfg = Path(self.tmp) / "cc4.json"
+        cfg.write_text(json.dumps({"people": {"John-The-Dev": {"discord": HUMAN},
+                                              "john-the-dev": {"discord": "1504316176686120980"}}}))
+        out = Path(self.tmp) / "v2d.json"
+        rc, _ = self._main("--roster", str(src), "--out", str(out), "--triage-config", str(cfg))
+        self.assertEqual(rc, 2, "one of two conflicting spellings disappeared silently")
+
+    def test_the_audit_row_reads_the_matched_triage_source(self):
+        # Reading triage_people[key] on an aliased row printed "triage human = -"
+        # while filling after_human from the same record.
+        src = self._roster({"rui": {"github": "john-the-dev"}})
+        cfg = Path(self.tmp) / "cc5.json"
+        cfg.write_text(json.dumps({"people": {"john-the-dev": {"discord": HUMAN}}}))
+        out = Path(self.tmp) / "v2t.json"
+        _rc, stdout = self._main("--roster", str(src), "--out", str(out),
+                                 "--triage-config", str(cfg), "--table")
+        # The BEFORE column specifically: asserting the id appears anywhere
+        # passes on after_human too, which is filled either way.
+        row = next(l for l in stdout.splitlines() if l.startswith("rui"))
+        before = row.split()[1:3]
+        self.assertIn(HUMAN, before,
+                      f"the 'triage human' column lost the matched source: {row!r}")
 
     def test_a_coverage_gap_is_reported_rather_than_read_as_success(self):
         # rc 5 says the file WAS written and somebody in it is unaddressable.

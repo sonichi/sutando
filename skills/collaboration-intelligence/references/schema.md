@@ -285,7 +285,7 @@ case-insensitively wherever they are joined.
 {
   "_schema": {"name": "reviewer-identity", "version": 2, "generated_at": "...",
               "migrated_from": "...", "contract": "..."},
-  "<github-login>": {
+  "<roster-local-key>": {
     "human_discord_id": "<the PERSON's id>  | null",
     "stand_discord_id": "<the AGENT's id>   | null",
     "other_stand_discord_ids": [{"id": "...", "basis": ["..."]}],

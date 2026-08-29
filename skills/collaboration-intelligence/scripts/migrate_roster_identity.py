@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -74,13 +75,26 @@ def _cited_in(entry: dict, id_: str) -> list:
 
 def _verdict_from_field(field: str):
     """A field name states the referent, or it states nothing."""
-    tail = field.split(".")[-1].lower()
-    whole = field.lower()
+    segs = [x.lower() for x in str(field).split(".")]
+    whole = str(field).lower()
     if "human" in whole:
         return HUMAN, f"cited in `{field}` (field names the human)"
-    if tail.startswith("stand") or whole.startswith("stand") or "agent" in whole:
+    # ANY segment, not the tail or the head: nesting must not change what a
+    # typed field states, or `wrapper.stand_status.id` classifies as nothing.
+    if any(x.startswith("stand") for x in segs) or "agent" in whole:
         return STAND, f"cited in `{field}` (field names the agent)"
     return None, None
+
+
+def _bad(entries: list, value, states, reason: str) -> None:
+    """Record a malformed observation against every canonical id it names.
+
+    `str(container)` attaches the disagreement to a repr no reader can match,
+    so the id it actually opposes keeps its slot.
+    """
+    found = _snowflakes(json.dumps(value, default=str))
+    for sf in found or [str(value)]:
+        entries.append({"id": sf, "states": states, "reason": reason})
 
 
 def _typed_path(path: list) -> bool:
@@ -132,15 +146,14 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     # A declared login is the SOLE join key, matched case-insensitively: the
     # local-key fallback crosses axes, and case-sensitivity splits one person.
     join = entry.get("github") or key
-    tp, src = {}, f"people.{join}"
-    for cand, val in (triage_people or {}).items():
-        if str(cand).casefold() == str(join).casefold():
-            tp, src = val or {}, f"people.{cand}"
-            break
-    if join != key and key in triage_people:
+    hit = (triage_people or {}).get(str(join).casefold())
+    tp, src = (hit[1] or {}, f"people.{hit[0]}") if hit else ({}, f"people.{join}")
+    if str(join).casefold() != str(key).casefold() and \
+            str(key).casefold() in (triage_people or {}):
         # Two axes collide on one spelling. Dropping the local-key row loses a
         # real identity silently; reject it here so the evidence survives.
-        for sf in _snowflakes(json.dumps(triage_people.get(key) or {})):
+        _hit = (triage_people or {}).get(str(key).casefold())
+        for sf in _snowflakes(json.dumps((_hit[1] if _hit else {}) or {})):
             bad.append({"id": sf, "states": None, "collision": True, "reason":
                         f"pr-triage `people.{key}` collides with roster key "
                         f"`{key}`, whose declared github is `{join}` — the two "
@@ -148,8 +161,8 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     # A typed field states the referent but not that the VALUE is an id. An
     # unvalidated one publishes junk into the slot the schema exists to protect.
     if not _is_snowflake(tp.get("discord")) and tp.get("discord"):
-        bad.append({"id": str(tp["discord"]), "states": HUMAN, "reason":
-                    f"pr-triage `{src}.discord` is not a snowflake"})
+        _bad(bad, tp["discord"], HUMAN,
+             f"pr-triage `{src}.discord` is not a snowflake")
     if _is_snowflake(tp.get("discord")):
         claim(str(tp["discord"]), HUMAN,
               f"pr-triage config `{src}.discord`")
@@ -157,16 +170,15 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     if bots is not None and not isinstance(bots, (list, tuple)):
         # A dict iterates its KEYS, a string its characters. Require the shape
         # the schema documents rather than anything that happens to iterate.
-        bad.append({"id": str(bots), "states": STAND, "reason":
-                    f"pr-triage `{src}.bots` is not a list"})
+        _bad(bad, bots, STAND, f"pr-triage `{src}.bots` is not a list")
         bots = []
     bots = bots or []
     for bot in bots:
         if _is_snowflake(str(bot)):
             claim(str(bot), STAND, f"pr-triage config `{src}.bots[]`")
         else:
-            bad.append({"id": str(bot), "states": STAND, "reason":
-                        f"pr-triage `{src}.bots[]` entry is not a snowflake"})
+            _bad(bad, bot, STAND,
+                 f"pr-triage `{src}.bots[]` entry is not a snowflake")
 
     for id_ in list(claims):
         if id_ in peer_ids:
@@ -237,9 +249,32 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     return human_id, stand_id, others, unresolved, basis
 
 
+def _canonical_triage(triage_people: dict):
+    """casefold -> (original key, value), plus the conflicting duplicates.
+
+    GitHub logins are case-insensitive, so two spellings are one person; leaving
+    both makes the second silently disappear behind the first.
+    """
+    canon, dupes = {}, []
+    for k, v in (triage_people or {}).items():
+        ck = str(k).casefold()
+        if ck in canon and canon[ck][1] != v:
+            dupes.append((canon[ck][0], k))
+            continue
+        canon.setdefault(ck, (k, v))
+    return canon, dupes
+
+
 def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             source_name: str):
     out, rows = {}, []
+    canon, dupes = _canonical_triage(triage_people)
+    if dupes:
+        # Two spellings of one login carrying DIFFERENT records: nothing here
+        # can choose between them, and picking one loses the other silently.
+        raise ValueError(
+            "pr-triage `people` has conflicting case-variant keys: "
+            + "; ".join(f"{a!r} vs {b!r}" for a, b in dupes))
     out[ri.SCHEMA_KEY] = {
         "name": ri.SCHEMA_NAME,
         "version": ri.SCHEMA_VERSION,
@@ -255,8 +290,8 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
     aliased = {str(e.get("github") or k).casefold() for k, e in doc.items()
                if ri.is_person_key(k) and isinstance(e, dict)}
     known = {str(k).casefold() for k in doc}
-    extra = {k: {} for k in triage_people
-             if str(k).casefold() not in known | aliased}
+    extra = {orig: {} for ck, (orig, _v) in canon.items()
+             if ck not in known | aliased}
     for key, entry in list(doc.items()) + sorted(extra.items()):
         if key == ri.SCHEMA_KEY:
             continue                            # the destination schema is reserved
@@ -264,7 +299,7 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             out[key] = entry
             continue
         human, stand, others, unresolved, basis = classify(
-            key, entry, triage_people, peer_ids, owner_id)
+            key, entry, canon, peer_ids, owner_id)
         new = dict(entry)                       # every provenance field survives
         new[ri.HUMAN_FIELD] = human
         new[ri.STAND_FIELD] = stand
@@ -275,11 +310,14 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         new[ri.UNRESOLVED_FIELD] = unresolved
         new[ri.BASIS_FIELD] = basis
         out[key] = new
+        # The MATCHED source, not the local key: reading triage_people[key] on
+        # an aliased row printed "triage human = -" while filling after_human.
+        _src = canon.get(str(entry.get("github") or key).casefold(), (None, {}))[1]
         rows.append({
             "key": key,
             "before_discord_id": entry.get("discord_id"),
-            "before_triage_human": (triage_people.get(key) or {}).get("discord"),
-            "before_triage_bots": (triage_people.get(key) or {}).get("bots") or [],
+            "before_triage_human": (_src or {}).get("discord"),
+            "before_triage_bots": (_src or {}).get("bots") or [],
             "after_human": human,
             "after_stand": stand,
             "after_other_stands": [o["id"] for o in others],
@@ -337,12 +375,21 @@ def main() -> int:
     peer_ids = {str(v): k for k, v in peer_raw.items()}
     owner_id = str((_source("--discord-config", a.discord_config) or {}).get("owner") or "")
 
-    out, rows = migrate(doc, triage_people, peer_ids, owner_id, a.roster.name)
+    try:
+        out, rows = migrate(doc, triage_people, peer_ids, owner_id, a.roster.name)
+    except ValueError as exc:
+        print(f"refusing to migrate: {exc}", file=sys.stderr)
+        return 2
     dest = a.out or a.roster.with_suffix(".v2.json")
-    if dest.resolve() == a.roster.resolve():
+    if dest.resolve() == a.roster.resolve() or (
+            dest.exists() and dest.samefile(a.roster)):
+        # samefile too: a hardlink has a different resolved NAME and the same
+        # inode, so a name check alone destroys the v1 rollback.
         print("refusing to overwrite the input roster", file=sys.stderr)
         return 2
-    dest.write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp.write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
+    os.replace(tmp, dest)
     if a.table:
         print_table(rows)
     print(f"\nwrote {dest} ({len(rows)} people); input untouched", file=sys.stderr)
