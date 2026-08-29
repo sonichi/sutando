@@ -58,10 +58,15 @@ from util_paths import _host_label, channel_access_path, claude_home_path, claud
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
+import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from gateway_serving import (  # noqa: E402
+    read_verdict as read_gateway_verdict,
+    safe_num as _gateway_num,
+)
 from task_archive import find_task_file  # noqa: E402
-
+from sutando_config import config_get  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
 # resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
@@ -95,17 +100,8 @@ def _default_memory_dir() -> str:
     slug = claude_project_slug(repo)
     return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
-# SUTANDO_MEMORY_DIR stays authoritative here, same as everywhere else that
-# resolves core memory (src/voice-agent.ts, src/voice-context.ts, and
-# CLAUDE.md/AGENTS.md all honor it). An earlier version of this fix made
-# ONLY this check ignore the override, on the theory that it was purely a
-# stale pre-#1454 workaround (see _default_memory_dir()'s docstring) — but
-# that broke the invariant that this check reports on the SAME directory the
-# rest of the runtime actually reads/writes, which is a worse failure mode
-# than the one being fixed (a health check silently diverging from ground
-# truth). If SUTANDO_MEMORY_DIR is a genuine leftover from that era, the
-# memory-dir-override check below flags the divergence instead of silently
-# redirecting.
+# SUTANDO_MEMORY_DIR is read via os.environ, not config_get: this check must
+# report on the same directory the runtime reads, so it opts out of #1724.
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))
 
 # How much of MEMORY.md a session actually loads. These are the RUNTIME's
@@ -5632,6 +5628,31 @@ def check_gateway_bridge() -> "dict | None":
                 "messages may not be delivered"
             ),
         }
+    if _gateway_status_ts_malformed():
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": ("process running but its status sidecar carries an unusable "
+                       "timestamp — the writer is not reporting poll outcomes, so "
+                       "ag2.space mobile messages may not be delivered"),
+        }
+    # Primary said nothing and is not merely stale, so it may not exist at all.
+    # Ask the lanes before calling a live PID healthy — one of them owns it.
+    lanes = _gateway_lane_verdicts()
+    if lanes and not any(serving for _, serving, _ in lanes):
+        never = [ln for ln, _, ever in lanes if not ever]
+        why = (f"lane {', '.join(never)} has never completed a poll" if never
+               else f"lane {', '.join(ln for ln, _, _ in lanes)} is not connected")
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": (f"process running but NOT serving — {why}; "
+                       "ag2.space mobile messages are not being delivered"),
+        }
+    if lanes:
+        served = ", ".join(ln for ln, serving, _ in lanes if serving)
+        return {"name": "gateway-bridge", "status": "ok",
+                "detail": f"running + connected (lane {served})"}
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
@@ -5652,9 +5673,12 @@ def _gateway_last_ok_age_h(path: "Path | None" = None,
         last = json.loads(Path(p).read_text()).get("last_ok_ts")
     except (OSError, ValueError, AttributeError, TypeError):
         return None
-    if not isinstance(last, (int, float)) or isinstance(last, bool):
+    # Same numeric policy as the shared verdict owner: a huge int raises on
+    # float(), and NaN/inf would collapse to 0.0 here — "just polled".
+    last = _gateway_num(last, nonneg=True)
+    if last is None:
         return None
-    return max(0.0, (now - float(last)) / 3600.0)
+    return max(0.0, (now - last) / 3600.0)
 
 
 def check_runtime_identity(path: "Path | None" = None,
@@ -5768,6 +5792,38 @@ def check_runtime_identity(path: "Path | None" = None,
             "detail": ("entrypoint=canonical " + " ".join(bits))}
 
 
+def _gateway_lane_verdicts(state_dir: "Path | None" = None,
+                           now: "float | None" = None) -> "list[tuple[str, bool, bool]]":
+    """(lane, serving, ever_served) for each fresh non-primary lane sidecar.
+
+    The PID proving "running" can belong to a lane other than primary — the lane
+    selector runs exactly one lane and parks the rest — so on a lane-only host
+    primary never writes a sidecar and its absence is not evidence of health.
+    Freshness, schema and the serving rule stay owned by gateway_serving; this
+    enumerates lanes and asks it per file. `ever_served` is read off the
+    normalized record rather than reusing GatewayVerdict.never_polled, which
+    additionally requires `connected` — a lane that is both disconnected and has
+    no successful poll is the misconfigured-endpoint case this message names, and
+    never_polled reports False for it.
+    """
+    import time as _time
+    now = _time.time() if now is None else now
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    out = []
+    try:
+        entries = sorted(root.glob("gateway-status.*.json"))
+    except OSError:
+        return out
+    for f in entries:
+        lane = f.name[len("gateway-status."):-len(".json")]
+        v = read_gateway_verdict(f, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
+        if v is None:
+            continue
+        out.append((lane, v.serving, v.last_ok_ts is not None))
+    return out
+
+
 def _gateway_status_stale_age_s(path: "Path | None" = None,
                                 now: "float | None" = None) -> "float | None":
     """Age of the sidecar's `ts` when it is present, usable, and PAST the
@@ -5783,10 +5839,26 @@ def _gateway_status_stale_age_s(path: "Path | None" = None,
         ts = json.loads(Path(p).read_text()).get("ts")
     except (OSError, ValueError, AttributeError, TypeError):
         return None
-    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+    # nonneg matches the shared verdict owner: one field, one admissibility rule.
+    ts = _gateway_num(ts, nonneg=True)
+    if ts is None:
         return None
     age = now - ts
     return age if age > GATEWAY_STATUS_MAX_AGE_S else None
+
+
+def _gateway_status_ts_malformed(path: "Path | None" = None) -> bool:
+    """Whether the sidecar carries a `ts` the shared rule rejects.
+
+    Separate from the age helper because its caller reads None as healthy: a
+    writer emitting garbage is an outage, and has no age to report.
+    """
+    p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
+    try:
+        raw = json.loads(Path(p).read_text()).get("ts")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+    return raw is not None and _gateway_num(raw, nonneg=True) is None
 
 
 def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> "bool | None":
@@ -5794,18 +5866,13 @@ def _gateway_serving(path: "Path | None" = None, now: "float | None" = None) -> 
 
     True/False when the sidecar is present and fresh; None (no opinion) when it
     is absent, unreadable, malformed, or older than GATEWAY_STATUS_MAX_AGE_S.
-    Mirrors core-input-watch._gateway_status() (#2253)."""
+    The sidecar verdict itself is owned by gateway_serving; only the freshness
+    window is this reader's."""
     import time as _time
     p = path or (status_read_path("gateway-status.json", WORKSPACE_DIR))
     now = _time.time() if now is None else now
-    try:
-        data = json.loads(Path(p).read_text())
-        ts = data.get("ts")
-        if not isinstance(ts, (int, float)) or (now - ts) > GATEWAY_STATUS_MAX_AGE_S:
-            return None
-        return bool(data.get("connected"))
-    except (OSError, ValueError, AttributeError, TypeError):
-        return None
+    v = read_gateway_verdict(p, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
+    return None if v is None else v.serving
 
 
 # Free-space thresholds. A full volume is not a slow degradation — it is a hard
@@ -5890,11 +5957,38 @@ def _daily_artifact_minutes(results: Path, stem: str, limit: int = 7) -> list:
     # rglob, not glob: delivered results are archived into MONTH buckets
     # (results/archive/YYYY-MM/), so the durable copies sit two levels down.
     for f in results.rglob(f"{stem}-20*"):
-        m = re.match(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})", f.name)
+        # Both date spellings are in live use and the compact one dominates;
+        # matching only YYYY-MM-DD discards the majority of real artifacts.
+        m = re.match(rf"{re.escape(stem)}-(\d{{4}})-?(\d{{2}})-?(\d{{2}})", f.name)
         if not m:
             continue
         lt = datetime.fromtimestamp(f.stat().st_mtime)
-        out.append((m.group(1), lt.hour * 60 + lt.minute))
+        out.append(("-".join(m.groups()), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-finished) from `results/task-cron-<job>-<epoch>.txt`.
+
+    The one completion record needing no per-job config: every job emitted by
+    `cron-runner.py` leaves one. Session crons registered via CronCreate do not
+    pass through that writer, so this lane does not observe them.
+    """
+    from datetime import datetime
+    out = []
+    if not results.is_dir():
+        return out
+    # The epoch in the NAME is emit time; mtime is the finish, as for sentinels.
+
+    # The writer slugifies the job name, so match its contract rather than the
+    # raw name; a raw name in the glob would also inject path/wildcard chars.
+    anchored = cron_task_id.record_matcher(job)
+    for f in results.rglob(cron_task_id.DISCOVERY_GLOB):
+        if not f.is_file() or not anchored.match(f.name):
+            continue
+        lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
 
@@ -5979,14 +6073,22 @@ def check_daily_cron_punctuality() -> dict:
         declared = str(e.get("artifact") or "").strip()
         stem = declared or (jname.split("-")[-1] if "-" in jname else jname)
         launchd = bool(e.get("launchd"))
-        # The launchd lane publishes no dated results file; its completion
-        # sentinel is the only dated record that it finished.
+        # Each lane is a preference, not a restriction: `launchd` says how a job is
+        # SCHEDULED, which does not determine what dated evidence it leaves behind.
         arts = (_daily_completion_minutes(ws / "state", jname) if launchd
                 else _daily_artifact_minutes(ws / "results", stem))
-        # `launchd` conflates "runs under launchd" with "publishes no dated results
-        # file"; a session-owned job can be the second without being the first.
-        if not arts and not launchd:
-            arts = _daily_completion_minutes(ws / "state", jname)
+        used_artifact_lane = not launchd
+        # Both directions, so neither lane's absence reads as the job's silence:
+        # without the launchd arm a daily artifact reports "no dated artifact" forever.
+        if not arts:
+            arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
+                    else _daily_completion_minutes(ws / "state", jname))
+            used_artifact_lane = bool(arts) and launchd
+        # Last resort, and the only lane needing no per-job config: a job that
+        # publishes nothing dated still leaves a task-cron result when it finishes.
+        if not arts:
+            arts = _daily_task_record_minutes(ws / "results", jname)
+            used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         newest = max((d for d, _ in arts), default=None)
@@ -6004,7 +6106,7 @@ def check_daily_cron_punctuality() -> dict:
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
             # `artifact` names a results file, so it cannot vouch for a sentinel:
             # only an observed history makes a missing sentinel today actionable.
-            "stem": stem, "stem_declared": bool(declared) and not launchd,
+            "stem": stem, "stem_declared": bool(declared) and used_artifact_lane,
             # Renders only when new input exists, so a quiet day produces nothing
             # and absence is evidence of nothing rather than of a miss.
             "conditional": bool(e.get("conditional")),
@@ -6443,6 +6545,57 @@ def _tasks_held_by_a_worker(ps_output: "str | None" = None) -> set:
     return set(_worker_holdings(ps_output))
 
 
+_POOL_HELD_RE = re.compile(r"\.(assigned|claimed)-([^.]+)\.txt$")
+
+
+def _pool_held_note(pooled: "list") -> str:
+    """Who holds what, by follower — the pool's in-flight signal is the name."""
+    by: dict = {}
+    for f in pooled:
+        m = _POOL_HELD_RE.search(f.name)
+        key = f"{m.group(1)}:{m.group(2)}"
+        by[key] = by.get(key, 0) + 1
+    return ", ".join(f"{k}x{v}" for k, v in sorted(by.items()))
+
+
+def _split_pool_held(files: "list") -> tuple:
+    """(not-held-by-a-follower, held-by-a-follower)."""
+    held = [f for f in files if _POOL_HELD_RE.search(f.name)]
+    return [f for f in files if f not in held], held
+
+
+def _pool_note(pooled: "list") -> str:
+    if not pooled:
+        return ""
+    return f", {len(pooled)} held by pool followers ({_pool_held_note(pooled)})"
+
+
+def _pool_only_detail(pooled: "list") -> str:
+    return (f"{len(pooled)} task(s) held by pool followers ({_pool_held_note(pooled)}), "
+            f"0 unassigned — the pool is working, not stalled")
+
+
+def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
+    """Pool-held files old enough that no holder is plausibly still working.
+
+    Holding is a RENAME, so a file whose holder died keeps that name forever:
+    nothing on main reclaims it (`sweep-stranded-claims.sh` is a documented
+    one-shot, wired to no scheduler). Age, not the holder's
+    `state/cores/<holder>.alive`: nothing on main writes that file, and where a
+    pool wrapper does, it beats from a sidecar rather than the session — so a
+    follower wedged at its input layer stays "alive" while never finishing the
+    task, which is the stall this exists to catch. Age catches death and wedge.
+    """
+    out = []
+    for f in pooled:
+        try:
+            if now - f.stat().st_mtime >= stuck_age_sec:
+                out.append(f)
+        except OSError:
+            continue
+    return out
+
+
 def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                      stuck_age_sec: int = 900) -> dict:
     """Detect a task-queue pileup, independent of which watcher or loop is dying.
@@ -6456,7 +6609,19 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     files = _pending_task_files(tasks_dir)
     if not files:
         return {"name": name, "status": "ok", "detail": "queue empty"}
+    # A follower holds by RENAMING, so argv-based holdings see none of it.
+    files, pooled = _split_pool_held(files)
     now = time.time()
+    if pooled and not files:
+        stuck = _pool_held_stuck(pooled, now, stuck_age_sec)
+        if stuck:
+            oldest_h = int(now - min(f.stat().st_mtime for f in stuck)) // 3600
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(stuck)} of {len(pooled)} pool-held task(s) have not moved "
+                              f"in over {stuck_age_sec // 60} min (oldest {oldest_h}h): "
+                              f"{_pool_held_note(stuck)}. A hold is a rename, so a dead holder "
+                              f"keeps the name forever — check those followers are alive"}
+        return {"name": name, "status": "ok", "detail": _pool_only_detail(pooled)}
     # An in-flight task looks exactly like a stalled one on disk; the worker's
     # argv is the only thing that tells them apart.
     holdings = _worker_holdings()
@@ -6482,13 +6647,14 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
                    "cannot be established")
     held_verdict = (" — all held by a live worker, not stalled" if held_is_progress
                     else wedged_note if all_held else None)
+    pool_note = _pool_note(pooled)
     if len(files) > threshold_count and oldest_age > threshold_age_sec:
         return {
             "name": name,
             # ok, not warn: every `warn` is alertable (emit_task_for_failures /
             # notify_for_failures), so rewording alone still fires the false alert.
             "status": "ok" if held_is_progress else "warn",
-            "detail": (f"{len(files)} tasks queued{held_note}, oldest {oldest_age}s"
+            "detail": (f"{len(files)} unassigned task(s) queued{held_note}{pool_note}, oldest {oldest_age}s"
                        + (held_verdict or " — watcher or core may be stuck")),
         }
     # ANDing count with age left a single stuck task unreachable, so one owner
@@ -6499,11 +6665,11 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
         return {
             "name": name,
             "status": "ok" if held_is_progress else "warn",
-            "detail": (f"{len(files)} task(s) queued{held_note}, oldest {oldest_age}s"
+            "detail": (f"{len(files)} unassigned task(s) queued{held_note}{pool_note}, oldest {oldest_age}s"
                        + (held_verdict or f" — undrained past {stuck_age_sec}s")),
         }
     return {"name": name, "status": "ok",
-            "detail": f"{len(files)} task(s){held_note}, oldest {oldest_age}s"}
+            "detail": f"{len(files)} task(s){held_note}{pool_note}, oldest {oldest_age}s"}
 
 
 def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
@@ -6690,6 +6856,24 @@ def check_stranded_destined_proactive() -> dict:
 _STRAND_MIN_AGE_S = 1800
 
 
+PARK_REASONS = ("deduped-orphan", "has-attachments", "no-task", "too-old",
+                "undeliverable-after-retries")
+
+
+def _park_reason_tally(kept) -> str:
+    """Count parked bodies by the reason their filename records.
+
+    Only `undeliverable-after-retries` is a delivery failure, so a summary that
+    names a cause for the other four states something no writer recorded.
+    """
+    counts = {}
+    for name, _age in kept:
+        reason = next((p for p in str(name).split(".") if p in PARK_REASONS),
+                      "unlabelled")
+        counts[reason] = counts.get(reason, 0) + 1
+    return ", ".join(f"{n} {r}" for r, n in sorted(counts.items()))
+
+
 def check_proactive_quarantine() -> dict:
     """Report proactive bodies that were SAVED from deletion and then forgotten.
 
@@ -6761,9 +6945,11 @@ def check_proactive_quarantine() -> dict:
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(kept)} proactive message(s) kept in results/undelivered/ that Discord "
-                   f"refused — preserved, but no consumer drains this directory, so they stay "
-                   f"until someone acts; oldest {oldest_name} "
+        # `_quarantine_orphan` names files <tid>.<reason>.<ts>.txt; the send-failure
+        # path preserves the body name, so a missing reason is unlabelled, not a failure.
+        "detail": (f"{len(kept)} proactive message(s) parked in results/undelivered/ "
+                   f"({_park_reason_tally(kept)}) — preserved, but no consumer drains this "
+                   f"directory, so they stay until someone acts; oldest {oldest_name} "
                    f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
                    f"{partial}"),
     }
@@ -9233,7 +9419,7 @@ def run_all_checks() -> list[dict]:
     if env_path.exists():
         env_content = env_path.read_text()
         has_twilio = twilio_configured(env_content)  # pragma: no cover — call-site in untested mega-function
-        skip_phone = "SKIP_PHONE=1" in env_content or os.environ.get("SKIP_PHONE") == "1"
+        skip_phone = "SKIP_PHONE=1" in env_content or config_get("SKIP_PHONE") == "1"  # pragma: no cover — call-site in untested mega-function
         if has_twilio and not skip_phone:
             c = check_port(3100, "conversation-server")
             if c["status"] != "ok":
@@ -9527,9 +9713,9 @@ def run_all_checks() -> list[dict]:
     # Stuck-loop / queue-pileup detection — consequence-level signals that
     # fire whether the watcher died, the proactive loop crashed mid-pass, or
     # both. Independent of which mechanism died.
-    loop_stale_sec = int(os.environ.get("SUTANDO_HEALTH_LOOP_STALE_SEC", "600"))
-    queue_age_sec = int(os.environ.get("SUTANDO_HEALTH_QUEUE_AGE_SEC", "300"))
-    queue_count = int(os.environ.get("SUTANDO_HEALTH_QUEUE_COUNT", "3"))
+    loop_stale_sec = int(config_get("SUTANDO_HEALTH_LOOP_STALE_SEC", "600"))
+    queue_age_sec = int(config_get("SUTANDO_HEALTH_QUEUE_AGE_SEC", "300"))
+    queue_count = int(config_get("SUTANDO_HEALTH_QUEUE_COUNT", "3"))
     checks.append(check_battery())
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
@@ -9576,6 +9762,48 @@ def _any_core_alive(workspace: Optional[Path] = None, max_age_s: float = 90.0) -
         except OSError:
             pass
     return False
+
+
+def _local_core_alive(workspace: Optional[Path] = None,
+                      max_age_s: float = 90.0) -> Optional[bool]:
+    """THIS host only, three-state: True fresh, False definitively dead (absent
+    or stale mtime), None UNKNOWN — callers must not act destructively on None.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from util_paths import _host_label
+        label = _host_label()
+    except Exception:
+        return None           # cannot identify this host -> UNKNOWN, not dead
+    alive_file = workspace / "state" / "cores" / f"{label}.alive"
+    try:
+        # heartbeat_is_fresh, not a one-sided age test: a future-dated mtime has a
+        # NEGATIVE age, which `< max_age_s` accepts as fresh forever (#2160 P1).
+        return heartbeat_is_fresh(alive_file.stat().st_mtime, time.time(), max_age_s)
+    except FileNotFoundError:
+        return False          # no heartbeat file at all == definitively dead
+    except OSError:
+        return None           # exists but unreadable (permissions, I/O) -> UNKNOWN
+
+
+def _local_core_stopped(workspace: Optional[Path] = None) -> bool:
+    """True when THIS host's core wrote a graceful-stop tombstone (SIGTERM/
+    SIGINT path in core_heartbeat). Gates only the DESTRUCTIVE relaunch —
+    _local_core_alive's contract (False == no heartbeat) is untouched. The
+    tombstone is cleared by the next heartbeat run, so it cannot suppress
+    recovery of a core that actually came back and then died (#2160).
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from util_paths import _host_label
+        label = _host_label()
+    except Exception:
+        return False          # cannot identify host -> do not suppress
+    return (workspace / "state" / "cores" / f"{label}.stopped").exists()
 
 
 def _alerts_suppressed(check: dict) -> bool:
@@ -10114,9 +10342,8 @@ def notify_gateway_for_failures(
 # no work is lost. 1M therefore stays the DEFAULT — we never disable it.
 #
 # Heavily guarded, because auto-restarting a 24/7 agent is consequential:
-#   - Fires only on a CONFIRMED, SUSTAINED wedge: core process alive AND the
-#     oldest queued task older than RECOVER_WEDGE_SEC AND the core didn't just
-#     boot — observed on two passes ≥ RECOVER_CONFIRM_SEC apart. Never a blip.
+#   - Fires on a CONFIRMED wedge (alive + oldest task > RECOVER_WEDGE_SEC + not
+#     just-booted) or a DEAD core, each seen twice ≥ RECOVER_CONFIRM_SEC apart.
 #   - Identity + progress gating (so a legitimately long-running single task is
 #     not killed mid-work): the SAME oldest task must persist across the window
 #     (a draining queue surfaces a different oldest each pass → resets) AND
@@ -10140,10 +10367,12 @@ def notify_gateway_for_failures(
 # start-cli.sh has its own from-inside-core guard — two independent guarantees
 # the recovery never runs from within the session it would kill.
 
-RECOVER_WEDGE_SEC = int(os.environ.get("SUTANDO_RECOVER_WEDGE_SEC", "600"))        # task stuck this long = wedged
-RECOVER_CONFIRM_SEC = int(os.environ.get("SUTANDO_RECOVER_CONFIRM_SEC", "120"))    # wedge must persist across passes
-RECOVER_COOLDOWN_SEC = int(os.environ.get("SUTANDO_RECOVER_COOLDOWN_SEC", "1800")) # min gap between restarts
-RECOVER_MAX_PER_HOUR = int(os.environ.get("SUTANDO_RECOVER_MAX_PER_HOUR", "3"))
+# wedge = a task stuck this long; it must persist across passes before a
+# restart, and cooldown is the minimum gap between restarts.
+RECOVER_WEDGE_SEC = int(config_get("SUTANDO_RECOVER_WEDGE_SEC", "600"))
+RECOVER_CONFIRM_SEC = int(config_get("SUTANDO_RECOVER_CONFIRM_SEC", "120"))
+RECOVER_COOLDOWN_SEC = int(config_get("SUTANDO_RECOVER_COOLDOWN_SEC", "1800"))
+RECOVER_MAX_PER_HOUR = int(config_get("SUTANDO_RECOVER_MAX_PER_HOUR", "3"))
 
 
 def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple[str, int] | None":
@@ -10222,6 +10451,38 @@ def _core_started_within(seconds: float, workspace: Optional[Path] = None, now: 
     return (now - youngest_start) < seconds
 
 
+def _local_core_started_within(seconds: float, workspace: Optional[Path] = None,
+                               now: Optional[float] = None) -> Optional[bool]:
+    """THIS host only, three-state like `_local_core_alive`: None is UNKNOWN and
+    must not read as "not just booted". A stale heartbeat is False, not None.
+    """
+    if workspace is None:
+        workspace = WORKSPACE_DIR
+    if now is None:
+        now = time.time()
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from util_paths import _host_label
+        label = _host_label()
+    except Exception:
+        return None
+    alive_file = workspace / "state" / "cores" / f"{label}.alive"
+    try:
+        # Two-sided: a future-dated mtime fails `>= 90.0` and would fall through
+        # to "just booted", suppressing the very recovery this path guards.
+        if not heartbeat_is_fresh(alive_file.stat().st_mtime, now):
+            return False          # stale or future-dated — not just-booted
+        data = json.loads(alive_file.read_text())
+    except FileNotFoundError:
+        return False              # no heartbeat at all — nothing booted here
+    except (OSError, ValueError):
+        return None               # unreadable / undecodable -> UNKNOWN
+    started = data.get("started_at")
+    if not isinstance(started, (int, float)):
+        return None               # cannot tell when it booted -> UNKNOWN
+    return (now - started) < seconds
+
+
 def _resolve_launch_env() -> dict:
     """Environment for out-of-process core restarts (start-cli.sh --restart).
 
@@ -10276,6 +10537,7 @@ def recover_core_if_wedged(
     status_ts_fn=None,
     just_booted_fn=None,
     restart_fn=None,
+    stopped_fn=None,
     sender=None,
 ) -> "dict | None":
     """Auto-restart the core when it is alive-but-wedged. Returns a dict
@@ -10293,10 +10555,16 @@ def recover_core_if_wedged(
         now = time.time()
     if state_file is None:
         state_file = WORKSPACE_DIR / "state" / "core-recovery.json"
-    alive_fn = alive_fn or _any_core_alive
+    # LOCAL, not fleet-wide: a peer's heartbeat must not suppress a relaunch on
+    # THIS host. Queue-gating call sites keep `_any_core_alive` — that IS fleet-wide.
+    alive_fn = alive_fn or _local_core_alive
+    stopped_fn = stopped_fn or _local_core_stopped
     oldest_task_fn = oldest_task_fn or (lambda: _oldest_pending_task(now))
     status_ts_fn = status_ts_fn or _core_status_ts
-    just_booted_fn = just_booted_fn or (lambda: _core_started_within(RECOVER_WEDGE_SEC, now=now))
+    # LOCAL boot guard, matching the liveness check: fleet-wide, a PEER's boot
+    # suppressed local dead-core recovery for the whole startup window.
+    just_booted_fn = just_booted_fn or (
+        lambda: _local_core_started_within(RECOVER_WEDGE_SEC, now=now))
     restart_fn = restart_fn or _default_core_restart
     send = sender or _default_slack_sender
 
@@ -10336,34 +10604,50 @@ def recover_core_if_wedged(
             state["wedge_first_seen"] = 0
             state["wedge_task"] = None
             state["wedge_status_ts"] = None
+            state["wedge_mode"] = None
 
         oldest = oldest_task_fn()                    # (identity, age) | None
         cur_key = oldest[0] if oldest else None
         oldest_age = oldest[1] if oldest else None
         status_ts = status_ts_fn()
+        alive = alive_fn()
+        just_booted = just_booted_fn()
+        # UNKNOWN must not reach the destructive path: `dead` is `not alive`, so a
+        # None would restart a healthy core. Leave observation state untouched.
+        if alive is None or just_booted is None:
+            which = "liveness" if alive is None else "boot-guard"
+            # Uncertainty invalidates the streak: a DEAD reading after an UNKNOWN
+            # would otherwise inherit a window opened before the uncertainty.
+            if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
+                _reset_observation()
+                _save()
+            print(f"[recover-core] WARNING: local {which} probe failed — state is "
+                  f"UNKNOWN, not dead; suppressing restart and RESETTING the "
+                  f"confirmation window", file=sys.stderr)
+            return {"action": "probe-failed", "probe": which}
         wedged = (
-            alive_fn()
+            alive
             and oldest is not None
             and oldest_age > RECOVER_WEDGE_SEC
-            and not just_booted_fn()
+            and not just_booted
         )
+        # A dead core is a distinct gap from a wedge (a wedge requires ALIVE) and
+        # flows through the same confirm/cooldown/give-up path below.
+        dead = (not alive) and (not just_booted)
 
-        if not wedged:
-            # Healthy / no queued work / core down / just booted. Clear any
-            # in-progress observation so a future wedge starts fresh.
-            # last_restart / history are preserved (cooldown + give-up survive).
+        if not wedged and not dead:
+            # Clear any in-progress observation; last_restart / history are
+            # preserved so cooldown and give-up survive.
             if state.get("wedge_first_seen") or state.get("wedge_task") is not None:
                 _reset_observation()
                 _save()
             return None
 
-        # Identity + progress gating (blocker 3): age alone can't tell a wedge
-        # from a legitimately long single task. Reset the confirmation window if
-        # EITHER the oldest task changed (queue draining → a different oldest, or
-        # the file was rewritten → new mtime) OR the core advanced core-status.json
-        # (it's making progress, not looping). Only a SAME-task, NO-progress
-        # streak across the window is treated as a real wedge.
+        # Age alone cannot separate a wedge from one legitimately long task: reset the
+        # window when the oldest task changes, the core advances, or the mode flips.
+        cur_mode = "wedged" if wedged else "dead"
         prev_key = state.get("wedge_task")
+        prev_mode = state.get("wedge_mode")
         prev_status_ts = state.get("wedge_status_ts")
         first_seen = state.get("wedge_first_seen") or 0
         progressed = (
@@ -10371,9 +10655,14 @@ def recover_core_if_wedged(
             and isinstance(status_ts, (int, float))
             and status_ts > prev_status_ts
         )
-        if (not first_seen) or prev_key != cur_key or progressed:
+        # An absent mode on an in-progress observation is a pre-upgrade state file,
+        # which could only have been a wedge; assuming so makes a now-dead core flip.
+        effective_prev_mode = prev_mode if prev_mode is not None else "wedged"
+        mode_flipped = bool(first_seen) and effective_prev_mode != cur_mode
+        if (not first_seen) or prev_key != cur_key or mode_flipped or progressed:
             state["wedge_first_seen"] = now
             state["wedge_task"] = cur_key
+            state["wedge_mode"] = cur_mode
             state["wedge_status_ts"] = status_ts
             _save()
             return {"action": "observed", "oldest_age": oldest_age, "task": cur_key}
@@ -10392,10 +10681,12 @@ def recover_core_if_wedged(
             # DM once per give-up episode. Record gave_up_at only on a SUCCESSFUL
             # send so a Slack outage doesn't silence the give-up alert for an hour.
             if not state.get("gave_up_at") or now - state["gave_up_at"] > 3600:
+                _stuck = f" (oldest task stuck {oldest_age // 60} min)" if oldest_age is not None else ""
+                _what = "still wedged" if alive else "still down"
                 if send(
                     ":octagonal_sign: *Sutando core auto-recovery gave up* — restarted "
-                    f"{len(history)}× in the last hour and the core is still wedged "
-                    f"(oldest task stuck {oldest_age // 60} min). Needs manual attention: "
+                    f"{len(history)}× in the last hour and the core is {_what}"
+                    f"{_stuck}. Needs manual attention: "
                     "check the CLI / `/usage-credits`."
                 ):
                     state["gave_up_at"] = now
@@ -10410,12 +10701,23 @@ def recover_core_if_wedged(
         # DM fails we still restart (recovery > notification — don't leave the
         # core wedged because Slack is down), but we record dm_sent=False and log
         # to stderr/launchd so the restart is never invisible.
-        dm_ok = send(
-            f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
-            f"while the core process is alive (likely the 1M usage-credit gate or a "
-            f"stalled turn). Auto-restarting on its configured model. Queued tasks "
-            f"are preserved."
-        )
+        if dead and stopped_fn():
+            # Graceful-stop tombstone: someone stopped this core ON PURPOSE.
+            # Relaunching would undo a deliberate act (john-the-dev, #2160).
+            return {"action": "deliberate-stop"}
+        if dead:
+            dm_ok = send(
+                ":skull: *Sutando core is down* — no heartbeat (the session exited, "
+                "taking its in-session crons/dailies). Auto-relaunching on its "
+                "configured model. Queued tasks are preserved."
+            )
+        else:
+            dm_ok = send(
+                f":hourglass: *Sutando core wedged* — oldest task stuck {oldest_age // 60} min "
+                f"while the core process is alive (likely the 1M usage-credit gate or a "
+                f"stalled turn). Auto-restarting on its configured model. Queued tasks "
+                f"are preserved."
+            )
         if not dm_ok:
             print("[recover-core] WARNING: wedge-restart DM failed; restarting anyway", flush=True)
 

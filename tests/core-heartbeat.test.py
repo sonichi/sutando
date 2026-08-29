@@ -59,6 +59,17 @@ class TestHeartbeatWrite(unittest.TestCase):
         alive_path = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
         self.assertTrue(alive_path.is_file(), f"expected {alive_path} to exist")
 
+    def test_handle_signal_writes_tombstone_before_unlink(self):
+        import core_heartbeat
+        core_heartbeat.write_beat()
+        alive = core_heartbeat._alive_path()
+        self.assertTrue(alive.is_file())
+        core_heartbeat._handle_signal(15, None)
+        stopped = alive.with_suffix(".stopped")
+        self.assertTrue(stopped.is_file(), "graceful stop must leave a .stopped tombstone (#2160)")
+        self.assertFalse(alive.exists(), "graceful stop must still unlink .alive")
+        float(stopped.read_text())  # payload is a timestamp
+
     def test_write_beat_payload_schema(self):
         import core_heartbeat
         # Pin the core-pid resolver. Before schema 3 this test asserted

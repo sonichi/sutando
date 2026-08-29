@@ -187,7 +187,14 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 6.5. **Proactive-comm / idle-surface (do NOT skip — this is the anti-going-dark hook).** Restored 2026-07-13; originally built 2026-06-26 as a working-tree SKILL.md step (it ran — idle-streak.json proves it) that was never committed to the repo file and was lost in the ~Jun-30 workspace-revamp rewrite (same rewrite that dropped 0.7). Its absence is exactly why the owner kept flagging "proactive comm handling is still missing" — with no step here, the loop silently idle-closes to the terminal and the owner sees nothing.
 
-   Classify this pass: **substantive** (processed a task, shipped a fix/PR, filed a memory, posted to owner) or **no-op** (nothing owner-visible happened). Maintain `state/idle-streak.json` `{streak, last_surfaced_hash, updated}`: substantive → `streak=0`; no-op → `streak++`.
+   Classify this pass: **substantive** (processed a task, shipped a fix/PR, filed a memory, posted to owner) or **no-op** (nothing owner-visible happened). Record it with the script — **do not maintain `state/idle-streak.json` by hand.** `record_outcome()` owns `streak` and the cumulative totals under a lock, so a second writer double-counts every pass and the drift is silent:
+
+   ```bash
+   python3 skills/proactive-loop/scripts/idle-surface-hash.py \
+     --state "$WORKSPACE/state/idle-streak.json" --pass-outcome substantive|noop
+   ```
+
+   It returns before touching stdin, so it is safe under cron. `last_surfaced_hash` is a different field with a different contract and is still written by the `--commit` path below.
 
    On the **first no-op** of a run (`streak >= 1`):
    1. **Generate, don't idle** — first widen the menu and actually try to produce a tangible artifact (peer-PR review, regression grep, parity verify, research, memory curation, own-PR CI). Gated ≠ nothing-to-do. Only if genuinely all-gated go to step 2.
@@ -213,6 +220,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    If `hash != last_surfaced_hash`: post ONE concise "here's what's held / needs you (FYI, not a block)" line to the **owner's primary channel** (see `PERSONAL_CLAUDE.md` channel routing — NOT the `#bot2bot` coord channel), then set `last_surfaced_hash`. If `hash == last_surfaced_hash`: stay quiet **only if the owner is away/asleep** (`last-owner-activity.json` older than ~30 min); if he's been active in the last ~30 min, never go dark — drop a one-line progress/activity signal to his channel anyway.
 
    **Guardrails (all owner-corrected):** the surface is a non-blocking FYI footnote — NEVER a new wait-state ("awaiting your go" is not a reason to pause; keep doing the next unblocked thing). Don't spam: one signal per changed set / per work-shift, not per file. Presence is the discriminator: recently-active → never silent; genuinely-away → dedup-quiet is fine.
+
+6.7. **Failure closure = mechanism, never a filed lesson (owner-durable 2026-08-27: "why do I
+   need to keep reminding you to make durable fix").** Every report of a failure — your own or one
+   a reviewer/owner caught — ends with exactly one of: (a) the MECHANISM that makes the recurrence
+   structurally impossible (a gate, a generated row, a checker), linked; or (b) the explicit
+   sentence "no mechanism exists, because X." A lesson written to a log or memory is not a third
+   option: a memory loads when RECALLED, a mechanism runs unconditionally — and this file loads
+   every pass, which is why the rule lives HERE and not in the memory that first recorded it.
+   Measured the day it was written: two mechanisms (sutando-skills#440, #441) each existed within
+   an hour of the owner's prompt, so the cost was never the building — only the definition of done.
 
 7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 

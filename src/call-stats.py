@@ -7,8 +7,7 @@ Usage:
     python3 src/call-stats.py --all            # all time
     python3 src/call-stats.py --json           # machine-readable
 
-Complements daily-insight.py. daily-insight picks ONE actionable pattern;
-call-stats dumps the full picture for weekly/monthly review.
+Dumps the full call picture for weekly/monthly review.
 
 Reads results/calls/calls.jsonl. Expects enriched fields (duration_seconds,
 caller, purpose, is_meeting, start_time) from PR #209 onward. Gracefully

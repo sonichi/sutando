@@ -117,7 +117,13 @@ if _PKG_ROOT not in sys.path:
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import channel_access_path, claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
+from util_paths import claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
+from access_store import (  # noqa: E402  — single locked writer for access.json (#3318)
+    mutate_access_file,
+    read_access_for_transaction,
+    resolve_discord_access_file,
+    discord_access_backup_file,
+)
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
@@ -150,11 +156,12 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery  # noqa: E402
+from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
 
@@ -199,6 +206,7 @@ async def _note_empty_result(task_id: str, result_file) -> None:
     pending_reply_anchors.pop(task_id, None)      # else a stale anchor id leaks
     _progress_msgs.pop(task_id, None)             # else the placeholder never clears
     tier = pending_task_tiers.pop(task_id, None) or "unknown"
+    pending_task_collab.pop(task_id, None)
     await _report_delivery_failure(channel, task_id, tier, EmptyResultError(notice))
     archive_file(result_file, "results", task_id)
     # Archive the SOURCE TASK too. Without this the task file sits in tasks/
@@ -430,6 +438,69 @@ DISCORD_TRUNCATION_NOTICE = (
 )
 
 
+def _mention_gate_owner_ids() -> list:
+    """Owner ids the mention gate keys on. A PRESENT tierMap is authoritative,
+    including empty ({} = no owners, gate never triggers) — falling back to
+    allowFrom there would promote read-only members to owner for this gate.
+    allowFrom is consulted only when the tierMap key is ABSENT (legacy file)."""
+    try:
+        data = json.loads(ACCESS_FILE.read_text())
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    if "tierMap" in data:
+        tier_map = data.get("tierMap")
+        if not isinstance(tier_map, dict):
+            return []
+        return [str(u) for u, t in tier_map.items() if t == "owner"]
+    allow = data.get("allowFrom")
+    return [str(u) for u in allow] if isinstance(allow, list) else []
+
+
+def _mention_gate_triggers_ingest(message) -> bool:
+    """ON-side gate (skills/mention-gate): while ON, a message @-tagging an
+    owner counts as a bot mention. Fail-closed: any error → today's rejection.
+    Verdict only — the audit is written by _mention_gate_log_admission AFTER
+    the task file exists, so an unauthorized sender can never inflate it."""
+    try:
+        owners = _mention_gate_owner_ids()
+        if not owners or str(message.author.id) in owners:
+            return False
+        mention_ids = [str(getattr(u, "id", ""))
+                       for u in (getattr(message, "mentions", None) or [])]
+        if not mention_gate.message_tags_owner(
+                mention_ids, getattr(message, "content", "") or "", owners):
+            return False
+        if not mention_gate.owner_tag_triggers_ingest(REPO):
+            return False
+        print(f"  [mention-gate] ON — owner-tagged msg {getattr(message, 'id', '?')} "
+              f"admitted as a mention (audit deferred to task write)", flush=True)
+        return True
+    except Exception as e:
+        print(f"  [mention-gate] check failed ({e}) — ordinary requireMention "
+              f"rejection stands", flush=True)
+        return False
+
+
+def _mention_gate_log_admission(message) -> None:
+    """Audit a gate admission AFTER its task file is durably written — a sender
+    the later authorization gates drop must leave no audit row. Best-effort:
+    the task already exists, so a failed append only logs, never retracts."""
+    try:
+        mention_gate.log_gated_ingest(REPO, {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "channel_id": str(getattr(message.channel, "id", "")),
+            "author_id": str(message.author.id),
+            "message_id": str(getattr(message, "id", "")),
+            "body": (getattr(message, "content", "") or "")[:120],
+        })
+        print(f"  [mention-gate] audited gated admission of msg "
+              f"{getattr(message, 'id', '?')}", flush=True)
+    except Exception as e:
+        print(f"  [mention-gate] audit append failed after task write: {e}", flush=True)
+
+
 def _chunk_for_discord(
     text: str,
     max_len: int = 1900,
@@ -486,7 +557,9 @@ def _dedup_recover(task_id: str, holder_id, channel_id):
                                    channel_id, f"task-{int(time.time() * 1000)}")
     except Exception as exc:  # noqa: BLE001 - never block the skip path
         print(f"  [dedup] recovery failed for {task_id}: {exc}", flush=True)
-        return "honour", None
+        # A planner that raised proved nothing about the asker being answered.
+        # "honour" archives; "defer" retains so a later pass can retry.
+        return "defer", None
 
 
 def archive_path(kind: str, task_id: str) -> "Path":
@@ -711,28 +784,10 @@ seen_message_ids = set()  # Discord message IDs already processed
 # with the owner de-authorized. This backup lives under state/auth/ (per
 # CLAUDE.md, the cleanup-exempt per-host install-state dir) so a restart can
 # auto-restore the allowlist from disk instead of exposing an open pairing gate.
-ACCESS_BACKUP_FILE = STATE_DIR / "auth" / "discord-access-backup.json"
-
-
-def _resolve_access_file() -> Path:
-    """Resolve the live file without letting the migration fallback bypass a
-    durable restore.
-
-    Before the first durable backup exists, preserve the transition-window
-    behavior: a missing canonical file may read/write the populated legacy
-    ``~/.claude`` file. Once the durable backup exists, however, a missing
-    canonical file is a wipe to restore—not a reason to resurrect legacy
-    authorization state. Pin to the canonical path so ``on_ready`` can restore
-    it from ``state/auth`` before any access read.
-    """
-    if ACCESS_BACKUP_FILE.exists():
-        return claude_home_path("channels", "discord", "access.json")
-    return channel_access_path("discord")
-
-
-# Load access config after defining the durable path: its presence determines
-# whether a missing canonical file means migration fallback or wipe recovery.
-ACCESS_FILE = _resolve_access_file()
+# Path resolution is owned by access_store.py so a separate skill-callable
+# CLI process resolves the identical file instead of duplicating the rule.
+ACCESS_BACKUP_FILE = discord_access_backup_file()
+ACCESS_FILE = resolve_discord_access_file()
 
 
 def _is_valid_access_doc(data) -> bool:
@@ -871,69 +926,34 @@ def ensure_tier_map_seeded() -> bool:
     needed but could NOT be persisted/read. On False the caller MUST fail
     closed — never grant owner off an empty/unconfirmed map (#2161 CR:
     a transient read/write error must not silently escalate every
-    allowlisted sender to owner)."""
+    allowlisted sender to owner).
+
+    Routed through access_store.mutate_access_file (#3318) — the single
+    locked owner every access.json writer shares, so this can't lost-update
+    against a concurrent thread-engage seed or pairing-code write."""
+    def _mutator(data):
+        allow = data.get("allowFrom") or []
+        # Test key PRESENCE, not truthiness — an explicitly-empty tierMap ({})
+        # is a deliberate "nobody is owner" state, not an unseeded file.
+        if "tierMap" in data:
+            return None, True
+        if not allow:
+            return None, True  # nothing to grandfather — an empty map is legitimate here
+        data["tierMap"] = {uid: "owner" for uid in allow}
+        return data, len(allow)
+
     try:
-        data = json.loads(ACCESS_FILE.read_text())
-    except Exception as e:
-        print(f"  [tier-map] WARNING: access.json unreadable ({e}); allowlisted senders resolve read-only (team) until the tierMap can be read", flush=True)
-        return False
-    allow = data.get("allowFrom") or []
-    # Test key PRESENCE, not truthiness. An explicitly-empty tierMap ({}) is a
-    # deliberate "nobody is owner via tierMap" state — treating it as falsy
-    # here would re-seed every allowFrom member as owner, escalating read-only
-    # users (#2161 CR: {"allowFrom":["U"],"tierMap":{}} must NOT become
-    # {"U":"owner"}). Only a genuinely ABSENT key (never-seeded legacy file)
-    # triggers first-run grandfathering below. A present-but-empty map returns
-    # here, so the allowlisted user is missing from the map and resolves team.
-    if "tierMap" in data:
-        return True
-    if not allow:
-        return True  # nothing to grandfather — an empty map is legitimate here
-    data["tierMap"] = {uid: "owner" for uid in allow}
-    # Atomic write: a bare ACCESS_FILE.write_text() truncates the live
-    # access-control file BEFORE writing, so a disk-full / interrupt / partial
-    # write can destroy allowFrom — and with fail-closed tier resolution that
-    # locks legitimate owners out against a corrupt file, at bridge startup.
-    # Write a sibling temp BORN 0600 (write_private_text), then os.replace() (mirrors the
-    # pairing path + the #2222 owner-activity fix). The pid+uuid suffix avoids
-    # colliding with a concurrent pairing-path .tmp; on any failure the original
-    # access.json bytes are left intact and the orphan temp is removed.
-    tmp = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        write_private_text(tmp, json.dumps(data, indent=2) + "\n")
-        os.replace(tmp, ACCESS_FILE)
-        _backup_access_to_disk(data)  # durable backup on every valid access write
-        print(f"  [tier-map] grandfathered {len(allow)} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
-        return True
+        seeded = mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
     except OSError as e:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
         print(f"  [tier-map] WARNING: failed to persist grandfather tierMap ({e}); allowlisted senders resolve read-only (team) until seeded", flush=True)
         return False
-
-def read_access_for_seed(path):
-    """Read access.json for a path that is about to WRITE it back (pairing seed).
-
-    Returns:
-      - the parsed dict when the file is present and valid;
-      - a fresh default dict when the file is genuinely ABSENT (first-run
-        onboarding — seeding a default is correct);
-      - None when the file EXISTS but is unreadable/corrupt — the caller MUST
-        NOT overwrite it. Writing an empty-allowFrom default over a
-        present-but-unparseable access.json turns a transient read glitch into
-        a PERMANENT config wipe: the owner is dropped from allowFrom, so every
-        sender gets a pairing prompt and codes leak into channels. Observed
-        2026-07-21 (the owner was silently de-authorized mid-session). The safe
-        move on corruption is to leave the file untouched and bail.
-    """
-    try:
-        return json.loads(path.read_text())
-    except FileNotFoundError:
-        return {"dmPolicy": "pairing", "allowFrom": [], "pending": {}}
-    except Exception:
-        return None
+    if seeded is None:
+        print(f"  [tier-map] WARNING: access.json unreadable; allowlisted senders resolve read-only (team) until the tierMap can be read", flush=True)
+        return False
+    if seeded is True:
+        return True
+    print(f"  [tier-map] grandfathered {seeded} existing Discord allowFrom member(s) as owner; new additions now default to read-only (team)", flush=True)
+    return True
 
 def load_channel_config(channel_id):
     """Load channel config. Returns (requireMention, allowFrom set) or None if not configured."""
@@ -2543,6 +2563,8 @@ pending_reply_anchors: dict[str, int] = {}
 # on restart; poll_progress fail-closes (skips streaming) when a task_id is
 # absent here, so a recovered task is never streamed without a known owner tier.
 pending_task_tiers: dict[str, str] = {}
+# Collaborators are engaged directly, so their tasks DO update core-status.
+pending_task_collab: dict[str, bool] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -2589,6 +2611,16 @@ async def _deliver_pairing_prompt(channel, code, username, sender_id, allowed):
 
 client = discord.Client(intents=intents)
 _ready_count = 0  # gateway sessions this process; flap-frequency signal in logs
+# RESUME is invisible to on_ready, so "no ready lines" cannot mean "no
+# reconnects" — these two counters are what make the classes distinguishable.
+_resume_count = 0
+_disconnect_count = 0
+
+def _reconnect_state() -> str:
+    """One shape for every reconnect-class line so the log stays greppable."""
+    return (f"gateway session #{_ready_count} "
+            f"(resume #{_resume_count}, disconnect #{_disconnect_count})")
+
 
 
 async def list_channel_members(channel_id: int) -> list[dict]:
@@ -2681,6 +2713,23 @@ async def _supervise_loop(coro_fn, name):
 
 
 @client.event
+async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
+    global _resume_count
+    _resume_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge resumed: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
+async def on_disconnect():  # pragma: no cover — gateway callback
+    # Re-dispatched per retry while ready/resumed need success: the only outage line.
+    global _disconnect_count
+    _disconnect_count += 1
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge disconnected: "
+          f"{_reconnect_state()}", flush=True)
+
+
+@client.event
 async def on_ready():
     global _ready_count
     _ready_count += 1
@@ -2690,7 +2739,7 @@ async def on_ready():
     # the owner de-authorized (observed 2026-07-21). Self-gating: a valid live
     # file is left untouched (see _restore_access_from_disk). #899 defense-in-depth.
     _restore_access_from_disk()  # pragma: no cover — on_ready startup glue; the restore fn is unit-tested (discord-access-backup.test.py)
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} (gateway session #{_ready_count})", flush=True)
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} Discord bridge ready: {client.user} ({_reconnect_state()})", flush=True)
     # Explicit presence: after a reconnect the default presence can lag; setting
     # it on every ready makes recovery visible immediately instead of waiting
     # for Discord to infer it. Best-effort — presence must never break startup.
@@ -2748,6 +2797,7 @@ async def on_ready():
         client.loop.create_task(_supervise_loop(poll_results, "poll_results"))
         client.loop.create_task(_supervise_loop(poll_progress, "poll_progress"))
         client.loop.create_task(_supervise_loop(poll_approved, "poll_approved"))
+        client.loop.create_task(_supervise_loop(poll_pending_notify, "poll_pending_notify"))
         client.loop.create_task(_supervise_loop(poll_proactive, "poll_proactive"))
         client.loop.create_task(_supervise_loop(poll_dm_fallback, "poll_dm_fallback"))
         # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
@@ -2984,6 +3034,17 @@ def _reply_author_header(message) -> str:
     )
 
 
+def channel_allows_collaborator_attachments(access_data, channel_id) -> bool:
+    """Per-channel owner opt-in: a COLLABORATOR's result may carry [file:]/
+    [attach:] markers here. Path authorization stays with the transport
+    allowlist; [channel:] redirects stay blocked regardless. Default off."""
+    for section in ("groups", "channels"):
+        cfg = (access_data.get(section) or {}).get(str(channel_id))
+        if isinstance(cfg, dict):
+            return cfg.get("collaboratorAttachments") is True
+    return False
+
+
 def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     """True iff `sender_id` is listed under the SERVING channel's `collaborators`
     array in access.json.
@@ -3004,6 +3065,14 @@ def resolve_is_collaborator(access_data, sender_id, serving_channel_id):
     except Exception:
         pass
     return False
+
+
+def resolve_team_collaborator(access_data, access_tier, sender_id, serving_channel_id):
+    """Collaborator status for a TEAM sender, however that tier was reached.
+    Global-allowlist members resolved to team by the tierMap are eligible too."""
+    if access_tier != "team":
+        return False
+    return resolve_is_collaborator(access_data, sender_id, serving_channel_id)
 
 
 def select_rulebook_key(access_tier, is_collaborator):
@@ -3127,6 +3196,10 @@ async def _handle_discord_message(message, force=False):
         except Exception as e:
             print(f"  [dm-checkpoint] update failed: {e}", flush=True)
 
+    # Set only by the requireMention branch below; read after the task write so
+    # the audit binds to a DURABLE admission, not to the gate's verdict.
+    _mention_gate_admitted = False
+
     safe_log_text = redact_chat_body(text)   # the shared chain; see src/chat_redaction.py
     print(f"  [msg] #{channel_name} @{username}: {safe_log_text[:80]} (mentions: {[str(m) for m in message.mentions]}, is_dm: {is_dm}, embeds: {len(message.embeds)}, type: {message.type}, ref: {message.reference is not None})", flush=True)
     # Debug: log message snapshots for forwarded messages
@@ -3247,7 +3320,8 @@ async def _handle_discord_message(message, force=False):
         #  - parent_cfg is True (open shorthand) → leave thread open: emit
         #    {requireMention: False} with no allowFrom (no restriction). A
         #    thread under an open parent must not be MORE restrictive.
-        #  - missing parent_cfg → engager-only [author_id] (safe default).
+        #  - missing parent_cfg → engager-only [author_id], but only when the
+        #    sender is already a global allowFrom member (#3318 blocker 2).
         # Ungated 2026-06-06 (was `if bot_mentioned and ...`): the bot_mentioned
         # gate left a gap where any thread's FIRST message that did NOT mention
         # the bot was silently dropped (the thread never landed in access.json,
@@ -3262,18 +3336,11 @@ async def _handle_discord_message(message, force=False):
         # in pending-questions.md (2026-05-17 entry + 2026-05-25 + 2026-06-02
         # updates).
         if isinstance(message.channel, discord.Thread):
-            try:
-                access_data = json.loads(ACCESS_FILE.read_text())
+            def _thread_seed_mutator(access_data):
                 access_groups = access_data.setdefault('groups', {})
                 thread_id_str = str(message.channel.id)
-                # Multi-bot-safe seed gate. In a fleet deployment (siblingBots
-                # declared), seed ONLY when THIS bot is the addressed one
-                # (direct @-mention or a sutando-role @) — otherwise every
-                # sibling bot seeds the same thread, posts its own 🌱 notice
-                # pinging its own owner (the seed storm), and then grabs every
-                # unaddressed follow-up (the 2026-07-02 #1823 pile-up). In a
-                # single-bot deployment (no siblingBots) seed on any first
-                # message, preserving the #1498 ep013 first-message-drop fix.
+                # Multi-bot fleets: seed only when THIS bot is addressed (avoids
+                # the sibling seed-storm, #1823). Single-bot: seed on any first message.
                 _seed_ok = (
                     bot_mentioned or role_mentioned
                     or not _has_sibling_bots(access_data, getattr(client.user, "id", None))
@@ -3287,42 +3354,42 @@ async def _handle_discord_message(message, force=False):
                         inherited_allow = parent_cfg.get('allowFrom', [str(message.author.id)])
                         thread_entry = {'requireMention': False, 'allowFrom': inherited_allow}
                     else:
+                        # No parent policy to inherit: seed only when the sender is
+                        # already a global allowFrom member (#3318 blocker 2).
+                        if str(message.author.id) not in (access_data.get('allowFrom') or []):
+                            return None, None
                         thread_entry = {'requireMention': False, 'allowFrom': [str(message.author.id)]}
                     access_groups[thread_id_str] = thread_entry
-                    # Atomic tmp+rename. Bare write_text truncates-then-writes,
-                    # exposing a window where a concurrent reader (every
-                    # message hits load_channel_config which re-reads
-                    # access.json) or a crash could see a partial file. Same
-                    # change also closes the lost-update race with the
-                    # `/discord:access` skill's read-modify-write.
-                    tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')
-                    write_private_text(tmp_path, json.dumps(access_data, indent=2))
-                    os.replace(tmp_path, ACCESS_FILE)
-                    _backup_access_to_disk(access_data)  # pragma: no cover — thread-engage seed write glue; the backup fn is unit-tested. Durable backup on every valid access write
-                    # Refresh the gate for THIS message. require_mention was
-                    # computed by load_channel_config before the seed existed,
-                    # so without this the seeding message itself is still
-                    # dropped at the requireMention gate below unless it
-                    # happened to @-mention the bot — the ep013-class
-                    # first-message drop was only half-fixed by the 2026-06-06
-                    # ungate (thread seeded, triggering message lost). Widen
-                    # only: never flip an already-False gate back to True.
-                    require_mention = require_mention and bool(thread_entry.get('requireMention', True))
-                    print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
-                    # Owner-visibility ping (one-shot, first seed only): when a
-                    # non-owner seeds the thread, @-mention the owner inline so an
-                    # auto-opened thread can't silently accumulate sandboxed replies
-                    # the owner never sees (#1498 slip-risk).
-                    owner_ids = access_data.get('allowFrom', [])
-                    if _should_notify_owner_on_seed(message.author.id, owner_ids):
-                        try:
-                            parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
-                            await message.channel.send(
-                                _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
-                        except Exception as e:
-                            print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
+                    return access_data, (thread_id_str, parent_id_str, thread_entry, access_data.get('allowFrom', []))
+                return None, None
+
+            # Same locked owner as ensure_tier_map_seeded/pairing — avoids lost
+            # updates. Absent or corrupt access.json both no-op here, untouched.
+            try:
+                seed_result = mutate_access_file(ACCESS_FILE, _thread_seed_mutator, backup=_backup_access_to_disk)
             except Exception as e:
+                seed_result = None
                 print(f"  [thread-engage] failed to update access.json: {e}", flush=True)
+            else:
+                if seed_result is None and read_access_for_transaction(ACCESS_FILE) is None:
+                    # Corrupt/unreadable ≠ missing — access_store already left the file
+                    # untouched; this re-read is diagnostic-only (best-effort, unlocked).
+                    print("  [thread-engage] WARNING: access.json unreadable; skipping seed, not overwriting", flush=True)
+
+            if seed_result is not None:  # pragma: no cover — needs a full discord.py Thread mock; mutator is unit-tested directly against access_store
+                thread_id_str, parent_id_str, thread_entry, owner_ids = seed_result
+                # Refresh the gate so the seeding message isn't dropped below; widen only.
+                require_mention = require_mention and bool(thread_entry.get('requireMention', True))
+                print(f"  [thread-engage] added thread {thread_id_str} (parent {parent_id_str}) to access.json with {thread_entry}", flush=True)
+                # First-seed owner-visibility ping — outside the lock deliberately,
+                # since we never hold it across a network await.
+                if _should_notify_owner_on_seed(message.author.id, owner_ids):
+                    try:
+                        parent_label = f"#{message.channel.parent.name}" if message.channel.parent else str(parent_id_str)
+                        await message.channel.send(
+                            _format_seed_notice(owner_ids[0], message.author.mention, parent_label, thread_id_str))
+                    except Exception as e:
+                        print(f"  [thread-engage] owner-notice send failed: {e}", flush=True)
 
         # Text/magic-word screen-push REMOVED (#1427, owner 2026-06-05). Screen
         # sharing in a voice session is owned entirely by the voice-invoked
@@ -3353,8 +3420,13 @@ async def _handle_discord_message(message, force=False):
             print(f"  [plugin-hook] early-path raised: {e}", flush=True)
 
         if require_mention and not bot_mentioned and not role_mentioned:
-            print(f"  [skip] not mentioned (requireMention=true)", flush=True)
-            return
+            # mention-gate ON side: an owner-tagged message counts as a mention
+            # of the bot; otherwise today's rejection stands (also on any error).
+            if _mention_gate_triggers_ingest(message):
+                _mention_gate_admitted = True  # audit only after the task write
+            else:
+                print(f"  [skip] not mentioned (requireMention=true)", flush=True)
+                return
 
         # Shared-channel addressee gate (require_mention=False, non-bot2bot).
         # Fixes owner-reported 2026-07-18: replies to OTHER agents and other
@@ -3469,52 +3541,40 @@ async def _handle_discord_message(message, force=False):
     if policy == "pairing" and sender_id not in allowed and not channel_authorized:
         # Generate pairing code — user must approve via /discord:access pair <code>
         import random, string
-        # Async gateway wiring is structurally pinned below; the pure helper's
-        # valid/absent/corrupt behavior is executed against real files.
-        access = read_access_for_seed(ACCESS_FILE)  # pragma: no cover
-        if access is None:  # pragma: no cover
-            # access.json EXISTS but is corrupt/unreadable. Do NOT overwrite it
-            # with an empty-allowFrom default — that permanently wipes the real
-            # config (owner dropped from allowFrom → pairing prompts + code leak
-            # to channels; observed 2026-07-21). Bail loudly; leave the file for
-            # recovery. A restart auto-restores from the durable state/auth/
-            # backup (_restore_access_from_disk in on_ready); the legacy
-            # channels/discord/access.json.bak-* files remain a manual fallback.
+
+        def _pairing_mutator(access):
+            code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+            pending = access.get("pending", {})
+            # Clean expired codes
+            now_ms = int(time.time() * 1000)
+            pending = {k: v for k, v in pending.items() if v.get("expiresAt", 0) > now_ms}
+            pending[code] = {
+                "senderId": sender_id,
+                "chatId": str(message.channel.id),
+                "createdAt": now_ms,
+                "expiresAt": now_ms + 3600000,  # 1 hour
+            }
+            access["pending"] = pending
+            return access, code
+
+        # Same locked owner as ensure_tier_map_seeded/thread-engage — avoids a
+        # lost-update race; corrupt/unreadable file leaves `code` None, untouched.
+        try:
+            code = mutate_access_file(ACCESS_FILE, _pairing_mutator, backup=_backup_access_to_disk)
+        except Exception as e:
+            code = None
+            print(f"  [pairing] failed to update access.json: {e}", flush=True)
+
+        if code is None:
             print(
-                f"  [pairing] access.json present but unreadable — NOT overwriting "
-                f"(would wipe allowFrom). Skipping pairing for @{username} ({sender_id}). "
+                f"  [pairing] access.json unreadable or write failed — NOT overwriting "
+                f"(would risk wiping allowFrom). Skipping pairing for @{username} ({sender_id}). "
                 f"Restart to auto-restore from the durable state/auth/discord-access-backup.json "
                 f"(or manually restore a channels/discord/access.json.bak-* backup).",
                 flush=True,
             )
             return
-        code = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
-        pending = access.get("pending", {})
-        # Clean expired codes
-        now_ms = int(time.time() * 1000)
-        pending = {k: v for k, v in pending.items() if v.get("expiresAt", 0) > now_ms}
-        pending[code] = {
-            "senderId": sender_id,
-            "chatId": str(message.channel.id),
-            "createdAt": now_ms,
-            "expiresAt": now_ms + 3600000,  # 1 hour
-        }
-        access["pending"] = pending
-        # Atomic tmp+rename. A bare write_text truncates-then-writes, exposing a
-        # window where a concurrent reader (every message hits load_channel_config,
-        # which re-reads access.json) sees a partial/empty file → json parse fail.
-        # THIS truncate-in-place write was the TRIGGER of the 2026-07-21 corrupt
-        # read: before the no-clobber guard above, that failed read fell to the
-        # bare-except default and permanently wiped allowFrom → pairing-code leak
-        # into DMs and #dev. The no-clobber guard stops the amplification; writing
-        # atomically here closes the window that produced the corrupt read at all
-        # (and the lost-update race with the `/discord:access` read-modify-write).
-        # Same pattern the thread-engage seed already uses. chmod the tmp before
-        # replace so the final file is never briefly 0644 (it holds owner IDs).
-        tmp_path = ACCESS_FILE.with_suffix(ACCESS_FILE.suffix + '.tmp')  # pragma: no cover — async pairing branch; atomicity asserted structurally
-        write_private_text(tmp_path, json.dumps(access, indent=2))  # pragma: no cover
-        os.replace(tmp_path, ACCESS_FILE)  # pragma: no cover
-        _backup_access_to_disk(access)  # pragma: no cover — durable backup on every valid access write (#2358)
+
         route = await _deliver_pairing_prompt(message.channel, code, username, sender_id, allowed)
         print(f"  Pairing requested: @{username} ({sender_id}) code delivered via {route}")
         return
@@ -3790,13 +3850,14 @@ async def _handle_discord_message(message, force=False):
                     team_ids.update(ch_cfg.get("allowFrom", []))
             if sender_id in team_ids:
                 access_tier = "team"
-                # Per-channel collaborator check (pure helper — unit-tested):
-                # only the serving channel's own `collaborators` list grants
-                # engagement; membership elsewhere does not carry over.
-                # Handler-glue line: resolution logic is exercised via
-                # resolve_is_collaborator's unit tests; this async-handler branch
-                # is not independently invocable (cf. media_headers no-cover below).
-                is_collaborator = resolve_is_collaborator(data, sender_id, message.channel.id)  # noqa: E501  # pragma: no cover
+        except Exception:  # pragma: no cover — handler glue; unreadable config leaves the guest tier
+            pass
+    # Collaborator status is orthogonal to WHICH arm resolved team tier — a
+    # globally-allowlisted team sender can be a serving-channel collaborator.
+    if access_tier == "team" and not is_collaborator:
+        try:  # pragma: no cover — handler glue; logic in resolve_team_collaborator's tests
+            _acc = json.loads(ACCESS_FILE.read_text())
+            is_collaborator = resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id)  # noqa: E501
         except Exception:
             pass
 
@@ -4240,8 +4301,13 @@ async def _handle_discord_message(message, force=False):
     if not _write_task_file(task_file, _build_task_content, username, channel_name,
                             access_tier, message.id):
         return
+    if _mention_gate_admitted:
+        # Every authorization gate above passed and the task file exists — only
+        # now does a mention-gate admission earn its audit row.
+        _mention_gate_log_admission(message)
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
+    pending_task_collab[task_id] = bool(is_collaborator)
     # Observability: one inbound accepted-message event.
     _emit_channel(
         "discord", "in",
@@ -4300,7 +4366,9 @@ def _approved_dirs() -> "list[Path]":
 
 
 async def poll_approved():
-    """Poll approved/ dirs and send 'you're in' confirmations."""
+    """Poll approved/ dirs and ADOPT each marker into pendingNotify.
+    This loop does not send: pendingNotify is the sole send owner, so two
+    pollers over the same grant cannot both deliver a confirmation (#3318)."""
     _legacy_warned = False
     while True:
         try:
@@ -4328,9 +4396,14 @@ async def poll_approved():
                     # marker in the directory and the loop just slept.
                     try:
                         chat_id = f.read_text().strip()
-                        channel = await client.fetch_channel(int(chat_id))
-                        await channel.send("You're in! Access approved.")
-                        print(f"  Sent approval confirmation to {sender_id} in {chat_id}")
+                        # A corrupt access.json makes mutate_access_file a silent
+                        # no-op; raising routes it into the never-delete path below.
+                        if not _adopt_pending_notify(sender_id, chat_id):
+                            raise RuntimeError(
+                                f"could not record pendingNotify for {sender_id} — "
+                                f"access.json unreadable; keeping the marker"
+                            )
+                        print(f"  Adopted approval marker for {sender_id} ({chat_id}) into pendingNotify")
                         if _i > 0 and not _legacy_warned:
                             _legacy_warned = True
                             print(
@@ -4387,6 +4460,128 @@ async def poll_approved():
                     f.unlink(missing_ok=True)
         except Exception as e:
             print(f"  Approved poll error: {e}")
+        await asyncio.sleep(3)
+
+
+_pending_notify_failed_attempts: dict = {}  # pragma: no cover — bridge not unit-imported
+
+
+def _adopt_pending_notify(sender_id: str, chat_id) -> bool:
+    """Record a legacy `approved/` marker as a pendingNotify obligation.
+    Returns False when nothing was committed — the caller MUST then keep the
+    marker, which is still the only record that a confirmation is owed.
+
+    No-ops if `sender_id` is already in `notified`: the marker's obligation
+    was already delivered and acked by the other poller, and adopting it
+    again would re-arm a fulfilled obligation for a second send (#3318 —
+    the "pending-first" poll-order race)."""
+
+    def _mutator(data):
+        pending_notify = data.get("pendingNotify", {})
+        if sender_id in pending_notify:
+            return None, {"ok": True}
+        if sender_id in data.get("notified", {}):
+            return None, {"ok": True}
+        pending_notify = dict(pending_notify)
+        pending_notify[sender_id] = chat_id
+        data["pendingNotify"] = pending_notify
+        return data, {"ok": True}
+
+    result = mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
+    return bool(result and result.get("ok"))
+
+
+def _ack_pending_notify(sender_id: str) -> None:
+    """Idempotently clear `sender_id` from pendingNotify via the same locked
+    transaction every other access.json writer uses (#3318).
+
+    Also records the fulfilled obligation in `notified`, in the SAME
+    transaction, so a stale legacy marker adopted afterward by
+    `poll_approved()` can never re-arm `pendingNotify` and cause a duplicate
+    send. Only stamps `notified` when there was actually something to ack —
+    a no-op ack (sender absent from pendingNotify) must not touch the file."""
+
+    def _mutator(data):
+        pending_notify = data.get("pendingNotify", {})
+        if sender_id not in pending_notify:
+            return None, None
+        pending_notify = dict(pending_notify)
+        del pending_notify[sender_id]
+        data["pendingNotify"] = pending_notify
+        notified = dict(data.get("notified", {}))
+        notified[sender_id] = True
+        data["notified"] = notified
+        return data, None
+
+    mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
+
+
+def _park_pending_notify(sender_id: str, chat_id) -> None:
+    """Move `sender_id` from pendingNotify into notifyFailed, atomically.
+
+    Mirrors poll_approved()'s undelivered/ quarantine: a permanently-failing
+    obligation must stop being retried every 3s (log spam, wasted API calls)
+    without ever being silently dropped. notifyFailed keeps it visible in
+    access.json itself for manual recovery, and — unlike the in-memory
+    attempts counter — survives a bridge restart.
+    """
+
+    def _mutator(data):
+        pending_notify = data.get("pendingNotify", {})
+        if sender_id not in pending_notify:
+            return None, None
+        pending_notify = dict(pending_notify)
+        del pending_notify[sender_id]
+        data["pendingNotify"] = pending_notify
+        notify_failed = dict(data.get("notifyFailed", {}))
+        notify_failed[sender_id] = chat_id
+        data["notifyFailed"] = notify_failed
+        return data, None
+
+    mutate_access_file(ACCESS_FILE, _mutator, backup=_backup_access_to_disk)
+
+
+async def poll_pending_notify():
+    """Poll access.json's `pendingNotify` field and send 'you're in'
+    confirmations. This is the durable source of truth for the grant ->
+    confirmation-owed obligation (#3318): `_pair()` writes it in the SAME
+    locked transaction as the `allowFrom` grant, so unlike the `approved/`
+    marker files `poll_approved()` reads, there is no window where the
+    process can crash after granting access but before the obligation is
+    recorded anywhere. `poll_approved()` is an INGRESS for the legacy marker
+    files the upstream plugin still writes — it adopts them into pendingNotify
+    and never sends — so this is the only loop that delivers.
+    """
+    while True:
+        try:
+            data = read_access_for_transaction(ACCESS_FILE)
+            # None = present-but-corrupt (access_store's three-way contract) —
+            # never treat that as "nothing pending"; just wait for repair.
+            pending_notify = dict(data.get("pendingNotify", {})) if isinstance(data, dict) else {}
+            for sender_id, chat_id in pending_notify.items():
+                try:
+                    channel = await client.fetch_channel(int(chat_id))
+                    await channel.send("You're in! Access approved.")
+                    print(f"  Sent approval confirmation to {sender_id} in {chat_id} (pendingNotify)")
+                    _pending_notify_failed_attempts.pop(sender_id, None)
+                    _ack_pending_notify(sender_id)
+                except Exception as e:
+                    # Same bounded-retry, never-drop discipline as poll_approved —
+                    # pendingNotify IS the obligation record, so a failed send must never ack.
+                    print(f"  Failed to send pendingNotify approval to {sender_id}: {e}")
+                    attempts = _pending_notify_failed_attempts.get(sender_id, 0)
+                    _pending_notify_failed_attempts[sender_id] = attempts + 1
+                    if not send_failure_policy.should_retry(e, attempts):
+                        _pending_notify_failed_attempts.pop(sender_id, None)
+                        print(
+                            f"  [pendingNotify] {sender_id} exceeded retry budget "
+                            f"({attempts + 1}/{send_failure_policy.MAX_TRANSIENT_ATTEMPTS}) — "
+                            f"moved to notifyFailed; NOT deleted, a confirmation is still owed",
+                            flush=True,
+                        )
+                        _park_pending_notify(sender_id, chat_id)
+        except Exception as e:
+            print(f"  pendingNotify poll error: {e}")
         await asyncio.sleep(3)
 
 
@@ -4755,6 +4950,20 @@ async def poll_results():
                 # "unknown" — never "owner" — so a lost/absent tier can't
                 # silently upgrade a non-owner reply in tier accounting.
                 _task_tier = pending_task_tiers.pop(task_id, None) or "unknown"
+                _task_collab = pending_task_collab.pop(task_id, None)
+                if _task_collab is None:
+                    # HEADERS ONLY: split at the task marker exactly like
+                    # resolve_access_tier, so body text can never escalate a tier.
+                    _tf_c = find_task_file(TASKS_DIR, task_id)
+                    _task_collab = False
+                    if _tf_c:
+                        _tf_head = _tf_c.read_text(errors="replace").split("\ntask:", 1)[0]
+                        _cvals = [line.partition(":")[2].strip()
+                                  for line in _tf_head.split("\n")
+                                  if line.startswith("collaborator:")]
+                        # exactly one "true": conflicting or malformed stamps
+                        # fail CLOSED, same as resolve_access_tier's tier guard
+                        _task_collab = _cvals == ["true"]
                 save_pending_replies()
                 # Skip sending if already replied directly (core agent used MCP).
                 # Clean up the result AND task files so the watcher doesn't
@@ -4769,8 +4978,15 @@ async def poll_results():
                     _guard_tier = _resolve_task_tier(_guard_tf) if _guard_tf else "guest"
                 # A Discord channel is a human surface: the suppression is journaled
                 # under STATE_DIR and closed silently rather than posted as prose.
+                try:
+                    _aa_access = json.loads(ACCESS_FILE.read_text())
+                except Exception:
+                    _aa_access = {}   # unreadable config -> default deny
+                _allow_attach = bool(_task_collab) and channel_allows_collaborator_attachments(
+                    _aa_access, getattr(channel, "id", None))
                 reply_text, _withheld = guard_result_for_tier(reply_text, _guard_tier, REPO,
-                                                             suppress_journal=(STATE_DIR, task_id))
+                                                             suppress_journal=(STATE_DIR, task_id),
+                                                             allow_attach=_allow_attach)
                 if _withheld:
                     print(f"  [team-guard] withheld result for {task_id} "
                           f"(tier={_guard_tier}): {_withheld}", flush=True)
@@ -4786,18 +5002,29 @@ async def poll_results():
                     # own channel. Loop guard: a task that comes back
                     # cross-channel-deduped a SECOND time is not re-queued again
                     # — notify in-channel instead (owner-directed).
-                    if _skip.value == "deduped" and _skip.extra:
+                    if _skip.value == "deduped":
+                        _act, _delivered = "defer", None
                         try:
-                            _holder_file = find_task_file(TASKS_DIR, _skip.extra)
+                            # find_task_file globs unchecked; an id failing the
+                            # gate find_result applies is "holder not found".
+                            _holder_file = (
+                                find_task_file(TASKS_DIR, _skip.extra)
+                                if local_task_protocol.valid_archive_lookup_id(_skip.extra)
+                                else None)
                             _holder_text = _holder_file.read_text() if _holder_file else None
                             _target = dedup_cross_channel_target(channel.id, _holder_text)
+                            # Cross-channel is an unconfirmed report: the asker is
+                            # only served once the notify or the re-queue lands.
                             _act, _pl = (_dedup_recover(task_id, _skip.extra, channel.id)
-                                         if not _target else ("honour", None))
+                                         if not _target else ("report", None))
                             if _act == "requeue":
                                 pending_replies[_pl] = channel
                                 save_pending_replies()
-                            elif _act == "report":
+                            elif _act == "report" and not _target:
+                                # Cross-channel carries a None payload and is
+                                # delivered by the _target block below instead.
                                 await channel.send(_pl)
+                                _delivered = True
                             if _target:
                                 _orig_file = find_task_file(TASKS_DIR, task_id)
                                 _orig_text = _orig_file.read_text() if _orig_file else None
@@ -4815,6 +5042,7 @@ async def poll_results():
                                         f"even after a re-queue — flagging instead of looping. "
                                         f"This needs a direct answer here."
                                     )
+                                    _delivered = True
                                 else:
                                     # First time — reject + re-queue for an
                                     # in-channel answer.
@@ -4833,9 +5061,16 @@ async def poll_results():
                                         f"{_new_id} for in-channel answer",
                                         flush=True,
                                     )
+                                    _delivered = True
                         except Exception as e:
-                            # Best-effort; never block the archive of this result.
                             print(f"  [dedup] cross-channel reject/requeue failed: {e}", flush=True)
+                        if report_disposition(_act, _delivered) == "retain":
+                            # Nobody was told. Keep the result AND the task so a
+                            # later pass retries; archiving loses the question.
+                            print(
+                                f"  [dedup] report not delivered for {task_id} — "
+                                f"retaining for retry", flush=True)
+                            continue
                     print(f"  Skipped (already replied or deduped): {task_id}")
                     # §7 audit: skip-marked results are resolved deliveries, not
                     # silent voids — one line per resolved result per spec.
@@ -5097,16 +5332,17 @@ def _queued_task_count():
         return 0
 
 
-def _render_progress_content(now, elapsed):
-    """Placeholder body for poll_progress: the live core step normally, or the
-    honest outage copy (frozen status + stale heartbeat + queue depth) when the
-    core looks dead (sonichi#2398 — the 2026-07-30 'restart in flight (1625s)'
-    class: never narrate progress the core is not making)."""
+def _render_progress_content(now, elapsed, channel_is_private=False):
+    """`channel_is_private` gates the STEP TEXT and defaults False, so a caller that
+    has not established the audience posts the placeholder without a step."""
     status = progress_stream.read_core_status(STATE_DIR)
     if progress_stream.core_looks_down(status, _newest_alive_mtime(), now):
         return progress_stream.format_outage(
             progress_stream.status_age_s(status, now), _queued_task_count())
-    return progress_stream.format_progress(progress_stream.current_step(status), elapsed)
+    step = progress_stream.current_step(status)
+    if not progress_stream.step_visible_in(channel_is_private):
+        step = None
+    return progress_stream.format_progress(step, elapsed)
 
 
 async def poll_progress():
@@ -5168,7 +5404,7 @@ async def poll_progress():
                     if progress_stream.should_edit(now, info["last_edit"]):
                         try:
                             await info["msg"].edit(
-                                content=_render_progress_content(now, elapsed)
+                                content=_render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                             )
                             info["last_edit"] = now
                         except Exception:
@@ -5188,7 +5424,10 @@ async def poll_progress():
                 # entry closes that hole (red-team #2).
                 if task_id not in pending_task_tiers:
                     continue
-                if not progress_stream.should_stream_task(pending_task_tiers.get(task_id)):
+                # Poll branch not unit-invocable; decision covered in progress_stream.
+                if not progress_stream.should_stream_task(  # pragma: no cover
+                        pending_task_tiers.get(task_id),
+                        pending_task_collab.get(task_id, False)):
                     continue  # non-owner → no placeholder, no leak
                 try:
                     created = int(task_id.split("-")[1]) / 1000.0
@@ -5198,7 +5437,7 @@ async def poll_progress():
                 if progress_stream.should_post_placeholder(elapsed):
                     try:
                         msg = await channel.send(
-                            _render_progress_content(now, elapsed)
+                            _render_progress_content(now, elapsed, isinstance(channel, discord.DMChannel))
                         )
                         _progress_msgs[task_id] = {
                             "msg": msg,
@@ -5229,6 +5468,7 @@ async def poll_progress():
                                 continue
                     _progress_msgs.pop(task_id, None)
                     pending_task_tiers.pop(task_id, None)
+                    pending_task_collab.pop(task_id, None)  # pragma: no cover
         except Exception as e:
             print(f"  [progress] poll_progress tick error: {e}", flush=True)
         await asyncio.sleep(3)

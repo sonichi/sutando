@@ -155,7 +155,19 @@ denied); non-Gmail tools are a no-op, so it is safe under a broad matcher.
 Escape hatch: `SUTANDO_ALLOW_GMAIL_CONNECTOR_WRITES=1` lifts the guard (for
 if/when the connector's scopes are fixed upstream). Fail-OPEN on hook errors.
 
-### Deploy (per node)
+### Registration
+
+**Auto-registered** for every core session: `start-cli.sh` passes this hook to
+`src/agent/claude/cli/build-core-settings.mjs`, which registers it under
+`PreToolUse` with matcher `mcp__.*[Gg][Mm][Aa][Ii][Ll].*` in the `--settings`
+JSON. Nothing to install per node.
+
+The registration rides `--settings` rather than a written `settings.json`, so it
+survives an app update that replaces the engine tree (the failure mode issue
+#3221 describes for the `install-claude-hooks.sh` set).
+
+To register it in a non-core session (e.g. an interactive Claude Code), add the
+same `PreToolUse` entry to `~/.claude/settings.json` by hand:
 
 ```bash
 cp hooks/gmail-write-guard.py ~/.claude/hooks/

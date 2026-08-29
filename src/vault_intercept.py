@@ -224,6 +224,54 @@ def set_vault_key(key: str, value: str) -> None:
     _store_in_keychain(key, value)
 
 
+def _deregister_key(key: str) -> None:
+    # Reverse of _register_key. Absent key is a no-op (no write), so a re-run
+    # does not churn the file. Atomic write, same as _register_key.
+    manifest = _read_manifest()
+    if key not in manifest:
+        return
+    del manifest[key]
+    path = _manifest_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp, path)
+
+
+_ERRSEC_ITEM_NOT_FOUND = 44  # errSecItemNotFound
+
+
+def _delete_from_keychain(key: str) -> None:
+    # rc 44 is errSecItemNotFound — already gone, so the manifest drop proceeds.
+    # Any other non-zero may leave the item LIVE; dropping it then strands a secret.
+    result = subprocess.run(
+        ["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
+        capture_output=True,
+    )
+    if result.returncode not in (0, _ERRSEC_ITEM_NOT_FOUND):
+        raise RuntimeError(
+            f"vault: failed to delete '{key}' from Keychain "
+            f"(rc={result.returncode}); manifest entry kept so the secret is not stranded"
+        )
+    _deregister_key(key)
+
+
+def delete_vault_key(key: str) -> None:
+    """Remove a secret from Keychain + manifest — the reverse of set_vault_key.
+
+    Idempotent: deleting an absent key, or reconciling a half-state where only
+    one of {Keychain item, manifest entry} survives, is SUCCESS, not an error —
+    the desktop T2.8 teardown re-runs and must not fail on an already-gone key.
+    Raises ValueError on an invalid key name (the same rule set_vault_key
+    enforces — not loosened here), and RuntimeError when the Keychain delete
+    fails for any reason other than the item already being absent.
+    """
+    if not _ENV_KEY_RE.match(key or ""):
+        raise ValueError(f"vault: invalid key name '{key}' (want [A-Za-z_][A-Za-z0-9_]*)")
+    _delete_from_keychain(key)
+
+
 def intercept_vault_commands(text: str) -> InterceptResult:
     """Detect vault-set commands in `text`, store secrets, return sanitized text.
 
