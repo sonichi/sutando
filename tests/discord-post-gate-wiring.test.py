@@ -185,7 +185,25 @@ try:
     check("proactive provider: refused", "NOT_DELIVERED" in str(receipt.outcome),
           str(receipt.outcome))
 
-    check("ZERO transport attempts across all five paths", attempts == [],
+    # 6. send_channel_message.py -- the reviewer-notification sender. Added when
+    # a review found it binding DiscordRestClient directly, which reaches the
+    # transport while skipping the gate. An enumeration covers what it enumerates.
+    _spec = importlib.util.spec_from_file_location(
+        "scm_gate", REPO / "skills" / "collaboration-intelligence" / "scripts"
+        / "send_channel_message.py")
+    scm = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(scm)
+    # Do NOT inject a client: injecting a gated one proves the gate works when
+    # you hand it over, never that this module BUILDS a gated one. Stub only the
+    # token so the real construction path runs.
+    scm.token = lambda: "tok"
+    r6, _posted6 = scm.send("chan-scm", "hi", "111")
+    check("send_channel_message: refused",
+          "NOT_DELIVERED" in str(r6.outcome), str(r6.outcome))
+    check("send_channel_message: refusal names the policy",
+          "wiring-test policy" in r6.detail, r6.detail)
+
+    check("ZERO transport attempts across all six paths", attempts == [],
           str(attempts))
 finally:
     urllib.request.urlopen = _real_urlopen
@@ -195,7 +213,7 @@ finally:
 seen = [json.loads(line) for line in _seen_file.read_text().splitlines()]
 seen_channels = {s["channel_id"] for s in seen}
 check("policy saw every channel id",
-      {"chan-dm", "chan-b2b", "chan-tp", "chan-cli", "chan-pro"} <= seen_channels,
+      {"chan-dm", "chan-b2b", "chan-tp", "chan-cli", "chan-pro", "chan-scm"} <= seen_channels,
       str(seen_channels))
 check("policy saw dict payloads with content",
       all(isinstance(s["payload"], dict) and "content" in s["payload"] for s in seen))
@@ -230,4 +248,4 @@ if FAILS:
     print(f"{len(FAILS)} FAILURE(S)")
     sys.exit(1)
 print("post-gate wiring holds: one refusing policy, installed via launch wiring, "
-      "blocks all five production sender paths with zero transport attempts")
+      "blocks all six production sender paths with zero transport attempts")

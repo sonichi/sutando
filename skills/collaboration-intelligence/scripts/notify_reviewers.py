@@ -160,9 +160,18 @@ def discord_reachable(target: dict) -> "tuple[bool, str]":
     if not isinstance(data, dict):
         return True, "unverified (non-object access map)"
     for section in ("groups", "channels"):
-        entry = (data.get(section) or {}).get(str(target["channel"]))
+        sect = data.get(section)
+        # A truthy non-object has no .get, and a scalar allowFrom ITERATES --
+        # "1" would answer per character and return a definite verdict from
+        # garbage. Every unusable shape is unverified, never an answer.
+        if sect is not None and not isinstance(sect, dict):
+            return True, f"unverified ({section} is {type(sect).__name__}, not an object)"
+        entry = (sect or {}).get(str(target["channel"]))
         if isinstance(entry, dict):
-            allowed = {str(x) for x in (entry.get("allowFrom") or [])}
+            raw = entry.get("allowFrom")
+            if raw is not None and not isinstance(raw, (list, tuple, set)):
+                return True, f"unverified (allowFrom is {type(raw).__name__}, not a list)"
+            allowed = {str(x) for x in (raw or [])}
             if not allowed:
                 return True, f"unverified ({section} entry has no allowFrom)"
             return str(target["discord_id"]) in allowed, f"{len(allowed)} in allowFrom"
@@ -177,7 +186,8 @@ def discord_command_for(target: dict, message: str) -> "list[str]":
     """
     return [_PY, str(_REPO / "skills" / "collaboration-intelligence" / "scripts"
                      / "send_channel_message.py"),
-            str(target["channel"]), f"<@{target['discord_id']}> {message}"]
+            str(target["channel"]), str(target["discord_id"]),
+            f"<@{target['discord_id']}> {message}"]
 
 
 def command_for(target: dict, message: str) -> "list[str]":
@@ -374,6 +384,25 @@ def main() -> int:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
             if p.returncode == 0:
                 print(f"{t['name']}: SENT to channel {t['channel']}")
+                # Same bookkeeping as the Matrix path: without it a delivered
+                # Discord ask reads as NOBODY_EVER_ASKED to pr-unattended.
+                try:
+                    n_logged = record_asks(a.message, t["name"])
+                except OSError as e:
+                    unlogged += 1
+                    print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT "
+                          f"recorded ({e}) — pr-unattended will under-report this PR "
+                          "as unasked", file=sys.stderr)
+                else:
+                    if n_logged:
+                        print(f"  logged {n_logged} PR ask(s) for {t['name']}",
+                              file=sys.stderr)
+            elif p.returncode == 4:
+                # OUTCOME_UNKNOWN: the post may have landed. Counting it as a
+                # failure invites the retry the receipt says is unsafe.
+                print(f"{t['name']}: OUTCOME UNKNOWN on channel {t['channel']} — "
+                      f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
+                failures += 1
             else:
                 print(f"{t['name']}: SEND FAILED rc={p.returncode} "
                       f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)

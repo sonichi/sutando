@@ -208,7 +208,11 @@ class MainDiscordSend(unittest.TestCase):
             json.dump({"d": DISCORD}, f)
         os.environ["SUTANDO_SCI_ROSTER"] = path
         os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {"222": {"allowFrom": ["111"]}}})
-        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m", "--send"]
+        # #3515 landed a two-reviewer minimum after these cases were written.
+        # They exercise the SEND path, not the reviewer-count rule, so they take
+        # the documented escape rather than being weakened to accommodate it.
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m", "--send",
+                       "--allow-single", "single-target send-path test"]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = nr.main()
@@ -258,7 +262,11 @@ class TwoChannelsDistinct(unittest.TestCase):
         with os.fdopen(fd, "w") as f:
             json.dump({"d": DISCORD}, f)
         os.environ["SUTANDO_SCI_ROSTER"] = path
-        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m", "--send"]
+        # #3515 landed a two-reviewer minimum after these cases were written.
+        # They exercise the SEND path, not the reviewer-count rule, so they take
+        # the documented escape rather than being weakened to accommodate it.
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m", "--send",
+                       "--allow-single", "single-target send-path test"]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = nr.main()
@@ -272,3 +280,32 @@ class TwoChannelsDistinct(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class DiscordAskIsRecorded(unittest.TestCase):
+    """A delivered Discord ask must reach the ledger the Matrix path writes.
+
+    The success branch used to `continue` before `record_asks`, so pr-unattended
+    read a correctly-delivered ask as NOBODY_EVER_ASKED.
+    """
+
+    def test_the_discord_success_branch_calls_record_asks(self):
+        src = (REPO / "skills" / "collaboration-intelligence" / "scripts"
+               / "notify_reviewers.py").read_text()
+        disc = src[src.index('if t["transport"] == "discord":'):]
+        disc = disc[:disc.index('if a.room and t["room"] != a.room:')]
+        self.assertIn("record_asks(", disc,
+                      "the Discord success path does not write the ask ledger")
+
+    def test_it_passes_the_target_id_so_mentions_can_be_pinned(self):
+        src = (REPO / "skills" / "collaboration-intelligence" / "scripts"
+               / "notify_reviewers.py").read_text()
+        cmd = src[src.index("def discord_command_for("):]
+        cmd = cmd[:cmd.index("\ndef ", 1)]
+        self.assertIn('str(target["discord_id"]),', cmd,
+                      "the sender cannot restrict allowed_mentions without the id")
+
+    def test_unknown_outcome_is_not_folded_into_send_failed(self):
+        src = (REPO / "skills" / "collaboration-intelligence" / "scripts"
+               / "notify_reviewers.py").read_text()
+        self.assertIn("OUTCOME UNKNOWN", src)
