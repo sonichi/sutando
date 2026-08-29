@@ -175,10 +175,23 @@ class AMigratedDocumentExposesNoMetadataAsAPerson(unittest.TestCase):
         # roster_identity.is_person_key is the owner; a byte-equivalent private
         # copy passes every behaviour test and drifts the moment the rule moves.
         import pathlib as _p
-        src = _p.Path(lk.__file__).read_text()
-        self.assertNotIn('startswith("_")', src,
-                         "lookup.py carries its own copy of the metadata rule")
-        self.assertIn("is_person_key", src, "it must call the owner")
+        # EVERY reader of the promoted roster, not just the one that prompted
+        # this test: a scan naming one file lets the next copy in unseen.
+        scripts = _p.Path(lk.__file__).parent
+        for name in ("lookup.py", "notify_reviewers.py"):
+            src = (scripts / name).read_text()
+            self.assertNotIn('startswith("_")', src,
+                             f"{name} carries its own copy of the metadata rule")
+            self.assertIn("is_person_key", src, f"{name} must call the owner")
+
+    def test_the_owner_itself_is_the_only_definition(self):
+        # The negative control: the scan above must not be satisfiable by
+        # deleting the rule everywhere, so pin that the owner still defines it.
+        import pathlib as _p
+        owner = (_p.Path(lk.__file__).parent / "roster_identity.py").read_text()
+        self.assertIn("def is_person_key", owner)
+        self.assertIn('startswith("_")', owner,
+                      "the owner is where the rule is allowed to live")
 
     def test_a_real_person_in_the_same_document_still_loads(self):
         # The negative control: filtering must not empty the roster.

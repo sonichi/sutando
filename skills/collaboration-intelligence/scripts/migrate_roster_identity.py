@@ -92,16 +92,28 @@ def _field_words(field: str) -> frozenset:
     return frozenset(w.lower() for w in _WORDS.findall(str(field)))
 
 
-def _verdict_from_field(field: str):
-    """A field name states the referent, or it states nothing."""
+def _verdicts_from_field(field: str) -> list:
+    """EVERY referent a field name states — two when it names both.
+
+    Returning both lets the existing disagreement path resolve it; picking one
+    would be a precedence no source documents.
+    """
     # Any word, at any depth: nesting must not change what a typed field
     # states, or `wrapper.stand_status.id` would classify as nothing.
     words = _field_words(field)
+    out = []
     if words & _HUMAN_WORDS:
-        return HUMAN, f"cited in `{field}` (field names the human)"
+        out.append((HUMAN, f"cited in `{field}` (field names the human)"))
     if words & _STAND_WORDS:
-        return STAND, f"cited in `{field}` (field names the agent)"
-    return None, None
+        out.append((STAND, f"cited in `{field}` (field names the agent)"))
+    return out
+
+
+def _verdict_from_field(field: str):
+    """The single referent a name states, or nothing. A name stating BOTH
+    states neither on its own — callers deciding a slot must use the plural."""
+    v = _verdicts_from_field(field)
+    return v[0] if len(v) == 1 else (None, None)
 
 
 def _bad(entries: list, value, states, reason: str) -> None:
@@ -121,7 +133,7 @@ def _typed_path(path: list) -> bool:
     `secondary_agent: {"id": ...}` states the referent at the ancestor; testing
     the leaf alone ("id") discards the very evidence the schema documents.
     """
-    return any("discord" in seg.lower() or _verdict_from_field(seg)[0]
+    return any("discord" in seg.lower() or _verdicts_from_field(seg)
                for seg in path)
 
 
@@ -158,8 +170,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
 
     for id_ in _collect_ids(entry):
         for field in _cited_in(entry, id_):
-            verdict, reason = _verdict_from_field(field)
-            if verdict:
+            for verdict, reason in _verdicts_from_field(field):
                 claim(id_, verdict, reason)
         claims.setdefault(id_, {})
 

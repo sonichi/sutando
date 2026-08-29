@@ -726,5 +726,45 @@ class MemberOrderIsNotIdentityEvidence(unittest.TestCase):
         self.assertEqual(others, [self.SECOND])
 
 
+class AFieldNamingBothReferentsStatesNeither(unittest.TestCase):
+    """`human` was checked first, so a name stating BOTH silently became HUMAN.
+
+    That is a precedence no source documents. Two stated referents are a
+    disagreement, and the migration already has a disagreement path.
+    """
+
+    def _entry(self, doc):
+        out, _ = migrate(doc)
+        return out["x"]
+
+    def test_a_flat_both_referent_name_is_unresolved(self):
+        e = self._entry({"x": {"human_agent_discord_id": BOT}})
+        self.assertIsNone(ri.human_discord_id(e))
+        self.assertIsNone(ri.stand_discord_id(e))
+        self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(e)], [BOT])
+
+    def test_a_nested_both_referent_path_is_unresolved(self):
+        # The path is what states both — `human_profile` and `secondary_agent`
+        # are different segments, so a leaf-only check would miss it.
+        e = self._entry({"x": {"human_profile": {"secondary_agent": {"id": BOT}}}})
+        self.assertIsNone(ri.human_discord_id(e))
+        self.assertIsNone(ri.stand_discord_id(e))
+        self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(e)], [BOT])
+
+    def test_single_referent_names_are_untouched(self):
+        # Positive control: passes at both revisions, so a fix that resolved
+        # nothing at all could not satisfy the two negatives and look correct.
+        self.assertEqual(
+            ri.human_discord_id(self._entry({"x": {"discord_human_id": HUMAN}})), HUMAN)
+        self.assertEqual(
+            ri.stand_discord_id(self._entry({"x": {"stand_discord_id": BOT}})), BOT)
+
+    def test_the_id_is_still_collected_rather_than_vanishing(self):
+        # The trap: a both-referent segment that stops counting as typed
+        # drops the id entirely instead of reporting it unresolved.
+        e = self._entry({"x": {"human_agent_discord_id": BOT}})
+        self.assertTrue(ri.unresolved_discord_ids(e), "id must survive as unresolved")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
