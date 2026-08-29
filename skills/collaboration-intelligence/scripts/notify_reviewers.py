@@ -602,8 +602,8 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
         payload += json.dumps(row) + "\n"
     # One write under O_APPEND: a reader never sees half a batch, and two
     # writers never interleave rows within one.
-    # Created private: a fresh ledger under umask 022 is 0644, and this file
-    # records who was asked about what.
+
+    # Created private: a fresh ledger under umask 022 would be 0644.
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _LEDGER_MODE)
     with os.fdopen(fd, "a") as fh:
         fh.write(payload)
