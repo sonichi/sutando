@@ -457,8 +457,8 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     names = {actor_of.get(x["name"], x["name"]) for x in targets}
     if not names or not names.issubset(prior):
         return False, ""            # at least one NEW name -> this IS widening
-    # The NEWEST ask among the selected targets: an older one belonging to a
-    # different person says nothing about whether THIS set may be re-asked.
+    # NEWEST among the selected targets: an older ask belonging to someone
+    # else says nothing about whether THIS set may be re-asked.
     ours = [per_actor[n] for n in names if per_actor.get(n)]
     earliest = max(ours) if ours else None
     if earliest is None:

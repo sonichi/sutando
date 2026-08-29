@@ -918,9 +918,8 @@ class ALegacyRowParksEverySpellingOfOneActor(unittest.TestCase):
             "a possibly-landed post can be resent through another spelling")
 
     def test_one_aliass_failure_does_not_settle_the_others_unknown(self):
-        # The history the earlier alias bypass produced: beta posted and the
-        # outcome is unknown, then alpha retried and definitely failed.
-        # Collapsing to one canonical stream lets alpha's failure clear beta's.
+        # beta posted with an unknown outcome, then alpha retried and failed.
+        # One collapsed stream lets alpha's failure clear beta's.
         self.led.write_text("".join(json.dumps(r) + "\n" for r in (
             {"repo": "o/r", "pr": 7, "reviewer": "beta",
              "ts": "2026-08-29T10:00:00Z", "channel": "room", "outcome": "unknown"},
