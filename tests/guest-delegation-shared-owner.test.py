@@ -76,6 +76,9 @@ class TestOwnerContract(unittest.TestCase):
         unavailable branch must produce a reply rather than nothing."""
         self.assertIn("do not silently skip", SANDBOXED_DELEGATION_CODEX)
         self.assertIn("no inspection was performed", SANDBOXED_DELEGATION_CODEX)
+        lines = sandboxed_delegation_lines(
+            "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
+        self.assertIn("no inspection was performed", "\n".join(lines))
 
     def test_scope_is_a_parameter_not_baked_in(self):
         """Slack's per-tier limits must not leak into the shared text."""
