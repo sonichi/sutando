@@ -5636,6 +5636,23 @@ def check_gateway_bridge() -> "dict | None":
                        "timestamp — the writer is not reporting poll outcomes, so "
                        "ag2.space mobile messages may not be delivered"),
         }
+    # Primary said nothing and is not merely stale, so it may not exist at all.
+    # Ask the lanes before calling a live PID healthy — one of them owns it.
+    lanes = _gateway_lane_verdicts()
+    if lanes and not any(serving for _, serving, _ in lanes):
+        never = [ln for ln, _, ever in lanes if not ever]
+        why = (f"lane {', '.join(never)} has never completed a poll" if never
+               else f"lane {', '.join(ln for ln, _, _ in lanes)} is not connected")
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": (f"process running but NOT serving — {why}; "
+                       "ag2.space mobile messages are not being delivered"),
+        }
+    if lanes:
+        served = ", ".join(ln for ln, serving, _ in lanes if serving)
+        return {"name": "gateway-bridge", "status": "ok",
+                "detail": f"running + connected (lane {served})"}
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
@@ -5773,6 +5790,38 @@ def check_runtime_identity(path: "Path | None" = None,
                           + " ".join(bits)}
     return {"name": name, "status": "ok",
             "detail": ("entrypoint=canonical " + " ".join(bits))}
+
+
+def _gateway_lane_verdicts(state_dir: "Path | None" = None,
+                           now: "float | None" = None) -> "list[tuple[str, bool, bool]]":
+    """(lane, serving, ever_served) for each fresh non-primary lane sidecar.
+
+    The PID proving "running" can belong to a lane other than primary — the lane
+    selector runs exactly one lane and parks the rest — so on a lane-only host
+    primary never writes a sidecar and its absence is not evidence of health.
+    Freshness, schema and the serving rule stay owned by gateway_serving; this
+    enumerates lanes and asks it per file. `ever_served` is read off the
+    normalized record rather than reusing GatewayVerdict.never_polled, which
+    additionally requires `connected` — a lane that is both disconnected and has
+    no successful poll is the misconfigured-endpoint case this message names, and
+    never_polled reports False for it.
+    """
+    import time as _time
+    now = _time.time() if now is None else now
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    out = []
+    try:
+        entries = sorted(root.glob("gateway-status.*.json"))
+    except OSError:
+        return out
+    for f in entries:
+        lane = f.name[len("gateway-status."):-len(".json")]
+        v = read_gateway_verdict(f, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
+        if v is None:
+            continue
+        out.append((lane, v.serving, v.last_ok_ts is not None))
+    return out
 
 
 def _gateway_status_stale_age_s(path: "Path | None" = None,
@@ -6070,6 +6119,99 @@ def check_daily_cron_punctuality() -> dict:
     if not jobs:
         return {"name": name, "status": "ok", "detail": "no plain-daily jobs — skipped"}
     return _interpret_daily_punctuality(jobs)
+
+
+def _porcelain_z_tracked_paths(porcelain: str) -> "list[str]":
+    """Tracked-change paths from `git status --porcelain -z`.
+
+    Rename/copy records carry the destination first and the original as a
+    second NUL field; the destination is the path that exists on disk, so
+    returning it is what makes an age check possible.  The `-z` form is used
+    because the default rendering spells a rename `R  old -> new`, which is a
+    literal arrow in the middle of an unusable path.
+    """
+    out = []
+    fields = porcelain.split("\0")
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        i += 1
+        if not rec:
+            continue
+        xy, path = rec[:2], rec[3:]
+        if xy == "??" or not xy.strip():
+            continue
+        if "R" in xy or "C" in xy:
+            i += 1  # skip the original-path field this record also emitted
+        if path:
+            out.append(path)
+    return out
+
+
+def check_live_tree_drift(repo_root: "Path | None" = None,
+                          behind_max: int = 30,
+                          dirty_age_max_s: int = 86400) -> dict:
+    """Warn when the LIVE checkout drifts: >=behind_max commits behind its own
+    upstream branch, or tracked dirty files older than dirty_age_max_s.
+    Measured 2026-08-26: the live tree sat 116 behind with ~190 dirty files
+    (some running in production while existing in no commit); nothing alarmed.
+    Diagnostic only — reconciliation needs an attended restart window."""
+    import subprocess as _sp
+    name = "live-tree-drift"
+    root = Path(repo_root) if repo_root else REPO_DIR
+    def _git(*args):
+        r = _sp.run(git_argv("-C", str(root), *args),
+                    capture_output=True, text=True, timeout=20)
+        # rstrip only: porcelain lines carry a SIGNIFICANT leading space
+        # (" M file"); .strip() would eat it and shift every field parse.
+        return r.returncode, r.stdout.rstrip("\n")
+    try:
+        rc, branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+        if rc != 0:
+            return {"name": name, "status": "ok", "detail": "not a git checkout"}
+        behind = 0
+        rc, up = _git("rev-parse", "--abbrev-ref", "@{upstream}")
+        if rc == 0 and up:
+            rc2, n = _git("rev-list", "--count", f"HEAD..{up}")
+            if rc2 == 0 and n.isdigit():
+                behind = int(n)
+        rc, porcelain = _git("status", "--porcelain", "-z")
+        if rc != 0:
+            # A failed read yields empty stdout, which would read as a clean
+            # tree -- the one verdict this probe exists to prevent.
+            return {"name": name, "status": "warn",
+                    "detail": "git status failed — the working tree is UNMEASURED, "
+                              "not clean; a stale dirty checkout is invisible here"}
+        dirty = _porcelain_z_tracked_paths(porcelain)
+        now = time.time()
+        stale = []
+        for rel in dirty:
+            p = root / rel
+            try:
+                if now - p.stat().st_mtime > dirty_age_max_s:
+                    stale.append(rel)
+            except OSError:
+                continue  # deleted-in-tree entries have no mtime; count as dirty only
+        problems = []
+        if behind >= behind_max:
+            problems.append(f"{behind} commits behind {up}")
+        if stale:
+            problems.append(f"{len(stale)} tracked dirty file(s) older than "
+                            f"{dirty_age_max_s // 3600}h (e.g. {stale[0]})")
+        if problems:
+            return {"name": name, "status": "warn",
+                    "detail": ("live tree drifting: " + "; ".join(problems) +
+                               " — running daemons restart onto whatever is on disk; "
+                               "commit/rescue the dirty state, then reconcile in an "
+                               "attended restart window")}
+        return {"name": name, "status": "ok",
+                "detail": f"{behind} behind upstream, {len(dirty)} tracked dirty"}
+    except GitUnavailable:
+        # No runnable git is a host state, not drift — never re-warn per pass.
+        return {"name": name, "status": "ok", "detail": "no runnable git on this host"}
+    except Exception as exc:  # a broken guard must not fail the whole health run
+        return {"name": name, "status": "warn",
+                "detail": f"drift probe could not measure: {str(exc)[:80]}"}
 
 
 def check_disk_space() -> dict:
@@ -6807,6 +6949,24 @@ def check_stranded_destined_proactive() -> dict:
 _STRAND_MIN_AGE_S = 1800
 
 
+PARK_REASONS = ("deduped-orphan", "has-attachments", "no-task", "too-old",
+                "undeliverable-after-retries")
+
+
+def _park_reason_tally(kept) -> str:
+    """Count parked bodies by the reason their filename records.
+
+    Only `undeliverable-after-retries` is a delivery failure, so a summary that
+    names a cause for the other four states something no writer recorded.
+    """
+    counts = {}
+    for name, _age in kept:
+        reason = next((p for p in str(name).split(".") if p in PARK_REASONS),
+                      "unlabelled")
+        counts[reason] = counts.get(reason, 0) + 1
+    return ", ".join(f"{n} {r}" for r, n in sorted(counts.items()))
+
+
 def check_proactive_quarantine() -> dict:
     """Report proactive bodies that were SAVED from deletion and then forgotten.
 
@@ -6878,9 +7038,11 @@ def check_proactive_quarantine() -> dict:
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(kept)} proactive message(s) kept in results/undelivered/ that Discord "
-                   f"refused — preserved, but no consumer drains this directory, so they stay "
-                   f"until someone acts; oldest {oldest_name} "
+        # `_quarantine_orphan` names files <tid>.<reason>.<ts>.txt; the send-failure
+        # path preserves the body name, so a missing reason is unlabelled, not a failure.
+        "detail": (f"{len(kept)} proactive message(s) parked in results/undelivered/ "
+                   f"({_park_reason_tally(kept)}) — preserved, but no consumer drains this "
+                   f"directory, so they stay until someone acts; oldest {oldest_name} "
                    f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
                    f"{partial}"),
     }
@@ -9664,6 +9826,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
     checks.append(check_runtime_identity())
+    checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
 
     return checks

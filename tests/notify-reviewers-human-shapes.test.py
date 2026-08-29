@@ -33,25 +33,32 @@ class HumanShapeTests(unittest.TestCase):
             {"name": "x", "stand": "@stand:ag2.space", "room": "!r:ag2.space",
              "human": human}, "body")
 
+    @staticmethod
+    def _body(cmd):
+        """The message argument. Asserting over the joined argv puts the repo path
+        in the subject, so a checkout under /tmp/tmp.jrjxccG0z6 fails on "cc"."""
+        return cmd[-2]
+
     def test_dict_human_does_not_raise(self):
         """The defect: a structured human record crashed the send."""
         self._cmd({"discord": "123", "username": "someone"})
 
     def test_dict_human_is_not_ccd(self):
         """A dict has no room-addressable handle -- skip it, never stringify it."""
-        self.assertNotIn("cc", " ".join(self._cmd({"discord": "123"})))
+        self.assertEqual(self._body(self._cmd({"discord": "123"})), "body")
 
     def test_string_human_is_still_ccd(self):
-        self.assertIn("(cc @who:ag2.space)", " ".join(self._cmd("@who:ag2.space")))
+        self.assertEqual(self._body(self._cmd("@who:ag2.space")),
+                         "body (cc @who:ag2.space)")
 
     def test_string_human_not_duplicated_when_already_present(self):
         cmd = self.mod.command_for(
             {"name": "x", "stand": "@s:ag2.space", "room": "!r:ag2.space",
              "human": "@who:ag2.space"}, "hi @who:ag2.space")
-        self.assertEqual(" ".join(cmd).count("@who:ag2.space"), 1)
+        self.assertEqual(self._body(cmd).count("@who:ag2.space"), 1)
 
     def test_missing_human_is_fine(self):
-        self.assertNotIn("cc", " ".join(self._cmd(None)))
+        self.assertEqual(self._body(self._cmd(None)), "body")
 
 
 if __name__ == "__main__":
