@@ -1020,6 +1020,23 @@ class TheReachabilityProbeResolvesTheClaudeHomeAndNeverRaises(unittest.TestCase)
                 sys.modules.pop("util_paths", None)
 
 
+class OneBadRosterRowDoesNotStarveTheBatch(unittest.TestCase):
+    """A malformed `same_actor_as` on an UNRELATED row raised for everyone."""
+
+    def test_a_non_string_same_actor_as_is_skipped_not_fatal(self):
+        roster = {"d": {"discord_id": "111", "home_channel": "222"},
+                  "junk": {"discord_id": "9", "same_actor_as": ["a"]}}
+        m = nr._actor_map(roster)       # must not raise
+        self.assertEqual(m.get("d", "d"), "d")
+
+    def test_a_valid_alias_still_unions(self):
+        # The negative control: skipping bad values must not skip good ones.
+        roster = {"d": {"discord_id": "111"},
+                  "e": {"discord_id": "111", "same_actor_as": "d"}}
+        m = nr._actor_map(roster)
+        self.assertEqual(m["d"], m["e"])
+
+
 class TheTwoReviewerGateCountsPeopleNotRows(unittest.TestCase):
     """"At least TWO" must mean two endpoints, or one Stand is pinged twice."""
 

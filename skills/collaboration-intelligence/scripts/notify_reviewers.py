@@ -648,7 +648,9 @@ def _actor_map(roster) -> dict:
             continue
         find(k)
         other = v.get("same_actor_as")
-        if other:
+        # A non-string is unhashable in the union map, and ONE unrelated bad
+        # row used to raise for every reviewer in the batch.
+        if isinstance(other, str) and other:
             union(k, other)
     return {k: find(k) for k in parent}
 

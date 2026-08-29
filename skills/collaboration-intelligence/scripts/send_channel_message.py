@@ -32,7 +32,10 @@ def token() -> str:
         "DISCORD_BOT_TOKEN",
         env_file=claude_home_path("channels", "discord", ".env"))
     if not tok:
-        raise SystemExit("send_channel_message: DISCORD_BOT_TOKEN not found")
+        # Known BEFORE any POST, so it is proven non-delivery, not ambiguity:
+        # a bare SystemExit exits 1 and the parent then parks it forever.
+        print("send_channel_message: DISCORD_BOT_TOKEN not found", file=sys.stderr)
+        raise SystemExit(NOT_DELIVERED_RC)
     return tok
 
 
@@ -43,7 +46,7 @@ def send(channel: str, body: str, user_id: str, client=None):
     client = client or make_client(token(), repo_root=_REPO)
     payload = {"content": body,
                "allowed_mentions": {"parse": [], "users": [str(user_id)]}}
-    receipt, _status, posted = client.send_message_with_response(channel, payload)
+    receipt, _status, posted = client.send_message_with_response(channel, payload)  # noqa: E501
     return receipt, posted
 
 
@@ -58,7 +61,15 @@ def main(argv=None) -> int:
         print("usage: send_channel_message.py <channel-id> <user-id> <body>", file=sys.stderr)
         return 2
     channel, user_id, body = argv
-    receipt, posted = send(channel, body, user_id)
+    try:
+        receipt, posted = send(channel, body, user_id)
+    except SystemExit:
+        raise
+    except Exception as exc:            # noqa: BLE001 - classified, not swallowed
+        # Before the POST: only send_message_with_response is ambiguous.
+        print(f"send_channel_message: failed before the POST ({type(exc).__name__}: "
+              f"{exc})", file=sys.stderr)
+        return NOT_DELIVERED_RC
     outcome = getattr(receipt, "outcome", None)
 
     # Three outcomes, three meanings. Collapsing them is what turns a landed
