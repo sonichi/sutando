@@ -14,6 +14,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 
 ## `src/`
 
+- **`access_store.py`** — Single writer contract for Discord access.json.
 - **`accessibility_probe.sh`** — Unbounded, this probe blocks forever on a session with nobody to answer the AppleScript prompt, and startup never reaches the services after it.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
@@ -68,6 +69,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`discord_result_delivery.py`** — Discord result-delivery state, bound to the shared outbox (#3279 action 2).
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
+- **`entrance_links.py`** — EntranceLink records — verified provider-identity ↔ Stand bindings (I2).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
@@ -251,6 +253,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`__init__.py`** — Discord channel: API mechanics + injected post-gate (bridge, client, http, reader, post_gate).
 - **`client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
 - **`delivery_provider.py`** — DiscordDeliveryProvider: binds the shared DiscordRestClient into the 3013 delivery-core seam — the first production provider behind it.
+- **`entrance_verify.py`** — Discord entrance verification — the provider-I/O edge of EntranceLink.
 - **`http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
 - **`post_gate.py`** — Production injection seam for the Discord post-gate.
 - **`reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
@@ -339,13 +342,24 @@ One entry per agent-facing module. 4 without a usable header comment.
 
 ## `src/runtime-api/`
 
+- **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
+- **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
+- **`identity_view.py`** — Read-only identity surface for THIS agent (the Sutando Server "smallest slice"): sutando.info / sutando.status / sutando.owner / sutando.allowlist.
+- **`instance_key.py`** — Composite (agent_id, instance_id) identity encoding — the ONE owner shared by the durable registry (flat manifest filenames) and the live run dir (the directory holding this instance's socket and lock).
+- **`instance_registry.py`** — Sutando Instance Manifest registry — persistent "this agent exists here" records, M1 of the manifest spec (taxonomy part 4/5): Agent existence ≠ agent process existence.
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
-- **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
+- **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py), the CLI (src/runtime-cli/sutando-runtime.py) and the shell descriptor (scripts/sutando-config.sh, which execs this module).
+- **`runtime_view.py`** — Runtime surface for THIS agent: runtime.health / runtime.details.
+- **`schedules_view.py`** — Schedule surface for the Sutando Server: schedule.list.
 - **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
+- **`state_records.py`** — Reading the workspace state records the runtime-API views project.
+- **`tasks_view.py`** — Task-pipeline surface for the Sutando Server: task.submit / task.status / task.get_result / task.details / task.cancel.
 
 ## `src/runtime-cli/`
 
 - **`sutando-runtime.py`** — sutando-runtime — CLI face of the local runtime API (v0).
+- **`terminal_open.py`** — Terminal adapter for `sutando open` — spawn `sutando attach <id>` in a new terminal tab/window so the Sutando control TUI can stay in the current tab (owner v1).
+- **`tui.py`** — sutando tui — a deliberately DUMB reference client + architecture probe.
