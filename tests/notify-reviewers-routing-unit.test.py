@@ -15,6 +15,7 @@ import os
 import pathlib
 import sys
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -506,6 +507,127 @@ class UnknownOutranksFailureInAMixedBatch(unittest.TestCase):
         src = pathlib.Path(nr.__file__).read_text()
         self.assertLess(src.index("    if unknowns:\n        return 4"),
                         src.index("    if failures or unlogged:\n        return 1"))
+
+
+
+class UnknownBranchesActuallyRun(unittest.TestCase):
+    """Drives the park and timeout paths in main(), not their source text."""
+
+    MSG = "re-review https://github.com/sonichi/sutando/pull/3509"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ub-")
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+        self._led, self._run = nr.ledger_path, nr.subprocess.run
+        nr.ledger_path = lambda: self.led
+        fd, self.roster = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"d": DISCORD}, f)
+        os.environ["SUTANDO_SCI_ROSTER"] = self.roster
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with(
+            {"groups": {"222": {"allowFrom": ["111"]}}})
+
+    def tearDown(self):
+        nr.ledger_path, nr.subprocess.run = self._led, self._run
+        os.unlink(self.roster)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_main(self, message=None):
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d",
+                       "--message", message or self.MSG, "--send",
+                       "--allow-single", "single-target send-path test"]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = nr.main()
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_prior_unknown_parks_the_send_and_never_calls_the_sender(self):
+        nr.record_asks(self.MSG, "d", outcome="unknown")
+        called = []
+        nr.subprocess.run = lambda *a, **k: called.append(1)
+        rc, _, err = self._run_main()
+        self.assertIn("PARKED", err)
+        self.assertEqual(rc, 4)
+        self.assertEqual(called, [], "a parked target must not be re-sent")
+
+    def test_a_timeout_is_unknown_not_failed_and_is_recorded(self):
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=60)
+        nr.subprocess.run = boom
+        rc, _, err = self._run_main()
+        self.assertIn("UNKNOWN outcome (TimeoutExpired)", err)
+        self.assertIn("may have landed", err)
+        self.assertEqual(rc, 4)
+        self.assertIn("unknown", self.led.read_text())
+
+    def test_an_oserror_takes_the_same_path(self):
+        def boom(*a, **k):
+            raise OSError("exec failed")
+        nr.subprocess.run = boom
+        rc, _, err = self._run_main()
+        self.assertIn("UNKNOWN outcome (OSError)", err)
+        self.assertEqual(rc, 4)
+
+    def test_a_timeout_on_an_unrecordable_message_says_it_was_not_recorded(self):
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=60)
+        nr.subprocess.run = boom
+        rc, _, err = self._run_main(message="re-review #3303")
+        self.assertIn("NOT recorded", err)
+        self.assertEqual(rc, 4)
+
+    def test_a_ledger_write_failure_is_reported_not_swallowed(self):
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=60)
+        nr.subprocess.run = boom
+        def bad(*a, **k):
+            raise OSError("disk full")
+        orig, nr.record_asks = nr.record_asks, bad
+        try:
+            rc, _, err = self._run_main()
+        finally:
+            nr.record_asks = orig
+        self.assertIn("ledger write failed", err)
+        self.assertEqual(rc, 4)
+
+    def test_the_absent_guard_still_refuses_if_reachability_ever_says_no(self):
+        # Every current return from discord_reachable is True, so this branch is
+        # unreachable today; the guard stays, and this pins what it must do.
+        orig, nr.discord_reachable = nr.discord_reachable, lambda t: (False, "forced")
+        called = []
+        nr.subprocess.run = lambda *a, **k: called.append(1)
+        try:
+            rc, _, err = self._run_main()
+        finally:
+            nr.discord_reachable = orig
+        self.assertIn("ABSENT from channel", err)
+        self.assertEqual(called, [], "an absent target must not be sent to")
+        self.assertNotEqual(rc, 0)
+
+    def test_a_ledger_oserror_on_an_rc4_send_is_reported(self):
+        class _R:
+            returncode, stdout, stderr = 4, "", ""
+        nr.subprocess.run = lambda *a, **k: _R()
+        def bad(*a, **k):
+            raise OSError("disk full")
+        orig, nr.record_asks = nr.record_asks, bad
+        try:
+            rc, _, err = self._run_main()
+        finally:
+            nr.record_asks = orig
+        self.assertIn("was NOT recorded", err)
+        self.assertIn("OUTCOME UNKNOWN", err)
+        self.assertEqual(rc, 4)
+
+    def test_a_malformed_ledger_line_does_not_crash_the_park_check(self):
+        self.led.write_text("not json\n" + json.dumps(
+            {"repo": "sonichi/sutando", "pr": 3509, "reviewer": "d",
+             "outcome": "unknown"}) + "\n")
+        self.assertTrue(nr.unknown_parked(self.MSG, "d"))
+
+    def test_an_unreadable_ledger_reports_not_parked_rather_than_raising(self):
+        self.led.mkdir()          # a directory where a file is expected
+        self.assertFalse(nr.unknown_parked(self.MSG, "d"))
 
 
 if __name__ == "__main__":
