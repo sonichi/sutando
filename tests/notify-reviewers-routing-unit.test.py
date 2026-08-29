@@ -314,6 +314,61 @@ class MalformedAccessMapNeverAnswers(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("in allowFrom", why)
 
+
+class DiscordLedgerBranchesRun(unittest.TestCase):
+    """Execute the ledger branch, rather than asserting it exists in the source.
+
+    Coverage measures execution: `assertIn("record_asks(", src)` passes on a
+    line that never runs, which is how these branches reached CI uncovered.
+    """
+
+    def _send(self, rc_out, record_effect):
+        class _R:
+            returncode, stdout, stderr = rc_out, "", "boom" if rc_out else ""
+        prev_run, prev_rec = nr.subprocess.run, nr.record_asks
+        nr.subprocess.run = lambda *a, **k: _R()
+        nr.record_asks = record_effect
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"d": DISCORD}, f)
+        prev_env = {k: os.environ.get(k) for k in ("SUTANDO_SCI_ROSTER", "CLAUDE_CONFIG_DIR")}
+        os.environ["SUTANDO_SCI_ROSTER"] = path
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {"222": {"allowFrom": ["111"]}}})
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message",
+                       "see https://github.com/o/r/pull/1", "--send",
+                       "--allow-single", "ledger-branch test"]
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = nr.main()
+        finally:
+            nr.subprocess.run, nr.record_asks = prev_run, prev_rec
+            os.unlink(path)
+            for k, v in prev_env.items():
+                os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_logged_ask_reports_the_count(self):
+        rc, out, err = self._send(0, lambda msg, who: 2)
+        self.assertIn("SENT to channel", out)
+        self.assertIn("logged 2 PR ask(s)", err)
+
+    def test_a_ledger_write_failure_is_loud_but_not_fatal(self):
+        # The ask already happened; losing the record makes pr-unattended
+        # report it as never asked, so this must warn rather than swallow.
+        def boom(msg, who):
+            raise OSError("disk full")
+        rc, out, err = self._send(0, boom)
+        self.assertIn("SENT to channel", out)
+        self.assertIn("SUCCEEDED but was NOT recorded", err)
+        self.assertIn("under-report", err)
+
+    def test_unknown_outcome_is_not_reported_as_a_plain_failure(self):
+        rc, _, err = self._send(4, lambda msg, who: 0)
+        self.assertIn("OUTCOME UNKNOWN", err)
+        self.assertNotIn("SEND FAILED", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
