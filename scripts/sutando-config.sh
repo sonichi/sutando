@@ -506,7 +506,7 @@ sys.path.insert(0, os.path.join(os.environ["SUTANDO_CONFIG_REPO"], "src", "runti
 import rundir
 sys.stdout.write(rundir.socket_path())
 PY
-)"
+)" || _sock=""
       # Never hard-fail this helper: everything shells out to it.
       if [ -n "$_sock" ]; then printf '%s' "$_sock"
       else printf '%s/sutando-runtime.sock' "$(bash "$0" run-dir)"; fi
