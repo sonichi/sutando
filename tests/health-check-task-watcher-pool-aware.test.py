@@ -87,7 +87,8 @@ class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
     """`_local_core_pids()` is the ownership oracle, so its tri-state matters:
     a set means tmux answered, None means it could not be asked at all."""
 
-    def _mod(self, default_rc, default_out, sock=None, sock_rc=0, sock_out=""):
+    def _mod(self, default_rc, default_out, sock=None, sock_rc=0, sock_out="",
+             panes_argv=None):
         hc = _load()
         hc._resolve_tmux_bin = lambda: "/usr/bin/tmux"
         hc._resolve_launch_env = lambda: {}
@@ -104,6 +105,16 @@ class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
                 run=lambda *a, **k: R(default_rc, default_out))
         hc._local_core_socket = lambda: sock
         hc._run_tmux = (lambda s, *a: R(sock_rc, sock_out)) if sock else (lambda s, *a: None)
+        # A pane is a core only if its process IS a core runtime, so the
+        # fixture must state that; `panes_argv` overrides a listed pane.
+        argv = {}
+        for text in (default_out or "", sock_out or ""):
+            for line in text.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    argv[parts[1]] = "claude --name sutando-core --dangerously-skip-permissions"
+        argv.update(panes_argv or {})
+        hc._ps_snapshot = lambda: "\n".join(f"{k} 1 {v}" for k, v in argv.items()) + "\n"
         return hc
 
     def test_pane_pids_from_the_default_socket(self):
@@ -124,7 +135,10 @@ class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
         runtime one, and `_local_core_socket()` is None without a fresh local
         heartbeat. Measured live: the main core's own watcher read as
         `unverified` because that socket was never asked."""
-        hc = self._mod(0, "core-1 3951\n")     # default socket: the pool
+        # This case swaps `_run_tmux` out from under `_mod`, so the runtime
+        # socket's pane must declare its process here.
+        hc = self._mod(0, "core-1 3951\n",
+                       panes_argv={"31930": "claude --name sutando-core --chrome"})
         seen = []
 
         class R:
@@ -362,6 +376,92 @@ class RepairDataAccompaniesTheRepairOffer(unittest.TestCase):
                    roots=["100", "200"], core_pids={"500"}, sentinel=None)
         self.assertIn("Re-stamp the sentinel with --fix", v["detail"])
         self.assertIn(v.get("_sentinel_restamp_pid"), {"100", "200"})
+
+
+class APaneIsACoreOnlyIfItRunsACoreRuntime(unittest.TestCase):
+    """The session NAME is not ownership. Both launchers preserve sibling
+    windows inside the core session, so an ordinary shell pane legitimately
+    sits in the canonical session — and before this it conferred core ownership
+    on any watcher it parented, blessing a hand-started duplicate."""
+
+    _mod = LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats._mod
+
+    def test_a_sibling_shell_pane_in_the_core_session_is_not_a_core(self):
+        hc = self._mod(0, "sutando-core 500\nsutando-core 600\n",
+                       panes_argv={"500": "claude --name sutando-core --chrome",
+                                   "600": "-zsh"})
+        self.assertEqual(hc._local_core_pids(), {"500"})
+
+    def test_a_pool_follower_carries_no_name_flag_and_is_still_a_core(self):
+        """Measured on a live 4-core host: 1 of 5 core panes carried `--name`.
+        Gating on it drops every pool pane and restores `stop the rest`."""
+        hc = self._mod(0, "core-1 74927\n", panes_argv={
+            "74927": "/opt/homebrew/bin/claude --dangerously-skip-permissions "
+                     "--add-dir /w -- /proactive-loop-pool"})
+        self.assertEqual(hc._local_core_pids(), {"74927"})
+
+    def test_a_codex_core_pane_is_a_core(self):
+        """A Codex core is a node script, not a `claude` process at all."""
+        hc = self._mod(0, "core-4 80059\n", panes_argv={
+            "80059": "node /Users/x/.local/bin/codex -C /repo --sandbox danger-full-access"})
+        self.assertEqual(hc._local_core_pids(), {"80059"})
+
+    def test_a_pane_with_no_ps_row_is_not_a_core(self):
+        hc = self._mod(0, "core-1 3951\n", panes_argv={"3951": ""})
+        self.assertEqual(hc._local_core_pids(), set())
+
+    def test_ps_unavailable_is_None_not_an_empty_set(self):
+        """Same tri-state as tmux: an unreadable process table verifies nothing,
+        and an empty set here would send every watcher to `unverified`."""
+        hc = self._mod(0, "core-1 3951\n")
+        hc._ps_snapshot = lambda: None
+        self.assertIsNone(hc._local_core_pids())
+
+
+class TheSiblingPaneMirrorControl(unittest.TestCase):
+    """The reviewer's control, end to end through the real probe: one real core
+    pane and one ordinary sibling pane in the SAME canonical session, a watcher
+    under each. Only the core descendant may be session-owned, and the sibling's
+    must not be handed a restamp repair."""
+
+    def _run(self, sibling_argv):
+        hc = _load()
+        ws = Path(tempfile.mkdtemp())
+        (ws / "state" / "cores").mkdir(parents=True)
+        hc.WORKSPACE_DIR = ws
+        table = ("100 500 bash src/watch-tasks-stream.sh\n"
+                 "200 600 bash src/watch-tasks-stream.sh\n"
+                 "500 1 claude --name sutando-core --chrome\n"
+                 f"600 1 {sibling_argv}\n")
+        hc._ps_snapshot = lambda: table
+        hc._watcher_trees = lambda ps_output=None: {"100": ["100"], "200": ["200"]}
+        hc._proc_argv = lambda pid: None
+        hc._any_core_alive = lambda *a, **k: True
+        hc._resolve_tmux_bin = lambda: "/usr/bin/tmux"
+        hc._resolve_launch_env = lambda: {}
+        hc._local_core_socket = lambda: None
+
+        class R:
+            returncode, stdout = 0, "sutando-core 500\nsutando-core 600\n"
+
+        hc.subprocess = types.SimpleNamespace(run=lambda *a, **k: R())
+        hc._run_tmux = lambda s, *a: R()
+        return hc.check_task_watcher()
+
+    def test_only_the_core_descendant_is_session_owned(self):
+        v = self._run("-zsh")
+        g = _groups(v["detail"])
+        self.assertEqual(g["session-owned"], {"100"})
+        self.assertEqual(g["unverified"], {"200"})
+        self.assertNotIn("_sentinel_restamp_pid", v)
+
+    def test_the_control_discriminates(self):
+        """Change ONLY the sibling pane's process into a real core runtime and
+        the verdict flips — so the assertion above is measuring the runtime
+        test, not something incidental to the fixture."""
+        g = _groups(self._run("claude --name sutando-core --chrome")["detail"])
+        self.assertEqual(g["session-owned"], {"100", "200"})
+        self.assertEqual(g["unverified"], set())
 
 
 if __name__ == "__main__":

@@ -6850,13 +6850,67 @@ def _is_core_session(name: str) -> bool:
     return name == main or bool(_POOL_SESSION_RE.match(name))
 
 
-def _core_pane_pids(stdout: str) -> set:
-    """Pane pids from `session_name pane_pid` lines, core sessions only."""
+#: What a Sutando launcher hands tmux as the pane command: the Claude runtime
+#: (`claude ...`) or the Codex runtime, whose CLI is a node script (`node .../codex`).
+_CORE_RUNTIME_NAMES = ("claude", "codex")
+
+
+def _is_core_runtime_argv(argv: str) -> bool:
+    """True iff this pane process is a runtime a core launcher started.
+
+    This is the pane's own ROOT argv, not its FOREGROUND command — the two are
+    different processes, and `core_heartbeat.core_pid()` forbids only the latter
+    (a healthy core mid-tool shows bash/python3/node as the foreground). Both
+    launchers exec the runtime directly as the pane command, and that argv does
+    not change while the agent runs a tool.
+
+    Deliberately NOT `--name <session>`: only the main core carries it. Measured
+    on a live 4-core host, 1 of 5 core panes matched it, because pool followers
+    launch as `claude ... -- /proactive-loop-pool` and a Codex core is not a
+    `claude` process at all. Gating on it would drop every pool pane and hand
+    back the "stop the rest" verdict this probe exists to remove.
+    """
+    toks = argv.split()
+    if not toks:
+        return False
+    if os.path.basename(toks[0]) in _CORE_RUNTIME_NAMES:
+        return True
+    return (os.path.basename(toks[0]) == "node" and len(toks) > 1
+            and os.path.basename(toks[1]) in _CORE_RUNTIME_NAMES)
+
+
+def _argv_by_pid(ps_out: "str | None") -> "dict | None":
+    """pid -> argv from a `pid ppid args` snapshot, or None if ps did not run.
+
+    None must not collapse into an empty map: an empty map verifies no pane, so
+    every watcher falls to `unverified` on a host whose `ps` merely timed out.
+    """
+    if ps_out is None:
+        return None
+    out: dict = {}
+    for line in ps_out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 3 and parts[0].isdigit():
+            out[parts[0]] = parts[2]
+    return out
+
+
+def _core_pane_pids(stdout: str, argv_by_pid: dict) -> set:
+    """Core-session pane pids that are actually RUNNING a core runtime.
+
+    The session name alone is not ownership. The Claude launcher deliberately
+    PRESERVES sibling windows inside the core session when the core window dies
+    (`src/agent/claude/cli/start-cli.sh`, the G10 heal), so an ordinary shell
+    pane legitimately sits in the canonical session — and would otherwise confer
+    core ownership on any watcher it happens to parent, blessing a hand-started
+    duplicate as a pool member.
+    """
     pids = set()
     for line in stdout.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[1].isdigit() and _is_core_session(parts[0]):
-            pids.add(parts[1])
+            if _is_core_runtime_argv(argv_by_pid.get(parts[1], "")):
+                pids.add(parts[1])
     return pids
 
 
@@ -6873,6 +6927,9 @@ def _local_core_pids() -> "set | None":
     process (measured: three labels, one heartbeat pid; a fourth naming a pid
     dead since June). tmux is asked live, so it cannot go stale this way.
     """
+    argv_by_pid = _argv_by_pid(_ps_snapshot())
+    if argv_by_pid is None:
+        return None          # ps did not run: unknown, never "no cores here"
     pids, saw_any = set(), False
     fmt = "#{session_name} #{pane_pid}"
     try:
@@ -6881,7 +6938,7 @@ def _local_core_pids() -> "set | None":
                               text=True, timeout=10)
         if done.returncode == 0:
             saw_any = True
-            pids.update(_core_pane_pids(done.stdout))
+            pids.update(_core_pane_pids(done.stdout, argv_by_pid))
     except Exception:  # noqa: BLE001
         pass
     # The pool runs on tmux's DEFAULT socket; the main core runs on the runtime
@@ -6893,7 +6950,7 @@ def _local_core_pids() -> "set | None":
         done = _run_tmux(sock, "list-panes", "-a", "-F", fmt)
         if done is not None and done.returncode == 0:
             saw_any = True
-            pids.update(_core_pane_pids(done.stdout))
+            pids.update(_core_pane_pids(done.stdout, argv_by_pid))
     return pids if saw_any else None
 
 
@@ -6997,10 +7054,8 @@ def check_task_watcher() -> dict:
                 "detail": "no local core running and no watcher processes — watcher not expected"}
     if not pid_file.exists():
         if roots:
-            # Sentinel gone but watchers alive: they are draining tasks/ but
-            # nothing supervises them, and each new start adds another (observed
-            # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
-            # duplicate processing, not a stalled queue).
+            # Watchers alive with no sentinel are draining tasks/ unsupervised,
+            # and each new start adds another that reports the same TASK_FILE.
 
             parents = {r: _pid_parent(r, ps_out) for r in roots}
             core_pids = _local_core_pids()
