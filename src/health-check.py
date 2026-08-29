@@ -5637,6 +5637,23 @@ def check_gateway_bridge() -> "dict | None":
                        "timestamp — the writer is not reporting poll outcomes, so "
                        "ag2.space mobile messages may not be delivered"),
         }
+    # Primary said nothing and is not merely stale, so it may not exist at all.
+    # Ask the lanes before calling a live PID healthy — one of them owns it.
+    lanes = _gateway_lane_verdicts()
+    if lanes and not any(serving for _, serving, _ in lanes):
+        never = [ln for ln, _, ever in lanes if not ever]
+        why = (f"lane {', '.join(never)} has never completed a poll" if never
+               else f"lane {', '.join(ln for ln, _, _ in lanes)} is not connected")
+        return {
+            "name": "gateway-bridge",
+            "status": "warn",
+            "detail": (f"process running but NOT serving — {why}; "
+                       "ag2.space mobile messages are not being delivered"),
+        }
+    if lanes:
+        served = ", ".join(ln for ln, serving, _ in lanes if serving)
+        return {"name": "gateway-bridge", "status": "ok",
+                "detail": f"running + connected (lane {served})"}
     return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
 
 
@@ -5774,6 +5791,38 @@ def check_runtime_identity(path: "Path | None" = None,
                           + " ".join(bits)}
     return {"name": name, "status": "ok",
             "detail": ("entrypoint=canonical " + " ".join(bits))}
+
+
+def _gateway_lane_verdicts(state_dir: "Path | None" = None,
+                           now: "float | None" = None) -> "list[tuple[str, bool, bool]]":
+    """(lane, serving, ever_served) for each fresh non-primary lane sidecar.
+
+    The PID proving "running" can belong to a lane other than primary — the lane
+    selector runs exactly one lane and parks the rest — so on a lane-only host
+    primary never writes a sidecar and its absence is not evidence of health.
+    Freshness, schema and the serving rule stay owned by gateway_serving; this
+    enumerates lanes and asks it per file. `ever_served` is read off the
+    normalized record rather than reusing GatewayVerdict.never_polled, which
+    additionally requires `connected` — a lane that is both disconnected and has
+    no successful poll is the misconfigured-endpoint case this message names, and
+    never_polled reports False for it.
+    """
+    import time as _time
+    now = _time.time() if now is None else now
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    out = []
+    try:
+        entries = sorted(root.glob("gateway-status.*.json"))
+    except OSError:
+        return out
+    for f in entries:
+        lane = f.name[len("gateway-status."):-len(".json")]
+        v = read_gateway_verdict(f, now=now, max_age=GATEWAY_STATUS_MAX_AGE_S)
+        if v is None:
+            continue
+        out.append((lane, v.serving, v.last_ok_ts is not None))
+    return out
 
 
 def _gateway_status_stale_age_s(path: "Path | None" = None,

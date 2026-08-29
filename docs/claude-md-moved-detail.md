@@ -67,9 +67,15 @@ without trusting a foreign caller's ambient env.
 `<workspace>/state/auth/` holds **per-host install/identity state**
 that survives across upgrades and MUST NOT be wiped by transient-state cleanup
 jobs (or by clear-on-restart logic that targets `state/*.json` generically).
-Current contents:
+Current contents (the protection is DIRECTORY-level — everything under
+`state/auth/` is exempt, including additions after this list):
 - `cloud-auth.json` — per-host cloud-side auth credentials
 - `device.json` — per-host device identity (UUID + provisioning metadata)
+- `ag2space.json` — enrolled agent identity (stand_id source)
+- `stand.json` — Stand record + OwnerBinding (owner-confirmed, 2026-08-23)
+- `entrance-links.json` — verified EntranceLink records (I2)
+- `task-hmac.key` — task-envelope trust root
+- `devices/`, `pairing/`, `scp-tls/`, `scp-wss.token` — SCP device auth
 
 Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
 were loose at workspace root, mistreated as transient JSON snapshots and
