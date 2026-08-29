@@ -154,15 +154,17 @@ local _ts="$(date +%s)"
 cat > "$WORKSPACE/tasks/task-chat-${_ts}.txt" << EOF
 id: task-chat-${_ts}
 timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-task: <concise description of what you're doing>
 source: chat
 interaction_type: message
 channel_id: local-chat
 user_id: ${SUTANDO_DM_OWNER_ID:-chat-local}
 access_tier: owner
 priority: normal
+task: <concise description of what you're doing>
 EOF
 ```
+
+**`task:` must be the LAST header.** Its value is free-form and may span lines, so the strict `parse_task_headers` treats everything below it as body. Nothing is discarded, but `source`, `channel_id`, `access_tier` and `priority` all read as absent — so a task written with `task:` earlier routes nowhere and sorts as `normal` however it declares itself. The delimiter rule is deliberate (it stops a user-supplied body forging headers), so the writer is what must change.
 
 **Priority field**: `urgent` (voice/phone, sub-second latency target) | `normal` (chat/owner DM, default) | `low` (cron, health-check, non-owner DMs). When more than one task is pending, the consumer processes highest-priority first; tie-breaker is mtime FIFO. Defaults per source are encoded in `src/task_priority.py:default_priority_for_source`.
 
