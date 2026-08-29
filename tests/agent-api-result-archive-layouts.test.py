@@ -112,6 +112,32 @@ check("a queued task reports pending, not completed",
 fresh()
 check("an absent task is None", api.get_task_result("task-absent") is None)
 
+# --- a longer id must never be served under a shorter one ---------------------
+# `<id>-*` also matches a LONGER id, and sorted()[-1] returns it.
+fresh()
+(api.RESULT_DIR / "archive" / "task-ws-grouping-1787961646170-1756000001.txt").write_text("OTHER TASK")
+got = api.get_task_result("task-ws-grouping")
+check("a LONGER id's re-archive is not served under this id (root)",
+      got is None or got.get("result") != "OTHER TASK", f"got {got!r}")
+
+fresh()
+mcol = api.RESULT_DIR / "archive" / "2026-08"
+mcol.mkdir()
+(mcol / "task-ws-grouping-1787961646170-1756000001.txt").write_text("OTHER TASK")
+got = api.get_task_result("task-ws-grouping")
+check("a LONGER id's re-archive is not served under this id (month dir)",
+      got is None or got.get("result") != "OTHER TASK", f"got {got!r}")
+
+# The guard must not reject the genuine case it sits next to.
+fresh()
+mown = api.RESULT_DIR / "archive" / "2026-08"
+mown.mkdir()
+(mown / "task-ws-grouping-1787961646170-1756000001.txt").write_text("OTHER TASK")
+(mown / "task-ws-grouping-1756000002.txt").write_text("MINE")
+got = api.get_task_result("task-ws-grouping")
+check("this id's own re-archive is still served alongside a longer sibling",
+      got is not None and got.get("result") == "MINE", f"got {got!r}")
+
 # --- security: the id gate must still reject traversal ------------------------
 fresh()
 outside = api.RESULT_DIR.parent / "escaped.txt"

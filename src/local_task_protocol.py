@@ -53,6 +53,7 @@ task-last; until then both parsers exist and are named for their trust model.
 from __future__ import annotations
 
 import json
+import glob
 import os
 import re
 import sys
@@ -514,6 +515,20 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
     return base / "archive" / iso_timestamp[:7]
 
 
+# A bare `<id>-*` also matches a LONGER id having this one as a hyphen prefix;
+# only a numeric epoch suffix marks a re-archive of THIS id.
+_EPOCH_SUFFIX_RE = re.compile(r"^[0-9]+$")
+
+
+def _epoch_suffixed(directory, task_id):
+    """Files that are re-archives of exactly `task_id`, oldest first."""
+    prefix = f"{task_id}-"
+    return sorted(
+        p for p in directory.glob(f"{glob.escape(prefix)}*.txt")
+        if _EPOCH_SUFFIX_RE.match(p.name[len(prefix):-len(".txt")])
+    )
+
+
 def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate an archived result across BOTH layouts in use.
 
@@ -549,13 +564,13 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
             return candidate
         # Re-archive inside a month dir suffixes the epoch (`<id>-<epoch>.txt`);
         # a literal-name scan misses it. Fallback only, so an exact hit still wins.
-        suffixed = sorted((archive / month).glob(f"{task_id}-*.txt"))
+        suffixed = _epoch_suffixed(archive / month, task_id)
         if suffixed:
             return suffixed[-1]
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
-    flat = sorted(archive.glob(f"{task_id}-*.txt"))
+    flat = _epoch_suffixed(archive, task_id)
     return flat[-1] if flat else None
 
 
