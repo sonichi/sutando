@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import datetime
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -126,10 +128,141 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
 
 def command_for(target: dict, message: str) -> "list[str]":
     body = message
-    if target.get("human") and target["human"] not in body:
-        body = f"{body} (cc {target['human']})"
+    # Roster "human" is a room handle for some entries and a structured record
+    # (discord id, username) for others; only the former is addressable here.
+    human = target.get("human")
+    if isinstance(human, str) and human and human not in body:
+        body = f"{body} (cc {human})"
     return [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
             "mention", target["stand"], body, target["room"]]
+
+
+_PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
+
+def ledger_path() -> Path:
+    from workspace_default import resolve_workspace
+    return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
+
+
+def record_asks(message: str, reviewer: str) -> int:
+    """Log a room ask so pr-unattended can see it. GitHub's timeline records only
+    review_requested events, and the owner's rule is to ask in the room and never
+    via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED."""
+    refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
+    if not refs:
+        return 0
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    p = ledger_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as fh:
+        for repo, num in sorted(refs):
+            fh.write(json.dumps({"repo": repo, "pr": num, "reviewer": reviewer,
+                                 "ts": ts, "channel": "room"}) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    return len(refs)
+
+
+def _actor_map(roster) -> dict:
+    """key -> canonical actor, over the CONNECTED COMPONENT of same_actor_as.
+
+    The links are mutual (a<->b) and can chain (c->b), so neither end is canonical
+    and following one hop splits a chain: with a<->b and c->b, min() sends a,b to
+    `a` but c to `b`, and one human is listed twice. Union by smallest key over
+    the whole component instead.
+    """
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            parent[hi] = lo
+
+    for k, v in (roster or {}).items():
+        if not isinstance(v, dict) or k.startswith("_"):
+            continue
+        find(k)
+        other = v.get("same_actor_as")
+        if other:
+            union(k, other)
+    return {k: find(k) for k in parent}
+
+def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
+    """(refuse, detail) — refuse re-asking the SAME non-responders after `minutes`.
+
+    The owner's rule is "if they didn't get back in 30min, ask OTHERS — do NOT
+    block". Re-requesting the same names is not escalation; the routing tool says
+    so about GitHub and it is equally true in-room. Enforced here because a rule
+    I have to remember is one I demonstrably do not: on sonichi#3511 I asked the
+    same two people twice, 8 minutes apart, and neither ever reviewed.
+
+    Fails OPEN on any uncertainty — a notifier that blocks on its own bug is
+    worse than one that over-notifies.
+    """
+    refs = _PR_URL.findall(message or "")
+    if not refs:
+        return False, ""
+    repo, num = refs[0]
+    ledger = ledger_path()
+    if not ledger.exists():
+        return False, ""
+    import json as _j
+    prior, earliest = set(), None
+    try:
+        for line in ledger.read_text().splitlines():
+            try:
+                d = _j.loads(line)
+            except ValueError:
+                continue
+            if str(d.get("pr")) != str(num) or d.get("repo") not in (repo, None):
+                continue
+            prior.add(d.get("reviewer"))
+            ts = d.get("ts") or ""
+            if ts and (earliest is None or ts < earliest):
+                earliest = ts
+    except OSError:
+        return False, ""
+    if not prior or earliest is None:
+        return False, ""
+    names = {x["name"] for x in targets}
+    if not names or not names.issubset(prior):
+        return False, ""            # at least one NEW name -> this IS widening
+    try:
+        age = (datetime.datetime.now(datetime.timezone.utc)
+               - datetime.datetime.fromisoformat(earliest.replace("Z", "+00:00")))
+    except ValueError:
+        return False, ""
+    if age.total_seconds() < minutes * 60:
+        return False, ""
+    # One human can hold several roster keys (jsun-m IS johnm-desktop). Listing
+    # both overstates the pool and re-asks one person under two names.
+    actor_of = _actor_map(roster)
+    seen_actors, unasked = set(), []
+    for k, v in sorted((roster or {}).items()):
+        if not isinstance(v, dict) or k.startswith("_"):
+            continue
+        actor = actor_of.get(k, k)
+        if k in prior or k == "keweichen":
+            seen_actors.add(actor)
+            continue
+        if actor in seen_actors:
+            continue
+        seen_actors.add(actor)
+        unasked.append(k)
+    # This reads the ledger only; it cannot know review state, and a refusal
+    # reason gets quoted onward as fact.
+    return True, (f"every target was already asked on {repo}#{num} "
+                  f"{int(age.total_seconds() // 60)} min ago (review state not "
+                  f"checked here — read it before reporting anyone unresponsive). "
+                  f"Not yet asked: {', '.join(unasked) or '<roster exhausted>'}")
 
 
 def main() -> int:
@@ -138,6 +271,10 @@ def main() -> int:
                     help="comma-separated roster keys")
     ap.add_argument("--message", required=True)
     ap.add_argument("--send", action="store_true")
+    ap.add_argument("--allow-single", metavar="REASON", default="",
+                    help="deliberately notify ONE reviewer; requires a reason")
+    ap.add_argument("--widen-override", metavar="REASON", default="",
+                    help="deliberately re-ask the SAME reviewers after 30min")
     ap.add_argument("--room", default=None,
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
@@ -145,7 +282,23 @@ def main() -> int:
     a = ap.parse_args()
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
-    failures = 0
+    # Gates run on RESOLVED targets before any send, so no partial batch notifies
+    # one person; plan mode is exempt because only a real ASK can strand a PR.
+    if a.send and len(targets) < 2 and not a.allow_single:
+        print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
+              "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
+              "or pass --allow-single '<reason>'.", file=sys.stderr)
+        # A failed name is WHY the count is short and is the actionable half.
+        # `> 0` not `or`: refusal codes are positive, 0 means nothing refused.
+        return refusal_rc if refusal_rc > 0 else 5
+    if a.allow_single and len(targets) < 2:
+        print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
+    stale, why = _stale_repeat_ask(a.message, targets, load_roster())
+    if stale and not a.widen_override:
+        print(f"REFUSED: {why} Re-asking the same people is not escalation — "
+              "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
+        return 6
+    failures = unlogged = 0
     for t in targets:
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in
@@ -193,7 +346,20 @@ def main() -> int:
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        # Per-target boundary: a raise here would drop every remaining target
+        # AND skip the return, so the caller sees no asks and no failure code.
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            print(f"{t['name']}: ok=False reason=room_ops exceeded the 60s timeout",
+                  file=sys.stderr)
+            failures += 1
+            continue
+        except OSError as e:
+            print(f"{t['name']}: ok=False reason=could not run room_ops ({e})",
+                  file=sys.stderr)
+            failures += 1
+            continue
         ok, event, reason = False, "", ""
         try:
             payload = json.loads(p.stdout)
@@ -212,11 +378,27 @@ def main() -> int:
         # Printing stderr alone renders every such refusal as a blank line.
         if ok:
             print(f"{t['name']}: ok=True event={event[:24]}")
+            # The ask already happened; a lost ledger write makes pr-unattended
+            # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
+            try:
+                n_logged = record_asks(a.message, t["name"])
+            except OSError as e:
+                unlogged += 1
+                print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
+                      f"({e}) — pr-unattended will under-report this PR as unasked",
+                      file=sys.stderr)
+            else:
+                if n_logged:
+                    print(f"  logged {n_logged} PR ask(s) for {t['name']}", file=sys.stderr)
         else:
             detail = reason or p.stderr.strip()[:120] or fallback
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
             failures += 1
-    if failures:
+    if unlogged:
+        print(f"{unlogged} ask(s) were delivered but not recorded — the ledger "
+              "under-reports and pr-unattended will read this PR as unasked",
+              file=sys.stderr)
+    if failures or unlogged:
         return 1
     return refusal_rc
 

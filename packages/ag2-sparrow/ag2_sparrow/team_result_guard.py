@@ -8,6 +8,13 @@ producer's compliance with an instruction.
 Ownership: this module is the single implementation of the policy — the control
 marker set, the secret scan, and what a withheld result says. Adapters bind
 their own tier lookup and delivery; they must not restate any of it.
+
+Suppression markers are deliberately NOT controls here. `[channel:]` and
+`[file:]` move data somewhere the sender should not reach; `[no-send]`,
+`[REPLIED]` and `[deduped:]` move nothing, and the party left without an answer
+is the same non-owner who asked. What they can hide is that a task was handled,
+which is an accountability property — so they are honoured on every tier and
+journaled, rather than refused.
 """
 
 from __future__ import annotations
@@ -15,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import sys
 import tempfile
 import time
@@ -35,16 +41,26 @@ TEAM_LEAK_RESULT = (
     "contain sensitive information. The owner can review the work locally."
 )
 
+# Safe to name: the marker is the sender's own construct. Content/secret
+# classes stay generic — naming those would confirm probe hits.
+TEAM_LEAK_RESULT_MARKER = (
+    "I completed the Team task, but the response was withheld because it "
+    "carried a delivery-control marker, which non-owner results may not use. "
+    "The owner can review the work locally."
+)
+
 TEAM_LEAK_RESULT_UNSAVED = (
     "I completed the Team task, but the response was withheld because it may "
     "contain sensitive information or delivery-control markers. Preparing the "
     "private owner review failed; the result remains withheld and will retry."
 )
 
+# Reached ONLY when the record cannot be written: a close must never be both
+# silent and untraceable. Unreachable in normal operation.
 TEAM_SUPPRESS_RESULT = (
-    "Task handled. The agent marked this reply as not-for-delivery; suppression "
-    "markers are not honoured on Team-tier results, so this notice is delivered "
-    "in its place. Nothing was withheld for content reasons."
+    "Task handled. The agent marked this reply as not-for-delivery, but the "
+    "record of that suppression could not be written, so this notice is "
+    "delivered in its place. Nothing was withheld for content reasons."
 )
 
 # Only `owner` is exempt — markers are a feature for the owner and a capability
@@ -152,8 +168,8 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     # redirect it suppressed never executes -- neither is a control here.
     if kinds & {"redirect", "attach"}:
         raise TeamResultLeakError("result delivery control marker")
-    if "skip" in kinds:
-        raise TeamResultLeakError("suppressive delivery marker")
+    # Suppression is deliberately absent: redirect and attach move data
+    # somewhere the sender should not reach, a skip marker moves nothing.
     # Marker checks stay above this narrow scanner opt-out.
     if not scan_sensitive_data:
         return body
@@ -167,30 +183,15 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     return body
 
 
-# The suppression verdict: one policy here, transport mechanics at the
-# edges (stub-alone where the server suppresses; notice where it delivers).
-_SKIP_STUB_LITERAL = {"no-send": "[no-send]", "REPLIED": "[REPLIED]"}
-_DEDUP_EXTRA_RE = re.compile(r"task-[A-Za-z0-9_-]{1,64}\Z")
+def is_suppression_only(body: str) -> bool:
+    """True when every marker the shared parser executes is suppressive.
 
-
-def suppression_stub_for_tier(body: str, tier) -> "str | None":
-    """The stub a guarded sender may close its lease with, or None.
-
-    None means NO suppression verdict -- the caller proceeds through
-    guard_result_for_tier as before (owner results, mixed markers,
-    out-of-grammar dedup extras, unknown future markers all land here)."""
-    if not is_guarded_tier(tier):
-        return None
-    parsed = parse_markers(body)
-    if not parsed.actions or any(a.kind != "skip" for a in parsed.actions):
-        return None
-    a = parsed.actions[0]
-    if a.value == "deduped":
-        extra = (a.extra or "").strip()
-        if _DEDUP_EXTRA_RE.fullmatch(extra):
-            return f"[deduped: {extra}]"
-        return None
-    return _SKIP_STUB_LITERAL.get(a.value)
+    Classification, not validation: the guard does not inspect a dedup target,
+    because the consumer that dereferences one already rejects an id it cannot
+    look up safely. Deciding here would be a second, drifting copy of that rule.
+    """
+    actions = parse_markers(body or "").actions
+    return bool(actions) and all(action.kind == "skip" for action in actions)
 
 
 VERDICT_DELIVER = "deliver"
@@ -201,9 +202,9 @@ SUPPRESSED_RESULT_DIR = "suppressed-team-results"
 
 
 class TeamResultVerdict(NamedTuple):
-    """kind: deliver | leak | suppress. body: what a notice-mechanics adapter
-    delivers; an adapter with a durable transport journal may realise SUPPRESS
-    as a journaled silent close instead -- the record requirement is the policy."""
+    """kind: deliver | leak | suppress. body: what the adapter delivers.
+    SUPPRESS now names only bodies the adapter must post in place of the
+    result: the pending-review stub, and the fail-closed unrecorded notice."""
     kind: str
     body: str
     reason: "str | None"
@@ -291,28 +292,26 @@ def suppressed_record_path(state_dir: Path, task_id: str) -> Path:
     return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
 
 
-def materialize_suppressed_verdict(verdict: TeamResultVerdict, body: str,
-                                   state_dir: Path, task_id: str, context=None,
-                                   agent_id: str = "", now=None, *,
-                                   stub: str) -> TeamResultVerdict:
-    """Realise a notice-bearing SUPPRESS as a journaled close carrying `stub`.
+def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
+                              state_dir: Path, task_id: str, context=None,
+                              agent_id: str = "", now=None) -> TeamResultVerdict:
+    """Record a guarded-tier suppression, then hand the body back unchanged.
 
-    The record requirement is the policy, not the notice: once the suppression
-    is durably journaled, posting prose about marker mechanics into a human
-    channel is noise. `stub` must come from suppression_stub_for_tier -- it is
-    the canonical, sender-uninfluenced body, and it preserves a dedup target
-    that a flat "[no-send]" would drop. Fail-CLOSED -- if the journal cannot be
-    written the notice stands, so the record is never silently dropped.
+    Accountability, not confidentiality: a skip marker moves no data, so the
+    guard honours it on every tier and the durable record is what keeps it
+    auditable. Fail-CLOSED -- if the record cannot be written the notice takes
+    the body's place, so a close is never both silent and unrecorded.
     """
-    if verdict.kind != VERDICT_SUPPRESS or verdict.body != TEAM_SUPPRESS_RESULT:
-        return verdict                     # already silent, or not a suppress
+    if verdict.kind != VERDICT_DELIVER:
+        return verdict                     # leak/suppress already decided
     timestamp = float(time.time() if now is None else now)
     directory = Path(state_dir) / SUPPRESSED_RESULT_DIR
     try:
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
     except OSError:
-        return verdict
+        return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT,
+                                 "suppression record unwritable")
     payload = {
         "schema_version": 1,
         "record_id": withheld_review_id(task_id),
@@ -329,9 +328,9 @@ def materialize_suppressed_verdict(verdict: TeamResultVerdict, body: str,
     except Exception:  # noqa: BLE001 -- storage failure must remain fail-closed
         saved = False
     if not saved:
-        return verdict
-    return TeamResultVerdict(
-        VERDICT_SUPPRESS, stub, f"{verdict.reason}; journaled silent close")
+        return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT,
+                                 "suppression record unwritable")
+    return verdict
 
 
 def classify_result_for_tier(body: str, tier, repo: Path,
@@ -342,14 +341,18 @@ def classify_result_for_tier(body: str, tier, repo: Path,
     violation, not an implementation choice."""
     if not is_guarded_tier(tier):
         return TeamResultVerdict(VERDICT_DELIVER, body, None)
+    if is_suppression_only(body):
+        # Above the scan on purpose: an undelivered body has nothing to leak,
+        # and a LEAK here would put a notice back in the channel.
+        return TeamResultVerdict(VERDICT_DELIVER, body, None)
     try:
         return TeamResultVerdict(
             VERDICT_DELIVER,
             scan_team_result(body, repo, secret_filter, scan_sensitive_data),
             None)
     except TeamResultLeakError as exc:
-        if str(exc) == "suppressive delivery marker":
-            return TeamResultVerdict(VERDICT_SUPPRESS, TEAM_SUPPRESS_RESULT, str(exc))
+        if str(exc) == "result delivery control marker":
+            return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT_MARKER, str(exc))
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT, str(exc))
     except Exception as exc:
         # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
@@ -367,18 +370,14 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     by catching an exception -- the safe body is the only one it is handed.
     Derived from classify_result_for_tier so the verdict has exactly one owner.
 
-    suppress_journal: `(state_dir, task_id)` from an adapter whose surface is a
-    human channel. The notice becomes a journaled silent close there; adapters
-    that omit it keep the posted notice.
+    suppress_journal: `(state_dir, task_id)` from an adapter that can write the
+    record. A guarded suppression is journaled there and the marker is honoured;
+    an adapter that omits it honours the marker with no record of its own.
     """
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data)
-    if suppress_journal is not None:
-        # The stub is this module's existing policy; the journal only adds
-        # the record. Never mint a body here.
-        stub = suppression_stub_for_tier(body, tier)
-        if stub is not None:
-            state_dir, task_id = suppress_journal
-            verdict = materialize_suppressed_verdict(
-                verdict, body, state_dir, task_id, stub=stub)
+    if (suppress_journal is not None and is_guarded_tier(tier)
+            and is_suppression_only(body)):
+        state_dir, task_id = suppress_journal
+        verdict = journal_suppressed_result(verdict, body, state_dir, task_id)
     return verdict.body, verdict.reason

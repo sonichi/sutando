@@ -521,11 +521,23 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
     return base / "archive" / iso_timestamp[:7]
 
 
+def _epoch_suffixed(directory, task_id):
+    """Files that are re-archives of exactly `task_id`, oldest first."""
+    # `<id>-*` alone also matches a LONGER task's file, attributing its result
+    # to this id; only the documented numeric epoch suffix is this task's.
+    prefix = f"{task_id}-"
+    return sorted(
+        p for p in directory.glob(f"{glob.escape(prefix)}*.txt")
+        if _EPOCH_SUFFIX_RE.match(p.name[len(prefix):-len(".txt")])
+    )
+
+
 def iter_result_candidates(results_dir: Path, task_id: str,
                            include_live: bool = True) -> "Iterable[Path]":
     """Every path this task's result can occupy, best-first.
 
-    Ordered live, `archive/<id>.txt`, `archive/<YYYY-MM>/` newest month first,
+    Ordered live, `archive/<id>.txt`, `archive/<YYYY-MM>/` newest month first
+    (each month's exact name before its epoch re-archives),
     `archive-<YYYY-MM-DD>/` newest day first, then the gateway's flat
     `archive/<id>-<epoch>.txt` newest first. Bridges use the month layout, the
     gateway the flat one, and startup retention (`src/archive-stale-results.py`,
@@ -563,6 +575,9 @@ def iter_result_candidates(results_dir: Path, task_id: str,
         candidate = archive / month / fname
         if candidate.is_file():
             yield candidate
+        # A re-archive inside a month dir carries the epoch suffix; a
+        # literal-name scan misses it. Yielded after, so an exact hit wins.
+        yield from reversed(_epoch_suffixed(archive / month, task_id))
 
     # Retention dirs are SIBLINGS of archive/, so they need their own scan;
     # newest day first, name-filtered before is_dir, as the month scan is.
@@ -580,13 +595,7 @@ def iter_result_candidates(results_dir: Path, task_id: str,
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
-    prefix = f"{task_id}-"
-    # `<id>-*` alone also matches a LONGER task's file, attributing its result
-    # to this id; only the documented numeric epoch suffix is this task's.
-    flat = sorted(p for p in archive.glob(f"{glob.escape(prefix)}*.txt")
-                  if _EPOCH_SUFFIX_RE.match(p.name[len(prefix):-len(".txt")]))
-    for candidate in reversed(flat):
-        yield candidate
+    yield from reversed(_epoch_suffixed(archive, task_id))
 
 
 def find_archived_result(results_dir: Path, task_id: str) -> Path | None:

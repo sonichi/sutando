@@ -194,6 +194,9 @@ ALLOWLIST = {
     # token composes the tasks dir FROM that injected value, mirroring
     # task_archive.py's caller-supplies-the-path rationale.
     "src/agent_endpoint.py",
+    # mention_gate.py: every path is composed FROM a caller-injected workspace
+    # (bridge/CLI resolve it) — task_archive.py's caller-supplies-the-path rationale.
+    "src/mention_gate.py",
 }
 
 

@@ -12,6 +12,14 @@ SCRIPT="$REPO/src/agent/stop-core.sh"
 command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not available"; exit 0; }
 
 SOCK="$(mktemp -d)/t.sock"
+
+# Every stop-core.sh run now invokes core_heartbeat --mark-stopped, which
+# resolves the REAL workspace unless scoped — an unscoped run here wrote a
+# live tombstone into the checkout's workspace and flipped health-check's
+# default stopped_fn for every other suite in the same CI run. Scope the
+# whole file to a throwaway workspace; case 5 layers its own on top.
+WSDEF="$(mktemp -d)"
+export SUTANDO_TEST_MODE=1 SUTANDO_WORKSPACE="$WSDEF" SUTANDO_HOST_LABEL=stoptest
 fails=0
 say() { echo "$1  $2"; [ "$1" = "FAIL" ] && fails=$((fails+1)); }
 cleanup() { tmux -S "$SOCK" kill-server 2>/dev/null; }
@@ -60,6 +68,65 @@ if [ $rc -eq 0 ] && ! tmux -S "$SOCK" has-session -t "=sutando-core" 2>/dev/null
   say ok "watcher sibling killed with core; debug survives"
 else
   say FAIL "watcher cleanup: rc=$rc out=$out"
+fi
+
+# --- 5. stop tombstone end-to-end (#2160, qingyun review): the PRODUCTION stop
+#        path must publish the durable graceful-stop state, and the recover
+#        path — with its DEFAULT production wiring, no injected stopped_fn —
+#        must read it and refuse to relaunch. Crash control: same recover run
+#        without the tombstone restarts, so the gate is proven able to fail.
+WS="$(mktemp -d)"
+HB_ENV=(SUTANDO_TEST_MODE=1 "SUTANDO_WORKSPACE=$WS" SUTANDO_HOST_LABEL=stoptest)
+tmux -S "$SOCK" new-session -d -s sutando-core sleep 60
+out="$(env "${HB_ENV[@]}" SUTANDO_TMUX_SOCKET="$SOCK" bash "$SCRIPT" 2>&1)"; rc=$?
+TOMB="$WS/state/cores/stoptest.stopped"
+if [ $rc -eq 0 ] && [ -f "$TOMB" ]; then
+  say ok "stop-core publishes the graceful-stop tombstone"
+else
+  say FAIL "tombstone publish: rc=$rc tomb-present=$([ -f "$TOMB" ] && echo y || echo n) out=$out"
+fi
+
+recover_action() {  # runs recover twice (observe -> past confirm) with production stopped_fn
+  env "${HB_ENV[@]}" python3 - "$WS" <<'PY'
+import importlib.util, sys, tempfile
+from pathlib import Path
+repo = Path(__file__).resolve()  # unused; module path from argv
+spec = importlib.util.spec_from_file_location("hc", str(Path("src/health-check.py").resolve()))
+hc = importlib.util.module_from_spec(spec); spec.loader.exec_module(hc)
+hc.RECOVER_CONFIRM_SEC = 120
+state = Path(tempfile.mkdtemp()) / "rec.json"
+kw = dict(state_file=state, alive_fn=lambda: False,
+          oldest_task_fn=lambda: ("t1", 5000), status_ts_fn=lambda: None,
+          just_booted_fn=lambda: False, restart_fn=lambda: True,
+          sender=lambda t: True)  # stopped_fn deliberately NOT injected
+hc.recover_core_if_wedged(now=1_000_000, **kw)
+r = hc.recover_core_if_wedged(now=1_000_200, **kw)
+print((r or {}).get("action"))
+PY
+}
+act="$(recover_action)"
+if [ "$act" = "deliberate-stop" ]; then
+  say ok "recover (production stopped_fn) refuses to relaunch a stopped core"
+else
+  say FAIL "recover with tombstone: action=$act (want deliberate-stop)"
+fi
+rm -f "$TOMB"
+act="$(recover_action)"
+if [ "$act" = "restarted" ]; then
+  say ok "crash control: without the tombstone the same recover run relaunches"
+else
+  say FAIL "crash control: action=$act (want restarted)"
+fi
+
+# --- 6. no-session early exit must NOT write a tombstone: probing a crashed
+#        core with stop-core must not mask it from recovery.
+WS2="$(mktemp -d)"
+out="$(env SUTANDO_TEST_MODE=1 "SUTANDO_WORKSPACE=$WS2" SUTANDO_HOST_LABEL=stoptest \
+       SUTANDO_TMUX_SOCKET="$SOCK" SUTANDO_TMUX_SESSION=absent-core bash "$SCRIPT" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ ! -f "$WS2/state/cores/stoptest.stopped" ]; then
+  say ok "nothing-to-stop path writes no tombstone"
+else
+  say FAIL "no-session tombstone guard: rc=$rc out=$out"
 fi
 
 echo
