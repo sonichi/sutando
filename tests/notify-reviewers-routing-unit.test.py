@@ -1229,7 +1229,7 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
         self._write(dict(self.GOOD, ts="2026-08-29T11:00:01Z", outcome="unknown"),
                     dict(self.GOOD, ts="2026-08-29T11:00:02Z", outcome="typo"))
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:01Z")})
+                         {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:01.000000Z")})
 
     def test_a_falsy_timestamp_is_not_coerced_into_an_accepted_empty_string(self):
         # `d.get("ts") or ""` turned each of these into "" BEFORE the type
@@ -1252,7 +1252,7 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
         # in one fixed-width UTC form so the comparisons downstream hold.
         self._write(dict(self.GOOD, ts="2026-08-29T06:00:00-05:00"))
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("confirmed", "2026-08-29T11:00:00Z")})
+                         {("o/r", "7", "k"): ("confirmed", "2026-08-29T11:00:00.000000Z")})
 
     def test_a_string_that_is_not_a_timestamp_is_rejected(self):
         # "0000" sorts below every real stamp, lending one actor's age to
@@ -1267,7 +1267,7 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
                     {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "2026-08-29T11:00:02Z",
                      "outcome": "unknown"})
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:02Z")})
+                         {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:02.000000Z")})
 
     def test_the_reader_streams_the_file_rather_than_materializing_it(self):
         # Peak traced memory, not a code read: restoring read_text().splitlines()
@@ -1301,8 +1301,8 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
                     dict(self.GOOD, ts="2026-08-29T11:00:02Z", outcome="pending"),
                     dict(self.GOOD, ts="2026-08-29T11:00:03Z", outcome="failed"))
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("failed", "2026-08-29T11:00:03Z")})
-        self.assertEqual(nr._first_ask(self.led), {("o/r", "7", "k"): "2026-08-29T11:00:01Z"})
+                         {("o/r", "7", "k"): ("failed", "2026-08-29T11:00:03.000000Z")})
+        self.assertEqual(nr._first_ask(self.led), {("o/r", "7", "k"): "2026-08-29T11:00:01.000000Z"})
 
     def test_both_readers_derive_their_output_from_the_one_owner(self):
         # A mutant called `_streams`, discarded it, re-read the file and stayed

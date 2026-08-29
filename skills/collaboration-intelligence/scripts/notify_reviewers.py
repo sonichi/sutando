@@ -25,6 +25,7 @@ Stand), false (it bounced), null/absent (never observed — send, then record).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -245,7 +246,7 @@ _KNOWN_OUTCOMES = {"pending", "unknown", "confirmed", "failed"}
 
 #: The one comparable form. Every accepted stamp is normalized to it, so the
 #: lexical comparisons downstream order correctly across writers.
-_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 def _norm_ts(ts: str) -> "str | None":
@@ -256,11 +257,14 @@ def _norm_ts(ts: str) -> "str | None":
     """
     try:
         dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
+        if dt.tzinfo is None:
+            return None                 # naive: no instant, only a wall clock
+
+        # OverflowError raises HERE, not at parse; uncaught it crashes the
+        # reader instead of preserving a park.
+        return dt.astimezone(datetime.timezone.utc).strftime(_TS_FMT)
+    except (ValueError, OverflowError, OSError):
         return None
-    if dt.tzinfo is None:
-        return None                     # naive: no instant, only a wall clock
-    return dt.astimezone(datetime.timezone.utc).strftime(_TS_FMT)
 
 #: Accepted row schema. A field of the wrong type is a malformed ROW, not a
 #: reason to crash a reader or to misattribute the stream it belongs to.
@@ -329,16 +333,62 @@ def _streams(led: Path) -> dict:
     return out
 
 
-#: Rows above which the ledger is compacted. Every stream reduces to at most
-#: two rows, so the file is bounded by history breadth, not by attempt count.
+#: Compaction trigger and hard ceiling. Compaction alone cannot bound BREADTH,
+#: so settled streams are evicted oldest-first to reach the ceiling.
 _COMPACT_ABOVE = 2000
+_MAX_ROWS = 4000
+
+#: Never evicted: an unresolved reservation or a possibly-landed post is the
+#: safety state the park is made of. Retention gives way to it, not the reverse.
+_ACTIVE = _UNSAFE_OUTCOMES
 
 
-def compact(led: Path) -> int:
-    """Rewrite the ledger to the smallest history the projections cannot tell
-    from the original: per raw stream, the earliest real ask and the latest
-    outcome. Caller MUST hold the writer lock. Returns rows written."""
+def _physical_rows(led: Path) -> int:
+    """Every line on disk, malformed ones included — the file is what grows."""
+    if not led.exists():
+        return 0
+    with open(led) as fh:
+        return sum(1 for _ in fh)
+
+
+def _rows_for(st: dict) -> int:
+    """Rows this stream costs after compaction: its first ask and its last."""
+    n = 1 if st["first_ask"] is not None else 0
+    if st["last"] and (not n or st["last"] != (st["first_ask_outcome"], st["first_ask"])):
+        n += 1
+    return n or 1
+
+
+def _maybe_compact(led: Path) -> None:
+    """Caller MUST hold the ledger lock. Compacts, then evicts SETTLED streams
+    oldest-first until the file is under _MAX_ROWS. Active safety state is never
+    evicted, and failing to reach the ceiling is reported rather than hidden."""
+    if _physical_rows(led) <= _COMPACT_ABOVE:
+        return
+    compact(led)
+    if _physical_rows(led) <= _MAX_ROWS:
+        return
     streams = _streams(led)
+    cost = {k: _rows_for(st) for k, st in streams.items()}
+    total = sum(cost.values())
+    settled = sorted((st["last"][1] if st["last"] else "", k)
+                     for k, st in streams.items()
+                     if not (st["last"] and st["last"][0] in _ACTIVE))
+    for _ts, k in settled:
+        if total <= _MAX_ROWS:
+            break
+        total -= cost[k]
+        streams.pop(k)
+    _rewrite(led, streams)
+    if _physical_rows(led) > _MAX_ROWS:
+        print(f"  WARNING: ask ledger holds {_physical_rows(led)} rows, above the "
+              f"{_MAX_ROWS} ceiling; every remaining stream carries active park "
+              "state, which is never evicted", file=sys.stderr)
+
+
+def _rewrite(led: Path, streams: dict) -> int:
+    """Atomically replace the ledger with the rows these streams imply.
+    Caller MUST hold the ledger lock."""
     rows = []
     for (repo, num, who), st in sorted(streams.items(), key=lambda kv: str(kv[0])):
         keep = []
@@ -347,10 +397,10 @@ def compact(led: Path) -> int:
         if st["last"] and (not keep or st["last"] != keep[0]):
             keep.append(st["last"])
         for outcome, ts in keep:
-            row = {"repo": repo, "pr": int(num) if num.isdigit() else num,
-                   "reviewer": who, "actor": who, "ts": ts,
-                   "channel": "room", "outcome": outcome}
-            rows.append(json.dumps(row))
+            # The reader's normalized string: int() renamed "007" to "7".
+            rows.append(json.dumps({"repo": repo, "pr": num, "reviewer": who,
+                                    "actor": who, "ts": ts, "channel": "room",
+                                    "outcome": outcome}))
     tmp = led.with_suffix(led.suffix + ".compact")
     with open(tmp, "w") as fh:
         fh.write("".join(r + "\n" for r in rows))
@@ -358,6 +408,13 @@ def compact(led: Path) -> int:
         os.fsync(fh.fileno())
     os.replace(tmp, led)                # atomic: a reader sees one file or the other
     return len(rows)
+
+
+def compact(led: Path) -> int:
+    """Rewrite to the smallest history the projections cannot tell from the
+    original: per raw stream, the earliest real ask and the latest outcome.
+    Caller MUST hold the ledger lock. Returns rows written."""
+    return _rewrite(led, _streams(led))
 
 
 def _fold(streams: dict, per_stream, combine, canonical=None) -> dict:
@@ -436,6 +493,30 @@ def unknown_parked(message: str, reviewer: str, actor: str = None,
     return False
 
 
+#: flock is per-fd, so a nested take on a second fd deadlocks. Re-entrant by
+#: depth: claim_park holds it and calls the same public writer everyone uses.
+_LOCK_DEPTH = []
+
+
+@contextlib.contextmanager
+def _ledger_lock(led: Path):
+    """The ledger's ONE mutual-exclusion point. Every writer takes it, so an
+    append can never land inside a compactor's snapshot-then-replace window."""
+    if _LOCK_DEPTH:
+        yield
+        return
+    led.parent.mkdir(parents=True, exist_ok=True)
+    lock = led.with_suffix(led.suffix + ".lock")
+    with open(lock, "a") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        _LOCK_DEPTH.append(1)
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH.pop()
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
 def claim_park(message: str, reviewer: str, actor: str = None,
                canonical=None) -> "int | None":
     """Atomically claim the park, or None if someone else already holds it.
@@ -448,24 +529,24 @@ def claim_park(message: str, reviewer: str, actor: str = None,
     led = ledger_path()
     led.parent.mkdir(parents=True, exist_ok=True)
     led.touch(exist_ok=True)
-    lock = led.with_suffix(led.suffix + ".lock")
-    with open(lock, "a") as lf:
-        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-        try:
-            if unknown_parked(message, reviewer, who, canonical=canonical):
-                return None
-            n = record_asks(message, reviewer, outcome="pending", actor=who)
-            # Under the same lock that guards the claim, so no reader or writer
-            # can observe the replace half-done.
-            if sum(st["n"] for st in _streams(led).values()) > _COMPACT_ABOVE:
-                compact(led)
-            return n
-        finally:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    with _ledger_lock(led):
+        if unknown_parked(message, reviewer, who, canonical=canonical):
+            return None
+        return record_asks(message, reviewer, outcome="pending", actor=who)
 
 
 def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
                 actor: str = None, detail: str = None) -> int:
+    """Locked public writer. Every append serialises against the compactor."""
+    if not _PR_URL.search(message or ""):
+        return 0        # nothing to write, so no path to resolve and no lock
+    led = ledger_path()
+    with _ledger_lock(led):
+        return _append(led, message, reviewer, outcome, actor, detail)
+
+
+def _append(p: Path, message: str, reviewer: str, outcome: str,
+            actor: str = None, detail: str = None) -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED.
@@ -498,6 +579,7 @@ def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
         fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
+    _maybe_compact(p)
     return len(refs)
 
 
