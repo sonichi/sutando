@@ -141,6 +141,29 @@ class TestProactiveQuarantine(unittest.TestCase):
             self.assertIn("could not scan", r["detail"])
 
     # --- hermetic ---------------------------------------------------------
+    def test_the_detail_names_no_transport_it_did_not_measure(self):
+        """A parked body records no transport, so the warn must not name one.
+
+        The docstring's Discord case is one real incident (#2626, a 413 from
+        discord.com). The emitted text used to generalise that transport to
+        every parked body — and the live bodies that prompted this were parked
+        by remote-gateway-bridge, not Discord at all. Asserted in BOTH
+        directions: a positive-only check passes on "delivery failed via Discord".
+        """
+        with tempfile.TemporaryDirectory() as td:
+            self._quarantine(td)
+            (pathlib.Path(td) / "results" / "undelivered" / "task-1.txt").write_text("body")
+            out = self._run(td)
+        self.assertEqual(out["status"], "warn")
+        detail = out["detail"]
+        self.assertIn("results/undelivered/", detail)
+        for transport in ("Discord", "Slack", "Telegram", "Matrix", "gateway"):
+            self.assertNotIn(transport, detail,
+                             f"detail names {transport}, which the probe never measured")
+        self.assertNotIn("refused", detail,
+                         "'refused' implies policy/permission; a transient network "
+                         "failure parks a body too, and points at a different fix")
+
     def test_the_operators_real_workspace_is_never_touched(self):
         before = None
         real = hc.WORKSPACE_DIR / "results" / "undelivered"

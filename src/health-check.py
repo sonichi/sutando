@@ -6927,9 +6927,12 @@ def check_proactive_quarantine() -> dict:
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"{len(kept)} proactive message(s) kept in results/undelivered/ that Discord "
-                   f"refused — preserved, but no consumer drains this directory, so they stay "
-                   f"until someone acts; oldest {oldest_name} "
+        # A parked body records no transport, so naming one states something this
+        # probe never measured; the docstring's Discord case is one incident, not all.
+        "detail": (f"{len(kept)} proactive message(s) parked in results/undelivered/ after "
+                   f"delivery failed — preserved, but no consumer drains this directory, so "
+                   f"they stay until someone acts; which transport and why are in the bridge "
+                   f"log, not here; oldest {oldest_name} "
                    f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
                    f"{partial}"),
     }
