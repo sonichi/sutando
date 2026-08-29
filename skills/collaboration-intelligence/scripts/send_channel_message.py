@@ -11,7 +11,6 @@ while skipping the post-gate and the env -> .env -> vault contract.
 """
 from __future__ import annotations
 
-import os
 import pathlib
 import sys
 
@@ -19,15 +18,19 @@ _REPO = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "src"))
 from channel_token import resolve_channel_token          # noqa: E402
 
+from util_paths import claude_home_path                  # noqa: E402
+
 from channels.discord.post_gate import make_client       # noqa: E402
 
 from outbox import DeliveryOutcome                       # noqa: E402
 
 
 def token() -> str:
-    base = pathlib.Path(os.environ.get("CLAUDE_CONFIG_DIR") or (pathlib.Path.home() / ".claude"))
-    tok = resolve_channel_token("DISCORD_BOT_TOKEN",
-                                env_file=base / "channels" / "discord" / ".env")
+    # claude_home_path, not a private CLAUDE_CONFIG_DIR-or-~/.claude rederivation:
+    # that copy misses $CLAUDE_HOME and drifts from every other channel reader.
+    tok = resolve_channel_token(
+        "DISCORD_BOT_TOKEN",
+        env_file=claude_home_path("channels", "discord", ".env"))
     if not tok:
         raise SystemExit("send_channel_message: DISCORD_BOT_TOKEN not found")
     return tok

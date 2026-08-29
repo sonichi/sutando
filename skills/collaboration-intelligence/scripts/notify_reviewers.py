@@ -25,6 +25,7 @@ Stand), false (it bounced), null/absent (never observed — send, then record).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import datetime
@@ -229,6 +230,33 @@ def ledger_path() -> Path:
 #: the spawn, so a crash between POST and outcome still parks.
 _UNSAFE_OUTCOMES = {"pending", "unknown"}
 
+#: A definite non-delivery. Nothing was posted, so it is neither a park nor an
+#: ask — counting it refuses the retry it exists to permit.
+_NOT_AN_ASK = {"failed"}
+
+
+def _latest_outcomes(led: Path, canonical=None) -> dict:
+    """(repo, pr, actor) -> (outcome, ts) from the LAST row for that key.
+
+    The ledger is append-only, so every earlier row for a key is superseded. A
+    reader that scans rows instead of reducing them sees outcomes that no longer
+    hold — a released reservation still reading as a completed ask.
+    """
+    out = {}
+    if not led.exists():
+        return out
+    for line in led.read_text().splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        who = d.get("actor") or d.get("reviewer")
+        if canonical:
+            who = canonical(who)
+        key = (d.get("repo"), str(d.get("pr")), who)
+        out[key] = (d.get("outcome"), d.get("ts") or "")
+    return out
+
 
 def unknown_parked(message: str, reviewer: str, actor: str = None) -> bool:
     """True when this ACTOR's latest row for this PR is unsafe to repeat.
@@ -244,26 +272,42 @@ def unknown_parked(message: str, reviewer: str, actor: str = None) -> bool:
     led = ledger_path()
     if not refs or not led.exists():
         return False
-    latest = {}
     try:
-        for line in led.read_text().splitlines():
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            # Legacy rows carry only `reviewer`; canonicalize both so a row
-            # written under an alias still parks the alias it was written for.
-            row_who = d.get("actor") or d.get("reviewer")
-            if row_who != who and d.get("reviewer") != reviewer:
-                continue
-            for r, n in refs:
-                if d.get("repo") in (r, None) and str(d.get("pr")) == str(n):
-                    latest[(r, n)] = d.get("outcome")
+        latest = _latest_outcomes(led)
     except OSError:
         # Cannot read the park state, so cannot prove this was NOT parked. Fail
         # closed: refusing a send is recoverable, a duplicated unsafe post is not.
         return True
-    return any(v in _UNSAFE_OUTCOMES for v in latest.values())
+    for (repo, num, row_who), (outcome, _ts) in latest.items():
+        # Legacy rows carry only `reviewer`; accept either spelling so a row
+        # written under an alias still parks the alias it was written for.
+        if row_who not in (who, reviewer):
+            continue
+        if any(repo in (r, None) and num == str(n) for r, n in refs):
+            if outcome in _UNSAFE_OUTCOMES:
+                return True
+    return False
+
+
+def claim_park(message: str, reviewer: str, actor: str = None) -> "int | None":
+    """Atomically claim the park, or None if someone else already holds it.
+
+    Check-then-append is not a claim: two callers both read "not parked", both
+    append `pending`, and both post. The check and the write happen under one
+    exclusive lock so exactly one caller can win.
+    """
+    who = actor or reviewer
+    led = ledger_path()
+    led.parent.mkdir(parents=True, exist_ok=True)
+    lock = led.with_suffix(led.suffix + ".lock")
+    with open(lock, "a") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            if unknown_parked(message, reviewer, who):
+                return None
+            return record_asks(message, reviewer, outcome="pending", actor=who)
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
 def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
@@ -281,15 +325,19 @@ def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     p = ledger_path()
     p.parent.mkdir(parents=True, exist_ok=True)
+    payload = ""
+    for repo, num in sorted(refs):
+        row = {"repo": repo, "pr": num, "reviewer": reviewer,
+               "ts": ts, "channel": "room", "outcome": outcome}
+        if actor:
+            row["actor"] = actor
+        if detail:
+            row["detail"] = detail
+        payload += json.dumps(row) + "\n"
+    # One write under O_APPEND: a reader never sees half a batch, and two
+    # writers never interleave rows within one.
     with open(p, "a") as fh:
-        for repo, num in sorted(refs):
-            row = {"repo": repo, "pr": num, "reviewer": reviewer,
-                   "ts": ts, "channel": "room", "outcome": outcome}
-            if actor:
-                row["actor"] = actor
-            if detail:
-                row["detail"] = detail
-            fh.write(json.dumps(row) + "\n")
+        fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
     return len(refs)
@@ -346,25 +394,27 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     ledger = ledger_path()
     if not ledger.exists():
         return False, ""
-    import json as _j
+    actor_of = _actor_map(roster)
     prior, earliest = set(), None
     try:
-        for line in ledger.read_text().splitlines():
-            try:
-                d = _j.loads(line)
-            except ValueError:
-                continue
-            if str(d.get("pr")) != str(num) or d.get("repo") not in (repo, None):
-                continue
-            prior.add(d.get("reviewer"))
-            ts = d.get("ts") or ""
-            if ts and (earliest is None or ts < earliest):
-                earliest = ts
+        latest = _latest_outcomes(ledger)
     except OSError:
         return False, ""
+    for (r, n, who), (outcome, ts) in latest.items():
+        if n != str(num) or r not in (repo, None):
+            continue
+        # A released reservation means nothing was posted, so it is not an ask.
+        # Counting it refuses the very retry the release exists to permit.
+        if outcome in _NOT_AN_ASK:
+            continue
+        # One set, one axis: canonical actors. Mixing spellings into it makes
+        # the subset test below answer about names rather than people.
+        prior.add(actor_of.get(who, who))
+        if ts and (earliest is None or ts < earliest):
+            earliest = ts
     if not prior or earliest is None:
         return False, ""
-    names = {x["name"] for x in targets}
+    names = {actor_of.get(x["name"], x["name"]) for x in targets}
     if not names or not names.issubset(prior):
         return False, ""            # at least one NEW name -> this IS widening
     try:
@@ -376,13 +426,14 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         return False, ""
     # One human can hold several roster keys (jsun-m IS johnm-desktop). Listing
     # both overstates the pool and re-asks one person under two names.
-    actor_of = _actor_map(roster)
     seen_actors, unasked = set(), []
     for k, v in sorted((roster or {}).items()):
         if not isinstance(v, dict) or k.startswith("_"):
             continue
         actor = actor_of.get(k, k)
-        if k in prior or k == "keweichen":
+        # keweichen is deliberately never offered as a widen target; the
+        # exclusion is pinned by test_keweichen_is_never_offered_as_the_widen_target.
+        if actor in prior or k == "keweichen":
             seen_actors.add(actor)
             continue
         if actor in seen_actors:
@@ -462,23 +513,22 @@ def main() -> int:
                 failures += 1
                 continue
             who = actors.get(t["name"], t["name"])
-            if unknown_parked(a.message, t["name"], who):
-                print(f"{t['name']}: PARKED — a previous send to {who} is UNSAFE "
-                      "to repeat (it landed, or may have); check the channel",
-                      file=sys.stderr)
-                unknowns += 1
-                continue
-            # Reserve BEFORE the POST can happen: a reservation written after
-            # it cannot cover a crash, or a write failure, between the two.
+            # Claim BEFORE the POST can happen: a reservation written after it
+            # cannot cover a crash, or a write failure, between the two.
             try:
-                reserved = record_asks(a.message, t["name"], outcome="pending",
-                                       actor=who)
+                reserved = claim_park(a.message, t["name"], who)
             except OSError as e:
                 reserved = 0
                 print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
                       "sending now would be unrepeatable-but-unrecorded. Nothing "
                       "was sent.", file=sys.stderr)
                 failures += 1
+                continue
+            if reserved is None:
+                print(f"{t['name']}: PARKED — a previous send to {who} is UNSAFE "
+                      "to repeat (it landed, or may have); check the channel",
+                      file=sys.stderr)
+                unknowns += 1
                 continue
             if not reserved:
                 print(f"{t['name']}: REFUSED — no PR reference to key the park on; "

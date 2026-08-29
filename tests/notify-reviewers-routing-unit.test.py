@@ -721,30 +721,67 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
 class DiscordAskIsRecorded(unittest.TestCase):
     """A delivered Discord ask must reach the ledger the Matrix path writes.
 
-    The success branch used to `continue` before `record_asks`, so pr-unattended
-    read a correctly-delivered ask as NOBODY_EVER_ASKED.
+    Behavioural, not source-text: these used to grep notify_reviewers.py for a
+    substring, which passes for a call that is present and never reached.
     """
 
-    def test_the_discord_success_branch_calls_record_asks(self):
-        src = (REPO / "skills" / "collaboration-intelligence" / "scripts"
-               / "notify_reviewers.py").read_text()
-        disc = src[src.index('if t["transport"] == "discord":'):]
-        disc = disc[:disc.index('if a.room and t["room"] != a.room:')]
-        self.assertIn("record_asks(", disc,
-                      "the Discord success path does not write the ask ledger")
+    MSG = "re-review https://github.com/sonichi/sutando/pull/3509"
 
-    def test_it_passes_the_target_id_so_mentions_can_be_pinned(self):
-        src = (REPO / "skills" / "collaboration-intelligence" / "scripts"
-               / "notify_reviewers.py").read_text()
-        cmd = src[src.index("def discord_command_for("):]
-        cmd = cmd[:cmd.index("\ndef ", 1)]
-        self.assertIn('str(target["discord_id"]),', cmd,
-                      "the sender cannot restrict allowed_mentions without the id")
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+        self._env = {k: os.environ.get(k) for k in
+                     ("SUTANDO_SCI_ROSTER", "CLAUDE_CONFIG_DIR",
+                      "SUTANDO_REVIEW_ASKS_LEDGER")}
+        self._run, self._argv = nr.subprocess.run, sys.argv[:]
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(self.led)
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with(
+            {"groups": {"222": {"allowFrom": ["111"]}}})
+        fd, self.roster = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"d": DISCORD}, f)
+        os.environ["SUTANDO_SCI_ROSTER"] = self.roster
 
-    def test_unknown_outcome_is_not_folded_into_send_failed(self):
-        src = (REPO / "skills" / "collaboration-intelligence" / "scripts"
-               / "notify_reviewers.py").read_text()
-        self.assertIn("OUTCOME UNKNOWN", src)
+    def tearDown(self):
+        nr.subprocess.run, sys.argv[:] = self._run, self._argv
+        os.unlink(self.roster)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+
+    def _run_main(self, rc_out):
+        class _R:
+            returncode, stdout, stderr = rc_out, "", ""
+        nr.subprocess.run = lambda *a, **k: _R()
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message",
+                       self.MSG, "--send", "--allow-single", "ledger behaviour"]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = nr.main()
+        rows = ([json.loads(l) for l in self.led.read_text().splitlines()]
+                if self.led.exists() else [])
+        return rc, err.getvalue(), rows
+
+    def test_a_delivered_discord_ask_reaches_the_ledger(self):
+        rc, _, rows = self._run_main(0)
+        self.assertEqual(rc, 0)
+        self.assertEqual(rows[-1]["outcome"], "confirmed",
+                         "pr-unattended would read this delivered ask as unasked")
+        self.assertEqual(rows[-1]["pr"], 3509)
+
+    def test_the_sender_is_given_the_target_id_as_its_own_argument(self):
+        # allowed_mentions can only be narrowed to a target the sender was
+        # handed separately from the message body.
+        argv = nr.discord_command_for({"discord_id": "111", "channel": "222"}, "hi")
+        self.assertIn("111", argv, f"the id is not a discrete argument: {argv}")
+        self.assertEqual(argv[-1], "<@111> hi")
+
+    def test_an_unknown_outcome_is_not_folded_into_send_failed(self):
+        rc, err, rows = self._run_main(4)
+        self.assertEqual(rc, 4)
+        self.assertIn("OUTCOME UNKNOWN", err)
+        self.assertNotIn("SEND FAILED", err)
+        self.assertEqual(rows[-1]["outcome"], "unknown")
 
 
 class RepeatsAreMechanicallySuppressed(unittest.TestCase):
