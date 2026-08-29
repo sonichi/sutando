@@ -2954,9 +2954,15 @@ async def on_message(message):
 
 
 def _counts_as_mention(message) -> bool:
-    """What the ARRIVAL path treats as addressing this bot: an explicit mention,
-    or an owner tag the mention gate stands in for one while the gate is ON."""
-    return _message_mentions_bot(message) or _mention_gate_triggers_ingest(message)
+    """What the ARRIVAL path treats as addressing this bot. The gate substitutes
+    ONLY inside arrival's requireMention branch, so this mirrors that condition:
+    a free-listen channel already ingests everything, and consulting the gate
+    there would queue an edited message a second time."""
+    if _message_mentions_bot(message):
+        return True
+    cfg = load_channel_config(str(getattr(message.channel, "id", "")))
+    require_mention = True if cfg is None else bool(cfg[0])
+    return require_mention and _mention_gate_triggers_ingest(message)
 
 
 @client.event

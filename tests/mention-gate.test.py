@@ -607,15 +607,16 @@ class EditIntroducesTheTag(unittest.TestCase):
         db.seen_message_ids.clear()
         self._td.cleanup()
 
-    def _edit(self, before_content, after_content, allow=None):
+    def _edit(self, before_content, after_content, allow=None, require_mention=True):
         """Drive the production on_message_edit; return (stdout, tasks)."""
         before, after = _FakeMsg(before_content), _FakeMsg(after_content)
         EditIntroducesTheTag._next_id += 1
         before.id = after.id = EditIntroducesTheTag._next_id
+        self._require_mention = require_mention
         before.mentions = [NS(id=111222333)] if "<@111222333>" in before_content else []
         after.mentions = [NS(id=111222333)] if "<@111222333>" in after_content else []
         fake_client = NS(user=object())
-        cfg = (True, allow if allow is not None else {str(STRANGER)})
+        cfg = (require_mention, allow if allow is not None else {str(STRANGER)})
         buf = io.StringIO()
 
         async def _noop(*a, **k):
@@ -671,6 +672,68 @@ class EditIntroducesTheTag(unittest.TestCase):
                                   allow={"999999999"})
         self.assertEqual(written, [], out)
         self.assertEqual(_audit_rows(), [])
+
+
+class FreeListenChannelIsNotDoubleIngested(unittest.TestCase):
+    """`requireMention:false` is the adjacent value the edit cases all fixed.
+
+    Arrival consults the gate ONLY inside its requireMention branch, so a
+    predicate that consults it unconditionally re-queues a message a free-listen
+    channel had already ingested — one task on arrival, a second on the edit.
+    """
+
+    def setUp(self):
+        _reset_ws_gate()
+        self._td = tempfile.TemporaryDirectory()
+        self.tasks = Path(self._td.name) / "tasks"
+        self.tasks.mkdir()
+        db.seen_message_ids.clear()
+
+    def tearDown(self):
+        mg.write_state(_WS, mentions_enabled=False, until=None)
+        db.seen_message_ids.clear()
+        self._td.cleanup()
+
+    def _arrive_then_edit(self, require_mention):
+        """Production on_message THEN on_message_edit, one authorized human."""
+        before = _FakeMsg("here are the six launch videos")
+        after = _FakeMsg("here are the six launch videos <@111222333>")
+        before.mentions, after.mentions = [], [NS(id=111222333)]
+        before.id = after.id = 770000001 if require_mention else 770000002
+        cfg = (require_mention, {str(STRANGER)})
+        fake_client = NS(user=object())
+
+        async def _noop(*a, **k):
+            return None
+
+        buf = io.StringIO()
+        with mock.patch.object(db, "client", fake_client), \
+                mock.patch.object(db, "_observe_for_mod", _noop), \
+                mock.patch.object(db, "TASKS_DIR", self.tasks), \
+                mock.patch.object(db, "load_channel_config", lambda cid: cfg), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            for coro in (db._handle_discord_message(before),
+                         db.on_message_edit(before, after)):
+                try:
+                    asyncio.run(coro)
+                except Exception:
+                    pass
+        return buf.getvalue(), sorted(p.name for p in self.tasks.glob("task-*.txt"))
+
+    def test_free_listen_arrival_plus_edit_is_exactly_one_task(self):
+        # The reviewer's control: parent gave 1 then 2; this must stay at 1.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._arrive_then_edit(require_mention=False)
+        self.assertEqual(len(written), 1,
+                         f"free-listen must not re-queue on edit, got {written}\n{out}")
+
+    def test_require_mention_channel_still_ingests_on_the_edit(self):
+        # The positive control that keeps the scoping from disabling the fix:
+        # here arrival skips and the edit is the ONLY thing that can ingest.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._arrive_then_edit(require_mention=True)
+        self.assertEqual(len(written), 1, out)
+        self.assertEqual(len(_audit_rows()), 1, out)
 
 
 if __name__ == "__main__":
