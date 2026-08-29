@@ -48,9 +48,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$(resolve_python "$REPO_ROOT")"
 
 # Demand Python LAZILY, at the point of use. Requiring it up front was wrong:
-# 9 of this script's subcommands are pure shell (app-node-dir, node-bin,
-# tsx-bin, claude-home-path, subdirs, bootstrap, tmux-socket, run-dir,
-# runtime-socket) and answering them needs no interpreter — yet an eager
+# 8 of this script's subcommands are pure shell (app-node-dir, node-bin,
+# tsx-bin, claude-home-path, subdirs, bootstrap, tmux-socket, run-dir)
+# and answering them needs no interpreter — yet an eager
 # `require_python … || exit 1` failed them too. src/startup.sh:57 asks for
 # `app-node-dir` under `set -e`, so on a Darwin/no-CLT host that eager demand
 # terminated startup at the very first config lookup (CR #2599, @qingyun-wu).
@@ -495,21 +495,16 @@ print(_host_label(), end='')
     ;;
 
   runtime-socket)
-    # DELEGATES to rundir.socket_path() — the daemon decides where it listens,
-    # so this must not carry a second copy of that rule (it drifted once).
+    # The runtime-API daemon's Unix socket. The default is (actor, instance)
+    # scoped, so this EXECS rundir.py rather than mirroring it: a shell copy of
+    # the chain published the pre-actor flat socket while the daemon listened on
+    # the scoped one, and no client could reach a fresh daemon (review P1).
+    # No fallback on failure: a synthesized flat endpoint is a plausible WRONG
+    # answer, and rc=0 beside it is worse than no answer at all.
     if [ -n "${SUTANDO_RUNTIME_SOCKET:-}" ]; then
       printf '%s' "$SUTANDO_RUNTIME_SOCKET"
     else
-      _sock="$(SUTANDO_CONFIG_REPO="$REPO_ROOT" "$PY" - <<'PY' 2>/dev/null
-import os, sys
-sys.path.insert(0, os.path.join(os.environ["SUTANDO_CONFIG_REPO"], "src", "runtime-api"))
-import rundir
-sys.stdout.write(rundir.socket_path())
-PY
-)"
-      # Never hard-fail this helper: everything shells out to it.
-      if [ -n "$_sock" ]; then printf '%s' "$_sock"
-      else printf '%s/sutando-runtime.sock' "$(bash "$0" run-dir)"; fi
+      py "$REPO_ROOT/src/runtime-api/rundir.py" --socket
     fi
     ;;
 
@@ -728,29 +723,16 @@ code = {
     'tree_digest': (_manifest.get('post_build_tree_digest')
                     if isinstance(_manifest.get('post_build_tree_digest'), str) else None),
 }
-# run-dir + runtime-api socket: mirror #2325 rundir.py (same policy as the
-# run-dir / runtime-socket subcommands). This is a second copy of the chain (the
-# bash subcommand is the other); the resolver test asserts the descriptor
-# runtimeSocket equals the runtime-socket subcommand, so the two cannot drift
-# silently (review nit). NOTE: no shell-active chars in this comment block -- the
-# python runs inside a bash double-quoted -c string, so a dollar-var or backtick
-# here would be bash-expanded and break the program.
-_run_dir_env = os.environ.get('SUTANDO_RUN_DIR')
-if _run_dir_env:
-    _rundir = _run_dir_env
-elif sys.platform == 'darwin':
-    _rundir = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'space.ag2.app', 'run')
-elif os.environ.get('XDG_RUNTIME_DIR'):
-    _rundir = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'sutando')
-else:
-    _rundir = os.path.join(os.path.expanduser('~'), '.sutando', 'run')
-# Same delegation as the runtime-socket subcommand: rundir owns the rule.
-try:
-    sys.path.insert(0, os.path.join(repo, 'src', 'runtime-api'))
-    import rundir as _rundir_mod
-    _runtime_socket = _rundir_mod.socket_path()
-except Exception:
-    _runtime_socket = os.environ.get('SUTANDO_RUNTIME_SOCKET') or os.path.join(_rundir, 'sutando-runtime.sock')
+# run-dir + runtime-api socket: IMPORT rundir.py instead of re-deriving it. The
+# socket default is (actor, instance) scoped, so a hand-mirrored copy of that
+# chain published a socket no daemon listens on (review P1). NOTE: no
+# shell-active chars in this comment block -- the python runs inside a bash
+# double-quoted -c string, so a dollar-var or backtick here would be
+# bash-expanded and break the program.
+sys.path.insert(0, os.path.join(repo, 'src', 'runtime-api'))
+import rundir as _rd
+_rundir = str(_rd.run_dir())
+_runtime_socket = _rd.socket_path()
 # runtimeRoot = parent of run/ when run-dir is <root>/run (darwin App-Support,
 # portable dot-sutando); for the XDG case the run-dir (XDG_RUNTIME_DIR/sutando) IS
 # the app dir (its parent is the shared XDG base), so use the run-dir itself.
