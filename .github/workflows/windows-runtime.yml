@@ -128,6 +128,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'file-lock.test.py failed' }
           python tests/access-store-concurrency.test.py
           if ($LASTEXITCODE -ne 0) { throw 'access-store-concurrency.test.py failed' }
+          python tests/workspace-lock.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'workspace-lock.test.py failed' }
+          python tests/runtime-api-dispatcher.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'runtime-api-dispatcher.test.py failed' }
+          python tests/runtime-api-identity-view.test.py TestAuthorityBoundaries
+          if ($LASTEXITCODE -ne 0) { throw 'runtime-api-identity-view.test.py failed' }
           python tests/task-workstreams.test.py
           if ($LASTEXITCODE -ne 0) { throw 'task-workstreams.test.py failed' }
           python tests/signal_guest_handler.test.py
