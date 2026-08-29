@@ -103,6 +103,9 @@ MAX_EMIT_LATENESS_SECONDS = 15 * 60
 MAX_EMIT_LATENESS_CAP_SECONDS = 60 * 60
 # Two fires of a weekly job can be ~13 days apart when today is midweek.
 PERIOD_SCAN_MAX_SECONDS = 15 * 24 * 3600
+# Widest real UTC-offset rollback is 2h (Antarctica/Troll); 3 gives margin
+# while keeping the per-day expansion bounded by a constant, not by 24.
+FOLD_LOOKAHEAD_HOURS = 3
 CORE_ALIVE_MAX_AGE_SECONDS = 90
 
 
@@ -221,14 +224,28 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
         # Anchor on noon: midnight can be skipped or repeated by a DST shift.
         noon = time.mktime((y, mo, d, 12, 0, 0, 0, 0, -1))
         if _day_matches(dom_f, month_f, dow_f, time.localtime(noon)):
-            # Per-hour batching: a DST fold interleaves offsets only within
-            # its own hour. day_idx, not a flag — a flag stays armed for day 1.
-            day_hours = [h for h in hours if h <= cur.tm_hour] if day_idx == 0 else hours
-            for h in day_hours:
-                hour_epochs = []
+            # A rollback wider than one hour moves an elapsed epoch into a
+            # later wall-clock hour, so batch a bounded window and sort it.
+            # Pay the widened scan only near a real transition: away from one
+            # the offset is stable, so wall-clock order IS epoch order.
+            folded = (time.localtime(now_epoch).tm_gmtoff
+                      != time.localtime(now_epoch - FOLD_LOOKAHEAD_HOURS * 3600).tm_gmtoff)
+            lookahead = FOLD_LOOKAHEAD_HOURS if folded else 0
+            day_hours = ([h for h in hours if h <= cur.tm_hour + lookahead]
+                         if day_idx == 0 else hours)
+            window = []
+            for idx, h in enumerate(day_hours):
                 for mi in minutes:
-                    hour_epochs.extend(_local_epochs(y, mo, d, h, mi))
-                for epoch in sorted(hour_epochs, reverse=True):
+                    window.extend(_local_epochs(y, mo, d, h, mi))
+                # Hold FOLD_LOOKAHEAD_HOURS of lookahead before consuming: a
+                # lower wall-clock hour can still outrank what is buffered.
+                if idx < lookahead and idx < len(day_hours) - 1:
+                    continue
+                window.sort(reverse=True)
+                keep = (window[-lookahead * len(minutes):]
+                        if lookahead and idx < len(day_hours) - 1 else [])
+                emit = window[:len(window) - len(keep)]
+                for epoch in emit:
                     if epoch > now_epoch:
                         continue
                     if epoch < floor:
@@ -236,6 +253,7 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
                     fires.append(epoch)
                     if len(fires) == 2:
                         return fires[0] - fires[1]
+                window = keep
         prev = time.localtime(noon - 86400)
         y, mo, d = prev.tm_year, prev.tm_mon, prev.tm_mday
     return None
