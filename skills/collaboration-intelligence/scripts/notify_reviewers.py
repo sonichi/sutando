@@ -238,65 +238,68 @@ _NOT_AN_ASK = {"failed"}
 _DID_ASK = {"confirmed", "unknown"}
 
 
-def _latest_outcomes(led: Path, canonical=None) -> dict:
-    """(repo, pr, actor) -> (outcome, ts) from the LAST row for that key.
+def _raw_streams(led: Path) -> dict:
+    """(repo, pr, RAW spelling) -> the rows for that stream, in file order.
 
-    The ledger is append-only, so every earlier row for a key is superseded. A
-    reader that scans rows instead of reducing them sees outcomes that no longer
-    hold — a released reservation still reading as a completed ask.
+    THE one owner of the ledger's read contract: file access, malformed-JSON
+    skipping, `actor or reviewer` identity, key shape, and append order. Both
+    readers below are projections over this; two copies of it produced the park
+    and ask-history defects independently, which is the duplication itself.
     """
-    out = {}
+    streams = {}
     if not led.exists():
-        return out
+        return streams
     for line in led.read_text().splitlines():
         try:
             d = json.loads(line)
         except ValueError:
             continue
-        who = d.get("actor") or d.get("reviewer")
-        if canonical:
-            who = canonical(who)
-        key = (d.get("repo"), str(d.get("pr")), who)
-        out[key] = (d.get("outcome"), d.get("ts") or "")
+        key = (d.get("repo"), str(d.get("pr")), d.get("actor") or d.get("reviewer"))
+        streams.setdefault(key, []).append(
+            (d.get("outcome"), d.get("ts") or ""))
+    return streams
+
+
+def _fold(streams: dict, per_stream, combine, canonical=None) -> dict:
+    """Project each RAW stream, then fold the results onto the canonical actor.
+
+    Reducing before folding is the invariant both readers need: one alias's
+    definite failure settles only its own reservation.
+    """
+    canon = canonical or (lambda w: w)
+    out = {}
+    for (repo, num, who), rows in streams.items():
+        v = per_stream(rows)
+        if v is None:
+            continue
+        k = (repo, num, canon(who))
+        out[k] = combine(out[k], v) if k in out else v
     return out
+
+
+def _latest_outcomes(led: Path, canonical=None) -> dict:
+    """(repo, pr, actor) -> (outcome, ts) from the LAST row for that key."""
+    return _fold(_raw_streams(led), lambda rows: rows[-1],
+                 lambda a, b: b, canonical=canonical)
 
 
 def _first_ask(led: Path, canonical=None) -> dict:
-    """(repo, pr, actor) -> earliest ts at which an ask actually reached them.
+    """(repo, pr, actor) -> earliest ts at which an ask actually reached them."""
+    def per_stream(rows):
+        asks = [ts for outcome, ts in rows
+                # A row predating the outcome field records a send that
+                # happened: absence is legacy, not "nothing was posted".
+                if outcome is None or outcome in _DID_ASK]
+        if asks:
+            return min(asks)
+        # A standing reservation may have posted, so it counts as an ask at its
+        # own ts until it settles; a settled `failed` never posted.
+        return rows[-1][1] if rows[-1][0] == "pending" else None
 
-    Reduced per RAW spelling and folded afterwards, for the same reason the park
-    is: one alias's definite failure settles only its own reservation.
-    """
-    raw_first, raw_last, raw_last_ts = {}, {}, {}
-    if not led.exists():
-        return {}
-    for line in led.read_text().splitlines():
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
-        who = d.get("actor") or d.get("reviewer")
-        key = (d.get("repo"), str(d.get("pr")), who)
-        ts, outcome = d.get("ts") or "", d.get("outcome")
-        raw_last[key], raw_last_ts[key] = outcome, ts
-        # A row predating the outcome field records a send that happened: the
-        # field's absence is legacy, not a claim that nothing was posted.
-        if (outcome is None or outcome in _DID_ASK) and (
-                key not in raw_first or ts < raw_first[key]):
-            raw_first[key] = ts
-    for key, outcome in raw_last.items():
-        # A standing reservation may have posted, so it counts as an ask until
-        # it settles, at its own ts; a settled `failed` never posted.
-        if outcome == "pending" and key not in raw_first:
-            raw_first[key] = raw_last_ts.get(key) or ""
-    canon = canonical or (lambda w: w)
-    out = {}
-    for (repo, num, who), ts in raw_first.items():
-        k = (repo, num, canon(who))
-        prev = out.get(k)
-        if k not in out or (ts and (not prev or ts < prev)):
-            out[k] = ts
-    return out
+    def earliest(a, b):
+        return min(x for x in (a, b) if x) if (a and b) else (a or b)
+
+    return _fold(_raw_streams(led), per_stream, earliest, canonical=canonical)
 
 
 def unknown_parked(message: str, reviewer: str, actor: str = None,

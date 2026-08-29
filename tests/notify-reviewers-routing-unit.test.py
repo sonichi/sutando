@@ -1103,5 +1103,56 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
         self.assertFalse(self._stale())
 
 
+class OneOwnerForTheLedgerReadContract(unittest.TestCase):
+    """Both readers are projections over `_raw_streams`, not two copies of it.
+
+    Two independent implementations of this contract produced the park and
+    ask-history defects separately; a fix to one kept missing the other.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_malformed_lines_are_skipped_not_fatal(self):
+        self.led.write_text("not json\n" + json.dumps(
+            {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "T", "outcome": "confirmed"}) + "\n")
+        self.assertEqual(list(nr._raw_streams(self.led)), [("o/r", "7", "k")])
+
+    def test_identity_prefers_actor_and_falls_back_to_reviewer(self):
+        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
+            {"repo": "o/r", "pr": 7, "reviewer": "spelling", "actor": "canon",
+             "ts": "T1", "outcome": "confirmed"},
+            {"repo": "o/r", "pr": 7, "reviewer": "legacy", "ts": "T2",
+             "outcome": "unknown"})))
+        self.assertEqual(sorted(k[2] for k in nr._raw_streams(self.led)),
+                         ["canon", "legacy"])
+
+    def test_a_stream_keeps_its_rows_in_file_order(self):
+        self.led.write_text("".join(json.dumps(
+            {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": t, "outcome": o}) + "\n"
+            for o, t in (("pending", "T1"), ("failed", "T2"))))
+        self.assertEqual(nr._raw_streams(self.led)[("o/r", "7", "k")],
+                         [("pending", "T1"), ("failed", "T2")])
+
+    def test_an_absent_ledger_is_empty_not_an_error(self):
+        self.assertEqual(nr._raw_streams(pathlib.Path(self.tmp) / "nope.jsonl"), {})
+
+    def test_both_readers_delegate_to_the_one_owner(self):
+        # The delegation, not the behaviour: a reader that re-implements the
+        # read contract passes every behavioural case and drifts anyway.
+        calls, orig = [], nr._raw_streams
+        nr._raw_streams = lambda led: (calls.append(led), orig(led))[1]
+        try:
+            nr._latest_outcomes(self.led)
+            nr._first_ask(self.led)
+        finally:
+            nr._raw_streams = orig
+        self.assertEqual(len(calls), 2, "a reader read the ledger on its own")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
