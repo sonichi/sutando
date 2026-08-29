@@ -875,6 +875,9 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
                 and str(argv[1]).endswith("evict-own-bridge.sh")):
             killed.append(f"evict:{argv[2]}:{argv[3]}")
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        # Post-eviction survivor scan: an empty table proves the pgrep hit gone.
+        if isinstance(argv, list) and argv and argv[0] in ("ps", "/bin/ps"):
+            return subprocess.CompletedProcess(argv, 0, stdout="  PID  PPID ARGS\n", stderr="")
         return real_run(argv, *args, **kwargs)
 
     if plan == "REAL":
