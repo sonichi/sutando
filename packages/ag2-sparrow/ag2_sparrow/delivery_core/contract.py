@@ -40,10 +40,16 @@ class DeliveryOutcome(str, Enum):
 
 
 class DrainStatus(str, Enum):
-    """Why a drain attempt ended, locally. NOT_CLAIMED means another worker
-    owns the item: no provider call was made, so nothing external is
-    ambiguous."""
+    """Why a drain attempt ended, locally. Neither non-ATTEMPTED status made
+    a provider call, so nothing external is ambiguous in either.
+
+    NOT_CLAIMED and TERMINAL are split because they differ in whether a later
+    pass can ever succeed: NOT_CLAIMED is contention (another worker owns it;
+    a reclaim recovers it), TERMINAL is the item's own final state. Collapsing
+    them makes a drainer retry a decided item forever.
+    """
     NOT_CLAIMED = "not_claimed"
+    TERMINAL = "terminal"
     ATTEMPTED = "attempted"
 
 
@@ -169,7 +175,24 @@ class ClaimBackend(Protocol):
         ...
 
     def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:
-        """Acquire exclusive local ownership, or None on a lost race."""
+        """Acquire exclusive local ownership, or None when it was not taken.
+
+        None does NOT mean "another worker owns it" — it also covers an item
+        that is already terminal, absent, or whose incarnation vanished. Ask
+        `is_terminal` to tell a decided item from a contended one.
+        """
+        ...
+
+    def is_terminal(self, item_id: str) -> bool:
+        """True when this item has reached its own final state (delivered or
+        parked) and no drain will ever claim it again.
+
+        Only meaningful after a failed `claim`, and read separately because a
+        terminal item and a contended one are indistinguishable from `claim`
+        alone. Terminal is absorbing except via the administrative requeue
+        path, which resets the attempt budget — so a `True` that goes stale
+        that way costs one extra pass, never a stuck item.
+        """
         ...
 
     # False = complete() accepts provider/destination and DROPS them.

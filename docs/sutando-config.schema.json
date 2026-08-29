@@ -159,13 +159,9 @@
       "properties": {
         "down_bridge_action": {
           "type": "string",
-          "enum": [
-            "restart",
-            "alert",
-            "off"
-          ],
+          "enum": ["restart", "alert", "off"],
           "default": "alert",
-          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout \u2014 clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
+          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout — clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
         }
       }
     },
@@ -179,8 +175,33 @@
           "description": "Emit in-channel '\u23f3 working\u2026 (Ns)' progress placeholders while a task runs."
         },
         "discord_post_gate": {
-          "type": "string",
-          "description": "Path to a Python file exporting validate(channel_id, payload) — the Discord post-gate policy src/channels/discord/post_gate.py resolves for every Discord sender. Unset: ungated. A configured path that fails to load refuses all sends (fail-closed). Env override: $SUTANDO_DISCORD_POST_GATE."
+          "description": "Discord post-gate policy resolved by src/channels/discord/post_gate.py for every Discord sender. Either one path applied to every channel, or a {channel_id: path} map. Unset: ungated. A configured path that fails to load refuses sends (fail-closed). Env override: $SUTANDO_DISCORD_POST_GATE.",
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Path to a Python file exporting validate(channel_id, payload). Applied to every channel. Blank is the legacy UNCONFIGURED form: the resolver strips and treats it as unset, so the schema must not reject it."
+            },
+            {
+              "type": "object",
+              "description": "Per-channel policy files. `*` is REQUIRED and is the fallback for any channel not listed: without it an unlisted channel would send unvalidated, so the resolver refuses the whole mapping. An entry with a null/blank path refuses that one channel.",
+              "required": ["*"],
+              "propertyNames": {
+                "pattern": "^\\S+$",
+                "description": "Channel ids carry no surrounding whitespace. The resolver strips keys; an untrimmed one would route that channel to `*` instead of its own policy."
+              },
+              "properties": {
+                "*": {
+                  "type": "string",
+                  "pattern": "\\S",
+                  "description": "Fallback policy file for every channel not named above."
+                }
+              },
+              "additionalProperties": {
+                "type": ["string", "null"],
+                "description": "Policy file for this channel id."
+              }
+            }
+          ]
         }
       }
     },
@@ -207,7 +228,7 @@
     },
     "stand": {
       "type": "string",
-      "description": "This instance's `Stand:` commit-trailer value (e.g. \"Echo Act IV Mini\"). Per-clone identity, so it belongs in sutando.config.local.json rather than the tracked default config. Read by scripts/sutando-config.sh stand and src/daily-insight.py to tell co-located Sutando instances apart, since both commit under the owner's GH-mapped email so --author cannot separate them."
+      "description": "This instance's `Stand:` commit-trailer value (e.g. \"Echo Act IV Mini\"). Per-clone identity, so it belongs in sutando.config.local.json rather than the tracked default config. Read by scripts/sutando-config.sh stand to tell co-located Sutando instances apart, since both commit under the owner's GH-mapped email so --author cannot separate them."
     },
     "delivery": {
       "type": "object",
@@ -223,6 +244,13 @@
           "default": "a",
           "description": "Which ClaimBackend the proactive delivery leg constructs. `a` (the default): the shipped Design A backend. `c`: the Design C striped backend, which requires an activated outbox root and falls back to Design A for the cycle if the root is not activated. Overridable via $SUTANDO_CLAIM_BACKEND. See resolve_claim_backend() in src/sutando_config.py."
         }
+      }
+    },
+    "env": {
+      "type": "object",
+      "description": "Non-secret config values mirroring the flat env-var namespace (issue #1724). Read by config_get(); secrets stay in .env / vault.",
+      "additionalProperties": {
+        "type": "string"
       }
     }
   }

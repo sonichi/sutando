@@ -191,9 +191,38 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    On the **first no-op** of a run (`streak >= 1`):
    1. **Generate, don't idle** — first widen the menu and actually try to produce a tangible artifact (peer-PR review, regression grep, parity verify, research, memory curation, own-PR CI). Gated ≠ nothing-to-do. Only if genuinely all-gated go to step 2.
-   2. **Surface once per changed set** — build the held-list (each item + who it's gated on), `sha1` it. If `hash != last_surfaced_hash`: post ONE concise "here's what's held / needs you (FYI, not a block)" line to the **owner's primary channel** (see `PERSONAL_CLAUDE.md` channel routing — NOT the `#bot2bot` coord channel), then set `last_surfaced_hash`. If `hash == last_surfaced_hash`: stay quiet **only if the owner is away/asleep** (`last-owner-activity.json` older than ~30 min); if he's been active in the last ~30 min, never go dark — drop a one-line progress/activity signal to his channel anyway.
+   2. **Surface once per changed set** — build the held-list as `(item_id, gated_on)` pairs, where
+   `gated_on` is a short stable token (`owner`, `ci`, `upstream`, `peer-review`) — it is reduced
+   to its leading token, so re-describing one blocker cannot make a second key. ⚠ **`item_id`
+   is NOT reduced**: use a stable identifier (a PR number, a fixed slug), never a rendered
+   description — an id carrying a live count re-hashes on a change nobody needs told about.
+   Hash it with:
+
+   ```bash
+   echo '[["3166","owner"],["3274","owner"]]' |
+     python3 skills/proactive-loop/scripts/idle-surface-hash.py \
+       --state "$WORKSPACE/state/idle-streak.json" --commit
+   # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
+   ```
+
+   ⚠ **Do not compute this hash yourself.** The rule used to live here as "sha1 the held-list", and an
+   agent handed that instruction hashes the sentence it was about to send — so re-wording the same
+   items yields a new hash every pass and the guard never dedups anything. A guard described in prose
+   is not unimplemented; it is implemented with the executor's default as its body.
+
+   If `hash != last_surfaced_hash`: post ONE concise "here's what's held / needs you (FYI, not a block)" line to the **owner's primary channel** (see `PERSONAL_CLAUDE.md` channel routing — NOT the `#bot2bot` coord channel), then set `last_surfaced_hash`. If `hash == last_surfaced_hash`: stay quiet **only if the owner is away/asleep** (`last-owner-activity.json` older than ~30 min); if he's been active in the last ~30 min, never go dark — drop a one-line progress/activity signal to his channel anyway.
 
    **Guardrails (all owner-corrected):** the surface is a non-blocking FYI footnote — NEVER a new wait-state ("awaiting your go" is not a reason to pause; keep doing the next unblocked thing). Don't spam: one signal per changed set / per work-shift, not per file. Presence is the discriminator: recently-active → never silent; genuinely-away → dedup-quiet is fine.
+
+6.7. **Failure closure = mechanism, never a filed lesson (owner-durable 2026-08-27: "why do I
+   need to keep reminding you to make durable fix").** Every report of a failure — your own or one
+   a reviewer/owner caught — ends with exactly one of: (a) the MECHANISM that makes the recurrence
+   structurally impossible (a gate, a generated row, a checker), linked; or (b) the explicit
+   sentence "no mechanism exists, because X." A lesson written to a log or memory is not a third
+   option: a memory loads when RECALLED, a mechanism runs unconditionally — and this file loads
+   every pass, which is why the rule lives HERE and not in the memory that first recorded it.
+   Measured the day it was written: two mechanisms (sutando-skills#440, #441) each existed within
+   an hour of the owner's prompt, so the cost was never the building — only the definition of done.
 
 7. **Update `$WORKSPACE/build_log.md`** — mark what changed, update statuses, note what's next.
 
@@ -346,12 +375,49 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
-   | probe says | action |
+   **⚠ STOP ONLY THE PIDS THE PROBE ITSELF CLASSIFIES AS OWNERLESS.** The sentinel is
+   single-valued, but a pool legitimately runs **one watcher per core**, so N-1 correct watchers
+   always read as "untracked duplicates" and which pid holds the sentinel is arbitrary.
+
+   The probe does this classification for you, same-host, from the local process table — but only in
+   *some* of its branches. **Act only on a verdict that presents owned and ownerless as two
+   separately-labelled groups.** Key on that structure, never on wording:
+
+   - two groups, one of them ownerless → stop exactly the ownerless roots, leave the rest.
+   - two groups, none ownerless (every untracked tree session-owned) → **change nothing**.
+   - **one undifferentiated list of pids → change nothing** and say so, *whatever adjective it
+     carries* — including "orphaned" and "unsupervised", and including when it ends in the
+     imperative "stop them and restart one cleanly". Ambiguous ownership is not a licence to stop a
+     watcher; it is a reason not to.
+
+   **The last bullet is the common case, not a legacy edge case.** On `main` every multi-root
+   verdict is a single undifferentiated list, and #3328 splits only the branch where the sentinel is
+   *live* — one of three. After it lands, the no-sentinel and dead-sentinel branches still emit
+   `N orphaned watcher(s) … stop them and restart one cleanly`, naming every root including the
+   session-owned ones. Read structurally, that is the safe bullet; read for tone, it is the
+   dangerous one. That gap is why this rule tests for two groups instead of trusting the adjective.
+
+   **Do not re-derive this yourself.** `ps -p <pid>` prints an identical row for a supervised watcher
+   and an ownerless one — the roots come from `_watcher_trees()` and are alive by construction — so a
+   hand-rolled trace cannot produce the split it appears to, and eyeballing raw PPIDs is the guessing
+   this step exists to prevent. That is also what the "don't hand-roll a process check" rule below
+   means: the probe is the authority for ownership as well as for liveness.
+
+   **Do NOT scope this by counting `state/cores/*.alive`.** That directory is SYNCED ACROSS HOSTS, so a
+   peer's fresh heartbeat inflates the count on a single-core machine and suppresses cleanup of
+   genuinely orphaned local watchers — the inverse failure, equally bad. Measured on a live host: a
+   remote `Mac-186.alive` carried the *same pid* as the local record.
+
+   | probe says | action (apply the two-group test above first) |
    |---|---|
    | `ok` | nothing to do. |
-   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. Stop the pids it names, then start exactly one. |
-   | sentinel pid dead but **other watcher(s) still run** | same: stop the named pids, then start one. |
+   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. This branch emits ONE undifferentiated list, so the two-group test fails: **change nothing**. Stop roots only if a future build names owned and ownerless separately here. |
+   | sentinel pid dead but **other watcher(s) still run** | same — one undifferentiated list, so **change nothing**. |
+   | multiple trees, some **not tracked by the sentinel**, reported as two groups | stop exactly the group with **no live owning session**; leave the session-owned group alone. If the ownerless group is empty, change nothing. |
    | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
+
+   **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
+   express on its own, and the one that makes the difference between a cleanup and an outage.
 
    **A missing sentinel is UNKNOWN, not DEAD.** The sentinel is written once at startup (`watch-tasks-stream.sh` line ~316) and removed by cleanup only when the content still matches that pid, so an absent file cannot distinguish "no watcher" from "a live watcher whose file was removed". Measured 2026-08-07 on a live core: the watcher had held one pid for ~5h, was **functioning** (it emitted `TASK_FILE:` for a probe written during the check), and the sentinel was absent from disk entirely. The instruction this step used to carry — *missing OR dead → restart* — would have attached a second watcher to that live one, and both then emit every task, so each task gets processed twice. `health-check.py` names this failure directly at its `task-watcher` probe: restarting on a dead-looking sentinel "is what produces the duplicates in the first place."
 

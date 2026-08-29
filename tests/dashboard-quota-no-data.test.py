@@ -43,12 +43,21 @@ def _tile(html: str, label: str) -> str:
     `">✓<" not in html` fails on an unrelated tile and reads as a real defect.
     Anchor on the tile's own label instead.
     """
-    # [^<]* — not (.*?): a dot-any capture starts at the FIRST stat-val on the
-    # page and swallows every tile until it reaches this label, so every tile
-    # "contains" every value and the assertion means nothing.
+    # [^<]*, never (.*?): a dot-any capture swallows every tile up to this label.
+    # Both tile shapes stay bounded — a plain value, and the ring's <text> fallback.
     m = re.search(
-        r'<div class="stat-val">([^<]*)</div><div class="stat-label">' + re.escape(label),
+        r'<div class="stat-val"[^>]*>(?:<span>)?([^<]+)(?:</span>)?'
+        r'(?:<svg[^>]*>[^<]*(?:</?[a-z][^>]*>[^<]*)*</svg>)?\s*</div><div class="stat-label">'
+        + re.escape(label),
         html)
+    if m is None:
+        m = re.search(
+            r'<div class="stat-val"[^>]*><svg[^>]*id="qr-[^"]*"[^>]*>'
+            r'(?:[^<]*(?:</?(?!text)[a-z][^>]*>[^<]*)*)'
+            r'<text[^>]*>([^<]*)</text>[^<]*</svg>'
+            r'(?:<svg[^>]*>[^<]*(?:</?[a-z][^>]*>[^<]*)*</svg>)?\s*</div><div class="stat-label">'
+            + re.escape(label),
+            html)
     assert m, f"tile {label!r} not found in rendered page"
     return m.group(1)
 

@@ -38,6 +38,12 @@ _spec = importlib.util.spec_from_file_location("slack_bridge", REPO / "src" / "s
 mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
+# TASKS_DIR resolves to the LIVE workspace at import, so the temp tree above is not
+# isolation on its own and `_write_task` writes real owner tasks into the real queue.
+TASKS_DIR = Path(_tmp) / "tasks"
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+mod.TASKS_DIR = TASKS_DIR
+
 
 class ContextFirstUngated(unittest.TestCase):
     def _write(self, tier: str = "owner") -> str:

@@ -85,10 +85,10 @@ check("positive control: the grandfathered import still exists (allowlist not st
 
 # 3. Resident-loop allowlist in room-ops is frozen at the grandfathered debt.
 # events.py:stream_with_resume = the resident-lifecycle debt (see doc);
-# _gateway.py:_token_from_vault = a BOUNDED ancestor-directory walk, listed so
-# the freeze stays a strict "no new while-True anywhere in the skill" gate.
+# _gateway.py:_core_src_on_path = the SAME bounded ancestor-directory walk that
+# was inline in _token_from_vault; factored out so two callers share one copy.
 ALLOWED_RESIDENT_LOOPS = {("events.py", "stream_with_resume"),
-                          ("_gateway.py", "_token_from_vault")}
+                          ("_gateway.py", "_core_src_on_path")}
 found = set()
 for p in _py_sources(ROOM_OPS):
     src = p.read_text(errors="replace")

@@ -214,6 +214,11 @@ class TransitionRefusalBackend:
     def attempts(self, item_id):
         return 0
 
+    # Refusal DEFERS, it does not decide: a queued body will be claimed once the
+    # root is servable, so reporting terminal here would strand it permanently.
+    def is_terminal(self, item_id):
+        return False
+
     def recover(self):
         from .contract import RecoverReport
         return RecoverReport()

@@ -84,5 +84,70 @@ else
   say FAIL "unrecognised probe form: $probe"
 fi
 
+# The vault token gate runs BEFORE the bridge launches, so it must use the SAME
+# interpreter decision -- never a bare `command -v python3`. An unvalidated PATH
+# python3 can be the Xcode Command Line Tools stub, which prompts an install
+# dialog when executed; the gate must not be what discovers that.
+mkdir -p "$TMP/ovr"
+cat > "$TMP/ovr/python3" <<OVR
+#!/bin/bash
+printf '%s\n' "\$*" >> "$TMP/ovr.log"
+exit 3   # 3 = token definitively absent, the resolver's documented "no" answer
+OVR
+chmod +x "$TMP/ovr/python3"
+
+echo "4. explicit override with a BROKEN PATH python3: the gate uses the override"
+: > "$TMP/argv.log"; : > "$TMP/ovr.log"
+MODE=all-fail SUTANDO_CHANNEL_BRIDGE_PYTHON="$TMP/ovr/python3" PATH="$TMP/bin:$PATH" \
+  _bound 20 "$TMP/out4" bash "$WRAPPER" telegram >/dev/null 2>&1
+if ! grep -q 'channel_token.py' "$TMP/ovr.log" 2>/dev/null; then
+  say FAIL "the override was never used for the token gate"
+elif grep -q 'channel_token.py' "$TMP/argv.log" 2>/dev/null; then
+  say FAIL "the BROKEN PATH python3 was invoked as the vault gate despite an override"
+else
+  say ok "gate ran on the override; broken PATH python3 never invoked"
+fi
+
+echo "5. no override + UNVALIDATED PATH python3: it must not be invoked as the gate"
+: > "$TMP/argv.log"; : > "$TMP/ovr.log"
+MODE=all-fail PATH="$TMP/bin:$PATH" \
+  _bound 20 "$TMP/out5" bash "$WRAPPER" telegram >/dev/null 2>&1
+# Order matters: check the DEFECT first. On the pre-fix wrapper the gate ran and
+# the wrapper then parked without ever reaching the probe, so an import-first
+# assertion reports "probe never ran" and misnames the cause it just caught.
+if grep -q 'channel_token.py' "$TMP/argv.log" 2>/dev/null; then
+  say FAIL "a python3 that FAILS the module probe was invoked as the vault gate"
+elif ! grep -q 'import ' "$TMP/argv.log" 2>/dev/null; then
+  say FAIL "the module probe never ran — cannot tell whether the gate was ordered after it"
+else
+  say ok "probe rejected PATH python3 and the gate never invoked it"
+fi
+
+echo "6. REGRESSION: the real macOS CLT-stub location must never be invoked (probe OR gate) when developer tools are absent"
+# Unlike the shadow-python3 cases above (an arbitrary PATH entry standing in for
+# "PATH has a python3"), this drives resolve_python() through its ACTUAL
+# stub-rejection rule: python3 resolved at the real /usr/bin, with only
+# `xcode-select` faked to report "not installed". That is the shape qingyun-wu's
+# review flagged as still unhandled -- a `command -v python3` probe accepts
+# /usr/bin/python3 unconditionally, which on a clean Mac IS the CLT stub, and
+# merely running it (even just for the module import probe) raises the install
+# dialog before it can fail.
+if [ -x /usr/bin/python3 ] && [ "$(uname -s)" = Darwin ]; then
+  fakexcode="$TMP/fakexcode"; mkdir -p "$fakexcode"
+  printf '#!/bin/sh\nexit 2\n' > "$fakexcode/xcode-select"; chmod +x "$fakexcode/xcode-select"
+  : > "$TMP/argv.log"
+  TELEGRAM_BOT_TOKEN=x OSTYPE=darwin24 PATH="$fakexcode:/usr/bin:/bin" \
+    _bound 20 "$TMP/out6" bash "$WRAPPER" telegram; rc6=$?
+  if [ -s "$TMP/argv.log" ]; then
+    say FAIL "something was logged to the shadow-python argv log during case 6 (should be untouched)"
+  elif grep -q 'no usable Python interpreter' "$TMP/out6" && [ "$rc6" = 1 ]; then
+    say ok "resolve_python() refused the real /usr/bin/python3 with no CLT; wrapper never invoked it for probe or gate"
+  else
+    say FAIL "expected exit 1 + 'no usable Python interpreter' with a faked no-CLT signal, got rc=$rc6: $(tail -1 "$TMP/out6")"
+  fi
+else
+  say ok "SKIP: no real /usr/bin/python3 on this platform — case 6 is macOS-only"
+fi
+
 [ "$fails" = 0 ] && echo "ALL PASSED" || echo "FAILED: $fails"
 exit "$fails"
