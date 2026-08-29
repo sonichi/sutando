@@ -158,5 +158,25 @@ class StoreShapes(unittest.TestCase):
             self.assertEqual(lk.match(lk.load_roster(d), "no-such-login"), [])
 
 
+class AMigratedDocumentExposesNoMetadataAsAPerson(unittest.TestCase):
+    """The reader is activated on the v2 sidecar, so its reserved block matters."""
+
+    V2 = {"_schema": {"version": 2, "contract": "reserved"},
+          "x": {"github": "gh-x", "human": "X", "stand": "@sutando-x:ag2.space"}}
+
+    def test_the_reserved_schema_block_is_not_a_reviewer(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=self.V2)
+            ids = [r["entity_id"] for r in lk.load_roster(d)]
+            self.assertNotIn("_schema", ids, "metadata rendered as an addressable person")
+            self.assertEqual(ids, ["x"])
+
+    def test_a_real_person_in_the_same_document_still_loads(self):
+        # The negative control: filtering must not empty the roster.
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=self.V2)
+            self.assertEqual(len(lk.match(lk.load_roster(d), "gh-x")), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

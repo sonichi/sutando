@@ -45,6 +45,11 @@ def load(d):
     return q, ents
 
 
+def _is_person_key(key: str) -> bool:
+    """Reserved keys start with an underscore; see schema.md's reserved block."""
+    return not str(key).startswith("_")
+
+
 def load_roster(d):
     """reviewer-stands.json rows, normalised to the quick-lookup row shape.
 
@@ -59,7 +64,9 @@ def load_roster(d):
         return []
     rows = []
     for key, r in json.loads(p.read_text()).items():
-        if not isinstance(r, dict):
+        # A v2 document carries a reserved `_schema` block. Accepting every
+        # top-level dict renders metadata as a person the caller can address.
+        if not isinstance(r, dict) or not _is_person_key(key):
             continue
         rows.append({
             "entity_id": key,

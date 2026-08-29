@@ -83,26 +83,33 @@ def _verdict_from_field(field: str):
     return None, None
 
 
+def _typed_path(path: list) -> bool:
+    """True when ANY ancestor names the referent, not only the leaf key.
+
+    `secondary_agent: {"id": ...}` states the referent at the ancestor; testing
+    the leaf alone ("id") discards the very evidence the schema documents.
+    """
+    return any("discord" in seg.lower() or _verdict_from_field(seg)[0]
+               for seg in path)
+
+
 def _collect_ids(entry: dict) -> list:
     """Every discord-shaped id anywhere in the entry, in stable order."""
     found = []
 
-    def walk(obj, key):
+    def walk(obj, path):
         if isinstance(obj, dict):
             for k, v in obj.items():
-                walk(v, str(k))
+                walk(v, path + [str(k)])
         elif isinstance(obj, list):
             for v in obj:
-                walk(v, key)
-        elif isinstance(obj, str) and (
-                "discord" in key.lower() or _verdict_from_field(key)[0]):
-            # Typed evidence fields (stand_status, secondary_agent) are named as
-            # evidence by the schema, so ids inside them must be DISCOVERED too.
+                walk(v, path)
+        elif isinstance(obj, str) and _typed_path(path):
             for sf in _snowflakes(obj):
                 if sf not in found:
                     found.append(sf)
 
-    walk(entry, "")
+    walk(entry, [])
     return found
 
 
@@ -127,6 +134,14 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     join = entry.get("github") or key
     tp = triage_people.get(join) or {}
     src = f"people.{join}"
+    if join != key and key in triage_people:
+        # Two axes collide on one spelling. Dropping the local-key row loses a
+        # real identity silently; reject it here so the evidence survives.
+        for sf in _snowflakes(json.dumps(triage_people.get(key) or {})):
+            bad.append({"id": sf, "reason":
+                        f"pr-triage `people.{key}` collides with roster key "
+                        f"`{key}`, whose declared github is `{join}` — the two "
+                        "may name different people; resolve before promoting"})
     # A typed field states the referent but not that the VALUE is an id. An
     # unvalidated one publishes junk into the slot the schema exists to protect.
     if not _is_snowflake(tp.get("discord")) and tp.get("discord"):
@@ -136,7 +151,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         claim(str(tp["discord"]), HUMAN,
               f"pr-triage config `{src}.discord`")
     bots = tp.get("bots")
-    if bots and not isinstance(bots, (list, tuple)):
+    if bots is not None and not isinstance(bots, (list, tuple)):
         # A dict iterates its KEYS, a string its characters. Require the shape
         # the schema documents rather than anything that happens to iterate.
         bad.append({"id": str(bots), "reason":
@@ -157,7 +172,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         if owner_id and id_ == owner_id:
             claim(id_, HUMAN, "discord-config.json `owner` (the human owner)")
 
-    humans, stands, unresolved, basis = [], [], list(bad), {}
+    humans, stands, unresolved, basis = [], [], [], {}
     for id_, verdicts in claims.items():
         if len(verdicts) > 1:
             unresolved.append({
@@ -189,6 +204,17 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         stand_id, reasons = stands[0]
         basis[ri.STAND_FIELD] = reasons
         others = [{"id": i, "basis": r} for i, r in stands[1:]]
+
+    # A malformed observation is folded in by canonical id: about an id that
+    # resolved it is a note on that id, never a row asserting the opposite.
+    resolved = {i for i in (human_id, stand_id) if i} | {o["id"] for o in others}
+    for b in bad:
+        if b["id"] in resolved:
+            basis.setdefault("malformed_observations", []).append(b)
+        else:
+            unresolved.append(b)
+    assert not (resolved & {u["id"] for u in unresolved}), (
+        "an id cannot be both resolved and unresolved")
     return human_id, stand_id, others, unresolved, basis
 
 

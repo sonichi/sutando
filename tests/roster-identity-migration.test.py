@@ -350,6 +350,59 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         self.assertIsNone(rec["stand_discord_id"], "a dict must not contribute its keys")
 
 
+    def test_an_alias_collision_is_rejected_with_its_evidence_intact(self):
+        # roster `rui` declares github john-the-dev while triage also has a
+        # `people.rui`. Dropping that row loses a real identity silently.
+        src = self._roster({"rui": {"github": "john-the-dev"}})
+        cfg = Path(self.tmp) / "cfg.json"
+        cfg.write_text(json.dumps({"people": {"rui": {"discord": HUMAN}}}))
+        out = Path(self.tmp) / "v2.json"
+        self.assertEqual(self._main("--roster", str(src), "--out", str(out),
+                                    "--triage-config", str(cfg))[0], 5)
+        rec = json.loads(out.read_text())["rui"]
+        self.assertIsNone(rec["human_discord_id"], "the two axes must not merge")
+        hits = [u for u in rec["unresolved_discord_ids"] if u["id"] == HUMAN]
+        self.assertTrue(hits, "the colliding identity vanished instead of being rejected")
+        self.assertIn("collides with roster key", hits[0]["reason"])
+        self.assertIn("john-the-dev", hits[0]["reason"])
+
+    def test_resolved_and_unresolved_sets_are_disjoint(self):
+        # A numeric triage `discord` equal to a valid roster id put the same
+        # canonical id in both outputs.
+        src = self._roster({"z": {"discord_human_id": HUMAN}})
+        cfg = Path(self.tmp) / "cfg.json"
+        cfg.write_text(json.dumps({"people": {"z": {"discord": int(HUMAN)}}}))
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--out", str(out), "--triage-config", str(cfg))
+        rec = json.loads(out.read_text())["z"]
+        resolved = {rec["human_discord_id"], rec["stand_discord_id"]} - {None}
+        unresolved = {u["id"] for u in rec["unresolved_discord_ids"]}
+        self.assertFalse(resolved & unresolved, f"{resolved} also in {unresolved}")
+        self.assertEqual(rec["human_discord_id"], HUMAN)
+
+    def test_a_present_bots_value_is_validated_by_type_not_truthiness(self):
+        # `{}` and `""` are falsy, so a truthiness guard let them through and
+        # the run reported success on a shape the schema forbids.
+        for bad, label in (({}, "empty object"), ("", "empty string")):
+            src = self._roster({"x": {}})
+            cfg = Path(self.tmp) / f"cfg-{label.replace(' ', '')}.json"
+            cfg.write_text(json.dumps({"people": {"x": {"discord": HUMAN, "bots": bad}}}))
+            out = Path(self.tmp) / f"v2-{label.replace(' ', '')}.json"
+            self.assertEqual(
+                self._main("--roster", str(src), "--out", str(out),
+                           "--triage-config", str(cfg))[0], 5,
+                f"a {label} bypassed the documented list requirement")
+
+    def test_typed_evidence_states_the_referent_for_ids_nested_under_it(self):
+        # schema.md says `secondary_agent` itself names the referent; testing
+        # only the leaf key ("id") discards exactly that evidence.
+        src = self._roster({"y": {"secondary_agent": {"id": "1504316176686120980"}}})
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--out", str(out))
+        rec = json.loads(out.read_text())["y"]
+        self.assertEqual(rec["stand_discord_id"], "1504316176686120980")
+        self.assertEqual(rec["unresolved_discord_ids"], [])
+
     def test_a_coverage_gap_is_reported_rather_than_read_as_success(self):
         # rc 5 says the file WAS written and somebody in it is unaddressable.
         # rc 0 would let a caller promote a map that reaches nobody.
