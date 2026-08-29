@@ -649,6 +649,6 @@
  "instructions_hash_fixed_env": "c75044993561fe13bf95f8d8d0bc9b1269074b7260abf797dc67ca1dcc5c7cd4",
  "meeting_greeting": "[System: MEETING MODE — LISTEN AND TAKE NOTES. A Zoom meeting is active. Listen to everything and mentally track the discussion: who said what, key decisions, action items, topics covered. But do NOT produce any audio output UNLESS someone says \"Sutando\" or \"hey Sutando\" — then respond to their request using your accumulated notes and context. When not addressed, produce absolutely zero words — no acknowledgments, no \"silent\", no sounds. You are an invisible note-taker until called upon.]\n\n[MODE-MARKER-MEETING]",
  "regions": {
-  "tool_table": "482b219b75f8ea21f232e9f2a540df3ac81d896906c032967c67343a08464773"
+  "tool_table": "e6d53e7a98b6c0f052148b6bae6096eab4e5768fb8187be8d03deee179023e78"
  }
 }

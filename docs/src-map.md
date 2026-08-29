@@ -222,13 +222,13 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`workspace_resolve.sh`** — Shared workspace resolution for bash scripts.
 - **`write_calendar_cache.py`** — Producer for the morning-briefing Google-calendar cache (PR #2256).
 
-## `src\Sutando/`
+## `src/Sutando/`
 
 - **`main.swift`** — Sutando Drop Menu Bar App
 - **`RestartCoordinator.swift`** — Restart lifecycle state machine for the menu-bar graceful restart.
 - **`SutandoConfig.swift`** — SutandoConfig.swift — Swift twin of src/sutando_config.{py,ts}.
 
-## `src\agent/`
+## `src/agent/`
 
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
 - **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
@@ -236,23 +236,23 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
 
-## `src\agent\claude\cli/`
+## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 
-## `src\agent\codex\cli/`
+## `src/agent/codex/cli/`
 
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
 - **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
 
-## `src\channels/`
+## `src/channels/`
 
 - **`__init__.py`** — AG2 Space / Sutando channel adapters.
 
-## `src\channels\discord/`
+## `src/channels/discord/`
 
 - **`__init__.py`** — Discord channel: API mechanics + injected post-gate (bridge, client, http, reader, post_gate).
 - **`client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
@@ -262,21 +262,21 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`post_gate.py`** — Production injection seam for the Discord post-gate.
 - **`reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
 
-## `src\delivery/`
+## `src/delivery/`
 
 - **`__init__.py`** — _(no header comment)_
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
 - **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
 - **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 
-## `src\launchd/`
+## `src/launchd/`
 
 - **`channel-bridge-wrapper.sh`** — launchd entry point shared by Slack, Discord, and Telegram bridges.
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.
 - **`evict-own-bridge.sh`** — Evict a pre-existing BARE channel bridge that belongs to THIS checkout, before the launchd wrapper starts its own supervised child.
 - **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed ag2.space gateway bridge (src/remote-gateway-bridge.py).
 
-## `src\observability/`
+## `src/observability/`
 
 - **`__init__.py`** — Sutando observability + metering — the local spine.
 - **`boot.ts`** — Collector daemon — the composition root for Sutando's local collector.
@@ -304,7 +304,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`usage.py`** — The usage record (Python twin of types.ts).
 - **`usage.ts`** — The usage record — the durable, billable/attributable primitive.
 
-## `src\observability\claude/`
+## `src/observability/claude/`
 
 - **`_map-util.ts`** — Shared helpers for the Claude Code mappers.
 - **`cc-hooks.ts`** — The Claude Code hook INGEST CONTRACT — the strict wire shape the core's hook (`obs-hook.sh`) POSTs to `/ingest/claude-code-hooks`, plus the decoder that turns an `unknown` body into that typed shape.
@@ -317,34 +317,34 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`otel-map.ts`** — `otelMap(rec, ctx)` — map one Claude Code OpenTelemetry record (metric, log, or span) to spine primitives.
 - **`otel-normalizer.ts`** — Claude Code OTel metrics → spine primitives, as a composable collector Normalizer.
 
-## `src\observability\claude\hooks/`
+## `src/observability/claude/hooks/`
 
 - **`build-hook-settings.mjs`** — Build the Claude Code `--settings` hooks JSON that registers the obs collector hook on every relevant lifecycle + tool event.
 - **`obs-hook.sh`** — Thin Claude Code obs hook — forwards a raw hook payload (JSON on stdin) to the Sutando collector IFF an export endpoint is configured.
 
-## `src\observability\collector/`
+## `src/observability/collector/`
 
 - **`collector.ts`** — Collector — the single, source-agnostic local ingestion point.
 - **`normalizer.ts`** — Normalizer — turns ONE source's raw payload into the universal spine vocabulary (ObsEvent / UsageRecord).
 - **`server.ts`** — HTTP shell for the Collector — the long-running local daemon.
 
-## `src\policy/`
+## `src/policy/`
 
 - **`__init__.py`** — _(no header comment)_
 - **`guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
 
-## `src\policy\context/`
+## `src/policy/context/`
 
 - **`__init__.py`** — _(no header comment)_
 - **`discord.py`** — contextNotFrom gate — the single policy deciding whether a serving channel may pull another Discord channel's content into context.
 
-## `src\policy\egress/`
+## `src/policy/egress/`
 
 - **`__init__.py`** — _(no header comment)_
 - **`attachment.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
 - **`result.py`** — Final scan applied to a Team-tier result before any router reads its markers.
 
-## `src\runtime-api/`
+## `src/runtime-api/`
 
 - **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
 - **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
@@ -362,7 +362,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`state_records.py`** — Reading the workspace state records the runtime-API views project.
 - **`tasks_view.py`** — Task-pipeline surface for the Sutando Server: task.submit / task.status / task.get_result / task.details / task.cancel.
 
-## `src\runtime-cli/`
+## `src/runtime-cli/`
 
 - **`sutando-runtime.py`** — sutando-runtime — CLI face of the local runtime API (v0).
 - **`terminal_open.py`** — Terminal adapter for `sutando open` — spawn `sutando attach <id>` in a new terminal tab/window so the Sutando control TUI can stay in the current tab (owner v1).

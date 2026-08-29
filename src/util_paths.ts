@@ -26,7 +26,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, win32 } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 
 function expandHome(p: string): string {
@@ -246,7 +246,9 @@ export function claudeProjectSlug(path: string): string {
 
 /** Derive the Claude project slug for the repository containing an agent module directory. */
 export function voiceMemoryProjectSlug(agentModuleDir: string): string {
-	return claudeProjectSlug(dirname(agentModuleDir).replace(/[\\/]+$/, ''));
+	const moduleDir = agentModuleDir.replace(/[\\/]+$/, '');
+	const repoDir = moduleDir.includes('\\') ? win32.dirname(moduleDir) : dirname(moduleDir);
+	return claudeProjectSlug(repoDir.replace(/[\\/]+$/, ''));
 }
 
 // ---------------------------------------------------------------------------

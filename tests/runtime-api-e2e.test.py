@@ -88,11 +88,11 @@ def start_daemon():
 
 
 def ha_store():
-    spec = importlib.util.spec_from_file_location(
-        "ha", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "human_action.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.ActionStore(ENV["SUTANDO_HA_DIR"])
+    package_root = str(REPO / "packages" / "ag2-sparrow")
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
+    from ag2_sparrow.human_action import ActionStore
+    return ActionStore(ENV["SUTANDO_HA_DIR"])
 
 
 def pending_action_for(request_id, store, timeout=5):

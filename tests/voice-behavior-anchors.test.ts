@@ -99,6 +99,12 @@ function stableInstructions(text: string): string {
 // The tuned static entries, in order (multi-line entries appear as their
 // constituent lines; conditional/dynamic segments are asserted separately).
 const va = readFileSync(join(REPO, 'src', 'voice-agent.ts'), 'utf-8');
+function toolTableRegionHash(source: string): string {
+	const normalized = source.replace(/\r\n/g, '\n');
+	const start = normalized.indexOf('const mainAgentTools');
+	const line = normalized.slice(start, normalized.indexOf('\n', start));
+	return createHash('sha256').update(line).digest('hex');
+}
 const anchors = {
 	note: 'Step-5 behavior anchors (post-5a-1: real factory output). Deliberate prompt changes must regenerate via ANCHOR_UPDATE=1 with the diff called out in the PR.',
 	tools: importableTools.map(toolAnchor)
@@ -106,8 +112,7 @@ const anchors = {
 	instructions_hash_fixed_env: createHash('sha256').update(stableInstructions(instructions)).digest('hex'),
 	meeting_greeting: cfg.buildGreeting(ctx({ meeting: true })),
 	regions: {
-		tool_table: createHash('sha256').update(
-			(() => { const i = va.indexOf('const mainAgentTools'); return va.slice(i, va.indexOf('\n', i)); })()).digest('hex'),
+		tool_table: toolTableRegionHash(va),
 	},
 };
 
@@ -173,6 +178,13 @@ test('greeting: reconnect replay guard preserved', () => {
 
 test('source tripwire: tool-table composition line unchanged', () => {
 	assert.deepStrictEqual(anchors.regions, expected.regions);
+});
+
+test('source tripwire: line endings do not change the hash', () => {
+	assert.strictEqual(
+		toolTableRegionHash('const mainAgentTools = [];\nnext'),
+		toolTableRegionHash('const mainAgentTools = [];\r\nnext'),
+	);
 });
 
 test('anchor breadth: importable tool table is non-trivial', () => {

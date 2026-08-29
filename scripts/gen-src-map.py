@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "src"
@@ -200,13 +200,13 @@ def render(rows: list[tuple[str, str]]) -> str:
     # Group by directory so related modules read together.
     groups: dict[str, list[tuple[str, str]]] = {}
     for rel, desc in rows:
-        groups.setdefault(str(Path(rel).parent), []).append((rel, desc))
+        groups.setdefault(PurePosixPath(rel).parent.as_posix(), []).append((rel, desc))
 
     for group in sorted(groups):
         out.append(f"## `{group}/`")
         out.append("")
         for rel, desc in groups[group]:
-            name = Path(rel).name
+            name = PurePosixPath(rel).name
             out.append(f"- **`{name}`** — {desc}" if desc else f"- **`{name}`** — _(no header comment)_")
         out.append("")
 
