@@ -58,7 +58,7 @@ def _run(*, with_pin: bool, src_mtime: float, bin_mtime: float) -> dict:
     from datetime import datetime as _dt
 
     class _R:
-        def __init__(self, out): self.stdout = out
+        def __init__(self, out, rc=0): self.stdout, self.returncode = out, rc
 
     def _fake_run(cmd, **_kw):
         if "/usr/bin/pgrep" in cmd[0]:
@@ -137,11 +137,32 @@ def _probe_with(run_impl):
 
 
 class _Out:
-    def __init__(self, s): self.stdout = s
+    def __init__(self, s, rc=0): self.stdout, self.returncode = s, rc
 
 
-# pgrep matches nothing -> no pids, no lstarts.
-assert _probe_with(lambda cmd, **kw: _Out("\n")) == ([], {})
+# pgrep rc=1 with empty output is the AUTHORITATIVE no-match.
+assert _probe_with(lambda cmd, **kw: _Out("\n", rc=1)) == ([], {})
+
+# pgrep rc>=2 is an ERROR exit — unknown, never no-match.
+assert _probe_with(lambda cmd, **kw: _Out("", rc=3)) == ([], None)
+
+
+def _ps_fails(cmd, **kw):
+    if "pgrep" in cmd[0]:
+        return _Out("123\n", rc=0)
+    return _Out("", rc=1)   # ps errored
+
+
+assert _probe_with(_ps_fails) == ([], None)
+
+
+def _ps_unusable(cmd, **kw):
+    if "pgrep" in cmd[0]:
+        return _Out("123\n", rc=0)
+    return _Out("garbage that parses to no lstart\n", rc=0)
+
+
+assert _probe_with(_ps_unusable) == ([], None)
 
 # The probe itself fails -> ([], None): unknown is NOT the empty set, so a
 # failed enumeration can never fabricate ORPHAN or authorize a restart.
@@ -156,4 +177,4 @@ assert _probe_with(_boom) == ([], None)
 good = _probe_with(lambda cmd, **kw: _Out(f"{PID}\n" if "pgrep" in cmd[0] else f"{PID} {LSTART}\n"))
 assert good[1] == {PID: LSTART}, good
 
-print("PASS: _proc_lstarts: no-match is ([], {}), probe error is ([], None); positive control returns data")
+print("PASS: _proc_lstarts: rc1 no-match is ([], {}); error exits, ps failure, unusable ps and exceptions are ([], None); positive control returns data")

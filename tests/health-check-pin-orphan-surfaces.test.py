@@ -177,6 +177,62 @@ class OrphanSurfacesOnServicePaths(unittest.TestCase):
         self.assertEqual(calls, [hc.LAUNCHD_BACKED_CHECKS["voice-agent"]],
                          "an authoritative no-match must not block the repair")
 
+    def test_expired_pin_never_regains_veto_through_probe_failure(self) -> None:
+        # Verified-expired and probe-failed-expired must AGREE: no veto.
+        for exp in ("2020-01-01T00:00:00Z",):
+            r = process_pins.evaluate(
+                [{"service": "s", "pid": "1", "lstart": "L",
+                  "reason": "r", "expires_at": exp}], "s", None, 2e9)
+            self.assertEqual(r[0][0], process_pins.EXPIRED, r)
+            self.assertIsNone(process_pins.veto_detail(r), r)
+        # Missing and malformed expiry are the same inversion.
+        for exp in ("", "soon"):
+            r = process_pins.evaluate(
+                [{"service": "s", "pid": "1", "lstart": "L",
+                  "reason": "r", "expires_at": exp}], "s", None, 2e9)
+            self.assertEqual(r[0][0], process_pins.EXPIRED, (exp, r))
+            self.assertIsNone(process_pins.veto_detail(r), (exp, r))
+        # CONTROL: a still-valid pin under a failed probe keeps the veto.
+        r = process_pins.evaluate(
+            [{"service": "s", "pid": "1", "lstart": "L",
+              "reason": "r", "expires_at": "2099-01-01T00:00:00Z"}], "s", None, 0)
+        self.assertEqual(r[0][0], process_pins.PROBE_FAILED, r)
+        self.assertIsNotNone(process_pins.veto_detail(r), r)
+
+    def test_fix_boundary_expired_pin_plus_probe_failure_still_repairs(self) -> None:
+        process_pins.arm_pin(self.pin_file, "voice-agent", "111",
+                             LSTART, "old witness", "2026-01-01T00:00:00Z")
+        row, calls = self._run_fix_on_down_voice(([], None))
+        self.assertNotIn("restart_veto", row, row)
+        self.assertIn("expired", row["detail"], row)
+        self.assertEqual(calls, [hc.LAUNCHD_BACKED_CHECKS["voice-agent"]],
+                         "an expired pin must not become eternal via a failed probe")
+
+    def test_bridge_probe_failure_row_is_not_a_fix_candidate(self) -> None:
+        from unittest import mock
+        process_pins.arm_pin(self.pin_file, "slack-bridge", "111",
+                             LSTART, "bridge witness", EXP)
+        unknown_row = {"name": "slack-bridge", "status": "warn",
+                       "detail": "process probe failed — bridge state unknown"}
+        hc._apply_pin_findings(unknown_row, hc._pin_verdicts("slack-bridge", None))
+        self.assertIn("could not be verified", unknown_row.get("restart_veto", ""),
+                      unknown_row)
+        down_row = {"name": "slack-bridge", "status": "warn",
+                    "detail": "configured but not running"}
+        launched = []
+        with mock.patch.object(hc, "_bridge_launch_plan",
+                               side_effect=lambda n: (launched.append(n), None)[1]):
+            hc.fix_down_bridges([unknown_row], action="restart",
+                                guard=lambda repo: (True, "t"),
+                                sender=lambda m: True, notifier=lambda m: True)
+            self.assertEqual(launched, [],
+                             "a probe-failed row must never be a restart candidate")
+            hc.fix_down_bridges([down_row], action="restart",
+                                guard=lambda repo: (True, "t"),
+                                sender=lambda m: True, notifier=lambda m: True)
+            self.assertEqual(launched, ["slack-bridge"],
+                             "the authoritative no-match row must stay a candidate")
+
     def test_CONTROL_no_pins_healthy_stays_plain_ok(self) -> None:
         self._port("ok")
         hc._proc_lstarts = lambda pat: ([0.0], {"222": LSTART})

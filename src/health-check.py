@@ -3677,10 +3677,15 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
     None into PROBE_FAILED instead of fabricating ORPHAN.
     """
     try:
-        pids = subprocess.run(
+        _pg = subprocess.run(
             ["/usr/bin/pgrep", "-f", pgrep_pattern],
             capture_output=True, text=True, timeout=5
-        ).stdout.strip().split("\n")
+        )
+        # Only rc 0 (matches) and rc 1 (authoritative no-match) are answers;
+        # any other exit is an ERROR and must stay unknown, never no-match.
+        if _pg.returncode not in (0, 1):
+            return [], None
+        pids = _pg.stdout.strip().split("\n")
         pids = [x for x in pids if x]
         if not pids:
             return [], {}
@@ -3689,10 +3694,13 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
         pids = _filter_pids_this_checkout(pids)
         if not pids:
             return [], {}
-        ps_out = subprocess.run(
+        _ps = subprocess.run(
             ["/bin/ps", "-o", "pid=,lstart=", "-p", ",".join(pids)],
             capture_output=True, text=True, timeout=5
-        ).stdout.strip().split("\n")
+        )
+        if _ps.returncode != 0:
+            return [], None
+        ps_out = _ps.stdout.strip().split("\n")
         from datetime import datetime as _dt
         starts, lstart_by_pid = [], {}
         for line in ps_out:
@@ -3714,6 +3722,10 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
             starts.append(stamp.timestamp())
             if pid_tok:
                 lstart_by_pid[pid_tok] = lstart_tok
+        if not starts:
+            # Live pids whose ps output parsed to nothing is UNUSABLE, not
+            # empty (the bare-lstart legacy shape still parses into starts).
+            return [], None
         return starts, lstart_by_pid
     except (subprocess.TimeoutExpired, OSError):
         return [], None
@@ -9283,6 +9295,9 @@ def run_all_checks() -> list[dict]:
             # name produces false-positive "multiple processes" warnings
             # that scared us into thinking the bridges were zombied today.
             result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
+            # rc 1 is the authoritative no-match; any other non-zero exit is a
+            # PROBE ERROR and must not read as "bridge is down".
+            _probe_ok = result.returncode in (0, 1)
             pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
             pids = [p for p in pids if p]
             # A launcher's argv ends with the same script path, so it matches
@@ -9290,8 +9305,17 @@ def run_all_checks() -> list[dict]:
             pids = _drop_launcher_parents(pids)
         except Exception:
             pids = []
+            _probe_ok = False
 
         if not pids:
+            if not _probe_ok:
+                # An errored probe is UNKNOWN: this row must never carry the
+                # fix_down_bridges candidate string, and the pin stays vetoing.
+                _row = {"name": name, "status": "warn",
+                        "detail": "process probe failed — bridge state unknown"}
+                _apply_pin_findings(_row, _pin_verdicts(name, None))
+                checks.append(_row)
+                continue
             # This exact detail string is a contract: fix_down_bridges()
             # matches it verbatim to pick restart candidates (and the
             # health-check-fix-down-bridges test locks it). Change both
@@ -9343,15 +9367,19 @@ def run_all_checks() -> list[dict]:
         pin_results = []
         bridge_veto = None
         try:
-            ps_out = subprocess.run(
+            _psb = subprocess.run(
                 ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
                 capture_output=True, text=True, timeout=5
-            ).stdout.strip()
-            if ps_out:
+            )
+            ps_out = _psb.stdout.strip()
+            if _psb.returncode == 0 and ps_out:
                 pin_results = _pin_verdicts(name, {pids[0]: ps_out})
-                pin_armed = process_pins.veto_detail(pin_results)
+            else:
+                # A live pid whose ps read failed is UNKNOWN, not unpinned.
+                pin_results = _pin_verdicts(name, None)
         except (subprocess.TimeoutExpired, OSError):
-            pass
+            pin_results = _pin_verdicts(name, None)
+        pin_armed = process_pins.veto_detail(pin_results)
 
         proc_start = None
         try:

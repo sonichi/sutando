@@ -185,10 +185,17 @@ def evaluate(pins: list, service: str, lstart_by_pid: dict, now_ts: float) -> li
         pid = str(pin.get("pid") or "")
         reason = str(pin.get("reason") or "no reason recorded")
         if lstart_by_pid is None:
-            out.append((PROBE_FAILED, pin, (
-                f"pin on {service} pid {pid} could not be verified — process "
-                f"enumeration failed; not orphaned, and no restart may be "
-                f"authorized on an unknown ({reason})")))
+            # Expiry outranks the unknown: a pin past (or without) its expiry
+            # must never regain the veto through a failing probe (eternal suppression).
+            if _expired(pin, now_ts):
+                out.append((EXPIRED, pin, (
+                    f"pin on {service} pid {pid} expired ({pin.get('expires_at') or 'no expiry declared'}) "
+                    f"— re-pin deliberately or restart; original reason: {reason}")))
+            else:
+                out.append((PROBE_FAILED, pin, (
+                    f"pin on {service} pid {pid} could not be verified — process "
+                    f"enumeration failed; not orphaned, and no restart may be "
+                    f"authorized on an unknown ({reason})")))
             continue
         live = lstart_by_pid.get(pid)
         if live is None:
