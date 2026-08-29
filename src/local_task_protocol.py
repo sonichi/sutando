@@ -52,8 +52,8 @@ task-last; until then both parsers exist and are named for their trust model.
 
 from __future__ import annotations
 
-import glob
 import json
+import glob
 import os
 import re
 import sys
@@ -164,9 +164,6 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
-    # Which instance a task belongs to; header status defangs forged
-    # body-line claims, consumers may verify before executing.
-    "instance_id",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
@@ -508,9 +505,6 @@ def media_attachment_headers(attachment_refs: Iterable["AttachmentRef"], has_tex
 # ── Archive rules ────────────────────────────────────────────────────────────
 
 _MONTH_DIR_RE = re.compile(r"^\d{4}-\d{2}$")
-_RETENTION_DIR_RE = re.compile(r"^archive-\d{4}-\d{2}-\d{2}$")
-# The gateway's flat archive suffix is an epoch stamp and nothing else.
-_EPOCH_SUFFIX_RE = re.compile(r"^\d+$")
 
 
 def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
@@ -521,15 +515,26 @@ def archive_month_dir(base: Path, iso_timestamp: str) -> Path:
     return base / "archive" / iso_timestamp[:7]
 
 
+# A bare `<id>-*` also matches a LONGER id having this one as a hyphen prefix;
+# only a numeric epoch suffix marks a re-archive of THIS id.
+_EPOCH_SUFFIX_RE = re.compile(r"^[0-9]+$")
+
+
+def _epoch_suffixed(directory, task_id):
+    """Files that are re-archives of exactly `task_id`, oldest first."""
+    prefix = f"{task_id}-"
+    return sorted(
+        p for p in directory.glob(f"{glob.escape(prefix)}*.txt")
+        if _EPOCH_SUFFIX_RE.match(p.name[len(prefix):-len(".txt")])
+    )
+
+
 def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
     """Locate an archived result across BOTH layouts in use.
 
     The messaging bridges archive as `archive/<YYYY-MM>/<id>.txt` via
-    `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`;
-    startup retention (`src/archive-stale-results.py`, run from `startup.sh`)
-    moves stale results to `archive-<YYYY-MM-DD>/<id>.txt`, a SIBLING of
-    `archive/` rather than a child of it.
-    A locator that knows only one silently returns None for the others, which
+    `archive_path`; the gateway archives flat as `archive/<id>-<epoch>.txt`.
+    A locator that knows only one silently returns None for the other, which
     reads as "this task never delivered" — the wrong answer for any caller
     deciding whether a delivery happened.
 
@@ -557,28 +562,15 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
         candidate = archive / month / fname
         if candidate.is_file():
             return candidate
-
-    # Retention dirs are SIBLINGS of archive/, so they need their own scan;
-    # newest day first, name-filtered before is_dir, as the month scan is.
-    try:
-        with os.scandir(Path(results_dir)) as entries:
-            days = sorted((e.name for e in entries
-                           if _RETENTION_DIR_RE.match(e.name) and e.is_dir()),
-                          reverse=True)
-    except (OSError, ValueError):
-        days = []
-    for day in days:
-        candidate = Path(results_dir) / day / fname
-        if candidate.is_file():
-            return candidate
+        # Re-archive inside a month dir suffixes the epoch (`<id>-<epoch>.txt`);
+        # a literal-name scan misses it. Fallback only, so an exact hit still wins.
+        suffixed = _epoch_suffixed(archive / month, task_id)
+        if suffixed:
+            return suffixed[-1]
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.
-    prefix = f"{task_id}-"
-    # `<id>-*` alone also matches a LONGER task's file, attributing its result
-    # to this id; only the documented numeric epoch suffix is this task's.
-    flat = sorted(p for p in archive.glob(f"{glob.escape(prefix)}*.txt")
-                  if _EPOCH_SUFFIX_RE.match(p.name[len(prefix):-len(".txt")]))
+    flat = _epoch_suffixed(archive, task_id)
     return flat[-1] if flat else None
 
 

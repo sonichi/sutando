@@ -1072,8 +1072,21 @@ def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
         return False
     if not re.fullmatch(r"task-[a-zA-Z0-9_.-]+", task_id):
         return False
-    task_path = Path(workspace) / "tasks" / f"{task_id}.txt"
-    if not task_path.is_file():
+    # Function-local: task_archive is also loaded BY PATH with src/ off
+    # sys.path, where a module-scope import here would take its caller down.
+    from task_archive import find_task_file
+
+    # The lead renames queued work to `.assigned-<inst>`, so a bare-name
+    # lookup here misses and the supersede silently no-ops.
+    tasks_dir = Path(workspace) / "tasks"
+    task_path = find_task_file(tasks_dir, task_id)
+    # find_task_file resolves by name, not by type, so keep the parent's
+    # file-type guard: a same-named DIRECTORY must not be os.replace'd away.
+    if task_path is None or not task_path.is_file():
+        return False
+    # Ask whether ANY claimed variant exists, not whether the returned one is
+    # claimed: find_task_file sorts, and `.assigned-` sorts before `.claimed-`.
+    if any(tasks_dir.glob(f"{task_id}.claimed-*")):
         return False
     archive_dir = task_path.parent / "archive" / datetime.now(timezone.utc).strftime("%Y-%m")
     archive_dir.mkdir(parents=True, exist_ok=True)
