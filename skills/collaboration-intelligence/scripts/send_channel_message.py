@@ -47,6 +47,11 @@ def send(channel: str, body: str, user_id: str, client=None):
     return receipt, posted
 
 
+#: Proven non-delivery. Deliberately not 1: the interpreter exits 1 on any
+#: uncaught exception, including one raised after the POST landed.
+NOT_DELIVERED_RC = 10
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 3:
@@ -59,9 +64,11 @@ def main(argv=None) -> int:
     # Three outcomes, three meanings. Collapsing them is what turns a landed
     # post into a retry: the receipt is RetrySafety.UNSAFE, so a repeat duplicates.
     if outcome == DeliveryOutcome.NOT_DELIVERED:
+        # 10, not 1: an uncaught Python failure also exits 1 and can happen
+        # AFTER the POST, so 1 cannot mean proven non-delivery.
         print(f"send_channel_message: NOT DELIVERED — {getattr(receipt, 'detail', '')}",
               file=sys.stderr)
-        return 1
+        return NOT_DELIVERED_RC
     if outcome != DeliveryOutcome.CONFIRMED:
         print(f"send_channel_message: OUTCOME UNKNOWN — the post MAY have landed "
               f"({getattr(receipt, 'detail', '')}). Do not retry blindly; check the "

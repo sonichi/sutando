@@ -236,6 +236,10 @@ _UNSAFE_OUTCOMES = {"pending", "unknown"}
 #: ask — counting it refuses the retry it exists to permit.
 _NOT_AN_ASK = {"failed"}
 
+#: The child's codes for proven non-delivery. Everything else — a crash, a
+#: signal, an unassigned code — is ambiguous and must park.
+_PROVEN_NOT_DELIVERED = {2, 10}
+
 #: Outcomes proving a post reached the channel, or may have.
 _DID_ASK = {"confirmed", "unknown"}
 
@@ -371,10 +375,13 @@ def _maybe_compact(led: Path) -> None:
     streams = _streams(led)
     cost = {k: _rows_for(st) for k, st in streams.items()}
     total = sum(cost.values())
-    settled = sorted((st["last"][1] if st["last"] else "", k)
-                     for k, st in streams.items()
-                     if not (st["last"] and st["last"][0] in _ACTIVE))
-    for _ts, k in settled:
+    # str() on every component: `repo` may legitimately be None, and a tuple
+    # sort then compares None with a string when timestamps tie.
+    settled = sorted(((st["last"][1] if st["last"] else "",
+                       tuple(str(x) for x in k), k)
+                      for k, st in streams.items()
+                      if not (st["last"] and st["last"][0] in _ACTIVE)))
+    for _ts, _sortkey, k in settled:
         if total <= _MAX_ROWS:
             break
         total -= cost[k]
@@ -390,7 +397,8 @@ def _rewrite(led: Path, streams: dict) -> int:
     """Atomically replace the ledger with the rows these streams imply.
     Caller MUST hold the ledger lock."""
     rows = []
-    for (repo, num, who), st in sorted(streams.items(), key=lambda kv: str(kv[0])):
+    for (repo, num, who), st in sorted(
+            streams.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
         keep = []
         if st["first_ask"] is not None:
             keep.append((st["first_ask_outcome"], st["first_ask"]))
@@ -402,10 +410,13 @@ def _rewrite(led: Path, streams: dict) -> int:
                                     "actor": who, "ts": ts, "channel": "room",
                                     "outcome": outcome}))
     tmp = led.with_suffix(led.suffix + ".compact")
+    mode = led.stat().st_mode & 0o777 if led.exists() else None
     with open(tmp, "w") as fh:
         fh.write("".join(r + "\n" for r in rows))
         fh.flush()
         os.fsync(fh.fileno())
+    if mode is not None:
+        os.chmod(tmp, mode)             # a new inode takes the umask, widening it
     os.replace(tmp, led)                # atomic: a reader sees one file or the other
     return len(rows)
 
@@ -579,7 +590,14 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
         fh.write(payload)
         fh.flush()
         os.fsync(fh.fileno())
-    _maybe_compact(p)
+    try:
+        _maybe_compact(p)
+    except Exception as exc:            # noqa: BLE001 - the append already succeeded
+
+        # Maintenance after a durable write: failing it must not convert that
+        # write into a failed claim, parking an ask nobody sent.
+        print(f"  WARNING: ledger compaction failed ({type(exc).__name__}: {exc}); "
+              "the append stands", file=sys.stderr)
     return len(refs)
 
 
@@ -706,8 +724,16 @@ def main() -> int:
                          "Stand is not a member THERE is REFUSED rather than silently notified "
                          "in their recorded room — correctly addressed, wrong venue.")
     a = ap.parse_args()
-    names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
-    targets, refusal_rc = resolve(names, load_roster())
+    names = list(dict.fromkeys(n.strip() for n in a.reviewers.split(",") if n.strip()))
+    roster = load_roster()
+    targets, refusal_rc = resolve(names, roster)
+    # "At least TWO" means two PEOPLE, not two roster rows: `--reviewers d,d`
+    # and two same_actor_as aliases share one endpoint and ping one Stand twice.
+    _actors = _actor_map(roster)
+    targets = list({(_actors.get(t["name"], t["name"]),
+                     t.get("channel") or t.get("room"),
+                     t.get("discord_id") or t.get("stand")): t
+                    for t in targets}.values())
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
     # one person; plan mode is exempt because only a real ASK can strand a PR.
     if a.send and len(targets) < 2 and not a.allow_single:
@@ -848,13 +874,21 @@ def main() -> int:
                       "the post may have landed; the park holds so a repeat does "
                       f"not duplicate it. {(p.stderr or '').strip() or 'no stderr'}",
                       file=sys.stderr)
-            else:
-                # rc 1 is NOT_DELIVERED and rc 2 is usage: no post exists, so
-                # release the park rather than blocking a legitimate retry.
+            elif p.returncode in _PROVEN_NOT_DELIVERED:
+                # Only these prove nothing was posted. rc 1 does not: the
+                # interpreter exits 1 on any uncaught exception, post-POST too.
                 _settle("failed", f"child rc={p.returncode}")
                 print(f"{t['name']}: SEND FAILED rc={p.returncode} "
                       f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
                 failures += 1
+            else:
+                # A crash, a signal, or a code nobody assigned: the post MAY
+                # have landed, so it parks rather than releasing.
+                _settle("unknown", f"ambiguous child exit rc={p.returncode}")
+                unknowns += 1
+                print(f"{t['name']}: AMBIGUOUS EXIT rc={p.returncode} — the post may "
+                      f"have landed; parked. {(p.stderr or '').strip() or 'no stderr'}",
+                      file=sys.stderr)
             continue
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in

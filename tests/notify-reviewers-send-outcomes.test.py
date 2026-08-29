@@ -66,8 +66,10 @@ class Outcomes(unittest.TestCase):
         self.assertNotIn("not delivered", err.lower())
 
     def test_not_delivered_is_a_plain_failure(self):
+        # rc 10, not 1: the interpreter exits 1 on any uncaught exception,
+        # including one raised AFTER the POST, so 1 cannot prove non-delivery.
         rc, _, err, _ = run_main(DeliveryOutcome.NOT_DELIVERED, [{"id": "111"}])
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 10)
         self.assertIn("NOT DELIVERED", err)
 
     def test_unknown_says_it_may_have_landed_and_warns_off_a_retry(self):

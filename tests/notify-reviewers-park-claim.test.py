@@ -221,6 +221,45 @@ class CompactionIsIndistinguishableFromTheFullHistory(unittest.TestCase):
         self.nr.compact(self.led)
         self.assertEqual(self.nr._latest_outcomes(self.led), before)
 
+    def test_a_compaction_failure_does_not_undo_a_durable_append(self):
+        # Compaction is maintenance AFTER the write. Letting it raise converted
+        # a successful reservation into a failed claim and parked an unsent ask.
+        orig = self.nr._maybe_compact
+        self.nr._maybe_compact = lambda led: (_ for _ in ()).throw(PermissionError("ro"))
+        import contextlib as _c
+        import io as _io
+        err = _io.StringIO()
+        try:
+            with _c.redirect_stderr(err):
+                n = self.nr.record_asks("see https://github.com/o/r/pull/9", "A",
+                                        outcome="unknown", actor="A")
+        finally:
+            self.nr._maybe_compact = orig
+        self.assertEqual(n, 1, "the append was reported as a failure")
+        self.assertIn("compaction failed", err.getvalue())
+        self.assertIn("the append stands", err.getvalue())
+        rows = [json.loads(l) for l in self.led.read_text().splitlines()]
+        self.assertTrue(any(str(r.get("pr")) == "9" for r in rows))
+
+    def test_the_eviction_ordering_is_total_over_every_accepted_row(self):
+        # `repo` may legitimately be None on a legacy row; a tuple sort then
+        # compares None with a string when the timestamps tie.
+        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
+            {"repo": None, "pr": 7, "reviewer": "k", "ts": "2026-08-29T11:00:00Z",
+             "channel": "room", "outcome": "confirmed"},
+            {"repo": "o/r", "pr": 8, "reviewer": "j", "ts": "2026-08-29T11:00:00Z",
+             "channel": "room", "outcome": "confirmed"})))
+        self.nr.compact(self.led)           # must not raise TypeError
+        self.assertEqual(len(self.nr._streams(self.led)), 2)
+
+    def test_compaction_preserves_the_ledger_mode(self):
+        # A fresh inode takes the process umask, widening 0600 to 0644.
+        import stat as _stat
+        self._history()
+        os.chmod(self.led, 0o600)
+        self.nr.compact(self.led)
+        self.assertEqual(_stat.S_IMODE(self.led.stat().st_mode), 0o600)
+
     def test_the_writer_refuses_an_outcome_the_reader_would_ignore(self):
         # Appending a row no reader accepts is a silent write; the writer holds
         # the same closed set the reader reads.

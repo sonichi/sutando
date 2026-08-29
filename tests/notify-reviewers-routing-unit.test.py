@@ -263,9 +263,9 @@ class MainDiscordSend(unittest.TestCase):
         self.assertIn("as message m-123", out)
 
     def test_a_failed_send_surfaces_stderr_and_is_not_silent(self):
-        # rc 1 is NOT_DELIVERED: no post exists, so this is the retryable shape.
-        rc, _, err = self._send(1)
-        self.assertIn("SEND FAILED rc=1", err)
+        # rc 10 is proven NOT_DELIVERED: no post exists, so this is retryable.
+        rc, _, err = self._send(10)
+        self.assertIn("SEND FAILED rc=10", err)
         self.assertIn("boom", err)
         self.assertNotEqual(rc, 0)
 
@@ -508,11 +508,20 @@ class UnknownOutcomeIsParkedNotFailed(unittest.TestCase):
         self.assertEqual(self._run(4)[0], 4)
 
     def test_a_real_failure_is_still_a_failure_and_does_not_park(self):
-        # rc 1 is NOT_DELIVERED, so the reservation is released. "Not parked"
-        # is the property; an empty file is not, since the reservation existed.
-        rc, _, rows = self._run(1)
+        # rc 10 is proven NOT_DELIVERED, so the reservation is released. "Not
+        # parked" is the property, not an empty file.
+        rc, _, rows = self._run(10)
         self.assertEqual(rc, 1)
         self.assertEqual([r["outcome"] for r in rows], ["pending", "failed"])
+
+    def test_an_ambiguous_child_exit_parks_rather_than_releasing(self):
+        # A crash or a signal can happen AFTER the POST. Only a code the
+        # interpreter cannot produce accidentally proves non-delivery.
+        for rc_out in (1, -9, 137, 99):
+            rc, err, rows = self._run(rc_out)
+            self.assertEqual(rc, 4, f"rc={rc_out} released the park")
+            self.assertIn("AMBIGUOUS EXIT", err)
+            self.assertEqual(rows[-1]["outcome"], "unknown")
 
     def test_a_landed_post_missing_its_mention_parks_instead_of_failing(self):
         # rc 3 holds a CONFIRMED receipt: the post exists, so a repeat duplicates.
@@ -874,7 +883,7 @@ class RepeatsAreMechanicallySuppressed(unittest.TestCase):
         # The negative control. Without it a park that refuses everything looks
         # identical to one that suppresses only the unsafe repeats.
         self._roster({"d": DISCORD})
-        sends = self._stub(1)
+        sends = self._stub(10)
         rc1, _ = self._invoke()
         rc2, err2 = self._invoke()
         self.assertEqual((rc1, rc2), (1, 1))
@@ -1009,6 +1018,65 @@ class TheReachabilityProbeResolvesTheClaudeHomeAndNeverRaises(unittest.TestCase)
                 sys.modules["util_paths"] = orig
             else:
                 sys.modules.pop("util_paths", None)
+
+
+class TheTwoReviewerGateCountsPeopleNotRows(unittest.TestCase):
+    """"At least TWO" must mean two endpoints, or one Stand is pinged twice."""
+
+    D = {"discord_id": "111", "home_channel": "222"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._env = {k: os.environ.get(k) for k in
+                     ("SUTANDO_SCI_ROSTER", "CLAUDE_CONFIG_DIR",
+                      "SUTANDO_REVIEW_ASKS_LEDGER")}
+        self._run, self._argv = nr.subprocess.run, sys.argv[:]
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(pathlib.Path(self.tmp) / "a.jsonl")
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with(
+            {"groups": {"222": {"allowFrom": ["111"]}}})
+
+    def tearDown(self):
+        nr.subprocess.run, sys.argv[:] = self._run, self._argv
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+
+    def _run_main(self, roster, reviewers):
+        rp = pathlib.Path(self.tmp) / "r.json"
+        rp.write_text(json.dumps(roster))
+        os.environ["SUTANDO_SCI_ROSTER"] = str(rp)
+        sends = []
+
+        class _R:
+            returncode, stdout, stderr = 0, "m1", ""
+        nr.subprocess.run = lambda *a, **k: (sends.append(1), _R())[1]
+        sys.argv[:] = ["n", "--reviewers", reviewers, "--message",
+                       "see https://github.com/o/r/pull/7", "--send"]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = nr.main()
+            except SystemExit as e:
+                rc = e.code
+        return rc, len(sends), err.getvalue()
+
+    def test_the_same_name_twice_does_not_satisfy_the_minimum(self):
+        rc, sends, err = self._run_main({"d": self.D}, "d,d")
+        self.assertIn("at least TWO", err)
+        self.assertEqual(sends, 0, "one Stand was pinged twice")
+
+    def test_two_aliases_of_one_actor_do_not_satisfy_it_either(self):
+        roster = {"d": self.D, "e": dict(self.D, same_actor_as="d")}
+        rc, sends, err = self._run_main(roster, "d,e")
+        self.assertIn("at least TWO", err)
+        self.assertEqual(sends, 0, "two spellings of one person passed the gate")
+
+    def test_two_real_people_still_pass(self):
+        # The negative control: dedup must not refuse a legitimate pair.
+        roster = {"d": self.D, "f": {"discord_id": "999", "home_channel": "222"}}
+        rc, sends, err = self._run_main(roster, "d,f")
+        self.assertNotIn("at least TWO", err)
+        self.assertEqual(sends, 2)
 
 
 class AnAllowFromHitIsNotMembership(unittest.TestCase):
