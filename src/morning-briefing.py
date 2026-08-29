@@ -74,11 +74,13 @@ def get_weather() -> str:
             'do shell script "defaults read /Library/Preferences/com.apple.timezone"',
             timeout=3
         )
-        # Use lat/lon from env if set
-        import os
-        if os.environ.get("WEATHER_LAT") and os.environ.get("WEATHER_LON"):
-            lat = float(os.environ["WEATHER_LAT"])
-            lon = float(os.environ["WEATHER_LON"])
+        # Use lat/lon from config (env legacy fallback) if set
+        from sutando_config import config_get
+        _lat_cfg, _lon_cfg = config_get("WEATHER_LAT"), config_get("WEATHER_LON")
+        configured = bool(_lat_cfg and _lon_cfg)
+        if configured:
+            lat = float(_lat_cfg)
+            lon = float(_lon_cfg)
 
         url = (
             f"https://api.open-meteo.com/v1/forecast"
@@ -98,7 +100,9 @@ def get_weather() -> str:
         rain = day["precipitation_probability_max"][0]
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
-        return f"{temp}°F and {desc}, high of {high}, low of {low}{rain_note}"
+        # Spoken aloud, so the label stays short and the remedy goes to the log.
+        where = "" if configured else " in San Francisco (default location)"
+        return f"{temp}°F and {desc}{where}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
 
@@ -280,8 +284,8 @@ return output
                     file=sys.stderr,
                 )
         return None
-    import os as _os
-    skip_cals_raw = _os.environ.get("MORNING_BRIEFING_SKIP_CALENDARS", "")
+    from sutando_config import config_get
+    skip_cals_raw = config_get("MORNING_BRIEFING_SKIP_CALENDARS", "") or ""
     skip_cals = {c.strip().lower() for c in skip_cals_raw.split(",") if c.strip()}
     # Dedup by (time_str, title) — cross-calendar duplication (#966).
     seen: set[str] = set()
@@ -737,6 +741,9 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
+    import os as _os
+    if weather and not (_os.environ.get("WEATHER_LAT") and _os.environ.get("WEATHER_LON")):
+        print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
 
     events = get_calendar_events()
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
