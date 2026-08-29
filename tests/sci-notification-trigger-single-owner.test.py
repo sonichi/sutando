@@ -46,8 +46,21 @@ for pat in UNCONDITIONAL:
     check(re.search(pat, item9) is None,
           f"item 9 states no unconditional trigger: /{pat}/")
 
-check(text.count(TRIGGER_OWNER) == 1,
-      "exactly ONE section states the messaging trigger")
+# The OWNER is bolded; item 9 only QUOTES it. Counting raw text found the quote
+# and missed the owner, which wraps a physical newline — so a needle in prose lies.
+_flat = re.sub(r"\s+", " ", text)
+check(_flat.count("**" + TRIGGER_OWNER) == 1,
+      "exactly ONE section OWNS the messaging trigger (bolded, whitespace-normalised)")
+check(_flat.count(TRIGGER_OWNER) >= 2,
+      "item 9 still QUOTES the owner (a bare mention is a reference, not ownership)")
+
+# Control: delete the owner and the gate must go RED. The raw-count check this
+# replaces stayed GREEN here — it was counting item 9's quote, not the owner.
+_without_owner = _flat.replace("**" + TRIGGER_OWNER, "", 1)
+check(_without_owner.count("**" + TRIGGER_OWNER) == 0,
+      "control: removing the bolded owner is detectable (the check can FAIL)")
+check(_without_owner.count(TRIGGER_OWNER) >= 1,
+      "control: item 9's quote SURVIVES that removal — which is why raw count was blind")
 
 check("trigger is owned solely by" in item9,
       "item 9 defers the trigger instead of restating it")
