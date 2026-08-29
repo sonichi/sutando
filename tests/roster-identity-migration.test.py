@@ -575,5 +575,71 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
                       "a list-valued id must not be dropped")
 
 
+class AnAxisCollisionBlocksWithoutAnyId(unittest.TestCase):
+    """The reviewer's exact production-CLI fixture (#3537).
+
+    The collision was reported only from inside a loop over the ids extracted
+    from the colliding row, so an EMPTY row yielded no ids, no record, and rc 0
+    — the gate keyed on an id being present rather than on the axis clash.
+    """
+
+    ROSTER = {"rui": {"github": "john-the-dev",
+                      "stand_status": f"stand id {BOT}"}}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="collide-")
+        self._argv = sys.argv
+
+    def tearDown(self):
+        sys.argv = self._argv
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, triage):
+        d = Path(self.tmp)
+        (d / "roster.json").write_text(json.dumps(self.ROSTER))
+        (d / "cfg.json").write_text(json.dumps(triage))
+        out = d / "v2.json"
+        sys.argv = ["m", "--roster", str(d / "roster.json"),
+                    "--triage-config", str(d / "cfg.json"), "--out", str(out)]
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = mig.main()
+        doc = json.loads(out.read_text()) if out.exists() else {}
+        return rc, err.getvalue(), doc
+
+    def test_an_empty_colliding_row_still_blocks(self):
+        # THE case: `people.rui = {}` collides with roster key `rui` whose
+        # declared github is `john-the-dev`, and carries no id at all.
+        rc, err, doc = self._run({"people": {"rui": {}}})
+        self.assertEqual(rc, 5, "an id-less collision must not exit 0")
+        self.assertIn("COLLISION rui", err)
+        self.assertEqual(sorted(k for k in doc if not k.startswith("_")), ["rui"])
+
+    def test_the_same_collision_carrying_an_id_still_blocks(self):
+        # Was already 5 before the fix; kept so a regression cannot pass by
+        # breaking the id path while the id-less one is watched.
+        rc, err, doc = self._run({"people": {"rui": {"discord": HUMAN}}})
+        self.assertEqual(rc, 5)
+        unres = [u for v in doc.values() if isinstance(v, dict)
+                 for u in (v.get("unresolved_discord_ids") or [])]
+        self.assertIn(HUMAN, [u["id"] for u in unres])
+
+    def test_a_non_colliding_extra_row_is_not_reported_as_a_collision(self):
+        # Negative control. Without it, flagging every triage key would pass
+        # the two cases above and be indistinguishable from the fix.
+        rc, err, doc = self._run({"people": {"other-reviewer": {}}})
+        self.assertEqual(rc, 5, "still 5, but for a GAP")
+        self.assertNotIn("COLLISION", err)
+        self.assertIn("GAP other-reviewer", err)
+        self.assertEqual(sorted(k for k in doc if not k.startswith("_")),
+                         ["other-reviewer", "rui"])
+
+    def test_no_triage_row_at_all_is_clean(self):
+        # Second negative control: the collision must need a real clash.
+        rc, err, _ = self._run({"people": {}})
+        self.assertNotIn("COLLISION", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

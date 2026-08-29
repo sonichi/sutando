@@ -132,9 +132,11 @@ def _collect_ids(entry: dict) -> list:
 
 def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
              owner_id: str):
-    """-> (human_id|None, stand_id|None, other_stands[], unresolved[], basis{})"""
+    """-> (human_id|None, stand_id|None, other_stands[], unresolved[], basis{},
+    collisions[]) — collisions are axis clashes, reported with or without ids."""
     claims: dict = {}   # id -> {verdict -> [reasons]}
     bad: list = []      # not-id values; `states` is the referent each claimed
+    collisions: list = []
 
     def claim(id_, verdict, reason):
         claims.setdefault(id_, {}).setdefault(verdict, []).append(reason)
@@ -156,11 +158,15 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         # Two axes collide on one spelling. Dropping the local-key row loses a
         # real identity silently; reject it here so the evidence survives.
         _hit = (triage_people or {}).get(str(key).casefold())
+        _why = (f"pr-triage `people.{key}` collides with roster key `{key}`, "
+                f"whose declared github is `{join}` — the two may name "
+                "different people; resolve before promoting")
+        # The collision is between two IDENTITY AXES, so it exists whether or
+        # not the colliding row happens to carry an id to hang it on.
+        collisions.append({"key": key, "join": join, "reason": _why})
         for sf in _snowflakes(json.dumps((_hit[1] if _hit else {}) or {})):
-            bad.append({"id": sf, "states": None, "collision": True, "reason":
-                        f"pr-triage `people.{key}` collides with roster key "
-                        f"`{key}`, whose declared github is `{join}` — the two "
-                        "may name different people; resolve before promoting"})
+            bad.append({"id": sf, "states": None, "collision": True,
+                        "reason": _why})
     # A typed field states the referent but not that the VALUE is an id. An
     # unvalidated one publishes junk into the slot the schema exists to protect.
     if not _is_snowflake(tp.get("discord")) and tp.get("discord"):
@@ -249,7 +255,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     resolved = {i for i in (human_id, stand_id) if i} | {o["id"] for o in others}
     assert not (resolved & {u["id"] for u in unresolved}), (
         "an id cannot be both resolved and unresolved")
-    return human_id, stand_id, others, unresolved, basis
+    return human_id, stand_id, others, unresolved, basis, collisions
 
 
 def _canonical_triage(triage_people: dict):
@@ -301,7 +307,7 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         if not ri.is_person_key(key) or not isinstance(entry, dict):
             out[key] = entry
             continue
-        human, stand, others, unresolved, basis = classify(
+        human, stand, others, unresolved, basis, collisions = classify(
             key, entry, canon, peer_ids, owner_id)
         new = dict(entry)                       # every provenance field survives
         new[ri.HUMAN_FIELD] = human
@@ -325,6 +331,7 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             "after_stand": stand,
             "after_other_stands": [o["id"] for o in others],
             "after_unresolved": [u["id"] for u in unresolved],
+            "after_collision": collisions,
             "basis": basis,
         })
     return out, rows
@@ -412,11 +419,17 @@ def main() -> int:
             if not r["after_human"] and not r["after_stand"]
             and not r["after_other_stands"]]
     unres = [r["key"] for r in rows if r["after_unresolved"]]
-    if gaps or unres:
+    # An axis collision blocks even when it carries no id: it is the two
+    # referents that clash, not the values they happen to hold.
+    coll = [r["key"] for r in rows if r.get("after_collision")]
+    if gaps or unres or coll:
         for k in gaps:
             print(f"  GAP {k}: no human and no stand id", file=sys.stderr)
         for k in unres:
             print(f"  GAP {k}: holds unresolved id(s)", file=sys.stderr)
+        for k in coll:
+            print(f"  COLLISION {k}: two identity axes name this key",
+                  file=sys.stderr)
         return 5
     return 0
 
