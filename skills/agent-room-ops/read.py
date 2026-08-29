@@ -15,7 +15,9 @@ from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_rea
                     quote, urlencode, HTTPError, URLError)
 
 DEFAULT_LIMIT = 20
-MAX_LIMIT = 100
+# Must not exceed the gateway's own clamp (room_ops.py MAX_CONTEXT_LIMIT):
+# beyond it the widest window repeats the previous page and reads as exhausted.
+MAX_LIMIT = 1000
 # How many times the raw-event window may widen before we stop. Small and FIXED so the
 # widening below is a bounded `for` rather than a resident loop: the room-ops skill bans
 # new ones outright (tests/events-plane-boundary.test.py freezes the allowlist to two
