@@ -2996,8 +2996,23 @@ def _delivery_core() -> DeliveryCore:
     return _DELIVERY_CORE
 
 
+def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
+    """Move a result the outbox has finally refused into results/undelivered/,
+    the same quarantine the proactive path uses. Without this the file is
+    rescanned every pass and the refusal is invisible."""
+    try:
+        UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        rfile.rename(UNDELIVERABLE_RESULTS_DIR /
+                     f"{rfile.stem}-{int(time.time())}.txt")
+        _log(f"result {tid}: {why} — quarantined to "
+             f"{UNDELIVERABLE_RESULTS_DIR.name}/, it will NOT be re-sent")
+    except OSError as e:
+        _log(f"result {tid}: {why} but quarantine failed ({e}) — "
+             "leaving it in place")
+
+
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
-                            no_send: bool = False) -> bool:
+                            no_send: bool = False, result_file=None) -> bool:
     """One outbound result POST through the delivery core. True = the
     gateway confirmed (server lease closed; caller archives). False = not
     confirmed this pass; leave the result file for the next one."""
@@ -3010,6 +3025,16 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
+    if res.status is DrainStatus.TERMINAL:
+        # The outbox has decided this item; no pass will ever claim it again,
+        # so retrying logs forever and hides the failure behind "will retry".
+        why = (f"outbox item is terminal after "
+               f"{core.backend.attempts(broker_tid)} attempt(s)")
+        if result_file is not None:
+            _quarantine_undelivered(result_file, tid, why)
+        else:
+            _log(f"result {tid}: {why} — not retrying")
+        return False
     if res.status is DrainStatus.NOT_CLAIMED:
         # A dead prior incarnation's claim; reclaim-TTL recovers it, and
         # with an idempotent provider nothing parks on ambiguity.
@@ -3150,7 +3175,8 @@ def _post_ready_results(inflight: set[str]) -> None:
         if _delivery is None:
             _log(f"delivery deferred for {tid} — alias ledger unreadable")
             continue
-        if not _deliver_result_payload(tid, _broker_tid(_delivery), out_body):
+        if not _deliver_result_payload(tid, _broker_tid(_delivery), out_body,
+                                       result_file=rfile):
             continue
         _archive_result(rfile, tid)
         inflight.discard(tid)

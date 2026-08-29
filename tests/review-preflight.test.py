@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -247,6 +248,43 @@ class PriorArtTest(unittest.TestCase):
         head = pf.prior_art_block("1", few)[0]
         self.assertIn(f"({pf.PRIOR_ART_SHOWN})", head)
         self.assertNotIn("showing last", head)
+
+
+class RepoResolution(unittest.TestCase):
+    """`{owner}/{repo}` is gh's REMOTE inference; an app-pinned install has no
+    `.git`, so it resolved to nothing and prior-art degraded on every run."""
+
+    def test_explicit_repo_wins(self):
+        self.assertEqual(pf.resolve_repo("a/b", env={"SUTANDO_REVIEW_REPO": "c/d"}), "a/b")
+
+    def test_env_is_used_when_no_flag(self):
+        self.assertEqual(pf.resolve_repo(None, env={"SUTANDO_REVIEW_REPO": "c/d"}), "c/d")
+
+    def test_remote_inference_is_the_LAST_resort_not_the_only_one(self):
+        self.assertEqual(pf.resolve_repo(None, env={}), "{owner}/{repo}")
+
+    def test_the_resolved_repo_reaches_the_gh_call(self):
+        seen = []
+
+        def run(argv):
+            seen.append(argv)
+            return types.SimpleNamespace(returncode=0, stdout="[]")
+
+        pf.prior_art("1", runner=run, repo="a/b")
+        self.assertTrue(seen, "no gh call was made")
+        self.assertTrue(any("repos/a/b/" in x for x in seen[0]), seen[0])
+        self.assertFalse(any("{owner}/{repo}" in x for x in seen[0]), seen[0])
+
+    def test_COULD_NOT_CHECK_is_still_reachable(self):
+        """The tell that this fix works is not that the check passes — it is
+        that the caveat still fires. A resolution fix that makes it unreachable
+        has replaced one silent failure with another."""
+
+        def failing(argv):
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        self.assertIsNone(pf.prior_art("1", runner=failing, repo="a/b"))
+        self.assertIn("COULD NOT CHECK", "\n".join(pf.prior_art_block("1", None)))
 
 
 if __name__ == "__main__":
