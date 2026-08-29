@@ -2953,6 +2953,12 @@ async def on_message(message):
     await _handle_discord_message(message)
 
 
+def _counts_as_mention(message) -> bool:
+    """What the ARRIVAL path treats as addressing this bot: an explicit mention,
+    or an owner tag the mention gate stands in for one while the gate is ON."""
+    return _message_mentions_bot(message) or _mention_gate_triggers_ingest(message)
+
+
 @client.event
 async def on_message_edit(before, after):
     """Handle edited messages in two cases:
@@ -2963,8 +2969,8 @@ async def on_message_edit(before, after):
         return
     if after.author.bot and client.user not in after.mentions:
         return
-    # Case 1: edit introduced a bot mention
-    if _message_mentions_bot(after) and not _message_mentions_bot(before):
+    # Case 1: the edit introduced whatever the arrival path counts as a mention.
+    if _counts_as_mention(after) and not _counts_as_mention(before):
         print(f"  [edit] mention added to msg {after.id} — reprocessing", flush=True)
         await _handle_discord_message(after, force=True)
         return

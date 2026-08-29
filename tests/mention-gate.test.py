@@ -585,5 +585,93 @@ class WitnessRunner(unittest.TestCase):
                 self.wit.main(["case3", "--marker", "m4", "--timeout", "1"]), 1)
 
 
+class EditIntroducesTheTag(unittest.TestCase):
+    """An owner tag added by an EDIT must reach the same gate as one that
+    arrived with the message. The bridge already reprocesses edits, but Case 1
+    asked `_message_mentions_bot`, which the gate is precisely what stands in
+    for — so a tag typed in two minutes later was judged by a different rule."""
+
+    _next_id = 550000000
+
+    def setUp(self):
+        _reset_ws_gate()
+        self._td = tempfile.TemporaryDirectory()
+        self.tasks = Path(self._td.name) / "tasks"
+        self.tasks.mkdir()
+        # seen_message_ids is a module global; a shared fake id would dedup a
+        # later test's message and read as a gate failure.
+        db.seen_message_ids.clear()
+
+    def tearDown(self):
+        mg.write_state(_WS, mentions_enabled=False, until=None)
+        db.seen_message_ids.clear()
+        self._td.cleanup()
+
+    def _edit(self, before_content, after_content, allow=None):
+        """Drive the production on_message_edit; return (stdout, tasks)."""
+        before, after = _FakeMsg(before_content), _FakeMsg(after_content)
+        EditIntroducesTheTag._next_id += 1
+        before.id = after.id = EditIntroducesTheTag._next_id
+        before.mentions = [NS(id=111222333)] if "<@111222333>" in before_content else []
+        after.mentions = [NS(id=111222333)] if "<@111222333>" in after_content else []
+        fake_client = NS(user=object())
+        cfg = (True, allow if allow is not None else {str(STRANGER)})
+        buf = io.StringIO()
+
+        async def _noop(*a, **k):
+            return None
+
+        with mock.patch.object(db, "client", fake_client), \
+                mock.patch.object(db, "_observe_for_mod", _noop), \
+                mock.patch.object(db, "TASKS_DIR", self.tasks), \
+                mock.patch.object(db, "load_channel_config", lambda cid: cfg), \
+                contextlib.redirect_stdout(buf):
+            try:
+                asyncio.run(db.on_message_edit(before, after))
+            except Exception:
+                pass
+        return buf.getvalue(), sorted(p.name for p in self.tasks.glob("task-*.txt"))
+
+    def test_an_edit_that_adds_the_owner_tag_is_ingested_while_the_gate_is_on(self):
+        # Measured 2026-08-29: posted untagged at 17:28, tag appended at 17:30.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("here are the six launch videos",
+                                  "here are the six launch videos <@111222333>")
+        self.assertEqual(len(written), 1, out)
+        self.assertEqual(len(_audit_rows()), 1, out)
+
+    def test_the_same_edit_is_not_ingested_while_the_gate_is_off(self):
+        # Fail-closed is the whole design: OFF must keep today's behavior.
+        mg.write_state(_WS, mentions_enabled=False)
+        out, written = self._edit("here are the six launch videos",
+                                  "here are the six launch videos <@111222333>")
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+    def test_an_edit_to_an_already_tagged_message_does_not_ingest_twice(self):
+        # The guard that makes this safe: `before` already counted, so the edit
+        # introduced nothing. Without it every later typo re-queues the message.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("<@111222333> take a look",
+                                  "<@111222333> take a look please")
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+    def test_an_edit_adding_no_tag_at_all_is_still_ignored(self):
+        # Negative control: without it the predicate could admit every edit.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("first draft", "second draft")
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+    def test_an_unauthorized_sender_edit_leaves_neither_task_nor_audit(self):
+        # The allowlist still runs after the gate admits, exactly as on arrival.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("nothing yet", "<@111222333> now tagged",
+                                  allow={"999999999"})
+        self.assertEqual(written, [], out)
+        self.assertEqual(_audit_rows(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
