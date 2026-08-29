@@ -261,9 +261,8 @@ class TwoChannelsDistinct(unittest.TestCase):
         with os.fdopen(fd, "w") as f:
             json.dump({"d": DISCORD}, f)
         os.environ["SUTANDO_SCI_ROSTER"] = path
-        # #3515 landed a two-reviewer minimum after these cases were written.
-        # They exercise the SEND path, not the reviewer-count rule, so they take
-        # the documented escape rather than being weakened to accommodate it.
+        # #3515's two-reviewer minimum landed after these cases; they test the
+        # SEND path, so they take the documented escape rather than weakening.
         sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m", "--send",
                        "--allow-single", "single-target send-path test"]
         out, err = io.StringIO(), io.StringIO()

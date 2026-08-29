@@ -18,7 +18,9 @@ import sys
 _REPO = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO / "src"))
 from channel_token import resolve_channel_token          # noqa: E402
+
 from channels.discord.post_gate import make_client       # noqa: E402
+
 from outbox import DeliveryOutcome                       # noqa: E402
 
 
