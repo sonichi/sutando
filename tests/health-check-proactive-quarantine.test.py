@@ -163,6 +163,28 @@ class TestProactiveQuarantine(unittest.TestCase):
         self.assertNotIn("refused", detail,
                          "'refused' implies policy/permission; a transient network "
                          "failure parks a body too, and points at a different fix")
+        # The list above pins two words already known wrong, not "states only what
+        # was measured": "after delivery failed" cleared it and was still false.
+        self.assertNotIn("delivery failed", detail)
+
+    def test_the_detail_tallies_the_reasons_the_filenames_record(self):
+        """`_quarantine_orphan` writes <tid>.<reason>.<ts>.txt for five reasons,
+        of which only one is a delivery failure; the send-failure path records
+        none. The summary reports what is written, not a cause for all of them."""
+        with tempfile.TemporaryDirectory() as td:
+            self._quarantine(td)
+            d = pathlib.Path(td) / "results" / "undelivered"
+            for n in ("t-1.no-task.1.txt", "t-2.no-task.2.txt",
+                      "t-3.undeliverable-after-retries.3.txt",
+                      "task-abc-4.txt"):
+                (d / n).write_text("body")
+            out = self._run(td)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("2 no-task", out["detail"])
+        self.assertIn("1 undeliverable-after-retries", out["detail"])
+        self.assertIn("1 unlabelled", out["detail"],
+                      "a body with no reason token must not be given one")
+
 
     def test_the_operators_real_workspace_is_never_touched(self):
         before = None

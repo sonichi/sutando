@@ -6856,6 +6856,24 @@ def check_stranded_destined_proactive() -> dict:
 _STRAND_MIN_AGE_S = 1800
 
 
+PARK_REASONS = ("deduped-orphan", "has-attachments", "no-task", "too-old",
+                "undeliverable-after-retries")
+
+
+def _park_reason_tally(kept) -> str:
+    """Count parked bodies by the reason their filename records.
+
+    Only `undeliverable-after-retries` is a delivery failure, so a summary that
+    names a cause for the other four states something no writer recorded.
+    """
+    counts = {}
+    for name, _age in kept:
+        reason = next((p for p in str(name).split(".") if p in PARK_REASONS),
+                      "unlabelled")
+        counts[reason] = counts.get(reason, 0) + 1
+    return ", ".join(f"{n} {r}" for r, n in sorted(counts.items()))
+
+
 def check_proactive_quarantine() -> dict:
     """Report proactive bodies that were SAVED from deletion and then forgotten.
 
@@ -6927,12 +6945,11 @@ def check_proactive_quarantine() -> dict:
     return {
         "name": name,
         "status": "warn",
-        # A parked body records no transport, so naming one states something this
-        # probe never measured; the docstring's Discord case is one incident, not all.
-        "detail": (f"{len(kept)} proactive message(s) parked in results/undelivered/ after "
-                   f"delivery failed — preserved, but no consumer drains this directory, so "
-                   f"they stay until someone acts; which transport and why are in the bridge "
-                   f"log, not here; oldest {oldest_name} "
+        # `_quarantine_orphan` names files <tid>.<reason>.<ts>.txt; the send-failure
+        # path preserves the body name, so a missing reason is unlabelled, not a failure.
+        "detail": (f"{len(kept)} proactive message(s) parked in results/undelivered/ "
+                   f"({_park_reason_tally(kept)}) — preserved, but no consumer drains this "
+                   f"directory, so they stay until someone acts; oldest {oldest_name} "
                    f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
                    f"{partial}"),
     }
