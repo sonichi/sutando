@@ -4436,11 +4436,27 @@ const server = createServer((req, res) => {
 	// backend as the dashboard textbox; markdown rendering + full-viewport
 	// chat + persistent history. Lives at /chat to leave / untouched.
 	if (url.pathname === '/chat') {
+		// Presentation is the client's call: a host that draws its own title bar
+		// asks for embed, and one with a theme asks for it rather than inheriting
+		// this page's default. Stamped server-side so the page never paints one
+		// theme before switching to the other.
+		const theme = url.searchParams.get('theme');
+		const rootClass = [
+			theme === 'light' ? 'theme-light' : '',
+			theme === 'dark' ? 'theme-dark' : '',
+			url.searchParams.get('embed') === '1' ? 'embed' : '',
+		]
+			.filter(Boolean)
+			.join(' ');
 		res.writeHead(200, {
 			'Content-Type': 'text/html; charset=utf-8',
 			'Cache-Control': 'no-cache, no-store, must-revalidate',
 		});
-		res.end(CHAT_HTML);
+		res.end(
+			rootClass
+				? CHAT_HTML.replace('<html lang="en">', `<html lang="en" class="${rootClass}">`)
+				: CHAT_HTML,
+		);
 		return;
 	}
 
