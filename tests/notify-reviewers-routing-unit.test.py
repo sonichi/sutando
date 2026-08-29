@@ -954,7 +954,10 @@ class TheReachabilityProbeResolvesTheClaudeHomeAndNeverRaises(unittest.TestCase)
     """Replacing the helper with the old private fallback left 84 tests green."""
 
     def _probe(self, **env):
-        prev = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME")}
+        # HOME too: without it a miss falls through to the real ~/.claude and
+        # the probe answers from this machine rather than the fixture.
+        env.setdefault("HOME", tempfile.mkdtemp(prefix="home-iso-"))
+        prev = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "HOME")}
         for k in prev:
             os.environ.pop(k, None)
         os.environ.update({k: v for k, v in env.items() if v is not None})
@@ -978,9 +981,16 @@ class TheReachabilityProbeResolvesTheClaudeHomeAndNeverRaises(unittest.TestCase)
         self.assertIn("allowFrom", why)
 
     def test_CLAUDE_CONFIG_DIR_takes_precedence(self):
+        # Both maps mention allowFrom, so the old assertion passed either way.
+        # The listed map and the EMPTY one give different reasons; pin which.
         ok, why = self._probe(CLAUDE_CONFIG_DIR=self._home(["111"]),
                               CLAUDE_HOME=self._home([]))
-        self.assertIn("allowFrom", why, "the CCD map was not the one read")
+        self.assertIn("listed in groups allowFrom", why,
+                      f"the CLAUDE_HOME map was read instead: {why}")
+        ok2, why2 = self._probe(CLAUDE_CONFIG_DIR=self._home([]),
+                                CLAUDE_HOME=self._home(["111"]))
+        self.assertIn("no allowFrom", why2,
+                      f"precedence did not hold in the other direction: {why2}")
 
     def test_a_missing_helper_is_unverified_not_an_exception(self):
         # The probe's contract is that it never raises; a tree without src/
@@ -1147,6 +1157,20 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
              "ts": at(5), "channel": "room", "outcome": "failed"})))
         self.assertFalse(self._stale())
 
+    def test_a_recent_pending_does_not_inherit_an_old_confirmed_age(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        def at(m):
+            return (now - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.led.write_text("".join(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": w, "actor": w,
+            "ts": at(m), "channel": "room", "outcome": o}) + "\n"
+            for w, o, m in (("A", "confirmed", 90), ("B", "pending", 3))))
+        roster = {"A": {"discord_id": "1", "home_channel": "2"},
+                  "B": {"discord_id": "3", "home_channel": "4"}}
+        self.assertFalse(
+            nr._stale_repeat_ask(self.MSG, [{"name": "A"}, {"name": "B"}], roster)[0],
+            "B's 3-minute reservation was aged against A's 90 minutes")
+
     def test_a_recent_ask_is_not_stale_yet(self):
         # The negative control on the CLOCK rather than the outcome: without it
         # a rule that refused every repeat would pass all four cases above.
@@ -1214,6 +1238,22 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
             self._write(dict(self.GOOD, ts=bad))
             self.assertEqual(nr._streams(self.led), {}, f"ts={bad!r} was accepted")
 
+    def test_a_well_shaped_but_impossible_instant_is_rejected(self):
+        # A regex accepts these; they are not instants, and they sort below
+        # every real stamp exactly as bare "0000" did.
+        for bad in ("0000-00-00T00:00:00Z", "2026-02-30T11:00:00Z",
+                    "2026-08-29T25:00:00Z", "2026-08-29T11:00:00+99:99",
+                    "2026-08-29T11:00:00"):
+            self._write(dict(self.GOOD, ts=bad))
+            self.assertEqual(nr._streams(self.led), {}, f"ts={bad!r} was accepted")
+
+    def test_an_offset_stamp_is_normalized_so_it_orders_against_a_Z_stamp(self):
+        # Mixed offsets do not sort lexically; every accepted stamp is stored
+        # in one fixed-width UTC form so the comparisons downstream hold.
+        self._write(dict(self.GOOD, ts="2026-08-29T06:00:00-05:00"))
+        self.assertEqual(nr._latest_outcomes(self.led),
+                         {("o/r", "7", "k"): ("confirmed", "2026-08-29T11:00:00Z")})
+
     def test_a_string_that_is_not_a_timestamp_is_rejected(self):
         # "0000" sorts below every real stamp, lending one actor's age to
         # another in the widen comparison.
@@ -1228,6 +1268,20 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
                      "outcome": "unknown"})
         self.assertEqual(nr._latest_outcomes(self.led),
                          {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:02Z")})
+
+    def test_the_reader_streams_the_file_rather_than_materializing_it(self):
+        # Peak traced memory, not a code read: restoring read_text().splitlines()
+        # takes this from kilobytes to the size of the file.
+        import tracemalloc
+        self._write(*[dict(self.GOOD, ts=f"2026-08-29T{i//3600:02d}:{i//60%60:02d}:{i%60:02d}Z")
+                      for i in range(20000)])
+        size = self.led.stat().st_size
+        tracemalloc.start()
+        nr._streams(self.led)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        self.assertLess(peak, size // 4,
+                        f"peak {peak}B against a {size}B file — the read is not streaming")
 
     def test_state_is_bounded_per_stream_not_per_row(self):
         # The structural bound: 500 rows for one stream must not retain 500

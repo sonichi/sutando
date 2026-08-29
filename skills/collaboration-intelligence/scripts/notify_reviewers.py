@@ -243,9 +243,24 @@ _DID_ASK = {"confirmed", "unknown"}
 #: row, never a settlement.
 _KNOWN_OUTCOMES = {"pending", "unknown", "confirmed", "failed"}
 
-#: ISO-8601 to the second, fraction and offset optional. Comparisons are
-#: lexical, so a value outside this shape does not order against one inside it.
-_TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+#: The one comparable form. Every accepted stamp is normalized to it, so the
+#: lexical comparisons downstream order correctly across writers.
+_TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _norm_ts(ts: str) -> "str | None":
+    """A real instant rendered as fixed-width UTC, or None.
+
+    Shape is not enough: `0000-00-00T00:00:00Z` and `+99:99` match a regex and
+    are not instants, and mixed offsets do not sort against Z at all.
+    """
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None                     # naive: no instant, only a wall clock
+    return dt.astimezone(datetime.timezone.utc).strftime(_TS_FMT)
 
 #: Accepted row schema. A field of the wrong type is a malformed ROW, not a
 #: reason to crash a reader or to misattribute the stream it belongs to.
@@ -267,10 +282,12 @@ def _row(d) -> "tuple | None":
     # accepted empty string, so the type check never sees what was written.
     if ts is not None and not isinstance(ts, str):
         return None
-    # A string is not a timestamp: "0000" sorts below every real stamp and
-    # silently lends one actor's age to another in the widen comparison.
-    if ts and not _TS.fullmatch(ts):
-        return None
+    # Normalized, not just shaped: an impossible date matches a regex, and a
+    # mixed offset does not order against a Z stamp at all.
+    if ts:
+        ts = _norm_ts(ts)
+        if ts is None:
+            return None
     # A closed set. An unrecognised outcome must not become the latest one and
     # settle a possibly-landed post; the row is malformed, so the park holds.
     if outcome is not None and (not isinstance(outcome, str)
@@ -300,15 +317,47 @@ def _streams(led: Path) -> dict:
                 continue                # one bad row never hides a later good one
             repo, pr, who, outcome, ts = row
             st = out.setdefault((repo, pr, who),
-                                {"last": None, "first_ask": None, "n": 0})
+                                {"last": None, "first_ask": None,
+                                 "first_ask_outcome": None, "n": 0})
             st["last"] = (outcome, ts)
             st["n"] += 1
             # A row predating the outcome field records a send that happened:
             # absence is legacy, not a claim that nothing was posted.
             if (outcome is None or outcome in _DID_ASK) and (
                     st["first_ask"] is None or ts < st["first_ask"]):
-                st["first_ask"] = ts
+                st["first_ask"], st["first_ask_outcome"] = ts, outcome
     return out
+
+
+#: Rows above which the ledger is compacted. Every stream reduces to at most
+#: two rows, so the file is bounded by history breadth, not by attempt count.
+_COMPACT_ABOVE = 2000
+
+
+def compact(led: Path) -> int:
+    """Rewrite the ledger to the smallest history the projections cannot tell
+    from the original: per raw stream, the earliest real ask and the latest
+    outcome. Caller MUST hold the writer lock. Returns rows written."""
+    streams = _streams(led)
+    rows = []
+    for (repo, num, who), st in sorted(streams.items(), key=lambda kv: str(kv[0])):
+        keep = []
+        if st["first_ask"] is not None:
+            keep.append((st["first_ask_outcome"], st["first_ask"]))
+        if st["last"] and (not keep or st["last"] != keep[0]):
+            keep.append(st["last"])
+        for outcome, ts in keep:
+            row = {"repo": repo, "pr": int(num) if num.isdigit() else num,
+                   "reviewer": who, "actor": who, "ts": ts,
+                   "channel": "room", "outcome": outcome}
+            rows.append(json.dumps(row))
+    tmp = led.with_suffix(led.suffix + ".compact")
+    with open(tmp, "w") as fh:
+        fh.write("".join(r + "\n" for r in rows))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, led)                # atomic: a reader sees one file or the other
+    return len(rows)
 
 
 def _fold(streams: dict, per_stream, combine, canonical=None) -> dict:
@@ -398,13 +447,19 @@ def claim_park(message: str, reviewer: str, actor: str = None,
     who = actor or reviewer
     led = ledger_path()
     led.parent.mkdir(parents=True, exist_ok=True)
+    led.touch(exist_ok=True)
     lock = led.with_suffix(led.suffix + ".lock")
     with open(lock, "a") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
             if unknown_parked(message, reviewer, who, canonical=canonical):
                 return None
-            return record_asks(message, reviewer, outcome="pending", actor=who)
+            n = record_asks(message, reviewer, outcome="pending", actor=who)
+            # Under the same lock that guards the claim, so no reader or writer
+            # can observe the replace half-done.
+            if sum(st["n"] for st in _streams(led).values()) > _COMPACT_ABOVE:
+                compact(led)
+            return n
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
@@ -421,7 +476,11 @@ def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
     refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
     if not refs:
         return 0
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if outcome not in _KNOWN_OUTCOMES:
+        # The writer holds the reader's schema: an unwritable outcome must fail
+        # here, not be appended and silently ignored on the next read.
+        raise ValueError(f"outcome {outcome!r} is not one of {sorted(_KNOWN_OUTCOMES)}")
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime(_TS_FMT)
     p = ledger_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = ""
