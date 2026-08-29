@@ -575,8 +575,8 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
                          "a send that never started must not be parked")
 
     def test_an_unrecordable_message_is_refused_before_any_send(self):
-        # The unparkable-unknown case is now unreachable BY CONSTRUCTION: a
-        # message with no full PR URL cannot record an unknown, so it never sends.
+        # Unreachable by construction: a message with no full PR URL cannot
+        # record an unknown, so it never sends.
         called = []
         nr.subprocess.run = lambda *a, **k: called.append(1)
         rc, _, err = self._run_main(message="re-review #3303")

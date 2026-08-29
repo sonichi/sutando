@@ -441,9 +441,8 @@ def main() -> int:
             try:
                 p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
             except OSError as e:
-                # A spawn failure means no child ran and no POST was possible, so
-                # this is DEFINITELY not delivered — parking it would strand an
-                # ask that never started.
+                # No child ran, so no POST was possible: definitely not delivered.
+                # Parking it would strand an ask that never started.
                 print(f"{t['name']}: SEND FAILED before spawn ({type(e).__name__}: {e})"
                       " — nothing was sent; safe to retry", file=sys.stderr)
                 failures += 1
