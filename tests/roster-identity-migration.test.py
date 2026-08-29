@@ -304,8 +304,9 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         rec = json.loads(out.read_text())["y"]
         self.assertIsNone(rec["human_discord_id"])
         self.assertIsNone(rec["stand_discord_id"])
-        self.assertEqual(sorted(u["id"] for u in rec["unresolved_discord_ids"]),
-                         ["12", "not-a-snowflake"])
+        # CHANGED (#3537): neither value contains an id, and this field is
+        # documented as ids only — no invented ones. rc is still 5.
+        self.assertEqual(rec["unresolved_discord_ids"], [])
 
     def test_a_supplied_but_missing_source_is_an_error_not_a_silent_skip(self):
         src = self._roster({"x": {}})
@@ -671,7 +672,8 @@ class AFieldNameStatesAWordNotASubstring(unittest.TestCase):
     def test_an_unstated_field_leaves_the_id_unresolved_not_guessed(self):
         # End to end: the whole point is that no slot gets filled from a name
         # that never named a referent.
-        human, stand, _others, unresolved, _basis, _coll = mig.classify(
+        (human, stand, _others, unresolved, _basis, _coll,
+         _shapes) = mig.classify(
             "x", {"understanding_discord_id": HUMAN}, {}, {}, "")
         self.assertIsNone(human)
         self.assertIsNone(stand)

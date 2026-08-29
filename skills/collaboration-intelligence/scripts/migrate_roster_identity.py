@@ -116,14 +116,20 @@ def _verdict_from_field(field: str):
     return v[0] if len(v) == 1 else (None, None)
 
 
-def _bad(entries: list, value, states, reason: str) -> None:
+def _bad(entries: list, value, states, reason: str, shapes: list) -> None:
     """Record a malformed observation against every canonical id it names.
 
     `str(container)` attaches the disagreement to a repr no reader can match,
     so the id it actually opposes keeps its slot.
     """
     found = _snowflakes(json.dumps(value, default=str))
-    for sf in found or [str(value)]:
+    if not found:
+        # `str(value)` here would publish a container repr into a field the
+        # schema documents as ids only; record it as a shape failure instead.
+        shapes.append({"path": None, "kind": type(value).__name__,
+                       "reason": reason})
+        return
+    for sf in found:
         entries.append({"id": sf, "states": states, "reason": reason})
 
 
@@ -137,8 +143,12 @@ def _typed_path(path: list) -> bool:
                for seg in path)
 
 
-def _collect_ids(entry: dict) -> list:
-    """Every discord-shaped id anywhere in the entry, in stable order."""
+def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
+    """Every discord-shaped id in the entry, in stable order.
+
+    A non-string leaf at a TYPED path is a present observation that states a
+    referent and yields no id; it is reported, never silently skipped.
+    """
     found = []
 
     def walk(obj, path):
@@ -152,6 +162,11 @@ def _collect_ids(entry: dict) -> list:
             for sf in _snowflakes(obj):
                 if sf not in found:
                     found.append(sf)
+        elif obj is not None and not isinstance(obj, str) and _typed_path(path) \
+                and shapes is not None:
+            shapes.append({"path": ".".join(path), "kind": type(obj).__name__,
+                           "reason": "typed field holds a non-string value, so "
+                                     "its id is unreadable rather than absent"})
 
     walk(entry, [])
     return found
@@ -164,11 +179,12 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     claims: dict = {}   # id -> {verdict -> [reasons]}
     bad: list = []      # not-id values; `states` is the referent each claimed
     collisions: list = []
+    shape_failures: list = []
 
     def claim(id_, verdict, reason):
         claims.setdefault(id_, {}).setdefault(verdict, []).append(reason)
 
-    for id_ in _collect_ids(entry):
+    for id_ in _collect_ids(entry, shape_failures):
         for field in _cited_in(entry, id_):
             for verdict, reason in _verdicts_from_field(field):
                 claim(id_, verdict, reason)
@@ -195,9 +211,9 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
                         "reason": _why})
     # A typed field states the referent but not that the VALUE is an id. An
     # unvalidated one publishes junk into the slot the schema exists to protect.
-    if not _is_snowflake(tp.get("discord")) and tp.get("discord"):
+    if "discord" in tp and not _is_snowflake(tp.get("discord")):
         _bad(bad, tp["discord"], HUMAN,
-             f"pr-triage `{src}.discord` is not a snowflake")
+             f"pr-triage `{src}.discord` is not a snowflake", shapes=shape_failures)
     if _is_snowflake(tp.get("discord")):
         claim(str(tp["discord"]), HUMAN,
               f"pr-triage config `{src}.discord`")
@@ -205,7 +221,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     if bots is not None and not isinstance(bots, (list, tuple)):
         # A dict iterates its KEYS, a string its characters. Require the shape
         # the schema documents rather than anything that happens to iterate.
-        _bad(bad, bots, STAND, f"pr-triage `{src}.bots` is not a list")
+        _bad(bad, bots, STAND, f"pr-triage `{src}.bots` is not a list", shapes=shape_failures)
         bots = []
     bots = bots or []
     for bot in bots:
@@ -288,7 +304,8 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     resolved = {i for i in (human_id, stand_id) if i} | {o["id"] for o in others}
     assert not (resolved & {u["id"] for u in unresolved}), (
         "an id cannot be both resolved and unresolved")
-    return human_id, stand_id, others, unresolved, basis, collisions
+    return (human_id, stand_id, others, unresolved, basis, collisions,
+            shape_failures)
 
 
 def _canonical_triage(triage_people: dict):
@@ -340,7 +357,8 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         if not ri.is_person_key(key) or not isinstance(entry, dict):
             out[key] = entry
             continue
-        human, stand, others, unresolved, basis, collisions = classify(
+        (human, stand, others, unresolved, basis, collisions,
+         shape_failures) = classify(
             key, entry, canon, peer_ids, owner_id)
         new = dict(entry)                       # every provenance field survives
         new[ri.HUMAN_FIELD] = human
@@ -365,6 +383,7 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             "after_other_stands": [o["id"] for o in others],
             "after_unresolved": [u["id"] for u in unresolved],
             "after_collision": collisions,
+            "after_shape_failure": shape_failures,
             "basis": basis,
         })
     return out, rows
@@ -455,7 +474,8 @@ def main() -> int:
     # An axis collision blocks even when it carries no id: it is the two
     # referents that clash, not the values they happen to hold.
     coll = [r["key"] for r in rows if r.get("after_collision")]
-    if gaps or unres or coll:
+    shape = [r["key"] for r in rows if r.get("after_shape_failure")]
+    if gaps or unres or coll or shape:
         for k in gaps:
             print(f"  GAP {k}: no human and no stand id", file=sys.stderr)
         for k in unres:
@@ -463,6 +483,9 @@ def main() -> int:
         for k in coll:
             print(f"  COLLISION {k}: two identity axes name this key",
                   file=sys.stderr)
+        for k in shape:
+            print(f"  SHAPE {k}: a typed field holds a value no id can be read "
+                  f"from", file=sys.stderr)
         return 5
     return 0
 
