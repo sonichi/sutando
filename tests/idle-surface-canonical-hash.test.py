@@ -13,6 +13,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -146,6 +147,80 @@ proc = subprocess.run([sys.executable, str(SCRIPT), "--state", str(state),
 check("the script runs as a subprocess with the same verdict",
       proc.returncode == 0 and proc.stdout.strip().startswith("quiet"),
       f"{proc.returncode} {proc.stdout!r} {proc.stderr!r}")
+
+# ── pass-outcome counters ───────────────────────────────────────────────────
+# `streak` resets each substantive pass: a gauge, not a counter.
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "idle-streak.json"
+
+    def outcome(kind):
+        """In-process, for the same reason `run()` above is: a subprocess runs
+        the production code where coverage cannot see it."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ish.main(["--state", str(st), "--pass-outcome", kind])
+        return buf.getvalue().strip(), rc
+
+    out, rc = outcome("noop")
+    check("a no-op pass records without a held-list on stdin",
+          rc == 0 and "streak=1" in out and "noop_total=1" in out, out)
+    outcome("noop")
+    out, _ = outcome("substantive")
+    check("a substantive pass resets the streak but not the totals",
+          "streak=0" in out and "noop_total=2" in out and "substantive_total=1" in out, out)
+
+    doc = json.loads(st.read_text())
+    check("both cumulative totals persist, so the denominator is recoverable",
+          doc.get("noop_total") == 2 and doc.get("substantive_total") == 1, doc)
+
+    # The reason for the lock: last-writer-wins silently under-counts, and an
+    # under-count is indistinguishable from a genuinely quiet stretch.
+    st2 = Path(d) / "concurrent.json"
+    procs = [subprocess.Popen([sys.executable, str(SCRIPT), "--state", str(st2),
+                               "--pass-outcome", "noop"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL) for _ in range(20)]
+    for p in procs:
+        p.wait()
+    got = json.loads(st2.read_text()).get("noop_total")
+    check("20 concurrent recorders lose no increments (the lock earns its place)",
+          got == 20, f"noop_total={got}, expected 20")
+
+# --pass-outcome is record-only and must return BEFORE touching stdin: under
+# cron stdin is an open pipe nobody writes, and a read there never returns.
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "s.json"
+    r, w = os.pipe()                      # open, silent, NOT closed
+    p = subprocess.Popen([sys.executable, str(SCRIPT), "--state", str(st),
+                          "--pass-outcome", "noop"],
+                         stdin=r, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True)
+    os.close(r)
+    try:
+        out, _ = p.communicate(timeout=10)
+        hung = False
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, hung = "", True
+    os.close(w)
+    check("record-only does not block on an open, silent stdin pipe",
+          not hung and p.returncode == 0 and "noop_total=1" in out,
+          "BLOCKED on stdin.read()" if hung else out)
+
+    # It ignores --items rather than half-doing both, so the mode is unambiguous.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc2 = ish.main(["--state", str(st), "--items", json.dumps(BASE),
+                        "--pass-outcome", "substantive"])
+    check("record-only ignores --items and prints the outcome, not a hash",
+          rc2 == 0 and buf.getvalue().strip().startswith("substantive"), buf.getvalue())
+    check("...and leaves last_surfaced_hash untouched",
+          "last_surfaced_hash" not in json.loads(st.read_text()), st.read_text())
+
+    # record_outcome directly: the lock/unlock path, not reached via main()'s print.
+    doc = ish.record_outcome(st, "noop")
+    check("record_outcome returns the doc it persisted",
+          doc["streak"] == 1 and doc == json.loads(st.read_text()), doc)
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
