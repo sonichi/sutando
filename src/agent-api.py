@@ -621,13 +621,17 @@ def get_task_result(task_id: str):
         return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
     # Check archive — task-bridge archives results within seconds of delivery,
     # so direct /result polls often arrive after the file has been moved.
+    #
+    # Delegated: this scanned only `archive/<month>/<id>.txt`, while the archive
+    # move at :608 mints `archive/<id>-<epoch>.txt` on collision — so agent-api
+    # produced a layout it could not then find, and returned a terminal 404 for a
+    # result that exists. find_archived_result covers direct, month and flat, and
+    # gates the id by rejection rather than by sanitizing it into a different one.
     safe_id = _safe_id(task_id)
     if safe_id:
-        filename = f"{safe_id}.txt"
-        for month_dir in sorted((RESULT_DIR / "archive").glob("*/"), reverse=True):
-            candidate = month_dir / filename
-            if candidate.exists():
-                return {"task_id": safe_id, "status": "completed", "result": candidate.read_text()}
+        archived = local_task_protocol.find_archived_result(RESULT_DIR, task_id)
+        if archived is not None:
+            return {"task_id": safe_id, "status": "completed", "result": archived.read_text()}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}
