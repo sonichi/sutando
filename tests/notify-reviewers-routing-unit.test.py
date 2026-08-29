@@ -1141,6 +1141,26 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
     def test_an_absent_ledger_is_empty_not_an_error(self):
         self.assertEqual(nr._raw_streams(pathlib.Path(self.tmp) / "nope.jsonl"), {})
 
+    def test_a_valid_json_line_that_is_not_a_record_is_skipped(self):
+        # Syntax was already handled; a bare list or string is valid JSON and
+        # crashed on .get. Semantic row failure belongs to the shared reader.
+        self.led.write_text('["not", "a", "record"]\n"a bare string"\n123\n'
+                            + json.dumps({"repo": "o/r", "pr": 7, "reviewer": "k",
+                                          "ts": "T", "outcome": "confirmed"}) + "\n")
+        self.assertEqual(list(nr._raw_streams(self.led)), [("o/r", "7", "k")])
+
+    def test_latest_outcomes_is_raw_keyed_and_offers_no_canonical_mode(self):
+        # Folding last-row-wins onto a canonical actor erases the globally
+        # latest possibly-landed outcome; the API must not expose it at all.
+        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
+            {"repo": "o/r", "pr": 7, "reviewer": "beta", "ts": "T1", "outcome": "pending"},
+            {"repo": "o/r", "pr": 7, "reviewer": "alpha", "ts": "T2", "outcome": "failed"},
+            {"repo": "o/r", "pr": 7, "reviewer": "beta", "ts": "T3", "outcome": "unknown"})))
+        got = {k[2]: v for k, v in nr._latest_outcomes(self.led).items()}
+        self.assertEqual(got, {"beta": ("unknown", "T3"), "alpha": ("failed", "T2")})
+        self.assertNotIn("canonical", nr._latest_outcomes.__code__.co_varnames,
+                         "the unsafe mode is still callable")
+
     def test_both_readers_delegate_to_the_one_owner(self):
         # The delegation, not the behaviour: a reader that re-implements the
         # read contract passes every behavioural case and drifts anyway.

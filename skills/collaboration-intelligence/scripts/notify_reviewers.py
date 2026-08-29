@@ -254,6 +254,8 @@ def _raw_streams(led: Path) -> dict:
             d = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(d, dict):
+            continue                    # valid JSON, not a record: same skip
         key = (d.get("repo"), str(d.get("pr")), d.get("actor") or d.get("reviewer"))
         streams.setdefault(key, []).append(
             (d.get("outcome"), d.get("ts") or ""))
@@ -277,10 +279,13 @@ def _fold(streams: dict, per_stream, combine, canonical=None) -> dict:
     return out
 
 
-def _latest_outcomes(led: Path, canonical=None) -> dict:
-    """(repo, pr, actor) -> (outcome, ts) from the LAST row for that key."""
-    return _fold(_raw_streams(led), lambda rows: rows[-1],
-                 lambda a, b: b, canonical=canonical)
+def _latest_outcomes(led: Path) -> dict:
+    """(repo, pr, RAW spelling) -> (outcome, ts) from the LAST row of that stream.
+
+    Raw keys only. Folding this onto a canonical actor is the defect the park
+    was fixed for, so the API does not offer it rather than leaving it callable.
+    """
+    return _fold(_raw_streams(led), lambda rows: rows[-1], lambda a, b: b)
 
 
 def _first_ask(led: Path, canonical=None) -> dict:
