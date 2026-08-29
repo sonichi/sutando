@@ -231,7 +231,7 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
                                   "human_discord_id": "1358841611580080168"}})
         out = Path(self.tmp) / "v2.json"
         rc, _ = self._main("--roster", str(src), "--out", str(out))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 5, "a conflict leaves an unresolved id: a coverage gap")
         rec = json.loads(out.read_text())["z"]
         self.assertIsNone(rec["human_discord_id"],
                           "a conflict must not resolve to one of them")
@@ -255,11 +255,85 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         self.assertEqual(d["o"]["human_discord_id"], HUMAN, "discord-config states the owner")
 
 
+    def test_a_triage_only_login_is_not_dropped(self):
+        # The roster is keyed by person, pr-triage by GitHub login. Iterating
+        # only roster rows silently loses everyone pr-triage alone knows.
+        src = self._roster({})
+        cfg = Path(self.tmp) / "cfg.json"
+        cfg.write_text(json.dumps({"people": {"john-the-dev": {"discord": HUMAN}}}))
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--triage-config", str(cfg), "--out", str(out))
+        got = json.loads(out.read_text())
+        self.assertIn("john-the-dev", got)
+        self.assertEqual(got["john-the-dev"]["human_discord_id"], HUMAN)
+
+    def test_a_roster_row_is_joined_on_its_declared_github_login(self):
+        # key `rui`, field `github: john-the-dev` — joining on the key alone
+        # leaves the row unenriched while the evidence sits one field away.
+        src = self._roster({"rui": {"github": "john-the-dev"}})
+        cfg = Path(self.tmp) / "cfg.json"
+        cfg.write_text(json.dumps({"people": {"john-the-dev": {"discord": HUMAN}}}))
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--triage-config", str(cfg), "--out", str(out))
+        got = json.loads(out.read_text())
+        self.assertEqual(got["rui"]["human_discord_id"], HUMAN)
+        self.assertNotIn("john-the-dev", got, "the alias must not become a second person")
+
+    def test_a_prefix_id_is_not_claimed_by_a_longer_ids_citation(self):
+        # 17 digits is a substring of 18: substring matching published the
+        # wrong referent into the slot this schema exists to protect.
+        src = self._roster({"x": {"discord_id": "12345678901234567",
+                                  "stand_status": "stand id 123456789012345678"}})
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--out", str(out))
+        rec = json.loads(out.read_text())["x"]
+        self.assertIsNone(rec["stand_discord_id"])
+        self.assertEqual([u["id"] for u in rec["unresolved_discord_ids"]],
+                         ["12345678901234567"])
+
+    def test_typed_values_that_are_not_snowflakes_are_refused(self):
+        src = self._roster({"y": {}})
+        cfg = Path(self.tmp) / "cfg.json"
+        cfg.write_text(json.dumps({"people": {"y": {"discord": "not-a-snowflake",
+                                                    "bots": "12"}}}))
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--triage-config", str(cfg), "--out", str(out))
+        rec = json.loads(out.read_text())["y"]
+        self.assertIsNone(rec["human_discord_id"])
+        self.assertIsNone(rec["stand_discord_id"])
+        self.assertEqual(sorted(u["id"] for u in rec["unresolved_discord_ids"]),
+                         ["12", "not-a-snowflake"])
+
+    def test_a_supplied_but_missing_source_is_an_error_not_a_silent_skip(self):
+        src = self._roster({"x": {}})
+        with self.assertRaises(SystemExit) as cm:
+            self._main("--roster", str(src), "--out", str(Path(self.tmp) / "v2.json"),
+                       "--triage-config", str(Path(self.tmp) / "absent.json"))
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_an_input_v1_schema_does_not_survive_into_the_output(self):
+        src = self._roster({"_schema": {"version": "reviewer-identity/1"}, "x": {}})
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--out", str(out))
+        self.assertEqual(json.loads(out.read_text())["_schema"]["version"],
+                         mig.ri.SCHEMA_VERSION)
+
+
+    def test_a_coverage_gap_is_reported_rather_than_read_as_success(self):
+        # rc 5 says the file WAS written and somebody in it is unaddressable.
+        # rc 0 would let a caller promote a map that reaches nobody.
+        src = self._roster({"nobody": {}})
+        out = Path(self.tmp) / "v2.json"
+        rc, _ = self._main("--roster", str(src), "--out", str(out))
+        self.assertEqual(rc, 5)
+        self.assertTrue(out.is_file(), "rc 5 still writes the file")
+
+
     def test_an_id_inside_a_list_is_still_found(self):
         src = self._roster({"w": {"discord_ids": [BOT]}})
         out = Path(self.tmp) / "v2.json"
         rc, _ = self._main("--roster", str(src), "--out", str(out))
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 5, "an id with no stated referent is a coverage gap")
         self.assertIn(BOT, json.dumps(json.loads(out.read_text())["w"]),
                       "a list-valued id must not be dropped")
 

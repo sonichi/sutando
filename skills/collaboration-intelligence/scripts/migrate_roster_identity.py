@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -38,6 +39,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import roster_identity as ri  # noqa: E402
 
 HUMAN, STAND = "human", "stand"
+
+_SNOWFLAKE = re.compile(r"(?<!\d)\d{17,20}(?!\d)")
+
+
+def _snowflakes(text: str) -> list:
+    """Every whole snowflake in a string, never a prefix of a longer one."""
+    return _SNOWFLAKE.findall(str(text))
+
+
+def _is_snowflake(v) -> bool:
+    return isinstance(v, str) and bool(_SNOWFLAKE.fullmatch(v))
 
 
 def _cited_in(entry: dict, id_: str) -> list:
@@ -51,7 +63,9 @@ def _cited_in(entry: dict, id_: str) -> list:
         elif isinstance(obj, list):
             for v in obj:
                 walk(v, prefix)
-        elif id_ and id_ in str(obj):
+        elif id_ and id_ in _snowflakes(obj):
+                # whole-id match: a 17-digit id is a substring of an
+                # 18-digit one, and that published the wrong referent.
             hits.append(prefix)
 
     walk(entry, "")
@@ -92,6 +106,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
              owner_id: str):
     """-> (human_id|None, stand_id|None, other_stands[], unresolved[], basis{})"""
     claims: dict = {}   # id -> {verdict -> [reasons]}
+    bad: list = []      # values that state a referent but are not ids
 
     def claim(id_, verdict, reason):
         claims.setdefault(id_, {}).setdefault(verdict, []).append(reason)
@@ -103,12 +118,28 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
                 claim(id_, verdict, reason)
         claims.setdefault(id_, {})
 
-    tp = triage_people.get(key) or {}
-    if tp.get("discord"):
+    # The roster keys by person and declares the GitHub login in `github`;
+    # pr-triage keys BY that login. Joining on the roster key alone drops one.
+    tp = triage_people.get(entry.get("github") or key) or triage_people.get(key) or {}
+    # A typed field states the referent but not that the VALUE is an id. An
+    # unvalidated one publishes junk into the slot the schema exists to protect.
+    if not _is_snowflake(tp.get("discord")) and tp.get("discord"):
+        bad.append({"id": str(tp["discord"]), "reason":
+                    f"pr-triage `people.{key}.discord` is not a snowflake"})
+    if _is_snowflake(tp.get("discord")):
         claim(str(tp["discord"]), HUMAN,
               f"pr-triage config `people.{key}.discord`")
-    for bot in tp.get("bots") or []:
-        claim(str(bot), STAND, f"pr-triage config `people.{key}.bots[]`")
+    bots = tp.get("bots") or []
+    if isinstance(bots, str):                 # a string iterates per character
+        bad.append({"id": bots, "reason":
+                    f"pr-triage `people.{key}.bots` is a string, not a list"})
+        bots = []
+    for bot in bots:
+        if _is_snowflake(str(bot)):
+            claim(str(bot), STAND, f"pr-triage config `people.{key}.bots[]`")
+        else:
+            bad.append({"id": str(bot), "reason":
+                        f"pr-triage `people.{key}.bots[]` entry is not a snowflake"})
 
     for id_ in list(claims):
         if id_ in peer_ids:
@@ -117,7 +148,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         if owner_id and id_ == owner_id:
             claim(id_, HUMAN, "discord-config.json `owner` (the human owner)")
 
-    humans, stands, unresolved, basis = [], [], [], {}
+    humans, stands, unresolved, basis = [], [], list(bad), {}
     for id_, verdicts in claims.items():
         if len(verdicts) > 1:
             unresolved.append({
@@ -167,7 +198,12 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             "An id no source classifies lives in `unresolved_discord_ids` and "
             "answers no lookup."),
     }
-    for key, entry in doc.items():
+    aliased = {(e.get("github") or k) for k, e in doc.items()
+               if ri.is_person_key(k) and isinstance(e, dict)}
+    extra = {k: {} for k in triage_people if k not in doc and k not in aliased}
+    for key, entry in list(doc.items()) + sorted(extra.items()):
+        if key == ri.SCHEMA_KEY:
+            continue                            # the destination schema is reserved
         if not ri.is_person_key(key) or not isinstance(entry, dict):
             out[key] = entry
             continue
@@ -177,12 +213,11 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         new[ri.HUMAN_FIELD] = human
         new[ri.STAND_FIELD] = stand
         new["home_channel"] = entry.get("home_channel")
-        if others:
-            new[ri.OTHER_STANDS_FIELD] = others
-        if unresolved:
-            new[ri.UNRESOLVED_FIELD] = unresolved
-        if basis:
-            new[ri.BASIS_FIELD] = basis
+        # Assigned unconditionally: a rerun that only fills blanks leaves the
+        # old value beside the new one — an id in human AND unresolved at once.
+        new[ri.OTHER_STANDS_FIELD] = others
+        new[ri.UNRESOLVED_FIELD] = unresolved
+        new[ri.BASIS_FIELD] = basis
         out[key] = new
         rows.append({
             "key": key,
@@ -230,15 +265,21 @@ def main() -> int:
     a = ap.parse_args()
 
     doc = json.loads(a.roster.read_text())
-    triage_people = {}
-    if a.triage_config and a.triage_config.is_file():
-        triage_people = json.loads(a.triage_config.read_text()).get("people") or {}
-    peer_ids = {}
-    if a.peers and a.peers.is_file():
-        peer_ids = {str(v): k for k, v in json.loads(a.peers.read_text()).items()}
-    owner_id = ""
-    if a.discord_config and a.discord_config.is_file():
-        owner_id = str(json.loads(a.discord_config.read_text()).get("owner") or "")
+
+    def _source(flag, path):
+        # An OMITTED source is a choice; a SUPPLIED one that is missing is an
+        # error. Treating them alike migrates on evidence nobody knows is absent.
+        if path is None:
+            return None
+        if not path.is_file():
+            print(f"{flag} was supplied but does not exist: {path}", file=sys.stderr)
+            raise SystemExit(2)
+        return json.loads(path.read_text())
+
+    triage_people = (_source("--triage-config", a.triage_config) or {}).get("people") or {}
+    peer_raw = _source("--peers", a.peers) or {}
+    peer_ids = {str(v): k for k, v in peer_raw.items()}
+    owner_id = str((_source("--discord-config", a.discord_config) or {}).get("owner") or "")
 
     out, rows = migrate(doc, triage_people, peer_ids, owner_id, a.roster.name)
     dest = a.out or a.roster.with_suffix(".v2.json")
@@ -249,6 +290,19 @@ def main() -> int:
     if a.table:
         print_table(rows)
     print(f"\nwrote {dest} ({len(rows)} people); input untouched", file=sys.stderr)
+
+    # A coverage gap is not a failure of the migration and not a success for the
+    # caller: rc 5 says the file is written AND somebody in it is unaddressable.
+    gaps = [r["key"] for r in rows
+            if not r["after_human"] and not r["after_stand"]
+            and not r["after_other_stands"]]
+    unres = [r["key"] for r in rows if r["after_unresolved"]]
+    if gaps or unres:
+        for k in gaps:
+            print(f"  GAP {k}: no human and no stand id", file=sys.stderr)
+        for k in unres:
+            print(f"  GAP {k}: holds unresolved id(s)", file=sys.stderr)
+        return 5
     return 0
 
 
