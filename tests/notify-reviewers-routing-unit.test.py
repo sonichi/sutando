@@ -637,7 +637,7 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
     def test_an_unreadable_ledger_fails_CLOSED(self):
         # It cannot prove the target was NOT parked, and a refused send is
         # recoverable while a duplicated unsafe post is not.
-        self.led.mkdir()          # a directory where a file is expected
+        self.led.mkdir()
         self.assertTrue(nr.unknown_parked(self.MSG, "d"))
 
 
