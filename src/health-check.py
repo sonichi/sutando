@@ -3584,75 +3584,142 @@ def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
     return True
 
 
-# Resident supervisor wrapper per channel bridge, for hosts where launchctl
-# cannot answer. The gateway wrapper execs, so launchd is its only witness.
+# Wrapper channel per channel bridge; the gateway wrapper execs into the
+# bridge, so launchd itself is its only supervision witness.
+_BRIDGE_WRAPPER_CHANNEL = {
+    "telegram-bridge": "telegram",
+    "discord-bridge": "discord",
+    "slack-bridge": "slack",
+}
 _BRIDGE_WRAPPER_PGREP = {
-    "telegram-bridge": r"channel-bridge-wrapper\.sh telegram$",
-    "discord-bridge": r"channel-bridge-wrapper\.sh discord$",
-    "slack-bridge": r"channel-bridge-wrapper\.sh slack$",
+    n: rf"channel-bridge-wrapper\.sh {c}$" for n, c in _BRIDGE_WRAPPER_CHANNEL.items()
 }
 
 
-def _bridge_supervisor(name: str) -> "str | None":
-    """The launchd label supervising `name` (com.sutando.<name>), or None.
+def _bridge_supervision(name: str) -> "tuple[str, str | None]":
+    """Tri-state supervision verdict for `name`:
 
-    A REGISTERED job counts even when its state is not "running": launchd owns
-    the bridge's lifecycle either way, and a restart must go through it. The
-    wrapper-process fallback covers a live supervisor that `launchctl print`
-    cannot see (probe failure, or a job bootstrapped under another domain).
+    ("supervised", label) — a launchd job com.sutando.<name> is registered
+    (even inactive: launchd owns the lifecycle either way), or the resident
+    wrapper process is alive while launchctl cannot be asked.
+    ("absent", None)      — every applicable probe RAN and found nothing.
+    ("unknown", None)     — a probe failed; supervision is NOT ruled out.
+    UNKNOWN must fail closed in callers: a probe error is not a license to
+    spawn a bridge next to a supervisor that may well be there.
     """
     label = f"com.sutando.{name}"
+    launchctl_ran = False
     try:
         probe = subprocess.run(
             ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
             capture_output=True, text=True, timeout=10)
+        launchctl_ran = True
         if probe.returncode == 0:
-            return label
+            return ("supervised", label)
     except (subprocess.TimeoutExpired, OSError):
         pass
     pattern = _BRIDGE_WRAPPER_PGREP.get(name)
-    if pattern:
-        try:
-            pg = subprocess.run(["/usr/bin/pgrep", "-f", pattern],
-                                capture_output=True, text=True, timeout=10)
-            if pg.returncode == 0 and pg.stdout.strip():
-                return label
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-    return None
-
-
-def _kill_bridge_pids(name: str) -> bool:
-    """TERM every live <name>.py process; True if any was found.
-
-    Anchored `\\.py$` to stay consistent with the detect path — a bare name
-    also matches grep pipelines whose command line contains the bridge name.
-    """
+    if pattern is None:
+        # No resident wrapper exists for this bridge (gateway execs).
+        return ("absent", None) if launchctl_ran else ("unknown", None)
     try:
-        out = subprocess.run(["/usr/bin/pgrep", "-f", f"{name}\\.py$"],
-                             capture_output=True, text=True, timeout=10).stdout
-        pids = [p for p in out.strip().split("\n") if p]
-        for pid in pids:
-            subprocess.run(["/bin/kill", pid], check=False)
-        if pids:
-            time.sleep(1)
-        return bool(pids)
-    except Exception:  # noqa: BLE001 — a failed kill must not abort the restart decision
+        pg = subprocess.run(["/usr/bin/pgrep", "-f", pattern],
+                            capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return ("unknown", None)
+    if pg.returncode == 0 and pg.stdout.strip():
+        return ("supervised", label)
+    # pgrep exit 1 = ran, no match; anything else is a probe error.
+    if pg.returncode not in (0, 1):
+        return ("unknown", None)
+    return ("absent", None) if launchctl_ran else ("unknown", None)
+
+
+def _kill_supervised_child(name: str) -> bool:
+    """TERM the wrapper's OWN bridge child and confirm it exited.
+
+    Identity is by lineage — a candidate counts only when its ppid is a live
+    channel-bridge-wrapper process for this channel — so a bare pid from any
+    checkout can never satisfy it. True only after every signalled child is
+    confirmed gone (kill -0 fails); anything less is a failure the caller
+    must report, not paper over.
+    """
+    pattern = _BRIDGE_WRAPPER_PGREP.get(name)
+    if pattern is None:
         return False
+    try:
+        pg = subprocess.run(["/usr/bin/pgrep", "-f", pattern],
+                            capture_output=True, text=True, timeout=10)
+        wrapper_pids = set(pg.stdout.split()) if pg.returncode == 0 else set()
+        if not wrapper_pids:
+            return False
+        ps = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,command="],
+                            capture_output=True, text=True, timeout=10)
+        if ps.returncode != 0:
+            return False
+        children = []
+        for line in ps.stdout.splitlines():
+            parts = line.split(None, 2)
+            if (len(parts) == 3 and parts[1] in wrapper_pids
+                    and parts[2].rstrip().endswith(f"{name}.py")):
+                children.append(parts[0])
+        if not children:
+            return False
+        signalled = [pid for pid in children if subprocess.run(
+            ["/bin/kill", pid], capture_output=True).returncode == 0]
+        if len(signalled) != len(children):
+            return False
+        for _ in range(10):
+            time.sleep(0.5)
+            if all(subprocess.run(["/bin/kill", "-0", pid],
+                                  capture_output=True).returncode != 0
+                   for pid in signalled):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — an unidentifiable child is a reported failure, not a crash
+        return False
+
+
+def _evict_own_stale_bridge(name: str) -> None:
+    """Pre-spawn eviction of THIS checkout's old bridge process.
+
+    Delegates to the production identity contract in
+    src/launchd/evict-own-bridge.sh (command path under this repo, or cwd ==
+    this repo; indeterminate identity never kills) instead of a host-wide
+    pgrep — a bare `<name>.py$` match would TERM the same bridge launched
+    from any other checkout on the host (CR #2068). Bridges without a wrapper
+    channel (gateway) skip the pre-kill: their instance lock stands the loser
+    down, which beats risking a foreign kill.
+    """
+    channel = _BRIDGE_WRAPPER_CHANNEL.get(name)
+    if channel is None:
+        return
+    helper = REPO_DIR / "src" / "launchd" / "evict-own-bridge.sh"
+    try:
+        subprocess.run(["/bin/bash", str(helper), channel, str(REPO_DIR)],
+                       capture_output=True, timeout=30)
+        time.sleep(1)
+    except Exception:  # noqa: BLE001 — a failed eviction must not abort the restart decision
+        pass
 
 
 def _restart_bridge(name: str, *, stale: bool = False) -> "tuple[bool, str]":
     """Single supervision-aware owner of every bridge restart (down and stale).
 
     A supervised bridge restarts THROUGH its supervisor — `kickstart -k`, else
-    kill the supervised child so the wrapper's keepalive respawns it onto the
-    code now on disk — and is NEVER spawned directly: a hand-spawned bridge
-    (ppid 1) takes the singleton lock, and every keepalive respawn then loses
-    it seconds later, forever, one owner alert per cycle. A direct spawn is
-    only allowed when no supervisor exists. Returns (restarted, how).
+    kill the supervisor's own child so the wrapper's keepalive respawns it
+    onto the code now on disk — and is NEVER spawned directly: a hand-spawned
+    bridge (ppid 1) takes the singleton lock, and every keepalive respawn then
+    loses it seconds later, forever, one owner alert per cycle. A direct spawn
+    is allowed only when supervision is conclusively ABSENT; an unknown
+    verdict fails closed. Returns (restarted, how).
     """
-    label = _bridge_supervisor(name)
-    if label is not None:
+    verdict, label = _bridge_supervision(name)
+    if verdict == "unknown":
+        return False, (f"supervision state UNKNOWN (launchctl/pgrep probe failed) — "
+                       f"refusing to spawn or kill next to a possible supervisor; "
+                       f"check `launchctl print gui/$(id -u)/com.sutando.{name}` and re-run")
+    if verdict == "supervised":
         try:
             r = subprocess.run(
                 ["/bin/launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
@@ -3661,10 +3728,12 @@ def _restart_bridge(name: str, *, stale: bool = False) -> "tuple[bool, str]":
                 return True, f"restarted through launchd supervisor ({label}, kickstart -k)"
         except (subprocess.TimeoutExpired, OSError):
             pass
-        if _kill_bridge_pids(name):
-            return True, f"killed supervised child; {label}'s keepalive respawns it on current code"
-        return False, (f"supervised by {label} but kickstart failed and no child found — "
-                       f"not hand-spawning alongside a supervisor; run "
+        if _kill_supervised_child(name):
+            return True, (f"killed {label}'s own child (confirmed exited); "
+                          f"its keepalive respawns it on current code")
+        return False, (f"supervised by {label} but kickstart failed and its child could "
+                       f"not be identified and confirmed dead — not hand-spawning "
+                       f"alongside a supervisor; run "
                        f"`launchctl kickstart -k gui/$(id -u)/{label}` manually")
     # Plan BEFORE any kill: killing a working stale bridge with no viable
     # relaunch turns a warning into an outage.
@@ -3672,9 +3741,9 @@ def _restart_bridge(name: str, *, stale: bool = False) -> "tuple[bool, str]":
     if plan is None:
         return False, "no capable interpreter/env — restart skipped (see startup.sh launch requirements)"
     if stale:
-        _kill_bridge_pids(name)
+        _evict_own_stale_bridge(name)
     if _launch_bridge(name, plan):
-        return True, "spawned directly (no supervisor present)"
+        return True, "spawned directly (supervision conclusively absent)"
     return False, "spawn failed"
 
 
