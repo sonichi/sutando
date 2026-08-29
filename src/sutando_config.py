@@ -75,6 +75,7 @@ _OBJECT_TOP_LEVEL_KEYS = {
     "env",
     "health_check",
     "bridges",
+    "delivery",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
