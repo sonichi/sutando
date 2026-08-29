@@ -112,7 +112,9 @@ class LocalCorePidsComeFromTmuxNotTheSyncedHeartbeats(unittest.TestCase):
             for line in text.splitlines():
                 parts = line.split()
                 if len(parts) == 2 and parts[1].isdigit():
-                    argv[parts[1]] = "claude --name sutando-core --dangerously-skip-permissions"
+                    # A launcher names the session it started; a fixture that
+                    # hardcodes one session cannot represent a renamed core.
+                    argv[parts[1]] = f"claude --name {parts[0]} --dangerously-skip-permissions"
         argv.update(panes_argv or {})
         hc._ps_snapshot = lambda: "\n".join(f"{k} 1 {v}" for k, v in argv.items()) + "\n"
         return hc
@@ -392,19 +394,27 @@ class APaneIsACoreOnlyIfItRunsACoreRuntime(unittest.TestCase):
                                    "600": "-zsh"})
         self.assertEqual(hc._local_core_pids(), {"500"})
 
-    def test_a_pool_follower_carries_no_name_flag_and_is_still_a_core(self):
-        """Measured on a live 4-core host: 1 of 5 core panes carried `--name`.
-        Gating on it drops every pool pane and restores `stop the rest`."""
+    def test_a_pool_follower_has_no_launcher_identity_and_is_unverified(self):
+        """A pool pane carries no launcher-authored identity ON THIS BASE, so it
+        is unverified — NOT owned. The predicate this replaces accepted it on the
+        `claude` basename alone, which also accepted an ordinary `--resume`
+        sibling (keweichen, #3328).
+
+        This is safe, and the earlier claim that it "restores stop the rest" is
+        wrong: unverified roots are named in neither the orphaned group nor the
+        stop instruction (see the mirror control below)."""
         hc = self._mod(0, "core-1 74927\n", panes_argv={
             "74927": "/opt/homebrew/bin/claude --dangerously-skip-permissions "
                      "--add-dir /w -- /proactive-loop-pool"})
-        self.assertEqual(hc._local_core_pids(), {"74927"})
+        self.assertEqual(hc._local_core_pids(), set())
 
-    def test_a_codex_core_pane_is_a_core(self):
-        """A Codex core is a node script, not a `claude` process at all."""
+    def test_a_codex_core_pane_is_unverified_not_owned(self):
+        """A Codex core is a node script with no `--name`, so it cannot assert
+        launcher identity either. Unverified is the honest classification: no
+        launcher that could stamp one exists on this base."""
         hc = self._mod(0, "core-4 80059\n", panes_argv={
             "80059": "node /Users/x/.local/bin/codex -C /repo --sandbox danger-full-access"})
-        self.assertEqual(hc._local_core_pids(), {"80059"})
+        self.assertEqual(hc._local_core_pids(), set())
 
     def test_a_pane_with_no_ps_row_is_not_a_core(self):
         hc = self._mod(0, "core-1 3951\n", panes_argv={"3951": ""})
@@ -454,6 +464,30 @@ class TheSiblingPaneMirrorControl(unittest.TestCase):
         self.assertEqual(g["session-owned"], {"100"})
         self.assertEqual(g["unverified"], {"200"})
         self.assertNotIn("_sentinel_restamp_pid", v)
+
+    def test_a_runtime_sibling_without_launcher_identity_is_unverified(self):
+        """THE REPORTED BLOCKER (keweichen, #3328 02:30Z). The sibling is a real
+        `claude` process, so a runtime-BASENAME predicate calls it a core and
+        blesses the watcher it parents. Only launcher-authored identity separates
+        them: this pane never passed `--name <session>`.
+
+        The consequence is not cosmetic — Sutando.app runs health-check `--fix`
+        at startup and every 30 min, so a blessed duplicate also gets the
+        sentinel re-stamped onto its pid. Hence the `_sentinel_restamp_pid`
+        assertion: unverified must earn no repair."""
+        v = self._run("claude --resume user-work")
+        g = _groups(v["detail"])
+        self.assertEqual(g["session-owned"], {"100"}, v["detail"])
+        self.assertEqual(g["unverified"], {"200"}, v["detail"])
+        self.assertNotIn("_sentinel_restamp_pid", v)
+
+    def test_a_prefixed_session_name_does_not_satisfy_identity(self):
+        """`--name sutando-core-watcher` must not satisfy session `sutando-core`.
+        Substring matching was a live false-healthy path once already (#2488),
+        which is why the exact-match policy has one owner and this delegates."""
+        g = _groups(self._run("claude --name sutando-core-watcher")["detail"])
+        self.assertEqual(g["session-owned"], {"100"})
+        self.assertEqual(g["unverified"], {"200"})
 
     def test_the_control_discriminates(self):
         """Change ONLY the sibling pane's process into a real core runtime and

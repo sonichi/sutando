@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
+from core_heartbeat import _argv_names_session  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
@@ -6850,33 +6851,31 @@ def _is_core_session(name: str) -> bool:
     return name == main or bool(_POOL_SESSION_RE.match(name))
 
 
-#: What a Sutando launcher hands tmux as the pane command: the Claude runtime
-#: (`claude ...`) or the Codex runtime, whose CLI is a node script (`node .../codex`).
-_CORE_RUNTIME_NAMES = ("claude", "codex")
+def _is_core_launcher_argv(argv: str, session: str) -> bool:
+    """True iff this pane's ROOT argv carries identity a LAUNCHER authored.
 
+    A runtime BASENAME is not identity. `claude --resume user-work`, preserved
+    as a sibling inside the canonical session by the G10 heal, is a `claude`
+    process too — and accepting it conferred core ownership on any watcher it
+    parented, blessing a hand-started duplicate and handing it a sentinel
+    re-stamp (review-caught, keweichen on #3328).
 
-def _is_core_runtime_argv(argv: str) -> bool:
-    """True iff this pane process is a runtime a core launcher started.
+    Exact-match policy has ONE owner: `core_heartbeat._argv_names_session`,
+    already hardened so `--name sutando-core` does not match the prefixed
+    sibling session `sutando-core-watcher`.
 
-    This is the pane's own ROOT argv, not its FOREGROUND command — the two are
-    different processes, and `core_heartbeat.core_pid()` forbids only the latter
-    (a healthy core mid-tool shows bash/python3/node as the foreground). Both
-    launchers exec the runtime directly as the pane command, and that argv does
-    not change while the agent runs a tool.
-
-    Deliberately NOT `--name <session>`: only the main core carries it. Measured
-    on a live 4-core host, 1 of 5 core panes matched it, because pool followers
-    launch as `claude ... -- /proactive-loop-pool` and a Codex core is not a
-    `claude` process at all. Gating on it would drop every pool pane and hand
-    back the "stop the rest" verdict this probe exists to remove.
+    What this deliberately does NOT verify, and why that is safe: no launcher
+    that starts a `core-<N>` pool pane exists on this base (`git grep -l
+    proactive-loop-pool` -> 0; `scripts/pool-core-wrapper.sh` absent from
+    origin/main and from this head — it ships with the unmerged pool series and
+    is staged to ~/.sutando/bin at install). A Codex core carries no `--name`
+    either. Both therefore fall to `unverified`, which is neither stopped nor
+    re-stamped: the caller gates its affirmative verdict on `not orphaned and
+    not unverified` and its fallback names ONLY the ownerless roots. That is a
+    strictly safer degradation than the pre-fix verdict this probe removes,
+    which named every extra root as "stop the rest".
     """
-    toks = argv.split()
-    if not toks:
-        return False
-    if os.path.basename(toks[0]) in _CORE_RUNTIME_NAMES:
-        return True
-    return (os.path.basename(toks[0]) == "node" and len(toks) > 1
-            and os.path.basename(toks[1]) in _CORE_RUNTIME_NAMES)
+    return _argv_names_session(argv, session)
 
 
 def _argv_by_pid(ps_out: "str | None") -> "dict | None":
@@ -6896,7 +6895,7 @@ def _argv_by_pid(ps_out: "str | None") -> "dict | None":
 
 
 def _core_pane_pids(stdout: str, argv_by_pid: dict) -> set:
-    """Core-session pane pids that are actually RUNNING a core runtime.
+    """Core-session pane pids whose argv carries LAUNCHER-authored identity.
 
     The session name alone is not ownership. The Claude launcher deliberately
     PRESERVES sibling windows inside the core session when the core window dies
@@ -6909,7 +6908,7 @@ def _core_pane_pids(stdout: str, argv_by_pid: dict) -> set:
     for line in stdout.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[1].isdigit() and _is_core_session(parts[0]):
-            if _is_core_runtime_argv(argv_by_pid.get(parts[1], "")):
+            if _is_core_launcher_argv(argv_by_pid.get(parts[1], ""), parts[0]):
                 pids.add(parts[1])
     return pids
 
