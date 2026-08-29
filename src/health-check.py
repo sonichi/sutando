@@ -3724,6 +3724,10 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
 def _apply_pin_verdict(check, results, status, detail):
     """Set the verdict AND carry the armed veto. Setting status/detail alone
     leaves the remedy unenforced at the --fix action boundary."""
+    others = process_pins.other_notes(results)
+    if others and others not in detail:
+        # A lost pin is a finding; the caller's verdict must not swallow it.
+        detail = f"{detail}{others}"
     check["status"], check["detail"] = status, detail
     armed = process_pins.armed_detail(results)
     if armed:
@@ -9029,13 +9033,21 @@ def check_credential_proxy() -> dict:
                          if _process_executes_artifact(artifact, "credential-proxy")
                          else None),
         )
+    # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
+    # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
+    _, _pls = _proc_lstarts("credential-proxy")
+    _pin_results = _pin_verdicts("credential-proxy", _pls)
     if not check.get("restart_veto"):
         # A HEALTHY pinned proxy reaches no staleness arm, so nothing else sets
         # the field the remedy text and the --fix boundary both key on.
-        _, _pls = _proc_lstarts("credential-proxy")
-        _armed = process_pins.armed_detail(_pin_verdicts("credential-proxy", _pls))
+        _armed = process_pins.armed_detail(_pin_results)
         if _armed:
             check["restart_veto"] = _armed
+    _others = process_pins.other_notes(_pin_results)
+    if _others and _others not in str(check.get("detail") or ""):
+        check["detail"] = f"{check.get('detail') or ''}{_others}".strip()
+        if check["status"] == "ok":
+            check["status"] = "warn"
     return check
 MENUBAR_LABEL = "com.sutando.menubar"
 MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
@@ -9330,6 +9342,7 @@ def run_all_checks() -> list[dict]:
         # witness whichever diagnostic prescribed it.
         ps_out = ""
         pin_armed = None
+        pin_results = []
         bridge_veto = None
         try:
             ps_out = subprocess.run(
@@ -9337,8 +9350,8 @@ def run_all_checks() -> list[dict]:
                 capture_output=True, text=True, timeout=5
             ).stdout.strip()
             if ps_out:
-                pin_armed = process_pins.armed_detail(
-                    _pin_verdicts(name, {pids[0]: ps_out}))
+                pin_results = _pin_verdicts(name, {pids[0]: ps_out})
+                pin_armed = process_pins.armed_detail(pin_results)
         except (subprocess.TimeoutExpired, OSError):
             pass
 
@@ -9437,6 +9450,13 @@ def run_all_checks() -> list[dict]:
             except OSError:
                 pass
 
+        # Non-ARMED pin findings survive every later check: an orphaned pin
+        # means the protected process is gone, and silence would discard that.
+        _pin_others = process_pins.other_notes(pin_results)
+        if _pin_others and _pin_others not in detail:
+            detail = f"{detail}{_pin_others}"
+            if status == "ok":
+                status = "warn"
         _bridge_row = {"name": name, "status": status, "detail": detail}
         if bridge_veto:
             _bridge_row["restart_veto"] = bridge_veto

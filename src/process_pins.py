@@ -28,6 +28,7 @@ adapter that already resolves the workspace stays the one that decides. Shape:
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,6 +36,12 @@ ARMED = "armed"
 EXPIRED = "expired"
 MISMATCH = "mismatch"
 ORPHAN = "orphan"
+
+# Writer contract: schema = _REQUIRED string fields; bounds = MAX_PINS /
+# _FIELD_MAX; atomicity = temp + os.replace; writers raise, only the READER fails open.
+MAX_PINS = 32
+_FIELD_MAX = 500
+_REQUIRED = ("service", "pid", "lstart", "reason", "expires_at")
 
 
 def load_pins(path) -> list:
@@ -49,6 +56,69 @@ def load_pins(path) -> list:
         return []
     pins = data.get("pins") if isinstance(data, dict) else None
     return [p for p in pins if isinstance(p, dict)] if isinstance(pins, list) else []
+
+
+def _validated(pin) -> dict:
+    """One pin, normalized to the documented shape. Raises ValueError."""
+    if not isinstance(pin, dict):
+        raise ValueError(f"pin must be a dict, got {type(pin).__name__}")
+    out = {}
+    for key in _REQUIRED:
+        val = str(pin.get(key) or "").strip()
+        if not val:
+            raise ValueError(f"pin missing required field {key!r}")
+        if len(val) > _FIELD_MAX:
+            raise ValueError(f"pin field {key!r} exceeds {_FIELD_MAX} chars")
+        out[key] = val
+    out["pid"] = str(int(out["pid"]))
+    dt = datetime.fromisoformat(out["expires_at"].replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise ValueError("expires_at must carry a timezone")
+    return out
+
+
+def save_pins(path, pins: list) -> None:
+    """Validated, bounded, ATOMIC snapshot write.
+
+    Same-directory temp + os.replace, so a concurrent load_pins() observes
+    only the complete old or complete new snapshot — never a truncated
+    intermediate, which the fail-open reader would translate into "no pins"
+    and hand the restart prescription back the veto it was suppressing.
+    """
+    if len(pins) > MAX_PINS:
+        raise ValueError(f"{len(pins)} pins exceeds the bound of {MAX_PINS}")
+    payload = json.dumps({"pins": [_validated(p) for p in pins]}, indent=1)
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}")
+    try:
+        tmp.write_text(payload)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def arm_pin(path, service, pid, lstart, reason, expires_at) -> dict:
+    """The supported arm/extend entry point. Replaces any pin with the same
+    (service, pid) identity, keeps the rest, writes through save_pins()."""
+    pin = _validated({"service": service, "pid": pid, "lstart": lstart,
+                      "reason": reason, "expires_at": expires_at})
+    keep = [p for p in load_pins(path)
+            if not (str(p.get("service") or "") == pin["service"]
+                    and str(p.get("pid") or "") == pin["pid"])]
+    save_pins(path, keep + [pin])
+    return pin
+
+
+def release_pin(path, service, pid=None) -> int:
+    """The supported release entry point. Returns how many pins it removed."""
+    pins = load_pins(path)
+    keep = [p for p in pins
+            if not (str(p.get("service") or "") == str(service)
+                    and (pid is None or str(p.get("pid") or "") == str(pid)))]
+    if len(keep) != len(pins):
+        save_pins(path, keep)
+    return len(pins) - len(keep)
 
 
 def _expired(pin: dict, now_ts: float) -> bool:
