@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-os.environ.setdefault("CLAUDE_CONFIG_DIR", tempfile.mkdtemp(prefix="ccd-bridge-probe-"))
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-bridge-probe-")
 _ccd = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
 _ccd.mkdir(parents=True, exist_ok=True)
 (_ccd / "access.json").write_text("{}")
