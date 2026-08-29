@@ -128,6 +128,8 @@ PRIOR_ART_SHOWN = 8
 
 def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
     """Render prior art so "nothing there" can never read as "unchecked"."""
+    # Order is load-bearing: None is falsy, so a truthiness test first would
+    # render COULD NOT CHECK as "nothing" — silently, and identically to a clean thread.
     if seen is None:
         return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — gh is unavailable or",
                 "the call failed. Read the thread yourself: an unchecked thread is not an",
