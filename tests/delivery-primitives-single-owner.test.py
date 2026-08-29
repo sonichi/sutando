@@ -327,13 +327,18 @@ def _resolve_from(path, node):
     return ".".join(base + ((mod,) if mod else ()))
 
 
+# The owner package's own home. A substring test would exempt any nested
+# src/**/delivery_core/, letting a new adapter opt itself out of the ratchet.
+DELIVERY_CORE_HOME = "packages/ag2-sparrow/ag2_sparrow/delivery_core/"
+
+
 def scan_backend_module_imports(sources: dict) -> list[str]:
-    """Module ratchet: outside delivery_core, importing a concrete backend
+    """Module ratchet: outside the owner package, importing a concrete backend
     module OR holding the facade as a module object fails closed — getattr
     needs a module object, and names must arrive by from-import instead."""
     out = []
     for path, text in sources.items():
-        if "/delivery_core/" in path:
+        if path.startswith(DELIVERY_CORE_HOME):
             continue
         try:
             tree = ast.parse(text, filename=path)
@@ -421,6 +426,19 @@ mutated17[_db] = prod_sources[_db] + (
     "\n\nimport ag2_sparrow.delivery_core_backend_adapter_x as bax  # noqa\n")
 mv17 = [v for v in scan_backend_module_imports(mutated17) if "backend_adapter" in v]
 check(not mv17, "sibling-name module is NOT a false positive (path components)")
+
+# the exemption is the package HOME, not any path containing delivery_core:
+# a nested src/**/delivery_core/ must NOT be able to opt out of the ratchet
+_nested = "src/observability/delivery_core/adapter.py"
+mutated18 = dict(prod_sources)
+mutated18[_nested] = "import ag2_sparrow.delivery_core as dcn  # noqa\n"
+mv18 = scan_backend_module_imports(mutated18)
+check(any(_nested in v and "facade module" in v for v in mv18),
+      "nested src/**/delivery_core/ does NOT escape the module ratchet")
+check(not scan_backend_module_imports(
+          {DELIVERY_CORE_HOME + "adapter.py":
+           "import ag2_sparrow.delivery_core as dch  # noqa\n"}),
+      "the owner package's own home is still exempt (no false positive)")
 
 # ── vendored twins are byte-identical (drift = a second implementation) ────
 for name in ("outbox.py", "outbox_adapter.py", "result_markers.py"):
