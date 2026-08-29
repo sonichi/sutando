@@ -224,10 +224,8 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
         # Anchor on noon: midnight can be skipped or repeated by a DST shift.
         noon = time.mktime((y, mo, d, 12, 0, 0, 0, 0, -1))
         if _day_matches(dom_f, month_f, dow_f, time.localtime(noon)):
-            # A rollback wider than one hour moves an elapsed epoch into a
-            # later wall-clock hour, so batch a bounded window and sort it.
-            # Pay the widened scan only near a real transition: away from one
-            # the offset is stable, so wall-clock order IS epoch order.
+            # A >1h rollback breaks the wall-clock==epoch order this scan
+            # assumed; widen and sort only near a real transition.
             folded = (time.localtime(now_epoch).tm_gmtoff
                       != time.localtime(now_epoch - FOLD_LOOKAHEAD_HOURS * 3600).tm_gmtoff)
             lookahead = FOLD_LOOKAHEAD_HOURS if folded else 0

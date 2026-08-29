@@ -56,9 +56,11 @@ def reference_period(expr, now_epoch, window=3 * 86400):
     return None
 
 
-EXPR = "30 0,2 * * *"          # non-uniform: dropping a fire CHANGES the period
-FOLD_NOW = 1761442200          # 2025-10-26 01:30 +0000, after Troll's 2h rollback
-ORDINARY_NOW = 1763170200      # 2025-11-15 01:30 +0000, same zone, no transition
+# Non-uniform hours: dropping the swallowed fire CHANGES the period, which a
+# uniform schedule would hide. Epochs are Troll-local 01:30 +0000, fold and not.
+EXPR = "30 0,2 * * *"
+FOLD_NOW = 1761442200
+ORDINARY_NOW = 1763170200
 
 _tz_prev = os.environ.get("TZ")
 try:
