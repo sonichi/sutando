@@ -154,10 +154,12 @@ with tempfile.TemporaryDirectory() as d:
     st = Path(d) / "idle-streak.json"
 
     def outcome(kind):
-        p = subprocess.run([sys.executable, str(SCRIPT), "--state", str(st),
-                            "--pass-outcome", kind],
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
-        return p.stdout.strip(), p.returncode
+        """In-process, for the same reason `run()` above is: a subprocess runs
+        the production code where coverage cannot see it."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ish.main(["--state", str(st), "--pass-outcome", kind])
+        return buf.getvalue().strip(), rc
 
     out, rc = outcome("noop")
     check("a no-op pass records without a held-list on stdin",
@@ -206,13 +208,19 @@ with tempfile.TemporaryDirectory() as d:
           "BLOCKED on stdin.read()" if hung else out)
 
     # It ignores --items rather than half-doing both, so the mode is unambiguous.
-    p2 = subprocess.run([sys.executable, str(SCRIPT), "--state", str(st),
-                         "--items", json.dumps(BASE), "--pass-outcome", "substantive"],
-                        capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc2 = ish.main(["--state", str(st), "--items", json.dumps(BASE),
+                        "--pass-outcome", "substantive"])
     check("record-only ignores --items and prints the outcome, not a hash",
-          p2.returncode == 0 and p2.stdout.strip().startswith("substantive"), p2.stdout)
+          rc2 == 0 and buf.getvalue().strip().startswith("substantive"), buf.getvalue())
     check("...and leaves last_surfaced_hash untouched",
           "last_surfaced_hash" not in json.loads(st.read_text()), st.read_text())
+
+    # record_outcome directly: the lock/unlock path, not reached via main()'s print.
+    doc = ish.record_outcome(st, "noop")
+    check("record_outcome returns the doc it persisted",
+          doc["streak"] == 1 and doc == json.loads(st.read_text()), doc)
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
