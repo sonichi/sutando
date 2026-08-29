@@ -308,6 +308,22 @@ checks:
       - 'nohup.out'
 
   hardcoded-paths:
+    # Files matching these globs get a narrower exemption, not blanket exclusion
+    # (checked against the WHOLE path, matched full-diff-line via fnmatch, so
+    # '*.patch' also matches a nested path like 'skills/x/y.patch'). Within a
+    # match, only a line whose SECOND character (the nested diff's own syntax)
+    # is '-' is skipped — a stored .patch/.diff's own removal line reads as an
+    # ADDED line in the outer PR diff, and that second character distinguishes
+    # it from a real hardcoded path without inspecting content. An inner
+    # addition or inner-context line stays in scope, since that's what a
+    # re-applied patch (skills/plugin-patches/) actually introduces. Omitting
+    # the key uses these defaults rather than disabling the exemption. Mirrors
+    # the analogous glob under root-artifacts above, which lists the same two
+    # extensions for the same underlying reason (a stored patch's own diff
+    # syntax is not code to police).
+    skip_glob:
+      - '*.patch'
+      - '*.diff'
     # Added lines containing any of these substrings are flagged as errors...
     flag:
       - '/Users/'
