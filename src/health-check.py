@@ -3516,15 +3516,16 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
             continue
 
 
-        # #2905 moved the spawn behind the shared launch policy; this PR's
-        # contribution is the decision ABOVE it, so defer rather than keep a copy.
-        if _launch_bridge(name):
+        # Restart policy (supervision decision + spawn) lives in _restart_bridge;
+        # this loop owns only down-detection and alerting.
+        ok, how = _restart_bridge(name)
+        if ok:
             restarted.append(name)
-            _alert(f"♻️ health-check auto-restarted **{name}** (was down). "
+            _alert(f"♻️ health-check auto-restarted **{name}** (was down; {how}). "
                    f"If this repeats, it's crash-looping — check logs/{name}.log.")
         else:
             _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted "
-                   f"(no launch plan — see _bridge_launch_plan). Start it via startup.sh.")
+                   f"({how}). Start it via startup.sh.")
     return restarted
 
 
@@ -3581,6 +3582,100 @@ def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
                          stdout=log_f, stderr=subprocess.STDOUT,
                          env=child_env, start_new_session=True)
     return True
+
+
+# Resident supervisor wrapper per channel bridge, for hosts where launchctl
+# cannot answer. The gateway wrapper execs, so launchd is its only witness.
+_BRIDGE_WRAPPER_PGREP = {
+    "telegram-bridge": r"channel-bridge-wrapper\.sh telegram$",
+    "discord-bridge": r"channel-bridge-wrapper\.sh discord$",
+    "slack-bridge": r"channel-bridge-wrapper\.sh slack$",
+}
+
+
+def _bridge_supervisor(name: str) -> "str | None":
+    """The launchd label supervising `name` (com.sutando.<name>), or None.
+
+    A REGISTERED job counts even when its state is not "running": launchd owns
+    the bridge's lifecycle either way, and a restart must go through it. The
+    wrapper-process fallback covers a live supervisor that `launchctl print`
+    cannot see (probe failure, or a job bootstrapped under another domain).
+    """
+    label = f"com.sutando.{name}"
+    try:
+        probe = subprocess.run(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=10)
+        if probe.returncode == 0:
+            return label
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    pattern = _BRIDGE_WRAPPER_PGREP.get(name)
+    if pattern:
+        try:
+            pg = subprocess.run(["/usr/bin/pgrep", "-f", pattern],
+                                capture_output=True, text=True, timeout=10)
+            if pg.returncode == 0 and pg.stdout.strip():
+                return label
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    return None
+
+
+def _kill_bridge_pids(name: str) -> bool:
+    """TERM every live <name>.py process; True if any was found.
+
+    Anchored `\\.py$` to stay consistent with the detect path — a bare name
+    also matches grep pipelines whose command line contains the bridge name.
+    """
+    try:
+        out = subprocess.run(["/usr/bin/pgrep", "-f", f"{name}\\.py$"],
+                             capture_output=True, text=True, timeout=10).stdout
+        pids = [p for p in out.strip().split("\n") if p]
+        for pid in pids:
+            subprocess.run(["/bin/kill", pid], check=False)
+        if pids:
+            time.sleep(1)
+        return bool(pids)
+    except Exception:  # noqa: BLE001 — a failed kill must not abort the restart decision
+        return False
+
+
+def _restart_bridge(name: str, *, stale: bool = False) -> "tuple[bool, str]":
+    """Single supervision-aware owner of every bridge restart (down and stale).
+
+    A supervised bridge restarts THROUGH its supervisor — `kickstart -k`, else
+    kill the supervised child so the wrapper's keepalive respawns it onto the
+    code now on disk — and is NEVER spawned directly: a hand-spawned bridge
+    (ppid 1) takes the singleton lock, and every keepalive respawn then loses
+    it seconds later, forever, one owner alert per cycle. A direct spawn is
+    only allowed when no supervisor exists. Returns (restarted, how).
+    """
+    label = _bridge_supervisor(name)
+    if label is not None:
+        try:
+            r = subprocess.run(
+                ["/bin/launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+                capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return True, f"restarted through launchd supervisor ({label}, kickstart -k)"
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        if _kill_bridge_pids(name):
+            return True, f"killed supervised child; {label}'s keepalive respawns it on current code"
+        return False, (f"supervised by {label} but kickstart failed and no child found — "
+                       f"not hand-spawning alongside a supervisor; run "
+                       f"`launchctl kickstart -k gui/$(id -u)/{label}` manually")
+    # Plan BEFORE any kill: killing a working stale bridge with no viable
+    # relaunch turns a warning into an outage.
+    plan = _bridge_launch_plan(name)
+    if plan is None:
+        return False, "no capable interpreter/env — restart skipped (see startup.sh launch requirements)"
+    if stale:
+        _kill_bridge_pids(name)
+    if _launch_bridge(name, plan):
+        return True, "spawned directly (no supervisor present)"
+    return False, "spawn failed"
 
 
 # Interpreter candidates, in the same priority order startup.sh probes. First
@@ -11372,37 +11467,13 @@ def main():
                     if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):
                         print(f"  {c['name']}: token invalid — regenerate at discord.com/developers/applications (no restart)")
                     else:
-                        # Plan BEFORE any kill: killing a working stale bridge
-                        # with no viable relaunch turns a warning into an outage.
-                        plan = _bridge_launch_plan(c["name"])
-                        if plan is None:
-                            print(f"  {c['name']}: no capable interpreter/env — restart skipped (see startup.sh launch requirements)")
-                            continue
-                        # If stale (process older than source code), kill old PID first
-                        # so the new process doesn't conflict with a still-running zombie.
-                        if c["status"] == "stale":
-                            try:
-                                # Anchor to `\.py$` to match the detect path at
-                                # line ~277. Without this, a bare `pgrep -f
-                                # discord-bridge` also catches grep pipelines
-                                # and shell invocations whose command line
-                                # contains the bridge name, and we'd kill them
-                                # instead of (or in addition to) the real
-                                # bridge process. PR #243 fixed the detect
-                                # side; this keeps the kill side consistent.
-                                old_pids = subprocess.run(
-                                    ["/usr/bin/pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
-                                ).stdout.strip().split("\n")
-                                for pid in old_pids:
-                                    if pid:
-                                        subprocess.run(["/bin/kill", pid], check=False)
-                                import time as _t; _t.sleep(1)
-                            except Exception:
-                                pass
-                        # Shared launch policy — a bare sys.executable spawn
-                        # crash-loops on missing imports.
-                        _launch_bridge(c["name"], plan)
-                        print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                        # Supervision decision, plan-before-kill, and the spawn
+                        # all live in _restart_bridge — the shared restart owner.
+                        ok, how = _restart_bridge(
+                            c["name"], stale=(c["status"] == "stale"))
+                        verdict = ("restarted (stale code)" if ok and c["status"] == "stale"
+                                   else "restarted" if ok else "NOT restarted")
+                        print(f"  {c['name']}: {verdict} — {how}")
                 elif c["name"] == "sutando-app":
                     # Two distinct failure modes:
                     #   1. status="warn" + detail="not running …" → binary may
