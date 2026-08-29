@@ -13,6 +13,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -183,16 +184,35 @@ with tempfile.TemporaryDirectory() as d:
     check("20 concurrent recorders lose no increments (the lock earns its place)",
           got == 20, f"noop_total={got}, expected 20")
 
-# the hash path still works when an outcome rides along with a held-list
+# --pass-outcome is record-only and must return BEFORE touching stdin: under
+# cron stdin is an open pipe nobody writes, and a read there never returns.
 with tempfile.TemporaryDirectory() as d:
     st = Path(d) / "s.json"
-    p = subprocess.run([sys.executable, str(SCRIPT), "--state", str(st),
-                        "--items", json.dumps(BASE), "--pass-outcome", "substantive"],
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    check("a held-list and an outcome in one call still print the hash verdict",
-          p.returncode == 0 and p.stdout.strip().startswith("post"), p.stdout)
-    check("...and record the outcome alongside it",
-          json.loads(st.read_text()).get("substantive_total") == 1, st.read_text())
+    r, w = os.pipe()                      # open, silent, NOT closed
+    p = subprocess.Popen([sys.executable, str(SCRIPT), "--state", str(st),
+                          "--pass-outcome", "noop"],
+                         stdin=r, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True)
+    os.close(r)
+    try:
+        out, _ = p.communicate(timeout=10)
+        hung = False
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, hung = "", True
+    os.close(w)
+    check("record-only does not block on an open, silent stdin pipe",
+          not hung and p.returncode == 0 and "noop_total=1" in out,
+          "BLOCKED on stdin.read()" if hung else out)
+
+    # It ignores --items rather than half-doing both, so the mode is unambiguous.
+    p2 = subprocess.run([sys.executable, str(SCRIPT), "--state", str(st),
+                         "--items", json.dumps(BASE), "--pass-outcome", "substantive"],
+                        capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    check("record-only ignores --items and prints the outcome, not a hash",
+          p2.returncode == 0 and p2.stdout.strip().startswith("substantive"), p2.stdout)
+    check("...and leaves last_surfaced_hash untouched",
+          "last_surfaced_hash" not in json.loads(st.read_text()), st.read_text())
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

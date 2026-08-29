@@ -118,22 +118,20 @@ def main(argv=None) -> int:
                     help="record the hash when it differs")
     ap.add_argument("--items", help="JSON held-list; default reads stdin")
     ap.add_argument("--pass-outcome", choices=("substantive", "noop"),
-                    help="record this pass and return; maintains streak + totals")
+                    help="RECORD-ONLY: maintain streak + totals and exit; "
+                         "reads no stdin and ignores --items")
     a = ap.parse_args(argv)
 
-    # Keyed on input ARRIVING, not isatty(): under cron stdin is a pipe even
-    # when nothing is sent, and an isatty() gate would block on that read.
-    raw = a.items if a.items is not None else (
-        "" if sys.stdin.isatty() else sys.stdin.read())
-
-    # A substantive pass has no held-list, and the counters must still move.
-    if a.pass_outcome and not raw.strip():
+    # Record-only, and it must return BEFORE any stdin access: under cron stdin
+    # is an open pipe that is never written, so a read here blocks forever.
+    if a.pass_outcome:
         doc = record_outcome(Path(a.state), a.pass_outcome)
         print(f"{a.pass_outcome} streak={doc['streak']} "
               f"noop_total={doc.get('noop_total', 0)} "
               f"substantive_total={doc.get('substantive_total', 0)}")
         return 0
 
+    raw = a.items if a.items is not None else sys.stdin.read()
     try:
         items = json.loads(raw)
     except ValueError as e:
@@ -156,8 +154,6 @@ def main(argv=None) -> int:
         doc["last_surfaced_hash"] = h
         doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         write_state(path, doc)
-    if a.pass_outcome:
-        record_outcome(path, a.pass_outcome)
     print(f"{'post' if changed else 'quiet'} {h}")
     return 0
 
