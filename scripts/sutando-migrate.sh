@@ -406,16 +406,15 @@ mtime_ns() {
     printf '%s%s\n' "$sec" "${frac:0:9}"
 }
 
-# Check inflight age — returns 0 if file is older than guard
+# Check inflight age — 0: older than guard, 1: young (in-flight),
+# 2: mtime unavailable. A miss is NOT "young": callers must refuse, not classify.
 age_safe() {
     local file="$1"
     local now mtime age
     now="$(date +%s)"
-    # Unknown mtime is not "infinitely old": with mtime=0 the age is ~now, which
-    # clears any guard and declares an unreadable file safe to migrate.
-    mtime="$(_stat_field mtime "$file")" || return 1
+    mtime="$(_stat_field mtime "$file")" || return 2
     age=$((now - mtime))
-    [ "$age" -ge "$INFLIGHT_GUARD_SEC" ]
+    [ "$age" -ge "$INFLIGHT_GUARD_SEC" ] || return 1
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -450,7 +449,7 @@ scan_source() {
     # Walk every non-ignored regular file under src.
     local file rel cls dest_path collision_kind="" size mtime_iso
     local n_structural=0 n_append=0 n_newest=0 n_rehome=0 n_skip=0 n_inflight=0 n_collision=0 n_unknown=0 n_quarantine=0 n_union=0
-    local bytes_total=0
+    local bytes_total=0 n_size_unknown=0 n_mtime_unknown=0 _age_rc=0
 
     REPORT_LINES+=("")
     REPORT_LINES+=("--- Source $tag — $src ---")
@@ -554,7 +553,8 @@ scan_source() {
         esac
 
         cls="$(classify "$rel")"
-        size="$(_stat_field size "$file")" || size=0   # report only
+        # An unavailable size must not print as a measured 0 — count it instead.
+        size="$(_stat_field size "$file")" || { size=0; n_size_unknown=$((n_size_unknown+1)); }
         bytes_total=$((bytes_total + size))
 
         # Index for cross-source collision detection (only classes that
@@ -637,11 +637,14 @@ scan_source() {
                 fi
                 ;;
             inflight-guard)
-                if age_safe "$file"; then
+                _age_rc=0; age_safe "$file" || _age_rc=$?
+                if [ "$_age_rc" = "0" ]; then
                     # Old in-flight artifact — treat as archive
                     n_structural=$((n_structural+1))
-                else
+                elif [ "$_age_rc" = "1" ]; then
                     n_inflight=$((n_inflight+1))
+                else
+                    n_mtime_unknown=$((n_mtime_unknown+1))
                 fi
                 ;;
             skip-ephemeral|skip-unknown)
@@ -664,7 +667,12 @@ scan_source() {
     REPORT_LINES+=("    in-flight-skip (<${INFLIGHT_GUARD_SEC}s old):       $n_inflight")
     REPORT_LINES+=("    skip-ephemeral / .DS_Store / .gitkeep:$n_skip")
     REPORT_LINES+=("    unknown (no rule matched, will skip): $n_unknown")
-    REPORT_LINES+=("    total bytes:                          $(numfmt --to=iec "$bytes_total" 2>/dev/null || echo "$bytes_total")")
+    [ "$n_mtime_unknown" -gt 0 ] && REPORT_LINES+=("    mtime UNAVAILABLE (in-flight class, commit will refuse): $n_mtime_unknown")
+    if [ "$n_size_unknown" -gt 0 ]; then
+        REPORT_LINES+=("    total bytes (>= — $n_size_unknown file(s) of unknown size not counted): $(numfmt --to=iec "$bytes_total" 2>/dev/null || echo "$bytes_total")")
+    else
+        REPORT_LINES+=("    total bytes:                          $(numfmt --to=iec "$bytes_total" 2>/dev/null || echo "$bytes_total")")
+    fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1543,14 +1551,20 @@ commit_one() {
             # double-process old work). Route to tasks/archive/<src-tag>/ or
             # results/archive/<src-tag>/ instead. Bug discovered when a stale
             # May 22 task migrated from B fired the watcher post-test.
-            if age_safe "$src_file"; then
+            local _age_rc=0; age_safe "$src_file" || _age_rc=$?
+            if [ "$_age_rc" = "0" ]; then
                 local subdir="${rel%%/*}"  # tasks or results
                 local file_base="${rel#*/}" # task-*.txt
                 dst_path="$DEST_REAL/$subdir/archive/$tag/$file_base"
                 commit_copy "$src_file" "$dst_path" "$rel" || return 1
                 echo "archived-stale"
-            else
+            elif [ "$_age_rc" = "1" ]; then
                 echo "skipped-inflight"
+            else
+                # An unreadable mtime cannot witness in-flight vs stale; a skip
+                # here would complete the source and a later retry hits the sentinel.
+                echo "ERROR: $rel — mtime unavailable; refusing to classify in-flight vs stale" >&2
+                return 1
             fi
             return 0
             ;;
@@ -1689,10 +1703,10 @@ commit_source() {
         # is 0 (delete-source phase-2 path; pre-flight didn't run).
         if [ "$PROGRESS_TOTAL" -gt 0 ]; then
             PROGRESS_N=$((PROGRESS_N + 1))
-            _fsize="$(_stat_field size "$file")" || _fsize=0   # report only
+            _fsize="$(_stat_field size "$file")" || _fsize=""   # report only; "" = unknown
             printf "  [%d/%d] %s (%s) → %s\n" \
                 "$PROGRESS_N" "$PROGRESS_TOTAL" "${rel:0:60}" \
-                "$(humanize_bytes "$_fsize")" "$outcome" >&2
+                "$([ -n "$_fsize" ] && humanize_bytes "$_fsize" || echo "size unavailable")" "$outcome" >&2
             # Every 20 files: aggregate progress + ETA refinement
             if [ $((PROGRESS_N % 20)) -eq 0 ] && [ "$PROGRESS_N" -lt "$PROGRESS_TOTAL" ]; then
                 _pct=$((PROGRESS_N * 100 / PROGRESS_TOTAL))
