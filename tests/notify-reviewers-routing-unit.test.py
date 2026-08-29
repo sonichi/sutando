@@ -142,6 +142,28 @@ class CommandShape(unittest.TestCase):
         self.assertIn("mention", argv)
 
 
+_LEDGER_ISOLATION = None
+
+
+def setUpModule():
+    """Point the ask ledger at scratch for every case in this file.
+
+    A case that reads the real ledger is not a unit test: an earlier case's park
+    row makes a later one refuse, and the failure surfaces as an unrelated
+    assertion about missing output.
+    """
+    global _LEDGER_ISOLATION
+    _LEDGER_ISOLATION = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+    os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = tempfile.mkdtemp() + "/asks.jsonl"
+
+
+def tearDownModule():
+    if _LEDGER_ISOLATION is None:
+        os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None)
+    else:
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = _LEDGER_ISOLATION
+
+
 class MainDiscordBranch(unittest.TestCase):
     """main()'s discord branch, in-process: the CLI test reaches it in a child
     process, so coverage never attributes these lines to the file."""
@@ -198,11 +220,14 @@ class MainDiscordSend(unittest.TestCase):
     def setUp(self):
         self._argv, self._cfg = sys.argv[:], os.environ.get("CLAUDE_CONFIG_DIR")
         self._roster, self._run = os.environ.get("SUTANDO_SCI_ROSTER"), nr.subprocess.run
+        self._led = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = tempfile.mkdtemp() + "/asks.jsonl"
 
     def tearDown(self):
         sys.argv[:] = self._argv
         nr.subprocess.run = self._run
-        for k, v in (("CLAUDE_CONFIG_DIR", self._cfg), ("SUTANDO_SCI_ROSTER", self._roster)):
+        for k, v in (("CLAUDE_CONFIG_DIR", self._cfg), ("SUTANDO_SCI_ROSTER", self._roster),
+                     ("SUTANDO_REVIEW_ASKS_LEDGER", self._led)):
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
 
     def _send(self, rc_out):
@@ -230,10 +255,19 @@ class MainDiscordSend(unittest.TestCase):
         self.assertEqual(rc, 0)
 
     def test_a_failed_send_surfaces_stderr_and_is_not_silent(self):
-        rc, _, err = self._send(3)
-        self.assertIn("SEND FAILED rc=3", err)
+        # rc 1 is NOT_DELIVERED: no post exists, so this is the retryable shape.
+        rc, _, err = self._send(1)
+        self.assertIn("SEND FAILED rc=1", err)
         self.assertIn("boom", err)
         self.assertNotEqual(rc, 0)
+
+    def test_a_landed_post_that_missed_its_target_is_not_a_retryable_failure(self):
+        # rc 3 carries a CONFIRMED receipt and a message id: the post EXISTS,
+        # so calling it SEND FAILED invites the repeat that duplicates it.
+        rc, _, err = self._send(3)
+        self.assertIn("LANDED BUT DID NOT TRIGGER", err)
+        self.assertNotIn("SEND FAILED", err)
+        self.assertEqual(rc, 4, "unsafe-to-repeat outranks a plain failure")
 
 
 class TwoChannelsDistinct(unittest.TestCase):
@@ -355,14 +389,26 @@ class DiscordLedgerBranchesRun(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def test_a_logged_ask_reports_the_count(self):
-        rc, out, err = self._send(0, lambda msg, who, outcome='confirmed': 2)
+        rc, out, err = self._send(0, lambda msg, who, outcome='confirmed', actor=None, detail=None: 2)
         self.assertIn("SENT to channel", out)
         self.assertIn("logged 2 PR ask(s)", err)
 
-    def test_a_ledger_write_failure_is_loud_but_not_fatal(self):
+    def test_a_writer_that_cannot_reserve_refuses_before_sending(self):
+        # The park is reserved BEFORE the post. If that write fails there is no
+        # safe way to send: the post would be unrepeatable and unrecorded.
+        def boom(msg, who, outcome='confirmed', actor=None, detail=None):
+            raise OSError("disk full")
+        rc, out, err = self._send(0, boom)
+        self.assertIn("REFUSED", err)
+        self.assertIn("could not reserve", err)
+        self.assertNotIn("SENT to channel", out)
+
+    def test_a_write_failure_after_a_successful_reserve_is_loud_but_not_fatal(self):
         # The ask already happened; losing the record makes pr-unattended
         # report it as never asked, so this must warn rather than swallow.
-        def boom(msg, who, outcome='confirmed'):
+        def boom(msg, who, outcome='confirmed', actor=None, detail=None):
+            if outcome == "pending":
+                return 1
             raise OSError("disk full")
         rc, out, err = self._send(0, boom)
         self.assertIn("SENT to channel", out)
@@ -370,7 +416,7 @@ class DiscordLedgerBranchesRun(unittest.TestCase):
         self.assertIn("under-report", err)
 
     def test_unknown_outcome_is_not_reported_as_a_plain_failure(self):
-        rc, _, err = self._send(4, lambda msg, who, outcome='confirmed': 0)
+        rc, _, err = self._send(4, lambda msg, who, outcome='confirmed', actor=None, detail=None: 1)
         self.assertIn("OUTCOME UNKNOWN", err)
         self.assertNotIn("SEND FAILED", err)
 
@@ -444,17 +490,28 @@ class UnknownOutcomeIsParkedNotFailed(unittest.TestCase):
     def test_an_unknown_outcome_is_recorded(self):
         rc, err, rows = self._run(4)
         self.assertTrue(rows, "nothing recorded; a repeat could duplicate the ping")
-        self.assertEqual(rows[0]["outcome"], "unknown")
+        # The ledger is append-only: the reservation is superseded, not rewritten,
+        # so the verdict is the LAST row and the history stays readable.
+        self.assertEqual([r["outcome"] for r in rows], ["pending", "unknown"])
         self.assertIn("may have landed", err)
 
     def test_an_unknown_outcome_has_its_own_exit_code(self):
         # Not 0 and not 1: a caller must not read it as sent OR as failed.
         self.assertEqual(self._run(4)[0], 4)
 
-    def test_a_real_failure_is_still_a_failure_and_is_not_recorded(self):
-        rc, _, rows = self._run(3)
+    def test_a_real_failure_is_still_a_failure_and_does_not_park(self):
+        # rc 1 is NOT_DELIVERED, so the reservation is released. "Not parked"
+        # is the property; an empty file is not, since the reservation existed.
+        rc, _, rows = self._run(1)
         self.assertEqual(rc, 1)
-        self.assertEqual(rows, [])
+        self.assertEqual([r["outcome"] for r in rows], ["pending", "failed"])
+
+    def test_a_landed_post_missing_its_mention_parks_instead_of_failing(self):
+        # rc 3 holds a CONFIRMED receipt: the post exists, so a repeat duplicates.
+        rc, err, rows = self._run(3)
+        self.assertEqual(rc, 4)
+        self.assertIn("LANDED BUT DID NOT TRIGGER", err)
+        self.assertEqual(rows[-1]["outcome"], "unknown")
 
 
 
@@ -571,7 +628,7 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
         self.assertIn("safe to retry", err)
         self.assertNotIn("UNKNOWN outcome", err)
         self.assertEqual(rc, 1)
-        self.assertFalse(self.led.exists() and self.led.read_text().strip(),
+        self.assertFalse(nr.unknown_parked(self.MSG, "d"),
                          "a send that never started must not be parked")
 
     def test_an_unrecordable_message_is_refused_before_any_send(self):
@@ -589,14 +646,18 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
         def boom(*a, **k):
             raise subprocess.TimeoutExpired(cmd="x", timeout=60)
         nr.subprocess.run = boom
-        def bad(*a, **k):
+        orig = nr.record_asks
+        def bad(msg, who, outcome='confirmed', actor=None, detail=None):
+            if outcome == "pending":
+                return orig(msg, who, outcome=outcome, actor=actor, detail=detail)
             raise OSError("disk full")
-        orig, nr.record_asks = nr.record_asks, bad
+        nr.record_asks = bad
         try:
             rc, _, err = self._run_main()
         finally:
             nr.record_asks = orig
-        self.assertIn("ledger write failed", err)
+        self.assertIn("stayed PENDING", err)
+        self.assertIn("a repeat is blocked", err)
         self.assertEqual(rc, 4)
 
     def test_the_absent_guard_still_refuses_if_reachability_ever_says_no(self):
@@ -617,16 +678,23 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
         class _R:
             returncode, stdout, stderr = 4, "", ""
         nr.subprocess.run = lambda *a, **k: _R()
-        def bad(*a, **k):
+        orig = nr.record_asks
+        def bad(msg, who, outcome='confirmed', actor=None, detail=None):
+            if outcome == "pending":
+                return orig(msg, who, outcome=outcome, actor=actor, detail=detail)
             raise OSError("disk full")
-        orig, nr.record_asks = nr.record_asks, bad
+        nr.record_asks = bad
         try:
             rc, _, err = self._run_main()
         finally:
             nr.record_asks = orig
-        self.assertIn("was NOT recorded", err)
+        # The settle write failed, so the reservation stands. The message must
+        # say which way that fails: the park holds and the next run refuses.
+        self.assertIn("stayed PENDING", err)
         self.assertIn("OUTCOME UNKNOWN", err)
         self.assertEqual(rc, 4)
+        self.assertTrue(nr.unknown_parked(self.MSG, "d"),
+                        "a failed settle must leave the park in force")
 
     def test_a_malformed_ledger_line_does_not_crash_the_park_check(self):
         self.led.write_text("not json\n" + json.dumps(
@@ -641,8 +709,6 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
         self.assertTrue(nr.unknown_parked(self.MSG, "d"))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class DiscordAskIsRecorded(unittest.TestCase):
@@ -672,3 +738,127 @@ class DiscordAskIsRecorded(unittest.TestCase):
         src = (REPO / "skills" / "collaboration-intelligence" / "scripts"
                / "notify_reviewers.py").read_text()
         self.assertIn("OUTCOME UNKNOWN", src)
+
+
+class RepeatsAreMechanicallySuppressed(unittest.TestCase):
+    """The composed controls: two invocations, not two halves tested apart.
+
+    Each half passed alone while the composition resent, so these run main()
+    twice against one ledger and count what the second run actually sends.
+    """
+
+    MSG = "re-review https://github.com/sonichi/sutando/pull/3509"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+        self._env = {k: os.environ.get(k) for k in
+                     ("SUTANDO_SCI_ROSTER", "CLAUDE_CONFIG_DIR",
+                      "SUTANDO_REVIEW_ASKS_LEDGER")}
+        self._run, self._argv = nr.subprocess.run, sys.argv[:]
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(self.led)
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with(
+            {"groups": {"222": {"allowFrom": ["111"]}}})
+
+    def tearDown(self):
+        nr.subprocess.run, sys.argv[:] = self._run, self._argv
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for k, v in self._env.items():
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+
+    def _roster(self, doc):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(doc, f)
+        os.environ["SUTANDO_SCI_ROSTER"] = path
+
+    def _invoke(self, who="d"):
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", who, "--message",
+                       self.MSG, "--send", "--allow-single", "composed control",
+                       "--widen-override", "the control re-runs on purpose"]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = nr.main()
+        return rc, err.getvalue()
+
+    def _stub(self, rc_out):
+        sends = []
+
+        class _R:
+            returncode, stdout, stderr = rc_out, "", ""
+
+        def run(*a, **k):
+            sends.append(a[0] if a else None)
+            return _R()
+        nr.subprocess.run = run
+        return sends
+
+    def test_a_landed_post_missing_its_mention_is_not_resent(self):
+        # rc 3 already holds a message id, so a second post duplicates channel
+        # content and still proves nothing about whether the Stand triggered.
+        self._roster({"d": DISCORD})
+        sends = self._stub(3)
+        rc1, err1 = self._invoke()
+        rc2, err2 = self._invoke()
+        self.assertEqual((rc1, rc2), (4, 4))
+        self.assertIn("LANDED BUT DID NOT TRIGGER", err1)
+        self.assertIn("PARKED", err2)
+        self.assertEqual(len(sends), 1, "the second invocation resent a landed post")
+
+    def test_an_unknown_outcome_is_not_resent(self):
+        self._roster({"d": DISCORD})
+        sends = self._stub(4)
+        rc1, _ = self._invoke()
+        rc2, err2 = self._invoke()
+        self.assertEqual((rc1, rc2), (4, 4))
+        self.assertIn("PARKED", err2)
+        self.assertEqual(len(sends), 1)
+
+    def test_an_alias_of_a_parked_actor_is_also_parked(self):
+        # Two roster spellings, one person, one Discord endpoint. Keying the
+        # park by spelling let the second name resend to the same channel.
+        self._roster({"d": DISCORD, "d_alias": dict(DISCORD, same_actor_as="d")})
+        sends = self._stub(4)
+        rc1, _ = self._invoke("d")
+        rc2, err2 = self._invoke("d_alias")
+        self.assertEqual((rc1, rc2), (4, 4))
+        self.assertIn("PARKED", err2)
+        self.assertEqual(len(sends), 1, "an alias resent to the same endpoint")
+
+    def test_a_definite_failure_stays_retryable_across_invocations(self):
+        # The negative control. Without it a park that refuses everything looks
+        # identical to one that suppresses only the unsafe repeats.
+        self._roster({"d": DISCORD})
+        sends = self._stub(1)
+        rc1, _ = self._invoke()
+        rc2, err2 = self._invoke()
+        self.assertEqual((rc1, rc2), (1, 1))
+        self.assertNotIn("PARKED", err2)
+        self.assertEqual(len(sends), 2, "a send that never landed must be retryable")
+
+
+class AnAllowFromHitIsNotMembership(unittest.TestCase):
+    """The positive-hit direction, previously reported as verified reachability."""
+
+    def _probe(self, allow):
+        prev = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with(
+            {"groups": {"222": {"allowFrom": allow}}})
+        try:
+            return nr.discord_reachable({"discord_id": "111", "channel": "222"})
+        finally:
+            if prev is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = prev
+
+    def test_a_hit_is_unverified_just_as_a_miss_is(self):
+        for allow, label in ((["111"], "hit"), (["999"], "miss")):
+            ok, why = self._probe(allow)
+            self.assertTrue(ok, f"{label}: must not refuse")
+            self.assertTrue(why.startswith("unverified"),
+                            f"{label} reported as checked reachability: {why}")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

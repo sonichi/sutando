@@ -179,7 +179,10 @@ def discord_reachable(target: dict) -> "tuple[bool, str]":
             if not allowed:
                 return True, f"unverified ({section} entry has no allowFrom)"
             if str(target["discord_id"]) in allowed:
-                return True, f"listed in {section} allowFrom ({len(allowed)} entries)"
+                # A HIT is no more a membership witness than a miss: the field
+                # answers "who may send TO this channel", not who reads it.
+                return True, (f"unverified (listed in {section} allowFrom, which is "
+                              "inbound authorization rather than membership)")
             # NOT an absence. allowFrom answers "who may send", and the bridge
             # grants via a global superset this file cannot see.
             return True, (f"unverified (not in {section} allowFrom, which is inbound "
@@ -213,39 +216,58 @@ def command_for(target: dict, message: str) -> "list[str]":
 _PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
 
 def ledger_path() -> Path:
+    # Overridable so a test can exercise the real reserve/settle path against a
+    # scratch file. Two cases sharing one ledger park each other.
+    override = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+    if override:
+        return Path(override)
     from workspace_default import resolve_workspace
     return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
 
 
-def unknown_parked(message: str, reviewer: str) -> bool:
-    """True when this reviewer already has an UNKNOWN row for this PR.
+#: Outcomes that must block a repeat. `pending` is a reservation written BEFORE
+#: the spawn, so a crash between POST and outcome still parks.
+_UNSAFE_OUTCOMES = {"pending", "unknown"}
 
-    The receipt is UNSAFE to retry, so the park is immediate and per-target —
-    an age window would still permit the duplicate it exists to prevent.
+
+def unknown_parked(message: str, reviewer: str, actor: str = None) -> bool:
+    """True when this ACTOR's latest row for this PR is unsafe to repeat.
+
+    Keyed by canonical actor, not roster spelling: two aliases of one person are
+    one endpoint, and keying by spelling lets the second alias resend.
+
+    The ledger is append-only, so a later row supersedes an earlier one; the
+    verdict is the LAST row per (repo, pr, actor), never any matching row.
     """
+    who = actor or reviewer
     refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
     led = ledger_path()
     if not refs or not led.exists():
         return False
+    latest = {}
     try:
         for line in led.read_text().splitlines():
             try:
                 d = json.loads(line)
             except ValueError:
                 continue
-            if d.get("outcome") != "unknown" or d.get("reviewer") != reviewer:
+            # Legacy rows carry only `reviewer`; canonicalize both so a row
+            # written under an alias still parks the alias it was written for.
+            row_who = d.get("actor") or d.get("reviewer")
+            if row_who != who and d.get("reviewer") != reviewer:
                 continue
-            if any(d.get("repo") in (r, None) and str(d.get("pr")) == str(n)
-                   for r, n in refs):
-                return True
+            for r, n in refs:
+                if d.get("repo") in (r, None) and str(d.get("pr")) == str(n):
+                    latest[(r, n)] = d.get("outcome")
     except OSError:
         # Cannot read the park state, so cannot prove this was NOT parked. Fail
         # closed: refusing a send is recoverable, a duplicated unsafe post is not.
         return True
-    return False
+    return any(v in _UNSAFE_OUTCOMES for v in latest.values())
 
 
-def record_asks(message: str, reviewer: str, outcome: str = "confirmed") -> int:
+def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
+                actor: str = None, detail: str = None) -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED.
@@ -261,9 +283,13 @@ def record_asks(message: str, reviewer: str, outcome: str = "confirmed") -> int:
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a") as fh:
         for repo, num in sorted(refs):
-            fh.write(json.dumps({"repo": repo, "pr": num, "reviewer": reviewer,
-                                 "ts": ts, "channel": "room",
-                                 "outcome": outcome}) + "\n")
+            row = {"repo": repo, "pr": num, "reviewer": reviewer,
+                   "ts": ts, "channel": "room", "outcome": outcome}
+            if actor:
+                row["actor"] = actor
+            if detail:
+                row["detail"] = detail
+            fh.write(json.dumps(row) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
     return len(refs)
@@ -405,6 +431,9 @@ def main() -> int:
               "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
         return 6
     failures = unlogged = unknowns = 0
+    # One person may hold several roster spellings; the park keys the endpoint,
+    # so resolve the canonical actor once rather than per send.
+    actors = _actor_map(load_roster())
     for t in targets:
         if t["transport"] == "discord":
             # No room-relocation branch: a Discord mention is channel-scoped and
@@ -432,41 +461,77 @@ def main() -> int:
                       file=sys.stderr)
                 failures += 1
                 continue
-            if unknown_parked(a.message, t["name"]):
-                print(f"{t['name']}: PARKED — a previous send to them had an "
-                      "UNKNOWN outcome and is UNSAFE to retry; check the channel",
+            who = actors.get(t["name"], t["name"])
+            if unknown_parked(a.message, t["name"], who):
+                print(f"{t['name']}: PARKED — a previous send to {who} is UNSAFE "
+                      "to repeat (it landed, or may have); check the channel",
                       file=sys.stderr)
                 unknowns += 1
                 continue
+            # Reserve BEFORE the POST can happen: a reservation written after
+            # it cannot cover a crash, or a write failure, between the two.
+            try:
+                reserved = record_asks(a.message, t["name"], outcome="pending",
+                                       actor=who)
+            except OSError as e:
+                reserved = 0
+                print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
+                      "sending now would be unrepeatable-but-unrecorded. Nothing "
+                      "was sent.", file=sys.stderr)
+                failures += 1
+                continue
+            if not reserved:
+                print(f"{t['name']}: REFUSED — no PR reference to key the park on; "
+                      "nothing was sent", file=sys.stderr)
+                failures += 1
+                continue
+
+            def _settle(outcome, detail):
+                """Supersede the reservation. Append-only, so this is atomic."""
+                try:
+                    record_asks(a.message, t["name"], outcome=outcome, actor=who,
+                                detail=detail)
+                except OSError as err:
+                    # The reservation still stands, so the park holds and the
+                    # next run refuses rather than repeating. Say which way it fails.
+                    print(f"  WARNING: {t['name']} stayed PENDING ({err}) — the "
+                          "park holds, so a repeat is blocked until it is cleared",
+                          file=sys.stderr)
+
             try:
                 p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
             except OSError as e:
-                # No child ran, so no POST was possible: definitely not delivered.
-                # Parking it would strand an ask that never started.
+                # No child ran, so no POST was possible: release the reservation
+                # rather than stranding an ask that never started.
+                _settle("failed", f"no spawn: {type(e).__name__}")
                 print(f"{t['name']}: SEND FAILED before spawn ({type(e).__name__}: {e})"
                       " — nothing was sent; safe to retry", file=sys.stderr)
                 failures += 1
                 continue
             except subprocess.TimeoutExpired as e:
-                # A timeout is not a failure: the post may have landed, so it is
-                # recorded UNKNOWN and the batch continues to the next reviewer.
+                # A timeout is not a failure: the post may have landed, so the
+                # reservation settles to UNKNOWN and the batch continues.
+                _settle("unknown", f"timeout: {type(e).__name__}")
                 print(f"{t['name']}: UNKNOWN outcome ({type(e).__name__}) — the post "
                       "may have landed; not retrying", file=sys.stderr)
                 unknowns += 1
-                try:
-                    if not record_asks(a.message, t["name"], outcome="unknown"):
-                        print(f"  WARNING: {t['name']}'s unknown was NOT recorded "
-                              "(no resolvable PR reference in the message)",
-                              file=sys.stderr)
-                except OSError as err:
-                    print(f"  WARNING: ledger write failed ({err})", file=sys.stderr)
+                continue
+            if p.returncode == 3:
+                # A CONFIRMED receipt with a message id: the post LANDED and
+                # merely missed the mention, so a repeat duplicates it.
+                _settle("unknown", "posted without the target in mentions")
+                print(f"{t['name']}: LANDED BUT DID NOT TRIGGER on channel "
+                      f"{t['channel']} — the post exists and must not be repeated; "
+                      "the mention resolved to someone else, or to nobody. "
+                      f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
+                unknowns += 1
                 continue
             if p.returncode == 0:
                 print(f"{t['name']}: SENT to channel {t['channel']}")
                 # Same bookkeeping as the Matrix path: without it a delivered
                 # Discord ask reads as NOBODY_EVER_ASKED to pr-unattended.
                 try:
-                    n_logged = record_asks(a.message, t["name"])
+                    n_logged = record_asks(a.message, t["name"], actor=who)
                 except OSError as e:
                     unlogged += 1
                     print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT "
@@ -478,28 +543,17 @@ def main() -> int:
                               file=sys.stderr)
             elif p.returncode == 4:
                 # OUTCOME_UNKNOWN: the post may have landed, and the receipt is
-                # UNSAFE to retry, so this is PARKED durably rather than failed.
+                # UNSAFE to retry, so the reservation settles to UNKNOWN.
+                _settle("unknown", "child reported an unknown outcome")
                 unknowns += 1
-                _logged = 0
-                try:
-                    # Claim recorded only when a row was written: a message with
-                    # no resolvable PR ref logs nothing and must not say it did.
-                    _logged = record_asks(a.message, t["name"], outcome="unknown")
-                    if not _logged:
-                        print(f"  WARNING: {t['name']}'s unknown was NOT recorded "
-                              "(no resolvable PR reference) — a repeat may "
-                              "duplicate the ping", file=sys.stderr)
-                except OSError as e:
-                    print(f"  WARNING: {t['name']} unknown-outcome send was NOT "
-                          f"recorded ({e}) — a repeat may duplicate the ping",
-                          file=sys.stderr)
-                _kept = "recorded so a repeat does not duplicate it" if _logged else (
-                    "NOT recorded — no resolvable PR reference, so a repeat CAN "
-                    "duplicate it; check the channel before re-running")
                 print(f"{t['name']}: OUTCOME UNKNOWN on channel {t['channel']} — "
-                      f"the post may have landed; {_kept}. "
-                      f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
+                      "the post may have landed; the park holds so a repeat does "
+                      f"not duplicate it. {(p.stderr or '').strip() or 'no stderr'}",
+                      file=sys.stderr)
             else:
+                # rc 1 is NOT_DELIVERED and rc 2 is usage: no post exists, so
+                # release the park rather than blocking a legitimate retry.
+                _settle("failed", f"child rc={p.returncode}")
                 print(f"{t['name']}: SEND FAILED rc={p.returncode} "
                       f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
                 failures += 1
@@ -603,9 +657,9 @@ def main() -> int:
               "under-reports and pr-unattended will read this PR as unasked",
               file=sys.stderr)
     if unknowns:
-        print(f"{unknowns} send(s) had an UNKNOWN outcome and are recorded as such — "
-              "they may have landed; do not re-send without checking the channel",
-              file=sys.stderr)
+        print(f"{unknowns} send(s) are UNSAFE to repeat — each landed or may have. "
+              "The park is reserved before the post, so a repeat is refused; check "
+              "the channel before clearing one.", file=sys.stderr)
     # Unknown outranks a definite failure in a mixed batch: a failure is safe to
     # retry and an unknown is not, so collapsing to 1 invites the duplicate.
     if unknowns:
