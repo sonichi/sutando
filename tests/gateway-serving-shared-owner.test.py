@@ -85,6 +85,14 @@ state, detail, since = ss.probe_gateway(p, "no-such-pattern", NOW, lambda *a, **
 if state != "offline" or since is not None:
     failures.append(f"delegation: services_status.probe_gateway must be offline/None, got {(state, detail, since)}")
 
+# A fourth reader of the same record: it must ask the owner per lane file
+# rather than re-derive "serving" from `connected`.
+lane_dir = tempfile.mkdtemp()
+(Path(lane_dir) / "gateway-status.ag2space_dlocal.json").write_text(json.dumps(NEVER_POLLED))
+lanes = hc._gateway_lane_verdicts(state_dir=Path(lane_dir), now=NOW)
+if lanes != [("ag2space_dlocal", False, False)]:
+    failures.append(f"delegation: health-check._gateway_lane_verdicts must be not-serving on never-polled, got {lanes}")
+
 # Each reader must actually CALL the owner, not re-derive an agreeing answer.
 for mod, name in ((hc, "health-check"), (ciw, "core-input-watch"), (ss, "services_status")):
     if getattr(mod, "read_gateway_verdict", None) is not gs.read_verdict:
@@ -208,4 +216,4 @@ if failures:
         print(f"FAIL: {f}")
     sys.exit(1)
 print(f"ok - {len(CONTRACT)} contract + {len(NO_OPINION) + 1} no-opinion + {malformed_checked} malformed + {len(ACCEPTED)} accepted cases, "
-      f"3 readers delegating, 3 reader-specific edges preserved")
+      f"4 readers delegating, 3 reader-specific edges preserved")

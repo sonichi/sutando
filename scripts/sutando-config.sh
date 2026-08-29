@@ -495,14 +495,21 @@ print(_host_label(), end='')
     ;;
 
   runtime-socket)
-    # The runtime-API daemon's Unix socket. MIRRORS #2325's rundir.py
-    # socket_path(): SUTANDO_RUNTIME_SOCKET override wins, else
-    # <run-dir>/sutando-runtime.sock. (Filename is sutando-runtime.sock — NOT
-    # runtime-api.sock; #2325 ships that default and both ends interpret it here.)
+    # DELEGATES to rundir.socket_path() — the daemon decides where it listens,
+    # so this must not carry a second copy of that rule (it drifted once).
     if [ -n "${SUTANDO_RUNTIME_SOCKET:-}" ]; then
       printf '%s' "$SUTANDO_RUNTIME_SOCKET"
     else
-      printf '%s/sutando-runtime.sock' "$(bash "$0" run-dir)"
+      _sock="$(SUTANDO_CONFIG_REPO="$REPO_ROOT" "$PY" - <<'PY' 2>/dev/null
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["SUTANDO_CONFIG_REPO"], "src", "runtime-api"))
+import rundir
+sys.stdout.write(rundir.socket_path())
+PY
+)"
+      # Never hard-fail this helper: everything shells out to it.
+      if [ -n "$_sock" ]; then printf '%s' "$_sock"
+      else printf '%s/sutando-runtime.sock' "$(bash "$0" run-dir)"; fi
     fi
     ;;
 
@@ -737,7 +744,13 @@ elif os.environ.get('XDG_RUNTIME_DIR'):
     _rundir = os.path.join(os.environ['XDG_RUNTIME_DIR'], 'sutando')
 else:
     _rundir = os.path.join(os.path.expanduser('~'), '.sutando', 'run')
-_runtime_socket = os.environ.get('SUTANDO_RUNTIME_SOCKET') or os.path.join(_rundir, 'sutando-runtime.sock')
+# Same delegation as the runtime-socket subcommand: rundir owns the rule.
+try:
+    sys.path.insert(0, os.path.join(repo, 'src', 'runtime-api'))
+    import rundir as _rundir_mod
+    _runtime_socket = _rundir_mod.socket_path()
+except Exception:
+    _runtime_socket = os.environ.get('SUTANDO_RUNTIME_SOCKET') or os.path.join(_rundir, 'sutando-runtime.sock')
 # runtimeRoot = parent of run/ when run-dir is <root>/run (darwin App-Support,
 # portable dot-sutando); for the XDG case the run-dir (XDG_RUNTIME_DIR/sutando) IS
 # the app dir (its parent is the shared XDG base), so use the run-dir itself.
