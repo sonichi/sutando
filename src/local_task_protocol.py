@@ -547,6 +547,11 @@ def find_archived_result(results_dir: Path, task_id: str) -> Path | None:
         candidate = archive / month / fname
         if candidate.is_file():
             return candidate
+        # Re-archive inside a month dir suffixes the epoch (`<id>-<epoch>.txt`);
+        # a literal-name scan misses it. Fallback only, so an exact hit still wins.
+        suffixed = sorted((archive / month).glob(f"{task_id}-*.txt"))
+        if suffixed:
+            return suffixed[-1]
 
     # glob on a missing or non-directory path yields nothing rather than
     # raising, so no guard is needed here.

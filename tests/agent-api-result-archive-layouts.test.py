@@ -46,11 +46,31 @@ def fresh():
     return tmp
 
 
-# --- the defect: the layout agent-api's own archive move produces -------------
+# The collision branch suffixes the epoch INSIDE the month dir, not at the archive
+# root; a root-level fixture tests a layout agent-api never writes.
+fresh()
+month0 = api.RESULT_DIR / "archive" / "2026-08"
+month0.mkdir()
+(month0 / "task-collide-1785976425.txt").write_text("RE-ARCHIVED BODY")
+got = api.get_task_result("task-collide")
+check("month-dir re-archive archive/<YYYY-MM>/<id>-<epoch>.txt is found",
+      got is not None and got.get("result") == "RE-ARCHIVED BODY", f"got {got!r}")
+
+# Exact must still win: promoting the suffixed sibling would change existing
+# behaviour rather than only adding to it.
+fresh()
+month1 = api.RESULT_DIR / "archive" / "2026-08"
+month1.mkdir()
+(month1 / "task-exact.txt").write_text("EXACT WINS")
+(month1 / "task-exact-1785976425.txt").write_text("SUFFIXED SIBLING")
+got = api.get_task_result("task-exact")
+check("exact <id>.txt still wins over its suffixed sibling",
+      got is not None and got.get("result") == "EXACT WINS", f"got {got!r}")
+
 fresh()
 (api.RESULT_DIR / "archive" / "task-flat-1785976425.txt").write_text("FLAT BODY")
 got = api.get_task_result("task-flat")
-check("flat archive/<id>-<epoch>.txt is found",
+check("root-level flat archive/<id>-<epoch>.txt is found",
       got is not None and got.get("result") == "FLAT BODY", f"got {got!r}")
 
 fresh()
