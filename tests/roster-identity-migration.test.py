@@ -641,5 +641,42 @@ class AnAxisCollisionBlocksWithoutAnyId(unittest.TestCase):
         self.assertNotIn("COLLISION", err)
 
 
+class AFieldNameStatesAWordNotASubstring(unittest.TestCase):
+    """`_verdict_from_field` matched substrings, so a name could carry a
+    referent it never claimed (#3537). Reviewer's production-CLI controls."""
+
+    def _verdict(self, field):
+        return mig._verdict_from_field(field)[0]
+
+    def test_words_that_merely_contain_the_token_state_nothing(self):
+        for field in ("understanding_discord_id", "agentless_discord_id",
+                      "inhuman_discord_id", "standard_id", "humanoid_id",
+                      "management_id"):
+            self.assertIsNone(self._verdict(field), field)
+
+    def test_the_real_typed_fields_still_state_their_referent(self):
+        # The positive control: without it, returning None always would pass
+        # the negative cases and silently disable every classification.
+        for field in ("discord_human_id", "human_discord_id"):
+            self.assertEqual(self._verdict(field), mig.HUMAN, field)
+        for field in ("stand_discord_id", "stand_status", "secondary_agent",
+                      "other_stand_discord_ids", "wrapper.stand_status.id"):
+            self.assertEqual(self._verdict(field), mig.STAND, field)
+
+    def test_camel_case_is_split_too(self):
+        self.assertEqual(self._verdict("standDiscordId"), mig.STAND)
+        self.assertEqual(self._verdict("humanDiscordId"), mig.HUMAN)
+        self.assertIsNone(self._verdict("understandingId"))
+
+    def test_an_unstated_field_leaves_the_id_unresolved_not_guessed(self):
+        # End to end: the whole point is that no slot gets filled from a name
+        # that never named a referent.
+        human, stand, _others, unresolved, _basis, _coll = mig.classify(
+            "x", {"understanding_discord_id": HUMAN}, {}, {}, "")
+        self.assertIsNone(human)
+        self.assertIsNone(stand)
+        self.assertEqual([u["id"] for u in unresolved], [HUMAN])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

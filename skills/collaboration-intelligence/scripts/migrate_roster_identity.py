@@ -4,10 +4,12 @@
 Classification is EVIDENCE-ONLY. Every id placed in `human_discord_id` or
 `stand_discord_id` is placed there because some source states which one it is:
 
-  roster field names   `discord_human_id` / any field whose name contains
-                       "human" that cites the id   -> human
-                       any field whose name starts with "stand" or contains
-                       "agent" that cites the id    -> agent (stand)
+  roster field names   a field naming the WORD "human" (or "person") that
+                       cites the id                 -> human
+                       a field naming the WORD "stand" or "agent"
+                       that cites the id            -> agent (stand)
+                       Words, not substrings: `inhuman`, `agentless` and
+                       `understanding` state nothing and resolve nothing.
   pr-triage config     `people.<login>.discord` -> human,
                        `people.<login>.bots[]`  -> stand (that file's schema
                        names the two separately, which is why it is usable)
@@ -75,16 +77,29 @@ def _cited_in(entry: dict, id_: str) -> list:
     return hits
 
 
+_WORDS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+
+_HUMAN_WORDS = frozenset({"human", "humans", "person"})
+_STAND_WORDS = frozenset({"stand", "stands", "agent", "agents"})
+
+
+def _field_words(field: str) -> frozenset:
+    """Whole words in a field name, across `.`, `_` and camelCase.
+
+    A SUBSTRING is not a statement: `inhuman`, `agentless` and `understanding`
+    each contain one of these words and name none of these referents.
+    """
+    return frozenset(w.lower() for w in _WORDS.findall(str(field)))
+
+
 def _verdict_from_field(field: str):
     """A field name states the referent, or it states nothing."""
-    segs = [x.lower() for x in str(field).split(".")]
-    whole = str(field).lower()
-    if "human" in whole:
+    # Any word, at any depth: nesting must not change what a typed field
+    # states, or `wrapper.stand_status.id` would classify as nothing.
+    words = _field_words(field)
+    if words & _HUMAN_WORDS:
         return HUMAN, f"cited in `{field}` (field names the human)"
-    # ANY segment, not the tail or the head: nesting must not change what a
-    # typed field states, or `wrapper.stand_status.id` classifies as nothing.
-    if (any(x.startswith("stand") for x in segs) or "agent" in whole
-            or any("stand" in x for x in segs)):
+    if words & _STAND_WORDS:
         return STAND, f"cited in `{field}` (field names the agent)"
     return None, None
 
