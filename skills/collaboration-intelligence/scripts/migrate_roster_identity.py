@@ -94,9 +94,13 @@ def _collect_ids(entry: dict) -> list:
         elif isinstance(obj, list):
             for v in obj:
                 walk(v, key)
-        elif isinstance(obj, str) and "discord" in key.lower():
-            if obj.isdigit() and len(obj) >= 17 and obj not in found:
-                found.append(obj)
+        elif isinstance(obj, str) and (
+                "discord" in key.lower() or _verdict_from_field(key)[0]):
+            # Typed evidence fields (stand_status, secondary_agent) are named as
+            # evidence by the schema, so ids inside them must be DISCOVERED too.
+            for sf in _snowflakes(obj):
+                if sf not in found:
+                    found.append(sf)
 
     walk(entry, "")
     return found
@@ -118,28 +122,33 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
                 claim(id_, verdict, reason)
         claims.setdefault(id_, {})
 
-    # The roster keys by person and declares the GitHub login in `github`;
-    # pr-triage keys BY that login. Joining on the roster key alone drops one.
-    tp = triage_people.get(entry.get("github") or key) or triage_people.get(key) or {}
+    # A declared GitHub login is the SOLE join key. Falling back to the local
+    # key crosses identity axes: `people.rui` may be a different person.
+    join = entry.get("github") or key
+    tp = triage_people.get(join) or {}
+    src = f"people.{join}"
     # A typed field states the referent but not that the VALUE is an id. An
     # unvalidated one publishes junk into the slot the schema exists to protect.
     if not _is_snowflake(tp.get("discord")) and tp.get("discord"):
         bad.append({"id": str(tp["discord"]), "reason":
-                    f"pr-triage `people.{key}.discord` is not a snowflake"})
+                    f"pr-triage `{src}.discord` is not a snowflake"})
     if _is_snowflake(tp.get("discord")):
         claim(str(tp["discord"]), HUMAN,
-              f"pr-triage config `people.{key}.discord`")
-    bots = tp.get("bots") or []
-    if isinstance(bots, str):                 # a string iterates per character
-        bad.append({"id": bots, "reason":
-                    f"pr-triage `people.{key}.bots` is a string, not a list"})
+              f"pr-triage config `{src}.discord`")
+    bots = tp.get("bots")
+    if bots and not isinstance(bots, (list, tuple)):
+        # A dict iterates its KEYS, a string its characters. Require the shape
+        # the schema documents rather than anything that happens to iterate.
+        bad.append({"id": str(bots), "reason":
+                    f"pr-triage `{src}.bots` is not a list"})
         bots = []
+    bots = bots or []
     for bot in bots:
         if _is_snowflake(str(bot)):
-            claim(str(bot), STAND, f"pr-triage config `people.{key}.bots[]`")
+            claim(str(bot), STAND, f"pr-triage config `{src}.bots[]`")
         else:
             bad.append({"id": str(bot), "reason":
-                        f"pr-triage `people.{key}.bots[]` entry is not a snowflake"})
+                        f"pr-triage `{src}.bots[]` entry is not a snowflake"})
 
     for id_ in list(claims):
         if id_ in peer_ids:

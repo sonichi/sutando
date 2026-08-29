@@ -287,7 +287,9 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         out = Path(self.tmp) / "v2.json"
         self._main("--roster", str(src), "--out", str(out))
         rec = json.loads(out.read_text())["x"]
-        self.assertIsNone(rec["stand_discord_id"])
+        # The 18-digit id IS the stand — stand_status cites it. The 17-digit one
+        # must stay unresolved rather than inheriting that citation.
+        self.assertEqual(rec["stand_discord_id"], "123456789012345678")
         self.assertEqual([u["id"] for u in rec["unresolved_discord_ids"]],
                          ["12345678901234567"])
 
@@ -317,6 +319,35 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         self._main("--roster", str(src), "--out", str(out))
         self.assertEqual(json.loads(out.read_text())["_schema"]["version"],
                          mig.ri.SCHEMA_VERSION)
+
+
+    def test_typed_evidence_alone_is_enough_to_classify(self):
+        # schema.md names stand_status as evidence, so an id living only there
+        # must be discovered — not merely matched if some discord* field repeats it.
+        src = self._roster({"y": {"stand_status": "stand id 1504316176686120980"}})
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--out", str(out))
+        self.assertEqual(json.loads(out.read_text())["y"]["stand_discord_id"],
+                         "1504316176686120980")
+
+    def test_a_declared_github_login_never_falls_back_to_the_local_key(self):
+        # people.rui may be a DIFFERENT person; falling back crosses axes and
+        # then records people.rui as the provenance of a john-the-dev fact.
+        src = self._roster({"rui": {"github": "john-the-dev"}})
+        cfg = Path(self.tmp) / "cfg.json"
+        cfg.write_text(json.dumps({"people": {"rui": {"discord": HUMAN}}}))
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--out", str(out), "--triage-config", str(cfg))
+        self.assertIsNone(json.loads(out.read_text())["rui"]["human_discord_id"])
+
+    def test_a_bots_object_is_refused_rather_than_iterated_as_keys(self):
+        src = self._roster({"x": {}})
+        cfg = Path(self.tmp) / "cfg.json"
+        cfg.write_text(json.dumps({"people": {"x": {"bots": {HUMAN: "human"}}}}))
+        out = Path(self.tmp) / "v2.json"
+        self._main("--roster", str(src), "--out", str(out), "--triage-config", str(cfg))
+        rec = json.loads(out.read_text())["x"]
+        self.assertIsNone(rec["stand_discord_id"], "a dict must not contribute its keys")
 
 
     def test_a_coverage_gap_is_reported_rather_than_read_as_success(self):
