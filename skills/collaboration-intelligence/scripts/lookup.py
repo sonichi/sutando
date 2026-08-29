@@ -45,9 +45,14 @@ def load(d):
     return q, ents
 
 
-def _is_person_key(key: str) -> bool:
-    """Reserved keys start with an underscore; see schema.md's reserved block."""
-    return not str(key).startswith("_")
+def _ri():
+    """The shared owner of the metadata rule; a copy here would drift silently."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "roster_identity", pathlib.Path(__file__).with_name("roster_identity.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def load_roster(d):
@@ -66,7 +71,7 @@ def load_roster(d):
     for key, r in json.loads(p.read_text()).items():
         # A v2 document carries a reserved `_schema` block. Accepting every
         # top-level dict renders metadata as a person the caller can address.
-        if not isinstance(r, dict) or not _is_person_key(key):
+        if not isinstance(r, dict) or not _ri().is_person_key(key):
             continue
         rows.append({
             "entity_id": key,

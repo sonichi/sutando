@@ -403,6 +403,62 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         self.assertEqual(rec["stand_discord_id"], "1504316176686120980")
         self.assertEqual(rec["unresolved_discord_ids"], [])
 
+    def test_malformed_evidence_that_opposes_the_resolved_slot_stays_unresolved(self):
+        # The valid and malformed spellings of the same disagreement must agree:
+        # a malformed one used to be demoted to a note and publish the opposite slot.
+        SID = "1504316176686120980"
+        for people, label in (({"x": {"discord": SID}}, "valid human string"),
+                              ({"x": {"discord": int(SID)}}, "numeric human"),):
+            src = self._roster({"x": {"stand_discord_id": SID}})
+            cfg = Path(self.tmp) / f"c-{label.replace(' ', '')}.json"
+            cfg.write_text(json.dumps({"people": people}))
+            out = Path(self.tmp) / f"o-{label.replace(' ', '')}.json"
+            rc = self._main("--roster", str(src), "--out", str(out),
+                            "--triage-config", str(cfg))[0]
+            rec = json.loads(out.read_text())["x"]
+            self.assertEqual(rc, 5, f"{label} was published as success")
+            self.assertIsNone(rec["stand_discord_id"], label)
+            self.assertEqual([u["id"] for u in rec["unresolved_discord_ids"]], [SID], label)
+
+    def test_a_malformed_bots_value_opposing_a_human_stays_unresolved(self):
+        SID = "1504316176686120980"
+        for bots, label in (([SID], "valid list"), (SID, "bare string")):
+            src = self._roster({"x": {"discord_human_id": SID}})
+            cfg = Path(self.tmp) / f"cb-{label.replace(' ', '')}.json"
+            cfg.write_text(json.dumps({"people": {"x": {"bots": bots}}}))
+            out = Path(self.tmp) / f"ob-{label.replace(' ', '')}.json"
+            rc = self._main("--roster", str(src), "--out", str(out),
+                            "--triage-config", str(cfg))[0]
+            rec = json.loads(out.read_text())["x"]
+            self.assertEqual(rc, 5, f"{label} was published as success")
+            self.assertIsNone(rec["human_discord_id"], label)
+
+    def test_an_agreeing_malformed_observation_is_still_only_a_note(self):
+        # The negative control: without it, treating every malformed row as
+        # disagreement would pass the two cases above and block everything.
+        src = self._roster({"x": {"discord_human_id": HUMAN}})
+        cfg = Path(self.tmp) / "cn.json"
+        cfg.write_text(json.dumps({"people": {"x": {"discord": int(HUMAN)}}}))
+        out = Path(self.tmp) / "on.json"
+        self._main("--roster", str(src), "--out", str(out), "--triage-config", str(cfg))
+        rec = json.loads(out.read_text())["x"]
+        self.assertEqual(rec["human_discord_id"], HUMAN)
+        self.assertEqual(rec["unresolved_discord_ids"], [])
+
+    def test_a_case_only_github_alias_does_not_split_one_reviewer(self):
+        # GitHub logins are case-insensitive, so `John-The-Dev` and
+        # `john-the-dev` are one login; matching case-sensitively made two rows.
+        src = self._roster({"rui": {"github": "John-The-Dev",
+                                    "stand_discord_id": "1504316176686120980"}})
+        cfg = Path(self.tmp) / "cc.json"
+        cfg.write_text(json.dumps({"people": {"john-the-dev": {"discord": HUMAN}}}))
+        out = Path(self.tmp) / "oc.json"
+        self._main("--roster", str(src), "--out", str(out), "--triage-config", str(cfg))
+        doc = json.loads(out.read_text())
+        self.assertEqual(sorted(k for k in doc if k != "_schema"), ["rui"])
+        self.assertEqual(doc["rui"]["human_discord_id"], HUMAN)
+        self.assertEqual(doc["rui"]["stand_discord_id"], "1504316176686120980")
+
     def test_a_coverage_gap_is_reported_rather_than_read_as_success(self):
         # rc 5 says the file WAS written and somebody in it is unaddressable.
         # rc 0 would let a caller promote a map that reaches nobody.

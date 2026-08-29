@@ -117,7 +117,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
              owner_id: str):
     """-> (human_id|None, stand_id|None, other_stands[], unresolved[], basis{})"""
     claims: dict = {}   # id -> {verdict -> [reasons]}
-    bad: list = []      # values that state a referent but are not ids
+    bad: list = []      # not-id values; `states` is the referent each claimed
 
     def claim(id_, verdict, reason):
         claims.setdefault(id_, {}).setdefault(verdict, []).append(reason)
@@ -129,23 +129,26 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
                 claim(id_, verdict, reason)
         claims.setdefault(id_, {})
 
-    # A declared GitHub login is the SOLE join key. Falling back to the local
-    # key crosses identity axes: `people.rui` may be a different person.
+    # A declared login is the SOLE join key, matched case-insensitively: the
+    # local-key fallback crosses axes, and case-sensitivity splits one person.
     join = entry.get("github") or key
-    tp = triage_people.get(join) or {}
-    src = f"people.{join}"
+    tp, src = {}, f"people.{join}"
+    for cand, val in (triage_people or {}).items():
+        if str(cand).casefold() == str(join).casefold():
+            tp, src = val or {}, f"people.{cand}"
+            break
     if join != key and key in triage_people:
         # Two axes collide on one spelling. Dropping the local-key row loses a
         # real identity silently; reject it here so the evidence survives.
         for sf in _snowflakes(json.dumps(triage_people.get(key) or {})):
-            bad.append({"id": sf, "reason":
+            bad.append({"id": sf, "states": None, "collision": True, "reason":
                         f"pr-triage `people.{key}` collides with roster key "
                         f"`{key}`, whose declared github is `{join}` — the two "
                         "may name different people; resolve before promoting"})
     # A typed field states the referent but not that the VALUE is an id. An
     # unvalidated one publishes junk into the slot the schema exists to protect.
     if not _is_snowflake(tp.get("discord")) and tp.get("discord"):
-        bad.append({"id": str(tp["discord"]), "reason":
+        bad.append({"id": str(tp["discord"]), "states": HUMAN, "reason":
                     f"pr-triage `{src}.discord` is not a snowflake"})
     if _is_snowflake(tp.get("discord")):
         claim(str(tp["discord"]), HUMAN,
@@ -154,7 +157,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     if bots is not None and not isinstance(bots, (list, tuple)):
         # A dict iterates its KEYS, a string its characters. Require the shape
         # the schema documents rather than anything that happens to iterate.
-        bad.append({"id": str(bots), "reason":
+        bad.append({"id": str(bots), "states": STAND, "reason":
                     f"pr-triage `{src}.bots` is not a list"})
         bots = []
     bots = bots or []
@@ -162,7 +165,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         if _is_snowflake(str(bot)):
             claim(str(bot), STAND, f"pr-triage config `{src}.bots[]`")
         else:
-            bad.append({"id": str(bot), "reason":
+            bad.append({"id": str(bot), "states": STAND, "reason":
                         f"pr-triage `{src}.bots[]` entry is not a snowflake"})
 
     for id_ in list(claims):
@@ -205,14 +208,30 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         basis[ri.STAND_FIELD] = reasons
         others = [{"id": i, "basis": r} for i, r in stands[1:]]
 
-    # A malformed observation is folded in by canonical id: about an id that
-    # resolved it is a note on that id, never a row asserting the opposite.
-    resolved = {i for i in (human_id, stand_id) if i} | {o["id"] for o in others}
+    # A NOTE only where it agrees with the slot the id holds; opposite-referent
+    # evidence and alias collisions stay unresolved however they were spelled.
+    slot = {}
+    if human_id:
+        slot[human_id] = HUMAN
+    if stand_id:
+        slot[stand_id] = STAND
+    for o in others:
+        slot.setdefault(o["id"], STAND)
     for b in bad:
-        if b["id"] in resolved:
+        agrees = (b["id"] in slot and not b.get("collision")
+                  and b.get("states") in (None, slot[b["id"]]))
+        if agrees:
             basis.setdefault("malformed_observations", []).append(b)
-        else:
-            unresolved.append(b)
+            continue
+        if b["id"] == human_id:
+            human_id, humans = None, []
+            basis.pop(ri.HUMAN_FIELD, None)
+        if b["id"] == stand_id:
+            stand_id = None
+            basis.pop(ri.STAND_FIELD, None)
+        others = [o for o in others if o["id"] != b["id"]]
+        unresolved.append(b)
+    resolved = {i for i in (human_id, stand_id) if i} | {o["id"] for o in others}
     assert not (resolved & {u["id"] for u in unresolved}), (
         "an id cannot be both resolved and unresolved")
     return human_id, stand_id, others, unresolved, basis
@@ -233,9 +252,11 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             "An id no source classifies lives in `unresolved_discord_ids` and "
             "answers no lookup."),
     }
-    aliased = {(e.get("github") or k) for k, e in doc.items()
+    aliased = {str(e.get("github") or k).casefold() for k, e in doc.items()
                if ri.is_person_key(k) and isinstance(e, dict)}
-    extra = {k: {} for k in triage_people if k not in doc and k not in aliased}
+    known = {str(k).casefold() for k in doc}
+    extra = {k: {} for k in triage_people
+             if str(k).casefold() not in known | aliased}
     for key, entry in list(doc.items()) + sorted(extra.items()):
         if key == ri.SCHEMA_KEY:
             continue                            # the destination schema is reserved

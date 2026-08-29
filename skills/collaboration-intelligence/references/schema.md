@@ -275,7 +275,11 @@ Explicit end dates and newer contradictory evidence override these windows.
 ## Reviewer identity map (`reviewer-identity/2`)
 
 `<workspace>/data/collaboration-intelligence/reviewer-stands.json` — the single
-map of a reviewer's Discord identities. Keyed by GitHub login where one exists.
+map of a reviewer's Discord identities. **Keyed by the roster's own local
+key**, with the GitHub login in the `github` FIELD — a key-equality lookup
+on a login queries the wrong axis and reads a mapped reviewer as absent
+(measured twice, 2026-08-27 and 08-28). GitHub logins are matched
+case-insensitively wherever they are joined.
 
 ```json
 {

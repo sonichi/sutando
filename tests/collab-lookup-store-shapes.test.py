@@ -171,6 +171,15 @@ class AMigratedDocumentExposesNoMetadataAsAPerson(unittest.TestCase):
             self.assertNotIn("_schema", ids, "metadata rendered as an addressable person")
             self.assertEqual(ids, ["x"])
 
+    def test_the_metadata_rule_has_ONE_owner(self):
+        # roster_identity.is_person_key is the owner; a byte-equivalent private
+        # copy passes every behaviour test and drifts the moment the rule moves.
+        import pathlib as _p
+        src = _p.Path(lk.__file__).read_text()
+        self.assertNotIn('startswith("_")', src,
+                         "lookup.py carries its own copy of the metadata rule")
+        self.assertIn("is_person_key", src, "it must call the owner")
+
     def test_a_real_person_in_the_same_document_still_loads(self):
         # The negative control: filtering must not empty the roster.
         with tempfile.TemporaryDirectory() as t:
