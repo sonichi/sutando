@@ -882,6 +882,49 @@ class RepeatsAreMechanicallySuppressed(unittest.TestCase):
         self.assertEqual(len(sends), 2, "a send that never landed must be retryable")
 
 
+class ALegacyRowParksEverySpellingOfOneActor(unittest.TestCase):
+    """A park keyed by spelling lets a resend out through an alias."""
+
+    MSG = "re-review https://github.com/o/r/pull/7"
+    ROSTER = {"alpha": {"discord_id": "1", "home_channel": "2"},
+              "beta": {"discord_id": "1", "home_channel": "2",
+                       "same_actor_as": "alpha"}}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+        self.prev = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(self.led)
+        # A row predating the actor field, written under the OTHER spelling.
+        self.led.write_text(json.dumps({
+            "repo": "o/r", "pr": 7, "reviewer": "beta",
+            "ts": "2026-08-29T11:00:00Z", "channel": "room",
+            "outcome": "unknown"}) + "\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self.prev is None:
+            os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None)
+        else:
+            os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = self.prev
+
+    def _canon(self):
+        m = nr._actor_map(self.ROSTER)
+        return lambda w: m.get(w, w)
+
+    def test_an_alias_is_parked_by_the_other_spellings_row(self):
+        self.assertTrue(
+            nr.unknown_parked(self.MSG, "alpha", "alpha", canonical=self._canon()),
+            "a possibly-landed post can be resent through another spelling")
+
+    def test_an_unrelated_actor_is_not_parked_by_it(self):
+        # The negative control: canonicalization must not park everybody.
+        roster = dict(self.ROSTER, gamma={"discord_id": "9", "home_channel": "8"})
+        m = nr._actor_map(roster)
+        self.assertFalse(
+            nr.unknown_parked(self.MSG, "gamma", "gamma", canonical=lambda w: m.get(w, w)))
+
+
 class AnAllowFromHitIsNotMembership(unittest.TestCase):
     """The positive-hit direction, previously reported as verified reachability."""
 
@@ -967,6 +1010,22 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
             "ts": (now - datetime.timedelta(minutes=90)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "channel": "room"}) + "\n")
         self.assertTrue(self._stale())
+
+    def test_every_selected_target_must_clear_the_window(self):
+        # One global earliest reported the OLDEST ask as if it were everyone's,
+        # so a person asked 5 minutes ago was refused on someone else's 90.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.led.write_text("".join(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": w, "actor": w,
+            "ts": (now - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "channel": "room", "outcome": "confirmed"}) + "\n"
+            for w, m in (("A", 90), ("B", 5))))
+        roster = {"A": {"discord_id": "1", "home_channel": "2"},
+                  "B": {"discord_id": "3", "home_channel": "4"}}
+        both = nr._stale_repeat_ask(self.MSG, [{"name": "A"}, {"name": "B"}], roster)[0]
+        self.assertFalse(both, "B was asked 5 minutes ago and must not be refused")
+        # The positive control on the same ledger: A alone IS past the window.
+        self.assertTrue(nr._stale_repeat_ask(self.MSG, [{"name": "A"}], roster)[0])
 
     def test_a_recent_ask_is_not_stale_yet(self):
         # The negative control on the CLOCK rather than the outcome: without it

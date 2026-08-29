@@ -294,7 +294,8 @@ def _first_ask(led: Path, canonical=None) -> dict:
     return out
 
 
-def unknown_parked(message: str, reviewer: str, actor: str = None) -> bool:
+def unknown_parked(message: str, reviewer: str, actor: str = None,
+                   canonical=None) -> bool:
     """True when this ACTOR's latest row for this PR is unsafe to repeat.
 
     Keyed by canonical actor, not roster spelling: two aliases of one person are
@@ -309,7 +310,9 @@ def unknown_parked(message: str, reviewer: str, actor: str = None) -> bool:
     if not refs or not led.exists():
         return False
     try:
-        latest = _latest_outcomes(led)
+        # Canonicalize the ROW too: a legacy row written under one alias must
+        # park every spelling of that actor, or a resend goes out through another.
+        latest = _latest_outcomes(led, canonical=canonical)
     except OSError:
         # Cannot read the park state, so cannot prove this was NOT parked. Fail
         # closed: refusing a send is recoverable, a duplicated unsafe post is not.
@@ -325,7 +328,8 @@ def unknown_parked(message: str, reviewer: str, actor: str = None) -> bool:
     return False
 
 
-def claim_park(message: str, reviewer: str, actor: str = None) -> "int | None":
+def claim_park(message: str, reviewer: str, actor: str = None,
+               canonical=None) -> "int | None":
     """Atomically claim the park, or None if someone else already holds it.
 
     Check-then-append is not a claim: two callers both read "not parked", both
@@ -339,7 +343,7 @@ def claim_park(message: str, reviewer: str, actor: str = None) -> "int | None":
     with open(lock, "a") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
-            if unknown_parked(message, reviewer, who):
+            if unknown_parked(message, reviewer, who, canonical=canonical):
                 return None
             return record_asks(message, reviewer, outcome="pending", actor=who)
         finally:
@@ -438,17 +442,24 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         asked = _first_ask(ledger, canonical=lambda w: actor_of.get(w, w))
     except OSError:
         return False, ""
+    per_actor = {}
     for (r, n, who), ts in asked.items():
         if n != str(num) or r not in (repo, None):
             continue
         prior.add(who)
-        if ts and (earliest is None or ts < earliest):
-            earliest = ts
-    if not prior or earliest is None:
+        if ts and (who not in per_actor or ts < per_actor[who]):
+            per_actor[who] = ts
+    if not prior:
         return False, ""
     names = {actor_of.get(x["name"], x["name"]) for x in targets}
     if not names or not names.issubset(prior):
         return False, ""            # at least one NEW name -> this IS widening
+    # The NEWEST ask among the selected targets: an older one belonging to a
+    # different person says nothing about whether THIS set may be re-asked.
+    ours = [per_actor[n] for n in names if per_actor.get(n)]
+    earliest = max(ours) if ours else None
+    if earliest is None:
+        return False, ""
     try:
         age = (datetime.datetime.now(datetime.timezone.utc)
                - datetime.datetime.fromisoformat(earliest.replace("Z", "+00:00")))
@@ -548,7 +559,8 @@ def main() -> int:
             # Claim BEFORE the POST can happen: a reservation written after it
             # cannot cover a crash, or a write failure, between the two.
             try:
-                reserved = claim_park(a.message, t["name"], who)
+                reserved = claim_park(a.message, t["name"], who,
+                                      canonical=lambda w: actors.get(w, w))
             except OSError as e:
                 reserved = 0
                 print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
