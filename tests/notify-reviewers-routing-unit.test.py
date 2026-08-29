@@ -917,6 +917,32 @@ class ALegacyRowParksEverySpellingOfOneActor(unittest.TestCase):
             nr.unknown_parked(self.MSG, "alpha", "alpha", canonical=self._canon()),
             "a possibly-landed post can be resent through another spelling")
 
+    def test_one_aliass_failure_does_not_settle_the_others_unknown(self):
+        # The history the earlier alias bypass produced: beta posted and the
+        # outcome is unknown, then alpha retried and definitely failed.
+        # Collapsing to one canonical stream lets alpha's failure clear beta's.
+        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
+            {"repo": "o/r", "pr": 7, "reviewer": "beta",
+             "ts": "2026-08-29T10:00:00Z", "channel": "room", "outcome": "unknown"},
+            {"repo": "o/r", "pr": 7, "reviewer": "alpha", "actor": "alpha",
+             "ts": "2026-08-29T11:00:00Z", "channel": "room", "outcome": "pending"},
+            {"repo": "o/r", "pr": 7, "reviewer": "alpha", "actor": "alpha",
+             "ts": "2026-08-29T11:00:05Z", "channel": "room", "outcome": "failed"})))
+        self.assertTrue(
+            nr.unknown_parked(self.MSG, "alpha", "alpha", canonical=self._canon()),
+            "alpha's failure cannot prove beta's post did not land")
+
+    def test_an_actors_own_release_still_clears_its_own_park(self):
+        # The safe negative control: without it, ORing across spellings could
+        # park forever and pass the case above for the wrong reason.
+        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
+            {"repo": "o/r", "pr": 7, "reviewer": "alpha", "actor": "alpha",
+             "ts": "2026-08-29T11:00:00Z", "channel": "room", "outcome": "pending"},
+            {"repo": "o/r", "pr": 7, "reviewer": "alpha", "actor": "alpha",
+             "ts": "2026-08-29T11:00:05Z", "channel": "room", "outcome": "failed"})))
+        self.assertFalse(
+            nr.unknown_parked(self.MSG, "alpha", "alpha", canonical=self._canon()))
+
     def test_an_unrelated_actor_is_not_parked_by_it(self):
         # The negative control: canonicalization must not park everybody.
         roster = dict(self.ROSTER, gamma={"discord_id": "9", "home_channel": "8"})
@@ -1026,6 +1052,16 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
         self.assertFalse(both, "B was asked 5 minutes ago and must not be refused")
         # The positive control on the same ledger: A alone IS past the window.
         self.assertTrue(nr._stale_repeat_ask(self.MSG, [{"name": "A"}], roster)[0])
+
+    def test_a_standing_reservation_carries_its_own_timestamp(self):
+        # _first_ask stored "" for a pending-only actor, and "" is falsy, so the
+        # age reduction dropped that actor and the whole set read as un-asked.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.led.write_text(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": "k", "actor": "k",
+            "ts": (now - datetime.timedelta(minutes=90)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "channel": "room", "outcome": "pending"}) + "\n")
+        self.assertTrue(self._stale(), "a standing reservation was dropped from the age")
 
     def test_a_recent_ask_is_not_stale_yet(self):
         # The negative control on the CLOCK rather than the outcome: without it

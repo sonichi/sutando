@@ -268,7 +268,7 @@ def _first_ask(led: Path, canonical=None) -> dict:
     releases its own reservation and must not erase an ask that landed hours
     earlier. Retry-safety and ask-history are two questions over one file.
     """
-    out, last = {}, {}
+    out, last, last_ts = {}, {}, {}
     if not led.exists():
         return out
     for line in led.read_text().splitlines():
@@ -281,7 +281,7 @@ def _first_ask(led: Path, canonical=None) -> dict:
             who = canonical(who)
         key = (d.get("repo"), str(d.get("pr")), who)
         ts, outcome = d.get("ts") or "", d.get("outcome")
-        last[key] = outcome
+        last[key], last_ts[key] = outcome, ts
         # A row predating the outcome field records a send that happened: the
         # field's absence is legacy, not a claim that nothing was posted.
         if (outcome is None or outcome in _DID_ASK) and (key not in out or ts < out[key]):
@@ -290,7 +290,9 @@ def _first_ask(led: Path, canonical=None) -> dict:
         # A standing reservation may have posted, so it counts as an ask until
         # it settles; a settled `failed` never posted and never counts.
         if outcome == "pending" and key not in out:
-            out[key] = ""
+            # Its own ts, never "": an empty string is falsy and silently drops
+            # the actor from every age reduction downstream.
+            out[key] = last_ts.get(key) or ""
     return out
 
 
@@ -310,17 +312,18 @@ def unknown_parked(message: str, reviewer: str, actor: str = None,
     if not refs or not led.exists():
         return False
     try:
-        # Canonicalize the ROW too: a legacy row written under one alias must
-        # park every spelling of that actor, or a resend goes out through another.
-        latest = _latest_outcomes(led, canonical=canonical)
+        # Per RAW spelling, then OR across the actor: alpha's definite failure
+        # settles alpha's reservation and proves nothing about beta's post.
+        latest = _latest_outcomes(led)
     except OSError:
         # Cannot read the park state, so cannot prove this was NOT parked. Fail
         # closed: refusing a send is recoverable, a duplicated unsafe post is not.
         return True
+    canon = canonical or (lambda w: w)
     for (repo, num, row_who), (outcome, _ts) in latest.items():
-        # Legacy rows carry only `reviewer`; accept either spelling so a row
-        # written under an alias still parks the alias it was written for.
-        if row_who not in (who, reviewer):
+        # A row under any spelling of this actor counts; legacy rows carry only
+        # `reviewer`, so accept the raw name too.
+        if canon(row_who) != canon(who) and row_who not in (who, reviewer):
             continue
         if any(repo in (r, None) and num == str(n) for r, n in refs):
             if outcome in _UNSAFE_OUTCOMES:
