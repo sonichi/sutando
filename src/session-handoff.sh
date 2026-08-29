@@ -256,6 +256,10 @@ import importlib.util
 spec = importlib.util.spec_from_file_location('cpq', '$REPO/src/check-pending-questions.py')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+# Read the file the shell already guarded. The module resolves its own PQ_FILE
+# independently, and a second resolution can name a file the [ -f ] never saw.
+from pathlib import Path as _P
+m.PQ_FILE = _P('$PQ_PATH')
 qs = m.get_waiting_questions()
 print('\n'.join('- ' + q['title'] for q in qs[:20]) if qs else 'None')
 " 2>/dev/null)

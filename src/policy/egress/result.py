@@ -161,12 +161,17 @@ def load_team_result_scanner(repo: Path):
 
 
 def scan_team_result(body: str, repo: Path, secret_filter=None,
-                     scan_sensitive_data: bool = True) -> str:
+                     scan_sensitive_data: bool = True,
+                     allow_attach: bool = False) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
     kinds = {action.kind for action in parse_markers(body or "").actions}
     # dm-only only suppresses a redirect the guard already withholds, and a
     # redirect it suppressed never executes -- neither is a control here.
-    if kinds & {"redirect", "attach"}:
+    if kinds & {"redirect"}:
+        raise TeamResultLeakError("result delivery control marker")
+    if "attach" in kinds and not allow_attach:
+        # Verdict-only exemption: the adapter says whether THIS channel+sender
+        # may attach; path authorization stays with the transport allowlist.
         raise TeamResultLeakError("result delivery control marker")
     # Suppression is deliberately absent: redirect and attach move data
     # somewhere the sender should not reach, a skip marker moves nothing.
@@ -227,6 +232,47 @@ def withheld_review_id(task_id: str) -> str:
 
 def withheld_review_path(state_dir: Path, task_id: str) -> Path:
     return Path(state_dir) / WITHHELD_RESULT_DIR / f"{withheld_review_id(task_id)}.json"
+
+
+def is_attach_only_withhold(body: str) -> bool:
+    """True when the ONLY control markers are attachments — the one withhold
+    class an owner can release per-instance (redirects are never releasable)."""
+    kinds = {action.kind for action in parse_markers(body or "").actions}
+    return "attach" in kinds and "redirect" not in kinds
+
+
+def quarantined_attachment_path(state_dir: Path, task_id: str) -> Path:
+    return Path(state_dir) / SUPPRESSED_RESULT_DIR / f"qa_{withheld_review_id(task_id)}.json"
+
+
+def journal_quarantined_attachment(body: str, state_dir: Path, task_id: str,
+                                   now=None) -> bool:
+    """Quarantine a withheld attach-only result so an owner word can release it.
+
+    Best-effort by design: the withhold already happened fail-closed upstream;
+    this record only enables the later release, so an unwritable record costs
+    the release option, never the withhold."""
+    timestamp = float(time.time() if now is None else now)
+    directory = Path(state_dir) / SUPPRESSED_RESULT_DIR
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    except OSError:
+        return False
+    payload = {
+        "schema_version": 1,
+        "record_id": withheld_review_id(task_id),
+        "task_id": task_id,
+        "status": "withheld_attachment_pending",
+        "created_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+        "withheld_body": body,
+    }
+    try:
+        return _write_artifact(quarantined_attachment_path(state_dir, task_id), payload)
+    except OSError:
+        # best-effort for real: a failed record costs the release option,
+        # never the already-decided withhold and never the delivery loop
+        return False
 
 
 def _write_artifact(path: Path, payload: dict) -> bool:
@@ -335,7 +381,8 @@ def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
 
 def classify_result_for_tier(body: str, tier, repo: Path,
                              secret_filter=None,
-                             scan_sensitive_data: bool = True) -> TeamResultVerdict:
+                             scan_sensitive_data: bool = True,
+                             allow_attach: bool = False) -> TeamResultVerdict:
     """The guard-owned policy verdict. Adapters apply transport mechanics only;
     re-deciding (or bypassing) this classification in a bridge is a boundary
     violation, not an implementation choice."""
@@ -348,7 +395,8 @@ def classify_result_for_tier(body: str, tier, repo: Path,
     try:
         return TeamResultVerdict(
             VERDICT_DELIVER,
-            scan_team_result(body, repo, secret_filter, scan_sensitive_data),
+            scan_team_result(body, repo, secret_filter, scan_sensitive_data,
+                         allow_attach=allow_attach),
             None)
     except TeamResultLeakError as exc:
         if str(exc) == "result delivery control marker":
@@ -363,7 +411,7 @@ def classify_result_for_tier(body: str, tier, repo: Path,
 
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
                           scan_sensitive_data: bool = True, *,
-                          suppress_journal=None):
+                          suppress_journal=None, allow_attach: bool = False):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
@@ -375,9 +423,14 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     an adapter that omits it honours the marker with no record of its own.
     """
     verdict = classify_result_for_tier(
-        body, tier, repo, secret_filter, scan_sensitive_data)
+        body, tier, repo, secret_filter, scan_sensitive_data,
+        allow_attach=allow_attach)
     if (suppress_journal is not None and is_guarded_tier(tier)
             and is_suppression_only(body)):
         state_dir, task_id = suppress_journal
         verdict = journal_suppressed_result(verdict, body, state_dir, task_id)
+    if (suppress_journal is not None and verdict.kind == VERDICT_LEAK
+            and is_attach_only_withhold(body)):
+        state_dir, task_id = suppress_journal
+        journal_quarantined_attachment(body, state_dir, task_id)
     return verdict.body, verdict.reason

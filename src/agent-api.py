@@ -75,7 +75,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 
     # Prefer static base URL to prevent Host header injection bypass.
     # TWILIO_WEBHOOK_URL is the public ngrok/funnel URL Twilio sends webhooks to.
-    base_url = os.environ.get("TWILIO_WEBHOOK_URL", "")
+    base_url = config_get("TWILIO_WEBHOOK_URL", "")
     if base_url:
         url = base_url.rstrip("/") + handler.path
     else:
@@ -105,6 +105,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_config import config_get  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
@@ -620,13 +621,13 @@ def get_task_result(task_id: str):
         return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
     # Check archive — task-bridge archives results within seconds of delivery,
     # so direct /result polls often arrive after the file has been moved.
+    # Delegated: the archive move above mints `<id>-<epoch>.txt` on collision, a
+    # layout a month-only scan cannot find. find_archived_result covers all three.
     safe_id = _safe_id(task_id)
     if safe_id:
-        filename = f"{safe_id}.txt"
-        for month_dir in sorted((RESULT_DIR / "archive").glob("*/"), reverse=True):
-            candidate = month_dir / filename
-            if candidate.exists():
-                return {"task_id": safe_id, "status": "completed", "result": candidate.read_text()}
+        archived = local_task_protocol.find_archived_result(RESULT_DIR, task_id)
+        if archived is not None:
+            return {"task_id": safe_id, "status": "completed", "result": archived.read_text()}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}
@@ -1446,7 +1447,7 @@ def _resolve_local_ip() -> str:
 
 
 if __name__ == "__main__":
-    bind = os.environ.get("AGENT_API_BIND", "127.0.0.1")
+    bind = config_get("AGENT_API_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client stalled mid-request or a handler ran a slow subprocess/urlopen —
     # every later request hung on a port that still looked open to startup.sh's
