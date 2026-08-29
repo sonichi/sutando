@@ -32,6 +32,8 @@ import argparse
 import datetime
 import json
 import os
+import pathlib
+import tempfile
 import re
 import sys
 from pathlib import Path
@@ -81,7 +83,8 @@ def _verdict_from_field(field: str):
         return HUMAN, f"cited in `{field}` (field names the human)"
     # ANY segment, not the tail or the head: nesting must not change what a
     # typed field states, or `wrapper.stand_status.id` classifies as nothing.
-    if any(x.startswith("stand") for x in segs) or "agent" in whole:
+    if (any(x.startswith("stand") for x in segs) or "agent" in whole
+            or any("stand" in x for x in segs)):
         return STAND, f"cited in `{field}` (field names the agent)"
     return None, None
 
@@ -387,9 +390,18 @@ def main() -> int:
         # inode, so a name check alone destroys the v1 rollback.
         print("refusing to overwrite the input roster", file=sys.stderr)
         return 2
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    tmp.write_text(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
-    os.replace(tmp, dest)
+    # A UNIQUE sibling created O_EXCL: a deterministic name can already be a
+    # hardlink or symlink to the roster, and write_text follows it.
+    fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=dest.name + ".",
+                                    suffix=".tmp")
+    tmp = pathlib.Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(out, indent=1, ensure_ascii=False) + "\n")
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)     # never leave a half-written sibling
+        raise
     if a.table:
         print_table(rows)
     print(f"\nwrote {dest} ({len(rows)} people); input untouched", file=sys.stderr)

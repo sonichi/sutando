@@ -530,6 +530,32 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         self.assertIn(HUMAN, before,
                       f"the 'triage human' column lost the matched source: {row!r}")
 
+    def test_a_prelinked_temp_path_cannot_destroy_the_input(self):
+        # A deterministic <dest>.tmp can already be a hardlink to the roster,
+        # and write_text follows it before the destination guard ever runs.
+        src = self._roster({"x": {}})
+        dest = Path(self.tmp) / "out_pl.json"
+        os.link(src, str(dest) + ".tmp")
+        rc = self._main("--roster", str(src), "--out", str(dest))[0]
+        self.assertEqual(json.loads(src.read_text()), {"x": {}},
+                         "the migration overwrote its own input through the temp")
+
+    def test_the_migration_is_semantically_idempotent(self):
+        # `other_stand_discord_ids` begins with "other_", so the secondary
+        # Stand was not typed evidence on a rerun and got demoted.
+        SEC = "1529720369668292629"
+        src = self._roster({"y": {"stand_discord_id": "1504316176686120980",
+                                  "other_stand_discord_ids": [{"id": SEC, "basis": "x"}]}})
+        first = Path(self.tmp) / "v2-1.json"
+        self._main("--roster", str(src), "--out", str(first))
+        second = Path(self.tmp) / "v2-2.json"
+        rc = self._main("--roster", str(first), "--out", str(second))[0]
+        rec = json.loads(second.read_text())["y"]
+        self.assertEqual([o["id"] for o in rec["other_stand_discord_ids"]], [SEC],
+                         "a rerun demoted the secondary Stand")
+        self.assertEqual(rec["unresolved_discord_ids"], [])
+        self.assertEqual(rc, 0)
+
     def test_a_coverage_gap_is_reported_rather_than_read_as_success(self):
         # rc 5 says the file WAS written and somebody in it is unaddressable.
         # rc 0 would let a caller promote a map that reaches nobody.
