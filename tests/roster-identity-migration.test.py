@@ -16,6 +16,12 @@ Run: python3 tests/roster-identity-migration.test.py
 """
 import importlib.util
 import json
+import pathlib
+import shutil
+import subprocess
+import sys
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -176,6 +182,86 @@ class Reversibility(unittest.TestCase):
             finally:
                 sys.argv = argv
             self.assertEqual(src.read_bytes(), before)
+
+
+
+class TheCommandLineActuallyRuns(unittest.TestCase):
+    """The CLI, its table and its refusals — run IN PROCESS so coverage sees it.
+
+    A subprocess is not traced by the gate, so the same assertions via
+    subprocess would pass while leaving these lines measured as uncovered.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="cli-")
+        self._argv = sys.argv
+
+    def tearDown(self):
+        sys.argv = self._argv
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _roster(self, d):
+        p = Path(self.tmp) / "roster.json"
+        p.write_text(json.dumps(d))
+        return p
+
+    def _main(self, *argv):
+        sys.argv = ["m", *argv]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mig.main()
+        return rc, buf.getvalue()
+
+    def test_it_migrates_and_prints_the_before_after_table(self):
+        src = self._roster({"qingyun-wu": {"discord_id": BOT}})
+        cfg = Path(self.tmp) / "cfg.json"
+        cfg.write_text(json.dumps({"people": {"qingyun-wu": {
+            "discord": HUMAN, "bots": [BOT]}}}))
+        out = Path(self.tmp) / "v2.json"
+        rc, txt = self._main("--roster", str(src), "--triage-config", str(cfg),
+                             "--out", str(out), "--table")
+        self.assertEqual(rc, 0)
+        self.assertIn("-> human_discord_id", txt)
+        got = json.loads(out.read_text())["qingyun-wu"]
+        self.assertEqual(got["human_discord_id"], HUMAN)
+        self.assertEqual(got["stand_discord_id"], BOT)
+
+    def test_two_ids_claiming_the_human_slot_is_a_conflict_not_a_pick(self):
+        src = self._roster({"z": {"discord_human_id": HUMAN,
+                                  "human_discord_id": "1358841611580080168"}})
+        out = Path(self.tmp) / "v2.json"
+        rc, _ = self._main("--roster", str(src), "--out", str(out))
+        self.assertEqual(rc, 0)
+        rec = json.loads(out.read_text())["z"]
+        self.assertIsNone(rec["human_discord_id"],
+                          "a conflict must not resolve to one of them")
+        reasons = [u["reason"] for u in rec["unresolved_discord_ids"]]
+        self.assertTrue(any("two ids claim the human slot" in r for r in reasons), reasons)
+
+    def test_peers_and_owner_config_are_read_when_supplied(self):
+        # Both are optional inputs, so nothing else exercises their read path —
+        # and they are what classify a peer bot id and the owner's own id.
+        src = self._roster({"p": {"discord_id": BOT}, "o": {"discord_id": HUMAN}})
+        peers = Path(self.tmp) / "peers.json"
+        peers.write_text(json.dumps({"pro": BOT}))
+        dcfg = Path(self.tmp) / "discord-config.json"
+        dcfg.write_text(json.dumps({"owner": HUMAN}))
+        out = Path(self.tmp) / "v2.json"
+        rc, _ = self._main("--roster", str(src), "--peers", str(peers),
+                           "--discord-config", str(dcfg), "--out", str(out))
+        self.assertEqual(rc, 0)
+        d = json.loads(out.read_text())
+        self.assertEqual(d["p"]["stand_discord_id"], BOT, "peers.json states it is a bot")
+        self.assertEqual(d["o"]["human_discord_id"], HUMAN, "discord-config states the owner")
+
+
+    def test_an_id_inside_a_list_is_still_found(self):
+        src = self._roster({"w": {"discord_ids": [BOT]}})
+        out = Path(self.tmp) / "v2.json"
+        rc, _ = self._main("--roster", str(src), "--out", str(out))
+        self.assertEqual(rc, 0)
+        self.assertIn(BOT, json.dumps(json.loads(out.read_text())["w"]),
+                      "a list-valued id must not be dropped")
 
 
 if __name__ == "__main__":
