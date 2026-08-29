@@ -1062,6 +1062,40 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
             "channel": "room", "outcome": "pending"}) + "\n")
         self.assertTrue(self._stale(), "a standing reservation was dropped from the age")
 
+    def test_one_aliass_failure_does_not_settle_the_others_standing_ask(self):
+        # The park was fixed per raw stream and ask-history was not, so the same
+        # collapse still lost beta's 90-minute reservation and its timestamp.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        def at(m):
+            return (now - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
+            {"repo": "sonichi/sutando", "pr": 3509, "reviewer": "beta",
+             "ts": at(90), "channel": "room", "outcome": "pending"},
+            {"repo": "sonichi/sutando", "pr": 3509, "reviewer": "alpha",
+             "actor": "alpha", "ts": at(5), "channel": "room", "outcome": "pending"},
+            {"repo": "sonichi/sutando", "pr": 3509, "reviewer": "alpha",
+             "actor": "alpha", "ts": at(5), "channel": "room", "outcome": "failed"})))
+        roster = {"alpha": {"discord_id": "1", "home_channel": "2"},
+                  "beta": {"discord_id": "1", "home_channel": "2",
+                           "same_actor_as": "alpha"}}
+        for name in ("alpha", "beta"):
+            self.assertTrue(
+                nr._stale_repeat_ask(self.MSG, [{"name": name}], roster)[0],
+                f"{name}'s standing 90m reservation was settled by alpha's failure")
+
+    def test_a_single_streams_release_still_clears_its_own_ask_history(self):
+        # The control: without it, never settling a pending would pass the case
+        # above by refusing every repeat forever.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        def at(m):
+            return (now - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.led.write_text("".join(json.dumps(r) + "\n" for r in (
+            {"repo": "sonichi/sutando", "pr": 3509, "reviewer": "k", "actor": "k",
+             "ts": at(90), "channel": "room", "outcome": "pending"},
+            {"repo": "sonichi/sutando", "pr": 3509, "reviewer": "k", "actor": "k",
+             "ts": at(5), "channel": "room", "outcome": "failed"})))
+        self.assertFalse(self._stale())
+
     def test_a_recent_ask_is_not_stale_yet(self):
         # The negative control on the CLOCK rather than the outcome: without it
         # a rule that refused every repeat would pass all four cases above.

@@ -264,35 +264,38 @@ def _latest_outcomes(led: Path, canonical=None) -> dict:
 def _first_ask(led: Path, canonical=None) -> dict:
     """(repo, pr, actor) -> earliest ts at which an ask actually reached them.
 
-    Deliberately NOT the last-outcome reduction: a later attempt that failed
-    releases its own reservation and must not erase an ask that landed hours
-    earlier. Retry-safety and ask-history are two questions over one file.
+    Reduced per RAW spelling and folded afterwards, for the same reason the park
+    is: one alias's definite failure settles only its own reservation.
     """
-    out, last, last_ts = {}, {}, {}
+    raw_first, raw_last, raw_last_ts = {}, {}, {}
     if not led.exists():
-        return out
+        return {}
     for line in led.read_text().splitlines():
         try:
             d = json.loads(line)
         except ValueError:
             continue
         who = d.get("actor") or d.get("reviewer")
-        if canonical:
-            who = canonical(who)
         key = (d.get("repo"), str(d.get("pr")), who)
         ts, outcome = d.get("ts") or "", d.get("outcome")
-        last[key], last_ts[key] = outcome, ts
+        raw_last[key], raw_last_ts[key] = outcome, ts
         # A row predating the outcome field records a send that happened: the
         # field's absence is legacy, not a claim that nothing was posted.
-        if (outcome is None or outcome in _DID_ASK) and (key not in out or ts < out[key]):
-            out[key] = ts
-    for key, outcome in last.items():
+        if (outcome is None or outcome in _DID_ASK) and (
+                key not in raw_first or ts < raw_first[key]):
+            raw_first[key] = ts
+    for key, outcome in raw_last.items():
         # A standing reservation may have posted, so it counts as an ask until
-        # it settles; a settled `failed` never posted and never counts.
-        if outcome == "pending" and key not in out:
-            # Its own ts, never "": an empty string is falsy and silently drops
-            # the actor from every age reduction downstream.
-            out[key] = last_ts.get(key) or ""
+        # it settles, at its own ts; a settled `failed` never posted.
+        if outcome == "pending" and key not in raw_first:
+            raw_first[key] = raw_last_ts.get(key) or ""
+    canon = canonical or (lambda w: w)
+    out = {}
+    for (repo, num, who), ts in raw_first.items():
+        k = (repo, num, canon(who))
+        prev = out.get(k)
+        if k not in out or (ts and (not prev or ts < prev)):
+            out[k] = ts
     return out
 
 
@@ -457,8 +460,8 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     names = {actor_of.get(x["name"], x["name"]) for x in targets}
     if not names or not names.issubset(prior):
         return False, ""            # at least one NEW name -> this IS widening
-    # NEWEST among the selected targets: an older ask belonging to someone
-    # else says nothing about whether THIS set may be re-asked.
+
+    # NEWEST among the targets: someone else's older ask says nothing here.
     ours = [per_actor[n] for n in names if per_actor.get(n)]
     earliest = max(ours) if ours else None
     if earliest is None:
