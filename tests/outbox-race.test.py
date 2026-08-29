@@ -32,7 +32,9 @@ def plant_stale_claim(root, item):
     }, sort_keys=True), encoding="utf-8")
 
 if __name__ == "__main__":
-    N, rounds = 24, 12
+    # Contention is workers-per-core, not an absolute: a fixed 24 is 12x
+    # oversubscribed on a 2-core runner, and the thrash is what timed out.
+    N, rounds = max(8, (os.cpu_count() or 2) * 3), 12
     totals = []
     # ONE warm pool here too, for the reason phase 2 already states: a fresh pool
     # per round pays process startup inside the window under test.
