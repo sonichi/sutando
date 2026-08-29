@@ -277,6 +277,44 @@ class TwoChannelsDistinct(unittest.TestCase):
         self.assertNotIn("999", argv, f"sent to bot2bot, which the reviewer is not in: {argv}")
 
 
+
+
+class MalformedAccessMapNeverAnswers(unittest.TestCase):
+    """Unusable shapes are unverified, not verdicts.
+
+    A scalar allowFrom ITERATES: "111" answers per character, which is a
+    definite verdict computed from garbage.
+    """
+
+    def _reach(self, blob):
+        cfg = config_with(blob)
+        prev = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        try:
+            return nr.discord_reachable({"channel": "222", "discord_id": "111"})
+        finally:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None) if prev is None else os.environ.update({"CLAUDE_CONFIG_DIR": prev})
+
+    def test_truthy_non_object_section_is_unverified(self):
+        ok, why = self._reach({"groups": "not-an-object"})
+        self.assertTrue(ok)
+        self.assertIn("not an object", why)
+
+    def test_scalar_allow_from_is_unverified(self):
+        ok, why = self._reach({"groups": {"222": {"allowFrom": 1}}})
+        self.assertTrue(ok)
+        self.assertIn("not a list", why)
+
+    def test_string_allow_from_is_unverified_rather_than_per_character(self):
+        ok, why = self._reach({"groups": {"222": {"allowFrom": "111"}}})
+        self.assertTrue(ok)
+        self.assertIn("not a list", why)
+
+    def test_a_good_list_still_answers(self):
+        ok, why = self._reach({"groups": {"222": {"allowFrom": ["111"]}}})
+        self.assertTrue(ok)
+        self.assertIn("in allowFrom", why)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

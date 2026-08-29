@@ -111,5 +111,45 @@ class Owners(unittest.TestCase):
         self.assertNotIn("DISCORD_BOT_TOKEN=", src)
 
 
+
+class TokenResolution(unittest.TestCase):
+    """The shared resolver, exercised — not just asserted from the source text."""
+
+    def test_env_only_host_resolves_without_an_env_file(self):
+        m = load()
+        import os
+        prev = os.environ.get("DISCORD_BOT_TOKEN")
+        os.environ["DISCORD_BOT_TOKEN"] = "env-token"
+        os.environ["CLAUDE_CONFIG_DIR"] = "/nonexistent-config-dir"
+        try:
+            self.assertEqual(m.token(), "env-token")
+        finally:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            if prev is None:
+                os.environ.pop("DISCORD_BOT_TOKEN", None)
+            else:
+                os.environ["DISCORD_BOT_TOKEN"] = prev
+
+    def test_no_token_anywhere_exits_rather_than_posting(self):
+        # The resolver has THREE layers: env, .env file, vault. Clearing the
+        # first two still resolves on a host whose vault holds the token.
+        m = load()
+        m.resolve_channel_token = lambda *a, **k: ""
+        with self.assertRaises(SystemExit):
+            m.token()
+
+
+class Usage(unittest.TestCase):
+    def test_wrong_arg_count_is_a_usage_error_not_a_send(self):
+        m = load()
+        sent = []
+        m.send = lambda *a, **k: sent.append(a)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = m.main(["222", "only-two"])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage:", err.getvalue())
+        self.assertEqual(sent, [], "a malformed invocation must not reach the transport")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
