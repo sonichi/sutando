@@ -230,9 +230,10 @@ class MainDiscordSend(unittest.TestCase):
                      ("SUTANDO_REVIEW_ASKS_LEDGER", self._led)):
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
 
-    def _send(self, rc_out):
+    def _send(self, rc_out, stdout=""):
         class _R:
-            returncode, stdout, stderr = rc_out, "", "boom" if rc_out else ""
+            returncode, stderr = rc_out, "boom" if rc_out else ""
+        _R.stdout = stdout
         nr.subprocess.run = lambda *a, **k: _R()
         fd, path = tempfile.mkstemp(suffix=".json")
         with os.fdopen(fd, "w") as f:
@@ -253,6 +254,12 @@ class MainDiscordSend(unittest.TestCase):
         rc, out, _ = self._send(0)
         self.assertIn("SENT to channel 222", out)
         self.assertEqual(rc, 0)
+
+    def test_a_successful_send_names_the_message_it_created(self):
+        # Without the id there is no artifact naming what landed, so a live
+        # delivery cannot be checked against the channel afterwards.
+        rc, out, _ = self._send(0, stdout="m-123")
+        self.assertIn("as message m-123", out)
 
     def test_a_failed_send_surfaces_stderr_and_is_not_silent(self):
         # rc 1 is NOT_DELIVERED: no post exists, so this is the retryable shape.

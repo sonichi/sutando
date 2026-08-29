@@ -527,7 +527,11 @@ def main() -> int:
                 unknowns += 1
                 continue
             if p.returncode == 0:
-                print(f"{t['name']}: SENT to channel {t['channel']}")
+                # The child prints the message id. Swallowing it leaves no
+                # artifact naming what actually landed.
+                mid = (p.stdout or "").strip()
+                print(f"{t['name']}: SENT to channel {t['channel']}"
+                      + (f" as message {mid}" if mid else ""))
                 # Same bookkeeping as the Matrix path: without it a delivered
                 # Discord ask reads as NOBODY_EVER_ASKED to pr-unattended.
                 try:
