@@ -189,7 +189,14 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 6.5. **Proactive-comm / idle-surface (do NOT skip — this is the anti-going-dark hook).** Restored 2026-07-13; originally built 2026-06-26 as a working-tree SKILL.md step (it ran — idle-streak.json proves it) that was never committed to the repo file and was lost in the ~Jun-30 workspace-revamp rewrite (same rewrite that dropped 0.7). Its absence is exactly why the owner kept flagging "proactive comm handling is still missing" — with no step here, the loop silently idle-closes to the terminal and the owner sees nothing.
 
-   Classify this pass: **substantive** (processed a task, shipped a fix/PR, filed a memory, posted to owner) or **no-op** (nothing owner-visible happened). Maintain `state/idle-streak.json` `{streak, last_surfaced_hash, updated}`: substantive → `streak=0`; no-op → `streak++`.
+   Classify this pass: **substantive** (processed a task, shipped a fix/PR, filed a memory, posted to owner) or **no-op** (nothing owner-visible happened). Record it with the script — **do not maintain `state/idle-streak.json` by hand.** `record_outcome()` owns `streak` and the cumulative totals under a lock, so a second writer double-counts every pass and the drift is silent:
+
+   ```bash
+   python3 skills/proactive-loop/scripts/idle-surface-hash.py \
+     --state "$WORKSPACE/state/idle-streak.json" --pass-outcome substantive|noop
+   ```
+
+   It returns before touching stdin, so it is safe under cron. `last_surfaced_hash` is a different field with a different contract and is still written by the `--commit` path below.
 
    On the **first no-op** of a run (`streak >= 1`):
    1. **Generate, don't idle** — first widen the menu and actually try to produce a tangible artifact (peer-PR review, regression grep, parity verify, research, memory curation, own-PR CI). Gated ≠ nothing-to-do. Only if genuinely all-gated go to step 2.
