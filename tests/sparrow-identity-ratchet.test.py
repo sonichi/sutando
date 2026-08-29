@@ -60,6 +60,9 @@ TASK_MINT_PIN = {
     ("slack-bridge.py", "_write_task"): 1,
     ("telegram-bridge.py", "_dedup_recover"): 1,
     ("telegram-bridge.py", "main"): 1,
+    # Origination, not ingress: a client submits text over the local socket, so
+    # there is no provider_event_id for ingress_task_id to be injective over.
+    ("runtime-api/tasks_view.py", "submit"): 1,
 }
 
 # Pre-canonical delivery_id sites, pinned per (file, function) like
