@@ -14,6 +14,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 
 ## `src/`
 
+- **`access_store.py`** — Single writer contract for Discord access.json.
 - **`accessibility_probe.sh`** — Unbounded, this probe blocks forever on a session with nobody to answer the AppleScript prompt, and startup never reaches the services after it.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
@@ -71,6 +72,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
+- **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.

@@ -100,6 +100,7 @@ def run_send(stub_payload, roster=None, stub_stderr=""):
     rp.write_text(json.dumps(roster or GOOD))
     env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
     return subprocess.run([sys.executable, str(copy), "--send",
+                           "--allow-single", "presence test",
                            "--reviewers", "rui", "--message", "m"],
                           capture_output=True, text=True, timeout=30, env=env)
 
@@ -188,6 +189,9 @@ def run_room(members_payload, *extra, roster=None, env_overrides=None):
     rp.write_text(json.dumps(roster or GOOD))
     env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp), **(env_overrides or {})}
     return subprocess.run([sys.executable, str(copy), "--send",
+                           # These exercise ROOM PRESENCE, not the >=2 rule: without
+                           # it the count gate answers before any presence assertion.
+                           "--allow-single", "presence test",
                            "--reviewers", "rui", "--message", "m", *extra],
                           capture_output=True, text=True, timeout=30, env=env)
 
@@ -224,6 +228,7 @@ def run_room_per_room(per_room: dict, default, *extra, roster=None):
     rp.write_text(json.dumps(roster or GOOD))
     env = {**os.environ, "SUTANDO_SCI_ROSTER": str(rp)}
     proc = subprocess.run([sys.executable, str(copy), "--send",
+                           "--allow-single", "presence test",
                            "--reviewers", "rui", "--message", "m", *extra],
                           capture_output=True, text=True, timeout=30, env=env)
     proc.queried = seen.read_text().split() if seen.exists() else []
