@@ -44,9 +44,8 @@ DEST_BODY = '{"token": "NEWER-DEST"}\n'
 FORBIDDEN = ("rehomed-newer", "COMMIT complete")
 
 SHIM = """#!/bin/bash
-# Fail BOTH mtime probes (%m BSD, %Y GNU) for one operand only. Size probes and
-# every other path fall through to the real stat, so the failure is per-file and
-# per-field -- not a globally broken stat, which would prove nothing.
+# Fail BOTH mtime probes (%m BSD, %Y GNU) for one operand only; size probes and
+# other paths hit the real stat -- per-file, per-field, not a broken stat.
 want_mtime=0; hit=0
 for a in "$@"; do
     case "$a" in

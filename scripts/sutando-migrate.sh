@@ -2298,36 +2298,44 @@ by_rel = defaultdict(list)
 for e in entries:
     by_rel[e["rel"]].append(e)
 collisions = {k: v for k, v in by_rel.items() if len(v) > 1}
+def has_unknown(entries):
+    """A miss cannot witness equality: two unreadable mtimes are ambiguous, not equal."""
+    return any(e["mtime"] is None or e["size"] is None for e in entries)
 identical = sum(1 for v in collisions.values()
-                if len({(e["mtime"], e["size"]) for e in v}) == 1)
+                if not has_unknown(v)
+                and len({(e["mtime"], e["size"]) for e in v}) == 1)
 genuine = len(collisions) - identical
 by_class = defaultdict(int)
 for v in collisions.values():
     by_class[v[0]["class"]] += 1
+def _known(vals):
+    return [x for x in vals if x is not None]
 def has_size_mismatch(entries):
-    """True if entries differ in size — real content divergence the user must reason about."""
-    return len({e["size"] for e in entries}) > 1
+    """True if KNOWN sizes differ — real content divergence the user must reason about."""
+    return len(set(_known(e["size"] for e in entries))) > 1
 def has_mtime_mismatch(entries):
-    return len({e["mtime"] for e in entries}) > 1
-# Sort by actionability: size-mismatch (real content conflict) first, then
-# mtime-only diff (commit's newest-mtime resolves it), then identical
-# (drop-dup). Tiebreak by class then rel.
+    return len(set(_known(e["mtime"] for e in entries))) > 1
+# Sort by actionability: size-mismatch (real content conflict), then unknown
+# metadata (ambiguous, commit fails closed), then mtime-only, then identical.
 def sort_key(item):
     k, v = item
-    sz_diff = has_size_mismatch(v)
-    mt_diff = has_mtime_mismatch(v)
-    # priority: 0=size-diff (real), 1=mtime-only, 2=identical
-    if sz_diff: prio = 0
-    elif mt_diff: prio = 1
-    else: prio = 2
+    if has_size_mismatch(v): prio = 0
+    elif has_unknown(v): prio = 1
+    elif has_mtime_mismatch(v): prio = 2
+    else: prio = 3
     return (prio, v[0]["class"], k)
 notable = [{"class": v[0]["class"], "rel": k,
             "size_mismatch": has_size_mismatch(v),
             "mtime_mismatch": has_mtime_mismatch(v),
+            "unknown_metadata": has_unknown(v),
             "entries": [{"tag": e["tag"], "mtime": e["mtime"], "size": e["size"]} for e in v]}
            for k, v in sorted(collisions.items(), key=sort_key)]
 size_diff = sum(1 for v in collisions.values() if has_size_mismatch(v))
-mtime_only = sum(1 for v in collisions.values() if not has_size_mismatch(v) and has_mtime_mismatch(v))
+unknown_meta = sum(1 for v in collisions.values()
+                   if not has_size_mismatch(v) and has_unknown(v))
+mtime_only = sum(1 for v in collisions.values()
+                 if not has_size_mismatch(v) and not has_unknown(v)
+                 and has_mtime_mismatch(v))
 out = {
     "dest": dest,
     "sources": {"A": a or None, "B": b or None, "C": c or None},
@@ -2337,7 +2345,9 @@ out = {
         "identical_content": identical,
         "mtime_only_diff": mtime_only,  # commit's newest-mtime auto-resolves
         "size_mismatch": size_diff,     # the actionable subset — real content conflicts
-        # Legacy "genuine_conflicts" kept for backward-compat; equals mtime_only + size_mismatch
+        "unknown_metadata": unknown_meta,  # a probe failed; ambiguous, never identical
+        # Legacy "genuine_conflicts" kept for backward-compat; equals
+        # mtime_only + size_mismatch + unknown_metadata
         "genuine_conflicts": genuine,
         "by_class": dict(by_class),
     },
