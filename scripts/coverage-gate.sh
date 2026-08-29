@@ -96,6 +96,8 @@ fully_skipped=()
 partly_skipped=()
 # Each file writes its own .coverage.* fragment (`parallel = True`), merged
 # by the `coverage combine` below.
+# One worktree per worker, so this trades disk for wall clock: the lanes are
+# CPU-bound once created, and an unbounded count would thrash a small runner.
 COVGATE_WORKERS="${COVERAGE_GATE_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 RECDIR="$(mktemp -d)"
 trap 'rm -rf "$RECDIR"' EXIT
@@ -113,11 +115,25 @@ else
 fi
 export RECDIR COVGATE_TIMEOUT
 
+# Lanes are worktrees at HEAD, so uncommitted work is invisible to them: a
+# clean report here would cover code this run never executed.
+if [ -z "${COVERAGE_GATE_ALLOW_DIRTY:-}" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+    _covgate_dirty=""
+    git diff --quiet HEAD 2>/dev/null || _covgate_dirty="tracked edits"
+    if [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then
+        _covgate_dirty="${_covgate_dirty:+$_covgate_dirty, }untracked files"
+    fi
+    if [ -n "$_covgate_dirty" ]; then
+        echo "coverage-gate: working tree is dirty ($_covgate_dirty); lanes run against HEAD," >&2
+        echo "  so your edits would NOT be measured. Commit them, or set" >&2
+        echo "  COVERAGE_GATE_ALLOW_DIRTY=1 to measure HEAD deliberately." >&2
+        exit 1
+    fi
+fi
+
 find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
 # Key on the LINE INDEX: a name-derived key collides (`tr "/." "__"` maps
 # tests/a/b and tests/a_b alike), letting a failing rc be overwritten.
-_covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
-
 # Shared scheduler: one SERIAL worker per worktree; the regression drives it.
 
 # It also brings the worktrees' .coverage.* fragments home for the combine.
