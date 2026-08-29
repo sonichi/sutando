@@ -39,11 +39,17 @@ def token() -> str:
     return tok
 
 
+def _build_client():
+    """Token plus client — the whole of what must succeed BEFORE a request
+    exists, isolated so only its failures can be called proven non-delivery."""
+    return make_client(token(), repo_root=_REPO)
+
+
 def send(channel: str, body: str, user_id: str, client=None):
     """-> (receipt, posted_body). `client` is injectable so the tests drive
     every outcome without a network. `allowed_mentions` is narrowed to
     `user_id`: the read-back can then only succeed for the intended target."""
-    client = client or make_client(token(), repo_root=_REPO)
+    client = client or _build_client()
     payload = {"content": body,
                "allowed_mentions": {"parse": [], "users": [str(user_id)]}}
     receipt, _status, posted = client.send_message_with_response(channel, payload)  # noqa: E501
@@ -62,14 +68,24 @@ def main(argv=None) -> int:
         return 2
     channel, user_id, body = argv
     try:
-        receipt, posted = send(channel, body, user_id)
+        client = _build_client()
     except SystemExit:
         raise
     except Exception as exc:            # noqa: BLE001 - classified, not swallowed
-        # Before the POST: only send_message_with_response is ambiguous.
+        # No request exists yet, so this is the only provable non-delivery.
         print(f"send_channel_message: failed before the POST ({type(exc).__name__}: "
               f"{exc})", file=sys.stderr)
         return NOT_DELIVERED_RC
+    try:
+        receipt, posted = send(channel, body, user_id, client=client)
+    except SystemExit:
+        raise
+    except Exception as exc:            # noqa: BLE001 - classified, not swallowed
+        # It may have committed before raising, so 10 would license a duplicate.
+        print(f"send_channel_message: OUTCOME UNKNOWN — the POST MAY have landed "
+              f"({type(exc).__name__}: {exc}). Do not retry blindly; check the "
+              "channel before sending again.", file=sys.stderr)
+        return 4
     outcome = getattr(receipt, "outcome", None)
 
     # Three outcomes, three meanings. Collapsing them is what turns a landed

@@ -43,13 +43,78 @@ class FakeClient:
 def run_main(outcome, mentions, target="111"):
     m = load()
     client = FakeClient(outcome, mentions)
-    m.send = lambda ch, body, uid, _c=client: (
+    m.send = lambda ch, body, uid, client=None, _c=client: (
         _c.send_message_with_response(ch, {"content": body,
                                            "allowed_mentions": {"parse": [], "users": [str(uid)]}})[0::2])
+    m._build_client = lambda: client
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         rc = m.main(["222", target, "hello"])
     return rc, out.getvalue(), err.getvalue(), client
+
+
+class CommittingClient:
+    """Records the POST, then raises — a response read that dies after the
+    request landed, which is the only case the two boundaries disagree on."""
+
+    def __init__(self):
+        self.posts = []
+
+    def send_message_with_response(self, channel, payload):
+        self.posts.append(payload)
+        raise ConnectionResetError("peer reset while reading the response")
+
+
+def run_main_real_send(client, target="111"):
+    """Drives the REAL send(), so the try/except boundary under test is the
+    production one — a stubbed send would route around the whole defect."""
+    m = load()
+    m._build_client = lambda: client
+    err = io.StringIO()
+    with redirect_stdout(io.StringIO()), redirect_stderr(err):
+        rc = m.main(["222", target, "hello"])
+    return rc, err.getvalue()
+
+
+class PostCommitExceptionIsAmbiguous(unittest.TestCase):
+    """A POST that commits and then raises must never read as proven failure."""
+
+    def test_an_exception_after_the_post_landed_is_ambiguous_not_failure(self):
+        # `except Exception` spanned send(), whose one statement IS the POST, so
+        # a committed-then-raised request read as proven failure and retried.
+        client = CommittingClient()
+        rc, err = run_main_real_send(client)
+        self.assertEqual(len(client.posts), 1, "the POST committed")
+        self.assertEqual(rc, 4, f"a committed POST must be ambiguous, got {rc}")
+        self.assertIn("MAY have landed", err)
+        self.assertNotIn("failed before the POST", err)
+
+    def test_that_rc_is_not_one_a_retry_is_licensed_on(self):
+        # The coupling that decides duplication lives in the parent, so assert
+        # against ITS set rather than restating the number here.
+        spec = importlib.util.spec_from_file_location(
+            "nr", REPO / "skills" / "collaboration-intelligence" / "scripts"
+            / "notify_reviewers.py")
+        nr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(nr)
+        rc, _ = run_main_real_send(CommittingClient())
+        self.assertNotIn(rc, nr._PROVEN_NOT_DELIVERED)
+        self.assertIn(10, nr._PROVEN_NOT_DELIVERED, "the pre-POST code still is")
+
+    def test_a_pre_post_failure_is_still_proven_non_delivery(self):
+        # The negative control. Without it the fix could route EVERY failure to
+        # ambiguous, parking sends that provably never left.
+        m = load()
+
+        def boom():
+            raise RuntimeError("no token")
+
+        m._build_client = boom
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = m.main(["222", "111", "hello"])
+        self.assertEqual(rc, 10)
+        self.assertIn("failed before the POST", err.getvalue())
 
 
 class Outcomes(unittest.TestCase):
