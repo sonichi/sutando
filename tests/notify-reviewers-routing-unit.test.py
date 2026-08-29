@@ -161,7 +161,7 @@ class MainDiscordBranch(unittest.TestCase):
             json.dump(roster, f)
         os.environ["SUTANDO_SCI_ROSTER"] = path
         os.environ["CLAUDE_CONFIG_DIR"] = cfg
-        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m"]
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "re-review https://github.com/sonichi/sutando/pull/3509"]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = nr.main()
@@ -216,7 +216,7 @@ class MainDiscordSend(unittest.TestCase):
         os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {"222": {"allowFrom": ["111"]}}})
         # #3515's two-reviewer minimum landed after these cases; they test the
         # SEND path, so they take the documented escape rather than weakening.
-        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m", "--send",
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "re-review https://github.com/sonichi/sutando/pull/3509", "--send",
                        "--allow-single", "single-target send-path test"]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -269,7 +269,7 @@ class TwoChannelsDistinct(unittest.TestCase):
         os.environ["SUTANDO_SCI_ROSTER"] = path
         # #3515's two-reviewer minimum landed after these cases; they test the
         # SEND path, so they take the documented escape rather than weakening.
-        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "m", "--send",
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message", "re-review https://github.com/sonichi/sutando/pull/3509", "--send",
                        "--allow-single", "single-target send-path test"]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -560,21 +560,30 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
         self.assertEqual(rc, 4)
         self.assertIn("unknown", self.led.read_text())
 
-    def test_an_oserror_takes_the_same_path(self):
+    def test_a_spawn_failure_is_not_delivered_rather_than_unknown(self):
+        # A spawn failure means no child ran and no POST was possible, so it is
+        # definitely not delivered; parking it strands an ask that never started.
         def boom(*a, **k):
             raise OSError("exec failed")
         nr.subprocess.run = boom
         rc, _, err = self._run_main()
-        self.assertIn("UNKNOWN outcome (OSError)", err)
-        self.assertEqual(rc, 4)
+        self.assertIn("SEND FAILED before spawn", err)
+        self.assertIn("safe to retry", err)
+        self.assertNotIn("UNKNOWN outcome", err)
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.led.exists() and self.led.read_text().strip(),
+                         "a send that never started must not be parked")
 
-    def test_a_timeout_on_an_unrecordable_message_says_it_was_not_recorded(self):
-        def boom(*a, **k):
-            raise subprocess.TimeoutExpired(cmd="x", timeout=60)
-        nr.subprocess.run = boom
+    def test_an_unrecordable_message_is_refused_before_any_send(self):
+        # The unparkable-unknown case is now unreachable BY CONSTRUCTION: a
+        # message with no full PR URL cannot record an unknown, so it never sends.
+        called = []
+        nr.subprocess.run = lambda *a, **k: called.append(1)
         rc, _, err = self._run_main(message="re-review #3303")
-        self.assertIn("NOT recorded", err)
-        self.assertEqual(rc, 4)
+        self.assertIn("REFUSED", err)
+        self.assertIn("no full PR URL", err)
+        self.assertEqual(called, [], "must not send what it could not park")
+        self.assertEqual(rc, 1)
 
     def test_a_ledger_write_failure_is_reported_not_swallowed(self):
         def boom(*a, **k):
@@ -625,9 +634,11 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
              "outcome": "unknown"}) + "\n")
         self.assertTrue(nr.unknown_parked(self.MSG, "d"))
 
-    def test_an_unreadable_ledger_reports_not_parked_rather_than_raising(self):
+    def test_an_unreadable_ledger_fails_CLOSED(self):
+        # It cannot prove the target was NOT parked, and a refused send is
+        # recoverable while a duplicated unsafe post is not.
         self.led.mkdir()          # a directory where a file is expected
-        self.assertFalse(nr.unknown_parked(self.MSG, "d"))
+        self.assertTrue(nr.unknown_parked(self.MSG, "d"))
 
 
 if __name__ == "__main__":

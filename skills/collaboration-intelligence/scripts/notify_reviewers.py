@@ -239,7 +239,9 @@ def unknown_parked(message: str, reviewer: str) -> bool:
                    for r, n in refs):
                 return True
     except OSError:
-        return False
+        # Cannot read the park state, so cannot prove this was NOT parked. Fail
+        # closed: refusing a send is recoverable, a duplicated unsafe post is not.
+        return True
     return False
 
 
@@ -421,6 +423,15 @@ def main() -> int:
             if not a.send:
                 print("PLAN:", " ".join(argv))
                 continue
+            if not _PR_URL.search(a.message):
+                # An UNKNOWN outcome here could not be parked, so a retry would
+                # duplicate a post that may have landed. Refuse before sending.
+                print(f"{t['name']}: REFUSED — the message carries no full PR URL, "
+                      "so an unknown outcome could not be recorded and a repeat "
+                      "could duplicate it. Use the full URL, not a short #ref.",
+                      file=sys.stderr)
+                failures += 1
+                continue
             if unknown_parked(a.message, t["name"]):
                 print(f"{t['name']}: PARKED — a previous send to them had an "
                       "UNKNOWN outcome and is UNSAFE to retry; check the channel",
@@ -429,7 +440,15 @@ def main() -> int:
                 continue
             try:
                 p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-            except (subprocess.TimeoutExpired, OSError) as e:
+            except OSError as e:
+                # A spawn failure means no child ran and no POST was possible, so
+                # this is DEFINITELY not delivered — parking it would strand an
+                # ask that never started.
+                print(f"{t['name']}: SEND FAILED before spawn ({type(e).__name__}: {e})"
+                      " — nothing was sent; safe to retry", file=sys.stderr)
+                failures += 1
+                continue
+            except subprocess.TimeoutExpired as e:
                 # A timeout is not a failure: the post may have landed, so it is
                 # recorded UNKNOWN and the batch continues to the next reviewer.
                 print(f"{t['name']}: UNKNOWN outcome ({type(e).__name__}) — the post "
@@ -462,10 +481,12 @@ def main() -> int:
                 # OUTCOME_UNKNOWN: the post may have landed, and the receipt is
                 # UNSAFE to retry, so this is PARKED durably rather than failed.
                 unknowns += 1
+                _logged = 0
                 try:
                     # Claim recorded only when a row was written: a message with
                     # no resolvable PR ref logs nothing and must not say it did.
-                    if not record_asks(a.message, t["name"], outcome="unknown"):
+                    _logged = record_asks(a.message, t["name"], outcome="unknown")
+                    if not _logged:
                         print(f"  WARNING: {t['name']}'s unknown was NOT recorded "
                               "(no resolvable PR reference) — a repeat may "
                               "duplicate the ping", file=sys.stderr)
@@ -473,10 +494,12 @@ def main() -> int:
                     print(f"  WARNING: {t['name']} unknown-outcome send was NOT "
                           f"recorded ({e}) — a repeat may duplicate the ping",
                           file=sys.stderr)
+                _kept = "recorded so a repeat does not duplicate it" if _logged else (
+                    "NOT recorded — no resolvable PR reference, so a repeat CAN "
+                    "duplicate it; check the channel before re-running")
                 print(f"{t['name']}: OUTCOME UNKNOWN on channel {t['channel']} — "
-                      f"the post may have landed; recorded so a repeat does not "
-                      f"duplicate it. {(p.stderr or '').strip() or 'no stderr'}",
-                      file=sys.stderr)
+                      f"the post may have landed; {_kept}. "
+                      f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
             else:
                 print(f"{t['name']}: SEND FAILED rc={p.returncode} "
                       f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
