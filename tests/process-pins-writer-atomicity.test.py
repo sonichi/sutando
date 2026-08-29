@@ -7,9 +7,12 @@ the pin exists to carry. The writer therefore must never let a reader observe
 a partial snapshot: save_pins goes through a same-directory temp + os.replace.
 
 The detector control proves a torn file IS detectable by the probe used here
-(a truncated snapshot fails json.loads while load_pins returns []), then the
-concurrency drill hammers the PRODUCTION writer from forked OS processes
-while a reader asserts every observation parses as a complete snapshot.
+(a truncated snapshot fails json.loads while load_pins returns []). The
+concurrency drills then call the PRODUCTION writer from forked OS processes
+and assert BOTH halves of the transaction: no reader ever observes a torn
+snapshot, and every successful unique arm PERSISTS — os.replace alone keeps
+snapshots whole while silently dropping concurrent updates, so snapshot
+integrity without persistence is half a writer.
 
 Run: python3 tests/process-pins-writer-atomicity.test.py
 """
@@ -32,7 +35,13 @@ GOOD = {"service": "discord-bridge", "pid": "123",
         "reason": "witness armed", "expires_at": "2026-12-31T00:00:00Z"}
 
 
-def _hammer(path: str, worker: int, cycles: int) -> None:
+def _arm_one(path: str, worker: int) -> None:
+    process_pins.arm_pin(path, f"svc-{worker}", str(1000 + worker),
+                         f"lstart {worker}", f"worker {worker}",
+                         "2026-12-31T00:00:00Z")
+
+
+def _arm_release_cycles(path: str, worker: int, cycles: int) -> None:
     for i in range(cycles):
         process_pins.arm_pin(path, f"svc-{worker}", str(1000 + worker),
                              f"lstart {worker}", f"cycle {i}",
@@ -84,8 +93,22 @@ class WriterValidatesAndBounds(unittest.TestCase):
             json.loads(self.path.read_text())            # probe CAN detect it
         self.assertEqual(process_pins.load_pins(self.path), [])  # reader fails open
 
-    def test_concurrent_production_writers_never_expose_a_torn_snapshot(self) -> None:
-        procs = [multiprocessing.Process(target=_hammer,
+    def test_16_simultaneous_unique_arms_ALL_persist(self) -> None:
+        procs = [multiprocessing.Process(target=_arm_one,
+                                         args=(str(self.path), w))
+                 for w in range(16)]
+        for pr in procs:
+            pr.start()
+        for pr in procs:
+            pr.join()
+            self.assertEqual(pr.exitcode, 0, "a writer process failed")
+        pins = process_pins.load_pins(self.path)
+        got = sorted(p["service"] for p in pins)
+        self.assertEqual(got, sorted(f"svc-{w}" for w in range(16)),
+                         "a successful arm was silently dropped by a racer")
+
+    def test_concurrent_arm_release_cycles_stay_whole_and_serialized(self) -> None:
+        procs = [multiprocessing.Process(target=_arm_release_cycles,
                                          args=(str(self.path), w, 25))
                  for w in range(4)]
         for pr in procs:
@@ -104,6 +127,17 @@ class WriterValidatesAndBounds(unittest.TestCase):
             self.assertEqual(pr.exitcode, 0, "a writer process failed")
         self.assertGreater(observations, 10,
                            "reader loop never actually raced the writers")
+        # Every worker's last act was release: a serialized ledger ends empty.
+        self.assertEqual(process_pins.load_pins(self.path), [])
+
+    def test_arm_on_malformed_existing_state_RAISES_not_replaces(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not json")
+        with self.assertRaises(ValueError):
+            process_pins.arm_pin(self.path, "svc", "9", "l", "r",
+                                 "2026-12-31T00:00:00Z")
+        self.assertEqual(self.path.read_text(), "{not json",
+                         "a writer must not destroy state it cannot parse")
 
 
 if __name__ == "__main__":

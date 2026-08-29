@@ -27,8 +27,10 @@ adapter that already resolves the workspace stays the one that decides. Shape:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +38,7 @@ ARMED = "armed"
 EXPIRED = "expired"
 MISMATCH = "mismatch"
 ORPHAN = "orphan"
+PROBE_FAILED = "probe-failed"
 
 # Writer contract: schema = _REQUIRED string fields; bounds = MAX_PINS /
 # _FIELD_MAX; atomicity = temp + os.replace; writers raise, only the READER fails open.
@@ -98,26 +101,56 @@ def save_pins(path, pins: list) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _load_strict(path) -> list:
+    """Writer-side load: absent file is [], but malformed state RAISES.
+    Only the reader may fail open — a writer that fails open destroys pins."""
+    target = Path(path)
+    if not target.exists():
+        return []
+    data = json.loads(target.read_text())
+    pins = data.get("pins") if isinstance(data, dict) else None
+    if not isinstance(pins, list):
+        raise ValueError(f"{target}: existing pin record is malformed")
+    return [p for p in pins if isinstance(p, dict)]
+
+
+@contextmanager
+def _locked(path):
+    """Serialize the whole read-modify-write: os.replace keeps SNAPSHOTS whole,
+    but only a lock keeps two concurrent writers from dropping each other."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock = target.with_name(f".{target.name}.lock")
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def arm_pin(path, service, pid, lstart, reason, expires_at) -> dict:
     """The supported arm/extend entry point. Replaces any pin with the same
     (service, pid) identity, keeps the rest, writes through save_pins()."""
     pin = _validated({"service": service, "pid": pid, "lstart": lstart,
                       "reason": reason, "expires_at": expires_at})
-    keep = [p for p in load_pins(path)
-            if not (str(p.get("service") or "") == pin["service"]
-                    and str(p.get("pid") or "") == pin["pid"])]
-    save_pins(path, keep + [pin])
+    with _locked(path):
+        keep = [p for p in _load_strict(path)
+                if not (str(p.get("service") or "") == pin["service"]
+                        and str(p.get("pid") or "") == pin["pid"])]
+        save_pins(path, keep + [pin])
     return pin
 
 
 def release_pin(path, service, pid=None) -> int:
     """The supported release entry point. Returns how many pins it removed."""
-    pins = load_pins(path)
-    keep = [p for p in pins
-            if not (str(p.get("service") or "") == str(service)
-                    and (pid is None or str(p.get("pid") or "") == str(pid)))]
-    if len(keep) != len(pins):
-        save_pins(path, keep)
+    with _locked(path):
+        pins = _load_strict(path)
+        keep = [p for p in pins
+                if not (str(p.get("service") or "") == str(service)
+                        and (pid is None or str(p.get("pid") or "") == str(pid)))]
+        if len(keep) != len(pins):
+            save_pins(path, keep)
     return len(pins) - len(keep)
 
 
@@ -141,6 +174,9 @@ def evaluate(pins: list, service: str, lstart_by_pid: dict, now_ts: float) -> li
     `ps -o lstart=` string. A pin is ARMED only if its pid is live AND its
     recorded lstart still matches — every other outcome is reported so a lost
     pin surfaces instead of quietly suppressing or quietly disappearing.
+
+    `lstart_by_pid=None` means the ENUMERATION FAILED: unknown is not the empty
+    set, so no pin may be called ORPHAN and no restart may lean on the result.
     """
     out = []
     for pin in pins:
@@ -148,6 +184,12 @@ def evaluate(pins: list, service: str, lstart_by_pid: dict, now_ts: float) -> li
             continue
         pid = str(pin.get("pid") or "")
         reason = str(pin.get("reason") or "no reason recorded")
+        if lstart_by_pid is None:
+            out.append((PROBE_FAILED, pin, (
+                f"pin on {service} pid {pid} could not be verified — process "
+                f"enumeration failed; not orphaned, and no restart may be "
+                f"authorized on an unknown ({reason})")))
+            continue
         live = lstart_by_pid.get(pid)
         if live is None:
             out.append((ORPHAN, pin, (
@@ -182,10 +224,11 @@ def verdict_for(results: list, warn_lead: str, stale_detail: str) -> tuple:
     src-vs-process one: a pin preserves a branch-only compiled witness, and a
     rebuild destroys it exactly as a restart does.
     """
-    armed = armed_detail(results)
-    others = other_notes(results)
-    if armed:
-        return ("warn", f"{warn_lead}, but {armed}{others}")
+    veto = veto_detail(results)
+    # The veto's own note must not repeat in the trailing findings.
+    others = other_notes([r for r in results if r[2] != veto])
+    if veto:
+        return ("warn", f"{warn_lead}, but {veto}{others}")
     return ("stale", f"{stale_detail}{others}")
 
 
@@ -196,6 +239,15 @@ def stale_verdict(results: list, age_min: int) -> tuple:
         f"code is {age_min} min newer than process",
         f"running but code is {age_min} min newer than process "
         f"\u2014 restart needed")
+
+
+def veto_detail(results: list):
+    """The first detail that forbids a restart: ARMED, or PROBE_FAILED —
+    an unverifiable pin must not be destroyed on the strength of a failed probe."""
+    for verdict, _pin, detail in results:
+        if verdict in (ARMED, PROBE_FAILED):
+            return detail
+    return None
 
 
 def armed_detail(results: list):

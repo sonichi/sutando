@@ -4,9 +4,12 @@
 evaluate() reports ORPHAN/MISMATCH/EXPIRED precisely so a lost pin becomes a
 finding, but the credential-proxy adapter kept only armed_detail(): a healthy
 replacement rendered plain `ok` and a down service plain `not running`, while
-the stale pin sat silent forever. These controls drive the PUBLIC
-check_credential_proxy() entry with only the socket/process seams replaced,
-and write pins through the production writer.
+the stale pin sat silent forever. These controls drive PUBLIC
+entries (check_credential_proxy, check_voice_stack) with only socket/process
+seams replaced, write pins through the production writer, and pin the
+probe-failure reciprocals: ([], {}) is an authoritative no-match (ORPHAN
+surfaces, restarts stay available), ([], None) is a FAILED enumeration
+(no ORPHAN may be fabricated, and the veto blocks any restart).
 
 Run: python3 tests/health-check-pin-orphan-surfaces.test.py
 """
@@ -86,6 +89,93 @@ class OrphanSurfacesOnServicePaths(unittest.TestCase):
                       check.get("restart_veto", ""), check)
         self.assertIn("no longer running", check["detail"], check)
         self.assertEqual(check["status"], "warn", check)
+
+    def test_probe_failure_healthy_is_not_orphan_and_carries_veto(self) -> None:
+        process_pins.arm_pin(self.pin_file, "credential-proxy", "111",
+                             LSTART, "branch witness", EXP)
+        self._port("ok")
+        hc._proc_lstarts = lambda pat: ([], None)   # enumeration FAILED
+        check = hc.check_credential_proxy()
+        self.assertNotIn("no longer running", check["detail"], check)
+        self.assertIn("could not be verified", check["detail"], check)
+        self.assertIn("could not be verified", check.get("restart_veto", ""),
+                      "a failed probe must NOT authorize a restart")
+        self.assertEqual(check["status"], "warn", check)
+
+    def test_probe_failure_down_service_still_vetoes_fix(self) -> None:
+        process_pins.arm_pin(self.pin_file, "credential-proxy", "111",
+                             LSTART, "branch witness", EXP)
+        self._port("down")
+        hc._proc_lstarts = lambda pat: ([], None)
+        check = hc.check_credential_proxy()
+        self.assertIn("could not be verified", check.get("restart_veto", ""),
+                      "down + unknown pin state must not hand --fix the process")
+        self.assertNotIn("no longer running", check["detail"], check)
+
+    def test_voice_stack_healthy_replacement_surfaces_orphan(self) -> None:
+        process_pins.arm_pin(self.pin_file, "voice-agent", "111",
+                             LSTART, "voice witness", EXP)
+        saved = (hc.resolve_voice_health_config, hc.check_voice_watchers,
+                 hc.check_voice_transport, hc.check_bodhi_dist)
+        hc.resolve_voice_health_config = lambda **k: {"enabled": True,
+                                                      "detail": "", "error": ""}
+        hc.check_voice_watchers = lambda vc: {"name": "voice-watchers",
+                                              "status": "ok", "detail": ""}
+        hc.check_voice_transport = lambda vc: {"name": "voice-transport",
+                                               "status": "ok", "detail": ""}
+        hc.check_bodhi_dist = lambda: {"name": "bodhi-dist",
+                                       "status": "ok", "detail": ""}
+        hc.check_port = lambda *a, **k: {"name": "voice-agent",
+                                         "status": "ok", "detail": "port 9900"}
+        hc._proc_lstarts = lambda pat: ([0.0], {"222": LSTART})
+        try:
+            rows = hc.check_voice_stack()
+        finally:
+            (hc.resolve_voice_health_config, hc.check_voice_watchers,
+             hc.check_voice_transport, hc.check_bodhi_dist) = saved
+        voice = next(r for r in rows if r["name"] == "voice-agent")
+        self.assertEqual(voice["status"], "warn", voice)
+        self.assertIn("no longer running", voice["detail"], voice)
+        self.assertIn("port 9900", voice["detail"], voice)
+
+    def _run_fix_on_down_voice(self, lstarts):
+        """REAL check_port row (closed port) + REAL main --fix dispatch."""
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        hc._proc_lstarts = lambda pat: lstarts
+        row = hc.check_port(port, "voice-agent", probe=True)
+        calls = []
+        saved = (hc.fix_launchd, hc.run_all_checks, sys.argv)
+        hc.fix_launchd = lambda label: (calls.append(label), "restarted")[1]
+        hc.run_all_checks = lambda: [row]
+        sys.argv = ["health-check.py", "--fix"]
+        try:
+            hc.main()
+        except SystemExit:
+            pass
+        finally:
+            hc.fix_launchd, hc.run_all_checks, sys.argv = saved
+        return row, calls
+
+    def test_fix_boundary_probe_timeout_withholds_restart(self) -> None:
+        process_pins.arm_pin(self.pin_file, "voice-agent", "111",
+                             LSTART, "voice witness", EXP)
+        row, calls = self._run_fix_on_down_voice(([], None))
+        self.assertIn("could not be verified", row.get("restart_veto", ""), row)
+        self.assertEqual(calls, [],
+                         "a failed probe must not hand --fix the pinned process")
+
+    def test_CONTROL_fix_boundary_authoritative_no_match_still_restarts(self) -> None:
+        process_pins.arm_pin(self.pin_file, "voice-agent", "111",
+                             LSTART, "voice witness", EXP)
+        row, calls = self._run_fix_on_down_voice(([], {}))
+        self.assertNotIn("restart_veto", row, row)
+        self.assertIn("no longer running", row["detail"], row)
+        self.assertEqual(calls, [hc.LAUNCHD_BACKED_CHECKS["voice-agent"]],
+                         "an authoritative no-match must not block the repair")
 
     def test_CONTROL_no_pins_healthy_stays_plain_ok(self) -> None:
         self._port("ok")

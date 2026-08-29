@@ -36,7 +36,7 @@ class ProxyPinWithdrawsRestartAdvice(unittest.TestCase):
              patch.object(hc, "mark_stale_if_outdated", lambda *a, **k: None), \
              patch.object(hc, "_process_executes_artifact", return_value=False), \
              patch.object(hc, "_proc_lstarts", return_value=([], {})), \
-             patch.object(hc.process_pins, "armed_detail", return_value=armed):
+             patch.object(hc.process_pins, "veto_detail", return_value=armed):
             return hc.check_credential_proxy()
 
     def test_producer_sets_the_veto_on_a_HEALTHY_pinned_proxy(self):

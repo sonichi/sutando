@@ -541,13 +541,10 @@ def check_voice_stack(
             REPO_DIR / "src" / "voice-agent.ts",
             "voice-agent.ts",
         )
-    if not voice_check.get("restart_veto"):
-        # A HEALTHY pinned process reaches no staleness arm, so nothing else
-        # sets the field both consumers key on.
-        _, _vls = _proc_lstarts("voice-agent[.]ts|voice-agent[.]js")
-        _varmed = process_pins.armed_detail(_pin_verdicts("voice-agent", _vls))
-        if _varmed:
-            voice_check["restart_veto"] = _varmed
+    # Full composition on EVERY branch: a healthy replacement still owes any
+    # ORPHAN/MISMATCH/EXPIRED finding, and a failed probe still owes the veto.
+    _, _vls = _proc_lstarts("voice-agent[.]ts|voice-agent[.]js")
+    _apply_pin_findings(voice_check, _pin_verdicts("voice-agent", _vls))
     checks = [
         voice_check,
         check_voice_watchers(voice_check),
@@ -782,8 +779,8 @@ def check_port(port: int, name: str, probe: bool = False,
                     # exactly as it does for the staleness arms.
                     _, _lstarts = _proc_lstarts(pgrep_pattern or name)
                     _res = _pin_verdicts(name, _lstarts)
-                    _armed = process_pins.armed_detail(_res)
-                    _notes = process_pins.other_notes(_res)
+                    _armed = process_pins.veto_detail(_res)
+                    _notes = process_pins.other_notes([r for r in _res if r[2] != _armed])
                     _base = f"port {port} listening but unresponsive"
                     # Status stays `wedged` even when pinned: `warn` is benign
                     # and would drop a live outage out of `issues` entirely.
@@ -3675,8 +3672,9 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
 
     Extracted so every prescription in mark_stale_if_outdated can consult a
     pin, including the two that return before the src-vs-process comparison.
-    Returns ([], {}) on any probe failure or when nothing matches -- callers
-    that must run "regardless of process start" therefore still run.
+    Returns ([], {}) ONLY for an authoritative no-match; a probe failure
+    returns ([], None) — unknown is not the empty set, and evaluate() turns
+    None into PROBE_FAILED instead of fabricating ORPHAN.
     """
     try:
         pids = subprocess.run(
@@ -3718,20 +3716,28 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
                 lstart_by_pid[pid_tok] = lstart_tok
         return starts, lstart_by_pid
     except (subprocess.TimeoutExpired, OSError):
-        return [], {}
+        return [], None
+
+
+def _apply_pin_findings(check, results):
+    """The ONE composition every service adapter routes through: carry the
+    veto (ARMED or PROBE_FAILED) and surface non-ARMED findings; a bare ok
+    escalates to warn so a dead pinned process never renders as silence."""
+    veto = process_pins.veto_detail(results)
+    if veto and not check.get("restart_veto"):
+        check["restart_veto"] = veto
+    others = process_pins.other_notes(results)
+    if others and others not in str(check.get("detail") or ""):
+        check["detail"] = f"{check.get('detail') or ''}{others}".strip()
+        if check.get("status") == "ok":
+            check["status"] = "warn"
 
 
 def _apply_pin_verdict(check, results, status, detail):
-    """Set the verdict AND carry the armed veto. Setting status/detail alone
+    """Set the verdict AND carry the veto. Setting status/detail alone
     leaves the remedy unenforced at the --fix action boundary."""
-    others = process_pins.other_notes(results)
-    if others and others not in detail:
-        # A lost pin is a finding; the caller's verdict must not swallow it.
-        detail = f"{detail}{others}"
     check["status"], check["detail"] = status, detail
-    armed = process_pins.armed_detail(results)
-    if armed:
-        check["restart_veto"] = armed
+    _apply_pin_findings(check, results)
 
 
 def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, threshold_sec: int = 1800,
@@ -4178,9 +4184,9 @@ def check_voice_transport(voice_check: dict) -> dict:
                 # A kickstart destroys a pinned witness; packaged installs run
                 # dist/voice-agent.js, so a .ts-only probe misses the pin.
                 _, _lstarts = _proc_lstarts("voice-agent[.]ts|voice-agent[.]js")
-                # `_proc_lstarts` fails closed to ({}, {}), so a probe TIMEOUT is
-                # indistinguishable from "unpinned" — fall back to the established veto.
-                _armed = process_pins.armed_detail(
+                # A probe TIMEOUT now reads ([], None) -> PROBE_FAILED, which
+                # veto_detail carries; the established veto stays the fallback.
+                _armed = process_pins.veto_detail(
                     _pin_verdicts(voice_check.get("name") or "voice-agent", _lstarts)) or _veto
                 base = (f"stuck CONNECTING ~{elapsed_min}min after "
                         f"code={code} transport close")
@@ -9036,18 +9042,7 @@ def check_credential_proxy() -> dict:
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
     # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
     _, _pls = _proc_lstarts("credential-proxy")
-    _pin_results = _pin_verdicts("credential-proxy", _pls)
-    if not check.get("restart_veto"):
-        # A HEALTHY pinned proxy reaches no staleness arm, so nothing else sets
-        # the field the remedy text and the --fix boundary both key on.
-        _armed = process_pins.armed_detail(_pin_results)
-        if _armed:
-            check["restart_veto"] = _armed
-    _others = process_pins.other_notes(_pin_results)
-    if _others and _others not in str(check.get("detail") or ""):
-        check["detail"] = f"{check.get('detail') or ''}{_others}".strip()
-        if check["status"] == "ok":
-            check["status"] = "warn"
+    _apply_pin_findings(check, _pin_verdicts("credential-proxy", _pls))
     return check
 MENUBAR_LABEL = "com.sutando.menubar"
 MENUBAR_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{MENUBAR_LABEL}.plist"
@@ -9085,6 +9080,9 @@ def run_all_checks() -> list[dict]:
         web_check = check_port(web_config["port"], "web-client", probe=True)
     if web_check["status"] == "ok":
         mark_stale_if_outdated(web_check, REPO_DIR / "src" / "web-client.ts", "web-client.ts")
+    # Same composition as voice/proxy: healthy or stale, the findings surface.
+    _, _wls2 = _proc_lstarts("web-client")
+    _apply_pin_findings(web_check, _pin_verdicts("web-client", _wls2))
     checks.append(web_check)
 
     # Optional services (downgrade missing to warning, not failure)
@@ -9351,7 +9349,7 @@ def run_all_checks() -> list[dict]:
             ).stdout.strip()
             if ps_out:
                 pin_results = _pin_verdicts(name, {pids[0]: ps_out})
-                pin_armed = process_pins.armed_detail(pin_results)
+                pin_armed = process_pins.veto_detail(pin_results)
         except (subprocess.TimeoutExpired, OSError):
             pass
 

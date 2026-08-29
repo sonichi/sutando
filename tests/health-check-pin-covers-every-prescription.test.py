@@ -143,16 +143,17 @@ class _Out:
 # pgrep matches nothing -> no pids, no lstarts.
 assert _probe_with(lambda cmd, **kw: _Out("\n")) == ([], {})
 
-# The probe itself fails -> fail OPEN, never a fabricated start time.
+# The probe itself fails -> ([], None): unknown is NOT the empty set, so a
+# failed enumeration can never fabricate ORPHAN or authorize a restart.
 def _boom(cmd, **_kw):
     raise _sp.TimeoutExpired(cmd, 5)
 
 
-assert _probe_with(_boom) == ([], {})
+assert _probe_with(_boom) == ([], None)
 
 # CONTROL: a working probe must still return data, or the two asserts above
 # would pass on a helper that always returns empty.
 good = _probe_with(lambda cmd, **kw: _Out(f"{PID}\n" if "pgrep" in cmd[0] else f"{PID} {LSTART}\n"))
 assert good[1] == {PID: LSTART}, good
 
-print("PASS: _proc_lstarts fails open on no-match and on probe error; positive control returns data")
+print("PASS: _proc_lstarts: no-match is ([], {}), probe error is ([], None); positive control returns data")
