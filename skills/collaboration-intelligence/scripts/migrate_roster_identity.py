@@ -238,6 +238,13 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     if human_id:
         basis[ri.HUMAN_FIELD] = humans[0][1]
 
+    # The schema NAMES primacy — `stand_discord_id` is the primary agent and
+    # `other_stand_discord_ids` the secondaries. Member order is not evidence.
+    _primary = set(_snowflakes(json.dumps(entry.get(ri.STAND_FIELD) or "")))
+    _secondary = set(_snowflakes(json.dumps(entry.get(ri.OTHER_STANDS_FIELD) or "")))
+    stands.sort(key=lambda it: 0 if it[0] in _primary
+                else 2 if it[0] in _secondary else 1)
+
     stand_id, others = None, []
     if stands:
         stand_id, reasons = stands[0]

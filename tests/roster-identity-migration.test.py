@@ -678,5 +678,53 @@ class AFieldNameStatesAWordNotASubstring(unittest.TestCase):
         self.assertEqual([u["id"] for u in unresolved], [HUMAN])
 
 
+class MemberOrderIsNotIdentityEvidence(unittest.TestCase):
+    """Re-running a v2 record must not let JSON member order pick the primary.
+
+    `_collect_ids` walks in traversal order and the first Stand claim became
+    primary, so writing the schema's own two fields in the other order swapped
+    the agents while still returning 0 (#3537).
+    """
+
+    SECOND = "1529720369668292629"
+
+    def _primary_and_others(self, doc):
+        out, _ = migrate(doc)
+        e = out["x"]
+        return ri.stand_discord_id(e), [o["id"] if isinstance(o, dict) else o
+                                        for o in e.get(ri.OTHER_STANDS_FIELD) or []]
+
+    def test_secondary_first_still_yields_the_declared_primary(self):
+        # The reviewer's exact rerun: only the member order differs.
+        primary, others = self._primary_and_others(
+            {"x": {ri.OTHER_STANDS_FIELD: [self.SECOND], ri.STAND_FIELD: BOT}})
+        self.assertEqual(primary, BOT)
+        self.assertEqual(others, [self.SECOND])
+
+    def test_primary_first_is_unchanged(self):
+        # Positive control: passes at both revisions, so a regression that
+        # simply reversed the order could not masquerade as the fix.
+        primary, others = self._primary_and_others(
+            {"x": {ri.STAND_FIELD: BOT, ri.OTHER_STANDS_FIELD: [self.SECOND]}})
+        self.assertEqual(primary, BOT)
+        self.assertEqual(others, [self.SECOND])
+
+    def test_the_reader_contract_agrees_in_both_orders(self):
+        # roster_identity.stand_discord_ids promises "primary stand first".
+        for doc in ({"x": {ri.STAND_FIELD: BOT, ri.OTHER_STANDS_FIELD: [self.SECOND]}},
+                    {"x": {ri.OTHER_STANDS_FIELD: [self.SECOND], ri.STAND_FIELD: BOT}}):
+            out, _ = migrate(doc)
+            self.assertEqual(ri.stand_discord_ids(out["x"]), [BOT, self.SECOND])
+
+    def test_a_v1_doc_declaring_neither_field_keeps_traversal_order(self):
+        # Negative control: with no schema statement there is nothing to rank
+        # by, and the ranking must not silently reorder those either.
+        doc = {"x": {"discord_id": BOT, "stand_status": f"stand id {BOT}",
+                     "secondary_agent": {"discord_id": self.SECOND}}}
+        primary, others = self._primary_and_others(doc)
+        self.assertEqual(primary, BOT)
+        self.assertEqual(others, [self.SECOND])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
