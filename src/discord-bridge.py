@@ -2954,12 +2954,15 @@ async def on_message(message):
 
 
 def _counts_as_mention(message) -> bool:
-    """What the ARRIVAL path treats as addressing this bot. The gate substitutes
-    ONLY inside arrival's requireMention branch, so this mirrors that condition:
-    a free-listen channel already ingests everything, and consulting the gate
-    there would queue an edited message a second time."""
+    """What the ARRIVAL path treats as addressing this bot. Arrival derives
+    requireMention and consults the gate ONLY inside `if not is_dm`, so both
+    halves of that condition are mirrored here: a DM and a free-listen channel
+    each already ingest on arrival, and consulting the gate for either would
+    queue an edited message a second time."""
     if _message_mentions_bot(message):
         return True
+    if isinstance(getattr(message, "channel", None), discord.DMChannel):
+        return False
     cfg = load_channel_config(str(getattr(message.channel, "id", "")))
     require_mention = True if cfg is None else bool(cfg[0])
     return require_mention and _mention_gate_triggers_ingest(message)
