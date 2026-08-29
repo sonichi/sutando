@@ -147,6 +147,8 @@ EOF
   cp "$REAL_REPO/src/agent/claude/cli/start-cli.sh" "$REPO_FAKE/src/agent/claude/cli/"
   # start-cli sources the shared resolve-or-refuse policy from $REPO/src/.
   cp "$REAL_REPO/src/claude_config_dir.sh" "$REPO_FAKE/src/"
+  # Sourced by the launcher before anything else it does here.
+  cp "$REAL_REPO/src/agent/restart-guard.sh" "$REPO_FAKE/src/agent/"
   cp "$REAL_REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO_FAKE/src/agent/claude/cli/"
   cp "$REAL_REPO/hooks/skip-ask-user-question.py" "$REPO_FAKE/hooks/"
 

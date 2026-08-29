@@ -1,33 +1,154 @@
 --- a/skills/access/SKILL.md
 +++ b/skills/access/SKILL.md
-@@ -106,6 +106,30 @@
+@@ -61,50 +61,74 @@
+ 2. Show: dmPolicy, allowFrom count and list, pending count with codes +
+    sender IDs + age, groups count.
  
- 1. Read, `delete groups[<channelId>]`, write.
++**Every mutating command below runs through the locked CLI** —
++`python3 scripts/access-mutate.py <subcommand> ...`, from the repo root. This
++goes through the same locked read-modify-write transaction every access.json
++writer uses (`access_store.mutate_access_file`) — do NOT read access.json and
++write it back by hand; a freehand edit races the bridge's own writers
++(tier-map seeding, thread-engage seeding, pairing) and can silently drop one
++side's update. Each subcommand prints a JSON result on stdout: report its
++`ok`/error/added/removed/skipped fields to the user. A non-zero exit or an
++`"ok": false` result means the target didn't exist or access.json was
++unreadable — relay the `error` field, don't retry by hand.
++
+ ### `pair <code>`
  
-+### `group append <channelId> <senderId>` (optional: extra IDs)
-+
-+Append one or more sender IDs to an existing group's `allowFrom` (preserves
-+existing members). Use this when adding a collaborator to an already-configured
-+channel — `group add` replaces the list, which would drop existing members.
-+
-+1. Read access.json. If `groups[<channelId>]` doesn't exist, tell the user
-+   to run `group add <channelId> --allow <senderId>` first; do not create.
-+2. For each sender ID arg, append to `groups[<channelId>].allowFrom` (dedupe).
-+3. Write back.
-+4. Confirm: which IDs were added (skipping any that were already present).
-+
-+### `group rm-allow <channelId> <senderId>` (optional: extra IDs)
-+
-+Symmetric inverse of `group append`. Remove one or more sender IDs from an
-+existing group's `allowFrom` without touching the rest of the entry.
-+
-+1. Read access.json. If `groups[<channelId>]` doesn't exist, tell the user;
-+   nothing to do.
-+2. For each sender ID arg, filter `groups[<channelId>].allowFrom` to exclude
-+   it.
-+3. Write back.
-+4. Confirm: which IDs were removed (skipping any that weren't present).
-+
+-1. Read `~/.claude/channels/discord/access.json`.
+-2. Look up `pending[<code>]`. If not found or `expiresAt < Date.now()`,
+-   tell the user and stop.
+-3. Extract `senderId` and `chatId` from the pending entry.
+-4. Add `senderId` to `allowFrom` (dedupe).
+-5. Delete `pending[<code>]`.
+-6. Write the updated access.json.
+-7. `mkdir -p ~/.claude/channels/discord/approved` then write
+-   `~/.claude/channels/discord/approved/<senderId>` with `chatId` as the
+-   file contents. The channel server polls this dir and sends "you're in".
+-8. Confirm: who was approved (senderId).
++```
++python3 scripts/access-mutate.py pair <code>
++```
++Looks up `pending[<code>]` (stopping if not found or expired), adds its
++`senderId` to `allowFrom`, deletes the pending entry, and — only after that
++locked write succeeds — writes the per-sender approved marker (see "State
++shape" above for the exact path) with `chatId` as the contents (the channel
++server polls this dir and sends "you're in"). Confirm to the user who was
++approved (`senderId`).
+ 
+ ### `deny <code>`
+ 
+-1. Read access.json, delete `pending[<code>]`, write back.
+-2. Confirm.
++```
++python3 scripts/access-mutate.py deny <code>
++```
++Deletes `pending[<code>]`. Confirm.
+ 
+ ### `allow <senderId>`
+ 
+-1. Read access.json (create default if missing).
+-2. Add `<senderId>` to `allowFrom` (dedupe).
+-3. Write back.
++```
++python3 scripts/access-mutate.py allow <senderId>
++```
++Adds `<senderId>` to `allowFrom` (dedupe).
+ 
+ ### `remove <senderId>`
+ 
+-1. Read, filter `allowFrom` to exclude `<senderId>`, write.
++```
++python3 scripts/access-mutate.py remove <senderId>
++```
++Filters `<senderId>` out of `allowFrom`.
+ 
+ ### `policy <mode>`
+ 
+-1. Validate `<mode>` is one of `pairing`, `allowlist`, `disabled`.
+-2. Read (create default if missing), set `dmPolicy`, write.
++```
++python3 scripts/access-mutate.py policy <mode>
++```
++`<mode>` must be one of `pairing`, `allowlist`, `disabled` — validate before
++invoking; the CLI rejects anything else.
+ 
+ ### `group add <channelId>` (optional: `--no-mention`, `--allow id1,id2`)
+ 
+-1. Read (create default if missing).
+-2. Set `groups[<channelId>] = { requireMention: !hasFlag("--no-mention"),
+-   allowFrom: parsedAllowList }`.
+-3. Write.
++```
++python3 scripts/access-mutate.py group-add <channelId> [--no-mention] [--allow id1,id2]
++```
++Sets `groups[<channelId>] = { requireMention: !hasFlag("--no-mention"),
++allowFrom: parsedAllowList }`, **replacing** any existing entry for that
++channel. Use `group append` instead when the goal is adding to an existing
++group without dropping current members.
+ 
+ ### `group rm <channelId>`
+ 
+-1. Read, `delete groups[<channelId>]`, write.
++```
++python3 scripts/access-mutate.py group-rm <channelId>
++```
++Deletes `groups[<channelId>]`.
+ 
+ ### `group append <channelId> <senderId>` (optional: extra IDs)
+ 
+@@ -112,35 +136,39 @@
+ existing members). Use this when adding a collaborator to an already-configured
+ channel — `group add` replaces the list, which would drop existing members.
+ 
+-1. Read access.json. If `groups[<channelId>]` doesn't exist, tell the user
+-   to run `group add <channelId> --allow <senderId>` first; do not create.
+-2. For each sender ID arg, append to `groups[<channelId>].allowFrom` (dedupe).
+-3. Write back.
+-4. Confirm: which IDs were added (skipping any that were already present).
++```
++python3 scripts/access-mutate.py group-append <channelId> <senderId> [<senderId> ...]
++```
++If `groups[<channelId>]` doesn't exist, the CLI reports an error instead of
++creating one — tell the user to run `group add <channelId> --allow
++<senderId>` first. Report the printed JSON's `added`/`skipped` IDs to the
++user.
+ 
+ ### `group rm-allow <channelId> <senderId>` (optional: extra IDs)
+ 
+ Symmetric inverse of `group append`. Remove one or more sender IDs from an
+ existing group's `allowFrom` without touching the rest of the entry.
+ 
+-1. Read access.json. If `groups[<channelId>]` doesn't exist, tell the user;
+-   nothing to do.
+-2. For each sender ID arg, filter `groups[<channelId>].allowFrom` to exclude
+-   it.
+-3. Write back.
+-4. Confirm: which IDs were removed (skipping any that weren't present).
++```
++python3 scripts/access-mutate.py group-rm-allow <channelId> <senderId> [<senderId> ...]
++```
++If `groups[<channelId>]` doesn't exist, the CLI reports an error — nothing to
++do. Report the printed JSON's `removed`/`skipped` IDs to the user.
+ 
  ### `set <key> <value>`
  
  Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
+-`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
++`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types before
++invoking — the CLI re-validates and rejects a bad type/value:
+ - `ackReaction`: string (emoji) or `""` to disable
+ - `replyToMode`: `off` | `first` | `all`
+ - `textChunkLimit`: number
+ - `chunkMode`: `length` | `newline`
+ - `mentionPatterns`: JSON array of regex strings
+ 
+-Read, set the key, write, confirm.
++```
++python3 scripts/access-mutate.py set <key> <value>
++```
+ 
+ ---
+ 
