@@ -85,10 +85,13 @@ class DiscordReachability(unittest.TestCase):
         self.assertTrue(present)
         self.assertIn("allowFrom", why)
 
-    def test_absent_is_a_positive_absence(self):
+    def test_an_allowfrom_miss_is_unverified_not_an_absence(self):
+        # allowFrom is inbound authorization, never membership, so an
+        # omission proves nothing about whether the person is reachable.
         os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {"222": {"allowFrom": ["9"]}}})
-        present, _ = nr.discord_reachable(self._target())
-        self.assertFalse(present)
+        present, why = nr.discord_reachable(self._target())
+        self.assertTrue(present)
+        self.assertIn("inbound authorization", why)
 
     def test_channels_section_is_read_too(self):
         os.environ["CLAUDE_CONFIG_DIR"] = config_with({"channels": {"222": {"allowFrom": ["111"]}}})
@@ -171,12 +174,13 @@ class MainDiscordBranch(unittest.TestCase):
         self.assertIn("<@111>", out)
         self.assertEqual(rc, 0)
 
-    def test_absent_from_channel_refuses_and_counts_a_failure(self):
+    def test_an_allowfrom_miss_plans_the_send_and_says_it_is_unchecked(self):
+        # Refusing here would silence a reviewer who is in fact reachable.
         cfg = config_with({"groups": {"222": {"allowFrom": ["999"]}}})
         rc, out, err = self._run({"d": DISCORD}, cfg)
-        self.assertIn("ABSENT from channel 222", err)
-        self.assertNotIn("PLAN:", out)
-        self.assertNotEqual(rc, 0)
+        self.assertNotIn("ABSENT from channel", err)
+        self.assertIn("UNVERIFIED", err)
+        self.assertIn("PLAN:", out)
 
     def test_unverified_config_sends_but_says_it_did_not_check(self):
         rc, out, err = self._run({"d": DISCORD}, tempfile.mkdtemp(prefix="cfg-mainunv-"))
@@ -312,7 +316,7 @@ class MalformedAccessMapNeverAnswers(unittest.TestCase):
     def test_a_good_list_still_answers(self):
         ok, why = self._reach({"groups": {"222": {"allowFrom": ["111"]}}})
         self.assertTrue(ok)
-        self.assertIn("in allowFrom", why)
+        self.assertIn("listed in", why)
 
 
 class DiscordLedgerBranchesRun(unittest.TestCase):
@@ -349,14 +353,14 @@ class DiscordLedgerBranchesRun(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def test_a_logged_ask_reports_the_count(self):
-        rc, out, err = self._send(0, lambda msg, who: 2)
+        rc, out, err = self._send(0, lambda msg, who, outcome='confirmed': 2)
         self.assertIn("SENT to channel", out)
         self.assertIn("logged 2 PR ask(s)", err)
 
     def test_a_ledger_write_failure_is_loud_but_not_fatal(self):
         # The ask already happened; losing the record makes pr-unattended
         # report it as never asked, so this must warn rather than swallow.
-        def boom(msg, who):
+        def boom(msg, who, outcome='confirmed'):
             raise OSError("disk full")
         rc, out, err = self._send(0, boom)
         self.assertIn("SENT to channel", out)
@@ -364,9 +368,91 @@ class DiscordLedgerBranchesRun(unittest.TestCase):
         self.assertIn("under-report", err)
 
     def test_unknown_outcome_is_not_reported_as_a_plain_failure(self):
-        rc, _, err = self._send(4, lambda msg, who: 0)
+        rc, _, err = self._send(4, lambda msg, who, outcome='confirmed': 0)
         self.assertIn("OUTCOME UNKNOWN", err)
         self.assertNotIn("SEND FAILED", err)
+
+
+
+class AllowFromIsNotMembership(unittest.TestCase):
+    """An allowFrom miss is UNVERIFIED, never a positive absence.
+
+    allowFrom is inbound authorization -- who may send -- and the bridge also
+    grants via a global superset this file cannot see, so an omission is not
+    evidence the reviewer is absent.
+    """
+
+    def _reach(self, blob):
+        prev = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with(blob)
+        try:
+            return nr.discord_reachable({"channel": "222", "discord_id": "111"})
+        finally:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None) if prev is None else os.environ.update({"CLAUDE_CONFIG_DIR": prev})
+
+    def test_globally_allowed_but_missing_from_the_channel_list_is_unverified(self):
+        ok, why = self._reach({"allowFrom": ["111"],
+                               "groups": {"222": {"allowFrom": ["999"]}}})
+        self.assertTrue(ok, "reported a positive absence for a reachable reviewer")
+        self.assertIn("inbound authorization", why)
+
+    def test_being_listed_still_reads_as_listed(self):
+        ok, why = self._reach({"groups": {"222": {"allowFrom": ["111"]}}})
+        self.assertTrue(ok)
+        self.assertIn("listed in", why)
+
+    def test_non_scalar_elements_are_unverified(self):
+        for bad in ([{"id": "111"}], [["111"]], [None], [True]):
+            ok, why = self._reach({"groups": {"222": {"allowFrom": bad}}})
+            self.assertTrue(ok, f"{bad!r} produced a verdict")
+            self.assertIn("non-scalar", why, f"{bad!r} -> {why}")
+
+
+class UnknownOutcomeIsParkedNotFailed(unittest.TestCase):
+    """A send that may have landed is recorded, so a repeat cannot duplicate it."""
+
+    def _run(self, rc_out):
+        led = pathlib.Path(tempfile.mkdtemp()) / "review-asks.jsonl"
+        prev_run, prev_led = nr.subprocess.run, nr.ledger_path
+        class _R:
+            returncode, stdout, stderr = rc_out, "", "OUTCOME UNKNOWN"
+        nr.subprocess.run = lambda *a, **k: _R()
+        nr.ledger_path = lambda: led
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"d": DISCORD}, f)
+        prev_env = {k: os.environ.get(k) for k in ("SUTANDO_SCI_ROSTER", "CLAUDE_CONFIG_DIR")}
+        os.environ["SUTANDO_SCI_ROSTER"] = path
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {"222": {"allowFrom": ["111"]}}})
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", "d", "--message",
+                       "see https://github.com/o/r/pull/1", "--send",
+                       "--allow-single", "unknown-outcome test"]
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = nr.main()
+        finally:
+            nr.subprocess.run, nr.ledger_path = prev_run, prev_led
+            os.unlink(path)
+            for k, v in prev_env.items():
+                os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+        rows = [json.loads(l) for l in led.read_text().splitlines()] if led.exists() else []
+        return rc, err.getvalue(), rows
+
+    def test_an_unknown_outcome_is_recorded(self):
+        rc, err, rows = self._run(4)
+        self.assertTrue(rows, "nothing recorded; a repeat could duplicate the ping")
+        self.assertEqual(rows[0]["outcome"], "unknown")
+        self.assertIn("may have landed", err)
+
+    def test_an_unknown_outcome_has_its_own_exit_code(self):
+        # Not 0 and not 1: a caller must not read it as sent OR as failed.
+        self.assertEqual(self._run(4)[0], 4)
+
+    def test_a_real_failure_is_still_a_failure_and_is_not_recorded(self):
+        rc, _, rows = self._run(3)
+        self.assertEqual(rc, 1)
+        self.assertEqual(rows, [])
 
 
 if __name__ == "__main__":

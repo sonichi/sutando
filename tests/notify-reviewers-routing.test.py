@@ -62,11 +62,14 @@ class RoutingTest(unittest.TestCase):
         # this test exists for -- it made every refusal read as "unreachable".
         self.assertEqual(3, len({ln for ln in p.stderr.splitlines() if "UNUSABLE" in ln}))
 
-    def test_absent_from_channel_is_a_positive_absence(self):
-        cfg = config_with("222", ["999"])          # 111 is not on the list
+    def test_an_allowfrom_miss_is_unverified_and_still_plans(self):
+        # allowFrom is inbound authorization, and the bridge grants via a
+        # superset this file cannot see; a miss proves nothing.
+        cfg = config_with("222", ["999"])
         p = run({"r": DISCORD_OK}, "r", cfg)
-        self.assertIn("ABSENT from channel 222", p.stderr)
-        self.assertNotIn("PLAN:", p.stdout)
+        self.assertNotIn("ABSENT", p.stderr)
+        self.assertIn("UNVERIFIED", p.stderr)
+        self.assertIn("PLAN:", p.stdout)
 
     def test_unreadable_access_map_is_unverified_never_absent(self):
         # The safety property: a broken config must not be reported as a person

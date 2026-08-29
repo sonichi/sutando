@@ -144,11 +144,11 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
 
 
 def discord_reachable(target: dict) -> "tuple[bool, str]":
-    """Is this id actually in the channel we are about to mention it in?
+    """Can this id be checked at all? Never a positive absence.
 
-    Same shape as stand_present_in_room and the same failure discipline: an
-    UNREADABLE access map is UNVERIFIED, never a positive absence, so a broken
-    config can never be reported as "this reviewer is unreachable".
+    `allowFrom` is INBOUND AUTHORIZATION -- who may send to a channel -- not
+    membership, and the bridge also grants via a global superset this file
+    cannot see. So an omission is not evidence of absence and never returns one.
     """
     cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     base = Path(cfg_dir) if cfg_dir else Path.home() / ".claude"
@@ -170,10 +170,20 @@ def discord_reachable(target: dict) -> "tuple[bool, str]":
             raw = entry.get("allowFrom")
             if raw is not None and not isinstance(raw, (list, tuple, set)):
                 return True, f"unverified (allowFrom is {type(raw).__name__}, not a list)"
-            allowed = {str(x) for x in (raw or [])}
+            # [{"id": "111"}], [None], [True] all stringify, so a check on
+            # the container alone yields a verdict computed from garbage.
+            items = list(raw or [])
+            if any(not isinstance(x, (str, int)) or isinstance(x, bool) for x in items):
+                return True, f"unverified ({section} allowFrom holds non-scalar entries)"
+            allowed = {str(x) for x in items}
             if not allowed:
                 return True, f"unverified ({section} entry has no allowFrom)"
-            return str(target["discord_id"]) in allowed, f"{len(allowed)} in allowFrom"
+            if str(target["discord_id"]) in allowed:
+                return True, f"listed in {section} allowFrom ({len(allowed)} entries)"
+            # NOT an absence. allowFrom answers "who may send", and the bridge
+            # grants via a global superset this file cannot see.
+            return True, (f"unverified (not in {section} allowFrom, which is inbound "
+                          "authorization rather than membership)")
     return True, "unverified (channel not in the access map)"
 
 
@@ -207,10 +217,14 @@ def ledger_path() -> Path:
     return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
 
 
-def record_asks(message: str, reviewer: str) -> int:
+def record_asks(message: str, reviewer: str, outcome: str = "confirmed") -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
-    via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED."""
+    via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED.
+
+    `outcome="unknown"` records a send that MAY have landed. It must be written:
+    the receipt is RetrySafety.UNSAFE, so an unrecorded unknown invites the
+    repeat that duplicates the ping."""
     refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
     if not refs:
         return 0
@@ -220,7 +234,8 @@ def record_asks(message: str, reviewer: str) -> int:
     with open(p, "a") as fh:
         for repo, num in sorted(refs):
             fh.write(json.dumps({"repo": repo, "pr": num, "reviewer": reviewer,
-                                 "ts": ts, "channel": "room"}) + "\n")
+                                 "ts": ts, "channel": "room",
+                                 "outcome": outcome}) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
     return len(refs)
@@ -361,7 +376,7 @@ def main() -> int:
         print(f"REFUSED: {why} Re-asking the same people is not escalation — "
               "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
         return 6
-    failures = unlogged = 0
+    failures = unlogged = unknowns = 0
     for t in targets:
         if t["transport"] == "discord":
             # No room-relocation branch: a Discord mention is channel-scoped and
@@ -397,11 +412,19 @@ def main() -> int:
                         print(f"  logged {n_logged} PR ask(s) for {t['name']}",
                               file=sys.stderr)
             elif p.returncode == 4:
-                # OUTCOME_UNKNOWN: the post may have landed. Counting it as a
-                # failure invites the retry the receipt says is unsafe.
+                # OUTCOME_UNKNOWN: the post may have landed, and the receipt is
+                # UNSAFE to retry, so this is PARKED durably rather than failed.
+                unknowns += 1
+                try:
+                    record_asks(a.message, t["name"], outcome="unknown")
+                except OSError as e:
+                    print(f"  WARNING: {t['name']} unknown-outcome send was NOT "
+                          f"recorded ({e}) — a repeat may duplicate the ping",
+                          file=sys.stderr)
                 print(f"{t['name']}: OUTCOME UNKNOWN on channel {t['channel']} — "
-                      f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
-                failures += 1
+                      f"the post may have landed; recorded so a repeat does not "
+                      f"duplicate it. {(p.stderr or '').strip() or 'no stderr'}",
+                      file=sys.stderr)
             else:
                 print(f"{t['name']}: SEND FAILED rc={p.returncode} "
                       f"{(p.stderr or '').strip() or 'no stderr'}", file=sys.stderr)
@@ -505,8 +528,16 @@ def main() -> int:
         print(f"{unlogged} ask(s) were delivered but not recorded — the ledger "
               "under-reports and pr-unattended will read this PR as unasked",
               file=sys.stderr)
+    if unknowns:
+        print(f"{unknowns} send(s) had an UNKNOWN outcome and are recorded as such — "
+              "they may have landed; do not re-send without checking the channel",
+              file=sys.stderr)
     if failures or unlogged:
         return 1
+    # An unknown is not a failure and not a success: distinct so a caller cannot
+    # read it as either, and so a retry loop cannot treat it as "send again".
+    if unknowns:
+        return 4
     return refusal_rc
 
 
