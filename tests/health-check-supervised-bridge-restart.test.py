@@ -25,6 +25,8 @@ Guards:
      treated as supervised.
   f) no supervisor → the pre-existing behavior is intact: stale kills the old
      pid first, then the bridge is spawned directly.
+  g) probe exceptions (launchctl/pgrep unavailable, kickstart timeout) pick a
+     safe leg — never a hand-spawn beside a supervisor, never a crash.
 
 Run: python3 tests/health-check-supervised-bridge-restart.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -54,11 +56,15 @@ class Host:
     against any internal shape of the restart path (including the parent's)."""
 
     def __init__(self, *, job_registered=True, kickstart_rc=0,
-                 wrapper_alive=False, child_pids=""):
+                 wrapper_alive=False, child_pids="",
+                 print_raises=False, kickstart_raises=False, pgrep_raises=False):
         self.job_registered = job_registered
         self.kickstart_rc = kickstart_rc
         self.wrapper_alive = wrapper_alive
         self.child_pids = child_pids
+        self.print_raises = print_raises
+        self.kickstart_raises = kickstart_raises
+        self.pgrep_raises = pgrep_raises
         self.spawned = []  # Popen argvs
         self.kickstarted = []
         self.killed = []  # pids passed to /bin/kill
@@ -67,13 +73,19 @@ class Host:
         if not isinstance(argv, list):
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         if argv[:2] == ["/bin/launchctl", "print"]:
+            if self.print_raises:
+                raise OSError("launchctl unavailable")
             rc = 0 if self.job_registered else 113
             out = "state = running" if self.job_registered else ""
             return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
         if argv[:3] == ["/bin/launchctl", "kickstart", "-k"]:
             self.kickstarted.append(argv)
+            if self.kickstart_raises:
+                raise subprocess.TimeoutExpired(argv, 15)
             return subprocess.CompletedProcess(argv, self.kickstart_rc, stdout="", stderr="")
         if argv[:2] == ["/usr/bin/pgrep", "-f"]:
+            if self.pgrep_raises:
+                raise OSError("pgrep unavailable")
             if "wrapper" in argv[2]:
                 rc = 0 if self.wrapper_alive else 1
                 out = "4242\n" if self.wrapper_alive else ""
@@ -196,6 +208,39 @@ def case_f_unsupervised_direct_spawn_is_preserved() -> list[str]:
     return fails
 
 
+def case_g_probe_failures_fail_safe() -> list[str]:
+    """Probe exceptions pick a safe leg instead of crashing the fix pass."""
+    fails = []
+    # launchctl print raises → the live wrapper process is still the witness,
+    # and a raising kickstart still falls back to the child-kill.
+    host = Host(job_registered=True, print_raises=True, kickstart_raises=True,
+                wrapper_alive=True, child_pids="555\n")
+    ok, _how = with_host(host, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if not ok or host.killed != ["555"]:
+        fails.append(f"g) wrapper witness + kickstart raise: ok={ok} killed={host.killed}")
+    if host.bridge_spawns():
+        fails.append(f"g) probe failure led to a hand-spawn beside a supervisor: {host.bridge_spawns()}")
+    # No launchd job and every pgrep raises → unsupervised; the stale-kill
+    # probe failure must not block the respawn.
+    host2 = Host(job_registered=False, pgrep_raises=True)
+    ok2, _ = with_host(host2, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if not ok2 or len(host2.bridge_spawns()) != 1 or host2.killed:
+        fails.append(f"g) pgrep-raise leg: ok={ok2} spawns={host2.spawned} killed={host2.killed}")
+    # Unsupervised with no viable plan → nothing killed, nothing spawned.
+    host3 = Host(job_registered=False)
+    with mock.patch.object(hc, "_bridge_launch_plan", return_value=None):
+        ok3, how3 = with_host(host3, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if ok3 or "restart skipped" not in how3 or host3.killed or host3.spawned:
+        fails.append(f"g) plan-None leg: ok={ok3} how={how3!r} killed={host3.killed} spawns={host3.spawned}")
+    # A spawn that reports failure propagates as failure.
+    host4 = Host(job_registered=False)
+    with mock.patch.object(hc, "_launch_bridge", return_value=False):
+        ok4, how4 = with_host(host4, lambda: hc._restart_bridge("slack-bridge"))
+    if ok4 or how4 != "spawn failed":
+        fails.append(f"g) spawn-failed leg: ok={ok4} how={how4!r}")
+    return fails
+
+
 def main() -> int:
     cases = [
         case_a_supervised_down_restarts_through_launchd,
@@ -204,6 +249,7 @@ def main() -> int:
         case_d_supervised_with_no_child_is_reported_not_spawned,
         case_e_wrapper_process_counts_as_supervisor,
         case_f_unsupervised_direct_spawn_is_preserved,
+        case_g_probe_failures_fail_safe,
     ]
     failures = []
     for case in cases:
