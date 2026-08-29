@@ -147,5 +147,52 @@ check("the script runs as a subprocess with the same verdict",
       proc.returncode == 0 and proc.stdout.strip().startswith("quiet"),
       f"{proc.returncode} {proc.stdout!r} {proc.stderr!r}")
 
+# ── pass-outcome counters ───────────────────────────────────────────────────
+# `streak` resets each substantive pass: a gauge, not a counter.
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "idle-streak.json"
+
+    def outcome(kind):
+        p = subprocess.run([sys.executable, str(SCRIPT), "--state", str(st),
+                            "--pass-outcome", kind],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        return p.stdout.strip(), p.returncode
+
+    out, rc = outcome("noop")
+    check("a no-op pass records without a held-list on stdin",
+          rc == 0 and "streak=1" in out and "noop_total=1" in out, out)
+    outcome("noop")
+    out, _ = outcome("substantive")
+    check("a substantive pass resets the streak but not the totals",
+          "streak=0" in out and "noop_total=2" in out and "substantive_total=1" in out, out)
+
+    doc = json.loads(st.read_text())
+    check("both cumulative totals persist, so the denominator is recoverable",
+          doc.get("noop_total") == 2 and doc.get("substantive_total") == 1, doc)
+
+    # The reason for the lock: last-writer-wins silently under-counts, and an
+    # under-count is indistinguishable from a genuinely quiet stretch.
+    st2 = Path(d) / "concurrent.json"
+    procs = [subprocess.Popen([sys.executable, str(SCRIPT), "--state", str(st2),
+                               "--pass-outcome", "noop"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL) for _ in range(20)]
+    for p in procs:
+        p.wait()
+    got = json.loads(st2.read_text()).get("noop_total")
+    check("20 concurrent recorders lose no increments (the lock earns its place)",
+          got == 20, f"noop_total={got}, expected 20")
+
+# the hash path still works when an outcome rides along with a held-list
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "s.json"
+    p = subprocess.run([sys.executable, str(SCRIPT), "--state", str(st),
+                        "--items", json.dumps(BASE), "--pass-outcome", "substantive"],
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    check("a held-list and an outcome in one call still print the hash verdict",
+          p.returncode == 0 and p.stdout.strip().startswith("post"), p.stdout)
+    check("...and record the outcome alongside it",
+          json.loads(st.read_text()).get("substantive_total") == 1, st.read_text())
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
