@@ -79,6 +79,23 @@ FOREIGN_WRAPPER = "9999"
 DOWN = {"name": "slack-bridge", "status": "warn", "detail": "configured but not running"}
 
 
+def job_dump(repo: str, *, gateway=False, extra=""):
+    """A realistic `launchctl print` dump whose ownership lives ONLY in the
+    arguments block, exactly like the real output."""
+    wrapper = ("gateway-bridge-wrapper.sh" if gateway else "channel-bridge-wrapper.sh")
+    chan = "" if gateway else "\t\tslack\n"
+    return ("gui/501/com.sutando.x = {\n"
+            "\tstate = running\n"
+            "\tprogram = /bin/bash\n"
+            "\targuments = {\n"
+            "\t\t/bin/bash\n"
+            f"\t\t{repo}/src/launchd/{wrapper}\n"
+            f"{chan}"
+            "\t}\n"
+            f"{extra}"
+            "}\n")
+
+
 class Host:
     """Fake subprocess boundary: launchctl/pgrep/ps/lsof/kill answered from
     config, Popen recorded. Side effects land on ONE ordered `events` stream so
@@ -90,7 +107,8 @@ class Host:
                  child_pids="", foreign_child_pids="", bare_pids=(),
                  pgrep_raises=False, pgrep_rc_error=False,
                  ps_rc_error=False, ps_raises=False,
-                 evict_rc=0, evict_raises=False,
+                 evict_rc=0, evict_raises=False, job_stdout=None,
+                 popen_raises=False, kill0_eperm=False,
                  survivors=(), script_pgrep_raises=False, script_pgrep_rc_error=False,
                  ghost_wrapper=False, ghost_survivor=False, lsof_raises=False,
                  ps_fail_after=None, kill_rc=0, kill_raises=False,
@@ -113,6 +131,9 @@ class Host:
         self.ps_raises = ps_raises
         self.evict_rc = evict_rc
         self.evict_raises = evict_raises
+        self.job_stdout = job_stdout  # overrides the launchctl print dump
+        self.popen_raises = popen_raises
+        self.kill0_eperm = kill0_eperm
         # survivors: (pid, cmd, cwd) rows answered to the post-eviction scan.
         self.survivors = list(survivors)
         self.script_pgrep_raises = script_pgrep_raises
@@ -153,13 +174,14 @@ class Host:
                 raise OSError("launchctl unavailable")
             if self.print_rc is not None:
                 return subprocess.CompletedProcess(argv, self.print_rc, stdout="", stderr="")
+            if self.job_stdout is not None:
+                return subprocess.CompletedProcess(argv, 0, stdout=self.job_stdout, stderr="")
+            gateway = "gateway" in argv[2]
             if self.job == "ours":
-                out = (f"state = running\n\t\t/bin/bash\n"
-                       f"\t\t{hc.REPO_DIR}/src/launchd/channel-bridge-wrapper.sh slack\n")
+                out = job_dump(str(hc.REPO_DIR), gateway=gateway)
                 return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
             if self.job == "foreign":
-                out = ("state = running\n\t\t/bin/bash\n"
-                       "\t\t/repo-b/src/launchd/channel-bridge-wrapper.sh slack\n")
+                out = job_dump("/repo-b", gateway=gateway)
                 return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
             return subprocess.CompletedProcess(argv, 113, stdout="", stderr="")
         if argv[:3] == ["/bin/launchctl", "kickstart", "-k"]:
@@ -206,6 +228,9 @@ class Host:
             out = f"p{pid}\nn{cwd}\n" if cwd else ""
             return subprocess.CompletedProcess(argv, 0 if cwd else 1, stdout=out, stderr="")
         if argv[0] == "/bin/kill" and argv[1] == "-0":
+            if self.kill0_eperm:
+                return subprocess.CompletedProcess(argv, 1, stdout="",
+                                                   stderr="kill: Operation not permitted")
             alive = self.alive_after_kill
             return subprocess.CompletedProcess(argv, 0 if alive else 1, stdout="", stderr="")
         if argv[0] == "/bin/kill":
@@ -222,7 +247,18 @@ class Host:
 
     def popen(self, argv, **kwargs):
         self.events.append(("spawn", argv))
+        if self.popen_raises:
+            raise OSError(24, "EMFILE: too many open files")
         return mock.MagicMock()
+
+    def os_kill(self, pid, sig):
+        if sig != 0:
+            raise AssertionError(f"unexpected os.kill signal {sig}")
+        if self.kill0_eperm:
+            raise PermissionError(1, "Operation not permitted")
+        if self.alive_after_kill:
+            return None
+        raise ProcessLookupError(3, "No such process")
 
     def of(self, kind):
         return [d for k, d in self.events if k == kind]
@@ -240,6 +276,7 @@ def with_host(host, fn):
              mock.patch.object(hc, "_load_channel_env", return_value=env), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.object(hc.time, "sleep", lambda *_: None), \
+             mock.patch.object(hc.os, "kill", side_effect=host.os_kill), \
              mock.patch.object(hc.subprocess, "run", side_effect=host.run), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=host.popen):
             return fn()
@@ -429,6 +466,19 @@ def case_g_unknown_supervision_fails_closed() -> list[str]:
     if ok5 or "UNKNOWN" not in how5:
         fails.append(f"g) pgrep-error must refuse: ok={ok5} how={how5!r}")
     fails += no_side_effects(host5, "g/pgrep-error")
+    # A registered job whose dump has no parseable arguments block is UNPROVED
+    # ownership → UNKNOWN, not foreign and never ours.
+    hostu = Host(job_stdout="gui/501/com.sutando.x = {\n\tstate = running\n}\n")
+    oku, howu = with_host(hostu, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if oku or "UNKNOWN" not in howu:
+        fails.append(f"g) unparseable job dump must be UNKNOWN: ok={oku} how={howu!r}")
+    fails += no_side_effects(hostu, "g/unparseable-dump")
+    # An UNTERMINATED arguments block proves nothing either.
+    hostt = Host(job_stdout="\targuments = {\n\t\t/bin/bash\n")
+    okt, howt = with_host(hostt, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if okt or "UNKNOWN" not in howt:
+        fails.append(f"g) unterminated arguments block must be UNKNOWN: ok={okt} how={howt!r}")
+    fails += no_side_effects(hostt, "g/unterminated-dump")
     # A wrapper pid ps cannot classify (gone or table torn) → UNKNOWN.
     host6 = Host(job="absent", ghost_wrapper=True)
     ok6, how6 = with_host(host6, lambda: hc._restart_bridge("slack-bridge", stale=True))
@@ -461,6 +511,36 @@ def case_h_foreign_supervisor_fails_closed() -> list[str]:
     ok3, _ = with_host(host3, lambda: hc._restart_bridge("gateway-bridge"))
     if ok3 or host3.of("kickstart"):
         fails.append(f"h) foreign gateway job driven: ok={ok3} events={host3.events}")
+    # kewei r3 control: a SIBLING checkout sharing this repo's path as a PREFIX
+    # (<repo>-copy) is foreign — substring presence of our path must not own it.
+    host4 = Host(job_stdout=job_dump(f"{hc.REPO_DIR}-copy"))
+    ok4, how4 = with_host(host4, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if ok4 or "NOT this" not in how4:
+        fails.append(f"h) same-prefix sibling job must be foreign: ok={ok4} how={how4!r}")
+    if host4.of("kickstart"):
+        fails.append(f"h) kickstarted a same-prefix sibling's job: {host4.of('kickstart')}")
+    fails += no_side_effects(host4, "h/same-prefix")
+    # kewei r3 control: our repo path in an INCIDENTAL field (log path) while
+    # the program argument points elsewhere — still foreign.
+    host5 = Host(job_stdout=job_dump(
+        "/repo-b", extra=f"\tstdout path = {hc.REPO_DIR}/workspace/logs/slack-bridge.log\n"))
+    ok5, how5 = with_host(host5, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if ok5 or "NOT this" not in how5:
+        fails.append(f"h) incidental-field mention must not own the job: ok={ok5} how={how5!r}")
+    if host5.of("kickstart"):
+        fails.append(f"h) kickstarted on an incidental-field match: {host5.of('kickstart')}")
+    fails += no_side_effects(host5, "h/incidental-field")
+    # A same-prefix FOREIGN WRAPPER argv token is likewise not ours.
+    host6 = Host(job="absent", foreign_wrapper_alive=True, foreign_child_pids="888")
+    host6._ps_rows_orig = host6._ps_rows
+    def _rows6():
+        rows = host6._ps_rows_orig()
+        return [(p_, pp, cmd.replace("/repo-b", f"{hc.REPO_DIR}-copy")) for p_, pp, cmd in rows]
+    host6._ps_rows = _rows6
+    ok6, how6 = with_host(host6, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if ok6 or "NOT this" not in how6:
+        fails.append(f"h) same-prefix wrapper must be foreign: ok={ok6} how={how6!r}")
+    fails += no_side_effects(host6, "h/same-prefix-wrapper")
     return fails
 
 
@@ -480,6 +560,15 @@ def case_i_unconfirmed_kills_report_failure() -> list[str]:
     ok2, _ = with_host(host2, lambda: hc._restart_bridge("slack-bridge"))
     if ok2:
         fails.append("i) child survived TERM yet the restart claimed success")
+    # kewei r3 control: kill -0 EPERM means the pid may still exist and be
+    # unprobeable — never a confirmed exit, never a success claim.
+    hostp = Host(job="ours", kickstart_rc=1, wrapper_alive=True,
+                 child_pids="555", kill0_eperm=True)
+    okp, howp = with_host(hostp, lambda: hc._restart_bridge("slack-bridge"))
+    if okp:
+        fails.append(f"i) EPERM probe read as confirmed exit: how={howp!r}")
+    if hostp.bridge_spawns():
+        fails.append(f"i) EPERM leg hand-spawned: {hostp.bridge_spawns()}")
     # Lineage lookup unreadable → NO signal is sent (negative control).
     for label, kw in (("ps-error", {"ps_rc_error": True}), ("ps-raise", {"ps_raises": True})):
         host3 = Host(job="ours", kickstart_rc=1, wrapper_alive=True,
@@ -552,11 +641,18 @@ def case_j_unverified_eviction_refuses_spawn() -> list[str]:
     if ok2 or "restart skipped" not in how2:
         fails.append(f"j) plan-None leg: ok={ok2} how={how2!r}")
     fails += no_side_effects(host2, "j/plan-none")
-    host3 = Host(job="absent")
-    with mock.patch.object(hc, "_launch_bridge", return_value=False):
-        ok3, how3 = with_host(host3, lambda: hc._restart_bridge("slack-bridge"))
-    if ok3 or how3 != "spawn failed":
-        fails.append(f"j) spawn-failed leg: ok={ok3} how={how3!r}")
+    # kewei r3 control: a REAL Popen EMFILE (no _launch_bridge mock) degrades
+    # to a reported failure on BOTH legs instead of aborting the fix pass.
+    host3 = Host(job="absent", popen_raises=True)
+    ok3, how3 = with_host(host3, lambda: hc._restart_bridge("slack-bridge"))
+    if ok3 or "spawn failed" not in how3 or "OSError" not in how3:
+        fails.append(f"j) down-leg Popen raise escaped or misreported: ok={ok3} how={how3!r}")
+    host4 = Host(job="absent", popen_raises=True)
+    ok4, how4 = with_host(host4, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if ok4 or "spawn failed" not in how4 or "OSError" not in how4:
+        fails.append(f"j) post-eviction Popen raise escaped or misreported: ok={ok4} how={how4!r}")
+    if [k for k, _ in host4.events if k in ("evict", "spawn")] != ["evict", "spawn"]:
+        fails.append(f"j) post-eviction raise leg lost its event order: {host4.events}")
     return fails
 
 

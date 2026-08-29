@@ -3636,14 +3636,59 @@ def _wrapper_pids(name: str) -> "tuple[list, list] | None":
     if rows is None:
         return None
     cmd_by_pid = {p: cmd for p, _pp, cmd in rows}
-    marker = f"{REPO_DIR}/src/launchd/channel-bridge-wrapper.sh {channel}"
+    wrapper_paths = {f"{REPO_DIR}/src/launchd/channel-bridge-wrapper.sh",
+                     f"{os.path.realpath(str(REPO_DIR))}/src/launchd/channel-bridge-wrapper.sh"}
     ours, foreign = [], []
     for pid in pids:
         cmd = cmd_by_pid.get(pid)
         if cmd is None:
             return None
-        (ours if marker in cmd else foreign).append(pid)
+        # Token-exact, like the launchd-job check: the wrapper path must BE an
+        # argv token followed by this channel, never a substring of the line.
+        toks = cmd.split()
+        mine = any(tok in wrapper_paths and i + 1 < len(toks) and toks[i + 1] == channel
+                   for i, tok in enumerate(toks))
+        (ours if mine else foreign).append(pid)
     return (ours, foreign)
+
+
+def _launchctl_job_arguments(stdout: str) -> "list[str] | None":
+    """Argument lines of launchctl print's `arguments = { ... }` block, or None
+    when the block is absent/unterminated. Parsing, not substring: ownership
+    must come from the exact program argument — never from the repo path
+    appearing anywhere in the dump (log paths, working directory, or a sibling
+    checkout sharing this repo's path as a prefix)."""
+    lines = stdout.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip() == "arguments = {":
+            args = []
+            for raw in lines[i + 1:]:
+                stripped = raw.strip()
+                if stripped == "}":
+                    return args
+                args.append(stripped)
+            return None
+    return None
+
+
+def _job_is_ours(name: str, stdout: str) -> "bool | None":
+    """Does the registered job's exact program argument name THIS checkout's
+    wrapper (and, for channel bridges, this channel)? None when the arguments
+    block cannot be parsed — callers must fail closed on None, because an
+    unproved job is not ours to kickstart and not proven foreign either."""
+    args = _launchctl_job_arguments(stdout)
+    if args is None:
+        return None
+    channel = _BRIDGE_WRAPPER_CHANNEL.get(name)
+    wrapper = "channel-bridge-wrapper.sh" if channel is not None else "gateway-bridge-wrapper.sh"
+    expected = {f"{REPO_DIR}/src/launchd/{wrapper}",
+                f"{os.path.realpath(str(REPO_DIR))}/src/launchd/{wrapper}"}
+    for i, arg in enumerate(args):
+        if arg in expected:
+            if channel is None:
+                return True
+            return i + 1 < len(args) and args[i + 1] == channel
+    return False
 
 
 def _bridge_supervision(name: str) -> "tuple[str, str | None]":
@@ -3662,14 +3707,19 @@ def _bridge_supervision(name: str) -> "tuple[str, str | None]":
     label = f"com.sutando.{name}"
     job_absent = False
     job_foreign = False
+    job_unproved = False
     try:
         probe = subprocess.run(
             ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
             capture_output=True, text=True, timeout=10)
         if probe.returncode == 0:
-            if str(REPO_DIR) in probe.stdout:
+            owned = _job_is_ours(name, probe.stdout)
+            if owned is True:
                 return ("supervised", label)
-            job_foreign = True
+            if owned is False:
+                job_foreign = True
+            else:
+                job_unproved = True
         elif probe.returncode == _LAUNCHCTL_NOT_FOUND_RC:
             job_absent = True
     except (subprocess.TimeoutExpired, OSError):
@@ -3685,9 +3735,24 @@ def _bridge_supervision(name: str) -> "tuple[str, str | None]":
     ours, foreign = wrappers
     if ours:
         return ("supervised", None)
+    if job_unproved:
+        return ("unknown", None)
     if job_foreign or foreign:
         return ("foreign", None)
     return ("absent", None) if job_absent else ("unknown", None)
+
+
+def _pid_confirmed_gone(pid: "str | int") -> bool:
+    """True only when the pid provably does not exist (ESRCH). EPERM means the
+    pid may still exist but is unprobeable, and any other error proves
+    nothing — neither may ever read as a confirmed exit."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    except Exception:  # noqa: BLE001 — includes PermissionError: not proof of exit
+        return False
+    return False
 
 
 def _kill_supervised_child(name: str) -> bool:
@@ -3717,9 +3782,7 @@ def _kill_supervised_child(name: str) -> bool:
             return False
         for _ in range(10):
             time.sleep(0.5)
-            if all(subprocess.run(["/bin/kill", "-0", pid],
-                                  capture_output=True).returncode != 0
-                   for pid in signalled):
+            if all(_pid_confirmed_gone(pid) for pid in signalled):
                 return True
         return False
     except Exception:  # noqa: BLE001 — an unconfirmable kill is a reported failure, not a crash
@@ -3850,7 +3913,13 @@ def _restart_bridge(name: str, *, stale: bool = False) -> "tuple[bool, str]":
         if not evicted:
             return False, (f"stale pre-eviction not verified ({why}) — refusing to spawn a "
                            f"duplicate next to a possibly-live stale process")
-    if _launch_bridge(name, plan):
+    # _launch_bridge does real I/O (mkdir/open/Popen); a raising spawn must
+    # degrade to a reported failure, never abort the whole health-check pass.
+    try:
+        spawned = _launch_bridge(name, plan)
+    except Exception as e:  # noqa: BLE001 — normalize EMFILE/EACCES/etc. into the failure path
+        return False, f"spawn failed ({type(e).__name__}: {e})"
+    if spawned:
         return True, "spawned directly (supervision conclusively absent)"
     return False, "spawn failed"
 
