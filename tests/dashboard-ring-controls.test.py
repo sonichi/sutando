@@ -80,9 +80,19 @@ def main() -> None:
         return float(m.group(1))
     assert tick_x(t1["ring"]) != tick_x(t2["ring"]), "pace tick must track elapsed fraction"
 
+    # The hydrated ring must degrade the SAME way the server tile does. The
+    # server clamps at 999%+ and em-dashes non-finite or negative values.
+    huge = _run_ring([{"x": 0.9, "y": 1e308}], 1.0)
+    assert "Infinity%" not in huge["ring"], "hydrated ring must not render Infinity%"
+    assert "999%+" in huge["ring"], f"huge usage must clamp like the server: {huge['ring'][-90:]}"
+
+    for bad, why in ((float("nan"), "NaN"), (float("-inf"), "-inf"), (-0.5, "negative")):
+        r = _run_ring([{"x": 0.9, "y": bad}], 1.0)
+        assert "NaN" not in r["ring"], f"{why} leaked NaN into the ring: {r['ring'][-90:]}"
+        assert "\u2014" in r["ring"], f"{why} must render an em dash like the server tile"
+
     print("dashboard-ring-controls: PASS — arc/tick/color executed via the page's own JS")
 
 
 if __name__ == "__main__":
     main()
-

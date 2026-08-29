@@ -601,7 +601,11 @@ for(const[k,el]of[['5h','qs-5h'],['7d','qs-7d']]){
   // ring meter: fill = usage, tick = even pace; red once usage passes the tick
   const ring=document.getElementById(el.replace('qs-','qr-'));
   if(ring){
-    const lastP=s.points[s.points.length-1],u=lastP.y,pc=lastP.x;
+    const lastP=s.points[s.points.length-1],uRaw=lastP.y,pc=lastP.x;
+    // Same degradation as _quota_tile_pct, so both render paths agree:
+    // unusable -> em dash, huge -> 999%+. Unguarded this printed Infinity%.
+    const ok=Number.isFinite(uRaw)&&uRaw>=0,u=ok?uRaw:0;
+    const label=!ok?'\u2014':(uRaw*100>999?'999%+':Math.trunc(uRaw*100)+'%');
     const C=22,R=17,TAU=2*Math.PI,a0=-TAU/4;
     const arc=(frac,color,w)=>{
       const a1=a0+frac*TAU,large=frac>0.5?1:0;
@@ -610,7 +614,7 @@ for(const[k,el]of[['5h','qs-5h'],['7d','qs-7d']]){
     ro+=arc(Math.min(u,1),u>pc?'#e94560':'#4ecca3',5);
     const ta=a0+pc*TAU;
     ro+=`<line x1="${C+(R-4)*Math.cos(ta)}" y1="${C+(R-4)*Math.sin(ta)}" x2="${C+(R+4)*Math.cos(ta)}" y2="${C+(R+4)*Math.sin(ta)}" stroke="#8888aa" stroke-width="1.5"/>`;
-    ro+=`<text x="${C}" y="${C+3.5}" text-anchor="middle" fill="#e8e8f0" font-size="10" font-weight="600">${Math.round(u*100)}%</text>`;
+    ro+=`<text x="${C}" y="${C+3.5}" text-anchor="middle" fill="#e8e8f0" font-size="10" font-weight="600">${label}</text>`;
     ring.innerHTML=ro;
   }
   let out=`<line x1="0" y1="${Y(0)}" x2="${W}" y2="${Y(1)}" stroke="#555" stroke-dasharray="2,2"/>`;
