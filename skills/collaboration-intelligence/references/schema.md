@@ -9,6 +9,7 @@ Use this conceptual schema with any available durable store. Preserve stable IDs
 - [Relationship](#relationship)
 - [Evidenced fact](#evidenced-fact)
 - [Candidate identity link](#candidate-identity-link)
+- [Reviewer identity map (`reviewer-identity/2`)](#reviewer-identity-map-reviewer-identity2)
 - [Alert](#alert)
 - [Merge rules](#merge-rules)
 - [Suggested freshness windows](#suggested-freshness-windows)
@@ -270,3 +271,53 @@ Treat these as defaults, not truth:
 | Explicit identity / ownership | 180 days |
 
 Explicit end dates and newer contradictory evidence override these windows.
+
+## Reviewer identity map (`reviewer-identity/2`)
+
+`<workspace>/data/collaboration-intelligence/reviewer-stands.json` — the single
+map of a reviewer's Discord identities. Keyed by GitHub login where one exists.
+
+```json
+{
+  "_schema": {"name": "reviewer-identity", "version": 2, "generated_at": "...",
+              "migrated_from": "...", "contract": "..."},
+  "<github-login>": {
+    "human_discord_id": "<the PERSON's id>  | null",
+    "stand_discord_id": "<the AGENT's id>   | null",
+    "other_stand_discord_ids": [{"id": "...", "basis": ["..."]}],
+    "unresolved_discord_ids": [{"id": "...", "reason": "..."}],
+    "home_channel": "<channel id> | null",
+    "id_basis": {"human_discord_id": ["..."], "stand_discord_id": ["..."]},
+    "...": "every v1 provenance field (verification, verified_at, source, observed_at, stand, evidence) is preserved verbatim"
+  }
+}
+```
+
+**Why the field names are long.** v1 carried one `discord_id` whose referent was
+unstated, and the pr-triage config carried `{discord, bots[]}` for the same
+people. Measured 2026-08-28: for `qingyun-wu` the roster's `discord_id` was the
+AGENT and pr-triage's `discord` was the HUMAN — both spelled "discord". Merging
+on the shared name makes a person and their agent the same value, and every
+downstream ping then reaches the wrong party while reporting success.
+
+**Rules for writers.**
+
+- Fill a slot only from a source that STATES the referent: a field whose own
+  name says which (`discord_human_id`, `stand_status`, `secondary_agent`),
+  pr-triage `people.<login>.discord` vs `.bots[]`, the Discord `peers.json`
+  (peer bot ids), or `discord-config.json` `owner` (the human owner).
+- A display name is not evidence. "Sutando-Mini" reads as a bot to a person and
+  states nothing to a program.
+- Sources that disagree, or two ids claiming one slot, go to
+  `unresolved_discord_ids` — never arbitrate.
+- Keys beginning with `_` are document metadata, not people.
+
+**Rules for readers.** Check `_schema` first and refuse anything below version 2
+rather than reading `discord_id`; use `scripts/roster_identity.py`'s accessors
+(`human_discord_id`, `stand_discord_id`, `stand_discord_ids`). An id in
+`unresolved_discord_ids` answers no lookup.
+
+**Migrating.** `scripts/migrate_roster_identity.py --roster <v1> --triage-config
+<pr-triage/config.json> --peers <peers.json> --discord-config <discord-config.json>
+--out <v2> --table` — it never writes its input and prints the per-entry
+before/after.
