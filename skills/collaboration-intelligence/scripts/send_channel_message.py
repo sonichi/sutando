@@ -6,9 +6,8 @@ channel: routing a reviewer notification through it validated one channel and
 delivered to another.
 
 Constructs through `post_gate.make_client` and resolves its token through
-`resolve_channel_token`, because those are where the post-gate and the
-env -> .env -> vault contract live; binding the client directly reaches the
-transport while skipping both owners.
+`resolve_channel_token`: binding the client directly reaches the transport
+while skipping the post-gate and the env -> .env -> vault contract.
 """
 from __future__ import annotations
 
@@ -64,9 +63,8 @@ def main(argv=None) -> int:
               "channel before sending again.", file=sys.stderr)
         return 4
 
-    # A mention is the delivery mechanism, and the API reports 200 either way.
-    # Any non-empty array proves only that SOMEBODY was mentioned, so require
-    # the id we were asked to reach.
+    # The API reports 200 either way, and a non-empty array proves only that
+    # SOMEBODY was mentioned: require the id we were asked to reach.
     mentioned = {str(m.get("id")) for m in ((posted or {}).get("mentions") or [])
                  if isinstance(m, dict)}
     if str(user_id) not in mentioned:

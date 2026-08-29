@@ -185,17 +185,15 @@ try:
     check("proactive provider: refused", "NOT_DELIVERED" in str(receipt.outcome),
           str(receipt.outcome))
 
-    # 6. send_channel_message.py -- the reviewer-notification sender. Added when
-    # a review found it binding DiscordRestClient directly, which reaches the
-    # transport while skipping the gate. An enumeration covers what it enumerates.
+    # 6. send_channel_message.py, added when a review found it binding the
+    # client directly. An enumeration covers only what it enumerates.
     _spec = importlib.util.spec_from_file_location(
         "scm_gate", REPO / "skills" / "collaboration-intelligence" / "scripts"
         / "send_channel_message.py")
     scm = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(scm)
-    # Do NOT inject a client: injecting a gated one proves the gate works when
-    # you hand it over, never that this module BUILDS a gated one. Stub only the
-    # token so the real construction path runs.
+    # Do NOT inject a client: a gated one proves the gate works when handed
+    # over, never that this module BUILDS one. Stub only the token.
     scm.token = lambda: "tok"
     r6, _posted6 = scm.send("chan-scm", "hi", "111")
     check("send_channel_message: refused",

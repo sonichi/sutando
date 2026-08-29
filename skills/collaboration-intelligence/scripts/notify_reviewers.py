@@ -161,9 +161,8 @@ def discord_reachable(target: dict) -> "tuple[bool, str]":
         return True, "unverified (non-object access map)"
     for section in ("groups", "channels"):
         sect = data.get(section)
-        # A truthy non-object has no .get, and a scalar allowFrom ITERATES --
-        # "1" would answer per character and return a definite verdict from
-        # garbage. Every unusable shape is unverified, never an answer.
+        # A truthy non-object has no .get, and a scalar allowFrom ITERATES:
+        # "1" answers per character. Unusable shapes are unverified, not answers.
         if sect is not None and not isinstance(sect, dict):
             return True, f"unverified ({section} is {type(sect).__name__}, not an object)"
         entry = (sect or {}).get(str(target["channel"]))
