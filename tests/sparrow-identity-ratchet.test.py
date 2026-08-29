@@ -126,9 +126,15 @@ def scan_task_mints(root: Path) -> dict:
             visit_AsyncFunctionDef = visit_FunctionDef
 
             def visit_JoinedStr(self, n):
+                # A glob metacharacter in the literal half makes this a MATCHER
+                # over existing names, not a new identity — `.glob(f"{P}*.txt")`.
                 if (n.values and _leads_task(n.values[0])
                         and any(isinstance(v, ast.FormattedValue)
-                                for v in n.values)):
+                                for v in n.values)
+                        and not any(isinstance(v, ast.Constant)
+                                    and isinstance(v.value, str)
+                                    and any(g in v.value for g in "*?[")
+                                    for v in n.values)):
                     record()
                 self.generic_visit(n)
 
