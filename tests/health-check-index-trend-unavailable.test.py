@@ -52,9 +52,8 @@ def index_in(dirpath, size, gitted, revisions=1):
     if not gitted:
         idx.write_text("- [x](x.md) — " + "y" * size + "\n")
         return idx
-    # Pin the fixture repo's config: bare `git` inherits the host's gc/maintenance
-    # settings and hooks, so ambient config decides whether a background writer
-    # touches .git/objects while TemporaryDirectory is removing it (#3542).
+    # Bare `git` inherits the host's gc/maintenance settings and hooks, so ambient
+    # config decides whether a background writer touches .git/objects (#3542).
     genv = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
                 GIT_CONFIG_NOSYSTEM="1")
     git = ["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.fsmonitor=false"]
