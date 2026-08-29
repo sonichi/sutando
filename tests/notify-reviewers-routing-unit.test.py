@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import datetime
 import json
 import os
 import pathlib
@@ -902,6 +903,76 @@ class AnAllowFromHitIsNotMembership(unittest.TestCase):
             self.assertTrue(ok, f"{label}: must not refuse")
             self.assertTrue(why.startswith("unverified"),
                             f"{label} reported as checked reachability: {why}")
+
+
+class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
+    """`_stale_repeat_ask` had no caller in this suite, so its rule was unpinned.
+
+    The two questions differ: retry-safety wants the LAST outcome, ask-history
+    wants whether a post ever landed. One reduction serving both erases a real
+    ask whenever a later attempt fails.
+    """
+
+    MSG = "see https://github.com/sonichi/sutando/pull/3509"
+    TARGETS = [{"name": "k"}]
+    ROSTER = {"k": {"discord_id": "1", "home_channel": "2"}}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.led = pathlib.Path(self.tmp) / "asks.jsonl"
+        self.prev = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(self.led)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self.prev is None:
+            os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None)
+        else:
+            os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = self.prev
+
+    def _rows(self, *pairs):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.led.write_text("".join(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": "k", "actor": "k",
+            "ts": (now - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "channel": "room", "outcome": o}) + "\n" for o, m in pairs))
+
+    def _stale(self):
+        return nr._stale_repeat_ask(self.MSG, self.TARGETS, self.ROSTER)[0]
+
+    def test_a_later_failed_attempt_does_not_erase_an_ask_that_landed(self):
+        self._rows(("confirmed", 90), ("pending", 5), ("failed", 5))
+        self.assertTrue(self._stale(), "re-pinging someone asked 90 minutes ago")
+
+    def test_a_landed_ask_alone_still_refuses_the_repeat(self):
+        self._rows(("confirmed", 90))
+        self.assertTrue(self._stale())
+
+    def test_a_reservation_that_never_posted_leaves_the_retry_open(self):
+        # The finding this exclusion was added for: nothing was posted, so the
+        # widen rule must not treat the released reservation as an ask.
+        self._rows(("pending", 90), ("failed", 90))
+        self.assertFalse(self._stale())
+
+    def test_an_unsafe_settle_counts_as_an_ask(self):
+        self._rows(("pending", 90), ("unknown", 90))
+        self.assertTrue(self._stale())
+
+    def test_a_row_predating_the_outcome_field_still_counts_as_an_ask(self):
+        # Every row written before this PR has no `outcome`. Reading absence as
+        # "nothing was posted" would silently re-ping everyone asked so far.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.led.write_text(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": "k",
+            "ts": (now - datetime.timedelta(minutes=90)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "channel": "room"}) + "\n")
+        self.assertTrue(self._stale())
+
+    def test_a_recent_ask_is_not_stale_yet(self):
+        # The negative control on the CLOCK rather than the outcome: without it
+        # a rule that refused every repeat would pass all four cases above.
+        self._rows(("confirmed", 5))
+        self.assertFalse(self._stale())
 
 
 if __name__ == "__main__":

@@ -234,6 +234,9 @@ _UNSAFE_OUTCOMES = {"pending", "unknown"}
 #: ask — counting it refuses the retry it exists to permit.
 _NOT_AN_ASK = {"failed"}
 
+#: Outcomes proving a post reached the channel, or may have.
+_DID_ASK = {"confirmed", "unknown"}
+
 
 def _latest_outcomes(led: Path, canonical=None) -> dict:
     """(repo, pr, actor) -> (outcome, ts) from the LAST row for that key.
@@ -255,6 +258,39 @@ def _latest_outcomes(led: Path, canonical=None) -> dict:
             who = canonical(who)
         key = (d.get("repo"), str(d.get("pr")), who)
         out[key] = (d.get("outcome"), d.get("ts") or "")
+    return out
+
+
+def _first_ask(led: Path, canonical=None) -> dict:
+    """(repo, pr, actor) -> earliest ts at which an ask actually reached them.
+
+    Deliberately NOT the last-outcome reduction: a later attempt that failed
+    releases its own reservation and must not erase an ask that landed hours
+    earlier. Retry-safety and ask-history are two questions over one file.
+    """
+    out, last = {}, {}
+    if not led.exists():
+        return out
+    for line in led.read_text().splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        who = d.get("actor") or d.get("reviewer")
+        if canonical:
+            who = canonical(who)
+        key = (d.get("repo"), str(d.get("pr")), who)
+        ts, outcome = d.get("ts") or "", d.get("outcome")
+        last[key] = outcome
+        # A row predating the outcome field records a send that happened: the
+        # field's absence is legacy, not a claim that nothing was posted.
+        if (outcome is None or outcome in _DID_ASK) and (key not in out or ts < out[key]):
+            out[key] = ts
+    for key, outcome in last.items():
+        # A standing reservation may have posted, so it counts as an ask until
+        # it settles; a settled `failed` never posted and never counts.
+        if outcome == "pending" and key not in out:
+            out[key] = ""
     return out
 
 
@@ -397,19 +433,15 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     actor_of = _actor_map(roster)
     prior, earliest = set(), None
     try:
-        latest = _latest_outcomes(ledger)
+        # Canonical actors on one axis: mixing spellings makes the subset test
+        # below answer about names rather than people.
+        asked = _first_ask(ledger, canonical=lambda w: actor_of.get(w, w))
     except OSError:
         return False, ""
-    for (r, n, who), (outcome, ts) in latest.items():
+    for (r, n, who), ts in asked.items():
         if n != str(num) or r not in (repo, None):
             continue
-        # A released reservation means nothing was posted, so it is not an ask.
-        # Counting it refuses the very retry the release exists to permit.
-        if outcome in _NOT_AN_ASK:
-            continue
-        # One set, one axis: canonical actors. Mixing spellings into it makes
-        # the subset test below answer about names rather than people.
-        prior.add(actor_of.get(who, who))
+        prior.add(who)
         if ts and (earliest is None or ts < earliest):
             earliest = ts
     if not prior or earliest is None:
