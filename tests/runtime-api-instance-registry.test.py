@@ -184,14 +184,18 @@ class InstanceRegistryTests(unittest.TestCase):
         envdump = Path(self.tmp.name) / "env.txt"
         import stat as _stat
         launcher = Path(self.tmp.name) / "dump-env"
-        launcher.write_text("#!/bin/sh\nenv > \"%s\"\n" % envdump)
+        # write to a temp path and rename: `> envdump` would truncate the file
+        # into existence before `env` writes, so readiness could read it empty
+        launcher.write_text("#!/bin/sh\nenv > \"%s\" && mv \"%s\" \"%s\"\n"
+                            % (envdump.with_suffix(".part"),
+                               envdump.with_suffix(".part"), envdump))
         launcher.chmod(launcher.stat().st_mode | _stat.S_IXUSR)
         reg.write_manifest("q-1", endpoint=str(sock), instance="q-1",
                            tmux_socket="/run/q-1/tmux.sock", session="core-q1",
                            config_dir="/cfg/q-1",
                            launcher={"type": "process", "executable": str(launcher),
                                      "args": [], "working_directory": self.tmp.name})
-        # readiness true once the env dump exists
+        # readiness true once the COMPLETE env dump has been renamed into place
         reg.start_instance("q-1", wait_s=5, instance="q-1",
                            _ready=lambda m: {"attachable": envdump.exists()})
         text = envdump.read_text()
