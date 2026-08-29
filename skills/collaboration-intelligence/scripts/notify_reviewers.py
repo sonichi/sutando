@@ -151,11 +151,11 @@ def discord_reachable(target: dict) -> "tuple[bool, str]":
     membership, and the bridge also grants via a global superset this file
     cannot see. So an omission is not evidence of absence and never returns one.
     """
-    # Imported here, not at module scope: the probe must still run from a tree
-    # without src/, and a private rederivation would miss $CLAUDE_HOME.
-    from util_paths import claude_home_path
-    access = claude_home_path("channels", "discord", "access.json")
     try:
+        # Inside the probe's own try, not above it: a tree without src/ raises
+        # ModuleNotFoundError, and this probe must answer UNVERIFIED, never raise.
+        from util_paths import claude_home_path
+        access = claude_home_path("channels", "discord", "access.json")
         data = json.loads(access.read_text())
     except Exception as exc:                     # noqa: BLE001 - probe must not raise
         return True, f"unverified ({type(exc).__name__})"
@@ -239,6 +239,14 @@ _NOT_AN_ASK = {"failed"}
 _DID_ASK = {"confirmed", "unknown"}
 
 
+#: Every outcome `record_asks` writes. A value outside this set is a malformed
+#: row, never a settlement.
+_KNOWN_OUTCOMES = {"pending", "unknown", "confirmed", "failed"}
+
+#: ISO-8601 to the second, fraction and offset optional. Comparisons are
+#: lexical, so a value outside this shape does not order against one inside it.
+_TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+
 #: Accepted row schema. A field of the wrong type is a malformed ROW, not a
 #: reason to crash a reader or to misattribute the stream it belongs to.
 def _row(d) -> "tuple | None":
@@ -250,14 +258,25 @@ def _row(d) -> "tuple | None":
     if actor is not None and not (isinstance(actor, str) and actor):
         return None                     # PRESENT but wrong: not an absent actor
     who = actor or d.get("reviewer")
-    outcome, ts = d.get("outcome"), d.get("ts") or ""
+    outcome, ts = d.get("outcome"), d.get("ts")
     if not isinstance(repo, (str, type(None))) or not isinstance(who, str) or not who:
         return None
     if not isinstance(pr, (str, int)) or isinstance(pr, bool):
         return None
-    if not isinstance(outcome, (str, type(None))) or not isinstance(ts, str):
+    # Checked BEFORE coercion: `x or ""` turns 0, False, [] and {} into an
+    # accepted empty string, so the type check never sees what was written.
+    if ts is not None and not isinstance(ts, str):
         return None
-    return repo, str(pr), who, outcome, ts
+    # A string is not a timestamp: "0000" sorts below every real stamp and
+    # silently lends one actor's age to another in the widen comparison.
+    if ts and not _TS.fullmatch(ts):
+        return None
+    # A closed set. An unrecognised outcome must not become the latest one and
+    # settle a possibly-landed post; the row is malformed, so the park holds.
+    if outcome is not None and (not isinstance(outcome, str)
+                                or outcome not in _KNOWN_OUTCOMES):
+        return None                     # type first: a list is unhashable
+    return repo, str(pr), who, outcome, ts or ""
 
 
 def _streams(led: Path) -> dict:
@@ -270,24 +289,25 @@ def _streams(led: Path) -> dict:
     out = {}
     if not led.exists():
         return out
-    for line in led.read_text().splitlines():
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
-        row = _row(d)
-        if row is None:
-            continue                    # one bad row never hides a later good one
-        repo, pr, who, outcome, ts = row
-        st = out.setdefault((repo, pr, who),
-                            {"last": None, "first_ask": None, "n": 0})
-        st["last"] = (outcome, ts)
-        st["n"] += 1
-        # A row predating the outcome field records a send that happened:
-        # absence is legacy, not a claim that nothing was posted.
-        if (outcome is None or outcome in _DID_ASK) and (
-                st["first_ask"] is None or ts < st["first_ask"]):
-            st["first_ask"] = ts
+    with open(led) as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            row = _row(d)
+            if row is None:
+                continue                # one bad row never hides a later good one
+            repo, pr, who, outcome, ts = row
+            st = out.setdefault((repo, pr, who),
+                                {"last": None, "first_ask": None, "n": 0})
+            st["last"] = (outcome, ts)
+            st["n"] += 1
+            # A row predating the outcome field records a send that happened:
+            # absence is legacy, not a claim that nothing was posted.
+            if (outcome is None or outcome in _DID_ASK) and (
+                    st["first_ask"] is None or ts < st["first_ask"]):
+                st["first_ask"] = ts
     return out
 
 

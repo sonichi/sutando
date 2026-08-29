@@ -950,6 +950,57 @@ class ALegacyRowParksEverySpellingOfOneActor(unittest.TestCase):
             nr.unknown_parked(self.MSG, "gamma", "gamma", canonical=lambda w: m.get(w, w)))
 
 
+class TheReachabilityProbeResolvesTheClaudeHomeAndNeverRaises(unittest.TestCase):
+    """Replacing the helper with the old private fallback left 84 tests green."""
+
+    def _probe(self, **env):
+        prev = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_HOME")}
+        for k in prev:
+            os.environ.pop(k, None)
+        os.environ.update({k: v for k, v in env.items() if v is not None})
+        try:
+            return nr.discord_reachable({"discord_id": "111", "channel": "222"})
+        finally:
+            for k, v in prev.items():
+                os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+
+    def _home(self, allow):
+        d = tempfile.mkdtemp(prefix="home-")
+        chan = pathlib.Path(d, "channels", "discord")
+        chan.mkdir(parents=True)
+        (chan / "access.json").write_text(json.dumps({"groups": {"222": {"allowFrom": allow}}}))
+        return d
+
+    def test_it_honours_CLAUDE_HOME(self):
+        # The tier a private `CLAUDE_CONFIG_DIR or ~/.claude` rederivation drops.
+        ok, why = self._probe(CLAUDE_HOME=self._home(["111"]))
+        self.assertTrue(ok)
+        self.assertIn("allowFrom", why)
+
+    def test_CLAUDE_CONFIG_DIR_takes_precedence(self):
+        ok, why = self._probe(CLAUDE_CONFIG_DIR=self._home(["111"]),
+                              CLAUDE_HOME=self._home([]))
+        self.assertIn("allowFrom", why, "the CCD map was not the one read")
+
+    def test_a_missing_helper_is_unverified_not_an_exception(self):
+        # The probe's contract is that it never raises; a tree without src/
+        # must answer UNVERIFIED like any other unreadable map.
+        orig = sys.modules.pop("util_paths", None)
+        path_backup = sys.path[:]
+        sys.path[:] = [p for p in sys.path if not p.endswith("/src")]
+        sys.modules["util_paths"] = None       # force ModuleNotFoundError
+        try:
+            ok, why = self._probe()
+            self.assertTrue(ok)
+            self.assertTrue(why.startswith("unverified"), why)
+        finally:
+            sys.path[:] = path_backup
+            if orig is not None:
+                sys.modules["util_paths"] = orig
+            else:
+                sys.modules.pop("util_paths", None)
+
+
 class AnAllowFromHitIsNotMembership(unittest.TestCase):
     """The positive-hit direction, previously reported as verified reachability."""
 
@@ -1106,7 +1157,7 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
 class OneOwnerForTheLedgerReadContract(unittest.TestCase):
     """Both readers are projections over `_streams`, not two copies of it."""
 
-    GOOD = {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "T", "outcome": "confirmed"}
+    GOOD = {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "2026-08-29T11:00:00Z", "outcome": "confirmed"}
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -1129,7 +1180,7 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
 
     def test_identity_prefers_actor_and_falls_back_to_reviewer(self):
         self._write(dict(self.GOOD, reviewer="spelling", actor="canon"),
-                    {"repo": "o/r", "pr": 7, "reviewer": "legacy", "ts": "T2",
+                    {"repo": "o/r", "pr": 7, "reviewer": "legacy", "ts": "2026-08-29T11:00:02Z",
                      "outcome": "unknown"})
         self.assertEqual(sorted(k[2] for k in nr._streams(self.led)),
                          ["canon", "legacy"])
@@ -1148,19 +1199,40 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
             self.assertEqual(nr._latest_outcomes(self.led), {})
             self.assertEqual(nr._first_ask(self.led), {})
 
+    def test_an_unrecognised_outcome_cannot_settle_a_park(self):
+        # A typo'd outcome became the latest one and cleared a possibly-landed
+        # post. It is a malformed row, so the earlier unknown still stands.
+        self._write(dict(self.GOOD, ts="2026-08-29T11:00:01Z", outcome="unknown"),
+                    dict(self.GOOD, ts="2026-08-29T11:00:02Z", outcome="typo"))
+        self.assertEqual(nr._latest_outcomes(self.led),
+                         {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:01Z")})
+
+    def test_a_falsy_timestamp_is_not_coerced_into_an_accepted_empty_string(self):
+        # `d.get("ts") or ""` turned each of these into "" BEFORE the type
+        # check, so the check never saw what was written.
+        for bad in (0, False, [], {}):
+            self._write(dict(self.GOOD, ts=bad))
+            self.assertEqual(nr._streams(self.led), {}, f"ts={bad!r} was accepted")
+
+    def test_a_string_that_is_not_a_timestamp_is_rejected(self):
+        # "0000" sorts below every real stamp, lending one actor's age to
+        # another in the widen comparison.
+        self._write(dict(self.GOOD, ts="0000"))
+        self.assertEqual(nr._streams(self.led), {})
+
     def test_a_malformed_row_never_hides_a_later_unsafe_one(self):
         # The consequence that matters: one bad record must not stop a later
         # possibly-landed row from being seen, or the park silently clears.
-        self._write({"repo": [], "pr": 7, "reviewer": "k", "ts": "T1"},
-                    {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "T2",
+        self._write({"repo": [], "pr": 7, "reviewer": "k", "ts": "2026-08-29T11:00:01Z"},
+                    {"repo": "o/r", "pr": 7, "reviewer": "k", "ts": "2026-08-29T11:00:02Z",
                      "outcome": "unknown"})
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("unknown", "T2")})
+                         {("o/r", "7", "k"): ("unknown", "2026-08-29T11:00:02Z")})
 
     def test_state_is_bounded_per_stream_not_per_row(self):
         # The structural bound: 500 rows for one stream must not retain 500
         # anything — the result is per-stream and of fixed size.
-        self._write(*[dict(self.GOOD, ts=f"T{i:04d}", outcome="pending")
+        self._write(*[dict(self.GOOD, ts=f"2026-08-29T11:{i//60:02d}:{i%60:02d}Z", outcome="pending")
                       for i in range(500)])
         st = nr._streams(self.led)[("o/r", "7", "k")]
         self.assertEqual(st["n"], 500, "the count is kept")
@@ -1171,25 +1243,25 @@ class OneOwnerForTheLedgerReadContract(unittest.TestCase):
     def test_the_projections_read_first_and_last_of_the_same_stream(self):
         # Order, without retaining rows: last-wins and earliest-ask must both
         # come out of one line-by-line fold.
-        self._write(dict(self.GOOD, ts="T1", outcome="confirmed"),
-                    dict(self.GOOD, ts="T2", outcome="pending"),
-                    dict(self.GOOD, ts="T3", outcome="failed"))
+        self._write(dict(self.GOOD, ts="2026-08-29T11:00:01Z", outcome="confirmed"),
+                    dict(self.GOOD, ts="2026-08-29T11:00:02Z", outcome="pending"),
+                    dict(self.GOOD, ts="2026-08-29T11:00:03Z", outcome="failed"))
         self.assertEqual(nr._latest_outcomes(self.led),
-                         {("o/r", "7", "k"): ("failed", "T3")})
-        self.assertEqual(nr._first_ask(self.led), {("o/r", "7", "k"): "T1"})
+                         {("o/r", "7", "k"): ("failed", "2026-08-29T11:00:03Z")})
+        self.assertEqual(nr._first_ask(self.led), {("o/r", "7", "k"): "2026-08-29T11:00:01Z"})
 
     def test_both_readers_derive_their_output_from_the_one_owner(self):
         # A mutant called `_streams`, discarded it, re-read the file and stayed
         # green. Feed a sentinel the file cannot produce, from a missing path.
-        sentinel = {("S/S", "99", "sent"): {"last": ("unknown", "TZ"),
-                                            "first_ask": "TA", "n": 1}}
+        sentinel = {("S/S", "99", "sent"): {"last": ("unknown", "2026-08-29T11:00:09Z"),
+                                            "first_ask": "2026-08-29T11:00:00Z", "n": 1}}
         missing = pathlib.Path(self.tmp) / "does-not-exist.jsonl"
         orig = nr._streams
         nr._streams = lambda led: sentinel
         try:
             self.assertEqual(nr._latest_outcomes(missing),
-                             {("S/S", "99", "sent"): ("unknown", "TZ")})
-            self.assertEqual(nr._first_ask(missing), {("S/S", "99", "sent"): "TA"})
+                             {("S/S", "99", "sent"): ("unknown", "2026-08-29T11:00:09Z")})
+            self.assertEqual(nr._first_ask(missing), {("S/S", "99", "sent"): "2026-08-29T11:00:00Z"})
         finally:
             nr._streams = orig
 
