@@ -957,6 +957,39 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rc, 5, err)
         self.assertIn("SHAPE x", err)
 
+    def test_a_snowflake_shaped_foreign_id_is_not_mined_into_a_slot(self):
+        # Reviewer, 2026-08-30: the leaf rule reached VALIDATION only, so
+        # discovery mined a provider id that merely looked like a snowflake.
+        for parent, slot in (("human", "human_discord_id"),
+                             ("secondary_agent", ri.OTHER_STANDS_FIELD)):
+            rc, err, rec = self._cli({parent: {"provider_user_id": HUMAN},
+                                      "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 0, err)
+            got = rec[slot]
+            got = [o["id"] for o in got] if isinstance(got, list) else got
+            self.assertNotIn(HUMAN, got if isinstance(got, list) else [got],
+                             f"{parent}.provider_user_id was read as Discord")
+            self.assertEqual(rec[parent]["provider_user_id"], HUMAN)
+
+    def test_the_collector_still_reads_a_referent_leaf_and_a_bare_id(self):
+        # Positive controls: skipping every `*_id` leaf would pass the test
+        # above and stop the migration classifying anything at all.
+        rc, _e, rec = self._cli({"secondary_agent": {"id": self.SECOND}})
+        self.assertEqual(rc, 0)
+        self.assertIn(self.SECOND, ri.stand_discord_ids(rec))
+        rc, _e, rec = self._cli({"stand_status": f"stand id {self.SECOND}"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(ri.stand_discord_id(rec), self.SECOND)
+
+    def test_a_foreign_leaf_cannot_cite_an_id_a_real_slot_already_holds(self):
+        # Same digits in both: without the citation skip the provider field
+        # adds a HUMAN claim, they disagree, and a real Stand goes unresolved.
+        rc, err, rec = self._cli({"stand_discord_id": BOT,
+                                  "human": {"provider_user_id": BOT}})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(ri.stand_discord_id(rec), BOT)
+        self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [])
+
     def test_a_plural_slot_refuses_a_member_that_holds_no_id(self):
         # Empty is the slot being empty; junk INSIDE it is the same defect one
         # axis over, and the readable sibling must still be collected.

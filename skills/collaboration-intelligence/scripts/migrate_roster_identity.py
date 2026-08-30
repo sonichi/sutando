@@ -61,19 +61,21 @@ def _cited_in(entry: dict, id_: str) -> list:
     """Field names (dotted for nested) whose value mentions this id."""
     hits = []
 
-    def walk(obj, prefix):
+    def walk(obj, path):
         if isinstance(obj, dict):
             for k, v in obj.items():
-                walk(v, f"{prefix}.{k}" if prefix else str(k))
+                if _foreign_id_leaf(path, str(k)):
+                    continue
+                walk(v, path + [str(k)])
         elif isinstance(obj, list):
             for v in obj:
-                walk(v, prefix)
+                walk(v, path)
         elif id_ and id_ in _snowflakes(obj):
                 # whole-id match: a 17-digit id is a substring of an
                 # 18-digit one, and that published the wrong referent.
-            hits.append(prefix)
+            hits.append(".".join(path))
 
-    walk(entry, "")
+    walk(entry, [])
     return hits
 
 
@@ -165,6 +167,14 @@ def _declares_discord_id(ancestors: list, key: str) -> bool:
         and _typed_path(ancestors)
 
 
+def _foreign_id_leaf(ancestors: list, key: str) -> bool:
+    """A leaf declaring an id in someone else's namespace. Its digits are a
+    PROVIDER id however Discord-shaped they look, so discovery must not mine
+    them and no field may cite one — a wrong slot here names the wrong account.
+    """
+    return bool(_id_slot(key)) and not _declares_discord_id(ancestors, key)
+
+
 def _absent(value) -> bool:
     """None and blank agree with `roster_identity`'s readers, which coerce both
     to None; calling either malformed would split the two apart."""
@@ -199,10 +209,13 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
     def walk(obj, path):
         if isinstance(obj, dict):
             for k, v in obj.items():
+                # Discovery obeys the same rule as validation, or a
+                # snowflake-SHAPED provider id is mined into a Discord slot.
+                if _foreign_id_leaf(path, str(k)):
+                    continue
                 slot = _id_slot(k)
                 # Inside the basis map the key IS the slot and the value prose.
-                if slot and shapes is not None and ri.BASIS_FIELD not in path \
-                        and _declares_discord_id(path, str(k)):
+                if slot and shapes is not None and ri.BASIS_FIELD not in path:
                     _slot_failures(v, slot, path + [str(k)], shapes)
                 walk(v, path + [str(k)])
         elif isinstance(obj, list):
