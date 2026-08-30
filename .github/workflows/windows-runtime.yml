@@ -122,6 +122,8 @@ jobs:
         run: |
           python tests/find-pids.test.py
           if ($LASTEXITCODE -ne 0) { throw 'find-pids.test.py failed' }
+          python tests/cwd-lint.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'cwd-lint.test.py failed' }
           python tests/git-binary-resolution.test.py
           if ($LASTEXITCODE -ne 0) { throw 'git-binary-resolution.test.py failed' }
           python tests/health-check-live-tree-drift.test.py

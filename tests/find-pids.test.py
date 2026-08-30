@@ -20,6 +20,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -96,6 +97,15 @@ class TestFindPids(unittest.TestCase):
                          f"end-anchored find_pids({marker+'$'!r}) must NOT match a mid-line marker; got {pids}")
         # …but the unanchored form DOES find it.
         self.assertIn(str(p.pid), self.mod.find_pids(marker))
+
+    def test_windows_query_allows_for_cold_cim_startup(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="4242\n", stderr="")
+        with mock.patch.object(self.mod, "is_macos", return_value=False), \
+                mock.patch.object(self.mod, "is_linux", return_value=False), \
+                mock.patch.object(self.mod, "is_windows", return_value=True), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(self.mod.find_pids("marker"), ["4242"])
+        self.assertGreaterEqual(run.call_args.kwargs["timeout"], 15)
 
 
 if __name__ == "__main__":

@@ -125,6 +125,9 @@ def clipboard_write(text: str) -> None:
 
 # ---------- Process listing / killing ----------
 
+WINDOWS_CIM_TIMEOUT = 15.0
+
+
 def find_pids(pattern: str) -> list[str]:
     """Return PIDs (as strings) of running processes whose command line matches `pattern`.
 
@@ -170,7 +173,7 @@ def find_pids(pattern: str) -> list[str]:
             )
             r = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                timeout=5.0,
+                timeout=WINDOWS_CIM_TIMEOUT,
                 capture_output=True,
                 text=True,
                 check=False,
