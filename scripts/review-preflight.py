@@ -155,7 +155,7 @@ def _gh_json(run, args):
 
 
 def stale_approvals(pr: str, runner=None, repo: "str | None" = None) -> "list[dict] | None":
-    """Approvals counted toward the gate that were never cast against the current head.
+    """Approvals counted toward the gate whose reviewer has not seen the current head.
 
     A ruleset leaving dismiss_stale_reviews_on_push off keeps them green, so
     nothing on the PR page separates such an approval from a live one.
@@ -172,7 +172,7 @@ def stale_approvals(pr: str, runner=None, repo: "str | None" = None) -> "list[di
     if not head:
         return None
     # The PR's own commits, not a base compare: a base merge drags in main's
-    # history, which did not change what the approver read.
+    # history, which was never part of what this reviewer read.
     shas = [c.get("sha", "") for c in commits]
     # COMMENTED never supersedes a verdict, so it must not overwrite the latest state.
     latest: "dict[str, dict]" = {}
@@ -187,18 +187,22 @@ def stale_approvals(pr: str, runner=None, repo: "str | None" = None) -> "list[di
     for who, row in sorted(latest.items()):
         if (row.get("state") or "").upper() != "APPROVED":
             continue
-        at = row.get("commit_id") or ""
-        if not at or at == head:
+        when = row.get("submitted_at") or ""
+        if not when:
             continue
-        row_out = {"user": who, "submitted_at": row.get("submitted_at", "?"),
-                   "commit_id": at, "head": head, "content": 0, "since": 0,
-                   "first_content": "", "locatable": at in shas}
-        if row_out["locatable"]:
-            after = commits[shas.index(at) + 1:]
-            content = [c for c in after if len((c.get("parents") or [])) == 1]
-            row_out.update(since=len(after), content=len(content),
-                           first_content=content[0].get("sha", "") if content else "")
-        out.append(row_out)
+        # Anchor on the review's own timestamp, never on commit_id: GitHub
+        # re-points commit_id forward, so position cannot represent the review.
+        after = [c for c in commits
+                 if ((c.get("commit") or {}).get("committer") or {}).get("date", "") > when]
+        if not after:
+            continue
+        content = [c for c in after if len(c.get("parents") or []) == 1]
+        at = row.get("commit_id") or ""
+        out.append({"user": who, "submitted_at": when, "commit_id": at, "head": head,
+                    "since": len(after), "content": len(content),
+                    "merges": len(after) - len(content),
+                    "first_unseen": after[0].get("sha", ""),
+                    "locatable": bool(at) and at in shas})
     return sorted(out, key=lambda r: r["submitted_at"])
 
 
@@ -206,24 +210,26 @@ def stale_approval_block(pr: str, rows: "list[dict] | None") -> "list[str]":
     """Render so "none stale" and "could not tell" can never read alike."""
     if rows is None:
         return ["STALE APPROVALS: *** COULD NOT CHECK *** — gh is unavailable or the call",
-                "failed. Do not read this as none: compare each approval's commit_id with",
-                "the head yourself before treating the approvals gate as satisfied."]
+                "failed. Do not read this as none: compare each approval's timestamp with",
+                "the commit dates yourself before treating the approvals gate as satisfied."]
     if not rows:
-        return ["STALE APPROVALS: none — every counted approval is against the current head."]
-    out = ["STALE APPROVALS — these still COUNT toward the required-approvals gate but were",
-           "cast against a diff that is no longer the head. The PR page cannot show this",
-           "when the ruleset leaves dismiss_stale_reviews_on_push off:"]
+        return ["STALE APPROVALS: none — no commit on this PR postdates any counted approval."]
+    out = ["STALE APPROVALS — these still COUNT toward the required-approvals gate, but a",
+           "commit landed after each one, so the approver has not read the current head.",
+           "CONTRIBUTING.md requires re-checking whether approvals still apply after any",
+           "update or rebase — a merge commit carries a tree nobody reviewed either:"]
     for r in rows:
-        if not r["locatable"]:
-            what = ("that commit is NOT among the PR's commits — force-push or rebase;"
-                    " what was approved is unrecoverable, so RE-READ")
-        elif r["content"]:
-            what = (f"{r['content']} content commit(s) on the branch since (first "
-                    f"{r['first_content'][:10]}) — RE-READ before counting this approval")
-        else:
-            what = f"{r['since']} commit(s) since, all merges — base-only, approval still fits"
-        out += [f"  {r['user']}  APPROVED {r['submitted_at']}  @{r['commit_id'][:10]}",
-                f"    vs head @{r['head'][:10]}: {what}"]
+        kinds = []
+        if r["content"]:
+            kinds.append(f"{r['content']} content")
+        if r["merges"]:
+            kinds.append(f"{r['merges']} merge")
+        detail = ", ".join(kinds) or f"{r['since']}"
+        note = "" if r["locatable"] else "; its commit_id is not in the PR's commits (force-push)"
+        out += [f"  {r['user']}  APPROVED {r['submitted_at']}",
+                f"    {r['since']} commit(s) since ({detail}), first unseen"
+                f" {r['first_unseen'][:10]}, head {r['head'][:10]}{note}",
+                "    -> RE-READ before counting this approval"]
     return out
 
 
