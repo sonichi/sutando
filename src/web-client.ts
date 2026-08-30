@@ -367,6 +367,15 @@ const HTML = /* html */ `<!DOCTYPE html>
     border-top: 1px solid #1e1e30;
     padding: 8px 16px 12px;
   }
+  #bottom-panel.collapsed #transcript { display: none; }
+  .bottom-panel-controls {
+    display: flex; justify-content: flex-end; margin-bottom: 6px;
+  }
+  .btn-panel-toggle {
+    background: transparent; color: #888; border: 1px solid #2a2a40;
+    font-size: 11px; padding: 4px 8px; border-radius: 5px; cursor: pointer;
+  }
+  .btn-panel-toggle:hover { color: #fff; border-color: #4ecca3; }
   .input-bar {
     display: flex; gap: 8px;
   }
@@ -837,6 +846,9 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 
 <div class="toast-container" id="toast-container"></div>
 <div id="bottom-panel">
+<div class="bottom-panel-controls">
+  <button class="btn-panel-toggle" id="btn-panel-toggle" type="button" aria-expanded="true" onclick="toggleBottomPanel()">Hide transcript</button>
+</div>
 <div id="transcript">
   <div class="t-entry t-system">Ask Sutando anything.</div>
 </div>
@@ -1057,6 +1069,22 @@ let recognition = null;
 
 const debugLog = [];
 const $ = (id) => document.getElementById(id);
+
+const PERSIST_KEY_BOTTOM_PANEL = 'sutando-bottom-panel-collapsed-v1';
+function setBottomPanelCollapsed(collapsed) {
+  const panel = $('bottom-panel');
+  const button = $('btn-panel-toggle');
+  if (!panel || !button) return;
+  panel.classList.toggle('collapsed', collapsed);
+  button.setAttribute('aria-expanded', String(!collapsed));
+  button.textContent = collapsed ? 'Show transcript' : 'Hide transcript';
+  try { localStorage.setItem(PERSIST_KEY_BOTTOM_PANEL, collapsed ? '1' : '0'); } catch {}
+}
+function toggleBottomPanel() {
+  const panel = $('bottom-panel');
+  setBottomPanelCollapsed(panel ? !panel.classList.contains('collapsed') : false);
+}
+try { setBottomPanelCollapsed(localStorage.getItem(PERSIST_KEY_BOTTOM_PANEL) === '1'); } catch {}
 
 // ─── Chrome STT (real-time interim display) ───────────────
 function initChromeStt() {
