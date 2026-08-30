@@ -1074,6 +1074,44 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(ri.stand_discord_id(rec), self.SECOND)
 
+    ROOM = "1535008729106485288"
+
+    def test_a_discord_provider_does_not_grant_every_sibling(self):
+        # Reviewer, 2026-08-30: the provider names the NAMESPACE. Under it,
+        # a room id was published as the human and could erase the real one.
+        rc, err, rec = self._cli({"human": {"provider": "discord",
+                                            "activity": {"rooms": [self.ROOM]}},
+                                  "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(rec["human_discord_id"])
+
+    def test_a_room_beside_a_user_id_does_not_erase_the_human(self):
+        # The damaging half: both were mined, the claims disagreed, and the
+        # real human fell to unresolved.
+        rc, err, rec = self._cli({
+            "human": {"provider": "discord", "user_id": HUMAN,
+                      "activity": {"rooms": [self.ROOM]}},
+            "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec["human_discord_id"], HUMAN)
+        self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [])
+
+    def test_a_display_name_under_a_discord_provider_is_not_evidence(self):
+        rc, err, rec = self._cli({"human": {"provider": "discord",
+                                            "display_name": HUMAN},
+                                  "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(rec["human_discord_id"])
+
+    def test_derived_basis_prose_is_never_fresh_evidence(self):
+        # `id_basis` is this migration's OWN output. Re-reading it as input
+        # lets a recorded reason re-cite the id it was written to explain.
+        rc, err, rec = self._cli({
+            ri.BASIS_FIELD: {"human_discord_id": [f"cited in `x` {HUMAN}"]},
+            "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(rec["human_discord_id"])
+
     def test_the_one_measured_legacy_spelling_still_resolves(self):
         # The allowlist, and the reason it is not empty: a bare `id` under a
         # referent ancestor states no provider and is documented in-tree.

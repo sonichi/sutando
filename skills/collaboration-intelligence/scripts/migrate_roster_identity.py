@@ -70,6 +70,7 @@ def _cited_in(entry: dict, id_: str) -> list:
             for v in obj:
                 walk(v, path, provider)
         elif id_ and id_ in _snowflakes(obj) and path \
+                and ri.BASIS_FIELD not in path \
                 and _discord_source(path[:-1], path[-1], provider):
                 # whole-id match: a 17-digit id is a substring of an
                 # 18-digit one, and that published the wrong referent.
@@ -191,6 +192,11 @@ def _discord_source(ancestors: list, key: str, provider: "str | None") -> bool:
     else the leaf itself must name the referent (`stand_status`), because an
     ancestor naming it says nothing about which of its fields hold ids.
     """
+    # A provider names the NAMESPACE, not that every sibling under it holds an
+    # identity: `activity.rooms` and `display_name` are neither.
+    if not (_id_slot(key) or _verdicts_from_field(key)
+            or "discord" in _field_words(key)):
+        return False
     if provider is not None:
         return provider == "discord"
     if "discord" in _field_words(key):
@@ -254,7 +260,7 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
         elif isinstance(obj, list):
             for v in obj:
                 walk(v, path, provider)
-        elif isinstance(obj, str) and path \
+        elif isinstance(obj, str) and path and ri.BASIS_FIELD not in path \
                 and _discord_source(path[:-1], path[-1], provider):
             for sf in _snowflakes(obj):
                 if sf not in found:
