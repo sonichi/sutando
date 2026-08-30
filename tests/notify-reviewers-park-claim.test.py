@@ -115,6 +115,33 @@ class OneClaimWins(unittest.TestCase):
         self.assertIsNone(nr.claim_park(MSG, "k", "beta", endpoint=ep),
                           "an alias rename bypassed the park")
 
+    def test_the_discord_route_carries_a_durable_endpoint(self):
+        # The fix keyed the park on `stand`, which a Discord target does not
+        # have — so the ordinary Discord route was left entirely unkeyed.
+        nr = _load()
+        roster = {"kewei": {"stand_name": "kewei-red", "discord_id": "153795",
+                            "home_channel": "1535008"}}
+        targets, _ = nr.resolve(["kewei"], roster)
+        self.assertEqual(targets[0]["transport"], "discord")
+        self.assertIsNone(targets[0]["stand"], "fixture stopped being Discord-only")
+        ep = targets[0].get("endpoint")
+        self.assertTrue(ep, "a Discord target carries no durable endpoint")
+        self.assertTrue(nr.claim_park(MSG, "kewei", "alpha", endpoint=ep))
+        nr.record_asks(MSG, "kewei", outcome="unknown", actor="alpha", endpoint=ep)
+        self.assertIsNone(nr.claim_park(MSG, "kewei", "beta", endpoint=ep),
+                          "an alias rename bypassed the park on Discord")
+
+    def test_a_settlement_lands_in_its_reservations_stream(self):
+        # Reservation keyed by endpoint and settlement keyed by the actor left
+        # two streams, so the reservation never got superseded.
+        nr = _load()
+        ep = "discord:153795"
+        nr.claim_park(MSG, "kewei", "alpha", endpoint=ep)
+        nr.record_asks(MSG, "kewei", outcome="failed", actor="alpha", endpoint=ep)
+        rows = [json.loads(l) for l in self.led.read_text().splitlines()]
+        self.assertEqual({r.get("endpoint") for r in rows}, {ep},
+                         f"reservation and settlement split streams: {rows}")
+
     def test_the_negative_control_a_different_endpoint_still_gets_asked(self):
         # Without this, keying on the endpoint could park EVERYONE and every
         # case above would still pass while suppressing legitimate asks.

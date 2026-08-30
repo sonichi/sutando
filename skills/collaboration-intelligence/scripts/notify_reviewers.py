@@ -104,9 +104,12 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
+        # The transport's immutable recipient id. A Discord target has no
+        # Stand mxid, so keying the park on `stand` left that route unkeyed.
+        endpoint = stand if transport == "matrix" else f"discord:{dm_id}"
         out.append({"name": name, "transport": transport, "stand": stand,
                     "room": room, "discord_id": dm_id, "channel": channel,
-                    "human": entry.get("human")})
+                    "endpoint": endpoint, "human": entry.get("human")})
     return out, worst
 
 
@@ -840,7 +843,7 @@ def main() -> int:
             try:
                 reserved = claim_park(a.message, t["name"], who,
                                       canonical=lambda w: actors.get(w, w),
-                                      endpoint=t.get("stand"))
+                                      endpoint=t.get("endpoint"))
             except OSError as e:
                 reserved = 0
                 print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
@@ -864,7 +867,7 @@ def main() -> int:
                 """Supersede the reservation. Append-only, so this is atomic."""
                 try:
                     record_asks(a.message, t["name"], outcome=outcome, actor=who,
-                                detail=detail)
+                                detail=detail, endpoint=t.get("endpoint"))
                 except OSError as err:
                     # The reservation still stands, so the park holds and the
                     # next run refuses rather than repeating. Say which way it fails.
@@ -909,7 +912,8 @@ def main() -> int:
                 # Same bookkeeping as the Matrix path: without it a delivered
                 # Discord ask reads as NOBODY_EVER_ASKED to pr-unattended.
                 try:
-                    n_logged = record_asks(a.message, t["name"], actor=who)
+                    n_logged = record_asks(a.message, t["name"], actor=who,
+                                           endpoint=t.get("endpoint"))
                 except OSError as e:
                     unlogged += 1
                     print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT "
@@ -1025,7 +1029,8 @@ def main() -> int:
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
             try:
-                n_logged = record_asks(a.message, t["name"])
+                n_logged = record_asks(a.message, t["name"],
+                                       endpoint=t.get("endpoint"))
             except OSError as e:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
