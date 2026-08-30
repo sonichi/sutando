@@ -57,30 +57,50 @@ Trade-off: a daemon restart drops connected clients. (Contrast ACP's stdio, wher
 the client spawns the agent as a 1:1 child subprocess — session-shaped; the Unix
 socket is task-shaped, a durable service many clients submit tasks to.)
 
-### [v0.1+] — Remote agent support *(LAN transport SHIPPED and opt-in; WAN/relay not built)*
+### [v0.1+] — Remote agent support *(LAN WebSocket transport SHIPPED, opt-in, loopback-default; WAN/relay not built)*
 
 A remote transport so a client can drive a Sutando agent across machines. The task
 model makes this a clean extension rather than a retrofit — submit a task over the
 wire and stream `task.update` back — because a task is durable and channel-agnostic
 and does not require a co-located session.
 
-**⚠ v0 is NOT local-only. A LAN WSS transport is shipped.**
+**⚠ v0 is NOT local-only. A LAN WebSocket transport is shipped.**
 `src/runtime-api/ws_transport.py` is a second transport for the same daemon and the
 same dispatcher, alongside the Unix socket — one dispatcher, N transports. A
-phone-class client on the same network dials the Server's own WSS listener directly
+phone-class client on the same network dials the Server's own listener directly
 (no relay, no cloud). `src/runtime-api/server.py` starts it **only** when
-`SUTANDO_SCP_WSS_ENABLE` is truthy, so it is opt-in and off by default.
+`SUTANDO_SCP_WSS_ENABLE` is truthy, and binds **loopback (`127.0.0.1`) by
+default** — LAN exposure additionally requires an explicit non-loopback
+`SUTANDO_SCP_WSS_HOST`. So: opt-in, and local-host-only until deliberately opened.
 
-Because that leg is **network-exposed** — where the UDS transport is same-user local
-(0600, no auth needed) — it carries two edge protections the socket does not need:
+**The wire has two listeners, and the primary one is cleartext.** The primary
+listener speaks **plain `ws://`** (embedded devices like the M5 speak it). TLS is
+an optional **sibling** listener on its own port (default 8443), enabled
+separately by `SUTANDO_SCP_WSS_TLS` with a generated self-signed cert — it exists
+because browser mic APIs require a secure context. Enabling TLS does not encrypt
+the primary listener; on a LAN-exposed host, traffic to the primary port is
+readable on the network.
 
-1. **A bearer token on connect.**
-2. **A read-only method allowlist**: mutating methods are refused at the transport
-   edge until per-device authorization lands.
+Because the network leg is exposed where the UDS transport is same-user local
+(0600, no auth needed), authorization is **per-credential, not read-only across
+the board**:
 
-Still genuinely not built: a WAN/relay path (reaching an agent from off-LAN), and
-per-device authorization — which is what currently confines the LAN leg to
-read-only methods.
+1. **Shared bearer token** → confined to `READ_ONLY_METHODS` (status, listings,
+   results; plus `task.subscribe`). Cannot mutate state.
+2. **Pairing token** → may only call `pair.redeem`.
+3. **Paired device credential** → authorized by its **own per-device grants**
+   (`DEFAULT_DEVICE_GRANTS` in `device_store.py`): the read surface **plus
+   `task.submit`, `task.cancel`, and `voice.open`/`voice.close`**. A paired
+   device can submit and cancel owner-tier work by default — deliberately, the
+   wearable's core function — while `terminal.input`, `restart`, and
+   `approval.respond` stay off until the owner widens that device's grants.
+
+Per-device authorization is therefore **built and enforced**
+(`ws_transport.py:_resolve_auth`); the read-only confinement applies to the
+shared bearer only. A captured paired-device credential can mutate state, so the
+credential — not the transport — is the security boundary on the LAN leg.
+
+Still genuinely not built: a WAN/relay path (reaching an agent from off-LAN).
 
 ## 3. Core methods (implemented in v0)
 
