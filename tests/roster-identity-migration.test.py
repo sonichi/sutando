@@ -1156,6 +1156,24 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertEqual(rc, 5, f"{value!r}: {err}")
             self.assertIn("SHAPE x", err)
 
+    def test_a_nested_member_is_validated_leaf_by_leaf(self):
+        # Reviewer, 2026-08-30: only the OUTER list was flattened, so one
+        # readable string made a whole nested member "readable".
+        for entry in ({"secondary_agent": {"ids": [[self.SECOND,
+                                                    1529720369668292629]]}},
+                      {"discord_human_id": [[HUMAN, 1529720369668292629]]}):
+            entry["stand_discord_id"] = self.STAND
+            rc, err, _ = self._cli(entry)
+            self.assertEqual(rc, 5, err)
+            self.assertIn("SHAPE x", err)
+
+    def test_a_nested_list_of_readable_ids_is_still_accepted(self):
+        # Positive control: the collector descends lists without changing the
+        # path, so rejecting nesting outright would refuse ids it does read.
+        rc, err, rec = self._cli({"secondary_agent": {"ids": [[self.SECOND]]}})
+        self.assertEqual(rc, 0, err)
+        self.assertIn(self.SECOND, ri.stand_discord_ids(rec))
+
     def test_a_schema_record_member_is_still_read(self):
         # Positive control: `{"id": ...}` IS mined, and the v2 writer emits
         # exactly this shape — refusing it would break re-migration.

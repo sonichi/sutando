@@ -236,7 +236,17 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
                                  "can be read from, so the referent it states "
                                  "is discarded rather than absent"})
 
-    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    def _leaves(v):
+        # Lists keep the path in the collector, so a nested member is still IN
+        # this slot; a mapping changes the key, so it answers as one value.
+        if isinstance(v, (list, tuple)):
+            for x in v:
+                yield from _leaves(x)
+        else:
+            yield v
+
+    values = list(_leaves(value)) if isinstance(value, (list, tuple)) \
+        else [value]
     if not values:
         # An empty PLURAL slot is empty; an empty container in a SINGULAR one
         # is a present value the collector reads nothing from.
