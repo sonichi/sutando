@@ -140,6 +140,93 @@ def prior_art(pr: str, runner=None, repo: "str | None" = None) -> "list[str] | N
 PRIOR_ART_SHOWN = 8
 
 
+def _gh_json(run, args):
+    """None on any failure: a call that did not answer must not read as an empty answer."""
+    try:
+        r = run(["gh", "api"] + args)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout) if r.stdout.strip() else None
+    except ValueError:
+        return None
+
+
+def stale_approvals(pr: str, runner=None, repo: "str | None" = None) -> "list[dict] | None":
+    """Approvals counted toward the gate that were never cast against the current head.
+
+    A ruleset leaving dismiss_stale_reviews_on_push off keeps them green, so
+    nothing on the PR page separates such an approval from a live one.
+    """
+    run = runner or (lambda a: subprocess.run(a, capture_output=True,
+                                              text=True, timeout=20))
+    base = f"repos/{resolve_repo(repo)}/"
+    pull = _gh_json(run, [base + f"pulls/{pr}"])
+    reviews = _gh_json(run, [base + f"pulls/{pr}/reviews", "--paginate"])
+    commits = _gh_json(run, [base + f"pulls/{pr}/commits", "--paginate"])
+    if pull is None or reviews is None or commits is None:
+        return None
+    head = (pull.get("head") or {}).get("sha") or ""
+    if not head:
+        return None
+    # The PR's own commits, not a base compare: a base merge drags in main's
+    # history, which did not change what the approver read.
+    shas = [c.get("sha", "") for c in commits]
+    # COMMENTED never supersedes a verdict, so it must not overwrite the latest state.
+    latest: "dict[str, dict]" = {}
+    for row in reviews:
+        if (row.get("state") or "").upper() not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            continue
+        who = (row.get("user") or {}).get("login", "?")
+        prev = latest.get(who)
+        if prev is None or (row.get("submitted_at") or "") >= (prev.get("submitted_at") or ""):
+            latest[who] = row
+    out: "list[dict]" = []
+    for who, row in sorted(latest.items()):
+        if (row.get("state") or "").upper() != "APPROVED":
+            continue
+        at = row.get("commit_id") or ""
+        if not at or at == head:
+            continue
+        row_out = {"user": who, "submitted_at": row.get("submitted_at", "?"),
+                   "commit_id": at, "head": head, "content": 0, "since": 0,
+                   "first_content": "", "locatable": at in shas}
+        if row_out["locatable"]:
+            after = commits[shas.index(at) + 1:]
+            content = [c for c in after if len((c.get("parents") or [])) == 1]
+            row_out.update(since=len(after), content=len(content),
+                           first_content=content[0].get("sha", "") if content else "")
+        out.append(row_out)
+    return sorted(out, key=lambda r: r["submitted_at"])
+
+
+def stale_approval_block(pr: str, rows: "list[dict] | None") -> "list[str]":
+    """Render so "none stale" and "could not tell" can never read alike."""
+    if rows is None:
+        return ["STALE APPROVALS: *** COULD NOT CHECK *** — gh is unavailable or the call",
+                "failed. Do not read this as none: compare each approval's commit_id with",
+                "the head yourself before treating the approvals gate as satisfied."]
+    if not rows:
+        return ["STALE APPROVALS: none — every counted approval is against the current head."]
+    out = ["STALE APPROVALS — these still COUNT toward the required-approvals gate but were",
+           "cast against a diff that is no longer the head. The PR page cannot show this",
+           "when the ruleset leaves dismiss_stale_reviews_on_push off:"]
+    for r in rows:
+        if not r["locatable"]:
+            what = ("that commit is NOT among the PR's commits — force-push or rebase;"
+                    " what was approved is unrecoverable, so RE-READ")
+        elif r["content"]:
+            what = (f"{r['content']} content commit(s) on the branch since (first "
+                    f"{r['first_content'][:10]}) — RE-READ before counting this approval")
+        else:
+            what = f"{r['since']} commit(s) since, all merges — base-only, approval still fits"
+        out += [f"  {r['user']}  APPROVED {r['submitted_at']}  @{r['commit_id'][:10]}",
+                f"    vs head @{r['head'][:10]}: {what}"]
+    return out
+
+
 def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
     """Render prior art so "nothing there" can never read as "unchecked"."""
     if seen is None:
@@ -167,6 +254,7 @@ def render(guide: Path, pr: str | None, repo: "str | None" = None) -> str:
     if pr:
         out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
         out += prior_art_block(pr, prior_art(pr, repo=repo)) + [""]
+        out += stale_approval_block(pr, stale_approvals(pr, repo=repo)) + [""]
     out.append(lessons if lessons else
                "WARNING: no '## Lessons' section found — the guide's criteria could not be read.")
     n_flag, n_allow = count_check_patterns(checks)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import tempfile
 import types
 import unittest
@@ -285,6 +286,99 @@ class RepoResolution(unittest.TestCase):
 
         self.assertIsNone(pf.prior_art("1", runner=failing, repo="a/b"))
         self.assertIn("COULD NOT CHECK", "\n".join(pf.prior_art_block("1", None)))
+
+
+class StaleApprovalTest(unittest.TestCase):
+    """The gate can read satisfied while an approval sits against a vanished diff."""
+
+    HEAD = "e56769db012f1f68348e927053d0ede1e12cb659"
+    OLD = "03dea831c2726f40ccd33eeebad70df6251df1a6"
+
+    def _runner(self, reviews=None, commits=None, pull=None, fail=None):
+        def run(argv):
+            url = argv[2]
+            if fail and fail in url:
+                return _R(1, "")
+            if url.endswith("/reviews"):
+                return _R(0, json.dumps(reviews or []))
+            if url.endswith("/commits"):
+                return _R(0, json.dumps(commits if commits is not None else []))
+            return _R(0, json.dumps(pull if pull is not None else {"head": {"sha": self.HEAD}}))
+        return run
+
+    def _review(self, who, state, at, when):
+        return {"user": {"login": who}, "state": state, "commit_id": at, "submitted_at": when}
+
+    def _commit(self, sha, parents=1):
+        return {"sha": sha, "parents": [{"sha": "p"}] * parents}
+
+    def test_an_approval_on_the_head_is_not_stale(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.HEAD, "2026-08-30T11:00:00Z")]))
+        self.assertEqual(rows, [])
+
+    def test_a_content_commit_on_the_branch_since_approval_is_reported(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("john-the-dev", "APPROVED", self.OLD, "2026-08-27T23:48:51Z")],
+            commits=[self._commit(self.OLD), self._commit("ed530fbcb2"),
+                     self._commit(self.HEAD, parents=2)]))
+        self.assertEqual([r["content"] for r in rows], [1])
+        body = "\n".join(pf.stale_approval_block("1", rows))
+        self.assertIn("RE-READ", body)
+        self.assertIn("ed530fbcb2", body)
+
+    def test_a_base_merge_only_gap_is_not_dressed_up_as_a_content_change(self):
+        """An update-branch merge stales the SHA without changing what was reviewed."""
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-30T11:00:10Z")],
+            commits=[self._commit(self.OLD), self._commit(self.HEAD, parents=2)]))
+        self.assertEqual(rows[0]["content"], 0)
+        body = "\n".join(pf.stale_approval_block("1", rows))
+        self.assertIn("base-only", body)
+        self.assertNotIn("RE-READ", body)
+
+    def test_main_commits_pulled_in_by_a_base_merge_are_not_counted(self):
+        """The branch's own history is the subject; main's is not, and a compare conflates them."""
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-30T11:00:10Z")],
+            commits=[self._commit(self.OLD), self._commit(self.HEAD, parents=2)]))
+        self.assertEqual(rows[0]["since"], 1)
+
+    def test_an_approval_whose_commit_vanished_is_flagged_not_silently_cleared(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", "deadbeefcafe", "2026-08-27T00:00:00Z")],
+            commits=[self._commit(self.HEAD)]))
+        self.assertFalse(rows[0]["locatable"])
+        self.assertIn("force-push", "\n".join(pf.stale_approval_block("1", rows)))
+
+    def test_commented_does_not_supersede_the_approval_it_follows(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-27T00:00:00Z"),
+                     self._review("a", "COMMENTED", self.HEAD, "2026-08-29T00:00:00Z")],
+            commits=[self._commit(self.OLD), self._commit(self.HEAD)]))
+        self.assertEqual([r["user"] for r in rows], ["a"])
+
+    def test_a_later_changes_requested_is_not_reported_as_a_stale_approval(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-27T00:00:00Z"),
+                     self._review("a", "CHANGES_REQUESTED", self.OLD, "2026-08-28T00:00:00Z")]))
+        self.assertEqual(rows, [])
+
+    def test_a_failed_call_is_not_reported_as_nothing_stale(self):
+        """The whole point: unchecked must never render as clean."""
+        for endpoint in ("/reviews", "/commits"):
+            self.assertIsNone(pf.stale_approvals("1", runner=self._runner(fail=endpoint)))
+        body = "\n".join(pf.stale_approval_block("1", None))
+        self.assertIn("COULD NOT CHECK", body)
+        clean = "\n".join(pf.stale_approval_block("1", []))
+        self.assertIn("none", clean)
+        self.assertNotIn("COULD NOT CHECK", clean)
+
+
+class _R:
+    def __init__(self, returncode, stdout):
+        self.returncode, self.stdout = returncode, stdout
+
 
 
 if __name__ == "__main__":
