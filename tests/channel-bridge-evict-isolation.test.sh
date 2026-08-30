@@ -138,9 +138,11 @@ case "$LIST_OUT" in
   "OWN $PID_LA") echo "  ok   list mode: exactly this checkout's pid, foreign silent" ;;
   *) echo "  FAIL list mode output: '$LIST_OUT' (expected 'OWN $PID_LA')"; FAILED=1 ;;
 esac
-LIST_BLIND="$(PATH="$SHADOW:$PATH" bash "$HELPER" --list slack "$A" GATEWAY_INSTANCE "" 2>/dev/null)"
+# Indeterminate identity must SURFACE, not hide. The probe seam is overridden
+# directly (platform-portable: /proc makes real env/cwd readable on Linux).
+LIST_BLIND="$( . "$HELPER"; _pid_env() { return 1; }; list_own_bridge slack "$A" GATEWAY_INSTANCE "" 2>/dev/null )"
 case "$LIST_BLIND" in
-  *INDETERMINATE*) echo "  ok   list mode: unreadable identity prints INDETERMINATE (fail-closed signal)" ;;
+  *INDETERMINATE*) echo "  ok   list mode: indeterminate identity prints INDETERMINATE (fail-closed signal)" ;;
   *) echo "  FAIL list mode hid an indeterminate pid: '$LIST_BLIND'"; FAILED=1 ;;
 esac
 kill "$PID_LA" "$PID_LB" 2>/dev/null || true
