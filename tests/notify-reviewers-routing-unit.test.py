@@ -1301,6 +1301,25 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
         self.assertEqual(spellings, {"alias-a", "alias-b", "alias-c"},
                          f"a legacy spelling was collapsed away: {spellings}")
 
+    def test_compaction_keeps_the_latest_unsafe_state_last(self):
+        # `_streams` reads latest state by LINE ORDER, so an alias row written
+        # after the semantic last event flipped an active park to settled.
+        for who, outcome in (("old", "confirmed"), ("middle", "confirmed"),
+                             ("new", "unknown")):
+            nr.record_asks(self.MSG, who, outcome=outcome, actor=who,
+                           endpoint="discord:1")
+        before = list(nr._streams(self.led).values())[0]["last"]
+        self.assertEqual(before[0], "unknown", "fixture is not an active park")
+        with nr._ledger_lock(self.led):
+            nr._rewrite(self.led, nr._streams(self.led))
+        after = list(nr._streams(self.led).values())[0]["last"]
+        self.assertEqual(after[0], "unknown",
+                         f"compaction settled an active park: {before} -> {after}")
+        spellings = {json.loads(l).get("reviewer")
+                     for l in self.led.read_text().splitlines() if l.strip()}
+        self.assertEqual(spellings, {"old", "middle", "new"},
+                         f"a spelling was lost while fixing order: {spellings}")
+
     def test_the_control_distinct_endpoints_stay_distinct(self):
         # Without this, retaining every spelling could merge two PEOPLE into one
         # stream and the case above would still pass.

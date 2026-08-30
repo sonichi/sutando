@@ -434,10 +434,13 @@ def _retained(st: dict) -> list:
         keep.append((st["last"][0], st["last"][1],
                      st.get("last_identity") or st.get("identity") or {}))
     spelt = {k[2].get("reviewer") for k in keep if k[2].get("reviewer")}
-    for reviewer, (outcome, ts, ident) in sorted((st.get("by_reviewer") or {}).items()):
-        if reviewer not in spelt:
-            keep.append((outcome, ts, ident))
-    return keep or [(None, "", st.get("identity") or {})]
+    extra = [(o, t, i) for r, (o, t, i) in sorted((st.get("by_reviewer") or {}).items())
+             if r not in spelt]
+    if not keep:
+        return extra or [(None, "", st.get("identity") or {})]
+    # The SEMANTIC last event must stay the LAST physical row: `_streams` reads
+    # latest state by line order, so an alias row after it flips the verdict.
+    return keep[:-1] + extra + keep[-1:]
 
 
 def _rows_for(st: dict) -> int:
