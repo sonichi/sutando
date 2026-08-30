@@ -390,6 +390,12 @@ def main() -> int:
             else:
                 if n_logged:
                     print(f"  logged {n_logged} PR ask(s) for {t['name']}", file=sys.stderr)
+                else:
+                    # Not counted as a failure: an ask need not concern a PR. But it
+                    # must not be silent -- an unrecorded PR ask reads as never-asked.
+                    print(f"  note: nothing recorded for {t['name']} — the message "
+                          f"names no github.com/<owner>/<repo>/pull/<n> URL, so any "
+                          f"PR it refers to will read as unasked", file=sys.stderr)
         else:
             detail = reason or p.stderr.strip()[:120] or fallback
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
