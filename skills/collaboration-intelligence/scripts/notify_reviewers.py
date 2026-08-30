@@ -704,7 +704,9 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     Fails OPEN on any uncertainty — a notifier that blocks on its own bug is
     worse than one that over-notifies.
     """
-    refs = _PR_URL.findall(message or "")
+    # Through `_refs()`, like the writer: parsing raw here let an upper-cased
+    # URL name a "different" PR and permit a repeat ask.
+    refs = sorted(_refs(message))
     if not refs:
         return False, ""
     repo, num = refs[0]
@@ -728,13 +730,21 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
             per_actor[who] = ts
     if not prior:
         return False, ""
-    # Every spelling a target may be recorded under: rows are endpoint-keyed
-    # now and name-keyed before that, and one axis alone fails open.
+    # Every endpoint in an actor's component, because two aliases of one person
+    # can hold different ones and either may be the recorded spelling.
+    by_actor: dict = {}
+    for k, v in (roster or {}).items():
+        ep = durable_endpoint(v)
+        if ep:
+            by_actor.setdefault(actor_of.get(k, k), set()).add(ep)
+
     def _ids(t):
         # From the ROSTER too: a caller may pass a bare {"name": ...} target,
         # and deriving from the dict alone left those on the name axis only.
-        got = {actor_of.get(t["name"], t["name"]), t["name"], t.get("endpoint"),
+        actor = actor_of.get(t["name"], t["name"])
+        got = {actor, t["name"], t.get("endpoint"),
                durable_endpoint((roster or {}).get(t["name"]))}
+        got |= by_actor.get(actor, set())
         return {i for i in got if i}
 
     tids = [_ids(x) for x in targets]
@@ -811,8 +821,10 @@ def main() -> int:
     _seen_actor, _seen_endpoint, _deduped = set(), set(), []
     for t in targets:
         actor = _actors.get(t["name"], t["name"])
-        endpoint = (t.get("channel") or t.get("room"),
-                    t.get("discord_id") or t.get("stand"))
+        # The DURABLE endpoint, not the route: a channel key counted one
+        # person in two channels as two, and relocation happens after this.
+        endpoint = t.get("endpoint") or (t.get("channel") or t.get("room"),
+                                         t.get("discord_id") or t.get("stand"))
         if actor in _seen_actor or endpoint in _seen_endpoint:
             continue
         _seen_actor.add(actor)

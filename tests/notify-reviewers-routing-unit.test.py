@@ -326,6 +326,56 @@ class TwoChannelsDistinct(unittest.TestCase):
 
 
 
+class OneRecipientIsNotTwoPeople(unittest.TestCase):
+    """The at-least-two gate counted ROUTES, so one person in two channels
+    satisfied it and was pinged twice."""
+
+    def setUp(self):
+        self._argv, self._cfg = sys.argv[:], os.environ.get("CLAUDE_CONFIG_DIR")
+        self._roster, self._run = os.environ.get("SUTANDO_SCI_ROSTER"), nr.subprocess.run
+        self.seen = []
+        nr.subprocess.run = lambda a, **k: self.seen.append(a) or type(
+            "R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    def tearDown(self):
+        sys.argv[:] = self._argv
+        nr.subprocess.run = self._run
+        for k, v in (("CLAUDE_CONFIG_DIR", self._cfg), ("SUTANDO_SCI_ROSTER", self._roster)):
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+
+    def _run_with(self, roster, names):
+        os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {
+            "222": {"allowFrom": ["111"]}, "333": {"allowFrom": ["111"]},
+            "444": {"allowFrom": ["999"]}}})
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(roster, f)
+        os.environ["SUTANDO_SCI_ROSTER"] = path
+        sys.argv[:] = ["notify_reviewers.py", "--reviewers", names, "--message",
+                       "re-review https://github.com/sonichi/sutando/pull/3509", "--send"]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = nr.main()
+        os.unlink(path)
+        return rc, err.getvalue()
+
+    def test_one_id_in_two_channels_is_one_person(self):
+        rc, err = self._run_with(
+            {"a1": {"discord_id": "111", "home_channel": "222"},
+             "a2": {"discord_id": "111", "home_channel": "333"}}, "a1,a2")
+        self.assertEqual(len(self.seen), 0, f"pinged one person twice: {self.seen}")
+        self.assertEqual(rc, 5, err)
+
+    def test_the_control_two_real_people_still_send(self):
+        # Without this, a dedup that collapsed EVERYTHING would pass the case
+        # above while silently refusing every legitimate pair.
+        rc, err = self._run_with(
+            {"a1": {"discord_id": "111", "home_channel": "222"},
+             "b1": {"discord_id": "999", "home_channel": "444"}}, "a1,b1")
+        self.assertEqual(len(self.seen), 2, f"two distinct people did not both send: {err}")
+        self.assertEqual(rc, 0, err)
+
+
 class MalformedAccessMapNeverAnswers(unittest.TestCase):
     """Unusable shapes are unverified, not verdicts.
 
@@ -1178,6 +1228,36 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
             "endpoint": ep, "channel": "room", "outcome": o,
             "ts": (now - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }) + "\n" for o, m in pairs))
+
+    def test_an_upper_cased_url_is_the_same_pull_request(self):
+        # The writer lower-cases refs and the guard parsed them raw, so a
+        # re-cased URL named a "different" PR and permitted a repeat ask.
+        self._endpoint_rows(("confirmed", 31))
+        up = self.MSG.replace("sonichi/sutando", "Sonichi/Sutando")
+        self.assertNotEqual(up, self.MSG, "fixture did not re-case the URL")
+        self.assertTrue(nr._stale_repeat_ask(up, self.TARGETS, self.ROSTER)[0],
+                        "an upper-cased URL bypassed the stale-repeat guard")
+
+    def test_another_alias_of_the_same_person_is_not_a_new_ask(self):
+        # Two aliases can hold DIFFERENT endpoints; comparing only the selected
+        # alias's own let the second route re-ask the same person.
+        roster = {"alpha": {"discord_id": "1", "home_channel": "c1"},
+                  "beta": {"discord_id": "2", "home_channel": "c2",
+                           "same_actor_as": "alpha"},
+                  "gamma": {"discord_id": "9", "home_channel": "c9"}}
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.led.write_text(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": "alpha",
+            "actor": "alpha", "endpoint": nr.durable_endpoint(roster["alpha"]),
+            "channel": "room", "outcome": "confirmed",
+            "ts": (now - datetime.timedelta(minutes=31)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }) + "\n")
+        beta, _ = nr.resolve(["beta"], roster)
+        gamma, _ = nr.resolve(["gamma"], roster)
+        self.assertTrue(nr._stale_repeat_ask(self.MSG, beta, roster)[0],
+                        "a second alias of the same person read as a new ask")
+        self.assertFalse(nr._stale_repeat_ask(self.MSG, gamma, roster)[0],
+                         "an unrelated person was wrongly treated as asked")
 
     def test_an_endpoint_keyed_ask_still_counts_as_asked(self):
         # Endpoint-keyed rows made the subset test compare endpoints against
