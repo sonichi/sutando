@@ -234,6 +234,28 @@ def attachable(manifest: dict) -> dict:
     return {"attachable": True, "endpoint": endpoint}
 
 
+
+def resolve_agent_id(id_or_instance: str) -> dict:
+    """Resolve a user-supplied identifier to a registered agent_id. An exact
+    agent_id (its manifest file exists) wins; otherwise a UNIQUE instance_id
+    match resolves — `sutando list` displays instance_id, so the id a user
+    reads off the list must work in attach/start. Ambiguity is an error
+    naming the candidates, never a guess."""
+    if _manifest_path(id_or_instance).exists():
+        return {"ok": True, "agent_id": id_or_instance}
+    hits = sorted({(m.get("identity") or {}).get("agent_id")
+                   for m in list_instances()
+                   if m.get("instance_id") == id_or_instance
+                   and (m.get("identity") or {}).get("agent_id")})
+    if len(hits) == 1:
+        return {"ok": True, "agent_id": hits[0]}
+    if hits:
+        return {"ok": False, "error": (
+            f"ambiguous instance_id {id_or_instance!r} matches: "
+            + ", ".join(hits))}
+    return {"ok": False, "error": f"not_registered: no manifest for {id_or_instance!r}"}
+
+
 def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> dict:
     """Start a registered instance via its manifest launcher and wait until it
     is ATTACHABLE (not merely socket-present). Idempotent, serialized by a
@@ -244,6 +266,10 @@ def start_instance(agent_id: str, wait_s: float = 30.0, _ready=attachable) -> di
     readiness probe (injectable for tests)."""
     import fcntl
     import subprocess
+    r = resolve_agent_id(agent_id)
+    if not r.get("ok"):
+        return r
+    agent_id = r["agent_id"]
     p = _manifest_path(agent_id)
     try:
         m = json.loads(p.read_text())
@@ -353,7 +379,10 @@ def attach_command(manifest: dict) -> dict:
 
 
 def attach(agent_id: str) -> dict:
-    p = _manifest_path(agent_id)
+    r = resolve_agent_id(agent_id)
+    if not r.get("ok"):
+        return r
+    p = _manifest_path(r["agent_id"])
     try:
         m = json.loads(p.read_text())
     except (OSError, ValueError):
