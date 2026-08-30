@@ -211,6 +211,24 @@ and loads whichever repo it reviews.
     The tell: the same expression supplies both the default and the measurement, usually as
     `x or 0`, `.get(k, 0)`, or an `except` that returns the empty case.
 
+    **The same rule binds the REVIEW's own prose, not just the patch's code.** Every instance
+    above is a formatter substituting a default for a measurement. A reviewer does it in
+    sentences: a version number, a platform threshold, a library behaviour written from
+    recall and set beside figures that were actually measured against the repo. On the page
+    they are indistinguishable, and the recalled one is often the actionable one — it is
+    what the author will go and act on. So **cite or label every external fact**: link the
+    source, or write "unverified" next to it. A review that mixes six measured claims with
+    one recalled claim does not read as five-sixths reliable; the measured majority launders
+    the recalled sentence.
+    *Grounded by:* 2026-08-30 — a review of `ag2-space/cinny-webclient#703` correctly
+    measured that `color-mix()` had zero precedent in that codebase (with a positive control
+    proving the search worked), then asserted it "needs WebKitGTK 2.42+" from recall. The
+    number was invented and too conservative: the feature landed upstream at WebKit r273244
+    in early 2021 and 2.42's release notes never mention it. Checking it produced the
+    sharper finding the review should have carried — Tauri v2's documented Linux baseline
+    (Ubuntu 22.04) ships WebKitGTK ~2.36 ≈ Safari 16, against a Safari 16.2 threshold. The
+    unmeasured sentence sat in the paragraph the review named as the blocker.
+
 14. **Never assert on source text as a stand-in for a behavioral claim.** When a module
     cannot be imported by tests (import-time side effects, heavy SDK deps), extract the
     decision into an importable unit and test THAT — do not regex the file. A source-text
