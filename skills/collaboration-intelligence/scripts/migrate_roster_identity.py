@@ -156,37 +156,22 @@ def _id_slot(field: str):
     return "singular" if last == "id" else "plural" if last == "ids" else None
 
 
-# NOT Discord: another provider, or a provider-neutral identifier `schema.md`
-# documents as a plain string — however Discord-shaped its digits are.
-_FOREIGN_NAMESPACES = frozenset({
-    "provider", "telegram", "slack", "matrix", "github", "gitlab", "email",
-    "phone", "sms", "twitter", "linkedin", "zoom", "whatsapp", "imessage",
-    "signal", "entity", "room", "user", "session", "external",
-})
-
-
 def _declares_discord_id(ancestors: list, key: str, siblings=None) -> bool:
-    """DISCORD evidence, not merely referent evidence. `telegram_human_id`
-    names the human and a different provider; reading it as a Discord slot
-    routes a Discord notification to a Telegram number.
+    """DISCORD evidence, FAIL CLOSED. Naming the referent is not naming the
+    provider: `telegram_human_id` and `teams_human_id` name the human and
+    someone else's account, and a denylist of providers cannot be complete.
 
-    Three ways to state it: the key says `discord`; a sibling `provider` says
-    so (the documented `{provider, user_id}` pair); or the key is a bare
-    `id`/`ids` under a referent ancestor, which states no provider at all and
-    is the roster's pre-provider spelling.
+    Evidence, in order: a sibling `provider` decides both ways when present;
+    else the key says the whole word `discord`; else the one measured legacy
+    spelling — a bare `id`/`ids` whose ancestor names the referent and which
+    states no provider at all. Anything else is not a Discord id.
     """
-    if "discord" in key.lower():
+    if isinstance(siblings, dict) and siblings.get("provider") is not None:
+        return str(siblings["provider"]).strip().lower() == "discord"
+    if "discord" in _field_words(key):
         return True
-    if isinstance(siblings, dict) and \
-            str(siblings.get("provider") or "").strip().lower() == "discord":
-        return True
-    words = [w.lower() for w in _WORDS.findall(str(key))]
-    if set(words) & _FOREIGN_NAMESPACES:
-        return False
-    # No provider named anywhere: the roster's pre-provider spelling, where the
-    # referent may come from the key (`agent_ids`) or an ancestor (`.id`).
-    return bool(_verdicts_from_field(key)) or \
-        (words in (["id"], ["ids"]) and _typed_path(ancestors))
+    return [w.lower() for w in _WORDS.findall(str(key))] in (["id"], ["ids"]) \
+        and _typed_path(ancestors)
 
 
 def _foreign_id_leaf(ancestors: list, key: str, siblings=None) -> bool:

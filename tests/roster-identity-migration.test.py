@@ -1019,18 +1019,49 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertIsNone(rec["human_discord_id"])
 
-    def test_a_referent_key_naming_no_provider_is_still_collected(self):
-        # The roster's pre-provider spelling. Requiring the word `discord`
-        # outright would silently drop these and lose reachable Stands.
-        rc, err, rec = self._cli({"other_agent_ids": [self.SECOND]})
+    def test_a_referent_key_naming_an_unknown_provider_fails_closed(self):
+        # CHANGED (#3537): asserted the opposite, on a fixture I invented.
+        # Measured: the live roster holds NO unqualified id key.
+        for field in ("teams_human_id", "webex_human_id", "other_agent_ids"):
+            rc, err, rec = self._cli({field: self.SECOND,
+                                      "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 0, err)
+            self.assertNotIn(self.SECOND, ri.stand_discord_ids(rec), field)
+            self.assertIsNone(rec["human_discord_id"], field)
+
+    def test_an_explicit_sibling_provider_decides_both_ways(self):
+        # Reviewer, 2026-08-30: a non-Discord sibling was ignored, so the bare
+        # `id` fell through to the legacy rule and was published anyway.
+        for provider, expect in (("discord", HUMAN), ("matrix", None),
+                                 ("teams", None)):
+            rc, err, rec = self._cli({"human": {"provider": provider,
+                                                "id": HUMAN},
+                                      "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(rec["human_discord_id"], expect, provider)
+
+    def test_discord_must_be_a_word_not_a_substring(self):
+        # The module's own rule ("words, not substrings") applied to the
+        # provider too: `discordant` names no account.
+        for field in ("discordant_human_id", "nondiscord_human_id"):
+            rc, err, rec = self._cli({field: HUMAN,
+                                      "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 0, err)
+            self.assertIsNone(rec["human_discord_id"], field)
+
+    def test_the_one_measured_legacy_spelling_still_resolves(self):
+        # The allowlist, and the reason it is not empty: a bare `id` under a
+        # referent ancestor states no provider and is documented in-tree.
+        rc, err, rec = self._cli({"human": {"id": HUMAN}})
         self.assertEqual(rc, 0, err)
-        self.assertIn(self.SECOND, ri.stand_discord_ids(rec))
+        self.assertEqual(rec["human_discord_id"], HUMAN)
 
     def test_a_plural_slot_refuses_a_member_that_holds_no_id(self):
         # Empty is the slot being empty; junk INSIDE it is the same defect one
         # axis over, and the readable sibling must still be collected.
         rc, err, rec = self._cli({ri.STAND_FIELD: self.STAND,
-                                  "other_agent_ids": [self.STAND, "junk"]})
+                                  "secondary_agent": {"ids": [self.STAND,
+                                                              "junk"]}})
         self.assertEqual(rc, 5)
         self.assertIn("SHAPE x", err)
         self.assertEqual(rec[ri.STAND_FIELD], self.STAND)
