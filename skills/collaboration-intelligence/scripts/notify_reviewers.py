@@ -275,6 +275,9 @@ def main() -> int:
                     help="deliberately notify ONE reviewer; requires a reason")
     ap.add_argument("--widen-override", metavar="REASON", default="",
                     help="deliberately re-ask the SAME reviewers after 30min")
+    ap.add_argument("--kind", choices=("ask", "notice"), default="ask",
+                    help="ask (default) requests review; notice tells reviewers "
+                         "something about a PR without asking for anything")
     ap.add_argument("--room", default=None,
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
@@ -284,7 +287,9 @@ def main() -> int:
     targets, refusal_rc = resolve(names, load_roster())
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
     # one person; plan mode is exempt because only a real ASK can strand a PR.
-    if a.send and len(targets) < 2 and not a.allow_single:
+    # The two-reviewer rule exists so one person being busy cannot stall a PR.
+    # A notice asks for nothing, so it cannot stall anything by going to one.
+    if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
         print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
               "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
               "or pass --allow-single '<reason>'.", file=sys.stderr)
@@ -293,7 +298,7 @@ def main() -> int:
         return refusal_rc if refusal_rc > 0 else 5
     if a.allow_single and len(targets) < 2:
         print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
-    stale, why = _stale_repeat_ask(a.message, targets, load_roster())
+    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
     if stale and not a.widen_override:
         print(f"REFUSED: {why} Re-asking the same people is not escalation — "
               "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
@@ -381,14 +386,17 @@ def main() -> int:
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
             try:
-                n_logged = record_asks(a.message, t["name"])
+                n_logged = record_asks(a.message, t["name"]) if a.kind == "ask" else 0
             except OSError as e:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
                       f"({e}) — pr-unattended will under-report this PR as unasked",
                       file=sys.stderr)
             else:
-                if n_logged:
+                if a.kind == "notice":
+                    print(f"  notice (not an ask) — nothing recorded for {t['name']}",
+                          file=sys.stderr)
+                elif n_logged:
                     print(f"  logged {n_logged} PR ask(s) for {t['name']}", file=sys.stderr)
                 else:
                     # Not counted as a failure: an ask need not concern a PR. But it
