@@ -64,7 +64,7 @@ def _cited_in(entry: dict, id_: str) -> list:
     def walk(obj, path):
         if isinstance(obj, dict):
             for k, v in obj.items():
-                if _foreign_id_leaf(path, str(k)):
+                if _foreign_id_leaf(path, str(k), obj):
                     continue
                 walk(v, path + [str(k)])
         elif isinstance(obj, list):
@@ -156,23 +156,46 @@ def _id_slot(field: str):
     return "singular" if last == "id" else "plural" if last == "ids" else None
 
 
-def _declares_discord_id(ancestors: list, key: str) -> bool:
-    """A Discord slot names the referent IN THE LEAF, or is a bare `id` whose
-    ancestor names it. `human.provider_user_id` is neither: the leaf declares a
-    PROVIDER namespace, and inheriting the referent would make nesting decide it.
+# NOT Discord: another provider, or a provider-neutral identifier `schema.md`
+# documents as a plain string — however Discord-shaped its digits are.
+_FOREIGN_NAMESPACES = frozenset({
+    "provider", "telegram", "slack", "matrix", "github", "gitlab", "email",
+    "phone", "sms", "twitter", "linkedin", "zoom", "whatsapp", "imessage",
+    "signal", "entity", "room", "user", "session", "external",
+})
+
+
+def _declares_discord_id(ancestors: list, key: str, siblings=None) -> bool:
+    """DISCORD evidence, not merely referent evidence. `telegram_human_id`
+    names the human and a different provider; reading it as a Discord slot
+    routes a Discord notification to a Telegram number.
+
+    Three ways to state it: the key says `discord`; a sibling `provider` says
+    so (the documented `{provider, user_id}` pair); or the key is a bare
+    `id`/`ids` under a referent ancestor, which states no provider at all and
+    is the roster's pre-provider spelling.
     """
-    if "discord" in key.lower() or _verdicts_from_field(key):
+    if "discord" in key.lower():
         return True
-    return [w.lower() for w in _WORDS.findall(str(key))] in (["id"], ["ids"]) \
-        and _typed_path(ancestors)
+    if isinstance(siblings, dict) and \
+            str(siblings.get("provider") or "").strip().lower() == "discord":
+        return True
+    words = [w.lower() for w in _WORDS.findall(str(key))]
+    if set(words) & _FOREIGN_NAMESPACES:
+        return False
+    # No provider named anywhere: the roster's pre-provider spelling, where the
+    # referent may come from the key (`agent_ids`) or an ancestor (`.id`).
+    return bool(_verdicts_from_field(key)) or \
+        (words in (["id"], ["ids"]) and _typed_path(ancestors))
 
 
-def _foreign_id_leaf(ancestors: list, key: str) -> bool:
+def _foreign_id_leaf(ancestors: list, key: str, siblings=None) -> bool:
     """A leaf declaring an id in someone else's namespace. Its digits are a
     PROVIDER id however Discord-shaped they look, so discovery must not mine
     them and no field may cite one — a wrong slot here names the wrong account.
     """
-    return bool(_id_slot(key)) and not _declares_discord_id(ancestors, key)
+    return bool(_id_slot(key)) and not _declares_discord_id(ancestors, key,
+                                                            siblings)
 
 
 def _absent(value) -> bool:
@@ -211,7 +234,7 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
             for k, v in obj.items():
                 # Discovery obeys the same rule as validation, or a
                 # snowflake-SHAPED provider id is mined into a Discord slot.
-                if _foreign_id_leaf(path, str(k)):
+                if _foreign_id_leaf(path, str(k), obj):
                     continue
                 slot = _id_slot(k)
                 # Inside the basis map the key IS the slot and the value prose.

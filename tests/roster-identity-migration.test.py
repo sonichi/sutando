@@ -990,6 +990,42 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(ri.stand_discord_id(rec), BOT)
         self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [])
 
+    def test_another_providers_key_is_not_a_discord_slot(self):
+        # Reviewer, 2026-08-30: naming the REFERENT is not naming DISCORD.
+        # `telegram_human_id` routed a Discord ping to a Telegram number.
+        for field in ("telegram_human_id", "slack_human_id",
+                      "matrix_stand_id", "github_human_id"):
+            rc, err, rec = self._cli({field: HUMAN,
+                                      "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 0, err)
+            self.assertIsNone(rec["human_discord_id"], field)
+
+    def test_a_sibling_provider_field_supplies_the_discord_evidence(self):
+        # The inverse, and the documented shape: `{provider, user_id}`. The
+        # leaf alone says nothing, so dropping it loses a reachable person.
+        rc, err, rec = self._cli({
+            "human": {"identities": [{"provider": "discord",
+                                      "user_id": HUMAN}]},
+            "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec["human_discord_id"], HUMAN)
+
+    def test_a_sibling_naming_another_provider_is_still_excluded(self):
+        # Paired negative: reading the sibling must not mean trusting it.
+        rc, err, rec = self._cli({
+            "human": {"identities": [{"provider": "matrix",
+                                      "user_id": HUMAN}]},
+            "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(rec["human_discord_id"])
+
+    def test_a_referent_key_naming_no_provider_is_still_collected(self):
+        # The roster's pre-provider spelling. Requiring the word `discord`
+        # outright would silently drop these and lose reachable Stands.
+        rc, err, rec = self._cli({"other_agent_ids": [self.SECOND]})
+        self.assertEqual(rc, 0, err)
+        self.assertIn(self.SECOND, ri.stand_discord_ids(rec))
+
     def test_a_plural_slot_refuses_a_member_that_holds_no_id(self):
         # Empty is the slot being empty; junk INSIDE it is the same defect one
         # axis over, and the readable sibling must still be collected.
