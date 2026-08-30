@@ -143,17 +143,56 @@ def _typed_path(path: list) -> bool:
                for seg in path)
 
 
+def _id_slot(field: str):
+    """"singular" / "plural" for a name DECLARING it holds ids, else None.
+
+    The last word decides, so `stand_status` stays free-form prose while
+    `..._id` and `..._ids` are held to their declaration.
+    """
+    words = _WORDS.findall(str(field))
+    last = words[-1].lower() if words else ""
+    return "singular" if last == "id" else "plural" if last == "ids" else None
+
+
+def _absent(value) -> bool:
+    """None and blank agree with `roster_identity`'s readers, which coerce both
+    to None; calling either malformed would split the two apart."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _slot_failures(value, slot: str, path: list, shapes: list) -> None:
+    """Every PRESENT value in a declared id slot from which no id can be read.
+
+    Empty containers are the slot being empty, not a bad value, so a v2 doc's
+    own `[]` collections re-migrate untouched.
+    """
+    values = list(value) if slot == "plural" and isinstance(value, (list, tuple)) \
+        else [value]
+    for v in values:
+        if _absent(v) or _snowflakes(json.dumps(v, default=str)):
+            continue
+        shapes.append({"path": ".".join(path), "kind": type(v).__name__,
+                       "reason": "a field declaring an id holds a value no id "
+                                 "can be read from, so the referent it states "
+                                 "is discarded rather than absent"})
+
+
 def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
     """Every discord-shaped id in the entry, in stable order.
 
-    A non-string leaf at a TYPED path is a present observation that states a
-    referent and yields no id; it is reported, never silently skipped.
+    A leaf at a TYPED path that states a referent and yields no id is reported,
+    never silently skipped — whatever type it holds.
     """
     found = []
 
     def walk(obj, path):
         if isinstance(obj, dict):
             for k, v in obj.items():
+                slot = _id_slot(k)
+                # Inside the basis map a slot name is the KEY being explained
+                # and the value is prose, so it declares nothing about an id.
+                if slot and shapes is not None and ri.BASIS_FIELD not in path:
+                    _slot_failures(v, slot, path + [str(k)], shapes)
                 walk(v, path + [str(k)])
         elif isinstance(obj, list):
             for v in obj:
@@ -163,7 +202,9 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
                 if sf not in found:
                     found.append(sf)
         elif obj is not None and not isinstance(obj, str) and _typed_path(path) \
-                and shapes is not None:
+                and shapes is not None and not _id_slot(path[-1] if path else ""):
+            # A declared slot is reported by _slot_failures; without this guard
+            # a non-string there is reported twice.
             shapes.append({"path": ".".join(path), "kind": type(obj).__name__,
                            "reason": "typed field holds a non-string value, so "
                                      "its id is unreadable rather than absent"})

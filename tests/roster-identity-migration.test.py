@@ -800,5 +800,120 @@ class EveryBadCallSiteIsExercised(unittest.TestCase):
                       "shapes must stay required, or a missed caller goes silent")
 
 
+class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
+    """A singular typed slot discarded a value it could read no id from, so the
+    CLI returned 0 having dropped explicitly human-typed evidence (#3537).
+
+    Only a NON-STRING scalar reached the shape branch, so `12` exited 5 while
+    the string and empty-container cases beside it exited 0. Run through the
+    CLI, because the exit status is what a promoting caller reads.
+    """
+
+    STAND = "1500000000000000001"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="slot-")
+        self._argv = sys.argv
+
+    def tearDown(self):
+        sys.argv = self._argv
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cli(self, entry):
+        src = Path(self.tmp) / "roster.json"
+        src.write_text(json.dumps({"x": entry}))
+        out = Path(self.tmp) / "v2.json"
+        sys.argv = ["m", "--roster", str(src), "--out", str(out)]
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = mig.main()
+        return rc, err.getvalue(), json.loads(out.read_text())["x"]
+
+    def _typed(self, value):
+        return self._cli({"discord_human_id": value,
+                          "stand_discord_id": self.STAND})
+
+    def test_a_string_holding_no_id_is_refused(self):
+        rc, err, rec = self._typed("not-a-snowflake")
+        self.assertEqual(rc, 5, "human evidence was discarded, not absent")
+        self.assertIn("SHAPE x", err)
+        self.assertIsNone(rec["human_discord_id"])
+
+    def test_an_empty_object_is_refused(self):
+        rc, err, _ = self._typed({})
+        self.assertEqual(rc, 5)
+        self.assertIn("SHAPE x", err)
+
+    def test_an_empty_list_is_refused(self):
+        rc, err, _ = self._typed([])
+        self.assertEqual(rc, 5)
+        self.assertIn("SHAPE x", err)
+
+    def test_a_number_is_still_refused(self):
+        # The reviewer's control: it passed BEFORE the fix, so a regression
+        # widening only the string path would satisfy the three cases above.
+        rc, err, _ = self._typed(12)
+        self.assertEqual(rc, 5)
+        self.assertIn("SHAPE x", err)
+
+    def test_a_scalar_in_a_declared_slot_is_recorded_once(self):
+        # Both branches can reach a non-string here. Assert on the AUDIT ROW:
+        # stderr prints one line per person, so a stderr count cannot fail.
+        _out, rows = mig.migrate({"x": {"discord_human_id": 12}}, {}, {}, "",
+                                 "test.json")
+        self.assertEqual(len(rows[0]["after_shape_failure"]), 1)
+
+    def test_a_readable_id_still_fills_the_slot(self):
+        # The positive control. Refusing everything would pass all four above.
+        rc, _err, rec = self._typed("1500000000000000009")
+        self.assertEqual(rc, 0)
+        self.assertEqual(rec["human_discord_id"], "1500000000000000009")
+
+    def test_an_absent_slot_is_absent_not_malformed(self):
+        # `roster_identity`'s readers coerce None and blank to None; flagging
+        # either here would make the migration disagree with every consumer.
+        for value in (None, ""):
+            rc, err, _ = self._cli({"human_discord_id": value,
+                                    "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 0, repr(value))
+            self.assertNotIn("SHAPE", err)
+
+    def test_a_free_form_field_naming_a_referent_is_not_an_id_slot(self):
+        # `stand_status` states the referent and holds prose. Keying the check
+        # on "typed" rather than on the name's last word refuses this.
+        rc, err, _ = self._cli({"stand_discord_id": self.STAND,
+                                "stand_status": "active"})
+        self.assertEqual(rc, 0)
+        self.assertNotIn("SHAPE", err)
+
+    def test_a_schema_owned_empty_collection_survives_re_migration(self):
+        # The v2 writer emits these; refusing them makes the migration refuse
+        # its own output, which is how the first attempt at this broke.
+        rc, err, _ = self._cli({"stand_discord_id": self.STAND,
+                                ri.OTHER_STANDS_FIELD: [],
+                                ri.UNRESOLVED_FIELD: []})
+        self.assertEqual(rc, 0)
+        self.assertNotIn("SHAPE", err)
+
+    def test_the_basis_map_is_keyed_by_slot_names_and_holds_prose(self):
+        # `id_basis.stand_discord_id` names the slot being EXPLAINED; its value
+        # is a reason, never an id. Checking it flags every migrated document.
+        rc, err, _ = self._cli({
+            "stand_discord_id": self.STAND,
+            ri.BASIS_FIELD: {"stand_discord_id": ["cited in `stand_status`"]}})
+        self.assertEqual(rc, 0)
+        self.assertNotIn("SHAPE", err)
+
+    def test_a_plural_slot_refuses_a_member_that_holds_no_id(self):
+        # Empty is the slot being empty; junk INSIDE it is the same defect one
+        # axis over, and the readable sibling must still be collected.
+        rc, err, rec = self._cli({ri.STAND_FIELD: self.STAND,
+                                  "other_agent_ids": [self.STAND, "junk"]})
+        self.assertEqual(rc, 5)
+        self.assertIn("SHAPE x", err)
+        self.assertEqual(rec[ri.STAND_FIELD], self.STAND)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
