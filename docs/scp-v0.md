@@ -57,7 +57,7 @@ Trade-off: a daemon restart drops connected clients. (Contrast ACP's stdio, wher
 the client spawns the agent as a 1:1 child subprocess — session-shaped; the Unix
 socket is task-shaped, a durable service many clients submit tasks to.)
 
-### [v0.1+] — Remote agent support *(LAN WebSocket transport SHIPPED, opt-in, loopback-default; WAN/relay not built)*
+### [v0.1+] — Remote agent support *(LAN WebSocket transport SHIPPED, opt-in, loopback-default; no SCP WAN transport yet — but see the remote-gateway relay below)*
 
 A remote transport so a client can drive a Sutando agent across machines. The task
 model makes this a clean extension rather than a retrofit — submit a task over the
@@ -100,7 +100,19 @@ Per-device authorization is therefore **built and enforced**
 shared bearer only. A captured paired-device credential can mutate state, so the
 credential — not the transport — is the security boundary on the LAN leg.
 
-Still genuinely not built: a WAN/relay path (reaching an agent from off-LAN).
+Still genuinely not built: a **WAN/relay transport for SCP's JSON-RPC method
+surface** — no SCP method reaches an agent from off-LAN.
+
+**That is a claim about SCP, not about reachability.** This repository already
+ships an off-LAN control path under a **separate protocol**: the remote gateway
+task/result relay (`docs/remote-gateway-protocol.md`). When configured,
+`src/startup-runtime.sh` starts `remote_gateway_bridge`, which authenticates to
+a remote HTTP gateway, long-polls `/v1/tasks`, and publishes received work into
+the local task queue — by default at **owner tier**. It is optional and
+token-gated, but do not read "SCP WebSocket disabled" as "no off-LAN control
+path exists": an operator auditing network exposure must check the gateway
+configuration too. The two surfaces are independent — disabling one says
+nothing about the other.
 
 ## 3. Core methods (implemented in v0)
 
