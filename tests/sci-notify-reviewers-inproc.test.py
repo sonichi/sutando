@@ -7,8 +7,10 @@ behaviour was tested. These call the functions directly.
 
 Run: python3 tests/sci-notify-reviewers-inproc.test.py   (stdlib only)
 """
+import contextlib
 import datetime
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -314,6 +316,17 @@ class FailurePaths(unittest.TestCase):
         rc, sends = self._run(self.ARGS + self.M, record_effect=OSError("read-only"))
         self.assertEqual(sends, 2)
         self.assertNotEqual(rc, 0)
+
+    def test_a_delivered_ask_that_records_NOTHING_is_loud(self):
+        # Ask delivered, ledger empty -- the OSError case reached by a return
+        # value. Silent before the fix; measured on ag2space-backend#872.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, sends = self._run(self.ARGS + self.M,
+                                  record_effect=lambda *a, **k: 0)
+        self.assertEqual(sends, 2)
+        self.assertIn("nothing recorded", err.getvalue())
+        self.assertEqual(rc, 0)                 # a PR-less ask is not a failure
 
     def test_an_unreadable_ledger_does_not_refuse_the_ask(self):
         with patch.object(self.mod, "ledger_path", return_value=self.led), \
