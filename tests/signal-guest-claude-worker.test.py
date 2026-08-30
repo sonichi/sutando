@@ -259,6 +259,153 @@ print("== P1: negative readiness is not cached for the positive TTL ==")
 ck(P._NEG_CACHE_TTL_S < P._CACHE_TTL_S,
    "an unavailable verdict expires fast so a fresh login is seen promptly")
 
+
+print("== the spawn path: env, argv, timeout kill, guarded publish ==")
+import subprocess as _sp
+import types as _types
+
+with _tf.TemporaryDirectory() as _td:
+    rd = Path(_td) / "results"
+    rd.mkdir()
+    home = Path(_td) / "home"
+    home.mkdir()
+    seen = {}
+
+    class _FakeProc:
+        """Stands in for the worker: records argv/env, returns a canned answer."""
+        def __init__(self, out="Findings: forty-two.\n", rc=0, timeout=False):
+            self._out, self.returncode, self._timeout = out, rc, timeout
+            self.pid = os.getpid()  # a real, signalable pid for pgid lookups
+            self.killed = False
+
+        def communicate(self, timeout=None):
+            if self._timeout:
+                raise _sp.TimeoutExpired(cmd="claude", timeout=timeout or 0)
+            return self._out, ""
+
+        def kill(self):
+            self.killed = True
+
+    def _fake_popen(argv, **kw):
+        seen["argv"] = argv
+        seen["env"] = kw.get("env", {})
+        seen["cwd"] = kw.get("cwd")
+        seen["new_session"] = kw.get("start_new_session")
+        seen["stdin"] = kw.get("stdin")
+        return seen.get("proc") or _FakeProc()
+
+    _real_popen, _real_guard = H.subprocess.Popen, H._guard
+    H.subprocess.Popen = _fake_popen
+    H._guard = lambda body: f"GUARDED::{body}"
+    _real_killpg = os.killpg
+    os.killpg = lambda *a, **k: None  # never signal the test runner's own group
+    try:
+        H._reset_stopping_for_tests()
+        with H._live_lock:
+            H._live_tasks["signal-guest-spawn"] = rd
+        H._slots.acquire()
+        H._run("signal-guest-spawn", "  a question  ", rd, lambda t: f"CONFINED({t})", str(home))
+
+        ck(seen["argv"][:2] == ["claude", "-p"], "spawns claude -p")
+        ck("CONFINED(" in seen["argv"][2], "the untrusted body is defanged before it reaches the prompt")
+        ck(seen["env"].get("CLAUDE_CONFIG_DIR") == str(home) and seen["env"].get("HOME") == str(home),
+           "config root and HOME are pinned to the isolated profile")
+        ck("ANTHROPIC_API_KEY" not in seen["env"] and "SUTANDO_API_TOKEN" not in seen["env"],
+           "the owner's environment does not reach the worker (allowlist)")
+        ck(seen["new_session"] is True, "worker runs in its own session/process group")
+        ck(seen["stdin"] == _sp.DEVNULL, "stdin is closed to the worker")
+        ck(seen["cwd"] != os.getcwd() and str(seen["cwd"]).startswith(_tf.gettempdir()),
+           "worker cwd is a throwaway tmp dir, not the repo")
+        body = (rd / "signal-guest-spawn.txt").read_text()
+        ck(body.startswith("GUARDED::"), "worker output goes through the egress guard before publication")
+        ck("forty-two" in body, "the guarded answer is what gets published")
+
+        # A timeout kills the group and still publishes a terminal payload.
+        seen["proc"] = _FakeProc(timeout=True)
+        with H._live_lock:
+            H._live_tasks["signal-guest-timeout"] = rd
+        H._slots.acquire()
+        H._run("signal-guest-timeout", "slow", rd, lambda t: t, str(home))
+        tbody = (rd / "signal-guest-timeout.txt").read_text()
+        ck(tbody.startswith("[deep_dive "), f"a timed-out worker still publishes a terminal payload: {tbody[:40]!r}")
+
+        # A non-zero exit publishes the no-result payload rather than partial output.
+        seen["proc"] = _FakeProc(out="partial junk", rc=3)
+        with H._live_lock:
+            H._live_tasks["signal-guest-rc"] = rd
+        H._slots.acquire()
+        H._run("signal-guest-rc", "boom", rd, lambda t: t, str(home))
+        rbody = (rd / "signal-guest-rc.txt").read_text()
+        ck("partial junk" not in rbody, "a failed worker's stdout is never published")
+    finally:
+        H.subprocess.Popen, H._guard = _real_popen, _real_guard
+        os.killpg = _real_killpg
+
+print("== fleet bound and availability short-circuit ==")
+with _tf.TemporaryDirectory() as _td:
+    rd = Path(_td)
+    _real_avail = H.guest_availability
+    H.guest_availability = lambda *a, **k: (True, None)
+    _acquired = []
+    try:
+        # Exhaust the fleet, then a further submission must answer "busy", not queue.
+        for _ in range(H.MAX_CONCURRENT):
+            _acquired.append(H._slots.acquire(blocking=False))
+        H.start_guest_deep_dive("signal-guest-busy", "q", rd, lambda t: t)
+        bbody = (rd / "signal-guest-busy.txt").read_text()
+        ck("busy" in bbody, f"a full fleet answers busy rather than spawning: {bbody[:40]!r}")
+    finally:
+        for _ in _acquired:
+            try:
+                H._slots.release()
+            except Exception:
+                pass
+        H.guest_availability = _real_avail
+
+print("== profile: provisioning failure paths ==")
+with _tf.TemporaryDirectory() as _td:
+    owner = Path(_td) / "owner"
+    (owner / ".claude").mkdir(parents=True)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(owner / ".claude")
+    # A non-object .claude.json is unauthenticated, not a crash.
+    (owner / ".claude.json").write_text('["not", "an", "object"]')
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(Path(_td) / "g1")
+    P.invalidate_readiness_cache()
+    ok, reason = P.ensure_guest_profile()
+    ck(ok is False and reason == "worker_unauthenticated", "a non-object .claude.json -> unauthenticated")
+
+    # Unreadable owner credential -> purge + unauthenticated (never a stale copy).
+    (owner / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "a"}}))
+    creds = owner / ".claude" / ".credentials.json"
+    creds.write_text('{"t":1}')
+    gh_dir = Path(_td) / "g2"
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(gh_dir)
+    P.invalidate_readiness_cache()
+    P.ensure_guest_profile()
+    ck((gh_dir / ".credentials.json").exists(), "precondition: the guest copy exists")
+    os.chmod(creds, 0o000)
+    try:
+        P.invalidate_readiness_cache()
+        ok, reason = P.ensure_guest_profile()
+        ck(ok is False, f"an unreadable owner credential is not ready ({reason})")
+        ck(not (gh_dir / ".credentials.json").exists(),
+           "the guest copy is purged when the owner credential cannot be read")
+    finally:
+        os.chmod(creds, 0o600)
+
+    # Keyring-style owner (no credential file): still ready, and any stale copy goes.
+    creds.unlink()
+    gh3 = Path(_td) / "g3"
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(gh3)
+    P.invalidate_readiness_cache()
+    ok, reason = P.ensure_guest_profile()
+    ck(ok is True, f"keyring-style auth (no credential file) is ready ({reason})")
+    ck(not (gh3 / ".credentials.json").exists(), "no credential file is fabricated for keyring auth")
+    ck(P.guest_env_overrides(gh3)["CLAUDE_CONFIG_DIR"] == str(gh3), "env overrides pin the profile")
+
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + "; ".join(FAILS))
