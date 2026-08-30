@@ -352,19 +352,23 @@ with nr._ledger_lock(led):
 
 
 class HoldingOneLedgerIsNotReentrancyOnAnother(unittest.TestCase):
-    """Requested by @kewei-red-ag2space at `dad78b91`.
+    """Requested by @kewei-red-ag2space; harness rebuilt on their second review.
 
-    The re-entrancy fix keys on the resolved ledger path. Nothing pinned the
-    ADJACENT axis: that holding ledger A must not make ledger B look re-entrant.
-    An any-ledger key passes every same-ledger test in this file, and the first
-    re-entrancy attempt is what broke the writer-lock contract.
+    The re-entrancy key resolves the ledger path, and nothing pinned the
+    ADJACENT axis: holding ledger A must not make ledger B look re-entrant. An
+    any-ledger key passes every single-ledger test in this file, and an
+    any-ledger key is what broke the writer-lock contract the first time.
+
+    The first version of this test used a real foreign holder and a sleep. It
+    could reject correct code and accept the mutant, because observing "held"
+    says nothing about how much of the window remains. This one stubs `flock`
+    and asserts the OPERATION SEQUENCE, so no wall clock is involved at all.
     """
 
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
         d = pathlib.Path(self._td.name)
         self.a, self.b = d / "a.jsonl", d / "b.jsonl"
-        self.gate = d / "gate"
         for f in (self.a, self.b):
             f.touch()
         self.nr = _load()
@@ -372,40 +376,35 @@ class HoldingOneLedgerIsNotReentrancyOnAnother(unittest.TestCase):
     def tearDown(self):
         self._td.cleanup()
 
-    def _hold_b(self):
-        src = HOLDER_MARKED.format(script=str(SCRIPT), repo=str(REPO),
-                                   led=str(self.b), gate=str(self.gate))
-        proc = subprocess.Popen([sys.executable, "-c", src])
-        for _ in range(100):                       # wait for the holder to own B
-            if self.gate.exists() and self.gate.read_text() == "held":
-                return proc
-            time.sleep(0.02)
-        proc.kill()
-        self.skipTest("holder never acquired ledger B")
+    def _ops(self, first, second):
+        """Real `_ledger_lock`, recording `flock` instead of performing it."""
+        seen = []
+        real = self.nr.fcntl
 
-    def test_holding_A_still_waits_for_a_foreign_holder_of_B(self):
-        proc = self._hold_b()
-        try:
-            with self.nr._ledger_lock(self.a):     # hold A ...
-                with self.nr._ledger_lock(self.b):  # ... then genuinely take B
-                    seen = self.gate.read_text()
-        finally:
-            proc.wait(timeout=5)
-        self.assertEqual(seen, "released",
-                         "holding A let B through while another process held it")
+        class _Rec:
+            LOCK_EX, LOCK_UN = real.LOCK_EX, real.LOCK_UN
 
-    def test_same_ledger_reentry_still_does_not_block(self):
-        # The control. Without it, a fix that simply removed re-entrancy would
-        # satisfy the case above and deadlock the writer's own nested calls.
-        proc = self._hold_b()
+            @staticmethod
+            def flock(fd, op):
+                seen.append("EX" if op == real.LOCK_EX else "UN")
+
+        self.nr.fcntl = _Rec
         try:
-            with self.nr._ledger_lock(self.a):
-                with self.nr._ledger_lock(self.a):   # re-entrant: must not wait
-                    seen = self.gate.read_text()
+            with self.nr._ledger_lock(first), self.nr._ledger_lock(second):
+                pass
         finally:
-            proc.wait(timeout=5)
-        self.assertEqual(seen, "held",
-                         "same-ledger re-entry blocked, so it is not re-entrant")
+            self.nr.fcntl = real
+        return seen
+
+    def test_a_second_ledger_takes_its_own_lock(self):
+        # Two distinct ledgers = two real acquisitions. An any-ledger key
+        # records one, because it treats B as already held.
+        self.assertEqual(self._ops(self.a, self.b), ["EX", "EX", "UN", "UN"])
+
+    def test_the_same_ledger_is_re_entrant_and_locks_once(self):
+        # Ships as a pair: removing re-entrancy satisfies the case above and
+        # locks twice here — against a real flock, the writer deadlocking.
+        self.assertEqual(self._ops(self.a, self.a), ["EX", "UN"])
 
 
 if __name__ == "__main__":
