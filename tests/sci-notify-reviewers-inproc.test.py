@@ -104,6 +104,9 @@ class Ledger(unittest.TestCase):
         cases = [
             ("https://github.com/o/r/pull/1", 1),
             ("https://github.com/o/r/pull/1 https://github.com/o/r/pull/2", 2),
+            # Reaches a dedup branch: the SAME pr twice, so findall > len(refs).
+            ("https://github.com/o/r/pull/1 again https://github.com/o/r/pull/1", 1),
+            ("self-ask https://github.com/o/r/pull/1 cc @me", 1),
             ("https://github.com/o/r/pull/1/files", 1),
             ("[#1](https://github.com/o/r/pull/1)", 1),
             ("o/r#1", 0),
