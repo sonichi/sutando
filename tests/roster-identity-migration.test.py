@@ -1627,6 +1627,23 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
         self.assertEqual(d2["alice"][ri.HUMAN_FIELD], BOT)
         self.assertEqual(d2["alice"][ri.UNRESOLVED_FIELD], [])
 
+    def test_CONTROL_a_slot_that_reads_again_drops_its_stale_seed(self):
+        # The guard's OTHER branch. An operator repairing the slot by hand is
+        # the case a carried seed would refuse — found by air (agent of qingyun).
+        triage = {"people": {"alice": {"bots": [BOT]}}}
+        rc1, d1 = self._pass({"alice": {"github": "alice",
+                                        ri.HUMAN_FIELD: BOT}}, triage)
+        self.assertEqual(rc1, 5)
+        d1["alice"][ri.HUMAN_FIELD] = HUMAN
+        _, d2 = self._pass(d1, {"people": {"alice": {}}})
+        e = d2["alice"]
+        self.assertEqual(e[ri.HUMAN_FIELD], HUMAN,
+                         "a slot that reads again was refused by a stale seed")
+        self.assertEqual(
+            [u["id"] for u in e[ri.UNRESOLVED_FIELD]
+             if "claims" in u or "seeded_by" in u], [],
+            "a seed whose slot reads again was carried anyway")
+
     def test_CONTROL_a_non_writer_owned_seed_was_never_affected(self):
         # States a referent but is not a slot we rewrite, so it survived on its
         # own — which is what isolates the failure to the rewritten slots.
