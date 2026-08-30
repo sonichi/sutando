@@ -31,10 +31,13 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
+import { resolveWorkspace } from '../../src/workspace_default.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
-const CACHE_PATH = join(process.cwd(), 'state', 'external-cache', 'inbox-important.json');
+// The cache lives under the WORKSPACE. cwd is whatever launched the agent —
+// on this host the repo, which is a different tree, so tier 1 never hit.
+const CACHE_PATH = join(resolveWorkspace(), 'state', 'external-cache', 'inbox-important.json');
 // 30 min TTL: balances cache-hit rate (~95% at 30min vs ~70% at 15min) against
 // staleness. Live gws fallback covers the freshness edge case anyway. Per Mini PR #704 review.
 const CACHE_MAX_AGE_MS = 30 * 60 * 1000;
