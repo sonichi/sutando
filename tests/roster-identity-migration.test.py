@@ -1270,6 +1270,64 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
                                       {"discord": HUMAN, "bots": [BOT]})
         self.assertEqual(rec["human_discord_id"], HUMAN)
 
+    def test_member_order_cannot_decide_a_referent(self):
+        # Reviewer, 2026-08-30: `arb_states` was a dict comprehension, so when
+        # one id appears in TWO failures the later record overwrote the earlier.
+        outs = []
+        for entry in ({ri.HUMAN_FIELD: [HUMAN, BOT], ri.STAND_FIELD: [HUMAN, self.SECOND]},
+                      {ri.STAND_FIELD: [HUMAN, self.SECOND], ri.HUMAN_FIELD: [HUMAN, BOT]}):
+            rc, err, rec = self._cli_tri(entry, {"discord": HUMAN, "bots": []})
+            self.assertEqual(rc, 5, err)
+            outs.append((rec["human_discord_id"], rec[ri.STAND_FIELD],
+                         sorted(u["id"] for u in ri.unresolved_discord_ids(rec))))
+        self.assertEqual(outs[0], outs[1], "member order reached the output")
+        self.assertIsNone(outs[0][0], "an id stated as BOTH was published")
+
+    def test_a_repair_clears_the_carried_finding(self):
+        # It latched: correcting the source still refused, because nothing ever
+        # dropped a carried record.
+        rc, err, rec = self._cli_tri({"secondary_agent": {"id": [HUMAN, BOT]}},
+                                     {"discord": HUMAN, "bots": []})
+        self.assertEqual(rc, 5, err)
+        rec["secondary_agent"] = {"id": BOT}
+        rc2, err2, fixed = self._cli_tri(rec, {"discord": HUMAN, "bots": []})
+        self.assertEqual(rc2, 0, err2)
+        self.assertEqual(fixed[ri.STAND_FIELD], BOT)
+        self.assertNotIn(ri.SHAPE_FIELD, fixed)
+
+    def test_a_malformed_carried_value_never_synthesises_ids(self):
+        # `arbitrated_ids` as a bare string was iterated per character and wrote
+        # one fake unresolved id per digit.
+        rc, err, rec = self._cli({"human": {"id": BOT},
+                                  ri.SHAPE_FIELD: [{"path": "p", "kind": "str",
+                                                    "reason": "r",
+                                                    "arbitrated_ids": HUMAN}]})
+        self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [], err)
+
+    def test_a_non_dict_carried_record_does_not_crash_the_run(self):
+        # Reviewer: "other malformed containers raise uncaught AttributeError".
+        # A hand-edited roster must degrade, never take the migration down.
+        rc, err, rec = self._cli({"human": {"id": BOT},
+                                  ri.SHAPE_FIELD: ["not-a-dict", 42]})
+        self.assertIn(rc, (0, 5), err)
+        self.assertEqual(rec.get(ri.SHAPE_FIELD, []), [])
+
+    def test_an_older_scalar_record_canonicalises_to_one(self):
+        # A pre-canonical writer's scalar and this one's list are the same
+        # finding; uncanonicalised they persist as two forever.
+        entry = {"human": {"id": BOT}, ri.SHAPE_FIELD: [
+            {"path": "p", "kind": "k", "reason": "r", "arbitrated_states": "stand"},
+            {"path": "p", "kind": "k", "reason": "r", "arbitrated_states": ["stand"]}]}
+        for _ in range(3):
+            rc, err, entry = self._cli(entry)
+            self.assertEqual(len(entry.get(ri.SHAPE_FIELD) or []), 1, err)
+
+    def test_the_carried_list_is_bounded(self):
+        # Unbounded carried state can grow a roster indefinitely.
+        big = [{"path": f"p{i}", "kind": "k", "reason": f"r{i}"} for i in range(80)]
+        rc, err, rec = self._cli({"human": {"id": BOT}, ri.SHAPE_FIELD: big})
+        self.assertLessEqual(len(rec.get(ri.SHAPE_FIELD) or []), ri.SHAPE_MAX, err)
+
     def test_the_carried_refusal_converges_across_passes(self):
         # `id_shape_failures` grew 1, 2, 3: the source field survives, so each
         # pass re-detected the finding and appended it beside the carried copy.

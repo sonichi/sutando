@@ -45,9 +45,8 @@ import roster_identity as ri  # noqa: E402
 
 HUMAN, STAND = "human", "stand"
 
-# The writer overwrites the malformed slot, so pass 2 would see a clean doc and
-# return 0. This key carries the finding forward instead.
-SHAPE_FIELD = "id_shape_failures"
+# The writer overwrites the malformed slot; this key carries the finding on.
+SHAPE_FIELD = ri.SHAPE_FIELD    # owned by the schema module
 
 _SNOWFLAKE = re.compile(r"(?<!\d)\d{17,20}(?!\d)")
 
@@ -325,6 +324,45 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
     return found
 
 
+def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
+    """Does a CARRIED finding still describe this entry?
+
+    Kept when this pass re-found it, when the path cannot be re-checked, or
+    when the value is gone (our own writer overwrites a canonical slot, so the
+    evidence is absent rather than fixed). Dropped once the path reads cleanly
+    again — otherwise a repair stays latched behind a stale record.
+    """
+    path = rec.get("path")
+    if not path or path in fresh_paths:
+        return True
+    node = entry
+    for seg in str(path).split("."):
+        if not isinstance(node, dict) or seg not in node:
+            return True                     # unreachable: cannot re-check
+        node = node[seg]
+    if node is None or (isinstance(node, str) and not node.strip()):
+        return True                         # destroyed by the writer
+    return not _mineable_now(node)
+
+
+def _mineable_now(value) -> bool:
+    """True when every present member of this value yields an id — the same
+    readability the collector applies, asked of one corrected value."""
+    vals = [value]
+    while vals:
+        v = vals.pop()
+        if isinstance(v, (list, tuple)):
+            if not v:
+                return False
+            vals.extend(v); continue
+        if isinstance(v, str) and _snowflakes(v):
+            continue
+        if isinstance(v, dict) and _snowflakes(json.dumps(v, default=str)):
+            continue
+        return False
+    return True
+
+
 def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
              owner_id: str):
     """-> (human_id|None, stand_id|None, other_stands[], unresolved[], basis{},
@@ -332,23 +370,28 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     claims: dict = {}   # id -> {verdict -> [reasons]}
     bad: list = []      # not-id values; `states` is the referent each claimed
     collisions: list = []
-    # A previous migration's findings are still findings: without this, running
-    # the tool twice reports success on a roster it refused the first time.
-    shape_failures: list = list(entry.get(SHAPE_FIELD) or []) \
-        if isinstance(entry, dict) else []
-
     def claim(id_, verdict, reason):
         claims.setdefault(id_, {}).setdefault(verdict, []).append(reason)
 
-    collected = _collect_ids(entry, shape_failures)
+    # THIS pass's own findings first; the carried ones are then reconciled
+    # against them, so a repair can clear a record rather than latch forever.
+    fresh: list = []
+    collected = _collect_ids(entry, fresh)
+    carried = ri.canonical_shape_failures(
+        (entry or {}).get(ri.SHAPE_FIELD) if isinstance(entry, dict) else None)
+    fresh_paths = {f.get("path") for f in fresh}
+    shape_failures: list = ri.canonical_shape_failures(
+        fresh + [c for c in carried if _still_unresolved(entry, c, fresh_paths)])
     # An id from an over-full singular slot is not evidence for that slot: it
     # would be picked by traversal order. Route it to unresolved instead.
     arbitrated = {i for f in shape_failures for i in f.get("arbitrated_ids") or []}
-    arb_states = {i: f.get("arbitrated_states")
-                  for f in shape_failures for i in f.get("arbitrated_ids") or []}
-    # A pre-#3537 record may hold the old scalar; normalise both to a list.
-    arb_states = {i: ([] if v is None else v if isinstance(v, list) else [v])
-                  for i, v in arb_states.items()}
+    # UNION, not last-wins: one id can appear in two failures stating different
+    # referents, and a dict comprehension let member order decide which survived.
+    arb_states: dict = {}
+    for f in shape_failures:
+        for i in f.get("arbitrated_ids") or []:
+            arb_states.setdefault(i, set()).update(f.get("arbitrated_states") or [])
+    arb_states = {i: sorted(v) for i, v in arb_states.items()}
     for id_ in sorted(arbitrated):   # a set's order must not reach the output
         _st = arb_states.get(id_) or []
         bad.append({"id": id_,
@@ -546,17 +589,11 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         new[ri.BASIS_FIELD] = basis
         # Carried, not recomputed: the malformed value is gone from `new`, so a
         # later pass could not re-derive this.
-        if shape_failures:
-            # The source field survives, so the next pass re-detects the same
-            # finding; without dedup the list grows by one every migration.
-            _seen, _uniq = set(), []
-            for f in shape_failures:
-                k = json.dumps(f, sort_keys=True, default=str)
-                if k not in _seen:
-                    _seen.add(k); _uniq.append(f)
-            new[SHAPE_FIELD] = _uniq
+        _sf = ri.canonical_shape_failures(shape_failures)
+        if _sf:
+            new[ri.SHAPE_FIELD] = _sf
         else:
-            new.pop(SHAPE_FIELD, None)
+            new.pop(ri.SHAPE_FIELD, None)
         out[key] = new
         # The MATCHED source, not the local key: reading triage_people[key] on
         # an aliased row printed "triage human = -" while filling after_human.

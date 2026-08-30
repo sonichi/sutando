@@ -25,6 +25,68 @@ OTHER_STANDS_FIELD = "other_stand_discord_ids"
 UNRESOLVED_FIELD = "unresolved_discord_ids"
 BASIS_FIELD = "id_basis"
 
+#: Findings carried so a refusal survives a re-migration. Owned here because it
+#: is part of the record, not a private detail of one script.
+SHAPE_FIELD = "id_shape_failures"
+
+#: A carried list is untrusted input: a hand-edit or an older writer can put
+#: anything here, and this file is what says which shapes are usable.
+SHAPE_MAX = 32
+_REFERENTS = ("human", "stand")
+
+
+def _snowflake_list(value) -> list:
+    """Whole snowflakes only. A bare string is NOT iterated — doing so wrote
+    one fake id per character into `unresolved_discord_ids`."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    import re as _re
+    return [v for v in value
+            if isinstance(v, str) and _re.fullmatch(r"\d{17,20}", v)]
+
+
+def canonical_shape_failure(rec) -> "dict | None":
+    """One carried finding, canonicalised, or None when it is unusable.
+
+    Canonical so an older writer's scalar `states` and this one's list collapse
+    to a single record instead of two; None rather than an exception so a
+    corrupt file degrades to "ignore this entry", never to a crash.
+    """
+    if not isinstance(rec, dict):
+        return None
+    reason = rec.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    path = rec.get("path")
+    out = {"path": path if isinstance(path, str) else None,
+           "kind": rec.get("kind") if isinstance(rec.get("kind"), str) else "?",
+           "reason": reason}
+    ids = _snowflake_list(rec.get("arbitrated_ids"))
+    if ids:
+        out["arbitrated_ids"] = sorted(set(ids))
+    st = rec.get("arbitrated_states")
+    st = [st] if isinstance(st, str) else st
+    st = [v for v in st if v in _REFERENTS] if isinstance(st, (list, tuple)) else []
+    if st:
+        out["arbitrated_states"] = sorted(set(st))
+    return out
+
+
+def canonical_shape_failures(value) -> list:
+    """The carried list, canonicalised, de-duplicated and bounded."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    seen, out = set(), []
+    for rec in value:
+        c = canonical_shape_failure(rec)
+        if c is None:
+            continue
+        import json as _json
+        k = _json.dumps(c, sort_keys=True)
+        if k not in seen:
+            seen.add(k); out.append(c)
+    return out[:SHAPE_MAX]
+
 #: A key starting with "_" is document metadata, not a person.
 def is_person_key(key: str) -> bool:
     return not str(key).startswith("_")
