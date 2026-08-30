@@ -440,9 +440,13 @@ def _rewrite(led: Path, streams: dict) -> int:
             keep.append(st["last"])
         for outcome, ts in keep:
             # The reader's normalized string: int() renamed "007" to "7".
-            rows.append(json.dumps({"repo": repo, "pr": num, "reviewer": who,
-                                    "actor": who, "ts": ts, "channel": "room",
-                                    "outcome": outcome}))
+            row = {"repo": repo, "pr": num, "actor": who, "ts": ts,
+                   "channel": "room", "outcome": outcome}
+            # Same rule as the append: restoring `reviewer` on retry-only rows
+            # here would silently undo rollback-safety at the compaction trigger.
+            if outcome in _DELIVERY_OUTCOMES:
+                row["reviewer"] = who
+            rows.append(json.dumps(row))
     tmp = led.with_suffix(led.suffix + ".compact")
     mode = led.stat().st_mode & 0o777 if led.exists() else _LEDGER_MODE
     # Opened at its final private mode: writing under umask and chmod-ing after
@@ -890,30 +894,30 @@ def main() -> int:
                 failures += 1
                 continue
             who = actors.get(t["name"], t["name"])
-            # Claim BEFORE the POST can happen: a reservation written after it
-            # cannot cover a crash, or a write failure, between the two.
-            try:
-                reserved = claim_park(a.message, t["name"], who,
-                                      canonical=lambda w: actors.get(w, w),
-                                      endpoint=t.get("endpoint"))
-            except OSError as e:
-                reserved = 0
-                print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
-                      "sending now would be unrepeatable-but-unrecorded. Nothing "
-                      "was sent.", file=sys.stderr)
-                failures += 1
-                continue
-            if reserved is None:
-                print(f"{t['name']}: PARKED — a previous send to {who} is UNSAFE "
-                      "to repeat (it landed, or may have); check the channel",
-                      file=sys.stderr)
-                unknowns += 1
-                continue
-            if not reserved:
-                print(f"{t['name']}: REFUSED — no PR reference to key the park on; "
-                      "nothing was sent", file=sys.stderr)
-                failures += 1
-                continue
+            # Claim BEFORE the POST: a later reservation cannot cover a crash
+            # between the two. A NOTICE is not an ask, so it skips the block.
+            if a.kind == "ask":
+                try:
+                    reserved = claim_park(a.message, t["name"], who,
+                                          canonical=lambda w: actors.get(w, w),
+                                          endpoint=t.get("endpoint"))
+                except OSError as e:
+                    print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
+                          "sending now would be unrepeatable-but-unrecorded. Nothing "
+                          "was sent.", file=sys.stderr)
+                    failures += 1
+                    continue
+                if reserved is None:
+                    print(f"{t['name']}: PARKED — a previous send to {who} is UNSAFE "
+                          "to repeat (it landed, or may have); check the channel",
+                          file=sys.stderr)
+                    unknowns += 1
+                    continue
+                if not reserved:
+                    print(f"{t['name']}: REFUSED — no PR reference to key the park on; "
+                          "nothing was sent", file=sys.stderr)
+                    failures += 1
+                    continue
 
             def _settle(outcome, detail):
                 """Supersede the reservation. Append-only, so this is atomic."""
@@ -964,8 +968,9 @@ def main() -> int:
                 # Same bookkeeping as the Matrix path: without it a delivered
                 # Discord ask reads as NOBODY_EVER_ASKED to pr-unattended.
                 try:
-                    n_logged = record_asks(a.message, t["name"], actor=who,
-                                           endpoint=t.get("endpoint"))
+                    n_logged = (record_asks(a.message, t["name"], actor=who,
+                                            endpoint=t.get("endpoint"))
+                                if a.kind == "ask" else 0)
                 except OSError as e:
                     unlogged += 1
                     print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT "

@@ -343,7 +343,9 @@ class OneRecipientIsNotTwoPeople(unittest.TestCase):
         for k, v in (("CLAUDE_CONFIG_DIR", self._cfg), ("SUTANDO_SCI_ROSTER", self._roster)):
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
 
-    def _run_with(self, roster, names):
+    def _run_with(self, roster, names, kind=None):
+        self.tmp_led = os.path.join(tempfile.mkdtemp(), "asks.jsonl")
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = self.tmp_led
         os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {
             "222": {"allowFrom": ["111"]}, "333": {"allowFrom": ["111"]},
             "444": {"allowFrom": ["999"]}}})
@@ -353,6 +355,8 @@ class OneRecipientIsNotTwoPeople(unittest.TestCase):
         os.environ["SUTANDO_SCI_ROSTER"] = path
         sys.argv[:] = ["notify_reviewers.py", "--reviewers", names, "--message",
                        "re-review https://github.com/sonichi/sutando/pull/3509", "--send"]
+        if kind:
+            sys.argv.extend(("--kind", kind))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = nr.main()
@@ -365,6 +369,30 @@ class OneRecipientIsNotTwoPeople(unittest.TestCase):
              "a2": {"discord_id": "111", "home_channel": "333"}}, "a1,a2")
         self.assertEqual(len(self.seen), 0, f"pinged one person twice: {self.seen}")
         self.assertEqual(rc, 5, err)
+
+    def test_a_discord_notice_delivers_without_entering_ask_history(self):
+        # Discord claimed and recorded regardless of kind, so a status post
+        # became a review ask and later made an escalation read as a repeat.
+        rc, err = self._run_with(
+            {"a1": {"discord_id": "111", "home_channel": "222"},
+             "b1": {"discord_id": "999", "home_channel": "444"}}, "a1,b1",
+            kind="notice")
+        led = pathlib.Path(self.tmp_led)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.seen), 2, f"a notice must still deliver: {err}")
+        rows = led.read_text().splitlines() if led.exists() else []
+        self.assertEqual(rows, [], f"a notice entered ask history: {rows}")
+
+    def test_the_control_an_ask_does_record(self):
+        # Without this, refusing to record ANYTHING would pass the case above
+        # while making every real ask invisible.
+        rc, err = self._run_with(
+            {"a1": {"discord_id": "111", "home_channel": "222"},
+             "b1": {"discord_id": "999", "home_channel": "444"}}, "a1,b1")
+        led = pathlib.Path(self.tmp_led)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(led.exists() and led.read_text().strip(),
+                        "an ask recorded nothing")
 
     def test_the_control_two_real_people_still_send(self):
         # Without this, a dedup that collapsed EVERYTHING would pass the case
@@ -1248,6 +1276,27 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
                              f"retry state carries delivery-history identity: {r}")
             self.assertTrue(r.get("actor") or r.get("endpoint"),
                             f"row has no identity for THIS reader: {r}")
+
+    def test_compaction_does_not_restore_the_legacy_reviewer_field(self):
+        # The append omits `reviewer` on retry-only rows; the compactor rebuilt
+        # every row WITH it, losing rollback-safety at the compaction trigger.
+        nr.record_asks(self.MSG, "k", outcome="failed", actor="k")
+        with nr._ledger_lock(self.led):
+            nr._rewrite(self.led, nr._streams(self.led))
+        rows = [json.loads(l) for l in self.led.read_text().splitlines()]
+        self.assertTrue(rows, "compaction emptied the ledger")
+        for r in rows:
+            self.assertNotIn("reviewer", r, f"compaction restored it: {r}")
+
+    def test_the_control_compaction_keeps_the_reviewer_on_delivery(self):
+        # Without this, stripping `reviewer` in the compactor unconditionally
+        # would pass the case above and erase real ask history.
+        nr.record_asks(self.MSG, "k", outcome="confirmed", actor="k")
+        with nr._ledger_lock(self.led):
+            nr._rewrite(self.led, nr._streams(self.led))
+        rows = [json.loads(l) for l in self.led.read_text().splitlines()]
+        self.assertTrue(any(r.get("reviewer") == "k" for r in rows),
+                        f"compaction dropped delivery history: {rows}")
 
     def test_the_control_delivery_history_still_carries_the_reviewer(self):
         # Without this, dropping `reviewer` everywhere would pass the case above
