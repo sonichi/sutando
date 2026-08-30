@@ -1288,6 +1288,19 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
         for r in rows:
             self.assertNotIn("reviewer", r, f"compaction restored it: {r}")
 
+    def test_compaction_keeps_the_reviewer_on_a_legacy_row(self):
+        # A row predating the outcome field IS a delivery. Gating `reviewer` on
+        # the outcome SET dropped it, so a pre-migration ask vanished on compact.
+        self.led.write_text(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": "d",
+            "channel": "room", "ts": "2026-08-30T00:00:00Z"}) + "\n")
+        with nr._ledger_lock(self.led):
+            nr._rewrite(self.led, nr._streams(self.led))
+        row = json.loads(self.led.read_text().splitlines()[0])
+        self.assertIsNone(row.get("outcome"), "fixture stopped being legacy")
+        self.assertEqual(row.get("reviewer"), "d",
+                         f"compaction dropped a legacy delivery: {row}")
+
     def test_compaction_preserves_every_identity_axis_distinctly(self):
         # The axes must DIFFER or this cannot see the defect: compaction
         # synthesised all of them from one key, renaming reviewer to endpoint.

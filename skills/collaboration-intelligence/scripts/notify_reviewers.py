@@ -453,9 +453,9 @@ def _rewrite(led: Path, streams: dict) -> int:
             row["actor"] = identity.get("actor") or who
             if identity.get("endpoint"):
                 row["endpoint"] = identity["endpoint"]
-            # Same rule as the append: restoring `reviewer` on retry-only rows
-            # here would silently undo rollback-safety at the compaction trigger.
-            if outcome in _DELIVERY_OUTCOMES:
+            # Same rule as the append, plus legacy: a row predating the outcome
+            # field IS a delivery, so compacting it must not drop `reviewer`.
+            if outcome is None or outcome in _DELIVERY_OUTCOMES:
                 row["reviewer"] = identity.get("reviewer") or who
             rows.append(json.dumps(row))
     tmp = led.with_suffix(led.suffix + ".compact")
