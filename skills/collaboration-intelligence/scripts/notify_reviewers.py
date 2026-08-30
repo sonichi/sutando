@@ -219,6 +219,19 @@ def command_for(target: dict, message: str) -> "list[str]":
 
 _PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
 
+
+def _canon_repo(r):
+    """GitHub owner/name is case-insensitive, so the park must be too: a
+    re-cased URL is the SAME pull request, not a second one to ask about."""
+    return r.lower() if isinstance(r, str) else r
+
+
+def _refs(message: str) -> set:
+    """Case-canonical (repo, pr) refs. One reader so a writer and a checker
+    cannot disagree about which PR a URL names."""
+    return {(_canon_repo(m.group(1)), int(m.group(2)))
+            for m in _PR_URL.finditer(message or "")}
+
 def ledger_path() -> Path:
     # Overridable so a test can exercise the real reserve/settle path against a
     # scratch file. Two cases sharing one ledger park each other.
@@ -281,7 +294,8 @@ def _row(d) -> "tuple | None":
     actor = d.get("actor")
     if actor is not None and not (isinstance(actor, str) and actor):
         return None                     # PRESENT but wrong: not an absent actor
-    who = actor or d.get("reviewer")
+    # The endpoint is durable identity; a roster alias is a renameable spelling.
+    who = d.get("endpoint") or actor or d.get("reviewer")
     outcome, ts = d.get("outcome"), d.get("ts")
     if not isinstance(repo, (str, type(None))) or not isinstance(who, str) or not who:
         return None
@@ -302,7 +316,7 @@ def _row(d) -> "tuple | None":
     if outcome is not None and (not isinstance(outcome, str)
                                 or outcome not in _KNOWN_OUTCOMES):
         return None                     # type first: a list is unhashable
-    return repo, str(pr), who, outcome, ts or ""
+    return _canon_repo(repo), str(pr), who, outcome, ts or ""
 
 
 def _streams(led: Path) -> dict:
@@ -473,7 +487,7 @@ def _first_ask(led: Path, canonical=None) -> dict:
 
 
 def unknown_parked(message: str, reviewer: str, actor: str = None,
-                   canonical=None) -> bool:
+                   canonical=None, endpoint: str = None) -> bool:
     """True when this ACTOR's latest row for this PR is unsafe to repeat.
 
     Keyed by canonical actor, not roster spelling: two aliases of one person are
@@ -483,7 +497,7 @@ def unknown_parked(message: str, reviewer: str, actor: str = None,
     verdict is the LAST row per (repo, pr, actor), never any matching row.
     """
     who = actor or reviewer
-    refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
+    refs = _refs(message)
     led = ledger_path()
     if not refs or not led.exists():
         return False
@@ -497,11 +511,13 @@ def unknown_parked(message: str, reviewer: str, actor: str = None,
         return True
     canon = canonical or (lambda w: w)
     for (repo, num, row_who), (outcome, _ts) in latest.items():
-        # A row under any spelling of this actor counts; legacy rows carry only
-        # `reviewer`, so accept the raw name too.
-        if canon(row_who) != canon(who) and row_who not in (who, reviewer):
-            continue
-        if any(repo in (r, None) and num == str(n) for r, n in refs):
+        # Endpoint first — it names the recipient under any spelling; the name
+        # comparison stays for legacy rows carrying only `reviewer`.
+        if not (endpoint and row_who == endpoint):
+            if canon(row_who) != canon(who) and row_who not in (who, reviewer):
+                continue
+        if any(_canon_repo(repo) in (r, None) and num == str(n)
+               for r, n in refs):
             if outcome in _UNSAFE_OUTCOMES:
                 return True
     return False
@@ -540,7 +556,7 @@ def _ledger_lock(led: Path):
 
 
 def claim_park(message: str, reviewer: str, actor: str = None,
-               canonical=None) -> "int | None":
+               canonical=None, endpoint: str = None) -> "int | None":
     """Atomically claim the park, or None if someone else already holds it.
 
     Check-then-append is not a claim: two callers both read "not parked", both
@@ -553,23 +569,28 @@ def claim_park(message: str, reviewer: str, actor: str = None,
     if not led.exists():
         os.close(os.open(led, os.O_CREAT | os.O_WRONLY, _LEDGER_MODE))
     with _ledger_lock(led):
-        if unknown_parked(message, reviewer, who, canonical=canonical):
+        if unknown_parked(message, reviewer, who, canonical=canonical,
+                          endpoint=endpoint):
             return None
-        return record_asks(message, reviewer, outcome="pending", actor=who)
+        return record_asks(message, reviewer, outcome="pending", actor=who,
+                           endpoint=endpoint)
 
 
 def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
-                actor: str = None, detail: str = None) -> int:
+                actor: str = None, detail: str = None,
+                endpoint: str = None) -> int:
     """Locked public writer. Every append serialises against the compactor."""
     if not _PR_URL.search(message or ""):
         return 0        # nothing to write, so no path to resolve and no lock
     led = ledger_path()
     with _ledger_lock(led):
-        return _append(led, message, reviewer, outcome, actor, detail)
+        return _append(led, message, reviewer, outcome, actor, detail,
+                       endpoint)
 
 
 def _append(p: Path, message: str, reviewer: str, outcome: str,
-            actor: str = None, detail: str = None) -> int:
+            actor: str = None, detail: str = None,
+            endpoint: str = None) -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED.
@@ -577,7 +598,7 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
     `outcome="unknown"` records a send that MAY have landed. It must be written:
     the receipt is RetrySafety.UNSAFE, so an unrecorded unknown invites the
     repeat that duplicates the ping."""
-    refs = {(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}
+    refs = _refs(message)
     if not refs:
         return 0
     if not isinstance(outcome, str) or outcome not in _KNOWN_OUTCOMES:
@@ -593,6 +614,8 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
                "ts": ts, "channel": "room", "outcome": outcome}
         if actor:
             row["actor"] = actor
+        if endpoint:
+            row["endpoint"] = endpoint
         if detail:
             row["detail"] = detail
         # The COMPLETE row, through the reader's own validator: appending one
@@ -816,7 +839,8 @@ def main() -> int:
             # cannot cover a crash, or a write failure, between the two.
             try:
                 reserved = claim_park(a.message, t["name"], who,
-                                      canonical=lambda w: actors.get(w, w))
+                                      canonical=lambda w: actors.get(w, w),
+                                      endpoint=t.get("stand"))
             except OSError as e:
                 reserved = 0
                 print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "

@@ -94,6 +94,39 @@ class OneClaimWins(unittest.TestCase):
         self.assertTrue(first)
         self.assertIsNone(second)
 
+    def test_a_recased_pr_url_is_the_same_pull_request(self):
+        # GitHub owner/name is case-insensitive, so a re-cased URL named the
+        # same PR while the park treated it as a second one.
+        nr = _load()
+        up = MSG.replace("sonichi/sutando", "Sonichi/Sutando")
+        self.assertNotEqual(up, MSG, "fixture did not actually re-case the URL")
+        self.assertTrue(nr.claim_park(MSG, "k", "k"))
+        nr.record_asks(MSG, "k", outcome="unknown", actor="k")
+        self.assertIsNone(nr.claim_park(up, "k", "k"),
+                          "a re-cased URL bypassed the park")
+
+    def test_removing_an_alias_does_not_release_the_endpoints_park(self):
+        # The roster spelling is mutable and the endpoint is not; keying on the
+        # spelling let a renamed alias re-ask the same recipient.
+        nr = _load()
+        ep = "@stand:ag2.space"
+        self.assertTrue(nr.claim_park(MSG, "k", "alpha", endpoint=ep))
+        nr.record_asks(MSG, "k", outcome="unknown", actor="alpha", endpoint=ep)
+        self.assertIsNone(nr.claim_park(MSG, "k", "beta", endpoint=ep),
+                          "an alias rename bypassed the park")
+
+    def test_the_negative_control_a_different_endpoint_still_gets_asked(self):
+        # Without this, keying on the endpoint could park EVERYONE and every
+        # case above would still pass while suppressing legitimate asks.
+        nr = _load()
+        self.assertTrue(nr.claim_park(MSG, "k", "alpha",
+                                      endpoint="@a:ag2.space"))
+        nr.record_asks(MSG, "k", outcome="unknown", actor="alpha",
+                       endpoint="@a:ag2.space")
+        self.assertTrue(nr.claim_park(MSG, "k", "beta",
+                                      endpoint="@b:ag2.space"),
+                        "a different recipient was wrongly parked")
+
     def test_the_negative_control_a_released_claim_is_reclaimable(self):
         # Without this, a claim that refused EVERYTHING would pass every case
         # above while suppressing legitimate retries.
