@@ -79,17 +79,30 @@ _own_bridge_verdict() {
 # evict_own_bridge <channel> <repo> [instance-var] [instance-value]
 # With an instance discriminator, a candidate is killed only when its own value of
 # <instance-var> equals <instance-value>; indeterminate identity never kills.
+# _own_bridge_candidates <channel>: echoes candidate pids; returns pgrep's rc.
+# Candidates: any process whose command line ends with `src/<channel>-bridge.py`
+# (matches both relative and absolute launches). rc 1 = clean no-match; any
+# other nonzero rc = discovery FAILED, and callers must propagate it — an
+# unreadable process table printed as emptiness reads as "already evicted".
+_own_bridge_candidates() {
+  pgrep -f "src/$1-bridge\.py\$" 2>/dev/null
+}
+
 evict_own_bridge() {
   channel="$1"; repo="$2"; inst_var="${3:-}"; inst_val="${4:-}"
-  # Candidates: any process whose command line ends with `src/<channel>-bridge.py`
-  # (matches both relative and absolute launches).
-  for pid in $(pgrep -f "src/$channel-bridge\.py\$" 2>/dev/null); do
+  candidates="$(_own_bridge_candidates "$channel")" && _disc_rc=0 || _disc_rc=$?
+  if [ "$_disc_rc" -gt 1 ]; then
+    echo "evict_own_bridge: candidate discovery FAILED (pgrep rc=$_disc_rc); no eviction attempted" >&2
+    return "$_disc_rc"
+  fi
+  for pid in $candidates; do
     [ "$pid" = "$$" ] && continue
     case "$(_own_bridge_verdict "$pid" "$channel" "$repo" "$inst_var" "$inst_val")" in
       OWN) kill "$pid" 2>/dev/null || true ;;
       INDETERMINATE) echo "evict_own_bridge: skip pid $pid (identity indeterminate; never killing)" >&2 ;;
     esac
   done
+  return 0
 }
 
 # list_own_bridge <channel> <repo> [instance-var] [instance-value]
@@ -98,13 +111,19 @@ evict_own_bridge() {
 # classify (callers must fail closed on those). Foreign pids print nothing.
 list_own_bridge() {
   channel="$1"; repo="$2"; inst_var="${3:-}"; inst_val="${4:-}"
-  for pid in $(pgrep -f "src/$channel-bridge\.py\$" 2>/dev/null); do
+  candidates="$(_own_bridge_candidates "$channel")" && _disc_rc=0 || _disc_rc=$?
+  if [ "$_disc_rc" -gt 1 ]; then
+    echo "list_own_bridge: candidate discovery FAILED (pgrep rc=$_disc_rc)" >&2
+    return "$_disc_rc"
+  fi
+  for pid in $candidates; do
     [ "$pid" = "$$" ] && continue
     case "$(_own_bridge_verdict "$pid" "$channel" "$repo" "$inst_var" "$inst_val")" in
       OWN) echo "OWN $pid" ;;
       INDETERMINATE) echo "INDETERMINATE $pid" ;;
     esac
   done
+  return 0
 }
 
 # Run directly when invoked as a script (tests / health-check), not when sourced.

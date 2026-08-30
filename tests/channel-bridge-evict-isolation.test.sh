@@ -168,6 +168,38 @@ assert_dead  "spaced-path checkout's bridge was evicted" "$PID_S"
 assert_alive "other checkout SURVIVED the spaced-path eviction" "$PID_SB"
 kill "$PID_SB" 2>/dev/null || true
 
+# --- hard candidate-discovery failure (#3553 round 5) ------------------------
+# A pgrep rc >1 is an UNREADABLE process table, not emptiness. Both REAL entry
+# points must exit nonzero and take no side effects — rc 0 + '' here is what let
+# health-check report "evicted + confirmed exited" over a live stale bridge.
+BADPG="$TMP/badpgrep"; mkdir -p "$BADPG"
+printf '#!/bin/sh\nexit 3\n' > "$BADPG/pgrep"; chmod +x "$BADPG/pgrep"
+( cd "$A" && exec "$PY" src/slack-bridge.py ) & PID_H=$!
+sleep 0.6
+assert_alive "hard-rc: own bridge started" "$PID_H"
+LIST_HARD_OUT="$(PATH="$BADPG:$PATH" bash "$HELPER" --list slack "$A")"; LIST_HARD_RC=$?
+if [ "$LIST_HARD_RC" -gt 1 ] && [ -z "$LIST_HARD_OUT" ]; then
+  echo "  ok   --list: pgrep rc=3 propagates (rc=$LIST_HARD_RC), no clean-empty lie"
+else
+  echo "  FAIL --list swallowed a hard discovery failure: rc=$LIST_HARD_RC out='$LIST_HARD_OUT'"; FAILED=1
+fi
+EV_HARD_OUT="$(PATH="$BADPG:$PATH" bash "$HELPER" slack "$A" 2>/dev/null)"; EV_HARD_RC=$?
+if [ "$EV_HARD_RC" -gt 1 ]; then
+  echo "  ok   evict: pgrep rc=3 propagates (rc=$EV_HARD_RC)"
+else
+  echo "  FAIL evict swallowed a hard discovery failure: rc=$EV_HARD_RC out='$EV_HARD_OUT'"; FAILED=1
+fi
+sleep 0.3
+assert_alive "hard-rc: bridge UNTOUCHED by the failed discovery (side-effect-free)" "$PID_H"
+# rc 1 (clean no-match) stays a clean empty success — the legitimate case.
+NOMATCH_OUT="$(bash "$HELPER" --list nosuchchannel "$A")"; NOMATCH_RC=$?
+if [ "$NOMATCH_RC" -eq 0 ] && [ -z "$NOMATCH_OUT" ]; then
+  echo "  ok   --list: rc 1 no-match is still a clean empty success"
+else
+  echo "  FAIL no-match case broke: rc=$NOMATCH_RC out='$NOMATCH_OUT'"; FAILED=1
+fi
+kill "$PID_H" 2>/dev/null || true
+
 echo
 if [ "$FAILED" -eq 0 ]; then echo "PASS — channel-bridge evict isolation"; exit 0; fi
 echo "FAIL — channel-bridge evict isolation"; exit 1
