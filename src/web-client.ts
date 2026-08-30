@@ -963,7 +963,8 @@ window.addEventListener('DOMContentLoaded', () => {
 // processing. On visibility change (tab returns to foreground), reconnect
 // the EventSource so ⌃V/⌃M hotkeys work immediately after tab wake-up.
 let _sseSource = null;
-function initRemoteToggle() {
+function initRemoteToggle(force = false) {
+  if (_sseSource && !force) return;
   if (_sseSource) { try { _sseSource.close(); } catch {} }
   _sseSource = new EventSource('/sse');
   _sseSource.addEventListener('toggle-voice', () => toggle());
@@ -1003,11 +1004,14 @@ function initRemoteToggle() {
   _sseSource.addEventListener('tool-cue', function(e) {
     try { playToolCue(String(e.data || '').trim()); } catch {}
   });
-  _sseSource.onerror = () => setTimeout(() => initRemoteToggle(), 5000);
+  // EventSource reconnects automatically after a transient stream failure.
+  // Closing and replacing it here turns that normal retry into an incomplete
+  // chunked response and can create overlapping reconnect timers.
+  _sseSource.onerror = () => {};
 }
 initRemoteToggle();
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') initRemoteToggle();
+  if (document.visibilityState === 'visible') initRemoteToggle(true);
 });
 
 // ─── State ────────────────────────────────────────────────
@@ -1081,6 +1085,7 @@ function setBottomPanelCollapsed(collapsed) {
   button.setAttribute('aria-expanded', String(!collapsed));
   button.textContent = collapsed ? 'Show transcript' : 'Hide transcript';
   try { localStorage.setItem(PERSIST_KEY_BOTTOM_PANEL, collapsed ? '1' : '0'); } catch {}
+  if (!collapsed) requestAnimationFrame(() => scrollTranscript(true));
 }
 function toggleBottomPanel() {
   const panel = $('bottom-panel');
@@ -1492,6 +1497,30 @@ function updateTask(taskId, status, text, result) {
 const expandedTasks = window.expandedTasks = loadPersistedExpanded();
 const userExpanded = window.userExpanded = new Set(); // user-initiated expands — never auto-collapse these
 let userCollapsed = false; // user manually collapsed — suppress auto-expand
+let lastTaskRenderSignature = null;
+let lastDynamicTaskRenderSignature = null;
+function taskRenderSignature() {
+  const tasks = Object.keys(taskMap).sort().map(id => {
+    const task = taskMap[id] || {};
+    const time = task.time instanceof Date ? task.time.getTime() : task.time;
+    return [id, task.status, task.text, time, task.result, task.source,
+      task.workstream_id, task.workstream_name, expandedTasks.has(id)];
+  });
+  return JSON.stringify([
+    showDone,
+    Array.from(collapsedTaskWorkstreams).sort(),
+    Object.keys(taskWorkstreamNames).sort().map(id => [id, taskWorkstreamNames[id]]),
+    tasks,
+  ]);
+}
+function refreshTaskTimes(root) {
+  const scope = root || document;
+  scope.querySelectorAll('.task-item[data-taskid]').forEach(item => {
+    const time = item.querySelector('.task-time');
+    const task = taskMap[item.dataset.taskid];
+    if (time && task) time.textContent = formatTaskAge(task.time);
+  });
+}
 // Listen for external collapse/expand commands (from inline tools via AppleScript).
 // Action is 'collapse' / 'expand' for all-tasks, or 'collapse:N' / 'expand:N' (1-based) for one.
 new MutationObserver(() => {
@@ -1693,6 +1722,12 @@ function renderTaskWorkstreamGroups(display, renderEntry) {
 
 function renderTasks() {
   const container = $('tasks');
+  const signature = taskRenderSignature();
+  if (signature === lastTaskRenderSignature) {
+    refreshTaskTimes(container);
+    return;
+  }
+  lastTaskRenderSignature = signature;
   const entries = Object.entries(taskMap).filter(function(entry) {
     return isOwnerVisibleTask(entry[0], entry[1]);
   });
@@ -3252,6 +3287,7 @@ window._drTaskCount = 0;
 window._drTabsRendered = false;
 
 function switchDRTab(tab) {
+  if (window._drActiveTab !== tab) lastDynamicTaskRenderSignature = null;
   window._drActiveTab = tab;
   window._drLocalContent = true; // prevent poll from clearing content
   updateTabHighlights();
@@ -3330,6 +3366,12 @@ function renderTabContent() {
     // template (summarizeTaskText / userExpanded / hover / 18px). Previous
     // inline-styled path was dead-code that bypassed all CSS work — see
     // Maddy's 2026-04-19 16:07 ET root-cause writeup.
+    var signature = taskRenderSignature();
+    if (signature === lastDynamicTaskRenderSignature) {
+      refreshTaskTimes(container);
+      return;
+    }
+    lastDynamicTaskRenderSignature = signature;
     var entries = Object.entries(taskMap);
     if (entries.length === 0) {
       container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No recent tasks</div>';

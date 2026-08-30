@@ -15,6 +15,17 @@ def test_task_time_uses_one_normalized_formatter():
     assert "Math.round((Date.now() - t.time) / 1000)" not in SOURCE
 
 
+def test_task_rendering_is_change_driven():
+    assert "function taskRenderSignature()" in SOURCE
+    assert "if (signature === lastTaskRenderSignature)" in SOURCE
+    assert "if (signature === lastDynamicTaskRenderSignature)" in SOURCE
+    assert "refreshTaskTimes(container);" in SOURCE
+
+
+def test_opening_transcript_scrolls_to_latest_message():
+    assert "if (!collapsed) requestAnimationFrame(() => scrollTranscript(true));" in SOURCE
+
+
 if __name__ == "__main__":
     test_task_time_uses_one_normalized_formatter()
     print("web-client task-time tests passed")
