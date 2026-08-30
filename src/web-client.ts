@@ -689,7 +689,7 @@ const HTML = /* html */ `<!DOCTYPE html>
 <div class="header">
   <div class="avatar-wrap s-idle" id="avatar-wrap">
     <canvas id="speak-canvas" width="60" height="60"></canvas>
-    <img class="avatar" id="stand-avatar" src="http://localhost:7844/avatar">
+    <img class="avatar" id="stand-avatar">
     <div id="avatar-svg-wrap">
       <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -760,9 +760,11 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
     if(t) t.textContent=s.nameOrigin.split(' — ')[1]||s.nameOrigin;
   }
   if(s.avatarGenerated){
-    document.getElementById('stand-avatar').style.display='block';
+    var headerAvatar=document.getElementById('stand-avatar');
+    headerAvatar.src='http://localhost:7844/avatar';
+    headerAvatar.style.display='block';
     var ha=document.getElementById('hero-avatar');
-    if(ha){ha.style.display='block';ha.style.opacity='0';}
+    if(ha){ha.src='http://localhost:7844/avatar';ha.style.display='block';ha.style.opacity='0';}
   } else {
     // No custom avatar — show the inline-SVG default in both places.
     // PR #443 shipped the SVG assets in docs/avatar-default.html; this
@@ -788,7 +790,7 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 </script>
 
 <div class="hero s-idle" id="hero">
-  <img class="avatar-hero" id="hero-avatar" src="http://localhost:7844/avatar">
+  <img class="avatar-hero" id="hero-avatar">
   <div class="hero-svg-wrap" id="hero-svg-wrap">
     <svg class="avatar-svg-default" viewBox="-50 -50 100 100" xmlns="http://www.w3.org/2000/svg">
       <!-- Hero reuses header's #visorSweep gradient (single definition). -->
@@ -1421,7 +1423,7 @@ function rememberTaskWorkstreams(workstreams) {
 function taskTimeFromRow(row, existing) {
   if (row.time instanceof Date && !Number.isNaN(row.time.getTime())) return row.time;
   if (typeof row.time === 'number') {
-    const date = new Date(row.time * 1000);
+    const date = new Date(row.time < 1e12 ? row.time * 1000 : row.time);
     if (!Number.isNaN(date.getTime())) return date;
   } else if (row.time) {
     const date = new Date(row.time);
@@ -1432,6 +1434,18 @@ function taskTimeFromRow(row, existing) {
     if (!Number.isNaN(date.getTime())) return date;
   }
   return new Date();
+}
+
+function formatTaskAge(time) {
+  const timestamp = time instanceof Date ? time.getTime() : new Date(time).getTime();
+  if (!Number.isFinite(timestamp)) return 'now';
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (ageSeconds < 60) return ageSeconds + 's ago';
+  const ageMinutes = Math.floor(ageSeconds / 60);
+  if (ageMinutes < 60) return ageMinutes + 'm ago';
+  const ageHours = Math.floor(ageMinutes / 60);
+  if (ageHours < 24) return ageHours + 'h ago';
+  return Math.floor(ageHours / 24) + 'd ago';
 }
 
 function mergeTaskRow(existing, row) {
@@ -1634,7 +1648,10 @@ function groupedTaskDisplay(entries, limit) {
     byWorkstream.get(workstreamId).entries.push(entry);
   });
 
-  const groups = Array.from(byWorkstream.values());
+  const groups = Array.from(byWorkstream.values()).sort(function(a, b) {
+    const byName = a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+    return byName || a.id.localeCompare(b.id);
+  });
   return {
     grouped: hasInferredWorkstream,
     groups,
@@ -1711,8 +1728,7 @@ function renderTasks() {
   const display = groupedTaskDisplay(visible, 30);
   container.innerHTML = renderTaskWorkstreamGroups(display, ([id, t], i) => {
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
-    const ago = Math.round((Date.now() - t.time) / 1000);
-    const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
+    const timeStr = formatTaskAge(t.time);
     // Show the result if it exists, regardless of status. The agent's task
     // bookkeeping sometimes leaves tasks in 'working' even after the result
     // file is written — gating render on status === 'done' meant those
@@ -3322,8 +3338,7 @@ function renderTabContent() {
       var icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
       container.innerHTML = renderTaskWorkstreamGroups(display, function(entry, i) {
         var id = entry[0], t = entry[1];
-        var ago = Math.round((Date.now() - t.time) / 1000);
-        var timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
+        var timeStr = formatTaskAge(t.time);
         // Render results whenever they exist — agent's task bookkeeping
         // sometimes leaves tasks in 'working' state even after the result
         // file is written. Same fix as the main renderTasks path above.
