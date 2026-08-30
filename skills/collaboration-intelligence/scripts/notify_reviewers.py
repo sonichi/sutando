@@ -77,6 +77,19 @@ def durable_endpoint(entry: dict) -> "str | None":
     return None
 
 
+def stated_reason(entry: dict) -> str:
+    """The roster's own words for why an entry refuses, if it gave any.
+
+    A blank `stand` can be missing data OR a deliberate DO-NOT-ROUTE. Only the
+    entry knows which, and a refusal that omits it invites the repair that
+    overrides it (#3468)."""
+    for key in ("refusal_basis", "note"):
+        v = entry.get(key)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())
+    return ""
+
+
 def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     """(targets, refusal_rc): one bad entry must never starve the rest of the
     batch — resolvable reviewers are still notified, the worst refusal code
@@ -109,12 +122,20 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
                 detail = ("carries no addressable route at all (a human handle "
                           "alone triggers no Stand)")
             print(f"UNUSABLE entry '{name}': {detail}", file=sys.stderr)
+            # From main: the roster's own words, so the obvious repair
+            # (populate the fields) cannot silently override a refusal.
+            why = stated_reason(entry)
+            if why:
+                print(f"  roster says: {why}", file=sys.stderr)
             worst = max(worst, 3)
             continue
         if entry.get("allowlisted") is False:
+            # From main: state the FLAG, never a cause — nothing sets
+            # allowlisted=False after a bounce, so a history claim is a guess.
             who = stand or dm_id
-            print(f"OFF-ALLOWLIST '{name}': {who} bounced a mention before —"
-                  " route through the owner instead of re-sending",
+            print(f"OFF-ALLOWLIST '{name}': {who} is not allowlisted for mentions"
+                  + (f" — {stated_reason(entry)}" if stated_reason(entry) else "")
+                  + " — route through the owner instead of re-sending",
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
