@@ -459,6 +459,18 @@ def case_g_unknown_supervision_fails_closed() -> list[str]:
     if oku or "UNKNOWN" not in howu:
         fails.append(f"g) unparseable job dump must be UNKNOWN: ok={oku} how={howu!r}")
     fails += no_side_effects(hostu, "g/unparseable-dump")
+    # An empty arguments block, or an interpreter flag before the script,
+    # leaves the EXECUTED position undeterminable -> UNKNOWN.
+    for label6, dump in (
+        ("empty-args", "\targuments = {\n\t}\n"),
+        ("interp-flag", "\targuments = {\n\t\t/bin/bash\n\t\t-x\n\t\t/repo-b/x.sh\n\t}\n"),
+        ("interp-only", "\targuments = {\n\t\t/bin/bash\n\t}\n"),
+    ):
+        hostn = Host(job_stdout=f"gui/501/x = {{\n\tstate = running\n{dump}}}\n")
+        okn, hown = with_host(hostn, lambda: hc._restart_bridge("slack-bridge", stale=True))
+        if okn or "UNKNOWN" not in hown:
+            fails.append(f"g) {label6}: undeterminable executed position must be UNKNOWN: ok={okn} how={hown!r}")
+        fails += no_side_effects(hostn, f"g/{label6}")
     # An UNTERMINATED arguments block proves nothing either.
     hostt = Host(job_stdout="\targuments = {\n\t\t/bin/bash\n")
     okt, howt = with_host(hostt, lambda: hc._restart_bridge("slack-bridge", stale=True))
@@ -516,9 +528,8 @@ def case_h_foreign_supervisor_fails_closed() -> list[str]:
     if host5.of("kickstart"):
         fails.append(f"h) kickstarted on an incidental-field match: {host5.of('kickstart')}")
     fails += no_side_effects(host5, "h/incidental-field")
-    # kewei r6 control: the EXECUTED wrapper is foreign; our exact wrapper +
-    # channel appear only as LATER arguments — data, not the program. Must be
-    # FOREIGN with zero side effects (at f8012a40 this kickstarted the job).
+    # kewei r6 control: the EXECUTED wrapper is foreign; ours appears only as
+    # a LATER argument (data, not the program) — FOREIGN, zero side effects.
     later_arg_dump = ("gui/501/com.sutando.x = {\n"
                       "\tstate = running\n"
                       "\targuments = {\n"
