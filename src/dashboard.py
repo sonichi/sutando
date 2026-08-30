@@ -890,13 +890,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
 
-    # No wildcard CORS. The dashboard UI is same-origin (served from this same
-    # loopback origin), so it needs no Access-Control-Allow-Origin. Sending
-    # `*` on every response — while advertising POST/DELETE — let a cross-origin
-    # browser tab mutate loopback schedules in browsers without Private Network
-    # Access enforcement (CR #2164, qingyun-wu). Omitting the header makes the
-    # browser block any cross-origin read or state-changing request; same-origin
-    # calls are unaffected.
+    # The local development UI may be served from port 8080 while this API stays
+    # on port 7844. Allow only those read-only UI origins; never advertise
+    # wildcard access or POST/DELETE methods for loopback state.
     def do_OPTIONS(self):  # pragma: no cover — HTTP preflight; no cross-origin grant
         # Same-origin requests never preflight; answer without granting cross-
         # origin access (no Access-Control-Allow-Origin → browser denies).
