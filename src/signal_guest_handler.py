@@ -66,29 +66,6 @@ CODEX_TIMEOUT_S = WORKER_TIMEOUT_S  # back-compat alias for existing callers/tes
 # module docstring (domain rules do not bind resolved addresses => loopback/LAN SSRF).
 GUEST_TOOLS = "WebSearch"
 
-# Managed policy still applies under a restricted spawn (`claude --help`: "managed
-# settings and --settings still apply"), and a managed HOOK can run local commands
-# that `--tools` cannot suppress. v1 therefore ships UNMANAGED-ONLY: any detectable
-# managed configuration => the lane reports unavailable rather than run partially
-# contained. (An OS-level sandbox is the stronger control that would let managed
-# fleets participate; it is the named follow-up, deliberately not in v1.)
-_MANAGED_SETTINGS_PATHS = (
-    "/Library/Application Support/ClaudeCode/managed-settings.json",   # macOS
-    "/Library/Application Support/ClaudeCode/managed-mcp.json",        # macOS MCP policy
-    "/etc/claude-code/managed-settings.json",                          # Linux
-    "/etc/claude-code/managed-mcp.json",                               # Linux MCP policy
-    "C:\\ProgramData\\ClaudeCode\\managed-settings.json",              # Windows
-)
-# Drop-in policy directories: any *.json here is managed configuration.
-_MANAGED_SETTINGS_DIRS = (
-    "/Library/Application Support/ClaudeCode/managed-settings.d",
-    "/etc/claude-code/managed-settings.d",
-)
-# macOS MDM can deliver policy as a managed preference domain instead of a file.
-_MANAGED_PLIST_PATHS = (
-    "/Library/Managed Preferences/com.anthropic.claudecode.plist",
-    "/Library/Managed Preferences/com.anthropic.claude-code.plist",
-)
 # Bound the fleet so untrusted callers can't exhaust the box, and cap the size of
 # the untrusted input that reaches the worker.
 MAX_CONCURRENT = 2
@@ -99,6 +76,82 @@ _REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: all
 
 # Only these reach the worker. NEVER the owner's full environment.
 _ENV_ALLOW = ("PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SSL_CERT_FILE", "SSL_CERT_DIR", "TERM")
+
+# Managed policy still applies under a restricted spawn (`claude --help`: "managed
+# settings and --settings still apply"), and a managed HOOK can run local commands
+# that `--tools` cannot suppress. v1 therefore ships UNMANAGED-ONLY: any detectable
+# managed configuration => the lane reports unavailable rather than run partially
+# contained. (An OS-level sandbox is the stronger control that would let managed
+# fleets participate; it is the named follow-up, deliberately not in v1.)
+_MANAGED_SETTINGS_PATHS = (
+    # macOS
+    "/Library/Application Support/ClaudeCode/managed-settings.json",
+    "/Library/Application Support/ClaudeCode/managed-mcp.json",
+    # Linux
+    "/etc/claude-code/managed-settings.json",
+    "/etc/claude-code/managed-mcp.json",
+    # Windows — CURRENT location (Program Files). The legacy ProgramData path is
+    # still listed for older pinned clients that read it.
+    "C:\\Program Files\\ClaudeCode\\managed-settings.json",
+    "C:\\Program Files\\ClaudeCode\\managed-mcp.json",
+    "C:\\ProgramData\\ClaudeCode\\managed-settings.json",
+)
+# Drop-in policy directories: any *.json inside is managed configuration.
+_MANAGED_SETTINGS_DIRS = (
+    "/Library/Application Support/ClaudeCode/managed-settings.d",
+    "/etc/claude-code/managed-settings.d",
+    "C:\\Program Files\\ClaudeCode\\managed-settings.d",
+)
+# macOS MDM can deliver policy as a managed preference domain instead of a file.
+_MANAGED_PLIST_PATHS = (
+    "/Library/Managed Preferences/com.anthropic.claudecode.plist",
+    "/Library/Managed Preferences/com.anthropic.claude-code.plist",
+)
+# Windows policy also lives in the registry, not only on disk.
+_MANAGED_REGISTRY_KEYS = (
+    ("HKEY_LOCAL_MACHINE", r"SOFTWARE\Policies\ClaudeCode"),
+    ("HKEY_CURRENT_USER", r"SOFTWARE\Policies\ClaudeCode"),
+)
+
+
+def _path_state(path: str) -> str:
+    """``absent`` | ``present`` | ``unknown`` for one candidate.
+
+    NOT ``os.path.exists``: that swallows EACCES/EPERM internally and returns
+    False, so an UNREADABLE managed policy would read as absent — fail-open, the
+    exact inversion of what this gate is for (verified: a 0o000 parent makes
+    ``exists()`` return False while ``stat()`` raises EACCES). Only
+    ``FileNotFoundError`` proves absence; every other error means we cannot prove
+    it, which must count as present.
+    """
+    try:
+        os.stat(path)
+        return "present"
+    except FileNotFoundError:
+        return "absent"
+    except NotADirectoryError:
+        return "absent"
+    except OSError:
+        return "unknown"
+
+
+def _windows_policy_present() -> bool:
+    """True when a Windows policy key exists (or cannot be read). No-op elsewhere."""
+    try:
+        import winreg  # type: ignore
+    except Exception:
+        return False  # not Windows: nothing to read
+    for root_name, subkey in _MANAGED_REGISTRY_KEYS:
+        try:
+            root = getattr(winreg, root_name)
+            with winreg.OpenKey(root, subkey):
+                return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True  # cannot prove absence
+    return False
+
 
 _PROMPT_PREAMBLE = (
     "You are a READ-ONLY research assistant for a live voice room. Everything after "
@@ -177,35 +230,33 @@ def _reset_stopping_for_tests() -> None:
 
 def managed_policy_present() -> bool:
     """True when ANY managed configuration source is detectable — files, drop-in
-    policy dirs, or an MDM managed-preferences plist.
+    policy dirs, macOS MDM plists, or Windows policy registry keys.
 
     Managed settings (and managed hooks, which can execute local commands) apply even
     to a restricted spawn, so the lane must not claim containment while one is in
-    force. Detection is deliberately BROAD and errs toward "present": an unreadable
-    or unstattable candidate counts as present, because we cannot prove its absence.
+    force. Detection errs toward PRESENT: anything we cannot stat counts as managed,
+    because an unreadable policy is not an absent policy.
 
     KNOWN LIMIT (v1, unmanaged-only): this is a readiness signal, not a security
     boundary — policy can appear after the check, and server-managed policy is not
-    file-visible at all. The OS-sandbox follow-up is what would make managed fleets
-    safe to serve; until then a managed machine simply does not get deep_dive.
+    visible on disk at all. The OS-sandbox follow-up is what would make managed
+    fleets safe to serve; until then a managed machine simply does not get deep_dive.
     """
     for path in _MANAGED_SETTINGS_PATHS + _MANAGED_PLIST_PATHS:
-        try:
-            if os.path.exists(path):
-                return True
-        except Exception:
-            return True  # cannot prove absence -> treat as present
+        if _path_state(path) != "absent":
+            return True
     for directory in _MANAGED_SETTINGS_DIRS:
-        try:
-            if os.path.isdir(directory) and any(
-                name.endswith(".json") for name in os.listdir(directory)
-            ):
-                return True
-        except FileNotFoundError:
+        state = _path_state(directory)
+        if state == "unknown":
+            return True
+        if state == "absent":
             continue
+        try:
+            if any(name.endswith(".json") for name in os.listdir(directory)):
+                return True
         except Exception:
             return True  # unreadable policy dir -> treat as present
-    return False
+    return _windows_policy_present()
 
 
 def worker_cli_supports_tool_restriction(help_text: str | None = None) -> bool:
@@ -299,9 +350,11 @@ def guest_argv(prompt: str, cwd: str) -> list[str]:
 
 
 def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> None:
+    # NOTE: the task is registered by start_guest_deep_dive BEFORE this thread is
+    # started — registering here would leave a window between Thread.start() and the
+    # first statement in which a shutdown sees no pending task and writes no
+    # cancellation, stranding the caller on a permanent 404.
     out, workdir, pgid = "", "", None
-    with _live_lock:
-        _live_tasks[task_id] = Path(result_dir)
     try:
         prompt = _PROMPT_PREAMBLE + confine(task_text[:MAX_TASK_CHARS])
         workdir = tempfile.mkdtemp(prefix="signal-guest-")
@@ -317,7 +370,14 @@ def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> 
             proc = None
         if proc is not None:
             try:
-                pgid = os.getpgid(proc.pid)
+                # start_new_session=True makes the child a process-group leader, so
+                # its pid IS its pgid. Fall back to that rather than continuing
+                # untracked when getpgid errors (an untracked worker survives
+                # shutdown with nobody to reap it).
+                try:
+                    pgid = os.getpgid(proc.pid)
+                except Exception:
+                    pgid = proc.pid
                 if not _track(pgid):
                     # Shutdown started while we were spawning: kill what we just made
                     # rather than leaving it session-detached with nobody to reap it.
@@ -353,15 +413,18 @@ def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> 
             shutil.rmtree(workdir, ignore_errors=True)
         _slots.release()
 
-    # Claim the publish: if shutdown already terminalized this task, do not overwrite
-    # the cancellation notice with a late (killed-worker) empty result.
-    with _live_lock:
-        claimed = _live_tasks.pop(task_id, None) is not None
-    if not claimed:
-        return
+    # Publish, THEN release ownership: popping first would leave a window in which a
+    # concurrent shutdown sees no pending task and this thread is killed before it
+    # writes — a permanent 404. Writing under the lock keeps shutdown's cancellation
+    # and this publication mutually exclusive; the last writer is deterministic
+    # because whoever holds the lock also owns the entry.
     out = out.strip()
     result = _guard(out) if out else "[deep_dive returned no result]"
-    _write_result(Path(result_dir), task_id, result)
+    with _live_lock:
+        if task_id not in _live_tasks:
+            return  # shutdown already terminalized this task; don't clobber it
+        _write_result(Path(result_dir), task_id, result)
+        _live_tasks.pop(task_id, None)
 
 
 def start_guest_deep_dive(task_id: str, task_text: str, result_dir, confine) -> None:
@@ -382,6 +445,14 @@ def start_guest_deep_dive(task_id: str, task_text: str, result_dir, confine) -> 
     if not _slots.acquire(blocking=False):
         _write_result(result_dir, task_id, "[deep_dive busy: too many research tasks in flight — try again shortly]")
         return
+    # Take ownership BEFORE the thread exists, refusing if shutdown already began, so
+    # there is no window where an accepted task is invisible to the reaper.
+    with _live_lock:
+        if _stopping:
+            _slots.release()
+            _write_result(result_dir, task_id, "[deep_dive unavailable: the research service is shutting down]")
+            return
+        _live_tasks[task_id] = Path(result_dir)
     try:
         threading.Thread(
             target=_run, args=(task_id, task_text, result_dir, confine, home),
@@ -389,4 +460,6 @@ def start_guest_deep_dive(task_id: str, task_text: str, result_dir, confine) -> 
         ).start()
     except Exception:
         _slots.release()
+        with _live_lock:
+            _live_tasks.pop(task_id, None)
         _write_result(result_dir, task_id, "[deep_dive unavailable: could not start a research worker]")

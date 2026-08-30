@@ -1297,7 +1297,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/guest-task":
             if not self.check_auth():
                 return
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
             # Cap BEFORE reading into memory (same guard as the owner lane): an
             # untrusted caller must not be able to exhaust memory via Content-Length.
             if length < 0 or length > 65536:

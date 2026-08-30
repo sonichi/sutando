@@ -137,27 +137,67 @@ with tempfile.TemporaryDirectory() as td:
 
 print("== B: managed policy is detected broadly and fails closed ==")
 import tempfile as _tf
-_real_exists = os.path.exists
-for label, hit in (("managed-settings.json", "/Library/Application Support/ClaudeCode/managed-settings.json"),
-                   ("managed-mcp.json", "/etc/claude-code/managed-mcp.json"),
-                   ("MDM plist", "/Library/Managed Preferences/com.anthropic.claudecode.plist")):
-    os.path.exists = lambda p, _h=hit: True if p == _h else _real_exists(p)
+_real_stat, _real_listdir = os.stat, os.listdir
+
+
+def _stat_hit(hit):
+    """os.stat that reports exactly `hit` as existing, everything else absent."""
+    def fake(path, *a, **k):
+        if str(path) == hit:
+            return _real_stat(__file__)  # any real stat result stands in
+        raise FileNotFoundError(path)
+    return fake
+
+
+for label, hit in (
+    ("macOS managed-settings.json", "/Library/Application Support/ClaudeCode/managed-settings.json"),
+    ("managed-mcp.json", "/etc/claude-code/managed-mcp.json"),
+    ("MDM plist", "/Library/Managed Preferences/com.anthropic.claudecode.plist"),
+    ("Windows Program Files policy", "C:\\Program Files\\ClaudeCode\\managed-settings.json"),
+):
+    os.stat = _stat_hit(hit)
     try:
         ck(H.managed_policy_present() is True, f"detects {label}")
     finally:
-        os.path.exists = _real_exists
-_real_isdir, _real_listdir = os.path.isdir, os.listdir
-os.path.isdir = lambda p: p.endswith("managed-settings.d") or _real_isdir(p)
-os.listdir = lambda p: ["policy.json"] if p.endswith("managed-settings.d") else _real_listdir(p)
+        os.stat = _real_stat
+
+# A drop-in policy directory with any *.json in it.
+_dir = "/etc/claude-code/managed-settings.d"
+os.stat = _stat_hit(_dir)
+os.listdir = lambda p: ["policy.json"] if str(p) == _dir else _real_listdir(p)
 try:
     ck(H.managed_policy_present() is True, "detects a drop-in managed-settings.d/*.json")
 finally:
-    os.path.isdir, os.listdir = _real_isdir, _real_listdir
-os.path.exists = lambda p: (_ for _ in ()).throw(OSError("EPERM"))
+    os.stat, os.listdir = _real_stat, _real_listdir
+
+# THE FAIL-OPEN CASE the previous implementation got wrong: os.path.exists() swallows
+# EACCES and returns False, so an UNREADABLE managed policy read as absent. Only
+# FileNotFoundError may mean absent; every other OSError must count as present.
+def _stat_denied(path, *a, **k):
+    raise PermissionError(13, "Permission denied", str(path))
+
+
+os.stat = _stat_denied
 try:
-    ck(H.managed_policy_present() is True, "an unstattable candidate counts as present (cannot prove absence)")
+    ck(H.managed_policy_present() is True,
+       "an UNREADABLE policy path counts as present (os.path.exists would have said absent)")
 finally:
-    os.path.exists = _real_exists
+    os.stat = _real_stat
+
+# And the real filesystem behavior that motivated it, exercised end to end.
+with _tf.TemporaryDirectory() as _td:
+    locked = Path(_td) / "locked"
+    locked.mkdir()
+    (locked / "managed-settings.json").write_text("{}")
+    os.chmod(locked, 0o000)
+    try:
+        target = str(locked / "managed-settings.json")
+        ck(os.path.exists(target) is False,
+           "baseline: os.path.exists() reports an unreadable policy as ABSENT (why it was unsafe)")
+        ck(H._path_state(target) == "unknown",
+           "_path_state() reports it as unknown -> treated as present (fail-closed)")
+    finally:
+        os.chmod(locked, 0o700)
 
 print("== P1: shutdown terminalizes accepted work, and a late result cannot clobber it ==")
 with _tf.TemporaryDirectory() as td:

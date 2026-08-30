@@ -143,6 +143,12 @@ def _replace_if_changed(path: Path, want: str) -> None:
         _write_private(path, want)
         return
     if not stat.S_ISREG(st.st_mode):
+        # Symlinks and other non-regular entries are removed and replaced. A
+        # DIRECTORY at a profile file path is not something we silently rewrite
+        # (unlink cannot remove it and os.replace onto it fails): treat it as a
+        # corrupt profile and fail closed, so readiness reports rather than pretends.
+        if stat.S_ISDIR(st.st_mode):
+            raise IsADirectoryError(f"profile path is a directory: {path}")
         try:
             path.unlink()
         except Exception:
@@ -200,7 +206,15 @@ def ensure_guest_profile(workspace: Path | str | None = None) -> tuple[bool, str
             # belt-and-braces so nothing in the guest root itself adds surface.
             _replace_if_changed(home / "settings.json", "{}\n")
             if creds is not None:
-                want = creds.read_text()
+                try:
+                    want = creds.read_text()
+                except Exception:
+                    # Stattable but unreadable: we cannot refresh the guest copy, so
+                    # the stale one must not survive (it would outlive a credential we
+                    # can no longer verify).
+                    if not _purge_credentials(home):
+                        return False, "guest_profile_purge_failed"
+                    return False, "worker_unauthenticated"
                 _replace_if_changed(home / _CREDENTIALS_NAME, want)
             else:
                 # Keyring store: no copy to make, and any stale copy must go. A copy
@@ -214,9 +228,12 @@ def ensure_guest_profile(workspace: Path | str | None = None) -> tuple[bool, str
 
 
 def _purge_credentials(home: Path) -> bool:
-    """Delete a copied guest credential (negative sync). Returns True when the file is
-    gone afterwards — a credential we cannot remove must fail readiness, not pass
-    silently."""
+    """Delete a copied guest credential (negative sync). Returns True only when the
+    file is provably gone — a credential we cannot remove must fail readiness.
+
+    Verification uses ``lstat`` rather than ``Path.exists()``: exists() swallows
+    permission errors and would report "gone" for a file we merely cannot stat.
+    """
     target = home / _CREDENTIALS_NAME
     try:
         target.unlink()
@@ -224,7 +241,13 @@ def _purge_credentials(home: Path) -> bool:
     except FileNotFoundError:
         return True
     except Exception:
-        return not target.exists()
+        try:
+            target.lstat()
+            return False  # still there
+        except FileNotFoundError:
+            return True   # provably gone
+        except OSError:
+            return False  # cannot prove absence -> fail closed
 
 
 def invalidate_readiness_cache() -> None:
@@ -242,7 +265,8 @@ def guest_profile_ready(workspace: Path | str | None = None, *, now: float | Non
     negative ones for only ``_NEG_CACHE_TTL_S``, so a login is reflected promptly.
     """
     stamp = time.monotonic() if now is None else now
-    key = str(guest_home(workspace))
+    # Resolve so symlink/relative aliases of the same profile share one entry.
+    key = str(guest_home(workspace).resolve(strict=False))
     with _cache_lock:
         cached = _cache.get(key)
         if cached is not None:
