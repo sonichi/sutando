@@ -633,6 +633,184 @@ with _tf.TemporaryDirectory() as _td:
     os.environ.pop("CLAUDE_CONFIG_DIR", None)
     os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
 
+print("== fault injection: the last error paths ==")
+import sys as _sys
+
+
+class _FakeWinreg:
+    """Stands in for the winreg module so the Windows policy probe is exercised."""
+    HKEY_LOCAL_MACHINE = "HKLM"
+    HKEY_CURRENT_USER = "HKCU"
+
+    def __init__(self, behavior):
+        self._behavior = behavior
+
+    def OpenKey(self, root, subkey):  # noqa: N802 - mirrors the stdlib name
+        return self._behavior(root, subkey)
+
+
+class _Ctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_saved_winreg = _sys.modules.get("winreg")
+try:
+    # An existing policy key -> present.
+    _sys.modules["winreg"] = _FakeWinreg(lambda r, k: _Ctx())
+    ck(H._windows_policy_present() is True, "an existing Windows policy key -> present")
+
+    # Every key absent -> not policy.
+    def _missing(r, k):
+        raise FileNotFoundError(k)
+
+    _sys.modules["winreg"] = _FakeWinreg(_missing)
+    ck(H._windows_policy_present() is False, "all policy keys absent -> not managed")
+
+    # A key we cannot read -> present (cannot prove absence).
+    def _denied(r, k):
+        raise OSError("access denied")
+
+    _sys.modules["winreg"] = _FakeWinreg(_denied)
+    ck(H._windows_policy_present() is True, "an unreadable policy key -> present (fail-closed)")
+finally:
+    if _saved_winreg is None:
+        _sys.modules.pop("winreg", None)
+    else:
+        _sys.modules["winreg"] = _saved_winreg
+
+# managed_policy_present short-circuits on the FIRST present source.
+_real_ps = H._path_state
+H._path_state = lambda p: "present"
+try:
+    ck(H.managed_policy_present() is True, "the first present source short-circuits detection")
+finally:
+    H._path_state = _real_ps
+
+print("== spawn: pgid lookup failure and the publish/claim race ==")
+with _tf.TemporaryDirectory() as _td:
+    rd = Path(_td)
+
+    class _P2:
+        returncode = 0
+
+        def __init__(self):
+            self.pid = os.getpid()
+
+        def communicate(self, timeout=None):
+            return "answer", ""
+
+        def kill(self):
+            pass
+
+    _rp, _rg = H.subprocess.Popen, H._guard
+    _rgetpgid, _rkillpg = os.getpgid, os.killpg
+    H.subprocess.Popen = lambda *a, **k: _P2()
+    H._guard = lambda b: b
+    os.killpg = lambda *a, **k: None
+    # getpgid raises -> the code must fall back to proc.pid rather than run untracked.
+    os.getpgid = lambda pid: (_ for _ in ()).throw(OSError("no pgid"))
+    try:
+        H._reset_stopping_for_tests()
+        with H._live_lock:
+            H._live_tasks["signal-guest-nopgid"] = rd
+        H._slots.acquire()
+        H._run("signal-guest-nopgid", "q", rd, lambda t: t, str(rd))
+        ck((rd / "signal-guest-nopgid.txt").exists(),
+           "a worker whose pgid cannot be read still publishes (pid fallback, never untracked)")
+    finally:
+        os.getpgid, os.killpg = _rgetpgid, _rkillpg
+        H.subprocess.Popen, H._guard = _rp, _rg
+
+    # Publish when shutdown already claimed the task: the cancellation must stand.
+    H._reset_stopping_for_tests()
+    (rd / "signal-guest-claimed.txt").write_text("[deep_dive cancelled: shutdown won]")
+    _rp2 = H.subprocess.Popen
+    H.subprocess.Popen = lambda *a, **k: _P2()
+    try:
+        H._slots.acquire()
+        # NOT registered in _live_tasks -> the publish path must bail out.
+        H._run("signal-guest-claimed", "q", rd, lambda t: t, str(rd))
+        ck((rd / "signal-guest-claimed.txt").read_text().startswith("[deep_dive cancelled"),
+           "a late publish never clobbers a shutdown cancellation")
+    finally:
+        H.subprocess.Popen = _rp2
+
+print("== profile: write failures and unremovable credentials ==")
+with _tf.TemporaryDirectory() as _td:
+    owner = Path(_td) / "owner"
+    (owner / ".claude").mkdir(parents=True)
+    (owner / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "a"}}))
+    os.environ["CLAUDE_CONFIG_DIR"] = str(owner / ".claude")
+    gh = Path(_td) / "home"
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(gh)
+
+    # _write_private cleans up its temp file and re-raises when the write fails.
+    _real_replace = os.replace
+    os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        P.invalidate_readiness_cache()
+        ok, reason = P.ensure_guest_profile()
+        ck(ok is False and reason == "guest_profile_missing",
+           "a failed profile write reports guest_profile_missing (never a half-written profile)")
+        leftovers = [f for f in gh.glob(".*.tmp-*")] if gh.exists() else []
+        ck(leftovers == [], "the temp file is cleaned up on a failed write")
+    finally:
+        os.replace = _real_replace
+
+    # A credential that cannot be unlinked AND still stats -> purge fails, readiness fails.
+    P.invalidate_readiness_cache()
+    P.ensure_guest_profile()
+    ck((gh / ".credentials.json").exists() or True, "profile provisioned for the purge test")
+    _real_unlink = Path.unlink
+
+    def _no_unlink(self, *a, **k):
+        raise PermissionError("cannot remove")
+
+    Path.unlink = _no_unlink
+    try:
+        (gh / ".credentials.json").write_text("stale")
+        ck(P._purge_credentials(gh) is False,
+           "a credential that cannot be removed fails the purge (never reported gone)")
+    finally:
+        Path.unlink = _real_unlink
+
+    # _read_owner_account: an unreadable (but present) .claude.json -> None.
+    _real_read_text = Path.read_text
+
+    def _boom_read(self, *a, **k):
+        if self.name == ".claude.json":
+            raise PermissionError("denied")
+        return _real_read_text(self, *a, **k)
+
+    Path.read_text = _boom_read
+    try:
+        P.invalidate_readiness_cache()
+        ok, reason = P.ensure_guest_profile()
+        ck(ok is False and reason in ("worker_unauthenticated", "guest_profile_purge_failed"),
+           f"an unreadable .claude.json is not ready ({reason})")
+    finally:
+        Path.read_text = _real_read_text
+
+    # _owner_credentials_path: a stat error on the credential -> treated as absent.
+    _real_is_symlink = Path.is_symlink
+
+    def _boom_symlink(self):
+        raise OSError("stat failed")
+
+    Path.is_symlink = _boom_symlink
+    try:
+        ck(P._owner_credentials_path() is None,
+           "an unstattable owner credential is treated as absent (no copy attempted)")
+    finally:
+        Path.is_symlink = _real_is_symlink
+
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + "; ".join(FAILS))
