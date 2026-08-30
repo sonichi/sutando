@@ -1644,6 +1644,30 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
              if "claims" in u or "seeded_by" in u], [],
             "a seed whose slot reads again was carried anyway")
 
+    def test_a_blank_slot_is_erased_like_a_null_one(self):
+        # Reachable only from a hand-edited roster: our writer emits None, never
+        # "". Found by air (agent of qingyun) as an untested third of the rule.
+        triage = {"people": {"alice": {"bots": [BOT]}}}
+        rc1, d1 = self._pass({"alice": {"github": "alice",
+                                        ri.HUMAN_FIELD: BOT}}, triage)
+        self.assertEqual(rc1, 5)
+        d1["alice"][ri.HUMAN_FIELD] = "   "
+        rc2, d2 = self._pass(d1, triage)
+        self.assertEqual(rc2, 5, "a blank slot dropped the seed that refused it")
+        self._assert_refused(d2, "pass 2 (blank slot)")
+
+    def test_an_absent_slot_is_erased_like_a_null_one(self):
+        # The live one: with absent read as "not erased", deleting the key by
+        # hand republishes the referent pass 1 refused — the original defect.
+        triage = {"people": {"alice": {"bots": [BOT]}}}
+        rc1, d1 = self._pass({"alice": {"github": "alice",
+                                        ri.HUMAN_FIELD: BOT}}, triage)
+        self.assertEqual(rc1, 5)
+        d1["alice"].pop(ri.HUMAN_FIELD, None)
+        rc2, d2 = self._pass(d1, triage)
+        self.assertEqual(rc2, 5, "an absent slot republished a refused referent")
+        self._assert_refused(d2, "pass 2 (absent slot)")
+
     def test_CONTROL_a_non_writer_owned_seed_was_never_affected(self):
         # States a referent but is not a slot we rewrite, so it survived on its
         # own — which is what isolates the failure to the rewritten slots.
