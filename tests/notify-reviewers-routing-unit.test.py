@@ -1169,6 +1169,36 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
     def _stale(self):
         return nr._stale_repeat_ask(self.MSG, self.TARGETS, self.ROSTER)[0]
 
+    def _endpoint_rows(self, *pairs):
+        """Rows as the CURRENT writer records them: keyed by durable endpoint."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ep = nr.durable_endpoint(self.ROSTER["k"])
+        self.led.write_text("".join(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": "k", "actor": "k",
+            "endpoint": ep, "channel": "room", "outcome": o,
+            "ts": (now - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }) + "\n" for o, m in pairs))
+
+    def test_an_endpoint_keyed_ask_still_counts_as_asked(self):
+        # Endpoint-keyed rows made the subset test compare endpoints against
+        # actor names, so a recorded ask was invisible and the guard failed open.
+        self._endpoint_rows(("confirmed", 31))
+        self.assertTrue(self._stale(),
+                        "an endpoint-keyed ask read as never-asked")
+
+    def test_an_endpoint_keyed_ask_is_not_offered_as_a_widen_target(self):
+        # The verdict and the suggestion must share one id axis; otherwise the
+        # message says everyone was asked AND names one of them as unasked.
+        self._endpoint_rows(("confirmed", 31))
+        _, why = nr._stale_repeat_ask(self.MSG, self.TARGETS, self.ROSTER)
+        self.assertNotIn("Not yet asked: k", why,
+                         f"already-asked target offered as a widen target: {why}")
+
+    def test_the_control_a_name_keyed_ask_is_unchanged(self):
+        # Legacy rows carry no endpoint; the fix must not need one to work.
+        self._rows(("confirmed", 31))
+        self.assertTrue(self._stale(), "a legacy name-keyed ask stopped counting")
+
     def test_a_later_failed_attempt_does_not_erase_an_ask_that_landed(self):
         self._rows(("confirmed", 90), ("pending", 5), ("failed", 5))
         self.assertTrue(self._stale(), "re-pinging someone asked 90 minutes ago")

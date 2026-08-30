@@ -63,6 +63,20 @@ def load_roster() -> dict:
     return data
 
 
+def durable_endpoint(entry: dict) -> "str | None":
+    """The transport's immutable recipient id, or None if the entry has no
+    route. One owner: a second copy drifts from the one the park writes."""
+    if not isinstance(entry, dict):
+        return None
+    stand, room = entry.get("stand"), entry.get("room")
+    dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
+    if stand and room:
+        return stand
+    if dm_id and entry.get("home_channel"):
+        return f"discord:{dm_id}"
+    return None
+
+
 def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     """(targets, refusal_rc): one bad entry must never starve the rest of the
     batch — resolvable reviewers are still notified, the worst refusal code
@@ -104,9 +118,7 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
-        # The transport's immutable recipient id. A Discord target has no
-        # Stand mxid, so keying the park on `stand` left that route unkeyed.
-        endpoint = stand if transport == "matrix" else f"discord:{dm_id}"
+        endpoint = durable_endpoint(entry)
         out.append({"name": name, "transport": transport, "stand": stand,
                     "room": room, "discord_id": dm_id, "channel": channel,
                     "endpoint": endpoint, "human": entry.get("human")})
@@ -716,12 +728,26 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
             per_actor[who] = ts
     if not prior:
         return False, ""
-    names = {actor_of.get(x["name"], x["name"]) for x in targets}
-    if not names or not names.issubset(prior):
-        return False, ""            # at least one NEW name -> this IS widening
+    # Every spelling a target may be recorded under: rows are endpoint-keyed
+    # now and name-keyed before that, and one axis alone fails open.
+    def _ids(t):
+        # From the ROSTER too: a caller may pass a bare {"name": ...} target,
+        # and deriving from the dict alone left those on the name axis only.
+        got = {actor_of.get(t["name"], t["name"]), t["name"], t.get("endpoint"),
+               durable_endpoint((roster or {}).get(t["name"]))}
+        return {i for i in got if i}
 
-    # NEWEST among the targets: someone else's older ask says nothing here.
-    ours = [per_actor[n] for n in names if per_actor.get(n)]
+    tids = [_ids(x) for x in targets]
+    if not tids or not all(s & prior for s in tids):
+        return False, ""            # at least one NEW target -> this IS widening
+
+    # Per target its EARLIEST ask, then the NEWEST across targets: someone
+    # else's older ask says nothing here.
+    ours = []
+    for s in tids:
+        got = [per_actor[i] for i in s if per_actor.get(i)]
+        if got:
+            ours.append(min(got))
     earliest = max(ours) if ours else None
     if earliest is None:
         return False, ""
@@ -739,9 +765,12 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         if not isinstance(v, dict) or k.startswith("_"):
             continue
         actor = actor_of.get(k, k)
+        # Same id axis as `prior`: an endpoint-keyed row must not make an
+        # already-asked person read as unasked.
+        ids = {actor, k, durable_endpoint(v)}
         # keweichen is deliberately never offered as a widen target; the
         # exclusion is pinned by test_keweichen_is_never_offered_as_the_widen_target.
-        if actor in prior or k == "keweichen":
+        if (ids & prior) or k == "keweichen":
             seen_actors.add(actor)
             continue
         if actor in seen_actors:
