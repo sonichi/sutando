@@ -67,11 +67,27 @@ CODEX_TIMEOUT_S = WORKER_TIMEOUT_S  # back-compat alias for existing callers/tes
 GUEST_TOOLS = "WebSearch"
 
 # Managed policy still applies under a restricted spawn (`claude --help`: "managed
-# settings and --settings still apply"), and a managed HOOK can run local commands.
-# Presence => the lane reports unavailable rather than run partially contained.
+# settings and --settings still apply"), and a managed HOOK can run local commands
+# that `--tools` cannot suppress. v1 therefore ships UNMANAGED-ONLY: any detectable
+# managed configuration => the lane reports unavailable rather than run partially
+# contained. (An OS-level sandbox is the stronger control that would let managed
+# fleets participate; it is the named follow-up, deliberately not in v1.)
 _MANAGED_SETTINGS_PATHS = (
-    "/Library/Application Support/ClaudeCode/managed-settings.json",  # macOS
+    "/Library/Application Support/ClaudeCode/managed-settings.json",   # macOS
+    "/Library/Application Support/ClaudeCode/managed-mcp.json",        # macOS MCP policy
     "/etc/claude-code/managed-settings.json",                          # Linux
+    "/etc/claude-code/managed-mcp.json",                               # Linux MCP policy
+    "C:\\ProgramData\\ClaudeCode\\managed-settings.json",              # Windows
+)
+# Drop-in policy directories: any *.json here is managed configuration.
+_MANAGED_SETTINGS_DIRS = (
+    "/Library/Application Support/ClaudeCode/managed-settings.d",
+    "/etc/claude-code/managed-settings.d",
+)
+# macOS MDM can deliver policy as a managed preference domain instead of a file.
+_MANAGED_PLIST_PATHS = (
+    "/Library/Managed Preferences/com.anthropic.claudecode.plist",
+    "/Library/Managed Preferences/com.anthropic.claude-code.plist",
 )
 # Bound the fleet so untrusted callers can't exhaust the box, and cap the size of
 # the untrusted input that reaches the worker.
@@ -101,12 +117,25 @@ _slots = threading.BoundedSemaphore(MAX_CONCURRENT)
 # runs in its own group; without this, replacing agent-api would leave workers running
 # with no thread enforcing the timeout, and repeated replacements could stack them).
 _live_pgids: set[int] = set()
+# task_id -> result_dir for work accepted but not yet published, so a shutdown can
+# write a terminal payload instead of leaving /result/<id> a permanent 404 (the
+# contract promises an accepted task always becomes terminal in normal operation).
+_live_tasks: dict[str, Path] = {}
 _live_lock = threading.Lock()
+# Set once shutdown begins. A worker that finishes spawning after this must kill
+# itself immediately instead of registering into a set nobody will drain again —
+# workers own their own session, so an unreaped one outlives this process.
+_stopping = False
 
 
-def _track(pgid: int) -> None:
+def _track(pgid: int) -> bool:
+    """Register a live worker group. Returns False when shutdown has already begun,
+    in which case the caller must terminate the worker it just spawned."""
     with _live_lock:
+        if _stopping:
+            return False
         _live_pgids.add(pgid)
+        return True
 
 
 def _untrack(pgid: int) -> None:
@@ -115,25 +144,68 @@ def _untrack(pgid: int) -> None:
 
 
 def reap_guest_workers() -> int:
-    """Terminate every tracked worker process group. Called from the SIGTERM handler
-    of this service so a supervised replacement of the gateway does not orphan
-    workers. Returns how many groups were signalled (diagnostics/tests)."""
+    """Terminate every tracked worker group, latch the stopping state (so an in-flight
+    spawn cannot register behind us), and TERMINALIZE every accepted-but-unpublished
+    task. Called from this service's SIGTERM handler: a supervised gateway replacement
+    must neither orphan workers nor leave a caller polling a 404 forever."""
+    global _stopping
     with _live_lock:
+        _stopping = True
         pgids = list(_live_pgids)
         _live_pgids.clear()
+        pending = list(_live_tasks.items())
+        _live_tasks.clear()
     for pgid in pgids:
         try:
             os.killpg(pgid, signal.SIGKILL)
         except Exception:
             pass
+    for task_id, result_dir in pending:
+        _write_result(
+            Path(result_dir), task_id,
+            "[deep_dive cancelled: the research service restarted before this finished]",
+        )
     return len(pgids)
 
 
+def _reset_stopping_for_tests() -> None:
+    """Test-only: clear the latch so a suite can exercise reaping repeatedly."""
+    global _stopping
+    with _live_lock:
+        _stopping = False
+
+
 def managed_policy_present() -> bool:
-    """True when a managed-settings file exists. Managed settings (and managed hooks,
-    which can execute local commands) apply even to a restricted spawn, so the lane
-    must NOT claim containment while one is in force."""
-    return any(os.path.exists(p) for p in _MANAGED_SETTINGS_PATHS)
+    """True when ANY managed configuration source is detectable — files, drop-in
+    policy dirs, or an MDM managed-preferences plist.
+
+    Managed settings (and managed hooks, which can execute local commands) apply even
+    to a restricted spawn, so the lane must not claim containment while one is in
+    force. Detection is deliberately BROAD and errs toward "present": an unreadable
+    or unstattable candidate counts as present, because we cannot prove its absence.
+
+    KNOWN LIMIT (v1, unmanaged-only): this is a readiness signal, not a security
+    boundary — policy can appear after the check, and server-managed policy is not
+    file-visible at all. The OS-sandbox follow-up is what would make managed fleets
+    safe to serve; until then a managed machine simply does not get deep_dive.
+    """
+    for path in _MANAGED_SETTINGS_PATHS + _MANAGED_PLIST_PATHS:
+        try:
+            if os.path.exists(path):
+                return True
+        except Exception:
+            return True  # cannot prove absence -> treat as present
+    for directory in _MANAGED_SETTINGS_DIRS:
+        try:
+            if os.path.isdir(directory) and any(
+                name.endswith(".json") for name in os.listdir(directory)
+            ):
+                return True
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return True  # unreadable policy dir -> treat as present
+    return False
 
 
 def worker_cli_supports_tool_restriction(help_text: str | None = None) -> bool:
@@ -228,6 +300,8 @@ def guest_argv(prompt: str, cwd: str) -> list[str]:
 
 def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> None:
     out, workdir, pgid = "", "", None
+    with _live_lock:
+        _live_tasks[task_id] = Path(result_dir)
     try:
         prompt = _PROMPT_PREAMBLE + confine(task_text[:MAX_TASK_CHARS])
         workdir = tempfile.mkdtemp(prefix="signal-guest-")
@@ -244,7 +318,17 @@ def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> 
         if proc is not None:
             try:
                 pgid = os.getpgid(proc.pid)
-                _track(pgid)
+                if not _track(pgid):
+                    # Shutdown started while we were spawning: kill what we just made
+                    # rather than leaving it session-detached with nobody to reap it.
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                    pgid = None
+                    raise RuntimeError("shutting down")
+            except RuntimeError:
+                raise
             except Exception:
                 pgid = None
             try:
@@ -269,6 +353,12 @@ def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> 
             shutil.rmtree(workdir, ignore_errors=True)
         _slots.release()
 
+    # Claim the publish: if shutdown already terminalized this task, do not overwrite
+    # the cancellation notice with a late (killed-worker) empty result.
+    with _live_lock:
+        claimed = _live_tasks.pop(task_id, None) is not None
+    if not claimed:
+        return
     out = out.strip()
     result = _guard(out) if out else "[deep_dive returned no result]"
     _write_result(Path(result_dir), task_id, result)

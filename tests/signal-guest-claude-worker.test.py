@@ -135,6 +135,91 @@ with tempfile.TemporaryDirectory() as td:
     ck(body.startswith("[deep_dive "), f"unavailable writes a canonical failure payload: {body[:60]!r}")
     ck("worker_missing" in body, "the payload names the machine-readable reason")
 
+print("== B: managed policy is detected broadly and fails closed ==")
+import tempfile as _tf
+_real_exists = os.path.exists
+for label, hit in (("managed-settings.json", "/Library/Application Support/ClaudeCode/managed-settings.json"),
+                   ("managed-mcp.json", "/etc/claude-code/managed-mcp.json"),
+                   ("MDM plist", "/Library/Managed Preferences/com.anthropic.claudecode.plist")):
+    os.path.exists = lambda p, _h=hit: True if p == _h else _real_exists(p)
+    try:
+        ck(H.managed_policy_present() is True, f"detects {label}")
+    finally:
+        os.path.exists = _real_exists
+_real_isdir, _real_listdir = os.path.isdir, os.listdir
+os.path.isdir = lambda p: p.endswith("managed-settings.d") or _real_isdir(p)
+os.listdir = lambda p: ["policy.json"] if p.endswith("managed-settings.d") else _real_listdir(p)
+try:
+    ck(H.managed_policy_present() is True, "detects a drop-in managed-settings.d/*.json")
+finally:
+    os.path.isdir, os.listdir = _real_isdir, _real_listdir
+os.path.exists = lambda p: (_ for _ in ()).throw(OSError("EPERM"))
+try:
+    ck(H.managed_policy_present() is True, "an unstattable candidate counts as present (cannot prove absence)")
+finally:
+    os.path.exists = _real_exists
+
+print("== P1: shutdown terminalizes accepted work, and a late result cannot clobber it ==")
+with _tf.TemporaryDirectory() as td:
+    rd = Path(td)
+    H._reset_stopping_for_tests()
+    with H._live_lock:
+        H._live_tasks["signal-guest-inflight"] = rd
+    H.reap_guest_workers()
+    body = (rd / "signal-guest-inflight.txt").read_text()
+    ck(body.startswith("[deep_dive cancelled"),
+       f"in-flight task terminalized on shutdown (no permanent 404): {body[:40]!r}")
+    # A late publish for the same id must NOT overwrite the cancellation notice.
+    with H._live_lock:
+        already_claimed = H._live_tasks.pop("signal-guest-inflight", None) is None
+    ck(already_claimed, "shutdown claimed the task, so a late worker publish is dropped")
+
+print("== P1: the stopping latch closes the spawn->track race ==")
+H._reset_stopping_for_tests()
+ck(H._track(4242) is True, "tracking works before shutdown")
+H._untrack(4242)
+H.reap_guest_workers()  # latches _stopping
+ck(H._track(4243) is False, "a worker spawned during shutdown is refused registration")
+H._reset_stopping_for_tests()
+
+print("== P1: profile hardening (symlink refusal, mode repair, purge failure) ==")
+with _tf.TemporaryDirectory() as td:
+    owner = Path(td) / "owner"
+    (owner / ".claude").mkdir(parents=True)
+    (owner / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "a"}}))
+    (owner / ".claude" / ".credentials.json").write_text('{"t":1}')
+    os.environ["CLAUDE_CONFIG_DIR"] = str(owner / ".claude")
+
+    # a symlinked guest home must be refused, never written through
+    linked = Path(td) / "linked-home"
+    target = Path(td) / "elsewhere"
+    target.mkdir()
+    linked.symlink_to(target)
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(linked)
+    P.invalidate_readiness_cache()
+    ready, reason = P.ensure_guest_profile()
+    ck(ready is False and reason == "guest_profile_missing",
+       "a symlinked guest home is refused (no credential write through a planted link)")
+
+    # mode repair even when content is unchanged
+    real = Path(td) / "real-home"
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(real)
+    P.invalidate_readiness_cache()
+    P.ensure_guest_profile()
+    creds = real / ".credentials.json"
+    os.chmod(creds, 0o644)
+    P.invalidate_readiness_cache()
+    P.ensure_guest_profile()
+    ck((creds.stat().st_mode & 0o777) == 0o600,
+       "a content-identical credential left world-readable is repaired to 0600")
+
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
+
+print("== P1: negative readiness is not cached for the positive TTL ==")
+ck(P._NEG_CACHE_TTL_S < P._CACHE_TTL_S,
+   "an unavailable verdict expires fast so a fresh login is seen promptly")
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + "; ".join(FAILS))

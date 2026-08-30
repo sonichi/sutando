@@ -1290,6 +1290,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
+        # /guest-task — the Signal Room lane. The tier is a property of the ROUTE, not
+        # of a caller-supplied field: everything arriving here is untrusted room
+        # content and is stamped guest server-side, so a body can never elect its own
+        # privilege. (The old body discriminator on /task is rejected outright below.)
+        if path == "/guest-task":
+            if not self.check_auth():
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            # Cap BEFORE reading into memory (same guard as the owner lane): an
+            # untrusted caller must not be able to exhaust memory via Content-Length.
+            if length < 0 or length > 65536:
+                self.send_json(413, {"error": "task request too large"})
+                return
+            try:
+                data = json.loads(self.rfile.read(length).decode() or "{}")
+            except Exception:
+                self.send_json(400, {"error": "invalid JSON"})
+                return
+            task = data.get("task", "")
+            if not isinstance(task, str) or not task.strip():
+                self.send_json(400, {"error": "task is required"})
+                return
+            # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
+            # results into the owner's voice session, so a guest result must not match.
+            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
+            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (guest, sandboxed)",
+            })
+            return
+
         if path != "/task":
             self.send_json(404, {"error": "not found"})
             return
@@ -1340,19 +1374,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "task is required"})
             return
 
-        # guest = untrusted content, so it must never reach the owner core: sandboxed
-        # read-only worker, secret-scanned, never TASK_DIR. See signal_guest_handler.
-        if data.get("access_tier") == "guest":
-            # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
-            # results into the owner's voice session, so a guest result must not match.
-            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
-            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
-            self.send_json(200, {
-                "ok": True,
-                "task_id": task_id,
-                "result_url": f"/result/{task_id}",
-                "message": "Task accepted (guest, sandboxed)",
-            })
+        # Privilege is NEVER selected by the request body. /task is the owner lane; a
+        # body that tries to name its own tier is refused rather than silently stamped
+        # owner (the old discriminator: unknown/misspelled/absent values used to fall
+        # through to owner authority). Untrusted callers use /guest-task, whose route
+        # stamps guest server-side.
+        if "access_tier" in data:
+            if data.get("access_tier") == "guest":
+                self.send_json(400, {
+                    "error": "guest tasks must be submitted to /guest-task",
+                    "hint": "POST /guest-task {task}",
+                })
+            else:
+                self.send_json(400, {"error": "access_tier is not accepted on /task"})
             return
 
         callback_url = data.get("callback_url", "")
