@@ -375,6 +375,11 @@ def _mineable_now(value) -> bool:
     return True
 
 
+#: The backticked path inside a generated basis reason ("cited in `a.b`").
+#: Reasons are produced by this module, so both sides share one spelling.
+_CITED_PATH = re.compile(r"`([A-Za-z0-9_.]+)`")
+
+
 def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
              owner_id: str):
     """-> (human_id|None, stand_id|None, other_stands[], unresolved[], basis{},
@@ -511,12 +516,16 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     if human_id:
         basis[ri.HUMAN_FIELD] = humans[0][1]
 
-    # The schema NAMES primacy — `stand_discord_id` is the primary agent and
-    # `other_stand_discord_ids` the secondaries. Member order is not evidence.
-    _primary = set(_snowflakes(json.dumps(entry.get(ri.STAND_FIELD) or "")))
-    _secondary = set(_snowflakes(json.dumps(entry.get(ri.OTHER_STANDS_FIELD) or "")))
-    stands.sort(key=lambda it: 0 if it[0] in _primary
-                else 2 if it[0] in _secondary else 1)
+    # The schema NAMES primacy, and the RANKING must read the same evidence the
+    # collector did: scanning the raw slot text let a note's snowflake rank it.
+    def _rank(item):
+        roots = {p.split(".")[0] for r in (item[1] or [])
+                 for p in _CITED_PATH.findall(str(r))}
+        if ri.STAND_FIELD in roots:
+            return 0
+        return 2 if ri.OTHER_STANDS_FIELD in roots else 1
+
+    stands.sort(key=_rank)
 
     stand_id, others = None, []
     if stands:

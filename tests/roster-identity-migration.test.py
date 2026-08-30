@@ -1367,6 +1367,24 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(len(got), ri.SHAPE_MAX,
                          f"diagnostics should fill the bound, got {len(got)}")
 
+    def test_metadata_cannot_choose_the_primary_stand(self):
+        # Ranking scanned the raw slot text, so a snowflake inside a NON-identity
+        # note promoted the secondary while the collector correctly ignored it.
+        import collections
+        other = "1529720369668292629"
+        def entry(note):
+            e = collections.OrderedDict()
+            e[ri.OTHER_STANDS_FIELD] = [{"id": other}]   # secondary seen FIRST
+            e[ri.STAND_FIELD] = {"id": BOT, "note": note}
+            return e
+        for note in ("plain", "room %s" % other):
+            rc, err, rec = self._cli(entry(note))
+            self.assertEqual(rec.get(ri.STAND_FIELD), BOT,
+                             f"note {note!r} chose the primary Stand: {err}")
+            self.assertEqual([o.get("id") for o in
+                              (rec.get(ri.OTHER_STANDS_FIELD) or [])], [other],
+                             f"note {note!r} reordered the secondaries: {err}")
+
     def test_the_overflow_marker_survives_a_second_bounded_write(self):
         # A marker the next write discards proves nothing. It was preserved by
         # the pathless-carry rule but not by the bound that produced it.
