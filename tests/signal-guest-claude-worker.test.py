@@ -811,6 +811,148 @@ with _tf.TemporaryDirectory() as _td:
     os.environ.pop("CLAUDE_CONFIG_DIR", None)
     os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
 
+print("== _replace_if_changed: every path, unit-level ==")
+with _tf.TemporaryDirectory() as _td:
+    d = Path(_td)
+
+    # 1. absent -> written 0600
+    f = d / "new.json"
+    P._replace_if_changed(f, "A")
+    ck(f.read_text() == "A" and (f.stat().st_mode & 0o777) == 0o600, "absent -> written at 0600")
+
+    # 2. same content, wrong mode -> mode REPAIRED, content untouched
+    os.chmod(f, 0o644)
+    P._replace_if_changed(f, "A")
+    ck((f.stat().st_mode & 0o777) == 0o600, "content-equal but 0644 -> mode repaired")
+
+    # 3. same content, correct mode -> no-op (idempotent)
+    before = f.stat().st_mtime_ns
+    P._replace_if_changed(f, "A")
+    ck(f.read_text() == "A", "content-equal at 0600 -> left alone")
+
+    # 4. different content -> replaced
+    P._replace_if_changed(f, "B")
+    ck(f.read_text() == "B", "changed content -> replaced")
+
+    # 5. a SYMLINK at the path is replaced, and the link target is NOT written through
+    target = d / "outside.json"
+    target.write_text("ORIGINAL")
+    link = d / "link.json"
+    link.symlink_to(target)
+    P._replace_if_changed(link, "SAFE")
+    ck(link.read_text() == "SAFE", "a symlinked profile path is replaced with a real file")
+    ck(not link.is_symlink(), "...and is no longer a symlink")
+    ck(target.read_text() == "ORIGINAL", "...and the link target was never written through")
+
+    # 6. a DIRECTORY at a file path raises (fails closed, never silently skipped)
+    dirpath = d / "dir.json"
+    dirpath.mkdir()
+    raised = False
+    try:
+        P._replace_if_changed(dirpath, "X")
+    except IsADirectoryError:
+        raised = True
+    ck(raised, "a directory at a profile file path raises rather than pretending to replace")
+
+    # 7. an unreadable existing file falls through to a rewrite
+    g = d / "unreadable.json"
+    g.write_text("OLD")
+    _rrt = Path.read_text
+
+    def _boom(self, *a, **k):
+        if self.name == "unreadable.json":
+            raise PermissionError("denied")
+        return _rrt(self, *a, **k)
+
+    Path.read_text = _boom
+    try:
+        P._replace_if_changed(g, "NEW")
+    finally:
+        Path.read_text = _rrt
+    ck(g.read_text() == "NEW", "an unreadable existing file is rewritten rather than trusted")
+
+    # 8. an lstat error (not FileNotFound) still writes
+    h = d / "lstat-err.json"
+    h.write_text("OLD")
+    _rls = Path.lstat
+    Path.lstat = lambda self: (_ for _ in ()).throw(OSError("stat blew up"))
+    try:
+        P._replace_if_changed(h, "FRESH")
+    finally:
+        Path.lstat = _rls
+    ck(h.read_text() == "FRESH", "an lstat error falls through to a write (never silently skipped)")
+
+    # 9. a non-regular, non-directory entry (FIFO) is unlinked and replaced
+    fifo = d / "fifo.json"
+    try:
+        os.mkfifo(fifo)
+        P._replace_if_changed(fifo, "REG")
+        ck(fifo.is_file() and fifo.read_text() == "REG", "a FIFO at a profile path is replaced by a regular file")
+    except (AttributeError, OSError):
+        ck(True, "mkfifo unavailable on this platform — skipped")
+
+print("== _write_private: temp cleanup on failure ==")
+with _tf.TemporaryDirectory() as _td:
+    d = Path(_td)
+    _rrep = os.replace
+    os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("no space"))
+    raised = False
+    try:
+        P._write_private(d / "x.json", "data")
+    except OSError:
+        raised = True
+    finally:
+        os.replace = _rrep
+    ck(raised, "_write_private re-raises a failed atomic replace")
+    ck(list(d.glob(".*.tmp-*")) == [] and list(d.glob("*.tmp*")) == [],
+       "no temp file is left behind on failure")
+
+print("== purge-failure blocks readiness (both call sites) ==")
+with _tf.TemporaryDirectory() as _td:
+    owner = Path(_td) / "owner"
+    (owner / ".claude").mkdir(parents=True)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(owner / ".claude")
+    gh = Path(_td) / "home"
+    gh.mkdir()
+    (gh / ".credentials.json").write_text("stale")
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(gh)
+
+    _rpurge = P._purge_credentials
+    P._purge_credentials = lambda home: False  # simulate an unremovable credential
+    try:
+        # No owner account -> the negative-sync path must report the purge failure.
+        P.invalidate_readiness_cache()
+        ok, reason = P.ensure_guest_profile()
+        ck(ok is False and reason == "guest_profile_purge_failed",
+           f"negative sync reports an unremovable guest credential ({reason})")
+
+        # Owner account present, keyring-style (no credential file) -> same guard.
+        (owner / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "a"}}))
+        P.invalidate_readiness_cache()
+        ok, reason = P.ensure_guest_profile()
+        ck(ok is False and reason == "guest_profile_purge_failed",
+           f"keyring path reports an unremovable stale copy ({reason})")
+    finally:
+        P._purge_credentials = _rpurge
+
+    # _purge_credentials own failure branches: unlink fails but the file is gone.
+    _runlink = Path.unlink
+
+    def _gone(self, *a, **k):
+        raise PermissionError("denied")
+
+    Path.unlink = _gone
+    try:
+        empty = Path(_td) / "empty-home"
+        empty.mkdir()
+        ck(P._purge_credentials(empty) is True,
+           "an unlink error on an ALREADY-absent credential still reports gone")
+    finally:
+        Path.unlink = _runlink
+
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + "; ".join(FAILS))
