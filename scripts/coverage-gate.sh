@@ -94,9 +94,65 @@ failed=0
 skipped_total=0
 fully_skipped=()
 partly_skipped=()
+# Each file writes its own .coverage.* fragment (`parallel = True`), merged
+# by the `coverage combine` below.
+# One worktree per worker, so this trades disk for wall clock: the lanes are
+# CPU-bound once created, and an unbounded count would thrash a small runner.
+COVGATE_WORKERS="${COVERAGE_GATE_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+RECDIR="$(mktemp -d)"
+trap 'rm -rf "$RECDIR"' EXIT
+
+# Per-file cap, mirroring ci.yml: without it one hung file burns the job
+# budget and the job is CANCELED mid-suite.
+
+# `timeout` is coreutils and absent on stock macOS, where this also runs by
+# hand; degrade to no cap rather than failing the local path.
+COVGATE_TIMEOUT=""
+if command -v timeout >/dev/null 2>&1; then
+    COVGATE_TIMEOUT="timeout -k 5 ${COVERAGE_GATE_FILE_TIMEOUT:-120}"
+else
+    echo "coverage-gate: no \`timeout\` binary — per-file cap disabled (local run)." >&2
+fi
+export RECDIR COVGATE_TIMEOUT
+
+# Lanes are worktrees at HEAD, so uncommitted work is invisible to them: a
+# clean report here would cover code this run never executed.
+if [ -z "${COVERAGE_GATE_ALLOW_DIRTY:-}" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+    _covgate_dirty=""
+    git diff --quiet HEAD 2>/dev/null || _covgate_dirty="tracked edits"
+    if [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then
+        _covgate_dirty="${_covgate_dirty:+$_covgate_dirty, }untracked files"
+    fi
+    if [ -n "$_covgate_dirty" ]; then
+        echo "coverage-gate: working tree is dirty ($_covgate_dirty); lanes run against HEAD," >&2
+        echo "  so your edits would NOT be measured. Commit them, or set" >&2
+        echo "  COVERAGE_GATE_ALLOW_DIRTY=1 to measure HEAD deliberately." >&2
+        exit 1
+    fi
+fi
+
+find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+# Key on the LINE INDEX: a name-derived key collides (`tr "/." "__"` maps
+# tests/a/b and tests/a_b alike), letting a failing rc be overwritten.
+# Shared scheduler: one SERIAL worker per worktree; the regression drives it.
+
+# It also brings the worktrees' .coverage.* fragments home for the combine.
+# shellcheck disable=SC2086
+bash "$(dirname "$0")/parallel-suite-lane.sh" "$COVGATE_WORKERS" "$RECDIR/files" "$RECDIR" \
+    env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc
+
+_covgate_idx=0
 while IFS= read -r f; do
-    if ! output=$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
-        echo "✖ test failed under instrumentation: $f"
+    _covgate_idx=$((_covgate_idx + 1))
+    rec="$RECDIR/$_covgate_idx"
+    rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
+    output="$(cat "$rec.out" 2>/dev/null || true)"
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            echo "✖ test TIMED OUT under instrumentation (>${COVERAGE_GATE_FILE_TIMEOUT:-120}s): $f"
+        else
+            echo "✖ test failed under instrumentation: $f"
+        fi
         echo "$output"
         failed=1
         continue
@@ -112,7 +168,7 @@ while IFS= read -r f; do
     elif [ "$skips" -gt 0 ]; then
         partly_skipped+=("$f ($skips/$ran skipped)")
     fi
-done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+done < "$RECDIR/files"
 
 if [ "$skipped_total" -gt 0 ]; then
     echo "coverage-gate: $skipped_total test case(s) SKIPPED in this environment."
