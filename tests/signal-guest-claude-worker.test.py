@@ -406,6 +406,233 @@ with _tf.TemporaryDirectory() as _td:
     os.environ.pop("CLAUDE_CONFIG_DIR", None)
     os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
 
+print("== detection helpers: every branch ==")
+_real_stat2 = os.stat
+# _path_state: absent / present / unknown
+os.stat = lambda p, *a, **k: (_ for _ in ()).throw(FileNotFoundError(p))
+try:
+    ck(H._path_state("/nope") == "absent", "_path_state: FileNotFoundError -> absent")
+finally:
+    os.stat = _real_stat2
+os.stat = lambda p, *a, **k: (_ for _ in ()).throw(NotADirectoryError(p))
+try:
+    ck(H._path_state("/x/y") == "absent", "_path_state: NotADirectoryError -> absent")
+finally:
+    os.stat = _real_stat2
+ck(H._path_state(__file__) == "present", "_path_state: a real file -> present")
+
+# managed dir that exists but cannot be listed -> present (fail-closed)
+_dir2 = "/etc/claude-code/managed-settings.d"
+_real_listdir2 = os.listdir
+os.stat = lambda p, *a, **k: (_real_stat2(__file__) if str(p) == _dir2
+                              else (_ for _ in ()).throw(FileNotFoundError(p)))
+os.listdir = lambda p: (_ for _ in ()).throw(PermissionError("nope"))
+try:
+    ck(H.managed_policy_present() is True, "an unlistable policy dir counts as present")
+finally:
+    os.stat, os.listdir = _real_stat2, _real_listdir2
+
+# a policy dir with no *.json is NOT policy
+os.stat = lambda p, *a, **k: (_real_stat2(__file__) if str(p) == _dir2
+                              else (_ for _ in ()).throw(FileNotFoundError(p)))
+os.listdir = lambda p: ["README.md"]
+try:
+    ck(H.managed_policy_present() is False, "a policy dir with no *.json is not managed policy")
+finally:
+    os.stat, os.listdir = _real_stat2, _real_listdir2
+
+# Windows registry probe: absent winreg (non-Windows) is not policy
+ck(H._windows_policy_present() is False, "no winreg module (non-Windows) -> no registry policy")
+
+# CLI feature check consults the real binary when no help text is supplied
+_real_run = H.subprocess.run
+H.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("no claude"))
+try:
+    ck(H.worker_cli_supports_tool_restriction() is False,
+       "an unrunnable CLI is treated as unsupported (fail-closed)")
+finally:
+    H.subprocess.run = _real_run
+
+H.subprocess.run = lambda *a, **k: _types.SimpleNamespace(stdout="--tools x --strict-mcp-config y")
+try:
+    ck(H.worker_cli_supports_tool_restriction() is True, "a capable CLI is detected via --help")
+finally:
+    H.subprocess.run = _real_run
+
+print("== availability: the full decision ladder ==")
+_wh, _cli, _mp = H.shutil.which, H.worker_cli_supports_tool_restriction, H.managed_policy_present
+H.shutil.which = lambda n: "/usr/local/bin/claude"
+H.worker_cli_supports_tool_restriction = lambda help_text=None: False
+try:
+    ck(H.guest_availability() == (False, "worker_unsupported_cli"),
+       "a CLI that cannot express the restriction -> worker_unsupported_cli")
+finally:
+    H.worker_cli_supports_tool_restriction = _cli
+
+H.worker_cli_supports_tool_restriction = lambda help_text=None: True
+H.managed_policy_present = lambda: False
+import signal_guest_profile as _P2
+_real_ready = _P2.guest_profile_ready
+_P2.guest_profile_ready = lambda *a, **k: (False, "worker_unauthenticated")
+try:
+    ck(H.guest_availability() == (False, "worker_unauthenticated"),
+       "an unready profile surfaces its own reason")
+    _P2.guest_profile_ready = lambda *a, **k: (False, None)
+    ck(H.guest_availability() == (False, "guest_profile_missing"),
+       "a reasonless failure falls back to guest_profile_missing")
+    _P2.guest_profile_ready = lambda *a, **k: (True, None)
+    ck(H.guest_availability() == (True, None), "everything ready -> available")
+    ck(H.worker_available() is True, "worker_available mirrors the ladder")
+finally:
+    _P2.guest_profile_ready = _real_ready
+    H.shutil.which, H.worker_cli_supports_tool_restriction, H.managed_policy_present = _wh, _cli, _mp
+
+print("== spawn: shutdown mid-spawn, and an unspawnable worker ==")
+with _tf.TemporaryDirectory() as _td:
+    rd = Path(_td)
+    _real_popen2 = H.subprocess.Popen
+
+    class _P:
+        pid = os.getpid()
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "unused", ""
+
+        def kill(self):
+            pass
+
+    _real_killpg2 = os.killpg
+    os.killpg = lambda *a, **k: None
+    H.subprocess.Popen = lambda *a, **k: _P()
+    try:
+        # Shutdown latched: the just-spawned worker is killed, not registered.
+        H.reap_guest_workers()  # latch _stopping
+        with H._live_lock:
+            H._live_tasks["signal-guest-midspawn"] = rd
+        H._slots.acquire()
+        H._run("signal-guest-midspawn", "q", rd, lambda t: t, str(rd))
+        mbody = (rd / "signal-guest-midspawn.txt").read_text()
+        ck(mbody.startswith("[deep_dive "),
+           f"a worker spawned during shutdown still yields a terminal payload: {mbody[:38]!r}")
+        H._reset_stopping_for_tests()
+
+        # Popen itself fails -> terminal payload, no hang.
+        H.subprocess.Popen = lambda *a, **k: (_ for _ in ()).throw(OSError("exec failed"))
+        with H._live_lock:
+            H._live_tasks["signal-guest-nospawn"] = rd
+        H._slots.acquire()
+        H._run("signal-guest-nospawn", "q", rd, lambda t: t, str(rd))
+        ck((rd / "signal-guest-nospawn.txt").read_text().startswith("[deep_dive "),
+           "an unspawnable worker still publishes a terminal payload")
+    finally:
+        H.subprocess.Popen = _real_popen2
+        os.killpg = _real_killpg2
+
+print("== start_guest_deep_dive: unavailable and shutting-down entry paths ==")
+with _tf.TemporaryDirectory() as _td:
+    rd = Path(_td)
+    _av = H.guest_availability
+    H.guest_availability = lambda *a, **k: (True, None)
+    try:
+        H.reap_guest_workers()  # latch shutdown
+        H.start_guest_deep_dive("signal-guest-shutdown", "q", rd, lambda t: t)
+        sbody = (rd / "signal-guest-shutdown.txt").read_text()
+        ck("shutting down" in sbody, f"submissions during shutdown are refused terminally: {sbody[:44]!r}")
+        H._reset_stopping_for_tests()
+    finally:
+        H.guest_availability = _av
+
+print("== profile: caching, purge verification, and the remaining branches ==")
+with _tf.TemporaryDirectory() as _td:
+    owner = Path(_td) / "owner"
+    (owner / ".claude").mkdir(parents=True)
+    (owner / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "a"}}))
+    os.environ["CLAUDE_CONFIG_DIR"] = str(owner / ".claude")
+
+    # An explicit workspace argument selects the profile location.
+    ws = Path(_td) / "ws"
+    os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
+    ck(str(P.guest_home(ws)).startswith(str(ws)), "an explicit workspace roots the guest home")
+
+    # The readiness cache: a second call inside the TTL does not re-provision.
+    gh = Path(_td) / "cached"
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(gh)
+    P.invalidate_readiness_cache()
+    calls = []
+    _real_ensure = P.ensure_guest_profile
+    P.ensure_guest_profile = lambda *a, **k: (calls.append(1), (True, None))[1]
+    try:
+        P.guest_profile_ready()
+        P.guest_profile_ready()
+        ck(len(calls) == 1, "a positive verdict is cached (one provisioning call for two probes)")
+        # Negative verdicts expire quickly: advance the clock past the negative TTL only.
+        P.invalidate_readiness_cache()
+        calls.clear()
+        P.ensure_guest_profile = lambda *a, **k: (calls.append(1), (False, "worker_missing"))[1]
+        P.guest_profile_ready(now=1000.0)
+        P.guest_profile_ready(now=1000.0 + P._NEG_CACHE_TTL_S + 1)
+        ck(len(calls) == 2, "a negative verdict expires fast and is re-checked")
+        # ...while a positive one survives that same interval.
+        P.invalidate_readiness_cache()
+        calls.clear()
+        P.ensure_guest_profile = lambda *a, **k: (calls.append(1), (True, None))[1]
+        P.guest_profile_ready(now=2000.0)
+        P.guest_profile_ready(now=2000.0 + P._NEG_CACHE_TTL_S + 1)
+        ck(len(calls) == 1, "a positive verdict survives the negative TTL")
+    finally:
+        P.ensure_guest_profile = _real_ensure
+        P.invalidate_readiness_cache()
+
+    # A malformed owner .claude.json (not JSON at all) is unauthenticated.
+    (owner / ".claude.json").write_text("{ not json")
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(Path(_td) / "bad")
+    P.invalidate_readiness_cache()
+    ok, reason = P.ensure_guest_profile()
+    ck(ok is False and reason == "worker_unauthenticated", "unparseable .claude.json -> unauthenticated")
+
+    # A .claude.json with none of the allowlisted keys is unauthenticated too.
+    (owner / ".claude.json").write_text(json.dumps({"telemetry": True}))
+    P.invalidate_readiness_cache()
+    ok, reason = P.ensure_guest_profile()
+    ck(ok is False and reason == "worker_unauthenticated",
+       "a .claude.json without account fields -> unauthenticated")
+
+    # A symlinked owner credential is refused as a source (never followed).
+    (owner / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "a"}}))
+    secret = Path(_td) / "elsewhere.json"
+    secret.write_text('{"stolen":1}')
+    link = owner / ".claude" / ".credentials.json"
+    link.symlink_to(secret)
+    gh2 = Path(_td) / "symlinked-src"
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(gh2)
+    P.invalidate_readiness_cache()
+    ok, _ = P.ensure_guest_profile()
+    ck(ok is True and not (gh2 / ".credentials.json").exists(),
+       "a symlinked owner credential is not copied (treated as keyring-style)")
+    link.unlink()
+
+    # A directory where a profile FILE belongs fails closed rather than pretending.
+    gh3 = Path(_td) / "dirblock"
+    gh3.mkdir()
+    (gh3 / ".claude.json").mkdir()
+    os.environ["SIGNAL_GUEST_CLAUDE_HOME"] = str(gh3)
+    P.invalidate_readiness_cache()
+    ok, reason = P.ensure_guest_profile()
+    ck(ok is False and reason == "guest_profile_missing",
+       "a directory at a profile file path fails closed")
+
+    # _purge_credentials: provably-gone vs cannot-prove.
+    gh4 = Path(_td) / "purge"
+    gh4.mkdir()
+    ck(P._purge_credentials(gh4) is True, "purging an absent credential succeeds")
+    (gh4 / ".credentials.json").write_text("x")
+    ck(P._purge_credentials(gh4) is True, "purging an existing credential succeeds")
+    ck(not (gh4 / ".credentials.json").exists(), "...and it is gone")
+
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    os.environ.pop("SIGNAL_GUEST_CLAUDE_HOME", None)
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + "; ".join(FAILS))
