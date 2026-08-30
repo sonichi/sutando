@@ -333,7 +333,15 @@ def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
     again — otherwise a repair stays latched behind a stale record.
     """
     path = rec.get("path")
-    if not path or path in fresh_paths:
+    if not path:
+        # Derived from a source this pass re-reads (the triage config), so the
+        # fresh pass re-raises it if it still holds. Carrying it latches it.
+        return False
+    if path in fresh_paths:
+        return True
+    if ri.writer_owned_path(path):
+        # Our own rewrite is not a repair: only re-migrating a repaired
+        # SOURCE can clear a writer-owned finding.
         return True
     node = entry
     for seg in str(path).split("."):
@@ -377,11 +385,22 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     # against them, so a repair can clear a record rather than latch forever.
     fresh: list = []
     collected = _collect_ids(entry, fresh)
-    carried = ri.canonical_shape_failures(
-        (entry or {}).get(ri.SHAPE_FIELD) if isinstance(entry, dict) else None)
+    _raw_carried = (entry or {}).get(ri.SHAPE_FIELD) if isinstance(entry, dict) else None
+    _raw_carried = list(_raw_carried) if isinstance(_raw_carried, (list, tuple)) else []
+    carried = ri.canonical_shape_failures(_raw_carried, bound=None)
     fresh_paths = {f.get("path") for f in fresh}
+    # Unbounded for the decision: truncating before arbitration let member
+    # order drop a live over-full-slot record and publish its id.
     shape_failures: list = ri.canonical_shape_failures(
-        fresh + [c for c in carried if _still_unresolved(entry, c, fresh_paths)])
+        fresh + [c for c in carried if _still_unresolved(entry, c, fresh_paths)],
+        bound=None)
+    # A refusal that cannot be represented is still a refusal. Count only
+    # REJECTED records: dedup also shrinks the list, and is not corruption.
+    if any(ri.canonical_shape_failure(r) is None for r in _raw_carried):
+        shape_failures.append({
+            "path": None, "kind": "invalid",
+            "reason": "carried refusal state was unusable and could not be "
+                      "validated; treat as still-refused, not as absent"})
     # An id from an over-full singular slot is not evidence for that slot: it
     # would be picked by traversal order. Route it to unresolved instead.
     arbitrated = {i for f in shape_failures for i in f.get("arbitrated_ids") or []}
@@ -587,9 +606,9 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         new[ri.OTHER_STANDS_FIELD] = others
         new[ri.UNRESOLVED_FIELD] = unresolved
         new[ri.BASIS_FIELD] = basis
-        # Carried, not recomputed: the malformed value is gone from `new`, so a
-        # later pass could not re-derive this.
-        _sf = ri.canonical_shape_failures(shape_failures)
+        # Carried, not recomputed: `new` no longer holds the malformed value.
+        # Bounded only HERE — history, after every live finding is arbitrated.
+        _sf = ri.canonical_shape_failures(shape_failures, bound=ri.SHAPE_MAX)
         if _sf:
             new[ri.SHAPE_FIELD] = _sf
         else:

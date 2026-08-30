@@ -1305,12 +1305,12 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [], err)
 
     def test_a_non_dict_carried_record_does_not_crash_the_run(self):
-        # Reviewer: "other malformed containers raise uncaught AttributeError".
-        # A hand-edited roster must degrade, never take the migration down.
+        # Corrupt carried state is not evidence that no refusal existed, so
+        # rc 0 is wrong here however the malformed container degrades.
         rc, err, rec = self._cli({"human": {"id": BOT},
                                   ri.SHAPE_FIELD: ["not-a-dict", 42]})
-        self.assertIn(rc, (0, 5), err)
-        self.assertEqual(rec.get(ri.SHAPE_FIELD, []), [])
+        self.assertEqual(rc, 5, err)
+        self.assertTrue(rec.get(ri.SHAPE_FIELD), "corrupt state was erased")
 
     def test_an_older_scalar_record_canonicalises_to_one(self):
         # A pre-canonical writer's scalar and this one's list are the same
@@ -1321,6 +1321,41 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         for _ in range(3):
             rc, err, entry = self._cli(entry)
             self.assertEqual(len(entry.get(ri.SHAPE_FIELD) or []), 1, err)
+
+    def test_the_writers_own_rewrite_is_not_a_repair(self):
+        # Pass 1 rewrites the malformed slot; pass 2 must not read that
+        # value as a user correction and clear the refusal.
+        rc1, err1, rec1 = self._cli_tri({ri.STAND_FIELD: {"value": BOT}},
+                                        {"bots": [BOT]})
+        self.assertEqual(rc1, 5, err1)
+        rc2, err2, _ = self._cli(rec1)
+        self.assertEqual(rc2, 5, "the writer cleared its own refusal")
+
+    def test_the_bound_cannot_decide_an_identity(self):
+        # The cap truncated LIVE findings before arbitration, so whether the
+        # over-full slot survived depended on member order.
+        noise = {f"bad{i}_discord_id": 12 for i in range(ri.SHAPE_MAX)}
+        outs = []
+        for entry in ({ri.STAND_FIELD: [HUMAN, BOT], **noise},
+                      {**noise, ri.STAND_FIELD: [HUMAN, BOT]}):
+            rc, err, rec = self._cli_tri(entry, {"discord": HUMAN, "bots": []})
+            self.assertEqual(rc, 5, err)
+            outs.append((rec[ri.STAND_FIELD],
+                         sorted(u["id"] for u in ri.unresolved_discord_ids(rec))))
+        self.assertEqual(outs[0], outs[1], "the bound let member order decide")
+        self.assertIsNone(outs[0][0], "an over-full slot published its id")
+
+    def test_cross_record_union_covers_the_stand_side_too(self):
+        # Reviewer: a STAND-precedence overwrite mutant passed every test,
+        # because the member-order case supplied only HUMAN evidence.
+        for tri in ({"discord": HUMAN, "bots": []}, {"bots": [HUMAN]}):
+            outs = []
+            for entry in ({ri.HUMAN_FIELD: [HUMAN, BOT], ri.STAND_FIELD: [HUMAN, self.SECOND]},
+                          {ri.STAND_FIELD: [HUMAN, self.SECOND], ri.HUMAN_FIELD: [HUMAN, BOT]}):
+                rc, err, rec = self._cli_tri(entry, tri)
+                outs.append((rec["human_discord_id"], rec[ri.STAND_FIELD]))
+            self.assertEqual(outs[0], outs[1], tri)
+            self.assertEqual(outs[0], (None, None), tri)
 
     def test_the_carried_list_is_bounded(self):
         # Unbounded carried state can grow a roster indefinitely.

@@ -32,6 +32,14 @@ SHAPE_FIELD = "id_shape_failures"
 #: A carried list is untrusted input: a hand-edit or an older writer can put
 #: anything here, and this file is what says which shapes are usable.
 SHAPE_MAX = 32
+
+#: Fields the WRITER owns: a finding on one is unre-checkable from our own
+#: output, so it is carried until the SOURCE is repaired and re-migrated.
+WRITER_OWNED = (HUMAN_FIELD, STAND_FIELD, OTHER_STANDS_FIELD, UNRESOLVED_FIELD)
+
+
+def writer_owned_path(path) -> bool:
+    return isinstance(path, str) and path.split(".")[0] in WRITER_OWNED
 _REFERENTS = ("human", "stand")
 
 
@@ -72,8 +80,12 @@ def canonical_shape_failure(rec) -> "dict | None":
     return out
 
 
-def canonical_shape_failures(value) -> list:
-    """The carried list, canonicalised, de-duplicated and bounded."""
+def canonical_shape_failures(value, *, bound: "int | None" = SHAPE_MAX) -> list:
+    """Canonicalised, de-duplicated, and bounded only when asked.
+
+    `bound=None` for anything that FEEDS A DECISION — truncating live findings
+    before classification let a dropped record publish an id.
+    """
     if not isinstance(value, (list, tuple)):
         return []
     seen, out = set(), []
@@ -85,7 +97,7 @@ def canonical_shape_failures(value) -> list:
         k = _json.dumps(c, sort_keys=True)
         if k not in seen:
             seen.add(k); out.append(c)
-    return out[:SHAPE_MAX]
+    return out if bound is None else out[:bound]
 
 #: A key starting with "_" is document metadata, not a person.
 def is_person_key(key: str) -> bool:

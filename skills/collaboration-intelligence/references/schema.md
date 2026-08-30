@@ -292,6 +292,8 @@ case-insensitively wherever they are joined.
     "unresolved_discord_ids": [{"id": "...", "reason": "..."}],
     "home_channel": "<channel id> | null",
     "id_basis": {"human_discord_id": ["..."], "stand_discord_id": ["..."]},
+    "id_shape_failures": [{"path": "…|null", "kind": "…", "reason": "…",
+                           "arbitrated_ids": ["…"], "arbitrated_states": ["human|stand"]}],
     "...": "every v1 provenance field (verification, verified_at, source, observed_at, stand, evidence) is preserved verbatim"
   }
 }
@@ -320,6 +322,15 @@ downstream ping then reaches the wrong party while reporting success.
 rather than reading `discord_id`; use `scripts/roster_identity.py`'s accessors
 (`human_discord_id`, `stand_discord_id`, `stand_discord_ids`). An id in
 `unresolved_discord_ids` answers no lookup.
+
+`id_shape_failures` is RESERVED and migration-owned: findings the migration
+could not re-derive from its own output, carried so a refusal survives a
+re-migration. `roster_identity.py` owns its record shape, its canonicalisation
+and its bound (`SHAPE_MAX`); a present-but-unusable value is a refusal, never
+an absence, and is never silently erased. A finding on a writer-owned field
+clears only by repairing the SOURCE roster and re-migrating — our own rewrite
+of that field is not a repair. Do not use this name for anything else: a v1
+roster carrying a same-named provenance field would be read as a refusal.
 
 **Migrating.** `scripts/migrate_roster_identity.py --roster <v1> --triage-config
 <pr-triage/config.json> --peers <peers.json> --discord-config <discord-config.json>
