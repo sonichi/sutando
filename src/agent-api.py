@@ -41,6 +41,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -794,6 +795,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json(200, {"status": "idle"})
             else:
                 self.send_json(200, {"status": "idle"})
+        elif path == "/capabilities":
+            # The Signal Room contract's readiness signal: the desktop supervisor asks
+            # whether a guest deep_dive can run RIGHT NOW instead of inspecting this
+            # service's internals (which engine, which profile, which auth store).
+            # Computing it PROVISIONS first (idempotent, single-flight), so a stock
+            # install converges to available without any task ever arriving.
+            if not self.check_auth():
+                return
+            try:
+                from signal_guest_handler import guest_availability
+                available, reason = guest_availability()
+            except Exception as e:
+                available, reason = False, f"capability_error: {e.__class__.__name__}"
+            payload = {"guest_deep_dive": {"available": bool(available)}}
+            if reason:
+                payload["guest_deep_dive"]["reason"] = reason
+            self.send_json(200, payload)
         elif path == "/voice/state":
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
@@ -1473,11 +1491,35 @@ if __name__ == "__main__":
     print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
         print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+    # A supervised replacement of this gateway (desktop token rotation / adopted-process
+    # takeover) sends SIGTERM. Guest workers run in their own process groups, so without
+    # this they would outlive us with no thread enforcing their timeout — and repeated
+    # replacements could stack them past the fleet cap.
+    def _reap_and_exit(_signum, _frame):
+        try:
+            from signal_guest_handler import reap_guest_workers
+            reaped = reap_guest_workers()
+            if reaped:
+                print(f"agent-api: reaped {reaped} guest worker group(s) on shutdown", flush=True)
+        except Exception:
+            pass
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _reap_and_exit)
+    except Exception:
+        pass
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDone.")
     finally:
+        try:
+            from signal_guest_handler import reap_guest_workers
+            reap_guest_workers()
+        except Exception:
+            pass
         workstream_maintenance_stop.set()
         workstream_maintenance.join(timeout=1)
         server.server_close()

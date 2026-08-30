@@ -9,30 +9,40 @@ So when ``/task`` carries ``access_tier: "guest"`` (stamped by the trusted host
 daemon), agent-api routes here instead of the owner writer. Containment, in
 layers, because prompt framing alone is NOT an enforcement boundary:
 
-  * an ISOLATED, guest-only ``CODEX_HOME`` (``SIGNAL_GUEST_CODEX_HOME``, provisioned
-    by the supervisor with NO write-capable MCP/connectors) — REQUIRED: a
-    ``--sandbox read-only`` worker governs its own shell/filesystem but NOT
-    configured MCP/connector tools, so inheriting the owner's config would hand a
-    prompt-injected guest the owner's external tools. Fail-closed without it.
+  * a RESTRICTED TOOL SURFACE — ``claude -p`` launched with ``--tools WebSearch``:
+    the surface-restricting switch (NOT ``--allowedTools``, which only pre-approves
+    permissions and would leave normally-permissionless tools such as ``Read``
+    present). ``WebFetch`` is deliberately EXCLUDED: tool rules bind domains, not
+    resolved addresses, so a fetch tool can be steered (DNS / redirects) at
+    loopback or LAN services — including this very gateway's tokenless read routes
+    — which would reopen the local-read boundary the profile exists to close.
+  * an ISOLATED, guest-only config root (``CLAUDE_CONFIG_DIR``/``HOME`` pinned to
+    the profile ``signal_guest_profile`` provisions) with ``--setting-sources ''``
+    (ignore user/project/local settings) and ``--strict-mcp-config`` (ignore every
+    ambient MCP configuration). REQUIRED: inheriting the owner's config would hand a
+    prompt-injected guest the owner's external tools.
+  * a MANAGED-POLICY READINESS GATE — managed settings (and managed hooks, which can
+    execute local commands) still apply under a restricted spawn, so when one is
+    present the lane reports UNAVAILABLE rather than run partially contained.
   * an ENV ALLOWLIST — the worker never sees the owner's full environment (API
-    keys / tokens a read could exfiltrate); only what codex needs to run.
-  * ``codex exec --sandbox read-only`` (no writes, no direct network), cwd /tmp,
-    stdin closed, in its own process group (killable as a group on timeout).
+    keys / tokens a read could exfiltrate); only what the CLI needs to run.
+  * cwd a throwaway tmp dir, stdin closed, own process group (killable as a group on
+    timeout, and reaped when this service is asked to exit).
   * the output is passed through the shipped fail-closed egress guard
     (``guard_result_for_tier(.., "guest", ..)``), which returns a SAFE body —
     redacted or withheld — never the raw text, even if the scanner errors.
   * a bounded worker fleet + an input-size cap, so room participants can't
     exhaust processes/threads/quota.
 
-ACCEPTED RESIDUAL (v1, owner decision — design "Bundling the Voice-News Host
-Daemon", Component 6): ``codex exec --sandbox read-only`` blocks the worker's
-WRITES and direct network but PERMITS local file *reads*. So read-confidentiality
-is best-effort: it rests on the egress secret-guard above, which is pattern-based
-and cannot guarantee that arbitrary non-secret private text a prompt-injected read
-pulled in is withheld. OS-enforced read-confinement (a Seatbelt/bwrap/UID sandbox
-exposing only sanitized inputs + minimal runtime, denying owner home / repo /
-workspace) is the correct stronger control and is explicitly DEFERRED to a follow
--up — v1 ships the isolated-config + read-only-sandbox + egress-guard combination.
+ACCEPTED RESIDUALS (v1, owner decision — design
+``design-signal-room-core-capability.md``): local reads, both filesystem and
+network-local, are closed BY CONSTRUCTION (no ``Read``/``Bash``/``WebFetch`` exists
+in the surface). What remains is (a) a harness or managed-policy bug that
+reintroduces a denied tool — mitigated by the managed-policy gate above, with an OS
+sandbox as the DEFERRED defense-in-depth — and (b) ``WebSearch`` query egress: a
+crafted query can carry data out, also DEFERRED. Arbitrary-URL research returns only
+behind an SSRF-resistant public-only fetch proxy (DNS + redirect enforcement,
+private/link-local ranges denied), a named follow-up.
 
 Async contract: ``/task`` returns a ``task_id`` immediately; the worker runs on a
 daemon thread and writes the guarded result to ``RESULT_DIR/<task_id>.txt`` when
@@ -49,7 +59,20 @@ import tempfile
 import threading
 from pathlib import Path
 
-CODEX_TIMEOUT_S = 240
+WORKER_TIMEOUT_S = 240
+CODEX_TIMEOUT_S = WORKER_TIMEOUT_S  # back-compat alias for existing callers/tests
+
+# The ONLY tools the guest worker may have. WebFetch is excluded on purpose — see the
+# module docstring (domain rules do not bind resolved addresses => loopback/LAN SSRF).
+GUEST_TOOLS = "WebSearch"
+
+# Managed policy still applies under a restricted spawn (`claude --help`: "managed
+# settings and --settings still apply"), and a managed HOOK can run local commands.
+# Presence => the lane reports unavailable rather than run partially contained.
+_MANAGED_SETTINGS_PATHS = (
+    "/Library/Application Support/ClaudeCode/managed-settings.json",  # macOS
+    "/etc/claude-code/managed-settings.json",                          # Linux
+)
 # Bound the fleet so untrusted callers can't exhaust the box, and cap the size of
 # the untrusted input that reaches the worker.
 MAX_CONCURRENT = 2
@@ -74,26 +97,86 @@ _PROMPT_PREAMBLE = (
 # Bounds the number of concurrent guest workers.
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT)
 
+# Live worker process groups, so a gateway shutdown does not orphan them (each worker
+# runs in its own group; without this, replacing agent-api would leave workers running
+# with no thread enforcing the timeout, and repeated replacements could stack them).
+_live_pgids: set[int] = set()
+_live_lock = threading.Lock()
 
-def isolated_codex_home() -> str | None:
-    """The REQUIRED guest-only ``CODEX_HOME`` (an authenticated Codex config the
-    supervisor provisions with no write-capable MCP/connectors), or ``None`` when
-    it is not provisioned — in which case guest ``deep_dive`` is fail-closed."""
-    home = os.environ.get("SIGNAL_GUEST_CODEX_HOME", "").strip()
-    return home if home and os.path.isdir(home) else None
+
+def _track(pgid: int) -> None:
+    with _live_lock:
+        _live_pgids.add(pgid)
+
+
+def _untrack(pgid: int) -> None:
+    with _live_lock:
+        _live_pgids.discard(pgid)
+
+
+def reap_guest_workers() -> int:
+    """Terminate every tracked worker process group. Called from the SIGTERM handler
+    of this service so a supervised replacement of the gateway does not orphan
+    workers. Returns how many groups were signalled (diagnostics/tests)."""
+    with _live_lock:
+        pgids = list(_live_pgids)
+        _live_pgids.clear()
+    for pgid in pgids:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            pass
+    return len(pgids)
+
+
+def managed_policy_present() -> bool:
+    """True when a managed-settings file exists. Managed settings (and managed hooks,
+    which can execute local commands) apply even to a restricted spawn, so the lane
+    must NOT claim containment while one is in force."""
+    return any(os.path.exists(p) for p in _MANAGED_SETTINGS_PATHS)
+
+
+def worker_cli_supports_tool_restriction(help_text: str | None = None) -> bool:
+    """The containment boundary is the SURFACE-restricting ``--tools`` switch. A CLI
+    that cannot express it must not run guest work (fail-closed), because
+    ``--allowedTools`` alone would leave permissionless tools such as ``Read``."""
+    if help_text is None:
+        try:
+            help_text = subprocess.run(
+                ["claude", "--help"], capture_output=True, text=True, timeout=10,
+            ).stdout
+        except Exception:
+            return False
+    return "--tools" in (help_text or "") and "--strict-mcp-config" in (help_text or "")
+
+
+def guest_availability(workspace=None) -> tuple[bool, str | None]:
+    """``(available, reason)`` for ``GET /capabilities`` — provisions first (idempotent,
+    single-flight) so a stock install converges without any task arriving."""
+    if shutil.which("claude") is None:
+        return False, "worker_missing"
+    if not worker_cli_supports_tool_restriction():
+        return False, "worker_unsupported_cli"
+    if managed_policy_present():
+        return False, "managed_policy_present"
+    from signal_guest_profile import guest_profile_ready
+    ok, reason = guest_profile_ready(workspace)
+    if not ok:
+        return False, reason or "guest_profile_missing"
+    return True, None
 
 
 def worker_available() -> bool:
-    """Fail-closed gate: a codex binary AND a provisioned isolated config."""
-    return shutil.which("codex") is not None and isolated_codex_home() is not None
+    """Fail-closed gate, kept as the handler's own pre-spawn check."""
+    return guest_availability()[0]
 
 
-def _guest_env(codex_home: str) -> dict:
+def _guest_env(home: str) -> dict:
     env = {k: os.environ[k] for k in _ENV_ALLOW if k in os.environ}
-    # Pin BOTH the Codex config and $HOME into the isolated root so no
+    # Pin BOTH the CLI config root and $HOME into the isolated profile so no
     # home-relative lookup escapes to the owner's dotfiles/credentials.
-    env["CODEX_HOME"] = codex_home
-    env["HOME"] = codex_home
+    env["CLAUDE_CONFIG_DIR"] = home
+    env["HOME"] = home
     return env
 
 
@@ -123,36 +206,54 @@ def _write_result(result_dir: Path, task_id: str, text: str) -> None:
         pass
 
 
-def _run(task_id: str, task_text: str, result_dir: Path, confine, codex_home: str) -> None:
-    out, out_path = "", ""
+def guest_argv(prompt: str, cwd: str) -> list[str]:
+    """The worker command line. Pure, so tests can pin the containment flags exactly.
+
+    Every restriction travels in ARGV (code), never in config the untrusted content
+    could influence: ``--tools`` restricts the available SURFACE (not
+    ``--allowedTools``, which merely pre-approves and would leave permissionless
+    tools such as ``Read``), ``--setting-sources`` with an empty value drops
+    user/project/local settings, and ``--strict-mcp-config`` with no ``--mcp-config``
+    leaves zero MCP servers.
+    """
+    return [
+        "claude", "-p", prompt,
+        "--tools", GUEST_TOOLS,
+        "--setting-sources", "",
+        "--strict-mcp-config",
+        "--permission-mode", "default",
+        "--add-dir", cwd,
+    ]
+
+
+def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> None:
+    out, workdir, pgid = "", "", None
     try:
         prompt = _PROMPT_PREAMBLE + confine(task_text[:MAX_TASK_CHARS])
-        fd, out_path = tempfile.mkstemp(prefix="signal-guest-", suffix=".txt")
-        os.close(fd)
-        argv = [
-            "codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
-            "-C", "/tmp", "-o", out_path, "--", prompt,
-        ]
+        workdir = tempfile.mkdtemp(prefix="signal-guest-")
         proc = None
         try:
             proc = subprocess.Popen(
-                argv, env=_guest_env(codex_home),
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                guest_argv(prompt, workdir), env=_guest_env(home), cwd=workdir,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True,
                 start_new_session=True,  # own process group -> killable as a group
             )
         except Exception:
             proc = None
         if proc is not None:
             try:
-                proc.wait(timeout=CODEX_TIMEOUT_S)
-                if proc.returncode == 0:
-                    try:
-                        out = Path(out_path).read_text()
-                    except Exception:
-                        out = ""
+                pgid = os.getpgid(proc.pid)
+                _track(pgid)
+            except Exception:
+                pgid = None
+            try:
+                out, _ = proc.communicate(timeout=WORKER_TIMEOUT_S)
+                if proc.returncode != 0:
+                    out = ""
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # the whole tree
+                    os.killpg(pgid if pgid is not None else os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
                     try:
                         proc.kill()
@@ -162,11 +263,10 @@ def _run(task_id: str, task_text: str, result_dir: Path, confine, codex_home: st
     except Exception:
         out = ""
     finally:
-        if out_path:
-            try:
-                os.unlink(out_path)
-            except Exception:
-                pass
+        if pgid is not None:
+            _untrack(pgid)
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
         _slots.release()
 
     out = out.strip()
@@ -180,16 +280,21 @@ def start_guest_deep_dive(task_id: str, task_text: str, result_dir, confine) -> 
     never a hang) when the sandboxed runtime is unavailable or the fleet is full.
     ``confine`` is the caller's ``confine_user_content`` (defangs the body)."""
     result_dir = Path(result_dir)
-    codex_home = isolated_codex_home()
-    if codex_home is None or shutil.which("codex") is None:
-        _write_result(result_dir, task_id, "[deep_dive unavailable: no isolated sandboxed research runtime]")
+    available, reason = guest_availability()
+    if not available:
+        _write_result(
+            result_dir, task_id,
+            f"[deep_dive unavailable: no isolated research runtime ({reason})]",
+        )
         return
+    from signal_guest_profile import guest_home
+    home = str(guest_home())
     if not _slots.acquire(blocking=False):
         _write_result(result_dir, task_id, "[deep_dive busy: too many research tasks in flight — try again shortly]")
         return
     try:
         threading.Thread(
-            target=_run, args=(task_id, task_text, result_dir, confine, codex_home),
+            target=_run, args=(task_id, task_text, result_dir, confine, home),
             name=f"signal-guest-{task_id}", daemon=True,
         ).start()
     except Exception:
