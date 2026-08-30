@@ -796,11 +796,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(200, {"status": "idle"})
         elif path == "/capabilities":
-            # The Signal Room contract's readiness signal: the desktop supervisor asks
-            # whether a guest deep_dive can run RIGHT NOW instead of inspecting this
-            # service's internals (which engine, which profile, which auth store).
-            # Computing it PROVISIONS first (idempotent, single-flight), so a stock
-            # install converges to available without any task ever arriving.
+            # The Signal Room contract's readiness signal: the desktop supervisor asks whether a
+            # guest deep_dive can run RIGHT NOW instead of inspecting this service's internals
             if not self.check_auth():
                 return
             try:
@@ -1290,10 +1287,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
-        # /guest-task — the Signal Room lane. The tier is a property of the ROUTE, not
-        # of a caller-supplied field: everything arriving here is untrusted room
-        # content and is stamped guest server-side, so a body can never elect its own
-        # privilege. (The old body discriminator on /task is rejected outright below.)
+        # /guest-task — the Signal Room lane.
         if path == "/guest-task":
             if not self.check_auth():
                 return
@@ -1378,18 +1372,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "task is required"})
             return
 
-        # Privilege is NEVER *escalated* by the request body. The route decides the
-        # tier: /guest-task always stamps guest. /task is the owner lane, and a body
-        # that names a tier can only ever DEMOTE itself:
-        #   • access_tier:"guest" — accepted as a compatibility shim, because shipped
-        #     daemons (vendored matrixrtc-conversation) still POST /task with the
-        #     discriminator. It routes to the guest lane exactly as /guest-task does,
-        #     so an old sender stays contained rather than breaking or, far worse,
-        #     silently falling through to owner authority. Remove once every pinned
-        #     sender has moved to /guest-task.
-        #   • anything else — refused. The dangerous legacy shape was an unknown,
-        #     misspelled, or absent value being stamped OWNER; that can no longer
-        #     happen by accident.
+        # Privilege is NEVER *escalated* by the request body. The route decides the tier:
+        # /guest-task always stamps guest.
         if "access_tier" in data:
             if data.get("access_tier") != "guest":
                 self.send_json(400, {"error": "access_tier is not accepted on /task"})
@@ -1540,10 +1524,8 @@ if __name__ == "__main__":
     print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
         print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
-    # A supervised replacement of this gateway (desktop token rotation / adopted-process
-    # takeover) sends SIGTERM. Guest workers run in their own process groups, so without
-    # this they would outlive us with no thread enforcing their timeout — and repeated
-    # replacements could stack them past the fleet cap.
+    # A supervised replacement of this gateway (desktop token rotation / adopted-process takeover)
+    # sends SIGTERM.
     def _reap_and_exit(_signum, _frame):
         try:
             from signal_guest_handler import reap_guest_workers

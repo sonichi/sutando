@@ -170,9 +170,8 @@ try:
 finally:
     os.stat, os.listdir = _real_stat, _real_listdir
 
-# THE FAIL-OPEN CASE the previous implementation got wrong: os.path.exists() swallows
-# EACCES and returns False, so an UNREADABLE managed policy read as absent. Only
-# FileNotFoundError may mean absent; every other OSError must count as present.
+# THE FAIL-OPEN CASE the previous implementation got wrong: os.path.exists() swallows EACCES and
+# returns False, so an UNREADABLE managed policy read as absent.
 def _stat_denied(path, *a, **k):
     raise PermissionError(13, "Permission denied", str(path))
 

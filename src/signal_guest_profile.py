@@ -36,9 +36,7 @@ import threading
 import time
 from pathlib import Path
 
-# Only these keys are carried into the guest ``.claude.json``. Everything else in the
-# owner's file — mcpServers, projects, hooks, plugins, settings, history — is dropped
-# by construction: an allowlist, so a NEW owner-side key can never silently leak in.
+# Only these keys are carried into the guest ``.claude.json``.
 _CLAUDE_JSON_ALLOW = ("oauthAccount", "userID", "hasCompletedOnboarding")
 
 # The credential file for the file-backed store (keyring installs simply lack it).
@@ -47,10 +45,8 @@ _CREDENTIALS_NAME = ".credentials.json"
 _lock = threading.Lock()  # single-flight: /capabilities can be polled concurrently
 _cache_lock = threading.Lock()  # guards the readiness cache against racing probes
 
-# Cached readiness. A POSITIVE result is bounded so `available: true` cannot outlive a
-# credential expiry by more than the TTL. A NEGATIVE result is cached only briefly:
-# caching "unavailable" for five minutes would leave a freshly-logged-in owner falsely
-# unavailable for that whole window.
+# Cached readiness. A POSITIVE result is bounded so `available: true` cannot outlive a credential
+# expiry by more than the TTL.
 _CACHE_TTL_S = 300.0
 _NEG_CACHE_TTL_S = 10.0
 # Keyed by the resolved profile path, so two workspaces cannot share a verdict.
@@ -58,9 +54,9 @@ _cache: dict[str, tuple[float, bool, str | None]] = {}
 
 
 def owner_config_dir() -> Path:
-    """The owner's Claude config root (``CLAUDE_CONFIG_DIR`` or ``~/.claude``)."""
-    env = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
-    return Path(env) if env else Path.home() / ".claude"
+    """The owner's Claude config root, via the canonical resolver."""
+    from util_paths import claude_home_path
+    return claude_home_path()
 
 
 def guest_home(workspace: Path | str | None = None) -> Path:
@@ -143,10 +139,7 @@ def _replace_if_changed(path: Path, want: str) -> None:
         _write_private(path, want)
         return
     if not stat.S_ISREG(st.st_mode):
-        # Symlinks and other non-regular entries are removed and replaced. A
-        # DIRECTORY at a profile file path is not something we silently rewrite
-        # (unlink cannot remove it and os.replace onto it fails): treat it as a
-        # corrupt profile and fail closed, so readiness reports rather than pretends.
+        # Symlinks and other non-regular entries are removed and replaced.
         if stat.S_ISDIR(st.st_mode):
             raise IsADirectoryError(f"profile path is a directory: {path}")
         try:
@@ -201,17 +194,14 @@ def ensure_guest_profile(workspace: Path | str | None = None) -> tuple[bool, str
 
         try:
             _replace_if_changed(home / ".claude.json", json.dumps(account, indent=2) + "\n")
-            # Settings: an explicit empty object. --setting-sources already excludes
-            # user/project/local files, and --strict-mcp-config excludes MCP; this is
-            # belt-and-braces so nothing in the guest root itself adds surface.
+            # Settings: an explicit empty object.
             _replace_if_changed(home / "settings.json", "{}\n")
             if creds is not None:
                 try:
                     want = creds.read_text()
                 except Exception:
-                    # Stattable but unreadable: we cannot refresh the guest copy, so
-                    # the stale one must not survive (it would outlive a credential we
-                    # can no longer verify).
+                    # Stattable but unreadable: we cannot refresh the guest copy, so the stale one
+                    # must not survive (it would outlive a credential we can no longer verify).
                     if not _purge_credentials(home):
                         return False, "guest_profile_purge_failed"
                     return False, "worker_unauthenticated"

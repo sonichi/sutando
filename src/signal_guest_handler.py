@@ -77,12 +77,8 @@ _REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: all
 # Only these reach the worker. NEVER the owner's full environment.
 _ENV_ALLOW = ("PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "SSL_CERT_FILE", "SSL_CERT_DIR", "TERM")
 
-# Managed policy still applies under a restricted spawn (`claude --help`: "managed
-# settings and --settings still apply"), and a managed HOOK can run local commands
-# that `--tools` cannot suppress. v1 therefore ships UNMANAGED-ONLY: any detectable
-# managed configuration => the lane reports unavailable rather than run partially
-# contained. (An OS-level sandbox is the stronger control that would let managed
-# fleets participate; it is the named follow-up, deliberately not in v1.)
+# Managed settings/hooks apply even under a restricted spawn and can run local
+# commands, so v1 is unmanaged-only: any detectable policy => unavailable.
 _MANAGED_SETTINGS_PATHS = (
     # macOS
     "/Library/Application Support/ClaudeCode/managed-settings.json",
@@ -166,18 +162,15 @@ _PROMPT_PREAMBLE = (
 # Bounds the number of concurrent guest workers.
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT)
 
-# Live worker process groups, so a gateway shutdown does not orphan them (each worker
-# runs in its own group; without this, replacing agent-api would leave workers running
-# with no thread enforcing the timeout, and repeated replacements could stack them).
+# Live worker process groups: each worker owns one, so a gateway shutdown can reap
+# them instead of orphaning workers with no thread left enforcing their timeout.
 _live_pgids: set[int] = set()
-# task_id -> result_dir for work accepted but not yet published, so a shutdown can
-# write a terminal payload instead of leaving /result/<id> a permanent 404 (the
-# contract promises an accepted task always becomes terminal in normal operation).
+# task_id -> result_dir for accepted-but-unpublished work, so a shutdown writes a
+# terminal payload instead of leaving /result/<id> a permanent 404.
 _live_tasks: dict[str, Path] = {}
 _live_lock = threading.Lock()
-# Set once shutdown begins. A worker that finishes spawning after this must kill
-# itself immediately instead of registering into a set nobody will drain again —
-# workers own their own session, so an unreaped one outlives this process.
+# Set once shutdown begins: a worker that finishes spawning after this kills itself
+# rather than registering into a set nobody will drain again.
 _stopping = False
 
 
@@ -350,10 +343,8 @@ def guest_argv(prompt: str, cwd: str) -> list[str]:
 
 
 def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> None:
-    # NOTE: the task is registered by start_guest_deep_dive BEFORE this thread is
-    # started — registering here would leave a window between Thread.start() and the
-    # first statement in which a shutdown sees no pending task and writes no
-    # cancellation, stranding the caller on a permanent 404.
+    # NOTE: the task is registered by start_guest_deep_dive BEFORE this thread is started —
+    # registering here would leave a window between Thread.start() and the first statement in
     out, workdir, pgid = "", "", None
     try:
         prompt = _PROMPT_PREAMBLE + confine(task_text[:MAX_TASK_CHARS])
@@ -370,10 +361,8 @@ def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> 
             proc = None
         if proc is not None:
             try:
-                # start_new_session=True makes the child a process-group leader, so
-                # its pid IS its pgid. Fall back to that rather than continuing
-                # untracked when getpgid errors (an untracked worker survives
-                # shutdown with nobody to reap it).
+                # start_new_session=True makes the child a process-group leader, so its pid IS its
+                # pgid.
                 try:
                     pgid = os.getpgid(proc.pid)
                 except Exception:
@@ -413,11 +402,8 @@ def _run(task_id: str, task_text: str, result_dir: Path, confine, home: str) -> 
             shutil.rmtree(workdir, ignore_errors=True)
         _slots.release()
 
-    # Publish, THEN release ownership: popping first would leave a window in which a
-    # concurrent shutdown sees no pending task and this thread is killed before it
-    # writes — a permanent 404. Writing under the lock keeps shutdown's cancellation
-    # and this publication mutually exclusive; the last writer is deterministic
-    # because whoever holds the lock also owns the entry.
+    # Publish, THEN release ownership: popping first would leave a window in which a concurrent
+    # shutdown sees no pending task and this thread is killed before it writes — a permanent 404.
     out = out.strip()
     result = _guard(out) if out else "[deep_dive returned no result]"
     with _live_lock:
