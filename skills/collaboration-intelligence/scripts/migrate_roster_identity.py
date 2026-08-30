@@ -222,37 +222,31 @@ def _absent(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
-def _mineable(value) -> bool:
-    """Would the collector read an id out of this value AT THIS PATH? It mines
-    strings and descends lists without changing the path; a mapping changes the
-    key, so its contents answer for a DIFFERENT field, not this slot.
+def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
+    """Every PRESENT member of a declared id slot the COLLECTOR does not read.
+
+    `mines` IS the collector, so validation cannot drift from it: a value it
+    accepts is one that reached a slot, and every other present member is a
+    referent stated and then discarded. Empty containers are the slot being
+    empty, so a v2 doc's own `[]` collections re-migrate untouched.
     """
-    if isinstance(value, str):
-        return bool(_snowflakes(value))
-    if isinstance(value, (list, tuple)):
-        return any(_mineable(v) for v in value)
-    return False
-
-
-def _slot_failures(value, slot: str, path: list, shapes: list) -> None:
-    """Every PRESENT value in a declared id slot from which no id can be read.
-
-    Empty containers are the slot being empty, not a bad value, so a v2 doc's
-    own `[]` collections re-migrate untouched.
-    """
-    values = list(value) if slot == "plural" and isinstance(value, (list, tuple)) \
-        else [value]
-    for v in values:
-        # ONE decision, shared with collection: readable means the collector
-        # would mine an id here. A plural member may be a schema record.
-        readable = _snowflakes(json.dumps(v, default=str)) if slot == "plural" \
-            else _mineable(v)
-        if _absent(v) or readable:
-            continue
+    def _bad_shape(v):
         shapes.append({"path": ".".join(path), "kind": type(v).__name__,
                        "reason": "a field declaring an id holds a value no id "
                                  "can be read from, so the referent it states "
                                  "is discarded rather than absent"})
+
+    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not values:
+        # An empty PLURAL slot is empty; an empty container in a SINGULAR one
+        # is a present value the collector reads nothing from.
+        if slot == "singular":
+            _bad_shape(value)
+        return
+    for v in values:
+        if _absent(v) or mines(v):
+            continue
+        _bad_shape(v)
 
 
 def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
@@ -263,24 +257,26 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
     """
     found = []
 
-    def walk(obj, path, provider):
+    def walk(obj, path, provider, sink, shapes):
         if isinstance(obj, dict):
             prov = _declared_provider(obj) or provider
             for k, v in obj.items():
+                sub = path + [str(k)]
                 slot = _id_slot(k)
                 # Inside the basis map the key IS the slot and the value prose.
                 if slot and shapes is not None and ri.BASIS_FIELD not in path \
                         and _discord_source(path, str(k), prov):
-                    _slot_failures(v, slot, path + [str(k)], shapes)
-                walk(v, path + [str(k)], prov)
+                    _slot_failures(v, slot, sub, shapes,
+                                   lambda m, _p=sub, _pr=prov: _mines(m, _p, _pr))
+                walk(v, sub, prov, sink, shapes)
         elif isinstance(obj, list):
             for v in obj:
-                walk(v, path, provider)
+                walk(v, path, provider, sink, shapes)
         elif isinstance(obj, str) and path and ri.BASIS_FIELD not in path \
                 and _discord_source(path[:-1], path[-1], provider):
             for sf in _snowflakes(obj):
-                if sf not in found:
-                    found.append(sf)
+                if sf not in sink:
+                    sink.append(sf)
         elif obj is not None and not isinstance(obj, str) and path \
                 and _discord_source(path[:-1], path[-1], provider) \
                 and shapes is not None and not _id_slot(path[-1]):
@@ -290,7 +286,13 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
                            "reason": "typed field holds a non-string value, so "
                                      "its id is unreadable rather than absent"})
 
-    walk(entry, [], None)
+    def _mines(member, path, provider) -> bool:
+        """Run the collector over one member and report whether it yielded."""
+        scratch = []
+        walk(member, path, provider, scratch, None)
+        return bool(scratch)
+
+    walk(entry, [], None, found, shapes)
     return found
 
 

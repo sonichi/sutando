@@ -1146,6 +1146,24 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(rec["human_discord_id"], HUMAN)
 
+    def test_a_compound_slot_refuses_the_members_the_collector_drops(self):
+        # Reviewer, 2026-08-30: validation approximated the collector, so an
+        # unreadable member rode along beside a readable one.
+        for value in ([self.SECOND, 1529720369668292629],
+                      [1529720369668292629], [{"value": self.SECOND}]):
+            rc, err, _ = self._cli({"secondary_agent": {"ids": value},
+                                    "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 5, f"{value!r}: {err}")
+            self.assertIn("SHAPE x", err)
+
+    def test_a_schema_record_member_is_still_read(self):
+        # Positive control: `{"id": ...}` IS mined, and the v2 writer emits
+        # exactly this shape — refusing it would break re-migration.
+        rc, err, rec = self._cli({"secondary_agent": {"ids": [{"id": self.SECOND}]},
+                                  "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertIn(self.SECOND, ri.stand_discord_ids(rec))
+
     def test_the_one_measured_legacy_spelling_still_resolves(self):
         # The allowlist, and the reason it is not empty: a bare `id` under a
         # referent ancestor states no provider and is documented in-tree.
