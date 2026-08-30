@@ -1552,5 +1552,97 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rec[ri.STAND_FIELD], self.STAND)
 
 
+class DisagreementSurvivesReMigration(unittest.TestCase):
+    """A refused disagreement must not resolve itself on the next pass.
+
+    `migrate()` overwrites the canonical slots, so the slot that stated one
+    half of the disagreement is empty in its own output. Pass 2 then saw only
+    the surviving source, agreed with itself, and published the referent pass 1
+    had refused — rc 5 becoming rc 0 with no new evidence.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def _pass(self, roster: dict, triage: dict):
+        d = Path(self.tmp)
+        (d / "in.json").write_text(json.dumps(roster))
+        (d / "cfg.json").write_text(json.dumps(triage))
+        out = d / "out.json"
+        sys.argv = ["m", "--roster", str(d / "in.json"),
+                    "--triage-config", str(d / "cfg.json"), "--out", str(out)]
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = mig.main()
+        return rc, (json.loads(out.read_text()) if out.exists() else {})
+
+    def _assert_refused(self, doc, where):
+        e = doc["alice"]
+        self.assertIsNone(e[ri.HUMAN_FIELD], f"{where}: human slot published")
+        self.assertIsNone(e[ri.STAND_FIELD], f"{where}: stand slot published")
+        self.assertIn(BOT, [u["id"] for u in e[ri.UNRESOLVED_FIELD]],
+                      f"{where}: the contested id stopped being unresolved")
+
+    def test_declared_human_contradicted_by_triage_stays_refused(self):
+        triage = {"people": {"alice": {"bots": [BOT]}}}
+        rc1, d1 = self._pass({"alice": {"github": "alice",
+                                        ri.HUMAN_FIELD: BOT}}, triage)
+        self.assertEqual(rc1, 5)
+        self._assert_refused(d1, "pass 1")
+        rc2, d2 = self._pass(d1, triage)
+        self.assertEqual(rc2, 5, "pass 2 resolved a disagreement it inherited")
+        self._assert_refused(d2, "pass 2")
+
+    def test_declared_stand_contradicted_by_triage_stays_refused(self):
+        # The other direction: the failure was symmetric, so watching one
+        # direction would let a regression through on the other.
+        triage = {"people": {"alice": {"discord": BOT}}}
+        rc1, d1 = self._pass({"alice": {"github": "alice",
+                                        ri.STAND_FIELD: BOT}}, triage)
+        self.assertEqual(rc1, 5)
+        self._assert_refused(d1, "pass 1")
+        rc2, d2 = self._pass(d1, triage)
+        self.assertEqual(rc2, 5, "pass 2 resolved a disagreement it inherited")
+        self._assert_refused(d2, "pass 2")
+
+    def test_a_third_pass_still_refuses(self):
+        # The carried record must re-emit its own seeds, or the fix survives
+        # exactly one pass and the bug returns at pass 3.
+        triage = {"people": {"alice": {"bots": [BOT]}}}
+        _, d = self._pass({"alice": {"github": "alice", ri.HUMAN_FIELD: BOT}},
+                          triage)
+        for n in (2, 3):
+            rc, d = self._pass(d, triage)
+            self.assertEqual(rc, 5, f"pass {n} resolved the disagreement")
+            self._assert_refused(d, f"pass {n}")
+
+    def test_CONTROL_a_repaired_source_still_clears_the_record(self):
+        # The naive fix — carry every refusal forever — also makes this pass,
+        # so without it the suite cannot tell a fix from a latch.
+        rc1, d1 = self._pass({"alice": {"github": "alice", ri.HUMAN_FIELD: BOT}},
+                             {"people": {"alice": {"bots": [BOT]}}})
+        self.assertEqual(rc1, 5)
+        rc2, d2 = self._pass(d1, {"people": {"alice": {}}})
+        self.assertEqual(rc2, 0, "a repaired source must clear the refusal")
+        self.assertEqual(d2["alice"][ri.HUMAN_FIELD], BOT)
+        self.assertEqual(d2["alice"][ri.UNRESOLVED_FIELD], [])
+
+    def test_CONTROL_a_non_writer_owned_seed_was_never_affected(self):
+        # States a referent but is not a slot we rewrite, so it survived on its
+        # own — which is what isolates the failure to the rewritten slots.
+        triage = {"people": {"alice": {"bots": [BOT]}}}
+        rc1, d1 = self._pass({"alice": {"github": "alice",
+                                        "discord_human_id": BOT}}, triage)
+        self.assertEqual(rc1, 5)
+        rc2, d2 = self._pass(d1, triage)
+        self.assertEqual(rc2, 5)
+        self._assert_refused(d2, "pass 2")
+        self.assertFalse(
+            any(s.get("path") == "discord_human_id"
+                for u in d2["alice"][ri.UNRESOLVED_FIELD]
+                for s in u.get("seeded_by") or []),
+            "a slot the writer never erases must not be carried as one")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

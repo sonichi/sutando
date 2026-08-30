@@ -324,6 +324,62 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
     return found
 
 
+def _slot_erased(entry, path) -> bool:
+    """Is a writer-owned slot empty — so its earlier claim cannot be re-read?
+
+    Absent, None and blank all mean the same thing here: the referent this slot
+    once stated is no longer legible from the entry.
+    """
+    node = entry
+    for seg in str(path).split("."):
+        if not isinstance(node, dict) or seg not in node:
+            return True
+        node = node[seg]
+    return node is None or (isinstance(node, str) and not node.strip())
+
+
+def _canonical_seeds(seeds: list) -> list:
+    """Deduped, ordered seeds. Re-seeding appends every pass, and an unbounded
+    record would grow without bound while stating nothing new."""
+    out, seen = [], set()
+    for s in seeds:
+        k = (s.get("path"), s.get("verdict"))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({"path": s.get("path"), "verdict": s.get("verdict"),
+                    "reason": s.get("reason")})
+    return sorted(out, key=lambda s: (str(s["path"]), str(s["verdict"])))
+
+
+def _carried_seeds(entry, arbitrated: set):
+    """Claims from a carried disagreement whose writer-owned slot we erased.
+
+    Dropped once the slot reads again: a repair must clear the record rather
+    than latch it, which is why this checks the slot instead of always carrying.
+    """
+    if not isinstance(entry, dict):
+        return
+    for rec in entry.get(ri.UNRESOLVED_FIELD) or []:
+        if not isinstance(rec, dict):
+            continue
+        id_ = rec.get("id")
+        if not id_ or str(id_) in arbitrated:
+            continue
+        for seed in rec.get("seeded_by") or []:
+            if not isinstance(seed, dict):
+                continue
+            path, verdict = seed.get("path"), seed.get("verdict")
+            if not path or verdict not in (HUMAN, STAND):
+                continue
+            if not ri.writer_owned_path(path) or not _slot_erased(entry, path):
+                continue
+            reason = seed.get("reason") or (
+                f"cited in `{path}` before this migration overwrote it")
+            yield str(id_), verdict, reason, {
+                "path": path, "verdict": verdict, "reason": reason}
+
+
 def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
     """Does a CARRIED finding still describe this entry?
 
@@ -434,11 +490,20 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
                     "collision": len(_st) > 1,
                     "reason": "two ids claim one singular slot; order would "
                               "decide, so neither is taken"})
+    seeds: dict = {}    # id -> writer-owned slots that stated a referent
     for id_ in [c for c in collected if c not in arbitrated]:
         for field in _cited_in(entry, id_):
             for verdict, reason in _verdicts_from_field(field):
                 claim(id_, verdict, reason)
+                if ri.writer_owned_path(field):
+                    seeds.setdefault(id_, []).append(
+                        {"path": field, "verdict": verdict, "reason": reason})
         claims.setdefault(id_, {})
+    # Same rule `_still_unresolved` applies to shape failures: our own write
+    # erases a canonical slot, so its claim is absent rather than withdrawn.
+    for id_, verdict, reason, seed in _carried_seeds(entry, arbitrated):
+        claim(id_, verdict, reason)
+        seeds.setdefault(id_, []).append(seed)
 
     # A declared login is the SOLE join key, matched case-insensitively: the
     # local-key fallback crosses axes, and case-sensitivity splits one person.
@@ -492,10 +557,13 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     humans, stands, unresolved, basis = [], [], [], {}
     for id_, verdicts in claims.items():
         if len(verdicts) > 1:
-            unresolved.append({
+            rec = {
                 "id": id_,
                 "reason": "sources disagree on the referent",
-                "claims": {v: r for v, r in verdicts.items()}})
+                "claims": {v: r for v, r in verdicts.items()}}
+            if seeds.get(id_):
+                rec["seeded_by"] = _canonical_seeds(seeds[id_])
+            unresolved.append(rec)
         elif HUMAN in verdicts:
             humans.append((id_, verdicts[HUMAN]))
         elif STAND in verdicts:

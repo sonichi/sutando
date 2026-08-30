@@ -289,7 +289,9 @@ case-insensitively wherever they are joined.
     "human_discord_id": "<the PERSON's id>  | null",
     "stand_discord_id": "<the AGENT's id>   | null",
     "other_stand_discord_ids": [{"id": "...", "basis": ["..."]}],
-    "unresolved_discord_ids": [{"id": "...", "reason": "..."}],
+    "unresolved_discord_ids": [{"id": "...", "reason": "...",
+                                "seeded_by": [{"path": "…", "verdict": "human|stand",
+                                               "reason": "…"}]}],
     "home_channel": "<channel id> | null",
     "id_basis": {"human_discord_id": ["..."], "stand_discord_id": ["..."]},
     "id_shape_failures": [{"path": "…|null", "kind": "…", "reason": "…",
@@ -322,6 +324,13 @@ downstream ping then reaches the wrong party while reporting success.
 rather than reading `discord_id`; use `scripts/roster_identity.py`'s accessors
 (`human_discord_id`, `stand_discord_id`, `stand_discord_ids`). An id in
 `unresolved_discord_ids` answers no lookup.
+
+`seeded_by` records which writer-owned slots stated a referent for a contested
+id. The migration overwrites those slots, so its own output no longer holds the
+claim that caused the disagreement; without the record a re-migration sees only
+the surviving source, agrees with itself, and publishes the referent the
+previous pass refused. It is read only while the named slot is still empty — a
+slot that reads again is a repair, and the record clears.
 
 `id_shape_failures` is RESERVED and migration-owned: findings the migration
 could not re-derive from its own output, carried so a refusal survives a
