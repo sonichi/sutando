@@ -1112,6 +1112,40 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertIsNone(rec["human_discord_id"])
 
+    def test_ordinary_metadata_is_not_a_shape_failure(self):
+        # Reviewer, 2026-08-30: the STRING branch consulted the source rule and
+        # the non-string branch did not, so a bool refused a valid roster.
+        rc, err, _ = self._cli({"human": {"provider": "matrix", "active": True},
+                                "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("SHAPE", err)
+
+    def test_a_slot_value_the_collector_cannot_read_is_refused(self):
+        # Validation called any JSON containing a snowflake readable, while the
+        # collector mines strings — so explicit human evidence vanished at rc 0.
+        for value in (1025828152183885925, {"value": HUMAN}, {}):
+            rc, err, rec = self._cli({"discord_human_id": value,
+                                      "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 5, f"{value!r}: {err}")
+            self.assertIn("SHAPE x", err)
+            self.assertIsNone(rec["human_discord_id"])
+
+    def test_a_readable_string_slot_is_still_accepted(self):
+        # Positive control: refusing every non-string would pass the case above
+        # and reject the canonical spelling too.
+        rc, err, rec = self._cli({"discord_human_id": HUMAN,
+                                  "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec["human_discord_id"], HUMAN)
+
+    def test_validation_and_collection_agree_on_a_wrapped_id(self):
+        # The reviewer asked for ONE decision. A one-element list IS mined at
+        # this path, so refusing it would accept and reject the same value.
+        rc, err, rec = self._cli({"discord_human_id": [HUMAN],
+                                  "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(rec["human_discord_id"], HUMAN)
+
     def test_the_one_measured_legacy_spelling_still_resolves(self):
         # The allowlist, and the reason it is not empty: a bare `id` under a
         # referent ancestor states no provider and is documented in-tree.

@@ -222,6 +222,18 @@ def _absent(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+def _mineable(value) -> bool:
+    """Would the collector read an id out of this value AT THIS PATH? It mines
+    strings and descends lists without changing the path; a mapping changes the
+    key, so its contents answer for a DIFFERENT field, not this slot.
+    """
+    if isinstance(value, str):
+        return bool(_snowflakes(value))
+    if isinstance(value, (list, tuple)):
+        return any(_mineable(v) for v in value)
+    return False
+
+
 def _slot_failures(value, slot: str, path: list, shapes: list) -> None:
     """Every PRESENT value in a declared id slot from which no id can be read.
 
@@ -231,7 +243,11 @@ def _slot_failures(value, slot: str, path: list, shapes: list) -> None:
     values = list(value) if slot == "plural" and isinstance(value, (list, tuple)) \
         else [value]
     for v in values:
-        if _absent(v) or _snowflakes(json.dumps(v, default=str)):
+        # ONE decision, shared with collection: readable means the collector
+        # would mine an id here. A plural member may be a schema record.
+        readable = _snowflakes(json.dumps(v, default=str)) if slot == "plural" \
+            else _mineable(v)
+        if _absent(v) or readable:
             continue
         shapes.append({"path": ".".join(path), "kind": type(v).__name__,
                        "reason": "a field declaring an id holds a value no id "
@@ -265,8 +281,9 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
             for sf in _snowflakes(obj):
                 if sf not in found:
                     found.append(sf)
-        elif obj is not None and not isinstance(obj, str) and _typed_path(path) \
-                and shapes is not None and not _id_slot(path[-1] if path else ""):
+        elif obj is not None and not isinstance(obj, str) and path \
+                and _discord_source(path[:-1], path[-1], provider) \
+                and shapes is not None and not _id_slot(path[-1]):
             # A declared slot is reported by _slot_failures; without this guard
             # a non-string there is reported twice.
             shapes.append({"path": ".".join(path), "kind": type(obj).__name__,
