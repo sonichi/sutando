@@ -1331,6 +1331,57 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         rc2, err2, _ = self._cli(rec1)
         self.assertEqual(rc2, 5, "the writer cleared its own refusal")
 
+    def test_a_present_but_unusable_container_is_a_refusal_not_an_absence(self):
+        # Coercing a non-list value to [] made corruption indistinguishable from
+        # a field that was never there, and the refusal was silently dropped.
+        for bad in ("corrupted", {"a": 1}, 7):
+            rc1, err1, r1 = self._cli_tri({"human": {"id": HUMAN},
+                                           ri.SHAPE_FIELD: bad},
+                                          {"discord": HUMAN})
+            self.assertEqual(rc1, 5, f"{bad!r} read as absent: {err1}")
+            self.assertTrue(r1.get(ri.SHAPE_FIELD),
+                            f"{bad!r} erased the refusal state")
+            rc2, err2, r2 = self._cli(r1)
+            self.assertEqual(rc2, 5, f"{bad!r} cleared on pass 2: {err2}")
+
+    def test_the_control_an_absent_container_is_not_a_refusal(self):
+        # Without this, treating absence as corruption would refuse every
+        # roster that merely has no carried state.
+        rc, err, rec = self._cli_tri({"human": {"id": HUMAN}}, {"discord": HUMAN})
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(rec.get(ri.SHAPE_FIELD))
+
+    def test_a_referent_without_an_id_decides_nothing_and_stays_bounded(self):
+        # `arbitrated_states` with no ids names no id, so the classifier never
+        # reads it; exempting it from the bound made the field unbounded.
+        recs = [{"path": "p%03d" % i, "kind": "k", "reason": "r",
+                 "arbitrated_states": ["stand"]} for i in range(80)]
+        rc, err, rec = self._cli_tri({"human": {"id": HUMAN},
+                                      ri.SHAPE_FIELD: recs}, {"discord": HUMAN})
+        got = rec.get(ri.SHAPE_FIELD) or []
+        self.assertLessEqual(len(got), ri.SHAPE_MAX, err)
+        # Bounded is not discriminating: treating these as identity also stays
+        # bounded, by COLLAPSING them. Diagnostics truncate, never aggregate.
+        self.assertFalse(any(r.get("kind") == ri.OVERFLOW_KIND for r in got),
+                         f"a referent with no id was treated as identity: {got}")
+        self.assertEqual(len(got), ri.SHAPE_MAX,
+                         f"diagnostics should fill the bound, got {len(got)}")
+
+    def test_overflowing_arbitration_aggregates_and_stays_refused(self):
+        # Identity facts may not be dropped, but they may not grow without
+        # bound either: they collapse into one aggregate that keeps every id.
+        recs = [{"path": "p%03d" % i, "kind": "k", "reason": "r",
+                 "arbitrated_ids": [BOT], "arbitrated_states": ["stand"]}
+                for i in range(80)]
+        rc, err, rec = self._cli_tri({"human": {"id": HUMAN},
+                                      ri.SHAPE_FIELD: recs}, {"discord": HUMAN})
+        got = rec.get(ri.SHAPE_FIELD) or []
+        self.assertLessEqual(len(got), ri.SHAPE_MAX, err)
+        self.assertTrue(any(r.get("kind") == ri.OVERFLOW_KIND for r in got),
+                        f"no overflow marker: {got}")
+        self.assertTrue(any(BOT in (r.get("arbitrated_ids") or []) for r in got),
+                        "the aggregate lost the contested id")
+
     def test_the_bound_cannot_decide_an_identity_ACROSS_PASSES(self):
         # The cap is diagnostic history; an identity-bearing record is the only
         # surviving evidence of a contested id once the source is overwritten.

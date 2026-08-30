@@ -80,11 +80,24 @@ def canonical_shape_failure(rec) -> "dict | None":
     return out
 
 
+#: An overflow aggregate stands in for arbitration records the bound cannot
+#: hold. It keeps the ids and referents, so the slot stays refused.
+OVERFLOW_KIND = "arbitration-overflow"
+#: A carried refusal that could not be represented. Blocking, and pathless, so
+#: it must survive both the bound and the pathless-evidence drop.
+INVALID_KIND = "invalid"
+
+
 def bears_identity(rec) -> bool:
-    """A record carrying arbitration facts: which ids were contested, and as
-    what. Losing one is not losing history, it is losing a referent."""
-    return bool(isinstance(rec, dict)
-                and (rec.get("arbitrated_ids") or rec.get("arbitrated_states")))
+    """Carries the fact the classifier actually reads: WHICH ids were contested.
+    A referent with no id decides nothing, so it is diagnostic, not identity."""
+    return bool(isinstance(rec, dict) and rec.get("arbitrated_ids"))
+
+
+def must_keep(rec) -> bool:
+    """Records the bound may never drop: identity facts and blocking refusals."""
+    return bears_identity(rec) or (isinstance(rec, dict)
+                                   and rec.get("kind") == INVALID_KIND)
 
 
 def canonical_shape_failures(value, *, bound: "int | None" = SHAPE_MAX) -> list:
@@ -106,11 +119,25 @@ def canonical_shape_failures(value, *, bound: "int | None" = SHAPE_MAX) -> list:
             seen.add(k); out.append(c)
     if bound is None:
         return out
-    # Diagnostic history only: once the source field is overwritten, an
-    # identity-bearing record is the sole evidence the id was contested.
-    keep = [r for r in out if bears_identity(r)]
-    rest = [r for r in out if not bears_identity(r)]
-    return keep + rest[:max(0, bound - len(keep))] if len(keep) < bound else keep
+    # Diagnostic history is bounded; identity facts and blocking refusals are
+    # not droppable, so an overflow AGGREGATES them rather than growing.
+    keep = [r for r in out if must_keep(r)]
+    rest = [r for r in out if not must_keep(r)]
+    if len(keep) <= bound:
+        return keep + rest[:max(0, bound - len(keep))]
+    ids, states = set(), set()
+    for r in keep:
+        ids.update(r.get("arbitrated_ids") or [])
+        states.update(r.get("arbitrated_states") or [])
+    agg = {"path": None, "kind": OVERFLOW_KIND,
+           "reason": f"{len(keep)} arbitration records exceeded the {bound}-record "
+                     "bound; their ids and referents are aggregated here and "
+                     "remain refused"}
+    if ids:
+        agg["arbitrated_ids"] = sorted(ids)
+    if states:
+        agg["arbitrated_states"] = sorted(states)
+    return [agg]
 
 #: A key starting with "_" is document metadata, not a person.
 def is_person_key(key: str) -> bool:

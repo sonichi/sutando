@@ -333,6 +333,10 @@ def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
     again — otherwise a repair stays latched behind a stale record.
     """
     path = rec.get("path")
+    if rec.get("kind") in (ri.INVALID_KIND, ri.OVERFLOW_KIND):
+        # Pathless BY DESIGN and blocking: no path exists to re-check, so the
+        # pathless-evidence rule below would silently discard the refusal.
+        return True
     if not path:
         # Derived from a source this pass re-reads (the triage config), so the
         # fresh pass re-raises it if it still holds. Carrying it latches it.
@@ -385,8 +389,12 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     # against them, so a repair can clear a record rather than latch forever.
     fresh: list = []
     collected = _collect_ids(entry, fresh)
-    _raw_carried = (entry or {}).get(ri.SHAPE_FIELD) if isinstance(entry, dict) else None
-    _raw_carried = list(_raw_carried) if isinstance(_raw_carried, (list, tuple)) else []
+    _has_carried = isinstance(entry, dict) and ri.SHAPE_FIELD in entry
+    _raw_value = entry.get(ri.SHAPE_FIELD) if _has_carried else None
+    # PRESENT but not a list. Coercing it to [] made corruption read as absence,
+    # which is the one thing this field must never do.
+    _bad_container = _has_carried and not isinstance(_raw_value, (list, tuple))
+    _raw_carried = list(_raw_value) if isinstance(_raw_value, (list, tuple)) else []
     carried = ri.canonical_shape_failures(_raw_carried, bound=None)
     fresh_paths = {f.get("path") for f in fresh}
     # Unbounded for the decision: truncating before arbitration let member
@@ -396,9 +404,10 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         bound=None)
     # A refusal that cannot be represented is still a refusal. Count only
     # REJECTED records: dedup also shrinks the list, and is not corruption.
-    if any(ri.canonical_shape_failure(r) is None for r in _raw_carried):
+    if _bad_container or any(ri.canonical_shape_failure(r) is None
+                             for r in _raw_carried):
         shape_failures.append({
-            "path": None, "kind": "invalid",
+            "path": None, "kind": ri.INVALID_KIND,
             "reason": "carried refusal state was unusable and could not be "
                       "validated; treat as still-refused, not as absent"})
     # An id from an over-full singular slot is not evidence for that slot: it

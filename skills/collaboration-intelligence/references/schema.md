@@ -332,6 +332,14 @@ clears only by repairing the SOURCE roster and re-migrating — our own rewrite
 of that field is not a repair. Do not use this name for anything else: a v1
 roster carrying a same-named provenance field would be read as a refusal.
 
+Two record kinds are reserved and pathless by design, so both survive the bound
+and the pathless-evidence drop. `kind: "invalid"` is a carried refusal that
+could not be represented — a present-but-unusable container is a refusal, never
+an absence. `kind: "arbitration-overflow"` stands in for arbitration records
+that exceed `SHAPE_MAX`, carrying the union of their `arbitrated_ids` and
+referents so the contested ids stay refused; identity facts are aggregated
+rather than dropped, while diagnostic history is truncated.
+
 **Migrating.** `scripts/migrate_roster_identity.py --roster <v1> --triage-config
 <pr-triage/config.json> --peers <peers.json> --discord-config <discord-config.json>
 --out <v2> --table` — it never writes its input and prints the per-entry
