@@ -19,6 +19,7 @@ held-list" naturally hashes the sentence it was about to send.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -85,13 +86,50 @@ def write_state(path: Path, doc: dict) -> None:
     os.replace(tmp, path)
 
 
+def record_outcome(path: Path, outcome: str) -> dict:
+    """Maintain `streak` and the two cumulative totals, under an exclusive lock.
+
+    Counters, unlike `last_surfaced_hash`, cannot use last-writer-wins: two
+    processes that both read total=5 would both write 6 and one pass would
+    vanish. The hash path is unaffected — replacing it with a stale-but-valid
+    hash costs at most one extra surface.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.with_suffix(".json.lock")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            doc = read_state(path)
+            noop = outcome == "noop"
+            doc["streak"] = int(doc.get("streak") or 0) + 1 if noop else 0
+            key = "noop_total" if noop else "substantive_total"
+            doc[key] = int(doc.get(key) or 0) + 1
+            doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            write_state(path, doc)
+            return doc
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--state", required=True, help="path to state/idle-streak.json")
     ap.add_argument("--commit", action="store_true",
                     help="record the hash when it differs")
     ap.add_argument("--items", help="JSON held-list; default reads stdin")
+    ap.add_argument("--pass-outcome", choices=("substantive", "noop"),
+                    help="RECORD-ONLY: maintain streak + totals and exit; "
+                         "reads no stdin and ignores --items")
     a = ap.parse_args(argv)
+
+    # Record-only, and it must return BEFORE any stdin access: under cron stdin
+    # is an open pipe that is never written, so a read here blocks forever.
+    if a.pass_outcome:
+        doc = record_outcome(Path(a.state), a.pass_outcome)
+        print(f"{a.pass_outcome} streak={doc['streak']} "
+              f"noop_total={doc.get('noop_total', 0)} "
+              f"substantive_total={doc.get('substantive_total', 0)}")
+        return 0
 
     raw = a.items if a.items is not None else sys.stdin.read()
     try:

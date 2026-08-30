@@ -651,22 +651,49 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     return None
 
 
-def iter_archived_tasks(tasks_dir: Path) -> Iterable[Path]:
+def iter_archived_tasks(tasks_dir: Path, *,
+                        newest_first: bool = False) -> Iterable[Path]:
     """Yield every archived task file (flat legacy + month-partitioned),
     for corpus sweeps and golden tests. Skips non-task artefacts (files
     without a `task:` line) that may accumulate in the archive directory
-    (e.g. `answer-Q*` files from the pending-questions flow)."""
+    (e.g. `answer-Q*` files from the pending-questions flow).
+
+    `newest_first` reverses the traversal for callers that stop early: the
+    default order puts the oldest month first, so a bounded consumer sees
+    only the least recent tasks. Both orders stay lazy — a caller that stops
+    at N never stats the rest of the archive.
+
+    Either order is a HEURISTIC about where a corpus keeps its recent tasks,
+    never a guarantee: `newest_first` assumes the flat legacy files are older
+    than every month partition, and a host whose flat tail holds recent tasks
+    defeats it (measured: first non-owner task at index 590 under
+    `newest_first` vs index 1 under the default). A bounded caller must
+    therefore treat exhausting its cap as UNKNOWN rather than absence — the
+    cap is a bound on work, not a tuning knob for accuracy.
+    """
     archive_root = tasks_dir / "archive"
     if not archive_root.is_dir():
         return
-    for p in sorted(archive_root.glob("*.txt")):
-        if _has_task_line(p):
-            yield p
-    for entry in sorted(archive_root.iterdir()):
-        if entry.is_dir() and _MONTH_DIR_RE.match(entry.name):
-            for p in sorted(entry.glob("*.txt")):
-                if _has_task_line(p):
-                    yield p
+    flat = sorted(archive_root.glob("*.txt"), reverse=newest_first)
+    months = [e for e in sorted(archive_root.iterdir(), reverse=newest_first)
+              if e.is_dir() and _MONTH_DIR_RE.match(e.name)]
+
+    def _months() -> Iterable[Path]:
+        for entry in months:
+            for q in sorted(entry.glob("*.txt"), reverse=newest_first):
+                if _has_task_line(q):
+                    yield q
+
+    def _flat() -> Iterable[Path]:
+        for q in flat:
+            if _has_task_line(q):
+                yield q
+
+    # Month partitions hold the recent tasks; flat files are the legacy tail.
+    groups = (_months(), _flat()) if newest_first else (_flat(), _months())
+    for group in groups:
+        for q in group:
+            yield q
 
 
 def _has_task_line(path: Path) -> bool:
