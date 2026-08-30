@@ -85,12 +85,13 @@ if (chosen) {
     const rest = content.slice(from);
     const next = rest.search(/## \d{4}-\d{2}-\d{2} — /);
     const section = next === -1 ? rest : rest.slice(0, next);
-    items = section.match(/^- \*\*.+?\*\*.*/gm) || [];
+    items = section.match(/^- \*\*.+?\*\*.*/gm) || [];   // header-only if empty
   } else {
     items = content.match(/^- \*\*.+?\*\*.*/gm) || [];      // BEFORE: whole file
   }
 }
-console.log(JSON.stringify({ headerCount, header, items: items.slice(0, 5) }));
+const renders = chosen !== null && (scopesItems ? true : items.length > 0);
+console.log(JSON.stringify({ headerCount, header, items: items.slice(0, 5), renders }));
 """
 
 bad: list[str] = []
@@ -140,10 +141,12 @@ check("does NOT inject the file preamble (the pre-fix behaviour)",
       "PREAMBLE-ITEM-3" not in joined and "Streaming task watcher" not in joined)
 check("does NOT inject the older section's items", "OLD-A" not in joined)
 
-# CONTROL: header with an empty section must yield NO items, not fall back.
+# REGRESSION GUARD (johnm-desktop, measured on a host where 11 of 13 sections
+# have no matching bullets): scoping must not make the whole block vanish.
 r2 = run_probe("# Build log\n\n- **PREAMBLE** x\n\n## 2026-08-28 — empty section\n")
-check("CONTROL: empty newest section yields NO items (no whole-file fallback)",
-      r2["items"] == [])
+check("empty newest section borrows NO items from elsewhere", r2["items"] == [])
+check("  and the block still RENDERS, header-only, rather than disappearing",
+      r2["renders"] is True and r2["header"] is not None)
 
 # CONTROL: probe must report a header, or every assertion above is vacuous.
 check("CONTROL: probe reports a header for a well-formed log", r["header"] is not None)

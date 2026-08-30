@@ -71,10 +71,10 @@ export function buildVoiceAgentContext(): string {
 				const rest = content.slice(from);
 				const next = rest.search(/## \d{4}-\d{2}-\d{2} — /);
 				const section = next === -1 ? rest : rest.slice(0, next);
-				const items = section.match(/^- \*\*.+?\*\*.*/gm);
-				if (items) {
-					lines.push('RECENT ACTIVITY:', newest[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), '');
-				}
+				// A section with no bulleted items renders header-only ON PURPOSE:
+				// borrowing items from elsewhere is the mispairing this fixes.
+				const items = section.match(/^- \*\*.+?\*\*.*/gm) ?? [];
+				lines.push('RECENT ACTIVITY:', newest[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), '');
 			}
 		} catch { /* best effort */ }
 	}
