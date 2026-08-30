@@ -11,6 +11,9 @@
 [run]
 parallel = True
 sigterm = True
+# Lanes run in mktemp worktrees (parallel-suite-lane.sh); relative paths let
+# the repo-root combine resolve sources after the worktrees are removed.
+relative_files = True
 source =
     src
     scripts
