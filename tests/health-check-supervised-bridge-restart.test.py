@@ -34,7 +34,8 @@ Guards:
      NOT rc=113 not-found), pgrep hard errors, and an unknowable job beside a
      live wrapper all refuse to spawn, kill, or evict — slack and gateway.
   h) FOREIGN fails CLOSED: a same-name launchd job or wrapper owned by another
-     checkout is never kickstarted, killed under, or spawned beside.
+     checkout is never kickstarted, killed under, or spawned beside — including
+     a foreign EXECUTED wrapper carrying our path as a later argument.
   i) a kill whose signal fails, whose target survives, or whose lineage lookup
      is unreadable is reported as failure with NO signal sent where unproven.
   j) an eviction that fails (helper rc != 0, helper unrunnable, an OWN
@@ -515,6 +516,31 @@ def case_h_foreign_supervisor_fails_closed() -> list[str]:
     if host5.of("kickstart"):
         fails.append(f"h) kickstarted on an incidental-field match: {host5.of('kickstart')}")
     fails += no_side_effects(host5, "h/incidental-field")
+    # kewei r6 control: the EXECUTED wrapper is foreign; our exact wrapper +
+    # channel appear only as LATER arguments — data, not the program. Must be
+    # FOREIGN with zero side effects (at f8012a40 this kickstarted the job).
+    later_arg_dump = ("gui/501/com.sutando.x = {\n"
+                      "\tstate = running\n"
+                      "\targuments = {\n"
+                      "\t\t/bin/bash\n"
+                      "\t\t/repo-b/src/launchd/channel-bridge-wrapper.sh\n"
+                      "\t\tslack\n"
+                      f"\t\t{hc.REPO_DIR}/src/launchd/channel-bridge-wrapper.sh\n"
+                      "\t\tslack\n"
+                      "\t}\n}\n")
+    own = with_host(Host(job="ours"), lambda: hc._job_is_ours("slack-bridge", job_dump(str(hc.REPO_DIR))))
+    frn = with_host(Host(job="ours"), lambda: hc._job_is_ours("slack-bridge", job_dump("/repo-b")))
+    lat = with_host(Host(job="ours"), lambda: hc._job_is_ours("slack-bridge", later_arg_dump))
+    if (own, frn, lat) != (True, False, False):
+        fails.append(f"h) three-probe control: own={own} foreign={frn} later_arg={lat} "
+                     f"(expected True/False/False)")
+    host7 = Host(job_stdout=later_arg_dump)
+    ok7, how7 = with_host(host7, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if ok7 or "NOT this" not in how7:
+        fails.append(f"h) later-arg job must refuse as foreign: ok={ok7} how={how7!r}")
+    if host7.of("kickstart"):
+        fails.append(f"h) kickstarted a job whose EXECUTED wrapper is foreign: {host7.of('kickstart')}")
+    fails += no_side_effects(host7, "h/later-arg")
     # A same-prefix FOREIGN WRAPPER argv token is likewise not ours.
     host6 = Host(job="absent", foreign_wrapper_alive=True, foreign_child_pids="888")
     host6._ps_rows_orig = host6._ps_rows
@@ -695,7 +721,7 @@ def case_l_spaced_repo_path_owns_its_wrapper() -> list[str]:
     flattens argv, so tokenization cannot be the identity mechanism — and a
     sibling sharing the spaced path as a prefix stays foreign."""
     fails = []
-    spaced = Path("/Users/neo/Library/Application Support/space.ag2.app/engine/sutando")
+    spaced = Path("/synthetic fixture/spaced path/engine/sutando")
     with mock.patch.object(hc, "REPO_DIR", spaced):
         # Positive control (kewei's exact shape): our wrapper under the spaced path.
         host = Host(job="absent", wrapper_alive=True, child_pids="555")

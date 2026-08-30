@@ -3671,24 +3671,48 @@ def _launchctl_job_arguments(stdout: str) -> "list[str] | None":
     return None
 
 
+# Shell interpreters the bridge plists may prefix the wrapper with. An argv
+# whose executed slot is one of these runs its NEXT argument as the script.
+_JOB_INTERPRETERS = frozenset({"/bin/bash", "bash", "/bin/sh", "sh", "/bin/zsh", "zsh"})
+
+
+def _job_executed_script(args: "list[str]") -> "tuple[str, str | None] | None":
+    """(script, next_arg) at the position launchd actually EXECUTES, or None
+    when that position cannot be determined (interpreter flags, empty argv).
+    Ownership must bind here — membership anywhere later in the block is data
+    passed TO the executed program, not the program."""
+    if not args:
+        return None
+    i = 0
+    if args[0] in _JOB_INTERPRETERS:
+        if len(args) < 2 or args[1].startswith("-"):
+            return None
+        i = 1
+    return (args[i], args[i + 1] if i + 1 < len(args) else None)
+
+
 def _job_is_ours(name: str, stdout: str) -> "bool | None":
-    """Does the registered job's exact program argument name THIS checkout's
-    wrapper (and, for channel bridges, this channel)? None when the arguments
-    block cannot be parsed — callers must fail closed on None, because an
-    unproved job is not ours to kickstart and not proven foreign either."""
+    """Is the wrapper launchd EXECUTES this checkout's (and, for channel
+    bridges, followed by this channel)? None when the arguments block or the
+    executed position cannot be determined — callers fail closed on None. A
+    foreign executed wrapper carrying our path as a LATER argument is foreign:
+    only the executed position proves who owns the job."""
     args = _launchctl_job_arguments(stdout)
     if args is None:
         return None
+    executed = _job_executed_script(args)
+    if executed is None:
+        return None
+    script, nxt = executed
     channel = _BRIDGE_WRAPPER_CHANNEL.get(name)
     wrapper = "channel-bridge-wrapper.sh" if channel is not None else "gateway-bridge-wrapper.sh"
     expected = {f"{REPO_DIR}/src/launchd/{wrapper}",
                 f"{os.path.realpath(str(REPO_DIR))}/src/launchd/{wrapper}"}
-    for i, arg in enumerate(args):
-        if arg in expected:
-            if channel is None:
-                return True
-            return i + 1 < len(args) and args[i + 1] == channel
-    return False
+    if script not in expected:
+        return False
+    if channel is None:
+        return True
+    return nxt == channel
 
 
 def _bridge_supervision(name: str) -> "tuple[str, str | None]":
