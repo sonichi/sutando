@@ -905,6 +905,33 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("SHAPE", err)
 
+    # `schema.md` documents these as ordinary string identifiers, not snowflakes.
+    FOREIGN = {"entity_id": "person-rui", "user_id": "octo-dev",
+               "room_id": "room-7", "provider_room_id": "!abc:ag2.space",
+               "provider_user_id": "user-42"}
+
+    def test_a_foreign_id_field_is_not_a_discord_slot(self):
+        # Reviewer, 2026-08-30: the last word alone made every `*_id` a
+        # snowflake slot, so a valid roster returned 5 and could not promote.
+        for field, value in self.FOREIGN.items():
+            rc, err, _ = self._cli({field: value,
+                                    "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 0, f"{field}={value!r}: {err}")
+            self.assertNotIn("SHAPE", err)
+
+    def test_a_foreign_id_beside_a_malformed_discord_slot_still_refuses(self):
+        # The pairing the reviewer asked for: scoping the discriminator must
+        # not be achieved by disabling it. One row, both fields.
+        entry = dict(self.FOREIGN)
+        entry["stand_discord_id"] = self.STAND
+        entry["discord_human_id"] = "not-a-snowflake"
+        rc, err, rec = self._cli(entry)
+        self.assertEqual(rc, 5, err)
+        self.assertIn("SHAPE x", err)
+        self.assertIsNone(rec["human_discord_id"])
+        for field, value in self.FOREIGN.items():
+            self.assertEqual(rec[field], value, f"{field} was rewritten")
+
     def test_a_plural_slot_refuses_a_member_that_holds_no_id(self):
         # Empty is the slot being empty; junk INSIDE it is the same defect one
         # axis over, and the readable sibling must still be collected.

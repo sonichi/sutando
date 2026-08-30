@@ -189,9 +189,10 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
         if isinstance(obj, dict):
             for k, v in obj.items():
                 slot = _id_slot(k)
-                # Inside the basis map a slot name is the KEY being explained
-                # and the value is prose, so it declares nothing about an id.
-                if slot and shapes is not None and ri.BASIS_FIELD not in path:
+                # BOTH halves: `provider_user_id` declares an id and names no
+                # referent; inside the basis map the key IS the slot, value prose.
+                if slot and shapes is not None and ri.BASIS_FIELD not in path \
+                        and _typed_path(path + [str(k)]):
                     _slot_failures(v, slot, path + [str(k)], shapes)
                 walk(v, path + [str(k)])
         elif isinstance(obj, list):
