@@ -1288,6 +1288,22 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
         for r in rows:
             self.assertNotIn("reviewer", r, f"compaction restored it: {r}")
 
+    def test_compaction_preserves_every_identity_axis_distinctly(self):
+        # The axes must DIFFER or this cannot see the defect: compaction
+        # synthesised all of them from one key, renaming reviewer to endpoint.
+        ep = "@d:ag2.space"
+        nr.record_asks(self.MSG, "d", outcome="confirmed", actor=ep, endpoint=ep)
+        before = json.loads(self.led.read_text().splitlines()[0])
+        self.assertNotEqual(before["reviewer"], before["actor"],
+                            "fixture collapsed the axes; it cannot detect this")
+        with nr._ledger_lock(self.led):
+            nr._rewrite(self.led, nr._streams(self.led))
+        after = json.loads(self.led.read_text().splitlines()[0])
+        self.assertEqual(after.get("reviewer"), "d",
+                         f"compaction renamed the reviewer: {after}")
+        self.assertEqual(after.get("actor"), ep, f"actor lost: {after}")
+        self.assertEqual(after.get("endpoint"), ep, f"endpoint dropped: {after}")
+
     def test_the_control_compaction_keeps_the_reviewer_on_delivery(self):
         # Without this, stripping `reviewer` in the compactor unconditionally
         # would pass the case above and erase real ask history.

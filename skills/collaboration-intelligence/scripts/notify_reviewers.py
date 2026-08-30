@@ -360,7 +360,14 @@ def _streams(led: Path) -> dict:
             repo, pr, who, outcome, ts = row
             st = out.setdefault((repo, pr, who),
                                 {"last": None, "first_ask": None,
-                                 "first_ask_outcome": None, "n": 0})
+                                 "first_ask_outcome": None, "n": 0,
+                                 "identity": {}})
+            # As WRITTEN, not re-derived: compaction synthesised every axis from
+            # the single stream key, renaming a reviewer to their endpoint.
+            for field in ("reviewer", "actor", "endpoint"):
+                value = d.get(field)
+                if isinstance(value, str) and value:
+                    st["identity"][field] = value
             st["last"] = (outcome, ts)
             st["n"] += 1
             # A row predating the outcome field records a send that happened:
@@ -440,12 +447,16 @@ def _rewrite(led: Path, streams: dict) -> int:
             keep.append(st["last"])
         for outcome, ts in keep:
             # The reader's normalized string: int() renamed "007" to "7".
-            row = {"repo": repo, "pr": num, "actor": who, "ts": ts,
+            identity = st.get("identity") or {}
+            row = {"repo": repo, "pr": num, "ts": ts,
                    "channel": "room", "outcome": outcome}
+            row["actor"] = identity.get("actor") or who
+            if identity.get("endpoint"):
+                row["endpoint"] = identity["endpoint"]
             # Same rule as the append: restoring `reviewer` on retry-only rows
             # here would silently undo rollback-safety at the compaction trigger.
             if outcome in _DELIVERY_OUTCOMES:
-                row["reviewer"] = who
+                row["reviewer"] = identity.get("reviewer") or who
             rows.append(json.dumps(row))
     tmp = led.with_suffix(led.suffix + ".compact")
     mode = led.stat().st_mode & 0o777 if led.exists() else _LEDGER_MODE
