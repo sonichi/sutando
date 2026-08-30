@@ -1238,6 +1238,29 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
         self.assertTrue(nr._stale_repeat_ask(up, self.TARGETS, self.ROSTER)[0],
                         "an upper-cased URL bypassed the stale-repeat guard")
 
+    def test_the_widen_list_excludes_an_earlier_sorting_alias(self):
+        # The reverse sort order alpha/beta cannot reach: the UNASKED alias
+        # sorts first, so its own endpoint misses `prior`.
+        roster = {"alpha": {"discord_id": "1", "home_channel": "c1",
+                            "same_actor_as": "zeta"},
+                  "zeta": {"discord_id": "2", "home_channel": "c2"},
+                  "gamma": {"discord_id": "9", "home_channel": "c9"}}
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.led.write_text(json.dumps({
+            "repo": "sonichi/sutando", "pr": 3509, "reviewer": "zeta",
+            "actor": "zeta", "endpoint": nr.durable_endpoint(roster["zeta"]),
+            "channel": "room", "outcome": "confirmed",
+            "ts": (now - datetime.timedelta(minutes=31)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }) + "\n")
+        targets, _ = nr.resolve(["alpha"], roster)
+        stale, why = nr._stale_repeat_ask(self.MSG, targets, roster)
+        self.assertTrue(stale, "an alias of the asked actor read as a new ask")
+        offered = why.split("Not yet asked:")[-1]
+        self.assertNotIn("alpha", offered,
+                         f"offered the already-asked person: {why}")
+        self.assertIn("gamma", offered,
+                      f"the unrelated person stopped being offered: {why}")
+
     def test_another_alias_of_the_same_person_is_not_a_new_ask(self):
         # Two aliases can hold DIFFERENT endpoints; comparing only the selected
         # alias's own let the second route re-ask the same person.

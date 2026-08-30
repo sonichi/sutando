@@ -775,9 +775,9 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
         if not isinstance(v, dict) or k.startswith("_"):
             continue
         actor = actor_of.get(k, k)
-        # Same id axis as `prior`: an endpoint-keyed row must not make an
-        # already-asked person read as unasked.
-        ids = {actor, k, durable_endpoint(v)}
+        # The SAME component-wide set the verdict uses: this row's own endpoint
+        # alone offered an already-asked person under an earlier-sorting alias.
+        ids = {actor, k, durable_endpoint(v)} | by_actor.get(actor, set())
         # keweichen is deliberately never offered as a widen target; the
         # exclusion is pinned by test_keweichen_is_never_offered_as_the_widen_target.
         if (ids & prior) or k == "keweichen":
