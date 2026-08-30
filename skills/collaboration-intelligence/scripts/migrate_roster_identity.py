@@ -45,6 +45,10 @@ import roster_identity as ri  # noqa: E402
 
 HUMAN, STAND = "human", "stand"
 
+# The writer overwrites the malformed slot, so pass 2 would see a clean doc and
+# return 0. This key carries the finding forward instead.
+SHAPE_FIELD = "id_shape_failures"
+
 _SNOWFLAKE = re.compile(r"(?<!\d)\d{17,20}(?!\d)")
 
 
@@ -251,13 +255,12 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
         # unrelated snowflake in a record's metadata as a second slot id.
         seen = {sf for v in values for sf in mines(v)}
         if len(seen) > 1:
-            # Which one wins would be decided by traversal order. The schema
-            # says this slot holds ONE id, so two of them resolve to NEITHER.
+            # Order would decide; the schema says ONE id, so two resolve to NEITHER.
             _bad_shape(value)
             shapes[-1]["arbitrated_ids"] = sorted(seen)
-            # The slot STATED a referent; dropping it lets a contradicting
-            # source look like agreement instead of a conflict.
-            _v = _verdicts_from_field(path[-1]) if path else []
+            # FULL path, not the leaf: a leaf-only read says None, and None is
+            # later treated as agreement with any other source.
+            _v = _verdicts_from_field(".".join(path)) if path else []
             shapes[-1]["arbitrated_states"] = _v[0][0] if len(_v) == 1 else None
             return
     if not values:
@@ -327,7 +330,10 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     claims: dict = {}   # id -> {verdict -> [reasons]}
     bad: list = []      # not-id values; `states` is the referent each claimed
     collisions: list = []
-    shape_failures: list = []
+    # A previous migration's findings are still findings: without this, running
+    # the tool twice reports success on a roster it refused the first time.
+    shape_failures: list = list(entry.get(SHAPE_FIELD) or []) \
+        if isinstance(entry, dict) else []
 
     def claim(id_, verdict, reason):
         claims.setdefault(id_, {}).setdefault(verdict, []).append(reason)
@@ -528,6 +534,12 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         new[ri.OTHER_STANDS_FIELD] = others
         new[ri.UNRESOLVED_FIELD] = unresolved
         new[ri.BASIS_FIELD] = basis
+        # Carried, not recomputed: the malformed value is gone from `new`, so a
+        # later pass could not re-derive this.
+        if shape_failures:
+            new[SHAPE_FIELD] = shape_failures
+        else:
+            new.pop(SHAPE_FIELD, None)
         out[key] = new
         # The MATCHED source, not the local key: reading triage_people[key] on
         # an aliased row printed "triage human = -" while filling after_human.

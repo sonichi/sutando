@@ -1217,6 +1217,52 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertEqual(rc, 0, f"{note!r}: {err}")
             self.assertEqual(ri.stand_discord_id(rec), self.SECOND, note)
 
+    def test_an_ancestor_slot_keeps_its_referent_too(self):
+        # Reviewer, 2026-08-30: arbitration read `path[-1]`, so a bare `id`
+        # under `human` yielded states=None — later treated as agreement.
+        cfg = Path(self.tmp) / "t.json"
+        cfg.write_text(json.dumps({"people": {"x": {"bots": [BOT]}}}))
+        for entry in ({"human_discord_id": [HUMAN, BOT]},
+                      {"human": {"id": [HUMAN, BOT]}}):
+            src = Path(self.tmp) / "r.json"
+            src.write_text(json.dumps({"x": entry}))
+            out = Path(self.tmp) / "v2.json"
+            sys.argv = ["m", "--roster", str(src), "--triage-config", str(cfg),
+                        "--out", str(out)]
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mig.main()
+            rec = json.loads(out.read_text())["x"]
+            self.assertIsNone(rec["human_discord_id"], entry)
+            self.assertIsNone(rec[ri.STAND_FIELD], entry)
+            self.assertEqual(sorted(u["id"] for u in
+                                    ri.unresolved_discord_ids(rec)),
+                             sorted([HUMAN, BOT]), entry)
+
+    def test_a_refusal_survives_re_migration(self):
+        # The writer overwrites the malformed slot, so pass 2 saw a clean doc
+        # and returned 0 — a refusal quietly becoming a success.
+        rc1, err1, rec1 = self._cli({ri.STAND_FIELD: {"value": HUMAN}})
+        self.assertEqual(rc1, 5, err1)
+        self.assertIn("SHAPE x", err1)
+        src = Path(self.tmp) / "again.json"
+        src.write_text(json.dumps({"x": rec1}))
+        out = Path(self.tmp) / "again.v2.json"
+        sys.argv = ["m", "--roster", str(src), "--out", str(out)]
+        err2 = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err2):
+            rc2 = mig.main()
+        self.assertEqual(rc2, 5, "a second migration reported success")
+        self.assertIn("SHAPE", err2.getvalue())
+
+    def test_a_clean_roster_gains_no_refusal_field(self):
+        # Negative control: carrying the field unconditionally would make every
+        # migrated doc look refused forever.
+        rc, err, rec = self._cli({ri.STAND_FIELD: self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(mig.SHAPE_FIELD, rec)
+
     def test_a_foreign_ancestor_cannot_launder_a_bare_id(self):
         # Refused as a leaf, then accepted by moving `id` one level down.
         # Assert the OUTPUT: with a valid Stand there is no gap, so rc is 0.
