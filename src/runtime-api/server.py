@@ -408,8 +408,10 @@ class RuntimeServer:
                 _log(f"SCP WSS TLS sibling on wss://{host}:{tls_port}/scp "
                      f"(browser/companion clients)")
             if host not in ("127.0.0.1", "localhost", "::1"):
-                _log(f"SCP WSS is LAN-exposed on {host}:{port} "
-                     f"(bearer-gated, read-only method set)")
+                _log(f"SCP plain-WS listener exposed beyond loopback on "
+                     f"ws://{host}:{port}/scp (per-credential authz: shared "
+                     f"bearer is read-only; paired devices may submit/cancel "
+                     f"tasks)")
                 self._advertiser = self._start_advertiser(wss_agent, port)
             return started
         except Exception as e:  # noqa: BLE001

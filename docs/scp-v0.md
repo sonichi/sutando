@@ -97,12 +97,15 @@ Because the network leg is exposed where the UDS transport is same-user local
 the board**:
 
 1. **Shared bearer token** → confined to `READ_ONLY_METHODS` (status, listings,
-   results; plus `task.subscribe`). Cannot mutate state.
+   results; plus `task.subscribe`). Cannot mutate state. (The `client.hello`
+   handshake is permitted for **every** authenticated credential, this one
+   included — `_dispatch_one` admits it before the grant check.)
 2. **Pairing token** → `pair.redeem` (plus the pre-authorization `client.hello`
    handshake).
 3. **Paired device credential** → authorized by its **own per-device grants**
    (`DEFAULT_DEVICE_GRANTS` in `device_store.py`): the read surface **plus
-   `task.submit`, `task.cancel`, and `voice.open`/`voice.close`**. A paired
+   `task.submit`, `task.cancel`, and `voice.open`/`voice.close`** (`voice.interrupt`
+   rides the `voice.open` grant). A paired
    device can submit and cancel owner-tier work by default — deliberately, the
    wearable's core function — while `approval.respond` stays off until the
    owner widens that device's grants. (`terminal.input` and restart are not SCP

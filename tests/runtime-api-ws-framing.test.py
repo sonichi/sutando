@@ -68,7 +68,8 @@ class ParseLineFraming(unittest.TestCase):
         self.assertEqual(cm.exception.code, -32700)
 
     def test_unix_side_per_line_framing_is_fine(self):
-        # readline() splits; each line parses independently — the NDJSON contract.
+        # Pins the PARSER half only: pre-split lines parse independently.
+        # The line-splitting is RuntimeServer.client readline(), not here.
         for i, obj in enumerate((REQ, REQ2), 1):
             rid, _, _ = protocol.parse_line((json.dumps(obj) + "\n").encode())
             self.assertEqual(rid, i)
