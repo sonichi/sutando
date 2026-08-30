@@ -59,14 +59,22 @@ export function buildVoiceAgentContext(): string {
 		} catch { /* best effort */ }
 	}
 
-	// Read recent build log activity (first date header + items)
+	// build_log.md is append-at-bottom: the newest header is the LAST match, and
+	// items must be scoped to it — unscoped, slice(5) returns the file preamble.
 	if (existsSync(buildLog)) {
 		try {
 			const content = readFileSync(buildLog, 'utf-8');
-			const dateMatch = content.match(/## \d{4}-\d{2}-\d{2} — .+/);
-			const items = content.match(/^- \*\*.+?\*\*.*/gm);
-			if (dateMatch && items) {
-				lines.push('RECENT ACTIVITY:', dateMatch[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), '');
+			const headers = [...content.matchAll(/## \d{4}-\d{2}-\d{2} — .+/g)];
+			const newest = headers.length ? headers[headers.length - 1] : null;
+			if (newest) {
+				const from = (newest.index ?? 0) + newest[0].length;
+				const rest = content.slice(from);
+				const next = rest.search(/## \d{4}-\d{2}-\d{2} — /);
+				const section = next === -1 ? rest : rest.slice(0, next);
+				const items = section.match(/^- \*\*.+?\*\*.*/gm);
+				if (items) {
+					lines.push('RECENT ACTIVITY:', newest[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), '');
+				}
 			}
 		} catch { /* best effort */ }
 	}
