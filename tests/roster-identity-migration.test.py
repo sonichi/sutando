@@ -768,5 +768,37 @@ class AFieldNamingBothReferentsStatesNeither(unittest.TestCase):
         self.assertTrue(ri.unresolved_discord_ids(e), "id must survive as unresolved")
 
 
+class EveryBadCallSiteIsExercised(unittest.TestCase):
+    """`_bad()` takes a required `shapes` list. A caller that forgets it raises
+    TypeError at RUNTIME, on the malformed input the argument exists to report —
+    so the crash lands exactly where the diagnostic was promised. One case per
+    call site, because a missed caller is invisible until its branch is taken."""
+
+    ROSTER = {"x": {"stand_status": f"stand id {BOT}"}}
+
+    def _run(self, triage):
+        out, _ = mig.migrate(self.ROSTER, triage, {}, "", "test.json")
+        return out["x"]
+
+    def test_triage_discord_that_is_not_a_snowflake(self):
+        self._run({"x": {"discord": "not-a-snowflake"}})
+
+    def test_triage_bots_that_is_not_a_list(self):
+        self._run({"x": {"bots": {"a": 1}}})
+
+    def test_a_bots_entry_that_is_not_a_snowflake(self):
+        # The one that was missed: it only fires when a LIST is supplied and an
+        # ENTRY inside it is malformed, which no other case reaches.
+        self._run({"x": {"bots": ["not-a-snowflake"]}})
+
+    def test_the_helper_still_requires_the_list(self):
+        # Negative control: if `shapes` were made optional the three cases above
+        # would pass with the bug reintroduced, so pin the signature itself.
+        import inspect
+        sig = inspect.signature(mig._bad)
+        self.assertIs(sig.parameters["shapes"].default, inspect.Parameter.empty,
+                      "shapes must stay required, or a missed caller goes silent")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

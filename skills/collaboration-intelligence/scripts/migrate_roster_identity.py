@@ -229,7 +229,8 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
             claim(str(bot), STAND, f"pr-triage config `{src}.bots[]`")
         else:
             _bad(bad, bot, STAND,
-                 f"pr-triage `{src}.bots[]` entry is not a snowflake")
+                 f"pr-triage `{src}.bots[]` entry is not a snowflake",
+                 shapes=shape_failures)
 
     for id_ in list(claims):
         if id_ in peer_ids:
