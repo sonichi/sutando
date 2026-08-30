@@ -5,7 +5,9 @@ daemon and CLI share. Pins the documented resolution order on every branch
 subprocess hides):
 
   SUTANDO_RUN_DIR > darwin app-support run dir > $XDG_RUNTIME_DIR/sutando >
-  ~/.sutando/run;  socket = SUTANDO_RUNTIME_SOCKET or <run_dir>/sutando-runtime.sock
+  ~/.sutando/run;  socket = SUTANDO_RUNTIME_SOCKET or
+  <run_dir>/<(agent, instance) key>/runtime.sock (legacy flat socket honored
+  only for the undeclared actor)
 
 Run: python3 tests/runtime-api-rundir.test.py   (stdlib only)
 """
@@ -32,13 +34,19 @@ def check(cond, msg):
 
 
 def _clear():
-    for k in ("SUTANDO_RUN_DIR", "SUTANDO_RUNTIME_SOCKET", "XDG_RUNTIME_DIR"):
+    # The actor chain reads env AND the enrolled record, so a hermetic socket
+    # assertion has to clear both halves — not just the run dir.
+    for k in ("SUTANDO_RUN_DIR", "SUTANDO_RUNTIME_SOCKET", "XDG_RUNTIME_DIR",
+              "SUTANDO_RUNTIME_STATE", "SUTANDO_AGENT_ID", "AGENT_MXID",
+              "AGENT_ID", "SUTANDO_INSTANCE_ID"):
         os.environ.pop(k, None)
 
 
 def main() -> int:
     saved = {k: os.environ.get(k) for k in
-             ("SUTANDO_RUN_DIR", "SUTANDO_RUNTIME_SOCKET", "XDG_RUNTIME_DIR")}
+             ("SUTANDO_RUN_DIR", "SUTANDO_RUNTIME_SOCKET", "XDG_RUNTIME_DIR",
+              "SUTANDO_RUNTIME_STATE", "SUTANDO_AGENT_ID", "AGENT_MXID",
+              "AGENT_ID", "SUTANDO_INSTANCE_ID")}
     try:
         # 1. explicit override always wins, on any platform
         _clear()
@@ -69,9 +77,17 @@ def main() -> int:
         check(rd.socket_path() == "/tmp/x.sock",
               "SUTANDO_RUNTIME_SOCKET override wins")
         os.environ.pop("SUTANDO_RUNTIME_SOCKET", None)
-        os.environ["SUTANDO_RUN_DIR"] = "/tmp/rt2"
-        check(rd.socket_path() == "/tmp/rt2/sutando-runtime.sock",
-              "default socket = <run_dir>/sutando-runtime.sock")
+        import tempfile
+        rt2 = tempfile.mkdtemp(prefix="rt2-")
+        os.environ["SUTANDO_RUN_DIR"] = rt2
+        os.environ["SUTANDO_RUNTIME_STATE"] = rt2  # no enrolled record here
+        check(rd.socket_path() == f"{rt2}/{rd.DEFAULT_ACTOR}/runtime.sock",
+              "default socket = <run_dir>/<(actor, instance) key>/runtime.sock")
+        # pre-M2 daemons/clients: flat legacy socket still honored for default
+        legacy = Path(rt2) / "sutando-runtime.sock"
+        legacy.touch()
+        check(rd.socket_path() == str(legacy),
+              "existing flat legacy socket wins for the default instance")
     finally:
         rd.sys.platform = __import__("sys").platform
         for k, v in saved.items():

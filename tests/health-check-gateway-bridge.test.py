@@ -54,7 +54,7 @@ def _pgrep(returncode, stdout):
 
 
 def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=False, serving=None,
-         locks=None):
+         locks=None, stale_age=None):
     """Call check_gateway_bridge() with env, the channel-.env path, and the
     pgrep result all controlled. env=None means the token vars are cleared.
     pgrep_raises=True makes subprocess.run raise (the except-branch path).
@@ -62,7 +62,10 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
     case depends on whether the host running the tests happens to have a live
     sidecar — without it, "one process -> ok" flips to warn on a real host.
     `locks` pins the role->PID instance-lock map; the default {} means "no lock
-    data", so no case reads the real state/locks/ of the host running them."""
+    data", so no case reads the real state/locks/ of the host running them.
+    `stale_age` pins the sidecar-staleness signal for the same reason `serving`
+    is pinned: unpinned, every serving=None case would read the host's own
+    sidecar and flip to warn on a machine whose bridge stopped writing one."""
     env = env or {}
     # Clear both token vars, then apply the requested env.
     base = {k: v for k, v in hc.os.environ.items()
@@ -74,6 +77,8 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
          unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path), \
          unittest.mock.patch.object(hc.subprocess, "run", run_mock):
         with unittest.mock.patch.object(hc, "_gateway_serving", lambda *a, **k: serving), \
+             unittest.mock.patch.object(hc, "_gateway_status_stale_age_s",
+                                        lambda *a, **k: stale_age), \
              unittest.mock.patch.object(hc, "_gateway_lock_pids", lambda: dict(locks or {})):
             return hc.check_gateway_bridge()
 
@@ -243,8 +248,14 @@ def main() -> int:
         f.write_text(_json.dumps(body))
         return f
     now = _time.time()
-    check("_gateway_serving: fresh + connected → True",
-          hc._gateway_serving(_sc({"connected": True, "ts": now}), now) is True)
+    # `connected` alone is not serving: the real writer stamps last_ok_ts on
+    # every connected write, so a pair without it never comes from that path.
+    check("_gateway_serving: fresh + connected + last_ok_ts → True",
+          hc._gateway_serving(_sc({"connected": True, "ts": now,
+                                   "last_ok_ts": now - 5}), now) is True)
+    check("_gateway_serving: connected but NEVER polled → False",
+          hc._gateway_serving(_sc({"connected": True, "ts": now,
+                                   "last_ok_ts": None}), now) is False)
     check("_gateway_serving: fresh + disconnected → False",
           hc._gateway_serving(_sc({"connected": False, "ts": now}), now) is False)
     check("_gateway_serving: stale → None (no opinion)",
@@ -253,6 +264,33 @@ def main() -> int:
           hc._gateway_serving(_sc({"connected": True}), now) is None)
     check("_gateway_serving: absent file → None",
           hc._gateway_serving(Path(_tf.mkdtemp()) / "nope.json", now) is None)
+
+    # 7b) Stale sidecar. Before this, _gateway_serving()'s None sent the probe
+    # to its process-only "ok" branch, so a stopped writer read as healthy.
+    check("_gateway_status_stale_age_s: fresh → None",
+          hc._gateway_status_stale_age_s(_sc({"connected": True, "ts": now}), now) is None)
+    check("_gateway_status_stale_age_s: stale → the age in seconds",
+          abs((hc._gateway_status_stale_age_s(
+              _sc({"connected": False, "ts": now - 4000}), now) or 0) - 4000) < 2)
+    check("_gateway_status_stale_age_s: absent file → None (old build, no opinion)",
+          hc._gateway_status_stale_age_s(Path(_tf.mkdtemp()) / "nope.json", now) is None)
+    check("_gateway_status_stale_age_s: malformed ts → None",
+          hc._gateway_status_stale_age_s(_sc({"connected": True, "ts": "soon"}), now) is None)
+    check("_gateway_status_stale_age_s: bool ts is not a number → None",
+          hc._gateway_status_stale_age_s(_sc({"connected": True, "ts": True}), now) is None)
+
+    r = _run(env={"REMOTE_TASK_TOKEN": "t"}, pgrep_rc=0, pgrep_out="123",
+             serving=None, stale_age=3850.0)
+    check("probe: running + stale sidecar → warn naming the age",
+          r["status"] == "warn" and "3850s" in r["detail"], f"got {r!r}")
+    r = _run(env={"REMOTE_TASK_TOKEN": "t"}, pgrep_rc=0, pgrep_out="123",
+             serving=None, stale_age=None)
+    check("probe: running + NO sidecar → still ok (no opinion, not a fault)",
+          r["status"] == "ok" and r["detail"] == "running", f"got {r!r}")
+    r = _run(env={"REMOTE_TASK_TOKEN": "t"}, pgrep_rc=0, pgrep_out="123",
+             serving=True, stale_age=9999.0)
+    check("probe: a fresh connected verdict outranks any staleness signal",
+          r["status"] == "ok" and "connected" in r["detail"], f"got {r!r}")
 
     # --- _gateway_configured(): the shared predicate itself -----------------
     with _tf.TemporaryDirectory() as _td:

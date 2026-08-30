@@ -89,6 +89,11 @@ def _load_bridge():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
+    # ACCESS_BACKUP_FILE resolves under the LIVE workspace at import, so the temp
+    # tree above is not isolation and the real durable file gets overwritten.
+    mod.ACCESS_BACKUP_FILE = (
+        Path(tempfile.mkdtemp(prefix="acl-bk-")) / "discord-access-backup.json")
+
     return mod
 
 
