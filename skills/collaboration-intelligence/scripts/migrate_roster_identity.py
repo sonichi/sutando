@@ -154,6 +154,17 @@ def _id_slot(field: str):
     return "singular" if last == "id" else "plural" if last == "ids" else None
 
 
+def _declares_discord_id(ancestors: list, key: str) -> bool:
+    """A Discord slot names the referent IN THE LEAF, or is a bare `id` whose
+    ancestor names it. `human.provider_user_id` is neither: the leaf declares a
+    PROVIDER namespace, and inheriting the referent would make nesting decide it.
+    """
+    if "discord" in key.lower() or _verdicts_from_field(key):
+        return True
+    return [w.lower() for w in _WORDS.findall(str(key))] in (["id"], ["ids"]) \
+        and _typed_path(ancestors)
+
+
 def _absent(value) -> bool:
     """None and blank agree with `roster_identity`'s readers, which coerce both
     to None; calling either malformed would split the two apart."""
@@ -189,10 +200,9 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
         if isinstance(obj, dict):
             for k, v in obj.items():
                 slot = _id_slot(k)
-                # BOTH halves: `provider_user_id` declares an id and names no
-                # referent; inside the basis map the key IS the slot, value prose.
+                # Inside the basis map the key IS the slot and the value prose.
                 if slot and shapes is not None and ri.BASIS_FIELD not in path \
-                        and _typed_path(path + [str(k)]):
+                        and _declares_discord_id(path, str(k)):
                     _slot_failures(v, slot, path + [str(k)], shapes)
                 walk(v, path + [str(k)])
         elif isinstance(obj, list):

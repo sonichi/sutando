@@ -810,6 +810,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
     """
 
     STAND = "1500000000000000001"
+    SECOND = "1529720369668292629"
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="slot-")
@@ -931,6 +932,30 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertIsNone(rec["human_discord_id"])
         for field, value in self.FOREIGN.items():
             self.assertEqual(rec[field], value, f"{field} was rewritten")
+
+    def test_a_foreign_id_under_a_referent_ancestor_is_not_a_discord_slot(self):
+        # Reviewer, 2026-08-30: `_typed_path` matches ANY ancestor, so nesting
+        # a provider-native id under `human` made it a snowflake slot.
+        for parent in ("human", "secondary_agent"):
+            for field, value in self.FOREIGN.items():
+                rc, err, rec = self._cli({parent: {field: value},
+                                          "stand_discord_id": self.STAND})
+                self.assertEqual(rc, 0, f"{parent}.{field}={value!r}: {err}")
+                self.assertNotIn("SHAPE", err)
+                self.assertEqual(rec[parent][field], value)
+
+    def test_a_bare_id_under_a_referent_ancestor_is_still_a_discord_slot(self):
+        # Scoping the leaf must not delete the ancestor evidence: this key
+        # has no referent of its own and needs its parent.
+        rc, _err, rec = self._cli({"secondary_agent": {"id": self.SECOND},
+                                   "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0)
+        self.assertIn(self.SECOND,
+                      [o["id"] for o in rec[ri.OTHER_STANDS_FIELD]])
+        rc, err, _ = self._cli({"secondary_agent": {"id": "not-a-snowflake"},
+                                "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 5, err)
+        self.assertIn("SHAPE x", err)
 
     def test_a_plural_slot_refuses_a_member_that_holds_no_id(self):
         # Empty is the slot being empty; junk INSIDE it is the same defect one
