@@ -57,13 +57,30 @@ Trade-off: a daemon restart drops connected clients. (Contrast ACP's stdio, wher
 the client spawns the agent as a 1:1 child subprocess — session-shaped; the Unix
 socket is task-shaped, a durable service many clients submit tasks to.)
 
-### [v0.1+] — Remote agent support *(planned, not built)*
+### [v0.1+] — Remote agent support *(LAN transport SHIPPED and opt-in; WAN/relay not built)*
 
-A remote transport (e.g. WebSocket / HTTP) so a client can drive a Sutando agent
-across machines. The task model makes this a clean extension rather than a
-retrofit — submit a task over the wire and stream `task.update` back — because a
-task is durable and channel-agnostic and does not require a co-located session.
-**Until built, this is aspirational: v0 is local-only.**
+A remote transport so a client can drive a Sutando agent across machines. The task
+model makes this a clean extension rather than a retrofit — submit a task over the
+wire and stream `task.update` back — because a task is durable and channel-agnostic
+and does not require a co-located session.
+
+**⚠ v0 is NOT local-only. A LAN WSS transport is shipped.**
+`src/runtime-api/ws_transport.py` is a second transport for the same daemon and the
+same dispatcher, alongside the Unix socket — one dispatcher, N transports. A
+phone-class client on the same network dials the Server's own WSS listener directly
+(no relay, no cloud). `src/runtime-api/server.py` starts it **only** when
+`SUTANDO_SCP_WSS_ENABLE` is truthy, so it is opt-in and off by default.
+
+Because that leg is **network-exposed** — where the UDS transport is same-user local
+(0600, no auth needed) — it carries two edge protections the socket does not need:
+
+1. **A bearer token on connect.**
+2. **A read-only method allowlist**: mutating methods are refused at the transport
+   edge until per-device authorization lands.
+
+Still genuinely not built: a WAN/relay path (reaching an agent from off-LAN), and
+per-device authorization — which is what currently confines the LAN leg to
+read-only methods.
 
 ## 3. Core methods (implemented in v0)
 
