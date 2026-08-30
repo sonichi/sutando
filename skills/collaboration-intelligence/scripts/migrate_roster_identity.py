@@ -330,12 +330,27 @@ def _slot_erased(entry, path) -> bool:
     Absent, None and blank all mean the same thing here: the referent this slot
     once stated is no longer legible from the entry.
     """
-    node = entry
-    for seg in str(path).split("."):
-        if not isinstance(node, dict) or seg not in node:
-            return True
-        node = node[seg]
-    return node is None or (isinstance(node, str) and not node.strip())
+    segs = str(path).split(".")
+
+    def readable(node, i) -> bool:
+        # The list case is FIRST, including at the terminal segment: an empty
+        # list states nothing, and `[] is None` is False, so evaluating it as a
+        # scalar reported an emptied slot as still readable and dropped the seed
+        # our own write had just made unreadable.
+        #
+        # A list does NOT consume a segment — `_cited_in`'s walk descends into
+        # members on the same path, so `other_stand_discord_ids` (scalars) and
+        # `unresolved_discord_ids.id` (dicts) are both produced that way.
+        # Traversing differently here would call a populated slot erased.
+        if isinstance(node, list):
+            return any(readable(v, i) for v in node)
+        if i == len(segs):
+            return not (node is None or (isinstance(node, str) and not node.strip()))
+        if not isinstance(node, dict) or segs[i] not in node:
+            return False
+        return readable(node[segs[i]], i + 1)
+
+    return not readable(entry, 0)
 
 
 def _canonical_seeds(seeds: list) -> list:

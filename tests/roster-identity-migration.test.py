@@ -1656,6 +1656,48 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
         self.assertEqual(rc2, 5, "a blank slot dropped the seed that refused it")
         self._assert_refused(d2, "pass 2 (blank slot)")
 
+    def test_a_list_slot_reflects_its_CONTENTS_not_its_type(self):
+        # qingyun-wu's blocker: `_slot_erased` traversed dicts only, so ANY path
+        # reaching a list returned True — "erased" — whatever the list held. A
+        # seed anchored there could never be dropped by a repair.
+        # A list does NOT consume a path segment, matching `_cited_in`'s walk;
+        # traversing otherwise would call a populated slot erased.
+        populated = {ri.UNRESOLVED_FIELD: [{"id": BOT}]}
+        self.assertFalse(
+            mig._slot_erased(populated, f"{ri.UNRESOLVED_FIELD}.id"),
+            "a populated list slot was reported erased, so its seed can never drop")
+        self.assertFalse(
+            mig._slot_erased({ri.OTHER_STANDS_FIELD: [BOT]}, ri.OTHER_STANDS_FIELD),
+            "a populated scalar list was reported erased")
+        self.assertTrue(
+            mig._slot_erased({ri.OTHER_STANDS_FIELD: [BOT, HUMAN]}, "other_stand_discord_ids.id"),
+            "a scalar list has no `.id` member — that path reads nothing")
+
+    def test_an_EMPTY_list_slot_is_erased_like_a_null_one(self):
+        # The converse, and the one a type-blind rewrite gets backwards: `[]` is
+        # neither None nor a blank string, so evaluating it as a scalar reports
+        # an emptied slot as still readable and drops the seed our own write
+        # just made unreadable. Every shape below states nothing.
+        for slot, path, label in (
+                ([], ri.OTHER_STANDS_FIELD, "empty scalar list"),
+                (["   "], ri.OTHER_STANDS_FIELD, "list of blanks"),
+        ):
+            with self.subTest(label):
+                self.assertTrue(mig._slot_erased({ri.OTHER_STANDS_FIELD: slot}, path),
+                                f"{label} read as still-present")
+        for recs, label in (([], "empty record list"),
+                            ([{"id": None}], "only id null"),
+                            ([{"id": "  "}], "only id blank")):
+            with self.subTest(label):
+                self.assertTrue(
+                    mig._slot_erased({ri.UNRESOLVED_FIELD: recs},
+                                     f"{ri.UNRESOLVED_FIELD}.id"),
+                    f"{label} read as still-present")
+        self.assertFalse(
+            mig._slot_erased({ri.UNRESOLVED_FIELD: [{"id": None}, {"id": BOT}]},
+                             f"{ri.UNRESOLVED_FIELD}.id"),
+            "one readable member among unreadable ones must still read")
+
     def test_an_absent_slot_is_erased_like_a_null_one(self):
         # The live one: with absent read as "not erased", deleting the key by
         # hand republishes the referent pass 1 refused — the original defect.
