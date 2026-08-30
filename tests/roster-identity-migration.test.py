@@ -1331,6 +1331,31 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         rc2, err2, _ = self._cli(rec1)
         self.assertEqual(rc2, 5, "the writer cleared its own refusal")
 
+    def test_the_bound_cannot_decide_an_identity_ACROSS_PASSES(self):
+        # The cap is diagnostic history; an identity-bearing record is the only
+        # surviving evidence of a contested id once the source is overwritten.
+        import collections
+        for slot_last in (True, False):
+            e = collections.OrderedDict()
+            e["human"] = {"id": HUMAN}
+            if not slot_last:
+                e[ri.STAND_FIELD] = [HUMAN, BOT]
+            for i in range(ri.SHAPE_MAX):
+                e["bad%02d_discord_id" % i] = 12
+            if slot_last:
+                e[ri.STAND_FIELD] = [HUMAN, BOT]
+            rc1, err1, r1 = self._cli_tri(e, {"discord": HUMAN})
+            self.assertEqual(rc1, 5, err1)
+            self.assertTrue(any(ri.bears_identity(x)
+                                for x in (r1.get(ri.SHAPE_FIELD) or [])),
+                            "the bound cut the arbitration fact (slot_last=%s)"
+                            % slot_last)
+            rc2, err2, r2 = self._cli(r1)
+            self.assertEqual(rc2, 5, err2)
+            self.assertIsNone(r2.get(ri.HUMAN_FIELD),
+                              "pass 2 published a contested id (slot_last=%s)"
+                              % slot_last)
+
     def test_the_bound_cannot_decide_an_identity(self):
         # The cap truncated LIVE findings before arbitration, so whether the
         # over-full slot survived depended on member order.

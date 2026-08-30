@@ -80,6 +80,13 @@ def canonical_shape_failure(rec) -> "dict | None":
     return out
 
 
+def bears_identity(rec) -> bool:
+    """A record carrying arbitration facts: which ids were contested, and as
+    what. Losing one is not losing history, it is losing a referent."""
+    return bool(isinstance(rec, dict)
+                and (rec.get("arbitrated_ids") or rec.get("arbitrated_states")))
+
+
 def canonical_shape_failures(value, *, bound: "int | None" = SHAPE_MAX) -> list:
     """Canonicalised, de-duplicated, and bounded only when asked.
 
@@ -97,7 +104,13 @@ def canonical_shape_failures(value, *, bound: "int | None" = SHAPE_MAX) -> list:
         k = _json.dumps(c, sort_keys=True)
         if k not in seen:
             seen.add(k); out.append(c)
-    return out if bound is None else out[:bound]
+    if bound is None:
+        return out
+    # Diagnostic history only: once the source field is overwritten, an
+    # identity-bearing record is the sole evidence the id was contested.
+    keep = [r for r in out if bears_identity(r)]
+    rest = [r for r in out if not bears_identity(r)]
+    return keep + rest[:max(0, bound - len(keep))] if len(keep) < bound else keep
 
 #: A key starting with "_" is document metadata, not a person.
 def is_person_key(key: str) -> bool:
