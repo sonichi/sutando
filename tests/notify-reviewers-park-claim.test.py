@@ -332,6 +332,81 @@ with nr._ledger_lock(led):
     _t.sleep(0.6)
 """
 
+# Same holder, but it marks its RELEASE too, so a waiter can prove it waited
+# by what it reads rather than by how long it took.
+HOLDER_MARKED = """
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("nr", {script!r})
+nr = importlib.util.module_from_spec(spec)
+sys.path.insert(0, os.path.join({repo!r}, "src"))
+spec.loader.exec_module(nr)
+import pathlib, time as _t
+led = pathlib.Path({led!r})
+led.parent.mkdir(parents=True, exist_ok=True)
+led.touch(exist_ok=True)
+with nr._ledger_lock(led):
+    pathlib.Path({gate!r}).write_text("held")
+    _t.sleep(0.6)
+    pathlib.Path({gate!r}).write_text("released")
+"""
+
+
+class HoldingOneLedgerIsNotReentrancyOnAnother(unittest.TestCase):
+    """Requested by @kewei-red-ag2space at `dad78b91`.
+
+    The re-entrancy fix keys on the resolved ledger path. Nothing pinned the
+    ADJACENT axis: that holding ledger A must not make ledger B look re-entrant.
+    An any-ledger key passes every same-ledger test in this file, and the first
+    re-entrancy attempt is what broke the writer-lock contract.
+    """
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        d = pathlib.Path(self._td.name)
+        self.a, self.b = d / "a.jsonl", d / "b.jsonl"
+        self.gate = d / "gate"
+        for f in (self.a, self.b):
+            f.touch()
+        self.nr = _load()
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _hold_b(self):
+        src = HOLDER_MARKED.format(script=str(SCRIPT), repo=str(REPO),
+                                   led=str(self.b), gate=str(self.gate))
+        proc = subprocess.Popen([sys.executable, "-c", src])
+        for _ in range(100):                       # wait for the holder to own B
+            if self.gate.exists() and self.gate.read_text() == "held":
+                return proc
+            time.sleep(0.02)
+        proc.kill()
+        self.skipTest("holder never acquired ledger B")
+
+    def test_holding_A_still_waits_for_a_foreign_holder_of_B(self):
+        proc = self._hold_b()
+        try:
+            with self.nr._ledger_lock(self.a):     # hold A ...
+                with self.nr._ledger_lock(self.b):  # ... then genuinely take B
+                    seen = self.gate.read_text()
+        finally:
+            proc.wait(timeout=5)
+        self.assertEqual(seen, "released",
+                         "holding A let B through while another process held it")
+
+    def test_same_ledger_reentry_still_does_not_block(self):
+        # The control. Without it, a fix that simply removed re-entrancy would
+        # satisfy the case above and deadlock the writer's own nested calls.
+        proc = self._hold_b()
+        try:
+            with self.nr._ledger_lock(self.a):
+                with self.nr._ledger_lock(self.a):   # re-entrant: must not wait
+                    seen = self.gate.read_text()
+        finally:
+            proc.wait(timeout=5)
+        self.assertEqual(seen, "held",
+                         "same-ledger re-entry blocked, so it is not re-entrant")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
