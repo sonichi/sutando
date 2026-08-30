@@ -1238,6 +1238,26 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
         self.assertTrue(nr._stale_repeat_ask(up, self.TARGETS, self.ROSTER)[0],
                         "an upper-cased URL bypassed the stale-repeat guard")
 
+    def test_retry_state_is_not_delivery_history(self):
+        # A pre-outcome reader keys asks on `reviewer` and has no outcome
+        # semantics, so a proven-failed row there suppresses a safe retry.
+        nr.record_asks(self.MSG, "k", outcome="failed", actor="k")
+        nr.record_asks(self.MSG, "k", outcome="pending", actor="k")
+        for r in [json.loads(l) for l in self.led.read_text().splitlines()]:
+            self.assertNotIn("reviewer", r,
+                             f"retry state carries delivery-history identity: {r}")
+            self.assertTrue(r.get("actor") or r.get("endpoint"),
+                            f"row has no identity for THIS reader: {r}")
+
+    def test_the_control_delivery_history_still_carries_the_reviewer(self):
+        # Without this, dropping `reviewer` everywhere would pass the case above
+        # while making every real ask invisible to the older reader.
+        nr.record_asks(self.MSG, "k", outcome="confirmed", actor="k")
+        nr.record_asks(self.MSG, "k", outcome="unknown", actor="k")
+        for r in [json.loads(l) for l in self.led.read_text().splitlines()]:
+            self.assertEqual(r.get("reviewer"), "k",
+                             f"a delivered ask lost its reviewer: {r}")
+
     def test_the_widen_list_excludes_an_earlier_sorting_alias(self):
         # The reverse sort order alpha/beta cannot reach: the UNASKED alias
         # sorts first, so its own endpoint misses `prior`.

@@ -277,6 +277,10 @@ _DID_ASK = {"confirmed", "unknown"}
 #: row, never a settlement.
 _KNOWN_OUTCOMES = {"pending", "unknown", "confirmed", "failed"}
 
+#: Delivery history — a post that landed or may have. ONLY these carry
+#: `reviewer`, the field a pre-outcome reader mistakes for a completed ask.
+_DELIVERY_OUTCOMES = {"unknown", "confirmed"}
+
 #: The one comparable form. Every accepted stamp is normalized to it, so the
 #: lexical comparisons downstream order correctly across writers.
 _TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -625,8 +629,10 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = ""
     for repo, num in sorted(refs):
-        row = {"repo": repo, "pr": num, "reviewer": reviewer,
+        row = {"repo": repo, "pr": num,
                "ts": ts, "channel": "room", "outcome": outcome}
+        if outcome in _DELIVERY_OUTCOMES:
+            row["reviewer"] = reviewer
         if actor:
             row["actor"] = actor
         if endpoint:
