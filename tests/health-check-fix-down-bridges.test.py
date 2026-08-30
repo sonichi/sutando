@@ -869,9 +869,8 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
         if isinstance(argv, list) and argv and argv[0] == "/bin/kill":
             killed.append(argv[1])
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-        # The stale pre-kill delegates to evict-own-bridge.sh; record it in the
-        # same `killed` stream so plan-before-kill assertions keep working.
-        # --list is the read-only survivor verifier: empty output = confirmed.
+        # Stale pre-kill delegates to evict-own-bridge.sh (recorded in `killed`
+        # for plan-before-kill); --list is the verifier, empty = confirmed.
         if (isinstance(argv, list) and len(argv) >= 4 and argv[0] == "/bin/bash"
                 and str(argv[1]).endswith("evict-own-bridge.sh")):
             if argv[2] == "--list":
