@@ -77,7 +77,11 @@ SANDBOXED_DELEGATION_CODEX = (
     "OUTPUT is non-empty before writing it: codex exits 0 both when it refuses and on a usage "
     "error, so the exit code is not evidence that an answer exists. The sandbox also has NO "
     "NETWORK: if the task needs something the sandbox cannot reach, say so and decline — never "
-    "describe an artifact you could not read."
+    "describe an artifact you could not read. And if codex cannot answer at all — absent, "
+    "exiting non-zero, or exiting 0 having written nothing — there is NO permitted fallback: "
+    "do NOT answer with the owner's unrestricted core, and do not silently skip. Say that the "
+    "sandboxed path was unavailable and that no inspection was performed, so the requester can "
+    "tell a refusal from silence."
 )
 
 
