@@ -98,6 +98,27 @@ class Ledger(unittest.TestCase):
         with self._at(self.tmp.name):
             self.assertEqual(self.mod.record_asks("no link here", "rui"), 0)
 
+    def test_zero_is_returned_ONLY_when_no_PR_URL_matched(self):
+        # main() names this cause in its warning, so a future early `return 0`
+        # would make that message assert something false while tests still pass.
+        cases = [
+            ("https://github.com/o/r/pull/1", 1),
+            ("https://github.com/o/r/pull/1 https://github.com/o/r/pull/2", 2),
+            ("https://github.com/o/r/pull/1/files", 1),
+            ("[#1](https://github.com/o/r/pull/1)", 1),
+            ("o/r#1", 0),
+            ("#1", 0),
+            ("https://api.github.com/repos/o/r/pulls/1", 0),
+            ("no link here", 0),
+            ("", 0),
+        ]
+        for msg, want in cases:
+            with self._at(self.tmp.name):
+                got = self.mod.record_asks(msg, "rui")
+            matched = self.mod._PR_URL.search(msg) is not None
+            self.assertEqual(got, want, msg)
+            self.assertEqual(got == 0, not matched, f"0-iff-no-match broken for {msg!r}")
+
     def test_two_PRs_in_one_message_record_both(self):
         msg = ("https://github.com/o/r/pull/1 and "
                "https://github.com/o/r/pull/2")
