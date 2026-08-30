@@ -98,11 +98,11 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             worst = max(worst, 3)
             continue
         if entry.get("allowlisted") is False:
-            # "bounced before" is a claim about history this code never checked.
-            # Where the roster states a reason, print THAT instead of asserting one.
-            because = f"{stand} bounced a mention before" if not why else why
-            print(f"OFF-ALLOWLIST '{name}': {because} —"
-                  " route through the owner instead of re-sending",
+            # State the FLAG, never a cause: nothing sets allowlisted=False after
+            # a detected bounce, so any history claim here would be a guess.
+            print(f"OFF-ALLOWLIST '{name}': {stand} is not allowlisted for mentions"
+                  + (f" — {why}" if why else "")
+                  + " — route through the owner instead of re-sending",
                   file=sys.stderr)
             worst = max(worst, 4)
             continue

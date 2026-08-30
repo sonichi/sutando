@@ -83,13 +83,17 @@ class RefusalOutput(unittest.TestCase):
             {"x": {"stand": "@s:x", "room": "!r:x", "allowlisted": False, "note": BASIS}})
         self.assertEqual(rc, 4)
         self.assertIn("DO NOT ROUTE", err)
-        self.assertNotIn("bounced a mention before", err,
-                         "with a stated reason, the code must not assert a history it never checked")
+        self.assertNotIn("bounced", err,
+                         "the code must not assert a history it never checked")
 
-    def test_CONTROL_off_allowlist_without_a_note_keeps_the_old_wording(self):
+    def test_CONTROL_off_allowlist_without_a_note_claims_no_history_either(self):
+        # The old wording asserted "bounced a mention before". Nothing sets
+        # allowlisted=False after a bounce, so that was a guess, not a fallback.
         _, rc, err = self._resolve({"x": {"stand": "@s:x", "room": "!r:x", "allowlisted": False}})
         self.assertEqual(rc, 4)
-        self.assertIn("bounced a mention before", err)
+        self.assertIn("not allowlisted for mentions", err)
+        self.assertNotIn("bounced", err,
+                         "with no stated reason the code must still not invent a cause")
 
     # --- the batch must not be starved, and rc must not drift ------------
     def test_CONTROL_a_usable_entry_still_resolves_alongside_a_refused_one(self):
