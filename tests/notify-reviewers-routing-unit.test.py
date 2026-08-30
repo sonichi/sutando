@@ -1288,6 +1288,47 @@ class TheWidenRuleReadsAskHistoryNotRetrySafety(unittest.TestCase):
         for r in rows:
             self.assertNotIn("reviewer", r, f"compaction restored it: {r}")
 
+    def test_two_aliases_on_one_endpoint_both_survive_compaction(self):
+        # One identity slot per STREAM lost asks made under an older alias.
+        # THREE on purpose: with two, first_ask and last already cover it.
+        for alias in ("alias-a", "alias-b", "alias-c"):
+            nr.record_asks(self.MSG, alias, outcome="confirmed",
+                           actor=alias, endpoint="discord:1")
+        with nr._ledger_lock(self.led):
+            nr._rewrite(self.led, nr._streams(self.led))
+        spellings = {json.loads(l).get("reviewer")
+                     for l in self.led.read_text().splitlines() if l.strip()}
+        self.assertEqual(spellings, {"alias-a", "alias-b", "alias-c"},
+                         f"a legacy spelling was collapsed away: {spellings}")
+
+    def test_the_control_distinct_endpoints_stay_distinct(self):
+        # Without this, retaining every spelling could merge two PEOPLE into one
+        # stream and the case above would still pass.
+        nr.record_asks(self.MSG, "a", outcome="confirmed", actor="a",
+                       endpoint="discord:1")
+        nr.record_asks(self.MSG, "b", outcome="confirmed", actor="b",
+                       endpoint="discord:2")
+        with nr._ledger_lock(self.led):
+            nr._rewrite(self.led, nr._streams(self.led))
+        eps = {json.loads(l).get("endpoint")
+               for l in self.led.read_text().splitlines() if l.strip()}
+        self.assertEqual(eps, {"discord:1", "discord:2"}, f"endpoints merged: {eps}")
+
+    def test_the_ceiling_count_matches_what_compaction_writes(self):
+        # `_rows_for` and `_rewrite` must read ONE retained-row set, or eviction
+        # accounting drifts from the file it is accounting for.
+        nr.record_asks(self.MSG, "old-alias", outcome="confirmed",
+                       actor="old-alias", endpoint="discord:1")
+        nr.record_asks(self.MSG, "new-alias", outcome="confirmed",
+                       actor="new-alias", endpoint="discord:1")
+        streams = nr._streams(self.led)
+        predicted = sum(nr._rows_for(st) for st in streams.values())
+        with nr._ledger_lock(self.led):
+            nr._rewrite(self.led, streams)
+        actual = len([l for l in self.led.read_text().splitlines() if l.strip()])
+        self.assertEqual(predicted, actual,
+                         f"_rows_for said {predicted}, compaction wrote {actual}")
+
     def test_compaction_keeps_the_reviewer_on_a_legacy_row(self):
         # A row predating the outcome field IS a delivery. Gating `reviewer` on
         # the outcome SET dropped it, so a pre-migration ask vanished on compact.

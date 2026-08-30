@@ -382,13 +382,17 @@ def _streams(led: Path) -> dict:
             st = out.setdefault((repo, pr, who),
                                 {"last": None, "first_ask": None,
                                  "first_ask_outcome": None, "n": 0,
-                                 "identity": {}})
-            # As WRITTEN, not re-derived: compaction synthesised every axis from
-            # the single stream key, renaming a reviewer to their endpoint.
-            for field in ("reviewer", "actor", "endpoint"):
-                value = d.get(field)
-                if isinstance(value, str) and value:
-                    st["identity"][field] = value
+                                 "identity": {}, "first_identity": {},
+                                 "last_identity": {}, "by_reviewer": {}})
+            # PER EVENT, not per stream: one slot stamped the newest spelling
+            # onto every retained row, losing asks made under an older alias.
+            ident = {f: d[f] for f in ("reviewer", "actor", "endpoint")
+                     if isinstance(d.get(f), str) and d.get(f)}
+            st["identity"].update(ident)
+            st["last_identity"] = ident
+            # One delivery row per distinct legacy spelling survives compaction.
+            if (outcome is None or outcome in _DELIVERY_OUTCOMES) and ident.get("reviewer"):
+                st["by_reviewer"][ident["reviewer"]] = (outcome, ts, ident)
             st["last"] = (outcome, ts)
             st["n"] += 1
             # A row predating the outcome field records a send that happened:
@@ -396,6 +400,7 @@ def _streams(led: Path) -> dict:
             if (outcome is None or outcome in _DID_ASK) and (
                     st["first_ask"] is None or ts < st["first_ask"]):
                 st["first_ask"], st["first_ask_outcome"] = ts, outcome
+                st["first_identity"] = ident
     return out
 
 
@@ -417,12 +422,27 @@ def _physical_rows(led: Path) -> int:
         return sum(1 for _ in fh)
 
 
+def _retained(st: dict) -> list:
+    """THE retained-row set: (outcome, ts, identity) per row compaction keeps.
+
+    One owner so `_rows_for` and `_rewrite` cannot disagree about the cost."""
+    keep = []
+    if st["first_ask"] is not None:
+        keep.append((st["first_ask_outcome"], st["first_ask"],
+                     st.get("first_identity") or st.get("identity") or {}))
+    if st["last"] and (not keep or st["last"] != (keep[0][0], keep[0][1])):
+        keep.append((st["last"][0], st["last"][1],
+                     st.get("last_identity") or st.get("identity") or {}))
+    spelt = {k[2].get("reviewer") for k in keep if k[2].get("reviewer")}
+    for reviewer, (outcome, ts, ident) in sorted((st.get("by_reviewer") or {}).items()):
+        if reviewer not in spelt:
+            keep.append((outcome, ts, ident))
+    return keep or [(None, "", st.get("identity") or {})]
+
+
 def _rows_for(st: dict) -> int:
-    """Rows this stream costs after compaction: its first ask and its last."""
-    n = 1 if st["first_ask"] is not None else 0
-    if st["last"] and (not n or st["last"] != (st["first_ask_outcome"], st["first_ask"])):
-        n += 1
-    return n or 1
+    """Rows this stream costs after compaction."""
+    return len(_retained(st))
 
 
 def _maybe_compact(led: Path) -> None:
@@ -461,14 +481,8 @@ def _rewrite(led: Path, streams: dict) -> int:
     rows = []
     for (repo, num, who), st in sorted(
             streams.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
-        keep = []
-        if st["first_ask"] is not None:
-            keep.append((st["first_ask_outcome"], st["first_ask"]))
-        if st["last"] and (not keep or st["last"] != keep[0]):
-            keep.append(st["last"])
-        for outcome, ts in keep:
+        for outcome, ts, identity in _retained(st):
             # The reader's normalized string: int() renamed "007" to "7".
-            identity = st.get("identity") or {}
             row = {"repo": repo, "pr": num, "ts": ts,
                    "channel": "room", "outcome": outcome}
             row["actor"] = identity.get("actor") or who
