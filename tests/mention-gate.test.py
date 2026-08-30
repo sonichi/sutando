@@ -659,6 +659,24 @@ class EditIntroducesTheTag(unittest.TestCase):
         self.assertEqual(written, [], out)
         self.assertEqual(_audit_rows(), [])
 
+    def test_an_already_tagged_edit_announces_no_admission(self):
+        # Reviewer, 2026-08-29: `tasks=0 audit=0 admitted_log_lines=2` — the
+        # `before` arm announces an admission that never happens.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("<@111222333> take a look",
+                                  "<@111222333> take a look please")
+        self.assertEqual(written, [])
+        self.assertEqual(out.count("admitted as a mention"), 0, out)
+
+    def test_a_real_admission_still_announces_exactly_once(self):
+        # Positive control: silencing the line everywhere would pass the case
+        # above and delete the only console trace of a live gate admission.
+        mg.write_state(_WS, mentions_enabled=True)
+        out, written = self._edit("here are the six launch videos",
+                                  "here are the six launch videos <@111222333>")
+        self.assertEqual(len(written), 1, out)
+        self.assertEqual(out.count("admitted as a mention"), 1, out)
+
     def test_an_edit_adding_no_tag_at_all_is_still_ignored(self):
         # Negative control: without it the predicate could admit every edit.
         mg.write_state(_WS, mentions_enabled=True)
