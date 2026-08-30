@@ -1374,19 +1374,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "task is required"})
             return
 
-        # Privilege is NEVER selected by the request body. /task is the owner lane; a
-        # body that tries to name its own tier is refused rather than silently stamped
-        # owner (the old discriminator: unknown/misspelled/absent values used to fall
-        # through to owner authority). Untrusted callers use /guest-task, whose route
-        # stamps guest server-side.
+        # Privilege is NEVER *escalated* by the request body. The route decides the
+        # tier: /guest-task always stamps guest. /task is the owner lane, and a body
+        # that names a tier can only ever DEMOTE itself:
+        #   • access_tier:"guest" — accepted as a compatibility shim, because shipped
+        #     daemons (vendored matrixrtc-conversation) still POST /task with the
+        #     discriminator. It routes to the guest lane exactly as /guest-task does,
+        #     so an old sender stays contained rather than breaking or, far worse,
+        #     silently falling through to owner authority. Remove once every pinned
+        #     sender has moved to /guest-task.
+        #   • anything else — refused. The dangerous legacy shape was an unknown,
+        #     misspelled, or absent value being stamped OWNER; that can no longer
+        #     happen by accident.
         if "access_tier" in data:
-            if data.get("access_tier") == "guest":
-                self.send_json(400, {
-                    "error": "guest tasks must be submitted to /guest-task",
-                    "hint": "POST /guest-task {task}",
-                })
-            else:
+            if data.get("access_tier") != "guest":
                 self.send_json(400, {"error": "access_tier is not accepted on /task"})
+                return
+            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
+            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (guest, sandboxed)",
+            })
             return
 
         callback_url = data.get("callback_url", "")
