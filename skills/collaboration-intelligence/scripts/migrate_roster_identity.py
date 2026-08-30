@@ -157,22 +157,22 @@ def _id_slot(field: str):
     return "singular" if last == "id" else "plural" if last == "ids" else None
 
 
-def _declares_discord_id(ancestors: list, key: str, siblings=None) -> bool:
-    """DISCORD evidence, FAIL CLOSED. Naming the referent is not naming the
-    provider: `telegram_human_id` and `teams_human_id` name the human and
-    someone else's account, and a denylist of providers cannot be complete.
+# The ancestors MEASURED to supply a referent for a bare `id` in this repo's
+# rosters and tests. `telegram_human` names a person AND another provider.
+_LEGACY_ID_ANCESTORS = frozenset({"human", "secondary_agent", "stand_status"})
 
-    Evidence, in order: a sibling `provider` decides both ways when present;
-    else the key says the whole word `discord`; else the one measured legacy
-    spelling — a bare `id`/`ids` whose ancestor names the referent and which
-    states no provider at all. Anything else is not a Discord id.
-    """
-    if isinstance(siblings, dict) and siblings.get("provider") is not None:
-        return str(siblings["provider"]).strip().lower() == "discord"
-    if "discord" in _field_words(key):
-        return True
-    return [w.lower() for w in _WORDS.findall(str(key))] in (["id"], ["ids"]) \
-        and _typed_path(ancestors)
+# An identity leaf, positively: it names the referent, or it is the schema's
+# own `user_id` / a bare `id`. `room_id` names a ROOM (`schema.md:67-70`).
+def _identity_leaf(key: str) -> bool:
+    words = [w.lower() for w in _WORDS.findall(str(key))]
+    return bool(_verdicts_from_field(key)) or words in (["user", "id"], ["id"],
+                                                        ["ids"])
+
+
+def _declares_discord_id(ancestors: list, key: str, siblings=None) -> bool:
+    """The same decision as `_discord_source`, with the provider read from this
+    leaf's own mapping. Two functions deciding this drifted once already."""
+    return _discord_source(ancestors, key, _declared_provider(siblings))
 
 
 def _declared_provider(mapping) -> "str | None":
@@ -183,19 +183,17 @@ def _declared_provider(mapping) -> "str | None":
 
 
 def _discord_source(ancestors: list, key: str, provider: "str | None") -> bool:
-    """May a snowflake in THIS leaf be read as a Discord id? Governs mining and
-    citation for every leaf, not only `*_id` ones — `display_name` under a
-    referent was a documented non-evidence field and was being mined.
+    """May a snowflake in THIS leaf be read as a Discord id? The ONE rule, used
+    for mining, citation and slot validation alike.
 
-    An enclosing `provider` decides, at any depth; else the key says the whole
-    word `discord`; else the legacy bare `id`/`ids` under a referent ancestor;
-    else the leaf itself must name the referent (`stand_status`), because an
-    ancestor naming it says nothing about which of its fields hold ids.
+    A provider names the NAMESPACE, not that every field under it is an
+    identity — `activity.room_id` names a room. So the leaf must be identity-
+    bearing first; then an enclosing `provider` decides at any depth; else the
+    key says the whole word `discord`; else the legacy bare `id`/`ids` under a
+    MEASURED ancestor, because any typed ancestor let `telegram_human.id`
+    become Discord by moving the key one level down.
     """
-    # A provider names the NAMESPACE, not that every sibling under it holds an
-    # identity: `activity.rooms` and `display_name` are neither.
-    if not (_id_slot(key) or _verdicts_from_field(key)
-            or "discord" in _field_words(key)):
+    if not _identity_leaf(key) and "discord" not in _field_words(key):
         return False
     if provider is not None:
         return provider == "discord"
@@ -203,7 +201,8 @@ def _discord_source(ancestors: list, key: str, provider: "str | None") -> bool:
         return True
     if _id_slot(key):
         return [w.lower() for w in _WORDS.findall(str(key))] in (["id"], ["ids"]) \
-            and _typed_path(ancestors)
+            and any(str(a).lower() in _LEGACY_ID_ANCESTORS
+                    or "discord" in _field_words(a) for a in ancestors)
     return bool(_verdicts_from_field(key))
 
 
@@ -247,6 +246,14 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
 
     values = list(_leaves(value)) if isinstance(value, (list, tuple)) \
         else [value]
+    if slot == "singular":
+        seen = {sf for v in values for sf in _snowflakes(json.dumps(v, default=str))}
+        if len(seen) > 1:
+            # Which one wins would be decided by traversal order. The schema
+            # says this slot holds ONE id, so two of them resolve to NEITHER.
+            _bad_shape(value)
+            shapes[-1]["arbitrated_ids"] = sorted(seen)
+            return
     if not values:
         # An empty PLURAL slot is empty; an empty container in a SINGULAR one
         # is a present value the collector reads nothing from.
@@ -318,7 +325,15 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     def claim(id_, verdict, reason):
         claims.setdefault(id_, {}).setdefault(verdict, []).append(reason)
 
-    for id_ in _collect_ids(entry, shape_failures):
+    collected = _collect_ids(entry, shape_failures)
+    # An id from an over-full singular slot is not evidence for that slot: it
+    # would be picked by traversal order. Route it to unresolved instead.
+    arbitrated = {i for f in shape_failures for i in f.get("arbitrated_ids") or []}
+    for id_ in sorted(arbitrated):   # a set's order must not reach the output
+        bad.append({"id": id_, "states": None,
+                    "reason": "two ids claim one singular slot; order would "
+                              "decide, so neither is taken"})
+    for id_ in [c for c in collected if c not in arbitrated]:
         for field in _cited_in(entry, id_):
             for verdict, reason in _verdicts_from_field(field):
                 claim(id_, verdict, reason)

@@ -1174,6 +1174,38 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertIn(self.SECOND, ri.stand_discord_ids(rec))
 
+    def test_two_ids_in_a_singular_slot_resolve_to_neither(self):
+        # Reviewer, 2026-08-30: both reached `stands` and the primary was the
+        # first traversal result, so reversing the input changed the answer.
+        first, second = [], []
+        for order, sink in (([self.SECOND, BOT], first), ([BOT, self.SECOND], second)):
+            rc, err, rec = self._cli({ri.STAND_FIELD: order})
+            self.assertEqual(rc, 5, err)
+            self.assertIsNone(ri.stand_discord_id(rec))
+            sink.extend(u["id"] for u in ri.unresolved_discord_ids(rec))
+        self.assertEqual(first, second, "input order reached the output")
+        self.assertEqual(sorted(first), sorted([BOT, self.SECOND]))
+
+    def test_a_foreign_ancestor_cannot_launder_a_bare_id(self):
+        # Refused as a leaf, then accepted by moving `id` one level down.
+        # Assert the OUTPUT: with a valid Stand there is no gap, so rc is 0.
+        rc, err, rec = self._cli({"telegram_human": {"id": HUMAN},
+                                  "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(rec["human_discord_id"])
+        self.assertNotIn(HUMAN, [u["id"] for u in
+                                 ri.unresolved_discord_ids(rec)])
+
+    def test_a_room_id_under_a_discord_provider_is_not_an_identity(self):
+        # `schema.md` defines room_id as a ROOM. A provider names the
+        # namespace, not that every id under it identifies a person.
+        rc, err, rec = self._cli({
+            "human": {"provider": "discord", "activity": {"room_id": self.ROOM}},
+            "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(rec["human_discord_id"])
+        self.assertNotIn(self.ROOM, ri.stand_discord_ids(rec))
+
     def test_a_schema_record_member_is_still_read(self):
         # Positive control: `{"id": ...}` IS mined, and the v2 writer emits
         # exactly this shape — refusing it would break re-migration.
