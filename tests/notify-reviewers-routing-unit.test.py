@@ -334,8 +334,9 @@ class OneRecipientIsNotTwoPeople(unittest.TestCase):
         self._argv, self._cfg = sys.argv[:], os.environ.get("CLAUDE_CONFIG_DIR")
         self._roster, self._run = os.environ.get("SUTANDO_SCI_ROSTER"), nr.subprocess.run
         self.seen = []
+        self._rc = 0
         nr.subprocess.run = lambda a, **k: self.seen.append(a) or type(
-            "R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            "R", (), {"returncode": self._rc, "stdout": "", "stderr": ""})()
 
     def tearDown(self):
         sys.argv[:] = self._argv
@@ -382,6 +383,18 @@ class OneRecipientIsNotTwoPeople(unittest.TestCase):
         self.assertEqual(len(self.seen), 2, f"a notice must still deliver: {err}")
         rows = led.read_text().splitlines() if led.exists() else []
         self.assertEqual(rows, [], f"a notice entered ask history: {rows}")
+
+    def test_an_UNSAFE_notice_never_enters_ask_history(self):
+        # An unsafe exit reaches `_settle`, which had no kind guard, so a
+        # notice persisted as a review ask and refused the next genuine one.
+        self._rc = 4
+        rc, err = self._run_with(
+            {"a1": {"discord_id": "111", "home_channel": "222"},
+             "b1": {"discord_id": "999", "home_channel": "444"}}, "a1,b1",
+            kind="notice")
+        led = pathlib.Path(self.tmp_led)
+        rows = [json.loads(l) for l in led.read_text().splitlines()] if led.exists() else []
+        self.assertEqual(rows, [], f"an unsafe notice entered ask history: {rows}")
 
     def test_the_control_an_ask_does_record(self):
         # Without this, refusing to record ANYTHING would pass the case above

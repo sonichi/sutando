@@ -969,7 +969,12 @@ def main() -> int:
                     continue
 
             def _settle(outcome, detail):
-                """Supersede the reservation. Append-only, so this is atomic."""
+                """Supersede the reservation. Append-only, so this is atomic.
+
+                A NOTICE never claimed, so it has nothing to supersede — and a
+                row here would be projected into ask history by `_first_ask`."""
+                if a.kind != "ask":
+                    return
                 try:
                     record_asks(a.message, t["name"], outcome=outcome, actor=who,
                                 detail=detail, endpoint=t.get("endpoint"))
