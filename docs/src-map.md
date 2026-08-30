@@ -33,6 +33,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
+- **`claim_task.py`** — Atomic-rename claim primitive for the multi-core agent pool (#880, #884).
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
@@ -104,6 +105,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`pool_follower.py`** — Follower-side work acquisition (lead-follower pool, slice L2).
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
@@ -333,6 +335,11 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
 - **`identity_view.py`** — Read-only identity surface for THIS agent (the Sutando Server "smallest slice"): sutando.info / sutando.status / sutando.owner / sutando.allowlist.
 - **`instance_registry.py`** — Sutando Instance Manifest registry — persistent "this agent exists here" records, M1 of the manifest spec (taxonomy part 4/5): Agent existence ≠ agent process existence.
+- **`pool_lead.py`** — Lead-side assignment engine (lead-follower pool, slice L1).
+- **`pool_metrics.py`** — Lead-side pool metrics (slice L4 — the owner's 2026-05-19 quality bar).
+- **`pool_notify.py`** — Lead-side progress communication (lead-follower pool, slice L5).
+- **`pool_scale.py`** — Lead-side follower autoscaling policy (lead-follower pool, slice L6).
+- **`pool_status.py`** — Owner-facing pool snapshot (single writer: the lead daemon).
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
 - **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
