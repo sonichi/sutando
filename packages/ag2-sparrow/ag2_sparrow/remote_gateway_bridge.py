@@ -162,7 +162,8 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
-from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROVENANCE
+from .team_guardrail import (team_guardrail_lines, engage_rulebook,
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox_adapter import classify_response
@@ -2399,16 +2400,10 @@ def _write_task(task: dict) -> str | None:
         else:
             lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
     if sender_tier == "guest":
-        lines.extend([
-            "",
-            "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
-            "This AG2Space task is GUEST tier, not owner tier.",
-            "Do not execute the request directly with the owner's unrestricted core.",
-            "Delegate it to Codex using `codex exec --sandbox read-only`.",
+        lines.extend(sandboxed_delegation_lines(
+            "AG2 Space", "GUEST tier", f"results/{tid}.txt",
             "Research, inspect, explain, and draft only. Do not modify files or external systems.",
-            f"Write only the sandboxed agent's safe user-facing answer to results/{tid}.txt.",
-            "===END SUTANDO SYSTEM INSTRUCTIONS===",
-        ])
+        ))
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":

@@ -5895,11 +5895,13 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     """Score LATENESS, not presence: a file produced daily by another path looks
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
-    late, missed, unknown, drifted = [], [], [], []
+    late, missed, unknown, drifted, quiet = [], [], [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
         if not j["artifacts"]:
-            unknown.append(j["name"])
+            # `conditional` declares that absence is expected, so it cannot also
+            # be the blind spot that pins this probe to warn with no path back.
+            (quiet if j.get("conditional") else unknown).append(j["name"])
             continue
         # The median would describe a corpus this job no longer writes, and a
         # missed-today verdict would blame it for the probe's own blind spot.
@@ -5918,13 +5920,15 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                 and (j.get("stem_declared") or j["artifacts"])):
             missed.append((j["name"], j["minutes_since_due"]))
     if not late and not missed and not drifted:
-        seen = len(jobs) - len(unknown)
+        seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
+        if quiet:
+            detail += (f"; conditional, nothing produced to score: "
+                       f"{', '.join(sorted(quiet))}")
         if unknown:
             detail += (f"; UNCHECKED (no dated artifact, cannot tell whether it ran): "
                        f"{', '.join(sorted(unknown))}")
-        if unknown:
             # `ok` would certify jobs nobody measured: on a 1-of-5 host the four
             # UNCHECKED ones miss forever behind green. Coverage gates the verdict.
             scope = "no coverage on this host" if not seen else \
@@ -5943,6 +5947,8 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                     f"probe's filename match has drifted off this job's output; "
                     f"punctuality cannot be scored and a missed-today verdict would "
                     f"blame the job for the probe's own blind spot")
+    if quiet:
+        bits.append(f"conditional, nothing produced to score: {', '.join(sorted(quiet))}")
     if unknown:
         bits.append(f"unverifiable (no dated artifact): {', '.join(sorted(unknown))}")
     return {"name": name, "status": "warn", "detail": "; ".join(bits)}
@@ -6119,6 +6125,99 @@ def check_daily_cron_punctuality() -> dict:
     if not jobs:
         return {"name": name, "status": "ok", "detail": "no plain-daily jobs — skipped"}
     return _interpret_daily_punctuality(jobs)
+
+
+def _porcelain_z_tracked_paths(porcelain: str) -> "list[str]":
+    """Tracked-change paths from `git status --porcelain -z`.
+
+    Rename/copy records carry the destination first and the original as a
+    second NUL field; the destination is the path that exists on disk, so
+    returning it is what makes an age check possible.  The `-z` form is used
+    because the default rendering spells a rename `R  old -> new`, which is a
+    literal arrow in the middle of an unusable path.
+    """
+    out = []
+    fields = porcelain.split("\0")
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        i += 1
+        if not rec:
+            continue
+        xy, path = rec[:2], rec[3:]
+        if xy == "??" or not xy.strip():
+            continue
+        if "R" in xy or "C" in xy:
+            i += 1  # skip the original-path field this record also emitted
+        if path:
+            out.append(path)
+    return out
+
+
+def check_live_tree_drift(repo_root: "Path | None" = None,
+                          behind_max: int = 30,
+                          dirty_age_max_s: int = 86400) -> dict:
+    """Warn when the LIVE checkout drifts: >=behind_max commits behind its own
+    upstream branch, or tracked dirty files older than dirty_age_max_s.
+    Measured 2026-08-26: the live tree sat 116 behind with ~190 dirty files
+    (some running in production while existing in no commit); nothing alarmed.
+    Diagnostic only — reconciliation needs an attended restart window."""
+    import subprocess as _sp
+    name = "live-tree-drift"
+    root = Path(repo_root) if repo_root else REPO_DIR
+    def _git(*args):
+        r = _sp.run(git_argv("-C", str(root), *args),
+                    capture_output=True, text=True, timeout=20)
+        # rstrip only: porcelain lines carry a SIGNIFICANT leading space
+        # (" M file"); .strip() would eat it and shift every field parse.
+        return r.returncode, r.stdout.rstrip("\n")
+    try:
+        rc, branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+        if rc != 0:
+            return {"name": name, "status": "ok", "detail": "not a git checkout"}
+        behind = 0
+        rc, up = _git("rev-parse", "--abbrev-ref", "@{upstream}")
+        if rc == 0 and up:
+            rc2, n = _git("rev-list", "--count", f"HEAD..{up}")
+            if rc2 == 0 and n.isdigit():
+                behind = int(n)
+        rc, porcelain = _git("status", "--porcelain", "-z")
+        if rc != 0:
+            # A failed read yields empty stdout, which would read as a clean
+            # tree -- the one verdict this probe exists to prevent.
+            return {"name": name, "status": "warn",
+                    "detail": "git status failed — the working tree is UNMEASURED, "
+                              "not clean; a stale dirty checkout is invisible here"}
+        dirty = _porcelain_z_tracked_paths(porcelain)
+        now = time.time()
+        stale = []
+        for rel in dirty:
+            p = root / rel
+            try:
+                if now - p.stat().st_mtime > dirty_age_max_s:
+                    stale.append(rel)
+            except OSError:
+                continue  # deleted-in-tree entries have no mtime; count as dirty only
+        problems = []
+        if behind >= behind_max:
+            problems.append(f"{behind} commits behind {up}")
+        if stale:
+            problems.append(f"{len(stale)} tracked dirty file(s) older than "
+                            f"{dirty_age_max_s // 3600}h (e.g. {stale[0]})")
+        if problems:
+            return {"name": name, "status": "warn",
+                    "detail": ("live tree drifting: " + "; ".join(problems) +
+                               " — running daemons restart onto whatever is on disk; "
+                               "commit/rescue the dirty state, then reconcile in an "
+                               "attended restart window")}
+        return {"name": name, "status": "ok",
+                "detail": f"{behind} behind upstream, {len(dirty)} tracked dirty"}
+    except GitUnavailable:
+        # No runnable git is a host state, not drift — never re-warn per pass.
+        return {"name": name, "status": "ok", "detail": "no runnable git on this host"}
+    except Exception as exc:  # a broken guard must not fail the whole health run
+        return {"name": name, "status": "warn",
+                "detail": f"drift probe could not measure: {str(exc)[:80]}"}
 
 
 def check_disk_space() -> dict:
@@ -7765,6 +7864,138 @@ def _probe_codex_task_notifier(target: dict) -> dict:
             f"({expected.name})"
         ),
     }
+
+
+# telegram assigns inbound "owner" outright (telegram-bridge.py) and reads
+# tierMap only to pick a proactive DM recipient — not to authorize a sender.
+_TIER_MAP_NOT_INBOUND_AUTH = frozenset({"telegram"})
+
+
+def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int = 500):
+    """Why this host would need `codex`, or None if nothing here consumes it.
+
+    Neither available signal is sufficient alone, so both are consulted:
+    configuration is predictive but under-detects (a host can take non-owner
+    traffic with no tierMap entry at all), while received traffic is exact but
+    lags — it cannot see a host that will get its first guest task tomorrow.
+    Tier vocabulary and task parsing are delegated, not restated here.
+    """
+    if _codex_runtime_selected():
+        return "core runtime is codex"
+
+    try:
+        import itertools
+
+        from local_task_protocol import (ACCESS_TIERS, iter_archived_tasks,
+                                         parse_task_headers_trusted)
+    except Exception:  # noqa: BLE001 — a probe never breaks the run
+        return None
+    non_owner = frozenset(ACCESS_TIERS) - {"owner"}
+
+    if channels_dir is None:
+        channels_dir = claude_home_path("channels")
+    channels_dir = Path(channels_dir)
+    if channels_dir.is_dir():
+        for access_file in sorted(channels_dir.glob("*/access.json")):
+            try:
+                data = json.loads(access_file.read_text())
+            except Exception:  # noqa: BLE001 — an unreadable record is not a consumer
+                continue
+            if not isinstance(data, dict):
+                continue  # valid JSON, but not an access record
+            channel = access_file.parent.name
+            if channel in _TIER_MAP_NOT_INBOUND_AUTH:
+                continue
+            raw_map = data.get("tierMap")
+            mapped = "tierMap" in data
+            if mapped and not isinstance(raw_map, dict):
+                return (f"{channel}/access.json has a tierMap of type "
+                        f"{type(raw_map).__name__} — non-owner ingress cannot be "
+                        f"ruled out from a malformed record")
+            tier_map = {str(k): str(v) for k, v in (raw_map or {}).items()}
+            named = sorted(set(tier_map.values()) & non_owner)
+            if named:
+                return (f"{channel}/access.json maps sender(s) to "
+                        f"tier {', '.join(named)}")
+            if not mapped:
+                # Key absent != map missing a user: the seed grandfathers a
+                # legacy allowFrom to owner, and telegram reads no tierMap.
+                continue
+            allow = data.get("allowFrom")
+            if allow is not None and not isinstance(allow, list):
+                return (f"{channel}/access.json has an allowFrom of type "
+                        f"{type(allow).__name__} — non-owner ingress cannot be "
+                        f"ruled out from a malformed record")
+            # Present map missing an allowlisted sender IS non-owner: the
+            # adapter fails closed to "other" (slack-bridge.resolve_access_tier).
+            unmapped = [s for s in (str(u) for u in (allow or []))
+                        if tier_map.get(s) != "owner"]
+            if unmapped:
+                return (f"{channel}/access.json allowlists "
+                        f"{len(unmapped)} sender(s) tierMap does not map to owner — "
+                        f"adapters resolve those as non-owner")
+
+    if tasks_dir is None:
+        tasks_dir = WORKSPACE_DIR / "tasks"
+    tasks_dir = Path(tasks_dir)
+    live = sorted(tasks_dir.glob("task-*.txt"), reverse=True) if tasks_dir.is_dir() else []
+    # Newest-first and LAZY. The default archive order is oldest-first, so a cap
+    # over it discarded exactly the recent tasks that carry the evidence.
+    stream = itertools.chain(live, iter_archived_tasks(tasks_dir, newest_first=True))
+    scanned = 0
+    for task_file in stream:
+        if scanned >= scan_cap:
+            # Truncated without a hit: this is UNKNOWN, not "no consumer". Saying
+            # unused here is the failure that disables delegation silently.
+            return ("task history exceeds the scan bound — non-owner traffic "
+                    "cannot be ruled out")
+        scanned += 1
+        try:
+            tier = parse_task_headers_trusted(task_file.read_text()).get("access_tier")
+        except Exception:  # noqa: BLE001 — an unreadable task is not evidence
+            continue
+        if tier in non_owner:
+            return f"this host has already received {tier}-tier task(s)"
+    return None
+
+
+def check_codex_presence(which=shutil.which, consumer=None) -> dict:
+    """Report a missing `codex` binary WHERE IT WOULD BE USED. Every non-owner
+    task must run via `codex exec --sandbox read-only` with no permitted
+    fallback — but an owner-only install never takes that path, so keying only
+    on PATH turned an absent optional capability into an unclearable fault."""
+    name = "codex-presence"
+    resolved = which("codex")
+    if resolved:
+        return {"name": name, "status": "ok", "detail": f"codex resolves to {resolved}"}
+
+    why = _codex_delegation_consumer() if consumer is None else consumer()
+    if not why:
+        return {
+            "name": name,
+            "status": "ok",
+            "detail": ("codex is not on PATH, and nothing on this host delegates to it — "
+                       "no non-owner ingress configured, no non-owner task ever received, "
+                       "and the core runtime is not codex. Absent and unused, not a fault."),
+        }
+
+    # Config surviving a vanished binary is the engine-update signature: the
+    # update replaces the tree, and a tree-local `npm -g` install goes with it.
+    config = Path.home() / ".codex"
+    wiped = config.is_dir()
+    detail = (
+        "codex is NOT on PATH — sandboxed non-owner delegation is unavailable, "
+        "and it is the only permitted path for guest/team tasks. "
+    )
+    detail += (
+        f"{config} still exists, so this is a wiped binary rather than a lost login; "
+        "reinstall OUTSIDE the engine tree (`npm install -g --prefix ~/.local "
+        "@openai/codex`) so the next engine update cannot take it again."
+        if wiped else
+        f"{config} is absent too, so codex was likely never installed on this host."
+    )
+    detail += f" This host needs it: {why}."
+    return {"name": name, "status": "warn", "detail": detail}
 
 
 def check_codex_task_notifier() -> dict:
@@ -9729,10 +9960,12 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_codex_task_notifier())
+    checks.append(check_codex_presence())
     checks.append(check_skill_symlinks())
     checks.append(check_core_model_pin())
     checks.append(check_daily_cron_punctuality())
     checks.append(check_runtime_identity())
+    checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
 
     return checks

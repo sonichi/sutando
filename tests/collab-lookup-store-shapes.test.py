@@ -152,6 +152,53 @@ class StoreShapes(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("@sutando-rui:ag2.space", out.getvalue())
 
+    def test_identity_matches_on_the_schema_documented_user_id(self):
+        # schema.md documents `user_id`; the reader only read `provider_id`, so a
+        # store written to the schema returned NO MATCH for every identifier.
+        ents = [{"entity_id": "person-x",
+                 "identities": [{"provider": "github", "user_id": "octo-dev"}]}]
+        rows = [{"entity_id": "person-x", "id": "person-x", "one_line": "", "agent_mxid": ""}]
+        self.assertEqual([r["entity_id"] for r in lk.match(rows, "octo-dev", ents)],
+                         ["person-x"])
+
+    def test_main_renders_a_schema_user_id_identity(self):
+        # Covers the RENDER site: matching alone never executes the id line.
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, yaml_text=(
+                "quick_lookup:\n"
+                "  updated_at: 2026-08-29T00:00:00Z\n"
+                "  recent_entities:\n"
+                "    - entity_id: person-x\n"
+                "      kind: human\n"
+                "      one_line: schema-faithful store\n"))
+            (d / "entities.yaml").write_text(
+                "entities:\n"
+                "  - entity_id: person-x\n"
+                "    identities:\n"
+                "      - {provider: github, user_id: octo-dev}\n")
+            orig_store, orig_argv = lk.store, sys.argv
+            out = io.StringIO()
+            try:
+                lk.store = lambda: d
+                sys.argv = ["lookup.py", "octo-dev"]
+                with contextlib.redirect_stdout(out):
+                    rc = lk.main()
+            finally:
+                lk.store, sys.argv = orig_store, orig_argv
+            self.assertEqual(rc, 0)
+            # Resolved by the documented key, and the id is actually printed.
+            self.assertIn("github=octo-dev", out.getvalue())
+
+    def test_identity_still_matches_on_provider_id(self):
+        # Existing stores use provider_id; honouring user_id must not drop them.
+        ents = [{"entity_id": "person-y",
+                 "identities": [{"provider": "github", "provider_id": "hubot"}]}]
+        rows = [{"entity_id": "person-y", "id": "person-y", "one_line": "", "agent_mxid": ""}]
+        self.assertEqual([r["entity_id"] for r in lk.match(rows, "hubot", ents)],
+                         ["person-y"])
+
     def test_no_match_returns_empty_not_invented(self):
         with tempfile.TemporaryDirectory() as t:
             d = store(t, roster=ROSTER)
