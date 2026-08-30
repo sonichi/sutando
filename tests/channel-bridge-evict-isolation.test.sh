@@ -126,6 +126,46 @@ sleep 0.4
 assert_alive "blind-case: env unreadable -> live instance SURVIVED (never kills on unknown)" "$PID_BLIND"
 kill "$PID_BLIND" 2>/dev/null || true
 
+# --- list mode (read-only verifier over the SAME identity decision) ---------
+# The one-owner rule (#3553 round 4): health-check's post-eviction survivor scan
+# delegates here instead of mirroring the policy in Python. OWN only for this
+# checkout; foreign silent; unreadable identity prints INDETERMINATE.
+( cd "$A" && exec "$PY" src/slack-bridge.py ) & PID_LA=$!
+( cd "$B" && exec "$PY" src/slack-bridge.py ) & PID_LB=$!
+sleep 0.6
+LIST_OUT="$(bash "$HELPER" --list slack "$A")"
+case "$LIST_OUT" in
+  "OWN $PID_LA") echo "  ok   list mode: exactly this checkout's pid, foreign silent" ;;
+  *) echo "  FAIL list mode output: '$LIST_OUT' (expected 'OWN $PID_LA')"; FAILED=1 ;;
+esac
+LIST_BLIND="$(PATH="$SHADOW:$PATH" bash "$HELPER" --list slack "$A" GATEWAY_INSTANCE "" 2>/dev/null)"
+case "$LIST_BLIND" in
+  *INDETERMINATE*) echo "  ok   list mode: unreadable identity prints INDETERMINATE (fail-closed signal)" ;;
+  *) echo "  FAIL list mode hid an indeterminate pid: '$LIST_BLIND'"; FAILED=1 ;;
+esac
+kill "$PID_LA" "$PID_LB" 2>/dev/null || true
+
+# --- a checkout path CONTAINING SPACES (#3553 round 4, blocker 1's shape) ----
+# The bundled install lives under "Application Support"; identity must survive
+# whitespace for both the evicting and listing entry points.
+mkdir -p "$TMP/spaced dir"
+mk_checkout "$TMP/spaced dir/checkoutS"
+SREPO="$(cd "$TMP/spaced dir/checkoutS" && pwd -P)"
+( cd "$SREPO" && exec "$PY" src/slack-bridge.py ) & PID_S=$!
+( cd "$B" && exec "$PY" src/slack-bridge.py ) & PID_SB=$!
+sleep 0.6
+assert_alive "spaced-path checkout's bridge started" "$PID_S"
+SLIST="$(bash "$HELPER" --list slack "$SREPO")"
+case "$SLIST" in
+  "OWN $PID_S") echo "  ok   list mode: spaced-path checkout classified OWN" ;;
+  *) echo "  FAIL spaced-path list output: '$SLIST' (expected 'OWN $PID_S')"; FAILED=1 ;;
+esac
+evict_own_bridge slack "$SREPO"
+sleep 0.4
+assert_dead  "spaced-path checkout's bridge was evicted" "$PID_S"
+assert_alive "other checkout SURVIVED the spaced-path eviction" "$PID_SB"
+kill "$PID_SB" 2>/dev/null || true
+
 echo
 if [ "$FAILED" -eq 0 ]; then echo "PASS — channel-bridge evict isolation"; exit 0; fi
 echo "FAIL — channel-bridge evict isolation"; exit 1

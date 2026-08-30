@@ -19,27 +19,33 @@ Guards:
      This is the incident witness: at the merge base the bridge is hand-spawned
      here, so this case fails there and passes at HEAD.
   b) supervised + stale → kickstart; no direct kill, spawn, or eviction.
-  c) two-checkout control: our wrapper (child 555) + a foreign checkout's
-     wrapper (child 888) + a bare pid 777 → ONLY 555 is signalled, confirmed
-     exited; never 888 or 777, never a spawn.
+  c) kickstart refused in a PURE-ours state → only OUR wrapper's child (555)
+     is signalled, ESRCH-confirmed exited; a bare pid (777) never. (The
+     two-checkout MIXED state refuses outright — case k.)
   d) a supervisor that cannot be driven (inactive job, childless wrapper,
      gateway with no wrapper) reports failure; nothing is signalled or spawned.
   e) this checkout's wrapper alone (no launchd job) supervises: no kickstart
      of an unregistered label, child-kill only.
-  f) supervision conclusively absent → stale eviction goes through
-     evict-own-bridge.sh AND is verified (survivor scan clean) BEFORE the one
-     direct spawn, on a single ordered event stream; down leg spawns without
-     eviction; a foreign-checkout survivor does not block our spawn.
+  f) supervision conclusively absent → stale eviction AND its survivor
+     verification both go through evict-own-bridge.sh (the ONE identity
+     owner; `--list` mode) before the one direct spawn, on a single ordered
+     event stream; down leg spawns without eviction.
   g) UNKNOWN fails CLOSED: probe exceptions, launchctl rc=2 (completed error,
-     NOT rc=113 not-found), and pgrep hard errors all refuse to spawn, kill,
-     or evict — for slack and gateway alike.
+     NOT rc=113 not-found), pgrep hard errors, and an unknowable job beside a
+     live wrapper all refuse to spawn, kill, or evict — slack and gateway.
   h) FOREIGN fails CLOSED: a same-name launchd job or wrapper owned by another
      checkout is never kickstarted, killed under, or spawned beside.
   i) a kill whose signal fails, whose target survives, or whose lineage lookup
      is unreadable is reported as failure with NO signal sent where unproven.
-  j) an eviction that fails (helper rc != 0, helper unrunnable, survivor still
-     alive, survivor scan unprovable, or gateway's no-path) refuses the spawn
-     and claims no recovery; plan-None and failed-spawn legs report failure.
+  j) an eviction that fails (helper rc != 0, helper unrunnable, an OWN
+     survivor listed, any INDETERMINATE line, an erroring/unrunnable --list,
+     or gateway's no-path) refuses the spawn and claims no recovery; the
+     plan-None and real-Popen-failure legs report failure.
+  k) the FULL job×wrapper ownership matrix: every own/foreign mix refuses
+     with zero side effects; pure states act as advertised.
+  l) a repo path containing spaces owns its wrapper (ps flattens argv, so
+     identity is whole-command equality, never tokenization); same-prefix
+     and embedded-path argvs stay foreign.
 
 Run: python3 tests/health-check-supervised-bridge-restart.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -109,8 +115,8 @@ class Host:
                  ps_rc_error=False, ps_raises=False,
                  evict_rc=0, evict_raises=False, job_stdout=None,
                  popen_raises=False, kill0_eperm=False,
-                 survivors=(), script_pgrep_raises=False, script_pgrep_rc_error=False,
-                 ghost_wrapper=False, ghost_survivor=False, lsof_raises=False,
+                 list_lines=(), list_rc=0, list_raises=False,
+                 ghost_wrapper=False,
                  ps_fail_after=None, kill_rc=0, kill_raises=False,
                  alive_after_kill=False):
         # job: "ours" (registered, program under REPO_DIR), "foreign"
@@ -134,13 +140,10 @@ class Host:
         self.job_stdout = job_stdout  # overrides the launchctl print dump
         self.popen_raises = popen_raises
         self.kill0_eperm = kill0_eperm
-        # survivors: (pid, cmd, cwd) rows answered to the post-eviction scan.
-        self.survivors = list(survivors)
-        self.script_pgrep_raises = script_pgrep_raises
-        self.script_pgrep_rc_error = script_pgrep_rc_error
+        self.list_lines = list(list_lines)  # evict-own-bridge.sh --list answers
+        self.list_rc = list_rc
+        self.list_raises = list_raises
         self.ghost_wrapper = ghost_wrapper
-        self.ghost_survivor = ghost_survivor
-        self.lsof_raises = lsof_raises
         self.ps_fail_after = ps_fail_after  # ps calls answered before failing
         self.ps_calls = 0
         self.kill_rc = kill_rc
@@ -162,8 +165,6 @@ class Host:
                 rows.append((pid, FOREIGN_WRAPPER, "/usr/bin/python3 /repo-b/src/slack-bridge.py"))
         for pid in self.bare_pids:
             rows.append((pid, "1", "/usr/bin/python3 /elsewhere/src/slack-bridge.py"))
-        for pid, cmd, _cwd in self.survivors:
-            rows.append((pid, "1", cmd))
         return rows
 
     def run(self, argv, *args, **kwargs):
@@ -200,15 +201,9 @@ class Host:
                        (["4343"] if self.ghost_wrapper else [])
                 rc = 0 if pids else 1
                 return subprocess.CompletedProcess(argv, rc, stdout="\n".join(pids), stderr="")
-            # post-eviction survivor scan (<script>.py$)
-            if self.script_pgrep_raises:
-                raise OSError("pgrep unavailable")
-            if self.script_pgrep_rc_error:
-                return subprocess.CompletedProcess(argv, 3, stdout="", stderr="pgrep: bad")
-            pids = [p for p, _c, _w in self.survivors] + \
-                   (["670"] if self.ghost_survivor else [])
-            rc = 0 if pids else 1
-            return subprocess.CompletedProcess(argv, rc, stdout="\n".join(pids), stderr="")
+            # No production caller pgreps the bridge script any more (the
+            # survivor scan delegates to evict-own-bridge.sh --list).
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
         if argv[0] in ("ps", "/bin/ps"):
             self.ps_calls += 1
             if self.ps_fail_after is not None and self.ps_calls > self.ps_fail_after:
@@ -220,13 +215,6 @@ class Host:
             out = "  PID  PPID ARGS\n" + "\n".join(
                 f"{p} {pp} {cmd}" for p, pp, cmd in self._ps_rows())
             return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
-        if argv[0] == "/usr/sbin/lsof":
-            if self.lsof_raises:
-                raise OSError("lsof unavailable")
-            pid = argv[argv.index("-p") + 1]
-            cwd = next((w for p, _c, w in self.survivors if p == pid), "")
-            out = f"p{pid}\nn{cwd}\n" if cwd else ""
-            return subprocess.CompletedProcess(argv, 0 if cwd else 1, stdout=out, stderr="")
         if argv[0] == "/bin/kill" and argv[1] == "-0":
             if self.kill0_eperm:
                 return subprocess.CompletedProcess(argv, 1, stdout="",
@@ -239,6 +227,12 @@ class Host:
                 raise OSError("kill unavailable")
             return subprocess.CompletedProcess(argv, self.kill_rc, stdout="", stderr="")
         if argv[0] == "/bin/bash" and str(argv[1]).endswith("evict-own-bridge.sh"):
+            if argv[2] == "--list":
+                if self.list_raises:
+                    raise OSError("bash unavailable")
+                self.events.append(("list", f"{argv[3]}:{argv[4]}"))
+                return subprocess.CompletedProcess(
+                    argv, self.list_rc, stdout="\n".join(self.list_lines), stderr="")
             if self.evict_raises:
                 raise OSError("bash unavailable")
             self.events.append(("evict", f"{argv[2]}:{argv[3]}"))
@@ -323,12 +317,12 @@ def case_b_supervised_stale_kickstarts() -> list[str]:
     return fails
 
 
-def case_c_two_checkouts_only_our_child_is_killed() -> list[str]:
-    """kewei's round-2 control: wrappers in two checkouts. Only THIS repo's
-    wrapper's child may be signalled; the foreign child and a bare pid never."""
+def case_c_kickstart_refused_kills_only_our_confirmed_child() -> list[str]:
+    """Pure-ours state (no foreign presence anywhere): kickstart refused →
+    only OUR wrapper's child is signalled, confirmed exited; a bare pid never.
+    (The two-checkout MIXED state now refuses outright — see the matrix case.)"""
     fails = []
     host = Host(job="ours", kickstart_rc=1, wrapper_alive=True, child_pids="555",
-                foreign_wrapper_alive=True, foreign_child_pids="888",
                 bare_pids=("777",))
     ok, how = with_host(host, lambda: hc._restart_bridge("slack-bridge", stale=True))
     if not ok:
@@ -411,21 +405,10 @@ def case_f_absent_supervision_verified_evict_then_spawn() -> list[str]:
     ok2, _ = with_host(host2, lambda: hc._restart_bridge("slack-bridge"))
     if not ok2 or [k for k, _ in host2.events if k in ("evict", "spawn")] != ["spawn"]:
         fails.append(f"f) down leg changed: ok={ok2} events={host2.events}")
-    # A foreign checkout's absolute-path survivor is not ours: spawn proceeds.
-    host3 = Host(job="absent", survivors=[("666", "/usr/bin/python3 /repo-b/src/slack-bridge.py", "/repo-b")])
-    ok3, _ = with_host(host3, lambda: hc._restart_bridge("slack-bridge", stale=True))
-    if not ok3 or len(host3.bridge_spawns()) != 1:
-        fails.append(f"f) foreign survivor wrongly blocked our spawn: ok={ok3} events={host3.events}")
-    # A relative-launch survivor whose cwd is elsewhere is not ours either.
-    host4 = Host(job="absent", survivors=[("667", "python3 src/slack-bridge.py", "/repo-b")])
-    ok4, _ = with_host(host4, lambda: hc._restart_bridge("slack-bridge", stale=True))
-    if not ok4 or len(host4.bridge_spawns()) != 1:
-        fails.append(f"f) foreign-cwd survivor wrongly blocked our spawn: ok={ok4} events={host4.events}")
-    # A pgrep hit that exits before ps reads it counts as gone, not unprovable.
-    host5 = Host(job="absent", ghost_survivor=True)
-    ok5, _ = with_host(host5, lambda: hc._restart_bridge("slack-bridge", stale=True))
-    if not ok5 or len(host5.bridge_spawns()) != 1:
-        fails.append(f"f) vanished pgrep hit wrongly blocked our spawn: ok={ok5} events={host5.events}")
+    # The verify leg goes through the ONE owner too: an empty --list from
+    # evict-own-bridge.sh (foreign survivors print nothing) clears the spawn.
+    if host.of("list") != [f"slack:{hc.REPO_DIR}"]:
+        fails.append(f"f) survivor scan must delegate to evict-own-bridge.sh --list, got {host.events}")
     return fails
 
 
@@ -450,11 +433,13 @@ def case_g_unknown_supervision_fails_closed() -> list[str]:
     if okg or "UNKNOWN" not in howg:
         fails.append(f"g) gateway launchctl rc=2 must refuse: ok={okg} how={howg!r}")
     fails += no_side_effects(hostg, "g/gateway-rc2")
-    # launchctl raises; the live wrapper is still a supervision witness.
+    # launchctl raises while our wrapper is alive: the job dimension is
+    # unknowable, so the complete-state rule refuses even the child-kill.
     host3 = Host(print_raises=True, wrapper_alive=True, child_pids="555")
-    ok3, _ = with_host(host3, lambda: hc._restart_bridge("slack-bridge", stale=True))
-    if not ok3 or host3.of("kill") != ["555"] or host3.bridge_spawns():
-        fails.append(f"g) wrapper-witness leg: ok={ok3} events={host3.events}")
+    ok3, how3 = with_host(host3, lambda: hc._restart_bridge("slack-bridge", stale=True))
+    if ok3 or "UNKNOWN" not in how3:
+        fails.append(f"g) unknowable-job + live wrapper must refuse: ok={ok3} how={how3!r}")
+    fails += no_side_effects(host3, "g/unknowable-job-wrapper")
     # Gateway has no wrapper witness: a raised probe alone is UNKNOWN.
     host4 = Host(print_raises=True)
     ok4, how4 = with_host(host4, lambda: hc._restart_bridge("gateway-bridge"))
@@ -586,12 +571,19 @@ def case_i_unconfirmed_kills_report_failure() -> list[str]:
     ok4, _ = with_host(host4, lambda: hc._restart_bridge("slack-bridge"))
     if ok4 or host4.bridge_spawns():
         fails.append(f"i) kill-raise leg: ok={ok4} events={host4.events}")
-    # ps readable for wrapper classification but torn before the child lookup.
+    # ps readable for the supervision scan + the kill's wrapper re-check, but
+    # torn before the child lookup (3rd read) — refuse without signalling.
     host5 = Host(job="ours", kickstart_rc=1, wrapper_alive=True,
-                 child_pids="555", ps_fail_after=1)
+                 child_pids="555", ps_fail_after=2)
     ok5, _ = with_host(host5, lambda: hc._restart_bridge("slack-bridge"))
     if ok5 or host5.of("kill") or host5.bridge_spawns():
         fails.append(f"i) torn-ps leg: ok={ok5} events={host5.events}")
+    # And torn at the kill's own wrapper re-check (2nd read).
+    host6 = Host(job="ours", kickstart_rc=1, wrapper_alive=True,
+                 child_pids="555", ps_fail_after=1)
+    ok6, _ = with_host(host6, lambda: hc._restart_bridge("slack-bridge"))
+    if ok6 or host6.of("kill") or host6.bridge_spawns():
+        fails.append(f"i) torn-ps-2nd leg: ok={ok6} events={host6.events}")
     return fails
 
 
@@ -602,18 +594,11 @@ def case_j_unverified_eviction_refuses_spawn() -> list[str]:
     for label, kw, needle in (
         ("helper-rc", {"evict_rc": 7}, "exited 7"),
         ("helper-unrunnable", {"evict_raises": True}, "could not be run"),
-        ("our-survivor", {"survivors": [("666", f"/usr/bin/python3 {hc.REPO_DIR}/src/slack-bridge.py", "")]},
-         "still alive"),
-        ("our-cwd-survivor", {"survivors": [("667", "python3 src/slack-bridge.py", str(hc.REPO_DIR))]},
-         "still alive"),
-        ("scan-unprovable", {"survivors": [("668", "python3 src/slack-bridge.py", "")]},
-         "could not prove"),
-        ("scan-error", {"script_pgrep_raises": True}, "could not prove"),
-        ("scan-rc-error", {"script_pgrep_rc_error": True}, "could not prove"),
-        ("scan-ps-error", {"survivors": [("666", "python3 src/slack-bridge.py", "x")], "ps_fail_after": 0},
-         "could not prove"),
-        ("lsof-raise", {"survivors": [("667", "python3 src/slack-bridge.py", str(hc.REPO_DIR)+"IGNORED")],
-                        "lsof_raises": True}, "could not prove"),
+        ("own-survivor", {"list_lines": ["OWN 666"]}, "still alive"),
+        ("indeterminate-survivor", {"list_lines": ["INDETERMINATE 668"]}, "could not prove"),
+        ("mixed-list", {"list_lines": ["OWN 666", "INDETERMINATE 668"]}, "could not prove"),
+        ("list-rc-error", {"list_rc": 3}, "could not prove"),
+        ("list-unrunnable", {"list_raises": True}, "could not prove"),
     ):
         host = Host(job="absent", **kw)
         ok, how = with_host(host, lambda: hc._restart_bridge("slack-bridge", stale=True))
@@ -629,6 +614,10 @@ def case_j_unverified_eviction_refuses_spawn() -> list[str]:
     if okg or "no eviction path" not in howg:
         fails.append(f"j) gateway stale must refuse: ok={okg} how={howg!r}")
     fails += no_side_effects(hostg, "j/gateway-stale")
+    # Gateway has no entry in the identity owner: the scan itself is unprovable.
+    hostg1 = Host(job="absent")
+    if with_host(hostg1, lambda: hc._surviving_own_bridge_pids("gateway-bridge")) is not None:
+        fails.append("j) gateway survivor scan must be unprovable (None)")
     # Gateway DOWN (not stale) with no supervisor still spawns.
     hostg2 = Host(job="absent")
     okg2, _ = with_host(hostg2, lambda: hc._restart_bridge("gateway-bridge"))
@@ -656,11 +645,97 @@ def case_j_unverified_eviction_refuses_spawn() -> list[str]:
     return fails
 
 
+def case_k_full_ownership_matrix() -> list[str]:
+    """kewei r4 blocker 2: the complete job×wrapper state decides the verdict,
+    and EVERY own/foreign mix refuses. Verdicts asserted via _bridge_supervision
+    directly; the two riskiest mixes also prove refusal at the action layer."""
+    fails = []
+    matrix = [
+        # (job, wrapper_alive(ours), foreign_wrapper, expected verdict, expected label)
+        ("ours",    False, False, "supervised", LABEL),
+        ("ours",    True,  False, "supervised", LABEL),
+        ("ours",    False, True,  "mixed",      None),
+        ("ours",    True,  True,  "mixed",      None),
+        ("foreign", True,  False, "mixed",      None),
+        ("foreign", True,  True,  "mixed",      None),
+        ("foreign", False, False, "foreign",    None),
+        ("foreign", False, True,  "foreign",    None),
+        ("absent",  True,  False, "supervised", None),
+        ("absent",  True,  True,  "mixed",      None),
+        ("absent",  False, True,  "foreign",    None),
+        ("absent",  False, False, "absent",     None),
+    ]
+    for job, ours_w, foreign_w, want, want_label in matrix:
+        host = Host(job=job, wrapper_alive=ours_w, child_pids="555" if ours_w else "",
+                    foreign_wrapper_alive=foreign_w,
+                    foreign_child_pids="888" if foreign_w else "")
+        verdict = with_host(host, lambda: hc._bridge_supervision("slack-bridge"))
+        if verdict != (want, want_label):
+            fails.append(f"k) job={job} ours_w={ours_w} foreign_w={foreign_w}: "
+                         f"expected {(want, want_label)}, got {verdict}")
+    # The two riskiest mixes also prove refusal at the action layer, with
+    # zero side effects (no kickstart, kill, evict, or spawn).
+    for label_, kw in (("own-job+foreign-wrapper",
+                        dict(job="ours", foreign_wrapper_alive=True, foreign_child_pids="888")),
+                       ("foreign-job+own-wrapper",
+                        dict(job="foreign", wrapper_alive=True, child_pids="555"))):
+        host = Host(**kw)
+        ok, how = with_host(host, lambda: hc._restart_bridge("slack-bridge", stale=True))
+        if ok or "BOTH" not in how:
+            fails.append(f"k) {label_}: mixed state must refuse: ok={ok} how={how!r}")
+        if host.of("kickstart"):
+            fails.append(f"k) {label_}: kickstarted in a mixed state: {host.of('kickstart')}")
+        fails += no_side_effects(host, f"k/{label_}")
+    return fails
+
+
+def case_l_spaced_repo_path_owns_its_wrapper() -> list[str]:
+    """kewei r4 blocker 1: a supported repo path containing spaces (the bundled
+    "Application Support" install) must classify OUR wrapper as ours — ps
+    flattens argv, so tokenization cannot be the identity mechanism — and a
+    sibling sharing the spaced path as a prefix stays foreign."""
+    fails = []
+    spaced = Path("/Users/neo/Library/Application Support/space.ag2.app/engine/sutando")
+    with mock.patch.object(hc, "REPO_DIR", spaced):
+        # Positive control (kewei's exact shape): our wrapper under the spaced path.
+        host = Host(job="absent", wrapper_alive=True, child_pids="555")
+        got = with_host(host, lambda: hc._wrapper_pids("slack-bridge"))
+        if got != ([OUR_WRAPPER], []):
+            fails.append(f"l) spaced-path wrapper must be OURS: got {got}")
+        # End-to-end: wrapper-only supervision drives the child, never spawns.
+        host2 = Host(job="absent", wrapper_alive=True, child_pids="555")
+        ok2, _ = with_host(host2, lambda: hc._restart_bridge("slack-bridge", stale=True))
+        if not ok2 or host2.of("kill") != ["555"] or host2.bridge_spawns():
+            fails.append(f"l) spaced-path restart leg: ok={ok2} events={host2.events}")
+        # Same-prefix sibling of the spaced path stays foreign.
+        host3 = Host(job="absent", foreign_wrapper_alive=True, foreign_child_pids="888")
+        host3._ps_rows_orig = host3._ps_rows
+        def _rows3():
+            return [(p_, pp, cmd.replace("/repo-b", f"{spaced}-copy"))
+                    for p_, pp, cmd in host3._ps_rows_orig()]
+        host3._ps_rows = _rows3
+        got3 = with_host(host3, lambda: hc._wrapper_pids("slack-bridge"))
+        if got3 != ([], [FOREIGN_WRAPPER]):
+            fails.append(f"l) same-prefix sibling of the spaced path must be FOREIGN: got {got3}")
+        # An adversarial argv that merely EMBEDS our spaced path is not ours.
+        host4 = Host(job="absent", foreign_wrapper_alive=True)
+        host4._ps_rows_orig = host4._ps_rows
+        def _rows4():
+            rows = host4._ps_rows_orig()
+            evil = (f"/bin/bash /repo-b/x.sh {spaced}/src/launchd/channel-bridge-wrapper.sh slack")
+            return [(p_, pp, evil if p_ == FOREIGN_WRAPPER else cmd) for p_, pp, cmd in rows]
+        host4._ps_rows = _rows4
+        got4 = with_host(host4, lambda: hc._wrapper_pids("slack-bridge"))
+        if got4 != ([], [FOREIGN_WRAPPER]):
+            fails.append(f"l) embedded-path argv must stay FOREIGN: got {got4}")
+    return fails
+
+
 def main() -> int:
     cases = [
         case_a_supervised_down_restarts_through_launchd,
         case_b_supervised_stale_kickstarts,
-        case_c_two_checkouts_only_our_child_is_killed,
+        case_c_kickstart_refused_kills_only_our_confirmed_child,
         case_d_undrivable_supervisor_reports_failure,
         case_e_wrapper_only_supervision_never_kickstarts,
         case_f_absent_supervision_verified_evict_then_spawn,
@@ -668,6 +743,8 @@ def main() -> int:
         case_h_foreign_supervisor_fails_closed,
         case_i_unconfirmed_kills_report_failure,
         case_j_unverified_eviction_refuses_spawn,
+        case_k_full_ownership_matrix,
+        case_l_spaced_repo_path_owns_its_wrapper,
     ]
     failures = []
     for case in cases:

@@ -3636,19 +3636,19 @@ def _wrapper_pids(name: str) -> "tuple[list, list] | None":
     if rows is None:
         return None
     cmd_by_pid = {p: cmd for p, _pp, cmd in rows}
-    wrapper_paths = {f"{REPO_DIR}/src/launchd/channel-bridge-wrapper.sh",
-                     f"{os.path.realpath(str(REPO_DIR))}/src/launchd/channel-bridge-wrapper.sh"}
+    # ps flattens argv without quoting (a path with spaces cannot be tokenized
+    # back), so ownership = the WHOLE command equals our known launch shape.
+    launch_shapes = set()
+    for root in {str(REPO_DIR), os.path.realpath(str(REPO_DIR))}:
+        wpath = f"{root}/src/launchd/channel-bridge-wrapper.sh"
+        launch_shapes.add(f"/bin/bash {wpath} {channel}")
+        launch_shapes.add(f"bash {wpath} {channel}")
     ours, foreign = [], []
     for pid in pids:
         cmd = cmd_by_pid.get(pid)
         if cmd is None:
             return None
-        # Token-exact, like the launchd-job check: the wrapper path must BE an
-        # argv token followed by this channel, never a substring of the line.
-        toks = cmd.split()
-        mine = any(tok in wrapper_paths and i + 1 < len(toks) and toks[i + 1] == channel
-                   for i, tok in enumerate(toks))
-        (ours if mine else foreign).append(pid)
+        (ours if cmd.strip() in launch_shapes else foreign).append(pid)
     return (ours, foreign)
 
 
@@ -3696,50 +3696,53 @@ def _bridge_supervision(name: str) -> "tuple[str, str | None]":
 
     ("supervised", label_or_None) — this checkout's launchd job (label given:
         kickstartable) or this checkout's resident wrapper (None: drive via
-        the wrapper's child only).
-    ("foreign", None)  — a same-name job or wrapper exists but is NOT this
-        checkout's; it is never ours to kickstart, kill under, or race.
+        the wrapper's child only) — with NO foreign presence anywhere.
+    ("mixed", None)    — own AND foreign supervision both present (any
+        job×wrapper combination); acting would race another install, so
+        callers must refuse everything.
+    ("foreign", None)  — only another checkout's job/wrapper exists; it is
+        never ours to kickstart, kill under, or race.
     ("absent", None)   — launchctl conclusively knows no job (rc 113) AND the
         wrapper scan ran clean.
     ("unknown", None)  — a probe failed or answered ambiguously. Fails closed
         in callers: not a license to spawn beside a possible supervisor.
     """
     label = f"com.sutando.{name}"
-    job_absent = False
-    job_foreign = False
-    job_unproved = False
+    job_state = "unknown"
     try:
         probe = subprocess.run(
             ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
             capture_output=True, text=True, timeout=10)
         if probe.returncode == 0:
             owned = _job_is_ours(name, probe.stdout)
-            if owned is True:
-                return ("supervised", label)
-            if owned is False:
-                job_foreign = True
-            else:
-                job_unproved = True
+            job_state = ("ours" if owned is True
+                         else "foreign" if owned is False else "unknown")
         elif probe.returncode == _LAUNCHCTL_NOT_FOUND_RC:
-            job_absent = True
+            job_state = "absent"
     except (subprocess.TimeoutExpired, OSError):
         pass
     if name not in _BRIDGE_WRAPPER_CHANNEL:
         # No resident wrapper exists for this bridge (the gateway wrapper execs).
-        if job_foreign:
-            return ("foreign", None)
-        return ("absent", None) if job_absent else ("unknown", None)
+        return {"ours": ("supervised", label),
+                "foreign": ("foreign", None),
+                "absent": ("absent", None)}.get(job_state, ("unknown", None))
+    # The COMPLETE state is scanned before any verdict — an owned job must not
+    # short-circuit past a foreign wrapper it is about to race.
     wrappers = _wrapper_pids(name)
-    if wrappers is None:
+    if wrappers is None or job_state == "unknown":
         return ("unknown", None)
     ours, foreign = wrappers
+    if (job_state == "foreign" and ours) or (foreign and (job_state == "ours" or ours)):
+        # ANY own/foreign mix refuses: acting would race the other install
+        # (singleton contention or duplicate delivery).
+        return ("mixed", None)
+    if job_state == "ours":
+        return ("supervised", label)
     if ours:
         return ("supervised", None)
-    if job_unproved:
-        return ("unknown", None)
-    if job_foreign or foreign:
+    if job_state == "foreign" or foreign:
         return ("foreign", None)
-    return ("absent", None) if job_absent else ("unknown", None)
+    return ("absent", None)
 
 
 def _pid_confirmed_gone(pid: "str | int") -> bool:
@@ -3790,46 +3793,31 @@ def _kill_supervised_child(name: str) -> bool:
 
 
 def _surviving_own_bridge_pids(name: str) -> "list | None":
-    """Live <script>.py pids belonging to THIS checkout; None when unprovable.
-
-    Ownership mirrors evict-own-bridge.sh's read side: absolute argv under this
-    repo, else cwd == this repo (physical). An unclassifiable pid returns None —
-    an unproven survivor must fail closed, never read as "gone".
+    """Live pids of THIS checkout's bridge, per the ONE production identity
+    owner — `evict-own-bridge.sh --list` (absolute argv under repo, else cwd ==
+    repo; indeterminate never classifies). "OWN <pid>" lines are survivors; any
+    "INDETERMINATE" line, a nonzero exit, or an unrunnable helper returns None —
+    an unprovable scan must fail closed, never read as "gone". Bridges without
+    a wrapper channel (gateway) have no owner entry here and return None.
     """
-    script = _BRIDGE_SCRIPT.get(name, name)
+    channel = _BRIDGE_WRAPPER_CHANNEL.get(name)
+    if channel is None:
+        return None
+    helper = REPO_DIR / "src" / "launchd" / "evict-own-bridge.sh"
     try:
-        pg = subprocess.run(["/usr/bin/pgrep", "-f", rf"{script}\.py$"],
-                            capture_output=True, text=True, timeout=10)
-    except (subprocess.TimeoutExpired, OSError):
+        r = subprocess.run(["/bin/bash", str(helper), "--list", channel, str(REPO_DIR)],
+                           capture_output=True, text=True, timeout=30)
+    except Exception:  # noqa: BLE001 — an unrunnable verifier is an unprovable scan
         return None
-    if pg.returncode == 1:
-        return []
-    if pg.returncode != 0:
+    if r.returncode != 0:
         return None
-    rows = _bridge_ps_rows()
-    if rows is None:
-        return None
-    cmd_by_pid = {p: cmd for p, _pp, cmd in rows}
-    repo_phys = os.path.realpath(str(REPO_DIR))
     survivors = []
-    for pid in pg.stdout.split():
-        cmd = cmd_by_pid.get(pid)
-        if cmd is None:
-            continue  # exited between pgrep and ps
-        if f"{REPO_DIR}/src/{script}.py" in cmd or f"{repo_phys}/src/{script}.py" in cmd:
-            survivors.append(pid)
-            continue
-        # Relative launch: ours only if its cwd is this checkout.
-        try:
-            lsof = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-p", pid, "-Fn"],
-                                  capture_output=True, text=True, timeout=10)
-        except (subprocess.TimeoutExpired, OSError):
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "OWN":
+            survivors.append(parts[1])
+        elif parts and parts[0] == "INDETERMINATE":
             return None
-        cwd = next((ln[1:] for ln in lsof.stdout.splitlines() if ln.startswith("n")), "")
-        if not cwd:
-            return None
-        if os.path.realpath(cwd) == repo_phys:
-            survivors.append(pid)
     return survivors
 
 
@@ -3886,6 +3874,10 @@ def _restart_bridge(name: str, *, stale: bool = False) -> "tuple[bool, str]":
         return False, (f"a com.sutando.{name} supervisor exists on this host but is NOT this "
                        f"checkout's ({REPO_DIR}) — refusing to drive another install's "
                        f"supervisor or spawn beside it; reconcile the installs manually")
+    if verdict == "mixed":
+        return False, (f"BOTH this checkout's and another install's supervision are present "
+                       f"for {name} (job/wrapper mix) — refusing to kickstart, kill, or spawn "
+                       f"into a contested singleton; reconcile the installs manually")
     if verdict == "supervised":
         if kick_label is not None:
             try:
