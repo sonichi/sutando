@@ -1367,6 +1367,20 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(len(got), ri.SHAPE_MAX,
                          f"diagnostics should fill the bound, got {len(got)}")
 
+    def test_the_overflow_marker_survives_a_second_bounded_write(self):
+        # A marker the next write discards proves nothing. It was preserved by
+        # the pathless-carry rule but not by the bound that produced it.
+        sent = [{"path": None, "kind": ri.INVALID_KIND, "reason": "r%02d" % i}
+                for i in range(ri.SHAPE_MAX + 1)]
+        first = ri.canonical_shape_failures(sent, bound=ri.SHAPE_MAX)
+        self.assertEqual([r["kind"] for r in first], [ri.OVERFLOW_KIND])
+        diag = [{"path": "d%02d" % i, "kind": "k", "reason": "r"}
+                for i in range(ri.SHAPE_MAX)]
+        second = ri.canonical_shape_failures(diag + first, bound=ri.SHAPE_MAX)
+        self.assertLessEqual(len(second), ri.SHAPE_MAX)
+        self.assertIn(ri.OVERFLOW_KIND, {r["kind"] for r in second},
+                      "the cap discarded the marker it had just produced")
+
     def test_overflowing_arbitration_aggregates_and_stays_refused(self):
         # Identity facts may not be dropped, but they may not grow without
         # bound either: they collapse into one aggregate that keeps every id.

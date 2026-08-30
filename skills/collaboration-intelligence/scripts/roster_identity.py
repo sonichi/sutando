@@ -95,9 +95,10 @@ def bears_identity(rec) -> bool:
 
 
 def must_keep(rec) -> bool:
-    """Records the bound may never drop: identity facts and blocking refusals."""
-    return bears_identity(rec) or (isinstance(rec, dict)
-                                   and rec.get("kind") == INVALID_KIND)
+    """Records the bound may never drop: identity facts, blocking refusals, and
+    the overflow marker itself — a marker a later write discards proves nothing."""
+    return bears_identity(rec) or (isinstance(rec, dict) and rec.get("kind")
+                                   in (INVALID_KIND, OVERFLOW_KIND))
 
 
 def canonical_shape_failures(value, *, bound: "int | None" = SHAPE_MAX) -> list:
