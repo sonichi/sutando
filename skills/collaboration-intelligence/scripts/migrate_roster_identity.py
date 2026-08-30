@@ -261,7 +261,9 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
             # FULL path, not the leaf: a leaf-only read says None, and None is
             # later treated as agreement with any other source.
             _v = _verdicts_from_field(".".join(path)) if path else []
-            shapes[-1]["arbitrated_states"] = _v[0][0] if len(_v) == 1 else None
+            # The SET, not one value: `None` cannot mean both "states no
+            # referent" and "states two", or agreement accepts either.
+            shapes[-1]["arbitrated_states"] = sorted({v for v, _ in _v})
             return
     if not values:
         # An empty PLURAL slot is empty; an empty container in a SINGULAR one
@@ -344,8 +346,16 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     arbitrated = {i for f in shape_failures for i in f.get("arbitrated_ids") or []}
     arb_states = {i: f.get("arbitrated_states")
                   for f in shape_failures for i in f.get("arbitrated_ids") or []}
+    # A pre-#3537 record may hold the old scalar; normalise both to a list.
+    arb_states = {i: ([] if v is None else v if isinstance(v, list) else [v])
+                  for i, v in arb_states.items()}
     for id_ in sorted(arbitrated):   # a set's order must not reach the output
-        bad.append({"id": id_, "states": arb_states.get(id_),
+        _st = arb_states.get(id_) or []
+        bad.append({"id": id_,
+                    # One stated referent can agree with a matching slot; two
+                    # cannot agree with either, and none states nothing.
+                    "states": _st[0] if len(_st) == 1 else None,
+                    "collision": len(_st) > 1,
                     "reason": "two ids claim one singular slot; order would "
                               "decide, so neither is taken"})
     for id_ in [c for c in collected if c not in arbitrated]:
@@ -537,7 +547,14 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         # Carried, not recomputed: the malformed value is gone from `new`, so a
         # later pass could not re-derive this.
         if shape_failures:
-            new[SHAPE_FIELD] = shape_failures
+            # The source field survives, so the next pass re-detects the same
+            # finding; without dedup the list grows by one every migration.
+            _seen, _uniq = set(), []
+            for f in shape_failures:
+                k = json.dumps(f, sort_keys=True, default=str)
+                if k not in _seen:
+                    _seen.add(k); _uniq.append(f)
+            new[SHAPE_FIELD] = _uniq
         else:
             new.pop(SHAPE_FIELD, None)
         out[key] = new

@@ -1239,6 +1239,48 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
                                     ri.unresolved_discord_ids(rec)),
                              sorted([HUMAN, BOT]), entry)
 
+    def _cli_tri(self, entry, tri):
+        src = Path(self.tmp) / "r.json"; src.write_text(json.dumps({"x": entry}))
+        cfg = Path(self.tmp) / "t.json"; cfg.write_text(json.dumps({"people": {"x": tri}}))
+        out = Path(self.tmp) / "v2.json"
+        sys.argv = ["m", "--roster", str(src), "--triage-config", str(cfg),
+                    "--out", str(out)]
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = mig.main()
+        return rc, err.getvalue(), json.loads(out.read_text())["x"]
+
+    def test_two_stated_referents_cannot_agree_with_either(self):
+        # Reviewer, 2026-08-30: a both-referent path collapsed to None, which
+        # the agreement rule accepts. Earlier tests had no independent source.
+        rc, err, rec = self._cli_tri(
+            {"human_profile": {"secondary_agent": {"id": [HUMAN, BOT]}}},
+            {"discord": HUMAN, "bots": []})
+        self.assertEqual(rc, 5, err)
+        self.assertIsNone(rec["human_discord_id"])
+        self.assertIsNone(rec[ri.STAND_FIELD])
+        self.assertEqual(sorted(u["id"] for u in ri.unresolved_discord_ids(rec)),
+                         sorted([HUMAN, BOT]))
+
+    def test_one_stated_referent_still_agrees_with_a_matching_slot(self):
+        # Positive control: making every arbitrated id un-agreeable would pass
+        # the case above and stop a single stated referent ever resolving.
+        rc, _err, rec = self._cli_tri({"human": {"id": [HUMAN, BOT]}},
+                                      {"discord": HUMAN, "bots": [BOT]})
+        self.assertEqual(rec["human_discord_id"], HUMAN)
+
+    def test_the_carried_refusal_converges_across_passes(self):
+        # `id_shape_failures` grew 1, 2, 3: the source field survives, so each
+        # pass re-detected the finding and appended it beside the carried copy.
+        entry = {"secondary_agent": {"id": [HUMAN, BOT]}}
+        counts = []
+        for _ in range(3):
+            rc, err, entry = self._cli_tri(entry, {"discord": HUMAN, "bots": []})
+            self.assertEqual(rc, 5, err)
+            counts.append(len(entry.get(mig.SHAPE_FIELD) or []))
+        self.assertEqual(counts, [1, 1, 1], counts)
+
     def test_a_refusal_survives_re_migration(self):
         # The writer overwrites the malformed slot, so pass 2 saw a clean doc
         # and returned 0 — a refusal quietly becoming a success.
