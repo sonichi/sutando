@@ -247,12 +247,18 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
     values = list(_leaves(value)) if isinstance(value, (list, tuple)) \
         else [value]
     if slot == "singular":
-        seen = {sf for v in values for sf in _snowflakes(json.dumps(v, default=str))}
+        # From what the collector actually mines: a raw JSON scan counted an
+        # unrelated snowflake in a record's metadata as a second slot id.
+        seen = {sf for v in values for sf in mines(v)}
         if len(seen) > 1:
             # Which one wins would be decided by traversal order. The schema
             # says this slot holds ONE id, so two of them resolve to NEITHER.
             _bad_shape(value)
             shapes[-1]["arbitrated_ids"] = sorted(seen)
+            # The slot STATED a referent; dropping it lets a contradicting
+            # source look like agreement instead of a conflict.
+            _v = _verdicts_from_field(path[-1]) if path else []
+            shapes[-1]["arbitrated_states"] = _v[0][0] if len(_v) == 1 else None
             return
     if not values:
         # An empty PLURAL slot is empty; an empty container in a SINGULAR one
@@ -303,11 +309,12 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
                            "reason": "typed field holds a non-string value, so "
                                      "its id is unreadable rather than absent"})
 
-    def _mines(member, path, provider) -> bool:
-        """Run the collector over one member and report whether it yielded."""
+    def _mines(member, path, provider) -> list:
+        """The ids the collector reads from ONE member — the list, not a bool,
+        so cardinality is counted from collection rather than re-derived."""
         scratch = []
         walk(member, path, provider, scratch, None)
-        return bool(scratch)
+        return scratch
 
     walk(entry, [], None, found, shapes)
     return found
@@ -329,8 +336,10 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     # An id from an over-full singular slot is not evidence for that slot: it
     # would be picked by traversal order. Route it to unresolved instead.
     arbitrated = {i for f in shape_failures for i in f.get("arbitrated_ids") or []}
+    arb_states = {i: f.get("arbitrated_states")
+                  for f in shape_failures for i in f.get("arbitrated_ids") or []}
     for id_ in sorted(arbitrated):   # a set's order must not reach the output
-        bad.append({"id": id_, "states": None,
+        bad.append({"id": id_, "states": arb_states.get(id_),
                     "reason": "two ids claim one singular slot; order would "
                               "decide, so neither is taken"})
     for id_ in [c for c in collected if c not in arbitrated]:

@@ -1186,6 +1186,37 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(first, second, "input order reached the output")
         self.assertEqual(sorted(first), sorted([BOT, self.SECOND]))
 
+    def test_an_over_full_slot_keeps_the_referent_it_stated(self):
+        # Reviewer, 2026-08-30: I recorded the arbitrated ids with states=None,
+        # so a contradicting source read as agreement and published a human.
+        cfg = Path(self.tmp) / "tri.json"
+        cfg.write_text(json.dumps({"people": {"x": {"discord": HUMAN,
+                                                    "bots": []}}}))
+        for order in ([HUMAN, BOT], [BOT, HUMAN]):
+            src = Path(self.tmp) / "roster.json"
+            src.write_text(json.dumps({"x": {ri.STAND_FIELD: order}}))
+            out = Path(self.tmp) / "v2.json"
+            sys.argv = ["m", "--roster", str(src), "--triage-config", str(cfg),
+                        "--out", str(out)]
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mig.main()
+            rec = json.loads(out.read_text())["x"]
+            self.assertIsNone(rec["human_discord_id"], order)
+            self.assertIsNone(rec[ri.STAND_FIELD], order)
+            self.assertEqual(sorted(u["id"] for u in
+                                    ri.unresolved_discord_ids(rec)),
+                             sorted([HUMAN, BOT]))
+
+    def test_cardinality_counts_collected_ids_not_raw_json(self):
+        # A snowflake in a record's metadata is not a second slot id; scanning
+        # the rendering made the NOTE's content decide the outcome.
+        for note in (f"room {self.ROOM}", "plain"):
+            rc, err, rec = self._cli({ri.STAND_FIELD: {"id": self.SECOND,
+                                                       "note": note}})
+            self.assertEqual(rc, 0, f"{note!r}: {err}")
+            self.assertEqual(ri.stand_discord_id(rec), self.SECOND, note)
+
     def test_a_foreign_ancestor_cannot_launder_a_bare_id(self):
         # Refused as a leaf, then accepted by moving `id` one level down.
         # Assert the OUTPUT: with a valid Stand there is no gap, so rc is 0.
