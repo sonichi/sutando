@@ -32,6 +32,7 @@ never a backlog storm.
 """
 from __future__ import annotations
 
+import calendar
 import fcntl
 import functools
 import json
@@ -103,9 +104,12 @@ MAX_EMIT_LATENESS_SECONDS = 15 * 60
 MAX_EMIT_LATENESS_CAP_SECONDS = 60 * 60
 # Two fires of a weekly job can be ~13 days apart when today is midweek.
 PERIOD_SCAN_MAX_SECONDS = 15 * 24 * 3600
-# Widest real UTC-offset rollback is 2h (Antarctica/Troll); 3 gives margin
-# while keeping the per-day expansion bounded by a constant, not by 24.
-FOLD_LOOKAHEAD_HOURS = 3
+# Widest UTC offset in the tz database, historical LMT included. Bounds where a
+# wall time's real epoch can land relative to its offset-free encoding.
+MAX_UTC_OFFSET_SECONDS = 16 * 3600
+# A rollback across midnight leaves ELAPSED epochs on a lexically LATER local
+# date, which a backward-only day walk would never visit.
+DATE_LOOKAHEAD_DAYS = 2
 CORE_ALIVE_MAX_AGE_SECONDS = 90
 
 
@@ -178,25 +182,73 @@ def _day_matches(dom: str, month: str, dow: str, t: time.struct_time) -> bool:
     return dom_ok and dow_ok
 
 
-def _local_epochs(y: int, mo: int, d: int, h: int, mi: int) -> "list[int]":
+def _day_offsets(y: int, mo: int, d: int) -> "tuple[int, ...]":
+    """Every UTC offset the zone can be at during this local date, with margin.
+
+    Enumerated from real offsets, never from DST polarity: Antarctica/Casey
+    rolls back three hours with tm_isdst=0 reported on BOTH sides.
+    """
+    naive = calendar.timegm((y, mo, d, 0, 0, 0, 0, 0, 0))
+    lo = naive - MAX_UTC_OFFSET_SECONDS
+    hi = naive + 86400 + MAX_UTC_OFFSET_SECONDS
+
+    def _off(e: int) -> "Optional[int]":
+        # A zone can make an instant unrepresentable on some libc; skip that
+        # probe rather than fail the tick.
+        try:
+            return time.localtime(e).tm_gmtoff
+        except (OverflowError, ValueError, OSError):
+            return None
+
+    # Seed coarsely, then bisect only between probes that disagree: an ordinary
+    # date costs 5 calls and only a transition date pays for the search.
+    seeds = [lo + (hi - lo) * i // 4 for i in range(5)]
+    probed = [(e, _off(e)) for e in seeds]
+    offsets = {o for _, o in probed if o is not None}
+    pending = [(probed[i], probed[i + 1]) for i in range(len(probed) - 1)
+               if probed[i][1] != probed[i + 1][1]]
+    while pending:
+        (a_e, a_v), (b_e, b_v) = pending.pop()
+        if b_e - a_e <= 60:
+            continue
+        m_e = (a_e + b_e) // 2
+        m_v = _off(m_e)
+        if m_v is not None:
+            offsets.add(m_v)
+        if m_v != a_v:
+            pending.append(((a_e, a_v), (m_e, m_v)))
+        if m_v != b_v:
+            pending.append(((m_e, m_v), (b_e, b_v)))
+    return tuple(sorted(offsets))
+
+
+def _local_epochs(y: int, mo: int, d: int, h: int, mi: int,
+                  offsets: "Optional[tuple[int, ...]]" = None) -> "list[int]":
     """Every real epoch whose local wall-clock is this minute, newest first.
 
-    A DST fall-back repeats an hour so an ambiguous minute has TWO epochs and
-    isdst=-1 collapses them; a skipped minute round-trips wrong and has none.
+    A rollback repeats a wall minute so an ambiguous one has TWO epochs and a
+    skipped one has none. ``offsets`` is hoisted per day by the caller.
     """
+    if offsets is None:
+        offsets = _day_offsets(y, mo, d)
+    naive = calendar.timegm((y, mo, d, h, mi, 0, 0, 0, 0))
     out = []
-    for isdst in (0, 1):
-        # A zone can make one isdst variant unrepresentable (Asia/Kathmandu
-        # raises OverflowError on isdst=1); skip it, do not fail the tick.
+    for off in offsets:
+        e = naive - off
         try:
-            e = int(time.mktime((y, mo, d, h, mi, 0, 0, 0, isdst)))
+            lt = time.localtime(e)
         except (OverflowError, ValueError, OSError):
             continue
-        lt = time.localtime(e)
         if (lt.tm_year, lt.tm_mon, lt.tm_mday,
                 lt.tm_hour, lt.tm_min) == (y, mo, d, h, mi) and e not in out:
             out.append(e)
     return sorted(out, reverse=True)
+
+
+def _offsets_on(day_utc: int) -> "tuple[int, ...]":
+    """``_day_offsets`` for the local date whose offset-free midnight is given."""
+    g = time.gmtime(day_utc)
+    return _day_offsets(g.tm_year, g.tm_mon, g.tm_mday)
 
 
 def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
@@ -205,8 +257,8 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
     Derived from the expression itself rather than declared, so it stays right
     when a schedule is edited. Bounded by MAX_CATCHUP_SECONDS like the scan below.
     """
-    # Walk BACKWARD by DAY, not by minute: a whole day is rejected with one
-    # date test, and only a matching day expands its hour x minute candidates.
+    # Walk by DAY, not by minute: a whole day is rejected with one date test,
+    # and only a matching day expands its hour x minute candidates.
     fields = expr.split()
     if len(fields) != 5:
         raise ValueError(f"cron expression must have 5 fields: {expr!r}")
@@ -218,43 +270,60 @@ def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
 
     floor = now_epoch - PERIOD_SCAN_MAX_SECONDS
     fires = []
+    window = []
     cur = time.localtime(now_epoch)
-    y, mo, d = cur.tm_year, cur.tm_mon, cur.tm_mday
-    for day_idx in range(PERIOD_SCAN_MAX_SECONDS // 86400 + 2):
-        # Anchor on noon: midnight can be skipped or repeated by a DST shift.
-        noon = time.mktime((y, mo, d, 12, 0, 0, 0, 0, -1))
-        if _day_matches(dom_f, month_f, dow_f, time.localtime(noon)):
-            # A >1h rollback breaks the wall-clock==epoch order this scan
-            # assumed; widen and sort only near a real transition.
-            folded = (time.localtime(now_epoch).tm_gmtoff
-                      != time.localtime(now_epoch - FOLD_LOOKAHEAD_HOURS * 3600).tm_gmtoff)
-            lookahead = FOLD_LOOKAHEAD_HOURS if folded else 0
-            day_hours = ([h for h in hours if h <= cur.tm_hour + lookahead]
-                         if day_idx == 0 else hours)
-            window = []
-            for idx, h in enumerate(day_hours):
-                for mi in minutes:
-                    window.extend(_local_epochs(y, mo, d, h, mi))
-                # Hold FOLD_LOOKAHEAD_HOURS of lookahead before consuming: a
-                # lower wall-clock hour can still outrank what is buffered.
-                if idx < lookahead and idx < len(day_hours) - 1:
+    # Start AHEAD of today's local date, then walk backward: a rollback across
+    # midnight puts already-elapsed epochs on a lexically later date.
+    day_utc = calendar.timegm((cur.tm_year, cur.tm_mon, cur.tm_mday,
+                               0, 0, 0, 0, 0, 0)) + DATE_LOOKAHEAD_DAYS * 86400
+    # Three dates bound the westmost offset any UNVISITED date can be at; two
+    # dates further back are already more than one offset-span in the past.
+    ring = [_offsets_on(day_utc - i * 86400) for i in range(3)]
+
+    def _drain(barrier: int) -> "Optional[int]":
+        """Emit buffered epochs above ``barrier``; period once two are found."""
+        while window and window[0] > barrier:
+            epoch = window.pop(0)
+            if epoch < floor:
+                return -1
+            fires.append(epoch)
+            if len(fires) == 2:
+                return fires[0] - fires[1]
+        return None
+
+    days = PERIOD_SCAN_MAX_SECONDS // 86400 + 4 + DATE_LOOKAHEAD_DAYS
+    for _ in range(days):
+        g = time.gmtime(day_utc)
+        y, mo, d = g.tm_year, g.tm_mon, g.tm_mday
+        offsets = ring[0]
+        seen = [o for t in ring for o in t]
+        west = min(seen) if seen else -MAX_UTC_OFFSET_SECONDS
+        if _day_matches(dom_f, month_f, dow_f, g):
+            east = max(offsets) if offsets else MAX_UTC_OFFSET_SECONDS
+            for h in hours:
+                base = calendar.timegm((y, mo, d, h, 0, 0, 0, 0, 0))
+                # Every real epoch of this wall hour is at least base - east,
+                # so an hour still wholly ahead cannot contribute.
+                if base - east > now_epoch:
                     continue
+                for mi in minutes:
+                    window.extend(e for e in _local_epochs(y, mo, d, h, mi, offsets)
+                                  if e <= now_epoch)
                 window.sort(reverse=True)
-                keep = (window[-lookahead * len(minutes):]
-                        if lookahead and idx < len(day_hours) - 1 else [])
-                emit = window[:len(window) - len(keep)]
-                for epoch in emit:
-                    if epoch > now_epoch:
-                        continue
-                    if epoch < floor:
-                        return None
-                    fires.append(epoch)
-                    if len(fires) == 2:
-                        return fires[0] - fires[1]
-                window = keep
-        prev = time.localtime(noon - 86400)
-        y, mo, d = prev.tm_year, prev.tm_mon, prev.tm_mday
-    return None
+                # Nothing unexpanded (lower hours, older dates) can exceed this,
+                # so anything above it is final and safe to consume in order.
+                got = _drain(base - west)
+                if got is not None:
+                    return None if got == -1 else got
+        window.sort(reverse=True)
+        got = _drain(day_utc - west)
+        if got is not None:
+            return None if got == -1 else got
+        day_utc -= 86400
+        ring = [ring[1], ring[2], _offsets_on(day_utc - 2 * 86400)]
+    window.sort(reverse=True)
+    got = _drain(floor - 1)
+    return None if got in (None, -1) else got
 
 
 def emit_lateness_budget(expr: str, now_epoch: int) -> int:

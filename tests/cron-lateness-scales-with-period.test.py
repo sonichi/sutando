@@ -9,6 +9,7 @@ late on consecutive days while its sub-hourly peers recovered immediately.
 Run: python3 tests/cron-lateness-scales-with-period.test.py
 """
 import importlib.util
+import calendar
 import os
 import pathlib
 import sys
@@ -205,33 +206,35 @@ try:
     ok("control: an ordinary local minute has exactly one",
        len(cr._local_epochs(2025, 6, 1, 1, 30)) == 1)
 
-    # Asia/Kathmandu really raises OverflowError on the isdst=1 probe, but only
-    # on some libc; substituted so the guard is exercised on every platform.
+    # A zone can make an instant unrepresentable on some libc; substituted so
+    # the guard is exercised on every platform, not only where it really raises.
     os.environ["TZ"] = "Asia/Kathmandu"
     time.tzset()
-    _real_mktime = cr.time.mktime
+    _real_localtime = cr.time.localtime
+    _naive = calendar.timegm((2026, 8, 28, 0, 0, 0, 0, 0, 0))
+    _raising = _naive - cr.MAX_UTC_OFFSET_SECONDS
     _probes = []
 
-    def _unrepresentable_dst(t):
-        _probes.append(t[8])
-        if t[8] == 1:
-            raise OverflowError("mktime argument out of range")
-        return _real_mktime(t)
+    def _unrepresentable(*a):
+        _probes.append(a[0] if a else None)
+        if a and a[0] == _raising:
+            raise OverflowError("localtime argument out of range")
+        return _real_localtime(*a)
 
-    cr.time.mktime = _unrepresentable_dst
+    cr.time.localtime = _unrepresentable
     _crash = None
     try:
         _kt = cr._local_epochs(2026, 8, 28, 10, 30)
     except Exception as exc:
         _kt, _crash = None, f"{type(exc).__name__}: {exc}"
     finally:
-        cr.time.mktime = _real_mktime
-    ok("an unrepresentable isdst probe does not escape _local_epochs",
+        cr.time.localtime = _real_localtime
+    ok("an unrepresentable offset probe does not escape _local_epochs",
        _crash is None)
     ok("and that minute still resolves to its one real epoch",
        _kt is not None and len(_kt) == 1)
-    ok("control: the raising probe was actually reached (both isdst tried)",
-       _probes == [0, 1])
+    ok(f"control: the raising probe was actually reached ({len(_probes)} probes)",
+       _raising in _probes)
 finally:
     if _tz_prev is None:
         os.environ.pop("TZ", None)
