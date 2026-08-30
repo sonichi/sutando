@@ -61,21 +61,21 @@ def _cited_in(entry: dict, id_: str) -> list:
     """Field names (dotted for nested) whose value mentions this id."""
     hits = []
 
-    def walk(obj, path):
+    def walk(obj, path, provider):
         if isinstance(obj, dict):
+            prov = _declared_provider(obj) or provider
             for k, v in obj.items():
-                if _foreign_id_leaf(path, str(k), obj):
-                    continue
-                walk(v, path + [str(k)])
+                walk(v, path + [str(k)], prov)
         elif isinstance(obj, list):
             for v in obj:
-                walk(v, path)
-        elif id_ and id_ in _snowflakes(obj):
+                walk(v, path, provider)
+        elif id_ and id_ in _snowflakes(obj) and path \
+                and _discord_source(path[:-1], path[-1], provider):
                 # whole-id match: a 17-digit id is a substring of an
                 # 18-digit one, and that published the wrong referent.
             hits.append(".".join(path))
 
-    walk(entry, [])
+    walk(entry, [], None)
     return hits
 
 
@@ -174,6 +174,33 @@ def _declares_discord_id(ancestors: list, key: str, siblings=None) -> bool:
         and _typed_path(ancestors)
 
 
+def _declared_provider(mapping) -> "str | None":
+    """The `provider` this mapping states, lowercased, or None."""
+    if isinstance(mapping, dict) and mapping.get("provider") is not None:
+        return str(mapping["provider"]).strip().lower()
+    return None
+
+
+def _discord_source(ancestors: list, key: str, provider: "str | None") -> bool:
+    """May a snowflake in THIS leaf be read as a Discord id? Governs mining and
+    citation for every leaf, not only `*_id` ones — `display_name` under a
+    referent was a documented non-evidence field and was being mined.
+
+    An enclosing `provider` decides, at any depth; else the key says the whole
+    word `discord`; else the legacy bare `id`/`ids` under a referent ancestor;
+    else the leaf itself must name the referent (`stand_status`), because an
+    ancestor naming it says nothing about which of its fields hold ids.
+    """
+    if provider is not None:
+        return provider == "discord"
+    if "discord" in _field_words(key):
+        return True
+    if _id_slot(key):
+        return [w.lower() for w in _WORDS.findall(str(key))] in (["id"], ["ids"]) \
+            and _typed_path(ancestors)
+    return bool(_verdicts_from_field(key))
+
+
 def _foreign_id_leaf(ancestors: list, key: str, siblings=None) -> bool:
     """A leaf declaring an id in someone else's namespace. Its digits are a
     PROVIDER id however Discord-shaped they look, so discovery must not mine
@@ -214,22 +241,21 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
     """
     found = []
 
-    def walk(obj, path):
+    def walk(obj, path, provider):
         if isinstance(obj, dict):
+            prov = _declared_provider(obj) or provider
             for k, v in obj.items():
-                # Discovery obeys the same rule as validation, or a
-                # snowflake-SHAPED provider id is mined into a Discord slot.
-                if _foreign_id_leaf(path, str(k), obj):
-                    continue
                 slot = _id_slot(k)
                 # Inside the basis map the key IS the slot and the value prose.
-                if slot and shapes is not None and ri.BASIS_FIELD not in path:
+                if slot and shapes is not None and ri.BASIS_FIELD not in path \
+                        and _discord_source(path, str(k), prov):
                     _slot_failures(v, slot, path + [str(k)], shapes)
-                walk(v, path + [str(k)])
+                walk(v, path + [str(k)], prov)
         elif isinstance(obj, list):
             for v in obj:
-                walk(v, path)
-        elif isinstance(obj, str) and _typed_path(path):
+                walk(v, path, provider)
+        elif isinstance(obj, str) and path \
+                and _discord_source(path[:-1], path[-1], provider):
             for sf in _snowflakes(obj):
                 if sf not in found:
                     found.append(sf)
@@ -241,7 +267,7 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
                            "reason": "typed field holds a non-string value, so "
                                      "its id is unreadable rather than absent"})
 
-    walk(entry, [])
+    walk(entry, [], None)
     return found
 
 

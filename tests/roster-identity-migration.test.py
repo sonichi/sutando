@@ -1049,6 +1049,31 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertEqual(rc, 0, err)
             self.assertIsNone(rec["human_discord_id"], field)
 
+    def test_a_non_id_leaf_under_a_referent_is_not_mined(self):
+        # Reviewer, 2026-08-30: the provider rule guarded `*_id` leaves only,
+        # so `schema.md`'s documented non-evidence field was still mined.
+        rc, err, rec = self._cli({"human": {"display_name": HUMAN},
+                                  "stand_discord_id": self.STAND})
+        self.assertEqual(rc, 0, err)
+        self.assertIsNone(rec["human_discord_id"])
+
+    def test_an_ancestor_provider_reaches_a_nested_leaf(self):
+        # Only the leaf's immediate siblings were consulted, so a provider one
+        # level up was invisible to a nested bare `id`.
+        for provider, expect in (("matrix", None), ("discord", HUMAN)):
+            rc, err, rec = self._cli({
+                "human": {"provider": provider, "account": {"id": HUMAN}},
+                "stand_discord_id": self.STAND})
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(rec["human_discord_id"], expect, provider)
+
+    def test_a_referent_naming_leaf_is_still_mined(self):
+        # The control that keeps the rule from becoming "ids only":
+        # `stand_status` names the referent in the LEAF and carries an id.
+        rc, err, rec = self._cli({"stand_status": f"stand id {self.SECOND}"})
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(ri.stand_discord_id(rec), self.SECOND)
+
     def test_the_one_measured_legacy_spelling_still_resolves(self):
         # The allowlist, and the reason it is not empty: a bare `id` under a
         # referent ancestor states no provider and is documented in-tree.
