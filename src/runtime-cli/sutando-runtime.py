@@ -140,7 +140,7 @@ def _raw_tmux() -> int:
     # tmux socket, never through the daemon push path. Ctrl-b d to detach.
     if _wss_url():
         # Gate at the chokepoint: raw is inherently LOCAL, and attaching the
-        # local tmux under a remote URL views the WRONG agent (#3565 r7).
+        # local tmux under a remote URL views the WRONG agent.
         print(json.dumps({"error": "raw view attaches the LOCAL tmux and is "
                           "not served over the remote WebSocket transport — "
                           "unset SUTANDO_SCP_WSS_URL for the local raw view"}),
