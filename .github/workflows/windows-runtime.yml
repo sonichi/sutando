@@ -136,6 +136,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'cron-state-lock-windows.test.py failed' }
           python tests/idle-surface-canonical-hash.test.py
           if ($LASTEXITCODE -ne 0) { throw 'idle-surface-canonical-hash.test.py failed' }
+          python tests/delivery-primitives-single-owner.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'delivery-primitives-single-owner.test.py failed' }
           python tests/access-store-concurrency.test.py
           if ($LASTEXITCODE -ne 0) { throw 'access-store-concurrency.test.py failed' }
           python tests/workspace-lock.test.py

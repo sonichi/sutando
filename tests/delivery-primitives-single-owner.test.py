@@ -29,7 +29,7 @@ def check(cond, label):
 
 
 def rel(p: Path) -> str:
-    return str(p.relative_to(REPO))
+    return p.relative_to(REPO).as_posix()
 
 
 # ── enumerate definition sites over every production module ────────────────
