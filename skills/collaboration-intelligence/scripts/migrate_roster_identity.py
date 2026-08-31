@@ -333,15 +333,8 @@ def _slot_erased(entry, path) -> bool:
     segs = str(path).split(".")
 
     def readable(node, i) -> bool:
-        # The list case is FIRST, including at the terminal segment: an empty
-        # list states nothing, and `[] is None` is False, so evaluating it as a
-        # scalar reported an emptied slot as still readable and dropped the seed
-        # our own write had just made unreadable.
-        #
-        # A list does NOT consume a segment — `_cited_in`'s walk descends into
-        # members on the same path, so `other_stand_discord_ids` (scalars) and
-        # `unresolved_discord_ids.id` (dicts) are both produced that way.
-        # Traversing differently here would call a populated slot erased.
+        # A list does not consume a segment: `_cited_in` descends into members
+        # on the same path, and an empty list states nothing.
         if isinstance(node, list):
             return any(readable(v, i) for v in node)
         if i == len(segs):

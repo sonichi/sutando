@@ -1657,11 +1657,7 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
         self._assert_refused(d2, "pass 2 (blank slot)")
 
     def test_a_list_slot_reflects_its_CONTENTS_not_its_type(self):
-        # qingyun-wu's blocker: `_slot_erased` traversed dicts only, so ANY path
-        # reaching a list returned True — "erased" — whatever the list held. A
-        # seed anchored there could never be dropped by a repair.
-        # A list does NOT consume a path segment, matching `_cited_in`'s walk;
-        # traversing otherwise would call a populated slot erased.
+        # A list does not consume a path segment, matching `_cited_in`'s walk.
         populated = {ri.UNRESOLVED_FIELD: [{"id": BOT}]}
         self.assertFalse(
             mig._slot_erased(populated, f"{ri.UNRESOLVED_FIELD}.id"),
@@ -1674,10 +1670,8 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
             "a scalar list has no `.id` member — that path reads nothing")
 
     def test_an_EMPTY_list_slot_is_erased_like_a_null_one(self):
-        # The converse, and the one a type-blind rewrite gets backwards: `[]` is
-        # neither None nor a blank string, so evaluating it as a scalar reports
-        # an emptied slot as still readable and drops the seed our own write
-        # just made unreadable. Every shape below states nothing.
+        # `[]` is neither None nor a blank string, so a scalar test reads an
+        # emptied slot as still present.
         for slot, path, label in (
                 ([], ri.OTHER_STANDS_FIELD, "empty scalar list"),
                 (["   "], ri.OTHER_STANDS_FIELD, "list of blanks"),
