@@ -66,35 +66,54 @@ SPACED_BOTH = ("  76550 76531 /Users/x/App Support/rt/python/bin/python3"
 BUNDLED = "/Users/x/App Support/rt/python/bin/python3"
 exe_ok = lambda pid: BUNDLED if pid == "76550" else None
 
-check("spaced interpreter path", hc._live_bridge_interpreter(
-    "remote-gateway-bridge.py", SPACED_INTERP, exe_ok), BUNDLED)
+check("spaced interpreter path", hc._live_bridge_interpreters(
+    "remote-gateway-bridge.py", SPACED_INTERP, exe_ok), [BUNDLED])
 
 # The round-1 regression: slicing argv at the last space before the script name
 # lands INSIDE a spaced script path, returning None -> false-green fallback.
-check("spaces in BOTH interpreter and script paths", hc._live_bridge_interpreter(
-    "remote-gateway-bridge.py", SPACED_BOTH, exe_ok), BUNDLED)
+check("spaces in BOTH interpreter and script paths", hc._live_bridge_interpreters(
+    "remote-gateway-bridge.py", SPACED_BOTH, exe_ok), [BUNDLED])
 
 # The probing shell's own argv contains the script name; its executable is not python.
 SELF = "  999 1 /bin/zsh -c grep remote-gateway-bridge.py somewhere\n"
-check("shell self-match is not a bridge", hc._live_bridge_interpreter(
-    "remote-gateway-bridge.py", SELF, lambda pid: "/bin/zsh"), None)
+check("shell self-match is not a bridge", hc._live_bridge_interpreters(
+    "remote-gateway-bridge.py", SELF, lambda pid: "/bin/zsh"), [])
 
 check("no ps output -> None",
-      hc._live_bridge_interpreter("remote-gateway-bridge.py", "", exe_ok), None)
+      hc._live_bridge_interpreters("remote-gateway-bridge.py", "", exe_ok), [])
 check("absent bridge -> None",
-      hc._live_bridge_interpreter("not-running-bridge.py", SPACED_BOTH, exe_ok), None)
-check("executable unresolvable -> None", hc._live_bridge_interpreter(
-    "remote-gateway-bridge.py", SPACED_BOTH, lambda pid: None), None)
+      hc._live_bridge_interpreters("not-running-bridge.py", SPACED_BOTH, exe_ok), [])
+check("executable unresolvable -> None", hc._live_bridge_interpreters(
+    "remote-gateway-bridge.py", SPACED_BOTH, lambda pid: None), [])
 
 # _proc_executable against the REAL ps: everything above injects exe_of, so
 # without this nothing exercises the helper that reads the process table.
 _self = hc._proc_executable(os.getpid())
 if not _self or "python" not in os.path.basename(_self).lower():
     failures.append(f"_proc_executable on our own live PID should name a python, got {_self!r}")
-check("framework Python (capital P) is still a python", hc._live_bridge_interpreter(
+check("framework Python (capital P) is still a python", hc._live_bridge_interpreters(
     "remote-gateway-bridge.py", SPACED_BOTH,
     lambda pid: "/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"),
-    "/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python")
+    ["/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"])
+
+# --- @qingyun-wu's blocker: cardinality, order, and over-match ---------------
+# startup-runtime.sh launches one gateway per AG2_REMOTE_TOKEN_*, so a scalar
+# both under-collects and makes the answer depend on ps row order.
+TWO_A = ("  10 1 /healthy/python3 /x/src/remote-gateway-bridge.py\n"
+         "  20 1 /degraded/python3 /y/src/remote-gateway-bridge.py\n")
+TWO_B = ("  20 1 /degraded/python3 /y/src/remote-gateway-bridge.py\n"
+         "  10 1 /healthy/python3 /x/src/remote-gateway-bridge.py\n")
+two = lambda pid: {"10": "/healthy/python3", "20": "/degraded/python3"}.get(pid)
+_a = hc._live_bridge_interpreters("remote-gateway-bridge.py", TWO_A, two)
+_b = hc._live_bridge_interpreters("remote-gateway-bridge.py", TWO_B, two)
+check("two live gateways: BOTH collected", _a, ["/degraded/python3", "/healthy/python3"])
+check("selection is ps-row-order invariant", _a, _b)
+
+# `script in argv` over-matched: a -c payload that merely prints the name is not
+# a launch. The script must appear as its own argv token.
+DECOY = "  900 1 /decoy/python3 -c print('remote-gateway-bridge.py')\n"
+check("a -c decoy naming the script is not a bridge", hc._live_bridge_interpreters(
+    "remote-gateway-bridge.py", DECOY, lambda pid: "/decoy/python3"), [])
 check("_proc_executable on an impossible PID -> None", hc._proc_executable(2**31 - 1), None)
 
 _run = hc.subprocess.run
