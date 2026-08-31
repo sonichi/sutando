@@ -40,7 +40,7 @@ def _blocker(s) -> str:
     return t[0] if t else ""
 
 
-def canonical_key(items) -> str:
+def canonical_lines(items) -> "list[str]":
     """`id:blocker` lines, sorted. Order- and wording-independent by construction.
 
     `gated_on` is reduced to its leading token — `owner`, `ci`, `upstream`,
@@ -63,7 +63,11 @@ def canonical_key(items) -> str:
         if not blocker:
             raise ValueError(f"held-list entry has no gated_on: {it!r}")
         out.append(f"{ident}:{blocker}")
-    return "\n".join(sorted(set(out)))
+    return sorted(set(out))
+
+
+def canonical_key(items) -> str:
+    return "\n".join(canonical_lines(items))
 
 
 def held_hash(items) -> str:
@@ -142,6 +146,7 @@ def main(argv=None) -> int:
         return 2
 
     try:
+        lines = canonical_lines(items)
         h = held_hash(items)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -150,8 +155,21 @@ def main(argv=None) -> int:
     path = Path(a.state)
     doc = read_state(path)
     changed = doc.get("last_surfaced_hash") != h
+    if changed:
+        # Without the previous ids a hash change is unauditable: a renamed id
+        # and a genuinely new blocker are the same opaque digest move.
+        prev = doc.get("last_surfaced_ids")
+        if isinstance(prev, list):
+            now = set(lines)
+            before = set(str(x) for x in prev)
+            added, gone = sorted(now - before), sorted(before - now)
+            print(f"changed: +{added} -{gone}", file=sys.stderr)
+        else:
+            print("changed: no previous ids recorded (first commit "
+                  "or pre-upgrade state)", file=sys.stderr)
     if changed and a.commit:
         doc["last_surfaced_hash"] = h
+        doc["last_surfaced_ids"] = lines
         doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         write_state(path, doc)
     print(f"{'post' if changed else 'quiet'} {h}")
