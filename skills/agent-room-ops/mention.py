@@ -80,8 +80,9 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         # triggers via the broker's localpart text-match, so this is harmlessly
         # ignored today — but it auto-activates structured push-notifications the
         # moment the broker honors it (a peer-review ask, ties to broker #151).
-        worker = os.environ.get("SUTANDO_CORE_ID")
-        stamp = ({"extra_content": {"space.ag2.worker": {"id": f"core-{worker}"}}}
+        cid = os.environ.get("SUTANDO_CORE_ID")
+        worker = os.environ.get("SUTANDO_WORKER_ID") or (f"core-{cid}" if cid else None)
+        stamp = ({"extra_content": {"space.ag2.worker": {"id": worker}}}
                  if worker else {})
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
