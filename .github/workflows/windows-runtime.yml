@@ -148,8 +148,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'runtime-api-identity-view.test.py failed' }
           python tests/task-workstreams.test.py
           if ($LASTEXITCODE -ne 0) { throw 'task-workstreams.test.py failed' }
-          python tests/signal-guest-windows.test.py
-          if ($LASTEXITCODE -ne 0) { throw 'signal-guest-windows.test.py failed' }
+          python tests/signal-room-tasks.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'signal-room-tasks.test.py failed' }
           python tests/voice-lock-windows.test.py
           if ($LASTEXITCODE -ne 0) { throw 'voice-lock-windows.test.py failed' }
           python tests/quota-projection.test.py RecordSample.test_cross_process_acks_all_survive RecordSample.test_concurrent_writers_lose_no_acknowledged_sample
