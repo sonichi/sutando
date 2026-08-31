@@ -131,8 +131,14 @@ def run() -> None:
         h = post("/guest-task", {"task": "x"}, auth=False)
         check("/guest-task honours check_auth", dispatched == [])
 
+        def drain_slots():
+            """Free admission slots so routing checks aren't answered with 429."""
+            for stale in Path(agent_api.TASK_DIR).glob("task-signal-*.txt"):
+                stale.unlink()
+
         # --- POST /task: demote-only shim, never escalation ---------------------
         dispatched.clear()
+        drain_slots()
         h = post("/task", {"from": "matrixrtc-voice-news", "task": "shipped daemon",
                            "access_tier": "guest"})
         stid = h._responses[0][1].get("task_id", "") if h._responses else ""
@@ -144,6 +150,29 @@ def run() -> None:
             h = post("/task", {"from": "x", "task": "t", "access_tier": tier})
             check(f"/task refuses access_tier={tier!r} (no silent owner fallthrough)",
                   h._responses[0][0] == 400 and dispatched == [])
+
+        # --- admission bound ------------------------------------------------------
+        import os as _os, time as _time
+        import signal_room_tasks as _srt
+        drain_slots()
+        dispatched.clear()
+        codes = [post("/guest-task", {"task": f"q{i}"})._responses[0][0]
+                 for i in range(_srt.MAX_OUTSTANDING + 1)]
+        check("/guest-task admits up to MAX_OUTSTANDING",
+              codes[:_srt.MAX_OUTSTANDING] == [200] * _srt.MAX_OUTSTANDING)
+        check("/guest-task over the bound -> 429, not 500",
+              codes[-1] == 429)
+        check("/guest-task over the bound writes no task file",
+              len(list(Path(agent_api.TASK_DIR).glob("task-signal-*.txt")))
+              == _srt.MAX_OUTSTANDING)
+
+        # A task whose core died is never cleaned up by anyone; if it held its
+        # slot forever the lane would wedge shut permanently.
+        stranded = _time.time() - (_srt.SLOT_TTL_SEC + 60)
+        for orphan in Path(agent_api.TASK_DIR).glob("task-signal-*.txt"):
+            _os.utime(orphan, (stranded, stranded))
+        h = post("/guest-task", {"task": "after the orphans"})
+        check("stranded tasks age out so the lane reopens", h._responses[0][0] == 200)
 
         # --- GET /capabilities ---------------------------------------------------
         def get(path: str, auth: bool = True):
