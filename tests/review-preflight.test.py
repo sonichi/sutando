@@ -229,6 +229,23 @@ class PriorArtTest(unittest.TestCase):
         self.assertNotIn("COULD NOT CHECK", empty)
         self.assertNotEqual(unknown, empty)
 
+    def test_an_unexpanded_repo_placeholder_names_its_own_fix(self):
+        """The one COULD-NOT-CHECK the reader can act on must say so.
+
+        An app-pinned install has no .git, so gh cannot expand {owner}/{repo}
+        and this check is inert on every run — indistinguishable, before this,
+        from ordinary gh flakiness.
+        """
+        no_repo = "\n".join(pf.prior_art_block("1", None, repo="{owner}/{repo}"))
+        gh_down = "\n".join(pf.prior_art_block("1", None, repo="a/b"))
+        for body in (no_repo, gh_down):
+            self.assertIn("COULD NOT CHECK", body)
+        self.assertIn("--repo", no_repo)
+        self.assertIn("SUTANDO_REVIEW_REPO", no_repo)
+        # The generic branch must NOT claim a repo-context cause it cannot know.
+        self.assertNotIn("--repo", gh_down)
+        self.assertNotEqual(no_repo, gh_down)
+
     def test_the_block_says_why_reviews_alone_are_not_enough(self):
         body = "\n".join(pf.prior_art_block("1", ["t  sonichi (comment)"]))
         self.assertIn("COMMENTED", body)

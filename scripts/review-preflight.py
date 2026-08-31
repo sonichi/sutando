@@ -140,9 +140,17 @@ def prior_art(pr: str, runner=None, repo: "str | None" = None) -> "list[str] | N
 PRIOR_ART_SHOWN = 8
 
 
-def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
+def prior_art_block(pr: str, seen: "list[str] | None",
+                    repo: "str | None" = None) -> "list[str]":
     """Render prior art so "nothing there" can never read as "unchecked"."""
     if seen is None:
+        # An unexpanded placeholder is the one COULD-NOT-CHECK with a fix the
+        # reader can apply, so it must not read as generic gh flakiness.
+        if (repo or resolve_repo()) == "{owner}/{repo}":
+            return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — no repo context.",
+                    "This install has no .git, so gh cannot expand {owner}/{repo}. Re-run",
+                    "with --repo owner/name or set $SUTANDO_REVIEW_REPO; until then this",
+                    "check is inert and every duplicate review passes it."]
         return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — gh is unavailable or",
                 "the call failed. Read the thread yourself: an unchecked thread is not an",
                 "empty one."]
@@ -166,7 +174,7 @@ def render(guide: Path, pr: str | None, repo: "str | None" = None) -> str:
     out = [f"review-preflight: criteria from {guide}", ""]
     if pr:
         out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
-        out += prior_art_block(pr, prior_art(pr, repo=repo)) + [""]
+        out += prior_art_block(pr, prior_art(pr, repo=repo), repo=repo) + [""]
     out.append(lessons if lessons else
                "WARNING: no '## Lessons' section found — the guide's criteria could not be read.")
     n_flag, n_allow = count_check_patterns(checks)
