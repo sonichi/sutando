@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 
@@ -82,6 +83,52 @@ def _is_login_class(signal: dict) -> bool:
     return signal.get("state") == "logged-out" or signal.get("kind") == "login"
 
 
+#: A record older than this is a core that stopped beating; the socket it names
+#: may no longer exist, so pointing the owner at it is worse than generic phrasing.
+_ALIVE_STALE_SEC = 90
+# Must match the launchers' ${SUTANDO_TMUX_SESSION:-sutando-core} (src/agent/start-cli.sh).
+_DEFAULT_TMUX_SESSION = "sutando-core"
+
+
+def _core_host_label() -> str:
+    """Must match the label `core_heartbeat` WROTE the file under, not this
+    process's hostname — DHCP drift makes those disagree and the read misses."""
+    try:
+        from util_paths import _host_label
+        return _host_label()
+    except Exception:
+        return platform.node().split(".")[0]
+
+
+def _derive_backend() -> "dict | None":
+    """The core's own recorded backend, or None when it isn't knowable here.
+    An embedded core records no tmux backend, and a stale record gets None."""
+    try:
+        import json
+        import os
+        import sys
+        import time
+        from pathlib import Path
+        # Resolve src/ from THIS file, not ambient sys.path: run as a script sys.path[0]
+        # is src/, but loaded as a module it is not, and the import would silently fail.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from workspace_default import resolve_workspace
+        p = Path(resolve_workspace()) / "state" / "cores" / f"{_core_host_label()}.alive"
+        if time.time() - p.stat().st_mtime > _ALIVE_STALE_SEC:
+            return None
+        d = json.loads(p.read_text())
+        sock = (d.get("socket") or "").strip()
+        # The socket is shared with sibling sessions (the watcher, and ${SESSION}-watcher
+        # under Codex), so an attach without -t can land anywhere but the core prompt.
+        sess = ((d.get("session") or "").strip()
+                or os.environ.get("SUTANDO_TMUX_SESSION")
+                or _DEFAULT_TMUX_SESSION)
+        # A socket alone is the tmux case; anything else is not addressable as a console.
+        return {"socket": sock, "session": sess} if sock else None
+    except Exception:
+        return None            # fail-open: an unknown target degrades to generic phrasing
+
+
 def compose_message(signal: dict) -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt."""
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
@@ -94,14 +141,28 @@ def compose_message(signal: dict) -> str:
         parts.append(f"({kind})")
     msg = " ".join(parts)
     if excerpt:
-        msg += f": {excerpt[:160]}"
+        # The remedy is the actionable half, so it keeps its length; the prompt
+        # echo is what gives way to stay inside the message-length bound.
+        msg += f": {excerpt[:110]}"
     if _is_login_class(signal):
-        host = platform.node().split(".")[0] or "the host"
+        host = _core_host_label() or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"
                 " `bash src/restart.sh` from the repo, then complete /login."
                 " A chat reply can't resolve this.")
     else:
-        msg += " — reply here or open the app to resolve."
+        host = _core_host_label() or "the host"
+        # Guard at the CALL SITE too: this message is the owner's only channel
+        # here, so nothing in derivation may crash the escalation.
+        try:
+            be = _derive_backend()
+        except Exception:
+            be = None
+        # A bare socket path is not actionable; the attach command is — and it must
+        # name the session, or a shared socket attaches to the wrong one.
+        where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} "
+                 f"attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
+                 if be else f"where the core is running on {host}")
+        msg += f" — answer it {where}. A chat reply can't answer it."
     return msg
 
 
@@ -189,7 +250,50 @@ def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=
 # Surfaces task-progress notify.py can actually DELIVER to. Other values that
 # land in last-owner-activity.json ("voice", "github-commits", …) are activity
 # signals, not deliverable channels — never route an escalation to them.
+# Beyond the static set, any source with a configured channel dir
+# ($CLAUDE_CONFIG_DIR/channels/<source>/ containing a *.env) counts — that
+# mirrors notify.py's own resolution rule, so a NEW homeserver bridge (e.g.
+# "dev-ag2space") becomes routable by creating its config dir, no code change.
 _DELIVERABLE_SURFACES = {"discord", "slack", "telegram", "ag2space"}
+
+# Must stay identical to notify.py's slug rule (sender/probe alignment): dots
+# only BETWEEN alphanumerics, so traversal shapes never reach the path probe.
+_SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
+
+
+def _load_channel_env_containment():
+    """The shared containment policy (src/channel_env_containment.py), or a
+    fail-closed stub when it isn't importable this way. Mirrors
+    _derive_backend's sys.path fix below: run as a script sys.path[0] is
+    src/, but loaded as a module (tests) it is not."""
+    try:
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from channel_env_containment import channel_env_is_contained  # type: ignore
+        return channel_env_is_contained
+    except Exception:
+        return lambda env_path, channels_dir, source: False
+
+
+# Single shared owner: src/channel_env_containment.py (see its docstring for
+# the accept/refuse rule; also delegated to by notify.py).
+_channel_env_is_contained = _load_channel_env_containment()
+
+
+def _is_deliverable(source):
+    if source in _DELIVERABLE_SURFACES:
+        return True
+    if not source or not _SOURCE_SLUG_RE.match(source):
+        return False
+    # Probe for exactly what notify.py's sender reads: same three-tier base,
+    # then the shared containment policy (review P1 x2 on #2701).
+    base = (os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_HOME")
+            or os.path.join(os.path.expanduser("~"), ".claude"))
+    channels_dir = os.path.join(base, "channels")
+    env_path = os.path.join(channels_dir, source, ".env")
+    if not os.path.isfile(env_path):
+        return False
+    return _channel_env_is_contained(env_path, channels_dir, source)
 
 
 def resolve_active_target(activity_path):
@@ -210,7 +314,7 @@ def resolve_active_target(activity_path):
         return "", ""
     source = str(data.get("channel", "")).strip()
     channel = str(data.get("channel_id", "")).strip()
-    if source in _DELIVERABLE_SURFACES and channel:
+    if _is_deliverable(source) and channel:
         return source, channel
     return "", ""
 

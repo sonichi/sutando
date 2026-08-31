@@ -1,18 +1,15 @@
-"""Presence gate: a peer FLEET agent must not set owner-presence, while its
-task authority (access_tier) stays exactly as today.
+"""Presence gate: a peer FLEET agent must not set owner-presence, and its task
+authority must remain bounded by the broker-attested access tier.
 
 Regression: `_tier_for()` falls through to LOCAL_TIER="owner" for any unlisted
 sender on a tierMap-less node, so a peer agent's room post (a) read as owner-tier
 AND (b) overwrote `last-owner-activity.json`, poisoning the proactive-loop's
 "owner active N min ago" signal (and the core-supervisor escalation target).
 
-The fix gates PRESENCE ONLY (`_write_owner_activity` consults the /v1/agents
-fleet directory and returns early for peers) and deliberately leaves `_tier_for`
-untouched — because `_tier_for` also feeds the task's access_tier, and
-down-tiering peers there would sandbox all peer-to-peer delegation. So this test
-covers BOTH consumers of `_tier_for` (per the review requirement): after the
-change a peer task still resolves access_tier=owner, but no owner-activity is
-written for it.
+The presence gate consults the /v1/agents fleet directory and returns early for
+peers. Independently, `_tier_for` feeds the task's access_tier and must not let a
+local owner default promote a broker-attested team or guest task. Team retains
+bounded workspace-write delegation without receiving unrestricted owner access.
 """
 import importlib
 import json
@@ -88,13 +85,14 @@ def test_owner_sender_still_writes_owner_activity():
     assert json.loads(f.read_text())["channel"] == "ag2space"
 
 
-def test_peer_task_authority_unchanged_access_tier_still_owner():
+def test_peer_task_authority_follows_broker_attestation():
     m = _load()
-    # consumer 2 (task authority): _tier_for is UNTOUCHED — a peer still resolves
-    # to owner tier on this tierMap-less node, so peer-to-peer delegation keeps
-    # working. If this flips to team/other, the fix wrongly sandboxed peers.
-    assert m._tier_for(PEER) == "owner"
-    assert m._tier_for(OWNER) == "owner"
+    # consumer 2 (task authority): local owner is only a cap. The authenticated
+    # broker decides whether a peer has useful team access or read-only guest
+    # access; only an attested owner remains unrestricted.
+    assert m._tier_for(PEER, "team") == "team"
+    assert m._tier_for(PEER, "guest") == "guest"
+    assert m._tier_for(OWNER, "owner") == "owner"
 
 
 def test_fail_open_records_peer_when_directory_unknown():

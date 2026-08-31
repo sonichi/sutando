@@ -105,7 +105,6 @@ tests/bridge-restart-intercept.test.py
 tests/bridge-skill-path-resolution.test.py
 tests/bridges-allowlist-default-readonly.test.py
 tests/bridges-sending-orphan-recovery.test.py
-tests/discord-bridge-access-no-clobber.test.py
 tests/discord-bridge-attachment-filename-sanitize.test.py
 tests/discord-bridge-codex-subprocess-argv.test.py
 tests/discord-bridge-collaborator-tier.test.py
@@ -953,6 +952,207 @@ def classify(path: Path) -> str | None:
     return MITIGATED if _mitigation_line(tree, exec_line, mod_var) is not None else VIOLATION
 
 
+
+# --- workspace-resolver stub arity ----------------------------------
+
+# The CCD checks prove a test isolates CLAUDE_CONFIG_DIR, not the WORKSPACE.
+# A CCD-hermetic test can still write to the real `<workspace>/state/`.
+
+RESOLVER_NAMES = frozenset({"resolve_workspace", "_resolve_workspace"})
+
+#: Resolver stubs predating this check; same contract as KNOWN_UNISOLATED.
+#: The list must SHRINK, never rot; each entry was verified latent when added.
+KNOWN_RESOLVER_STUBS = {
+    "tests/telegram-bridge-access.test.py",
+}
+
+
+def _lambda_absorbs_args(fn: ast.Lambda) -> bool:
+    """True when the lambda can take an argument: `*args`/`**kwargs` or any declared
+    parameter. A bare `lambda:` is the failure mode this exists to catch."""
+    a = fn.args
+    if a.vararg or a.kwarg:
+        return True
+    return bool(a.args or a.posonlyargs or a.kwonlyargs)
+
+
+def _assign_target_name(t: ast.expr) -> str | None:
+    """The bare name a single assignment target binds (`x` or `mod.x`)."""
+    if isinstance(t, ast.Attribute):
+        return t.attr
+    if isinstance(t, ast.Name):
+        return t.id
+    return None
+
+
+def _binding_state(value: ast.expr, env: "dict[str, bool]") -> "bool | None":
+    """Is `value` a non-absorbing stub? None when it says nothing about arity."""
+    if isinstance(value, ast.Lambda):
+        return not _lambda_absorbs_args(value)
+    if isinstance(value, ast.Name):
+        return env.get(value.id)
+    return None
+
+
+def _assign_targets(node: "ast.stmt") -> "list[ast.expr]":
+    """Targets an assignment binds. `ast.Assign` has `.targets`; `ast.AnnAssign` has a
+    single `.target` and binds NOTHING when `.value` is None (a bare annotation)."""
+    if isinstance(node, ast.AnnAssign):
+        return [node.target] if node.value is not None else []
+    return list(getattr(node, "targets", []))
+
+
+def _unsafe_names_in_scope(body: "list[ast.stmt]") -> "set[str]":
+    """Names this scope ever binds to a zero-arg lambda, at any depth, not descending
+    into nested def/class. Order-free: a nested function reads the global when it RUNS."""
+    found: "set[str]" = set()
+    stack = list(body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        # An annotated assignment binds like a plain one, so `_fake: object = lambda: tmp`
+        # must reach the gate; a bare `_fake: object` has value None and binds nothing.
+        if isinstance(n, (ast.Assign, ast.AnnAssign)) and isinstance(n.value, ast.Lambda):
+            if not _lambda_absorbs_args(n.value):
+                for t in _assign_targets(n):
+                    if isinstance(t, ast.Name):
+                        found.add(t.id)
+        for f in ("body", "orelse", "finalbody", "handlers"):
+            sub = getattr(n, f, None)
+            if isinstance(sub, list):
+                stack.extend(x for x in sub if isinstance(x, ast.stmt) or hasattr(x, "body"))
+    return found
+
+
+class _ScopeWalk:
+    """Reaching-binding walk over ONE lexical scope in statement order; nested scopes take
+    a snapshot, so a sibling cannot leak. Branches merge with OR (unsafe if any path is)."""
+
+    def __init__(self, env: "dict[str, bool]", out: "list[tuple[int, str]]",
+                 inherited: "set[str] | None" = None, *, class_body: bool = False) -> None:
+        self.env = dict(env)
+        self.out = out
+        # Names an ENCLOSING scope ever binds unsafely, carried down so a method still
+        # gets late-binding treatment even though the class body is not its scope.
+        self.ever_unsafe: "set[str]" = set(inherited or ())
+        # A class namespace is NOT a lexical scope for its methods: an unqualified
+        # name in a method skips the class body and resolves module or enclosing.
+        self.class_body = class_body
+        self.func_env = dict(env)
+        self.func_unsafe = set(inherited or ())
+
+    def run(self, body: "list[ast.stmt]") -> None:
+        own = _unsafe_names_in_scope(body)
+        self.ever_unsafe |= own
+        if not self.class_body:
+            # A class body's own names must not reach its methods (see __init__).
+            self.func_unsafe |= own
+        for stmt in body:
+            self.visit(stmt)
+
+    def visit(self, node: ast.stmt) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # ONE rule for every nested scope rather than a branch per surface: a class
+            # namespace lexically encloses nothing nested inside it.
+            base_env = self.func_env if self.class_body else self.env
+            base_unsafe = self.func_unsafe if self.class_body else self.ever_unsafe
+            if isinstance(node, ast.ClassDef):
+                # A class body executes IMMEDIATELY at its own statement, so
+                # definition-point state is exact — no late-binding widening.
+                _ScopeWalk(base_env, self.out, base_unsafe, class_body=True).run(node.body)
+                return
+            # A function body runs LATER: a global resolves at CALL time, so a binding
+            # written after the `def` still reaches it.
+            inner = dict(base_env)
+            for nm in base_unsafe:
+                inner[nm] = True
+            _ScopeWalk(inner, self.out, base_unsafe).run(node.body)
+            return
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            self._assign(node)
+            return
+        # `finalbody` is NOT an alternative branch: it runs on EVERY path, after
+        # whichever of body/handlers/orelse ran, so OR-merging it keeps the prior state.
+        finalbody = getattr(node, "finalbody", None)
+        # On a `try`, `else` is NOT an alternative to the body: Python runs it
+        # SEQUENTIALLY after the body succeeds, so both are ONE success path.
+        _try_types = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, "TryStar") else ())
+        if isinstance(node, _try_types):
+            success = list(getattr(node, "body", None) or []) + \
+                list(getattr(node, "orelse", None) or [])
+            branches = [success] if success else []
+        else:
+            branches = [b for b in (getattr(node, "body", None),
+                                    getattr(node, "orelse", None)) if b]
+        branches += [h.body for h in getattr(node, "handlers", [])]
+        if not branches and not finalbody:
+            return
+        merged: "dict[str, bool]" = {}
+        # A statement whose body may not run leaves the PRE-STATE live: `if` with no
+        # `else`, a loop over an empty iterable, a `try` that raised immediately.
+        covers_all = (isinstance(node, ast.If) and node.orelse) or isinstance(
+            node, (ast.With, ast.AsyncWith)
+        )
+        if not covers_all:
+            merged.update(self.env)
+        for body in branches:
+            # A control-flow block is the SAME scope, not a nested one, so the sub-walk
+            # must carry EVERYTHING forward, including `ever_unsafe`.
+            w = _ScopeWalk(self.env, self.out, self.ever_unsafe,
+                           class_body=self.class_body)
+            w.func_env = dict(self.func_env)
+            w.func_unsafe = set(self.func_unsafe)
+            w.run(body)
+            for k, v in w.env.items():
+                merged[k] = merged.get(k, False) or v
+        self.env.update(merged)
+        # `finally` runs last over the merged state and its result WINS: it executes
+        # whether the body completed, raised or returned, so its rebinding is final.
+        if finalbody:
+            w = _ScopeWalk(self.env, self.out, self.ever_unsafe,
+                           class_body=self.class_body)
+            w.func_env = dict(self.func_env)
+            w.func_unsafe = set(self.func_unsafe)
+            w.run(finalbody)
+            self.env.update(w.env)
+
+    def _assign(self, node: "ast.Assign | ast.AnnAssign") -> None:
+        targets = _assign_targets(node)
+        if not targets:            # bare annotation: no value, so no binding happens
+            return
+        state = _binding_state(node.value, self.env)
+        for t in targets:                            # flag BEFORE rebinding
+            nm = _assign_target_name(t)
+            if nm in RESOLVER_NAMES and state:
+                self.out.append((node.lineno, nm))
+        for t in targets:
+            if isinstance(t, ast.Name) and t.id not in RESOLVER_NAMES:
+                self.env[t.id] = bool(state)
+
+
+def resolver_stub_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """(lineno, name) for every zero-arg lambda that reaches a resolver name. Tracked per
+    scope in statement order - a file-global alias set false-flags cross-function cases."""
+    out: list[tuple[int, str]] = []
+    _ScopeWalk({}, out).run(getattr(tree, "body", []))
+    return sorted(set(out))
+
+def scan_resolver_stubs(paths) -> dict[str, list[tuple[int, str]]]:
+    """Resolver-stub violations per path, over EVERY tracked test rather than the
+    bridge-loading subset - a resolver stub is hazardous wherever it appears."""
+    out: dict[str, list[tuple[int, str]]] = {}
+    for rel in paths:
+        try:
+            tree = ast.parse((REPO / rel).read_text(errors="ignore"))
+        except (OSError, SyntaxError):
+            continue
+        hits = resolver_stub_violations(tree)
+        if hits:
+            out[rel] = hits
+    return out
+
+
 def scan(paths) -> dict[str, str]:
     out = {}
     for p in paths:
@@ -1061,13 +1261,18 @@ def main() -> int:
         targets = tracked_tests()
 
     results = scan(targets)
+    stub_hits = scan_resolver_stubs(targets)
 
     if mode == "--list":
         for p, v in sorted(results.items()):
             print(f"{v:9} {p}")
+        for p, hits in sorted(stub_hits.items()):
+            for ln, nm in hits:
+                print(f"{'STUB':9} {p}:{ln} ({nm})")
         return 0
 
     new_violations = [p for p, v in results.items() if v == VIOLATION and p not in KNOWN_UNISOLATED]
+    new_stubs = {p: h for p, h in stub_hits.items() if p not in KNOWN_RESOLVER_STUBS}
     mitigated = [p for p, v in results.items() if v == MITIGATED]
 
     # The grandfather list must shrink, never rot: a listed file that now isolates
@@ -1077,6 +1282,16 @@ def main() -> int:
         for p in sorted(KNOWN_UNISOLATED):
             if not (REPO / p).exists() or results.get(p) != VIOLATION:
                 stale.append(p)
+
+    for p, hits in sorted(new_stubs.items()):
+        for ln, nm in hits:
+            print(
+                f"error: {p}:{ln} — `{nm}` stubbed with a ZERO-ARG lambda. "
+                f"25 production call sites pass `migrate=False` or `repo`; a zero-arg "
+                f"stub raises TypeError at each, and behind a broad `except` that "
+                f"DISABLES the write path instead of redirecting it. "
+                f"Use `lambda *a, **kw: <ws>`."
+            )
 
     for p in mitigated:
         print(f"note: {p} — import still resolves host config; destructive path rebound post-import")
@@ -1091,13 +1306,18 @@ def main() -> int:
         for p_ in stale:
             print(f"  {p_}")
 
-    if not new_violations:
+    if not new_violations and not new_stubs:
         print(
             f"lint-hermetic-bridge-tests: ok "
             f"({len(results)} bridge-importing tests scanned, "
-            f"{len(KNOWN_UNISOLATED)} grandfathered, {len(mitigated)} mitigated)"
+            f"{len(KNOWN_UNISOLATED)} grandfathered, {len(mitigated)} mitigated; "
+            f"{len(targets)} scanned for resolver stubs, "
+            f"{len(KNOWN_RESOLVER_STUBS)} grandfathered)"
         )
         return 0
+
+    if new_stubs:
+        print("\nlint-hermetic-bridge-tests: FAIL — zero-arg workspace-resolver stub\n")
 
     if new_violations:
         print("\nlint-hermetic-bridge-tests: FAIL — test imports a bridge without isolating CLAUDE_CONFIG_DIR\n")

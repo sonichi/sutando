@@ -4,10 +4,37 @@ Extract readable text from document files — PDF, XLSX/CSV/TSV, DOCX, PPTX, and
 
 **Usage**:
 ```bash
-python3 skills/doc-ingest/scripts/ingest.py <file> [<file> ...] [--json] [--max-chars N]
+python3 skills/doc-ingest/scripts/ingest.py <file> [<file> ...] [--json] [--csv] [--max-chars N]
 ```
 
-Prints the extracted text to stdout (default cap 200k chars per file, `--max-chars 0` = uncapped). `--json` wraps each file's result in `{"file", "kind", "ok", "text"|"error"}` lines (JSONL) for programmatic callers.
+Prints the extracted text to stdout (default cap 200k chars per file, `--max-chars 0` = uncapped). `--json` wraps each file's result in `{"file", "kind", "ok", "text"|"error"}` lines (JSONL) for programmatic callers. `--csv` switches tabular files to the compute-exact view (below).
+
+## Quantitative questions: compute, don't read
+
+When the ask is quantitative over a tabular file — "how many …", "total …", "average …",
+"what percentage …", any filter/sum/count — do NOT answer by reading the extracted markdown.
+Load the exact table and **compute**:
+
+```bash
+python3 skills/doc-ingest/scripts/ingest.py sheet.xlsx --csv   # exact, uncapped per-sheet CSV
+```
+
+then aggregate programmatically (pandas or stdlib `csv`), keeping a per-row breakdown so the
+result is auditable. Two exactness guarantees distinguish `--csv` from the reading view:
+no default row/char caps (a silently truncated table computes a silently wrong aggregate),
+and xlsx without `openpyxl` is refused with a clear error rather than served by the
+approximate zip-XML fallback (approximate cells are fine to read, not to compute with).
+
+No caps does not mean no bounds — attachments are untrusted, so `--csv` carries a
+fail-closed compute budget: inputs over 32 MiB, renders over 64 MiB, or tables over the
+1M-cell cap are **refused with a loud error** (never truncated). A caller that genuinely
+needs a bigger table passes the explicit `--csv-no-budget` override.
+
+Why this is a rule and not a preference: on the GAIA file-attached benchmark subset
+(2026-07-30), switching solvers from reading extracted text to computing over the loaded
+table flipped 3/3 computable misses (multi-row Whyte-notation sums, filtered counts,
+parity logic) with no other change — 84.2% → 92.1%. The markdown view is for humans and
+summaries; numbers come from computation.
 
 ## When to use
 

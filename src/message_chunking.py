@@ -10,15 +10,18 @@ Slack and Telegram each hand-rolled a naive `range(0, len, N)` byte-slice, so:
   contains a ```-fenced block was split mid-fence → the first message rendered a
   half-open code block and the second leaked the trailing backticks. **This is
   the user-visible bug S3 fixes** — Slack now shares this chunker.
-- **Telegram** sends plain text (no `parse_mode`), so a mid-fence split is only
-  cosmetic there; it is intentionally NOT wired here (nothing to render). If
-  Telegram ever adopts MarkdownV2, route it through `chunk_message` too — the
-  same fence-safety then becomes correctness (unbalanced entities would 400).
+- **Telegram** sends plain text (no `parse_mode`): there is nothing to render,
+  so it must NOT use `chunk_message` — the synthetic close/re-open fences that
+  transport inserts are formatting for Discord/Slack but literal extra bytes on
+  a plain-text surface. Telegram uses `chunk_plain_text`, whose contract is
+  byte-identity: the concatenation of the chunks IS the input. If Telegram ever
+  adopts MarkdownV2, switch it to `chunk_message` + real escaping — fence
+  safety then becomes correctness (unbalanced entities would 400).
 
 Pure functions only — no I/O, no bridge state — so any delivery path can adopt
 it without coupling. `chunk_message` is the single source of truth; the Discord
-bridge keeps its `_chunk_for_discord(text)` name as a thin `max_len=1900` alias
-so its call sites and byte-for-byte output are unchanged.
+bridge uses it beneath its network-facing delivery budget while retaining a
+lossless private alias for golden reassembly tests.
 """
 
 from __future__ import annotations
@@ -123,9 +126,27 @@ def chunk_message(text: str, max_len: int = 1900):
         buf_len = 0
         return chunk
 
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    for idx, line in enumerate(lines):
         # Real fence-line detection (only at start of stripped line, not anywhere)
         opener_on_line = _is_fence_open_line(line)
+
+        # A fence block that fits a chunk alone must not be entered near the
+        # cap — that forces a close/reopen split inside the block.
+        if opener_on_line is not None and fence_opener is None and buf:
+            block_len = len(line) + 1
+            for look in lines[idx + 1:]:
+                block_len += len(look) + 1
+                if _is_fence_open_line(look) is not None \
+                        and _closes_fence(look.strip(), opener_on_line):
+                    break
+            else:
+                block_len = None  # unterminated fence — no lookahead call
+            if block_len is not None and block_len <= max_len \
+                    and buf_len + block_len > max_len:
+                chunk = flush()
+                if chunk is not None:
+                    yield chunk
         # If we're outside a fence and this line is a fence-open, treat as opening.
         # If we're inside a fence and this line matches the fence-token kind,
         # treat as closing (we don't require exact length match for close).
@@ -135,13 +156,40 @@ def chunk_message(text: str, max_len: int = 1900):
         reserve = (len(fence_closer(fence_opener)) + 1) if fence_opener else 0
 
         if buf_len + line_overhead + reserve > max_len and buf:
-            chunk = flush()
-            if chunk is not None:
-                yield chunk
-            # Reopen fence in next chunk if we were inside one
-            if fence_opener:
-                buf.append(fence_opener)
-                buf_len = len(fence_opener) + 1
+            # Outside a fence, prefer the last blank line in the lookback
+            # window: the paragraph is what a reader loses to a mid-cut.
+            cut = None
+            if fence_opener is None:
+                scanned = 0
+                for j in range(len(buf) - 1, 0, -1):
+                    scanned += len(buf[j]) + 1
+                    # Lookback is a quarter of the budget so chunks stay near
+                    # max_len (no half-empty sends) at ANY cap, not only 1900.
+                    if scanned > max_len // 4:
+                        break
+                    if buf[j] == "":
+                        cut = j
+                        break
+            tail_len = 0
+            if cut is not None:
+                tail_len = sum(len(t) + 1 for t in buf[cut + 1:])
+                # A cut must leave room for this line, or it trades a clean
+                # boundary for a chunk over max_len.
+                if tail_len + line_overhead + reserve > max_len:
+                    cut = None
+            if cut is not None:
+                head, tail = buf[:cut], buf[cut + 1:]
+                yield "\n".join(head)
+                buf = tail
+                buf_len = tail_len
+            else:
+                chunk = flush()
+                if chunk is not None:
+                    yield chunk
+                # Reopen fence in next chunk if we were inside one
+                if fence_opener:
+                    buf.append(fence_opener)
+                    buf_len = len(fence_opener) + 1
 
         # Single line longer than max_len → hard-split
         if line_overhead + reserve > max_len:
@@ -190,3 +238,37 @@ def chunk_message(text: str, max_len: int = 1900):
     chunk = flush()
     if chunk is not None:
         yield chunk
+
+
+def chunk_plain_text(text: str, max_len: int) -> list[str]:
+    """Split for a plain-text transport. Contract: ``"".join(result) == text``
+    (nothing inserted, nothing dropped), every chunk is 1..max_len chars, and
+    splits prefer the last newline in the window, then the last space, then a
+    hard cut for unbreakable runs."""
+    if max_len < 1:
+        raise ValueError("max_len must be >= 1")
+    chunks: list[str] = []
+    rest = text
+    while len(rest) > max_len:
+        window = rest[:max_len]
+        cut = window.rfind("\n")
+        if cut <= 0:
+            cut = window.rfind(" ")
+        cut = max_len if cut <= 0 else cut + 1   # boundary char stays left
+        chunks.append(rest[:cut])
+        rest = rest[cut:]
+    if rest:
+        chunks.append(rest)
+    return chunks
+
+
+def fits_one_message(text: str, max_len: int = 1900) -> bool:
+    """True when chunk_message would deliver `text` as ONE message.
+
+    The compose-time half of the delivery cap: gate a body on this before
+    writing it, instead of learning from the delivered thread that it split.
+    """
+    gen = chunk_message(text, max_len)
+    if next(gen, None) is None:
+        return True
+    return next(gen, None) is None

@@ -35,9 +35,11 @@ test('context-drop writer emits telemetry from the exact serialized task body', 
 		join(import.meta.dirname ?? '.', '..', 'src', 'task-bridge.ts'),
 		'utf-8',
 	);
+	// The invariant is telemetry-sees-the-written-bytes: the stamped content
+	// is what lands on disk, and the same variable feeds the emit.
 	assert.match(
 		src,
-		/writeFileSync\([\s\S]*?taskContent,[\s\S]*?\);\s*emitTaskProcessed\(taskContent\);/,
+		/const stampedContent = tryStampText\(taskContent\);[\s\S]*?writeFileSync\([\s\S]*?stampedContent,[\s\S]*?\);\s*emitTaskProcessed\(stampedContent\);/,
 	);
 });
 
@@ -70,9 +72,14 @@ test('LocalTaskBackend.submitTask is byte-identical to the pre-seam write', () =
 		'user_id: o\naccess_tier: owner\npriority: urgent\ntask: hello\n\n--- ctx ---\nline\n';
 	const backend = new LocalTaskBackend(taskDir, resultDir, noopArchive);
 	backend.submitTask('task-1', content);
-	// The exact bytes the old inline writeFileSync produced:
-	const expected = join(taskDir, 'task-1.txt');
-	assert.strictEqual(readFileSync(expected, 'utf-8'), content);
+	// Since the #3058 writer-edge stamping, the write is the input PLUS one
+	// canonical stamp line after `id:` — stripping it must restore the input
+	// byte-identically (the pre-seam contract, modulo the stamp).
+	const written = readFileSync(join(taskDir, 'task-1.txt'), 'utf-8');
+	const lines = written.split('\n');
+	assert.match(lines[1], /^envelope_hmac: v1:[0-9a-f]{64}$/);
+	lines.splice(1, 1);
+	assert.strictEqual(lines.join('\n'), content);
 });
 
 test('LocalTaskBackend result primitives mirror the watcher I/O', () => {

@@ -116,7 +116,7 @@
         "sync": {
           "type": "object",
           "additionalProperties": false,
-          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) \u2014 overriding in .local.json wipes the defaults for that array.",
+          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. include/exclude arrays REPLACE on merge (not unioned) \u2014 overriding either in .local.json wipes the defaults for that array. Use exclude_extra to ADD a carve-out while keeping the shipped ones.",
           "properties": {
             "include": {
               "type": "array",
@@ -133,6 +133,14 @@
                 "minLength": 1
               },
               "description": "Workspace-relative paths to skip during sync. Glob patterns supported (e.g. '*.heartbeat')."
+            },
+            "exclude_extra": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Workspace-relative paths APPENDED to exclude rather than replacing it. Shipped denies stay first (gitignore is last-match-wins) and duplicates are dropped. There is no include_extra: include is the whitelist, and unioning it would widen what the vault carries."
             }
           }
         },
@@ -144,6 +152,19 @@
         }
       }
     },
+    "health_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Behavior of src/health-check.py.",
+      "properties": {
+        "down_bridge_action": {
+          "type": "string",
+          "enum": ["restart", "alert", "off"],
+          "default": "alert",
+          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout — clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
+        }
+      }
+    },
     "bridges": {
       "type": "object",
       "description": "Bridge-wide toggles shared by the Discord/Telegram/Slack bridges.",
@@ -152,6 +173,35 @@
         "progress_stream": {
           "type": "boolean",
           "description": "Emit in-channel '\u23f3 working\u2026 (Ns)' progress placeholders while a task runs."
+        },
+        "discord_post_gate": {
+          "description": "Discord post-gate policy resolved by src/channels/discord/post_gate.py for every Discord sender. Either one path applied to every channel, or a {channel_id: path} map. Unset: ungated. A configured path that fails to load refuses sends (fail-closed). Env override: $SUTANDO_DISCORD_POST_GATE.",
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Path to a Python file exporting validate(channel_id, payload). Applied to every channel. Blank is the legacy UNCONFIGURED form: the resolver strips and treats it as unset, so the schema must not reject it."
+            },
+            {
+              "type": "object",
+              "description": "Per-channel policy files. `*` is REQUIRED and is the fallback for any channel not listed: without it an unlisted channel would send unvalidated, so the resolver refuses the whole mapping. An entry with a null/blank path refuses that one channel.",
+              "required": ["*"],
+              "propertyNames": {
+                "pattern": "^\\S+$",
+                "description": "Channel ids carry no surrounding whitespace. The resolver strips keys; an untrimmed one would route that channel to `*` instead of its own policy."
+              },
+              "properties": {
+                "*": {
+                  "type": "string",
+                  "pattern": "\\S",
+                  "description": "Fallback policy file for every channel not named above."
+                }
+              },
+              "additionalProperties": {
+                "type": ["string", "null"],
+                "description": "Policy file for this channel id."
+              }
+            }
+          ]
         }
       }
     },
@@ -178,7 +228,14 @@
     },
     "stand": {
       "type": "string",
-      "description": "This instance's `Stand:` commit-trailer value (e.g. \"Echo Act IV Mini\"). Per-clone identity, so it belongs in sutando.config.local.json rather than the tracked default config. Read by scripts/sutando-config.sh stand and src/daily-insight.py to tell co-located Sutando instances apart, since both commit under the owner's GH-mapped email so --author cannot separate them."
+      "description": "This instance's `Stand:` commit-trailer value (e.g. \"Echo Act IV Mini\"). Per-clone identity, so it belongs in sutando.config.local.json rather than the tracked default config. Read by scripts/sutando-config.sh stand to tell co-located Sutando instances apart, since both commit under the owner's GH-mapped email so --author cannot separate them."
+    },
+    "env": {
+      "type": "object",
+      "description": "Non-secret config values mirroring the flat env-var namespace (issue #1724). Read by config_get(); secrets stay in .env / vault.",
+      "additionalProperties": {
+        "type": "string"
+      }
     }
   }
 }

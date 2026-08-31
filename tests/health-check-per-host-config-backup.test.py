@@ -24,6 +24,8 @@ Covers:
   k) malformed JSON, bytes differ       → warn (raw-byte fallback)
   l) malformed JSON, bytes identical    → ok (raw-byte fallback)
   m) resolves canonical tree, not env ~/.claude → ok (no false all-clear; #2277 review)
+  n) no vault URL configured           → ok (snapshot writer unreachable; unactionable warn)
+  o) same tree WITH a vault URL        → warn (control for n; gate ≠ detection off)
 
 Run: python3 tests/health-check-per-host-config-backup.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -55,13 +57,17 @@ class _Harness:
         resolver would read `home_divergent` — an EMPTY tree — and fail loudly)
       - hc.WORKSPACE_DIR    (carrier base is WORKSPACE_DIR/hosts/<host>/channels)
       - hc._host_label      (which host subtree is the carrier)
+      - hc._vault_remote_url (drift only means something when a vault carries the
+        backup; default to a configured vault so every case below exercises the
+        comparison rather than the no-vault gate — see case n)
     """
 
-    def __init__(self, tmp: Path):
+    def __init__(self, tmp: Path, vault_url: str = "git@example.com:vault.git"):
         self.tmp = tmp
         self.home = tmp / "canonical-config"        # resolve_claude_sutando_config_dir() target
         self.home_divergent = tmp / "legacy-home"   # what the old claude_home_path fallback would hit
         self.ws = tmp / "workspace"
+        self.vault_url = vault_url
         self._saved = {}
 
     def __enter__(self):
@@ -69,8 +75,10 @@ class _Harness:
             "hc.claude_home_path": hc.claude_home_path,
             "hc.WORKSPACE_DIR": hc.WORKSPACE_DIR,
             "hc._host_label": hc._host_label,
+            "hc._vault_remote_url": hc._vault_remote_url,
             "sc.resolve_claude_sutando_config_dir": sutando_config.resolve_claude_sutando_config_dir,
         }
+        hc._vault_remote_url = lambda *a, **k: self.vault_url
         # canonical resolver → temp config dir (this is where write_live seeds)
         sutando_config.resolve_claude_sutando_config_dir = lambda *a, **k: self.home
         # old env-based path → a SEPARATE empty tree, so a regression to it reads nothing
@@ -83,6 +91,7 @@ class _Harness:
         hc.claude_home_path = self._saved["hc.claude_home_path"]
         hc.WORKSPACE_DIR = self._saved["hc.WORKSPACE_DIR"]
         hc._host_label = self._saved["hc._host_label"]
+        hc._vault_remote_url = self._saved["hc._vault_remote_url"]
         sutando_config.resolve_claude_sutando_config_dir = self._saved["sc.resolve_claude_sutando_config_dir"]
 
     def write_live(self, svc: str, content: bytes):
@@ -273,6 +282,30 @@ def case_m_reads_canonical_tree_not_env_home() -> list[str]:
     return []
 
 
+def case_n_no_vault_configured_ok() -> list[str]:
+    """No vault URL → informational ok, even with a live channel and no backup:
+    the push path exits before `_snapshot_per_host_config`, so nothing clears it."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td), vault_url="") as h:
+            h.write_live("discord", b'{"allowFrom":["123"]}')      # no carrier at all
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "ok" or "no vault configured" not in r["detail"]:
+        return [f"n) no vault URL should be informational ok, got {r}"]
+    return []
+
+
+def case_o_vault_configured_still_warns() -> list[str]:
+    """Control for case n: the SAME tree with a vault URL must still warn, so the
+    gate can't be read as "drift detection was disabled"."""
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(Path(td), vault_url="git@example.com:vault.git") as h:
+            h.write_live("discord", b'{"allowFrom":["123"]}')      # no carrier at all
+            r = hc.check_per_host_config_backup()
+    if r["status"] != "warn" or "no backup" not in r["detail"]:
+        return [f"o) configured vault must still warn on drift, got {r}"]
+    return []
+
+
 def main() -> int:
     cases = [
         ("a", case_a_identical_ok),
@@ -288,6 +321,8 @@ def main() -> int:
         ("k", case_k_malformed_json_raw_fallback_warn),
         ("l", case_l_malformed_but_byte_identical_ok),
         ("m", case_m_reads_canonical_tree_not_env_home),
+        ("n", case_n_no_vault_configured_ok),
+        ("o", case_o_vault_configured_still_warns),
     ]
     failures = []
     for label, fn in cases:

@@ -137,8 +137,22 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 		// Notice fired on stderr — points at the CLI
 		assert.match(result.stderr, /legacy state detected/i, 'legacy_state_notice fires on first run');
 		assert.match(result.stderr, /sutando-migrate\.sh/, 'notice references the CLI');
-		// Sentinel written so second run silences the notice
-		assert.equal(existsSync(join(workspace, '.legacy-notice-printed')), true, 'notice sentinel written');
+		// Sentinel written so second run silences the notice — under state/, since
+		// the workspace root is reserved for top-level directories.
+		assert.equal(existsSync(join(workspace, 'state', '.legacy-notice-printed')), true, 'notice sentinel written under state/');
+		assert.equal(existsSync(join(workspace, '.legacy-notice-printed')), false, 'no sentinel left at the workspace root');
+	});
+
+	it('migrates an already-printed install: root sentinel moves to state/, notice stays silent', () => {
+		// The population that actually carries the workspace-root-tidy warning.
+		// Honouring the root file without moving it would warn forever (#3205 review).
+		mkdirSync(join(workspace, 'state'), { recursive: true });
+		writeFileSync(join(workspace, 'core-status.json'), '{"step":"legacy"}');
+		writeFileSync(join(workspace, '.legacy-notice-printed'), '');
+		const result = runInit(scratch, '--auto');
+		assert.equal(existsSync(join(workspace, 'state', '.legacy-notice-printed')), true, 'state/ sentinel seeded from the legacy one');
+		assert.equal(existsSync(join(workspace, '.legacy-notice-printed')), false, 'legacy root sentinel removed, so root-tidy stops warning');
+		assert.doesNotMatch(result.stderr, /legacy state detected/i, 'notice is NOT re-printed for an install that already saw it');
 	});
 });
 

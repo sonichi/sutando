@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timedelta
@@ -134,6 +135,66 @@ def read_crons(path: Path) -> list:
 _CRONS_LOCK = threading.Lock()
 
 
+_RUN_PREFIX_RE = re.compile(r"^Run:?\s*")
+
+
+def schedule_owner(job: dict) -> str:
+    """Which scheduler fires this entry: the OS-backed codex runner, the
+    launchd cron-runner, a self-pacing /loop, or the live session's cron."""
+    if job.get("execution") == "codex-task":
+        return "codex"
+    if job.get("launchd"):
+        return "launchd"
+    if job.get("loop") == "dynamic":
+        return "dynamic-loop"
+    return "session"
+
+
+def list_schedules(path: Path, now: datetime | None = None) -> list[dict]:
+    """Every crons.json entry — no owner filtering — with its computed next
+    run. The read policy behind the dashboard Schedules card and SCP
+    schedule.list; [] on missing/invalid file (never raises).
+
+    Per entry: name, cron ("" for a dynamic loop), kind (shell|skill|prompt),
+    prompt_or_skill (the skill name or prompt text), owner (session|launchd|
+    codex|dynamic-loop — who fires it), description (UNescaped — HTML escaping
+    is presentation), next_run (display string: "Mon 21:00 (in 2m)" | ">7d" |
+    "invalid"), next_run_ts (epoch seconds, None when uncomputable)."""
+    now = now or datetime.now()
+    out = []
+    for job in read_crons(Path(path)):
+        expr = job.get("cron", "")
+        skill = job.get("prompt_skill")
+        nxt = next_run(expr, now) if expr else None
+        if nxt:
+            mins = int((nxt - now).total_seconds() // 60)
+            if mins < 60:
+                rel = f"in {mins}m"
+            elif mins < 1440:
+                rel = f"in {mins // 60}h{mins % 60:02d}m"
+            else:
+                rel = f"in {mins // 1440}d{(mins % 1440) // 60}h"
+            next_str = f'{nxt.strftime("%a %H:%M")} ({rel})'
+        else:
+            next_str = ">7d" if expr else "invalid"
+        if job.get("description"):
+            desc = job["description"]
+        elif skill:
+            desc = f"Runs the /{skill} skill"
+        else:
+            _p = _RUN_PREFIX_RE.sub("", (job.get("prompt") or "").strip())
+            desc = (_p[:100] + "…") if len(_p) > 100 else _p
+        _shell = bool((job.get("shell_command") or "").strip())
+        out.append({"name": job.get("name", "?"), "cron": expr,
+                    "kind": "shell" if _shell else ("skill" if skill else "prompt"),
+                    "prompt_or_skill": skill or (job.get("prompt") or ""),
+                    "owner": schedule_owner(job),
+                    "description": desc,
+                    "next_run": next_str,
+                    "next_run_ts": int(nxt.timestamp()) if nxt else None})
+    return out
+
+
 def write_crons(path: Path, jobs: list) -> None:
     """Persist the cron list atomically (tmp + os.replace) so a crash mid-write
     can't leave a truncated crons.json. Callers MUST hold _CRONS_LOCK for the
@@ -156,8 +217,8 @@ def write_crons(path: Path, jobs: list) -> None:
 
 def validate_job(job: dict) -> str | None:
     """Return an error string if the job is invalid, else None. A job needs a
-    non-empty name, a valid 5-field cron expr, and exactly one of prompt /
-    prompt_skill (what schedule-crons requires to actually fire something)."""
+    non-empty name, a valid 5-field cron expr, and exactly one execution body:
+    shell_command, prompt, or prompt_skill."""
     if not isinstance(job, dict):
         return "job must be an object"
     name = (job.get("name") or "").strip()
@@ -175,8 +236,12 @@ def validate_job(job: dict) -> str | None:
         return f"invalid cron expression: {expr!r}"
     has_prompt = bool((job.get("prompt") or "").strip())
     has_skill = bool((job.get("prompt_skill") or "").strip())
-    if has_prompt == has_skill:
-        return "provide exactly one of prompt or prompt_skill"
+    has_shell = bool((job.get("shell_command") or "").strip())
+    if sum((has_shell, has_prompt, has_skill)) != 1:
+        if "shell_command" not in job:
+            # Keep the established API error for the legacy two-form schema.
+            return "provide exactly one of prompt or prompt_skill"
+        return "provide exactly one of shell_command, prompt or prompt_skill"
     return None
 
 
@@ -192,7 +257,7 @@ def upsert_schedule(path: Path, body: dict) -> tuple[int, dict]:
     # AttributeError on `.strip()` and close the request with no JSON 400
     # (CR #2164, qingyun-wu). `null` is allowed here — it's handled downstream as
     # "field absent".
-    for _k in ("name", "cron", "prompt", "prompt_skill", "description"):
+    for _k in ("name", "cron", "prompt", "prompt_skill", "shell_command", "description"):
         _v = body.get(_k)
         if _v is not None and not isinstance(_v, str):
             return 400, {"error": f"{_k} must be a string"}
@@ -211,13 +276,22 @@ def upsert_schedule(path: Path, body: dict) -> tuple[int, dict]:
         existing = next((j for j in jobs if j.get("name") == name), None)
         merged = dict(existing) if existing else {}
         merged["name"] = name
-        for k in ("cron", "prompt", "prompt_skill", "description"):
+        for k in ("cron", "prompt", "prompt_skill", "shell_command", "description"):
             if k in body and str(body.get(k)).strip():
                 merged[k] = str(body[k]).strip()
-        if (body.get("prompt_skill") or "").strip():
+        if (body.get("shell_command") or "").strip():
             merged.pop("prompt", None)
+            merged.pop("prompt_skill", None)
+        elif (body.get("prompt_skill") or "").strip():
+            merged.pop("prompt", None)
+            merged.pop("shell_command", None)
         elif (body.get("prompt") or "").strip():
             merged.pop("prompt_skill", None)
+            merged.pop("shell_command", None)
+        if (merged.get("shell_command") or "").strip():
+            # Only the launchd runner executes shell jobs and the session
+            # scheduler skips them, so an unflagged one would never run at all.
+            merged["launchd"] = True
         err = validate_job(merged)
         if err:
             return 400, {"error": err}

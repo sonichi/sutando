@@ -59,6 +59,17 @@ class TestHeartbeatWrite(unittest.TestCase):
         alive_path = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
         self.assertTrue(alive_path.is_file(), f"expected {alive_path} to exist")
 
+    def test_handle_signal_writes_tombstone_before_unlink(self):
+        import core_heartbeat
+        core_heartbeat.write_beat()
+        alive = core_heartbeat._alive_path()
+        self.assertTrue(alive.is_file())
+        core_heartbeat._handle_signal(15, None)
+        stopped = alive.with_suffix(".stopped")
+        self.assertTrue(stopped.is_file(), "graceful stop must leave a .stopped tombstone (#2160)")
+        self.assertFalse(alive.exists(), "graceful stop must still unlink .alive")
+        float(stopped.read_text())  # payload is a timestamp
+
     def test_write_beat_payload_schema(self):
         import core_heartbeat
         # Pin the core-pid resolver. Before schema 3 this test asserted
@@ -66,7 +77,7 @@ class TestHeartbeatWrite(unittest.TestCase):
         # server on the socket — on a machine that DID, it would have failed.
         # Pinning makes the contract, not the environment, decide.
         _orig = core_heartbeat.core_pid
-        core_heartbeat.core_pid = lambda socket_path=None: 4242
+        core_heartbeat.core_pid = lambda socket_path=None, session=None: 4242
         try:
             core_heartbeat.write_beat(status="custom-status")
         finally:
@@ -84,6 +95,10 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertEqual(data["schema_version"], 3)
         # locality (Track 10): {kind, host}, self-reported. Default kind=local.
         self.assertEqual(data["locality"], {"kind": "local", "host": _short_host()})
+        # session: what tmux says this core is IN, not what the env claims.
+        self.assertEqual(data["session"], core_heartbeat._observed_session(
+            os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")))
+
         # socket: the runtime-authored tmux socket the core runs on. Consumed by
         # `sutando-config.sh runtime` so the AgentRuntime descriptor reports the
         # real socket (incl. custom sockets) independent of a caller's env.
@@ -95,6 +110,80 @@ class TestHeartbeatWrite(unittest.TestCase):
         self.assertIsInstance(data["last_beat_at"], float)
         # last_beat_at advances after a sleep; just sanity-check it's recent.
         self.assertLess(abs(time.time() - data["last_beat_at"]), 5)
+
+    def test_observed_session_prefers_tmux_over_a_lying_env(self):
+        """The Claude launcher hardcodes SESSION and never forwards
+        SUTANDO_TMUX_SESSION, so an exported value can name a session that does
+        not exist. Recording it would send the owner to a dead target."""
+        import core_heartbeat
+        import subprocess as _sp
+        _orig = core_heartbeat._tmux
+        core_heartbeat._tmux = lambda sock, *a: _sp.CompletedProcess(
+            a, 0, stdout="sutando-core\n", stderr="")
+        os.environ["TMUX"] = "/tmp/sutando-tmux.sock,1,0"
+        os.environ["SUTANDO_TMUX_SESSION"] = "custom-core-does-not-exist"
+        try:
+            self.assertEqual(core_heartbeat.core_session(),
+                             "custom-core-does-not-exist")   # the env still lies
+            self.assertEqual(core_heartbeat._observed_session("/tmp/s.sock"),
+                             "sutando-core")                 # tmux wins
+        finally:
+            core_heartbeat._tmux = _orig
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
+            os.environ.pop("TMUX", None)
+
+    def test_observed_session_never_uses_bare_display_message_outside_tmux(self):
+        """Outside tmux a bare display-message resolves an arbitrary session on a
+        shared socket. Scoped calls are fine; that one specific call is not."""
+        import core_heartbeat
+        import subprocess as _sp
+        _orig, _origpid = core_heartbeat._tmux, core_heartbeat.core_pid
+
+        def _guard(sock, *a):
+            if a and a[0] == "display-message":
+                raise AssertionError("bare display-message outside tmux")
+            return _sp.CompletedProcess(["tmux"], 1, "", "")
+
+        core_heartbeat._tmux = _guard
+        core_heartbeat.core_pid = lambda socket_path=None, session=None: None
+        os.environ.pop("TMUX", None)
+        os.environ["SUTANDO_TMUX_SESSION"] = "from-contract"
+        try:
+            self.assertEqual(core_heartbeat._observed_session("/tmp/s.sock"),
+                             "from-contract")
+        finally:
+            core_heartbeat._tmux, core_heartbeat.core_pid = _orig, _origpid
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
+
+    def test_write_beat_records_the_live_session_not_a_lying_env(self):
+        """With $TMUX unset and SUTANDO_TMUX_SESSION naming a session that does not
+        exist, the beat records the live session on the socket, not the env's claim."""
+        import core_heartbeat
+        import json as _json
+        import subprocess as _sp
+        _orig, _origpid = core_heartbeat._tmux, core_heartbeat.core_pid
+        LIE, REAL = "custom-core-does-not-exist", "sutando-core"
+
+        def _fake_tmux(sock, *a):
+            if a and a[0] == "list-sessions":
+                return _sp.CompletedProcess(["tmux"], 0, f"{REAL}\n", "")
+            return _sp.CompletedProcess(["tmux"], 1, "", "")
+
+        core_heartbeat._tmux = _fake_tmux
+        core_heartbeat.core_pid = (lambda socket_path=None, session=None:
+                                  4321 if session == REAL else None)
+        os.environ.pop("TMUX", None)
+        os.environ["SUTANDO_TMUX_SESSION"] = LIE
+        try:
+            core_heartbeat.write_beat()
+            rec = _json.loads((self.tmp / "state" / "cores" /
+                               f"{_short_host()}.alive").read_text())
+            self.assertNotEqual(rec["session"], LIE,
+                                "recorded the unverified env value")
+            self.assertEqual(rec["session"], REAL)
+        finally:
+            core_heartbeat._tmux, core_heartbeat.core_pid = _orig, _origpid
+            os.environ.pop("SUTANDO_TMUX_SESSION", None)
 
     def test_locality_kind_from_env(self):
         """Track 10: `kind` self-reports from $SUTANDO_CORE_LOCALITY — `cloud`

@@ -7,11 +7,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveWorkspace } from './workspace_default.js';
-import { claudeHomePath } from './util_paths.js';
+import { claudeHomePath, claudeProjectSlug } from './util_paths.js';
 
 function defaultMemoryDir(): string {
     const repo = resolve(join(import.meta.dirname, '..'));
-    const slug = repo.replace(/\//g, '-');
+    const slug = claudeProjectSlug(repo);
     return claudeHomePath('projects', slug, 'memory');
 }
 
@@ -33,6 +33,27 @@ function readMemory(filename: string): string | null {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * RECENT ACTIVITY lines for a build_log body. Exported so tests drive this
+ * implementation instead of a second copy that cannot disagree with it.
+ */
+export function pickRecentActivity(content: string): string[] {
+	// build_log.md is append-at-bottom, so the newest dated header is the LAST
+	// match; items must be scoped to it or slice(5) returns the file preamble.
+	const headers = [...content.matchAll(/## \d{4}-\d{2}-\d{2} — .+/g)];
+	const newest = headers.length ? headers[headers.length - 1] : null;
+	if (!newest) return [];
+	const rest = content.slice((newest.index ?? 0) + newest[0].length);
+	// The delimiter must match ANY level-two header, not just the narrow form
+	// the selector accepts — otherwise one section swallows the next.
+	const next = rest.search(/^## /m);
+	const section = next === -1 ? rest : rest.slice(0, next);
+	// A section with no bulleted items renders header-only ON PURPOSE:
+	// borrowing items from elsewhere is the mispairing this fixes.
+	const items = section.match(/^- \*\*.+?\*\*.*/gm) ?? [];
+	return ['RECENT ACTIVITY:', newest[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), ''];
 }
 
 /**
@@ -59,15 +80,9 @@ export function buildVoiceAgentContext(): string {
 		} catch { /* best effort */ }
 	}
 
-	// Read recent build log activity (first date header + items)
 	if (existsSync(buildLog)) {
 		try {
-			const content = readFileSync(buildLog, 'utf-8');
-			const dateMatch = content.match(/## \d{4}-\d{2}-\d{2} — .+/);
-			const items = content.match(/^- \*\*.+?\*\*.*/gm);
-			if (dateMatch && items) {
-				lines.push('RECENT ACTIVITY:', dateMatch[0].replace('## ', '  '), ...items.slice(0, 5).map(i => '  ' + i), '');
-			}
+			lines.push(...pickRecentActivity(readFileSync(buildLog, 'utf-8')));
 		} catch { /* best effort */ }
 	}
 

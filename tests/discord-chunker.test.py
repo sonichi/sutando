@@ -74,19 +74,38 @@ dm = _load("dm_result", REPO / "src" / "dm-result.py")
 
 
 def _run_against(mod, label):
+    # The bridge's network-facing alias is intentionally bounded. Exercise the
+    # lossless primitive here so these golden checks remain about fence-safe
+    # reassembly; dm-result.py still exposes only its lossless alias.
+    chunk = getattr(mod, "_chunk_for_discord_unbounded", mod._chunk_for_discord)
+
+    # The fallback above is deliberate (dm-result names its lossless alias
+    # differently), but it made this suite BLIND: renaming the bridge's primitive
+    # away left every assertion below satisfied by the bounded path, which caps at
+    # DISCORD_DELIVERY_MAX_CHUNKS. Assert the PROPERTY, not the name — a lossless
+    # chunker must exceed that cap on input that needs more.
+    _long = ("x" * 1800 + "\n") * 8
+    _n = len(list(chunk(_long)))
+    _cap = getattr(mod, "DISCORD_DELIVERY_MAX_CHUNKS", None)
+    if _cap is not None:
+        assert _n > _cap, (
+            f"{label}: resolved chunker produced {_n} chunks on ~14k chars, at or under the "
+            f"{_cap}-chunk delivery cap — the lossless primitive is missing and the bounded "
+            f"path was substituted silently")
+
     # Test 1: empty/short
-    assert list(mod._chunk_for_discord("")) == []
-    assert list(mod._chunk_for_discord("hi")) == ["hi"]
+    assert list(chunk("")) == []
+    assert list(chunk("hi")) == ["hi"]
 
     # Test 2: long plain text → multiple chunks, all <= max_len
     src = "\n".join(["line " + str(i) * 40 for i in range(200)])
-    chunks = list(mod._chunk_for_discord(src, max_len=300))
+    chunks = list(chunk(src, max_len=300))
     assert all(len(c) <= 300 for c in chunks), f"{label}: chunk too long"
     assert len(chunks) > 1
 
     # Test 3: code block spanning multiple chunks preserves opener with language tag
     src = "intro\n```python\n" + ("x = 1\n" * 400) + "```\nouter"
-    chunks = list(mod._chunk_for_discord(src, max_len=300))
+    chunks = list(chunk(src, max_len=300))
     assert len(chunks) >= 3, f"{label}: expected multi-chunk, got {len(chunks)}"
     # All but last must end with ``` (closer)
     for i, c in enumerate(chunks[:-1]):
@@ -96,7 +115,7 @@ def _run_against(mod, label):
 
     # Test 4: print("```") inside fenced block must NOT close the fence early
     src = '```python\nprint("```")\nx = 1\nmore = 2\n```'
-    chunks = list(mod._chunk_for_discord(src))
+    chunks = list(chunk(src))
     # Single chunk — but more important: fence is balanced (one opener, one closer)
     full = "\n".join(chunks)
     fence_lines = [
@@ -109,7 +128,7 @@ def _run_against(mod, label):
 
     # Test 5: nested 4-tick outer fence preserved (Markdown allows ```` to wrap ```)
     src = "````markdown\n```python\ninner\n```\nstill outer\n````"
-    chunks = list(mod._chunk_for_discord(src))
+    chunks = list(chunk(src))
     # Outer ```` opener present in first chunk
     assert "````markdown" in chunks[0], f"{label}: outer 4-tick opener lost"
 
@@ -131,7 +150,7 @@ def _run_against(mod, label):
 
     # Test 7: tilde fence closes with tildes (not backticks) — token-kind preservation
     src = "~~~python\n" + ("x = 1\n" * 400) + "~~~"
-    chunks = list(mod._chunk_for_discord(src, max_len=300))
+    chunks = list(chunk(src, max_len=300))
     assert len(chunks) >= 2
     # First chunk closes with ~~~ (matching opener kind), not ```
     assert chunks[0].rstrip().endswith("~~~"), (
@@ -141,9 +160,28 @@ def _run_against(mod, label):
     print(f"[{label}] all 7 cases OK")
 
 
+def _run_delivery_budget_cases():
+    assert list(bridge._chunk_for_discord("hi")) == ["hi"]
+
+    chunks = list(bridge._chunk_for_discord("oversized\n" * 100, max_len=40, max_chunks=4))
+    assert len(chunks) == 4, f"budget: expected 4 sends, got {len(chunks)}"
+    assert chunks[0].startswith("oversized"), "budget: preview lost the beginning"
+    assert chunks[-1] == bridge.DISCORD_TRUNCATION_NOTICE
+
+    try:
+        list(bridge._chunk_for_discord("x", max_chunks=0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("budget: max_chunks=0 should raise ValueError")
+
+    print("[discord delivery budget] all 3 cases OK")
+
+
 def main():
     _run_against(bridge, "discord-bridge.py")
     _run_against(dm, "dm-result.py")
+    _run_delivery_budget_cases()
     print("All chunker tests passed.")
 
 

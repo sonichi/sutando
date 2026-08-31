@@ -30,24 +30,63 @@
 import 'dotenv/config';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { inlineTools } from './inline-tools.js';
-import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
+import { inlineTools, personalSkillSetups } from './inline-tools.js';
+import { runSkillSetups } from './skill-setup-runner.js';
+import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { VoiceSession } from 'bodhi-realtime-agent';
+import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
+function assertMacOS() {
+	if (process.platform !== 'darwin' && process.env.SUTANDO_TEST_MODE !== '1') {
+		console.error('Sutando requires macOS');
+		process.exit(1);
+	}
+}
 import { workTool, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
+import { createAudioHealthLedger } from './voice-audio-health.js';
+import { createHealthPersistence } from './voice-audio-health-persist.js';
+import { evaluateMatrix, type MatrixBaseline } from './voice-health-matrix.js';
+import { initialGoodbyeGuard, shouldFireGoodbye, createConversationClearHelper, clearStaleResumptionHandle } from './voice-continuity.js';
+import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndExit, EXIT_CODE_DUPLICATE_INSTANCE } from './crash-only.js';
+import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
-import { classifyTransportClose, type ClassifiedClose } from './voice-error-classifier.js';
+import {
+	classifyTransportClose,
+	recordTerminalClassification,
+	lastTerminalClassification,
+	clearTerminalClassification,
+	formatVoiceOfflineNotification,
+	formatVoiceRecoveryNotification,
+	type ClassifiedClose,
+} from './voice-error-classifier.js';
+import {
+	createAgentStateProvider,
+	createIsolatedIdleRestore,
+	publishCapabilitiesMarker,
+	publishLifecycleSnapshot,
+	type AgentStateV1,
+} from './voice-agent-state.js';
 
-import { sharedPersonalPath, claudeHomePath } from './util_paths.js';
+import { sharedPersonalPath, claudeHomePath, claudeProjectSlug } from './util_paths.js';
+import { nextConnectingTick } from './voice-connect-watchdog.js';
+import { VoiceWatchdogShadow, DETECTOR_VERSION, CAPABILITY_SET } from './voice-watchdog-shadow.js';
+import { WatchdogLedger } from './voice-watchdog-ledger.js';
+import { parseActiveSilenceMode, parseActiveSilenceTicks } from './voice-active-silence-watchdog.js';
+import {
+	VoiceSilenceRecoveryCoordinator,
+	recoverySurfaceSupported,
+	type RecoverySessionSurface,
+} from './voice-silence-recovery-coordinator.js';
+import {
+	initialRedialState, noteLifecycle, noteDialed, shouldEventDial, tickMayDial,
+} from './voice-redial-scheduler.js';
 
 // Cartesia is loaded dynamically at the bottom of the config section so
 // the `@cartesia/cartesia-js` package is only required when the user has
@@ -106,6 +145,7 @@ const PORT = Number(process.env.PORT) || 9900;
 // web-client /ws proxy (SUTANDO_LAN_SHARE), never a direct bind to this port.
 // Set HOST=0.0.0.0 explicitly only for a trusted deployment that needs it.
 const HOST = process.env.HOST || '127.0.0.1';
+
 // Per-user runtime state lives under the resolved workspace (post-v0.8
 // / #1440 default: <repo>/workspace/), not the repo checkout. Pre-#762
 // voice-agent resolved its tasks/results/state against the repo path via
@@ -118,8 +158,46 @@ const HOST = process.env.HOST || '127.0.0.1';
 // the file pipeline); the dual-use rationale is obsolete.
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 const WORKSPACE_DIR = resolveWorkspace();
-const PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
+// Canonical since #2722; the root `.voice-agent.pid` is the pre-move legacy
+// location, read by the shell side only via `sutando-config.sh voice-pidfile`.
+const PIDFILE = join(WORKSPACE_DIR, 'state', 'locks', 'voice-agent.pid');
+const LEGACY_PIDFILE = join(WORKSPACE_DIR, '.voice-agent.pid');
+
+/** Bounded primitive-only crash record — shared by BOTH fatal paths (the
+ * uncaught handler and `main().catch`), which obey identical crash-only
+ * rules (design 1d; amendments R1/R2). */
+const CRASH_RECORD_PATH = join(WORKSPACE_DIR, 'logs', 'voice-agent.crash.json');
 const SESSION_ID = `session_${Date.now()}`;
+// ACTIVE-silence watchdog, Phase 0a shadow observer (never touches the live
+// session; see docs/design-voice-active-silence-recovery.md in the desktop
+// repo). Timestamps deliberately share the audio-health snapshot's Date.now
+// domain for this diagnostic phase; the armed implementation migrates to the
+// monotonic domain with the bodhi surface.
+const voiceWatchdogShadow = new VoiceWatchdogShadow({
+	voiceSessionId: SESSION_ID,
+	ledger: new WatchdogLedger({
+		path: join(WORKSPACE_DIR, 'logs', 'voice-watchdog.jsonl'),
+		meta: {
+			detectorVersion: DETECTOR_VERSION,
+			capabilitySet: CAPABILITY_SET,
+			capabilitySetId: JSON.stringify(CAPABILITY_SET),
+			pid: process.pid,
+		},
+		onError: (err) => console.error(`${new Date().toISOString().slice(11, 23)} [SilenceShadow] ledger write failed: ${err.message}`),
+	}),
+});
+
+// ACTIVE-silence recovery, Phase 1 (armed): explicit opt-in via
+// VOICE_ACTIVE_SILENCE_MODE=armed; everything else stays Phase 0a shadow.
+const ACTIVE_SILENCE_MODE = parseActiveSilenceMode(process.env.VOICE_ACTIVE_SILENCE_MODE);
+const ACTIVE_SILENCE_TICKS = parseActiveSilenceTicks(process.env.VOICE_ACTIVE_SILENCE_TICKS);
+let voiceRecoveryCoordinator: VoiceSilenceRecoveryCoordinator | null = null;
+let voiceRecoveryLedger: WatchdogLedger | null = null;
+/** True while the legacy CLOSED guard is inside its cast-call reconnect —
+ *  bodhi fires onClientConnected synchronously in there, and that fake
+ *  attach must not mint a coordinator client epoch. */
+let legacyReconnectInFlight = false;
+
 const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
 
 /** Single-instance lock for this workspace.
@@ -136,44 +214,70 @@ const CALL_RESULTS_DIR = join(WORKSPACE_DIR, 'results', 'calls');
  * binds, no watchers wired, no `setVisionSession`) — it exits before the
  * `VoiceSession` constructor runs.
  *
- * Stale pidfiles (SIGKILL / crash without `process.on('exit')` firing) are
- * detected via `process.kill(pid, 0)` and overwritten. The rare race between
- * two simultaneous startups is backstopped by the EADDRINUSE branch in
- * `uncaughtException` below.
+ * The lock is a STRUCTURED JSON record `{v:1, lockId, pid, startTimeMs,
+ * entry, workspace}` created/validated/replaced exclusively by the guarded
+ * bundled-Python helper `scripts/voice-lock.py` under an advisory
+ * `fcntl.flock` on `.voice-agent.lock.guard` — the single implementation
+ * shared with the Node supervisor and `restart-voice-agent.sh` (design 1b).
+ * Stale locks (dead pid, or PID reuse detected via a `ps -o lstart=`
+ * mismatch) are replaced under the guard; a live lock is never removed. If
+ * the helper's interpreter is unavailable, lock operations FAIL CLOSED with
+ * an actionable error (amendment R3) — there is no unguarded legacy writer.
+ *
+ * EXIT CODE 7 = duplicate lock/port: "another instance owns the singleton
+ * resource; my exit is the expected outcome of a race". The supervisor's
+ * exit-7 grace window keys on it to distinguish a lost race from a crash
+ * (impl plan WS1 Steps 2/8). The EADDRINUSE fatal path exits 7 for the same
+ * reason (see `classifyFatalExitCode`).
  */
-function isProcessAlive(pid: number): boolean {
-	try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
+let voiceLockId: string | undefined;
 function acquirePidLock(): void {
 	const myPid = process.pid;
-	try {
-		// Atomic create-or-fail (O_EXCL). If another voice-agent is starting
-		// concurrently, exactly one open() wins; the other gets EEXIST.
-		const fd = openSync(PIDFILE, 'wx');
-		try { writeSync(fd, Buffer.from(`${myPid}\n`)); }
-		finally { closeSync(fd); }
-	} catch (e) {
-		if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-		let raw = '';
-		try { raw = readFileSync(PIDFILE, 'utf-8').trim(); } catch {}
-		const oldPid = Number.parseInt(raw, 10);
-		if (oldPid && oldPid !== myPid && isProcessAlive(oldPid)) {
-			console.error(`${ts()} [Startup] FATAL: voice-agent already running (pid ${oldPid}) for ${WORKSPACE_DIR}`);
-			console.error(`${ts()} [Startup] Kill it first or remove ${PIDFILE}. Exiting.`);
-			process.exit(1);
-		}
-		console.warn(`${ts()} [Startup] Stale pidfile (pid=${raw || 'empty'} not alive) — overwriting.`);
-		writeFileSync(PIDFILE, `${myPid}\n`);
+	const guard = voiceLockGuardPath(WORKSPACE_DIR);
+	let entry = process.argv[1] ?? fileURLToPath(import.meta.url);
+	try { entry = realpathSync(entry); } catch { /* keep the unresolved path */ }
+	const py = resolveLockPython();
+	if (!py.ok) {
+		// Fail closed (amendment R3): never fall back to an unguarded bare-pid
+		// writer — a second writer implementation would reopen the lock races
+		// the guarded helper exists to close.
+		console.error(`${ts()} [Startup] FATAL: cannot resolve a usable python3 for the voice lock helper — ${py.detail}`);
+		console.error(`${ts()} [Startup] Lock operations fail closed. Fix: install python3 (brew install python), set SUTANDO_PY to a working interpreter, or run xcode-select --install. Exiting.`);
+		process.exit(1);
 	}
-	// Only unlink if WE still own the pidfile — protects against a race where
-	// a restart-driven successor overwrote it between our exit signal and
-	// this handler running.
+	try { mkdirSync(join(WORKSPACE_DIR, 'state', 'locks'), { recursive: true }); } catch { /* acquire fails closed below */ }
+	const res = acquireVoiceLock({
+		pidfile: PIDFILE,
+		legacyPidfile: LEGACY_PIDFILE,
+		guard,
+		pid: myPid,
+		entry,
+		workspace: WORKSPACE_DIR,
+		pythonBin: py.bin,
+	});
+	if (res.status === 'held') {
+		console.error(`${ts()} [Startup] FATAL: voice-agent already running (pid ${res.holderPid ?? 'unknown'}) for ${WORKSPACE_DIR}`);
+		console.error(`${ts()} [Startup] Kill it first or remove ${PIDFILE}. Exiting.`);
+		process.exit(EXIT_CODE_DUPLICATE_INSTANCE);
+	}
+	if (res.status !== 'acquired') {
+		console.error(`${ts()} [Startup] FATAL: voice lock acquisition failed (fail closed): ${res.detail}`);
+		console.error(`${ts()} [Startup] Fix the lock helper (scripts/voice-lock.py + its python3), then restart. Exiting.`);
+		process.exit(1);
+	}
+	// Capability-marker binding token: a stale marker can never match a later
+	// acquisition, even one that reuses this pid.
+	voiceLockId = res.lockId;
+	// Guarded release on clean exit — NON-BLOCKING fire-and-forget (amendment
+	// S4: a blocking release can deadlock against the helper that just TERM'd
+	// us). Skipped entirely on the fatal path (amendment R1): a stale
+	// structured lock is left for the supervisor to replace safely under the
+	// guard.
 	process.on('exit', () => {
-		try {
-			const raw = readFileSync(PIDFILE, 'utf-8').trim();
-			if (Number.parseInt(raw, 10) === myPid) unlinkSync(PIDFILE);
-		} catch {}
+		releaseOnExitUnlessFatal(
+			{ pidfile: PIDFILE, guard, pid: myPid, pythonBin: py.bin },
+			isFatalExit,
+		);
 	});
 }
 
@@ -191,7 +295,7 @@ const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 // because the web client's code-heavy workload prefers 3.1 and the (key,
 // 3.1, googleSearch) combo trips a 1011 close on the VOICE key when search
 // is true. Phone inherits the package default (2.5+search).
-import { loadVoiceConfig } from './voice-config.js';
+import { loadVoiceConfig, resolveSessionTuning } from './voice-config.js';
 const _voiceAgentDir = dirname(fileURLToPath(import.meta.url));
 const VOICE_AGENT_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'voice-agent.json');
 if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
@@ -209,6 +313,26 @@ if (!existsSync(VOICE_AGENT_CONFIG_PATH)) {
 const VOICE_AGENT_CONFIG = loadVoiceConfig(VOICE_AGENT_CONFIG_PATH);
 const VOICE_NATIVE_AUDIO_MODEL = VOICE_AGENT_CONFIG.model;
 const VOICE_GOOGLE_SEARCH = VOICE_AGENT_CONFIG.googleSearch;
+// Shadow STT (config "shadowStt": true — default OFF): re-runs the same
+// audio through a batch model and logs disagreement — observation-only.
+const VOICE_SHADOW_STT = VOICE_AGENT_CONFIG.shadowStt === true;
+// "divergenceCorrection": true additionally speaks a self-correction when
+// the shadow pass disagrees. Requires shadowStt.
+const VOICE_DIVERGENCE_CORRECTION = VOICE_AGENT_CONFIG.divergenceCorrection === true;
+// Phase 0.5 seams (design §2.1/§2.2): OFF unless configured — with nothing
+// set the VoiceSession config carries neither key and the wire behaviour is
+// byte-identical to the previous build (the Phase 0.5 gate). A half-set or
+// inverted threshold pair throws HERE, failing startup loudly.
+const VOICE_SESSION_TUNING = resolveSessionTuning(VOICE_AGENT_CONFIG);
+console.log(
+	`${new Date().toISOString().slice(11, 23)} [voice-agent] session tuning: compression=${
+		VOICE_SESSION_TUNING.compressionConfig === undefined
+			? 'off'
+			: VOICE_SESSION_TUNING.compressionConfig.triggerTokens === undefined
+				? 'server-defaults'
+				: `trigger=${VOICE_SESSION_TUNING.compressionConfig.triggerTokens},target=${VOICE_SESSION_TUNING.compressionConfig.targetTokens}`
+	} mediaResolution=${VOICE_SESSION_TUNING.mediaResolution ?? 'unset'}`,
+);
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
@@ -319,6 +443,8 @@ function applyModeRequest() {
 		const want = req === 'meeting';
 		if (meetingActive === want && presenterActive === wantPresenter) return; // no-op if already in that mode
 		meetingActive = want;
+		voiceWatchdogShadow.noteMeetingMode(want);
+		voiceRecoveryCoordinator?.noteMeetingMode(want);
 		presenterActive = wantPresenter;
 		writeVoiceModeSentinel();
 		syncPresenterSentinel();
@@ -336,6 +462,7 @@ try {
 		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
 		if (parseInt(inMeeting) >= 2) {
 			meetingActive = true;
+			voiceWatchdogShadow.noteMeetingMode(true);
 			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
 		}
 	}
@@ -366,6 +493,8 @@ const switchModeTool: ToolDefinition = {
 	async execute(args) {
 		const { mode } = args as { mode: 'active' | 'meeting' | 'presenter' };
 		meetingActive = mode === 'meeting';
+		voiceWatchdogShadow.noteMeetingMode(meetingActive);
+		voiceRecoveryCoordinator?.noteMeetingMode(meetingActive);
 		presenterActive = mode === 'presenter';
 		syncPresenterSentinel();
 		// Sync the on-disk sentinel so menu-bar consumers (Sutando.app
@@ -498,22 +627,10 @@ const endSession: ToolDefinition = {
 		// Death spiral observed live 2026-04-09 at 22:57 — 3 self-initiated
 		// end_session calls in 36 seconds. sessionManager.reset() only
 		// clears the state machine; conversationContext persists separately.
-		try {
-			const vs = voiceSessionRef as any;
-			const items = vs?.conversationContext?.items;
-			// `items` is a GETTER returning bodhi's underlying _items array
-			// by reference. We can't reassign to it (TypeError: only has a
-			// getter, hit live at 23:01:09 on 2026-04-09) but we CAN mutate
-			// in place via `length = 0`. Verified against bodhi dist
-			// ConversationContext class around line 945 of index.js.
-			if (Array.isArray(items)) {
-				const count = items.length;
-				items.length = 0;
-				console.log(`${ts()} [end_session] Cleared ${count} conversationContext items`);
-			}
-		} catch (e) {
-			console.log(`${ts()} [end_session] Could not clear conversationContext: ${e}`);
-		}
+		// (`items` is a GETTER returning bodhi's underlying _items array by
+		// reference — mutate in place via length = 0, never reassign. The
+		// helper also rebases the turn.end transcript cursor: P7 D7.3.)
+		itemsClear.clear('end_session');
 		// Also force-close client WS after 4s as fallback
 		setTimeout(() => {
 			console.log(`${ts()} [end_session] Force-closing client WS`);
@@ -539,11 +656,35 @@ const endSession: ToolDefinition = {
 
 let voiceSessionRef: VoiceSession | null = null;
 
+// P7 D7.3: the ONE clear path for bodhi's conversationContext — items and the
+// turn.end transcript cursor move together (G-P7-8: a clear that leaves the
+// cursor pointing past the emptied array makes the logger skip everything
+// that accumulates after it). Used by end_session, the goodbye detector, and
+// the sessionEnding turn.end sweep.
+const itemsClear = createConversationClearHelper(
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	() => (voiceSessionRef as any)?.conversationContext?.items,
+	(m) => console.log(`${ts()} ${m}`),
+);
+// P7 D7.3 stale-repeat goodbye guard (Tranche A engine-side). The guard
+// compares against userTurnCount, which resets per logical session — every
+// reset MUST rebase the guard too, or a legitimate goodbye in the next
+// session (count restarted below the old watermark) would be suppressed.
+let goodbyeGuard = initialGoodbyeGuard();
+function resetSessionGateState(): void {
+	userTurnCount = 0;
+	userHasInterrupted = false;
+	sessionEnding = false;
+	goodbyeGuard = initialGoodbyeGuard();
+}
+
 // Unified base-mode resolver: see src/voice-mode-resolver.ts for the
 // rationale + canonical mode descriptors. Local wrapper threads the in-memory
 // `meetingActive` boolean (this module owns that state) into the pure
 // resolver function.
 import { resolveCurrentMode as resolveCurrentModeImpl, type ModeState } from './voice-mode-resolver.js';
+
+import { wireSanitizerToTransport } from './output_sanitizer.js';
 function resolveCurrentMode(): ModeState {
 	return resolveCurrentModeImpl({ meetingActive, presenterActive });
 }
@@ -557,7 +698,7 @@ const _configCtx: VoiceConfigContext = {
 	resolveCurrentMode,
 	isMeetingActive: () => meetingActive,
 	googleSearch: VOICE_GOOGLE_SEARCH,
-	resetSessionGates: () => { userTurnCount = 0; userHasInterrupted = false; sessionEnding = false; },
+	resetSessionGates: () => { resetSessionGateState(); },
 	resetNoteViewingDebounce,
 	getRecentConversation,
 	getSecondsSinceLastTurn,
@@ -640,13 +781,21 @@ const mainAgent: MainAgent = {
 			if (lastText.length === 0 || lastText.length >= 80) return;
 			const FAREWELL_START = /^(goodbye|bye\b|farewell|good\s*bye|see you)/i;
 			if (!FAREWELL_START.test(lastText)) return;
+			// P7 D7.3 stale-repeat guard: a reconnect replay can make the model
+			// repeat the SAME short farewell with no new real user turn — that
+			// repeat must not re-fire session_end.
+			const verdict = shouldFireGoodbye(goodbyeGuard, lastText, userTurnCount);
+			if (!verdict.fire) {
+				console.log(`${ts()} [Agent] Stale-repeat goodbye suppressed (same farewell, no new user turn)`);
+				return;
+			}
+			goodbyeGuard = verdict.next;
 			console.log(`${ts()} [Agent] Strict goodbye detected — closing client in 3s`);
 			logSessionBoundary('voice_goodbye');
 			(ctx as any).sendJsonToClient?.({ type: 'session_end', reason: 'user_goodbye' });
 			setTimeout(() => {
 				try {
-					const vsItems = (voiceSessionRef as any)?.conversationContext?.items;
-					if (Array.isArray(vsItems)) vsItems.length = 0;
+					itemsClear.clear('voice_goodbye');
 					const ct = (voiceSessionRef as any)?.clientTransport;
 					ct?.client?.close(4000, 'goodbye');
 				} catch {}
@@ -668,7 +817,10 @@ const mainAgent: MainAgent = {
 // ($CLAUDE_CONFIG_DIR/projects/-{slug}/memory). Failure-silent: a missing memory
 // dir should never block voice startup.
 function bootstrapMemoryDir(): void {
-	const slug = '-' + WORKSPACE_DIR.replace(/\/$/, '').split('/').filter(Boolean).join('-');
+	// Claude Code keys its project dir on the REPO it was launched in, not on the
+	// workspace. Passing WORKSPACE_DIR derives a slug no project dir ever has, so
+	// this silently created an empty memory dir beside the real one.
+	const slug = claudeProjectSlug(dirname(_voiceAgentDir).replace(/\/$/, ''));
 	const memDir = process.env.SUTANDO_MEMORY_DIR || claudeHomePath('projects', slug, 'memory');
 	try {
 		mkdirSync(memDir, { recursive: true });
@@ -689,6 +841,14 @@ async function main() {
 	// Runs BEFORE any side effects (port binds, watchers, session construction)
 	// so a duplicate exits without stranding `:7847` with a dead session.
 	acquirePidLock();
+
+	// Test-only fault injection (SUTANDO_TEST_MODE only): throw AFTER the lock
+	// is acquired so the crash-only contract of `main().catch` — bounded crash
+	// record, static-string logging, R1 release suppression (the stale lock
+	// stays for the supervisor) — is provable end-to-end.
+	if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_FAIL_MAIN) {
+		throw new Error(process.env.SUTANDO_TEST_FAIL_MAIN);
+	}
 
 	// --- Voice agent observability ---
 	// Same format as phone agent's call-metrics.jsonl so diagnose.py can
@@ -748,6 +908,152 @@ async function main() {
 	}
 
 
+	// Bumped 5min into the future on every non-retryable transport close
+	// (set inside the classifier IIFE below). Read by the 30s health
+	// monitor — when the deadline is in the future, the monitor skips its
+	// reconnect-trigger so a permanent upstream failure (credits depleted,
+	// key invalid, quota exceeded) doesn't produce a tight 60s retry loop
+	// that spams logs + Gemini API requests until the user fixes things.
+	// Auto-recovery resumes ~5min after the last fatal close. Reset to 0
+	// when the session reaches ACTIVE so a transient close after recovery
+	// doesn't inherit a stale backoff window. (Declared BEFORE the
+	// VoiceSession construction so the agent.state provider below can read
+	// it — Step 12's `backoff` upstream mapping.)
+	let voiceFatalBackoffUntil = 0;
+
+	// F5: event-driven redial with exponential backoff (voice-redial-scheduler.ts).
+	// The 30s tick below remains the safety net; these fire on bodhi's
+	// connection-lifecycle events instead of waiting up to 60s of dead air.
+	// Declared before the VoiceSession constructor because the constructor's
+	// onConnectionLifecycle option feeds them; session access is late-bound
+	// via sessionRef (assigned right after construction, before any event).
+	let redialState = initialRedialState();
+	let redialTimer: ReturnType<typeof setTimeout> | null = null;
+	// Shared with the 30s tick's throttle + the CONNECTING watchdog below.
+	let lastReconnectAt = 0;
+	const fireEventRedial = (): void => {
+		redialTimer = null;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const s = sessionRef as any;
+		if (!s) return;
+		const now = Date.now();
+		const state = String(s.sessionManager?.state ?? 'unknown');
+		const clientConnected = Boolean(s.clientConnected);
+		if (!shouldEventDial({ state, clientConnected, now, nextDialAt: redialState.nextDialAt, fatalBackoffUntil: voiceFatalBackoffUntil })) {
+			// Blocked by the fatal gate alone → re-arm for when it lifts.
+			// Any other veto drops the dial: the next lifecycle event or the
+			// 30s tick takes over.
+			if (redialState.nextDialAt > 0 && now <= voiceFatalBackoffUntil && state === 'CLOSED' && clientConnected) {
+				armRedialTimer(voiceFatalBackoffUntil - now + 100);
+			}
+			return;
+		}
+		// While the armed coordinator owns the episode, F5 stands down: its
+		// dial would be an uncounted attempt, and the fake attach below must
+		// not mint a coordinator client epoch. Lifecycle events resume F5
+		// naturally once the episode resolves.
+		if (voiceRecoveryCoordinator?.ownsRecovery ?? false) return;
+		redialState = noteDialed(redialState);
+		lastReconnectAt = now;
+		console.log(`${ts()} [Redial] event-driven reconnect (failures=${redialState.failures})`);
+		try {
+			legacyReconnectInFlight = true;
+			s.handleClientConnected();
+		} catch (err) {
+			console.error(`${ts()} [Redial] reconnect trigger failed:`, (err as Error)?.message ?? err);
+		} finally {
+			legacyReconnectInFlight = false;
+		}
+	};
+	const armRedialTimer = (delayMs: number): void => {
+		if (redialTimer) clearTimeout(redialTimer);
+		redialTimer = setTimeout(fireEventRedial, delayMs);
+	};
+
+	// Declared outside the classifier IIFE below so the recovery hook can read it
+	// too; a banner already shown is what makes a recovery notice owed.
+	const voiceNotifiedCategories = new Set<string>();
+
+	// Announce recovery and re-arm the alert. Clearing the set is what lets a later
+	// failure of the same category notify at all; the throttle is once-per-process.
+	const notifyVoiceRecovered = (): void => {
+		if (voiceNotifiedCategories.size === 0) return;
+		const had = [...voiceNotifiedCategories].join(', ');
+		voiceNotifiedCategories.clear();
+		console.log(`${ts()} [VoiceRecovered] ACTIVE after ${had} — notifying owner + re-arming alerts`);
+		try {
+			execFileSync('osascript', ['-e',
+				`display notification "${formatVoiceRecoveryNotification(new Date())}" with title "Sutando — voice online"`,
+			], { stdio: 'ignore' });
+		} catch {}
+	};
+
+	// =========================================================================
+	// `agent.state` v1 provider (design 1a′; impl plan WS1 Step 12,
+	// amendments R8/A9/A10/S3). All getters are late-bound: `sessionRef` is
+	// assigned right after the constructor, and no client (or probe) can
+	// reach the WS server before session.start() runs below.
+	// =========================================================================
+	let agentInitialized = false;
+	const agentStateProvider = createAgentStateProvider({
+		initialized: () => agentInitialized,
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		sessionState: () => String((sessionRef as any)?.sessionManager?.state ?? 'CREATED'),
+		// Real clients only — probe sockets never attach (Step 11's bodhi
+		// interception keeps them off `clientConnected`).
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		clientAttached: () => Boolean((sessionRef as any)?.clientConnected),
+		backoffUntil: () => voiceFatalBackoffUntil,
+		// R8: the persisted last terminal classification lives in the
+		// classifier module — one classifier, one store.
+		lastTerminalFailure: () => lastTerminalClassification(),
+		// A10: the EXISTING resolver result the agent loaded its key from —
+		// `voiceApiKey()`'s string signature is untouched; label mapping
+		// (env→byok) happens inside the provider. `credentialGeneration` is
+		// only ever REPORTED (Rust mints it; S3 plumbs it via the managed
+		// file / SUTANDO_VOICE_CREDENTIAL_GENERATION).
+		credential: () => voiceCredential,
+		// R17: echo launchdContract:1 only when the launchd contract env
+		// marker is present.
+		launchdContract: () => process.env.SUTANDO_VOICE_LAUNCHD_CONTRACT === '1',
+	});
+	const buildAgentState = (): AgentStateV1 => agentStateProvider.build();
+
+	// Feature-detect Step-11 probe support in the pinned bodhi. The
+	// `probeState` constructor option ships with the bodhi PR + pin bump
+	// (impl plan PR group E); until that pin lands the option would be
+	// silently ignored, so the detect keeps the wiring intent explicit and
+	// lets the pin bump activate it without touching this file. Detection:
+	// the bundled VoiceSession source must mention the option.
+	// Test seam (SUTANDO_TEST_MODE only): forces the detect false so the suite
+	// can prove the marker gate's dormant branch against a spawned agent.
+	const bodhiSupportsProbeState = (() => {
+		if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_FORCE_NO_PROBE_STATE === '1') {
+			return false;
+		}
+		try { return String(VoiceSession).includes('probeState'); } catch { return false; }
+	})();
+
+	// P7 D7.1: engine-side audio-progress ledger (Tranche A interim, coverage
+	// session-only) + worker-thread persistence. Created before the session so
+	// the hooks below can reference it; the wraps install after construction.
+	const healthPersistence = createHealthPersistence();
+	const audioHealth = createAudioHealthLedger({
+		sessionId: SESSION_ID,
+		persist: (row) => healthPersistence.tryEnqueue(row),
+		log: (m) => console.log(`${ts()} ${m}`),
+		// Samples bodhi's getDiagnostics on ledger ticks. `session` is assigned
+		// below; the try/catch — not the typeof — is what covers a tick racing
+		// construction, since typeof on a const in its TDZ still throws.
+		getSessionDiagnostics: () => {
+			try {
+				return typeof session !== 'undefined' ? (session.getDiagnostics?.() ?? null) : null;
+			} catch {
+				return null;
+			}
+		},
+	});
+
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,
 		userId: 'user',
@@ -760,9 +1066,84 @@ async function main() {
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
 		inputAudioTranscription: true,
+		// ACTIVE-silence recovery wire — a null coordinator (shadow/off mode)
+		// makes every forward a no-op.
+		onClientCommand: (message) => voiceRecoveryCoordinator?.handleClientCommand(message),
+		onClientConnected: () => {
+			if (legacyReconnectInFlight) return; // not a real attach edge
+			voiceRecoveryCoordinator?.handleClientConnected();
+		},
+		onClientDisconnected: () => voiceRecoveryCoordinator?.handleClientDisconnected(),
+		// Whenever the coordinator owns the episode (restarting, waiting-retry,
+		// terminal, or a recovered origin), bodhi's attach auto-actions —
+		// greeting, context replay and especially the CLOSED auto-reconnect —
+		// would be uncounted bypasses of the attempt budget. The synthetic hold
+		// already gates the injection paths post-recovery; this gates the dial.
+		suppressClientAutoActions: () => voiceRecoveryCoordinator?.ownsRecovery ?? false,
+		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
+		// context occupancy and connection lineage (design §1.1/§1.4).
+		// The per-modality breakdown rides the same message (design §1.4) but is
+		// provider-specific, so bodhi types only the shared fields — cast to read.
+		onUsageMetadata: (u) =>
+			audioHealth.noteUsageMetadata(
+				u.promptTokenCount,
+				(u as { promptTokensDetails?: Array<{ modality?: string; tokenCount?: number }> })
+					.promptTokensDetails,
+			),
+		// One lifecycle stream, THREE consumers: the ledger derives lineage and
+		// context facts; F5's redial scheduler reacts to terminal losses; the
+		// armed coordinator correlates activations and closes. While the
+		// coordinator owns the episode, F5 keeps tracking state but must not
+		// arm a dial — that would be an uncounted attempt outside the budget.
+		onConnectionLifecycle: (ev) => {
+			audioHealth.noteLifecycleEvent(ev);
+			voiceRecoveryCoordinator?.handleLifecycleEvent(ev);
+			const r = noteLifecycle(redialState, ev, { now: Date.now(), fatalBackoffUntil: voiceFatalBackoffUntil });
+			redialState = r.state;
+			if (r.scheduleDelayMs !== null && !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
+				console.log(`${ts()} [Redial] ${ev.kind}${'code' in ev && ev.code !== undefined ? ` code=${ev.code}` : ''} — dial in ${r.scheduleDelayMs}ms (failures=${redialState.failures})`);
+				armRedialTimer(r.scheduleDelayMs);
+			}
+		},
+		// Phase 0.5 seams — spread for REAL key absence (design §2.1: an absent
+		// key lets the server default apply; `undefined` is not absent).
+		...(VOICE_SESSION_TUNING.compressionConfig !== undefined
+			? { compressionConfig: VOICE_SESSION_TUNING.compressionConfig }
+			: {}),
+		...(VOICE_SESSION_TUNING.mediaResolution !== undefined
+			? { mediaResolution: VOICE_SESSION_TUNING.mediaResolution }
+			: {}),
+		...(VOICE_SHADOW_STT
+			? {
+					shadowSttProvider: new GeminiBatchSTTProvider({
+						apiKey: GEMINI_VOICE_API_KEY,
+						model: 'gemini-2.5-flash',
+					}),
+					divergenceCorrection: VOICE_DIVERGENCE_CORRECTION,
+					onTranscriptionDivergence: (live: string, shadow: string, turnId?: number) => {
+						console.log(`${ts()} [ShadowSTT] model heard ≠ said (turn ${turnId ?? '?'}): live="${live}" shadow="${shadow}"`);
+					},
+				}
+			: {}),
+		// Step 11/12: when the pinned bodhi supports `?probe=1` probe
+		// interception, hand it the agent.state builder — probes get one
+		// frame + close 1000 without ever touching `this.client`. The Z3
+		// isolated idle-restore arms here too: a probe is the only
+		// probe-shaped hook this repo controls until bodhi exposes a
+		// dedicated probe/verifier-close callback (seam documented on
+		// `createIsolatedIdleRestore().arm`).
+		...(bodhiSupportsProbeState
+			? {
+				probeState: (): AgentStateV1 => {
+					const frame = buildAgentState();
+					probeIdleRestore.arm();
+					return frame;
+				},
+			}
+			: {}),
 		hooks: {
 			onSessionStart: (e) => {
-				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
+				resetSessionGateState();
 				recorder.reset();
 				recorder.events.push({ event: 'session_started', timestamp: new Date().toISOString() });
 				recorder.startTicker(VOICE_NATIVE_AUDIO_MODEL);
@@ -774,7 +1155,17 @@ async function main() {
 				clearActiveArtifact();
 				recorder.flush();
 			},
+			// P7 D7.3: bodhi's turn-latency hook was half-blind AND unconsumed
+			// (G-P7-12) — the ledger keeps the last value for [Health] and the
+			// persisted snapshot.
+			onTurnLatency: (e: { turnId?: string; segments?: { totalE2EMs?: number } }) => {
+				audioHealth.noteTurnLatency(e?.segments?.totalE2EMs);
+				console.log(`${ts()} [Latency] ${e?.turnId ?? '?'} e2e=${e?.segments?.totalE2EMs ?? '?'}ms`);
+			},
 			onToolCall: (e) => {
+				audioHealth.noteModelEvent(); // P7 D7.1: a tool call is model activity
+				voiceWatchdogShadow.noteToolCall(e.toolCallId, e.execution);
+				voiceRecoveryCoordinator?.noteToolCall(e.toolCallId, e.execution);
 				voiceToolIdMap.set(e.toolCallId, e.toolName);
 				// tool_call event push removed per #1052 — canonical record
 				// is the surface-table row written in onToolResult via
@@ -790,13 +1181,19 @@ async function main() {
 				// Auto-switch meeting mode on join/dismiss
 				if (['summon', 'join_zoom', 'join_gmeet'].includes(e.toolName)) {
 					meetingActive = true;
+					voiceWatchdogShadow.noteMeetingMode(true);
+					voiceRecoveryCoordinator?.noteMeetingMode(true);
 					console.log(`${ts()} [Meeting] Auto-activated by ${e.toolName}`);
 				} else if (e.toolName === 'dismiss') {
 					meetingActive = false;
+					voiceWatchdogShadow.noteMeetingMode(false);
+					voiceRecoveryCoordinator?.noteMeetingMode(false);
 					console.log(`${ts()} [Meeting] Ended by dismiss`);
 				}
 			},
 			onToolResult: (e) => {
+				voiceWatchdogShadow.noteToolSettled(e.toolCallId);
+				voiceRecoveryCoordinator?.noteToolSettled(e.toolCallId);
 				const toolName = voiceToolIdMap.get(e.toolCallId) || 'unknown';
 				recorder.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				// tool_result event push removed per #1052 — recordToolCall
@@ -817,6 +1214,118 @@ async function main() {
 	});
 
 	sessionRef = session;
+
+	// Armed only with the full bodhi recovery surface; anything less falls
+	// back to shadow with a loud line (the design's capability-validation rule).
+	if (ACTIVE_SILENCE_MODE === 'armed' && ACTIVE_SILENCE_TICKS > 0) {
+		if (recoverySurfaceSupported(session)) {
+			voiceRecoveryLedger = new WatchdogLedger({
+				path: join(WORKSPACE_DIR, 'logs', 'voice-recovery.jsonl'),
+				meta: { detectorVersion: DETECTOR_VERSION, mode: 'armed', pid: process.pid },
+				onError: (err) => console.error(`${ts()} [SilenceRecovery] ledger write failed: ${err.message}`),
+			});
+			voiceRecoveryCoordinator = new VoiceSilenceRecoveryCoordinator({
+				voiceSessionId: SESSION_ID,
+				session: session as unknown as RecoverySessionSurface,
+				requiredTicks: ACTIVE_SILENCE_TICKS,
+				// Reducer clock domain is MONOTONIC; only wire frames and the
+				// ledger use wall time (wallNowFn default).
+				nowFn: () => performance.now(),
+				log: (m) => console.log(`${ts()} [SilenceRecovery] ${m}`),
+				record: (row) => voiceRecoveryLedger?.append(row),
+			});
+			// Seed startup-detected meeting state — the coordinator was not
+			// alive when the boot-time Zoom probe ran.
+			voiceRecoveryCoordinator.noteMeetingMode(meetingActive);
+			console.log(`${ts()} [SilenceRecovery] ARMED (ticks=${ACTIVE_SILENCE_TICKS})`);
+		} else {
+			console.warn(`${ts()} [SilenceRecovery] armed requested but the bodhi surface lacks the recovery capabilities — staying in shadow`);
+		}
+	} else if (ACTIVE_SILENCE_MODE === 'armed') {
+		console.warn(`${ts()} [SilenceRecovery] armed requested but VOICE_ACTIVE_SILENCE_TICKS=0 disables the watchdog — staying in shadow`);
+	}
+
+	// P7 D7.1: install the session-layer ledger wraps (audio ingress count +
+	// ingress-RMS speech tracker, audio_health heartbeat intercept, egress
+	// count). Coverage is honestly session-only until the bodhi pin.
+	audioHealth.wrapSession(session);
+	// P7 D7.4: vision defers frames while the canonical speech evidence is
+	// active (pause-during-speech rides the same tracker as the matrix).
+	setVisionSpeechEvidence(() => audioHealth.getSpeechEvidence());
+
+	// =========================================================================
+	// `agent.state` emission + lifecycle snapshot (Step 12 + amendment A9).
+	// One emitter, three triggers: an immediate frame on every accepted real
+	// connection, a repeat frame on every upstream transition, and an atomic
+	// `state/voice-lifecycle.json` publish on every relevant transition
+	// (client attach/detach, initialized flip, upstream change). This module
+	// is the ONLY writer of the lifecycle file (A9) — WS2's control consumer
+	// reads it cross-process.
+	// =========================================================================
+	let lastEmittedUpstream: string | null = null;
+	let lastLifecycleKey = '';
+	// The marker must never advertise a capability the resolved bodhi lacks, and
+	// never publish unbound (no token → no marker): a marker on disk is always real and bound.
+	if (bodhiSupportsProbeState && typeof voiceLockId === 'string' && voiceLockId) {
+		publishCapabilitiesMarker(WORKSPACE_DIR, {
+			lockId: voiceLockId,
+			onError: (err) => console.error(`${ts()} [AgentState] capabilities marker write failed: ${(err as Error)?.message ?? err}`),
+		});
+	} else if (!bodhiSupportsProbeState) {
+		console.error(`${ts()} [AgentState] bodhi lacks probeState — capability marker NOT published (probes stay dormant)`);
+	} else {
+		console.error(`${ts()} [AgentState] no acquisition token from the lock helper — capability marker NOT published (probes stay dormant)`);
+	}
+	const sendAgentStateFrame = (frame: AgentStateV1): void => {
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(session as any).clientTransport?.sendJsonToClient?.(frame);
+		} catch (err) {
+			console.error(`${ts()} [AgentState] frame send failed: ${(err as Error)?.message ?? err}`);
+		}
+	};
+	const emitAgentState = (opts: { immediate?: boolean } = {}): void => {
+		const frame = buildAgentState();
+		// A transition includes reason/category changes within 'failed'
+		// (e.g. auth-invalid → quota-exceeded after a key rotation) — those
+		// are meaningful upstream transitions even when the state name
+		// doesn't change.
+		const upstreamKey = `${frame.upstream}|${frame.reason ?? ''}|${frame.category ?? ''}`;
+		const upstreamChanged = upstreamKey !== lastEmittedUpstream;
+		lastEmittedUpstream = upstreamKey;
+		if (opts.immediate || upstreamChanged) sendAgentStateFrame(frame);
+		// A9: publish the lifecycle snapshot when any relevant field flipped
+		// (attach/detach, initialized, upstream, and — P7 D7.1 — the additive
+		// inputHealth verdict P4's evidence ladder consumes) — atomic
+		// temp+rename inside publishLifecycleSnapshot.
+		const ledgerHealth = audioHealth.getInputHealth(session.clientConnected);
+		// The lifecycle schema's four values: no-client folds into 'unknown'
+		// (a detached client is absence of evidence for THIS field).
+		const inputHealth = ledgerHealth === 'no-client' ? 'unknown' : ledgerHealth;
+		const lifecycleKey = `${frame.clientAttached}|${frame.initialized}|${upstreamKey}|${inputHealth}`;
+		if (lifecycleKey !== lastLifecycleKey) {
+			lastLifecycleKey = lifecycleKey;
+			publishLifecycleSnapshot(WORKSPACE_DIR, frame, {
+				inputHealth,
+				onError: (err) => console.error(`${ts()} [AgentState] lifecycle snapshot write failed: ${(err as Error)?.message ?? err}`),
+			});
+		}
+	};
+	// Upstream transitions: bodhi's sessionManager publishes
+	// `session.stateChange` on every transitionTo() — the same seam the
+	// health monitor's state reads observe. ACTIVE proves the credential
+	// works again, so it clears the persisted terminal classification (R8)
+	// before the frame is built.
+	session.eventBus.subscribe('session.stateChange', (e) => {
+		if ((e as { toState?: string })?.toState === 'ACTIVE') {
+			clearTerminalClassification();
+			// One recovery site, event-driven: the same seam the classification clear
+			// uses, so a polled second copy cannot drift from it.
+			notifyVoiceRecovered();
+		}
+		emitAgentState();
+	});
+
 	// Wire vision streaming — the start_vision tool needs the live session
 	// to call session.transport.sendFile for each frame. Also boot the local
 	// HTTP control endpoint so the web-client Watch button can drive the
@@ -827,17 +1336,6 @@ async function main() {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	setSessionToolUpdater((tools) => (session as any).transport?.updateTools?.(tools), mainAgentTools);
 	startVisionControlServer();
-
-	// Bumped 5min into the future on every non-retryable transport close
-	// (set inside the classifier IIFE below). Read by the 30s health
-	// monitor — when the deadline is in the future, the monitor skips its
-	// reconnect-trigger so a permanent upstream failure (credits depleted,
-	// key invalid, quota exceeded) doesn't produce a tight 60s retry loop
-	// that spams logs + Gemini API requests until the user fixes things.
-	// Auto-recovery resumes ~5min after the last fatal close. Reset to 0
-	// when the session reaches ACTIVE so a transient close after recovery
-	// doesn't inherit a stale backoff window.
-	let voiceFatalBackoffUntil = 0;
 
 	// Wire voice-failure classifier: when the Gemini Live transport closes
 	// with a non-retryable reason (credits depleted, quota exceeded, key
@@ -853,15 +1351,27 @@ async function main() {
 		const origOnClose = typeof transport.onClose === 'function'
 			? transport.onClose.bind(transport)
 			: null;
-		const notifiedCategories = new Set<string>();
+		// Shared with the recovery hook, which needs to know a banner was shown.
+		const notifiedCategories = voiceNotifiedCategories;
 		const handleClose = (c: ClassifiedClose): void => {
 			if (c.retryable) return;
+			// R8: persist the terminal classification (one classifier, one
+			// store — voice-error-classifier.ts) so buildAgentState() reports
+			// `upstream:'failed'` with the stable reason/category between
+			// closes, then emit the upstream transition to any attached
+			// client + the lifecycle snapshot (Step 12).
+			recordTerminalClassification(c);
 			// Push the health-monitor reconnect window out by 5min on every
 			// non-retryable close — including repeats of an already-notified
 			// category — so the 60s retry loop doesn't keep firing while the
 			// upstream issue persists. Without this, a 1011 credit-depleted
 			// loop produces ~6 log lines / 60s indefinitely.
 			voiceFatalBackoffUntil = Date.now() + 5 * 60 * 1000;
+			// The reducer clock domain is MONOTONIC — the wall-time deadline
+			// above (kept for agent-state/UI) must not cross into it, or the
+			// backoff never expires in reducer time.
+			voiceRecoveryCoordinator?.handleFatalBackoff(performance.now() + 5 * 60 * 1000);
+			emitAgentState();
 			if (notifiedCategories.has(c.category)) return;
 			notifiedCategories.add(c.category);
 			console.error(`${ts()} [VoiceFailure] ${c.category}: ${c.userMessage} (raw="${c.rawReason}")`);
@@ -883,7 +1393,7 @@ async function main() {
 			// double-quote stripping below protects the AppleScript string
 			// literal itself (not the shell).
 			try {
-				const safe = c.userMessage.replace(/["\\]/g, '');
+				const safe = formatVoiceOfflineNotification(c.userMessage, new Date());
 				execFileSync('osascript', ['-e', `display notification "${safe}" with title "Sutando — voice offline"`], { stdio: 'ignore' });
 			} catch {}
 		};
@@ -901,6 +1411,47 @@ async function main() {
 			}
 		};
 		console.log(`${ts()} [VoiceFailure] classifier wired into transport.onClose`);
+	})();
+
+	// Test-only fault injection (SUTANDO_TEST_MODE only): synthesize an
+	// upstream transport close through the REAL wrapped `transport.onClose`
+	// seam above, so integration tests can drive classifier →
+	// recordTerminalClassification → agent.state 'failed' emission
+	// deterministically offline (no dependency on live Gemini responses).
+	// File-triggered so the test controls WHEN the close fires relative to
+	// its own client connection (boot timing on CI is unbounded).
+	// Format: SUTANDO_TEST_UPSTREAM_CLOSE="<triggerFile>|<code>|<reason>".
+	if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_UPSTREAM_CLOSE) {
+		const [trigger, codeRaw, ...reasonParts] = process.env.SUTANDO_TEST_UPSTREAM_CLOSE.split('|');
+		const poll = setInterval(() => {
+			if (!existsSync(trigger)) return;
+			clearInterval(poll);
+			try {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(session as any).transport?.onClose?.(Number(codeRaw) || 1011, reasonParts.join('|'));
+			} catch { /* test-only */ }
+		}, 250);
+	}
+	// Native audio streams transcript and audio concurrently, so suppression reaches only
+	// the REMAINING chunks of a turn — anything already sent cannot be recalled.
+	(() => {
+		// Wiring lives in output_sanitizer.ts so it has a test seam: this adapter
+		// path had none, which is the standing review blocker on this PR.
+		wireSanitizerToTransport({
+			transport: (session as any).transport,
+			subscribe: (ev, fn) => session.eventBus.subscribe(ev as any, fn),
+			beforeTranscriptFlush: (reset) => {
+				// bodhi flushes the transcript 2-4 lines BEFORE publishing turn.end
+				// (dist/index.js:3019/3106/3177), so a subscriber runs too late.
+				const tm = (session as any).transcriptManager;
+				if (!tm || typeof tm.flush !== 'function') return;
+				const origFlush = tm.flush.bind(tm);
+				tm.flush = () => { try { reset(); } catch {} origFlush(); };
+			},
+			onBlocked: (buffered) =>
+				console.error(`${ts()} [OutputSanitizer] BLOCKED fabricated directive spoken aloud: ${buffered.slice(0, 120)}`),
+			log: (m) => console.log(`${ts()} ${m}`),
+		});
 	})();
 
 	// Wire narration-tee: capture Gemini's outbound audio for screen recordings
@@ -929,7 +1480,8 @@ async function main() {
 	// The Cartesia stuck-session fallback is adapter-provided via opts.
 	wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech });
 
-	let lastLoggedIndex = 0;
+	// P7 D7.3: the transcript cursor lives in the clear helper so every clear
+	// path rebases it with the items array (G-P7-8).
 	const liveTranscriptPath = '/tmp/sutando-live-transcript-voice.txt';
 	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
 	session.eventBus.subscribe('turn.end', () => {
@@ -939,12 +1491,10 @@ async function main() {
 		// to inject on the next reconnect. Items re-accumulate during
 		// the post-goodbye "Farewell. Talk to you next time." turns.
 		if (sessionEnding && Array.isArray(items) && items.length > 0) {
-			console.log(`${ts()} [turn.end] Clearing ${items.length} items (sessionEnding=true)`);
-			items.length = 0;
-			lastLoggedIndex = 0;
+			itemsClear.clear('session-ending-turn-end');
 			return;
 		}
-		for (const item of items.slice(lastLoggedIndex)) {
+		for (const item of items.slice(itemsClear.cursor.index)) {
 			if (item.role === 'user' || item.role === 'assistant') {
 				console.log(`${ts()}   [${item.role}] ${item.content}`);
 				logConversation(item.role, item.content, SESSION_ID);
@@ -966,7 +1516,7 @@ async function main() {
 				}
 			}
 		}
-		lastLoggedIndex = items.length;
+		itemsClear.cursor.index = items.length;
 	});
 
 	// Track user interruption events as a secondary signal for the
@@ -979,6 +1529,11 @@ async function main() {
 		console.log(`${ts()} [VoiceSession] user interrupt detected — userHasInterrupted=true`);
 	});
 
+	// Give each skill's setup() the live session so it registers handlers without
+	// importing core. Guarded: a buggy setup must not break session bootstrap.
+	runSkillSetups(personalSkillSetups, { session, injectText },
+		(msg, detail) => console.error(`${ts()} ${msg}`, detail));
+
 	// Audio-duck relay: flag the slide server (localhost:7877) when Sutando is
 	// producing audio, so the deck ducks the active slide video under the
 	// narration. turn.start → speaking on; turn.end / turn.interrupted → off.
@@ -988,12 +1543,23 @@ async function main() {
 		try { fetch(`http://localhost:7877/speaking/${mode}`, { method: 'POST' }).catch(() => {}); } catch {}
 	};
 	session.eventBus.subscribe('turn.start', () => _duck('on'));
+	// P7 D7.1: the model hop is EVENTS — a text/tool-first turn must count
+	// as model activity even before any audio frame lands.
+	session.eventBus.subscribe('turn.start', () => audioHealth.noteModelEvent());
+	// Armed coordinator: model progress advances the reducer's silence anchor,
+	// generation-fenced by the event's own transport generation (bodhi #35).
+	session.eventBus.subscribe('turn.start', (e: { transportGeneration?: number }) =>
+		voiceRecoveryCoordinator?.handleModelEvent(e?.transportGeneration),
+	);
 	session.eventBus.subscribe('turn.end', () => _duck('off'));
 	session.eventBus.subscribe('turn.interrupted', () => _duck('off'));
 
 	const shutdown = async () => {
 		console.log(`\n${ts()} Shutting down...`);
 		recorder.flush();
+		await voiceWatchdogShadow.flush().catch(() => {});
+		voiceRecoveryCoordinator?.stop();
+		await voiceRecoveryLedger?.flush().catch(() => {});
 		setVisionSession(null);
 		setSessionToolUpdater(null, []);
 		stopVisionControlServer();
@@ -1002,25 +1568,56 @@ async function main() {
 	};
 	process.on('SIGINT', shutdown);
 	process.on('SIGTERM', shutdown);
-	process.on('uncaughtException', (err) => {
-		// EADDRINUSE on the WS port means another voice-agent (typically the
-		// launchd-managed one) already owns it. The existing process is the
-		// one with the live Gemini transport — the duplicate that tripped
-		// this handler has already bound the vision control port and would
-		// happily answer /vision/start with a dead sessionRef, breaking
-		// push-mode screen sharing for the active session. Release the
-		// control port and exit so the launchd voice-agent (or the next
-		// restart) can claim 7847 with a live session.
-		if ((err as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
+	// Crash-only fatal handlers (design 1d; impl plan WS1 Step 1). The
+	// 2026-08-04 incident (pid 14059, ~5 h outage) spun INSIDE the old
+	// `console.error(…, err)` reporting path (`TriggerUncaughtException` →
+	// `InspectorConsoleCall` / `ErrorStackGetter`) while staying alive and
+	// holding :9900. New invariant: a fatal TERMINATES, promptly, via a
+	// bounded primitive-only crash record — no logger, no recorder, no
+	// SQLite, no `err.stack`, no object inspection. `recorder.flush()` stays
+	// ONLY in the graceful shutdown path above; richer crash metadata is the
+	// supervisor's job when it reaps the exit.
+	const crashRecordPath = CRASH_RECORD_PATH;
+	const onFatal = (err: unknown) => {
+		// One-shot guard: a second fatal while handling the first goes
+		// straight to process.exit(1). markFatalExit() also suppresses the
+		// exit-time Python lock release (amendment R1) — the helper can block
+		// on the guard; the stale lock is replaced safely by the supervisor.
+		if (markFatalExit()) {
+			process.exit(1);
+			return;
+		}
+		if (classifyFatalExitCode(err) === EXIT_CODE_DUPLICATE_INSTANCE) {
+			// EADDRINUSE on the WS port means another voice-agent (typically
+			// the launchd-managed one) already owns it — duplicate-instance
+			// semantics, exit 7 (impl plan WS1 Step 2 / amendment R2), same as
+			// the duplicate-lock exit. Release the vision control port so the
+			// live agent (or the next restart) can claim 7847.
 			console.error(`${ts()} [FATAL] EADDRINUSE on :${PORT} — another voice-agent is listening; exiting so the live one keeps the vision control port.`);
 			try { stopVisionControlServer(); } catch {}
-			process.exit(1);
+			process.exit(EXIT_CODE_DUPLICATE_INSTANCE);
+			return;
 		}
-		console.error(`${ts()} [FATAL] uncaught exception (staying alive):`, err);
-	});
-	process.on('unhandledRejection', (err) => {
-		console.error(`${ts()} [FATAL] unhandled rejection (staying alive):`, err);
-	});
+		// Static string only — never interpolate or inspect `err` here.
+		console.error(`${ts()} [FATAL] uncaught fatal — crash-only exit (record: ${crashRecordPath})`);
+		writeCrashRecordAndExit(err, crashRecordPath, { exit: (code) => process.exit(code) });
+	};
+	process.on('uncaughtException', onFatal);
+	process.on('unhandledRejection', onFatal);
+
+	// Test-only fault injection (SUTANDO_TEST_MODE only): raise an uncaught
+	// exception AFTER the fatal handlers are installed so tests can pin the
+	// uncaughtException path directly — e.g. EADDRINUSE → exit 7 through
+	// `onFatal`, not only through `main().catch` (amendment R2).
+	if (process.env.SUTANDO_TEST_MODE === '1' && process.env.SUTANDO_TEST_RAISE_UNCAUGHT) {
+		const raiseCode = process.env.SUTANDO_TEST_RAISE_UNCAUGHT;
+		setTimeout(() => {
+			throw Object.assign(
+				new Error(`test uncaught ${raiseCode}`),
+				raiseCode === 'EADDRINUSE' ? { code: raiseCode } : {},
+			);
+		}, 250);
+	}
 
 	voiceSessionRef = session;
 
@@ -1040,6 +1637,22 @@ async function main() {
 	const IDLE_TEARDOWN_MS = Number(process.env.SUTANDO_VOICE_IDLE_TEARDOWN_MS) || 60_000;
 	let idleTeardownTimer: ReturnType<typeof setTimeout> | null = null;
 
+	// Shared teardown body — used by the one-shot idle timer below AND by the
+	// Z3 isolated idle-restore (probe/verifier fence). Re-checks real-client
+	// attachment at fire time so a client that connected while the timer was
+	// pending is never torn down under.
+	const teardownIdleUpstream = async (via: string) => {
+		if ((session as any).clientConnected) return;
+		const transport = (session as any).transport;
+		if (!transport?.disconnect) return;
+		console.log(`${ts()} [VoiceSession] Idle (${via}) — closing Gemini transport (no phantoms while CLOSED)`);
+		try {
+			await transport.disconnect();
+		} catch (err) {
+			console.error(`${ts()} [VoiceSession] Idle teardown failed: ${(err as Error)?.message ?? err}`);
+		}
+	};
+
 	const cancelIdleTeardown = () => {
 		if (idleTeardownTimer) {
 			clearTimeout(idleTeardownTimer);
@@ -1050,17 +1663,28 @@ async function main() {
 		cancelIdleTeardown();
 		idleTeardownTimer = setTimeout(async () => {
 			idleTeardownTimer = null;
-			if ((session as any).clientConnected) return;
-			const transport = (session as any).transport;
-			if (!transport?.disconnect) return;
-			console.log(`${ts()} [VoiceSession] Idle ${IDLE_TEARDOWN_MS / 1000}s — closing Gemini transport (no phantoms while CLOSED)`);
-			try {
-				await transport.disconnect();
-			} catch (err) {
-				console.error(`${ts()} [VoiceSession] Idle teardown failed: ${(err as Error)?.message ?? err}`);
-			}
+			await teardownIdleUpstream(`${IDLE_TEARDOWN_MS / 1000}s idle`);
 		}, IDLE_TEARDOWN_MS);
 	};
+
+	// Amendment Z3 — verifier/probe idle restoration. The initial idle timer
+	// above is one-shot and rearmed only by the REAL-client disconnect
+	// wrapper; a probe/verifier that closes after that timer already fired
+	// would otherwise leave a woken upstream connected forever (no real
+	// client will ever rearm it). The isolated restore timer arms on
+	// probe-role close with no real client attached and restores the prior
+	// idle state (upstream → CLOSED); a later real connection fences it
+	// (handleClientConnected wrapper below). SEAM: until the Step-11 bodhi
+	// pin exposes a probe/verifier-close hook, the only in-repo arm point is
+	// the `probeState` callback passed to the VoiceSession constructor —
+	// when bodhi's role close hook lands, wire it to `probeIdleRestore.arm()`
+	// directly.
+	const probeIdleRestore = createIsolatedIdleRestore({
+		delayMs: IDLE_TEARDOWN_MS,
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		clientAttached: () => Boolean((session as any).clientConnected),
+		teardown: () => teardownIdleUpstream('probe-idle-restore'),
+	});
 
 	// Flush metrics on client disconnect — bodhi's handleClientDisconnected()
 	// doesn't trigger onSessionEnd, so metrics would never be written. Also
@@ -1069,9 +1693,22 @@ async function main() {
 	if (origDisconnect) {
 		(session as any).handleClientDisconnected = () => {
 			origDisconnect();
+			// No listener left, so frames only burn capture + quota. Reason is
+			// terminal: a browser push driver must tear down, not re-arm.
+			const stopped = stopVisionStreaming('no-client');
+			if (stopped.status === 'stopped') {
+				console.log(`${ts()} [Vision] stopped on client disconnect (${stopped.frames} frame(s))`);
+			}
 			recorder.flush();
 			writeVoiceState(false);
+			// P7 D7.1: final ledger row for the departing epoch — written NOW
+			// (the crash-evidence rule: end-of-session-only flushes lose it).
+			audioHealth.onClientDisconnected();
+			audioHealth.persistTick('final', false);
 			scheduleIdleTeardown();
+			// Step 12/A9: client detach is a lifecycle transition (and may
+			// flip upstream backoff→idle now that no client is attached).
+			emitAgentState();
 		};
 	}
 
@@ -1093,8 +1730,21 @@ async function main() {
 	if (origConnect) {
 		(session as any).handleClientConnected = () => {
 			cancelIdleTeardown();
+			// A dead session's resumption handle must not poison the fresh
+			// connect (1008 "Requested entity was not found" staircase — see
+			// clearStaleResumptionHandle). Only the CLOSED path reconnects.
+			if (session.sessionManager.state === 'CLOSED' && clearStaleResumptionHandle(session)) {
+				console.log(`${ts()} [Resume] cleared stale resumption handle from dead session before fresh connect`);
+			}
+			// P7 D7.1: new client connection = new (pending) ledger epoch; the
+			// epoch value is minted on first heartbeat sight (nonce mapping).
+			audioHealth.onClientConnected();
+			// Z3 fence: a REAL connection invalidates any pending
+			// probe/verifier idle-restore — the restore must never tear the
+			// upstream down under this client.
+			probeIdleRestore.fence();
 			if (recorder.wasFlushed) {
-				userTurnCount = 0; userHasInterrupted = false; sessionEnding = false;
+				resetSessionGateState();
 				recorder.reset();
 				recorder.events.push({ event: 'session_started:client_connect', timestamp: new Date().toISOString() });
 				// bodhi's onSessionStart won't re-fire (#1372 above), so start the
@@ -1104,6 +1754,11 @@ async function main() {
 			}
 			writeVoiceState(true);
 			origConnect();
+			// Step 12: immediate `agent.state` frame on every accepted real
+			// connection (after origConnect so `clientAttached` reads true),
+			// then repeats ride the upstream-transition subscription. Also
+			// publishes the A9 lifecycle attach transition.
+			emitAgentState({ immediate: true });
 		};
 	}
 
@@ -1137,6 +1792,14 @@ async function main() {
 		} catch (err) { console.error(`${ts()} [CallResult] Error:`, err); }
 	}, 2000);
 
+	// L2 initialized (Step 12): tools are loaded, the VoiceSession is
+	// constructed, and the WS server is about to listen (session.start()
+	// binds the WS listener before the LLM transport, per bodhi internals) —
+	// set immediately before the start() try, per the readiness model, and
+	// publish the lifecycle flip (A9).
+	agentInitialized = true;
+	emitAgentState();
+
 	// Start session — don't let a transient Gemini failure kill the process.
 	// WS server starts *before* the LLM transport (per bodhi internals), so the
 	// listener on :PORT is already healthy; only the upstream Gemini connection is broken.
@@ -1147,6 +1810,12 @@ async function main() {
 		const msg = (err as Error)?.message || String(err);
 		console.error(`${ts()} [Startup] session.start() failed: ${msg}`);
 		console.error(`${ts()} [Startup] Staying alive — WS server on :${PORT}, will retry LLM transport on next client connect`);
+		// The regex below is a LOGGING HINT only (amendment R8) — the
+		// protocol classification seam is voice-error-classifier.ts: run the
+		// startup failure message through the same classifier as transport
+		// closes so a terminal cause (bad key, quota) is persisted for
+		// buildAgentState() and reported as upstream:'failed'.
+		recordTerminalClassification(classifyTransportClose(undefined, msg));
 		if (/credit|quota|billing|auth|401|403/i.test(msg)) {
 			console.error(`${ts()} [Startup] Likely cause: Gemini API key invalid or prepayment credits depleted`);
 			console.error(`${ts()} [Startup] Fix: top up at https://ai.studio/projects or rotate GEMINI_API_KEY in .env`);
@@ -1164,6 +1833,11 @@ async function main() {
 		} catch (e) {
 			console.error(`${ts()} [Startup] Could not transition to CLOSED (state=${session.sessionManager.state}): ${(e as Error)?.message ?? e}`);
 		}
+		// Belt-and-braces: the transitionTo above already emits via the
+		// stateChange subscription; when it throws (state already CLOSED)
+		// this still publishes the terminal classification (dedup makes a
+		// double call a no-op).
+		emitAgentState();
 	}
 
 	// Health monitor — runs regardless of whether initial start() succeeded.
@@ -1171,40 +1845,196 @@ async function main() {
 	// CLOSED→CONNECTING inline before kicking off the async connect. So the next
 	// 30s tick sees state=CONNECTING (not CLOSED) and skips the guard. If the
 	// connect fails fast and bodhi flips back to CLOSED, the 60s lastReconnectAt
-	// throttle prevents a tight retry loop.
-	let lastReconnectAt = 0;
+	// throttle prevents a tight retry loop. (lastReconnectAt is declared with
+	// the F5 redial machinery above — the event-driven path shares it.)
+	let connectingSince = 0;
 	let lastLoggedStatus = '';
+	let matrixBaseline: MatrixBaseline | null = null;
+	let lastMatrixVerdict = '';
+	// Phase-1 shadow: the 'session+egress' ruleset runs in parallel and is
+	// telemetry-only — canary 3a later compares live vs shadow on identical
+	// input, which is impossible if the shadow never ran.
+	let shadowBaseline: MatrixBaseline | null = null;
+	let lastShadowVerdict = '';
+	let lastFailedWrites = 0;
 	setInterval(() => {
 		const state = session.sessionManager.state ?? 'unknown';
 		const clientConnected = session.clientConnected;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const serverBufferedAmount = (session as any).clientTransport?.client?.bufferedAmount ?? null;
 		// Log only on state changes or non-ACTIVE states — avoid 2,880 lines/day of
-		// "state=ACTIVE client=true" during healthy operation.
+		// "state=ACTIVE client=true" during healthy operation. P7 D7.1 inverts
+		// the suppression for anomalies: any tick where the ledger latched an
+		// anomaly logs the FULL line even mid-ACTIVE-streak (the suppression
+		// rule was hiding exactly the dead zones we need to see).
 		const status = `state=${state} client=${clientConnected}`;
-		if (state !== 'ACTIVE' || status !== lastLoggedStatus) {
-			console.log(`${ts()} [Health] ${status}`);
+		// PEEK anomalies; the latches clear only AFTER the anomaly row has
+		// been persisted (clearing first would serialize a snapshot with the
+		// evidence already gone).
+		const anomaly = audioHealth.anomalies(clientConnected);
+		const persistFailed = healthPersistence.failedWrites > lastFailedWrites;
+		lastFailedWrites = healthPersistence.failedWrites;
+		// P7 D7.2: evaluate the localization matrix per tick. lastEgressAt is
+		// the Tranche-A model-event proxy (model audio out = the model spoke);
+		// the native model hop lands with the bodhi pin.
+		const snapshot = audioHealth.getSnapshot(clientConnected);
+		const matrix = evaluateMatrix({
+			sessionState: state,
+			clientConnected,
+			snapshot,
+			prev: matrixBaseline,
+			serverBufferedAmount,
+			lastModelEventAt: snapshot.lastModelEventAt,
+			now: Date.now(),
+		});
+		matrixBaseline = matrix.baseline;
+		const shadow = evaluateMatrix({
+			sessionState: state,
+			clientConnected,
+			snapshot,
+			prev: shadowBaseline,
+			serverBufferedAmount,
+			lastModelEventAt: snapshot.lastModelEventAt,
+			effectiveCoverage: 'session+egress',
+			now: Date.now(),
+		});
+		shadowBaseline = shadow.baseline;
+		if (
+			shadow.verdict !== lastShadowVerdict &&
+			(shadow.verdict !== 'healthy-idle' || lastShadowVerdict)
+		) {
+			console.log(
+				`${ts()} [Matrix-shadow] ${shadow.verdict}${shadow.reasons.length ? ' (' + shadow.reasons.join('; ') + ')' : ''}`,
+			);
+		}
+		lastShadowVerdict = shadow.verdict;
+		audioHealth.noteMatrixVerdict(matrix.verdict, matrix.facts, matrix.reasons);
+		if (matrix.verdict !== lastMatrixVerdict && (matrix.verdict !== 'healthy-idle' || lastMatrixVerdict)) {
+			console.log(`${ts()} [Matrix] ${matrix.verdict}${matrix.reasons.length ? ' (' + matrix.reasons.join('; ') + ')' : ''}`);
+		}
+		const verdictChanged = matrix.verdict !== lastMatrixVerdict;
+		lastMatrixVerdict = matrix.verdict;
+		// A verdict TRANSITION is itself evidence worth a row — without this a
+		// transient verdict can vanish before the 1-min baseline write.
+		if (anomaly.anomalous || (verdictChanged && matrix.verdict !== 'healthy-idle')) {
+			audioHealth.persistTick('anomaly', clientConnected);
+		}
+		// Rate windows advance EVERY tick (a suppressed streak must not turn
+		// the next logged line into a long-window average).
+		const seg = audioHealth.healthSegments(clientConnected, serverBufferedAmount);
+		// Whether the vision throttle engaged was previously unknowable from the
+		// log — deferredBudget existed but was never surfaced (investigation F2).
+		const eg = getVisionEgressStats();
+		const visionSeg = isStreaming()
+			? ` vision={sent:${eg.sent},defB:${eg.deferredBudget},defG:${eg.deferredGate},disp:${eg.displaced}}`
+			: '';
+		if (state !== 'ACTIVE' || status !== lastLoggedStatus || anomaly.anomalous || persistFailed) {
+			const why = anomaly.anomalous ? ` anomaly=${anomaly.reasons.join(',')}` : '';
+			const pf = persistFailed ? ` persistFail=${healthPersistence.failedWrites}` : '';
+			console.log(`${ts()} [Health] ${status}${clientConnected ? ' ' + seg : ''}${visionSeg}${why}${pf}`);
 			lastLoggedStatus = status;
 		}
+		audioHealth.clearTickLatches();
+		// P7 D7.1: an inputHealth flip republishes the lifecycle snapshot
+		// (emitAgentState publishes only when its key changed — cheap).
+		emitAgentState();
 		// Clear any stale fatal-backoff once we observe a healthy session —
 		// otherwise a brief outage that triggered a backoff would suppress
 		// recovery from a later transient close even after the upstream
 		// issue was fixed.
 		if (state === 'ACTIVE' && voiceFatalBackoffUntil > 0) {
 			voiceFatalBackoffUntil = 0;
+			voiceRecoveryCoordinator?.handleFatalBackoffCleared();
+		}
+		// A connect that HANGS never returns to CLOSED, so the recovery guard below
+		// — which only fires from CLOSED — can never see it. Observed live: 23min
+		// in CONNECTING with a client attached, mic captured, nothing reaching the
+		// model. Force CLOSED so the next tick recovers; same transition the
+		// startup path already uses, and valid per bodhi's state table.
+		// The hang clock keys on STATE, not client attachment: a panel reload
+		// mid-hang must not restart the countdown (policy + tests live in
+		// voice-connect-watchdog.ts).
+		const tick = nextConnectingTick({
+			connectingSince, state, clientConnected, now: Date.now(),
+			lastReconnectAt, fatalBackoffUntil: voiceFatalBackoffUntil,
+		});
+		connectingSince = tick.connectingSince;
+		if (tick.forceClose) {
+			console.error(`${ts()} [Health] Stuck in CONNECTING for `
+				+ `${Math.round((Date.now() - connectingSince) / 1000)}s — forcing CLOSED to recover`);
+			try {
+				session.sessionManager.transitionTo('CLOSED');
+				connectingSince = 0;
+			} catch (err) {
+				// Clock stays armed: the throttles in shouldForceClosed bound retries.
+				console.error(`${ts()} [Health] Could not force CLOSED (state=${session.sessionManager.state}):`,
+					(err as Error)?.message ?? err);
+			}
 		}
 		// Recover when session is CLOSED and a client is waiting. handleClientConnected
 		// is bodhi's internal entry point for this exact scenario (CLOSED + client
 		// present → transition to CONNECTING, reconnect fire-and-forget).
+		// F5: this is now the SAFETY NET behind the event-driven redial —
+		// tickMayDial defers to a pending scheduled dial so the tick cannot
+		// preempt the backoff.
 		// TODO: drop the (session as any) cast once bodhi exposes a public API.
-		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil) {
+		if (state === 'CLOSED' && clientConnected && Date.now() - lastReconnectAt > 60_000 && Date.now() > voiceFatalBackoffUntil
+			&& tickMayDial({ now: Date.now(), nextDialAt: redialState.nextDialAt })
+			&& !(voiceRecoveryCoordinator?.ownsRecovery ?? false)) {
 			lastReconnectAt = Date.now();
+			redialState = noteDialed(redialState);
 			console.log(`${ts()} [Health] Dead session — triggering reconnect`);
 			try {
+				legacyReconnectInFlight = true;
 				(session as any).handleClientConnected();
 			} catch (err) {
 				console.error(`${ts()} [Health] Reconnect trigger failed:`, (err as Error)?.message ?? err);
+			} finally {
+				legacyReconnectInFlight = false;
 			}
 		}
+		// ACTIVE-silence shadow observation (Phase 0a): diagnostic only — no
+		// effect on the guards above, ever, in this mode.
+		voiceWatchdogShadow.observeTick({
+			at: Date.now(),
+			sessionState: state,
+			clientConnected,
+			meetingMode: meetingActive,
+			snapshot,
+			facts: matrix.facts,
+		});
+		// Armed coordinator (Phase 1): live feed on the MONOTONIC clock — a
+		// wall-clock jump must not strand waiting-retry or bypass cooldowns.
+		// Snapshot speech timestamps are wall-domain; translate by age.
+		if (voiceRecoveryCoordinator) {
+			const mono = performance.now();
+			const wallAboveFloor = snapshot.speech.lastAboveFloorAt;
+			const monoAboveFloor =
+				wallAboveFloor === null ? null : mono - Math.max(0, Date.now() - wallAboveFloor);
+			voiceRecoveryCoordinator.observeTick({
+				at: mono,
+				sessionState: state,
+				facts: matrix.facts,
+				lastAboveFloorAt: monoAboveFloor,
+				pendingToolCount: 0,
+				delivered: {
+					epoch: snapshot.epoch,
+					chunksEnded: snapshot.clientTotals.chunksEnded,
+					egressFrames: snapshot.egressFrames,
+					heartbeatSeen: snapshot.lastHeartbeat !== null,
+				},
+			});
+		}
 	}, 30_000);
+
+	// P7 D7.1: periodic ledger persistence — a try-enqueue into the worker's
+	// one-slot mailbox (a busy slot skips the sample; §D7.0b). Anomaly rows
+	// ride the 30 s tick above; this is the once-a-minute baseline. Gated on
+	// an attached client: idle no-client rows would slowly evict the real
+	// evidence through the per-session row cap.
+	setInterval(() => {
+		if (session.clientConnected) audioHealth.persistTick('timer', true);
+	}, 60_000);
 
 	// The server bound successfully (EADDRINUSE would have exited via main().catch
 	// before here) — record the actual bound endpoint for the runtime descriptor.
@@ -1237,12 +2067,30 @@ async function main() {
 }
 
 main().catch((err) => {
-	if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+	// This is a FATAL path and obeys the SAME crash-only rules as the
+	// uncaught handler above (design 1d; amendments R1/R2): markFatalExit()
+	// FIRST, so the exit-time lock release skips the (potentially
+	// guard-blocked) Python helper and a second fatal while handling this
+	// one goes straight to process.exit(1); never `console.error(err)` —
+	// object inspection inside error reporting was the 2026-08-04 incident's
+	// spin — only static strings + the bounded primitive-only crash record.
+	if (markFatalExit()) {
+		process.exit(1);
+		return;
+	}
+	// Centralized exit classification (amendment R2): EADDRINUSE reaches
+	// exit 7 on BOTH fatal paths — the uncaught handler above AND this one —
+	// so the supervisor's exit-7 grace window sees every duplicate-instance
+	// race, whichever path the bind error takes.
+	const code = classifyFatalExitCode(err);
+	if (code === EXIT_CODE_DUPLICATE_INSTANCE) {
 		console.error(`\nError: port ${PORT} is already in use.`);
 		console.error(`Kill the existing process: kill $(lsof -ti :${PORT})`);
 		console.error('Then run pnpm start again.\n');
-	} else {
-		console.error('Fatal:', err);
+		process.exit(code);
+		return;
 	}
-	process.exit(1);
+	// Static string only — the crash record replaces `'Fatal:', err`.
+	console.error(`[FATAL] main() failed — crash-only exit (record: ${CRASH_RECORD_PATH})`);
+	writeCrashRecordAndExit(err, CRASH_RECORD_PATH, { exit: (c) => process.exit(c) });
 });

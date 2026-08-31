@@ -28,10 +28,12 @@ import tempfile
 import threading
 import time
 import unittest
-import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+from owner_activity import write_owner_activity  # noqa: E402
 
 
 # ---- the two staging strategies, isolated so the test exercises the exact
@@ -53,18 +55,27 @@ def _write_perpid(target: Path, payload: dict) -> None:
 
 
 def _write_perinvocation(target: Path, payload: dict) -> None:
-    # Per-invocation staging (PID + uuid4): unique across BOTH processes and
-    # same-process threads. This is the fix the bridges use.
-    tmp = target.with_suffix(f".json.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(json.dumps(payload))
-    os.replace(tmp, target)
+    # Exercise the production helper rather than a copied implementation.
+    ok = write_owner_activity(
+        target,
+        str(payload.get("pid") or "test"),
+        json.dumps(payload),
+        payload.get("tid"),
+    )
+    if not ok:
+        raise OSError("production owner-activity write failed")
 
 
 def _hammer(target_str: str, strategy: str, n: int) -> int:
     """Write `n` times; return the count of self-observed valid final states.
     Runs in a child process (macOS spawn re-imports this module cleanly)."""
     target = Path(target_str)
-    writer = _write_shared if strategy == "shared" else _write_perpid
+    if strategy == "shared":
+        writer = _write_shared
+    elif strategy == "production":
+        writer = _write_perinvocation
+    else:
+        writer = _write_perpid
     for i in range(n):
         writer(target, {"ts": int(time.time()), "pid": os.getpid(), "i": i})
     return n
@@ -96,12 +107,12 @@ class TestOwnerActivityAtomicWrite(unittest.TestCase):
         self._torn = torn
         return target
 
-    def test_perpid_never_tears_under_concurrency(self):
-        """With per-PID staging, no concurrent reader ever sees torn JSON."""
-        self._run_fleet("perpid")
+    def test_production_writer_never_tears_under_concurrency(self):
+        """The real shared writer never exposes torn JSON across processes."""
+        self._run_fleet("production")
         self.assertEqual(
             self._torn, 0,
-            f"per-PID staging produced {self._torn} torn reads — must be 0",
+            f"production writer produced {self._torn} torn reads — must be 0",
         )
 
     def _run_threads(self, writer, n_threads=16, writes=400) -> int:
@@ -158,14 +169,9 @@ class TestOwnerActivityAtomicWrite(unittest.TestCase):
             "can then no longer demonstrate it fixes a real race",
         )
 
-    def test_source_sites_use_perpid_staging(self):
-        """All FIVE owner-activity writers — the three bridges, the sparrow
-        remote-gateway bridge (Python), and the task-bridge (TypeScript) — must
-        stage OWNER_ACTIVITY_FILE per-PID (#2222). The census is complete: any
-        new writer of the shared target must appear here or the guard is a lie."""
-        bridges = ["src/slack-bridge.py", "src/discord-bridge.py",
-                   "src/telegram-bridge.py",
-                   "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"]
+    def test_remaining_package_and_typescript_writers_use_unique_staging(self):
+        """Independent package and cross-language writers retain unique temps."""
+        bridges = ["packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"]
         # bad = a SHARED '.json.tmp' OR a PID-only '.json.{os.getpid()}.tmp'
         # (the latter still collides across threads in one process). good = the
         # per-invocation PID+uuid name, unique across processes AND threads.

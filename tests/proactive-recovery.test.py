@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -51,11 +52,11 @@ with tempfile.TemporaryDirectory(prefix="sutando-proactive-recovery-") as tmp:
     target.unlink()
     raced = results / "proactive-raced.sending"
     raced.write_text("race")
-    with mock.patch.object(Path, "rename", side_effect=FileNotFoundError):
+    with mock.patch.object(os, "link", side_effect=FileNotFoundError):
         check("lost recovery race is harmless", recover_orphan_sending_files(results) == 0)
 
     output = io.StringIO()
-    with mock.patch.object(Path, "rename", side_effect=OSError("disk unavailable")):
+    with mock.patch.object(os, "link", side_effect=OSError("disk unavailable")):
         with contextlib.redirect_stdout(output):
             recovered = recover_orphan_sending_files(results)
     check("per-file failure does not block startup", recovered == 0)
@@ -80,8 +81,29 @@ for adapter in ("discord-bridge.py", "slack-bridge.py", "telegram-bridge.py"):
         and isinstance(return_node.value.func, ast.Name)
         and return_node.value.func.id == "recover_orphan_sending_files"
     )
-    check(f"{adapter} imports shared recovery", "from proactive_recovery import recover_orphan_sending_files" in source)
-    check(f"{adapter} wrapper delegates to shared recovery", delegates)
+    # Match the NAME, not the import line's text: a multi-name or parenthesised
+    # import is the same delegation and a substring test calls it a regression.
+    imported = {
+        alias.name
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom) and node.module == "proactive_recovery"
+        for alias in node.names
+    }
+    # discord delegates through the 5b fence, whose recover() calls the shared
+    # sweep (pinned here at source + behaviorally in the fence suite).
+    if adapter == "discord-bridge.py":
+        fence_src = (REPO / "src" / "proactive_claim_fence.py").read_text()
+        fence_delegates = (
+            ".recover()" in source
+            and "recover_orphan_sending_files" in fence_src
+        )
+        check(f"{adapter} imports shared recovery", fence_delegates)
+        check(f"{adapter} wrapper delegates to shared recovery",
+              delegates or fence_delegates)
+    else:
+        check(f"{adapter} imports shared recovery",
+              "recover_orphan_sending_files" in imported)
+        check(f"{adapter} wrapper delegates to shared recovery", delegates)
 
 
 if failures:

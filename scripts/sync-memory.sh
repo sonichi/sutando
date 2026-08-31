@@ -166,7 +166,9 @@ fi
 # back via `find … | head -1` to whichever sibling memory dir landed first
 # (alphabetical). Bug silently skipped real memory writes for 5+ weeks
 # before being caught. See docs/workspace-contract.md.
-MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory")"
+# Claude Code dashes EVERY non-alphanumeric char, not just `/` — a slash-only
+# derivation resolves to a slug it never creates on a spaced/dotted path.
+MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(printf '%s' "$SCRIPT_PARENT" | tr -c 'A-Za-z0-9' '-')/memory")"
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"
@@ -442,7 +444,7 @@ done
 # gap so a rebuilt host restores its plugin/hook/permission config. Sourced
 # from the Claude Code config dir (CLAUDE_CONFIG_DIR canonical; CLAUDE_HOME
 # legacy; ~/.claude fallback) to work on both new and pre-migration hosts.
-SETTINGS_SRC="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}/settings.json"
+SETTINGS_SRC="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-home-path settings.json)"
 if [ -f "$SETTINGS_SRC" ]; then
     copy_if_newer "$SETTINGS_SRC" "$MACHINE_DIR/settings.json"
 fi

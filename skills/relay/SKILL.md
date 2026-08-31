@@ -1,6 +1,6 @@
 ---
 name: relay
-description: "Write a handoff/continuity note for the NEXT Sutando session. Captures what was just in flight, what to check first, what might go wrong, and implicit context the structured snapshot doesn't carry. Read first by /catchup-after-startup."
+description: "Write a handoff/continuity note for the NEXT Sutando session. Captures what was just in flight, what to check first, what might go wrong, and implicit context the structured snapshot doesn't carry. Drained into session-state.md by src/session-handoff.sh."
 user-invocable: true
 ---
 
@@ -12,7 +12,7 @@ Pass the baton to the next Sutando session. Where `session-handoff.sh` writes st
 
 ## Why this exists
 
-Catchup-after-startup pulls together 10 categories of structured state for the next session. But "I was about to land PR #X and Mini's review said Y matters most" isn't captured by `git log`, `gh pr list`, or `pending-questions.md` tail. The next session reads structured facts but has to RE-INFER the continuity, which costs context and frequently misses the load-bearing decision.
+`src/session-handoff.sh` pulls together the structured state for the next session — system status, recent commits, open PRs, pending questions, tasks, conversation tail, quota, repo stats — and writes it to `session-state.md`. But "I was about to land PR #X and Mini's review said Y matters most" isn't captured by `git log`, `gh pr list`, or `pending-questions.md` tail. The next session reads structured facts but has to RE-INFER the continuity, which costs context and frequently misses the load-bearing decision.
 
 The relay note encodes intent + judgment — the thing only the LLM that lived through the session can write.
 
@@ -22,14 +22,14 @@ Mirrors Sutando's existing `tasks/` and `results/` convention:
 
 ```
 workspace/relay/
-├── relay-{epoch_seconds}.md     # pending relay notes (read by next catchup, then archived)
+├── relay-{epoch_seconds}.md     # pending relay notes (drained into session-state.md, then archived)
 └── processed/
-    └── relay-{epoch_seconds}.md # already consumed by catchup; kept for audit
+    └── relay-{epoch_seconds}.md # already drained; kept for audit
 ```
 
 - **File naming:** `relay-{epoch}.md` — sortable + greppable, matches the `task-{epoch}.txt` shape.
 - **Multiple files allowed:** `/relay` always creates a NEW file by default. `--append` appends to the LATEST unprocessed `relay-*.md` instead of creating a new one.
-- **Consumption:** catchup-after-startup reads ALL unprocessed `relay-*.md` files in mtime order (oldest first), prints them as section 0 of its briefing, then `mv`s each one to `processed/` (mirroring the result-watcher drain pattern).
+- **Consumption:** `src/session-handoff.sh` reads ALL unprocessed `relay-*.md` files in sorted order, appends them to `session-state.md` under `## Relay Notes (from prior sessions)`, then `mv`s each one to `processed/` — but only after confirming its `### <basename>` header landed in the written file, so an interrupt cannot retire an uncaptured note.
 - **Cleanup:** kept indefinitely on local disk. Tiny files (~200-500 bytes each); a year of relay notes is < 1 MB. Sync via the workspace-sync engine (`scripts/sync-workspace.sh`) for fleet visibility — the legacy `sync-memory.sh` flow is deprecated in v0.3.0 and removed in v0.4.0.
 
 ## What to write
@@ -38,10 +38,10 @@ Write a narrative note (~150–300 words typical, no fixed schema) covering:
 
 1. **What I was just working on** — the active PR / thread / decision in flight. Be specific. ("PR #1429 just merged; was about to start the relay skill PR.")
 2. **What to check FIRST in the next session** — concrete first action. ("Pull origin; verify the relay skill SKILL.md lints clean; ping owner on quality-gate decision.")
-3. **What might go wrong + recovery** — known failure modes + how to detect them. ("If catchup says 'no relay note found', the relay/ dir is probably orphaned; check `ls workspace/relay/`.")
+3. **What might go wrong + recovery** — known failure modes + how to detect them. ("If session-state.md has no `## Relay Notes` section, the relay/ dir is probably orphaned; check `ls workspace/relay/`.")
 4. **Implicit context** — the why-behind-the-what, decisions that haven't been committed yet, things you'd want a colleague to know if they walked in cold.
 
-Don't write things that are already in the structured snapshot (recent commits, open PRs, pending-questions tail). Catchup will print those anyway. Relay's value is the things the structured snapshot can't reach.
+Don't write things that are already in the structured snapshot (recent commits, open PRs, pending-questions tail). `session-state.md` already carries those. Relay's value is the things the structured snapshot can't reach.
 
 ## Steps
 
@@ -61,13 +61,13 @@ A good relay note is the difference between the next session starting at full sp
 
 **Good:** "PR #1429 (import-UX) merged at 06:21Z; owner asked to start relay-skill PR next. Lucy's nit on stderr-parity landed pre-merge (commit 0ca0c89). Open thread: catchup PID-stamp variant — local edits applied to repo/skills/, NOT committed; owner is doing E2E test. If they greenlight, PR off staging-workspace-revamp with ~25-line diff in 2 SKILL.md files."
 
-If the session was genuinely uneventful (read-only, no decisions, no in-flight work), say so explicitly: "No new work this session; previous relay note still valid." (Still write the file so catchup has a current heartbeat to read.)
+If the session was genuinely uneventful (read-only, no decisions, no in-flight work), say so explicitly: "No new work this session; previous relay note still valid." (Still write the file so the next session has a current heartbeat to read.)
 
 ## Phase 1 scope
 
 - **Manual-invocation only.** Auto-refresh (writing/updating from `/proactive-loop`) deferred to Phase 2 once we see how owners actually use the manual path.
 - **No quality-gate (refuse-on-thin-note).** Always write whatever the LLM produces. Quality-gate deferred to Phase 2 pending observation.
-- **Read-side** lives in `/catchup-after-startup` — see that skill for the read-then-archive flow.
+- **Read-side** lives in `src/session-handoff.sh` — see its relay-drain block for the read-then-archive flow.
 
 ## Phase 2 ideas (NOT in scope)
 
@@ -77,4 +77,4 @@ If the session was genuinely uneventful (read-only, no decisions, no in-flight w
 
 ## Where it lives
 
-`workspace/relay/relay-{epoch}.md` (pending) + `workspace/relay/processed/relay-{epoch}.md` (consumed by catchup). Workspace-root parallel to `build_log.md` + `pending-questions.md` + `tasks/`. Owner-readable; both LLM and human can `cat` it cleanly.
+`workspace/relay/relay-{epoch}.md` (pending) + `workspace/relay/processed/relay-{epoch}.md` (drained by session-handoff). Workspace-root parallel to `build_log.md` + `pending-questions.md` + `tasks/`. Owner-readable; both LLM and human can `cat` it cleanly.

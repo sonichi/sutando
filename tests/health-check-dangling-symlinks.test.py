@@ -44,7 +44,15 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
     def setUp(self):
         self.hc = _load()
         self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
+        # SPACES ARE DELIBERATE, and belong in the shared fixture rather than in
+        # one bespoke test. The remedy this suite executes is a SHELL command
+        # built from these paths, so an unquoted placeholder word-splits and the
+        # repair silently does nothing (qingyun-wu + bassilkhilo-ag2, #2660).
+        # A space-free fixture passes against the broken command, which is
+        # exactly how the defect survived a test that already ran the remedy.
+        # Widening the axis here means every case below carries the property.
+        root = Path(self._tmp.name) / "sp ace root"
+        root.mkdir()
         self.repo = root / "repo"
         self.src = self.repo / "skills"
         self.dst = root / "home" / ".claude" / "skills"
@@ -75,6 +83,144 @@ class TestDanglingSkillSymlinks(unittest.TestCase):
         self.assertEqual(r["status"], "warn", r["detail"])
         self.assertIn("dangling", r["detail"])
         self.assertEqual(r["_broken"], ["alpha"])
+
+    def test_real_directory_is_not_reported_as_linked(self):
+        """The fourth state. A real dir where a symlink belongs fell through
+        BOTH branches into "healthy": `is_symlink()` False, `exists()` True.
+
+        It is not a link -- it is a copy, so `git pull` never reaches it and the
+        running skill diverges silently. Observed live 2026-08-05: `x-twitter`
+        had been a real dir since Jul 17, 11 days behind the repo, while the
+        probe reported "all 60 skills linked".
+        """
+        self._skill("alpha")
+        real = self.dst / "alpha"
+        real.mkdir()
+        (real / "SKILL.md").write_text("# stale copy\n")
+        r = self.hc.check_skill_symlinks()
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertEqual(r["_shadowed"], ["alpha"])
+        self.assertIn("real dir", r["detail"])
+
+    def test_the_advertised_remedy_ACTUALLY_REPAIRS_the_state(self):
+        """Run the remedy the warning prints. Not a string match — the command
+        is extracted from the detail and EXECUTED.
+
+        The first version of this warning said "`ln -sfn` to re-track", which
+        does not repair it: with the real directory still present, macOS `ln`
+        treats the destination as a target DIRECTORY and creates a nested
+        `<dst>/<name>/<name>` symlink while the real dir stays. The operator
+        follows the advice, sees no error, and is still broken
+        (john-the-dev, #2660). A wording-only assertion would not have caught
+        that, so this one runs it.
+        """
+        import re
+        import subprocess
+
+        self._skill("alpha")
+        real = self.dst / "alpha"
+        real.mkdir()
+        (real / "SKILL.md").write_text("# local edits\n")
+
+        detail = self.hc.check_skill_symlinks()["detail"]
+
+        # The remedy is the backticked command in the warning. Extract it rather
+        # than hardcoding, so a future edit to the text is what gets tested.
+        cmds = re.findall(r"`([^`]+)`", detail)
+        remedy = next((c for c in cmds if "ln -s" in c), None)
+        self.assertIsNotNone(remedy, f"no remedy command in the warning: {detail}")
+        self.assertNotIn("ln -sfn", remedy,
+                         "the warning advertises `ln -sfn`, which does NOT repair a real dir")
+
+        concrete = (remedy.replace("<dst>", str(self.dst))
+                          .replace("<src>", str(self.src))
+                          .replace("<name>", "alpha"))
+        subprocess.run(["bash", "-c", concrete], check=True)
+
+        self.assertTrue((self.dst / "alpha").is_symlink(),
+                        "the advertised remedy did not produce a symlink")
+        self.assertFalse((self.dst / "alpha" / "alpha").exists(),
+                         "the remedy created a NESTED link — the `ln -sfn` failure mode")
+        self.assertTrue((self.dst.parent / "alpha.skill-backup" / "SKILL.md").exists(),
+                        "the remedy did not preserve the local edits it moved aside")
+        self.assertFalse((self.dst / "alpha.skill-backup").exists(),
+                         "the backup landed INSIDE <dst> — the skill loader registers "
+                         "every directory there, so it loads as a phantom duplicate skill")
+
+    def test_every_path_in_the_remedy_is_QUOTED(self):
+        """Pin the property, not just the fixture.
+
+        The suite's paths now contain spaces, so an unquoted remedy fails when
+        executed. But a later refactor could quietly de-space the fixture and
+        this class would go green against a broken command again. This asserts
+        the shape directly: every complete path in the emitted command is
+        wrapped in double quotes.
+
+        The failure it guards is silent, which is what makes it worth a second
+        test: unquoted, `mv` exits 1 with "<tail>.skill-backup is not a
+        directory", the real directory stays, and NEITHER the symlink nor the
+        backup is created -- the operator's only recovery path reports success
+        while doing nothing.
+        """
+        import re
+
+        self._skill("alpha")
+        (self.dst / "alpha").mkdir()
+
+        detail = self.hc.check_skill_symlinks()["detail"]
+        remedy = next(c for c in re.findall(r"`([^`]+)`", detail) if "ln -s" in c)
+
+        bare = re.findall(r'(?<!")<(?:src|dst)>/<name>[^\s"]*', remedy)
+        self.assertEqual(
+            bare, [],
+            f"unquoted path(s) {bare} in the remedy -- a path with a space "
+            f"word-splits and the repair silently no-ops: {remedy}",
+        )
+        for placeholder in ("<dst>/<name>", "<src>/<name>", "<dst>/../<name>.skill-backup"):
+            self.assertIn(f'"{placeholder}"', remedy,
+                          f"{placeholder} must be quoted in: {remedy}")
+
+    def test_ln_sfn_alone_does_NOT_repair_it(self):
+        """The control that justifies the remedy above. If this ever starts
+        passing, macOS `ln` changed and the warning can be simplified."""
+        import subprocess
+        self._skill("alpha")
+        real = self.dst / "alpha"
+        real.mkdir()
+        (real / "SKILL.md").write_text("# local\n")
+        # Quoted for the same reason the remedy is: the fixture paths contain
+        # spaces, and this control must fail on `ln -sfn` SEMANTICS (the nested
+        # link), not on word-splitting -- otherwise it would "pass" for the
+        # wrong reason and stop justifying the longer remedy.
+        subprocess.run(["bash", "-c",
+                        f'ln -sfn "{self.src}/alpha" "{self.dst}/alpha"'], check=True)
+        self.assertFalse((self.dst / "alpha").is_symlink(),
+                         "ln -sfn repaired it — the warning's caveat is now obsolete")
+        self.assertTrue((self.dst / "alpha" / "alpha").is_symlink(),
+                        "expected the nested-link failure mode")
+
+    def test_shadowed_is_reported_but_NOT_auto_fixed(self):
+        """--fix must not clobber it: a real dir may be an intentional local
+        install someone is editing. Same reason refresh-skill.sh refuses."""
+        self._skill("alpha")
+        real = self.dst / "alpha"
+        real.mkdir()
+        (real / "SKILL.md").write_text("# local edits\n")
+        (real / "LOCAL_ONLY.txt").write_text("do not lose me\n")
+        r = self.hc.check_skill_symlinks()
+        self.hc.fix_skill_symlinks(r)
+        self.assertFalse((self.dst / "alpha").is_symlink(),
+                         "--fix replaced a real dir with a symlink")
+        self.assertTrue((real / "LOCAL_ONLY.txt").exists(),
+                        "--fix destroyed local-only content")
+
+    def test_a_healthy_symlink_is_NOT_flagged_as_shadowed(self):
+        """Control: without this, a fix that flags everything would pass above."""
+        self._skill("alpha")
+        (self.dst / "alpha").symlink_to(self.src / "alpha")
+        r = self.hc.check_skill_symlinks()
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertEqual(r.get("_shadowed", []), [])
 
     def test_healthy_link_still_ok(self):
         self._skill("alpha")

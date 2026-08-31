@@ -39,7 +39,10 @@ URL_ALIAS_PRECEDENCE: "tuple[str, ...]" = (
 # some transports URL-encode as %7C/%7c. Only a value STARTING with an
 # http(s) scheme is combined; a bare secret is opaque and never touched even
 # if it contains either separator (#2307: secrets are split, never mutated).
-_SEPARATOR_RE = re.compile(r"\||%7[Cc]")
+# A literal "|" is PREFERRED over %7C/%7c when both appear: a raw pipe
+# cannot legally occur inside a URL, so when one exists it IS the separator
+# — this keeps a URL half that carries an encoded %7C intact (#2670 review).
+_ENCODED_SEPARATOR_RE = re.compile(r"%7[Cc]")
 
 
 @dataclass(frozen=True)
@@ -59,14 +62,21 @@ class GatewayCredentials:
 def parse_onboarding_token(raw: str) -> "tuple[str, str]":
     """Split an onboarding string into (url_from_token, secret).
 
-    Case-insensitive scheme detection; splits at the FIRST ``|`` or
-    ``%7C``/``%7c``; both halves returned verbatim (never mutated). A bare
-    secret — no leading scheme — is ('', raw) untouched even if it contains
-    a separator. A scheme-prefixed value with no separator is ('', raw) too
-    (the caller's URL-less guard speaks)."""
+    Case-insensitive scheme detection; splits at the first literal ``|``,
+    falling back to the first ``%7C``/``%7c`` only when no literal pipe
+    exists; both halves returned verbatim (never mutated). The literal pipe
+    is preferred because a raw ``|`` cannot legally occur inside a URL — so
+    when one is present it must be the separator, and a URL half that
+    legitimately carries an encoded ``%7C`` stays intact (#2670 review). A
+    bare secret — no leading scheme — is ('', raw) untouched even if it
+    contains a separator. A scheme-prefixed value with no separator is
+    ('', raw) too (the caller's URL-less guard speaks)."""
     if not raw.lower().startswith(("http://", "https://")):
         return "", raw
-    m = _SEPARATOR_RE.search(raw)
+    i = raw.find("|")
+    if i != -1:
+        return raw[:i], raw[i + 1:]
+    m = _ENCODED_SEPARATOR_RE.search(raw)
     if m is None:
         return "", raw
     return raw[: m.start()], raw[m.end():]

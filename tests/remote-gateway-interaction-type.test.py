@@ -72,12 +72,21 @@ for v in sorted(rgb._INTERACTION_TYPES):
     h = _headers({"id": f"task-it-{v}", "task": "x", "interaction_type": v})
     check(f"vocab round-trip: {v}", h.get("interaction_type") == v)
 
-# 5. access_tier still the LAST header (regression guard: the new branch must
-# not disturb the ordering the tier defense relies on — locally-decided tier
-# written last so it wins under a last-occurrence parser).
+# 5. access_tier must remain the ONLY access_tier line and the final recognized
+# task header. Bridge-authored security guidance intentionally follows as prose.
 body = (rgb.TASKS_DIR / "task-it-1.txt").read_text()
 lines = [l for l in body.split("\n") if l]
-check("access_tier is the last header", lines[-1].startswith("access_tier:"))
+_tier_at = [i for i, l in enumerate(lines) if l.startswith("access_tier:")]
+_tail = lines[_tier_at[0] + 1:] if len(_tier_at) == 1 else None
+_known_headers = set(rgb._TASK_FIELDS) | {
+    "interaction_type", "content_modalities", "media_form", "attachments",
+}
+check("access_tier is the last header",
+      _tail is not None and not any(
+          line.startswith(f"{key}:")
+          for line in _tail
+          for key in _known_headers
+      ))
 
 if failures:
     sys.exit(1)

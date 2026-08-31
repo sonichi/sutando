@@ -2,19 +2,19 @@
 """
 GitHub webhook bridge — receives GitHub events and writes task files.
 
-Listens on port 7846 for GitHub webhook payloads. Converts relevant events
+Listens on port 7847 for GitHub webhook payloads. Converts relevant events
 (new issues, PRs, stars, comments) into task files in tasks/.
 
 Setup:
   1. Start: python3 src/github-webhook.py &
-  2. Expose via ngrok: ngrok http 7846
+  2. Expose via ngrok: ngrok http 7847
   3. Add webhook in GitHub repo settings → Payload URL = ngrok URL
      Content type: application/json
      Events: Issues, Pull requests, Stars, Issue comments
 
 Usage:
   python3 src/github-webhook.py              # start server
-  python3 src/github-webhook.py --port 7846  # custom port
+  python3 src/github-webhook.py --port 7842  # custom port
 """
 
 import hashlib
@@ -187,7 +187,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 f"access_tier: other\n"
                 f"task: {safe_task}\n"
             )
-            TASKS_DIR.mkdir(exist_ok=True)
+            TASKS_DIR.mkdir(parents=True, exist_ok=True)
             (TASKS_DIR / f"{task_id}.txt").write_text(task_content)
             _emit_github_telemetry()
             print(f"[{time.strftime('%H:%M:%S')}] {event_type}/{payload.get('action', '')} → {task_id}")

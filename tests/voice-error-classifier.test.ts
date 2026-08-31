@@ -5,7 +5,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyTransportClose } from '../src/voice-error-classifier.ts';
+import {
+	classifyTransportClose,
+	protocolFailureFor,
+	recordTerminalClassification,
+	lastTerminalClassification,
+	clearTerminalClassification,
+} from '../src/voice-error-classifier.ts';
 
 test('credits_depleted: paid-tier prepayment exhausted', () => {
 	const r = classifyTransportClose(
@@ -78,4 +84,76 @@ test('rawCode and rawReason are preserved', () => {
 	const r = classifyTransportClose(1011, 'Your prepayment credits are depleted.');
 	assert.equal(r.rawCode, 1011);
 	assert.match(r.rawReason, /prepayment/);
+});
+
+// ---------------------------------------------------------------------------
+// `agent.state` protocol mapper + persisted terminal classification
+// (design 1a′; impl plan WS1 Step 12, amendment R8)
+// ---------------------------------------------------------------------------
+
+test('protocol mapper: auth_invalid → failed/auth with stable reason code', () => {
+	const c = classifyTransportClose(1011, 'API key not valid. Please pass a valid API key.');
+	const p = protocolFailureFor(c);
+	assert.deepEqual(p, { upstream: 'failed', reason: 'auth-invalid', category: 'auth' });
+});
+
+test('protocol mapper: quota_exceeded → failed/quota — distinct from auth', () => {
+	const c = classifyTransportClose(1011, 'You exceeded your current quota, please check your plan and billing details.');
+	const p = protocolFailureFor(c);
+	assert.deepEqual(p, { upstream: 'failed', reason: 'quota-exceeded', category: 'quota' });
+});
+
+test('protocol mapper: credits_depleted → failed/quota with its own reason code', () => {
+	const c = classifyTransportClose(1011, 'Your prepayment credits are depleted.');
+	const p = protocolFailureFor(c);
+	assert.deepEqual(p, { upstream: 'failed', reason: 'credits-depleted', category: 'quota' });
+});
+
+test('protocol mapper: model_not_found → failed/other', () => {
+	const c = classifyTransportClose(1011, 'models/gemini-3.1-flash-live-preview is not found for API version v1beta');
+	const p = protocolFailureFor(c);
+	assert.deepEqual(p, { upstream: 'failed', reason: 'model-not-found', category: 'other' });
+});
+
+test('protocol mapper: retryable classifications never map to failed', () => {
+	for (const [code, reason] of [
+		[1011, 'Too Many Requests: rate-limit exceeded'],
+		[1000, 'normal close'],
+		[1011, 'something we have not seen before'],
+		[undefined, undefined],
+	] as Array<[number | undefined, string | undefined]>) {
+		assert.equal(protocolFailureFor(classifyTransportClose(code, reason)), null,
+			`retryable close (${code}, ${reason}) must not map to failed`);
+	}
+});
+
+test('recordTerminalClassification persists ONLY terminal classifications for buildAgentState', () => {
+	clearTerminalClassification();
+	assert.equal(lastTerminalClassification(), null);
+
+	// Retryable close: nothing recorded, returns null.
+	const r = recordTerminalClassification(classifyTransportClose(1011, 'rate-limit exceeded'));
+	assert.equal(r, null);
+	assert.equal(lastTerminalClassification(), null);
+
+	// Terminal close: recorded + returned.
+	const t = recordTerminalClassification(
+		classifyTransportClose(1011, 'API key not valid. Please pass a valid API key.'),
+	);
+	assert.deepEqual(t, { upstream: 'failed', reason: 'auth-invalid', category: 'auth' });
+	assert.deepEqual(lastTerminalClassification(), t);
+
+	// A later retryable close does NOT clear the persisted terminal one —
+	// the agent stays 'failed' until recovery (ACTIVE) clears it.
+	recordTerminalClassification(classifyTransportClose(1000, 'normal close'));
+	assert.deepEqual(lastTerminalClassification(), t);
+
+	// A later terminal close of a DIFFERENT category replaces it (auth → quota).
+	recordTerminalClassification(classifyTransportClose(1011, 'You exceeded your current quota'));
+	assert.deepEqual(lastTerminalClassification(),
+		{ upstream: 'failed', reason: 'quota-exceeded', category: 'quota' });
+
+	// Recovery clears.
+	clearTerminalClassification();
+	assert.equal(lastTerminalClassification(), null);
 });

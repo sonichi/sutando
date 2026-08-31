@@ -135,23 +135,47 @@ golden("bearer containing '|' without scheme stays intact",
 golden("trailing slash normalized identically",
        {"GATEWAY_URL": "https://gw.example/", "GATEWAY_TOKEN": "sek4"})
 
-# The KNOWN divergence, frozen explicitly (contract=sparrow semantics):
-golden("%7C combined: legacy room-ops does NOT split (frozen divergence)",
-       {"REMOTE_TASK_TOKEN": "https://gw.example%7Csek5"}, expect_same=False)
+# The former divergence, CONVERGED by PR2 (the named enabling-only change
+# ratified in #2668): room-ops' facade now delegates to the contract, so
+# %7C and uppercase-scheme combined tokens split identically on both sides.
+golden("%7C combined: room-ops now MATCHES the contract (PR2 convergence)",
+       {"REMOTE_TASK_TOKEN": "https://gw.example%7Csek5"})
 with env_scenario({"REMOTE_TASK_TOKEN": "https://gw.example%7Csek5"}):
     base, headers = legacy.gateway()
-check("  legacy %7C behavior pinned: whole value is the bearer, no base URL",
-      base == "" and headers.get("Authorization", "").removeprefix("Bearer ")
-      == "https://gw.example%7Csek5")
-check("  contract %7C behavior pinned: splits into URL + verbatim secret",
+check("  converged %7C behavior: splits into URL + verbatim secret",
+      base == "https://gw.example"
+      and headers.get("Authorization", "").removeprefix("Bearer ") == "sek5")
+check("  contract %7C behavior unchanged",
       parse_onboarding_token("https://gw.example%7Csek5") == ("https://gw.example", "sek5"))
-golden("uppercase-scheme combined: legacy case-sensitive check misses (frozen divergence)",
-       {"REMOTE_TASK_TOKEN": "HTTPS://gw.example|sek6", "GATEWAY_URL": "https://gw.example"},
-       expect_same=False)
+golden("uppercase-scheme combined: converged (PR2)",
+       {"REMOTE_TASK_TOKEN": "HTTPS://gw.example|sek6", "GATEWAY_URL": "https://gw.example"})
 check("  contract is case-insensitive on scheme",
       parse_onboarding_token("HTTPS://gw.example|sek6") == ("HTTPS://gw.example", "sek6"))
 check("  bare secret containing %7C never touched",
       parse_onboarding_token("sekret%7Cstill-opaque") == ("", "sekret%7Cstill-opaque"))
+
+# Literal-pipe preference (#2670 review finding): a URL half legitimately
+# carrying an encoded %7C must NOT be split at the encoding when a literal
+# "|" separator exists — a raw pipe cannot occur inside a URL, so it IS the
+# separator. Legacy room-ops (literal-| only) already got this right; the
+# contract now agrees, so this golden holds on BOTH sides.
+golden("URL containing %7C before the '|' separator splits at the pipe",
+       {"REMOTE_TASK_TOKEN": "https://gw.example/a%7Cb|sec"})
+check("  contract prefers the literal pipe; URL's %7C intact",
+      parse_onboarding_token("https://gw.example/a%7Cb|sec")
+      == ("https://gw.example/a%7Cb", "sec"))
+check("  %7C-only combined still splits at the encoding (fallback intact)",
+      parse_onboarding_token("https://gw.example%7Csek5") == ("https://gw.example", "sek5"))
+check("  secret half keeps %7C verbatim after a pipe split",
+      parse_onboarding_token("https://gw.example|a%7Cb") == ("https://gw.example", "a%7Cb"))
+# The documented TRADE (review on #2679): pipe-preference is not a strict
+# superset. A %7C-separated token whose SECRET contains a literal | now splits
+# at the pipe inside the secret — previously parsed correctly. Both edge
+# classes are rare and fail loudly; literal-pipe-wins is the better default
+# because a transport that encodes the separator most likely encodes the
+# whole value, secret pipes included. Pinned so the trade stays on the record:
+check("  %7C-separated token with a literal | in the secret splits at the pipe (documented trade)",
+      parse_onboarding_token("https://gw/path%7Csec|ret") == ("https://gw/path%7Csec", "ret"))
 
 # ── C. sparrow goldens (module-level resolution via subprocess import) ──────
 SPARROW_SNIPPET = (

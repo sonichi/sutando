@@ -489,7 +489,9 @@ def test_run_drops_stale_catchup_slot():
         cr.CRONS_FILE = root / "crons.json"
         cr.STATE_FILE = root / "state" / "cron-runner-state.json"
         fire = _epoch(2026, 7, 2, 6, 0)
-        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        # Past THIS job's budget, not a flat constant: the budget scales with the
+        # period, so hard-coding the floor stops exercising the drop path.
+        now = fire + cr.emit_lateness_budget("0 6 * * *", fire) + 60
         cr.CRONS_FILE.write_text(json.dumps([
             {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
         ]))
@@ -504,6 +506,88 @@ def test_run_drops_stale_catchup_slot():
         check("dropping stale slot for briefing" in stderr.getvalue(),
               "stale drop is observable")
         check(not cr.TASKS_DIR.exists(), "stale slot leaves no task file")
+
+
+def test_drop_line_is_timestamped():
+    """A drop is the ONLY record that a slot was skipped, so it must be datable.
+
+    The log carried no timestamps, so drops could be counted but never correlated
+    with a sleep window or attributed to a day — the gap #2754 and #3232 both hit.
+    """
+    import contextlib
+    import io
+    import json
+    import re
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        fire = _epoch(2026, 7, 2, 6, 0)
+        # Past THIS job's budget, not a flat constant: the budget scales with the
+        # period, so hard-coding the floor stops exercising the drop path.
+        now = fire + cr.emit_lateness_budget("0 6 * * *", fire) + 60
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"briefing": fire - 60}))
+        _mark_core_alive(root, now)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            cr.run(now_epoch=now)
+        line = stderr.getvalue()
+        check(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z cron-runner: dropping",
+                       line),
+              f"drop line starts with an ISO-8601 UTC stamp, got: {line[:60]!r}")
+        # The stamp is a PREFIX, not a replacement: the existing substring
+        # assertion above must keep passing.
+        check("dropping stale slot for briefing" in line,
+              "stamping preserves the searchable message")
+
+
+def test_run_executes_shell_command_without_core_or_task_file():
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.REPO_ROOT = root
+        fire = _epoch(2026, 7, 2, 6, 2)
+        cr.CRONS_FILE.write_text(json.dumps([
+            {
+                "name": "mechanical",
+                "cron": "2 6 * * *",
+                "shell_command": (
+                    "python3 -c \"from pathlib import Path; import sys; "
+                    "Path('shell-marker').write_text('ok'); print('stdout-ok'); "
+                    "print('stderr-ok', file=sys.stderr); sys.exit(3)\""
+                ),
+                "prompt": "must not become an agent turn",
+                "launchd": True,
+            },
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"mechanical": fire - 60}))
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            emitted = cr.run(now_epoch=fire)
+
+        check(emitted == ["mechanical"], "shell command is recorded as executed")
+        check((root / "shell-marker").read_text() == "ok", "shell command runs from repo root")
+        check(not cr.TASKS_DIR.exists(), "shell command does not emit an agent task")
+        check("stdout-ok" in stdout.getvalue(), "shell stdout is observable")
+        check("stderr-ok" in stderr.getvalue() and "exit code 3" in stderr.getvalue(),
+              "shell stderr and non-zero exit are loud")
+        log = (root / "logs" / "cron-runner.log").read_text()
+        check("exit_code=3" in log and "stdout-ok" in log and "stderr-ok" in log,
+              "shell stdout and stderr are persisted in the runner log")
+        cr.REPO_ROOT = original_repo_root
 
 
 def test_run_acquires_shared_state_lock():
@@ -543,6 +627,63 @@ def test_run_acquires_shared_state_lock():
         check(len(files) == 1, "run() emits the due entry after acquiring the lock")
 
 
+def test_emit_task_stamps_the_hmac_envelope():
+    """#3014's writer census lists cron-runner as unstamped. It writes with a
+    bare `path.write_text`, so it needs an edge stamp, not the injected seam."""
+    import tempfile
+    sys.path.insert(0, str(REPO / "src"))
+    from task_envelope import verify_text
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        orig_ws, orig_tasks = cr.WORKSPACE, cr.TASKS_DIR
+        try:
+            cr.WORKSPACE = root
+            cr.TASKS_DIR = root / "tasks"
+            cr.TASKS_DIR.mkdir(parents=True)
+            path = cr.emit_task("probe", {"prompt": "hello"})
+            text = path.read_text()
+            check(verify_text(text, root)["verdict"] == "verified",
+                  "an emitted cron task verifies against the per-host key")
+            check(text.splitlines()[0].startswith("id:"),
+                  "the stamp is inserted AFTER id:, so task-last readers see a header")
+            check("\ntask:" in text and text.rstrip().endswith("hello"),
+                  "task: stays last and the body is unchanged")
+            # The key must land beside the tasks it signs, not via a second
+            # independent workspace resolution.
+            check((root / "state" / "auth" / "task-hmac.key").is_file(),
+                  "the key is created under the workspace cron-runner writes to")
+        finally:
+            cr.WORKSPACE, cr.TASKS_DIR = orig_ws, orig_tasks
+
+
+def test_emit_task_survives_a_raising_stamper():
+    """Fail-open is the contract: a stamping error must cost the stamp, never
+    the fire. Without the guard this test loses the task entirely."""
+    import tempfile
+    sys.path.insert(0, str(REPO / "src"))
+    import task_envelope
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        orig_ws, orig_tasks = cr.WORKSPACE, cr.TASKS_DIR
+        orig_stamp = task_envelope.stamp_text
+        def boom(*_a, **_k):
+            raise RuntimeError("keychain on fire")
+        try:
+            task_envelope.stamp_text = boom
+            cr.WORKSPACE = root
+            cr.TASKS_DIR = root / "tasks"
+            cr.TASKS_DIR.mkdir(parents=True)
+            path = cr.emit_task("probe", {"prompt": "hello"})
+            check(path.is_file(), "the task is still written when stamping raises")
+            body = path.read_text()
+            check("hello" in body, "the body survives a raising stamper intact")
+            check("envelope_hmac:" not in body,
+                  "no partial stamp is left behind")
+        finally:
+            task_envelope.stamp_text = orig_stamp
+            cr.WORKSPACE, cr.TASKS_DIR = orig_ws, orig_tasks
+
+
 def _run_all():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
@@ -554,6 +695,172 @@ def _run_all():
         sys.exit(1)
     print("ALL PASSED")
 
+
+def test_shell_command_timeout_kills_the_whole_process_tree():
+    """An unbounded command would stall the tick that holds the state lock, and
+    killing only the shell leaves grandchildren holding the pipes."""
+    import os
+    import tempfile
+    import time as _t
+    marker = Path(tempfile.mkdtemp()) / "grandchild.pid"
+    started = _t.monotonic()
+    rc = cr._run_shell_command(
+        "probe", f"sleep 120 & echo $! > {marker}; sleep 120", timeout_s=2)
+    elapsed = _t.monotonic() - started
+    check(rc == 124, "timeout returns 124")
+    check(elapsed < 20, "timeout is bounded")
+    _t.sleep(0.5)
+    gpid = int(marker.read_text().strip())
+    try:
+        os.kill(gpid, 0)
+        alive = True
+    except OSError:
+        alive = False
+    check(not alive, "grandchild is killed, not just the shell")
+
+
+def test_shell_command_output_is_bounded():
+    """A chatty command must not grow the log without limit."""
+    rc = cr._run_shell_command(
+        "chatty", "python3 -c \"print('x' * 200000)\"", timeout_s=60)
+    log = cr._shell_log_path().read_text()
+    check(rc == 0, "chatty command still succeeds")
+    check("[truncated" in log, "output is truncated with a notice")
+    check(len(log) < cr.SHELL_OUTPUT_LIMIT * 3, "log stays near the cap")
+
+
+def test_shell_timeout_override_rejects_unusable_values():
+    """A bad per-entry value must fall back to the default, never disable the bound."""
+    d = cr.SHELL_COMMAND_TIMEOUT_S
+    check(cr._shell_timeout_for({}) == d, "absent -> default")
+    check(cr._shell_timeout_for({"shell_timeout_s": 7}) == 7, "valid override honoured")
+    check(cr._shell_timeout_for({"shell_timeout_s": 0}) == d, "zero -> default")
+    check(cr._shell_timeout_for({"shell_timeout_s": -1}) == d, "negative -> default")
+    check(cr._shell_timeout_for({"shell_timeout_s": "60"}) == d, "string -> default")
+    check(cr._shell_timeout_for({"shell_timeout_s": True}) == d, "bool -> default")
+
+
+def test_kill_tree_survives_a_process_that_vanished():
+    """getpgid/killpg raise once the process is already reaped; the harness must
+    return quietly rather than propagate out of the timeout handler."""
+    class _Gone:
+        pid = 999999
+        def wait(self, timeout=None):
+            return 0
+    import unittest.mock as _m
+    with _m.patch.object(cr.os, "getpgid", side_effect=OSError(3, "no such process")):
+        cr._kill_process_tree(_Gone())          # 290-291
+    check(True, "vanished process: getpgid OSError is swallowed")
+    with _m.patch.object(cr.os, "getpgid", return_value=4242), \
+         _m.patch.object(cr.os, "killpg", side_effect=OSError(1, "not permitted")):
+        cr._kill_process_tree(_Gone())          # 295-296
+    check(True, "killpg OSError is swallowed")
+
+
+def test_kill_tree_escalates_to_sigkill_when_term_is_ignored():
+    """A tree that ignores SIGTERM must still be killed — the loop continues to
+    SIGKILL rather than returning after the first signal."""
+    import unittest.mock as _m
+    sent = []
+    class _Stubborn:
+        pid = 4242
+        def __init__(self):
+            self.calls = 0
+        def wait(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:                 # 300-301: TERM ignored
+                raise subprocess.TimeoutExpired("cmd", timeout or 5)
+            return 0
+    with _m.patch.object(cr.os, "getpgid", return_value=4242), \
+         _m.patch.object(cr.os, "killpg", side_effect=lambda g, s: sent.append(s)):
+        cr._kill_process_tree(_Stubborn())
+    check(sent == [cr.signal.SIGTERM, cr.signal.SIGKILL],
+          f"TERM then KILL escalation (sent={sent})")
+
+
+def test_drain_that_hangs_after_the_kill_still_returns_124():
+    """If the post-kill drain also hangs, the runner must not hang with it."""
+    import unittest.mock as _m
+    class _Hang:
+        pid = 4242
+        returncode = None
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired("cmd", timeout or 1)
+    with _m.patch.object(cr.subprocess, "Popen", return_value=_Hang()), \
+         _m.patch.object(cr, "_kill_process_tree", lambda p: None):
+        rc = cr._run_shell_command("hang", "irrelevant", timeout_s=1)   # 335-336
+    check(rc == 124, f"hung drain still returns 124 (got {rc})")
+
+
+def test_unspawnable_command_is_reported_not_raised():
+    """Popen itself can fail (ENOENT/EMFILE); that must become a logged 127."""
+    import unittest.mock as _m
+    with _m.patch.object(cr.subprocess, "Popen", side_effect=OSError(2, "nope")):
+        rc = cr._run_shell_command("bad", "irrelevant", timeout_s=5)    # 341-344
+    check(rc == 127, f"unspawnable command returns 127 (got {rc})")
+    log = cr._shell_log_path().read_text()
+    # Not the class name: OSError(2, ...) promotes to FileNotFoundError, so assert
+    # on the message that actually has to reach an operator.
+    check("nope" in log, "the spawn failure detail is persisted in the log")
+
+
+def test_malformed_shell_command_is_skipped_and_not_retried():
+    """A non-string or blank shell_command must be skipped loudly AND have its
+    state advanced, or the runner retries the same bad entry every tick."""
+    import contextlib
+    import io
+    import json
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        original_repo_root = cr.REPO_ROOT
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.REPO_ROOT = root
+        try:
+            fire = _epoch(2026, 7, 2, 6, 2)
+            cr.CRONS_FILE.write_text(json.dumps([
+                {"name": "blank", "cron": "2 6 * * *", "shell_command": "   ",
+                 "launchd": True},
+                {"name": "nonstring", "cron": "2 6 * * *", "shell_command": 123,
+                 "launchd": True},
+            ]))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                cr.run(now_epoch=fire)                       # 466, 470-471
+            msg = err.getvalue()
+            check("shell_command must be a non-empty string" in msg,
+                  "malformed shell_command is reported on stderr")
+            check(msg.count("shell_command must be a non-empty string") == 2,
+                  "both malformed entries are reported")
+            state = json.loads(cr.STATE_FILE.read_text())
+            check(state.get("blank") == fire and state.get("nonstring") == fire,
+                  "state advanced so the bad entry is not retried every tick")
+            check(not list((root / "tasks").glob("*.txt")) if (root / "tasks").is_dir() else True,
+                  "no task file emitted for a malformed shell entry")
+        finally:
+            cr.REPO_ROOT = original_repo_root
+
+
+
+# A dense schedule must not expand the whole day under run()'s state lock.
+# Pin the call bound, not a duration — elapsed time is host-dependent.
+def test_dense_schedule_does_not_expand_the_day():
+    import time as _t
+    calls = {"mk": 0}
+    real = _t.mktime
+    cr.time.mktime = lambda *a: (calls.__setitem__("mk", calls["mk"] + 1) or real(*a))
+    try:
+        now = int(real((2026, 6, 15, 14, 37, 0, 0, 0, -1)))
+        assert cr.cron_period_seconds("* * * * *", now) == 60
+        # one hour is 60 minutes x <=2 epochs, plus the day/noon probes
+        assert calls["mk"] < 200, f"expanded the day: {calls['mk']} mktime calls"
+    finally:
+        cr.time.mktime = real
+    print("OK: dense '* * * * *' stays under the per-hour bound")
+
+
+test_dense_schedule_does_not_expand_the_day()
 
 if __name__ == "__main__":
     _run_all()

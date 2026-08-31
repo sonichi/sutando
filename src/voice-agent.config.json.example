@@ -1,5 +1,11 @@
 {
   "_comment": "TEMPLATE — do not edit in place. The live config is per-user data and lives at $WORKSPACE/config/voice-agent.json where $WORKSPACE is resolved via scripts/sutando-config.sh (M0 default: <repo>/workspace/; $SUTANDO_WORKSPACE is NOT honored — removed in v0.8). On first run voice-agent copies this template there if it is missing. Edit the workspace copy, never this file. Keys: model + googleSearch are voice prefs (the switch_voice_config tool writes them at runtime). voice-agent ships with model=3.1 + googleSearch=false because the web client's code-heavy workload prefers 3.1.",
   "model": "gemini-3.1-flash-live-preview",
-  "googleSearch": false
+  "googleSearch": false,
+  "shadowStt": false,
+  "_comment_shadowStt": "true = run a second (batch gemini-2.5-flash) transcription of the same audio and LOG divergences from what the Live model heard. Observation-only; needs bodhi >= PR #25.",
+  "divergenceCorrection": false,
+  "_comment_divergenceCorrection": "true (with shadowStt) = on a detected mishear, the agent interrupts itself, acknowledges in one sentence, and answers the real question (bodhi PR #26). Default false.",
+  "_comment_compressionConfig": "Phase 0.5 seam, OFF by default (key absent = today's behaviour). Add \"compressionConfig\": {} to enable Gemini context-window compression with the SERVER's defaults (trigger 80% of the model limit, target half the trigger), or {\"triggerTokens\": N, \"targetTokens\": M} with 0 < M < N (both-or-neither; positive integers; startup fails loudly otherwise). Env VOICE_CTX_TRIGGER_TOKENS/VOICE_CTX_TARGET_TOKENS override the file and on their own enable compression.",
+  "_comment_mediaResolution": "Phase 0.5 seam, UNSET by default (key absent = server default). Add \"mediaResolution\": \"MEDIA_RESOLUTION_LOW\" (or MEDIUM/HIGH) to set the session-wide media token cost for realtime-input images (LOW = 64 tokens/frame). Session-wide: it reaches one-shot send_vision_frame too."
 }

@@ -17,6 +17,7 @@ import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
 import { OVERLAY_MANAGER_HTML } from './overlay-manager-ui.js';
 import { resolveWorkspace, statusReadPath } from './workspace_default.js';
+import { readBodyCapped } from './http-body-limit.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -352,6 +353,9 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-user::before { content: 'You: '; font-weight: 600; color: #5a9fd4; }
   .t-assistant { color: #a8d8b0; }
   .t-assistant::before { content: 'Sutando: '; font-weight: 600; color: #6dbe82; }
+  .t-working { opacity: 0.6; font-style: italic; }
+  @keyframes t-working-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.7; } }
+  .t-working { animation: t-working-pulse 1.4s ease-in-out infinite; }
   .t-system { color: #888; font-size: 14px; }
   .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 16px; }
   .t-interim::before { content: 'You: '; font-weight: 600; }
@@ -860,6 +864,12 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 <div style="height:80px"></div>
 </div>
 
+<!-- The ONE canonical browser voice transport (src/web-voice-transport.ts),
+     served as a classic-script IIFE that installs the SutandoVoice global.
+     Loaded before the page script so SutandoVoice is defined when voice
+     wiring below runs. A 503 here (packaging error) logs to the console and
+     connectWs() reports it to the user. -->
+<script src="${BROWSER_TRANSPORT_ROUTE}"></script>
 <script>
 // ─── Config ───────────────────────────────────────────────
 let INPUT_RATE  = 16000;
@@ -885,6 +895,13 @@ function getDefaultWsUrl() {
     return protocol + '//' + window.location.host + '/ws';
   }
   return protocol + '//' + hostname + ':' + WS_PORT;
+}
+
+// #bottom-panel is position:fixed and grows to 50vh, so a static body
+// padding-bottom cannot reserve its space — keep the two in sync.
+function syncBottomPad() {
+  const bp = $('bottom-panel');
+  if (bp) document.body.style.paddingBottom = (bp.offsetHeight + 12) + 'px';
 }
 
 // Set default WebSocket URL on page load + init Chrome STT
@@ -914,6 +931,17 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Reserve bottom space equal to the fixed panel's height so the chat history
+  // never covers the dashboard (e.g. the Questions panel).
+  try {
+    const bp = $('bottom-panel');
+    if (bp && window.ResizeObserver) { new ResizeObserver(syncBottomPad).observe(bp); }
+    syncBottomPad();
+    window.addEventListener('resize', syncBottomPad);
+  } catch {}
+  // Restore the chat transcript saved before the last reload, then watch for
+  // new entries to persist.
+  try { initTranscriptPersistence(); } catch {}
 });
 
 // ─── Remote toggle via SSE ────────────────────────────────
@@ -969,7 +997,8 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ─── State ────────────────────────────────────────────────
-let ws = null;
+// Page-level AudioContext is for tool cues ONLY — the voice audio graph
+// (mic capture + playback) lives inside the canonical transport.
 let audioCtx = null;
 // Play a short, low-volume Web Audio blip to signal a tool/core invocation
 // (owner ask 2026-07-09). Reuses the AudioContext created on the call's user
@@ -1006,22 +1035,22 @@ function playToolCue(kind) {
     });
   } catch (e) {}
 }
-let micStream = null;
-let processor = null;
+// Voice session surface state. The audio pipeline + WS protocol live in the
+// canonical transport (SutandoVoice.VoiceTransport, loaded from
+// /web-voice-transport.js); the page keeps ONLY surface concerns: transcript
+// DOM, status text, stats mirror, reconnect policy, avatar analyser.
+let voice = null;               // SutandoVoice.VoiceTransport of the active session
 let connected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
-let nextPlayTime = 0;
-let analyserNode = null;
+let analyserNode = null;        // playback AnalyserNode handed over via onAnalyser
 let speakingRAF = null;
-let activeSources = [];
-let playbackRate = 1.0;
-let bytesSent = 0;
+let bytesSent = 0;              // onStats mirror (stats panel + debug dump)
 let bytesRecv = 0;
-let audioChunksRecv = 0;
-let playChunkCount = 0;
-let statsTimer = null;
 let muted = false;
+let micAnnounced = false;       // one "Microphone active" system line per session
+let cleanupDone = true;         // doCleanup idempotence latch (reset on connect)
+let _voiceUrlOverride = null;   // takeoverVoice() one-shot URL override
 
 // Chrome STT state — provides real-time interim display; server STT replaces with final
 let recognition = null;
@@ -1186,6 +1215,16 @@ const PERSIST_KEY_TASKS = 'sutando-taskmap-v1';
 const PERSIST_KEY_EXPAND = 'sutando-expanded-v1';
 const PERSIST_KEY_SHOW_DONE = 'sutando-show-done-v1';
 const PERSIST_KEY_WORKSTREAM_DISPLAY = 'sutando-task-workstream-display-v1';
+// Durable schedulers and health probes use normal task records for claiming,
+// retries, and audit. Archive-backed history must keep those records available
+// to the API without turning them into owner work in the Tasks UI.
+function isOwnerVisibleTask(taskId, task) {
+  const id = String(taskId || '');
+  const source = String((task && task.source) || '').toLowerCase();
+  return source !== 'cron' && source !== 'health-check' &&
+    !id.startsWith('task-cron-') && !id.startsWith('task-health-') &&
+    !id.startsWith('task-smoke-') && !id.startsWith('task-discord-e2e-');
+}
 // Default-hide done tasks. With Tasks growing to top-30, completed work was
 // crowding out active items and the watcher-glance use case ("what's still
 // running?") got lost. Toggle persists across reloads.
@@ -1202,6 +1241,9 @@ function loadPersistedTaskMap() {
     const raw = localStorage.getItem(PERSIST_KEY_TASKS);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
+    Object.keys(parsed).forEach(function(taskId) {
+      if (!isOwnerVisibleTask(taskId, parsed[taskId])) delete parsed[taskId];
+    });
     // Reconstruct Date objects on time fields
     Object.values(parsed).forEach(t => { if (t && t.time) t.time = new Date(t.time); });
     return parsed;
@@ -1220,6 +1262,83 @@ function persistTaskMap() {
 function persistExpanded() {
   try { localStorage.setItem(PERSIST_KEY_EXPAND, JSON.stringify(Array.from(expandedTasks))); } catch {}
 }
+
+// ─── Transcript persistence ──────────────────────────────
+// A MutationObserver is used so every append path is captured without editing
+// each call site.
+const PERSIST_KEY_TRANSCRIPT = 'sutando-transcript-v1';
+const TRANSCRIPT_MAX_ENTRIES = 50;
+const TRANSCRIPT_MAX_ENTRY_LEN = 20000; // skip oversized entries (e.g. data-URL images) to stay under localStorage quota
+let _transcriptRestoring = false;
+let _snapshotTimer = null;
+function snapshotTranscript() {
+  try {
+    const t = $('transcript');
+    if (!t) return;
+    const kids = Array.from(t.children).slice(-TRANSCRIPT_MAX_ENTRIES);
+    const entries = kids.map(el => {
+      // Drop the injected copy button (its onclick can't survive an innerHTML
+      // round-trip) — a live one is re-added on restore.
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('.copy-btn').forEach(b => b.remove());
+      return { cls: el.className, html: clone.innerHTML };
+    }).map(e => {
+      if (!e.html) return null;
+      // Oversized entries get a static placeholder, not a silent drop: omitting
+      // the bubble would make the restored transcript lie. Never user content.
+      if (e.html.length >= TRANSCRIPT_MAX_ENTRY_LEN) {
+        return { cls: e.cls, html: '<em class="t-not-persisted">[image/attachment not kept across reloads — too large for local storage]</em>' };
+      }
+      return e;
+    }).filter(Boolean);
+    try {
+      localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries));
+    } catch {
+      // Quota exceeded — keep only the most recent half and retry once.
+      try { localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries.slice(-Math.ceil(entries.length / 2)))); } catch {}
+    }
+  } catch {}
+}
+function scheduleSnapshot() {
+  if (_transcriptRestoring) return;
+  if (_snapshotTimer) clearTimeout(_snapshotTimer);
+  _snapshotTimer = setTimeout(snapshotTranscript, 400);
+}
+function restoreTranscript() {
+  let entries;
+  try { entries = JSON.parse(localStorage.getItem(PERSIST_KEY_TRANSCRIPT) || '[]'); } catch { return; }
+  if (!Array.isArray(entries) || !entries.length) return;
+  _transcriptRestoring = true;
+  const t = $('transcript');
+  // Clear the freshly-rendered default seed so it isn't duplicated by the
+  // seed entry captured in the snapshot.
+  t.innerHTML = '';
+  entries.forEach(e => {
+    const el = document.createElement('div');
+    el.className = e.cls || 't-entry';
+    // Sanitize on restore — stored html may include agent-origin markdown.
+    if (window.DOMPurify) {
+      try { el.innerHTML = window.DOMPurify.sanitize(e.html); } catch { el.textContent = e.html; }
+    } else {
+      el.textContent = e.html;
+    }
+    t.appendChild(el);
+    // Re-attach a live copy button on user/assistant bubbles.
+    if (el.classList.contains('t-assistant') || el.classList.contains('t-user')) addCopyBtn(el);
+  });
+  _transcriptRestoring = false;
+  scrollTranscript(true);
+}
+function initTranscriptPersistence() {
+  restoreTranscript();
+  try {
+    const t = $('transcript');
+    if (t && window.MutationObserver) {
+      new MutationObserver(scheduleSnapshot).observe(t, { childList: true, subtree: true, characterData: true });
+    }
+  } catch {}
+}
+
 const taskMap = window.taskMap = loadPersistedTaskMap();
 let taskWorkstreamNames = Object.create(null);
 
@@ -1307,6 +1426,7 @@ function mergeTaskRow(existing, row) {
 }
 
 function updateTask(taskId, status, text, result) {
+  if (!isOwnerVisibleTask(taskId, null)) return;
   const existing = taskMap[taskId] || {};
   const isNew = !existing.status;
   taskMap[taskId] = Object.assign({}, existing, {
@@ -1462,7 +1582,9 @@ function summarizeTaskText(raw) {
 // canonical numbered display order used by rendering and voice expand:N.
 const UNGROUPED_WORKSTREAM_ID = '__ungrouped__';
 function groupedTaskDisplay(entries, limit) {
-  let chronological = entries.slice().sort(function(a, b) {
+  let chronological = entries.filter(function(entry) {
+    return isOwnerVisibleTask(entry[0], entry[1]);
+  }).sort(function(a, b) {
     return b[1].time - a[1].time;
   });
   if (Number.isInteger(limit) && limit >= 0) chronological = chronological.slice(0, limit);
@@ -1526,7 +1648,9 @@ function renderTaskWorkstreamGroups(display, renderEntry) {
 
 function renderTasks() {
   const container = $('tasks');
-  const entries = Object.entries(taskMap);
+  const entries = Object.entries(taskMap).filter(function(entry) {
+    return isOwnerVisibleTask(entry[0], entry[1]);
+  });
   window._drTaskCount = entries.length;
   const hdr = $('tasks-header');
   if (entries.length === 0) { container.innerHTML = ''; if (hdr) hdr.style.display = 'none'; return; }
@@ -1658,7 +1782,7 @@ async function hydrateTaskHistory() {
     const data = await resp.json();
     rememberTaskWorkstreams(data.workstreams);
     for (const row of (data.tasks || [])) {
-      if (!row || !row.id) continue;
+      if (!row || !row.id || !isOwnerVisibleTask(row.id, row)) continue;
       knownTaskIds.add(row.id);
       taskMap[row.id] = mergeTaskRow(taskMap[row.id] || {}, row);
       if (row.workstream_id) taskWorkstreamRefreshRequested.delete(row.id);
@@ -1690,6 +1814,7 @@ function startTaskPolling() {
       // Replace taskMap with API data (preserve expanded state and WebSocket-delivered results)
       const apiTasks = new Set();
       for (const t of (data.tasks || [])) {
+        if (!t || !isOwnerVisibleTask(t.id, t)) continue;
         apiTasks.add(t.id);
         const existing = taskMap[t.id] || {};
         if (t.workstream_id) {
@@ -1754,9 +1879,10 @@ hydrateTaskHistory();
 startTaskPolling();
 
 function updateStats() {
+  // Fed by the transport's onStats (byte totals). Per-chunk detail lives in
+  // the debug log via the transport's onDebug audio channel.
   $('stats').textContent =
-    'Sent ' + fmtBytes(bytesSent) + ' / Recv ' + fmtBytes(bytesRecv) +
-    ' (' + audioChunksRecv + ' chunks, ' + playChunkCount + ' played)';
+    'Sent ' + fmtBytes(bytesSent) + ' / Recv ' + fmtBytes(bytesRecv);
 }
 
 function fmtBytes(n) {
@@ -1771,7 +1897,7 @@ function saveDebug() {
     config: { INPUT_RATE, OUTPUT_RATE, CAPTURE_BUF },
     audioCtxState: audioCtx?.state ?? null,
     audioCtxSampleRate: audioCtx?.sampleRate ?? null,
-    bytesSent, bytesRecv, audioChunksRecv, playChunkCount,
+    bytesSent, bytesRecv,
     log: debugLog,
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1783,94 +1909,9 @@ function saveDebug() {
   dbg('Debug data saved');
 }
 
-// ─── PCM helpers ──────────────────────────────────────────
-function downsample(input, fromRate, toRate) {
-  if (fromRate === toRate) return input;
-  const ratio = fromRate / toRate;
-  const len = Math.floor(input.length / ratio);
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    const pos = i * ratio;
-    const idx = Math.floor(pos);
-    const frac = pos - idx;
-    out[i] = input[idx] * (1 - frac) + (input[idx + 1] || 0) * frac;
-  }
-  return out;
-}
-
-function float32ToInt16(f32) {
-  const i16 = new Int16Array(f32.length);
-  for (let i = 0; i < f32.length; i++) {
-    const s = Math.max(-1, Math.min(1, f32[i]));
-    i16[i] = s < 0 ? (s * 0x8000) | 0 : (s * 0x7FFF) | 0;
-  }
-  return i16;
-}
-
-function int16ToFloat32(buf) {
-  const view = new DataView(buf);
-  const len = buf.byteLength / 2;
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    out[i] = view.getInt16(i * 2, true) / 32768;
-  }
-  return out;
-}
-
-// ─── Audio playback (gapless scheduling) ──────────────────
-function playChunk(arrayBuf) {
-  if (!audioCtx || audioCtx.state === 'closed') {
-    try {
-      audioCtx = new AudioContext();
-      dbg('playChunk: created new AudioContext: ' + audioCtx.sampleRate + ' Hz');
-    } catch (e) {
-      dbg('playChunk: failed to create AudioContext: ' + e, 'err');
-      return;
-    }
-  }
-  if (audioCtx.state === 'suspended') {
-    audioCtx.resume();
-    dbg('playChunk: resumed suspended audioCtx');
-  }
-
-  const f32 = int16ToFloat32(arrayBuf);
-  if (f32.length === 0) return;
-
-  try {
-    const audioBuf = audioCtx.createBuffer(1, f32.length, OUTPUT_RATE);
-    audioBuf.getChannelData(0).set(f32);
-
-    const src = audioCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.playbackRate.value = playbackRate;
-    if (!analyserNode) {
-      analyserNode = audioCtx.createAnalyser();
-      analyserNode.fftSize = 256;
-      analyserNode.connect(audioCtx.destination);
-      startSpeakingDetection();
-    }
-    src.connect(analyserNode);
-
-    const now = audioCtx.currentTime;
-    if (nextPlayTime < now) {
-      nextPlayTime = now + 0.05;
-    }
-    src.start(nextPlayTime);
-    nextPlayTime += audioBuf.duration / playbackRate;
-    activeSources.push(src);
-    src.onended = () => {
-      const idx = activeSources.indexOf(src);
-      if (idx >= 0) activeSources.splice(idx, 1);
-    };
-    playChunkCount++;
-
-    if (playChunkCount <= 5) {
-      dbg('Played chunk #' + playChunkCount + ': ' + f32.length + ' samples, scheduled at ' + nextPlayTime.toFixed(3) + 's (ctx.state=' + audioCtx.state + ')', 'audio');
-    }
-  } catch (err) {
-    dbg('playChunk error: ' + err.message, 'err');
-  }
-}
+// PCM DSP + gapless playback live in the canonical transport
+// (SutandoVoice — src/web-voice-transport.ts). The page receives the
+// playback AnalyserNode via onAnalyser for the avatar animation below.
 
 // ─── Speaking detection (avatar animation) ────────────────
 function startSpeakingDetection() {
@@ -1984,288 +2025,105 @@ function stopSpeakingDetection() {
   if (canvas) { var ctx = canvas.getContext('2d'); if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height); }
 }
 
-// ─── Microphone capture ───────────────────────────────────
-async function startMic() {
-  // Check if getUserMedia is available (requires HTTPS or localhost)
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    const isLocalhost = window.location.hostname === 'localhost' || 
-                       window.location.hostname === '127.0.0.1' ||
-                       window.location.hostname === '[::1]';
-    const isHttps = window.location.protocol === 'https:';
-    
-    if (!isLocalhost && !isHttps) {
-      throw new Error('Microphone access requires HTTPS. Please access this page via HTTPS (https://your-domain.com) or use localhost. Modern browsers block getUserMedia on HTTP for security.');
-    } else {
-      throw new Error('Microphone access is not available in this browser. Please use a modern browser that supports getUserMedia.');
-    }
-  }
+// ─── Voice session wiring (canonical transport) ───────────
+// Mic capture, playback, WS protocol, connect timeout, and failure
+// classification all live in SutandoVoice.VoiceTransport (the canonical
+// src/web-voice-transport.ts served at /web-voice-transport.js). The page
+// supplies callbacks for its surface concerns and keeps reconnect policy.
 
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    }
-  });
-
-  const trackSettings = micStream.getAudioTracks()[0].getSettings();
-  dbg('Mic stream: ' + (trackSettings.sampleRate || '?') + ' Hz, device=' + (trackSettings.deviceId || '?').slice(0, 8));
-
-  // Reuse AudioContext created in toggle() on user gesture
-  if (!audioCtx || audioCtx.state === 'closed') {
-    audioCtx = new AudioContext();
-    dbg('Created new AudioContext: ' + audioCtx.sampleRate + ' Hz');
-  }
-  dbg('AudioContext state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
-
-  if (audioCtx.state === 'suspended') {
-    await audioCtx.resume();
-    dbg('AudioContext resumed');
-  }
-
-  const source = audioCtx.createMediaStreamSource(micStream);
-
-  processor = audioCtx.createScriptProcessor(CAPTURE_BUF, 1, 1);
-  let sendCount = 0;
-  processor.onaudioprocess = (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const raw = e.inputBuffer.getChannelData(0);
-    const down = downsample(raw, audioCtx.sampleRate, INPUT_RATE);
-    const pcm = float32ToInt16(down);
-    ws.send(pcm.buffer);
-    bytesSent += pcm.buffer.byteLength;
-    sendCount++;
-    if (sendCount <= 3) {
-      dbg('Sent mic #' + sendCount + ': ' + pcm.buffer.byteLength + 'B (' + down.length + ' samples @ ' + INPUT_RATE + 'Hz)', 'audio');
-    }
-  };
-
-  source.connect(processor);
-  const silence = audioCtx.createGain();
-  silence.gain.value = 0;
-  processor.connect(silence);
-  silence.connect(audioCtx.destination);
-
-  dbg('Mic capture started');
-  reconnectAttempts = 0;
-  addSystem('Microphone active — speak now.');
-
-  // Start Chrome STT for real-time interim display (server final replaces)
-  startChromeStt();
-}
-
-function stopMic() {
-  stopChromeStt();
-  if (processor) { processor.disconnect(); processor = null; }
-  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  // Don't close audioCtx here — playback may still be draining
-}
-
-// ─── WebSocket ────────────────────────────────────────────
 function connectWs() {
-  const url = $('wsUrl').value.trim();
+  const url = _voiceUrlOverride || $('wsUrl').value.trim();
+  _voiceUrlOverride = null;
   if (!url) return;
+  if (typeof SutandoVoice === 'undefined' || !SutandoVoice.VoiceTransport) {
+    // The classic <script> for /web-voice-transport.js failed (packaging
+    // error → 503; console already has the server-side reason).
+    setStatus('Voice unavailable', 'error');
+    addSystem('Voice transport failed to load (/web-voice-transport.js) — check the server logs, then reload this page.');
+    doCleanup({ keepStatus: true });
+    return;
+  }
 
   dbg('Connecting to ' + url);
   setStatus('Connecting...', '');
 
-  ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
+  voice = new SutandoVoice.VoiceTransport({
+    captureBuf: CAPTURE_BUF,
+    inputRate: INPUT_RATE,
+    outputRate: OUTPUT_RATE,
+    onStatus: onVoiceStatus,
+    onConnectFailure: onVoiceConnectFailure,
+    onDebug: function (msg, kind) { dbg(msg, kind); },
+    onTranscript: function (role, text, partial) { handleTranscript(role, text, partial); },
+    // turn.end and turn.interrupted need the same per-turn transcript reset
+    // here; the transport already handles the barge-in playback flush itself.
+    onTurnEnd: resetTurnTranscriptState,
+    onInterrupted: resetTurnTranscriptState,
+    onSessionConfig: function (inRate, outRate) {
+      INPUT_RATE = inRate;
+      OUTPUT_RATE = outRate;
+      dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
+    },
+    onProtocolMessage: handleProtocolMessage,
+    onMicError: function (name, message, friendly) { addSystem(friendly); },
+    onAnalyser: function (node) { analyserNode = node; startSpeakingDetection(); },
+    onStats: function (s) { bytesSent = s.bytesSent; bytesRecv = s.bytesRecv; updateStats(); },
+  });
+  // Fire-and-forget by contract: async outcomes arrive via the callbacks.
+  voice.connect(url).catch(function (e) {
+    dbg('connect failed: ' + e, 'err');
+    setStatus('Connection failed', 'error');
+    doCleanup({ keepStatus: true });
+  });
+}
 
-  ws.onopen = async () => {
-    dbg('WebSocket connected');
-    setStatus('Starting mic...', 'live');
-    try {
-      await startMic();
-      setStatus('Live — speak now', 'live');
-      statsTimer = setInterval(updateStats, 500);
-    } catch (err) {
-      dbg('Mic error: ' + (err && err.name ? err.name + ': ' : '') + err.message, 'err');
-      setStatus('Mic error', 'error');
-      // Not every failure is a permission denial — name the real cause so the user
-      // isn't sent to "browser settings" when the mic is merely busy or absent.
-      let micMsg;
-      switch (err && err.name) {
-        case 'NotAllowedError':
-        case 'SecurityError':
-          micMsg = 'Microphone access denied. Allow mic for this site in browser settings, then click Connect again.';
-          break;
-        case 'NotReadableError':
-        case 'AbortError':
-          micMsg = 'Microphone is in use by another app or tab (Zoom, Photo Booth, another tab, or a prior session). Close it, then click Connect again.';
-          break;
-        case 'NotFoundError':
-        case 'OverconstrainedError':
-          micMsg = 'No microphone found. Connect an input device and select it as the default in your OS sound settings, then Connect.';
-          break;
-        default:
-          micMsg = 'Microphone error (' + (err && err.name ? err.name : 'unknown') + '): ' + (err && err.message ? err.message : 'could not start capture') + '. Click Connect to retry.';
-      }
-      addSystem(micMsg);
-      connected = false;  // prevent auto-reconnect loop
-      ws.close();
+function resetTurnTranscriptState() {
+  // Remove orphaned Chrome STT interim — if server never finalized it,
+  // it's echo from the assistant's voice picked up by mic.
+  if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
+    currentUserEl.remove();
+  }
+  currentUserEl = null;
+  currentAssistantEl = null;
+  serverUserTextReceived = false;
+}
+
+function onVoiceStatus(status, detail, close) {
+  if (status === 'connecting') {
+    setStatus(detail || 'Connecting...', '');
+    return;
+  }
+  if (status === 'live') {
+    setStatus(detail || 'Live', 'live');
+    // The transport emits exactly this detail when mic capture is up;
+    // announce once per session and start the Chrome interim-STT display.
+    if (!micAnnounced && detail === 'Live — speak now') {
+      micAnnounced = true;
+      reconnectAttempts = 0;
+      addSystem('Microphone active — speak now.');
+      startChromeStt();
     }
-  };
-
-  ws.onmessage = (event) => {
-    if (event.data instanceof ArrayBuffer) {
-      bytesRecv += event.data.byteLength;
-      audioChunksRecv++;
-      if (audioChunksRecv <= 5) {
-        dbg('Recv audio #' + audioChunksRecv + ': ' + event.data.byteLength + 'B', 'audio');
-      }
-      playChunk(event.data);
-    } else {
-      try {
-        const msg = JSON.parse(event.data);
-        dbg('Recv: ' + JSON.stringify(msg), 'event');
-
-        if (msg.type === 'session.config' && msg.audioFormat) {
-          INPUT_RATE = msg.audioFormat.inputSampleRate;
-          OUTPUT_RATE = msg.audioFormat.outputSampleRate;
-          dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
-        } else if (msg.type === 'transcript') {
-          handleTranscript(msg.role, msg.text, msg.partial !== false);
-        } else if (msg.type === 'turn.end') {
-          // Remove orphaned Chrome STT interim — if server never finalized it,
-          // it's echo from the assistant's voice picked up by mic.
-          if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
-            currentUserEl.remove();
-          }
-          currentUserEl = null;
-          currentAssistantEl = null;
-          serverUserTextReceived = false;
-        } else if (msg.type === 'turn.interrupted') {
-          for (const s of activeSources) {
-            try { s.stop(); } catch {}
-          }
-          activeSources = [];
-          nextPlayTime = 0;
-          if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
-            currentUserEl.remove();
-          }
-          currentUserEl = null;
-          currentAssistantEl = null;
-          serverUserTextReceived = false;
-        } else if (msg.type === 'gui.update') {
-          const guiData = msg.payload?.data;
-          if (guiData?.type === 'subprocess_log' && guiData.line) {
-            dbg('subprocess  ' + guiData.line, 'audio');
-          } else if (guiData?.type === 'image' && guiData.base64) {
-            const imgEl = document.createElement('div');
-            imgEl.className = 't-entry t-system';
-            const img = document.createElement('img');
-            const imgDataUrl = 'data:' + (guiData.mimeType || 'image/png') + ';base64,' + guiData.base64;
-            img.src = imgDataUrl;
-            img.alt = guiData.description || 'Generated image';
-            img.style.maxWidth = '100%';
-            img.style.borderRadius = '8px';
-            img.style.marginTop = '8px';
-            imgEl.appendChild(img);
-            const dlLink = document.createElement('a');
-            dlLink.className = 'btn-download';
-            dlLink.href = imgDataUrl;
-            const ext = (guiData.mimeType || 'image/png').split('/')[1] || 'png';
-            dlLink.download = 'generated-image-' + Date.now() + '.' + ext;
-            dlLink.textContent = 'Download image';
-            imgEl.appendChild(dlLink);
-            $('transcript').appendChild(imgEl);
-            scrollTranscript();
-            dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
-          } else if (guiData?.type === 'video' && guiData.base64) {
-            const vidEl = document.createElement('div');
-            vidEl.className = 't-entry t-system';
-            const vidDataUrl = 'data:' + (guiData.mimeType || 'video/mp4') + ';base64,' + guiData.base64;
-            const video = document.createElement('video');
-            video.src = vidDataUrl;
-            video.controls = true;
-            video.autoplay = true;
-            video.muted = true;
-            video.style.maxWidth = '100%';
-            video.style.borderRadius = '8px';
-            video.style.marginTop = '8px';
-            if (guiData.description) {
-              const caption = document.createElement('div');
-              caption.style.fontSize = '12px';
-              caption.style.color = '#888';
-              caption.style.marginTop = '4px';
-              caption.textContent = guiData.description;
-              vidEl.appendChild(caption);
-            }
-            vidEl.appendChild(video);
-            const dlLink = document.createElement('a');
-            dlLink.className = 'btn-download';
-            dlLink.href = vidDataUrl;
-            const vidExt = (guiData.mimeType || 'video/mp4').split('/')[1] || 'mp4';
-            dlLink.download = 'generated-video-' + Date.now() + '.' + vidExt;
-            dlLink.textContent = 'Download video';
-            vidEl.appendChild(dlLink);
-            $('transcript').appendChild(vidEl);
-            scrollTranscript();
-            dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
-          } else {
-            addSystem('[gui] ' + JSON.stringify(guiData));
-          }
-        } else if (msg.type === 'gui.command') {
-          if (msg.command === 'collapse_tasks') { collapseAllTasks(); }
-          else if (msg.command === 'expand_tasks') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); renderTasks(); }
-        } else if (msg.type === 'gui.notification') {
-          addSystem('[notification] ' + (msg.payload?.message || ''));
-        } else if (msg.type === 'image') {
-          const imgEl = document.createElement('div');
-          imgEl.className = 't-entry t-system';
-          const img = document.createElement('img');
-          const legacyDataUrl = 'data:' + (msg.data.mimeType || 'image/png') + ';base64,' + msg.data.base64;
-          img.src = legacyDataUrl;
-          img.alt = msg.data.description || 'Generated image';
-          img.style.maxWidth = '100%';
-          img.style.borderRadius = '8px';
-          img.style.marginTop = '8px';
-          imgEl.appendChild(img);
-          const dlLink2 = document.createElement('a');
-          dlLink2.className = 'btn-download';
-          dlLink2.href = legacyDataUrl;
-          const ext2 = (msg.data.mimeType || 'image/png').split('/')[1] || 'png';
-          dlLink2.download = 'generated-image-' + Date.now() + '.' + ext2;
-          dlLink2.textContent = 'Download image';
-          imgEl.appendChild(dlLink2);
-          $('transcript').appendChild(imgEl);
-          scrollTranscript();
-          dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
-        } else if (msg.type === 'speech_speed') {
-          const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
-          playbackRate = speeds[msg.speed] || 1.0;
-          addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + playbackRate + 'x)');
-        } else if (msg.type === 'session_end') {
-          addSystem('Session ended by voice command.');
-          dbg('session_end received — disconnecting', 'event');
-          connected = false; // prevent auto-reconnect
-          if (ws) { ws.close(); ws = null; }
-          doCleanup();
-        } else if (msg.type === 'task.status') {
-          updateTask(msg.taskId, msg.status, msg.text, msg.result);
-        } else if (msg.type === 'grounding') {
-          const chunks = msg.payload?.groundingChunks;
-          if (Array.isArray(chunks) && chunks.length > 0) {
-            const sources = chunks.map(c => c.web?.title || c.web?.uri || '').filter(Boolean).join(', ');
-            if (sources) addSystem('[sources] ' + sources);
-          }
-        }
-      } catch {
-        dbg('Bad JSON text frame', 'warn');
-      }
-    }
-  };
-
-  ws.onclose = (e) => {
-    dbg('WS closed: code=' + e.code + ' reason=' + e.reason);
+    return;
+  }
+  if (status === 'error') {
+    setStatus(detail || 'Error', 'error');
+    return;
+  }
+  if (status === 'superseded') {
+    // Close 4410 (superseded-by-takeover): a user-confirmed takeover moved
+    // the call to another surface. Terminal — never auto-reconnect into a
+    // fight over the call.
+    addSystem('Voice call moved to another surface (window or device).');
+    doCleanup({ keepStatus: true });
+    setStatus('Call moved', 'error');
+    return;
+  }
+  if (status === 'closed') {
     // Server-initiated clean close (goodbye code 4000) or user clicked Disconnect
-    const wasCleanDisconnect = !connected || e.code === 4000;
+    const wasCleanDisconnect = !connected || (close && close.code === 4000);
     // Always reset connected here so subsequent toggle calls (from auto-
     // reconnect or the external SSE toggle path) take the open-new-ws
-    // branch instead of seeing stale state. Without this, an unclean drop
-    // (e.g. voice-agent restart) leaves the page in a wedged state where
-    // ws=null but connected=true, requiring a hard reload to recover.
+    // branch instead of seeing stale state.
     connected = false;
     doCleanup();
     if (wasCleanDisconnect) {
@@ -2274,12 +2132,7 @@ function connectWs() {
       // Unexpected drop (Gemini timeout, voice-agent restart) — auto-reconnect with limit
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        addSystem('Still trying to connect. Common causes:');
-        addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
-        addSystem('2. Voice agent not running — run: bash src/startup.sh');
-        addSystem('3. Port 9900 blocked — check: lsof -i :9900');
-        addSystem('You can type commands below while reconnecting.');
-        addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+        showVoiceTroubleshooting('Still trying to connect. Common causes:');
         setStatus('Reconnecting...', 'error');
         reconnectAttempts = 0;  // reset counter and keep retrying
       } else {
@@ -2294,23 +2147,176 @@ function connectWs() {
         }
       }, 3000);
     }
-  };
-
-  ws.onerror = () => {
-    dbg('WS error', 'err');
-    setStatus('Connection failed', 'error');
-    addSystem('Connection error — is the agent server running?');
-  };
+  }
 }
 
-function doCleanup() {
-  stopMic();
-  if (audioCtx && audioCtx.state !== 'closed') {
-    // Close audio context immediately — don't use a delayed timeout
-    // (a delayed null can race with reconnect and kill the new AudioContext)
-    if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
+function showVoiceTroubleshooting(lead) {
+  addSystem(lead);
+  addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
+  addSystem('2. Voice agent not running — run: bash src/startup.sh');
+  addSystem('3. Port 9900 blocked — check: lsof -i :9900');
+  addSystem('You can type commands below in the meantime.');
+  addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+}
+
+// Terminal connect-attempt failures (design 1e): the transport latched the
+// 'error' status and suppressed its own close, so the page resets its UI here
+// — fail fast with actionable copy instead of the eternal reconnect spinner.
+function onVoiceConnectFailure(f) {
+  dbg('Voice connect failure: ' + f.kind + ' — ' + f.detail, 'err');
+  doCleanup({ keepStatus: true });
+  if (f.kind === 'mic-permission' || f.kind === 'mic-device' || f.kind === 'mic-other') {
+    return; // onMicError already printed the classified mic guidance
   }
-  setStatus('Text only', '');
+  if (f.kind === 'client-busy') {
+    // W5: voice is in use elsewhere — offer the user-confirmed take-over.
+    addSystem(f.detail + ' <span style="color:#4ecca3;cursor:pointer;text-decoration:underline" onclick="takeoverVoice()">Take over the call here</span>', true);
+    return;
+  }
+  addSystem(f.detail + (f.remediation ? ' ' + f.remediation : ''));
+  if (f.kind === 'timeout' || f.kind === 'connect-error') {
+    showVoiceTroubleshooting('Voice did not come up. Common causes:');
+  }
+}
+
+// W5 take-over affordance: the click IS the user confirmation. The challenger
+// reconnects with ?takeover=1; the server closes the incumbent with 4410
+// (its surface shows "call moved") and attaches us.
+function takeoverVoice() {
+  if (connected) return; // already in a call here
+  const url = $('wsUrl').value.trim();
+  if (!url) return;
+  const sep = url.indexOf('?') >= 0 ? '&' : '?';
+  _voiceUrlOverride = url + sep + 'takeover=1';
+  toggle();
+}
+window.takeoverVoice = takeoverVoice;
+
+// Non-audio protocol frames the transport forwards raw. Types the transport
+// itself owns (session.config, transcript, turn.*, agent.state) are handled
+// via the typed callbacks above and deliberately NOT re-handled here.
+function handleProtocolMessage(msg) {
+  if (!msg || !msg.type) return;
+  if (msg.type === 'gui.update') {
+    const guiData = msg.payload?.data;
+    if (guiData?.type === 'subprocess_log' && guiData.line) {
+      dbg('subprocess  ' + guiData.line, 'audio');
+    } else if (guiData?.type === 'image' && guiData.base64) {
+      const imgEl = document.createElement('div');
+      imgEl.className = 't-entry t-system';
+      const img = document.createElement('img');
+      const imgDataUrl = 'data:' + (guiData.mimeType || 'image/png') + ';base64,' + guiData.base64;
+      img.src = imgDataUrl;
+      img.alt = guiData.description || 'Generated image';
+      img.style.maxWidth = '100%';
+      img.style.borderRadius = '8px';
+      img.style.marginTop = '8px';
+      imgEl.appendChild(img);
+      const dlLink = document.createElement('a');
+      dlLink.className = 'btn-download';
+      dlLink.href = imgDataUrl;
+      const ext = (guiData.mimeType || 'image/png').split('/')[1] || 'png';
+      dlLink.download = 'generated-image-' + Date.now() + '.' + ext;
+      dlLink.textContent = 'Download image';
+      imgEl.appendChild(dlLink);
+      $('transcript').appendChild(imgEl);
+      scrollTranscript();
+      dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
+    } else if (guiData?.type === 'video' && guiData.base64) {
+      const vidEl = document.createElement('div');
+      vidEl.className = 't-entry t-system';
+      const vidDataUrl = 'data:' + (guiData.mimeType || 'video/mp4') + ';base64,' + guiData.base64;
+      const video = document.createElement('video');
+      video.src = vidDataUrl;
+      video.controls = true;
+      video.autoplay = true;
+      video.muted = true;
+      video.style.maxWidth = '100%';
+      video.style.borderRadius = '8px';
+      video.style.marginTop = '8px';
+      if (guiData.description) {
+        const caption = document.createElement('div');
+        caption.style.fontSize = '12px';
+        caption.style.color = '#888';
+        caption.style.marginTop = '4px';
+        caption.textContent = guiData.description;
+        vidEl.appendChild(caption);
+      }
+      vidEl.appendChild(video);
+      const dlLink = document.createElement('a');
+      dlLink.className = 'btn-download';
+      dlLink.href = vidDataUrl;
+      const vidExt = (guiData.mimeType || 'video/mp4').split('/')[1] || 'mp4';
+      dlLink.download = 'generated-video-' + Date.now() + '.' + vidExt;
+      dlLink.textContent = 'Download video';
+      vidEl.appendChild(dlLink);
+      $('transcript').appendChild(vidEl);
+      scrollTranscript();
+      dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
+    } else {
+      addSystem('[gui] ' + JSON.stringify(guiData));
+    }
+  } else if (msg.type === 'gui.command') {
+    if (msg.command === 'collapse_tasks') { collapseAllTasks(); }
+    else if (msg.command === 'expand_tasks') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); renderTasks(); }
+  } else if (msg.type === 'gui.notification') {
+    addSystem('[notification] ' + (msg.payload?.message || ''));
+  } else if (msg.type === 'image') {
+    const imgEl = document.createElement('div');
+    imgEl.className = 't-entry t-system';
+    const img = document.createElement('img');
+    const legacyDataUrl = 'data:' + (msg.data.mimeType || 'image/png') + ';base64,' + msg.data.base64;
+    img.src = legacyDataUrl;
+    img.alt = msg.data.description || 'Generated image';
+    img.style.maxWidth = '100%';
+    img.style.borderRadius = '8px';
+    img.style.marginTop = '8px';
+    imgEl.appendChild(img);
+    const dlLink2 = document.createElement('a');
+    dlLink2.className = 'btn-download';
+    dlLink2.href = legacyDataUrl;
+    const ext2 = (msg.data.mimeType || 'image/png').split('/')[1] || 'png';
+    dlLink2.download = 'generated-image-' + Date.now() + '.' + ext2;
+    dlLink2.textContent = 'Download image';
+    imgEl.appendChild(dlLink2);
+    $('transcript').appendChild(imgEl);
+    scrollTranscript();
+    dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
+  } else if (msg.type === 'speech_speed') {
+    const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
+    const rate = speeds[msg.speed] || 1.0;
+    if (voice) voice.setPlaybackRate(rate);
+    addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + rate + 'x)');
+  } else if (msg.type === 'session_end') {
+    addSystem('Session ended by voice command.');
+    dbg('session_end received — disconnecting', 'event');
+    connected = false; // prevent auto-reconnect
+    // disconnect() emits one synchronous 'closed'; the status handler
+    // sees connected=false → clean path ("Disconnected.", no retry).
+    if (voice) { voice.disconnect(); }
+    doCleanup();
+  } else if (msg.type === 'task.status') {
+    updateTask(msg.taskId, msg.status, msg.text, msg.result);
+  } else if (msg.type === 'grounding') {
+    const chunks = msg.payload?.groundingChunks;
+    if (Array.isArray(chunks) && chunks.length > 0) {
+      const sources = chunks.map(c => c.web?.title || c.web?.uri || '').filter(Boolean).join(', ');
+      if (sources) addSystem('[sources] ' + sources);
+    }
+  }
+}
+
+// Page-surface reset after a voice session ends (any path: user disconnect,
+// server close, terminal failure, takeover). The TRANSPORT owns mic/playback/
+// audio-graph teardown; this only resets what the page itself put up.
+// Idempotent via cleanupDone — several paths may reach it for one session.
+function doCleanup(opts) {
+  if (cleanupDone) return;
+  cleanupDone = true;
+  const keepStatus = opts && opts.keepStatus; // preserve an error status line
+  voice = null; // drop the handle — a dead session must not be reused
+  stopChromeStt();
+  if (!keepStatus) setStatus('Text only', '');
   connected = false;
   muted = false;
   fetch('/mute-state?muted=false&voice=false').catch(() => {}); // Reset state on disconnect
@@ -2326,7 +2332,6 @@ function doCleanup() {
   stopVisionPoll();
   $('voice-status').className = 'status-pill voice-off';
   try { sessionStorage.removeItem('sutando-voice'); } catch {}
-  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   updateStats();
 }
 
@@ -2353,6 +2358,9 @@ var _visionCanvas = null;            // hidden canvas reused for toBlob
 // Capped to prevent thrashing if recovery genuinely fails.
 var _visionRearmInFlight = false;
 var _visionRearmCount = 0;
+// Latched when the server reports a terminal stop; cleared only by a fresh
+// user-initiated start, so no recovery path can undo that decision.
+var _visionTerminalStop = false;
 var _VISION_REARM_LIMIT = 3;
 
 function applyVisionState(state) {
@@ -2377,7 +2385,13 @@ function applyVisionState(state) {
   // is gone, just tear down our side.
   var ourSideStale = _visionPushActive && (!streaming || state.source !== 'browser');
   if (ourSideStale) {
-    if (_visionStream && _visionStream.active) {
+    // A terminal stop is a decision, not a glitch — re-arming would restart the
+    // capture the server just stopped, and the voice session it fed is gone.
+    if (state.stoppedReason === 'no-client') {
+      console.log('[Vision] server stopped push mode: no voice client — tearing down');
+      _visionTerminalStop = true;
+      teardownPushSession();
+    } else if (_visionStream && _visionStream.active) {
       rearmPushMode();
     } else {
       teardownPushSession();
@@ -2394,6 +2408,9 @@ function applyVisionState(state) {
 // _VISION_REARM_LIMIT consecutive attempts to prevent thrashing if
 // recovery genuinely fails (e.g., voice session is gone).
 function rearmPushMode() {
+  // A terminal stop is a decision. Re-arming would restart the capture the
+  // server just stopped, so it outranks every recovery guard below.
+  if (_visionTerminalStop) return;
   if (_visionRearmInFlight || _visionRearmCount >= _VISION_REARM_LIMIT) return;
   if (!_visionStream || !_visionStream.active) return;
   _visionRearmInFlight = true;
@@ -2441,17 +2458,59 @@ function updateVisionPreviewStats() {
   if (stats) stats.textContent = _visionFrameCount + ' frame' + (_visionFrameCount === 1 ? '' : 's');
 }
 
+// P7 D7.4: this page's main thread also runs the voice capture
+// (ScriptProcessor in the vendored transport) — drawImage + JPEG encode
+// there competes with audio. A tiny Blob-URL worker does the draw + encode
+// in an OffscreenCanvas; the main thread only grabs a cheap ImageBitmap.
+// One frame in flight at a time (latest-frame discipline, no backlog).
+var _visionWorker = null;
+var _visionWorkerBusy = false;
+function ensureVisionWorker() {
+  if (_visionWorker !== null) return _visionWorker;
+  if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined' || typeof Worker === 'undefined') {
+    _visionWorker = false; // feature-detected once; falsy → main-thread fallback
+    return _visionWorker;
+  }
+  var src = 'onmessage=async function(e){var d=e.data;try{' +
+    'var c=new OffscreenCanvas(d.w,d.h);var x=c.getContext("2d");' +
+    'x.drawImage(d.bmp,0,0,d.w,d.h);d.bmp.close();' +
+    'var b=await c.convertToBlob({type:"image/jpeg",quality:d.q});' +
+    'postMessage({ok:true,blob:b});}catch(err){postMessage({ok:false});}}';
+  try {
+    _visionWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    _visionWorker.onmessage = function(e) {
+      _visionWorkerBusy = false;
+      if (e.data && e.data.ok && e.data.blob) _postVisionBlob(e.data.blob);
+    };
+    _visionWorker.onerror = function() { _visionWorkerBusy = false; };
+  } catch (e) { _visionWorker = false; }
+  return _visionWorker;
+}
+
 function captureAndSendFrame() {
   var preview = document.getElementById('vision-preview');
   if (!preview || !_visionStream) return;
   // Wait for the video to actually have pixels — readyState >= HAVE_CURRENT_DATA (2)
   if (preview.readyState < 2 || !preview.videoWidth || !preview.videoHeight) return;
+  var worker = ensureVisionWorker();
+  if (worker) {
+    if (_visionWorkerBusy) return; // latest-frame: skip, never queue
+    _visionWorkerBusy = true;
+    createImageBitmap(preview).then(function(bmp) {
+      worker.postMessage({ bmp: bmp, w: VISION_FRAME_WIDTH, h: VISION_FRAME_HEIGHT, q: VISION_FRAME_QUALITY }, [bmp]);
+    }).catch(function() { _visionWorkerBusy = false; });
+    return;
+  }
+  // Fallback (no OffscreenCanvas): the original main-thread canvas path.
   if (!_visionCanvas) _visionCanvas = document.createElement('canvas');
   _visionCanvas.width = VISION_FRAME_WIDTH;
   _visionCanvas.height = VISION_FRAME_HEIGHT;
   var ctx = _visionCanvas.getContext('2d');
   ctx.drawImage(preview, 0, 0, VISION_FRAME_WIDTH, VISION_FRAME_HEIGHT);
-  _visionCanvas.toBlob(function(blob) {
+  _visionCanvas.toBlob(function(blob) { _postVisionBlob(blob); }, 'image/jpeg', VISION_FRAME_QUALITY);
+}
+
+function _postVisionBlob(blob) {
     if (!blob) return;
     // Skip blank frames — getDisplayMedia sometimes paints a black frame
     // for the first tick when the user switches surfaces; uploading a
@@ -2472,7 +2531,16 @@ function captureAndSendFrame() {
         // 409 means the server's pushMode flag is false (voice-agent
         // restart) — try to re-arm without waiting for the 2s state poll.
         if (r.status === 409 && _visionPushActive) {
-          rearmPushMode();
+          // The 2s poll usually loses this race at >=1fps, so read the reason
+          // off the rejection itself rather than waiting for the next poll.
+          r.clone().json().then(function(d) {
+            if (d && d.stoppedReason === 'no-client') {
+              _visionTerminalStop = true;
+              teardownPushSession();
+            } else {
+              rearmPushMode();
+            }
+          }).catch(function() { rearmPushMode(); });
         }
         // Surface the first rejection so the user sees why Sutando doesn't
         // see frames (e.g. push mode not active because voice isn't ready).
@@ -2481,11 +2549,11 @@ function captureAndSendFrame() {
         }
       }
     }).catch(function() { /* network blip — next tick will retry */ });
-  }, 'image/jpeg', VISION_FRAME_QUALITY);
 }
 
 function teardownPushSession() {
   _visionPushActive = false;
+  _visionWorkerBusy = false; // an in-flight encode must not block the next session's first frame
   if (_visionFrameTimer) { clearInterval(_visionFrameTimer); _visionFrameTimer = null; }
   if (_visionStream) {
     try { _visionStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
@@ -2550,6 +2618,7 @@ async function startWatch() {
     pollVisionState();
     return;
   }
+  _visionTerminalStop = false;   // a user-initiated start supersedes it
   _visionPushActive = true;
   _visionFrameCount = 0;
   updateVisionPreviewStats();
@@ -2606,9 +2675,11 @@ window.toggleWatch = toggleWatch;
 
 // ─── Mute toggle ──────────────────────────────────────────
 function toggleMute() {
-  if (!micStream) return;
+  if (!voice || !connected) return;
   muted = !muted;
-  micStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+  // Transport call-control gate (also flips the track so the OS mic
+  // indicator reflects the mute).
+  voice.setMicMuted(muted);
   const btn = document.getElementById('btn-mute');
   btn.textContent = muted ? 'Unmute' : 'Mute';
   btn.className = muted ? 'btn-mute muted' : 'btn-mute';
@@ -2661,10 +2732,17 @@ setInterval(reportAgentState, 1000);
 // ─── UI toggle (user gesture context!) ────────────────────
 function toggle() {
   if (connected) {
-    if (ws) { ws.close(); ws = null; }
-    doCleanup();
+    // Set connected=false BEFORE disconnect(): the transport synchronously
+    // emits one 'closed', and the status handler must read it as a clean
+    // user stop (no auto-reconnect).
+    connected = false;
+    const v = voice;
+    if (v) v.disconnect();
+    doCleanup(); // idempotent — no-op when the closed handler already ran
   } else {
-    // Create AudioContext if not already created (may exist from page load or prior toggle)
+    // Page-level AudioContext (tool cues) on the user gesture; the transport
+    // creates its own voice audio graph inside connect(), also within this
+    // gesture's synchronous call stack.
     if (!audioCtx || audioCtx.state === 'closed') {
       audioCtx = new AudioContext();
     } else if (audioCtx.state === 'suspended') {
@@ -2672,12 +2750,11 @@ function toggle() {
     }
     dbg('AudioContext: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
 
-    // Reset counters
-    nextPlayTime = 0;
+    // Reset per-session surface state
     bytesSent = 0;
     bytesRecv = 0;
-    audioChunksRecv = 0;
-    playChunkCount = 0;
+    micAnnounced = false;
+    cleanupDone = false;
 
     connected = true;
     muted = false;
@@ -2870,6 +2947,127 @@ window.toggleActivity = toggleActivity;
 window.showNotesInDR = showNotesInDR;
 window.showNoteInDR = showNoteInDR;
 
+// ─── Web-chat send-path persistence ──────────────────────
+// When voice is disconnected, sendText() routes through the task bridge and
+// polls /result for the late reply (core pickup is 10-32s). The poll used to
+// live in an in-page setInterval closure that died on page reload, so a refresh
+// during the wait dropped the reply forever. Persist {task_id, text} to
+// localStorage and resume polling on load so a reload re-attaches and renders
+// the reply. /result/<id> serves from results/archive too, so the reply
+// survives the bridge archiving the file before the resumed poll runs.
+const PERSIST_KEY_CHAT_PENDING = 'sutando-dashboard-chat-pending-v1';
+// Long-running agent tasks (PR creation, research, multi-step analysis) routinely
+// take many minutes. A short poll cap orphaned the reply: the result landed in the
+// Tasks tab but the transcript was stuck on a dead "(No response yet…)" line forever.
+// Keep polling well past the first minute (backing the cadence off once past the
+// fast window), and on the hard ceiling stop the in-page timer but KEEP the
+// persisted entry so a reload re-attaches and still renders the late reply.
+const CHAT_POLL_FAST_MS = 2 * 1000;            // cadence during the fast window
+const CHAT_POLL_SLOW_MS = 15 * 1000;           // cadence after the fast window
+const CHAT_POLL_FAST_WINDOW_MS = 2 * 60 * 1000;// poll every 2s for the first 2 min
+const CHAT_POLL_MAX_MS = 30 * 60 * 1000;       // ceiling for ONE page session's polling
+// Must stay strictly greater than the poll ceiling: an entry kept for a reload
+// to recover is by definition already older than the ceiling that stopped it.
+const CHAT_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+function loadPendingChatSends() {
+  try {
+    const cutoff = Date.now() - CHAT_PENDING_TTL_MS;
+    return JSON.parse(localStorage.getItem(PERSIST_KEY_CHAT_PENDING) || '[]')
+      .filter(p => p && p.task_id && (p.ts || 0) >= cutoff);
+  } catch { return []; }
+}
+function addPendingChatSend(taskId, text) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    list.push({ task_id: taskId, text, ts: Date.now() });
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function removePendingChatSend(taskId) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function renderChatReply(el, resultText) {
+  // Same markdown-or-escaped-text rendering the inline poll used. marked +
+  // DOMPurify both required — marked alone would be unsafe innerHTML on agent
+  // results that originate from external task channels.
+  if (window.marked && window.DOMPurify) {
+    try {
+      el.innerHTML = window.DOMPurify.sanitize(
+        window.marked.parse(resultText, { breaks: true, gfm: true })
+      );
+    } catch (e) {
+      el.textContent = resultText;
+    }
+  } else {
+    el.textContent = resultText;
+  }
+  el.classList.remove('t-working');
+  addCopyBtn(el);
+}
+// Poll the task bridge for a chat reply and render it into placeholderEl when
+// it arrives. Backs the cadence off after the fast window. On completion it
+// clears the persisted entry; on the ceiling it stops this session's timer but
+// KEEPS the entry so a reload re-attaches and still renders the reply (the
+// result is served from results/archive indefinitely).
+// sentAt is display/context only. The ceiling deliberately runs from THIS
+// session's start: measuring it from the original send made a resumed poll
+// exceed it on its first tick and return without ever calling /result.
+function pollChatReply(taskId, placeholderEl, sentAt) {
+  const apiBase = 'http://' + location.hostname + ':7843';
+  const begin = Date.now();
+  let timer = null;
+  const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const schedule = (elapsed) => {
+    const delay = elapsed < CHAT_POLL_FAST_WINDOW_MS ? CHAT_POLL_FAST_MS : CHAT_POLL_SLOW_MS;
+    timer = setTimeout(tick, delay);
+  };
+  const tick = () => {
+    const elapsed = Date.now() - begin;
+    if (elapsed > CHAT_POLL_MAX_MS) {
+      stop();
+      // Keep the persisted entry — a reload resumes the poll and can still
+      // render the reply once the (slow) task finishes.
+      if (placeholderEl && placeholderEl.classList.contains('t-working')) {
+        placeholderEl.textContent = '(Still working — the reply will appear here when it lands, or refresh. It is also in the Tasks tab.)';
+        placeholderEl.classList.remove('t-working');
+      }
+      return;
+    }
+    fetch(apiBase + '/result/' + taskId).then(r => r.json()).then(r => {
+      if (r.status === 'completed') {
+        stop();
+        removePendingChatSend(taskId);
+        renderChatReply(placeholderEl, r.result);
+        scrollTranscript();
+      } else {
+        schedule(elapsed);
+      }
+    }).catch(() => { schedule(elapsed); });
+  };
+  tick();
+}
+// On page load, re-render any in-flight chat sends and resume polling so a
+// reload during the core-pickup wait still surfaces the reply.
+function resumePendingChatSends() {
+  const pending = loadPendingChatSends();
+  if (!pending.length) return;
+  pending.forEach(p => {
+    const ue = document.createElement('div');
+    ue.className = 't-entry t-user';
+    ue.textContent = p.text;
+    $('transcript').appendChild(ue);
+    const placeholder = document.createElement('div');
+    placeholder.className = 't-entry t-assistant t-working';
+    placeholder.textContent = 'working…';
+    $('transcript').appendChild(placeholder);
+    pollChatReply(p.task_id, placeholder, p.ts);
+  });
+  scrollTranscript(true);
+}
+
 // ─── Text input ──────────────────────────────────────────
 function sendText() {
   const input = $('textInput');
@@ -2885,9 +3083,8 @@ function sendText() {
   scrollTranscript(true);
   input.value = '';
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    // Voice connected — send through voice agent
-    ws.send(JSON.stringify({ type: 'text_input', text }));
+  if (voice && voice.sendTextInput(text)) {
+    // Voice connected — sent through the voice agent's live socket
     dbg('Sent text via voice: "' + text.slice(0, 50) + '"', 'event');
   } else {
     // Voice disconnected — route through task bridge (same as Telegram/Discord)
@@ -2897,36 +3094,18 @@ function sendText() {
       .then(d => {
         if (d.ok) {
           dbg('Sent text via task bridge: ' + d.task_id, 'event');
-          // Poll for result
-          const poll = setInterval(() => {
-            fetch(apiBase + '/result/' + d.task_id).then(r => r.json()).then(r => {
-              if (r.status === 'completed') {
-                clearInterval(poll);
-                const re = document.createElement('div');
-                re.className = 't-entry t-assistant';
-                // Render markdown if marked.js + DOMPurify both loaded; fall
-                // back to escaped textContent otherwise. Both required — marked
-                // alone would be unsafe innerHTML on agent results that
-                // originate from external task channels.
-                // Before this, headings/lists in long replies (e.g. skill
-                // suggestions) came through as raw "###" / "*" characters.
-                if (window.marked && window.DOMPurify) {
-                  try {
-                    re.innerHTML = window.DOMPurify.sanitize(
-                      window.marked.parse(r.result, { breaks: true, gfm: true })
-                    );
-                  } catch (e) {
-                    re.textContent = r.result;
-                  }
-                } else {
-                  re.textContent = r.result;
-                }
-                addCopyBtn(re);
-                $('transcript').appendChild(re);
-                scrollTranscript();
-              }
-            }).catch(() => {});
-          }, 2000);
+          // Persist the in-flight send so a page reload during the core-pickup
+          // wait re-attaches and renders the reply instead of dropping it.
+          addPendingChatSend(d.task_id, text);
+          // Show a "working…" placeholder immediately so the 10-32s wait reads
+          // as in-progress, not failure. The placeholder is filled in place
+          // when the reply arrives.
+          const placeholder = document.createElement('div');
+          placeholder.className = 't-entry t-assistant t-working';
+          placeholder.textContent = 'working…';
+          $('transcript').appendChild(placeholder);
+          scrollTranscript();
+          pollChatReply(d.task_id, placeholder);
         }
       })
       .catch(() => {
@@ -2937,6 +3116,8 @@ function sendText() {
       });
   }
 }
+
+try { resumePendingChatSends(); } catch {}
 
 // ─── Dynamic region: contextual generative UI ────────────
 // Priority: dynamic-content.json > pending questions > proactive status > chips
@@ -4191,15 +4372,23 @@ const server = createServer((req, res) => {
 		const port = Number(process.env.VISION_CONTROL_PORT) || 7847;
 		const method = req.method === 'POST' ? 'POST' : 'GET';
 		const isFrame = url.pathname === '/vision/frame';
-		const chunks: Buffer[] = [];
-		req.on('data', (c: Buffer) => chunks.push(c));
-		req.on('end', async () => {
+		// This surface binds 0.0.0.0 by default, and every oversized frame it
+		// forwards costs a subprocess downstream — so the body is capped here,
+		// not just at the control server.
+		void readBodyCapped(req).then(async (body) => {
+			if (!body) {
+				res.writeHead(413, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ status: 'failed', error: 'body too large' }));
+				return;
+			}
 			try {
 				const incomingType = (req.headers['content-type'] as string | undefined) || (isFrame ? 'image/jpeg' : 'application/json');
 				const r = await fetch(`http://127.0.0.1:${port}${url.pathname}`, {
 					method,
 					headers: method === 'POST' ? { 'Content-Type': incomingType } : undefined,
-					body: method === 'POST' ? (chunks.length ? Buffer.concat(chunks) : (isFrame ? Buffer.alloc(0) : '{}')) : undefined,
+					// Uint8Array view, not the Buffer itself: fetch's BodyInit does not
+					// accept Buffer under @types/node's generic-backed Buffer type.
+					body: method === 'POST' ? (body.byteLength ? new Uint8Array(body) : (isFrame ? new Uint8Array(0) : '{}')) : undefined,
 				});
 				const text = await r.text();
 				res.writeHead(r.status, { 'Content-Type': 'application/json' });

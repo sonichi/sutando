@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from send_allowlist import is_path_sendable, SEND_ALLOWED_ROOTS
+from policy.egress.attachment import is_path_sendable, SEND_ALLOWED_ROOTS
 
 
 class ExtraRoots(unittest.TestCase):

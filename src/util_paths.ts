@@ -232,6 +232,18 @@ export function claudeHomePath(...subpath: string[]): string {
 	return join(base, ...subpath);
 }
 
+/**
+ * Derive the project slug Claude Code uses under `projects/<slug>/` for a
+ * given absolute path, by dashing every non-alphanumeric character (not just
+ * "/"). Matching only "/" resolves to a nonexistent dir on any path
+ * containing a space or dot — e.g. a desktop-bundled checkout under
+ * "Application Support/space.ag2.app/" — so every caller must derive the
+ * slug through this one function rather than re-implementing the regex.
+ */
+export function claudeProjectSlug(path: string): string {
+	return path.replace(/[^A-Za-z0-9]/g, '-');
+}
+
 // ---------------------------------------------------------------------------
 // Screen-capture token — issued once at screen-capture-server startup,
 // stored 0600 at ~/.config/sutando/screen-capture-token.  Callers include

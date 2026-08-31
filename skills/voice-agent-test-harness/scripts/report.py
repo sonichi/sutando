@@ -77,7 +77,10 @@ def deliver(text: str, workspace: str | None = None) -> str:
     results = ws / "results"
     results.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
-    path = results / f"proactive-{ts}.txt"
+    # Telegram-destined by contract (module docstring); the filename tag makes
+    # the intended bridge — not the polling race — the claimant.
+    from proactive_routing import proactive_filename
+    path = results / proactive_filename(ts, channel="telegram")
     path.write_text(text)
     return str(path)
 

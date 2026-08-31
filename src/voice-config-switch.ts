@@ -4,9 +4,11 @@
  * Writes the per-user voice-agent config at
  * `$SUTANDO_WORKSPACE/config/voice-agent.json` (data, not code — NOT a
  * committed repo file; the repo ships voice-agent.config.json.example as a
- * template) and kicks `launchctl kickstart -k
- * gui/$(id -u)/com.sutando.voice-agent` so voice-agent restarts and picks
- * up the new config. The web client auto-reconnects on restart, so the
+ * template) and fires the GUARDED restart wrapper
+ * (`scripts/restart-voice-agent.sh`) so voice-agent restarts and picks
+ * up the new config — never a direct `launchctl kickstart -k` (amendment
+ * T4: the pre-kickstart validation runs as one guarded voice-lock.py
+ * takeover transaction). The web client auto-reconnects on restart, so the
  * user-visible flow is: spoken command → ack → ~2-3s silence → voice
  * back with new model.
  *
@@ -14,18 +16,46 @@
  *   - 'search'    → 2.5-flash-native-audio + googleSearch:true  (Web grounding ON)
  *   - 'no-search' → 3.1-flash-live-preview + googleSearch:false (newer model, no Web)
  *
- * The tool returns BEFORE the kickstart fires (small setTimeout) so Gemini
- * can speak the ack before the transport closes. Kickstart kills this
- * process; launchd respawns it; web client reconnects.
+ * The tool returns BEFORE the restart fires (small setTimeout) so Gemini
+ * can speak the ack before the transport closes. The guarded takeover kills
+ * this process; launchd respawns it; web client reconnects.
  */
 
 import { z } from 'zod';
-import { writeFileSync, renameSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeFileSync, renameSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { VOICE_CONFIG_DEFAULTS, type VoiceConfig } from './voice-config.js';
 import { resolveWorkspace } from './workspace_default.js';
+
+const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+
+/** Absolute path of the guarded restart wrapper — the ONLY sanctioned way to
+ * restart voice-agent (voice-reliability plan amendment T4). */
+export const GUARDED_RESTART_SCRIPT = join(REPO_ROOT, 'scripts', 'restart-voice-agent.sh');
+
+/**
+ * Fire the guarded restart (detached, fire-and-forget). Never a direct
+ * `launchctl kickstart -k` of com.sutando.voice-agent: kickstart of a launchd
+ * job is a restart, and amendment T4 requires the pre-kickstart validation —
+ * identity of the running job pid via ONE guarded `voice-lock.py takeover`
+ * transaction — to precede it. restart-voice-agent.sh wraps exactly that
+ * (validate → TERM → wait → KILL → revalidate → unlink under the held fcntl
+ * guard, then kickstart + etime verification); identity mismatch ⇒
+ * takeover-blocked, nothing signaled; missing interpreter ⇒ the wrapper fails
+ * closed before touching the lock. `spawnImpl` is injectable for tests.
+ */
+export function fireGuardedRestart(spawnImpl: typeof spawn = spawn): void {
+	// detached so the wrapper outlives this process — the takeover it runs
+	// kills the current voice-agent (we ARE the lock holder) mid-script.
+	const child = spawnImpl('bash', [GUARDED_RESTART_SCRIPT], {
+		detached: true,
+		stdio: 'ignore',
+	});
+	child.unref();
+}
 
 // Presets carry only the two knobs this tool switches (model + googleSearch);
 // owner_mode / channels are merged in from VOICE_CONFIG_DEFAULTS at write time.
@@ -37,6 +67,38 @@ const PRESETS: Record<'search' | 'no-search', VoiceConfigPreset> = {
 };
 
 const ts = () => new Date().toISOString().slice(11, 23);
+
+/** Read the live config as raw JSON. An absent, unreadable, or corrupt file
+ *  is not a reason to refuse a switch — the caller falls back to defaults. */
+export function readConfigRaw(path: string): unknown {
+	try {
+		return existsSync(path) ? JSON.parse(readFileSync(path, 'utf-8')) : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * What the switch writes: defaults fill gaps, **the user's own file is
+ * preserved**, and only the preset's keys are overlaid.
+ *
+ * The previous form was `{...VOICE_CONFIG_DEFAULTS, ...preset}` — it never
+ * read the file, so every switch REPLACED it. That silently deleted session
+ * tuning (`compressionConfig`, `mediaResolution`), their explicit
+ * `null`/`false` off-switches, and any future key, with a restart right
+ * behind it so the loss left no trace. Preserving raw is also what makes a
+ * fleet-wide defaults revert reach devices whose user has used the switch.
+ */
+export function nextSwitchConfig(
+	existingRaw: unknown,
+	preset: Pick<VoiceConfig, 'model' | 'googleSearch'>,
+): VoiceConfig {
+	const existing =
+		existingRaw && typeof existingRaw === 'object' && !Array.isArray(existingRaw)
+			? (existingRaw as Partial<VoiceConfig>)
+			: {};
+	return { ...VOICE_CONFIG_DEFAULTS, ...existing, ...preset };
+}
 
 export const switchVoiceConfigTool: ToolDefinition = {
 	name: 'switch_voice_config',
@@ -72,8 +134,7 @@ export const switchVoiceConfigTool: ToolDefinition = {
 		const tmpPath = `${configPath}.tmp-${process.pid}`;
 		try {
 			mkdirSync(join(resolveWorkspace(), 'config'), { recursive: true });
-			// Merge with defaults so the on-disk file is complete + auditable.
-			const next: VoiceConfig = { ...VOICE_CONFIG_DEFAULTS, ...cfg };
+			const next = nextSwitchConfig(readConfigRaw(configPath), cfg);
 			writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
 			renameSync(tmpPath, configPath);
 			console.log(`${ts()} [SwitchVoiceConfig] wrote ${configPath} → preset=${preset} (model=${cfg.model}, search=${cfg.googleSearch})`);
@@ -84,16 +145,10 @@ export const switchVoiceConfigTool: ToolDefinition = {
 
 		// Schedule restart AFTER returning so Gemini speaks the ack first.
 		// 1.5s gives the model time to render the ack into audio + push to
-		// the transport before launchd kills us.
+		// the transport before the guarded takeover kills us.
 		setTimeout(() => {
-			console.log(`${ts()} [SwitchVoiceConfig] firing launchctl kickstart`);
-			const uid = process.getuid?.() ?? 501;
-			// detached so the child outlives this process if the kill is fast.
-			const child = spawn('launchctl', ['kickstart', '-k', `gui/${uid}/com.sutando.voice-agent`], {
-				detached: true,
-				stdio: 'ignore',
-			});
-			child.unref();
+			console.log(`${ts()} [SwitchVoiceConfig] firing guarded restart (${GUARDED_RESTART_SCRIPT})`);
+			fireGuardedRestart();
 		}, 1500);
 
 		const summary = preset === 'search'

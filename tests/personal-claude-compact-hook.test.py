@@ -189,6 +189,35 @@ with tempfile.TemporaryDirectory() as ws:
     except (json.JSONDecodeError, KeyError) as e:
         fail("cwd independence", f"bad output {r.stdout[:200]!r} ({e})")
 
+# ── Test 8b: installer skips (not crashes) on a clean Mac with no dev tools ───
+# "No CLT" fixture per tests/python-binary-sh.test.sh: fake xcode-select (exit 2).
+with tempfile.TemporaryDirectory() as tmp:
+    noclt = os.path.join(tmp, "noclt")
+    os.makedirs(noclt)
+    with open(os.path.join(noclt, "xcode-select"), "w") as f:
+        f.write("#!/bin/sh\nexit 2\n")
+    os.chmod(os.path.join(noclt, "xcode-select"), 0o755)
+
+    cwd = os.path.join(tmp, "cwd")
+    os.makedirs(cwd)
+    env = dict(os.environ)
+    env["SUTANDO_CLAUDE_WORKING_DIR"] = cwd
+    env["PATH"] = f"{noclt}:/usr/bin:/bin"
+    env["OSTYPE"] = "darwin25"
+    env.pop("SUTANDO_PY", None)
+    r = subprocess.run(
+        ["bash", INSTALLER], capture_output=True, text=True, env=env, timeout=30
+    )
+    settings_path = os.path.join(cwd, ".claude", "settings.json")
+    if r.returncode == 0 and not os.path.exists(settings_path):
+        ok("installer skips cleanly on a clean Mac with no developer tools")
+    else:
+        fail(
+            "installer clean-mac stub skip",
+            f"rc={r.returncode} settings_exists={os.path.exists(settings_path)} "
+            f"out={r.stdout[:160]!r} err={r.stderr[:160]!r}",
+        )
+
 # ── Test 8: scope gate — non-core session (no SUTANDO_CORE_SESSION) is silent ──
 with tempfile.TemporaryDirectory() as ws:
     with open(os.path.join(ws, "PERSONAL_CLAUDE.md"), "w") as f:

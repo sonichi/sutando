@@ -62,6 +62,12 @@ class EnvCase(unittest.TestCase):
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in ENVK}
         _clear()
+        # setUp clears every token var, so an unshadowed gateway() would fall
+        # through and read the operator's REAL channels/ag2space/.env.
+        self._env_file_patch = mock.patch.object(
+            _gateway, "_channel_env_file", lambda: None)
+        self._env_file_patch.start()
+        self.addCleanup(self._env_file_patch.stop)
 
     def tearDown(self):
         _clear()
@@ -130,6 +136,66 @@ class ReadTests(EnvCase):
                                side_effect=lambda m, u, h: (cap.update(url=u), (200, b'{"messages":[]}', {}))[1]):
             rd.read_room(ROOM, HS, limit=9999, gate=None)
         self.assertIn(f"limit={rd.MAX_LIMIT}", cap["url"])
+
+    def _raw_window_gateway(self, total_messages=14, noise_per_message=2):
+        """A gateway whose `limit` bounds RAW EVENTS, of which only some are messages.
+
+        This is what the live ag2.space gateway does. Reproduced here because the failure
+        it causes is silent: fewer messages than asked for, ok:true, and no error.
+        """
+        import urllib.parse as _up
+
+        def _http(_m, url, _h):
+            raw = int(dict(_up.parse_qsl(_up.urlparse(url).query))["limit"])
+            # Newest-first timeline: every message preceded by `noise` non-message events,
+            # so the first `noise` slots of any window contain no messages at all.
+            msgs, consumed = [], 0
+            for i in range(total_messages):
+                consumed += noise_per_message
+                if consumed >= raw:
+                    break
+                consumed += 1
+                msgs.append({"sender": "@a:hs", "ts": 1000 - i, "body": f"m{i}"})
+                if consumed >= raw:
+                    break
+            return (200, json.dumps({"messages": msgs}).encode(), {})
+        return _http
+
+    def test_small_limit_does_not_report_an_empty_room(self):
+        """limit=3 must not return zero messages from a room that has fourteen.
+
+        REGRESSION (measured live 2026-08-05): the gateway's limit counts raw timeline
+        events, so `--limit 3` returned `ok:true` with an EMPTY message list on a busy
+        room. A cheap "did anyone reply?" probe is exactly what passes a small limit, and
+        the false empty is indistinguishable from silence. Before the fix this asserts 0.
+        """
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request", side_effect=self._raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=3, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["messages"]), 3, "a small limit must still yield messages")
+
+    def test_limit_counts_messages_not_raw_events(self):
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request", side_effect=self._raw_window_gateway()):
+            res = rd.read_room(ROOM, HS, limit=10, gate=None)
+        self.assertEqual(len(res["messages"]), 10)
+        self.assertTrue(res["complete"])
+
+    def test_short_room_under_claims_completeness(self):
+        """Short of `limit` never claims complete — the client cannot tell why it is short.
+
+        Updated per the #2678 review: a repeated message count across a wider window is
+        NOT proof of exhausted history (the extra raw events may all be non-messages), and
+        this endpoint returns only message-type items, so a short page is indistinguishable
+        from a noisy one. Under-claiming is the safe direction here.
+        """
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(rd, "http_request",
+                               side_effect=self._raw_window_gateway(total_messages=2)):
+            res = rd.read_room(ROOM, HS, limit=20, gate=None)
+        self.assertEqual(len(res["messages"]), 2)
+        self.assertFalse(res["complete"], "short of limit -> never claim complete")
 
     def test_success_parses(self):
         os.environ["RELAY_URL"] = "https://r"
@@ -678,6 +744,54 @@ class EventsSubscribeTests(EnvCase):
                           ev.subscribe(ROOM, ["message.created"], agent_mxid=HS, gate=None)["reason"])
 
 
+# ----- events: typed emit (op:event) ----- #
+class EventsEmitTests(EnvCase):
+    def test_no_gateway(self):
+        res = ev.emit(ROOM, "space.ag2.app.card", {"k": 1}, agent_mxid=HS, gate=None)
+        self.assertIn("no gateway", res["reason"])
+
+    def test_gate_deny(self):
+        os.environ["RELAY_URL"] = "https://r"
+        res = ev.emit(ROOM, "space.ag2.app.card", {"k": 1}, agent_mxid=HS, gate={})
+        self.assertIn("gate denied", res["reason"])
+
+    def test_emit_envelope_and_event_id(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        fake = {"event_id": "$abc"}
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(url=u, payload=p), (200, fake))[1]):
+            res = ev.emit(ROOM, "space.ag2.app.card", {"k": 1}, agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["event_id"], "$abc")
+        self.assertEqual(res["state"], "confirmed")
+        self.assertTrue(cap["url"].endswith("/v1/room"))
+        self.assertEqual(cap["payload"], {"op": "event", "room_id": ROOM,
+                                          "type": "space.ag2.app.card",
+                                          "content": {"k": 1}})
+
+    def test_missing_event_id_is_unconfirmed_but_ok(self):
+        # Same fail-open receipt as say/mention — a caller must not re-send an
+        # event the gateway may already have landed.
+        os.environ["RELAY_URL"] = "https://r"
+        with mock.patch.object(ev, "http_json",
+                               side_effect=lambda m, u, h, p: (200, {"ok": True})):
+            res = ev.emit(ROOM, "space.ag2.app.card", {"k": 1}, agent_mxid=HS, gate=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["state"], "unconfirmed")
+        self.assertIsNone(res["event_id"])
+
+    def test_server_type_refusal_surfaces_verbatim(self):
+        # The namespace rule lives server-side and is deliberately NOT copied
+        # into the client; its refusal must reach the caller as `reason`.
+        os.environ["RELAY_URL"] = "https://r"
+        err = {"error": "event type must be under space.ag2.*"}
+        with mock.patch.object(ev, "http_json", side_effect=lambda m, u, h, p: (200, err)):
+            res = ev.emit(ROOM, "not.ag2.thing", {"k": 1}, agent_mxid=HS, gate=None)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["reason"], "event type must be under space.ag2.*")
+
+
 # ----- events: long-poll pull ----- #
 class EventsPullTests(EnvCase):
     def test_no_gateway(self):
@@ -1164,6 +1278,243 @@ class AcceptanceRunnerArgTests(EnvCase):
                 ea._main(["--room", ROOM, "--cursor-file", "/tmp/c",
                           "--mode", "taskify", "--task-dir", "/tmp/t"])
 
+
+# ----- reply citation (relations, say, mention) ----- #
+import say as sy, relations as rl  # noqa: E401,E402
+
+OTHER = "$evt2"
+
+
+class RelationFieldsTests(unittest.TestCase):
+    def test_none_is_uncited(self):
+        self.assertEqual(rl.relation_fields(), {})
+
+    def test_reply_to_becomes_the_field(self):
+        self.assertEqual(rl.relation_fields(reply_to=EV), {"reply_to": EV})
+
+    def test_malformed_ids_raise(self):
+        for bad in ("evt1", "$", "root", "  ", "  $ok"[:3]):
+            with self.assertRaises(rl.RelationError):
+                rl.relation_fields(reply_to=bad)
+
+    def test_empty_string_means_no_citation(self):
+        # Distinct from malformed: "" is the flag not being given at all.
+        self.assertEqual(rl.relation_fields(reply_to=""), {})
+
+    def test_whitespace_is_stripped(self):
+        self.assertEqual(rl.relation_fields(reply_to="  $evt1  "), {"reply_to": EV})
+
+    def test_no_thread_surface_is_offered(self):
+        # The gateway cannot honour a thread relation, so asking for one must be
+        # impossible rather than silently downgraded to this citation.
+        with self.assertRaises(TypeError):
+            rl.relation_fields(thread_root=EV)
+
+
+class SayCitationTests(EnvCase):
+    def _post(self, **kwargs):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {}))[1]):
+            res = sy.say("hi", ROOM, HS, gate=None, **kwargs)
+        return res, cap
+
+    def test_plain_say_cites_nothing(self):
+        res, cap = self._post()
+        self.assertTrue(res["ok"])
+        self.assertNotIn("reply_to", cap["payload"])
+
+    def test_reply_to_rides_the_payload(self):
+        res, cap = self._post(reply_to=EV)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["reply_to"], EV)
+        # The body and op are untouched by the citation field.
+        self.assertEqual(cap["payload"]["body"], "hi")
+        self.assertEqual(cap["payload"]["op"], "message")
+
+    def test_no_thread_relation_is_ever_sent(self):
+        # Pins the review's requirement: nothing on this path may claim thread
+        # membership the gateway cannot deliver.
+        _res, cap = self._post(reply_to=EV)
+        self.assertNotIn("thread_root", cap["payload"])
+        self.assertNotIn("m.relates_to", cap["payload"])
+
+    def test_bad_id_refuses_before_the_network(self):
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            res = sy.say("hi", ROOM, HS, gate=None, reply_to="evt1")
+        self.assertFalse(res["ok"])
+        self.assertIn("event id", res["reason"])
+        self.assertEqual(called, [])   # no post — control below proves the mock fires
+
+    def test_control_good_id_does_post(self):
+        # Pairs with the test above: proves the empty call list there is the
+        # refusal, not a mock that never fires.
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(sy, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            sy.say("hi", ROOM, HS, gate=None, reply_to=EV)
+        self.assertEqual(len(called), 1)
+
+
+class MentionCitationTests(EnvCase):
+    AGENTS = [{"id": "@peer:hs", "label": "peer"}]
+
+    def test_citation_rides_the_payload(self):
+        os.environ["RELAY_URL"] = "https://r"
+        cap = {}
+        with mock.patch.object(mn, "http_json",
+                               side_effect=lambda m, u, h, p: (cap.update(payload=p), (200, {}))[1]):
+            res = mn.mention("peer", "ping", ROOM, HS, gate=None, agents=self.AGENTS,
+                             reply_to=OTHER)
+        self.assertTrue(res["ok"])
+        self.assertEqual(cap["payload"]["reply_to"], OTHER)
+        self.assertEqual(cap["payload"]["mentions"], ["@peer:hs"])
+
+    def test_bad_id_refuses_before_resolve_and_network(self):
+        os.environ["RELAY_URL"] = "https://r"
+        called = []
+        with mock.patch.object(mn, "http_json",
+                               side_effect=lambda *a, **k: called.append(a) or (200, {})):
+            res = mn.mention("peer", "ping", ROOM, HS, gate=None, agents=self.AGENTS,
+                             reply_to="root")
+        self.assertFalse(res["ok"])
+        self.assertEqual(called, [])
+
+
+class CitationCLITests(EnvCase):
+    def test_say_flag_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._say, "say",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["say", ROOM, "hi", "--reply-to", EV])
+        self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_mention_flag_reaches_the_function(self):
+        cap = {}
+        with mock.patch.object(room_ops._mention, "mention",
+                               side_effect=lambda *a, **k: (cap.update(kw=k), {"ok": True})[1]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                room_ops._main(["mention", "peer", "ping", ROOM, "--reply-to", EV])
+        self.assertEqual(cap["kw"], {"reply_to": EV})
+
+    def test_help_says_a_citation_is_not_a_thread(self):
+        # The surface a caller hits first must carry the limitation, not only
+        # the module docstring and the skill doc.
+        for verb in ("say", "mention"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                room_ops._main([verb, "--help"])
+            text = out.getvalue()
+            self.assertIn("CITATION", text)
+            self.assertIn("does NOT put", text)
+
+
+class ChannelEnvLocatorTests(unittest.TestCase):
+    """Exercise the REAL _channel_env_file() — every other test shadows it.
+
+    Without this, drifting the path segments or moving claude_home_path leaves the
+    tier permanently unresolved and the suite green, reproducing the exact symptom
+    this feature removes: "no gateway configured" with a credential on disk.
+    """
+
+    def test_locates_the_channel_env_under_claude_config_dir(self):
+        d = tempfile.mkdtemp()
+        ch = os.path.join(d, "channels", "ag2space")
+        os.makedirs(ch)
+        env = os.path.join(ch, ".env")
+        with open(env, "w") as fh:
+            fh.write("REMOTE_TASK_TOKEN=x\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
+            got = _gateway._channel_env_file()
+        self.assertIsNotNone(got, "real locator returned None for a file that exists")
+        self.assertEqual(os.path.realpath(str(got)), os.path.realpath(env))
+        os.remove(env)
+        for p in (ch, os.path.dirname(ch), d):
+            os.rmdir(p)
+
+    def test_returns_none_when_the_file_is_absent(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, d)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
+            self.assertIsNone(_gateway._channel_env_file())
+
+
+class ChannelEnvTierTests(EnvCase):
+    """The channel `.env` tier: env -> channels/ag2space/.env -> vault.
+
+    Regression: the desktop-spawned core's supervisor uses a fixed env whitelist,
+    so REMOTE_TASK_* never reach the process even though the channel .env holds
+    them. gateway() read env then vault and skipped the file, reporting
+    "no gateway configured" while a working credential sat on disk.
+    """
+
+    def _write_env(self, body):
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, ".env")
+        with open(f, "w") as fh:
+            fh.write(body)
+        self.addCleanup(lambda: (os.remove(f), os.rmdir(d)))
+        return f
+
+    def test_token_and_url_come_from_channel_env(self):
+        f = self._write_env("REMOTE_TASK_URL=https://gw.example\n"
+                            "REMOTE_TASK_TOKEN=sekret\n")
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: f):
+            base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://gw.example")
+        self.assertEqual(headers.get("Authorization"), "Bearer sekret")
+
+    def test_process_env_still_wins_over_the_file(self):
+        f = self._write_env("REMOTE_TASK_URL=https://file.example\n"
+                            "REMOTE_TASK_TOKEN=from-file\n")
+        os.environ["GATEWAY_URL"] = "https://env.example"
+        os.environ["GATEWAY_TOKEN"] = "from-env"
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: f):
+            base, headers = _gateway.gateway()
+        self.assertEqual(base, "https://env.example")
+        self.assertEqual(headers.get("Authorization"), "Bearer from-env")
+
+    def test_file_wins_over_vault(self):
+        f = self._write_env("REMOTE_TASK_URL=https://file.example\n"
+                            "REMOTE_TASK_TOKEN=from-file\n")
+        _VAULT_STORE["REMOTE_TASK_TOKEN"] = "https://vault.example|from-vault"
+        self.addCleanup(_VAULT_STORE.pop, "REMOTE_TASK_TOKEN", None)
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: f):
+            base, headers = _gateway.gateway()
+        self.assertEqual(headers.get("Authorization"), "Bearer from-file")
+        self.assertEqual(base, "https://file.example")
+
+    def test_absent_file_leaves_prior_behaviour_untouched(self):
+        # _channel_env_file() -> None is EnvCase's default shadow.
+        base, headers = _gateway.gateway()
+        self.assertEqual(base, "")
+        self.assertNotIn("Authorization", headers)
+
+    def test_legacy_ag2_remote_token_alias_resolves(self):
+        # Parity with the vault tier, which has always tried this legacy name.
+        # Old installs carry the token under it; without this they stay broken.
+        f = self._write_env("REMOTE_TASK_URL=https://gw.example\n"
+                            "AG2_REMOTE_TOKEN=legacy-secret\n")
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: f):
+            base, headers = _gateway.gateway()
+        self.assertEqual(headers.get("Authorization"), "Bearer legacy-secret")
+        self.assertEqual(base, "https://gw.example")
+
+    def test_missing_path_is_not_an_error(self):
+        with mock.patch.object(_gateway, "_channel_env_file",
+                               lambda: "/nope/does/not/exist/.env"):
+            base, _ = _gateway.gateway()
+        self.assertEqual(base, "")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

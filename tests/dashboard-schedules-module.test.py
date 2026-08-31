@@ -128,6 +128,13 @@ check("failed write leaves the original intact",
 print("── validate_job ──")
 _ok = {"name": "n", "cron": "*/5 * * * *", "prompt_skill": "s"}
 check("a well-formed job validates", ds.validate_job(_ok) is None)
+check("a shell-command job validates",
+      ds.validate_job({"name": "shell", "cron": "*/5 * * * *",
+                       "shell_command": "bash scripts/poll.sh"}) is None)
+check("shell-command conflicts with prompt",
+      ds.validate_job({"name": "shell", "cron": "*/5 * * * *",
+                       "shell_command": "bash scripts/poll.sh", "prompt": "x"})
+      == "provide exactly one of shell_command, prompt or prompt_skill")
 check("non-dict rejected", ds.validate_job("nope") == "job must be an object")
 check("missing name rejected",
       ds.validate_job({**_ok, "name": ""}) == "name is required")
@@ -190,6 +197,29 @@ ds.upsert_schedule(p4, {"name": "j2", "prompt_skill": "morning-briefing"})
 _j2 = next(j for j in ds.read_crons(p4) if j["name"] == "j2")
 check("switching back to skill removes prompt",
       "prompt" not in _j2 and _j2.get("prompt_skill") == "morning-briefing", str(_j2))
+
+# A shell job is executable ONLY by the launchd runner; the session scheduler
+# skips it. Unflagged, a newly posted one would never run at all.
+ds.upsert_schedule(p4, {"name": "mech", "cron": "*/5 * * * *",
+                        "shell_command": "echo hi"})
+_m = next(j for j in ds.read_crons(p4) if j["name"] == "mech")
+check("a new shell job is flagged launchd-owned", _m.get("launchd") is True, str(_m))
+
+# Use a FRESH prompt job: one already carrying the launchd flag would pass
+# whether or not the code claims ownership.
+ds.upsert_schedule(p4, {"name": "conv", "cron": "0 9 * * *", "prompt": "plain"})
+_pre = next(j for j in ds.read_crons(p4) if j["name"] == "conv")
+check("fixture starts unflagged, so the next assertion can fail",
+      "launchd" not in _pre, str(_pre))
+ds.upsert_schedule(p4, {"name": "conv", "shell_command": "echo converted"})
+_conv = next(j for j in ds.read_crons(p4) if j["name"] == "conv")
+check("converting a prompt job to shell claims launchd ownership",
+      _conv.get("launchd") is True and "prompt" not in _conv, str(_conv))
+ds.delete_schedule(p4, "conv")
+
+# restore the fixture for the assertions below (they assert an exact count)
+ds.upsert_schedule(p4, {"name": "j2", "prompt_skill": "morning-briefing"})
+ds.delete_schedule(p4, "mech")
 
 # upsert replaces by name rather than duplicating
 ds.upsert_schedule(p4, {"name": "j2", "cron": "0 11 * * *"})

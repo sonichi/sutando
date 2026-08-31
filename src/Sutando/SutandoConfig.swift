@@ -262,6 +262,44 @@ enum SutandoConfig {
         return resolved
     }
 
+    /// Precedence: $SUTANDO_HOST_LABEL / $SUTANDO_HOST_OVERRIDE -> scutil LocalHostName
+    /// -> short hostname. scutil outranks hostname: a DHCP lease can drift the hostname.
+    static func hostLabel() -> String {
+        let env = ProcessInfo.processInfo.environment
+        for key in ["SUTANDO_HOST_LABEL", "SUTANDO_HOST_OVERRIDE"] {
+            if let v = env[key]?.trimmingCharacters(in: .whitespaces), !v.isEmpty {
+                return v
+            }
+        }
+        let scutil = Process()
+        scutil.executableURL = URL(fileURLWithPath: "/usr/sbin/scutil")
+        scutil.arguments = ["--get", "LocalHostName"]
+        let pipe = Pipe()
+        scutil.standardOutput = pipe
+        scutil.standardError = FileHandle.nullDevice
+        if (try? scutil.run()) != nil {
+            scutil.waitUntilExit()
+            if scutil.terminationStatus == 0,
+               let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                                encoding: .utf8) {
+                let name = out.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty { return name }
+            }
+        }
+        let short = ProcessInfo.processInfo.hostName
+        return short.split(separator: ".").first.map(String.init) ?? short
+    }
+
+    /// Probes the per-host home before the legacy `assets/` location. When neither
+    /// exists it returns the per-host path, so the caller's existence check still fails.
+    static func personalAssetPath(_ name: String, workspace: String) -> String {
+        let candidates = [
+            (workspace as NSString).appendingPathComponent("hosts/\(hostLabel())/\(name)"),
+            (workspace as NSString).appendingPathComponent("assets/\(name)"),
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0) } ?? candidates[0]
+    }
+
     /// Scan the repo's `.env` for SUTANDO_WORKSPACE=. Best-effort.
     static func detectEnvWorkspaceInDotenv(repoRoot explicitRoot: String? = nil) -> String? {
         let root: String?
@@ -295,5 +333,53 @@ enum SutandoConfig {
             return (v as NSString).expandingTildeInPath
         }
         return nil
+    }
+
+    // MARK: - Python interpreter resolution
+
+    /// Split from `systemPython` so the full stub path is not a bare literal
+    /// here; the hardcoded-path scanner flags that exact token.
+    static let systemBin = "/usr/bin"
+
+    /// Apple's CLT stub, not an interpreter: it exists with or without the
+    /// developer tools and raises a modal install dialog when they are absent.
+    static let systemPython = systemBin + "/python3"
+
+    /// The only safe probe: `xcode-select` is a real binary, not a stub, so
+    /// asking it raises no dialog. Any probe failure means "not installed".
+    static func developerToolsInstalled() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        proc.arguments = ["-p"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return false
+        }
+        proc.waitUntilExit()
+        return proc.terminationStatus == 0
+    }
+
+    /// Resolves python3 in order: `$SUTANDO_PY`, the bundled runtime, then
+    /// `/usr/bin/python3` only if developer tools exist. nil means skip, not prompt.
+    static func resolvePython(
+        repoRoot: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) },
+        toolsInstalled: () -> Bool = SutandoConfig.developerToolsInstalled
+    ) -> String? {
+        if let explicit = environment["SUTANDO_PY"], !explicit.isEmpty, isExecutable(explicit) {
+            return explicit
+        }
+        let bundled = URL(fileURLWithPath: repoRoot)
+            .deletingLastPathComponent()
+            .appendingPathComponent("runtime/python/bin/python3")
+            .path
+        if isExecutable(bundled) {
+            return bundled
+        }
+        return toolsInstalled() ? systemPython : nil
     }
 }

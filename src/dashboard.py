@@ -34,9 +34,11 @@ from urllib.parse import urlparse
 REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_config import config_get  # noqa: E402
 from util_paths import personal_path, shared_personal_path, _host_label  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 import dashboard_schedules  # noqa: E402
+import quota_projection  # noqa: E402
 WORKSPACE_DIR = resolve_workspace()
 PORT = 7844
 
@@ -171,14 +173,23 @@ def get_quota_status() -> dict:
     try:
         data = json.loads(quota_file.read_text())
         headers = data.get("headers", {})
-        # Parse reset timestamps
-        reset_5h = headers.get("anthropic-ratelimit-unified-5h-reset", "")
-        reset_7d = headers.get("anthropic-ratelimit-unified-7d-reset", "")
-        if reset_5h:
-            data["reset_5h"] = datetime.fromtimestamp(int(reset_5h)).strftime("%H:%M %b %d")
-        if reset_7d:
-            data["reset_7d"] = datetime.fromtimestamp(int(reset_7d)).strftime("%H:%M %b %d")
+        # Parse reset timestamps PER WINDOW: one malformed value degrades
+        # its own tile to unknown, never the sibling or the whole panel.
+        for w in ("5h", "7d"):
+            raw = headers.get(f"anthropic-ratelimit-unified-{w}-reset", "")
+            try:
+                data[f"reset_{w}"] = datetime.fromtimestamp(int(raw)).strftime("%H:%M %b %d")
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
         data.update(_quota_freshness(data, quota_file))
+        # Feed the history the chart reads; value-dedup'd, so the 15s refresh
+        # costs nothing while quota stands still. Never let it break the panel.
+        try:
+            quota_projection.record_sample(
+                data, WORKSPACE_DIR / "state" / "quota-history.jsonl",
+                datetime.now().timestamp())
+        except OSError:
+            pass
         return data
     except Exception:
         return {"available": True}
@@ -188,6 +199,23 @@ def get_quota_status() -> dict:
 # the 6h "down" threshold the comm-sweep freshness probe already uses, so the
 # fleet has one staleness vocabulary rather than a per-panel invention.
 QUOTA_STALE_HOURS = 6.0
+
+
+def quota_chart_response() -> tuple[int, bytes]:
+    """The /api/quota-chart decision: (status, body).
+
+    Serializes BEFORE returning a status so a strict-JSON failure surfaces as
+    a 500, never a 200 with an empty body. `live` is the same observation the
+    quota tile renders, so the chart cannot publish a current point the tile
+    contradicts.
+    """
+    try:
+        payload = quota_projection.chart_payload(
+            WORKSPACE_DIR / "state" / "quota-history.jsonl",
+            datetime.now().timestamp(), live=get_quota_status())
+        return 200, json.dumps(payload, allow_nan=False).encode()
+    except ValueError:
+        return 500, b'{"error": "non-finite value in chart payload"}'
 
 
 def _quota_freshness(data: dict, quota_file) -> dict:
@@ -215,6 +243,47 @@ def _quota_freshness(data: dict, quota_file) -> dict:
     age_h = max(0.0, (datetime.now().timestamp() - ts) / 3600.0)
     return {"age_h": round(age_h, 1), "stale": age_h >= QUOTA_STALE_HOURS}
 
+
+
+def _quota_has_data(quota: dict) -> bool:
+    """Whether a reading actually exists, as opposed to defaulting to zero.
+
+    The tiles below format utilization with `.get(..., 0)`, so an ABSENT file
+    rendered as "0% used" plus a green check — absence shown as "healthy,
+    nothing consumed", which is the confidently-wrong failure get_quota_status
+    exists to avoid. Same discriminator as the age label.
+    """
+    return bool(quota.get("headers")) or quota.get("age_h") is not None
+
+
+# Glyph is a THREE-way split, not two: no reading -> "—", a reading the API
+# refused -> "✗", a good reading -> "✓". Collapsing the last two hides a real
+# rate-limit behind a check.
+
+
+def _quota_tile_pct(quota: dict, window: str) -> str:
+    """One tile's percentage, or an em dash for unknown.
+
+    Per-window on purpose: a missing, non-finite, negative or unparseable
+    value degrades ITS tile to unknown; the sibling window still renders.
+    """
+    import math as _math
+    raw = quota.get(f"utilization_{window}")
+    if raw in (None, "", 0):
+        raw = (quota.get("headers") or {}).get(
+            f"anthropic-ratelimit-unified-{window}-utilization")
+    try:
+        v = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return "—"
+    if not _math.isfinite(v) or v < 0:
+        return "—"
+    pct = v * 100.0
+    # The module leaves utilization unbounded; THIS consumer's clamp is the
+    # triple-digit cap, so a huge finite value can never overflow int().
+    if pct > 999:
+        return "999%+"
+    return f"{int(pct)}%"
 
 
 def _quota_age_label(quota: dict) -> str:
@@ -487,7 +556,12 @@ def get_schedules() -> list[dict]:
     out = []
     for job in jobs:
         expr = job.get("cron", "")
-        kind = f'skill:{job["prompt_skill"]}' if job.get("prompt_skill") else "prompt"
+        if job.get("shell_command"):
+            kind = "shell"
+        elif job.get("prompt_skill"):
+            kind = f'skill:{job["prompt_skill"]}'
+        else:
+            kind = "prompt"
         nxt = _cron_next_run(expr, now) if expr else None
         if nxt:
             mins = int((nxt - now).total_seconds() // 60)
@@ -502,6 +576,8 @@ def get_schedules() -> list[dict]:
             next_str = ">7d" if expr else "invalid"
         if job.get("description"):
             desc = job["description"]
+        elif job.get("shell_command"):
+            desc = f'Runs shell command: {job["shell_command"]}'
         elif job.get("prompt_skill"):
             desc = f'Runs the /{job["prompt_skill"]} skill'
         else:
@@ -511,6 +587,56 @@ def get_schedules() -> list[dict]:
         out.append({"name": job.get("name", "?"), "cron": expr, "kind": kind,
                     "next": next_str, "desc": desc})
     return out
+
+
+# Sparklines for the two quota stat cells: current window vs even-pace
+# diagonal. Plain string, NOT an f-string — the inline JS is brace-heavy.
+_QUOTA_SPARK_JS = """<script>
+(async()=>{try{
+const d=await (await fetch('/api/quota-chart')).json();
+for(const[k,el]of[['5h','qs-5h'],['7d','qs-7d']]){
+  const svg=document.getElementById(el);if(!svg)continue;
+  const segs=d.windows[k].segments.filter(s=>s.current);
+  if(!segs.length)continue;
+  const s=segs[segs.length-1],W=160,H=60,X=f=>f*W,Y=u=>H-Math.min(u,1.2)/1.2*H;
+  // ring meter: fill = usage, tick = even pace; red once usage passes the tick
+  const ring=document.getElementById(el.replace('qs-','qr-'));
+  if(ring){
+    const lastP=s.points[s.points.length-1],uRaw=lastP.y,pc=lastP.x;
+    // Same degradation as _quota_tile_pct, so both render paths agree:
+    // unusable -> em dash, huge -> 999%+. Unguarded this printed Infinity%.
+    const ok=Number.isFinite(uRaw)&&uRaw>=0,u=ok?uRaw:0;
+    const label=!ok?'\u2014':(uRaw*100>999?'999%+':Math.trunc(uRaw*100)+'%');
+    const C=22,R=17,TAU=2*Math.PI,a0=-TAU/4;
+    const arc=(frac,color,w)=>{
+      const a1=a0+frac*TAU,large=frac>0.5?1:0;
+      return `<path d="M ${C+R*Math.cos(a0)} ${C+R*Math.sin(a0)} A ${R} ${R} 0 ${large} 1 ${C+R*Math.cos(a1)} ${C+R*Math.sin(a1)}" fill="none" stroke="${color}" stroke-width="${w}"/>`;};
+    let ro=`<circle cx="${C}" cy="${C}" r="${R}" fill="none" stroke="#2a2a45" stroke-width="5"/>`;
+    ro+=arc(Math.min(u,1),u>pc?'#e94560':'#4ecca3',5);
+    const ta=a0+pc*TAU;
+    ro+=`<line x1="${C+(R-4)*Math.cos(ta)}" y1="${C+(R-4)*Math.sin(ta)}" x2="${C+(R+4)*Math.cos(ta)}" y2="${C+(R+4)*Math.sin(ta)}" stroke="#8888aa" stroke-width="1.5"/>`;
+    ro+=`<text x="${C}" y="${C+3.5}" text-anchor="middle" fill="#e8e8f0" font-size="10" font-weight="600">${label}</text>`;
+    ring.innerHTML=ro;
+  }
+  let out=`<line x1="0" y1="${Y(0)}" x2="${W}" y2="${Y(1)}" stroke="#555" stroke-dasharray="2,2"/>`;
+  const stroke=(p,q,over)=>{out+=`<line x1="${X(p.x)}" y1="${Y(p.y)}" x2="${X(q.x)}" y2="${Y(q.y)}" stroke="${over?'#e94560':'#4ecca3'}" stroke-width="1.5"/>`;};
+  for(let j=1;j<s.points.length;j++){
+    const a=s.points[j-1],b=s.points[j];
+    const d0=a.y-a.x,d1=b.y-b.x;
+    if((d0>0)!==(d1>0)&&d0!==d1){
+      const f=d0/(d0-d1),c={x:a.x+f*(b.x-a.x),y:a.y+f*(b.y-a.y)};
+      stroke(a,c,d0>0);stroke(c,b,d1>0);
+    }else{
+      stroke(a,b,(d0+d1)/2>0);
+    }
+  }
+  const last=s.points[s.points.length-1];
+  out+=`<circle cx="${X(last.x)}" cy="${Y(last.y)}" r="2" fill="${last.y>last.x?'#e94560':'#4ecca3'}"/>`;
+  if(s.projected_end!==undefined)
+    out+=`<line x1="${X(last.x)}" y1="${Y(last.y)}" x2="${X(1)}" y2="${Y(s.projected_end)}" stroke="${s.projected_end>1?'#e94560':'#4ecca3'}" stroke-dasharray="2,2"/>`;
+  svg.innerHTML=out;
+}}catch(e){}})();
+</script>"""
 
 
 def render_dashboard() -> str:
@@ -548,10 +674,10 @@ def render_dashboard() -> str:
 <div class="stat"><div class="stat-val">{stats['battery']}{charge}</div><div class="stat-label">Battery</div></div>
 <div class="stat"><div class="stat-val">{ok_count}/{total_count}</div><div class="stat-label">Services OK</div></div>
 <div class="stat"><div class="stat-val">{pending['open']}</div><div class="stat-label">Pending</div></div>
-<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("✓" if stats["quota"].get("available", True) else "✗")}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
-<div class="stat"><div class="stat-val">{int(float(stats["quota"].get("utilization_5h", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-5h-utilization", 0)) * 100)}%</div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
-<div class="stat"><div class="stat-val">{int(float(stats["quota"].get("utilization_7d", 0) or stats["quota"].get("headers", {}).get("anthropic-ratelimit-unified-7d-utilization", 0)) * 100)}%</div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
-</div></div>""")
+<div class="stat"><div class="stat-val">{"⚠" if stats["quota"].get("stale") else ("—" if not _quota_has_data(stats["quota"]) else ("✓" if stats["quota"].get("available", True) else "✗"))}</div><div class="stat-label">Quota<br><span style="font-size:9px;color:{"#b45309" if stats["quota"].get("stale") else "#444"}">{_quota_age_label(stats["quota"])}</span></div></div>
+<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-5h" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "5h") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-5h" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">5h Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_5h", "?")}</span></div></div>
+<div class="stat"><div class="stat-val" style="display:flex;align-items:center;justify-content:center;gap:8px"><svg id="qr-7d" width="44" height="44" viewBox="0 0 44 44" style="flex:none"><text x="22" y="26" text-anchor="middle" fill="#e8e8f0" font-size="10">{_quota_tile_pct(stats["quota"], "7d") if _quota_has_data(stats["quota"]) else "—"}</text></svg><svg id="qs-7d" width="160" height="60" viewBox="0 0 160 60" style="flex:none"></svg></div><div class="stat-label">7d Used<br><span style="font-size:9px;color:#444">↻ {stats["quota"].get("reset_7d", "?")}</span></div></div>
+</div>""" + _QUOTA_SPARK_JS + """</div>""")
 
     # Services (ports + daemons only)
     services = [c for c in health if "port" in c.get("detail", "") or "running" in c.get("detail", "") or c.get("name", "").startswith("com.sutando.")]
@@ -666,7 +792,7 @@ def render_dashboard() -> str:
         '</tr>'
     )
     cards.append(
-        '<div class="card full"><h2>Schedules</h2>'
+        '<div class="card full" id="schedules"><h2>Schedules</h2>'
         '<table style="width:100%;font-size:11px;border-collapse:collapse">'
         '<tr style="color:#555;text-align:left"><th>Name</th><th>Cron</th>'
         '<th>Type</th><th>Next run</th><th></th></tr>'
@@ -694,6 +820,56 @@ def render_dashboard() -> str:
 </div></div>""")
 
     return HTML.replace("__CONTENT__", "\n".join(cards))
+
+
+# ── Mutating-request gate ────────────────────────────────────────────────────
+
+# CORS hides a cross-origin response but does not stop the request, and a
+# safelisted text/plain POST reaches the handler with no preflight.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# A wildcard bind names no host, so the legitimate Host set cannot be derived
+# from it; DASHBOARD_ALLOWED_HOSTS supplies it explicitly for LAN mode.
+_WILDCARD_BINDS = frozenset({"0.0.0.0", "::", ""})
+
+
+def _authority_host(value: str) -> str:
+    """Hostname from a Host/Origin authority, minus port and IPv6 brackets."""
+    v = (value or "").strip().lower()
+    if v.startswith("["):
+        return v[1:].split("]", 1)[0]
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
+def _allowed_mutation_hosts(bind: str, declared: str) -> "set[str] | None":
+    """Host names a mutation may carry. None = wildcard bind with none declared."""
+    names = {h for h in (_authority_host(x) for x in (declared or "").split(",")) if h}
+    if (bind or "").strip().lower() in _WILDCARD_BINDS:
+        return (_LOOPBACK_HOSTS | names) if names else None
+    return _LOOPBACK_HOSTS | {bind.strip().lower()} | names
+
+
+def mutation_request_allowed(origin, host, content_type, *, expect_body,
+                             bind="127.0.0.1", allowed_hosts=""):
+    """Fail-closed gate for state-changing dashboard requests → (ok, reason)."""
+    permitted = _allowed_mutation_hosts(bind, allowed_hosts)
+    if permitted is None:
+        # Refusing loudly beats 403-ing every save with "host not allowed": on a
+        # wildcard bind the operator must name the hosts, or rebinding is free.
+        return False, ("wildcard DASHBOARD_BIND requires DASHBOARD_ALLOWED_HOSTS "
+                       "(comma-separated) before mutations are accepted")
+    if _authority_host(host) not in permitted:
+        # DNS rebinding: the attacker's name resolves to us, so only the Host
+        # header still carries it.
+        return False, "host not allowed"
+    if not origin:
+        return False, "missing Origin"
+    if urlparse(origin).netloc.strip().lower() != (host or "").strip().lower():
+        return False, "cross-origin request refused"
+    if expect_body and (content_type or "").split(";", 1)[0].strip().lower() != "application/json":
+        # Non-safelisted type: a cross-origin sender must preflight, which this
+        # server never grants.
+        return False, "Content-Type must be application/json"
+    return True, None
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -731,11 +907,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(obj).encode())
 
+    def _gate(self, *, expect_body):  # pragma: no cover — reads request headers
+        """Refuse a state-changing request that fails mutation_request_allowed."""
+        ok, why = mutation_request_allowed(
+            self.headers.get("Origin"), self.headers.get("Host", ""),
+            self.headers.get("Content-Type"), expect_body=expect_body,
+            bind=os.environ.get("DASHBOARD_BIND", "127.0.0.1"),
+            allowed_hosts=os.environ.get("DASHBOARD_ALLOWED_HOSTS", ""))
+        if not ok:
+            # Drain first: replying and closing with the body still unread makes
+            # the peer see a connection reset instead of the 403.
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                self.rfile.read(n)
+            self._reply_json(403, {"error": why})
+        return ok
+
     def do_POST(self):  # pragma: no cover — thin HTTP glue over upsert_schedule()
-        """Upsert a cron job. Loopback-only (same bind as GET). Business logic
-        is the unit-tested pure upsert_schedule()."""
+        """Upsert a cron job. Business logic is the unit-tested pure
+        upsert_schedule(); the gate is mutation_request_allowed()."""
         if urlparse(self.path).path != "/api/schedules":
             self.send_response(404); self.end_headers(); return
+        if not self._gate(expect_body=True):
+            return
         code, obj = upsert_schedule(self._json_body())
         self._reply_json(code, obj)
 
@@ -764,6 +961,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
+        elif urlparse(self.path).path == "/api/quota-chart":
+            code, body = quota_chart_response()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
         elif urlparse(self.path).path == "/json":
             data = {
                 "score": get_score(),
@@ -865,7 +1068,10 @@ load()
 
 
     def do_DELETE(self):
-        """Handle DELETE requests."""
+        """Handle DELETE requests. Every branch here mutates, so the whole
+        method is gated — /notes/ deletion was reachable the same way."""
+        if not self._gate(expect_body=False):
+            return
         path = urlparse(self.path).path
         if path.startswith("/notes/"):
             raw_slug = path.split("/notes/", 1)[1]
@@ -900,7 +1106,11 @@ if __name__ == "__main__":
     # `DASHBOARD_BIND=0.0.0.0` to opt back into LAN exposure when you
     # know you want it. Same env-override shape as `AGENT_API_BIND` in
     # agent-api.py.
-    bind = os.environ.get("DASHBOARD_BIND", "127.0.0.1")
+    #
+    # A wildcard bind ALSO requires `DASHBOARD_ALLOWED_HOSTS` (comma-separated
+    # host[:port] the UI is reached by) or every mutation 403s: with 0.0.0.0
+    # there is no host to infer, so the DNS-rebinding gate cannot fail open.
+    bind = config_get("DASHBOARD_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client held a connection without completing a request — every later
     # request (and the dashboard UI) hung on a port that still looked open

@@ -86,7 +86,7 @@ def load_bridge():
     spec = importlib.util.spec_from_loader("bridge", loader=None)
     bridge = importlib.util.module_from_spec(spec)
     bridge.__file__ = str(REPO / "src" / "discord-bridge.py")
-    exec(src, bridge.__dict__)
+    exec(compile(src, bridge.__file__, "exec"), bridge.__dict__)
     return bridge
 
 

@@ -3,8 +3,8 @@
  * endpoint for "call your agent" so the user never chooses a tier.
  *
  * The candidate order encodes the tier ladder, best/fastest first:
- *   local core on this machine (Tier 0) → same-LAN core (Tier 0-LAN) →
- *   relay to the core (Tier 2b) → cloud daemon (Tier 1, always-available).
+ *   local (T0) → direct via Tailscale/LAN (T1–2) → relay/Element (T3).
+ *   Canonical taxonomy: docs/voice-tiers.md.
  * Each is PROBED in order; the first reachable wins. This is the "user never
  * picks a tier" behaviour: the app resolves the best available path invisibly
  * and only the latency/capability differs — never the agent's behaviour.
@@ -18,7 +18,7 @@
  * resolver falls through to the next tier.
  */
 
-export type VoiceTier = 'local' | 'lan' | 'relay' | 'cloud';
+export type VoiceTier = 'local' | 'tailnet' | 'lan' | 'relay' | 'cloud';
 
 export interface VoiceEndpoint {
 	tier: VoiceTier;
@@ -79,21 +79,69 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 
 /**
  * Build the default candidate ladder for a user's own core. Any field omitted
- * is skipped (e.g. no LAN host known → no LAN candidate). `local` is always
- * first (best) and `cloud` last (the always-available fallback).
+ * is skipped (e.g. no tailnet host known → no tailnet candidate). `local` is
+ * always first (best) and `cloud` last (the always-available fallback).
+ *
+ * Two distinct ports matter:
+ *  - `localPort` (default 9900) is the voice-agent WS, bound to loopback on the
+ *    core — reachable ONLY from the same machine, so it backs the `local` tier.
+ *  - `proxyPort` (default 8080) is the core webUI's opt-in `/ws` proxy (guarded
+ *    by SUTANDO_LAN_SHARE, sonichi/sutando#2021). Off-localhost callers can't
+ *    reach loopback:9900, so tailnet/LAN candidates go through `:proxyPort/ws`.
+ *
+ * `tailnet` sits directly after `local`: a mesh-VPN (Tailscale) address is a
+ * superset of LAN — it reaches the core on the same network AND remotely, with a
+ * stable address — so it's preferred over the same-subnet-only `lan` path.
+ *
+ * A browser on an HTTPS page blocks insecure `ws://` to a non-localhost host
+ * (mixed content), so a directly-reachable core must be reached over `wss://`.
+ * The core advertises this: when it's fronted by `tailscale serve` (TLS on the
+ * MagicDNS name, sonichi/sutando#2035) it publishes an `https://<host>` endpoint,
+ * and `directWsUrl` turns that into `wss://<host>/ws`. A plain `http://host:port`
+ * or bare host stays `ws://…/ws` (native/non-browser clients); from a hosted page
+ * that probe simply fails and the resolver falls through — safe either way.
  */
+export function directWsUrl(endpoint: string, proxyPort: number): string {
+	// https://<host>  → wss://<host>/ws  (tailscale serve fronts :443, no port)
+	if (/^https:\/\//i.test(endpoint)) {
+		return `wss://${endpoint.replace(/^https:\/\//i, '').replace(/\/+$/, '')}/ws`;
+	}
+	// http://<host>[:port] → ws://<host>[:port]/ws  (preserve the advertised port)
+	if (/^http:\/\//i.test(endpoint)) {
+		return `ws://${endpoint.replace(/^http:\/\//i, '').replace(/\/+$/, '')}/ws`;
+	}
+	// bare host → assume the plain /ws proxy on proxyPort
+	return `ws://${endpoint}:${proxyPort}/ws`;
+}
+
 export function defaultCandidates(opts: {
-	localPort?: number;     // default 9900 (the local voice-agent WS port)
-	lanHost?: string;       // e.g. "192.168.1.20" — same-wifi core
+	localPort?: number;     // default 9900 (loopback voice-agent WS → local tier)
+	proxyPort?: number;     // default 8080 (webUI /ws proxy → off-localhost tiers)
+	tailnetHost?: string;   // "host.ts.net" | "https://host.ts.net" — mesh-VPN core (preferred)
+	lanHost?: string;       // "192.168.1.20" | "http://192.168.1.20:8080" — same-wifi core
 	relayWsUrl?: string;    // wss://relay/.../<agent> — Tier 2b bridge to the core
 	cloudUrl?: string;      // the Tier-1 cloud fallback
+	agentEndpoint?: string;  // target room-agent's advertised endpoint (https://<magicdns>) — identity-routed, wins over local
 }): VoiceEndpoint[] {
 	const port = opts.localPort ?? 9900;
+	const proxyPort = opts.proxyPort ?? 8080;
+	// Identity-routed: a specific room-agent advertised its endpoint. Dial THAT agent
+	// and never the generic local host (which would answer as the wrong agent). Element
+	// Call (relay/cloud) stays a valid fallback since it routes to the same agent.
+	if (opts.agentEndpoint) {
+		const ep: VoiceEndpoint[] = [
+			{ tier: 'tailnet', url: directWsUrl(opts.agentEndpoint, proxyPort), label: "this room's agent, direct over Tailscale (T1–2)" },
+		];
+		if (opts.relayWsUrl) ep.push({ tier: 'relay', url: opts.relayWsUrl, label: 'relay to the agent (T3)' });
+		if (opts.cloudUrl) ep.push({ tier: 'cloud', url: opts.cloudUrl, label: 'relay via Element (T3)' });
+		return ep;
+	}
 	const out: VoiceEndpoint[] = [
-		{ tier: 'local', url: `ws://localhost:${port}`, label: 'this machine (Tier 0)' },
+		{ tier: 'local', url: `ws://localhost:${port}`, label: 'this machine (T0 · local)' },
 	];
-	if (opts.lanHost) out.push({ tier: 'lan', url: `ws://${opts.lanHost}:${port}`, label: 'same network (Tier 0-LAN)' });
-	if (opts.relayWsUrl) out.push({ tier: 'relay', url: opts.relayWsUrl, label: 'relay to your core (Tier 2b)' });
-	if (opts.cloudUrl) out.push({ tier: 'cloud', url: opts.cloudUrl, label: 'cloud agent (Tier 1)' });
+	if (opts.tailnetHost) out.push({ tier: 'tailnet', url: directWsUrl(opts.tailnetHost, proxyPort), label: 'your core, direct over Tailscale (T1–2)' });
+	if (opts.lanHost) out.push({ tier: 'lan', url: directWsUrl(opts.lanHost, proxyPort), label: 'same network, direct (T1 · LAN)' });
+	if (opts.relayWsUrl) out.push({ tier: 'relay', url: opts.relayWsUrl, label: 'relay to your core (T3)' });
+	if (opts.cloudUrl) out.push({ tier: 'cloud', url: opts.cloudUrl, label: 'relay via Element (T3)' });
 	return out;
 }

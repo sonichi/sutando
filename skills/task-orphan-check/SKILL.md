@@ -37,7 +37,7 @@ If no live tasks, emit "orphan-check: no live tasks, nothing to recover" and idl
 
 For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g. `task-1779570142563`). The file is `tasks/<id>.txt`. Per-task paths below use `<id>` consistently — note `<id>` already includes the `task-` prefix; do NOT add it again.
 
-1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (if Discord), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner).
+1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (Discord channel or ag2.space room id — both producers supply it, and the later `contextNotFrom`/requeue workflow needs the exact id, so never discard it in favor of the friendly name), `chat_id` (Telegram), `room_name` / `channel_name` (whichever the surface carries — ag2.space sends `room_name` and no `channel_name`, so a reader that parses only the latter gets nothing and step 3b falls back to the raw id), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner).
 
 2. **Cross-reference completion markers** (any single match = task already completed):
    - **`<workspace>/results/<id>.txt`** exists → **DONE**. The result file is the canonical completion marker; if it exists the task was processed.
@@ -105,7 +105,23 @@ Otherwise:
 
    The system-instructions block is only **stripped for the preview** — the archived task file body remains intact (see step 5), so re-queueing via `mv tasks/archive/<id>.txt tasks/` preserves sandboxing for non-owner tiers.
 
-3. Group `deferred_orphans` by `access_tier` (owner / team / other) → per-tier counts; and by `channel_name` → per-channel counts.
+3. Resolve a **readable channel label** for each orphan, then group.
+
+   `channel_id` alone is unreadable in a report — `!JzcRmAhNYbiWhIWNCL:ag2.space`
+   tells the owner nothing about which conversation stalled. The task file already
+   carries the name the bridge saw:
+
+   ```python
+   name = header.get("room_name") or header.get("channel_name")   # bridges write one of these
+   cid  = header.get("channel_id") or header.get("chat_id") or ""
+   label = f"{name} ({cid})" if name else (cid or "DM")
+   ```
+
+   Use `label` everywhere the report shows a channel. Keep the id: it is what
+   `contextNotFrom` and re-queue commands key on, so dropping it trades one
+   unreadable report for an unactionable one. Group `deferred_orphans` by
+   `access_tier` (owner / team / other) → per-tier counts; and by `label` →
+   per-channel counts.
 
 4. Apply step 3c bomb-guard (see below) to decide whether to truncate the preview list.
 
@@ -115,10 +131,10 @@ Otherwise:
    Orphan recovery — N stale tasks from a prior session (oldest <Nm>, newest <Nm>, no completion markers).
 
    By tier: owner (<o>), team (<t>), other (<r>).
-   By channel: <ch1> (<x>), <ch2> (<y>), DM (<z>), ...
+   By channel: <name> (<id>) — <x>; <name2> (<id2>) — <y>; DM — <z>; ...
 
    Previews (most-recent first, first ~100 chars of task body; in-band system instructions stripped):
-   - task-<id> [<tier>, <channel>, <Nm ago>]: <preview>
+   - task-<id> [<tier>, <channel label>, <Nm ago>]: <preview>
    - ...
    [If truncated by step 3c: "+<N-20> more — see tasks/archive/ for the full list."]
 

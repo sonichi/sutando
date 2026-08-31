@@ -19,7 +19,10 @@ from pathlib import Path
 from urllib.request import urlopen
 from urllib.error import URLError
 
-sys.path.insert(0, str(Path(__file__).parent))
+# Sibling scripts are launched with cwd=WORKSPACE, so their paths must not depend
+# on it. Defensive only: Python >=3.11 already absolutises __file__ (bpo-20443).
+_SRC_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import personal_path  # noqa: E402
 
@@ -71,11 +74,13 @@ def get_weather() -> str:
             'do shell script "defaults read /Library/Preferences/com.apple.timezone"',
             timeout=3
         )
-        # Use lat/lon from env if set
-        import os
-        if os.environ.get("WEATHER_LAT") and os.environ.get("WEATHER_LON"):
-            lat = float(os.environ["WEATHER_LAT"])
-            lon = float(os.environ["WEATHER_LON"])
+        # Use lat/lon from config (env legacy fallback) if set
+        from sutando_config import config_get
+        _lat_cfg, _lon_cfg = config_get("WEATHER_LAT"), config_get("WEATHER_LON")
+        configured = bool(_lat_cfg and _lon_cfg)
+        if configured:
+            lat = float(_lat_cfg)
+            lon = float(_lon_cfg)
 
         url = (
             f"https://api.open-meteo.com/v1/forecast"
@@ -95,7 +100,9 @@ def get_weather() -> str:
         rain = day["precipitation_probability_max"][0]
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
-        return f"{temp}°F and {desc}, high of {high}, low of {low}{rain_note}"
+        # Spoken aloud, so the label stays short and the remedy goes to the log.
+        where = "" if configured else " in San Francisco (default location)"
+        return f"{temp}°F and {desc}{where}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
 
@@ -123,14 +130,71 @@ def _read_calendar_cache() -> list[dict] | None:
         return None
     events: list[dict] = []
     for ev in raw_events:
+        start = ""
         if isinstance(ev, dict):
             raw = (ev.get("raw") or "").strip()
             cal = ev.get("calendar", "")
+            start = str(ev.get("start") or "").strip()
         else:
             raw, cal = str(ev).strip(), ""
         if raw:
-            events.append({"raw": raw, "calendar": cal})
+            out = {"raw": raw, "calendar": cal}
+            # This loop rebuilds each event, so any field not named here is
+            # dropped — `start` must be carried or _next_event() never fires.
+            if start:
+                out["start"] = start
+            events.append(out)
     return events
+
+
+def _parse_start(ev: dict):
+    """Return an aware datetime for `ev['start']`, or None if absent/unparseable.
+
+    `start` is optional by design: the gws producer supplies an ISO timestamp,
+    while piped connector events and the macOS AppleScript fallback do not. A
+    missing or malformed value must never be treated as "now" or as the epoch —
+    either would silently reorder the day.
+    """
+    raw = str(ev.get("start") or "").strip()
+    if not raw:
+        return None
+    # A bare YYYY-MM-DD is an ALL-DAY event: the DAY is known, the time of day is
+    # not, and midnight would read as already-past for the rest of the day.
+    if "T" not in raw and ":" not in raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:                 # naive but time-bearing: assume local
+        dt = dt.astimezone()
+    return dt
+
+
+def _all_starts_known(events: list[dict]) -> bool:
+    """True only if EVERY event has a usable start.
+
+    Both time-based claims assert something about the whole day, so partial
+    knowledge cannot support either: one unknown-time event may be upcoming.
+    """
+    return bool(events) and all(_parse_start(e) is not None for e in events)
+
+
+def _last_event(events: list[dict]):
+    """The latest event by parsed start — not list order, which may be unsorted."""
+    dated = [(s, e) for e in events if (s := _parse_start(e)) is not None]
+    return max(dated, key=lambda pair: pair[0])[1] if dated else None
+
+
+def _next_event(events: list[dict], now=None):
+    """The earliest event still ahead of `now`, or None.
+
+    Events with no parseable start are skipped rather than assumed upcoming.
+    """
+    now = now or datetime.now().astimezone()
+    future = [(s, e) for e in events
+              if (s := _parse_start(e)) is not None and s > now]
+    return min(future, key=lambda pair: pair[0])[1] if future else None
 
 
 def get_calendar_events() -> list[dict] | None:
@@ -220,8 +284,8 @@ return output
                     file=sys.stderr,
                 )
         return None
-    import os as _os
-    skip_cals_raw = _os.environ.get("MORNING_BRIEFING_SKIP_CALENDARS", "")
+    from sutando_config import config_get
+    skip_cals_raw = config_get("MORNING_BRIEFING_SKIP_CALENDARS", "") or ""
     skip_cals = {c.strip().lower() for c in skip_cals_raw.split(",") if c.strip()}
     # Dedup by (time_str, title) — cross-calendar duplication (#966).
     seen: set[str] = set()
@@ -262,7 +326,7 @@ def get_reminders() -> "list[str] | None":
     clean" — the same shape as the 2026-07-21 falsely-clear calendar bug
     (#2256), which is why `get_calendar_events()` already draws this line.
     """
-    script_path = Path(__file__).parent.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
+    script_path = _SRC_DIR.parent / "skills" / "macos-tools" / "scripts" / "reminders.py"
     if not script_path.exists():
         return None
     try:
@@ -282,9 +346,36 @@ def get_reminders() -> "list[str] | None":
             line = line.strip()
             if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
-        return items[:5]
+        return _demote_stale_reminders(items)[:5]
     except (subprocess.TimeoutExpired, OSError):
         return None
+
+
+# TWO years, not one: the due clause gives only year granularity, so `year_now - 1`
+# would demote a December item in January — one month overdue, not a year.
+_STALE_YEARS = 2
+# Anchored to the literal `(due` so a lowercase "due" in a TITLE cannot supply the year;
+# any 4-digit run, because an alternation of plausible years cannot match a corrupt one.
+_DUE_YEAR_RE = re.compile(r"\(due\b[^)]*?\b(\d{4})\b")
+
+
+def _reminder_due_year(line):
+    """The year in a reminder's `(due …)` clause, or None. Takes the LAST clause: the
+    real one is appended, so a title containing `(due …)` cannot win."""
+    m = _DUE_YEAR_RE.findall(line)
+    return int(m[-1]) if m else None
+
+
+def _demote_stale_reminders(items, now=None):
+    """Move reminders overdue by >= two calendar years to the END. Never drops; an
+    unparseable date keeps its position so a format change cannot bury a live one."""
+    year_now = (datetime.fromtimestamp(now) if now else datetime.now()).year
+    cutoff = year_now - _STALE_YEARS
+    fresh, stale = [], []
+    for it in items:
+        y = _reminder_due_year(it)
+        (stale if (y is not None and y <= cutoff) else fresh).append(it)
+    return fresh + stale
 
 
 def get_overnight_discord(now: float | None = None) -> list[str]:
@@ -382,7 +473,7 @@ def _load_notifier():
     """
     import importlib.util
 
-    src = Path(__file__).parent / "check-pending-questions.py"
+    src = _SRC_DIR / "check-pending-questions.py"
     spec = importlib.util.spec_from_file_location("_cpq_predicate", src)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -512,7 +603,7 @@ def get_health_issues() -> "list[str] | None":
     None means it did not run. A timed-out health check returning [] made the
     briefing assert a clean system it had never inspected.
     """
-    hc = Path(__file__).parent / "health-check.py"
+    hc = _SRC_DIR / "health-check.py"
     if not hc.exists():
         return None
     try:
@@ -548,30 +639,7 @@ def get_health_issues() -> "list[str] | None":
         return None
 
 
-def get_daily_insight() -> str | None:
-    """Get today's behavioral insight from daily-insight.py (cached via sentinel)."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    sentinel = STATE_DIR / f"daily-insight-{today}.sentinel"
-    if sentinel.exists():
-        return sentinel.read_text().strip() or None
-    # Not yet generated — run it
-    hc = Path(__file__).parent / "daily-insight.py"
-    if not hc.exists():
-        return None
-    try:
-        r = subprocess.run(
-            [sys.executable, str(hc)],
-            capture_output=True, text=True, timeout=20,
-            cwd=str(WORKSPACE)
-        )
-        if r.returncode == 0 and sentinel.exists():
-            return sentinel.read_text().strip() or None
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    return None
-
-
-def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight=None) -> str:
+def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues) -> str:
     now = datetime.now()
     hour = now.hour
     if hour < 12:
@@ -595,8 +663,17 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if count == 1:
             parts.append(f"One meeting today: {events[0]['raw']}.")
         else:
-            next_ev = events[0]["raw"]
-            parts.append(f"{count} meetings today. First up: {next_ev}.")
+            upcoming = _next_event(events) if _all_starts_known(events) else None
+            last = _last_event(events) if _all_starts_known(events) else None
+            if upcoming is not None:
+                parts.append(f"{count} meetings today. Next up: {upcoming['raw']}.")
+            elif last is not None:
+                # Every start known and all past — naming one implies it is ahead.
+                parts.append(f"{count} meetings today, all earlier — "
+                             f"last was {last['raw']}.")
+            else:
+                # Incomplete start times: claim neither, keep the prior wording.
+                parts.append(f"{count} meetings today. First up: {events[0]['raw']}.")
     else:
         parts.append("Your calendar is clear today.")
 
@@ -620,13 +697,6 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
     if health_issues:
         issues_str = "; ".join(health_issues[:2])
         parts.append(f"System note: {issues_str}.")
-
-    # Daily insight (closing thought) — take first sentence, skip if it's just raw data
-    if insight:
-        first_sentence = insight.split('.')[0].strip()
-        has_raw_data = '{' in first_sentence or first_sentence.count(':') > 2
-        if not has_raw_data and len(first_sentence) > 20:
-            parts.append(f"Insight: {first_sentence}.")
 
     # Closing — every input must be VERIFIED empty, not merely falsy. `None`
     # from any gather means that query did not run, and an unanswered query is
@@ -671,6 +741,9 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
+    import os as _os
+    if weather and not (_os.environ.get("WEATHER_LAT") and _os.environ.get("WEATHER_LON")):
+        print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
 
     events = get_calendar_events()
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
@@ -681,8 +754,6 @@ def main():
     discord_msgs = get_overnight_discord()
     print(f"  discord overnight: {len(discord_msgs)} messages")
 
-    insight = get_daily_insight()
-    print(f"  insight: {'yes' if insight else 'none'}")
 
     pending_qs = get_pending_questions()
     print(f"  pending questions: {len(pending_qs)}")
@@ -691,7 +762,7 @@ def main():
     print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")
 
     # Synthesize
-    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight)
+    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues)
 
     # Write voice result
     ts = int(time.time() * 1000)

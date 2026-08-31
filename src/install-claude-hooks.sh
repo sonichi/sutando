@@ -25,9 +25,8 @@
 # turn-end (after every assistant response), NOT session-end — so the
 # PID-kill block killed the live Monitor watcher every turn, triggering an
 # exit-143 + Monitor-restart cycle.  Watcher orphan-cleanup is handled by
-# the `Reap any stale watch-tasks-stream watcher` block in
-# `src/startup.sh` (defense-in-depth: PID-file + cmdline-check before
-# kill), which runs at every session start.  See the original #1061 /
+# `reap_stale_task_watcher` in `src/startup-runtime.sh`, which runs at every
+# session start.  See the original #1061 /
 # #1063 / #1065 thread for the orphan-watcher background.
 #
 # Idempotent: re-running is safe.  Existing hook entries with the same
@@ -100,6 +99,20 @@ HOOKS=(
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
 )
 
+# Parallel to HOOKS by index, not another `|` field: CMD must stay last to hold a
+# `|`, and a second path-bearing field cannot also be last. Sized from HOOKS.
+HOOK_PRIOR=()
+for _i in "${!HOOKS[@]}"; do HOOK_PRIOR+=(""); done
+
+# Skill-declared hooks via src/skill_hooks.py (the same discovery the health probe reads).
+# NUL-framed (-d '') because two of the four fields embed the repo path.
+while IFS= read -r -d '' _ev && IFS= read -r -d '' _tok \
+   && IFS= read -r -d '' _cmd && IFS= read -r -d '' _prior; do
+  [ -n "${_ev:-}" ] || continue
+  HOOKS+=("$_ev|$_tok|$_cmd")
+  HOOK_PRIOR+=("$_prior")
+done < <(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
+
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
 # Matching uses `.command | contains(substring)` so we don't need to track
 # the exact command string an old installer wrote — just a stable token.
@@ -159,7 +172,8 @@ re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
 #
 # Sweeping a *different clone's* entry is intended — that shape is
 # installer-generated, just not by this checkout.
-for entry in "${HOOKS[@]}"; do
+for i in "${!HOOKS[@]}"; do
+  entry="${HOOKS[$i]}"
   EVENT="${entry%%|*}"
   REST="${entry#*|}"
   MARKER="${REST%%|*}"
@@ -226,22 +240,31 @@ for entry in "${HOOKS[@]}"; do
   CMD_TAIL="${CMD_TAIL#[\"\']}"       # drop shq's closing quote, if present
   SHAPE="^$(re_escape "$CMD_WORD") [\"']?[^ -].*$(re_escape "$MARKER")[\"']?$(re_escape "$CMD_TAIL")\$"
 
-  if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" --arg shape "$SHAPE" \
+  # SHAPE cannot match the runner-first entry (its first word is `[`), so match the
+  # prior command exactly, taken from the emitter — `${CMD#*exec }` splits on a path.
+  LEGACY_SHAPE=""
+  [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+
+  if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
+           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
-       | map(contains($marker) and (. != $cmd) and test($shape))
+       | map(contains($marker) and (. != $cmd)
+             and (test($shape) or ($legacy != "" and test($legacy))))
        | any' \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
   fi
 
   TMP="$(mktemp "${SETTINGS}.XXXXXX")"
-  jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" --arg shape "$SHAPE" '
+  jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
+     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
     if (.hooks // {})[$event] then
       .hooks[$event] |= map(
         .hooks |= map(select(
           ((.command // "") | contains($marker))
           and ((.command // "") != $cmd)
-          and ((.command // "") | test($shape))
+          and ((.command // "")
+               | test($shape) or ($legacy != "" and test($legacy)))
           | not
         ))
       )

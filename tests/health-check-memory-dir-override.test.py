@@ -48,6 +48,17 @@ class TestMemoryDirHonorsOverride(unittest.TestCase):
         hc = _load_health_check()
         self.assertEqual(hc.MEMORY_DIR, Path(hc._default_memory_dir()))
 
+    def test_default_memory_dir_uses_shared_slug_helper(self):
+        """_default_memory_dir() must derive its slug through the shared
+        claude_project_slug() helper, not a hand-rolled "/" -> "-" regex —
+        the hand-rolled version silently resolved to a nonexistent dir on
+        any checkout path containing a space or dot."""
+        hc = _load_health_check()
+        repo = Path(hc.__file__).parent.parent.resolve()
+        expected_slug = hc.claude_project_slug(repo)
+        self.assertEqual(
+            Path(hc._default_memory_dir()).parent.name, expected_slug)
+
     def test_env_override_is_honored_consistent_with_rest_of_runtime(self):
         """MEMORY_DIR must follow SUTANDO_MEMORY_DIR when set — matching
         voice-agent.ts / voice-context.ts, which also honor it. Silently

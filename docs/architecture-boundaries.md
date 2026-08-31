@@ -111,7 +111,8 @@ Optional capability discovery also remains at the adapter edge. A generic
 core helper may run an injected script path and standardize timeout/failure
 semantics, but it must not name, locate, or import a concrete skill. This keeps
 the dependency direction adapter → helper while preserving the rule that core
-does not depend on installed skills.
+does not depend on installed skills. Add direct contract tests for the runner
+and wiring tests for every adapter that delegates to it.
 
 ### Shared adapter policy
 
@@ -121,6 +122,22 @@ and retain only provider-specific receive, send, threading, and formatting
 mechanics. For example, `src/presenter_mode.py` owns the presenter sentinel path
 and expiry semantics; Discord, Slack, Telegram, and notification jobs decide
 what delivery to suppress when that policy reports active.
+
+When several adapters publish the same mutable workspace record, the shared
+module also owns the record's schema, field bounds, atomic publication, and
+fail-open/fail-closed contract. Adapters inject the resolved path and their log
+sink; they do not reproduce the write recipe. Tests exercise the production
+writer directly under the relevant concurrency model, then separately pin each
+adapter's delegation. `src/owner_activity.py` is the reference pattern.
+
+Centralize only writers with the same policy. AG2 Sparrow's
+`remote_gateway_bridge._write_owner_activity` intentionally remains separate:
+before publishing the shared record it applies the sender-tier gate, excludes
+known fleet agents, strips gateway attribution, and redacts secrets. Those are
+gateway trust-boundary rules, not provider-neutral record-publication mechanics.
+Do not delegate that writer to `src/owner_activity.py` unless those controls and
+their tests move with it. Any writer excepted from centralization must have its
+exception documented, as this one is.
 
 ### Shared result-file lifecycle
 
@@ -132,13 +149,71 @@ and retain only provider-specific delivery. For example,
 crash, while Discord, Slack, and Telegram decide how the recovered result is
 sent. Copying the filesystem state machine into each adapter is not permitted.
 
+### Outbound delivery ownership
+
+Outbound delivery of an already-published result has one implementation, and it
+is the outbox. `src/outbox.py` owns delivery claims (acquire/release/reclaim,
+per-item locking, crash recovery) and `src/outbox_adapter.py` owns the
+three-state delivery outcome (CONFIRMED / NOT_DELIVERED / OUTCOME_UNKNOWN);
+both are vendored verbatim into `packages/ag2-sparrow/`. Scope is the outbound
+leg only — an existing `OutboundItem` from claim through terminal disposition;
+other task/result lifecycle transitions keep their documented owners (e.g.
+`src/proactive_recovery.py` above). Consumers delivering outbound results bind
+these; do not re-implement claim, delivered-sentinel, or retry machinery in a
+bridge. Adapters bind their resolved directories and retain provider-specific
+delivery only. Pin both the shared contract and every adapter's delegation in
+tests. Pre-outbox private copies (e.g. discord-bridge's
+archive/delivered-sentinel/pending-replies machinery) are migration debt, not
+precedent.
+
 ### HTTP transport handlers
 
 HTTP handlers are transport adapters, not the owner of feature policy. Repeated
 authentication gates, status/header emission, and JSON serialization belong in
 small handler helpers so every route uses one wire contract. Route branches retain
-endpoint-specific orchestration and payload construction. Refactors must preserve
-status codes, headers, and payload shapes with direct contract tests.
+only dispatch; named endpoint methods own orchestration and payload construction.
+Refactors must preserve delegation, status codes, headers, and payload shapes with
+direct contract tests.
+
+### HTTP route boundaries
+
+HTTP route methods should remain dispatch layers: parse and authorize the request,
+call a named operation, then emit its result. Filesystem reconciliation and
+response assembly belong in module-level operations that can be tested without a
+socket. Protect both the operation contract and one route-wiring path.
+
+The same rule governs result-body markers, with an explicit one-way dependency
+direction:
+
+    result_markers.parse_markers()   # protocol interpretation
+              |
+              v
+    send_allowlist.is_path_sendable()  # delivery authorization
+              |
+              v
+    provider-specific upload mechanism
+
+`src/result_markers.py` owns marker syntax, precedence, stripping, and action
+extraction. `src/send_allowlist.py` owns attachment-path authorization. Delivery
+consumers (Discord, Slack, Telegram, gateway, and the `dm-result.py` REST
+fallback) own transport routing and upload calls only — they must not define
+marker regexes or path-policy copies.
+
+**All four Python consumers now conform, and the guard enforces it.**
+`discord-bridge.py`, `dm-result.py`, `telegram-bridge.py`, and `slack-bridge.py`
+obtain marker grammar solely from `parse_markers()`.
+`tests/bridge-marker-no-leak.test.py` fails if any of them declares the grammar
+itself, matching the grammar in any regex literal so a renamed private parser
+cannot slip past. Telegram's `send_reply()` used to compile its own
+`file|send|attach` regex and Slack declared the same regex dead at module scope;
+both are gone. The rule above forbids *new* private parsers — add any new
+consumer to that guard when it starts handling markers.
+
+Parsing never authorizes and authorization never parses: `parse_markers()`
+extracts any marker value and leaves the decision about whether a path may be
+opened to the allowlist. A consumer that filters values during parsing
+re-couples the two and drifts — which is precisely how `dm-result.py` came to
+deliver literal `[file: ...]` text that every other consumer stripped.
 
 ## Current repository classification
 

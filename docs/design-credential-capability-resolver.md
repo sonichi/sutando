@@ -22,7 +22,7 @@ A consumer asks for a **capability** — what it needs to *do* — and the
 resolver decides which credential satisfies it:
 
 ```ts
-resolveCredential('gemini-voice')  →  { key, source: 'managed' | 'env' | 'none' }
+resolveCredential('gemini-voice')  →  { key, source: 'managed' | 'env' | 'none', credentialGeneration? }
 ```
 
 Three rules, all load-bearing. Rules 1–2 and the *resolver-seam* half of rule 3
@@ -54,11 +54,60 @@ are implemented by #2197's `src/credential-resolver.ts`; rule 3's Settings/healt
    desktop first-run banner (G5) and Settings (G6) build on the returned
    property to do.
 
+### Voice-source policy gates (S1)
+
+Two top-level managed-file fields modulate rules 1–2 for the **voice**
+capability (design authority: the desktop repo's
+`docs/design-voice-reliability-and-onboarding.md` §2b, amendment S1):
+
+- **`voicePreference`** (`"managed" | "byok"`; unset ⇒ legacy):
+  - *unset* — rules 1–2 apply unchanged (managed → env, voice → text).
+  - *`managed`* — only a non-quarantined **managed** entry satisfies
+    `gemini-voice`; env keys never silently substitute. A managed-preference
+    install with no managed key resolves `none` — a typed absence the
+    desktop enable-voice flow routes on, rather than a wrong-source key.
+  - *`byok`* — only **env** keys satisfy `gemini-voice`; managed slots are
+    skipped entirely.
+- **`quarantined`** (honored only as strict JSON `true`; stamped by the
+  desktop host at logout): every managed entry is treated as absent, in
+  every mode — a preserved managed key must never satisfy a resolution
+  after logout.
+
+The preference governs the voice capability; `gemini-text` resolution is
+preference-independent (its consumers are not voice surfaces) but still
+honors `quarantined`. Resolution also returns the satisfying credential's
+**`credentialGeneration`** (opaque `cg1-<UUID>`: the managed entry's
+`generation` field, or `SUTANDO_VOICE_CREDENTIAL_GENERATION` for env keys
+when present) so a supervisor can verify *which* credential a running agent
+loaded. The full truth table is pinned one-for-one across all four
+consumers — TS resolver, Python twin, startup gate, health check — by
+`tests/voice-preference-consumers.test.sh` +
+`tests/fixtures/voice-preference-matrix.json` (the desktop supervisor
+asserts the same fixture verbatim on its side).
+
 ## Managed-file schema
 
 ```json
-{ "version": 1, "capabilities": { "gemini-voice": { "key": "…" }, "gemini-text": { "key": "…" } } }
+{
+  "version": 1,
+  "capabilities": {
+    "gemini-voice": { "key": "…", "generation": "cg1-…" },
+    "gemini-text": { "key": "…" }
+  },
+  "voicePreference": "managed",
+  "preferenceRevision": 4,
+  "sessionRevision": 2,
+  "quarantined": false
+}
 ```
+
+The policy fields (`voicePreference`, `preferenceRevision`,
+`sessionRevision`, `quarantined`) and the per-entry `generation` are written
+by the desktop host's credential provisioner (desktop design doc §2b; the
+Rust writer is in flight as of 2026-08). Readers here honor them per S1 and
+keep the existing failure posture: malformed file ⇒ managed tier skipped,
+`voicePreference` outside the two literals ⇒ unset, `quarantined` anything
+but strict `true` ⇒ not quarantined.
 
 Writers (**required of a future provisioner — not yet implemented**): the
 desktop onboarding flow (G1/G2, air's lane) or AU provisioning. **No production

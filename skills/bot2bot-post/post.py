@@ -3,12 +3,17 @@
 
 Usage:
     python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> <text>
+    python3 skills/bot2bot-post/post.py [--to <peer|id>] <kind> --body-file <path>
     python3 skills/bot2bot-post/post.py claim "refactor X, ETA 20m"
     python3 skills/bot2bot-post/post.py --to pro ping "your take on the WIRE topic?"
     python3 skills/bot2bot-post/post.py --to lucy opinion "disagreement axis below"
     python3 skills/bot2bot-post/post.py done "shipped PR #472"
 
 Kinds: claim | blocked | done | ping | nack | opinion
+--body-file <path>: read the body from a FILE instead of argv. Use it for any
+prose containing backticks or apostrophes — an apostrophe closes a
+single-quoted shell argument and re-arms the backticks, truncating the message
+at that point while the send still reports success.
 Peers (for --to): a name from ~/.claude/channels/discord/peers.json, or a raw numeric id
 
 The target channel ID is read from `$CLAUDE_CONFIG_DIR/channels/discord/access.json`:
@@ -41,9 +46,8 @@ Requires DISCORD_BOT_TOKEN in $CLAUDE_CONFIG_DIR/channels/discord/.env.
 """
 import json
 import os
+import pathlib
 import sys
-import urllib.request
-import urllib.error
 from pathlib import Path
 
 # Claude Code per-user home. Mirrors src/util_paths.py `claude_home_path()`
@@ -101,20 +105,9 @@ def resolve_bot2bot_channel(access: dict) -> str:
     sys.exit("ERROR: no bot2bot channel found in access.json.groups")
 
 
-USER_AGENT = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
-
-
 def get_self_id(token: str) -> str:
-    """Discord GET /users/@me → this bot's user ID."""
-    req = urllib.request.Request(
-        "https://discord.com/api/v10/users/@me",
-        headers={
-            "Authorization": f"Bot {token}",
-            "User-Agent": USER_AGENT,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())["id"]
+    """Discord GET /users/@me → this bot's user ID (via the shared client)."""
+    return str(_client(token).get_json("/users/@me")["id"])
 
 
 def resolve_other_bot(access: dict, self_id: str, channel_id: str):
@@ -185,23 +178,53 @@ def _recipient_in_channel(access: dict, channel_id: str, recipient_id: str) -> b
     return str(recipient_id) in {str(x) for x in cfg.get("allowFrom", [])}
 
 
-def post(channel_id: str, text: str, token: str):
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    body = json.dumps({"content": text}).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        },
+#: Discord rejects a message whose `content` exceeds this many characters.
+DISCORD_MAX_CONTENT = 2000
+
+
+def check_length(text: str, overhead: int = 0) -> "str | None":
+    """The refusal message if `text` is over the limit, else None.
+
+    Measures the FINAL content — the routing prefix and `kind:` tag are part of
+    what Discord counts, and they are the part callers forget. A body sized to
+    exactly 2000 is already over once `<@id> done: ` is prepended.
+
+    Returned rather than raised so the caller decides how to fail, and so a test
+    can assert the wording without trapping SystemExit.
+    """
+    n = len(text)
+    if n <= DISCORD_MAX_CONTENT:
+        return None
+    over = n - DISCORD_MAX_CONTENT
+    room = DISCORD_MAX_CONTENT - overhead
+    detail = (
+        f" The count INCLUDES the {overhead}-char routing prefix, so the body "
+        f"itself must be <= {room} chars."
+        if overhead else ""
     )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        sys.exit(f"ERROR: Discord API {e.code}: {e.read().decode()}")
+    return (
+        f"ERROR: content is {n} chars — {over} over Discord's "
+        f"{DISCORD_MAX_CONTENT} limit. NOTHING WAS SENT.{detail} "
+        f"Cut ~{over} chars and retry."
+    )
+
+
+def post(channel_id: str, text: str, token: str, overhead: int = 0):
+    # Refuse locally rather than spending a round trip to be told the same thing
+    # by a 400 that reports no numbers. The API's error names the limit but not
+    # the actual length or the overage, so the caller cannot tell how much to
+    # cut without measuring again.
+    problem = check_length(text, overhead)
+    if problem:
+        sys.exit(problem)
+    receipt, _status, body = _client(token).send_message_with_response(
+        channel_id, {"content": text})
+    if receipt.outcome is DeliveryOutcome.CONFIRMED and isinstance(body, dict):
+        return body
+    hint = (" The post MAY have landed — check the channel before retrying."
+            if receipt.outcome is DeliveryOutcome.OUTCOME_UNKNOWN
+            else " NOTHING WAS SENT.")
+    sys.exit(f"ERROR: Discord send {receipt.outcome.value}: {receipt.detail}.{hint}")
 
 
 # Peer roster lives in per-host config, NOT hardcoded here: this script is
@@ -238,6 +261,19 @@ def resolve_to_target(value: str) -> str:
     )
 
 
+_repo = next(p for p in pathlib.Path(__file__).resolve().parents
+             if (p / "src" / "body_file.py").is_file())
+sys.path.insert(0, str(_repo / "src"))
+from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402
+from channels.discord.post_gate import make_client  # noqa: E402  — the one Discord POST chokepoint
+from outbox import DeliveryOutcome  # noqa: E402
+
+
+def _client(token: str):
+    """Shared-DiscordRestClient seam for tests; keeps the pre-client 10s cap."""
+    return make_client(token, timeout=10)
+
+
 def main():
     argv = sys.argv[1:]
     # Optional explicit recipient: --to <name|id>. When given, the @-mention
@@ -251,11 +287,23 @@ def main():
         to_target = argv[i + 1]
         del argv[i : i + 2]
 
-    if len(argv) < 2:
-        print(__doc__, file=sys.stderr)
-        sys.exit(1)
-    kind = argv[0]
-    text = " ".join(argv[1:])
+    # --body-file must be the FIRST body token: recognising it anywhere would
+    # turn ordinary prose ("document --body-file usage") into a file read.
+    if argv and argv[0] in VALID_KINDS and len(argv) > 1 and argv[1] == "--body-file":
+        if len(argv) < 3:
+            sys.exit("ERROR: --body-file requires a path")
+        if len(argv) > 3:
+            sys.exit(f"ERROR: --body-file takes the body; drop {argv[3:]!r}")
+        kind = argv[0]
+        text = _read_body_file(argv[2])
+        if not text.strip():
+            sys.exit(f"ERROR: --body-file {argv[2]!r} is empty — refusing to post")
+    else:
+        if len(argv) < 2:
+            print(__doc__, file=sys.stderr)
+            sys.exit(1)
+        kind = argv[0]
+        text = " ".join(argv[1:])
     if kind not in VALID_KINDS:
         sys.exit(f"ERROR: kind must be one of {sorted(VALID_KINDS)}, got {kind!r}")
 
@@ -289,7 +337,7 @@ def main():
     prefix = f"<@{other_id}> " if other_id else ""
     message = f"{prefix}{kind}: {text}"
 
-    result = post(channel_id, message, token)
+    result = post(channel_id, message, token, overhead=len(message) - len(text))
     print(f"Posted to #{channel_id} (msg_id {result.get('id')}): {message[:80]}")
 
 

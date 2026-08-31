@@ -6,7 +6,10 @@ starting with "com.sutando." while those checks are named by service.
 
 Guards:
   a) LAUNCHD_BACKED_CHECKS maps both service names to their launchd labels
-  b) fix_launchd() with a mapped label kickstarts gui/<uid>/<label>
+  b) fix_launchd() with a mapped label restarts the job — voice-agent through
+     the GUARDED restart wrapper (amendment T4: never a direct
+     `launchctl kickstart -k` of voice-agent; the wrapper runs the
+     voice-lock.py takeover validation first), web-client via kickstart
      (verified via recorded subprocess calls against a temp LaunchAgents)
   c) fix_launchd() falls back to bootstrap when kickstart fails
   d) the --fix dispatch in main() actually routes LAUNCHD_BACKED_CHECKS
@@ -84,14 +87,27 @@ def main() -> int:
             hc.Path.home = staticmethod(lambda: Path(tmp))  # type: ignore[assignment]
             with_fake_home(tmp, make_plists=True)
 
-            # b) kickstart path
+            # b) restart path. voice-agent: NEVER a direct kickstart -k — the
+            # repair goes through the guarded wrapper (amendment T4), which
+            # runs the voice-lock.py takeover validation before its kickstart.
             rec = _Recorder(kickstart_rc=0)
             hc.subprocess.run = rec
             out = hc.fix_launchd(hc.LAUNCHD_BACKED_CHECKS["voice-agent"])
             kicks = [c for c in rec.calls if c[:2] == ["/bin/launchctl", "kickstart"]]
-            check(out == "restarted com.sutando.voice-agent"
-                  and kicks and kicks[0][-1].endswith("/com.sutando.voice-agent"),
-                  f"mapped label kickstarts the launchd job (got {out!r})")
+            wraps = [c for c in rec.calls
+                     if any(str(part).endswith("restart-voice-agent.sh") for part in c)]
+            check(out == "restarted com.sutando.voice-agent (guarded restart wrapper)"
+                  and wraps and not kicks,
+                  f"voice-agent repair uses the guarded wrapper, no direct kickstart (got {out!r}, kicks={kicks})")
+            # web-client keeps the direct kickstart (its label never names
+            # voice-agent, so the T4 gate does not apply).
+            rec_wc = _Recorder(kickstart_rc=0)
+            hc.subprocess.run = rec_wc
+            out_wc = hc.fix_launchd(hc.LAUNCHD_BACKED_CHECKS["web-client"])
+            kicks_wc = [c for c in rec_wc.calls if c[:2] == ["/bin/launchctl", "kickstart"]]
+            check(out_wc == "restarted com.sutando.web-client"
+                  and kicks_wc and kicks_wc[0][-1].endswith("/com.sutando.web-client"),
+                  f"web-client mapped label kickstarts the launchd job (got {out_wc!r})")
 
             # c) bootstrap fallback
             rec2 = _Recorder(kickstart_rc=1, bootstrap_rc=0)

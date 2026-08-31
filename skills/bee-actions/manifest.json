@@ -1,0 +1,16 @@
+{
+  "name": "bee-actions",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "stability": "experimental",
+  "enabled": true,
+  "access_tier": "owner",
+  "description": "Tool half of the Bee integration (channels-vs-tools split): agent-callable actions on the owner's Bee — read todos/conversations/facts, complete/create/edit todos (the captured-todo closed loop), confirm-gated deletes. Works against the local `bee login` proxy or the Bee cloud API. Config-only manifest — run scripts/bee_actions.py <verb>.",
+  "config": {
+    "BEE_PROXY_URL": "",
+    "BEE_API_BASE": "",
+    "BEE_API_TOKEN": "",
+    "BEE_ROOM_ID": "",
+    "BEE_ROOM_OWNER": ""
+  }
+}

@@ -227,9 +227,12 @@ def _post_to_room(room_id, body, repo=None):
                  "User-Agent": "sutando-core/1.0"})
     try:
         r = urllib.request.urlopen(req, timeout=30)
-        return (json.loads(r.read().decode() or "{}")).get("event_id")
+        body_json = json.loads(r.read().decode() or "{}")
     except (urllib.error.URLError, urllib.error.HTTPError):
         return None
+    # A 2xx IS delivery: the gateway may answer {"ok": true} with no event_id,
+    # so keying the return on that field reports every success as a failure.
+    return body_json.get("event_id") or body_json.get("ok") or True
 
 
 def _default_state_file():

@@ -66,6 +66,12 @@ class _DMChannel: pass
 _discord_stub.Intents = _Intents
 _discord_stub.Client = _Client
 _discord_stub.AllowedMentions = _AllowedMentions
+class _Thread:
+    """The stub omitted Thread, so the thread branch was unreachable under
+    test and went uncovered."""
+
+
+_discord_stub.Thread = _Thread
 _discord_stub.MessageReference = _MessageReference
 _discord_stub.MessageType = types.SimpleNamespace(default=0, reply=1)
 _discord_stub.File = lambda *a, **kw: None
@@ -87,7 +93,7 @@ def load_bridge():
         spec = importlib.util.spec_from_loader("bridge", loader=None)
         bridge = importlib.util.module_from_spec(spec)
         bridge.__file__ = str(REPO / "src" / "discord-bridge.py")
-        exec(src, bridge.__dict__)
+        exec(compile(src, bridge.__file__, "exec"), bridge.__dict__)
     return bridge
 
 
@@ -216,6 +222,10 @@ class _MockChannel:
         return types.SimpleNamespace(id=12345)
 
 
+class _MockThreadChannel(_MockChannel, _Thread):
+    """A channel that is a Discord thread."""
+
+
 # ---------------------------------------------------------------------------
 # Drive one iteration of poll_results
 # ---------------------------------------------------------------------------
@@ -312,6 +322,23 @@ def case_c_directive_only_first_chunk():
     return fails
 
 
+def case_d_oversized_result_has_a_delivery_budget():
+    """Oversized results use three previews plus a truncation notice."""
+    fails = []
+    ch = _MockChannel(channel_id=888999000)
+    body = "oversized-review-output\n" * 1200
+    sent = asyncio.run(_run_one_poll_iteration("test-task-d", ch, body))
+    if len(sent) != 4:
+        fails.append(f"d) oversized result should use exactly 4 sends (got {len(sent)})")
+        return fails
+    if not (sent[0]["content"] or "").startswith("oversized-review-output"):
+        fails.append("d) first send should retain the beginning of the result")
+    notice = sent[-1]["content"] or ""
+    if "truncated" not in notice.lower() or "suppressed" not in notice.lower():
+        fails.append(f"d) final send should explain truncation (got {notice!r})")
+    return fails
+
+
 def test_resolver_bindings_restored_after_the_context() -> int:
     """Protect the late-import restore sweep with an activated assertion.
 
@@ -358,7 +385,7 @@ def _workspace_fingerprint(ws) -> dict:
         try:
             # CONTENT hash under results/ — that subtree holds the owner's
             # archived task evidence, and the fixture task ids are FIXED
-            # (test-task-a/b/c), so a destructive OVERWRITE of an existing file
+            # (test-task-a/b/c/d), so a destructive OVERWRITE of an existing file
             # is the realistic collision (john-the-dev, #2619). A same-size
             # rewrite is exactly what a name-only or size-only check misses.
             # (size, mtime) elsewhere keeps a whole-workspace scan cheap.
@@ -413,6 +440,52 @@ def test_no_writes_reach_the_live_workspace(live_ws) -> int:
     return 0
 
 
+def _auto_thread_reference(task_id, channel):
+    """Drive one poll with an anchor registered and NO explicit directive."""
+    bridge.pending_reply_anchors.clear()
+    bridge.pending_reply_anchors[task_id] = 1500000000000000009
+    sent = asyncio.run(_run_one_poll_iteration(task_id, channel, "plain text reply"))
+    return sent
+
+
+def case_e_auto_thread_quotes_in_a_plain_channel():
+    """Anchor registered, no directive: the reply quotes what triggered it."""
+    fails = []
+    sent = _auto_thread_reference("test-task-e", _MockChannel(channel_id=111222333))
+    if not sent:
+        return ["e) no channel.send call observed"]
+    ref = sent[0]["reference"]
+    if ref is None or getattr(ref, "message_id", None) != 1500000000000000009:
+        fails.append(f"e) plain channel should quote the anchor, got {ref}")
+    return fails
+
+
+def case_f_auto_thread_quotes_inside_a_thread_too():
+    """A Discord THREAD gets the same quote: interleaved exchanges make
+    position stop identifying what a message answers."""
+    fails = []
+    sent = _auto_thread_reference("test-task-f", _MockThreadChannel(channel_id=444000111))
+    if not sent:
+        return ["f) no channel.send call observed"]
+    ref = sent[0]["reference"]
+    if ref is None:
+        fails.append("f) a thread reply carries NO reference — the skip is still in place")
+    elif getattr(ref, "message_id", None) != 1500000000000000009:
+        fails.append(f"f) thread reply quoted the wrong message: {ref}")
+    return fails
+
+
+def case_g_the_stub_can_actually_see_a_thread():
+    """Guard: an absent Thread class reads exactly like a non-thread channel,
+    so without this case f would pass for the wrong reason."""
+    fails = []
+    if getattr(bridge.discord, "Thread", None) is None:
+        fails.append("g) the stub exposes no Thread class, so case f proves nothing")
+    if not isinstance(_MockThreadChannel(), getattr(bridge.discord, "Thread", ())):
+        fails.append("g) _MockThreadChannel is not an instance of the stub's Thread")
+    return fails
+
+
 def main():
     # Baseline BEFORE any case runs, so the final check covers every write this
     # file triggers — not just the ones the regression itself makes.
@@ -426,6 +499,10 @@ def main():
         ("a-directive-present-constructs-reference", case_a_directive_present_constructs_reference),
         ("b-no-directive-no-reference", case_b_no_directive_no_reference),
         ("c-directive-only-first-chunk", case_c_directive_only_first_chunk),
+        ("d-oversized-result-has-a-delivery-budget", case_d_oversized_result_has_a_delivery_budget),
+        ("e-auto-thread-quotes-in-a-plain-channel", case_e_auto_thread_quotes_in_a_plain_channel),
+        ("f-auto-thread-quotes-inside-a-thread-too", case_f_auto_thread_quotes_inside_a_thread_too),
+        ("g-the-stub-can-actually-see-a-thread", case_g_the_stub_can_actually_see_a_thread),
     ]
     failures = []
     with _bridge_writes_redirected() as (_tmp, _redirected):

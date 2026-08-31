@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -25,7 +26,25 @@ from presenter_mode import presenter_mode_active  # noqa: E402
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
 RESULTS_DIR = WORKSPACE / "results"
-LAST_NOTIFY_FILE = WORKSPACE / ".last-pq-notify"
+# No read-fallback to the old root path on purpose: a missing stamp makes the
+# reader notify ONCE rather than suppress, so the move costs one notification.
+LAST_NOTIFY_FILE = WORKSPACE / "state" / "last-pq-notify"
+
+
+def write_notify_stamp(questions, now=None):
+    """Record that this question set was just notified.
+
+    Named so it is testable without driving `main`, which fires a real notification.
+    """
+    LAST_NOTIFY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time()) if now is None else now
+    LAST_NOTIFY_FILE.write_text(f"{ts} {notify_key(questions)}")
+    # Retire AFTER the new stamp exists: a crash between the two costs at most a
+    # cooldown. Path derived from LAST_NOTIFY_FILE so a redirected test stays in tmp.
+    try:
+        (LAST_NOTIFY_FILE.parent.parent / ".last-pq-notify").unlink(missing_ok=True)
+    except OSError:
+        pass
 VOICE_LOG = WORKSPACE / "logs" / "voice-agent.log"
 # How long an UNCHANGED question set stays quiet before it is raised again. This
 # is the floor that stops "notify only when the set changes" from turning an
@@ -177,9 +196,13 @@ def get_waiting_questions():
             # that blank line and a start-anchored slice comes back empty.
             line_start = content.rfind("\n", 0, m.end()) + 1
             line_end = content.find("\n", m.end())
-            body = content[line_start:line_end if line_end != -1 else len(content)].strip()
+            stop = line_end if line_end != -1 else len(content)
+            body = content[line_start:stop].strip()
+            # The DM renders `snippet`, not `body`; an empty one delivered the
+            # bracketed label alone, so options and defaults never reached anyone.
+            ask = content[m.end():stop].strip().lstrip("*").strip()
             questions.append({"id": title[:40], "title": title,
-                              "snippet": "", "body": body or title})
+                              "snippet": ask[:120], "body": body or title})
     return questions
 
 
@@ -234,9 +257,29 @@ def should_notify(key=None):
     return (time.time() - mtime) > UNCHANGED_REMINDER_SEC
 
 
+#: Body budget for the macOS notification. Not a hard OS limit — a chosen bound
+#: the assembled body is held under, so no count width can overrun it.
+BODY_MAX = 160
+
+
 def notify_macos(count, titles):
     """Returns True only if osascript actually accepted the notification."""
-    msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(titles[:3])}"
+    # macOS truncates the body: the [:40] cap is the bound, since a title need
+    # not contain a comma; blanks are dropped so the join cannot emit a bare `, ,`.
+    names = [n for n in (t.split(",", 1)[0].strip()[:40] for t in titles[:3]) if n]
+    extra = f" (+{count - len(names)} more)" if count > len(names) else ""
+    head = f"{count} pending question{'s' if count > 1 else ''}: "
+    # Cap the ASSEMBLED body, not just each name: the count and the overflow both
+    # widen with the queue, so per-name bounds alone leave the total arithmetic.
+    room = BODY_MAX - len(head) - len(extra) - 1
+    joined = ", ".join(names)
+    if room <= 0:
+        joined = ""
+    elif len(joined) > room:
+        joined = joined[:room - 1] + "…"
+    # When every candidate name is blank there is nothing between the colon and the
+    # overflow, and `head` already ends in a space — so join on the stripped head.
+    msg = f"{head}{joined}{extra}" if joined else f"{head.rstrip()}{extra}"
     # AppleScript string literal: backslashes and double quotes in question
     # titles must be escaped, or osascript rejects the script and the
     # notification silently reports FAILED (bit us 2026-07-26 — a title
@@ -253,6 +296,35 @@ def questions_key(questions):
     """sha256[:16] of the sorted question titles -- a stable id for the set."""
     key = "|".join(sorted(q["title"] for q in questions))
     return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+# Deepest ordered prefix any consumer renders: notify_macos shows titles[:3],
+# the proactive DM body shows questions[:5]. Covering 5 covers both.
+VISIBLE_PREFIX = 5
+
+
+def notify_key(questions):
+    """sha256[:16] of what the owner would actually SEE — set AND visible order.
+
+    Deliberately NOT `questions_key`, which answers a different question. That one
+    identifies the SET and must stay order-independent: it names the proactive file
+    (`proactive-pending-q-<key>.txt`), so a reordered-but-identical set has to
+    collapse onto the same filename instead of delivering a second copy. Pinned by
+    tests/check-pending-questions-collapse.test.py.
+
+    The cooldown asks something else: "would this fire show him anything new?"
+    Both renders are ORDERED prefixes, so the set hash is wrong in both directions —
+    promoting an item into the top 3 changes every rendered word while the hash holds
+    (suppressed, and a promotion is deliberate precisely because the top slot should
+    change), and adding a 21st item below the fold changes the hash while the rendered
+    text is identical (fires, showing nothing new).
+
+    Composed from `questions_key` rather than replacing it, so every membership change
+    that notified before still notifies: this can only ever widen, never suppress.
+    """
+    visible = "|".join(q["title"] for q in questions[:VISIBLE_PREFIX])
+    seed = f"{questions_key(questions)}#{visible}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:16]
 
 
 def notify_voice(questions):
@@ -286,7 +358,22 @@ def notify_discord_dm(questions):
     lines.append(
         f"Reply here or edit pending-questions.md on {socket.gethostname().split('.')[0]} to resolve."
     )
-    path.write_text("\n".join(lines))
+    # Each body is a whole snapshot, so a stale one is wrong, not redundant. Look
+    # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
+    superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
+    # Appear at the deliverable name in one step, from a scratch name no other run
+    # can hold: a poll claims proactive-*.txt on sight and would DM a partial body.
+    fd, tmp_name = tempfile.mkstemp(dir=RESULTS_DIR, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines))
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    for old in superseded:
+        old.unlink(missing_ok=True)
 
 
 # A proactive-*.txt is only a DELIVERY if some bridge drains it. On a host where
@@ -443,7 +530,7 @@ def main():
         print(f"(presenter-mode) {len(questions)} pending questions — suppressed")
         return
 
-    if not force and not should_notify(questions_key(questions)):
+    if not force and not should_notify(notify_key(questions)):
         print(f"(cooldown) {len(questions)} pending questions — skipping notification")
         return
 
@@ -455,7 +542,7 @@ def main():
     # exact "claimed an outcome it never achieved" failure this script exists to
     # remove, reproduced in its own control flow.
     summary = deliver(questions, count, titles)
-    LAST_NOTIFY_FILE.write_text(f"{int(time.time())} {questions_key(questions)}")
+    write_notify_stamp(questions)  # pragma: no cover — covered as a unit; reaching here fires a real notification
     print(summary)
 
 

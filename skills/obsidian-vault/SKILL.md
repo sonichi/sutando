@@ -49,7 +49,7 @@ SUTANDO_OBSIDIAN_MIRROR=1
 
 Then either:
 - One-shot now: `python3 src/obsidian-mirror.py` (single sweep + exit).
-- Or wire into `skills/schedule-crons/crons.json` to run on a cadence (default template adds `obsidian-dream` nightly at 03:37, which sweeps + judges in one go).
+- Or add an `obsidian-dream` entry to your per-host `crons.json` to run on a cadence (it is not included in the default template). The nightly job sweeps + judges in one go.
 
 CLI flags worth knowing:
 - `python3 src/obsidian-mirror.py --force` — bypass the env gate (used by `run_dream` voice tool).

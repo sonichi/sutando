@@ -64,7 +64,17 @@ def _install_mocks():
     b2b.load_token = lambda: "tok"
     b2b.load_access = lambda: ACCESS
     b2b.get_self_id = lambda token: MEMBER_SELF  # this bot is a channel member
-    b2b.post = lambda ch, txt, tok: _posted.update(channel=ch, text=txt) or {"id": "1"}
+    # `**kw` absorbs optional keyword args the real `post()` grows (e.g. the
+    # `overhead` hint the length guard passes). A fixed-arity mock turns any
+    # such addition into a TypeError in the TEST while production is fine —
+    # this exact stub broke that way when `overhead=` was added.
+    #
+    # It CAPTURES the kwargs rather than discarding them, so the handoff from
+    # main() can be asserted. Absorbing-and-dropping would keep the suite green
+    # while main() forwarded a wrong (or hardcoded) value.
+    b2b.post = lambda ch, txt, tok, **kw: (
+        _posted.update(channel=ch, text=txt, kwargs=kw) or {"id": "1"}
+    )
 
 
 def _restore():
@@ -92,6 +102,82 @@ try:
     b2b.main()
     check("main: --to member → posts to bot2bot channel", _posted.get("channel") == BOT2BOT)
     check("main: member post carries the mention", _posted.get("text", "").startswith(f"<@{MEMBER_B}> "))
+
+    # --- main() forwards the REAL overhead to the length guard ---------------
+    # The focused guard suite checks `check_length` arithmetic in isolation; it
+    # cannot see whether main() hands it the right number. Derive the expected
+    # value from the observed message and the body main() was given, so a
+    # hardcoded constant in main() (today's prefix happens to be 24 chars) fails
+    # here instead of shipping a guard that measures the wrong string.
+    _body = "shipped"
+    _sent = _posted.get("text", "")
+    _seen = _posted.get("kwargs", {})
+    check("main: forwards overhead= to post()", "overhead" in _seen)
+    check("main: overhead equals len(message) - len(body)",
+          _seen.get("overhead") == len(_sent) - len(_body))
+    check("main: overhead accounts for BOTH the mention and the kind tag",
+          _seen.get("overhead") == len(f"<@{MEMBER_B}> done: "))
+
+    # --- --body-file: prose never crosses a shell quoting boundary ----------
+    import pathlib
+    import tempfile
+    _hazard = ("He approved `qingyun-wu`'s #2909 — an apostrophe closes a "
+               "single-quoted shell arg and re-arms the backticks.")
+    with tempfile.TemporaryDirectory() as td:
+        f = pathlib.Path(td) / "body.txt"
+        f.write_text(_hazard + "\n", encoding="utf-8")
+
+        _posted.clear()
+        sys.argv = ["post.py", "--to", MEMBER_B, "ping", "--body-file", str(f)]
+        b2b.main()
+        _sent2 = _posted.get("text", "")
+        # The whole point: every character survives, backticks and apostrophe included.
+        check("--body-file: body delivered VERBATIM", _hazard in _sent2)
+        check("--body-file: trailing newline stripped, not doubled",
+              not _sent2.endswith("\n"))
+        check("--body-file: mention + kind prefix still applied",
+              _sent2.startswith(f"<@{MEMBER_B}> ping: "))
+        check("--body-file: overhead still measured against the real body",
+              _posted.get("kwargs", {}).get("overhead") == len(_sent2) - len(_hazard))
+
+        # COMPATIBILITY: the flag is only recognised immediately after <kind>.
+        # A later literal occurrence is ordinary prose and must still send.
+        _posted.clear()
+        sys.argv = ["post.py", "--to", MEMBER_B, "ping", "please document", "--body-file", "usage"]
+        b2b.main()
+        check("literal --body-file LATER in a body stays prose",
+              _posted.get("text", "").endswith("please document --body-file usage"))
+
+        # a trailing argument after the path is ambiguous -> refuse
+        _posted.clear()
+        sys.argv = ["post.py", "--to", MEMBER_B, "ping", "--body-file", str(f), "extra"]
+        try:
+            b2b.main(); raised2 = False
+        except SystemExit:
+            raised2 = True
+        check("--body-file + trailing arg → refused, nothing posted",
+              raised2 and "posted" not in _posted)
+
+        # an empty file must not post a blank message
+        blank = pathlib.Path(td) / "blank.txt"; blank.write_text("   \n", encoding="utf-8")
+        _posted.clear()
+        sys.argv = ["post.py", "--to", MEMBER_B, "ping", "--body-file", str(blank)]
+        try:
+            b2b.main(); raised3 = False
+        except SystemExit:
+            raised3 = True
+        check("--body-file: empty file refused, nothing posted",
+              raised3 and "posted" not in _posted)
+
+    # a missing path fails loudly rather than posting an empty body
+    _posted.clear()
+    sys.argv = ["post.py", "--to", MEMBER_B, "ping", "--body-file", "/nonexistent/nope.txt"]
+    try:
+        b2b.main(); raised4 = False
+    except SystemExit:
+        raised4 = True
+    check("--body-file: unreadable path refused, nothing posted",
+          raised4 and "posted" not in _posted)
 
     # --- multi-peer NO-GUESS (2026-07-29 double misfire regression) ---
     # With 2+ peer bots allowlisted and no --to, the old code picked

@@ -94,6 +94,104 @@ class VoiceHealthConfigTests(unittest.TestCase):
                 self.assertFalse(hc.resolve_voice_health_config(
                     env={}, env_path=self._no_dotenv)["enabled"])
 
+    # --- S1 truth table: voicePreference / quarantined (design 2b, WS2 Step 4)
+    # health-check implements the SHARED credential-source table (amendment S1)
+    # alongside the launcher, the TS/python resolvers, and the desktop
+    # supervisor's spawn-env gate; tests/voice-preference-consumers.test.sh
+    # drives them all over one fixture matrix — these cases pin this module's
+    # own decisions + detail strings.
+
+    _BOTH_SLOTS = ('"capabilities": {"gemini-voice": {"key": "managed-v"},'
+                   ' "gemini-text": {"key": "managed-t"}}')
+
+    def test_byok_preference_hides_managed_entries_from_the_gate(self) -> None:
+        root = self.write_managed('{%s, "voicePreference": "byok"}' % self._BOTH_SLOTS)
+        path = root / "state" / "auth" / "managed-credentials.json"
+        self.assertFalse(hc.managed_voice_credential_present(path))
+
+    def test_byok_preference_without_env_key_reads_disabled_with_a_reason(self) -> None:
+        # Impl plan WS2 Step 4: a byok-with-no-env-key install must read as
+        # *disabled with a reason*, not "managed credential configured".
+        self.write_managed('{%s, "voicePreference": "byok"}' % self._BOTH_SLOTS)
+        cfg = hc.resolve_voice_health_config(env={}, env_path=self._no_dotenv)
+        self.assertFalse(cfg["enabled"])
+        self.assertIn("BYOK preference set (managed entries ignored)", cfg["detail"])
+
+    def test_byok_preference_with_env_key_is_enabled_via_env(self) -> None:
+        self.write_managed('{%s, "voicePreference": "byok"}' % self._BOTH_SLOTS)
+        cfg = hc.resolve_voice_health_config(
+            env={"GEMINI_API_KEY": "byo-mk"}, env_path=self._no_dotenv)
+        self.assertTrue(cfg["enabled"])
+        self.assertIn("BYOK preference", cfg["detail"])
+        self.assertNotIn("managed voice credential", cfg["detail"])
+
+    def test_quarantined_entries_are_absent_in_every_mode(self) -> None:
+        root = self.write_managed('{%s, "quarantined": true}' % self._BOTH_SLOTS)
+        path = root / "state" / "auth" / "managed-credentials.json"
+        self.assertFalse(hc.managed_voice_credential_present(path))
+        # Unset preference: the legacy walk falls through to env...
+        cfg = hc.resolve_voice_health_config(
+            env={"GEMINI_API_KEY": "byo-mk"}, env_path=self._no_dotenv)
+        self.assertTrue(cfg["enabled"])
+        # ...and with no env key the quarantined entries must not enable.
+        cfg = hc.resolve_voice_health_config(env={}, env_path=self._no_dotenv)
+        self.assertFalse(cfg["enabled"])
+
+    def test_quarantined_false_keeps_the_tier(self) -> None:
+        root = self.write_managed('{%s, "quarantined": false}' % self._BOTH_SLOTS)
+        path = root / "state" / "auth" / "managed-credentials.json"
+        self.assertTrue(hc.managed_voice_credential_present(path))
+
+    def test_managed_preference_with_usable_entry_is_enabled(self) -> None:
+        self.write_managed('{%s, "voicePreference": "managed"}' % self._BOTH_SLOTS)
+        cfg = hc.resolve_voice_health_config(env={}, env_path=self._no_dotenv)
+        self.assertTrue(cfg["enabled"])
+        self.assertIn("managed", cfg["detail"])
+
+    def test_s1_env_key_never_satisfies_a_managed_preference(self) -> None:
+        """S1's load-bearing row: managed preference + quarantined/missing managed
+        entries + a present env key -> DISABLED.
+
+        An env key silently satisfying a managed preference is the
+        logout-quarantine bypass the design closes (design 2b).
+        """
+        for doc in (
+            '{%s, "voicePreference": "managed", "quarantined": true}' % self._BOTH_SLOTS,
+            '{"capabilities": {}, "voicePreference": "managed"}',
+        ):
+            with self.subTest(doc=doc):
+                self.write_managed(doc)
+                cfg = hc.resolve_voice_health_config(
+                    env={"GEMINI_VOICE_API_KEY": "vk", "GEMINI_API_KEY": "mk"},
+                    env_path=self._no_dotenv)
+                self.assertFalse(cfg["enabled"])
+                self.assertIn("voicePreference=managed", cfg["detail"])
+
+    def test_r15_revision_fields_are_tolerated_and_ignored(self) -> None:
+        self.write_managed(
+            '{%s, "preferenceRevision": 7, "sessionRevision": 3}' % self._BOTH_SLOTS)
+        cfg = hc.resolve_voice_health_config(env={}, env_path=self._no_dotenv)
+        self.assertTrue(cfg["enabled"])
+        self.assertIn("managed", cfg["detail"])
+
+    def test_managed_voice_preference_vocabulary(self) -> None:
+        rows = (
+            ('{"capabilities": {}, "voicePreference": "managed"}', "managed"),
+            ('{"capabilities": {}, "voicePreference": "byok"}', "byok"),
+            ('{"capabilities": {}}', "unset"),
+            ('{"capabilities": {}, "voicePreference": "MANAGED"}', "unset"),
+            ('{"capabilities": {}, "voicePreference": 42}', "unset"),
+            ("{not json", "unset"),
+        )
+        for doc, expected in rows:
+            with self.subTest(doc=doc):
+                root = self.write_managed(doc)
+                path = root / "state" / "auth" / "managed-credentials.json"
+                self.assertEqual(hc.managed_voice_preference(path), expected)
+        missing = Path(tempfile.gettempdir()) / "no-such-managed-credentials.json"
+        missing.unlink(missing_ok=True)
+        self.assertEqual(hc.managed_voice_preference(missing), "unset")
+
     def test_managed_credential_wins_over_inherited_skip_voice(self) -> None:
         """Managed key + inherited SKIP_VOICE=1 must report ENABLED, like the launcher.
 

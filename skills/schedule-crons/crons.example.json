@@ -1,18 +1,13 @@
 [
   {
     "name": "main-loop",
-    "cron": "*/5 * * * *",
+    "cron": "*/15 * * * *",
     "prompt_skill": "proactive-loop"
   },
   {
     "name": "morning-briefing",
     "cron": "57 6 * * *",
     "prompt": "Morning briefing. FIRST produce the calendar cache from the owner's REAL Google calendar (the standalone script can't reach the connector): pull today's events via the Google-calendar connector (e.g. sutando-station composio_exec GOOGLECALENDAR_EVENTS_LIST, calendarId=primary, today's local-day window), then pipe them as a JSON array of {raw,calendar} to `python3 src/write_calendar_cache.py` (or `python3 src/write_calendar_cache.py --empty` if genuinely no events today). THEN run `MORNING_BRIEFING_CALENDAR_SOURCE=google python3 src/morning-briefing.py` to deliver the briefing (weather, calendar, reminders, overnight Discord, pending questions, health). Producing the cache first makes the briefing read the owner's real Google Workspace calendar instead of falsely reporting 'clear' off an empty local macOS-Calendar read (#2256). If you have no Google connector, drop the cache step and the env var to fall back to the local macOS Calendar. Speak the result if voice is connected, send as Discord DM otherwise."
-  },
-  {
-    "name": "daily-insight",
-    "cron": "50 6 * * *",
-    "prompt": "Run python3 src/daily-insight.py to generate today's behavioral insight. If it produces output, include it in the morning briefing."
   },
   {
     "name": "pending-questions",
@@ -25,11 +20,6 @@
     "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh — syncs workspace (memory + notes + state/cores) to the private vault via per-host branch (requires vault.remote_url in sutando.config.local.json, or --vault-url flag; deferred when owner tasks are queued; next */30 retry covers a skipped fire). Replaces the legacy sync-memory entry (which used rsync to a separate ~/.sutando/memory-sync/ clone); sync-memory.sh still works during the transition but emits a deprecation banner."
   },
   {
-    "name": "obsidian-dream",
-    "cron": "37 3 * * *",
-    "prompt": "Run python3 skills/obsidian-vault/scripts/dream.py for the nightly LLM-judged vault relink pass (gated by SUTANDO_OBSIDIAN_MIRROR=1 — no-op when unset). Default model: claude-opus-4-7 (override via SUTANDO_DREAM_MODEL)."
-  },
-  {
     "name": "learned-skills-scan",
     "cron": "30 7 * * *",
     "prompt": "Run python3 skills/learned-skills/scripts/detect-learned-skills.py to scan recent task archives for repeated workflow patterns and propose candidate learned skills. Gated on state/learned-skills-enabled.sentinel (toggled from Settings → Skills → Behavior); the script exits early when the gate is off."
@@ -38,12 +28,5 @@
     "name": "example-digest",
     "cron": "2 6 * * *",
     "prompt": "Example digest cron — replace with your own research prompt. Web search for the latest <topic> developments in the past 24h. Summarize top 3-5 items as 'title — why-it-matters — link'. Keep under ~1500 chars. DELIVERY (required for digest crons): Write the full result to results/proactive-example-$(date +%s).txt — and nothing else. Do NOT use notify.py for the final result (it hard-rejects messages over 280 chars — it is a progress-ping tool, not a delivery channel), do NOT write results/briefing-* (Slack never drains that prefix), and do NOT mint a synthetic tasks/task-cron-* (an orphan task with no matching keyed result — re-processed as noise, delivers nothing). Every bridge drains results/proactive-*.txt via proactive_routing, routed to the owner's most-recently-active channel exactly once."
-  },
-  {
-    "name": "agent-landscape-digest",
-    "cron": "4 6 * * 1,4",
-    "launchd": true,
-    "_comment": "Cadence caveat: a true 'every 3 days' is NOT expressible in 5-field cron. `*/3` in the day-of-month field steps 1,4,7,...,31 and then RESETS at the start of each month (so the gap across a month boundary is 1-2 days, not 3 — and Feb/short months skew it further). To stay honest we approximate a ~2x/week cadence with a stable, correctly-expressible expression: DOW 1,4 (Mon & Thu) at 6:04 local. If you truly need fixed 3-day spacing, gate the prompt on an interval check (e.g. a state-file timestamp) rather than relying on the cron field.",
-    "prompt": "Agent-landscape digest (Mon & Thu). Use web search to find the latest progress across personal / autonomous AI agents — Claude (Claude Code), Codex, OpenClaw, Hermes Agent (Nous), and other rising agents/frameworks. Compare each against Sutando and suggest 2-3 concrete features Sutando should adopt (be specific: which existing Sutando component it extends, and why it's worth it). Keep it under ~1800 chars. DELIVERY (required for digest crons): write the full digest to results/proactive-agent-landscape-$(date +%s).txt — and nothing else. Do NOT use notify.py for the final result (it hard-rejects messages over 280 chars — a progress-ping tool, not a delivery channel); every bridge drains results/proactive-*.txt via proactive_routing, routed to the owner's most-recently-active channel exactly once. Fires at 6:04 local Pacific (off-minute from the 6:02 daily loop-engineering digest) on Mon & Thu and tracks PST/PDT automatically. `\"launchd\": true` routes this through the reliable OS-level cron-runner so it fires regardless of session state."
   }
 ]

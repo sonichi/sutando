@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pathlib
 import tempfile
 import time
 import unittest
@@ -75,9 +76,58 @@ class OrphanedResultsTest(unittest.TestCase):
     # --- negative: the guards that keep a 'warn' meaningful -------------
 
     def test_task_still_queued_is_not_an_orphan(self):
-        """The consumer simply has not reached this pair yet."""
+        """Not-reached-yet is transient, so this is scoped to a fresh task."""
         self._write("results/task-abc.txt", TWO_HOURS_AGO)
-        self._write("tasks/task-abc.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-abc.txt")
+        self.assertEqual(hc.check_orphaned_results()["status"], "ok")
+
+    def test_aged_unclaimed_task_beside_its_result_IS_an_orphan(self):
+        """An unclaimed pair past the threshold is stranded, not in flight."""
+        self._write("results/task-newsradar-1.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-newsradar-1.txt", TWO_HOURS_AGO)
+        result = hc.check_orphaned_results()
+        self.assertEqual(result["status"], "warn", result)
+        self.assertIn("task-newsradar-1.txt", result["detail"])
+
+    def test_unmeasurable_task_age_warns_rather_than_dropping_the_result(self):
+        """An unreadable task age is partial coverage, never a clean pass."""
+        self._write("results/task-stat.txt", TWO_HOURS_AGO)
+
+        class _UnstatableTask:
+            # Deterministic counterpart to the real-locator control below:
+            # patching Path.stat globally would also break Path.exists().
+            name = "task-stat.txt"
+
+            def stat(self, *a, **k):
+                raise OSError("EIO")
+
+        with mock.patch.object(hc, "find_task_file", return_value=_UnstatableTask()):
+            result = hc.check_orphaned_results()
+        self.assertEqual(result["status"], "warn", result)
+        self.assertIn("unreadable", result["detail"])
+
+    def test_real_locator_raising_does_not_abort_the_probe(self):
+        """Drives the REAL find_task_file, whose exists() stats the path too."""
+        self._write("results/task-real.txt", TWO_HOURS_AGO)
+        task = self._write("tasks/task-real.txt", TWO_HOURS_AGO)
+        real_stat = pathlib.Path.stat
+
+        def boom(self_p, *a, **k):
+            if self_p == task:
+                raise OSError("EIO")
+            return real_stat(self_p, *a, **k)
+
+        # No stub: the failure must survive the locator, not bypass it.
+        with mock.patch.object(pathlib.Path, "stat", boom):
+            result = hc.check_orphaned_results()
+        # 3.12 raises out of exists(); 3.14 swallows it and the pair reads as
+        # an orphan. Both must warn; only the route differs.
+        self.assertEqual(result["status"], "warn", result)
+
+    def test_aged_CLAIMED_task_is_still_not_an_orphan(self):
+        """A claimed task is owned by a running consumer, however long it runs."""
+        self._write("results/task-slow.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-slow.claimed-core-2.txt", TWO_HOURS_AGO)
         self.assertEqual(hc.check_orphaned_results()["status"], "ok")
 
     def test_claimed_task_is_still_a_live_task(self):

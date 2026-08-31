@@ -66,6 +66,21 @@ for e in digest_entries:
     ok(f"digest '{name}': writes results/proactive-*.txt (cross-surface delivery)",
        "results/proactive-" in prompt, "missing the proactive-* delivery path")
 
+# Doc-drift guard (qingyun-wu CR on #2578): a feature-specific cron that is NOT
+# in the default template must not have its skill docs claim the default template
+# installs it. obsidian-dream was removed from crons.example.json here; the
+# obsidian-vault SKILL.md must not tell users the default template adds it — else
+# a new user enabling the mirror believes nightly relinking is scheduled when
+# nothing runs.
+_names = {e.get("name") for e in entries}
+_obsidian_skill = REPO / "skills" / "obsidian-vault" / "SKILL.md"
+if "obsidian-dream" not in _names and _obsidian_skill.is_file():
+    _txt = _obsidian_skill.read_text()
+    ok("obsidian SKILL.md doesn't claim the default template adds obsidian-dream",
+       not re.search(r"default template adds\s*`?obsidian-dream", _txt, re.I),
+       "SKILL.md still says the default template installs obsidian-dream, but it "
+       "was removed from crons.example.json — update the setup instruction")
+
 print()
 if _failed:
     print(f"FAIL — {_failed} of {_passed + _failed}")
