@@ -32,6 +32,18 @@ _CLAIMED_RE = re.compile(
     r"^task-([A-Za-z0-9._~-]+)\.claimed-(.+)\.txt$")
 
 
+def result_evidence(results_dir: Path, task_name: str) -> bool:
+    """A result was produced: live in results/, or already consumed by a
+    bridge (archive/ and undelivered/ are the two consumer dispositions)."""
+    stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
+    name = f"{stem}.txt"
+    results_dir = Path(results_dir)
+    return any(p.exists() for p in (
+        results_dir / name,
+        results_dir / "archive" / name,
+        results_dir / "undelivered" / name))
+
+
 def lead_alive(state_dir, lead_label: str, now_fn=time.time) -> bool:
     """False on a missing OR future-dated beat — clock skew must degrade,
     never keep followers deferring to a lead that is not really there."""
@@ -76,7 +88,14 @@ def acquire_work(tasks_dir, state_dir, instance: str,
         pending = [f for f in tasks.iterdir() if _UNASSIGNED_RE.match(f.name)]
     except OSError:
         return None
+    # results/ is the tasks dir's workspace sibling — derived, not passed,
+    # so no caller can omit the guard on the path that exists to survive crashes.
+    results_dir = tasks.parent / "results"
     for f in sort_tasks_by_priority(pending):
+        # A reclaimed task whose work already produced a result must not be
+        # re-executed (same guard as the lead's pooling scan).
+        if result_evidence(results_dir, f.name):
+            continue
         # assignment-suffix convention so lead-side load counting and
         # reclaim see fallback claims (legacy .claimed-core-N stays put)
         target = f.with_name(f.name[:-4] + f".claimed-{instance}.txt")

@@ -508,14 +508,9 @@ class PoolLead:
         return removed
 
     def _result_evidence(self, task_name: str) -> bool:
-        """A result was produced: live in results/, or already consumed by a
-        bridge (archive/ and undelivered/ are the two consumer dispositions)."""
-        stem = task_name[:-len(".txt")] if task_name.endswith(".txt") else task_name
-        name = f"{stem}.txt"
-        return any(p.exists() for p in (
-            self.results_dir / name,
-            self.results_dir / "archive" / name,
-            self.results_dir / "undelivered" / name))
+        """Delegates to the shared owner; see pool_follower.result_evidence."""
+        from pool_follower import result_evidence
+        return result_evidence(self.results_dir, task_name)
 
     def reclaim_claimed(self) -> "list[tuple[str, str]]":
         """Recover claimed files whose claimer died. Delivered means result

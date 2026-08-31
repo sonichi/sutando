@@ -77,6 +77,25 @@ class AcquireTests(unittest.TestCase):
         got = pf.acquire_work(self.tasks, self.state, "me", "lead")
         self.assertEqual(got.name, "task-free.claimed-me.txt")
 
+    def test_fallback_skips_task_with_result_evidence(self):
+        # A reclaimed task with an existing result must not be re-executed:
+        # the fallback path needs the lead's pooling-scan guard.
+        root = self.tasks.parent
+        for disposition in ("", "archive", "undelivered"):
+            name = f"task-done-{disposition or 'live'}"
+            (self.tasks / f"{name}.txt").write_text("task: t\n")
+            rdir = root / "results" / disposition if disposition else root / "results"
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / f"{name}.txt").write_text("already answered\n")
+        (self.tasks / "task-fresh.txt").write_text("task: t\n")
+        got = pf.acquire_work(self.tasks, self.state, "me", "lead")
+        self.assertEqual(got.name, "task-fresh.claimed-me.txt")
+        for disposition in ("live", "archive", "undelivered"):
+            self.assertTrue((self.tasks / f"task-done-{disposition}.txt").exists(),
+                            f"{disposition}: evidenced task must stay put, unclaimed")
+        self.assertIsNone(pf.acquire_work(self.tasks, self.state, "me", "lead"),
+                          "only evidenced tasks remain -> idle, never a re-claim")
+
     def test_assignments_still_honored_in_fallback_mode(self):
         (self.tasks / "task-mine.assigned-me.txt").write_text("x")
         (self.tasks / "task-free.txt").write_text("task: t\n")
