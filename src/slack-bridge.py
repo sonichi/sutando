@@ -624,9 +624,8 @@ _event_count_lock = threading.Lock()
 # Bolt App. Socket Mode handler attaches via SocketModeHandler below.
 app = App(token=BOT_TOKEN)
 
-# Handler reference so the heartbeat writer can check the LIVE socket state.
-# The heartbeat thread starts before the handler is built, so this is wired in
-# main() right before handler.start().
+# Handler reference so the heartbeat writer can read LIVE socket state; the
+# heartbeat thread starts first, so main() wires this just before handler.start().
 _socket_handler = None
 
 
@@ -649,20 +648,8 @@ def _socket_connected() -> bool:
         return False
 
 
-# Reconnect-churn discriminator (qingyun CR 2026-07-31). The live repro on
-# Chis-MacBook-Pro showed a second wedge shape the connection gate alone
-# misses: a tight BrokenPipe/reconnect loop minting new Socket Mode sessions
-# at ~7/min (1,016 sessions over 1d14h) where is_connected() reads True at
-# the instants the heartbeat gate samples it — connected, tearing down
-# cleanly, reconnecting, but never carrying events. The discriminating
-# signal is session churn: the builtin SocketModeClient mints a fresh
-# session id per (re)connect, and a healthy connection changes id rarely
-# (Slack's routine refresh is ~1 per 10-30 min). The result_watcher loop
-# samples session_id() every tick; >= _CHURN_MAX_SESSIONS distinct id
-# changes inside _CHURN_WINDOW_S marks the socket unhealthy, the heartbeat
-# write is suppressed, and health-check's existing staleness detector
-# (Check 3) flips to warn. Self-recovering: when churn stops the window
-# drains and heartbeats resume.
+# A wedge can hold is_connected() True while thrashing sessions, so CHURN is the
+# discriminator: >= _CHURN_MAX_SESSIONS id changes in _CHURN_WINDOW_S is unhealthy.
 _CHURN_WINDOW_S = 300
 _CHURN_MAX_SESSIONS = 3
 _session_changes: deque = deque()  # timestamps of observed session-id changes
@@ -1770,13 +1757,8 @@ def result_watcher():
                             print(f"  [proactive] failed, releasing {claim.name}: {e}", flush=True)
                             release_claim(claim)
 
-            # Heartbeat (used by health-check.py) — written ONLY while the
-            # Socket Mode connection is actually up AND not thrashing through
-            # reconnect churn. This thread runs independently of the WSS loop,
-            # so an unconditional write would stay fresh through a socket
-            # wedge and hide it; gating on live-socket health makes the
-            # heartbeat go stale during either wedge shape so health-check
-            # can detect an alive-but-deaf bridge.
+            # Written ONLY while the socket is up and not churning: this thread is independent
+            # of the WSS loop, so an unconditional write would stay fresh through a wedge.
             _note_session_sample()
             now = time.time()
             if now - last_heartbeat >= 60 and _socket_healthy():

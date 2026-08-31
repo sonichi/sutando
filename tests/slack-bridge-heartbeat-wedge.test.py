@@ -15,10 +15,8 @@ from pathlib import Path
 import os
 import tempfile
 
-# --- Hermetic isolation at MODULE level, BEFORE any bridge source is exec'd ---
-# (scripts/lint-hermetic-bridge-tests.py). Point CLAUDE_CONFIG_DIR at a SEEDED
-# temp dir so any bridge config resolution reads the temp channels/slack/access.json
-# instead of the operator's real ~/.claude tree.
+# Hermetic isolation before any bridge source is exec'd: CLAUDE_CONFIG_DIR points
+# at a seeded temp dir so config resolution never reads the operator's ~/.claude.
 os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-token-wedge")
 os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-token-wedge")
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="wedge-test-ccd-")
@@ -39,10 +37,8 @@ def check(name, cond, detail=""):
 
 # --- structure: the three load-bearing properties of the fix ---
 
-# 1. The heartbeat write is GATED on _socket_healthy() — an unconditional
-#    write would stay fresh through a wedge and hide it (the original bug),
-#    and a connection-only gate would stay fresh through reconnect churn
-#    (the 2026-07-31 live repro: is_connected() True, ~7 new sessions/min).
+# 1. The heartbeat write is GATED on _socket_healthy(): an unconditional write
+#    stays fresh through a wedge, a connection-only gate through reconnect churn.
 check("heartbeat-gated-on-health",
       re.search(r"if\s+now\s*-\s*last_heartbeat\s*>=\s*60\s+and\s+_socket_healthy\(\)\s*:", SRC) is not None,
       "heartbeat write must be guarded by `and _socket_healthy()`")
@@ -52,9 +48,8 @@ check("healthy-requires-connected-and-no-churn",
       re.search(r"def _socket_healthy\(\)[\s\S]+?_socket_connected\(\)\s+and\s+not\s+_reconnect_churning\(\)", SRC) is not None,
       "_socket_healthy() must be `_socket_connected() and not _reconnect_churning()`")
 
-# 1c. The result_watcher loop samples the session id every tick, not just at
-#     heartbeat instants — churn faster than the 60s heartbeat cadence must
-#     still be observed.
+# 1c. session id is sampled every result_watcher tick, not at heartbeat instants,
+#     so churn faster than the 60s cadence is still observed.
 check("session-sampled-every-tick",
       re.search(r"_note_session_sample\(\)\s*\n\s*now = time\.time\(\)", SRC) is not None,
       "result_watcher must call _note_session_sample() each tick before the heartbeat check")
@@ -74,11 +69,8 @@ check("handler-wired-before-start",
       wire != -1 and start != -1 and wire < start,
       "_socket_handler must be set before handler.start()")
 
-# --- behavioral: exec the real _socket_connected source against fakes ---
-# Pull the function's source out of the module and exec it standalone, so we
-# test the actual code without importing slack_bolt. Preserve the production
-# filename and line offset so coverage attributes these branches to the real
-# source file instead of this test harness.
+# Exec the real _socket_connected source standalone: exercises production code
+# without slack_bolt, and keeps coverage attributed to the real file.
 m = re.search(r"\ndef _socket_connected\(\)[\s\S]+?\n(?=\S)", SRC)
 assert m, "could not locate _socket_connected source"
 fn_src = "\n" * SRC[:m.start()].count("\n") + m.group(0)
@@ -108,11 +100,8 @@ class _Boom:
         raise RuntimeError("socket state unavailable")
 check("is_connected-raises-false", run_socket_connected(types.SimpleNamespace(client=_Boom())) is False)
 
-# --- behavioral: reconnect-churn discriminator (qingyun CR 2026-07-31) ---
-# The P1 scenario: is_connected() stays True while Socket Mode thrashes
-# through sessions. Exec the REAL churn functions (production filename +
-# line offsets preserved, same as above) and drive them with a fake clock
-# and a client whose is_connected() never goes False.
+# The P1 case: is_connected() stays True while Socket Mode thrashes sessions.
+# Drives the real churn functions with a fake clock and an always-True client.
 
 def _extract(name):
     m2 = re.search(rf"\ndef {name}\([\s\S]+?\n(?=\S)", SRC)
@@ -183,8 +172,7 @@ check("sustained-churn-stays-unhealthy",
       ns["_socket_healthy"]() is False,
       "sustained reconnect churn must keep the heartbeat suppressed")
 
-# Recovery: churn stops, the window drains -> healthy again (self-recovering,
-# no restart required for the gate itself).
+# Recovery: churn stops, the window drains, the gate returns to healthy.
 last_change = 30 + 19 * 9  # ts of the final reconnect above
 check("churn-subsides-recovers",
       ns["_reconnect_churning"](now=last_change + 301) is False and ns["_socket_healthy"]() is True,
@@ -229,11 +217,8 @@ for i, t in [(1, 600), (2, 1200), (3, 1800), (4, 2400)]:
           ns4["_reconnect_churning"](now=t) is False,
           "routine ~10-min session refreshes must never trip the churn gate")
 
-# --- real-module behavioral: import the bridge (slack_bolt stubbed, same
-#     pattern as slack-bridge-allowlist.test.py) and drive the REAL
-#     result_watcher loop through both phases: heartbeat suppressed under
-#     churn while is_connected() is True, then resuming once churn drains.
-#     This is the loop-level half the exec-based tests above cannot reach. ---
+# Real-module half: imports the bridge with slack_bolt stubbed and drives the
+# actual result_watcher through both phases, which the exec tests cannot reach.
 import os
 import sys
 import tempfile
@@ -312,9 +297,8 @@ if _mod is not None:
     hb = Path(_mod.REPO) / "state" / "slack-bridge.heartbeat"
     hb.unlink(missing_ok=True)
 
-    # Seed one pending reply whose result carries a skip marker, so the
-    # loop's delivery branch (skip-marker path, part of this branch's diff)
-    # executes alongside the heartbeat phases.
+    # Seed a pending reply whose result carries a skip marker so the loop's delivery
+    # branch runs alongside the heartbeat phases.
     with _mod.pending_replies_lock:
         _mod.pending_replies["task-wedge-test"] = {"channel": "C000", "access_tier": "owner"}
     (Path(_mod.RESULTS_DIR) / "task-wedge-test.txt").write_text("[no-send]\ninternal\n")
