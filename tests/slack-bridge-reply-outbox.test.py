@@ -163,5 +163,54 @@ class ReplyOutboxTest(unittest.TestCase):
             self.assertTrue(r["live"], "pair archived on the NEXT pass by is_parked")
 
 
+    def test_live_claim_holder_defers_the_send(self):
+        # claim held by a LIVE incarnation (this pid): the pass must neither
+        # send nor archive — the holder finishes or dies before we may act.
+        with tempfile.TemporaryDirectory() as td:
+            def prepare(results):
+                self.assertIsNotNone(srd.claim_for_send(results, TID))
+            r = self._one_pass(td, lambda: _Resp(), prepare)
+            self.assertEqual(len(r["calls"]), 0, "sent past a live claim")
+            self.assertTrue(r["live"] and not r["archived"], "kept for a later pass")
+            self.assertTrue(r["pending"], "route kept")
+
+    def test_escaped_raise_re_readies_via_outbox(self):
+        # a raise ESCAPING _send_reply (provider raises park inside it): the
+        # watcher's except must release the claim via failed() for retry.
+        def _boom(*a, **k):
+            raise RuntimeError("local failure outside the provider call")
+        orig = sb._send_reply
+        sb._send_reply = _boom
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                r = self._one_pass(td, lambda: _Resp())
+        finally:
+            sb._send_reply = orig
+        self.assertEqual(r["status"], "READY", "failed() re-readied the item")
+        self.assertTrue(r["live"] and not r["archived"], "kept for retry")
+        self.assertTrue(r["pending"], "route kept")
+
+
+class IngressReplaySkip(unittest.TestCase):
+    def test_replayed_event_writes_no_second_task(self):
+        # covers _write_task's dedup-hit return: same provider event delivered
+        # twice must map to the SAME file and skip, never mint a second task.
+        with tempfile.TemporaryDirectory() as td:
+            tasks, results = Path(td) / "tasks", Path(td) / "results"
+            tasks.mkdir(); results.mkdir()
+            (Path(td) / "tasks" / "archive").mkdir()
+            sb.TASKS_DIR, sb.RESULTS_DIR = tasks, results
+            sb.ARCHIVE_TASKS_DIR = tasks / "archive"
+            event = {"user": "UOWNER", "channel": "C1", "ts": "1724.0009",
+                     "team": "T1", "channel_type": "im"}
+            first = sb._write_task(event, "DM", "hello", "owner")
+            self.assertIsNotNone(first, "first delivery admits")
+            n_after_first = len(list(tasks.glob("task-*.txt")))
+            second = sb._write_task(event, "DM", "hello", "owner")
+            self.assertIsNone(second, "replay is skipped, not re-minted")
+            self.assertEqual(len(list(tasks.glob("task-*.txt"))), n_after_first,
+                             "replay wrote a second task file")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
