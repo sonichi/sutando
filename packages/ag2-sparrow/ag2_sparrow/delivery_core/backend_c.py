@@ -285,6 +285,20 @@ class DesignCClaimBackend:
         os.replace(str(tmp), str(p))
         return n
 
+    def is_terminal(self, item_id: str) -> bool:
+        # C records terminality by LOCATION, not a status field: ARCHIVE and
+        # PARKED entries lead with the item key as their first SEP component.
+        key = _safe_key(item_id)
+        prefix = key + SEP
+        for name in (ARCHIVE, PARKED):
+            d = self._d(name)
+            try:
+                if any(e.name.startswith(prefix) for e in d.iterdir()):
+                    return True
+            except FileNotFoundError:
+                continue
+        return False
+
     def attempts_by_key(self, key: str) -> int:
         try:
             return int(self._attempts_path(key).read_text(encoding="utf-8"))

@@ -32,14 +32,18 @@ def plant_stale_claim(root, item):
     }, sort_keys=True), encoding="utf-8")
 
 if __name__ == "__main__":
-    N, rounds = 24, 12
+    # Contention is workers-per-core, not an absolute: a fixed 24 is 12x
+    # oversubscribed on a 2-core runner, and the thrash is what timed out.
+    N, rounds = max(8, (os.cpu_count() or 2) * 3), 12
     totals = []
-    for r in range(rounds):
-        with tempfile.TemporaryDirectory() as tmp:
-            os.makedirs(os.path.join(tmp, ".claims"), exist_ok=True)  # pre-make so mkdir isn't the serializer
-            with mp.Pool(N) as pool:
+    # ONE warm pool here too, for the reason phase 2 already states: a fresh pool
+    # per round pays process startup inside the window under test.
+    with mp.Pool(N) as pool:
+        for r in range(rounds):
+            with tempfile.TemporaryDirectory() as tmp:
+                os.makedirs(os.path.join(tmp, ".claims"), exist_ok=True)  # pre-make so mkdir isn't the serializer
                 got = pool.map(worker, [(tmp, f"item-race-{r}", i) for i in range(N)])
-        totals.append(sum(got))
+            totals.append(sum(got))
     print(f"  {rounds} rounds x {N} concurrent PROCESSES racing one item")
     print(f"  winners per round: {totals}")
     bad = [t for t in totals if t != 1]
