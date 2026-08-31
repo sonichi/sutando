@@ -82,8 +82,13 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         # moment the broker honors it (a peer-review ask, ties to broker #151).
         cid = os.environ.get("SUTANDO_CORE_ID")
         worker = os.environ.get("SUTANDO_WORKER_ID") or (f"core-{cid}" if cid else None)
-        stamp = ({"extra_content": {"space.ag2.worker": {"id": worker}}}
-                 if worker else {})
+        _color = os.environ.get("SUTANDO_WORKER_COLOR")
+        _stripe = os.environ.get("SUTANDO_WORKER_STRIPE")
+        _w = ({"id": worker,
+               **({"color": _color} if _color else {}),
+               **({"stripe": _stripe != "0"} if _stripe in ("0", "1") else {})}
+              if worker else None)
+        stamp = {"extra_content": {"space.ag2.worker": _w}} if _w else {}
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
             {"op": "message", "room_id": room_id, "body": body, "mentions": [mxid], **rel, **stamp},

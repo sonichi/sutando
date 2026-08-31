@@ -70,7 +70,10 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
         # The client renders attribution from this per-event stamp; a direct
         # post self-declares its worker, and optionally its color.
         _color = os.environ.get("SUTANDO_WORKER_COLOR")
-        _w = ({"id": worker, **({"color": _color} if _color else {})}
+        _stripe = os.environ.get("SUTANDO_WORKER_STRIPE")
+        _w = ({"id": worker,
+               **({"color": _color} if _color else {}),
+               **({"stripe": _stripe != "0"} if _stripe in ("0", "1") else {})}
               if worker else None)
         stamp = {"extra_content": {"space.ag2.worker": _w}} if _w else {}
         _status, parsed = http_json(
