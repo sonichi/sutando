@@ -61,7 +61,12 @@ def _stage(c, path: Path, data: bytes) -> None:
 
 
 def _same_bytes(path: Path, payload: bytes) -> bool:
+    """Exact-byte match on a REGULAR, non-symlink entry. read_bytes() alone
+    follows symlinks, laundering external content into writer-produced state."""
+    import stat as _stat
     try:
+        if not _stat.S_ISREG(os.lstat(path).st_mode):
+            return False
         return path.read_bytes() == payload
     except OSError:
         return False
@@ -307,6 +312,11 @@ def import_a_state(root: Path) -> dict:
         import ag2_sparrow.outbox as _outbox
         claim = _outbox.read_delivery_claim(root, item_id)
         if status == "DELIVERED":
+            # Normative classification FIRST: a bare sentinel has no receipt
+            # to bind a terminal to THIS cycle, so it may never reuse one.
+            _ref = (rec.get("destination")
+                    if rec.get("provider") and rec.get("destination") else None)
+            _bare = classify_legacy_sentinel(_ref) is not DeliveryOutcome.CONFIRMED
             dst = c._terminal_path(key)
             if dst.exists():
                 # A colliding NAME is not membership: only a record passing
@@ -315,7 +325,7 @@ def import_a_state(root: Path) -> dict:
                 if _recs:
                     # Presence proves SOME cycle imported this key, not
                     # THIS A record; a republish would serve the old receipt.
-                    if _receipt_matches(_recs, rec):
+                    if not _bare and _receipt_matches(_recs, rec):
                         _retire_budget(ap)
                         report["skipped"] += 1
                     else:
@@ -324,11 +334,7 @@ def import_a_state(root: Path) -> dict:
                 report["unmigratable"] = (
                     f"terminal collision for {key} is not valid proof")
                 return report
-            # Normative: a bare sentinel (no durable receipt) is
-            # OUTCOME_UNKNOWN, never upgraded to a confirmed terminal.
-            _ref = (rec.get("destination")
-                    if rec.get("provider") and rec.get("destination") else None)
-            if classify_legacy_sentinel(_ref) is not DeliveryOutcome.CONFIRMED:
+            if _bare:
                 marker = c._d("undelivered") / f"{key}{SEP}outcome-unknown{SEP}import"
                 _reconcile_marker(c, marker, payload,
                                   key, report, conflicts, "unknown")

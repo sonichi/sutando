@@ -230,6 +230,82 @@ with tempfile.TemporaryDirectory() as td:
     check(r2.get("verified") is True and r2.get("fenced") is True,
           f"the identical re-run verifies and fences ({r2})")
 
+# --- SYMLINKED EVIDENCE: bytes behind a symlink are not writer state ------
+# External-file symlinks passed _same_bytes; the store held nothing.
+import os
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    external = Path(td) / "external-payload"
+    external.write_bytes(b"SAME-PAYLOAD")
+    a = DesignAClaimBackend(root)
+    a.publish("ready-1", b"SAME-PAYLOAD")
+    mig.import_a_state(root)
+    check(_dead_claim(root, "ready-1"),
+          "a C claimant takes the token and dies holding it")
+    # swap the token for a symlink to the external file (same bytes)
+    tok = next((root / "inflight").iterdir())
+    tok.unlink()
+    os.symlink(external, tok)
+    _rollback(root)
+    r2 = mig.import_a_state(root)
+    check(r2.get("conflicts") == [_safe_key("ready-1")],
+          f"a symlinked token is a conflict even with matching bytes ({r2})")
+    check(r2.get("fenced") is not True,
+          "the fence is withheld while a conflict stands")
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    external = Path(td) / "external-payload"
+    external.write_bytes(b"SAME-PAYLOAD")
+    a = DesignAClaimBackend(root)
+    a.publish("ready-1", b"SAME-PAYLOAD")
+    mig.import_a_state(root)
+    c = DesignCClaimBackend(root)
+    rp = c._d("ready") / _safe_key("ready-1")
+    rp.unlink()
+    os.symlink(external, rp)
+    _rollback(root)
+    r2 = mig.import_a_state(root)
+    check(r2.get("conflicts") == [_safe_key("ready-1")],
+          f"a symlinked ready entry is a conflict even with matching bytes ({r2})")
+    check(r2.get("fenced") is not True,
+          "the fence is withheld while a conflict stands")
+
+# --- BARE SENTINEL vs A RECEIPT-LESS PRIOR TERMINAL -----------------------
+# (None, None) matched, laundering a bare sentinel through an old terminal.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    c = DesignCClaimBackend(root, activate=True)
+    c.publish("bare-3", b"OLD")
+    tok = c.claim("bare-3", "w0")
+    c.complete(tok, DeliveryOutcome.CONFIRMED)      # prior cycle, NO receipt
+    a = DesignAClaimBackend(root)
+    a.publish("bare-3", b"NEW")
+    t2 = a.claim("bare-3", "w0")
+    a.complete(t2, DeliveryOutcome.CONFIRMED)       # bare A sentinel
+    r = mig.import_a_state(root)
+    check(r.get("conflicts") == [_safe_key("bare-3")],
+          f"a bare sentinel never reuses a terminal — collision conflicts ({r})")
+    check(r.get("fenced") is not True,
+          "the fence is withheld while a conflict stands")
+
+# ...and receipt-BEARING reuse still says yes (identical receipt re-import)
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("done-2", b"sent")
+    tok = a.claim("done-2", "w0")
+    a.complete(tok, DeliveryOutcome.CONFIRMED,
+               provider="p1", destination="SAME-DEST")
+    mig.import_a_state(root)
+    _rollback(root)
+    r2 = mig.import_a_state(root)
+    check("conflicts" not in r2 and r2.get("skipped", 0) >= 1,
+          f"an identical receipt-bearing record reuses its terminal ({r2})")
+    check(r2.get("verified") is True and r2.get("fenced") is True,
+          f"the receipt-bearing re-run verifies and fences ({r2})")
+
 # --- THE RULE MUST STILL SAY YES ------------------------------------------
 # Without this, a predicate that conflicts on everything passes all six above.
 with tempfile.TemporaryDirectory() as td:
