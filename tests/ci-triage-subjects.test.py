@@ -203,10 +203,8 @@ def _no_issue_runner(a, **_k):
         return _R(0, "[]")
     return _full_runner(a)
 
-# ---------------------------------------------------------------- transports
-# Every network helper takes an injected `run`, so the whole read path is
-# reachable without a network. The branches that matter are the ones that
-# FAIL: each must report UNKNOWN rather than a confident empty answer.
+# Every network helper takes an injected `run`, so the read path needs no
+# network. A lookup that did not answer must read UNKNOWN, not empty.
 
 check("l) _gh maps a raising runner to UNKNOWN, not a crash",
       ct._gh(_raise, ["pr", "view"]) is None)
@@ -243,9 +241,8 @@ check("s) log_text drops a non-zero run rather than treating its stdout as a log
       ct.log_text("1", lambda a: _R(1, "partial garbage"), "o/r") == "")
 
 
-# ---------------------------------------------------------------------- main
-# CONTROL for the whole file: main() is the only caller that wires the helpers
-# together, so a helper that works in isolation can still be mis-sequenced here.
+# CONTROL: main() is the only caller wiring the helpers together, so one that
+# works in isolation can still be mis-sequenced.
 
 def _main_out(argv, runner):
     buf = io.StringIO()
