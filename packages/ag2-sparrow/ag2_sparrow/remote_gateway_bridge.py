@@ -1327,6 +1327,8 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_i
                 # Ingress only: the backend inherits the route by task id, so a
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
+                # Per-message worker addressing (intake-stamped; lead-honored).
+                "target_worker", "fan_out",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
