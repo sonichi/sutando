@@ -137,7 +137,8 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="voice-lock-test-"))
     ws = tmp / "workspace"
     ws.mkdir()
-    pidfile = ws / ".voice-agent.pid"
+    pidfile = ws / "state" / "locks" / "voice-agent.pid"
+    pidfile.parent.mkdir(parents=True)
     guard = ws / ".voice-agent.lock.guard"
     entry = tmp / "src" / "voice-agent.ts"
     entry.parent.mkdir()
@@ -186,6 +187,43 @@ def main():
         pidfile.write_text(f"{sleeper.pid}\n")
         p = run_helper(base("acquire") + ["--pid", os.getpid(), "--entry", entry, "--workspace", ws])
         check("acquire blocks on live legacy pid", p.returncode == 7, str(p.returncode))
+
+        # --- #2722 transition: a LIVE pre-move owner at the legacy path must
+        # hold canonical acquisition inside the same guarded transaction.
+        print("legacy-path transition (#2722):")
+        pidfile.unlink()
+        legacy_pidfile = ws / ".voice-agent.pid"
+        oldowner = spawn_sleeper()
+        structured_lock(legacy_pidfile, oldowner.pid, my_start_time_ms(oldowner.pid), entry, ws)
+        p = run_helper(base("acquire") + ["--pid", os.getpid(), "--entry", entry,
+                                          "--workspace", ws, "--legacy-pidfile", legacy_pidfile])
+        check("live legacy owner holds canonical acquire (7)", p.returncode == 7, p.stdout + p.stderr)
+        check("held payload marks the legacy location", out_json(p).get("at") == "legacy", p.stdout)
+        check("live legacy record left intact",
+              json.loads(legacy_pidfile.read_text())["pid"] == oldowner.pid)
+        check("no canonical record created", not pidfile.exists())
+        check("pre-move owner never signaled", oldowner.poll() is None)
+
+        # Stale pre-move record → retired in-transaction, canonical created.
+        oldowner.kill()
+        oldowner.wait()
+        p = run_helper(base("acquire") + ["--pid", os.getpid(), "--entry", entry,
+                                          "--workspace", ws, "--legacy-pidfile", legacy_pidfile])
+        check("stale legacy retired and canonical acquired", p.returncode == 0, p.stdout + p.stderr)
+        check("legacy record gone", not legacy_pidfile.exists())
+        check("canonical names acquirer", json.loads(pidfile.read_text())["pid"] == os.getpid())
+
+        # Control: without --legacy-pidfile a legacy record is invisible —
+        # proves the flag, not coincidence, gates the new branch.
+        pidfile.unlink()
+        legacy_pidfile.write_text("{junk")
+        p = run_helper(base("acquire") + ["--pid", os.getpid(), "--entry", entry, "--workspace", ws])
+        check("without the flag, legacy path is not consulted",
+              p.returncode == 0 and legacy_pidfile.exists(), p.stdout + p.stderr)
+        legacy_pidfile.unlink()
+        pidfile.unlink()
+        # Restore the state the later sections expect (sleeper bare-pid lock).
+        pidfile.write_text(f"{sleeper.pid}\n")
 
         # --- read normalization ---
         print("read:")

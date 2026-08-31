@@ -474,6 +474,16 @@ def _recover_orphan_sending_files() -> int:
 # swallowed so the real result still delivers.
 _progress_msgs: dict = {}        # task_id -> {message_id, chat_id, first, last_edit, last_text} | {"expired": True}
 pending_task_tiers: dict = {}    # task_id -> access_tier; in-memory ONLY → fail-closed on restart
+pending_task_private: dict = {}  # task_id -> chat audience is private; in-memory ONLY → fail-closed on restart
+
+
+def _render_progress_text(elapsed: float, task_id: str) -> str:
+    """The allowlist holds a USER id but that user can write from a group, so the gate
+    is the recorded chat audience; unknown (e.g. after a restart) means not-private."""
+    if not progress_stream.step_visible_in(pending_task_private.get(task_id, False)):
+        return progress_stream.format_progress(None, elapsed)
+    step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
+    return progress_stream.format_progress(step, elapsed)
 
 
 def _dedup_recover(task_id: str, holder_id, chat_id) -> str | None:
@@ -498,6 +508,7 @@ def _clear_progress(task_id: str) -> None:
     Called when the result is delivered/skipped/given-up so the placeholder
     doesn't linger next to the real reply."""
     pending_task_tiers.pop(task_id, None)
+    pending_task_private.pop(task_id, None)
     info = _progress_msgs.pop(task_id, None)
     if info and info.get("message_id") and info.get("chat_id") is not None:
         try:
@@ -551,7 +562,9 @@ def _recover_orphaned_task_routing(results_dir: Path, tasks_dir: Path, known_tas
         if not task_file:
             continue
         try:
-            text = task_file.read_text()
+            # Recovery runs right after the crash that tore these files, so a
+            # strict read here exits main() — headers are at the top and survive.
+            text = task_file.read_text(errors="replace")
         except OSError:
             continue
         headers = local_task_protocol.parse_task_headers(text).headers
@@ -625,8 +638,7 @@ def poll_progress(pending_replies: dict) -> None:
                 _progress_msgs[task_id] = {"expired": True}  # terminal — never re-post
                 continue
             if progress_stream.should_edit(now, info["last_edit"]):
-                step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
-                text = progress_stream.format_progress(step, elapsed)
+                text = _render_progress_text(elapsed, task_id)
                 if text != info.get("last_text"):
                     try:
                         api("editMessageText", chat_id=chat_id, message_id=info["message_id"], text=text)
@@ -647,8 +659,7 @@ def poll_progress(pending_replies: dict) -> None:
         except (ValueError, IndexError):
             created = now
         if progress_stream.should_post_placeholder(now - created):
-            step = progress_stream.current_step(progress_stream.read_core_status(STATE_DIR))
-            text = progress_stream.format_progress(step, now - created)
+            text = _render_progress_text(now - created, task_id)
             resp = api("sendMessage", chat_id=chat_id, text=text)
             mid = (resp or {}).get("result", {}).get("message_id")
             if mid:
@@ -669,12 +680,48 @@ def poll_progress(pending_replies: dict) -> None:
     for tid in list(pending_task_tiers.keys()):
         if tid not in pending_replies:
             pending_task_tiers.pop(tid, None)
+    for tid in list(pending_task_private.keys()):
+        if tid not in pending_replies:
+            pending_task_private.pop(tid, None)
+
+
+def log_privacy_setting(get_me):
+    """Report the bot-wide BotFather privacy setting at boot.
+
+    Scope matters: this flag is GLOBAL, and an administrator bot receives every group
+    message regardless of it — so the flag alone never determines what one group delivers.
+    """
+    try:
+        me = (get_me() or {}).get("result") or {}
+    except Exception as e:  # noqa: BLE001 — a diagnostic must never take the bridge down
+        return f"[Telegram] privacy-setting: getMe failed ({e}) — setting unknown"
+    if not me:
+        return "[Telegram] privacy-setting: getMe returned no result — setting unknown"
+    BOT_EXCEPTION = (
+        "one exception applies regardless: Telegram never delivers a message sent by "
+        "another bot, even to an administrator or with privacy mode off "
+        "(https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)"
+    )
+    if me.get("can_read_all_group_messages"):
+        return ("[Telegram] privacy-setting: privacy mode OFF (BotFather, bot-wide) — "
+                f"all group messages from human senders are delivered to this bot; "
+                f"{BOT_EXCEPTION}")
+    return (
+        "[Telegram] privacy-setting: privacy mode ON (BotFather, bot-wide). In a group where "
+        f"@{me.get('username') or 'this bot'} is NOT an administrator it receives only "
+        "commands addressed to it (/command@bot), replies to its own messages, messages sent "
+        "via it inline, and general commands when it posted last — a plain @username mention "
+        "is NOT delivered. Where it IS a group administrator it receives everything from human "
+        f"senders regardless of this setting, so this flag alone does not describe any "
+        f"particular group's reach; {BOT_EXCEPTION}"
+    )
 
 
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
     print("Telegram bridge started. Polling for messages...", flush=True)
+    print(log_privacy_setting(lambda: api("getMe")), flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll
     # loop starts. See _recover_orphan_sending_files for rationale.
     _recover_orphan_sending_files()
@@ -749,6 +796,9 @@ def main():  # pragma: no cover
                 sender_id = str(msg["from"]["id"])
                 username = msg["from"].get("username", sender_id)
                 chat_id = msg["chat"]["id"]
+                # The allowlist gates the SENDER, who may be writing from a group,
+                # so record the chat audience for the progress placeholder's gate.
+                chat_is_private = msg["chat"].get("type") == "private"
                 text = msg.get("text", "")
 
                 # Reload access list periodically
@@ -974,6 +1024,7 @@ def main():  # pragma: no cover
                 task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
+                pending_task_private[task_id] = chat_is_private  # audience, not sender: gates the step text
                 # Observability: one inbound accepted-message event. Source the
                 # tier from the bridge's own assignment above (single source of
                 # truth) rather than re-asserting a literal here.

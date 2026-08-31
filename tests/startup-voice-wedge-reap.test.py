@@ -114,7 +114,8 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="startup-wedge-"))
     ws = tmp / "workspace"
     ws.mkdir()
-    pidfile = ws / ".voice-agent.pid"
+    pidfile = ws / "state" / "locks" / "voice-agent.pid"
+    pidfile.parent.mkdir(parents=True)
     shim_bin = tmp / "bin"
     shim_bin.mkdir()
     (shim_bin / "curl").write_text('#!/bin/bash\nexit "${SHIM_CURL_RC:-28}"\n')

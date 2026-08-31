@@ -18,9 +18,10 @@ echo "Stopping Sutando services..."
 # never signal without validation.
 if _VOICE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)"; then
     _VOICE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
-    if [ -n "$_VOICE_WS" ] && [ -f "$_VOICE_WS/.voice-agent.pid" ]; then
+    _VOICE_PIDFILE="$(bash "$REPO/scripts/sutando-config.sh" voice-pidfile "$_VOICE_WS" 2>/dev/null || true)"
+    if [ -n "$_VOICE_WS" ] && [ -n "$_VOICE_PIDFILE" ] && [ -f "$_VOICE_PIDFILE" ]; then
         "$_VOICE_PY" "$REPO/scripts/voice-lock.py" takeover \
-            --pidfile "$_VOICE_WS/.voice-agent.pid" \
+            --pidfile "$_VOICE_PIDFILE" \
             --guard "$_VOICE_WS/.voice-agent.lock.guard" \
             --workspace "$_VOICE_WS" \
             --mode adopted --port 9900 \

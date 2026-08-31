@@ -381,6 +381,38 @@ class AbandonedHardening(_Base):
         finally:
             gw._save_inflight = self._saved_save
 
+    def _pending_probe(self, name):
+        """Same two passes, with `name` pending in tasks/."""
+        (gw.TASKS_DIR / name).write_text("id: x\n")
+        self._saved_save = gw._save_inflight
+        gw._save_inflight = lambda s: None
+        try:
+            return self._drop_probe()
+        finally:
+            gw._save_inflight = self._saved_save
+
+    def test_every_pooled_pending_state_keeps_the_id(self):
+        # The pool renames a task through three names. A state the reconciler
+        # cannot see reads as abandoned, and the reply is dropped mid-flight.
+        for name in (f"{TID}.txt",
+                     f"{TID}.assigned-core-2.txt",
+                     f"{TID}.claimed-core-2.txt"):
+            with self.subTest(pending=name):
+                self.assertTrue(
+                    self._pending_probe(name),
+                    f"{name} is live work, not an abandoned id")
+            (gw.TASKS_DIR / name).unlink()
+
+    def test_nothing_pending_still_drops(self):
+        # The control: without it the test above passes on a reconciler that
+        # never drops anything at all.
+        self._saved_save = gw._save_inflight
+        gw._save_inflight = lambda s: None
+        try:
+            self.assertFalse(self._drop_probe())
+        finally:
+            gw._save_inflight = self._saved_save
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

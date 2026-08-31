@@ -671,7 +671,13 @@ def _apply_inference_locked(
         if not isinstance(group, dict):
             skipped += 1
             continue
-        title = _safe_title(group.get("name"))
+        requested_id = str(group.get("workstream_id") or "")
+        reused = workstreams.get(requested_id) if requested_id else None
+        # A reused workstream already stores its title; demanding `name` again would
+        # drop an otherwise valid proposal into the skip branch below.
+        title = _safe_title(group.get("name")) or (
+            _safe_title(reused.get("title")) if isinstance(reused, dict) else ""
+        )
         task_ids = group.get("task_ids")
         try:
             confidence = float(group.get("confidence", 0))
@@ -687,7 +693,6 @@ def _apply_inference_locked(
         skipped += len(task_ids) - len(valid_task_ids)
         if not valid_task_ids:
             continue
-        requested_id = str(group.get("workstream_id") or "")
         if requested_id and requested_id in workstreams:
             workstream_id = requested_id
         else:
