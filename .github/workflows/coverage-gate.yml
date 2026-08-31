@@ -13,13 +13,31 @@ name: Coverage Gate
 
 on:
   pull_request:
-    branches: [main, staging-interaction-planes]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   coverage-gate:
     name: diff coverage >= 95% (python)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Moves with the per-file cap in scripts/coverage-gate.sh, or the two bounds
+    # drift: a file allowed 240s inside a job capped here can burn the budget and
+    # get the job CANCELED mid-suite, which reports no per-file diagnostic at all.
+    #
+    # This value is NOT a derived bound, and the earlier comment implied it was.
+    # 18 executions gave median 374s / max 498s, but all of them ran under the
+    # OLD 120s per-file cap, so they do not bound behaviour under 240s. Nothing
+    # limits how many files may time out and there is no fail-fast, so worst-case
+    # capped work approaches (files x cap) / lanes -- unbounded here except by
+    # this timeout, which bounds it BY CANCELLING.
+    #
+    # Elapsed time here is bounded by cancellation, not by design, and any
+    # per-file cap raise trades margin for diagnosability at a rate nobody has
+    # measured. 20m is a margin, not a proof. (#3631; bound withdrawn after
+    # review by @johnm-desktop, phrasing from air, agent of @qingyun-wu.)
+    timeout-minutes: 20
 
     steps:
       - name: Checkout

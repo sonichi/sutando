@@ -153,17 +153,17 @@ def test_poll_results_checks_sentinel_before_main_send():
     )
     assert poll_block, "could not locate poll_results"
     body = poll_block.group(1)
-    delivered_pos = body.find("_is_delivered(task_id)")
+    delivered_pos = body.find("_drd.is_delivered(RESULTS_DIR, task_id")
     # Find the first channel.send AFTER the skip-block. The skip-block
     # has `archive_file(result_file, "results", task_id)` followed by
     # `continue`, then the sentinel check, then the try-block with
     # the send. The first `await channel.send(` should be after both.
     skip_continue_pos = body.find("Skipped (already replied or deduped)")
     first_send_pos = body.find("await channel.send(", skip_continue_pos)
-    assert delivered_pos > 0, "_is_delivered NOT called in poll_results"
+    assert delivered_pos > 0, "_drd.is_delivered NOT called in poll_results"
     assert first_send_pos > 0, "could not locate post-skip channel.send"
     assert delivered_pos < first_send_pos, (
-        "_is_delivered check must come BEFORE the first channel.send — "
+        "_drd.is_delivered check must come BEFORE the first channel.send — "
         "otherwise the send fires before the sentinel is checked, "
         "defeating the fix."
     )
@@ -182,13 +182,13 @@ def test_poll_results_marks_delivered_in_send_block():
     )
     assert poll_block
     body = poll_block.group(1)
-    mark_pos = body.find("_mark_delivered(task_id)")
+    mark_pos = body.find("_drd.confirm(RESULTS_DIR, _send_tok")
     skip_continue_pos = body.find("Skipped (already replied or deduped)")
     first_send_pos = body.find("await channel.send(", skip_continue_pos)
-    assert mark_pos > 0, "_mark_delivered NOT called in poll_results"
+    assert mark_pos > 0, "_drd.confirm NOT called in poll_results"
     assert first_send_pos > 0
     assert mark_pos > first_send_pos, (
-        "_mark_delivered must be called AFTER the first channel.send "
+        "_drd.confirm must be called AFTER the first channel.send "
         "(post-success) — otherwise a crash between mark and send "
         "marks a delivery that never happened, silently dropping the "
         "message on restart."
