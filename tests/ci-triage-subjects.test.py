@@ -310,6 +310,21 @@ check("aa) failure_text takes the BOT comment's subject",
 check("bb) and ignores a human comment quoting an unrelated failure",
       "tests/quoted-elsewhere.test.py" not in _ft, _ft)
 
+# Measured live on #3606: the tool named six files whose NAMES contain
+# "failure" and missed the real one, which a lint reported.
+_LISTING = "  tests/discord-bridge-archive-failure-keeps-the-file.test.py  tests/outbox-error-paths.test.py"
+check("cc) a line merely LISTING *-failure-* files is not an accusation",
+      ct.subjects_from_text(_LISTING) == [], ct.subjects_from_text(_LISTING))
+
+_LINT = "prose-cap: tests/injection-guard-sweep.test.py:362 comment block is 3 lines (cap 2)"
+check("dd) a lint accusation (tool: path:LINE msg) names its subject",
+      ct.subjects_from_text(_LINT) == ["tests/injection-guard-sweep.test.py"],
+      ct.subjects_from_text(_LINT))
+
+check("ee) a real ✖ accusation still wins, with the path intact",
+      ct.subjects_from_text("✖ test TIMED OUT: tests/outbox-race.test.py")
+      == ["tests/outbox-race.test.py"])
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")

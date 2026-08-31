@@ -29,6 +29,9 @@ _SRC_PATH = re.compile(r"\b((?:src|scripts|skills)/[\w.\-/]+?\.(?:py|sh|ts))\b")
 
 # A log names far more files than it blames; only these lines accuse one.
 _BLAMED = re.compile(r"✖|✗|FAIL|TIMED OUT|Error|Traceback|Missing lines", re.I)
+# Lint accusations carry none of those words: `tool: path:LINE message`. Without
+# this a real finding is invisible while a mere listing can still look blamed.
+_LINT_HIT = re.compile(r"[\w.\-/]+\.(?:py|sh|ts):\d+")
 
 
 def subjects_from_text(text: str) -> "list[str]":
@@ -44,7 +47,14 @@ def subjects_from_text(text: str) -> "list[str]":
             out.extend(m.group(1) for m in rx.finditer(chunk or ""))
         return tests + srcs
 
-    blamed = "\n".join(l for l in (text or "").splitlines() if _BLAMED.search(l))
+    def accuses(line: str) -> bool:
+        # Test the line with its PATHS REMOVED: `*-failure-*.test.py` contains
+        # "FAIL", so a line merely listing such files would otherwise read as an
+        # accusation of every file on it.
+        stripped = _SRC_PATH.sub(" ", _TEST_PATH.sub(" ", line))
+        return bool(_BLAMED.search(stripped) or _LINT_HIT.search(line))
+
+    blamed = "\n".join(l for l in (text or "").splitlines() if accuses(l))
     ordered, seen = [], set()
     # Only blamed lines. Whole-text order is a listing, not an accusation, and a
     # confident pointer at an unrelated file is worse than reporting nothing.
