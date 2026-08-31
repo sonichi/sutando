@@ -105,9 +105,16 @@ trap 'rm -rf "$RECDIR"' EXIT
 
 # `timeout` is coreutils and absent on stock macOS, where this also runs by
 # hand; degrade to no cap rather than failing the local path.
+#
+# 240s, not 120s: instrumentation slows race/bench-style tests well past their
+# uninstrumented runtime, so a cap sized for a bare run fails them here and the
+# red reads as the PR's fault (#3630). Defaulted ONCE -- the fallback used to be
+# written inline at both the cap and the timeout message, so changing one left
+# the other reporting a bound that was no longer enforced.
+COVERAGE_GATE_FILE_TIMEOUT="${COVERAGE_GATE_FILE_TIMEOUT:-240}"
 COVGATE_TIMEOUT=""
 if command -v timeout >/dev/null 2>&1; then
-    COVGATE_TIMEOUT="timeout -k 5 ${COVERAGE_GATE_FILE_TIMEOUT:-120}"
+    COVGATE_TIMEOUT="timeout -k 5 $COVERAGE_GATE_FILE_TIMEOUT"
 else
     echo "coverage-gate: no \`timeout\` binary — per-file cap disabled (local run)." >&2
 fi
@@ -133,7 +140,7 @@ while IFS= read -r f; do
     output="$(cat "$rec.out" 2>/dev/null || true)"
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-            echo "✖ test TIMED OUT under instrumentation (>${COVERAGE_GATE_FILE_TIMEOUT:-120}s): $f"
+            echo "✖ test TIMED OUT under instrumentation (>${COVERAGE_GATE_FILE_TIMEOUT}s): $f"
         else
             echo "✖ test failed under instrumentation: $f"
         fi
