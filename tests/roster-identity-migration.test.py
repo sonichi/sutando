@@ -1669,6 +1669,45 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
         self.assertIn(BOT, [u["id"] for u in e[ri.UNRESOLVED_FIELD]],
                       "the contested id stopped being unresolved")
 
+    def _pass_with_peers(self, roster: dict, triage: dict, peers: dict):
+        """Two-pass driver that also supplies `--peers`, which `_pass` omits."""
+        d = Path(self.tmp)
+        (d / "in.json").write_text(json.dumps(roster))
+        (d / "cfg.json").write_text(json.dumps(triage))
+        (d / "peers.json").write_text(json.dumps(peers))
+        out = d / "out.json"
+        sys.argv = ["m", "--roster", str(d / "in.json"),
+                    "--triage-config", str(d / "cfg.json"),
+                    "--peers", str(d / "peers.json"), "--out", str(out)]
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = mig.main()
+        return rc, (json.loads(out.read_text()) if out.exists() else {})
+
+    def test_a_seed_contested_only_via_peers_json_is_not_discharged(self):
+        """The same defect one source over -- found by air (agent of qingyun).
+
+        Discharge reads what THIS pass says about the id. Triage claims are in
+        `claims` by then, but peers.json and the owner id are stamped later, so
+        an id contested only there was absent and occupancy discharged it. The
+        loop is NOT moved below that stamping: that block iterates `list(claims)`,
+        so a seed-only id would never be stamped STAND and would publish as
+        HUMAN instead -- the opposite error. The lookups are consulted directly.
+        """
+        RIVAL = "1025828152183885925"
+        triage = {"people": {"alice": {"discord": RIVAL}}}   # names NO bots
+        peers = {"pro": BOT}                                  # BOT is a peer bot
+        rc1, d1 = self._pass_with_peers(
+            {"alice": {"github": "alice", ri.HUMAN_FIELD: BOT}}, triage, peers)
+        self.assertEqual(rc1, 5, "pass 1 did not refuse the peers-contested id")
+        rc2, d2 = self._pass_with_peers(d1, triage, peers)
+        e = d2["alice"]
+        self.assertNotEqual(e.get(ri.STAND_FIELD), BOT,
+                            "a peers-contested id was published as a Stand on pass 2")
+        self.assertNotEqual(e.get(ri.HUMAN_FIELD), BOT,
+                            "the seed landed unopposed and published as human")
+        self.assertEqual(rc2, 5, "the refusal signal vanished on pass 2")
+
     def test_a_blank_slot_is_erased_like_a_null_one(self):
         # Reachable only from a hand-edited roster: our writer emits None, never
         # "". Found by air (agent of qingyun) as an untested third of the rule.

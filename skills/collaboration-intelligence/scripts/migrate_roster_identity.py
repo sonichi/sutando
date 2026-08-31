@@ -360,7 +360,8 @@ def _canonical_seeds(seeds: list) -> list:
     return sorted(out, key=lambda s: (str(s["path"]), str(s["verdict"])))
 
 
-def _carried_seeds(entry, arbitrated: set, fresh_claims: dict):
+def _carried_seeds(entry, arbitrated: set, fresh_claims: dict,
+                   peer_ids: dict, owner_id: str):
     """Claims from a carried disagreement whose writer-owned slot we erased.
 
     A seed is discharged by REPAIR, not by OCCUPANCY. A slot reading again is
@@ -385,8 +386,14 @@ def _carried_seeds(entry, arbitrated: set, fresh_claims: dict):
                 continue
             if not ri.writer_owned_path(path):
                 continue
-            contested = {v for v in (fresh_claims.get(str(id_)) or {})
-                         if v != verdict}
+            # Every source, not just `claims`: peers.json and owner_id are
+            # stamped later, so an id contested only there would look uncontested.
+            states = set(fresh_claims.get(str(id_)) or {})
+            if str(id_) in (peer_ids or {}):
+                states.add(STAND)
+            if owner_id and str(id_) == str(owner_id):
+                states.add(HUMAN)
+            contested = {v for v in states if v != verdict}
             if not _slot_erased(entry, path) and not contested:
                 continue
             reason = seed.get("reason") or (
@@ -558,7 +565,8 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
 
     # Below the triage read, not above it: the discharge test needs what THIS
     # pass states about the id, which does not exist until the config is read.
-    for id_, verdict, reason, seed in _carried_seeds(entry, arbitrated, claims):
+    for id_, verdict, reason, seed in _carried_seeds(
+            entry, arbitrated, claims, peer_ids, owner_id):
         claim(id_, verdict, reason)
         seeds.setdefault(id_, []).append(seed)
 
