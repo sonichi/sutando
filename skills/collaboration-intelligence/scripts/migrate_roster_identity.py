@@ -360,11 +360,14 @@ def _canonical_seeds(seeds: list) -> list:
     return sorted(out, key=lambda s: (str(s["path"]), str(s["verdict"])))
 
 
-def _carried_seeds(entry, arbitrated: set):
+def _carried_seeds(entry, arbitrated: set, fresh_claims: dict):
     """Claims from a carried disagreement whose writer-owned slot we erased.
 
-    Dropped once the slot reads again: a repair must clear the record rather
-    than latch it, which is why this checks the slot instead of always carrying.
+    A seed is discharged by REPAIR, not by OCCUPANCY. A slot reading again is
+    sufficient only when nothing this pass still contradicts the seed: a RIVAL
+    id filling the slot leaves the original disagreement untouched, so dropping
+    the seed there republishes the contested id. Carry while this pass states a
+    different referent for the same id; drop once nothing does.
     """
     if not isinstance(entry, dict):
         return
@@ -380,7 +383,11 @@ def _carried_seeds(entry, arbitrated: set):
             path, verdict = seed.get("path"), seed.get("verdict")
             if not path or verdict not in (HUMAN, STAND):
                 continue
-            if not ri.writer_owned_path(path) or not _slot_erased(entry, path):
+            if not ri.writer_owned_path(path):
+                continue
+            contested = {v for v in (fresh_claims.get(str(id_)) or {})
+                         if v != verdict}
+            if not _slot_erased(entry, path) and not contested:
                 continue
             reason = seed.get("reason") or (
                 f"cited in `{path}` before this migration overwrote it")
@@ -507,12 +514,6 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
                     seeds.setdefault(id_, []).append(
                         {"path": field, "verdict": verdict, "reason": reason})
         claims.setdefault(id_, {})
-    # Same rule `_still_unresolved` applies to shape failures: our own write
-    # erases a canonical slot, so its claim is absent rather than withdrawn.
-    for id_, verdict, reason, seed in _carried_seeds(entry, arbitrated):
-        claim(id_, verdict, reason)
-        seeds.setdefault(id_, []).append(seed)
-
     # A declared login is the SOLE join key, matched case-insensitively: the
     # local-key fallback crosses axes, and case-sensitivity splits one person.
     join = entry.get("github") or key
@@ -554,6 +555,12 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
             _bad(bad, bot, STAND,
                  f"pr-triage `{src}.bots[]` entry is not a snowflake",
                  shapes=shape_failures)
+
+    # Below the triage read, not above it: the discharge test needs what THIS
+    # pass states about the id, which does not exist until the config is read.
+    for id_, verdict, reason, seed in _carried_seeds(entry, arbitrated, claims):
+        claim(id_, verdict, reason)
+        seeds.setdefault(id_, []).append(seed)
 
     for id_ in list(claims):
         if id_ in peer_ids:

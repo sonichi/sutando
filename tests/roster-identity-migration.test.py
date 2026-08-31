@@ -1644,6 +1644,31 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
              if "claims" in u or "seeded_by" in u], [],
             "a seed whose slot reads again was carried anyway")
 
+    def test_a_RIVAL_id_filling_the_slot_does_not_discharge_a_carried_seed(self):
+        """A seed is discharged by REPAIR, not by the slot being occupied.
+
+        Found independently by qingyun-wu and by Mark's agent. Pass 1 refuses BOT
+        (roster says human, triage says bot) and the writer puts the clean id in
+        that slot. On pass 2 the slot reads again -- but it holds a DIFFERENT id,
+        and triage still calls BOT a bot, so the disagreement is untouched. The
+        old occupancy test read "someone is in the slot" as "the dispute ended",
+        dropped the seed, and republished the contested id as a Stand with rc=0.
+        """
+        RIVAL = "1025828152183885926"
+        triage = {"people": {"alice": {"discord": RIVAL, "bots": [BOT]}}}
+        rc1, d1 = self._pass({"alice": {"github": "alice",
+                                        ri.HUMAN_FIELD: BOT}}, triage)
+        self.assertEqual(rc1, 5, "pass 1 did not refuse the contested id")
+        self.assertEqual(d1["alice"][ri.HUMAN_FIELD], RIVAL,
+                         "pass 1 did not put the clean id in the slot")
+        rc2, d2 = self._pass(d1, triage)
+        e = d2["alice"]
+        self.assertNotEqual(e.get(ri.STAND_FIELD), BOT,
+                            "a contested id was published as a Stand on pass 2")
+        self.assertEqual(rc2, 5, "the refusal signal vanished on pass 2")
+        self.assertIn(BOT, [u["id"] for u in e[ri.UNRESOLVED_FIELD]],
+                      "the contested id stopped being unresolved")
+
     def test_a_blank_slot_is_erased_like_a_null_one(self):
         # Reachable only from a hand-edited roster: our writer emits None, never
         # "". Found by air (agent of qingyun) as an untested third of the rule.
