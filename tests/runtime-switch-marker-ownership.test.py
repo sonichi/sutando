@@ -75,5 +75,59 @@ class MarkerOwnership(unittest.TestCase):
                              "a switch that never launched must not rewrite the marker")
 
 
+    def test_codex_publishes_only_after_the_session_is_created(self):
+        """Ordering, not presence. Publishing before creation replaces a
+        truthful marker with a runtime that never came up."""
+        src = CODEX.read_text(encoding="utf-8")
+        launch = src.index("new-session -d")
+        self.assertGreater(src.index("publish_active_runtime", launch), launch,
+                           "codex must publish only after tmux new-session")
+
+    def _run_codex_publish(self, tmp, tmux_rc):
+        """The real publish function plus its real guarded call site, with tmux
+        forced to `tmux_rc`. Slicing further would cut an unbalanced if-block."""
+        src = CODEX.read_text(encoding="utf-8")
+        i = src.index("publish_active_runtime() {")
+        fn = src[i:src.index("\n}\n", i) + 3]
+        gated = [l.strip() for l in src.splitlines()
+                 if "has-session" in l and "publish_active_runtime" in l]
+        self.assertTrue(gated, "no gated publish call in the codex launcher — the "
+                               "publish is ungated, which is the defect this pins")
+        call = gated[0]
+        harness = (
+            "set -uo pipefail\n"
+            f'REPO="{REPO}"\nSESSION="sutando-core"\nTMUX_SOCKET="/tmp/none"\n'
+            f'sutando_config() {{ printf "%s" "{Path(tmp) / "workspace"}"; }}\n'
+            f"tmux() {{ return {tmux_rc}; }}\n"
+            + fn.replace('bash "$REPO/scripts/sutando-config.sh" workspace', "sutando_config")
+            + "\n" + call + "\n"
+        )
+        subprocess.run(["/bin/bash", "-c", harness], capture_output=True, text=True, cwd=tmp)
+
+    def test_a_failed_codex_launch_leaves_the_previous_marker_truthful(self):
+        """Claude->Codex where tmux refuses: the marker must still say claude."""
+        before = {"runtime": "claude", "session": "sutando-core", "started_at": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace" / "state"
+            ws.mkdir(parents=True)
+            (ws / "core-runtime.json").write_text(json.dumps(before), encoding="utf-8")
+            self._run_codex_publish(tmp, 42)
+            after = json.loads((ws / "core-runtime.json").read_text(encoding="utf-8"))
+            self.assertEqual(after, before,
+                             "a codex launch that never came up must not rewrite the marker")
+
+        # Positive control: a snippet that does nothing would also leave the
+        # marker unchanged, so prove the same harness DOES publish on success.
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace" / "state"
+            ws.mkdir(parents=True)
+            (ws / "core-runtime.json").write_text(json.dumps(before), encoding="utf-8")
+            self._run_codex_publish(tmp, 0)
+            after = json.loads((ws / "core-runtime.json").read_text(encoding="utf-8"))
+            self.assertEqual(after.get("runtime"), "codex",
+                             "control failed: the harness never publishes, so the "
+                             "failure case above proves nothing")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=0)

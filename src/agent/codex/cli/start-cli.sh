@@ -279,9 +279,22 @@ if ! command -v fswatch >/dev/null 2>&1; then
 fi
 
 apply_tmux_defaults
+
+publish_active_runtime() {
+  # Only callers that have VERIFIED the session may call this: a launch that
+  # never came up must leave the previous runtime's marker truthful.
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  [ -n "$ws" ] || return 0
+  mkdir -p "$ws/state" 2>/dev/null || true
+  printf '{"runtime":"codex","session":"%s","started_at":%s}\n' \
+    "$SESSION" "$(date +%s)" > "$ws/state/core-runtime.json" 2>/dev/null || true
+}
+
+# Append-only launch history, not a claim about what is live, so it is
+# unconditional — unlike the active-runtime marker above.
 if ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ]; then
   mkdir -p "$ws/state"
-  printf '{"runtime":"codex","session":"%s","started_at":%s}\n' "$SESSION" "$(date +%s)" > "$ws/state/core-runtime.json"
   printf '{"host":"%s","session_started_at":%s,"iso":"%s","source":"start-cli","runtime":"codex"}\n' \
     "$(hostname | sed 's/\..*//')" "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     >> "$ws/state/session-starts.log"
@@ -289,12 +302,14 @@ fi
 
 if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
+  tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null && publish_active_runtime
   ensure_task_notifier
   ensure_core_monitor
   ensure_core_heartbeat
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
+  tmux -S "$TMUX_SOCKET" has-session -t "$SESSION" 2>/dev/null && publish_active_runtime
   ensure_task_notifier
   ensure_core_monitor
   ensure_core_heartbeat
