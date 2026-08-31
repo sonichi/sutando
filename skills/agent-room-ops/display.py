@@ -48,7 +48,7 @@ def main(argv=None) -> int:
     ap.add_argument("--worker-color", action="append", default=[])
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--decorators", choices=["on", "off", "auto"])
-    ap.add_argument("--message-style", choices=["stripe", "highlight", "none"])
+    ap.add_argument("--message-style", choices=["stripe", "highlight", "underline", "glow", "gradient", "none"])
     ap.add_argument("--description")
     ap.add_argument("--room-avatar")
     ap.add_argument("--clear", action="store_true")
