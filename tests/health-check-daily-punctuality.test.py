@@ -350,6 +350,38 @@ class TestConditionalProducers(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r["detail"])
         self.assertNotIn("no output today", r["detail"])
 
+    def test_a_conditional_producer_that_has_produced_NOTHING_is_not_a_blind_spot(self):
+        """The quiet stretch can cover the whole window, and often does.
+
+        A threshold guard or an opt-in job may legitimately produce nothing for
+        months, so `conditional` has to excuse an empty artifact set too - not
+        only a single quiet day. Otherwise the flag can never reach `ok` on the
+        hosts it exists for, which is the standing warning #2754 rules out.
+        """
+        r = hc._interpret_daily_punctuality(
+            [job("rotate-log", 4, 23, [], today_seen=False, since_due=300,
+                 conditional=True)])
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertNotIn("UNCHECKED", r["detail"])
+
+    def test_an_unconditional_producer_with_no_artifacts_still_gates(self):
+        """The control that must keep failing: without the declaration an empty
+        artifact set is a real blind spot, and green would claim coverage."""
+        r = hc._interpret_daily_punctuality(
+            [job("mystery", 4, 23, [], today_seen=False, since_due=300)])
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("UNCHECKED", r["detail"])
+
+    def test_a_quiet_conditional_job_does_not_hide_a_real_warn(self):
+        """Excusing it must not also silence a genuinely late sibling."""
+        late = [(f"2026-08-{d:02d}", 6 * 60 + 200) for d in range(6, 13)]
+        r = hc._interpret_daily_punctuality(
+            [job("render", 6, 0, late),
+             job("rotate-log", 4, 23, [], today_seen=False, since_due=300,
+                 conditional=True)])
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("render", r["detail"])
+
     def test_conditional_does_not_suppress_LATENESS(self):
         """Only absence is excused. A conditional job that renders consistently
         late is still late, and that signal must survive the exemption."""
@@ -468,7 +500,7 @@ class TestCollectorMarksStaleNaming(unittest.TestCase):
         self.assertNotIn("UNCHECKED", r["detail"], r)
 
     def test_a_shape_valid_but_impossible_date_does_not_crash_the_probe(self):
-        """`_daily_artifact_minutes` matches dates by SHAPE (\d{4}-\d{2}-\d{2}),
+        r"""`_daily_artifact_minutes` matches dates by SHAPE (\d{4}-\d{2}-\d{2}),
         so `2026-13-45` reaches the parser and raises. An unparseable date makes
         the age unknown, which must read as "cannot tell", never as stale."""
         r = self._run("2026-13-45")

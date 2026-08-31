@@ -60,6 +60,19 @@ def load_roster() -> dict:
     return data
 
 
+def stated_reason(entry: dict) -> str:
+    """The roster's own words for why an entry refuses, if it gave any.
+
+    A blank `stand` can be missing data OR a deliberate DO-NOT-ROUTE. Only the
+    entry knows which, and a refusal that omits it invites the repair that
+    overrides it (#3468)."""
+    for key in ("refusal_basis", "note"):
+        v = entry.get(key)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())
+    return ""
+
+
 def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     """(targets, refusal_rc): one bad entry must never starve the rest of the
     batch — resolvable reviewers are still notified, the worst refusal code
@@ -73,15 +86,23 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             worst = max(worst, 2)
             continue
         stand, room = entry.get("stand"), entry.get("room")
+        why = stated_reason(entry)
         if not stand or not room:
             # a human id alone cannot be a target: person-mentions trigger no Stand
             print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
                   f"(human-only = not Stand addressing)", file=sys.stderr)
+            # Without this the refusal reads as a data gap, and the obvious
+            # repair — populate the fields — silently overrides the refusal.
+            if why:
+                print(f"  roster says: {why}", file=sys.stderr)
             worst = max(worst, 3)
             continue
         if entry.get("allowlisted") is False:
-            print(f"OFF-ALLOWLIST '{name}': {stand} bounced a mention before —"
-                  " route through the owner instead of re-sending",
+            # State the FLAG, never a cause: nothing sets allowlisted=False after
+            # a detected bounce, so any history claim here would be a guess.
+            print(f"OFF-ALLOWLIST '{name}': {stand} is not allowlisted for mentions"
+                  + (f" — {why}" if why else "")
+                  + " — route through the owner instead of re-sending",
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
@@ -275,6 +296,9 @@ def main() -> int:
                     help="deliberately notify ONE reviewer; requires a reason")
     ap.add_argument("--widen-override", metavar="REASON", default="",
                     help="deliberately re-ask the SAME reviewers after 30min")
+    ap.add_argument("--kind", choices=("ask", "notice"), default="ask",
+                    help="ask (default) requests review; notice tells reviewers "
+                         "something about a PR without asking for anything")
     ap.add_argument("--room", default=None,
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
@@ -284,7 +308,9 @@ def main() -> int:
     targets, refusal_rc = resolve(names, load_roster())
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
     # one person; plan mode is exempt because only a real ASK can strand a PR.
-    if a.send and len(targets) < 2 and not a.allow_single:
+    # The two-reviewer rule exists so one person being busy cannot stall a PR.
+    # A notice asks for nothing, so it cannot stall anything by going to one.
+    if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
         print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
               "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
               "or pass --allow-single '<reason>'.", file=sys.stderr)
@@ -293,7 +319,7 @@ def main() -> int:
         return refusal_rc if refusal_rc > 0 else 5
     if a.allow_single and len(targets) < 2:
         print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
-    stale, why = _stale_repeat_ask(a.message, targets, load_roster())
+    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
     if stale and not a.widen_override:
         print(f"REFUSED: {why} Re-asking the same people is not escalation — "
               "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
@@ -381,14 +407,17 @@ def main() -> int:
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
             try:
-                n_logged = record_asks(a.message, t["name"])
+                n_logged = record_asks(a.message, t["name"]) if a.kind == "ask" else 0
             except OSError as e:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
                       f"({e}) — pr-unattended will under-report this PR as unasked",
                       file=sys.stderr)
             else:
-                if n_logged:
+                if a.kind == "notice":
+                    print(f"  notice (not an ask) — nothing recorded for {t['name']}",
+                          file=sys.stderr)
+                elif n_logged:
                     print(f"  logged {n_logged} PR ask(s) for {t['name']}", file=sys.stderr)
                 else:
                     # Not counted as a failure: an ask need not concern a PR. But it

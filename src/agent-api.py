@@ -41,6 +41,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -794,6 +795,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json(200, {"status": "idle"})
             else:
                 self.send_json(200, {"status": "idle"})
+        elif path == "/capabilities":
+            # The Signal Room contract's readiness signal: the desktop supervisor asks whether a
+            # guest deep_dive can run RIGHT NOW instead of inspecting this service's internals
+            if not self.check_auth():
+                return
+            try:
+                from signal_guest_handler import guest_availability
+                available, reason = guest_availability()
+            except Exception as e:
+                available, reason = False, f"capability_error: {e.__class__.__name__}"
+            payload = {"guest_deep_dive": {"available": bool(available)}}
+            if reason:
+                payload["guest_deep_dive"]["reason"] = reason
+            self.send_json(200, payload)
         elif path == "/voice/state":
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
@@ -1272,6 +1287,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
+        # /guest-task — the Signal Room lane.
+        if path == "/guest-task":
+            if not self.check_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
+            # Cap BEFORE reading into memory (same guard as the owner lane): an
+            # untrusted caller must not be able to exhaust memory via Content-Length.
+            if length < 0 or length > 65536:
+                self.send_json(413, {"error": "task request too large"})
+                return
+            try:
+                data = json.loads(self.rfile.read(length).decode() or "{}")
+            except Exception:
+                self.send_json(400, {"error": "invalid JSON"})
+                return
+            task = data.get("task", "")
+            if not isinstance(task, str) or not task.strip():
+                self.send_json(400, {"error": "task is required"})
+                return
+            # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
+            # results into the owner's voice session, so a guest result must not match.
+            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
+            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (guest, sandboxed)",
+            })
+            return
+
         if path != "/task":
             self.send_json(404, {"error": "not found"})
             return
@@ -1322,11 +1372,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"error": "task is required"})
             return
 
-        # guest = untrusted content, so it must never reach the owner core: sandboxed
-        # read-only worker, secret-scanned, never TASK_DIR. See signal_guest_handler.
-        if data.get("access_tier") == "guest":
-            # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
-            # results into the owner's voice session, so a guest result must not match.
+        # Privilege is NEVER *escalated* by the request body. The route decides the tier:
+        # /guest-task always stamps guest.
+        if "access_tier" in data:
+            if data.get("access_tier") != "guest":
+                self.send_json(400, {"error": "access_tier is not accepted on /task"})
+                return
             task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
             start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
             self.send_json(200, {
@@ -1473,11 +1524,33 @@ if __name__ == "__main__":
     print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
         print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+    # A supervised replacement of this gateway (desktop token rotation / adopted-process takeover)
+    # sends SIGTERM.
+    def _reap_and_exit(_signum, _frame):
+        try:
+            from signal_guest_handler import reap_guest_workers
+            reaped = reap_guest_workers()
+            if reaped:
+                print(f"agent-api: reaped {reaped} guest worker group(s) on shutdown", flush=True)
+        except Exception:
+            pass
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _reap_and_exit)
+    except Exception:
+        pass
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDone.")
     finally:
+        try:
+            from signal_guest_handler import reap_guest_workers
+            reap_guest_workers()
+        except Exception:
+            pass
         workstream_maintenance_stop.set()
         workstream_maintenance.join(timeout=1)
         server.server_close()
