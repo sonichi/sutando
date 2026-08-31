@@ -20,9 +20,13 @@ echo "default-lane GATEWAY_FOREIGN_SUFFIXES derivation:"
 
 # Each case runs the SHIPPED function in a clean subshell so ambient
 # AG2_REMOTE_TOKEN_* / GATEWAY_FOREIGN_SUFFIXES on the invoking host cannot
-# leak into the derivation under test.
+# leak into the derivation under test. GATEWAY_CHANNELS_DIR always points at a
+# fixture so the host's real channel .envs never reach the derivation.
+FIXTURES="$(mktemp -d)"
+trap 'rm -rf "$FIXTURES"' EXIT
+mkdir -p "$FIXTURES/empty"
 derive() {
-  env -i HOME="$HOME" PATH="$PATH" "$@" bash -c \
+  env -i HOME="$HOME" PATH="$PATH" GATEWAY_CHANNELS_DIR="$FIXTURES/empty" "$@" bash -c \
     "source '$REPO/src/startup-runtime.sh' >/dev/null 2>&1; derive_foreign_suffixes"
 }
 
@@ -62,6 +66,50 @@ if [ "$got" = ":custom.example" ]; then
   ok "operator GATEWAY_FOREIGN_SUFFIXES wins verbatim over derivation"
 else
   bad "operator GATEWAY_FOREIGN_SUFFIXES wins verbatim over derivation" "got '$got'"
+fi
+
+# --- the lane's identity domain outranks the name convention ----------------
+# The instance name is a label; the homeserver is whatever the lane's
+# AGENT_MXID says. A local homeserver named "localhost" must fence
+# ":localhost" — ":local.ag2.space" fences a suffix that exists nowhere.
+mkdir -p "$FIXTURES/mxid/local-ag2space" "$FIXTURES/mxid/dev-ag2space"
+printf 'AGENT_MXID=@qingyun-local.agent:localhost\n' \
+  > "$FIXTURES/mxid/local-ag2space/.env"
+printf 'REMOTE_TASK_PROVIDER=dev-ag2space\n' \
+  > "$FIXTURES/mxid/dev-ag2space/.env"
+got="$(derive GATEWAY_CHANNELS_DIR="$FIXTURES/mxid" AG2_REMOTE_TOKEN_LOCAL=x)"
+if [ "$got" = ":localhost" ]; then
+  ok "AGENT_MXID domain outranks the name convention (:localhost)"
+else
+  bad "AGENT_MXID domain outranks the name convention (:localhost)" "got '$got'"
+fi
+
+# A lane .env WITHOUT an AGENT_MXID keeps the conventional suffix (pre-identity
+# lanes must fence exactly as before this change).
+got="$(derive GATEWAY_CHANNELS_DIR="$FIXTURES/mxid" AG2_REMOTE_TOKEN_DEV=x)"
+if [ "$got" = ":dev.ag2.space" ]; then
+  ok "lane .env without AGENT_MXID falls back to the convention"
+else
+  bad "lane .env without AGENT_MXID falls back to the convention" "got '$got'"
+fi
+
+# Mixed fleet: one identity-bearing lane + one conventional lane, both fenced.
+got="$(derive GATEWAY_CHANNELS_DIR="$FIXTURES/mxid" AG2_REMOTE_TOKEN_DEV=x AG2_REMOTE_TOKEN_LOCAL=y)"
+case "$got" in
+  *":dev.ag2.space"*":localhost"*|*":localhost"*":dev.ag2.space"*)
+    ok "mixed fleet derives both the mxid and conventional suffixes" ;;
+  *)
+    bad "mixed fleet derives both the mxid and conventional suffixes" "got '$got'" ;;
+esac
+
+# A malformed AGENT_MXID (no colon) cannot produce an empty suffix.
+mkdir -p "$FIXTURES/bad/dev-ag2space"
+printf 'AGENT_MXID=not-an-mxid\n' > "$FIXTURES/bad/dev-ag2space/.env"
+got="$(derive GATEWAY_CHANNELS_DIR="$FIXTURES/bad" AG2_REMOTE_TOKEN_DEV=x)"
+if [ "$got" = ":dev.ag2.space" ]; then
+  ok "malformed AGENT_MXID falls back to the convention"
+else
+  bad "malformed AGENT_MXID falls back to the convention" "got '$got'"
 fi
 
 # --- wiring: BOTH launch paths carry the derived value ----------------------
