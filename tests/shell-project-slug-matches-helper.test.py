@@ -59,14 +59,49 @@ class TestShellSlugMatchesHelper(unittest.TestCase):
             self.assertTrue(SHELL_IDIOM in body,
                             f"{rel} must derive the slug with the complement set")
 
+    # Quote style and sed delimiter are free choices, so pinning one spelling
+    # scans for a typo rather than for the defect.
+    SLASH_ONLY = re.compile(
+        r"""tr\s+(['"])/\1\s+(['"])-\2"""     # tr '/' '-'    /  tr "/" "-"
+        r"""|sed\s+(['"])s(.)/\4-\4g\3"""     # sed 's|/|-|g' /  's:/:-:g'  /  "s|/|-|g"
+    )
+
+    def test_the_scanner_recognises_the_defect_it_scans_for(self):
+        # A scan that matches nothing reports zero offenders forever. This is a
+        # control on the REGEX; the control above is on the idiom's semantics.
+        must_fire = [
+            "tr '/' '-'",
+            'tr "/" "-"',
+            "sed 's|/|-|g'",
+            'sed "s|/|-|g"',
+            "sed 's:/:-:g'",
+        ]
+        for frag in must_fire:
+            line = "SLUG=\"$(printf '%s' \"$p\" | " + frag + ')"'
+            self.assertTrue(self.SLASH_ONLY.search(line),
+                            f"scanner blind to a slash-only spelling: {line}")
+        good = "SLUG=\"$(printf '%s' \"$p\" | " + SHELL_IDIOM + ')"'
+        self.assertIsNone(self.SLASH_ONLY.search(good),
+                          "scanner flags the prescribed idiom — it would be disabled, not obeyed")
+
     def test_no_shell_file_derives_a_slug_with_a_slash_only_replacement(self):
-        slash_only = re.compile(r"tr\s+'/'\s+'-'|sed\s+'s\|/\|-\|g'")
+        # `tests/` is deliberately out of scope: fixtures build their own paths
+        # and compare against themselves, which is a separate question.
         offenders = []
-        for d in ("src", "scripts"):
+        # Per-directory, not a total: an aggregate stays non-zero when ONE
+        # directory silently contributes nothing, which is this PR's own bug.
+        scanned = {}
+        for d in ("src", "scripts", "skills"):
+            scanned[d] = 0
             for f in sorted((REPO / d).rglob("*.sh")):
-                for i, line in enumerate(f.read_text().splitlines(), 1):
-                    if slash_only.search(line):
+                if "node_modules" in f.parts:
+                    continue
+                scanned[d] += 1
+                for i, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
+                    if self.SLASH_ONLY.search(line):
                         offenders.append(f"{f.relative_to(REPO)}:{i}")
+        for d, n in scanned.items():
+            self.assertGreater(n, 0, f"{d}/ contributed no shell files — renamed, moved, or empty")
         self.assertEqual([], offenders,
                          "slash-only slug derivation(s) reintroduced: " + ", ".join(offenders))
 

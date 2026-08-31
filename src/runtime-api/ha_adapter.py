@@ -98,6 +98,33 @@ class HumanActionAdapter:
             q["multiSelect"] = True
         return self._write(request, [q])
 
+    def open_human_action(self, request: dict) -> str:
+        """A real-world act the human must perform (sign, pay, plug in, ...).
+        The card asks for the act and takes the outcome; Done/Decline map to
+        the request's completed/declined terminal states."""
+        p = request["params"]
+        q = (f"Action needed: {p.get('action', '?')}"
+             + (f"\nInstructions: {p['instructions']}" if p.get("instructions") else "")
+             + (f"\nDeadline: {p['deadline']}" if p.get("deadline") else ""))
+        return self._write(request, [{
+            "question": q,
+            "options": [{"label": "Done"}, {"label": "Decline"}],
+        }])
+
+    def close(self, action_id: str, resolved_by: str, note: str | None = None) -> None:
+        """Resolve a still-pending card out-of-band (API completion path) so
+        CardPoster stops showing a question the requester already settled."""
+        rec = self.store.get(action_id)
+        if rec is None or rec.get("status") != "pending":
+            return
+        rec["status"] = "resolved"
+        rec["resolved_by"] = resolved_by
+        rec["decision"] = {"answers": {}, "via": "runtime-api",
+                           **({"note": note} if note else {})}
+        rec.setdefault("audit", []).append(
+            {"at": _now(), "event": "resolved-via-api", "by": resolved_by})
+        self.store.update(rec)
+
     def _write(self, request: dict, questions: list) -> str:
         action_id = ha_action_id(request["requestId"])
         now = _now()

@@ -89,9 +89,16 @@ ok("empty body → snippet is empty string",
 
 # 4. Bullet-format entries have no snippet (one-liners, body = "")
 qs = questions_for("  - **[bullet item, 2026-06-30]** action text here\n")
-ok("bullet entry → no snippet key or empty",
-   len(qs) == 1 and not qs[0].get("snippet"),
+# #1861 asserted bullets carry no snippet because at the time they were
+# one-liners whose label WAS the content. The format outgrew that premise.
+ok("bullet entry → snippet is the ask after the label",
+   len(qs) == 1 and qs[0].get("snippet") == "action text here",
    f"got {qs[0] if qs else 'N/A'}")
+
+qs_bare = questions_for("  - **[bare label, 2026-06-30]**\n")
+ok("label-only bullet → still no snippet",
+   len(qs_bare) == 1 and not qs_bare[0].get("snippet"),
+   f"got {qs_bare[0] if qs_bare else 'N/A'}")
 
 # 5. notify_discord_dm renders arrow-snippet under title when present
 qs_with_snippet = [{"title": "pending question", "snippet": "Run bash --init to fix."}]
