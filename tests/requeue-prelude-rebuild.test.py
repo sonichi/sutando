@@ -112,6 +112,29 @@ def _run_cases(build_requeued_task, render_skill_prelude):
     check("===SUTANDO SYSTEM INSTRUCTIONS" in out3,
           "prelude-less requeue still carries the trusted note")
 
+    # --- source (broker PROVIDER fallback) and lane dir (bridge env) diverge:
+    # the injected dir must win.
+    diverged = stored_task(source="remote", stale_dir="ag2space")
+    out4 = build_requeued_task(diverged, "task-req555", 1,
+                               "!other:dev.ag2.space", "task-holder",
+                               channel_dir="ag2space")
+    check("channel-env.sh ag2space)" in out4,
+          "injected lane dir wins over a diverging source header")
+    check("channel-env.sh remote)" not in out4,
+          "the broker PROVIDER fallback never names the lane")
+
+    out5 = build_requeued_task(stored_task(source="slack"), "task-req666", 1,
+                               "!other:dev.ag2.space", "task-holder",
+                               channel_dir="ag2space")
+    check("channel-env.sh ag2space)" in out5 and "channel-env.sh slack)" not in out5,
+          "cross-provider source header cannot steal the lane from the injected dir")
+
+    # --- no injection (legacy/unknown caller): header source is the last resort
+    out6 = build_requeued_task(stored_task(), "task-req777", 1,
+                               "!other:dev.ag2.space", "task-holder")
+    check("channel-env.sh dev-ag2space)" in out6,
+          "without an injected dir the header source still renders (fallback)")
+
     # --- renderer is the single owner: the bridge carries no inline template ---
     bridge = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
               / "remote_gateway_bridge.py").read_text()
@@ -119,6 +142,12 @@ def _run_cases(build_requeued_task, render_skill_prelude):
           "bridge holds no inline copy of the prelude template")
     check("render_skill_prelude" in bridge,
           "bridge delegates to the shared renderer")
+    check("channel_dir=CHANNEL_DIR" in bridge,
+          "bridge injects its own lane dir into the requeue plan")
+    recovery = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
+                / "dedup_recovery.py").read_text()
+    check("channel_dir=channel_dir" in recovery,
+          "recovery threads the injected dir through to the renderer")
 
 
 def _finish() -> int:

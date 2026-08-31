@@ -396,7 +396,7 @@ def render_skill_prelude(
     """The ===SKILL INSTRUCTIONS=== prelude for an owner-tier task, rendered
     from the task's OWN routing fields. Single owner of the template: the
     gateway writes with its live lane values; a dedup requeue re-renders from
-    the stored header (channel_dir = the `source:` field, per-lane since the
+    the requeuing adapter (channel_dir = that host's own lane dir, per-lane since the
     lane-authoritative stamping change) so a requeue can never resurrect a
     superseded prelude."""
     import shlex as _shlex
@@ -438,7 +438,7 @@ def render_skill_prelude(
 
 def build_requeued_task(
     orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str,
-    reason: str = "cross-channel",
+    reason: str = "cross-channel", channel_dir: str = "",
 ) -> str:
     """Rewrite an original task for re-processing after a REJECTED cross-channel
     dedup. Keeps the original fields (channel_id, access_tier, source, body, …)
@@ -479,11 +479,11 @@ def build_requeued_task(
     if not seen_count:
         lines.append(f"dedup_requeue_count: {count}")
     if had_prelude:
-        # Re-render from the stored header, never copy: source names the lane
-        # (its channel dir), so the fresh prelude binds the task's own channel.
+        # Re-render, never copy. The requeuing adapter's own lane dir is
+        # authoritative; the broker-supplied source header is a last resort.
         lines.extend(render_skill_prelude(
-            hdr.get("channel_id", ""), hdr.get("source", ""), new_task_id,
-            hdr.get("addressed_to", "")))
+            hdr.get("channel_id", ""), channel_dir or hdr.get("source", ""),
+            new_task_id, hdr.get("addressed_to", "")))
     note = (
         "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
         + _REQUEUE_REASONS.get(reason, _REQUEUE_REASONS["cross-channel"])(

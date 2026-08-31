@@ -2913,7 +2913,8 @@ def _dedup_plan(tid: str, holder_id: str | None):
 
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit,
+        channel_dir=CHANNEL_DIR)
     return action, payload, room
 
 
