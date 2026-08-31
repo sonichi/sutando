@@ -138,6 +138,14 @@ def _raw_tmux() -> int:
     # RAW = a live READ-ONLY view of the core's tmux window (everything it
     # prints). Uses tmux's own read-only attach — the firehose stays on the
     # tmux socket, never through the daemon push path. Ctrl-b d to detach.
+    if _wss_url():
+        # Gate at the chokepoint: raw is inherently LOCAL, and attaching the
+        # local tmux under a remote URL views the WRONG agent (#3565 r7).
+        print(json.dumps({"error": "raw view attaches the LOCAL tmux and is "
+                          "not served over the remote WebSocket transport — "
+                          "unset SUTANDO_SCP_WSS_URL for the local raw view"}),
+              flush=True)
+        return 2
     import subprocess
     sock = os.environ.get("SUTANDO_TMUX_SOCKET") or "/tmp/sutando-tmux.sock"
     session = os.environ.get("SUTANDO_TMUX_SESSION") or "sutando-core"
