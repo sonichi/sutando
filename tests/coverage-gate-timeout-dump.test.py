@@ -61,8 +61,10 @@ class DumpMechanism(unittest.TestCase):
     def test_abrt_with_faulthandler_names_every_threads_position(self):
         out = self._run_hang_probe({"PYTHONFAULTHANDLER": "1"})
         self.assertIn("Fatal Python error: Aborted", out)
-        # Both the worker thread and the main thread are located by file:line.
-        self.assertIn("stuck-worker", out)
+        # Both threads are located by file:line. Assert the version-stable
+        # shape: 3.12 prints bare "Thread 0x..." headers (names arrived later).
+        self.assertIn("Current thread 0x", out)
+        self.assertRegex(out, r"(?m)^Thread 0x")
         self.assertRegex(out, r"File .*, line \d+ in <module>")
 
     def test_without_faulthandler_the_death_is_silent(self):
@@ -70,7 +72,7 @@ class DumpMechanism(unittest.TestCase):
         # alone — remove the variable and the diagnostic disappears.
         out = self._run_hang_probe({})
         self.assertNotIn("Fatal Python error", out)
-        self.assertNotIn("stuck-worker", out)
+        self.assertNotIn("Current thread 0x", out)
 
 
 class GateWiring(unittest.TestCase):
