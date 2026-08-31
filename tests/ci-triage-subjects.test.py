@@ -12,7 +12,9 @@ Exit code: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 from pathlib import Path
@@ -118,6 +120,166 @@ _RANKED = json.dumps([{"number": 1, "title": "unrelated flake", "body": "nothing
 check("k) an issue that only RANKS for the subject is dropped; a literal match is kept",
       [h["number"] for h in ct.open_issues_for("tests/x.test.py", lambda a: _R(0, _RANKED), "o/r")] == [2],
       f'got {ct.open_issues_for("tests/x.test.py", lambda a: _R(0, _RANKED), "o/r")}')
+
+
+def _raise(_a, **_k):
+    raise OSError("gh not on PATH")
+
+
+_COMMENTS = json.dumps({"comments": [{"body": "first"}, {"body": "second"}]})
+
+# Two failing checks pointing at the SAME run, plus a green one at another run.
+_RUNS_ROLLUP = json.dumps({"statusCheckRollup": [
+    {"name": "a", "conclusion": "FAILURE", "detailsUrl": "https://x/runs/77/job/1"},
+    {"name": "b", "conclusion": "FAILURE", "detailsUrl": "https://x/runs/77/job/2"},
+    {"name": "c", "conclusion": "SUCCESS", "detailsUrl": "https://x/runs/99/job/3"}]})
+_RUNS_TWO = json.dumps({"statusCheckRollup": [
+    {"name": "a", "conclusion": "FAILURE", "detailsUrl": "https://x/runs/77/job/1"},
+    {"name": "b", "conclusion": "TIMED_OUT", "detailsUrl": "https://x/runs/88/job/2"}]})
+
+_ACCUSING = "✖ test TIMED OUT under instrumentation (>120s): tests/outbox-race.test.py"
+
+
+def _ann_runner(a, **_k):
+    if "statusCheckRollup" in a:
+        return _R(0, _RUNS_ROLLUP)
+    if "/jobs" in a[-1]:
+        # One failed job and one green one: only the failed job is read.
+        return _R(0, json.dumps({"jobs": [{"id": 9, "conclusion": "failure"},
+                                          {"id": 8, "conclusion": "success"}]}))
+    if "/check-runs/9/" in a[-1]:
+        return _R(0, json.dumps([{"message": "the real message"}]))
+    # The GREEN job also has annotations. They must not appear: this is what
+    # makes the skip-guard load-bearing rather than incidentally satisfied.
+    if "/check-runs/8/" in a[-1]:
+        return _R(0, json.dumps([{"message": "green job noise"}]))
+    return _R(1)
+
+
+def _log_runner(a, **_k):
+    if "statusCheckRollup" in a:
+        return _R(0, _RUNS_TWO)
+    if "run" in a and "77" in a:
+        raise OSError("transient")
+    if "run" in a and "88" in a:
+        return _R(0, "job log body")
+    return _R(1)
+
+
+def _full_runner(a, **_k):
+    if "statusCheckRollup" in a:
+        return _R(0, json.dumps({"statusCheckRollup": [
+            {"name": "diff coverage >= 95% (python)", "conclusion": "FAILURE"}]}))
+    if "comments" in a:
+        return _R(0, json.dumps({"comments": [{"body": _ACCUSING}]}))
+    if "issue" in a:
+        return _R(0, json.dumps([{"number": 4242,
+                                  "title": "tests/outbox-race.test.py times out",
+                                  "body": ""}]))
+    return _R(1)
+
+
+def _no_subject_runner(a, **_k):
+    if "statusCheckRollup" in a:
+        return _R(0, json.dumps({"statusCheckRollup": [
+            {"name": "some gate", "conclusion": "FAILURE",
+             "detailsUrl": "https://x/runs/77/job/1"}]}))
+    # Comments, annotations and log all readable but naming no file.
+    if "comments" in a:
+        return _R(0, json.dumps({"comments": [{"body": "it broke"}]}))
+    return _R(0, "")
+
+
+def _search_fails_runner(a, **_k):
+    if "issue" in a:
+        return _R(1)
+    return _full_runner(a)
+
+
+def _no_issue_runner(a, **_k):
+    # Search SUCCEEDS and matches nothing. The other half of the discriminator
+    # this script exists for: a real zero must not print like a failed lookup.
+    if "issue" in a:
+        return _R(0, "[]")
+    return _full_runner(a)
+
+# ---------------------------------------------------------------- transports
+# Every network helper takes an injected `run`, so the whole read path is
+# reachable without a network. The branches that matter are the ones that
+# FAIL: each must report UNKNOWN rather than a confident empty answer.
+
+check("l) _gh maps a raising runner to UNKNOWN, not a crash",
+      ct._gh(_raise, ["pr", "view"]) is None)
+
+check("m) _gh maps empty stdout to UNKNOWN (a silent gh is not an answer)",
+      ct._gh(lambda a: _R(0, "   "), ["x"]) is None)
+
+# gh prints a JSON error body and exits non-zero. Parsing it would yield a
+# confident, wrong answer, so the returncode must be checked before the body.
+check("m2) a non-zero exit is UNKNOWN even when stdout is VALID json",
+      ct._gh(lambda a: _R(1, '{"message":"Not Found"}'), ["x"]) is None)
+
+check("n) failure_text returns '' when gh fails, and joins comment bodies when it works",
+      ct.failure_text("1", lambda a: _R(1), "o/r") == ""
+      and "second" in ct.failure_text("1", lambda a: _R(0, _COMMENTS), "o/r"))
+
+# _run_ids feeds both annotation_text and log_text: a wrong id sends every
+# downstream lookup at another PR's run.
+_ids = ct._run_ids("1", lambda a: _R(0, _RUNS_ROLLUP), "o/r")
+check("o) _run_ids takes ids only from FAILING checks, and de-duplicates them",
+      _ids == ["77"], f"got {_ids}")
+
+check("p) _run_ids yields nothing when gh fails (no id is better than a wrong id)",
+      ct._run_ids("1", lambda a: _R(1), "o/r") == [])
+
+_ann = ct.annotation_text("1", _ann_runner, "o/r")
+check("q) annotation_text reads the ANNOTATIONS endpoint, skipping non-failed jobs",
+      _ann == "the real message" and "green job noise" not in _ann, f"got {_ann!r}")
+
+check("r) log_text survives a raising runner and keeps the successful log",
+      ct.log_text("1", _log_runner, "o/r") == "job log body")
+
+check("s) log_text drops a non-zero run rather than treating its stdout as a log",
+      ct.log_text("1", lambda a: _R(1, "partial garbage"), "o/r") == "")
+
+
+# ---------------------------------------------------------------------- main
+# CONTROL for the whole file: main() is the only caller that wires the helpers
+# together, so a helper that works in isolation can still be mis-sequenced here.
+
+def _main_out(argv, runner):
+    buf = io.StringIO()
+    real, ct.subprocess.run = ct.subprocess.run, runner
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = ct.main(argv)
+    finally:
+        ct.subprocess.run = real
+    return rc, buf.getvalue()
+
+rc, out = _main_out(["1"], lambda a, **k: _R(1))
+check("t) main reports UNKNOWN when gh cannot read the checks — never 'none failing'",
+      rc == 0 and "UNKNOWN" in out and "no failing checks" not in out, out.strip())
+
+rc, out = _main_out(["1"], lambda a, **k: _R(0, json.dumps({"statusCheckRollup": []})))
+check("u) main reports a real zero when the checks are readable and green",
+      rc == 0 and "no failing checks" in out, out.strip())
+
+rc, out = _main_out(["1"], _full_runner)
+check("v) main names the failing check, extracts the subject, and reports the open issue",
+      rc == 0 and "outbox-race.test.py" in out and "#4242" in out, out.strip())
+
+rc, out = _main_out(["1"], _no_subject_runner)
+check("w) main says diagnose-by-hand when no line ACCUSES a file",
+      rc == 0 and "diagnose by hand" in out, out.strip())
+
+rc, out = _main_out(["1"], _no_issue_runner)
+check("x0) a successful search matching nothing prints a real zero, not UNKNOWN",
+      rc == 0 and "no open issue" in out and "FAILED" not in out, out.strip())
+
+rc, out = _main_out(["1"], _search_fails_runner)
+check("x) a failed issue search reads as UNKNOWN, not as 'no open issue'",
+      rc == 0 and "issue search FAILED" in out and "no open issue" not in out, out.strip())
 
 print()
 if failures:
