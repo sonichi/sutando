@@ -222,12 +222,18 @@ and loads whichever repo it reviews.
     the recalled sentence.
     *Grounded by:* 2026-08-30 — a review of `ag2-space/cinny-webclient#703` correctly
     measured that `color-mix()` had zero precedent in that codebase (with a positive control
-    proving the search worked), then asserted it "needs WebKitGTK 2.42+" from recall. The
-    number was invented and too conservative: the feature landed upstream at WebKit r273244
-    in early 2021 and 2.42's release notes never mention it. Checking it produced the
-    sharper finding the review should have carried — Tauri v2's documented Linux baseline
-    (Ubuntu 22.04) ships WebKitGTK ~2.36 ≈ Safari 16, against a Safari 16.2 threshold. The
-    unmeasured sentence sat in the paragraph the review named as the blocker.
+    proving the search worked), then asserted it "needs WebKitGTK 2.42+" from recall. The 2.42
+    figure was never checked. Checking produces the sharper finding the review should have
+    carried: Tauri v2's Linux baseline is Ubuntu 22.04, which ships WebKitGTK 2.36 — listed as
+    Safari-16.0-equivalent in [Tauri's webview-versions table][tauri-webviews] — against a
+    Safari 16.2 threshold for the settled `color-mix()` syntax (**unverified**: that threshold
+    comes from secondary sources, not a primary WebKit release note). Note what the citation
+    itself says: the same table warns its Linux data is "a very incomplete list", so it is
+    evidence, not proof — which is why `@supports (color: color-mix(in srgb, red 50%, blue))`
+    is the right instrument here and a version comparison is not. The unmeasured sentence sat
+    in the paragraph the review named as the blocker.
+
+    [tauri-webviews]: https://v2.tauri.app/reference/webview-versions/
 
 14. **Never assert on source text as a stand-in for a behavioral claim.** When a module
     cannot be imported by tests (import-time side effects, heavy SDK deps), extract the
