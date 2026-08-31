@@ -230,10 +230,8 @@ class PoolLead:
                 and self._load(lane_core) < AFFINITY_BUSY_MAX
                 and self._claiming(lane_core)):
             return lane_core
-        # owner prefers claude seats (codex wrapper polls, slow turnaround); a
-        # sole claude doubles as lane core yet stays owner-eligible
-        # An all-reserved pool falls back: availability beats exclusivity
-        # in the degenerate case, never starving a task.
+        # owner prefers claude seats; a sole claude doubles as lane core yet stays
+        # owner-eligible. All-reserved pool falls back — never starve a task.
         free = [f for f in eligible if f not in reserved] or eligible
         primary = [f for f in free if f != lane_core] or free
         # A repool drops the follower's load, so least-loaded actively PREFERS
