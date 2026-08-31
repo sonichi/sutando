@@ -199,6 +199,10 @@ def _main(argv):
     p.add_argument("room_id")
     p.add_argument("message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--worker", default=None,
+                   help="worker id to stamp on the event (space.ag2.worker) so the "
+                        "client renders attribution; defaults to core-$SUTANDO_CORE_ID "
+                        "when that env var is set, pass '' to post unstamped")
     p.add_argument("--reply-to", dest="reply_to", default=None,
                    help="event id ($abc) to cite as the message replied to. This is a "
                         "CITATION: the post stays in the main timeline. It does NOT put "
@@ -259,7 +263,8 @@ def _main(argv):
                                reply_to=a.reply_to)
     elif a.cmd == "say":
         res = _say.say(a.message, a.room_id, a.agent_mxid,
-                       reply_to=a.reply_to)
+                       reply_to=a.reply_to,
+                       worker=(None if a.worker == "" else a.worker))
     elif a.cmd == "grant":
         import grant as _grant
         try:
