@@ -13,6 +13,7 @@ Exit code: 0 on pass, 1 on fail.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -47,8 +48,11 @@ check("a) the accused file is found at all", "tests/outbox-race.test.py" in subs
 check("b) the accused file RANKS FIRST, ahead of merely-mentioned ones",
       subs and subs[0] == "tests/outbox-race.test.py", f"got {subs}")
 
-check("c) benign mentions are still available, just lower",
-      "tests/browser-persistent.test.py" in subs, f"got {subs}")
+# Changed deliberately: benign mentions are now EXCLUDED, not merely ranked
+# lower. A confident pointer at an unrelated file is worse than reporting none.
+check("c) files mentioned WITHOUT a failure marker are excluded entirely",
+      "tests/browser-persistent.test.py" not in subs
+      and "tests/workspace-default.test.py" not in subs, f"got {subs}")
 
 # CONTROL: without blame-ranking, log order would put the accused file first only
 # by luck. Put it LAST in the text and confirm ranking still promotes it.
@@ -67,6 +71,10 @@ COV = "src/review-preflight.py (90.3%): Missing lines 147-148,153-154"
 check("e) a source file on an accusing line is a subject too",
       ct.subjects_from_text(COV)[:1] == ["src/review-preflight.py"],
       f"got {ct.subjects_from_text(COV)}")
+
+check("f2) a log with NO accusing line yields nothing, not a listing",
+      ct.subjects_from_text("  - tests/a.test.py (skipped)\n  - tests/b.test.py (ok)") == [],
+      "whole-text fallback would return both")
 
 check("f) empty and None inputs yield no subjects, not a crash",
       ct.subjects_from_text("") == [] and ct.subjects_from_text(None) == [])
@@ -88,6 +96,14 @@ check("i) unparseable stdout is also UNKNOWN",
 
 check("j) an empty issue list is a real zero, distinct from a failed call",
       ct.open_issues_for("x", lambda a: _R(0, "[]"), "o/r") == [])
+
+# gh's --search RANKS; it does not match. An issue that merely scores for a path
+# is a wrong pointer carrying the tool's authority, so it must be dropped.
+_RANKED = json.dumps([{"number": 1, "title": "unrelated flake", "body": "nothing here"},
+                      {"number": 2, "title": "tests/x.test.py times out", "body": ""}])
+check("k) an issue that only RANKS for the subject is dropped; a literal match is kept",
+      [h["number"] for h in ct.open_issues_for("tests/x.test.py", lambda a: _R(0, _RANKED), "o/r")] == [2],
+      f'got {ct.open_issues_for("tests/x.test.py", lambda a: _R(0, _RANKED), "o/r")}')
 
 print()
 if failures:

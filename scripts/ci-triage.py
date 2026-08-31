@@ -46,7 +46,9 @@ def subjects_from_text(text: str) -> "list[str]":
 
     blamed = "\n".join(l for l in (text or "").splitlines() if _BLAMED.search(l))
     ordered, seen = [], set()
-    for v in scan(blamed) + scan(text):
+    # Only blamed lines. Whole-text order is a listing, not an accusation, and a
+    # confident pointer at an unrelated file is worse than reporting nothing.
+    for v in scan(blamed):
         if v not in seen:
             seen.add(v)
             ordered.append(v)
@@ -114,10 +116,13 @@ def log_text(pr: str, run, repo: str) -> str:
 
 def open_issues_for(subject: str, run, repo: str) -> "list[dict] | None":
     j = _gh(run, ["issue", "list", "--repo", repo, "--state", "open",
-                  "--search", subject, "--json", "number,title", "--limit", "10"])
+                  "--search", subject, "--json", "number,title,body", "--limit", "20"])
     if j is None:
         return None
-    return [{"number": i["number"], "title": i["title"]} for i in j]
+    # `gh issue list --search` ranks; it does not match. An issue that merely
+    # scores for a path is a wrong pointer wearing the tool's authority.
+    return [{"number": i["number"], "title": i["title"]} for i in j
+            if subject in (i.get("title") or "") or subject in (i.get("body") or "")]
 
 
 def main(argv=None) -> int:
@@ -143,7 +148,7 @@ def main(argv=None) -> int:
         # Gates that say "see the job log" put the subject only there.
         subjects = subjects_from_text(log_text(a.pr, run, a.repo))
     if not subjects:
-        print("\n  no file subject found in comments or job log — diagnose by hand")
+        print("\n  no accusing line named a file — diagnose by hand")
         return 0
     print(f"\n  subjects named in the failure text: {', '.join(subjects[:6])}")
     for s in subjects[:6]:
