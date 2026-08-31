@@ -2354,7 +2354,12 @@ def _write_task(task: dict) -> str | None:
             if task.get(f) == "room":
                 lines.append("session_scope: room")
         elif f == "source":
-            lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+            # The RECEIVING lane is the origin authority — the wire label names
+            # the contract family, identical from BOTH homeservers (#3612 class).
+            lines.append(f"source: {_one_line(CHANNEL_DIR)}")
+            _wire_src = _one_line(str(task.get("source") or ""))
+            if _wire_src and _wire_src != CHANNEL_DIR:
+                lines.append(f"wire_source: {_wire_src}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
             # all current gateway traffic is Matrix room messages. Whitelisted:
