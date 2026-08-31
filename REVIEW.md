@@ -281,6 +281,26 @@ and loads whichever repo it reviews.
     time, which is exactly why the re-read is necessary rather than optional. The current state, not the
     remembered one, is what authorizes.
 
+17. **Read the PR's own failing checks before you approve — a red gate is usually a
+    finding the CI already made for you.** Lesson 8 says the verdict is a recommendation
+    and never the merge gate, which is true and is *not* a licence to skip looking: the
+    reason to read a failing check is not that your approval could merge something broken,
+    it is that the check is frequently reporting a defect in the diff you are reviewing.
+    A coverage gate naming uncovered lines is pointing at untested behavior; a failing
+    suite is naming the case the change breaks. Approving without reading it means
+    shipping a review that missed a finding the repository had already surfaced, and it
+    tells the author "ready" while the PR is not.
+    *Grounded by:* two approvals cast over red gates on 2026-08-31 by the same reviewer
+    within eight minutes. On #3567 the coverage gate read
+    `scripts/review-preflight.py (90.3%): Missing lines 147-148,153-154,173,192` — those
+    lines are the failure branches of `_gh_json`, the fail-closed design the review had
+    just singled out for praise. The gate had found that the praised behavior has no test
+    behind it, and the review said the opposite. On #3600 the gate was red at the reviewed
+    head (`89.7%`) and the author pushed a fix six minutes later, so nothing came of it —
+    luck, not process. Neither review looked. The cheap form is one call before the
+    verdict: `gh pr checks <PR>`, or `scripts/ci-triage.py <PR>`, which additionally maps
+    a failing check to any issue already filed about it.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
