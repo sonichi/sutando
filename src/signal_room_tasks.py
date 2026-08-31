@@ -121,7 +121,7 @@ def _one_line(value: str, confine) -> str:
     return confine(" ".join(str(value).splitlines()).strip())
 
 
-def core_is_alive(workspace, now: float | None = None) -> bool | None:
+def core_is_alive(workspace=None, now: float | None = None) -> bool | None:
     """Is some sutando-core around to consume a Signal Room task?
 
     True/False when the heartbeat facility is in use, None when it is not
@@ -129,7 +129,9 @@ def core_is_alive(workspace, now: float | None = None) -> bool | None:
     read None as "dead", or an install that simply never runs
     src/core_heartbeat.py would advertise the feature as permanently off.
     """
-    cores = Path(workspace) / "state" / "cores"
+    from workspace_default import resolve_workspace
+    root = Path(workspace) if workspace is not None else resolve_workspace()
+    cores = root / "state" / "cores"
     try:
         beats = list(cores.glob("*.alive"))
     except OSError:
@@ -185,7 +187,7 @@ def submission_status(task_dir, workspace=None) -> tuple[bool, str | None]:
         probe.unlink()
     except Exception:
         return False, "task_dir_unwritable"
-    if core_is_alive(workspace if workspace is not None else path.parent) is False:
+    if core_is_alive(workspace) is False:
         # Every heartbeat is stale: advertising deep_dive now would promise the
         # room an answer that nothing is running to produce.
         return False, "core_offline"
