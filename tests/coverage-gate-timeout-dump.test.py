@@ -14,6 +14,7 @@ so the TIMED OUT detection branch (rc 124/137) is unchanged.
 Run: python3 tests/coverage-gate-timeout-dump.test.py
 """
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -97,10 +98,49 @@ class GateWiring(unittest.TestCase):
             self.src,
         )
 
-    def test_timed_out_branch_still_keys_on_124(self):
+    def test_timed_out_detection_branch_text_unchanged(self):
         # ABRT must not have moved the detection: GNU timeout exits 124 on
         # expiry for any -s signal (137 is the -k KILL escalation).
         self.assertIn('[ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]', self.src)
+
+
+
+class TimeoutBinaryBehavior(unittest.TestCase):
+    """rc-124 and worker reach, verified against the real binary (Linux CI).
+
+    The static pin above only fixes the script text; this runs GNU timeout
+    over a real mp.Pool hang. The dump COUNT is emitted, not asserted:
+    interleaved multi-process dumps shred tokens, so exact counts are
+    unreliable — 1 means child-only signalling, >1 means the process group
+    (and thus the workers #3630 is about) received ABRT.
+    """
+
+    @unittest.skipUnless(shutil.which("timeout"), "GNU timeout absent (local macOS)")
+    def test_abrt_expiry_exits_124_and_dumps_reach_the_hang(self):
+        probe = (
+            "import multiprocessing as mp, time\n"
+            "if __name__ == '__main__':\n"
+            "    with mp.Pool(2) as pool:\n"
+            "        pool.map_async(time.sleep, [600, 600])\n"
+            "        time.sleep(600)\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(probe)
+            path = f.name
+        try:
+            env = dict(os.environ, PYTHONFAULTHANDLER="1")
+            r = subprocess.run(
+                ["timeout", "-k", "5", "-s", "ABRT", "3", sys.executable, path],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 124)
+            out = r.stdout + r.stderr
+            self.assertIn("Fatal Python error", out)
+            dumps = out.count("Fatal Python error")
+            print(f"\n[timeout-behavior] dumps={dumps} "
+                  f"({'group signalling, workers dumped' if dumps > 1 else 'child-only signalling'})")
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":
