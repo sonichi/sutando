@@ -13,6 +13,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -146,6 +147,164 @@ proc = subprocess.run([sys.executable, str(SCRIPT), "--state", str(state),
 check("the script runs as a subprocess with the same verdict",
       proc.returncode == 0 and proc.stdout.strip().startswith("quiet"),
       f"{proc.returncode} {proc.stdout!r} {proc.stderr!r}")
+
+# ── pass-outcome counters ───────────────────────────────────────────────────
+# `streak` resets each substantive pass: a gauge, not a counter.
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "idle-streak.json"
+
+    def outcome(kind):
+        """In-process, for the same reason `run()` above is: a subprocess runs
+        the production code where coverage cannot see it."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = ish.main(["--state", str(st), "--pass-outcome", kind])
+        return buf.getvalue().strip(), rc
+
+    out, rc = outcome("noop")
+    check("a no-op pass records without a held-list on stdin",
+          rc == 0 and "streak=1" in out and "noop_total=1" in out, out)
+    outcome("noop")
+    out, _ = outcome("substantive")
+    check("a substantive pass resets the streak but not the totals",
+          "streak=0" in out and "noop_total=2" in out and "substantive_total=1" in out, out)
+
+    doc = json.loads(st.read_text())
+    check("both cumulative totals persist, so the denominator is recoverable",
+          doc.get("noop_total") == 2 and doc.get("substantive_total") == 1, doc)
+
+    # The reason for the lock: last-writer-wins silently under-counts, and an
+    # under-count is indistinguishable from a genuinely quiet stretch.
+    st2 = Path(d) / "concurrent.json"
+    procs = [subprocess.Popen([sys.executable, str(SCRIPT), "--state", str(st2),
+                               "--pass-outcome", "noop"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL) for _ in range(20)]
+    for p in procs:
+        p.wait()
+    got = json.loads(st2.read_text()).get("noop_total")
+    check("20 concurrent recorders lose no increments (the lock earns its place)",
+          got == 20, f"noop_total={got}, expected 20")
+
+# --pass-outcome is record-only and must return BEFORE touching stdin: under
+# cron stdin is an open pipe nobody writes, and a read there never returns.
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "s.json"
+    r, w = os.pipe()                      # open, silent, NOT closed
+    p = subprocess.Popen([sys.executable, str(SCRIPT), "--state", str(st),
+                          "--pass-outcome", "noop"],
+                         stdin=r, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True)
+    os.close(r)
+    try:
+        out, _ = p.communicate(timeout=10)
+        hung = False
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, hung = "", True
+    os.close(w)
+    check("record-only does not block on an open, silent stdin pipe",
+          not hung and p.returncode == 0 and "noop_total=1" in out,
+          "BLOCKED on stdin.read()" if hung else out)
+
+    # It ignores --items rather than half-doing both, so the mode is unambiguous.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc2 = ish.main(["--state", str(st), "--items", json.dumps(BASE),
+                        "--pass-outcome", "substantive"])
+    check("record-only ignores --items and prints the outcome, not a hash",
+          rc2 == 0 and buf.getvalue().strip().startswith("substantive"), buf.getvalue())
+    check("...and leaves last_surfaced_hash untouched",
+          "last_surfaced_hash" not in json.loads(st.read_text()), st.read_text())
+
+    # record_outcome directly: the lock/unlock path, not reached via main()'s print.
+    doc = ish.record_outcome(st, "noop")
+    check("record_outcome returns the doc it persisted",
+          doc["streak"] == 1 and doc == json.loads(st.read_text()), doc)
+
+# ── a hash move is auditable: rename vs real change ──────────────────────────
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "idle-streak.json"
+
+    def run(items, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            ish.main(["--state", str(st), "--items", json.dumps(items), *extra])
+        return out.getvalue().strip(), err.getvalue().strip()
+
+    o1, _ = run(BASE, "--commit")
+    doc = json.loads(st.read_text())
+    # getattr, not a bare reference: on a build without the helper this must
+    # report a named failure, not raise and abort the remaining checks.
+    lines = getattr(ish, "canonical_lines", None)
+    check("--commit persists the canonical lines beside the hash",
+          callable(lines) and doc.get("last_surfaced_ids") == lines(BASE), doc)
+
+    renamed = [["pr-3166", "owner"], ["pr-3274", "owner"], ["pr-hooks", "owner"]]
+    _, e_ren = run(renamed)
+    added_only = BASE + [["3591", "upstream"]]
+    _, e_add = run(added_only)
+
+    # A rename swaps every line; a real addition only adds. Same opaque digest
+    # move, two different explanations — which is the whole point.
+    check("a rename reports every id swapped",
+          "+['pr-3166:owner'" in e_ren and "-['3166:owner'" in e_ren, e_ren)
+    check("a genuine addition reports only the addition",
+          "+['3591:upstream']" in e_add and e_add.endswith("-[]"), e_add)
+
+    # The explanation goes to stderr: stdout stays exactly `post|quiet <hash>`,
+    # which the loop parses.
+    o_ren, _ = run(renamed)
+    check("stdout contract is unchanged (verb + hash only)",
+          len(o_ren.split()) == 2 and o_ren.split()[0] in ("post", "quiet"), o_ren)
+
+    # Hashes must be untouched by this change — it explains the decision, it
+    # does not alter it.
+    check("the decision itself is unchanged",
+          o1.split()[1] == ish.held_hash(BASE), o1)
+
+    # A state file written before this change has no ids; that must degrade to a
+    # stated absence, not a crash or a fabricated empty diff.
+    st.write_text(json.dumps({"last_surfaced_hash": "0" * 16}))
+    _, e_old = run(BASE)
+    check("pre-upgrade state says so instead of inventing a delta",
+          "no previous ids" in e_old, e_old)
+
+# ── rolling upgrade: a quiet pass must seed ids for an existing hash ─────────
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "idle-streak.json"
+
+    def run(items, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            ish.main(["--state", str(st), "--items", json.dumps(items), *extra])
+        return out.getvalue().strip(), err.getvalue().strip()
+
+    # An install upgraded mid-run has the hash and no ids. Nothing has moved, so
+    # `changed` is false — and that quiet pass is the last chance to seed them.
+    st.write_text(json.dumps({"last_surfaced_hash": ish.held_hash(BASE)}))
+    o_q, e_q = run(BASE, "--commit")
+    doc = json.loads(st.read_text())
+    check("a quiet --commit backfills ids for a legacy hash",
+          doc.get("last_surfaced_ids") == ish.canonical_lines(BASE), doc)
+    check("...and the decision is still quiet, not a spurious post",
+          o_q.split()[0] == "quiet", o_q)
+    check("...and it says it backfilled rather than staying silent",
+          "backfilled" in e_q, e_q)
+
+    # The payoff: the next genuine change explains itself instead of reporting
+    # the absence this PR exists to remove.
+    _, e_add = run(BASE + [["3591", "upstream"]])
+    check("the next real change reports the addition, not 'no previous ids'",
+          "+['3591:upstream']" in e_add and "no previous ids" not in e_add, e_add)
+
+    # A backfill must not fire twice: once seeded, a quiet pass rewrites nothing.
+    before_doc = json.loads(st.read_text())
+    _, e_again = run(BASE, "--commit")
+    check("a second quiet pass does not re-announce a backfill",
+          "backfilled" not in e_again, e_again)
+    check("...and leaves the record untouched",
+          json.loads(st.read_text()) == before_doc, st.read_text())
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

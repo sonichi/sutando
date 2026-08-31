@@ -49,7 +49,7 @@ def test_uses_dashboard_bind_env_with_loopback_default():
     "127.0.0.1")`. Pin so a future refactor that changes the env-var
     name or the default has to update this test deliberately."""
     assert re.search(
-        r'os\.environ\.get\(\s*["\']DASHBOARD_BIND["\']\s*,\s*["\']127\.0\.0\.1["\']',
+        r'(?:os\.environ\.get|config_get)\(\s*["\']DASHBOARD_BIND["\']\s*,\s*["\']127\.0\.0\.1["\']',
         SRC,
     ), (
         "dashboard.py must read the bind address from DASHBOARD_BIND with "

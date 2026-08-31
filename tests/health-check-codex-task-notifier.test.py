@@ -118,6 +118,11 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
             mock.patch.object(
                 hc, "_watcher_trees", return_value={"4200": {"4200", "4242"}}
             ),
+            # check_task_watcher() returns early when ps is unavailable, so
+            # without this the generic assertion measures the host, not the code.
+            mock.patch.object(
+                hc, "_ps_snapshot", return_value="PID TT STAT TIME COMMAND\n"
+            ),
             mock.patch.object(hc, "_run_tmux", side_effect=tmux),
         ):
             generic = hc.check_task_watcher()

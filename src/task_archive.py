@@ -14,21 +14,45 @@ Usage:
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
+
+# A dot is legal inside an id: pool_lead allows [A-Za-z0-9._~-] and excludes the
+# state suffixes by lookahead rather than banning dots.
+_ID_STATE = re.compile(r"^(task-.+?)\.(?:assigned|claimed)-.+?\.txt$")
+_ID_PLAIN = re.compile(r"^(task-.+?)\.txt(?:\.\d+|\.archive-failed.*)?$")
+
+
+def task_id_from_filename(name: str) -> str | None:
+    r"""The canonical task id for any name a task file carries, or None.
+
+    `Path.stem` and a greedy `^task-(.+)\.txt$` both return the compound name
+    for a CLAIMED file, so the caller then looks for a result under an id that
+    nothing ever writes. Covers the lead's `.assigned-<inst>` rename too.
+    """
+    # _ID_STATE first: the non-greedy id in _ID_PLAIN would otherwise swallow a
+    # state suffix and hand back the compound name this function exists to avoid.
+    match = _ID_STATE.match(name) or _ID_PLAIN.match(name)
+    return match.group(1) if match else None
 
 def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     """Return the actual task file path for task_id, or None if absent.
 
-    Checks the bare name first (unclaimed), then globs for the claimed
-    variant (task-{id}.claimed-core-N.txt). If multiple claimed variants
-    exist (shouldn't happen but defensive), returns the first lexicographic
-    match and that's good enough — the caller only needs one path to archive.
+    Checks the bare name first (unclaimed), then any state variant. State
+    matching goes through `_ID_STATE` — the same grammar `task_id_from_filename`
+    uses — because a second, narrower pattern here is exactly how one state gets
+    handled and its sibling missed. If multiple variants exist (shouldn't happen
+    but defensive), returns the first lexicographic match; the caller only needs
+    one path to archive.
     """
     bare = tasks_dir / f"{task_id}.txt"
     if bare.exists():
         return bare
-    matches = sorted(tasks_dir.glob(f"{task_id}.claimed-core-*.txt"))
+    matches = sorted(
+        p for p in tasks_dir.glob(f"{task_id}.*")
+        if (m := _ID_STATE.match(p.name)) and m.group(1) == task_id
+    )
     if matches:
         return matches[0]
     # Quarantined last: it is the task's only surviving header block, and

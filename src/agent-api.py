@@ -41,6 +41,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -75,7 +76,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 
     # Prefer static base URL to prevent Host header injection bypass.
     # TWILIO_WEBHOOK_URL is the public ngrok/funnel URL Twilio sends webhooks to.
-    base_url = os.environ.get("TWILIO_WEBHOOK_URL", "")
+    base_url = config_get("TWILIO_WEBHOOK_URL", "")
     if base_url:
         url = base_url.rstrip("/") + handler.path
     else:
@@ -105,13 +106,22 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_config import config_get  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
+from task_archive import task_id_from_filename  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
 TASK_WORKSTREAM_GROUPING_SKILL = REPO_DIR / "skills" / "task-workstream-grouping" / "SKILL.md"
-PORT = 7843
+# Overridable so a live-path witness can run against an isolated instance
+# instead of restarting the owner's service; mirrors AGENT_API_BIND below.
+_PORT_ENV = os.environ.get("AGENT_API_PORT")
+if _PORT_ENV is not None and not _PORT_ENV.isdigit():
+    # Refusing rather than defaulting: 7843 is the live service, so a typo'd
+    # witness port must not silently collide with it.
+    raise ValueError(f"AGENT_API_PORT={_PORT_ENV!r} is not a port number")
+PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
@@ -119,6 +129,7 @@ PORT = 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from signal_guest_handler import start_guest_deep_dive  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -346,18 +357,22 @@ def _active_task_rows() -> list[dict]:
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )[:10]:
-        task_id = task_file.stem
+        # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
+        # the reply at results/{id}.txt — so key AND look up by the canonical id.
+        task_id = task_id_from_filename(task_file.name)
+        if task_id is None:
+            continue
         content = task_file.read_text()
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
-        result_file = RESULT_DIR / task_file.name
+        result_file = RESULT_DIR / f"{task_id}.txt"
         existing = task_history.get(task_id, {})
         # Priority: live file, then in-memory history, then archive. The
         # archive lookup is what survives a restart, when history is empty.
         archived_file = None
         for month_dir in (RESULT_DIR / "archive").glob("*/"):
-            candidate = month_dir / task_file.name
+            candidate = month_dir / f"{task_id}.txt"
             if candidate.exists():
                 archived_file = candidate
                 break
@@ -607,13 +622,13 @@ def get_task_result(task_id: str):
         return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
     # Check archive — task-bridge archives results within seconds of delivery,
     # so direct /result polls often arrive after the file has been moved.
+    # Delegated: the archive move above mints `<id>-<epoch>.txt` on collision, a
+    # layout a month-only scan cannot find. find_archived_result covers all three.
     safe_id = _safe_id(task_id)
     if safe_id:
-        filename = f"{safe_id}.txt"
-        for month_dir in sorted((RESULT_DIR / "archive").glob("*/"), reverse=True):
-            candidate = month_dir / filename
-            if candidate.exists():
-                return {"task_id": safe_id, "status": "completed", "result": candidate.read_text()}
+        archived = local_task_protocol.find_archived_result(RESULT_DIR, task_id)
+        if archived is not None:
+            return {"task_id": safe_id, "status": "completed", "result": archived.read_text()}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}
@@ -780,6 +795,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json(200, {"status": "idle"})
             else:
                 self.send_json(200, {"status": "idle"})
+        elif path == "/capabilities":
+            # The Signal Room contract's readiness signal: the desktop supervisor asks whether a
+            # guest deep_dive can run RIGHT NOW instead of inspecting this service's internals
+            if not self.check_auth():
+                return
+            try:
+                from signal_guest_handler import guest_availability
+                available, reason = guest_availability()
+            except Exception as e:
+                available, reason = False, f"capability_error: {e.__class__.__name__}"
+            payload = {"guest_deep_dive": {"available": bool(available)}}
+            if reason:
+                payload["guest_deep_dive"]["reason"] = reason
+            self.send_json(200, payload)
         elif path == "/voice/state":
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
@@ -842,6 +871,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(*delegation_read_result(
                     unquote(path[len("/delegation/results/"):])))
         elif path.startswith("/result/"):
+            # Owner data: gated like the write leg it belongs to (POST /task) —
+            # token checked when configured. NOT delegation's refuse-outright.
+            if not self.check_auth():
+                return
             task_id = path[len("/result/"):]
             result = get_task_result(task_id)
             if result:
@@ -1254,6 +1287,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
+        # /guest-task — the Signal Room lane.
+        if path == "/guest-task":
+            if not self.check_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
+            # Cap BEFORE reading into memory (same guard as the owner lane): an
+            # untrusted caller must not be able to exhaust memory via Content-Length.
+            if length < 0 or length > 65536:
+                self.send_json(413, {"error": "task request too large"})
+                return
+            try:
+                data = json.loads(self.rfile.read(length).decode() or "{}")
+            except Exception:
+                self.send_json(400, {"error": "invalid JSON"})
+                return
+            task = data.get("task", "")
+            if not isinstance(task, str) or not task.strip():
+                self.send_json(400, {"error": "task is required"})
+                return
+            # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
+            # results into the owner's voice session, so a guest result must not match.
+            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
+            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (guest, sandboxed)",
+            })
+            return
+
         if path != "/task":
             self.send_json(404, {"error": "not found"})
             return
@@ -1261,7 +1329,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.check_auth():
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.send_json(400, {"error": "invalid Content-Length"})
+            return
+        # Cap BEFORE reading into memory: an untrusted guest deep_dive could
+        # otherwise exhaust memory via Content-Length without taking a worker slot.
+        if length < 0 or length > 65536:
+            self.send_json(413, {"error": "task request too large"})
+            return
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
@@ -1271,6 +1348,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         from_agent = data.get("from", "unknown")
         task = data.get("task", "")
+        if not isinstance(task, str):
+            self.send_json(400, {"error": "task must be a string"})
+            return
         priority = data.get("priority", "normal")
 
         # Task-file header injection guard. `from_agent` lands on a single
@@ -1290,6 +1370,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if not task:
             self.send_json(400, {"error": "task is required"})
+            return
+
+        # Privilege is NEVER *escalated* by the request body. The route decides the tier:
+        # /guest-task always stamps guest.
+        if "access_tier" in data:
+            if data.get("access_tier") != "guest":
+                self.send_json(400, {"error": "access_tier is not accepted on /task"})
+                return
+            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
+            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (guest, sandboxed)",
+            })
             return
 
         callback_url = data.get("callback_url", "")
@@ -1402,7 +1498,7 @@ def _resolve_local_ip() -> str:
 
 
 if __name__ == "__main__":
-    bind = os.environ.get("AGENT_API_BIND", "127.0.0.1")
+    bind = config_get("AGENT_API_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client stalled mid-request or a handler ran a slow subprocess/urlopen —
     # every later request hung on a port that still looked open to startup.sh's
@@ -1428,11 +1524,33 @@ if __name__ == "__main__":
     print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
         print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+    # A supervised replacement of this gateway (desktop token rotation / adopted-process takeover)
+    # sends SIGTERM.
+    def _reap_and_exit(_signum, _frame):
+        try:
+            from signal_guest_handler import reap_guest_workers
+            reaped = reap_guest_workers()
+            if reaped:
+                print(f"agent-api: reaped {reaped} guest worker group(s) on shutdown", flush=True)
+        except Exception:
+            pass
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _reap_and_exit)
+    except Exception:
+        pass
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nDone.")
     finally:
+        try:
+            from signal_guest_handler import reap_guest_workers
+            reap_guest_workers()
+        except Exception:
+            pass
         workstream_maintenance_stop.set()
         workstream_maintenance.join(timeout=1)
         server.server_close()

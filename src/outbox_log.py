@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+from sutando_config import config_get
 import sys
 import time
 from pathlib import Path
@@ -85,7 +86,7 @@ def append(
         entry: dict = {
             "ts": now,
             "iso_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-            "core_id": core_id or os.environ.get("SUTANDO_CORE_ID", "unknown"),
+            "core_id": core_id or config_get("SUTANDO_CORE_ID", "unknown"),
             "channel_type": channel_type,
             "recipient": recipient,
             "body_preview": _preview(body),
