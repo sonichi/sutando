@@ -313,6 +313,26 @@ class StaleApprovalTest(unittest.TestCase):
         return {"sha": sha, "parents": [{"sha": "p"}] * parents,
                 "commit": {"committer": {"date": when}}}
 
+    def test_a_raising_gh_reads_as_could_not_check_not_empty(self):
+        def boom(argv):
+            raise OSError("no gh")
+        self.assertIsNone(pf.stale_approvals("1", runner=boom))
+
+    def test_unparsable_gh_output_reads_as_could_not_check(self):
+        self.assertIsNone(pf.stale_approvals(
+            "1", runner=lambda argv: _R(0, "not json {")))
+
+    def test_a_pull_without_a_head_sha_reads_as_could_not_check(self):
+        self.assertIsNone(pf.stale_approvals("1", runner=self._runner(
+            reviews=[], commits=[], pull={"head": {}})))
+
+    def test_an_approval_without_a_timestamp_is_skipped_not_crashed(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[{"user": {"login": "a"}, "state": "APPROVED",
+                      "commit_id": self.OLD, "submitted_at": ""}],
+            commits=[self._commit(self.HEAD, "2026-08-30T10:00:00Z")]))
+        self.assertEqual(rows, [])
+
     def test_an_approval_after_the_last_commit_is_not_stale(self):
         rows = pf.stale_approvals("1", runner=self._runner(
             reviews=[self._review("a", "APPROVED", self.HEAD, "2026-08-30T11:00:00Z")],
