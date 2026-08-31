@@ -213,6 +213,25 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+# Optional fence for instanced lanes: claim only rooms on this suffix
+GATEWAY_ROOM_SUFFIX = (os.environ.get("GATEWAY_ROOM_SUFFIX") or "").strip()
+# Rooms on these suffixes belong to a foreign lane; the default lane's gateway
+# 403s them, and the failure policy then parks deliverable work as undeliverable.
+GATEWAY_FOREIGN_SUFFIXES = tuple(
+    s.strip() for s in (os.environ.get("GATEWAY_FOREIGN_SUFFIXES") or "").split(",")
+    if s.strip())
+
+
+def _instance_may_claim(peek_room: "str | None") -> bool:
+    """Unaddressed proactives default to the owner's primary surface, which
+    only the DEFAULT lane serves — an instanced lane must never claim them."""
+    if not GATEWAY_INSTANCE:
+        if peek_room is None:
+            return True
+        return not any(peek_room.endswith(s) for s in GATEWAY_FOREIGN_SUFFIXES)
+    if peek_room is None:
+        return False
+    return not GATEWAY_ROOM_SUFFIX or peek_room.endswith(GATEWAY_ROOM_SUFFIX)
 
 
 def _local_tid(broker_tid: str) -> str:
@@ -262,11 +281,30 @@ def _valid_local_tid(tid: str) -> bool:
     return bool(m) and m.group(1) not in (".", "..")
 
 
+def _owns_local_tid(tid: str) -> bool:
+    """Is this LOCAL task id inside THIS bridge's namespace?
+
+    `_local_tid` mints `task-<inst>~<broker_id>` for a named instance and leaves
+    the primary's ids unscoped, so ownership is decidable from the id alone. A
+    shared `RESULTS_DIR` therefore needs no coordination — each lane can tell its
+    own files from a sibling's.
+
+    Both directions matter. A named instance must not touch unscoped ids, and the
+    primary must not touch `~`-scoped ones: `task-*` matches `task-dev~1` too, so
+    filtering only the instance side would leave the primary cannibalising every
+    named lane — the same defect mirrored.
+    """
+    if GATEWAY_INSTANCE:
+        return tid.startswith(f"task-{GATEWAY_INSTANCE}~")
+    # `~` is outside the broker-id alphabet, so any scoped id — including an
+    # instance this build does not know — is someone else's. Unowned > misrouted.
+    return "~" not in tid
+
+
 def _task_pending(tid: str) -> bool:
     """Is this task still live in tasks/, under ANY of its names?
 
-    A pooled task is renamed twice — unassigned -> `.assigned-<core>` (lead
-    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
+    A pooled task is renamed twice — unassigned -> `.assigned-<core>` (lead    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
     "is this still being worked?" must accept all three, so the question has
     one owner: a state missed here reads as finished, which drops a reply
     mid-flight or re-queues work another core already holds."""
@@ -2813,6 +2851,8 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if not _instance_may_claim(peek_room):
+            continue  # the default lane's file (or another lane's suffix)
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
         if route == "send" and peek_room is None and not PROACTIVE_ROOM:
@@ -2846,6 +2886,7 @@ def _post_proactive() -> None:
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
+                route == "send" and not _instance_may_claim(room_override)) or (
                 route == "send" and room_override is None and not PROACTIVE_ROOM):
             # Hand back rather than eat: a foreign target seen only post-claim,
             # or one that vanished with no default (room_id=None loses the body).
@@ -2988,9 +3029,11 @@ def _dedup_plan(tid: str, holder_id: str | None):
         _save_task_rooms(rooms)
         return True
 
+    # The re-ask id must live in THIS lane's namespace (`_owns_local_tid`):
+    # an unscoped mint on a named instance is orphaned to the primary's sweep.
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+        _local_tid(f"task-{uuid.uuid4().hex[:18]}"), commit_identity=_commit)
     return action, payload, room
 
 
@@ -3343,7 +3386,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         return
     _last_orphan_sweep = now
     try:
-        candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
+        # RESULTS_DIR is shared across lanes; the glob is not namespace-aware.
+        candidates = sorted(p for p in RESULTS_DIR.glob("task-*.txt")
+                            if _owns_local_tid(p.stem))
     except OSError:
         return
     for rfile in candidates:
