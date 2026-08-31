@@ -86,6 +86,24 @@ check("absent bridge -> None",
 check("executable unresolvable -> None", hc._live_bridge_interpreter(
     "remote-gateway-bridge.py", SPACED_BOTH, lambda pid: None), None)
 
+# _proc_executable against the REAL ps: everything above injects exe_of, so
+# without this nothing exercises the helper that reads the process table.
+_self = hc._proc_executable(os.getpid())
+if not _self or "python" not in os.path.basename(_self).lower():
+    failures.append(f"_proc_executable on our own live PID should name a python, got {_self!r}")
+check("framework Python (capital P) is still a python", hc._live_bridge_interpreter(
+    "remote-gateway-bridge.py", SPACED_BOTH,
+    lambda pid: "/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"),
+    "/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python")
+check("_proc_executable on an impossible PID -> None", hc._proc_executable(2**31 - 1), None)
+
+_run = hc.subprocess.run
+def _boom(*a, **k):
+    raise OSError("ps unavailable")
+hc.subprocess.run = _boom
+check("_proc_executable when ps cannot run -> None", hc._proc_executable(os.getpid()), None)
+hc.subprocess.run = _run
+
 # The gateway bridge must be IN the scanned population at all.
 if "remote-gateway-bridge" not in hc._VAULT_SCANNER_BRIDGES:
     failures.append("gateway bridge missing from _VAULT_SCANNER_BRIDGES")

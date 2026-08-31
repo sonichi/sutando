@@ -689,7 +689,8 @@ def _live_bridge_interpreter(script: str, ps_output: "str | None" = None,
         # Resolve via the PID, never by slicing argv: the interpreter path AND the
         # script path may both contain spaces, so no argv boundary is recoverable.
         exe = exe_of(parts[0])
-        if exe and os.path.basename(exe).startswith("python"):
+        # macOS framework builds report basename "Python" (capital P).
+        if exe and os.path.basename(exe).lower().startswith("python"):
             return exe
     return None
 
