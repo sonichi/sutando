@@ -346,7 +346,9 @@ def get_reminders() -> "list[str] | None":
             line = line.strip()
             if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
-        return _demote_stale_reminders(items)[:5]
+        # No cap here, for the same reason as get_health_issues(): the renderer
+        # is the only place that can still see the total it is omitting from.
+        return _demote_stale_reminders(items)
     except (subprocess.TimeoutExpired, OSError):
         return None
 
@@ -680,9 +682,11 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         parts.append("Your calendar is clear today.")
 
     # Reminders
+    n_rem = 0 if reminders is None else len(reminders)
     if reminders:
-        r_list = ", ".join(reminders[:3])
-        parts.append(f"Reminders due: {r_list}.")
+        shown = reminders[:3]
+        more = f" (+{n_rem - len(shown)} more)" if n_rem > len(shown) else ""
+        parts.append(f"Reminders due: {', '.join(shown)}{more}.")
 
     # Pending questions
     if pending_qs:

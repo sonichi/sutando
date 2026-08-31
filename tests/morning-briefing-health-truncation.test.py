@@ -64,6 +64,29 @@ with patch.object(subprocess, "run", return_value=_R()):
 check(got is not None and len(got) == 9,
       f"get_health_issues returns every failure, not a capped 3 (got {got and len(got)})")
 
+# --- reminders: the same double cap on the same surface ---------------------
+# get_reminders() capped at 5 and synthesize() rendered 3, so eight reminders
+# spoke as three. The pending-questions branch three lines below already names
+# its count, so one render site in this function was honest and two were not.
+eight = [f"reminder-{i}" for i in range(8)]
+rem_out = mb.synthesize(None, None, eight, None, None, None)
+check("(+5 more)" in rem_out, "reminders name how many were not read out")
+check("reminder-0" in rem_out and "reminder-2" in rem_out, "reminders still show the top three")
+check("more)" not in mb.synthesize(None, None, ["only-one"], None, None, None),
+      "no remainder clause for a single reminder")
+
+REM = "\n".join(f"reminder-{i}" for i in range(8))
+
+
+class _RR:
+    returncode, stdout, stderr = 0, REM, ""
+
+
+with patch.object(subprocess, "run", return_value=_RR()):
+    got_rem = mb.get_reminders()
+check(got_rem is not None and len(got_rem) == 8,
+      f"get_reminders returns every item, not a capped 5 (got {got_rem and len(got_rem)})")
+
 # --- contract the rest of the module depends on is unchanged ---
 with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("health", 5)):
     check(mb.get_health_issues() is None, "a check that did not run is still None, not []")
