@@ -445,6 +445,11 @@ def build_requeued_task(
     so it routes + tiers identically, but:
       * sets `id:` to new_task_id (so the watcher re-fires),
       * sets `dedup_requeue_count: count` (loop guard),
+      * when the caller injects its lane via `channel_dir`, strips the stored
+        `===SKILL INSTRUCTIONS===` block and re-renders it fresh (gateway
+        template). Without an injected lane the stored prelude is carried
+        byte-verbatim: Slack/Discord write their own bridge-specific
+        templates, which the gateway renderer cannot represent,
       * appends a trusted `===SUTANDO SYSTEM INSTRUCTIONS===` block telling the
         core the prior dedup was cross-channel (invalid) and to answer THIS
         task directly in its own channel, not dedup across channels.
@@ -459,9 +464,9 @@ def build_requeued_task(
     had_prelude = False
     hdr = {}
     for ln in (orig_text or "").rstrip("\n").split("\n"):
-        # The prelude is written by the gateway as the task's final block; a
-        # stale copy re-instructs handlers with superseded text (#3610 class).
-        if ln.startswith("===SKILL INSTRUCTIONS"):
+        # A stale gateway prelude re-instructs handlers with superseded text;
+        # only the injecting caller's template is ours to rewrite, though.
+        if ln.startswith("===SKILL INSTRUCTIONS") and channel_dir:
             had_prelude = True
             break
         if ln.startswith("id:"):
@@ -479,10 +484,9 @@ def build_requeued_task(
     if not seen_count:
         lines.append(f"dedup_requeue_count: {count}")
     if had_prelude:
-        # Re-render, never copy. The requeuing adapter's own lane dir is
-        # authoritative; the broker-supplied source header is a last resort.
+        # Re-render, never copy; the injected lane dir is the only lane source.
         lines.extend(render_skill_prelude(
-            hdr.get("channel_id", ""), channel_dir or hdr.get("source", ""),
+            hdr.get("channel_id", ""), channel_dir,
             new_task_id, hdr.get("addressed_to", "")))
     note = (
         "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"

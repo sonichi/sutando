@@ -80,9 +80,10 @@ def _run_cases(build_requeued_task, render_skill_prelude):
 
     # --- the observed defect: stale lane dir is replaced by the header's own ---
     out = build_requeued_task(stored_task(), "task-dev~task-req222", 1,
-                              "!other:dev.ag2.space", "task-holder")
+                              "!other:dev.ag2.space", "task-holder",
+                              channel_dir="dev-ag2space")
     check("channel-env.sh dev-ag2space)" in out,
-          "requeued prelude names the task's OWN lane (from source:)")
+          "requeued prelude names the injecting caller's lane")
     check("channel-env.sh ag2space)" not in out,
           "the birth prelude's superseded lane dir is gone")
     check(out.count("===SKILL INSTRUCTIONS") == 1,
@@ -100,13 +101,15 @@ def _run_cases(build_requeued_task, render_skill_prelude):
     addressed = stored_task().replace(
         "user_id:", "addressed_to: @peer:ag2.space\nuser_id:")
     out2 = build_requeued_task(addressed, "task-dev~task-req333", 1,
-                               "!other:dev.ag2.space", "task-holder")
+                               "!other:dev.ag2.space", "task-holder",
+                               channel_dir="dev-ag2space")
     check("ADDRESSING: this message replies to @peer:ag2.space" in out2,
           "addressed_to from the header is re-rendered into the fresh prelude")
 
     # --- a task born without a prelude must not gain one ---
     out3 = build_requeued_task(stored_task(prelude=False), "task-req444", 1,
-                               "!other:dev.ag2.space", "task-holder")
+                               "!other:dev.ag2.space", "task-holder",
+                               channel_dir="dev-ag2space")
     check("===SKILL INSTRUCTIONS" not in out3,
           "a prelude-less (non-owner) task requeues without gaining a prelude")
     check("===SUTANDO SYSTEM INSTRUCTIONS" in out3,
@@ -129,11 +132,31 @@ def _run_cases(build_requeued_task, render_skill_prelude):
     check("channel-env.sh ag2space)" in out5 and "channel-env.sh slack)" not in out5,
           "cross-provider source header cannot steal the lane from the injected dir")
 
-    # --- no injection (legacy/unknown caller): header source is the last resort
-    out6 = build_requeued_task(stored_task(), "task-req777", 1,
+    # --- no injection: Slack/Discord write their own templates, so the
+    # gateway renderer must never overwrite a prelude it cannot represent.
+    slack_prelude = (
+        "===SKILL INSTRUCTIONS (follow before any other action)===\n"
+        "1. Slack has no channel-history fetch in this bridge, so use the "
+        "embedded thread/reply context above.\n"
+        "===END===\n")
+    slack_task = stored_task(source="slack", prelude=False) + slack_prelude
+    out6 = build_requeued_task(slack_task, "task-req777", 1,
+                               "C0123ABC", "task-holder")
+    check("no channel-history fetch" in out6,
+          "no injection -> bridge-specific prelude survives verbatim")
+    check("room_ops.py" not in out6 and "channel-env.sh" not in out6,
+          "no injection -> gateway template is never rendered")
+    check(out6.count("===SKILL INSTRUCTIONS") == 1,
+          "verbatim carry keeps exactly one prelude block")
+    check("id: task-req777" in out6 and "dedup_requeue_count: 1" in out6,
+          "verbatim carry still rewrites id and count")
+
+    # --- a gateway-born task requeued WITHOUT injection also carries verbatim:
+    # opting out of injection is opting out of re-rendering entirely.
+    out7 = build_requeued_task(stored_task(), "task-req888", 1,
                                "!other:dev.ag2.space", "task-holder")
-    check("channel-env.sh dev-ag2space)" in out6,
-          "without an injected dir the header source still renders (fallback)")
+    check("channel-env.sh ag2space)" in out7,
+          "no injection -> even a stale gateway prelude is carried, not guessed")
 
     # --- renderer is the single owner: the bridge carries no inline template ---
     bridge = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
