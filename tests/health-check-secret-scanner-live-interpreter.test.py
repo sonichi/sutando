@@ -23,8 +23,14 @@ argv contains the script name — the self-match that `_proc_argv`'s docstring i
 this same module already warns about.
 """
 import importlib.util
+import os
 import pathlib
 import sys
+import tempfile
+
+# health-check resolves workspace/channel config at import, so isolate before
+# exec_module or this reads the developer's real per-user config.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-secret-scanner-")
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "health-check.py"
 spec = importlib.util.spec_from_file_location("hc", SRC)
@@ -58,9 +64,10 @@ check("shell self-match is not a bridge",
 check("no ps output -> None",
       hc._live_bridge_interpreter("remote-gateway-bridge.py", ""), None)
 
-# A bridge that is not running yields None so the caller can fall back.
+# A bridge that is not running yields None so the caller can fall back. The name is
+# arbitrary on purpose -- any script absent from the ps output exercises this path.
 check("absent bridge -> None",
-      hc._live_bridge_interpreter("telegram-bridge.py", SPACED), None)
+      hc._live_bridge_interpreter("not-running-bridge.py", SPACED), None)
 
 # The gateway bridge must be IN the scanned population at all.
 if "remote-gateway-bridge" not in hc._VAULT_SCANNER_BRIDGES:
