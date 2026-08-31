@@ -236,6 +236,21 @@ class TestSendSlack(unittest.TestCase):
             self.mod.send_slack("D123", "update", thread_ts="1234.56")
         self.assertEqual(captured.get("thread_ts"), "1234.56")
 
+    def test_unfurling_suppressed_in_payload(self):
+        # Slack renders a preview card per URL by default; a link-carrying
+        # progress note must not arrive as a stack of image blocks.
+        captured = {}
+
+        def fake_post(url, payload, headers):
+            captured.update(payload)
+            return True
+
+        with patch.object(self.mod, "_token", return_value="xoxb-fake"), \
+             patch.object(self.mod, "_post", side_effect=fake_post):
+            self.mod.send_slack("D123", "see https://example.com/a")
+        self.assertIs(captured.get("unfurl_links"), False)
+        self.assertIs(captured.get("unfurl_media"), False)
+
 
 class TestSendDiscord(unittest.TestCase):
     """send_discord routes through the shared src/channels/discord/client.py

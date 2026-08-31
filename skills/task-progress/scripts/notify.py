@@ -146,7 +146,9 @@ def send_slack(channel_id: str, message: str, thread_ts: str | None = None) -> b
     if not token:
         print("[task-progress] SLACK_BOT_TOKEN not found", file=sys.stderr)
         return False
-    payload: dict = {"channel": channel_id, "text": message}
+    # Same rule as the bridge's send path: no preview cards on our Slack posts.
+    payload: dict = {"channel": channel_id, "text": message,
+                     "unfurl_links": False, "unfurl_media": False}
     if thread_ts:
         payload["thread_ts"] = thread_ts
     return _post(
