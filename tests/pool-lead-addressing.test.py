@@ -96,5 +96,50 @@ class AddressingTests(unittest.TestCase):
             self.assertEqual(lead.sweep(), [("task-p1.txt", "core-1")])
 
 
+class AddressingIOGuards(unittest.TestCase):
+    def test_unreadable_task_reads_as_unaddressed(self):
+        from pool_lead import _read_addressing
+        self.assertEqual(
+            _read_addressing(Path("/nonexistent-addressing-guard")),
+            (None, False))
+
+    def test_fan_out_unreadable_original_assigns_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            lead = _lead(ws, ["core-1", "core-2"])
+            ghost = ws / "tasks" / "task-gone.txt"  # never created
+            self.assertEqual(lead._fan_out(ghost, ["core-1", "core-2"]), [])
+
+    def test_fan_out_unwritable_copies_assign_nothing_and_keep_original(self):
+        import os as _os
+        import stat as _stat
+        if _os.geteuid() == 0:
+            self.skipTest("EACCES not enforceable as root")
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            lead = _lead(ws, ["core-1", "core-2"])
+            _task(ws, "task-ro.txt", fan_out=True)
+            f = ws / "tasks" / "task-ro.txt"
+            _os.chmod(ws / "tasks", _stat.S_IRUSR | _stat.S_IXUSR)
+            try:
+                self.assertEqual(lead._fan_out(f, ["core-1", "core-2"]), [])
+            finally:
+                _os.chmod(ws / "tasks", _stat.S_IRWXU)
+            self.assertTrue(f.exists(), "original survives a failed fan-out")
+
+    def test_fan_out_blocked_archive_keeps_the_copies(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            lead = _lead(ws, ["core-1", "core-3"])
+            _task(ws, "task-ba.txt", fan_out=True)
+            (ws / "tasks" / "archive").write_text("a FILE blocks the dir")
+            got = sorted(lead._fan_out(ws / "tasks" / "task-ba.txt",
+                                       ["core-1", "core-3"]))
+            self.assertEqual(
+                got, [("task-ba~core-1.assigned-core-1.txt", "core-1"),
+                      ("task-ba~core-3.assigned-core-3.txt", "core-3")],
+                "copies stand even when the archive move fails")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
