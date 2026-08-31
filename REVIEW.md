@@ -220,12 +220,13 @@ and loads whichever repo it reviews.
     source, or write "unverified" next to it. A review that mixes six measured claims with
     one recalled claim does not read as five-sixths reliable; the measured majority launders
     the recalled sentence.
-    *Grounded by:* 2026-08-30 — a review of `ag2-space/cinny-webclient#703` correctly
-    measured that `color-mix()` had zero precedent in that codebase (with a positive control
+    *Grounded by:* 2026-08-30 — a review of [`ag2-space/cinny-webclient#703`][cinny-703]
+    correctly measured that `color-mix()` had zero precedent in that codebase (with a positive control
     proving the search worked), then asserted it "needs WebKitGTK 2.42+" from recall. The 2.42
     figure was never checked. Checking produces the sharper finding the review should have
-    carried: Tauri v2's Linux baseline is Ubuntu 22.04, which ships WebKitGTK 2.36 — listed as
-    Safari-16.0-equivalent in [Tauri's webview-versions table][tauri-webviews] — against a
+    carried: Tauri v2's Linux baseline is Ubuntu 22.04, which ships WebKitGTK 2.36 — both the
+    baseline and that version pairing are read from [Tauri's webview-versions
+    table][tauri-webviews], which also lists it as Safari-16.0-equivalent — against a
     Safari 16.2 threshold for the settled `color-mix()` syntax (**unverified**: that threshold
     comes from secondary sources, not a primary WebKit release note). Note what the citation
     itself says: the same table warns its Linux data is "a very incomplete list", so it is
@@ -234,6 +235,7 @@ and loads whichever repo it reviews.
     in the paragraph the review named as the blocker.
 
     [tauri-webviews]: https://v2.tauri.app/reference/webview-versions/
+    [cinny-703]: https://github.com/ag2-space/cinny-webclient/pull/703
 
 14. **Never assert on source text as a stand-in for a behavioral claim.** When a module
     cannot be imported by tests (import-time side effects, heavy SDK deps), extract the
