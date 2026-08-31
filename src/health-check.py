@@ -9110,11 +9110,8 @@ def check_claude_hook_registration(
         result = {"name": name, "status": "warn",
                   "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
         if missing:
-            # Structured so --fix keys on the repairable state, not on this sentence:
-            # most of this probe's warn branches (unreadable installer, unparseable
-            # HOOKS, malformed settings) are ones the installer cannot repair.
-            # `foreign` is excluded deliberately — re-running the installer is not
-            # verified to displace a hook aimed at another checkout.
+            # Keyed structurally so --fix cannot fire on the warn branches the
+            # installer can't repair; `foreign` excluded (displacement unverified).
             result["_unregistered_hooks"] = list(missing)
         return result
     return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}

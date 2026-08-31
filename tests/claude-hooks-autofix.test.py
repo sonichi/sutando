@@ -89,9 +89,8 @@ class FixHandlerGating(unittest.TestCase):
             import io
             hc.apply_claude_hooks_fix([check], stream=io.StringIO())
         finally:
-            # Restore BOTH: leaving the probe stubbed leaks into every later test
-            # in the file and turns their real assertions into assertions about
-            # this stub (it did, on the first run of this file).
+            # Restore the probe too: leaving it stubbed leaks into every later
+            # test here, which happened on this file's first run.
             hc.subprocess.run = real
             hc.check_claude_hook_registration = real_probe
         return calls
