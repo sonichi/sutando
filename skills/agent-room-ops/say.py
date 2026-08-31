@@ -26,7 +26,7 @@ def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
 
 
 def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
-        *, reply_to: str | None = None) -> dict:
+        *, reply_to: str | None = None, worker: str | None = None) -> dict:
     """Post `message` into `room_id` verbatim, mentioning no one.
 
     `reply_to` cites the message being replied to; the post stays in the main
@@ -63,9 +63,15 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
     try:
         # No `mentions` key: `say` must not ping. A body carrying an mxid the
         # caller wrote is theirs; this function never prepends one.
+        if worker is None and os.environ.get("SUTANDO_CORE_ID"):
+            worker = f"core-{os.environ['SUTANDO_CORE_ID']}"
+        # The client renders attribution from this per-event stamp; a direct
+        # post self-declares its worker the same way delivered results do.
+        stamp = ({"extra_content": {"space.ag2.worker": {"id": worker}}}
+                 if worker else {})
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
-            {"op": "message", "room_id": room_id, "body": message, **rel},
+            {"op": "message", "room_id": room_id, "body": message, **rel, **stamp},
         )
     except HTTPError as e:
         return _result(False, room_id=room_id, reason=degrade_reason(e.code))
