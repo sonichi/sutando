@@ -63,8 +63,10 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
     try:
         # No `mentions` key: `say` must not ping. A body carrying an mxid the
         # caller wrote is theirs; this function never prepends one.
-        if worker is None and os.environ.get("SUTANDO_CORE_ID"):
-            worker = f"core-{os.environ['SUTANDO_CORE_ID']}"
+        if worker is None:
+            worker = os.environ.get("SUTANDO_WORKER_ID") or (
+                f"core-{os.environ['SUTANDO_CORE_ID']}"
+                if os.environ.get("SUTANDO_CORE_ID") else None)
         # The client renders attribution from this per-event stamp; a direct
         # post self-declares its worker the same way delivered results do.
         stamp = ({"extra_content": {"space.ag2.worker": {"id": worker}}}
