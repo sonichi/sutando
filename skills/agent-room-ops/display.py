@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Set the agent-owned display config a room's clients render worker UI from.
+"""Set the agent-owned display config clients render worker UI from.
 
-Writes the 'space.ag2.display' room state event. User localStorage overrides
-still win client-side; this is the agent's declared layer above the defaults.
+Default target is the 'space.ag2.display' room state event (room-scoped);
+--profile targets the agent's own 'space.ag2.identity' custom profile field
+(agent-global, follows the agent into every room). --room-avatar sets the
+standard m.room.avatar state (power level permitting). User localStorage
+overrides still win client-side.
 
 Env: MATRIX_HS_URL (e.g. http://localhost:8080), MATRIX_AS_TOKEN (appservice
 token), AGENT_MXID (user to act as). Usage:
-  display.py <room_id> [--stripe on|off] [--base-color '#rrggbb']
+  display.py <room_id> [--profile] [--stripe on|off] [--base-color '#rrggbb']
              [--corner tl|tr|bl|br] [--shape corner|star]
-             [--worker-color <id>=<#rrggbb> ...] [--clear]
-Merges onto the existing event unless --clear is given.
+             [--worker-color <id>=<#rrggbb> ...] [--description TEXT]
+             [--room-avatar <mxc-uri>] [--clear]
+Merges onto the existing document unless --clear is given. With --profile the
+room_id is ignored for the write but still required positionally.
 """
 import argparse
 import json
@@ -41,6 +46,9 @@ def main(argv=None) -> int:
     ap.add_argument("--corner", choices=["tl", "tr", "bl", "br"])
     ap.add_argument("--shape", choices=["corner", "star"])
     ap.add_argument("--worker-color", action="append", default=[])
+    ap.add_argument("--profile", action="store_true")
+    ap.add_argument("--description")
+    ap.add_argument("--room-avatar")
     ap.add_argument("--clear", action="store_true")
     a = ap.parse_args(argv)
 
@@ -54,12 +62,29 @@ def main(argv=None) -> int:
 
     room = urllib.parse.quote(a.room_id, safe="")
     uid = urllib.parse.quote(mxid, safe="")
-    base = f"{hs}/_matrix/client/v3/rooms/{room}/state/space.ag2.display/"
+
+    if a.room_avatar:
+        if not a.room_avatar.startswith("mxc://"):
+            print("display.py: --room-avatar takes an mxc:// URI", file=sys.stderr)
+            return 2
+        st, out = _req(
+            f"{hs}/_matrix/client/v3/rooms/{room}/state/m.room.avatar/?user_id={uid}",
+            token, "PUT", {"url": a.room_avatar})
+        print(json.dumps({"ok": st == 200, "status": st, "resp": out}))
+        return 0 if st == 200 else 1
+
+    if a.profile:
+        base = f"{hs}/_matrix/client/v3/profile/{uid}/space.ag2.identity"
+    else:
+        base = f"{hs}/_matrix/client/v3/rooms/{room}/state/space.ag2.display/"
 
     content = {}
     if not a.clear:
         st, cur = _req(f"{base}?user_id={uid}", token)
-        if st == 200 and isinstance(cur, dict):
+        if a.profile and st == 200 and isinstance(cur, dict):
+            inner = cur.get("space.ag2.identity")
+            content = inner if isinstance(inner, dict) else {}
+        elif st == 200 and isinstance(cur, dict):
             content = cur
     if a.stripe:
         content["stripe"] = a.stripe == "on"
@@ -78,8 +103,11 @@ def main(argv=None) -> int:
             print(f"display.py: bad --worker-color {wc!r}", file=sys.stderr)
             return 2
         content.setdefault("colors", {})[wid] = col
+    if a.description is not None:
+        content["description"] = a.description
 
-    st, out = _req(f"{base}?user_id={uid}", token, "PUT", content)
+    body = {"space.ag2.identity": content} if a.profile else content
+    st, out = _req(f"{base}?user_id={uid}", token, "PUT", body)
     print(json.dumps({"ok": st == 200, "status": st, "content": content, "resp": out}))
     return 0 if st == 200 else 1
 
