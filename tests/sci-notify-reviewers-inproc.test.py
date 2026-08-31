@@ -7,8 +7,10 @@ behaviour was tested. These call the functions directly.
 
 Run: python3 tests/sci-notify-reviewers-inproc.test.py   (stdlib only)
 """
+import contextlib
 import datetime
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -95,6 +97,30 @@ class Ledger(unittest.TestCase):
     def test_a_message_naming_no_PR_records_nothing(self):
         with self._at(self.tmp.name):
             self.assertEqual(self.mod.record_asks("no link here", "rui"), 0)
+
+    def test_zero_is_returned_ONLY_when_no_PR_URL_matched(self):
+        # main() names this cause in its warning, so a future early `return 0`
+        # would make that message assert something false while tests still pass.
+        cases = [
+            ("https://github.com/o/r/pull/1", 1),
+            ("https://github.com/o/r/pull/1 https://github.com/o/r/pull/2", 2),
+            # Reaches a dedup branch: the SAME pr twice, so findall > len(refs).
+            ("https://github.com/o/r/pull/1 again https://github.com/o/r/pull/1", 1),
+            ("self-ask https://github.com/o/r/pull/1 cc @me", 1),
+            ("https://github.com/o/r/pull/1/files", 1),
+            ("[#1](https://github.com/o/r/pull/1)", 1),
+            ("o/r#1", 0),
+            ("#1", 0),
+            ("https://api.github.com/repos/o/r/pulls/1", 0),
+            ("no link here", 0),
+            ("", 0),
+        ]
+        for msg, want in cases:
+            with self._at(self.tmp.name):
+                got = self.mod.record_asks(msg, "rui")
+            matched = self.mod._PR_URL.search(msg) is not None
+            self.assertEqual(got, want, msg)
+            self.assertEqual(got == 0, not matched, f"0-iff-no-match broken for {msg!r}")
 
     def test_two_PRs_in_one_message_record_both(self):
         msg = ("https://github.com/o/r/pull/1 and "
@@ -314,6 +340,17 @@ class FailurePaths(unittest.TestCase):
         rc, sends = self._run(self.ARGS + self.M, record_effect=OSError("read-only"))
         self.assertEqual(sends, 2)
         self.assertNotEqual(rc, 0)
+
+    def test_a_delivered_ask_that_records_NOTHING_is_loud(self):
+        # Ask delivered, ledger empty -- the OSError case reached by a return
+        # value. Silent before the fix; measured on ag2space-backend#872.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc, sends = self._run(self.ARGS + self.M,
+                                  record_effect=lambda *a, **k: 0)
+        self.assertEqual(sends, 2)
+        self.assertIn("nothing recorded", err.getvalue())
+        self.assertEqual(rc, 0)                 # a PR-less ask is not a failure
 
     def test_an_unreadable_ledger_does_not_refuse_the_ask(self):
         with patch.object(self.mod, "ledger_path", return_value=self.led), \

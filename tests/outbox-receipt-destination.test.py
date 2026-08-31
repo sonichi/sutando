@@ -105,8 +105,8 @@ def main() -> int:
         from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
         check(DesignAClaimBackend.persists_receipt_metadata is True,
               "Design A declares it persists receipt metadata")
-        check(DesignCClaimBackend.persists_receipt_metadata is False,
-              "Design C declares it does NOT — it accepts and drops")
+        check(DesignCClaimBackend.persists_receipt_metadata is True,
+              "Design C now persists receipts in its terminal record (gate 3)")
 
     print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
     return 1 if failures else 0

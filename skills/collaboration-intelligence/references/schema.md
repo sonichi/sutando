@@ -353,3 +353,15 @@ rather than dropped, while diagnostic history is truncated.
 <pr-triage/config.json> --peers <peers.json> --discord-config <discord-config.json>
 --out <v2> --table` — it never writes its input and prints the per-entry
 before/after.
+
+## Roster refusal keys
+
+`allowlisted` (bool | null) — whether a mention to this Stand has been observed to
+trigger it. `false` REFUSES the send. **It records an observation, not a cause**:
+nothing in the tree sets it after a detected bounce, so no message may claim one.
+`null`/absent means never observed — send, then record.
+
+`refusal_basis` / `note` (string) — the entry's own words for why it refuses, printed
+verbatim by `notify_reviewers.resolve()`. Required whenever a blank `stand`/`room` is
+DELIBERATE: without it the refusal reads as missing data and the obvious repair —
+populating the fields — silently overrides it (#3468). `refusal_basis` wins over `note`.

@@ -125,7 +125,12 @@ and loads whichever repo it reviews.
    times and the harness was wrong. (d) A peer's probe reported `1 pending question` against
    a true 38 and delivered that number to the owner.
    The tell is that a broken instrument and a clean result are *byte-identical*, so the
-   author's confidence carries no information.
+   author's confidence carries no information. Reinforced 2026-08-17, three more in one
+   hour, all failing in the *reassuring* direction: a timeline query filtered on
+   `auto_merge_enabled` missed arms logged as `auto_squash_enabled` ("never armed");
+   a hand-typed abbreviated SHA returned an empty check-run list ("no runs"); a
+   banner-verification piped through `cut -c1-120` truncated the appended banner
+   ("did not fire"). Each empty result would have closed its investigation.
 
 10. **A fix that changes a decision rule is itself a decision rule — enumerate the
     adjacent inputs before pushing.** When a patch changes *how something is judged*
@@ -253,6 +258,28 @@ and loads whichever repo it reviews.
     approval read clean on every cheap signal (tests green, diff sensible); only exercising
     the restarted delivery loop end-to-end could have shown whether a recreated result is
     actually suppressed after a real delivery.
+
+16. **An authorization or approval is a statement about the object as it stood at its
+    timestamp — re-read the current state before acting on it.** Approvals, owner
+    go-aheads, and "it's green, land it" messages all describe a specific head and
+    review state. Before any merge-adjacent action (arming auto-merge, merging,
+    dismissing a review), fetch the CURRENT `reviewDecision` and check whether any
+    block, push, or review postdates the authorization being executed. A stored intent
+    executed against a moved PR is unauthorized in substance even when the words were
+    genuine.
+    *Grounded by:* sonichi/sutando#3056 (2026-08-17) — an agent re-armed auto-merge
+    citing an owner-side message sent when the PR had two approvals and zero blocks;
+    by arm time a `CHANGES_REQUESTED` was 39 seconds old, nothing consulted the review
+    state at the arm site, and a maintainer had to disarm manually 78 seconds later.
+    The same night's counter-example proves the cheap check works: a half-written
+    "armed over a stale approval" bug report was discarded by reading
+    `reviewDecision` first — it was `REVIEW_REQUIRED`, so no authorization was
+    outstanding to be stale. Blocks survive pushes; in this repo so do approvals
+    (approvals are not dismissed on push on either gate surface — classic
+    `dismiss_stale_reviews: false`, ruleset 19110427
+    `dismiss_stale_reviews_on_push: false`) — an approval CAN be stale at arm
+    time, which is exactly why the re-read is necessary rather than optional. The current state, not the
+    remembered one, is what authorizes.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
