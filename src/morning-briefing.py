@@ -634,7 +634,9 @@ def get_health_issues() -> "list[str] | None":
         # "unknown", not "clean".
         if r.returncode != 0 and not issues:
             return None
-        return issues[:3]
+        # No cap here: the count is what makes a partial list honest, and a cap
+        # applied before the renderer destroys it. synthesize() bounds the prose.
+        return issues
     except (subprocess.TimeoutExpired, OSError):
         return None
 
@@ -694,9 +696,17 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         parts.append(f"Overnight: {len(discord_msgs)} Discord message{'s' if len(discord_msgs) > 1 else ''}.")
 
     # Health issues
+    n_health = 0 if health_issues is None else len(health_issues)
     if health_issues:
-        issues_str = "; ".join(health_issues[:2])
-        parts.append(f"System note: {issues_str}.")
+        shown = health_issues[:2]
+        # Lead with the count and name the remainder, as the health-check
+        # notifiers already do — two of nine must not read as two of two.
+        more = f" (+{n_health - len(shown)} more)" if n_health > len(shown) else ""
+        noun = "failure" if n_health == 1 else "failures"
+        parts.append(
+            f"System note: {n_health} health {noun} — "
+            f"{'; '.join(shown)}{more}."
+        )
 
     # Closing — every input must be VERIFIED empty, not merely falsy. `None`
     # from any gather means that query did not run, and an unanswered query is
