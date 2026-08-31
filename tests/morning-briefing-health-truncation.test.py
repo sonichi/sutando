@@ -64,10 +64,8 @@ with patch.object(subprocess, "run", return_value=_R()):
 check(got is not None and len(got) == 9,
       f"get_health_issues returns every failure, not a capped 3 (got {got and len(got)})")
 
-# --- reminders: the same double cap on the same surface ---------------------
-# get_reminders() capped at 5 and synthesize() rendered 3, so eight reminders
-# spoke as three. The pending-questions branch three lines below already names
-# its count, so one render site in this function was honest and two were not.
+# --- reminders: capped at 5 by the gather, then 3 by the renderer -----------
+# Eight reminders spoke as three; the pending-questions branch beside it did not.
 eight = [f"reminder-{i}" for i in range(8)]
 rem_out = mb.synthesize(None, None, eight, None, None, None)
 check("(+5 more)" in rem_out, "reminders name how many were not read out")
