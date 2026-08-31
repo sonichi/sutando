@@ -21,6 +21,15 @@ a spaced interpreter path (shlex splits it mid-path), a `src/` prefixed script
 arg (cutting at the bare name leaves a trailing slash), and a shell whose own
 argv contains the script name — the self-match that `_proc_argv`'s docstring in
 this same module already warns about.
+
+ROUND 2 (qingyun-wu on #3597). The first implementation sliced argv at the last
+space before the script name. When the SCRIPT path also contains spaces that
+boundary falls inside the script path, so the helper returned None, the caller
+fell back to `_bridge_interpreter()`, and the exact would-launch false green this
+PR removes came straight back. The executable is now read from the matched PID
+via `ps -o comm=` — one field, so a spaced path survives it and no argv boundary
+has to be recovered. The spaced-both case and a composed warn/ok polarity pair
+are pinned below.
 """
 import importlib.util
 import os
@@ -48,26 +57,34 @@ def check(label, got, want):
         failures.append(f"{label}: got {got!r}, want {want!r}")
 
 
-# A real gateway-bridge row: interpreter path contains spaces, script carries src/.
-SPACED = ("  76550 76531 /Users/x/Application Support/app/runtime/python/bin/python3"
-          " src/remote-gateway-bridge.py\n")
-check("spaced interpreter path resolves whole",
-      hc._live_bridge_interpreter("remote-gateway-bridge.py", SPACED),
-      "/Users/x/Application Support/app/runtime/python/bin/python3")
+# --- resolution -------------------------------------------------------------
+# `exe_of` stands in for `ps -o comm=` so these synthetic PIDs resolve.
+SPACED_INTERP = ("  76550 76531 /Users/x/App Support/rt/python/bin/python3"
+                 " src/remote-gateway-bridge.py\n")
+SPACED_BOTH = ("  76550 76531 /Users/x/App Support/rt/python/bin/python3"
+               " /Users/x/My Sutando/src/remote-gateway-bridge.py\n")
+BUNDLED = "/Users/x/App Support/rt/python/bin/python3"
+exe_ok = lambda pid: BUNDLED if pid == "76550" else None
 
-# The probing shell's own argv contains the script name; it is not a bridge.
+check("spaced interpreter path", hc._live_bridge_interpreter(
+    "remote-gateway-bridge.py", SPACED_INTERP, exe_ok), BUNDLED)
+
+# The round-1 regression: slicing argv at the last space before the script name
+# lands INSIDE a spaced script path, returning None -> false-green fallback.
+check("spaces in BOTH interpreter and script paths", hc._live_bridge_interpreter(
+    "remote-gateway-bridge.py", SPACED_BOTH, exe_ok), BUNDLED)
+
+# The probing shell's own argv contains the script name; its executable is not python.
 SELF = "  999 1 /bin/zsh -c grep remote-gateway-bridge.py somewhere\n"
-check("shell self-match is not a bridge",
-      hc._live_bridge_interpreter("remote-gateway-bridge.py", SELF), None)
+check("shell self-match is not a bridge", hc._live_bridge_interpreter(
+    "remote-gateway-bridge.py", SELF, lambda pid: "/bin/zsh"), None)
 
-# ps unavailable must not manufacture an answer in either direction.
 check("no ps output -> None",
-      hc._live_bridge_interpreter("remote-gateway-bridge.py", ""), None)
-
-# A bridge that is not running yields None so the caller can fall back. The name is
-# arbitrary on purpose -- any script absent from the ps output exercises this path.
+      hc._live_bridge_interpreter("remote-gateway-bridge.py", "", exe_ok), None)
 check("absent bridge -> None",
-      hc._live_bridge_interpreter("not-running-bridge.py", SPACED), None)
+      hc._live_bridge_interpreter("not-running-bridge.py", SPACED_BOTH, exe_ok), None)
+check("executable unresolvable -> None", hc._live_bridge_interpreter(
+    "remote-gateway-bridge.py", SPACED_BOTH, lambda pid: None), None)
 
 # The gateway bridge must be IN the scanned population at all.
 if "remote-gateway-bridge" not in hc._VAULT_SCANNER_BRIDGES:
@@ -75,14 +92,25 @@ if "remote-gateway-bridge" not in hc._VAULT_SCANNER_BRIDGES:
 if set(hc._VAULT_SCANNER_SCRIPTS) != set(hc._VAULT_SCANNER_BRIDGES):
     failures.append("_VAULT_SCANNER_SCRIPTS and _VAULT_SCANNER_BRIDGES disagree")
 
-# Both polarities of the probe itself, so neither verdict is free.
-_orig = hc._live_bridge_interpreter
-hc._live_bridge_interpreter = lambda script, ps=None: sys.executable
-check("all interpreters healthy -> ok", hc.check_secret_scanner_mode()["status"], "ok")
+# The COMPOSED check, driven through _ps_snapshot + the parser rather than a stub
+# of the helper, so a parser regression fails here too.
+_snap, _exe = hc._ps_snapshot, hc._proc_executable
+hc._ps_snapshot = lambda: SPACED_BOTH
+hc._proc_executable = lambda pid: BUNDLED if pid == "76550" else None
 
-hc._live_bridge_interpreter = lambda script, ps=None: "/nonexistent/python-no-detect-secrets"
-check("a degraded interpreter -> warn", hc.check_secret_scanner_mode()["status"], "warn")
-hc._live_bridge_interpreter = _orig
+r = hc.check_secret_scanner_mode()
+if r["status"] != "warn":
+    failures.append(f"spaced-both live interpreter must WARN, got {r['status']}")
+if BUNDLED not in r["detail"]:
+    failures.append("warn must NAME the live interpreter it probed, not a would-launch one")
+
+# Same path, healthy interpreter -> ok. Without this the warn above is free.
+hc._proc_executable = lambda pid: sys.executable if pid == "76550" else None
+r = hc.check_secret_scanner_mode()
+if r["status"] != "ok":
+    failures.append(f"a healthy live interpreter must be ok, got {r['status']}")
+
+hc._ps_snapshot, hc._proc_executable = _snap, _exe
 
 if failures:
     for f in failures:

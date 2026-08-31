@@ -658,7 +658,19 @@ _VAULT_SCANNER_SCRIPTS = {
 }
 
 
-def _live_bridge_interpreter(script: str, ps_output: "str | None" = None) -> "str | None":
+def _proc_executable(pid: "str | int") -> "str | None":
+    """Executable path of `pid`, or None. `comm` is one field, so a path with
+    spaces survives it — argv cannot be split back apart reliably."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() or None
+
+
+def _live_bridge_interpreter(script: str, ps_output: "str | None" = None,
+                             exe_of=None) -> "str | None":
     """The interpreter a bridge is RUNNING on, or None if it is not running.
 
     `_bridge_interpreter` answers which interpreter would launch it; a bridge the
@@ -668,17 +680,17 @@ def _live_bridge_interpreter(script: str, ps_output: "str | None" = None) -> "st
         ps_output = _ps_snapshot()
     if ps_output is None:
         return None
+    exe_of = exe_of or _proc_executable
     me = str(os.getpid())
     for line in ps_output.splitlines():
         parts = line.split(None, 2)
         if len(parts) < 3 or parts[0] == me or script not in parts[2]:
             continue
-        # Cut at the space before the script ARG: the interpreter path contains
-        # spaces (shlex truncates it) and the arg carries a `src/` prefix.
-        cut = parts[2].rfind(" ", 0, parts[2].index(script))
-        interp = parts[2][:cut].strip() if cut > 0 else ""
-        if interp and os.path.basename(interp).startswith("python"):
-            return interp
+        # Resolve via the PID, never by slicing argv: the interpreter path AND the
+        # script path may both contain spaces, so no argv boundary is recoverable.
+        exe = exe_of(parts[0])
+        if exe and os.path.basename(exe).startswith("python"):
+            return exe
     return None
 
 
