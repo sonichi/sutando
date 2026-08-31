@@ -3009,6 +3009,16 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
              "leaving it in place")
 
 
+def _worker_of(task_id: str) -> str:
+    """Which pool worker finished this task, read from the per-core done-flag.
+    Ambiguous or absent means unattributed — never a guess, never an error."""
+    try:
+        hits = sorted((_STATE / "cores").glob(f"*/done/task-{task_id}.flag"))
+    except OSError:
+        return ""
+    return hits[0].parent.parent.name if len(hits) == 1 else ""
+
+
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
                             no_send: bool = False, result_file=None) -> bool:
     """One outbound result POST through the delivery core. True = the
@@ -3020,6 +3030,11 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     doc = {"id": broker_tid, "body": body}
     if no_send:
         doc["no_send"] = True
+    # Structured attribution, not the "— core-N" prose in the body: the
+    # signature is for humans and reformatting it must not change routing.
+    worker = _worker_of(tid)
+    if worker:
+        doc["metadata"] = {"worker_id": worker}
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
