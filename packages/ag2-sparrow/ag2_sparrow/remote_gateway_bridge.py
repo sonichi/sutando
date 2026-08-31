@@ -2007,6 +2007,55 @@ def _maybe_push_workers_snapshot() -> bool:
     return True
 
 
+_profile_push_key = ""
+_profile_push_retry_at = 0.0
+
+
+def _build_agent_profile() -> "dict | None":
+    """The instance's identity card for PUT /v1/agents/{mxid}/profile.
+    Only instance-authoritative fields — appearance is user/platform-owned
+    and the broker drops it from instance PUTs anyway."""
+    name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
+    try:
+        host_id = socket.gethostname().split(".")[0]
+    except OSError:
+        host_id = "unknown-host"
+    return {"display": {"name": name},
+            "host": {"host_id": host_id, "kind": "local"}}
+
+
+def _maybe_push_agent_profile() -> bool:
+    """Push-on-change relay of the agent's profile card. Same failure
+    contract as the workers-snapshot push: 404 defers an hour (broker not
+    deployed yet), other errors 5m; nothing here may break the task loop."""
+    global _profile_push_key, _profile_push_retry_at
+    now = time.time()
+    if now < _profile_push_retry_at:
+        return False
+    mxid = _reenroll_identity()
+    if not mxid:
+        return False  # identity may appear mid-episode; recheck next loop
+    card = _build_agent_profile()
+    key = mxid + json.dumps(card, sort_keys=True)
+    if key == _profile_push_key:
+        return False
+    try:
+        _req("PUT", f"/v1/agents/{urllib.parse.quote(mxid)}/profile",
+             card, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_push_retry_at = now + 3600
+        _log(f"agent-profile push deferred 1h (HTTP {e.code}"
+             f"{': broker has no profile API yet' if e.code == 404 else ''})")
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _profile_push_retry_at = now + 300
+        _log(f"agent-profile push failed, retrying in 5m: {e}")
+        return False
+    _profile_push_key = key
+    _log(f"agent-profile pushed for {mxid}")
+    return True
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -3679,6 +3728,7 @@ def main() -> None:
                 return
             _post_heartbeat(inflight)
             _maybe_push_workers_snapshot()
+            _maybe_push_agent_profile()
             _retry_pending_publications()
             _retry_review_card_resolutions()
             _retry_review_control_results()
