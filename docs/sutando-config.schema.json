@@ -230,6 +230,22 @@
       "type": "string",
       "description": "This instance's `Stand:` commit-trailer value (e.g. \"Echo Act IV Mini\"). Per-clone identity, so it belongs in sutando.config.local.json rather than the tracked default config. Read by scripts/sutando-config.sh stand to tell co-located Sutando instances apart, since both commit under the owner's GH-mapped email so --author cannot separate them."
     },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Outbound delivery behaviour shared by the bridges.",
+      "properties": {
+        "claim_backend": {
+          "type": "string",
+          "enum": [
+            "a",
+            "c"
+          ],
+          "default": "a",
+          "description": "Which ClaimBackend the proactive delivery leg constructs. `a` (the default): the shipped Design A backend. `c`: the Design C striped backend, which requires an activated outbox root and falls back to Design A for the cycle if the root is not activated. Overridable via $SUTANDO_CLAIM_BACKEND. See resolve_claim_backend() in src/sutando_config.py."
+        }
+      }
+    },
     "env": {
       "type": "object",
       "description": "Non-secret config values mirroring the flat env-var namespace (issue #1724). Read by config_get(); secrets stay in .env / vault.",

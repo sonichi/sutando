@@ -61,6 +61,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "health_check",
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
+    "delivery",       # outbound delivery: claim_backend, …
 }
 
 # Blocks every consumer reads with `.get()`. A scalar here is what the schema's
@@ -74,11 +75,14 @@ _OBJECT_TOP_LEVEL_KEYS = {
     "env",
     "health_check",
     "bridges",
+    "delivery",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
 
 _DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
+
+_CLAIM_BACKENDS = {"a", "c"}
 
 
 def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
@@ -89,6 +93,35 @@ def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
     configured = str(hc.get("down_bridge_action") or "alert").strip().lower()
     action = os.environ.get("SUTANDO_DOWN_BRIDGE_ACTION", "").strip().lower() or configured
     return action if action in _DOWN_BRIDGE_ACTIONS else "alert"
+
+
+def resolve_claim_backend(repo_root: Optional[Path] = None) -> str:
+    """Which ClaimBackend the outbound legs construct: "a" (default) or "c".
+
+    Selection is POLICY and lives here; mapping the name to a class is the
+    adapter's job, so this module stays free of delivery-core imports.
+    An unrecognised value resolves to "a" rather than raising — a typo in
+    config must not take the proactive leg down. That includes a `delivery`
+    of the wrong SHAPE: this loader is schema-lenient by design, so a scalar
+    or list there must degrade like a typo, not raise AttributeError.
+    Never-raise does not mean never-warn: each unrecognised value gets one
+    stderr line, and an unparseable env override defers to the CONFIGURED
+    value rather than discarding it (garbage is not an override).
+    """
+    delivery = load_config(repo_root).get("delivery")
+    if not isinstance(delivery, dict):
+        delivery = {}
+    configured = str(delivery.get("claim_backend") or "a").strip().lower()
+    if configured not in _CLAIM_BACKENDS:
+        print(f"sutando_config: unrecognised delivery.claim_backend "
+              f"{configured!r} — using \"a\"", file=sys.stderr)
+        configured = "a"
+    env = os.environ.get("SUTANDO_CLAIM_BACKEND", "").strip().lower()
+    if env and env not in _CLAIM_BACKENDS:
+        print(f"sutando_config: unrecognised SUTANDO_CLAIM_BACKEND {env!r} — "
+              f"keeping configured {configured!r}", file=sys.stderr)
+        env = ""
+    return env or configured
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:

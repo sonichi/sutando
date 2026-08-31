@@ -94,6 +94,7 @@ class DesignCClaimBackend:
     # The FILENAME is the record here — an archived rename carries no field
     # to hold receipt metadata, so complete() accepts and drops it.
     persists_receipt_metadata = False
+    refuses_claims = False
 
     capabilities = BackendCapabilities(supports_force_release=True)
 

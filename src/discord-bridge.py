@@ -5501,9 +5501,72 @@ def _proactive_fence():
     if _PROACTIVE_FENCE is None:
         from proactive_claim_fence import ProactiveClaimFence
         from ag2_sparrow.delivery_core import DesignAClaimBackend
+        from sutando_config import resolve_claim_backend
+        # The NAME is policy (sutando_config); mapping it to a class is this
+        # adapter's job, which keeps delivery-core imports out of the config module.
+        root = RESULTS_DIR / ".outbox-discord-proactive"
+        backend = DesignAClaimBackend(root)
+        # A switch must not hide Design A state: items/attempt history in
+        # .items would read as vanished under C and resurrect on rollback.
+        items = root / ".items"
+        try:
+            if items.is_dir():
+                entries = list(items.iterdir())  # ANY entry blocks
+            elif os.path.lexists(items):
+                # A file OR a dangling symlink at .items is unrecognized
+                # A-side state, not proof of absence — refuse, fail closed.
+                entries = [items]
+            else:
+                entries = []
+        except OSError:
+            entries = [items]  # unreadable A-side state: fail closed
+        if resolve_claim_backend() == "c":
+            from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend
+            from ag2_sparrow.delivery_core.migration import c_selection_allowed
+            # The fence, not just config, decides: C must not drain a root the
+            # migration owner still says A owns, and must defer on bad state.
+            _c_ok, _c_why = c_selection_allowed(root, not entries)
+            if entries:
+                print(f"  [proactive] claim_backend=c refused: {len(entries)} "
+                      f"unmigrated Design A entr(y/ies) at {items} — "
+                      "complete the A->C migration first; running on Design A",
+                      flush=True)
+            elif not _c_ok:
+                print(f"  [proactive] claim_backend=c refused: {_c_why} — "
+                      "running on Design A this cycle", flush=True)
+            else:
+                try:
+                    backend = DesignCClaimBackend(root)
+                except (RuntimeError, OSError) as exc:
+                    # C refuses an un-activated root (RuntimeError); namespace
+                    # mkdirs raise OSError; both fall back, not reach on_ready.
+                    print(f"  [proactive] claim_backend=c requested but unusable: "
+                          f"{type(exc).__name__}: {exc} — running on Design A this cycle",
+                          flush=True)
+        if isinstance(backend, DesignAClaimBackend):
+            # REVERSE fence (C -> A): A over a root C has operated resets the
+            # durable retry budget and resurrects parked items (duplicate DMs).
+            from ag2_sparrow.delivery_core.migration import (
+                TransitionRefusalBackend, c_live_state)
+            live = c_live_state(root)
+            if live and entries:
+                # MIXED state: neither protocol is safely authoritative —
+                # A resets C's budget, C hides A's items. Operator reconciles.
+                reason = (f"root carries BOTH unmigrated Design A entries and "
+                          f"live C state ({', '.join(live)} at {root})")
+                print(f"  [proactive] {reason} — proactive delivery DEFERRED; "
+                      "reconcile the root (migrate or clean one side) before "
+                      "either backend runs here", flush=True)
+                backend = TransitionRefusalBackend(reason)
+            elif live:
+                reason = (f"Design A refused on a C-operated root "
+                          f"({', '.join(live)} at {root})")
+                print(f"  [proactive] {reason} — proactive delivery DEFERRED; "
+                      "re-select claim_backend=c or migrate C state back to A "
+                      "before running A here", flush=True)
+                backend = TransitionRefusalBackend(reason)
         _PROACTIVE_FENCE = ProactiveClaimFence(
-            DesignAClaimBackend(RESULTS_DIR / ".outbox-discord-proactive"),
-            RESULTS_DIR, worker="discord-proactive")
+            backend, RESULTS_DIR, worker="discord-proactive")
     return _PROACTIVE_FENCE
 
 

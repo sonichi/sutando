@@ -198,6 +198,8 @@ class ClaimBackend(Protocol):
     # False = complete() accepts provider/destination and DROPS them.
     # Check this; a signature does not imply durable storage.
     persists_receipt_metadata: bool = False
+    # True = this backend never grants claims; callers must leave items queued.
+    refuses_claims = False
 
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,

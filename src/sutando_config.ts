@@ -48,6 +48,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 	'health_check',
 	'bridges',
 	'stand',
+	'delivery',
 ]);
 
 /**
@@ -64,6 +65,7 @@ const OBJECT_TOP_LEVEL_KEYS = new Set([
 	'env',
 	'health_check',
 	'bridges',
+	'delivery',
 ]);
 
 /**

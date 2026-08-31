@@ -19,6 +19,7 @@ class DesignAClaimBackend:
     (declared) as the administrative-destruction mechanism."""
 
     persists_receipt_metadata = True   # record_delivered() stores both
+    refuses_claims = False
 
     capabilities = BackendCapabilities(supports_force_release=True)
 
