@@ -5015,9 +5015,15 @@ def check_quota_account_identity(proxy_status: str, core_env_prober=None) -> dic
     else:
         try:
             rendered = plistlib.loads(plist.read_bytes())
-        except (OSError, ValueError) as exc:
-            return {"name": name, "status": "warn",
-                    "detail": f"cannot read the credential-proxy plist ({exc})"}
+        except Exception as exc:
+            # expat raises ExpatError, which subclasses Exception directly — a
+            # narrower tuple lets it escape and abort every remaining check.
+            rendered = _plist_via_plutil(plist)
+            if rendered is None:
+                return {"name": name, "status": "warn",
+                        "detail": (f"cannot read the credential-proxy plist "
+                                   f"({exc.__class__.__name__}: {exc}) and plutil "
+                                   f"could not read it either")}
     # A plist can PARSE and still be the wrong shape — `EnvironmentVariables`
     # encoded as a string, say. `.get` on that raises AttributeError, which is
     # not caught above and would abort the whole health run, taking every later
