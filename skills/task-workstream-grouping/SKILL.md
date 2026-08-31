@@ -88,12 +88,30 @@ labels.
        done = subprocess.run(["python3", S, "apply", "-"],
                              input=json.dumps(proposal), text=True,
                              capture_output=True)
-       if done.returncode == 0:
+       out = json.loads(done.stdout) if done.stdout.strip().startswith("{") else {}
+       # rc=0 is NOT the success condition. `apply` returns 0 with "assigned": 0
+       # when the snapshot moved under you, so a NON-EMPTY proposal that assigned
+       # nothing is a silent no-op wearing a success code.
+       if done.returncode == 0 and (not proposal["workstreams"]
+                                    or out.get("assigned", 0) > 0):
            break
    else:
-       raise RuntimeError(f"apply rejected after 3 snapshot/infer/apply cycles: "
-                          f"{done.stderr.strip()}")
+       raise RuntimeError(f"apply rejected or assigned nothing after 3 "
+                          f"snapshot/infer/apply cycles: {done.stderr.strip()} "
+                          f"{done.stdout.strip()[:200]}")
    ```
+
+   **Gate on `assigned`, not on the return code — and know that retrying is not
+   sufficient on its own.** Measured 2026-08-31 on snapshot `036e888f`: `apply`
+   returned rc=0 with `"assigned": 0` and a snapshot_hash different from the one
+   submitted, because an owner task landed between `snapshot` and `apply`. The
+   loop above (gating on rc) treated that as success. By the time the next fire
+   re-ran, both candidate tasks had left the candidate set — their results were
+   already written — so they were never grouped and never recorded as omitted.
+   **The grouping was lost, not deferred.** The `assigned` gate catches the
+   no-op; nothing catches a task that ages out between a failed apply and its
+   retry, so a fire that ends with candidates still ungrouped should say so
+   rather than report success.
 
    Bounded on purpose: an unbounded loop on a queue that never quiesces is a
    spin, and the failure has to reach the operator rather than be swallowed.
