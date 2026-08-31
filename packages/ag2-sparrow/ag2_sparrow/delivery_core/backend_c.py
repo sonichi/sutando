@@ -65,6 +65,44 @@ class InvariantError(RuntimeError):
     Raw-token plurality is NOT this error (dead ghosts are anticipated)."""
 
 
+def _record_is_terminal_proof(rec) -> bool:
+    """The ONE total validator — shared by staged promotion, archive
+    retirement, and reads. Divergent copies are the failure it prevents."""
+    if not isinstance(rec, dict) or not _exact_int(rec.get("schema")) \
+            or rec.get("schema") != 1:
+        return False
+    item_id = rec.get("item_id")
+    # "" is a legal id (publish("") is contract-valid); the _safe_key
+    # binding, not truthiness, is what discriminates.
+    if not isinstance(item_id, str):
+        return False
+    if rec.get("outcome") != DeliveryOutcome.CONFIRMED.value:
+        return False                     # C stages terminals ONLY for confirmed
+    receipt = rec.get("receipt")
+    # _write_terminal always emits both keys (values may be None); a
+    # receipt without them was not produced by the writer.
+    if not isinstance(receipt, dict) \
+            or "provider" not in receipt or "destination" not in receipt:
+        return False
+    if not _exact_int(rec.get("completed_ns")) \
+            or not _exact_int(rec.get("attempts")):
+        return False
+    worker = rec.get("worker")
+    # "" stays rejected here: _safe_component refuses it at claim time,
+    # so no real incarnation can carry an empty worker.
+    if not isinstance(worker, str) or not worker:
+        return False
+    inc = rec.get("incarnation")
+    if not isinstance(inc, str):
+        return False
+    iparts = inc.split(SEP)
+    if not iparts or iparts[0] != _safe_key(item_id):
+        return False                     # record's own incarnation/id split
+    if len(iparts) >= 2 and _safe_component(worker) != iparts[1]:
+        return False
+    return True
+
+
 def read_terminal_records(root: Path, item_id: str) -> "list[dict]":
     """Pure read of a root's terminal records — no dir creation, no fence
     check, usable on a root no backend has been constructed for (audit and
@@ -80,8 +118,7 @@ def read_terminal_records(root: Path, item_id: str) -> "list[dict]":
         data = _regular_json(f)
         if data is None:
             continue
-        # Resolved at call time; the class is defined below in this module.
-        if DesignCClaimBackend._record_is_terminal_proof(data) \
+        if _record_is_terminal_proof(data) \
                 and data.get("item_id") == item_id:
             out.append(data)
     # cycle FIRST: a clock correction must not let an older receipt win.
@@ -430,43 +467,7 @@ class DesignCClaimBackend:
         Records failing the total validator are never returned as proof."""
         return read_terminal_records(self.root, item_id)
 
-    @staticmethod
-    def _record_is_terminal_proof(rec) -> bool:
-        """The ONE total validator — shared by staged promotion, archive
-        retirement, and reads. Divergent copies are the failure it prevents."""
-        if not isinstance(rec, dict) or not _exact_int(rec.get("schema")) \
-                or rec.get("schema") != 1:
-            return False
-        item_id = rec.get("item_id")
-        # "" is a legal id (publish("") is contract-valid); the _safe_key
-        # binding, not truthiness, is what discriminates.
-        if not isinstance(item_id, str):
-            return False
-        if rec.get("outcome") != DeliveryOutcome.CONFIRMED.value:
-            return False                     # C stages terminals ONLY for confirmed
-        receipt = rec.get("receipt")
-        # _write_terminal always emits both keys (values may be None); a
-        # receipt without them was not produced by the writer.
-        if not isinstance(receipt, dict) \
-                or "provider" not in receipt or "destination" not in receipt:
-            return False
-        if not _exact_int(rec.get("completed_ns")) \
-                or not _exact_int(rec.get("attempts")):
-            return False
-        worker = rec.get("worker")
-        # "" stays rejected here: _safe_component refuses it at claim time,
-        # so no real incarnation can carry an empty worker.
-        if not isinstance(worker, str) or not worker:
-            return False
-        inc = rec.get("incarnation")
-        if not isinstance(inc, str):
-            return False
-        iparts = inc.split(SEP)
-        if not iparts or iparts[0] != _safe_key(item_id):
-            return False                     # record's own incarnation/id split
-        if len(iparts) >= 2 and _safe_component(worker) != iparts[1]:
-            return False
-        return True
+    _record_is_terminal_proof = staticmethod(_record_is_terminal_proof)
 
     @classmethod
     def _staged_is_complete(cls, staged, incarnation: str) -> bool:
