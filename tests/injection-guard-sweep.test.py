@@ -359,9 +359,8 @@ _GUARDED_PY_WRITERS = {
     "src/github-webhook.py",
     "src/agent-api.py",
     "src/cron-runner.py",
-    # Signal Room submissions: the body and every room-supplied header value go
-    # through confine(), and task: is written last so body newlines cannot forge
-    # fields. Untrusted input here is participant speech + quoted article text.
+    # Room speech + quoted article text: every value goes through confine(),
+    # and task: is written last so body newlines cannot forge fields.
     "src/signal_room_tasks.py",
 }
 

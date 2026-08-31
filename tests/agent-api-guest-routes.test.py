@@ -152,7 +152,8 @@ def run() -> None:
                   h._responses[0][0] == 400 and dispatched == [])
 
         # --- admission bound ------------------------------------------------------
-        import os as _os, time as _time
+        import os as _os
+        import time as _time
         import signal_room_tasks as _srt
         drain_slots()
         dispatched.clear()
