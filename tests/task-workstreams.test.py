@@ -356,7 +356,9 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
     assert cooled.reason == "cooling-down"
     state_path = workspace / "state" / "task-workstream-classifier.json"
     state = json.loads(state_path.read_text())
+    # completed_at governs the cooldown; enqueued_at is its legacy fallback.
     state["enqueued_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
+    state["completed_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
     state_path.write_text(json.dumps(state))
     with mock.patch.object(
         workstreams,
@@ -402,6 +404,15 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         "snapshot_hash": manual_snapshot["snapshot_hash"],
         "workstreams": [],
     })
+    reviewed = workstreams.classifier_status(manual)
+    # A just-applied inference is a fresh completion: the gate cools instead
+    # of rescanning — the churn-absorption that breaks the #3621 spin.
+    assert not reviewed.pending and reviewed.reason == "cooling-down"
+    manual_state_path = manual / "state" / "task-workstream-classifier.json"
+    manual_state = json.loads(manual_state_path.read_text())
+    manual_state["completed_at"] = (
+        time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1)
+    manual_state_path.write_text(json.dumps(manual_state))
     reviewed = workstreams.classifier_status(manual)
     assert not reviewed.pending and reviewed.reason == "complete"
 
