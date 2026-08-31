@@ -75,7 +75,9 @@ def failing_checks(pr: str, run, repo: str) -> "list[str] | None":
         return None
     out = []
     for c in (j.get("statusCheckRollup") or []):
-        bad = c.get("conclusion") in ("FAILURE", "TIMED_OUT", "CANCELLED") or c.get("state") == "FAILURE"
+        # CANCELLED is capacity (job cap or a superseded run), not a defect — and
+        # triaging it sends the reader after a cause that does not exist.
+        bad = c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") == "FAILURE"
         if bad:
             out.append(c.get("name") or c.get("context") or "?")
     return out

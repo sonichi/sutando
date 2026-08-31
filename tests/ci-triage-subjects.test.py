@@ -100,6 +100,14 @@ check("h) a failed gh call reads as UNKNOWN (None), never as 'nothing filed'",
 check("i) unparseable stdout is also UNKNOWN",
       ct.open_issues_for("x", lambda a: _R(0, "not json"), "o/r") is None)
 
+_ROLLUP = json.dumps({"statusCheckRollup": [
+    {"name": "real", "conclusion": "FAILURE"},
+    {"name": "superseded", "conclusion": "CANCELLED"},
+    {"name": "fine", "conclusion": "SUCCESS"}]})
+check("j2) CANCELLED is capacity, not a failing check — only FAILURE is triaged",
+      ct.failing_checks("1", lambda a: _R(0, _ROLLUP), "o/r") == ["real"],
+      f'got {ct.failing_checks("1", lambda a: _R(0, _ROLLUP), "o/r")}')
+
 check("j) an empty issue list is a real zero, distinct from a failed call",
       ct.open_issues_for("x", lambda a: _R(0, "[]"), "o/r") == [])
 
