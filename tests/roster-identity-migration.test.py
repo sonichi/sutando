@@ -1684,6 +1684,45 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
             rc = mig.main()
         return rc, (json.loads(out.read_text()) if out.exists() else {})
 
+    def _pass_with_owner(self, roster: dict, triage: dict, owner: str):
+        """Two-pass driver supplying `--discord-config`, which no other helper does."""
+        d = Path(self.tmp)
+        (d / "in.json").write_text(json.dumps(roster))
+        (d / "cfg.json").write_text(json.dumps(triage))
+        (d / "dc.json").write_text(json.dumps({"owner": owner}))
+        out = d / "out.json"
+        sys.argv = ["m", "--roster", str(d / "in.json"),
+                    "--triage-config", str(d / "cfg.json"),
+                    "--discord-config", str(d / "dc.json"), "--out", str(out)]
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = mig.main()
+        return rc, (json.loads(out.read_text()) if out.exists() else {})
+
+    def test_a_seed_contested_only_via_the_owner_id_is_not_discharged(self):
+        """The owner_id half of the same lookup -- gap found by air (agent of qingyun).
+
+        Two lookups were added together for one reason; only peers.json was
+        covered. This one's symptom is the INVERSE: the source stamping HUMAN is
+        the one discharge was blind to, so the contested id republishes as the
+        HUMAN rather than as a Stand. The peers test cannot catch it, and
+        without this an edit to the owner branch breaks nothing in the suite.
+        """
+        OWNER = BOT                                   # roster calls it a stand
+        RIVAL2 = "1025828152183885925"
+        triage = {"people": {"alice": {"bots": [RIVAL2]}}}
+        rc1, d1 = self._pass_with_owner(
+            {"alice": {"github": "alice", ri.STAND_FIELD: OWNER}}, triage, OWNER)
+        self.assertEqual(rc1, 5, "pass 1 did not refuse the owner-contested id")
+        self.assertIn(OWNER, [u["id"] for u in d1["alice"][ri.UNRESOLVED_FIELD]])
+        rc2, d2 = self._pass_with_owner(d1, triage, OWNER)
+        e = d2["alice"]
+        self.assertNotEqual(e.get(ri.HUMAN_FIELD), OWNER,
+                            "an owner-contested id was published as human on pass 2")
+        self.assertEqual(rc2, 5, "the refusal signal vanished on pass 2")
+        self.assertIn(OWNER, [u["id"] for u in e[ri.UNRESOLVED_FIELD]],
+                      "the contested id stopped being unresolved")
+
     def test_a_seed_contested_only_via_peers_json_is_not_discharged(self):
         """The same defect one source over -- found by air (agent of qingyun).
 
