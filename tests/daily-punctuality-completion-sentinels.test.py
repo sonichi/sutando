@@ -344,6 +344,26 @@ for _sfx in ("", "-late-duplicate", ".no-task.1787803712"):
     _own = cron_task_id.task_id("ghost-job", 1787000000000) + _sfx + ".txt"
     check(f"own record with suffix {_sfx!r} is accepted",
           bool(cron_task_id.record_matcher("ghost-job").match(_own)))
+# An ARCHIVED record carries the archiver's own stamp after the emit stamp:
+# `task-cron-<job>-<emit-ms>-<archive-s>.txt`. Measured across 1331 live
+# task-cron-* files on one host: 43 in that shape and 11 in that shape plus
+# `-late-duplicate`, i.e. 54 records the matcher scored as belonging to no job
+# — which reads to the punctuality probe as "no output today".
+check("archived record (emit stamp + archive stamp) is accepted",
+      bool(_gj.match("task-cron-ghost-job-1788172659933-1788173709.txt")))
+check("archived record plus -late-duplicate is accepted",
+      bool(_gj.match(
+          "task-cron-ghost-job-1788172659933-1788173709-late-duplicate.txt")))
+# The neighbour guard must survive the widening: `2` is not a stamp, so a
+# 13-digit number after it cannot be read as an archive stamp.
+check("numeric-suffix neighbour still refused against the archived shape",
+      not _gj.match("task-cron-ghost-job-2-1788172659933.txt"))
+check("control: a two-stamp neighbour still claims its own record",
+      bool(cron_task_id.record_matcher("ghost-job-2")
+           .match("task-cron-ghost-job-2-1788172659933-1788173709.txt")))
+check("a short second field is not an archive stamp",
+      not _gj.match("task-cron-ghost-job-1788172659933-7.txt"))
+
 check("task_id spells the writer's filename",
       cron_task_id.task_id("Money scan", 123) == "task-cron-Money-scan-123")
 check("discovery glob carries no job name", "*" == cron_task_id.DISCOVERY_GLOB[-1]
