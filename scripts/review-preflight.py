@@ -226,10 +226,14 @@ def stale_approval_block(pr: str, rows: "list[dict] | None") -> "list[str]":
             kinds.append(f"{r['merges']} merge")
         detail = ", ".join(kinds) or f"{r['since']}"
         note = "" if r["locatable"] else "; its commit_id is not in the PR's commits (force-push)"
+        base_only = r["merges"] and not r["content"] and r["locatable"]
+        verdict = ("    -> base-only, approval still fits (merges carry no reviewed-tree"
+                   " change; spot-check conflicts)" if base_only
+                   else "    -> RE-READ before counting this approval")
         out += [f"  {r['user']}  APPROVED {r['submitted_at']}",
                 f"    {r['since']} commit(s) since ({detail}), first unseen"
                 f" {r['first_unseen'][:10]}, head {r['head'][:10]}{note}",
-                "    -> RE-READ before counting this approval"]
+                verdict]
     return out
 
 

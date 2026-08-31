@@ -330,17 +330,40 @@ class StaleApprovalTest(unittest.TestCase):
         self.assertIn("RE-READ", body)
         self.assertIn("ed530fbcb2", body)
 
-    def test_a_merge_after_the_approval_still_demands_a_re_read(self):
-        """Parent count says a commit is a merge, never that its tree preserves the review.
+    def test_a_merge_only_row_renders_the_base_only_verdict(self):
+        """The body's table keeps base-only distinct from content-stale.
 
-        A conflict resolution lives in exactly such a commit, and CONTRIBUTING.md
-        requires re-checking approvals after any update or rebase.
+        A conflict resolution can still live in a merge commit, so the softer
+        verdict carries the spot-check caveat rather than silence about it.
         """
         rows = pf.stale_approvals("1", runner=self._runner(
             reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-30T11:00:10Z")],
             commits=[self._commit(self.OLD, "2026-08-30T10:00:00Z"),
                      self._commit(self.HEAD, "2026-08-30T11:30:00Z", parents=2)]))
         self.assertEqual((rows[0]["content"], rows[0]["merges"]), (0, 1))
+        body = "\n".join(pf.stale_approval_block("1", rows))
+        self.assertIn("base-only, approval still fits", body)
+        self.assertIn("spot-check conflicts", body)
+        self.assertNotIn("RE-READ", body)
+
+    def test_a_content_commit_since_still_demands_a_re_read(self):
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", self.OLD, "2026-08-30T11:00:10Z")],
+            commits=[self._commit(self.OLD, "2026-08-30T10:00:00Z"),
+                     self._commit("cc1" * 13 + "c", "2026-08-30T11:20:00Z"),
+                     self._commit(self.HEAD, "2026-08-30T11:30:00Z", parents=2)]))
+        self.assertEqual((rows[0]["content"], rows[0]["merges"]), (1, 1))
+        body = "\n".join(pf.stale_approval_block("1", rows))
+        self.assertIn("RE-READ", body)
+        self.assertNotIn("still fits", body)
+
+    def test_an_unlocatable_merge_only_row_stays_re_read(self):
+        """Force-push means the walk cannot be trusted: fail to the hard verdict."""
+        rows = pf.stale_approvals("1", runner=self._runner(
+            reviews=[self._review("a", "APPROVED", "f" * 40, "2026-08-30T11:00:10Z")],
+            commits=[self._commit(self.OLD, "2026-08-30T10:00:00Z"),
+                     self._commit(self.HEAD, "2026-08-30T11:30:00Z", parents=2)]))
+        self.assertFalse(rows[0]["locatable"])
         body = "\n".join(pf.stale_approval_block("1", rows))
         self.assertIn("RE-READ", body)
         self.assertNotIn("still fits", body)
