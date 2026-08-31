@@ -19,13 +19,20 @@ held-list" naturally hashes the sentence it was about to send.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
 import sys
 import time
 from pathlib import Path
+
+REPO = next(
+    parent for parent in Path(__file__).resolve().parents
+    if (parent / "src" / "file_lock.py").is_file()
+)
+sys.path.insert(0, str(REPO / "src"))
+
+from file_lock import lock_fd, unlock_fd  # noqa: E402
 
 
 def _token(s) -> str:
@@ -101,7 +108,7 @@ def record_outcome(path: Path, outcome: str) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_suffix(".json.lock")
     with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        lock_fd(lf.fileno())
         try:
             doc = read_state(path)
             noop = outcome == "noop"
@@ -112,7 +119,7 @@ def record_outcome(path: Path, outcome: str) -> dict:
             write_state(path, doc)
             return doc
         finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+            unlock_fd(lf.fileno())
 
 
 def main(argv=None) -> int:
