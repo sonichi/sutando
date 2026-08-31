@@ -1901,6 +1901,48 @@ def _read_core_status() -> tuple[str | None, str | None]:
         return (None, None)
 
 
+_WORKERS_SNAPSHOT_FILE = _STATE / "pool-status.json"
+_workers_push_mtime = 0.0
+_workers_push_retry_at = 0.0
+
+
+def _maybe_push_workers_snapshot() -> bool:
+    """Push-on-change relay of the pool's workers snapshot (the worker
+    picker's read path). No file = no pool = no-op; a broker without the
+    endpoint (404) backs the push off an hour; nothing here may ever
+    break the task loop."""
+    global _workers_push_mtime, _workers_push_retry_at
+    now = time.time()
+    if now < _workers_push_retry_at:
+        return False
+    try:
+        mtime = _WORKERS_SNAPSHOT_FILE.stat().st_mtime
+    except OSError:
+        return False
+    if mtime <= _workers_push_mtime:
+        return False
+    try:
+        snap = json.loads(_WORKERS_SNAPSHOT_FILE.read_text())
+    except (OSError, ValueError):
+        return False  # mid-write or malformed: the next change retries
+    if not isinstance(snap, dict):
+        return False
+    try:
+        _req("POST", "/v1/workers", snap, timeout=15)
+    except urllib.error.HTTPError as e:
+        _workers_push_retry_at = now + 3600
+        _log(f"workers-snapshot push deferred 1h (HTTP {e.code}"
+             f"{': broker has no /v1/workers yet' if e.code == 404 else ''})")
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _workers_push_retry_at = now + 300
+        _log(f"workers-snapshot push failed, retrying in 5m: {e}")
+        return False
+    _workers_push_mtime = mtime
+    _log("workers-snapshot pushed")
+    return True
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -3514,6 +3556,7 @@ def main() -> None:
                     _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
+            _maybe_push_workers_snapshot()
             _retry_pending_publications()
             _retry_review_card_resolutions()
             _retry_review_control_results()
