@@ -72,9 +72,16 @@ def post(path: str, payload: dict, auth: bool = True):
 
 
 def run() -> None:
+    # The route's job is to SUBMIT a Signal Room task; Sutando executes it. We spy on
+    # the submitter, never on an engine — there is no engine at this layer any more.
     dispatched = []
-    orig_guest = agent_api.start_guest_deep_dive
-    agent_api.start_guest_deep_dive = lambda *a, **k: dispatched.append(a)
+    orig_submit = agent_api.submit_signal_room_task
+
+    def _spy(task, task_dir, confine, **kw):
+        dispatched.append((task, kw))
+        return orig_submit(task, task_dir, confine, **kw)
+
+    agent_api.submit_signal_room_task = _spy
     orig_emit = getattr(agent_api, "_emit_task_processed", None)
     agent_api._emit_task_processed = lambda *a, **k: None
     try:
@@ -82,9 +89,9 @@ def run() -> None:
         dispatched.clear()
         h = post("/guest-task", {"task": "what happened with item 2?"})
         check("/guest-task -> 200", bool(h._responses) and h._responses[0][0] == 200)
-        check("/guest-task routes to the sandboxed worker", len(dispatched) == 1)
+        check("/guest-task submits one Signal Room task", len(dispatched) == 1)
         tid = h._responses[0][1].get("task_id", "") if h._responses else ""
-        check("/guest-task id is namespaced signal-guest-", tid.startswith("signal-guest-"))
+        check("/guest-task id is a canonical task-signal-* id", tid.startswith("task-signal-"))
         check("/guest-task result_url points at the async contract",
               (h._responses[0][1].get("result_url") or "") == f"/result/{tid}")
 
@@ -93,13 +100,13 @@ def run() -> None:
         h = post("/guest-task", {"task": "escalate me", "access_tier": "owner"})
         gid = h._responses[0][1].get("task_id", "") if h._responses else ""
         check("/guest-task ignores a body-declared owner tier (route wins)",
-              h._responses[0][0] == 200 and gid.startswith("signal-guest-") and len(dispatched) == 1)
+              h._responses[0][0] == 200 and gid.startswith("task-signal-") and len(dispatched) == 1)
 
         # Missing/blank task -> 400, worker never invoked.
         dispatched.clear()
         h = post("/guest-task", {"task": "   "})
         check("/guest-task blank task -> 400", h._responses[0][0] == 400)
-        check("/guest-task blank task never reaches the worker", dispatched == [])
+        check("/guest-task blank task is never submitted", dispatched == [])
 
         # Size guard runs BEFORE the body is read (same as the owner lane).
         dispatched.clear()
@@ -107,7 +114,7 @@ def run() -> None:
         h.do_POST()
         check("/guest-task oversized -> 413", h._responses[0][0] == 413)
         check("/guest-task oversized: body never read", h.rfile.read_calls == 0)
-        check("/guest-task oversized: worker never invoked", dispatched == [])
+        check("/guest-task oversized: nothing submitted", dispatched == [])
 
         h = make_handler("/guest-task", {"Content-Length": "not-a-number"})
         h.do_POST()
@@ -129,8 +136,8 @@ def run() -> None:
         h = post("/task", {"from": "matrixrtc-voice-news", "task": "shipped daemon",
                            "access_tier": "guest"})
         stid = h._responses[0][1].get("task_id", "") if h._responses else ""
-        check("/task with access_tier guest still routes to the guest lane (compat shim)",
-              h._responses[0][0] == 200 and len(dispatched) == 1 and stid.startswith("signal-guest-"))
+        check("/task with access_tier guest still routes to the Signal Room lane (compat shim)",
+              h._responses[0][0] == 200 and len(dispatched) == 1 and stid.startswith("task-signal-"))
 
         for tier in ("owner", "team", "admin", "", "GUEST"):
             dispatched.clear()
@@ -144,11 +151,8 @@ def run() -> None:
             h.do_GET()
             return h
 
-        orig_avail = None
-        import signal_guest_handler as sgh
-        orig_avail = sgh.guest_availability
-
-        sgh.guest_availability = lambda *a, **k: (True, None)
+        orig_avail = agent_api.submission_status
+        agent_api.submission_status = lambda *a, **k: (True, None)
         h = get("/capabilities")
         body = h._responses[0][1] if h._responses else {}
         check("/capabilities -> 200", bool(h._responses) and h._responses[0][0] == 200)
@@ -157,16 +161,16 @@ def run() -> None:
         check("/capabilities omits reason when ready",
               "reason" not in body.get("guest_deep_dive", {}))
 
-        sgh.guest_availability = lambda *a, **k: (False, "worker_missing")
+        agent_api.submission_status = lambda *a, **k: (False, "task_dir_unwritable")
         h = get("/capabilities")
         cap = h._responses[0][1].get("guest_deep_dive", {}) if h._responses else {}
         check("/capabilities reports available:false with the machine-readable reason",
-              cap.get("available") is False and cap.get("reason") == "worker_missing")
+              cap.get("available") is False and cap.get("reason") == "task_dir_unwritable")
 
         def boom(*a, **k):
             raise RuntimeError("lane exploded")
 
-        sgh.guest_availability = boom
+        agent_api.submission_status = boom
         h = get("/capabilities")
         cap = h._responses[0][1].get("guest_deep_dive", {}) if h._responses else {}
         check("/capabilities fails closed when the lane raises",
@@ -177,14 +181,22 @@ def run() -> None:
         check("/capabilities honours check_auth",
               not any(r[0] == 200 for r in h._responses))
 
-        sgh.guest_availability = orig_avail
+        agent_api.submission_status = orig_avail
 
         # --- the decisive property: no owner task from any guest submission ------
-        owner_files = list(Path(agent_api.TASK_DIR).glob("*")) if Path(agent_api.TASK_DIR).exists() else []
-        check("no owner task file was written by any guest-route submission",
-              all(not f.name.startswith("task-") for f in owner_files))
+        # Signal Room work now lands as a normal task — at TEAM tier, never owner.
+        signal_files = list(Path(agent_api.TASK_DIR).glob("task-signal-*.txt"))
+        check("Signal Room submissions produced task files", len(signal_files) >= 1)
+        tiers = set()
+        for f in signal_files:
+            for line in f.read_text().split("\n"):
+                if line.startswith("access_tier:"):
+                    tiers.add(line.partition(":")[2].strip())
+                if line.startswith("task:"):
+                    break
+        check(f"every Signal Room task is team tier, never owner (saw {tiers})", tiers == {"team"})
     finally:
-        agent_api.start_guest_deep_dive = orig_guest
+        agent_api.submit_signal_room_task = orig_submit
         if orig_emit is not None:
             agent_api._emit_task_processed = orig_emit
 

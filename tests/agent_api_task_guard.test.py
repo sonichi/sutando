@@ -19,7 +19,6 @@ from pathlib import Path
 _TEST_WS = tempfile.mkdtemp()
 os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ["SUTANDO_WORKSPACE"] = _TEST_WS
-os.environ.setdefault("SIGNAL_GUEST_CODEX_HOME", tempfile.mkdtemp())
 SRC = Path(__file__).resolve().parent.parent / "src"
 _spec = importlib.util.spec_from_file_location("agent_api", str(SRC / "agent-api.py"))
 agent_api = importlib.util.module_from_spec(_spec)
@@ -58,8 +57,13 @@ def make_handler(headers: dict, body: bytes = b"", auth: bool = True):
 
 def run() -> None:
     dispatched = []
-    orig = agent_api.start_guest_deep_dive
-    agent_api.start_guest_deep_dive = lambda *a, **k: dispatched.append(a)
+    orig = agent_api.submit_signal_room_task
+
+    def _spy(task, task_dir, confine, **kw):
+        dispatched.append((task, kw))
+        return orig(task, task_dir, confine, **kw)
+
+    agent_api.submit_signal_room_task = _spy
     # Keep the owner path from touching anything heavy in the accept test.
     orig_emit = getattr(agent_api, "_emit_task_processed", None)
     agent_api._emit_task_processed = lambda *a, **k: None
@@ -69,7 +73,7 @@ def run() -> None:
         h.do_POST()
         check("oversized request -> 413", bool(h._responses) and h._responses[0][0] == 413)
         check("oversized: body is never read into memory", h.rfile.read_calls == 0)
-        check("oversized: guest handler never invoked", dispatched == [])
+        check("oversized: nothing submitted", dispatched == [])
 
         # 2. Invalid (non-numeric) Content-Length -> 400, body never read.
         h = make_handler({"Content-Length": "not-a-number"})
@@ -84,11 +88,11 @@ def run() -> None:
         h = make_handler({"Content-Length": str(len(body))}, body)
         h.do_POST()
         check("valid guest within cap -> 200", bool(h._responses) and h._responses[0][0] == 200)
-        check("valid guest routed to start_guest_deep_dive", len(dispatched) == 1)
+        check("valid guest routed to the Signal Room submitter", len(dispatched) == 1)
         check("valid guest: body WAS read", h.rfile.read_calls >= 1)
         gtid = h._responses[0][1].get("task_id", "") if h._responses else ""
-        check("guest task_id is namespaced signal-guest- (won't inject into owner voice / task list)",
-              gtid.startswith("signal-guest-") and not gtid.startswith("task-"))
+        check("guest task_id is a canonical task-signal-* id (Sutando executes it at team tier)",
+              gtid.startswith("task-signal-"))
 
         # 4. Valid OWNER request within the cap -> accepted (200), NOT routed to guest.
         dispatched.clear()
@@ -96,7 +100,7 @@ def run() -> None:
         h = make_handler({"Content-Length": str(len(body))}, body)
         h.do_POST()
         check("valid owner within cap -> 200 (accepted)", bool(h._responses) and h._responses[0][0] == 200)
-        check("valid owner NOT routed to the guest handler", dispatched == [])
+        check("valid owner NOT routed to the Signal Room submitter", dispatched == [])
         tid = h._responses[0][1].get("task_id", "") if h._responses else ""
         _ws = str(Path(_TEST_WS).resolve())  # resolve() so macOS /var -> /private/var matches
         check("owner task file lands ONLY in the temp workspace (never the live one)",
@@ -110,7 +114,7 @@ def run() -> None:
         h.do_POST()
         check("non-string task -> 400", bool(h._responses) and h._responses[0][0] == 400)
     finally:
-        agent_api.start_guest_deep_dive = orig
+        agent_api.submit_signal_room_task = orig
         if orig_emit is not None:
             agent_api._emit_task_processed = orig_emit
 

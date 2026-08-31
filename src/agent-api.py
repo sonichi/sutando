@@ -129,7 +129,7 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from signal_guest_handler import start_guest_deep_dive  # noqa: E402
+from signal_room_tasks import submit_signal_room_task, submission_status  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -801,8 +801,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not self.check_auth():
                 return
             try:
-                from signal_guest_handler import guest_availability
-                available, reason = guest_availability()
+                available, reason = submission_status(TASK_DIR)
             except Exception as e:
                 available, reason = False, f"capability_error: {e.__class__.__name__}"
             payload = {"guest_deep_dive": {"available": bool(available)}}
@@ -1312,13 +1311,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             # NOT a `task-` id: the result-watcher injects task-/voice-/proactive-
             # results into the owner's voice session, so a guest result must not match.
-            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
-            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            task_id = submit_signal_room_task(
+                task, TASK_DIR, confine_user_content,
+                room_id=str(data.get("room_id", "")),
+                requested_by=str(data.get("requested_by", "")),
+            )
             self.send_json(200, {
                 "ok": True,
                 "task_id": task_id,
                 "result_url": f"/result/{task_id}",
-                "message": "Task accepted (guest, sandboxed)",
+                "message": "Task accepted (Signal Room, team tier)",
             })
             return
 
@@ -1378,13 +1380,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if data.get("access_tier") != "guest":
                 self.send_json(400, {"error": "access_tier is not accepted on /task"})
                 return
-            task_id = f"signal-guest-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(6)}"
-            start_guest_deep_dive(task_id, task, RESULT_DIR, confine_user_content)
+            task_id = submit_signal_room_task(
+                task, TASK_DIR, confine_user_content,
+                room_id=str(data.get("room_id", "")),
+                requested_by=str(data.get("requested_by", "")),
+            )
             self.send_json(200, {
                 "ok": True,
                 "task_id": task_id,
                 "result_url": f"/result/{task_id}",
-                "message": "Task accepted (guest, sandboxed)",
+                "message": "Task accepted (Signal Room, team tier)",
             })
             return
 
@@ -1527,13 +1532,6 @@ if __name__ == "__main__":
     # A supervised replacement of this gateway (desktop token rotation / adopted-process takeover)
     # sends SIGTERM.
     def _reap_and_exit(_signum, _frame):
-        try:
-            from signal_guest_handler import reap_guest_workers
-            reaped = reap_guest_workers()
-            if reaped:
-                print(f"agent-api: reaped {reaped} guest worker group(s) on shutdown", flush=True)
-        except Exception:
-            pass
         raise KeyboardInterrupt
 
     try:
@@ -1546,11 +1544,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nDone.")
     finally:
-        try:
-            from signal_guest_handler import reap_guest_workers
-            reap_guest_workers()
-        except Exception:
-            pass
         workstream_maintenance_stop.set()
         workstream_maintenance.join(timeout=1)
         server.server_close()
