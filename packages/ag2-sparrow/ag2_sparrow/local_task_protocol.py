@@ -172,10 +172,11 @@ _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # the archive lookup gate below: live API/task-result routes still key off
 # the canonical `task-*` namespace even though historic archives contain
 # additional gateway-safe producer ids like `ask-*`.
-TASK_ID_RE = re.compile(r"^task-[A-Za-z0-9][A-Za-z0-9-]{0,120}$")
+# \Z, not $: $ under .match() also accepts a terminal newline.
+TASK_ID_RE = re.compile(r"^task-[A-Za-z0-9][A-Za-z0-9-]{0,120}\Z")
 # `~` and 128 chars cover the gateway's named-instance ids
 # (`task-<inst>~<broker-id>`); neither is a traversal character.
-ARCHIVE_LOOKUP_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
+ARCHIVE_LOOKUP_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,128}\Z")
 
 
 def valid_task_id(tid: str) -> bool:
