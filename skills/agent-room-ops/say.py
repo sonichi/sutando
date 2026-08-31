@@ -73,7 +73,7 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
         _stripe = os.environ.get("SUTANDO_WORKER_STRIPE")
         _attn = os.environ.get("SUTANDO_WORKER_ATTENTION") == "1"
         _style = os.environ.get("SUTANDO_WORKER_STYLE")
-        _styles = ("stripe", "highlight", "underline", "glow", "gradient", "none")
+        _styles = ("stripe", "highlight", "none")
         _w = ({"id": worker,
                **({"color": _color} if _color else {}),
                **({"stripe": _stripe != "0"} if _stripe in ("0", "1") else {}),
