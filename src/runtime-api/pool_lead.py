@@ -136,11 +136,19 @@ class PoolLead:
         return _FlockCtx(path)
 
     # ── explicit pins: owner-declared room -> instance (2026-08-30) ─────────
-    def pin_room(self, channel: str, instance: str,
+    def pin_room(self, channel: str, instance: "str | list[str]",
                  dedicated: bool = False) -> dict:
+        """Pin a room to one worker, or to a bound SET (pool-restriction
+        semantics: the lead routes each task to one member of the set)."""
+        instances = [instance] if isinstance(instance, str) else [
+            str(i) for i in instance if str(i).strip()]
+        if not instances:
+            raise ValueError("pin_room: empty worker set")
         with self._affinity_lock():
             table = self._load_affinity()
-            row = {"instance": instance, "ts": self.now(), "pinned": True}
+            row = {"instance": instances[0], "ts": self.now(), "pinned": True}
+            if len(instances) > 1:
+                row["instances"] = instances
             if dedicated:
                 row["exclusive"] = True
             table[channel] = row
@@ -157,6 +165,7 @@ class PoolLead:
                 return False
             row.pop("pinned", None)
             row.pop("exclusive", None)
+            row.pop("instances", None)
             self._save_affinity(table)
             return True
 
@@ -241,7 +250,19 @@ class PoolLead:
             row = affinity.get(channel)
             # Binding: a live home core keeps its room; only death or an
             # unclaimed-reclaim moves it. Explicit pins beat lane defaults.
-            if isinstance(row, dict) and row.get("instance") in followers:
+            bound = row.get("instances") if isinstance(row, dict) else None
+            if isinstance(bound, list) and row.get("pinned"):
+                # Bound SET: the selected workers ARE the room's pool; pick
+                # the least-loaded claiming member, whole set busy -> loan.
+                live = [i for i in bound if i in followers
+                        and self._claiming(i)]
+                if live:
+                    pick = min(live, key=lambda f: (
+                        self._load(f), self._last_pick.get(str(f), 0.0),
+                        str(f)))
+                    self._last_pick[str(pick)] = self.now()
+                    return pick
+            elif isinstance(row, dict) and row.get("instance") in followers:
                 # A pinned home that stopped claiming is loaned out below;
                 # the pin survives, so the room returns when it recovers.
                 if not row.get("pinned") or self._claiming(row["instance"]):
