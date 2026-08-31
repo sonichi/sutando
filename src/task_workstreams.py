@@ -30,6 +30,9 @@ from workspace_default import status_read_path
 
 SCHEMA_VERSION = 1
 CLASSIFIER_VERSION = "task-workstream-grouping-v1"
+# Fleet churn shifts the candidate window on every completed task; a cooldown
+# bounds how often that churn can re-queue the classifier.
+CLASSIFIER_COOLDOWN_SECONDS = 1800
 CLASSIFIER_TASK_PREFIX = "task-workstream-grouping-"
 LEGACY_CLASSIFIER_TASK_PREFIX = "task-project-grouping-"
 MIN_CONFIDENCE = 0.65
@@ -919,6 +922,7 @@ def classifier_status(
     workspace: Path,
     ttl_seconds: int = 900,
     limit: int = 100,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
     """Report whether the current snapshot needs classification without writing."""
     workspace = Path(workspace)
@@ -945,6 +949,20 @@ def classifier_status(
             return _queue_result(
                 True, False, "already-queued", snapshot_hash,
                 str(state.get("task_id") or ""), source_state,
+            )
+
+    # Sources change on every completed owner task; a completed run younger
+    # than the cooldown absorbs that churn before the expensive discover+scan.
+    if state.get("status") == "complete" and cooldown_seconds > 0:
+        try:
+            age = time.time() - float(state.get("enqueued_at", 0))
+        except (TypeError, ValueError):
+            age = -1.0
+        # A negative age means a clock step or bad state; never cool on it.
+        if 0 <= age < cooldown_seconds:
+            return ClassifierQueueResult(
+                False, False, "cooling-down",
+                str(state.get("snapshot_hash") or ""),
             )
 
     # Discover archive directories immediately before the expensive scan, then
@@ -989,21 +1007,28 @@ def maybe_enqueue_classifier_task(
     ttl_seconds: int = 900,
     limit: int = 100,
     skill_file: Optional[Path] = None,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
     if skill_file is not None and not Path(skill_file).is_file():
         return ClassifierQueueResult(False, False, "skill-unavailable")
     with _workstream_store_lock(Path(workspace)):
-        return _maybe_enqueue_classifier_task_locked(workspace, ttl_seconds, limit)
+        return _maybe_enqueue_classifier_task_locked(
+            workspace, ttl_seconds, limit, cooldown_seconds,
+        )
 
 
 def _maybe_enqueue_classifier_task_locked(
     workspace: Path,
     ttl_seconds: int,
     limit: int,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
     """Queue one deduped classifier task only while the selected core is idle."""
     workspace = Path(workspace)
-    readiness = classifier_status(workspace, ttl_seconds=ttl_seconds, limit=limit)
+    readiness = classifier_status(
+        workspace, ttl_seconds=ttl_seconds, limit=limit,
+        cooldown_seconds=cooldown_seconds,
+    )
     if readiness.reason != "ready":
         if readiness.reason in {"complete", "already-queued"} and readiness.source_token:
             state_path = _classifier_state_path(workspace)

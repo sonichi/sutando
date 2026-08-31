@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import time
 import multiprocessing
 import re
 import sys
@@ -343,6 +344,20 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         "2026-08-03T13:00:00Z",
         "a newly archived task",
     )
+    # A fresh completion absorbs source churn without rescanning; only once the
+    # cooldown has lapsed does the new task re-open the gate.
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        side_effect=AssertionError("cooling-down must not scan history"),
+    ):
+        cooled = workstreams.classifier_status(workspace)
+    assert not cooled.pending and not cooled.enqueued
+    assert cooled.reason == "cooling-down"
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    state["enqueued_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
+    state_path.write_text(json.dumps(state))
     with mock.patch.object(
         workstreams,
         "scan_task_history",
