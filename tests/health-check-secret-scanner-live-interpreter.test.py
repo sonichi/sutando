@@ -96,7 +96,6 @@ check("framework Python (capital P) is still a python", hc._live_bridge_interpre
     lambda pid: "/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"),
     ["/L/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python"])
 
-# --- @qingyun-wu's blocker: cardinality, order, and over-match ---------------
 # startup-runtime.sh launches one gateway per AG2_REMOTE_TOKEN_*, so a scalar
 # both under-collects and makes the answer depend on ps row order.
 TWO_A = ("  10 1 /healthy/python3 /x/src/remote-gateway-bridge.py\n"
