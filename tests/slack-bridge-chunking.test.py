@@ -123,6 +123,13 @@ mod._send_reply("C0FAKECHAN", None, "just a short reply")
 check("slack: short body → one message", len(client.calls) == 1)
 check("slack: short body text intact", client.calls[0]["text"] == "just a short reply")
 
+# Suppression must happen at the send: stripping links from a link-dense body
+# would destroy the one thing a digest exists to deliver.
+check("slack: body posts suppress link unfurling",
+      all(c.get("unfurl_links") is False for c in client.calls), repr(client.calls[:1]))
+check("slack: body posts suppress media unfurling",
+      all(c.get("unfurl_media") is False for c in client.calls), repr(client.calls[:1]))
+
 # 3. thread_ts is threaded through to each chunk.
 client.calls.clear()
 mod._send_reply("C0FAKECHAN", "1699999999.000100", "line\n" * 2000)  # long, forces >1 chunk

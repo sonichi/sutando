@@ -1391,7 +1391,10 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     if clean_text:
         all_chunks_sent = True
         for chunk in chunk_message(clean_text, 4000):
-            kwargs = {"channel": channel, "text": chunk}
+            # A link-dense body (e.g. a digest) becomes a wall of preview cards
+            # otherwise; suppress at the send, never by dropping links.
+            kwargs = {"channel": channel, "text": chunk,
+                      "unfurl_links": False, "unfurl_media": False}
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             try:
