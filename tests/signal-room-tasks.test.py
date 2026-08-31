@@ -167,6 +167,57 @@ with tempfile.TemporaryDirectory() as td:
     ck(not list(Path(td).glob(".*tmp")), "the temp file is cleaned up on failure")
     ck(not list(Path(td).glob("task-signal-*.txt")), "no partial task is published")
 
+with tempfile.TemporaryDirectory() as td:
+    # If the cleanup itself fails, the ORIGINAL error must still be what surfaces.
+    real_replace, real_unlink = os.replace, os.unlink
+
+    def fail_replace(*a, **k):
+        raise OSError("disk full")
+
+    def fail_unlink(*a, **k):
+        raise PermissionError("cannot remove")
+
+    os.replace, os.unlink = fail_replace, fail_unlink
+    try:
+        S.submit_signal_room_task("doomed", td, lambda t: t)
+        ck(False, "a failed cleanup does not mask the original error")
+    except OSError as exc:
+        ck("disk full" in str(exc), "a failed cleanup does not mask the original error")
+    finally:
+        os.replace, os.unlink = real_replace, real_unlink
+
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td)
+    cores = ws / "state" / "cores"
+    cores.mkdir(parents=True)
+    real_glob = Path.glob
+
+    def boom_glob(self, pattern, *a, **k):
+        if self.name == "cores":
+            raise OSError("cannot list")
+        return real_glob(self, pattern, *a, **k)
+
+    Path.glob = boom_glob
+    try:
+        ck(S.core_is_alive(ws) is False, "an unlistable cores dir reads as offline")
+    finally:
+        Path.glob = real_glob
+
+    # An unreadable heartbeat is not evidence of life.
+    (cores / "host.alive").write_text("{}")
+    real_stat = os.stat
+
+    def boom_stat(path, *a, **k):
+        if str(path).endswith("host.alive"):
+            raise OSError("unreadable")
+        return real_stat(path, *a, **k)
+
+    os.stat = boom_stat
+    try:
+        ck(S.core_is_alive(ws) is False, "an unstattable heartbeat does not count as alive")
+    finally:
+        os.stat = real_stat
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + "; ".join(FAILS))
