@@ -13,6 +13,7 @@ compose tmp dirs and fake pools. See docs/lead-follower-pool.md.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -50,6 +51,25 @@ def _read_channel(path: Path) -> "str | None":
         return None
     m = _CHANNEL_RE.search(text)
     return m.group(1) if m else None
+
+
+class _FlockCtx:
+    """flock is per-open-file-description: each ctx opens its own fd so two
+    holders in one process still serialize correctly."""
+    def __init__(self, path: Path):
+        self._path = path
+
+    def __enter__(self):
+        self._fh = open(self._path, "w")
+        fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self._fh
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self._fh, fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+        return False
 
 
 def _read_lane(path: Path) -> str:
@@ -107,6 +127,37 @@ class PoolLead:
         tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(table))
         os.replace(tmp, p)
+
+    def _affinity_lock(self) -> _FlockCtx:
+        """Serializes table read-modify-write against the pin CLI, which runs
+        in another process; plain reads of the atomic file need no lock."""
+        path = self._affinity_path().with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return _FlockCtx(path)
+
+    # ── explicit pins: owner-declared room -> instance (2026-08-30) ─────────
+    def pin_room(self, channel: str, instance: str) -> dict:
+        with self._affinity_lock():
+            table = self._load_affinity()
+            table[channel] = {"instance": instance, "ts": self.now(),
+                              "pinned": True}
+            self._save_affinity(table)
+            return table[channel]
+
+    def unpin_room(self, channel: str) -> bool:
+        """Drop only the pin flag; the binding stays and auto re-homing
+        (death/wedge moves the room) resumes for it."""
+        with self._affinity_lock():
+            table = self._load_affinity()
+            row = table.get(channel)
+            if not (isinstance(row, dict) and row.get("pinned")):
+                return False
+            row.pop("pinned", None)
+            self._save_affinity(table)
+            return True
+
+    def bindings(self) -> dict:
+        return self._load_affinity()
 
     # ── liveness trace (change-driven; forensic aid for routing anomalies) ──
     def _trace_path(self) -> Path:
@@ -180,8 +231,11 @@ class PoolLead:
             # Binding: a live home core keeps its room; only death or an
             # unclaimed-reclaim moves it. Explicit pins beat lane defaults.
             if isinstance(row, dict) and row.get("instance") in followers:
-                self._last_pick[str(row["instance"])] = self.now()
-                return row["instance"]
+                # A pinned home that stopped claiming is loaned out below;
+                # the pin survives, so the room returns when it recovers.
+                if not row.get("pinned") or self._claiming(row["instance"]):
+                    self._last_pick[str(row["instance"])] = self.now()
+                    return row["instance"]
         # equal load -> least-recently-picked, so an idle pool round-robins
         pick = min(primary, key=lambda f: (
             self._load(f), self._last_pick.get(str(f), 0.0), str(f)))
@@ -241,14 +295,25 @@ class PoolLead:
                 continue
             # Only an owner-lane pick off the lane core may (re)bind a room:
             # a routine/overflow landing there must not become a sticky steal
-            if channel and lane == "owner" and inst != self._lane_core_of(followers):
+            prev = affinity.get(channel) if channel else None
+            if (channel and lane == "owner"
+                    and inst != self._lane_core_of(followers)
+                    and not (isinstance(prev, dict) and prev.get("pinned"))):
                 affinity[channel] = {"instance": inst, "ts": self.now()}
             if self.metrics is not None:
                 self.metrics.assigned(f.name, inst, channel,
                                       max(0.0, self.now() - arrived))
             out.append((f.name, inst))
         if out:
-            self._save_affinity(affinity)
+            with self._affinity_lock():
+                merged = self._load_affinity()
+                # Re-read under the lock: a pin written mid-sweep by the CLI
+                # must win over this sweep's stale auto rebinds.
+                for ch, row in affinity.items():
+                    cur = merged.get(ch)
+                    if not (isinstance(cur, dict) and cur.get("pinned")):
+                        merged[ch] = row
+                self._save_affinity(merged)
         return out
 
     # ── crash recovery ──────────────────────────────────────────────────────
@@ -370,15 +435,18 @@ class PoolLead:
             live.discard(f.name)
             self._mark_noclaim(m.group(2))
             out.append(f.name)
-            # The home core proved unresponsive: release the room's binding so
-            # the re-pick moves it (and re-stamps the new core as home).
+            # An unresponsive home releases its rooms so the re-pick moves
+            # them; a pinned row survives — pins move only by owner command.
             ch = _read_channel(f.with_name(m.group(1) + ".txt"))
             if ch:
-                aff = self._load_affinity()
-                row = aff.get(ch)
-                if isinstance(row, dict) and row.get("instance") == m.group(2):
-                    del aff[ch]
-                    self._save_affinity(aff)
+                with self._affinity_lock():
+                    aff = self._load_affinity()
+                    row = aff.get(ch)
+                    if (isinstance(row, dict)
+                            and row.get("instance") == m.group(2)
+                            and not row.get("pinned")):
+                        del aff[ch]
+                        self._save_affinity(aff)
         self._save_assign_ledger({k: v for k, v in ledger.items() if k in live})
         return out
 
