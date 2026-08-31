@@ -23,9 +23,8 @@ DISCOVERY_GLOB = TASK_PREFIX + "*"
 # `.no-task.<stamp>.txt`. An unknown suffix fails closed (record not counted).
 RECORD_SUFFIX = r"(?:-late-duplicate)?(?:\.no-task\.\d+)?\.txt"
 
-# The archiver appends its OWN stamp, so an archived record carries two: the
-# emit stamp (ms) then the archive stamp (s). Both halves demand >=10 digits so
-# a job named `<name>-2` still cannot pass its `2` off as this job's stamp.
+# An archived record carries two stamps: emit (ms) then archive (s). Both halves
+# demand >=10 digits so a job named `<name>-2` cannot pass its `2` off as one.
 STAMP = r"(?:\d{10,}-\d{10,}|\d+)"
 
 

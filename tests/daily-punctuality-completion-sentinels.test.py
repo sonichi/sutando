@@ -344,11 +344,8 @@ for _sfx in ("", "-late-duplicate", ".no-task.1787803712"):
     _own = cron_task_id.task_id("ghost-job", 1787000000000) + _sfx + ".txt"
     check(f"own record with suffix {_sfx!r} is accepted",
           bool(cron_task_id.record_matcher("ghost-job").match(_own)))
-# An ARCHIVED record carries the archiver's own stamp after the emit stamp:
-# `task-cron-<job>-<emit-ms>-<archive-s>.txt`. Measured across 1331 live
-# task-cron-* files on one host: 43 in that shape and 11 in that shape plus
-# `-late-duplicate`, i.e. 54 records the matcher scored as belonging to no job
-# — which reads to the punctuality probe as "no output today".
+# An archived record is `task-cron-<job>-<emit-ms>-<archive-s>.txt`; 54 of one
+# host's 1331 records carried that shape and matched no job at all.
 check("archived record (emit stamp + archive stamp) is accepted",
       bool(_gj.match("task-cron-ghost-job-1788172659933-1788173709.txt")))
 check("archived record plus -late-duplicate is accepted",
