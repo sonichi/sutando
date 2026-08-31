@@ -16,6 +16,7 @@ TASK_HANDLER_FALLBACKS_DIR="$(dirname "$TASKS_DIR")/state/task-event-handler-fal
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
+QUEUE_RESCAN_INTERVAL="${SUTANDO_NOTIFIER_QUEUE_RESCAN_INTERVAL:-30}"
 CORE_STATUS_STALE_SEC=90
 CORE_STATUS_FILE="${SUTANDO_CORE_STATUS_FILE:-$(dirname "$TASKS_DIR")/state/core-status.json}"
 WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstreams.py"
@@ -274,17 +275,20 @@ python3 -c \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
 
-while IFS= read -r event; do
-  case "$event" in
-    "TASK_FILE: "*)
-      # Watcher output is a wake signal, not queue order. While the core is
-      # busy, keep every task durable on disk instead of typing into Codex's
-      # non-durable interactive input. Once idle, re-scan the whole queue and
-      # select urgent/normal/low priority with FIFO only inside each tier.
-      next_pending_task >/dev/null || continue
-      wait_for_core_idle || exit 1
-      filename="$(next_pending_task)" || continue
-      submit_task "$filename" 1
-      ;;
-  esac
+while true; do
+  event=""
+  if IFS= read -r -t "$QUEUE_RESCAN_INTERVAL" event; then
+    case "$event" in
+      "TASK_FILE: "*) ;;
+      *) continue ;;
+    esac
+  elif ! kill -0 "$watcher_pid" 2>/dev/null; then
+    break
+  fi
+  # Watcher events wake the notifier immediately; the timeout also recovers
+  # durable queue entries whose filesystem event was missed.
+  next_pending_task >/dev/null || continue
+  wait_for_core_idle || exit 1
+  filename="$(next_pending_task)" || continue
+  submit_task "$filename" 1
 done < "$event_dir/events"

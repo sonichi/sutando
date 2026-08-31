@@ -16,7 +16,8 @@ the core's positive `idle` status and a pane without Codex's live working marker
 before touching the interactive input, then selects the highest-priority pending
 task from disk (`urgent`, `normal`, `low`, FIFO within a tier). This keeps a busy
 core from losing an injected prompt and prevents scheduled low-priority work
-from blocking later owner messages.
+from blocking later owner messages. It also re-scans the durable queue every 30
+seconds, so a missed filesystem event can delay a task but cannot strand it.
 
 On macOS the launcher also reconciles fixed `crons.json` schedules onto the
 OS-backed cron runner before starting or reusing the Codex session. Codex has

@@ -679,6 +679,49 @@ exit 0
         with self.assertRaises(ProcessLookupError):
             os.kill(watcher_pid, 0)
 
+    def test_managed_notifier_rescans_queue_without_watcher_event(self):
+        tasks = self.root / "workspace" / "tasks"
+        results = self.root / "workspace" / "results"
+        status = self.root / "workspace" / "state" / "core-status.json"
+        tasks.mkdir(exist_ok=True)
+        results.mkdir(exist_ok=True)
+        (tasks / "task-missed.txt").write_text("priority: normal\ntask: missed wake\n")
+        status.write_text('{"status":"idle","ts":1}\n')
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text("#!/bin/bash\nsleep 0.6\n")
+        watcher.chmod(0o755)
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+if [ "${1:-}" = has-session ]; then exit 0; fi
+if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
+  touch "$SUTANDO_RESULTS_DIR/task-missed.txt"
+fi
+exit 0
+''')
+        env = dict(
+            os.environ,
+            PATH=f"{self.bin}:/usr/bin:/bin",
+            TMUX_LOG=str(self.log),
+            SUTANDO_TMUX_SOCKET="/tmp/test.sock",
+            SUTANDO_TMUX_SESSION="sutando-core",
+            SUTANDO_TASKS_DIR=str(tasks),
+            SUTANDO_RESULTS_DIR=str(results),
+            SUTANDO_CORE_STATUS_FILE=str(status),
+            SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+            SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="2",
+            SUTANDO_NOTIFIER_QUEUE_RESCAN_INTERVAL="0.05",
+        )
+        notifier = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(
+            ["/bin/bash", str(notifier)], env=env,
+            capture_output=True, text=True, timeout=3,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertTrue((results / "task-missed.txt").exists())
+        self.assertIn("task-missed.txt", self.log.read_text())
+
     def test_notifier_submits_literal_safe_prompt(self):
         # The one-event mode tests the adapter without starting fswatch.
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
