@@ -9,6 +9,13 @@ REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURE="$(mktemp -d -t gitignore-swap-test.XXXXXX)"
 trap 'rm -rf "$FIXTURE"' EXIT
 
+# Ambient Git excludes must not supply the behaviour the repo's rules are meant to
+# prove: `git check-ignore` honours core.excludesFile, and editor-swap patterns are
+# exactly what tends to live in a user's global ignore file. Without this the suite
+# passes against an UNPATCHED .gitignore on any host that has such a rule.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 git init -q "$FIXTURE"
 cp "$REPO/.gitignore" "$FIXTURE/.gitignore"
 cd "$FIXTURE"
