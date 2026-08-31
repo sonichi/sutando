@@ -258,6 +258,7 @@ def import_a_state(root: Path) -> dict:
     # A's key fn, distinct from C's _safe_key in scope: A-era filenames must
     # be checked with A's encoding; kept local to avoid a legacy module dep.
     from ag2_sparrow.outbox import _safe_key as _a_key
+    from .backend_c import is_producer_token
     for f in sorted(items_dir.glob("*.json")):
         # Every A record must be a real local regular file whose name binds
         # to its body's item_id — a symlink or renamed record is not imported.
@@ -363,7 +364,17 @@ def import_a_state(root: Path) -> dict:
             elif c.publish(item_id, payload):
                 report["ready"] += 1
             else:
-                report["skipped"] += 1       # tokens present: C already owns it
+                # Tokens are C ownership only content-bound to THIS payload:
+                # a prior cycle's dead token conflicts; junk stays malformed.
+                toks = c._tokens(key)
+                pv = [t for t in toks if is_producer_token(t.name)]
+                if toks and len(pv) == len(toks) and not all(
+                        _same_bytes(t, payload) for t in pv):
+                    conflicts.append(key)
+                elif not toks and not _same_bytes(rp, payload):
+                    conflicts.append(key)
+                else:
+                    report["skipped"] += 1
     # Verify by MEMBERSHIP: every A item is represented somewhere in C.
     missing = []
     for f in sorted(items_dir.glob("*.json")):
@@ -379,10 +390,11 @@ def import_a_state(root: Path) -> dict:
             # Terminal membership is SEMANTIC — the total validator, not a
             # name at the terminal path (a corrupt collision is not proof).
             has_terminal = bool(read_terminal_records(root, rec["item_id"]))
+            a_payload = rec.get("payload", "").encode("utf-8")
         else:
             k = _safe_key(f.stem)
             has_terminal = False    # quarantined records never map to terminals
-        from .backend_c import is_producer_token
+            a_payload = None        # no body to bind a token against
 
         def _valid_marker(e):
             parts = e.name.split(SEP)
@@ -392,6 +404,17 @@ def import_a_state(root: Path) -> dict:
         raw_tokens = c._tokens(k)
         valid_tokens = [t for t in raw_tokens
                         if is_producer_token(t.name)]
+        if raw_tokens and not valid_tokens:
+            report.setdefault("malformed_tokens", []).extend(
+                t.name for t in raw_tokens[:3])
+            missing.append(k)
+            continue
+        # ...and only content-bound to the CURRENT A payload — grammar alone
+        # launders a dead prior-cycle body into membership. Unreadable fails closed.
+        if any(a_payload is None or not _same_bytes(t, a_payload)
+               for t in valid_tokens):
+            conflicts.append(k)
+            continue
         present = ((c._d("ready") / k).exists()
                    or has_terminal
                    or any(_valid_marker(e)
@@ -399,11 +422,6 @@ def import_a_state(root: Path) -> dict:
                    or any(_valid_marker(e)
                           for e in c._d("archive").iterdir())
                    or valid_tokens)
-        if raw_tokens and not valid_tokens:
-            report.setdefault("malformed_tokens", []).extend(
-                t.name for t in raw_tokens[:3])
-            missing.append(k)
-            continue
         if not present:
             missing.append(k)
     if conflicts:

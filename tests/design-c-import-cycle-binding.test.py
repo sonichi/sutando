@@ -2,6 +2,7 @@
 """The importer's skip checks must bind to the A record that produced C's
 representation, not merely to its presence. An A rollback + republish
 otherwise leaves C serving the previous cycle's payload or receipt."""
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -28,6 +29,21 @@ def _rollback(root):
     """Put A's items back and reset the fence, as a re-run would."""
     (root / ".items-migrated").rename(root / ".items")
     mig.write_fence(root, "A")
+
+
+def _dead_claim(root, item_id, worker="w0"):
+    """Claim in C from a child that exits without completing: leaves a dead
+    producer-valid token whose BYTES are the claimed cycle's payload."""
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(REPO / 'packages' / 'ag2-sparrow')!r})\n"
+        "from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend\n"
+        f"tok = DesignCClaimBackend(Path({str(root)!r}),"
+        f" activate=True).claim({item_id!r}, {worker!r})\n"
+        "sys.exit(0 if tok else 3)\n"
+    )
+    return subprocess.run([sys.executable, "-c", code]).returncode == 0
 
 
 # --- READY: republished with new content --------------------------------
@@ -171,6 +187,48 @@ with tempfile.TemporaryDirectory() as td:
           f"a changed quarantined body is a conflict, not a skip ({r2})")
     check(r2.get("fenced") is not True,
           "the fence is withheld while a conflict stands")
+
+# --- CLAIMED IN C, CLAIMANT DIED: a token is content, not grammar ---------
+# Grammar-only membership verified a NEW A body behind a dead OLD token.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("ready-1", b"OLD-PAYLOAD")
+    mig.import_a_state(root)
+    check(_dead_claim(root, "ready-1"),
+          "a C claimant takes the token and dies holding it")
+
+    _rollback(root)
+    for f in (root / ".items").glob("ready-1.*.json"):
+        f.unlink()
+    a2 = DesignAClaimBackend(root)
+    a2.publish("ready-1", b"NEW-PAYLOAD")
+
+    r2 = mig.import_a_state(root)
+    c = DesignCClaimBackend(root)
+    toks = c._tokens(_safe_key("ready-1"))
+    check(r2.get("conflicts") == [_safe_key("ready-1")],
+          f"the dead token's stale body is a conflict, not a skip ({r2})")
+    check(r2.get("fenced") is not True,
+          "the fence is withheld while a conflict stands")
+    check(bool(toks) and toks[0].read_bytes() == b"OLD-PAYLOAD",
+          "the token is left intact for recover(), not clobbered")
+
+# --- ...and the identical-payload dead token still says yes ---------------
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("ready-1", b"SAME-PAYLOAD")
+    mig.import_a_state(root)
+    check(_dead_claim(root, "ready-1"),
+          "a C claimant takes the token and dies holding it")
+
+    _rollback(root)
+    r2 = mig.import_a_state(root)
+    check("conflicts" not in r2 and r2.get("skipped", 0) >= 1,
+          f"an identical dead token is ownership, not a conflict ({r2})")
+    check(r2.get("verified") is True and r2.get("fenced") is True,
+          f"the identical re-run verifies and fences ({r2})")
 
 # --- THE RULE MUST STILL SAY YES ------------------------------------------
 # Without this, a predicate that conflicts on everything passes all six above.
