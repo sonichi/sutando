@@ -220,7 +220,7 @@ class RuntimeServer:
         return [r["requestType"] for r in self.store.pending()
                 if r.get("taskId") == task_id]
 
-    # ── LAN WSS transport (SCP over the network — opt-in) ────────────────────
+    # ── LAN WebSocket transport (SCP over the network — opt-in; cleartext ws) ─
     def _wss_token(self) -> str:
         """Resolve the bearer token: env wins, else a durable per-host token
         under state/auth/ (survives transient-state cleanup, like the other
@@ -245,7 +245,7 @@ class RuntimeServer:
         tok = secrets.token_urlsafe(32)
         tok_path.write_text(tok)
         os.chmod(tok_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
-        _log(f"generated SCP WSS token at {tok_path}")
+        _log(f"generated SCP shared bearer token (legacy scp-wss.token name) at {tok_path}")
         return tok
 
     def _wss_ssl_context(self):
@@ -338,7 +338,10 @@ class RuntimeServer:
             return None
 
     async def _maybe_start_wss(self):
-        """Start the LAN WSS transport iff SUTANDO_SCP_WSS_ENABLE is truthy.
+        """Start the LAN WebSocket transport iff SUTANDO_SCP_WSS_ENABLE is
+        truthy. The primary listener is cleartext ws://; the TLS sibling
+        (wss://) starts only when a certificate is available. Legacy _wss_*
+        names kept for env/back-compat.
         Best-effort: any failure here must NOT stop the UDS daemon from
         serving. Returns the transport (for cleanup) or None."""
         if (os.environ.get("SUTANDO_SCP_WSS_ENABLE") or "").lower() not in (

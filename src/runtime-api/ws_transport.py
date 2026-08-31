@@ -39,10 +39,8 @@ import media_frame  # noqa: E402
 from protocol import (MAX_LINE_BYTES, ProtocolError, error_frame,  # noqa: E402
                       parse_line, result_frame)
 
-# The read surface a network peer may call before per-device authz exists.
-# Anything that mutates state or reaches a governed capability is excluded and
-# refused at the edge (see module docstring). Kept as a frozenset so it cannot
-# be mutated at runtime.
+# The SHARED bearer's grant set only — paired-device credentials carry their
+# own per-device grants (task.submit/cancel/voice), resolved per connection.
 READ_ONLY_METHODS = frozenset({
     "sutando.info", "sutando.status", "sutando.owner", "sutando.allowlist",
     "runtime.health", "runtime.details",
@@ -85,7 +83,9 @@ class WsWriterSink:
 
 
 class WsTransport:
-    """A WSS front-end that dispatches SCP frames through a shared dispatcher.
+    """A WebSocket front-end that dispatches SCP frames through a shared
+    dispatcher. The primary listener is cleartext ws:// — wss:// only when a
+    TLS context is supplied (the optional sibling listener).
 
     The dispatcher is the SAME object the UDS transport uses — this class owns
     only the websocket mechanics + the network-edge gates (auth, allowlist).
@@ -393,8 +393,9 @@ class WsTransport:
                            ssl_context=ssl_context)
         await site.start()
         scheme = "wss" if ssl_context else "ws"
+        label = "SCP WebSocket (TLS)" if ssl_context else "SCP WebSocket (cleartext)"
         self._log(
-            f"SCP WSS listening on {scheme}://{self.host}:{self.port}{self.route}")
+            f"{label} listening on {scheme}://{self.host}:{self.port}{self.route}")
 
     async def cleanup(self) -> None:
         if self._runner is not None:

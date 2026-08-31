@@ -53,14 +53,17 @@ from rundir import socket_path as _socket_path  # noqa: E402
 
 
 def _wss_url() -> str | None:
-    """Remote SCP target, if set — the SAME client, over the LAN-WSS transport
-    instead of the local Unix socket (one SCP, N transports). Env-driven so
-    every read command works over WSS with no per-command flag:
-      SUTANDO_SCP_WSS_URL    ws://<host>:<port>/scp
-      SUTANDO_SCP_WSS_TOKEN  bearer credential (from the Server's
-                             state/auth/scp-wss.token)
-    Only the read method set is served over WSS today (the transport's
-    allowlist) — mutating verbs are refused until per-device authz lands."""
+    """Remote SCP target, if set — the SAME client, over the network
+    WebSocket transport instead of the local Unix socket (one SCP, N
+    transports; ws:// is cleartext, wss:// only against the TLS sibling).
+    Env-driven so every command routes remotely with no per-command flag:
+      SUTANDO_SCP_WSS_URL    ws://<host>:<port>/scp   (legacy _WSS_ name)
+      SUTANDO_SCP_WSS_TOKEN  credential (shared bearer or a paired-device
+                             credential)
+    ALL methods route through the remote transport when the URL is set; what
+    the server serves depends on the credential — the shared bearer gets only
+    READ_ONLY_METHODS, a paired-device credential its per-device grants
+    (task.submit/cancel/voice by default)."""
     return os.environ.get("SUTANDO_SCP_WSS_URL") or None
 
 
