@@ -39,7 +39,11 @@ class DumpMechanism(unittest.TestCase):
             f.write(probe)
             path = f.name
         try:
-            env = dict(os.environ, **env_extra)
+            # Build the child env deterministically: the gate itself exports
+            # PYTHONFAULTHANDLER=1, so inheriting os.environ arms the control.
+            env = dict(os.environ)
+            env.pop("PYTHONFAULTHANDLER", None)
+            env.update(env_extra)
             p = subprocess.Popen(
                 [sys.executable, path], env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
