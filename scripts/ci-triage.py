@@ -101,6 +101,25 @@ def _run_ids(pr: str, run, repo: str) -> "list[str]":
     return ids
 
 
+def annotation_text(pr: str, run, repo: str) -> str:
+    """`::error::` output lands in ANNOTATIONS, not the log.
+
+    A log holds the workflow's echoed script — including the literal
+    `::error::` lines it will emit — so grepping it finds the source and not
+    the failure. The annotations endpoint is where the emitted text is.
+    """
+    out = []
+    for rid in _run_ids(pr, run, repo)[:2]:
+        jobs = _gh(run, ["api", f"repos/{repo}/actions/runs/{rid}/jobs"])
+        for j in ((jobs or {}).get("jobs") or []):
+            if j.get("conclusion") not in ("failure", "timed_out"):
+                continue
+            ann = _gh(run, ["api", f"repos/{repo}/check-runs/{j.get('id')}/annotations"])
+            for a in (ann or []):
+                out.append(str(a.get("message") or ""))
+    return "\n".join(out)
+
+
 def log_text(pr: str, run, repo: str) -> str:
     """Fall back to the failed job's log: some gates report 'see the job log'."""
     out = []
@@ -144,6 +163,8 @@ def main(argv=None) -> int:
         print(f"  ✖ {n}")
 
     subjects = subjects_from_text(failure_text(a.pr, run, a.repo))
+    if not subjects:
+        subjects = subjects_from_text(annotation_text(a.pr, run, a.repo))
     if not subjects:
         # Gates that say "see the job log" put the subject only there.
         subjects = subjects_from_text(log_text(a.pr, run, a.repo))

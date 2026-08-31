@@ -76,6 +76,12 @@ check("f2) a log with NO accusing line yields nothing, not a listing",
       ct.subjects_from_text("  - tests/a.test.py (skipped)\n  - tests/b.test.py (ok)") == [],
       "whole-text fallback would return both")
 
+# Verbatim annotation text from job 99387881539 (#3588). `::error::` output
+# lands in annotations; the job LOG holds the workflow's echoed script instead.
+check("e2) a real CI annotation line yields the accused test file",
+      ct.subjects_from_text("FAILED: tests/runtime-tui-reference-client.test.py (exit 1)")
+      == ["tests/runtime-tui-reference-client.test.py"])
+
 check("f) empty and None inputs yield no subjects, not a crash",
       ct.subjects_from_text("") == [] and ct.subjects_from_text(None) == [])
 
