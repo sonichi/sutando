@@ -302,12 +302,17 @@ class PoolLead:
         live = [i for i in followers if self._claiming(i)]
         if not live:
             return []
+        stem = f.name[:-len(".txt")]
+        if self._fanned_already(stem):
+            # A prior fan-out survived a failed archive: retire the original
+            # instead of re-copying, or a claimed slot gets a second assignment.
+            self._retire_original(f)
+            return []
         try:
             body = f.read_text(errors="replace")
         except OSError:
             return []
         out = []
-        stem = f.name[:-len(".txt")]
         for inst in sorted(live):
             copy = f.with_name(f"{stem}~{inst}.assigned-{inst}.txt")
             try:
@@ -316,13 +321,27 @@ class PoolLead:
             except OSError:
                 continue
         if out:
-            try:
-                archive = f.parent / "archive"
-                archive.mkdir(parents=True, exist_ok=True)
-                os.rename(f, archive / f.name)
-            except OSError:
-                pass  # copies exist; a stale original re-sweeps as dup-guarded
+            self._retire_original(f)
         return out
+
+    def _fanned_already(self, stem: str) -> bool:
+        """~-suffixed traces of a prior fan-out: live/claimed copies in
+        tasks/, archived copies, or per-copy results in any disposition."""
+        pat = f"{stem}~*"
+        dirs = (self.tasks_dir, self.tasks_dir / "archive",
+                self.results_dir, self.results_dir / "archive",
+                self.results_dir / "undelivered")
+        return any(any(d.glob(pat)) for d in dirs)
+
+    def _retire_original(self, f: Path) -> None:
+        # Failure leaves the original for the next sweep, where the entry
+        # guard retires it again instead of re-fanning: idempotent by entry.
+        try:
+            archive = f.parent / "archive"
+            archive.mkdir(parents=True, exist_ok=True)
+            os.rename(f, archive / f.name)
+        except OSError:
+            pass
 
     # ── the sweep ───────────────────────────────────────────────────────────
     def sweep(self) -> "list[tuple[str, str]]":

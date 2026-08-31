@@ -161,6 +161,46 @@ class AddressingIOGuards(unittest.TestCase):
                       ("task-ba~core-3.assigned-core-3.txt", "core-3")],
                 "copies stand even when the archive move fails")
 
+    def test_fan_out_after_failed_archive_retires_instead_of_recopying(self):
+        # A stale original + a claimed copy must not become a second
+        # assignment: the entry guard retires it once the archive unblocks.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            lead = _lead(ws, ["core-1", "core-3"])
+            _task(ws, "task-ra.txt", fan_out=True)
+            blocker = ws / "tasks" / "archive"
+            blocker.write_text("a FILE blocks the dir")
+            orig = ws / "tasks" / "task-ra.txt"
+            first = lead._fan_out(orig, ["core-1", "core-3"])
+            self.assertEqual(len(first), 2)
+            self.assertTrue(orig.exists(), "archive blocked, original stale")
+            assigned = ws / "tasks" / "task-ra~core-1.assigned-core-1.txt"
+            assigned.rename(ws / "tasks" / "task-ra~core-1.claimed-core-1.txt")
+            second = lead._fan_out(orig, ["core-1", "core-3"])
+            self.assertEqual(second, [], "entry guard blocks the re-fan")
+            self.assertFalse(assigned.exists(),
+                             "the claimed worker gets no second assignment")
+            self.assertTrue(orig.exists(), "retire also failed: archive still blocked")
+            blocker.unlink()
+            third = lead._fan_out(orig, ["core-1", "core-3"])
+            self.assertEqual(third, [])
+            self.assertFalse(orig.exists(), "unblocked: original retired")
+            self.assertTrue((ws / "tasks" / "archive" / "task-ra.txt").exists())
+
+    def test_fan_out_guard_sees_consumed_copy_results(self):
+        # All copies consumed (results archived), original stale: still no re-fan.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            lead = _lead(ws, ["core-1"])
+            _task(ws, "task-rc.txt", fan_out=True)
+            ra = ws / "results" / "archive"
+            ra.mkdir(parents=True, exist_ok=True)
+            (ra / "task-rc~core-1.txt").write_text("done")
+            got = lead._fan_out(ws / "tasks" / "task-rc.txt", ["core-1"])
+            self.assertEqual(got, [], "per-copy result is fan-out evidence")
+            self.assertFalse((ws / "tasks" / "task-rc.txt").exists(),
+                             "original retired, not re-fanned")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
