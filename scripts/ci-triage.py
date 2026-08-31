@@ -48,9 +48,8 @@ def subjects_from_text(text: str) -> "list[str]":
         return tests + srcs
 
     def accuses(line: str) -> bool:
-        # Test the line with its PATHS REMOVED: `*-failure-*.test.py` contains
-        # "FAIL", so a line merely listing such files would otherwise read as an
-        # accusation of every file on it.
+        # Paths removed first: `*-failure-*.test.py` contains "FAIL", so a
+        # line listing such files would otherwise accuse every file on it.
         stripped = _SRC_PATH.sub(" ", _TEST_PATH.sub(" ", line))
         return bool(_BLAMED.search(stripped) or _LINT_HIT.search(line))
 
