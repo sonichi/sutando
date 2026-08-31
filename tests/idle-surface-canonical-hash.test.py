@@ -222,10 +222,7 @@ with tempfile.TemporaryDirectory() as d:
     check("record_outcome returns the doc it persisted",
           doc["streak"] == 1 and doc == json.loads(st.read_text()), doc)
 
-# ── a hash move must be auditable: rename vs real change ─────────────────────
-# The digest alone cannot tell "the agent renamed its ids" from "a blocker
-# actually changed" — both are just a different 16 hex chars. Persisting the
-# canonical lines makes the two distinguishable after the fact.
+# ── a hash move is auditable: rename vs real change ──────────────────────────
 with tempfile.TemporaryDirectory() as d:
     st = Path(d) / "idle-streak.json"
 
