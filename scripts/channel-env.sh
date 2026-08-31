@@ -15,8 +15,8 @@ case "$src" in
   *[!a-z0-9._-]*|""|.|..) echo "channel-env: invalid source '$src'" >&2; exit 2 ;;
 esac
 
-base="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+base="$(bash "$repo/scripts/sutando-config.sh" claude-home-path)"
 
 # A bare `python3` is the Xcode-CLT stub on a Mac without the tools, and it
 # ignores the $SUTANDO_PY the desktop launcher sets.

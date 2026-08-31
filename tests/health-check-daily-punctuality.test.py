@@ -500,7 +500,7 @@ class TestCollectorMarksStaleNaming(unittest.TestCase):
         self.assertNotIn("UNCHECKED", r["detail"], r)
 
     def test_a_shape_valid_but_impossible_date_does_not_crash_the_probe(self):
-        """`_daily_artifact_minutes` matches dates by SHAPE (\d{4}-\d{2}-\d{2}),
+        r"""`_daily_artifact_minutes` matches dates by SHAPE (\d{4}-\d{2}-\d{2}),
         so `2026-13-45` reaches the parser and raises. An unparseable date makes
         the age unknown, which must read as "cannot tell", never as stale."""
         r = self._run("2026-13-45")
