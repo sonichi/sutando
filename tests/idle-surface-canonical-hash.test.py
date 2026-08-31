@@ -270,5 +270,41 @@ with tempfile.TemporaryDirectory() as d:
     check("pre-upgrade state says so instead of inventing a delta",
           "no previous ids" in e_old, e_old)
 
+# ── rolling upgrade: a quiet pass must seed ids for an existing hash ─────────
+with tempfile.TemporaryDirectory() as d:
+    st = Path(d) / "idle-streak.json"
+
+    def run(items, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            ish.main(["--state", str(st), "--items", json.dumps(items), *extra])
+        return out.getvalue().strip(), err.getvalue().strip()
+
+    # An install upgraded mid-run has the hash and no ids. Nothing has moved, so
+    # `changed` is false — and that quiet pass is the last chance to seed them.
+    st.write_text(json.dumps({"last_surfaced_hash": ish.held_hash(BASE)}))
+    o_q, e_q = run(BASE, "--commit")
+    doc = json.loads(st.read_text())
+    check("a quiet --commit backfills ids for a legacy hash",
+          doc.get("last_surfaced_ids") == ish.canonical_lines(BASE), doc)
+    check("...and the decision is still quiet, not a spurious post",
+          o_q.split()[0] == "quiet", o_q)
+    check("...and it says it backfilled rather than staying silent",
+          "backfilled" in e_q, e_q)
+
+    # The payoff: the next genuine change explains itself instead of reporting
+    # the absence this PR exists to remove.
+    _, e_add = run(BASE + [["3591", "upstream"]])
+    check("the next real change reports the addition, not 'no previous ids'",
+          "+['3591:upstream']" in e_add and "no previous ids" not in e_add, e_add)
+
+    # A backfill must not fire twice: once seeded, a quiet pass rewrites nothing.
+    before_doc = json.loads(st.read_text())
+    _, e_again = run(BASE, "--commit")
+    check("a second quiet pass does not re-announce a backfill",
+          "backfilled" not in e_again, e_again)
+    check("...and leaves the record untouched",
+          json.loads(st.read_text()) == before_doc, st.read_text())
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

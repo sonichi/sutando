@@ -155,11 +155,12 @@ def main(argv=None) -> int:
     path = Path(a.state)
     doc = read_state(path)
     changed = doc.get("last_surfaced_hash") != h
+    prev = doc.get("last_surfaced_ids")
+    have_ids = isinstance(prev, list)
     if changed:
         # Without the previous ids a hash change is unauditable: a renamed id
         # and a genuinely new blocker are the same opaque digest move.
-        prev = doc.get("last_surfaced_ids")
-        if isinstance(prev, list):
+        if have_ids:
             now = set(lines)
             before = set(str(x) for x in prev)
             added, gone = sorted(now - before), sorted(before - now)
@@ -167,7 +168,11 @@ def main(argv=None) -> int:
         else:
             print("changed: no previous ids recorded (first commit "
                   "or pre-upgrade state)", file=sys.stderr)
-    if changed and a.commit:
+    elif a.commit and not have_ids:
+        # A legacy state carries the hash but no ids. A quiet pass is the only
+        # cheap chance to seed them BEFORE the set moves and needs explaining.
+        print("backfilled: recorded ids for an existing hash", file=sys.stderr)
+    if a.commit and (changed or not have_ids):
         doc["last_surfaced_hash"] = h
         doc["last_surfaced_ids"] = lines
         doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
