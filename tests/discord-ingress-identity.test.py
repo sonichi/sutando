@@ -112,5 +112,107 @@ class BridgeWiring(unittest.TestCase):
         self.assertRegex(tid, r"^task-[A-Za-z0-9._~-]+$")
 
 
+class HandlerReplaySkip(unittest.TestCase):
+    """Drive the real _handle_discord_message: a replayed event (same provider
+    message id) maps to the same file and returns at the dedup skip."""
+
+    def test_replayed_dm_writes_no_second_task(self):
+        import asyncio
+        import contextlib
+        import io
+        import json
+        import os
+        import types
+
+        cfg = tempfile.mkdtemp(prefix="ccd-ingress-replay-")
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        os.environ["HOME"] = cfg
+        os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
+        cdir = Path(cfg) / "channels" / "discord"
+        cdir.mkdir(parents=True)
+        (cdir / "access.json").write_text(json.dumps(
+            {"dmPolicy": "allowlist", "allowFrom": ["U_OWNER"]}))
+        (cdir / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
+
+        if "discord" not in sys.modules:
+            _d = types.ModuleType("discord")
+            _d.Intents = type("I", (), {"default": staticmethod(
+                lambda: type("X", (), {"message_content": False})())})
+            _d.Client = type("C", (), {"__init__": lambda self, **k: None,
+                                       "event": staticmethod(lambda fn: fn)})
+            _d.File = type("F", (), {})
+            _d.Message = type("M", (), {})
+            _d.DMChannel = type("DM", (), {})
+            _d.MessageType = types.SimpleNamespace(default="default")
+            sys.modules["discord"] = _d
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_ingress_replay_db", REPO / "src" / "discord-bridge.py")
+        db = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = db
+        spec.loader.exec_module(db)
+        dsm = sys.modules["discord"]
+
+        with tempfile.TemporaryDirectory() as td:
+            tasks, results = Path(td) / "tasks", Path(td) / "results"
+            tasks.mkdir(); results.mkdir()
+            (tasks / "archive").mkdir()
+            db.TASKS_DIR, db.RESULTS_DIR = tasks, results
+            db.ARCHIVE_TASKS_DIR = tasks / "archive"
+
+            class _User:
+                def __init__(self, uid, bot=False):
+                    self.id = uid; self.bot = bot
+                def __str__(self): return f"user{self.id}"
+                def __eq__(self, o): return getattr(o, "id", None) == self.id
+                def __hash__(self): return hash(self.id)
+
+            class _Typing:
+                async def __aenter__(self): return self
+                async def __aexit__(self, *a): return False
+
+            class _DM(dsm.DMChannel):
+                def __init__(self):
+                    self.id = 555; self.sent = []
+                async def send(self, text, **kw):
+                    self.sent.append(text)
+                def typing(self):
+                    return _Typing()
+
+            class _Msg:
+                def __init__(self):
+                    self.author = _User("U_OWNER")
+                    self.channel = _DM()
+                    self.content = "hello there"
+                    self.id = 424242
+                    self.mentions = []; self.role_mentions = []
+                    self.attachments = []; self.embeds = []
+                    self.reference = None; self.guild = None
+                    self.message_snapshots = []
+                    self.type = dsm.MessageType.default
+
+            async def _noop(*a, **k):
+                return None
+            db._observe_for_mod = _noop
+            db._update_dm_checkpoint = lambda *a, **k: None
+            db.client.user = _User(777888, bot=True)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                asyncio.run(db._handle_discord_message(_Msg()))
+            n_first = len(list(tasks.glob("task-*.txt")))
+            self.assertEqual(n_first, 1, f"first delivery mints one task; log={buf.getvalue()[-400:]}")
+
+            # a restart empties the in-memory seen set — the DURABLE skip is
+            # exactly what the ingress-dedup branch exists for
+            db.seen_message_ids.clear()
+            with contextlib.redirect_stdout(buf):
+                asyncio.run(db._handle_discord_message(_Msg()))
+            self.assertEqual(len(list(tasks.glob("task-*.txt"))), 1,
+                             "replay minted a second task")
+            self.assertIn("[ingress-dedup] replay of", buf.getvalue(),
+                          "skip did not go through the ingress-dedup branch")
+
+
 if __name__ == "__main__":
     unittest.main()

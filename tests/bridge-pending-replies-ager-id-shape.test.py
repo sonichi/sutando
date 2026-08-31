@@ -103,6 +103,14 @@ class AgerIdShape(unittest.TestCase):
         self.assertEqual(out["task-dc1~7"], "999")
         self.assertEqual(MOD.pending_admitted_ms["task-dc1~7"], FRESH)
 
+    def test_non_int_at_is_normalized_not_trusted(self):
+        # a corrupt/legacy at value (string, float) restarts the clock and is
+        # rewritten as int — never compared raw against now_ms.
+        out, f = self._run_loader({"task-dc1~8": {"ch": "999", "at": "oops"}})
+        self.assertIn("task-dc1~8", out, "corrupt at must not age the entry out")
+        stored = json.loads(f.read_text())["task-dc1~8"]
+        self.assertIsInstance(stored["at"], int, "at rewritten as an int stamp")
+
 
 if __name__ == "__main__":
     r = unittest.main(exit=False).result
