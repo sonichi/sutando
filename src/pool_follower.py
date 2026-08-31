@@ -11,8 +11,10 @@ Injected paths/clock; stdlib only. See docs/lead-follower-pool.md.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import stat as statmod
 import sys
 import time
 from pathlib import Path
@@ -87,8 +89,31 @@ def acquire_work(tasks_dir, state_dir, instance: str,
     return None
 
 
+def _source_of(claimed: Path) -> str:
+    try:
+        for line in claimed.read_text(errors="replace").splitlines():
+            if line.startswith("source:"):
+                return line.split(":", 1)[1].strip()[:40]
+            if not line.strip():
+                break
+    except OSError:
+        pass
+    return ""
+
+
+def _append_metric(metrics_path, record: dict) -> None:
+    """Bookkeeping only — a metrics failure must never fail a completed task."""
+    try:
+        p = Path(metrics_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def finish_task(tasks_dir, results_dir, state_dir, instance: str,
-                claimed_path, body: str) -> Path:
+                claimed_path, body: str, metrics_path=None) -> Path:
     """Complete a claimed task: result write, done-flag, archive — in that
     order. The body's first line MUST echo `task: <id>` (stripped before
     writing); a mismatch means the body was composed for another task, so
@@ -98,7 +123,15 @@ def finish_task(tasks_dir, results_dir, state_dir, instance: str,
     if m is None or m.group(2) != instance:
         raise ValueError(
             f"not a claim held by {instance!r}: {claimed.name}")
-    if not claimed.is_file():
+    # A stat that FAILS is not a file that is ABSENT, and only absence may
+    # discard a finished task. Path.is_file() swallows a per-version errno set.
+    try:
+        present = statmod.S_ISREG(os.stat(claimed).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        present = False
+    except OSError:
+        present = True
+    if not present:
         raise ValueError(f"claimed file missing: {claimed}")
     task_id = m.group(1)
     if not body or not body.strip():
@@ -125,11 +158,31 @@ def finish_task(tasks_dir, results_dir, state_dir, instance: str,
     done.mkdir(parents=True, exist_ok=True)
     (done / f"task-{task_id}.flag").write_text("")
 
+    # Renames preserve mtime, so the claim still carries the task's arrival
+    # time — read both before the archive move takes the file away.
+    source = _source_of(claimed)
+    try:
+        arrived_at = claimed.stat().st_mtime
+    except OSError:
+        arrived_at = None
+
     archive = Path(tasks_dir) / "archive"
     archive.mkdir(parents=True, exist_ok=True)
     # Canonical name: result consumers resolve destinations by task-<id>.txt,
     # so a claimed-suffix archive name dead-letters the reply as no-task.
     _move_without_clobbering(claimed, archive / f"task-{task_id}.txt")
+
+    if metrics_path is not None:
+        finished_at = time.time()
+        _append_metric(metrics_path, {
+            "task_id": task_id,
+            "core": instance,
+            "source": source,
+            "arrived_at": arrived_at,
+            "finished_at": finished_at,
+            "duration_s": (None if arrived_at is None
+                           else round(finished_at - arrived_at, 3)),
+        })
     return result
 
 
@@ -143,7 +196,8 @@ def _finish_cli(argv: "list[str]") -> int:
     try:
         result = finish_task(claimed.parent, workspace / "results",
                              workspace / "state", argv[1], claimed,
-                             sys.stdin.read())
+                             sys.stdin.read(),
+                             workspace / "data" / "pool-metrics.jsonl")
     except ValueError as e:
         print(f"finish refused: {e}", file=sys.stderr)
         return 2

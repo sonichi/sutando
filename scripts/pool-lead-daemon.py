@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -43,6 +44,24 @@ _KICK_SCRIPT = _HERE / "kick-pool.sh"
 # launchd PENDS non-demand spawns (both KeepAlive and StartInterval), so the
 # plist never revives a dead follower — the lead drives recovery instead.
 RECOVERY_EVERY_S = 60
+
+
+def runtime_of(inst: str, agents_dir: "Path | None" = None) -> str:
+    """The runtime a follower seat runs, read from its own launchd plist.
+
+    Module scope and dir-injected so it is reachable without running main();
+    nested inside main() nothing could call it, which is why it was uncovered.
+    """
+    # The core's own plist is the only authority; unreadable or unstated
+    # means claude, matching every plist written before the runtime flag.
+    base = agents_dir or (Path.home() / "Library/LaunchAgents")
+    try:
+        body = (base / f"com.sutando.{inst}.plist").read_text(errors="replace")
+    except OSError:
+        return "claude"
+    m = re.search(r"<key>POOL_RUNTIME</key>\s*<string>([^<]*)</string>", body)
+    rt = (m.group(1).strip() if m else "") or "claude"
+    return rt if rt in ("claude", "codex") else "claude"
 
 
 def _run_recovery() -> str:
@@ -101,7 +120,7 @@ def main() -> int:
         return 0 <= age < LEAD_STALE_S
 
     lead = PoolLead(tasks, state, followers, alive,
-                    metrics=PoolMetrics(state))
+                    metrics=PoolMetrics(state), runtime_fn=runtime_of)
     status = PoolStatusWriter(tasks, state, followers, alive)
     notifier = PoolNotifier(tasks, state, _send_notice)
     ledger = ScaleLedger(state)

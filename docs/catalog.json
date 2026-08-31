@@ -380,6 +380,16 @@
       "canonical_for": "lead-follower multi-core pool architecture (assignment, claim, recovery)",
       "last_verified": "2026-08-26"
     },
+    "docs/server-and-identity.md": {
+      "title": "Sutando Server & the Agent ID card \u2014 design",
+      "audience": [
+        "contributors",
+        "maintainers"
+      ],
+      "status": "draft",
+      "canonical_for": "the runtime-api read-only identity surface (\"ID card\") design mapping",
+      "last_verified": "2026-08-24"
+    },
     "docs/benchmark-reports/2026-08-24-3a73e03.md": {
       "title": "Sutando comprehensive benchmark \u2014 2026-08-24",
       "audience": [

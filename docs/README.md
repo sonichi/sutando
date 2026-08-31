@@ -60,6 +60,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
 - [Lead-follower agent pool design](lead-follower-pool.md)
+- [Sutando Server & the Agent ID card](server-and-identity.md) — runtime-api identity-surface design note.
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)

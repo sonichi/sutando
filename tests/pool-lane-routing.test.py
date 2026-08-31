@@ -131,5 +131,44 @@ class LaneDetectionTests(LaneBase):
         self.assertEqual(_read_lane(self.tasks / "absent.txt"), "owner")
 
 
+class RuntimeAwareLaneTests(LaneBase):
+    """The routine lane skips codex: it has no watcher and sweeps on a timer,
+    so maintenance parked there waits for a poll."""
+
+    def _lead(self, runtimes):
+        self.pool = sorted(runtimes)
+        return PoolLead(self.tasks, self.state,
+                        followers_fn=lambda: list(self.pool),
+                        alive_fn=lambda i: True, now_fn=lambda: 1_000.0,
+                        runtime_fn=lambda i: runtimes[i])
+
+    def test_routine_skips_codex_for_the_highest_claude_core(self):
+        lead = self._lead({"core-1": "claude", "core-2": "claude",
+                           "core-3": "codex"})
+        self._write("task-r1.txt", routine_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-r1"), "core-2")
+
+    def test_owner_work_avoids_the_lane_core_not_the_codex_core(self):
+        # core-2 is the lane; core-3 (codex) is back in the owner pool.
+        lead = self._lead({"core-1": "claude", "core-2": "claude",
+                           "core-3": "codex"})
+        self._occupy("core-1", 1)
+        self._write("task-o1.txt", owner_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-o1"), "core-3")
+
+    def test_all_codex_pool_still_has_a_lane(self):
+        lead = self._lead({"core-1": "codex", "core-2": "codex"})
+        self._write("task-r2.txt", routine_task())
+        lead.sweep()
+        self.assertEqual(self._assigned_to("task-r2"), "core-2")
+
+    def test_no_runtime_fn_keeps_the_pre_runtime_behaviour(self):
+        self._write("task-r3.txt", routine_task())
+        self.lead.sweep()
+        self.assertEqual(self._assigned_to("task-r3"), "core-2")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

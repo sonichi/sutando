@@ -7,8 +7,11 @@ Run: python3 tests/pool-follower-finish.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -143,6 +146,129 @@ class FinishTests(unittest.TestCase):
         self.assertFalse(calls[0][1])
         self.assertIn("archive", calls[1][0])
         self.assertTrue(calls[1][1])
+
+
+class MetricsTests(FinishTests):
+    """Per-task completion record — the pool's only source of duration."""
+
+    def _metrics(self):
+        return Path(self.tmp.name) / "data" / "pool-metrics.jsonl"
+
+    def _finish_m(self, claimed, body, instance="me"):
+        return pf.finish_task(self.tasks, self.results, self.state,
+                              instance, claimed, body, self._metrics())
+
+    def test_no_metrics_path_writes_no_file(self):
+        self._finish(self._claim("a1"), "task: a1\nbody\n")
+        self.assertFalse(self._metrics().exists())
+
+    def test_record_carries_core_source_and_duration(self):
+        claimed = self._claim("a1")
+        claimed.write_text("id: task-a1\nsource: ag2space\ntask: x\n")
+        os.utime(claimed, (time.time() - 30, time.time() - 30))
+        self._finish_m(claimed, "task: a1\nbody\n")
+        rec = json.loads(self._metrics().read_text().strip())
+        self.assertEqual(rec["task_id"], "a1")
+        self.assertEqual(rec["core"], "me")
+        self.assertEqual(rec["source"], "ag2space")
+        # arrival survives the assign/claim renames, so duration is real
+        self.assertGreaterEqual(rec["duration_s"], 30)
+        self.assertLess(rec["duration_s"], 120)
+
+    def test_appends_one_line_per_task(self):
+        for tid in ("a1", "b2", "c3"):
+            self._finish_m(self._claim(tid), f"task: {tid}\nbody\n")
+        lines = self._metrics().read_text().strip().splitlines()
+        self.assertEqual([json.loads(x)["task_id"] for x in lines],
+                         ["a1", "b2", "c3"])
+
+    def test_refused_finish_records_nothing(self):
+        with self.assertRaises(ValueError):
+            self._finish_m(self._claim("a1"), "task: b2\nbody\n")
+        self.assertFalse(self._metrics().exists())
+
+    def test_unwritable_metrics_path_does_not_fail_the_task(self):
+        # bookkeeping must never turn a delivered answer into a failure
+        blocked = Path(self.tmp.name) / "blocked"
+        blocked.write_text("not a directory")
+        out = pf.finish_task(self.tasks, self.results, self.state, "me",
+                             self._claim("a1"), "task: a1\nbody\n",
+                             blocked / "sub" / "m.jsonl")
+        self.assertTrue(out.exists())
+        self.assertTrue((self.tasks / "archive" / "task-a1.txt").exists())
+
+
+class DefensiveReadTests(unittest.TestCase):
+    """The two OSError arms. Both are bookkeeping — neither may fail a task
+    that has already completed, which is exactly what makes them easy to leave
+    unexercised."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_unreadable_claim_yields_no_source_not_an_error(self):
+        # A directory where the claim should be: read_text raises OSError.
+        d = self.root / "task-x.claimed-core-1.txt"
+        d.mkdir()
+        self.assertEqual(pf._source_of(d), "")
+
+    def test_a_readable_claim_still_yields_its_source(self):
+        # Positive control: without it, a _source_of that returned "" always
+        # would satisfy the assertion above.
+        f = self.root / "task-y.claimed-core-1.txt"
+        f.write_text("id: task-y\nsource: ag2space\n\nbody\n")
+        self.assertEqual(pf._source_of(f), "ag2space")
+
+    def test_a_blank_line_ends_the_header_scan(self):
+        # `source:` below the blank line belongs to the BODY, not the header
+        # block, so it must not be read as the task's source.
+        f = self.root / "task-w.claimed-core-1.txt"
+        f.write_text("id: task-w\n\nsource: forged-by-the-body\n")
+        self.assertEqual(pf._source_of(f), "")
+
+    def test_unstattable_claim_records_no_arrival_but_still_finishes(self):
+        tasks, results, state = (self.root / "tasks", self.root / "results",
+                                 self.root / "state")
+        tasks.mkdir()
+        claimed = tasks / "task-z.claimed-core-1.txt"
+        claimed.write_text("id: task-z\nsource: chat\n\nbody\n")
+        metrics = self.root / "data" / "pool-metrics.jsonl"
+
+        # finish_task reaches the claim's metadata through TWO callers -
+        # os.stat for the presence guard, Path.stat for the arrival time.
+        real_path_stat, real_os_stat = Path.stat, pf.os.stat
+        hits = []
+
+        def _boom(name):
+            if str(name).endswith("task-z.claimed-core-1.txt"):
+                hits.append(str(name))
+                raise OSError(5, "simulated stat failure")
+
+        def path_stat(self, *a, **kw):
+            _boom(self.name)
+            return real_path_stat(self, *a, **kw)
+
+        def os_stat(path, *a, **kw):
+            _boom(path)
+            return real_os_stat(path, *a, **kw)
+
+        Path.stat, pf.os.stat = path_stat, os_stat
+        try:
+            out = pf.finish_task(tasks, results, state, "core-1", claimed,
+                                 "task: z\nthe answer\n", metrics)
+        finally:
+            Path.stat, pf.os.stat = real_path_stat, real_os_stat
+
+        # Without this the test can pass by never reaching the code it covers:
+        # Path.is_file() stopped routing through Path.stat after 3.12.
+        self.assertGreaterEqual(len(hits), 2,
+                                "the failure never reached both stat callers")
+        self.assertTrue(out.exists(), "the result is still written")
+        rec = json.loads(metrics.read_text().strip())
+        self.assertIsNone(rec["arrived_at"], "arrival is unknown, not invented")
+        self.assertIsNone(rec["duration_s"], "and duration stays unknown too")
 
 
 if __name__ == "__main__":

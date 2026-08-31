@@ -80,12 +80,25 @@ BEAT=$!
 # is only this wrapper's tmux binding.
 pool_tmux() { "$POOL_TMUX_BIN" "$@" 2>/dev/null; }
 
+# Work-driven nudge: an assignment addressed to THIS core is a reason to sweep
+# now, not at the next timer tick. pool_drive_nudge still defers unless the
+# pane is idle, so "waiting on work" and "busy" stay distinguishable.
+pool_has_assignment() {
+  set -- "$POOL_WORKSPACE"/tasks/task-*.assigned-core-"$SUTANDO_CORE_ID".txt
+  [ -e "$1" ]
+}
+
 NUDGE_S="${SUTANDO_POOL_SWEEP_NUDGE_S:-$NUDGE_DEFAULT}"
+# Floor between work-driven nudges: a claim takes a moment to land, and
+# re-prompting inside that window stacks a second entry on the same task.
+NUDGE_MIN_S="${SUTANDO_POOL_NUDGE_MIN_S:-60}"
 LAST_NUDGE=$(date +%s)
 while "$POOL_TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; do
   sleep "${SUTANDO_POOL_SESSION_POLL:-30}"
   NOW=$(date +%s)
-  if [ $((NOW - LAST_NUDGE)) -ge "$NUDGE_S" ]; then
+  SINCE=$((NOW - LAST_NUDGE))
+  if [ "$SINCE" -ge "$NUDGE_S" ] \
+     || { [ "$SINCE" -ge "$NUDGE_MIN_S" ] && pool_has_assignment; }; then
     if pool_drive_nudge "$POOL_RUNTIME" "$SESSION" pool_tmux "$SUTANDO_CORE_ID"; then
       LAST_NUDGE=$NOW
     fi
