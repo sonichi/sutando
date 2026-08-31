@@ -3011,9 +3011,9 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
 
 def _worker_of(task_id: str) -> str:
     """Which pool worker finished this task, read from the per-core done-flag.
-    Ambiguous or absent means unattributed — never a guess, never an error."""
+    `task_id` is the result stem, which already carries the `task-` prefix."""
     try:
-        hits = sorted((_STATE / "cores").glob(f"*/done/task-{task_id}.flag"))
+        hits = sorted((_STATE / "cores").glob(f"*/done/{task_id}.flag"))
     except OSError:
         return ""
     return hits[0].parent.parent.name if len(hits) == 1 else ""

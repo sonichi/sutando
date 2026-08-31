@@ -51,9 +51,11 @@ class WorkerAttribution(unittest.TestCase):
         self.mod._delivery_core = lambda: type("C", (), {"backend": _Backend()})()
 
     def _flag(self, core: str, tid: str):
+        # Named exactly as finish_task writes it: the full result stem, prefix
+        # included. A bare-id fixture agrees with a prefix bug and hides it.
         d = Path(self.tmp) / "cores" / core / "done"
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"task-{tid}.flag").write_text("")
+        (d / f"{tid}.flag").write_text("")
 
     def _doc(self, tid: str) -> dict:
         self.seen.clear()
@@ -62,16 +64,16 @@ class WorkerAttribution(unittest.TestCase):
         return self.seen["payload"]
 
     def test_worker_rides_the_payload(self):
-        self._flag("core-2", "t1")
-        doc = self._doc("t1")
+        self._flag("core-2", "task-0023dacce4b1f0a9c7")
+        doc = self._doc("task-0023dacce4b1f0a9c7")
         self.assertEqual(doc["metadata"], {"worker_id": "core-2"})
         # Attribution must not leak into the text the user reads.
         self.assertEqual(doc["body"], "done!")
 
     def test_varying_the_worker_varies_the_payload(self):
-        self._flag("core-1", "t2")
-        self._flag("core-3", "t3")
-        a, b = self._doc("t2"), self._doc("t3")
+        self._flag("core-1", "task-dev~task-07c59a1b2d3e4f5061")
+        self._flag("core-3", "task-9f81c02de5a6b7c8d9")
+        a, b = self._doc("task-dev~task-07c59a1b2d3e4f5061"), self._doc("task-9f81c02de5a6b7c8d9")
         self.assertEqual(a["metadata"]["worker_id"], "core-1")
         self.assertEqual(b["metadata"]["worker_id"], "core-3")
         self.assertNotEqual(a["metadata"], b["metadata"])
@@ -79,16 +81,22 @@ class WorkerAttribution(unittest.TestCase):
     def test_control_no_flag_sends_no_metadata(self):
         # Single-core installs write no per-core flag; absent must mean absent,
         # never a fabricated default that would misattribute every result.
-        self.assertNotIn("metadata", self._doc("t-unflagged"))
+        self.assertNotIn("metadata", self._doc("task-unflagged00000000"))
 
     def test_control_ambiguous_flags_send_no_metadata(self):
-        self._flag("core-1", "t4")
-        self._flag("core-2", "t4")
-        self.assertNotIn("metadata", self._doc("t4"))
+        self._flag("core-1", "task-4ambiguous000000a")
+        self._flag("core-2", "task-4ambiguous000000a")
+        self.assertNotIn("metadata", self._doc("task-4ambiguous000000a"))
+
+    def test_control_a_bare_id_does_not_attribute(self):
+        # Production never passes a bare id; if one ever reaches here it must
+        # not resolve, or the prefix contract has silently changed shape.
+        self._flag("core-2", "task-6bareid00000000000")
+        self.assertEqual(self.mod._worker_of("6bareid00000000000"), "")
 
     def test_worker_of_survives_a_missing_state_tree(self):
         self.mod._STATE = Path(self.tmp) / "nonexistent"
-        self.assertEqual(self.mod._worker_of("t5"), "")
+        self.assertEqual(self.mod._worker_of("task-5missingstate0000"), "")
 
 
 if __name__ == "__main__":
