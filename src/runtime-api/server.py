@@ -398,24 +398,30 @@ class RuntimeServer:
             wss = make_transport(port)
             await wss.start()
             started.append(wss)
-            ssl_ctx = self._wss_ssl_context()
-            if ssl_ctx is not None:
-                try:
-                    tls_port = int(os.environ.get("SUTANDO_SCP_WSS_TLS_PORT")
-                                   or "8443")
-                except ValueError:
-                    tls_port = 8443
-                tls = make_transport(tls_port)
-                await tls.start(ssl_context=ssl_ctx)
-                started.append(tls)
-                _log(f"SCP WSS TLS sibling on wss://{host}:{tls_port}/scp "
-                     f"(browser/companion clients)")
+            # Primary is live from here: the exposure warning fires and the
+            # handle list is returned even if the TLS sibling fails below.
             if host not in ("127.0.0.1", "localhost", "::1"):
                 _log(f"SCP plain-WS listener exposed beyond loopback on "
                      f"ws://{host}:{port}/scp (per-credential authz: shared "
                      f"bearer is read-only; paired devices may submit/cancel "
                      f"tasks)")
                 self._advertiser = self._start_advertiser(wss_agent, port)
+            try:
+                ssl_ctx = self._wss_ssl_context()
+                if ssl_ctx is not None:
+                    try:
+                        tls_port = int(os.environ.get("SUTANDO_SCP_WSS_TLS_PORT")
+                                       or "8443")
+                    except ValueError:
+                        tls_port = 8443
+                    tls = make_transport(tls_port)
+                    await tls.start(ssl_context=ssl_ctx)
+                    started.append(tls)
+                    _log(f"SCP WSS TLS sibling on wss://{host}:{tls_port}/scp "
+                         f"(browser/companion clients)")
+            except Exception as e:  # noqa: BLE001 — sibling is optional
+                _log(f"SCP TLS sibling failed (cleartext primary unaffected, "
+                     f"still serving): {e}")
             return started
         except Exception as e:  # noqa: BLE001
             _log(f"SCP WSS start failed (non-fatal, UDS unaffected): {e}")

@@ -60,10 +60,11 @@ def _wss_url() -> str | None:
       SUTANDO_SCP_WSS_URL    ws://<host>:<port>/scp   (legacy _WSS_ name)
       SUTANDO_SCP_WSS_TOKEN  credential (shared bearer or a paired-device
                              credential)
-    ALL methods route through the remote transport when the URL is set; what
-    the server serves depends on the credential — the shared bearer gets only
-    READ_ONLY_METHODS, a paired-device credential its per-device grants
-    (task.submit/cancel/voice by default)."""
+    One-shot commands route through the remote transport when the URL is set
+    (persistent surfaces differ: task watch streams remotely, task chat
+    refuses — it is Unix-socket-only). What the server serves depends on the
+    credential — the shared bearer gets only READ_ONLY_METHODS, a paired
+    device its per-device grants (task.submit/cancel/voice by default)."""
     return os.environ.get("SUTANDO_SCP_WSS_URL") or None
 
 
@@ -148,8 +149,8 @@ def _raw_tmux() -> int:
 
 
 def _watch_wss(activity: bool = False) -> int:
-    # PUSH mode over the LAN-WSS transport — subscribe + stream results/activity
-    # live from a remote Server. Read-only stream (submit stays edge-refused).
+    # PUSH mode over the remote WebSocket transport — a read stream; what a
+    # credential may DO is resolved server-side per connection.
     import asyncio  # noqa: PLC0415
     import aiohttp  # noqa: PLC0415
     url = os.environ["SUTANDO_SCP_WSS_URL"]
@@ -162,8 +163,9 @@ def _watch_wss(activity: bool = False) -> int:
                 await ws.send_str(json.dumps({
                     "jsonrpc": "2.0", "id": "watch", "method": "task.subscribe",
                     "params": {"activity": activity}}))
+                scheme = url.split(":", 1)[0] if ":" in url else "ws"
                 print(json.dumps({"watching": True, "activity": activity,
-                                  "transport": "wss"}), flush=True)
+                                  "transport": scheme}), flush=True)
                 async for msg in ws:
                     if msg.type != aiohttp.WSMsgType.TEXT:
                         continue
@@ -602,6 +604,13 @@ async def _chat_tui(reader, writer, _send, level=0, agent_id=None) -> None:
 
 
 def _chat(activity: bool = False, verbose: bool = False, full: bool = False) -> int:
+    if _wss_url():
+        # chat multiplexes over the Unix socket only; opening the local UDS
+        # under a remote URL silently targets the WRONG agent — refuse loudly.
+        print(json.dumps({"error": "task chat is not served over the remote "
+                          "WebSocket transport yet — unset SUTANDO_SCP_WSS_URL "
+                          "to chat with the local agent"}), flush=True)
+        return 2
     try:
         asyncio.run(_chat_async(activity, verbose, full))
     except (KeyboardInterrupt, EOFError):
