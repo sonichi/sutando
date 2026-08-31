@@ -223,7 +223,9 @@ class PriorArtTest(unittest.TestCase):
                            ("bad json", self._runner(reviews="not json"))):
             with self.subTest(label):
                 self.assertIsNone(pf.prior_art("1", runner=run), label)
-        unknown = "\n".join(pf.prior_art_block("1", None))
+        # Pin the repo: unpinned, this falls through to resolve_repo() and reads the
+        # real env, so the branch under test depends on the developer's shell.
+        unknown = "\n".join(pf.prior_art_block("1", None, repo="a/b"))
         empty = "\n".join(pf.prior_art_block("1", []))
         self.assertIn("COULD NOT CHECK", unknown)
         self.assertNotIn("COULD NOT CHECK", empty)
@@ -301,7 +303,8 @@ class RepoResolution(unittest.TestCase):
             return types.SimpleNamespace(returncode=1, stdout="")
 
         self.assertIsNone(pf.prior_art("1", runner=failing, repo="a/b"))
-        self.assertIn("COULD NOT CHECK", "\n".join(pf.prior_art_block("1", None)))
+        self.assertIn("COULD NOT CHECK",
+                      "\n".join(pf.prior_art_block("1", None, repo="a/b")))
 
 
 if __name__ == "__main__":
