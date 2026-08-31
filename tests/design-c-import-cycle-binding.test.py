@@ -10,9 +10,9 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
 from ag2_sparrow.delivery_core import migration as mig  # noqa: E402
-from ag2_sparrow.delivery_core.backend_a import DesignAClaimBackend  # noqa: E402
 from ag2_sparrow.delivery_core.backend_c import (  # noqa: E402
     DesignCClaimBackend, SEP, _safe_key)
+from ag2_sparrow.delivery_core.backend_a import DesignAClaimBackend  # noqa: E402
 from ag2_sparrow.delivery_core.contract import DeliveryOutcome  # noqa: E402
 
 failures = []
