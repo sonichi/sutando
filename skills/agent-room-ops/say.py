@@ -72,9 +72,12 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
         _color = os.environ.get("SUTANDO_WORKER_COLOR")
         _stripe = os.environ.get("SUTANDO_WORKER_STRIPE")
         _attn = os.environ.get("SUTANDO_WORKER_ATTENTION") == "1"
+        _style = os.environ.get("SUTANDO_WORKER_STYLE")
+        _styles = ("stripe", "highlight", "underline", "glow", "gradient", "none")
         _w = ({"id": worker,
                **({"color": _color} if _color else {}),
                **({"stripe": _stripe != "0"} if _stripe in ("0", "1") else {}),
+               **({"style": _style} if _style in _styles else {}),
                **({"attention": True} if _attn else {})}
               if worker else None)
         stamp = {"extra_content": {"space.ag2.worker": _w}} if _w else {}
