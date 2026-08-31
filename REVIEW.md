@@ -224,11 +224,10 @@ and loads whichever repo it reviews.
     correctly measured that `color-mix()` had zero precedent in that codebase (with a positive control
     proving the search worked), then asserted it "needs WebKitGTK 2.42+" from recall. The 2.42
     figure was never checked. Checking produces the sharper finding the review should have
-    carried: Tauri v2's Linux baseline is Ubuntu 22.04, which ships WebKitGTK 2.36 — both the
-    baseline and that version pairing are read from [Tauri's webview-versions
-    table][tauri-webviews], which also lists it as Safari-16.0-equivalent — against a
-    Safari 16.2 threshold for the settled `color-mix()` syntax (**unverified**: that threshold
-    comes from secondary sources, not a primary WebKit release note). Note what the citation
+    carried: [Tauri's webview-versions table][tauri-webviews] pairs Ubuntu 22.04 with WebKitGTK
+    2.36, and lists that row as Safari "TP 140 (16.0)" — a technology preview, not a shipped
+    16.0 — against a Safari 16.2 threshold for the settled `color-mix()` syntax (**unverified**:
+    that threshold comes from secondary sources, not a primary WebKit release note). Note what the citation
     itself says: the same table warns its Linux data is "a very incomplete list", so it is
     evidence, not proof — which is why `@supports (color: color-mix(in srgb, red 50%, blue))`
     is the right instrument here and a version comparison is not. The unmeasured sentence sat
