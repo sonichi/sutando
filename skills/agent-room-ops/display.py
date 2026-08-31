@@ -48,7 +48,8 @@ def main(argv=None) -> int:
     ap.add_argument("--worker-color", action="append", default=[])
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--decorators", choices=["on", "off", "auto"])
-    ap.add_argument("--message-style", choices=["stripe", "highlight", "underline", "glow", "gradient", "none"])
+    ap.add_argument("--message-style", choices=["stripe", "highlight", "none"])
+    ap.add_argument("--highlight-weight", choices=["subtle", "medium", "strong"])
     ap.add_argument("--description")
     ap.add_argument("--room-avatar")
     ap.add_argument("--clear", action="store_true")
@@ -111,6 +112,8 @@ def main(argv=None) -> int:
         content["decorators"] = a.decorators
     if a.message_style:
         content["messageStyle"] = a.message_style
+    if a.highlight_weight:
+        content["highlightWeight"] = a.highlight_weight
 
     body = {"space.ag2.identity": content} if a.profile else content
     st, out = _req(f"{base}?user_id={uid}", token, "PUT", body)
