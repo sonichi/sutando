@@ -81,8 +81,12 @@ def _read_addressing(path: Path) -> "tuple[str | None, bool]":
         text = path.read_text(errors="replace")
     except OSError:
         return None, False
-    t = _TARGET_RE.search(text)
-    return (t.group(1) if t else None), bool(_FANOUT_RE.search(text))
+    # Headers end at the task: delimiter — a body line can never forge
+    # routing (same containment rule as parse_task_headers).
+    m = re.search(r"^task:", text, re.M)
+    head = text[:m.start()] if m else text
+    t = _TARGET_RE.search(head)
+    return (t.group(1) if t else None), bool(_FANOUT_RE.search(head))
 
 
 def _read_lane(path: Path) -> str:

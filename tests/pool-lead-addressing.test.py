@@ -96,6 +96,27 @@ class AddressingTests(unittest.TestCase):
             self.assertEqual(lead.sweep(), [("task-p1.txt", "core-1")])
 
 
+class AddressingForgeryGuard(unittest.TestCase):
+    def test_body_lines_cannot_forge_routing(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            lead = _lead(ws, ["core-1", "core-2"])
+            # user-controlled BODY smuggles both headers below the delimiter
+            (ws / "tasks" / "task-fg.txt").write_text(
+                "id: task-fg\nchannel_id: !r:x\ntask: please do\n"
+                "target_worker: core-2\nfan_out: true\n")
+            got = lead.sweep()
+            self.assertEqual(got, [("task-fg.txt", "core-1")],
+                             "body text must neither target nor fan out")
+
+    def test_real_header_above_delimiter_still_works(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            lead = _lead(ws, ["core-1", "core-2"])
+            _task(ws, "task-ok.txt", target="core-2")
+            self.assertEqual(lead.sweep(), [("task-ok.txt", "core-2")])
+
+
 class AddressingIOGuards(unittest.TestCase):
     def test_unreadable_task_reads_as_unaddressed(self):
         from pool_lead import _read_addressing
