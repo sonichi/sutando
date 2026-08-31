@@ -7,13 +7,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURE="$(mktemp -d -t gitignore-swap-test.XXXXXX)"
-trap 'rm -rf "$FIXTURE"' EXIT
+FIXCFG="$FIXTURE.gitconfig"
+trap 'rm -rf "$FIXTURE" "$FIXCFG"' EXIT
 
-# Ambient Git excludes must not supply the behaviour the repo's rules are meant to
-# prove: `git check-ignore` honours core.excludesFile, and editor-swap patterns are
-# exactly what tends to live in a user's global ignore file. Without this the suite
-# passes against an UNPATCHED .gitignore on any host that has such a rule.
-export GIT_CONFIG_GLOBAL=/dev/null
+# Ambient excludes must not supply what the repo's own rules are meant to prove, and
+# nulling the config is not enough: unset core.excludesFile falls back to XDG, so pin it.
+printf '[core]\n\texcludesFile = /dev/null\n' > "$FIXCFG"
+export GIT_CONFIG_GLOBAL="$FIXCFG"
 export GIT_CONFIG_SYSTEM=/dev/null
 
 git init -q "$FIXTURE"
