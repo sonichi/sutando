@@ -167,9 +167,8 @@ KNOWN_HEADER_KEYS = (
     # Which instance a task belongs to; header status defangs forged
     # body-line claims, consumers may verify before executing.
     "instance_id",
-    # Per-message worker addressing (owner semantics 2026-08-31): stamped by
-    # the intake extractor, honored by the pool lead. Header status defangs a
-    # forged body line — a message text can never route itself.
+    # Per-message worker addressing: intake-stamped, lead-honored; header
+    # status defangs a forged body line — a message can never route itself.
     "target_worker", "fan_out",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
