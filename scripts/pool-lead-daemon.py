@@ -117,7 +117,8 @@ def main() -> int:
 
     lead = PoolLead(tasks, state, followers, alive,
                     metrics=PoolMetrics(state), runtime_fn=runtime_of)
-    status = PoolStatusWriter(tasks, state, followers, alive)
+    status = PoolStatusWriter(tasks, state, followers, alive,
+                              bindings_fn=lead.bindings)
     notifier = PoolNotifier(tasks, state, _send_notice)
     ledger = ScaleLedger(state)
     last_prune = 0.0
