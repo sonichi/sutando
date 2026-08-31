@@ -32,7 +32,9 @@ never a backlog storm.
 """
 from __future__ import annotations
 
+import calendar
 import fcntl
+import functools
 import json
 import os
 import re
@@ -96,12 +98,24 @@ REPO_ROOT = SRC_DIR.parent
 MAX_CATCHUP_SECONDS = 24 * 3600
 # A short core restart may recover a recent slot, but a morning briefing or
 # other time-sensitive task must not execute hours after its intended time.
+# FLOOR: sub-hourly jobs keep exactly the old budget, so none gets stricter.
 MAX_EMIT_LATENESS_SECONDS = 15 * 60
+# CAP: honours the "never hours late" intent above, whatever the period is.
+MAX_EMIT_LATENESS_CAP_SECONDS = 60 * 60
+# Two fires of a weekly job can be ~13 days apart when today is midweek.
+PERIOD_SCAN_MAX_SECONDS = 15 * 24 * 3600
+# Widest UTC offset in the tz database, historical LMT included. Bounds where a
+# wall time's real epoch can land relative to its offset-free encoding.
+MAX_UTC_OFFSET_SECONDS = 16 * 3600
+# A rollback across midnight leaves ELAPSED epochs on a lexically LATER local
+# date, which a backward-only day walk would never visit.
+DATE_LOOKAHEAD_DAYS = 2
 CORE_ALIVE_MAX_AGE_SECONDS = 90
 
 
 # --- minimal 5-field cron matcher (no external deps) ------------------------
-def _parse_field(field: str, lo: int, hi: int) -> set[int]:
+@functools.lru_cache(maxsize=512)
+def _parse_field(field: str, lo: int, hi: int) -> frozenset[int]:
     """Expand one cron field into the set of matching integers.
 
     Supports ``*``, ``*/N``, ``A``, ``A,B``, ``A-B``, and ``A-B/N`` — the full
@@ -124,7 +138,8 @@ def _parse_field(field: str, lo: int, hi: int) -> set[int]:
         for v in range(start, end + 1, step):
             if lo <= v <= hi:
                 result.add(v)
-    return result
+    # Frozen: the lru_cache hands every caller the SAME object.
+    return frozenset(result)
 
 
 def cron_matches(expr: str, t: time.struct_time) -> bool:
@@ -137,6 +152,15 @@ def cron_matches(expr: str, t: time.struct_time) -> bool:
         return False
     if t.tm_hour not in _parse_field(hour, 0, 23):
         return False
+    return _day_matches(dom, month, dow, t)
+
+
+def _day_matches(dom: str, month: str, dow: str, t: time.struct_time) -> bool:
+    """True if the date part of ``t`` satisfies the dom/month/dow fields.
+
+    Split out so the period scan can reject a whole day with one test instead
+    of re-deriving DOM/DOW semantics — two copies of this would drift.
+    """
     if t.tm_mon not in _parse_field(month, 1, 12):
         return False
     # Standard cron DOM/DOW semantics: when both are restricted (not '*'), a
@@ -156,6 +180,164 @@ def cron_matches(expr: str, t: time.struct_time) -> bool:
     if dom_restricted and dow_restricted:
         return dom_ok or dow_ok
     return dom_ok and dow_ok
+
+
+def _day_offsets(y: int, mo: int, d: int) -> "tuple[int, ...]":
+    """Every UTC offset the zone can be at during this local date, with margin.
+
+    Enumerated from real offsets, never from DST polarity: Antarctica/Casey
+    rolls back three hours with tm_isdst=0 reported on BOTH sides.
+    """
+    naive = calendar.timegm((y, mo, d, 0, 0, 0, 0, 0, 0))
+    lo = naive - MAX_UTC_OFFSET_SECONDS
+    hi = naive + 86400 + MAX_UTC_OFFSET_SECONDS
+
+    def _off(e: int) -> "Optional[int]":
+        # A zone can make an instant unrepresentable on some libc; skip that
+        # probe rather than fail the tick.
+        try:
+            return time.localtime(e).tm_gmtoff
+        except (OverflowError, ValueError, OSError):
+            return None
+
+    # Seed coarsely, then bisect only between probes that disagree: an ordinary
+    # date costs 5 calls and only a transition date pays for the search.
+    seeds = [lo + (hi - lo) * i // 4 for i in range(5)]
+    probed = [(e, _off(e)) for e in seeds]
+    offsets = {o for _, o in probed if o is not None}
+    pending = [(probed[i], probed[i + 1]) for i in range(len(probed) - 1)
+               if probed[i][1] != probed[i + 1][1]]
+    while pending:
+        (a_e, a_v), (b_e, b_v) = pending.pop()
+        if b_e - a_e <= 60:
+            continue
+        m_e = (a_e + b_e) // 2
+        m_v = _off(m_e)
+        if m_v is not None:
+            offsets.add(m_v)
+        if m_v != a_v:
+            pending.append(((a_e, a_v), (m_e, m_v)))
+        if m_v != b_v:
+            pending.append(((m_e, m_v), (b_e, b_v)))
+    return tuple(sorted(offsets))
+
+
+def _local_epochs(y: int, mo: int, d: int, h: int, mi: int,
+                  offsets: "Optional[tuple[int, ...]]" = None) -> "list[int]":
+    """Every real epoch whose local wall-clock is this minute, newest first.
+
+    A rollback repeats a wall minute so an ambiguous one has TWO epochs and a
+    skipped one has none. ``offsets`` is hoisted per day by the caller.
+    """
+    if offsets is None:
+        offsets = _day_offsets(y, mo, d)
+    naive = calendar.timegm((y, mo, d, h, mi, 0, 0, 0, 0))
+    out = []
+    for off in offsets:
+        e = naive - off
+        try:
+            lt = time.localtime(e)
+        except (OverflowError, ValueError, OSError):
+            continue
+        if (lt.tm_year, lt.tm_mon, lt.tm_mday,
+                lt.tm_hour, lt.tm_min) == (y, mo, d, h, mi) and e not in out:
+            out.append(e)
+    return sorted(out, reverse=True)
+
+
+def _offsets_on(day_utc: int) -> "tuple[int, ...]":
+    """``_day_offsets`` for the local date whose offset-free midnight is given."""
+    g = time.gmtime(day_utc)
+    return _day_offsets(g.tm_year, g.tm_mon, g.tm_mday)
+
+
+def cron_period_seconds(expr: str, now_epoch: int) -> "Optional[int]":
+    """Seconds between the two most recent fire-minutes of ``expr``, or None.
+
+    Derived from the expression itself rather than declared, so it stays right
+    when a schedule is edited. Bounded by MAX_CATCHUP_SECONDS like the scan below.
+    """
+    # Walk by DAY, not by minute: a whole day is rejected with one date test,
+    # and only a matching day expands its hour x minute candidates.
+    fields = expr.split()
+    if len(fields) != 5:
+        raise ValueError(f"cron expression must have 5 fields: {expr!r}")
+    minute_f, hour_f, dom_f, month_f, dow_f = fields
+    hours = sorted(_parse_field(hour_f, 0, 23), reverse=True)
+    minutes = sorted(_parse_field(minute_f, 0, 59), reverse=True)
+    if not hours or not minutes:
+        return None
+
+    floor = now_epoch - PERIOD_SCAN_MAX_SECONDS
+    fires = []
+    window = []
+    cur = time.localtime(now_epoch)
+    # Start AHEAD of today's local date, then walk backward: a rollback across
+    # midnight puts already-elapsed epochs on a lexically later date.
+    day_utc = calendar.timegm((cur.tm_year, cur.tm_mon, cur.tm_mday,
+                               0, 0, 0, 0, 0, 0)) + DATE_LOOKAHEAD_DAYS * 86400
+    # Three dates bound the westmost offset any UNVISITED date can be at; two
+    # dates further back are already more than one offset-span in the past.
+    ring = [_offsets_on(day_utc - i * 86400) for i in range(3)]
+
+    def _drain(barrier: int) -> "Optional[int]":
+        """Emit buffered epochs above ``barrier``; period once two are found."""
+        while window and window[0] > barrier:
+            epoch = window.pop(0)
+            if epoch < floor:
+                return -1
+            fires.append(epoch)
+            if len(fires) == 2:
+                return fires[0] - fires[1]
+        return None
+
+    days = PERIOD_SCAN_MAX_SECONDS // 86400 + 4 + DATE_LOOKAHEAD_DAYS
+    for _ in range(days):
+        g = time.gmtime(day_utc)
+        y, mo, d = g.tm_year, g.tm_mon, g.tm_mday
+        offsets = ring[0]
+        seen = [o for t in ring for o in t]
+        west = min(seen) if seen else -MAX_UTC_OFFSET_SECONDS
+        if _day_matches(dom_f, month_f, dow_f, g):
+            east = max(offsets) if offsets else MAX_UTC_OFFSET_SECONDS
+            for h in hours:
+                base = calendar.timegm((y, mo, d, h, 0, 0, 0, 0, 0))
+                # Every real epoch of this wall hour is at least base - east,
+                # so an hour still wholly ahead cannot contribute.
+                if base - east > now_epoch:
+                    continue
+                for mi in minutes:
+                    window.extend(e for e in _local_epochs(y, mo, d, h, mi, offsets)
+                                  if e <= now_epoch)
+                window.sort(reverse=True)
+                # Nothing unexpanded (lower hours, older dates) can exceed this,
+                # so anything above it is final and safe to consume in order.
+                got = _drain(base - west)
+                if got is not None:
+                    return None if got == -1 else got
+        window.sort(reverse=True)
+        got = _drain(day_utc - west)
+        if got is not None:
+            return None if got == -1 else got
+        day_utc -= 86400
+        ring = [ring[1], ring[2], _offsets_on(day_utc - 2 * 86400)]
+    window.sort(reverse=True)
+    got = _drain(floor - 1)
+    return None if got in (None, -1) else got
+
+
+def emit_lateness_budget(expr: str, now_epoch: int) -> int:
+    """How late a slot of ``expr`` may be and still run.
+
+    A FLAT budget spends a half-period on a 30-minute job and 1/96th of one on a
+    daily job, so an equal delay costs the daily job an entire day. Scale with the
+    period, never below the old constant, never above the cap.
+    """
+    period = cron_period_seconds(expr, now_epoch)
+    if period is None:
+        return MAX_EMIT_LATENESS_SECONDS
+    return min(max(MAX_EMIT_LATENESS_SECONDS, period // 8),
+               MAX_EMIT_LATENESS_CAP_SECONDS)
 
 
 def latest_due_since(expr: str, last_epoch: int, now_epoch: int) -> Optional[int]:
@@ -494,7 +676,8 @@ def run(now_epoch: Optional[int] = None) -> list:
                     continue
                 else:
                     lateness = now_epoch - due_epoch
-                    if lateness <= MAX_EMIT_LATENESS_SECONDS:
+                    budget = emit_lateness_budget(expr, now_epoch)
+                    if lateness <= budget:
                         emit_task(name, entry)
                         emitted.append(name)
                     else:
@@ -503,7 +686,7 @@ def run(now_epoch: Optional[int] = None) -> list:
                         _ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                         print(
                             f"{_ts} cron-runner: dropping stale slot for {name} "
-                            f"({lateness}s late)",
+                            f"({lateness}s late, budget {budget}s)",
                             file=sys.stderr,
                         )
             state[name] = now_epoch
