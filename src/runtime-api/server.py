@@ -130,6 +130,9 @@ class RuntimeServer:
         # request needs a human (the wearable's buzz-and-card trigger).
         self._request_subscribers: set[asyncio.StreamWriter] = set()
         self._state_dir = state_dir
+        # Set once this process owns the instance manifest. Gates the stop
+        # transition: a process that never registered has nothing to stop.
+        self._registered = False
         # Actor identity is resolved DAEMON-SIDE, here, and handed to the
         # dispatcher explicitly — a client parameter can never override it.
         self.actor_id = resolve_actor_id(state_dir)
@@ -197,10 +200,19 @@ class RuntimeServer:
                 instance=instance_id(), tmux_socket=tmux_socket, session=session,
                 config_dir=os.environ.get("CLAUDE_CONFIG_DIR"),
                 status="running")
+            self._registered = True
         except Exception as e:  # noqa: BLE001
             _log(f"instance-registry write failed (non-fatal): {e}")
 
     def mark_stopped(self) -> None:
+        """Only the process holding this instance may record it stopped.
+
+        `serve()` refuses a duplicate start before registering anything, but
+        `main()` runs this in `finally` regardless — so without the gate an
+        ordinary double launch overwrote the LIVE daemon's manifest with
+        `stopped`, destroying the crash-vs-clean-stop signal while it served."""
+        if not self._registered:
+            return
         try:
             instance_registry.mark_stopped(self.actor_id, instance_id())
         except Exception:  # noqa: BLE001
@@ -276,7 +288,10 @@ class RuntimeServer:
             interval = float(os.environ.get("SUTANDO_RESULT_POLL_S") or 0.2)
         except ValueError:
             interval = 0.2
-        seen = {f.name for f in tasks._result_files()}
+        # Seed only COMPLETE backlog: an unready name must stay unseen so it
+        # is still pushed when it fills, matching _emit_new_results.
+        seen = {f.name for f, _ts in tasks._result_files()
+                if read_ready_result(f) is not None}
         while True:
             await asyncio.sleep(interval)
             await self._emit_new_results(tasks, seen)
@@ -409,17 +424,14 @@ class RuntimeServer:
             files = tasks._result_files()  # newest first
         except OSError:
             return
-        for f in reversed([f for f in files if f.name not in seen]):
+        for f, ts in reversed([p for p in files if p[0].name not in seen]):
             # readiness: unreadable/mid-write/empty = not-yet — the name only
             # enters `seen` after a ready read, so a transient race retries
             body = read_ready_result(f)
             if body is None:
                 continue
             seen.add(f.name)
-            try:
-                ts = int(f.stat().st_mtime)
-            except OSError:
-                ts = int(time.time())  # archived between read and stat
+            # `ts` is the enumeration mtime; no second stat to lose to archival.
             frame = notification_frame("task.result", {
                 "taskId": f.name.removesuffix(".txt"),
                 "result": body, "ts": ts})

@@ -13,8 +13,8 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-activity-hook.py>]
-//   arg4 (optional): path to hooks/emit-tool-activity.py — registered as
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-activity-hook.py>]
+//   arg5 (optional): path to hooks/emit-tool-activity.py — registered as
 //                    PostToolUse on every tool; feeds the server's /verbose
 //                    activity stream. Omitted → no activity feed.
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
@@ -28,6 +28,8 @@
 //                    emitted zero skill:* events in production (the obs blob is
 //                    only built when SUTANDO_OBS_ENDPOINT is set). The hook
 //                    script honors the telemetry opt-out on its own.
+//   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
+//                    PreToolUse for the Gmail MCP connector's write tools.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -93,7 +95,19 @@ if (skillTelemetryHook.trim()) {
 	};
 }
 
-const activityHook = process.argv[5] || '';
+// Always-on: the connector's write scopes are broken, so the deny must reach the
+// caller. The hook re-checks the tool name, so the matcher is belt-and-braces.
+const gmailWriteGuardHook = process.argv[5] || '';
+let gmailWriteGuardSettings = null;
+if (gmailWriteGuardHook.trim()) {
+	gmailWriteGuardSettings = {
+		hooks: {
+			PreToolUse: [{ matcher: 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*', hooks: [{ type: 'command', command: `python3 ${shq(gmailWriteGuardHook)}` }] }],
+		},
+	};
+}
+
+const activityHook = process.argv[6] || '';
 let activitySettings = null;
 if (activityHook.trim()) {
 	activitySettings = {
@@ -103,4 +117,8 @@ if (activityHook.trim()) {
 	};
 }
 
-process.stdout.write(JSON.stringify(mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, activitySettings)));
+process.stdout.write(
+	JSON.stringify(
+		mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings, activitySettings),
+	),
+);

@@ -22,6 +22,7 @@ and succeeds is the failure mode this exists to prevent.
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import re
 import subprocess
@@ -88,7 +89,20 @@ def count_check_patterns(checks_section: str) -> "tuple[int, int]":
     return counts["flag"], counts["allow"]
 
 
-def prior_art(pr: str, runner=None) -> "list[str] | None":
+def resolve_repo(explicit: "str | None" = None, env: "dict | None" = None) -> str:
+    """`--repo` > $SUTANDO_REVIEW_REPO > gh's `{owner}/{repo}` remote inference.
+
+    Remote inference is LAST, not only: an app-pinned install has no `.git`, so
+    `{owner}/{repo}` cannot resolve and the prior-art check silently degrades on
+    every run. A hardcoded repo would fix that host and break every fork.
+    """
+    if explicit:
+        return explicit
+    environ = os.environ if env is None else env
+    return environ.get("SUTANDO_REVIEW_REPO") or "{owner}/{repo}"
+
+
+def prior_art(pr: str, runner=None, repo: "str | None" = None) -> "list[str] | None":
     """Reviews and non-COMMENTED activity already on the PR, oldest first.
 
     None means COULD NOT CHECK, which is not the same as "nothing there" — a
@@ -102,7 +116,7 @@ def prior_art(pr: str, runner=None) -> "list[str] | None":
             ("review", f"pulls/{pr}/reviews", "submitted_at", "state"),
             ("comment", f"issues/{pr}/comments", "created_at", None)):
         try:
-            r = run(["gh", "api", "repos/{owner}/{repo}/" + path, "--paginate"])
+            r = run(["gh", "api", f"repos/{resolve_repo(repo)}/" + path, "--paginate"])
         except (OSError, subprocess.SubprocessError):
             return None
         if r.returncode != 0:
@@ -145,14 +159,14 @@ def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
             + [f"  {line}" for line in seen[-PRIOR_ART_SHOWN:]])
 
 
-def render(guide: Path, pr: str | None) -> str:
+def render(guide: Path, pr: str | None, repo: "str | None" = None) -> str:
     text = guide.read_text(encoding="utf-8", errors="replace")
     lessons = extract_section(text, LESSONS_HEADING)
     checks = extract_section(text, CHECKS_HEADING)
     out = [f"review-preflight: criteria from {guide}", ""]
     if pr:
         out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
-        out += prior_art_block(pr, prior_art(pr)) + [""]
+        out += prior_art_block(pr, prior_art(pr, repo=repo)) + [""]
     out.append(lessons if lessons else
                "WARNING: no '## Lessons' section found — the guide's criteria could not be read.")
     n_flag, n_allow = count_check_patterns(checks)
@@ -169,6 +183,8 @@ def main(argv: "list[str] | None" = None) -> int:
     ap = argparse.ArgumentParser(description="Print review criteria before reviewing a PR.")
     ap.add_argument("pr", nargs="?", help="PR number, for the header line only")
     ap.add_argument("--guide", help="path to the review guide (default <repo>/REVIEW.md)")
+    ap.add_argument("--repo", help="owner/name for the prior-art lookup; "
+                    "defaults to $SUTANDO_REVIEW_REPO, then the git remote")
     args = ap.parse_args(argv)
 
     guide = resolve_guide(args.guide)
@@ -176,7 +192,7 @@ def main(argv: "list[str] | None" = None) -> int:
         print(f"review-preflight: guide not found at {guide}", file=sys.stderr)
         return 1
     try:
-        print(render(guide, args.pr))
+        print(render(guide, args.pr, args.repo))
     except OSError as exc:
         print(f"review-preflight: cannot read {guide}: {exc}", file=sys.stderr)
         return 1

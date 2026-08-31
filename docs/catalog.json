@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-08-13"
+   "last_verified": "2026-08-26"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -404,25 +404,15 @@
    "canonical_for": "workspace synchronization mechanics",
    "last_verified": null
   },
-  "docs/lead-follower-pool.md": {
-   "title": "Lead-follower agent pool — design",
+  "docs/benchmarks/gaia-100-2026-08-26.md": {
+   "title": "GAIA-100 benchmark run (2026-08-26)",
    "audience": [
-    "contributors",
-    "maintainers"
+    "maintainers",
+    "contributors"
    ],
-   "status": "canonical",
-   "canonical_for": "lead-follower multi-core pool architecture (assignment, claim, recovery)",
-   "last_verified": "2026-08-26"
-  },
-  "docs/server-and-identity.md": {
-   "title": "Sutando Server & the Agent ID card — design",
-   "audience": [
-    "contributors",
-    "maintainers"
-   ],
-   "status": "draft",
-   "canonical_for": "the server v0 composition (daemon, CLI, registry) and the agent identity-card contract it exposes",
-   "last_verified": "2026-08-26"
+   "status": "active",
+   "canonical_for": "the 76/100 blind-scored GAIA validation result and how to rebuild the suite without republishing the answer key",
+   "last_verified": "2026-08-27"
   }
  }
 }
