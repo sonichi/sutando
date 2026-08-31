@@ -20,10 +20,24 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
-from ag2_sparrow.result_markers import (  # noqa: E402
-    build_requeued_task,
-    render_skill_prelude,
-)
+import importlib.util  # noqa: E402
+
+
+def _load(tag, path):
+    """Both vendored copies must BEHAVE identically, and the src/ copy is the
+    one the coverage gate scopes — so every case runs against each."""
+    spec = importlib.util.spec_from_file_location(f"result_markers_{tag}", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod  # dataclass creation resolves cls.__module__
+    spec.loader.exec_module(mod)
+    return mod
+
+
+COPIES = {
+    "src": _load("src", REPO / "src" / "result_markers.py"),
+    "pkg": _load("pkg", REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
+                  / "result_markers.py"),
+}
 
 FAILS: list = []
 
@@ -34,25 +48,36 @@ def check(cond, msg):
         FAILS.append(msg)
 
 
-def stored_task(source="dev-ag2space", stale_dir="ag2space", prelude=True):
-    head = (
-        "id: task-dev~task-orig111\n"
-        "task: hello\n"
-        f"source: {source}\n"
-        "channel_id: !room1:dev.ag2.space\n"
-        "user_id: @u:dev.ag2.space\n"
-        "access_tier: owner\n"
-    )
-    if not prelude:
-        return head
-    # The BIRTH prelude, rendered with a superseded channel dir — the #3613 shape.
-    stale = "\n".join(
-        render_skill_prelude("!room1:dev.ag2.space", stale_dir, "task-dev~task-orig111")
-    )
-    return head + stale + "\n"
+def run_suite(mod, tag):
+    build_requeued_task = mod.build_requeued_task
+    render_skill_prelude = mod.render_skill_prelude
+    global check
+    _check = check
+    check = lambda cond, msg: _check(cond, f"[{tag}] {msg}")  # noqa: E731
+    try:
+        _run_cases(build_requeued_task, render_skill_prelude)
+    finally:
+        check = _check
 
 
-def main() -> int:
+def _run_cases(build_requeued_task, render_skill_prelude):
+    global stored_task
+    def stored_task(source="dev-ag2space", stale_dir="ag2space", prelude=True):
+        head = (
+            "id: task-dev~task-orig111\n"
+            "task: hello\n"
+            f"source: {source}\n"
+            "channel_id: !room1:dev.ag2.space\n"
+            "user_id: @u:dev.ag2.space\n"
+            "access_tier: owner\n"
+        )
+        if not prelude:
+            return head
+        stale = "\n".join(
+            render_skill_prelude("!room1:dev.ag2.space", stale_dir,
+                                 "task-dev~task-orig111"))
+        return head + stale + "\n"
+
     # --- the observed defect: stale lane dir is replaced by the header's own ---
     out = build_requeued_task(stored_task(), "task-dev~task-req222", 1,
                               "!other:dev.ag2.space", "task-holder")
@@ -95,8 +120,16 @@ def main() -> int:
     check("render_skill_prelude" in bridge,
           "bridge delegates to the shared renderer")
 
+
+def _finish() -> int:
     print(("FAIL: " + "; ".join(FAILS)) if FAILS else "ALL OK")
     return 1 if FAILS else 0
+
+
+def main() -> int:
+    for tag, mod in COPIES.items():
+        run_suite(mod, tag)
+    return _finish()
 
 
 if __name__ == "__main__":
