@@ -101,6 +101,33 @@ class FixHandlerGating(unittest.TestCase):
         self.assertEqual(len(calls), 1, "the repairable case did not invoke the installer")
         self.assertIn("install-claude-hooks.sh", " ".join(map(str, calls[0])))
 
+    def test_installer_failure_warns_instead_of_raising(self):
+        """A failed repair must not take the whole health check down with it."""
+        calls = []
+        real, real_probe = subprocess.run, hc.check_claude_hook_registration
+
+        def boom(cmd, *a, **k):
+            calls.append(cmd)
+            raise OSError("bash vanished")
+
+        hc.subprocess.run = boom
+        hc.check_claude_hook_registration = lambda *a, **k: {
+            "name": "claude-hooks", "status": "warn", "detail": "still broken"
+        }
+        import io
+        buf = io.StringIO()
+        try:
+            check = {"name": "claude-hooks", "status": "warn",
+                     "detail": "x", "_unregistered_hooks": ["Stop:src/x.sh"]}
+            hc.apply_claude_hooks_fix([check], stream=buf)
+        finally:
+            hc.subprocess.run = real
+            hc.check_claude_hook_registration = real_probe
+        self.assertEqual(len(calls), 1, "the installer was never attempted")
+        self.assertIn("could not run", buf.getvalue())
+        self.assertIn("bash vanished", buf.getvalue())
+        self.assertEqual(check["status"], "warn")
+
     def test_skips_warn_without_the_marker(self):
         calls = self._run({"name": "claude-hooks", "status": "warn",
                            "detail": "could not parse HOOKS=(...)"})
