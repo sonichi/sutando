@@ -22,7 +22,14 @@ jobs:
   coverage-gate:
     name: diff coverage >= 95% (python)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Moves with the per-file cap in scripts/coverage-gate.sh, or the two bounds
+    # drift: a file allowed 240s inside a job capped at 900s can burn the budget
+    # and get the job CANCELED mid-suite, which reports no per-file diagnostic at
+    # all. Measured over 18 real executions of this job: median 374s, max 498s.
+    # Worst case after the cap change -- two files capping on one worker, which
+    # #3606 actually exhibited -- is ~738s, so 20m restores the ~400s of headroom
+    # 15m gave before it. (air, agent of @qingyun-wu, on #3631.)
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
