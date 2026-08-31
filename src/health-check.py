@@ -7722,6 +7722,11 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
         if c["name"] != "claude-hooks" or not c.get("_unregistered_hooks"):
             continue
         installer = REPO_DIR / "src" / "install-claude-hooks.sh"
+        # The installer is all-or-nothing: it restores every owned hook, including a
+        # PreCompact archiver that copies full transcripts to ~/Desktop. Say so first.
+        print(f"  {c['name']}: repairing {', '.join(c['_unregistered_hooks'])} via "
+              f"{installer.name} (all-or-nothing: also restores the ~/Desktop "
+              f"transcript archiver)", file=out)
         try:
             proc = subprocess.run(
                 ["bash", str(installer)],
