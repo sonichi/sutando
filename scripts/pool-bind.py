@@ -39,17 +39,19 @@ def main(argv, workspace=None) -> int:
     if argv[0] == "pin":
         dedicated = "--dedicated" in argv
         argv = [a for a in argv if a != "--dedicated"]
-        if len(argv) != 3:
-            print("usage: pool-bind.py pin <channel> <instance> [--dedicated]",
-                  file=sys.stderr)
+        if len(argv) < 3:
+            print("usage: pool-bind.py pin <channel> <instance>... "
+                  "[--dedicated]", file=sys.stderr)
             return 2
-        channel, instance = argv[1], argv[2]
-        beat = lead.state_dir / "cores" / f"{instance}.alive"
-        if not beat.exists():
-            print(f"warning: no liveness beat for {instance}; pinning anyway",
-                  file=sys.stderr)
+        channel, workers = argv[1], argv[2:]
+        for inst in workers:
+            beat = lead.state_dir / "cores" / f"{inst}.alive"
+            if not beat.exists():
+                print(f"warning: no liveness beat for {inst}; pinning anyway",
+                      file=sys.stderr)
+        target = workers[0] if len(workers) == 1 else workers
         print(json.dumps(
-            {channel: lead.pin_room(channel, instance, dedicated=dedicated)}))
+            {channel: lead.pin_room(channel, target, dedicated=dedicated)}))
         return 0
     if len(argv) != 2:
         print("usage: pool-bind.py unpin <channel>", file=sys.stderr)
