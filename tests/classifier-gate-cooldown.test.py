@@ -91,6 +91,14 @@ def main() -> int:
         check(r.reason == "enqueued",
               f"cooldown_seconds=0 -> gate ungated (got {r.reason})")
 
+        # --- an unparsable enqueued_at never cools (bad state proceeds)
+        ws = make_workspace(tmp, "badstamp")
+        write_state(ws, status="complete", snapshot_hash="aaaa",
+                    enqueued_at="not-a-number", source_token="stale-token")
+        r = tw.maybe_enqueue_classifier_task(ws)
+        check(r.reason == "enqueued",
+              f"unparsable enqueued_at -> not cooling (got {r.reason})")
+
         # --- a future enqueued_at (clock step) never cools forever
         ws = make_workspace(tmp, "future")
         write_state(ws, status="complete", snapshot_hash="aaaa",
