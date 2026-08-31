@@ -16,6 +16,7 @@ for park/reconcile — never CONFIRMED (seam doc §4, Discord's sentinel).
 """
 from __future__ import annotations
 
+import json as _json
 import os
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -106,21 +107,33 @@ def _reconcile_marker(c, marker: Path, payload: bytes, key: str,
         conflicts.append(key)
 
 
-def _receipt_matches(records, rec) -> bool:
-    """A terminal record proves THIS A record migrated only if it carries
-    that record's receipt. Otherwise C is holding an earlier cycle's."""
-    want = (rec.get("provider"), rec.get("destination"))
-    for r in records:
-        got = r.get("receipt") or {}
-        if (got.get("provider"), got.get("destination")) == want:
-            return True
-    return False
+def _a_record_digest(rec) -> str:
+    """Canonical digest binding a terminal to the COMPLETE A record/cycle —
+    a route alone matches any later cycle confirmed to the same place."""
+    import hashlib
+    basis = _json.dumps(
+        {"item_id": rec.get("item_id"), "payload": rec.get("payload"),
+         "provider": rec.get("provider"),
+         "destination": rec.get("destination"),
+         "attempts": rec.get("attempts")},
+        sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def _terminal_proves_record(records, rec) -> bool:
+    """Reuse only on importer provenance + full-record digest. A terminal
+    without a digest (native, or pre-digest import) proves a DIFFERENT cycle."""
+    want = _a_record_digest(rec)
+    return any(r.get("a_record_digest") == want for r in records)
 
 
 def _attempts_value(ap: Path) -> Optional[int]:
-    """The count an attempts file holds, or None when absent or unreadable.
-    A file that merely PARSES can still hold a previous cycle's number."""
+    """The count an attempts file holds, or None when absent, unreadable, or
+    not a local regular file — symlinked evidence is not writer state."""
+    import stat as _stat
     try:
+        if not _stat.S_ISREG(os.lstat(ap).st_mode):
+            return None
         return int(ap.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
@@ -264,7 +277,19 @@ def import_a_state(root: Path) -> dict:
     # be checked with A's encoding; kept local to avoid a legacy module dep.
     from ag2_sparrow.outbox import _safe_key as _a_key
     from .backend_c import is_producer_token
-    for f in sorted(items_dir.glob("*.json")):
+
+    def _list_records():
+        # os.listdir SURFACES enumeration denial; glob() folds it into an
+        # empty scan that reads as a clean, complete migration.
+        return [items_dir / n for n in sorted(os.listdir(items_dir))
+                if n.endswith(".json")]
+
+    try:
+        _records = _list_records()
+    except OSError as e:
+        report["unmigratable"] = f"source enumeration failed: {e}"
+        return report
+    for f in _records:
         # Every A record must be a real local regular file whose name binds
         # to its body's item_id — a symlink or renamed record is not imported.
         if f.is_symlink() or not f.is_file():
@@ -325,7 +350,7 @@ def import_a_state(root: Path) -> dict:
                 if _recs:
                     # Presence proves SOME cycle imported this key, not
                     # THIS A record; a republish would serve the old receipt.
-                    if not _bare and _receipt_matches(_recs, rec):
+                    if not _bare and _terminal_proves_record(_recs, rec):
                         _retire_budget(ap)
                         report["skipped"] += 1
                     else:
@@ -347,6 +372,7 @@ def import_a_state(root: Path) -> dict:
                 # 2-part pseudo-incarnation: binds id+worker for the total
                 # validator, can never equal a real 5-part claim filename.
                 "attempts": n, "imported": True,
+                "a_record_digest": _a_record_digest(rec),
                 "incarnation": _pseudo_incarnation(key),
             }, _pseudo_incarnation(key))
             _retire_budget(ap)
@@ -383,7 +409,12 @@ def import_a_state(root: Path) -> dict:
                     report["skipped"] += 1
     # Verify by MEMBERSHIP: every A item is represented somewhere in C.
     missing = []
-    for f in sorted(items_dir.glob("*.json")):
+    try:
+        _records = _list_records()
+    except OSError as e:
+        report["unmigratable"] = f"verification enumeration failed: {e}"
+        return report
+    for f in _records:
         # Same classification as the conversion pass: any record it would
         # quarantine verifies under the quarantine key, never its raw value.
         try:
@@ -410,9 +441,12 @@ def import_a_state(root: Path) -> dict:
         raw_tokens = c._tokens(k)
         valid_tokens = [t for t in raw_tokens
                         if is_producer_token(t.name)]
-        if raw_tokens and not valid_tokens:
+        if len(valid_tokens) != len(raw_tokens):
+            # one valid sibling must not launder the malformed one: recovery
+            # skips it forever while publish() lets it block the slot.
             report.setdefault("malformed_tokens", []).extend(
-                t.name for t in raw_tokens[:3])
+                t.name for t in raw_tokens
+                if not is_producer_token(t.name))
             missing.append(k)
             continue
         # ...and only content-bound to the CURRENT A payload — grammar alone
@@ -447,6 +481,22 @@ def import_a_state(root: Path) -> dict:
 
 
 FALLBACK_COUNTER = "a-fallback-hits.json"
+
+
+def read_fallback_counter(path) -> Optional[int]:
+    """Schema/bounds validator shared by the RMW writer and the release
+    probe. None = malformed/unreadable and must BLOCK deletion — a
+    permissive reader turns garbage into a measured zero."""
+    try:
+        rec = _json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    raw = rec.get("count")
+    if isinstance(raw, bool) or not isinstance(raw, int)             or not (0 <= raw <= 10**12):
+        return None
+    return raw
 
 
 def resolve_delivery(root: Path, item_id: str) -> dict:
@@ -513,18 +563,13 @@ def dual_read(root: Path, item_id: str) -> "dict | None":
         import fcntl
         with open(counter.with_suffix(".lock"), "a+") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
-            try:
-                prior = _json.loads(counter.read_text(encoding="utf-8"))
-                raw = prior.get("count") if isinstance(prior, dict) else None
-                # Release-gate integer: fail closed to 0 on any malformed
-                # shape (null/bool/str/list/non-finite/negative/oversized).
-                count = (raw if isinstance(raw, int) and not isinstance(raw, bool)
-                         and 0 <= raw <= 10**12 else 0)
-                existed = True
-            except FileNotFoundError:
+            if counter.exists():
+                validated = read_fallback_counter(counter)
+                # Malformed-but-present stays for the PROBE to flag (same
+                # validator): silently repairing would hide that it happened.
+                count, existed = (validated if validated is not None else 0), True
+            else:
                 count, existed = 0, False
-            except (OSError, ValueError):
-                count, existed = 0, True
             payload = update(count, existed)
             if payload is None:
                 return

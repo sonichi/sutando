@@ -100,5 +100,17 @@ with tempfile.TemporaryDirectory() as td:
     check(r["status"] == "ok" and "measured zero" in r["detail"],
           "migrated root with a zero counter -> ok as a MEASURED zero")
 
+    # Shared validator (writer + probe): a malformed count must BLOCK the
+    # gate, never read as a clean zero. int() accepted -5 as measured.
+    for bad in ('{"count": -5}', '{"count": true}', '{"count": "7"}',
+                '{"count": 10000000000000}'):
+        (root / "a-fallback-hits.json").write_text(bad)
+        r = hc.check_a_fallback_hits(ws)
+        check(r["status"] == "warn" and "malformed" in r["detail"],
+              f"malformed counter {bad} -> warn (gate blocked), not zero")
+    (root / "a-fallback-hits.json").write_text(json.dumps({"count": 0}))
+    r = hc.check_a_fallback_hits(ws)
+    check(r["status"] == "ok", "control: valid zero still measures ok")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

@@ -580,8 +580,8 @@ with tempfile.TemporaryDirectory() as td:
     check(r["source"] is None and not r["delivered"],
           "unfenced root: no fallback answer is fabricated for the collided id")
 
-# 6b) a VALID pre-existing terminal for the same id is genuine C membership:
-#     the DELIVERED row skips and the migration fences
+# 6b) a NATIVE terminal carries no importer provenance: route match alone
+#     proves a DIFFERENT cycle, so the row conflicts (fail closed).
 with tempfile.TemporaryDirectory() as td:
     root = Path(td) / "r-valid"
     a = DesignAClaimBackend(root)
@@ -593,9 +593,9 @@ with tempfile.TemporaryDirectory() as td:
     t = c_pre.claim("col-2", "w1")
     c_pre.complete(t, DeliveryOutcome.CONFIRMED, provider="P", destination="D")
     rep = import_a_state(root)
-    check(rep["skipped"] >= 1 and rep["verified"] and rep["fenced"],
-          f"validator-passing terminal collision skips and fences ({rep})")
-    check(read_epoch(root) == "C", "valid-collision root reaches epoch C")
+    check(rep.get("conflicts") and not rep["fenced"],
+          f"a digest-less native terminal is a conflict, not proof ({rep})")
+    check(read_epoch(root) != "C", "valid-collision root stays unfenced")
 
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

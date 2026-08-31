@@ -7525,13 +7525,20 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
         if not counter.is_file():
             continue
         try:
-            rec = json.loads(counter.read_text(encoding="utf-8"))
-            if not isinstance(rec, dict):
-                raise ValueError("counter is not a JSON object")
-            count = int(rec.get("count", 0))
-        except (OSError, ValueError, TypeError):
-            hits.append(f"{root.name}: counter unreadable")
+            sys.path.insert(0, str(REPO_DIR / "packages" / "ag2-sparrow"))
+            from ag2_sparrow.delivery_core.migration import read_fallback_counter
+            count = read_fallback_counter(counter)
+        except Exception:
+            count = None                 # validator unavailable: fail closed
+        if count is None:
+            # Shared validator (writer uses the same one): malformed, bool,
+            # negative or oversized must BLOCK deletion, never measure zero.
+            hits.append(f"{root.name}: counter malformed/unreadable")
             continue
+        try:
+            rec = json.loads(counter.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            rec = {}
         if count > 0:
             # fromtimestamp raises on domain garbage (inf/nan/1e30) that
             # isinstance passes; a probe on the gate path must never raise.

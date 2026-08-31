@@ -306,6 +306,115 @@ with tempfile.TemporaryDirectory() as td:
     check(r2.get("verified") is True and r2.get("fenced") is True,
           f"the receipt-bearing re-run verifies and fences ({r2})")
 
+# --- SAME ROUTE, NEW CYCLE: a terminal binds to the RECORD, not the route --
+# Route-only reuse discarded a fresh A cycle's payload/attempts/history.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("done-3", b"CYCLE-ONE")
+    tok = a.claim("done-3", "w0")
+    a.complete(tok, DeliveryOutcome.CONFIRMED, provider="p1", destination="DST")
+    mig.import_a_state(root)
+    _rollback(root)
+    for f in (root / ".items").glob("done-3.*.json"):
+        f.unlink()
+    a2 = DesignAClaimBackend(root)
+    a2.publish("done-3", b"CYCLE-TWO")            # new payload, same route
+    t1 = a2.claim("done-3", "w0")
+    a2.complete(t1, DeliveryOutcome.NOT_DELIVERED)           # one failed attempt
+    t2 = a2.claim("done-3", "w0")
+    a2.complete(t2, DeliveryOutcome.CONFIRMED, provider="p1", destination="DST")
+    r2 = mig.import_a_state(root)
+    check(r2.get("conflicts") == [_safe_key("done-3")],
+          f"same-route new-cycle record is a conflict, not a skip ({r2})")
+    check(r2.get("fenced") is not True,
+          "the fence is withheld while a conflict stands")
+
+# --- UNREADABLE SOURCE: enumeration denial is not an empty migration ------
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("perm-1", b"payload")
+    (root / ".items").rename(root / ".items-migrated")     # resume window
+    os.chmod(root / ".items-migrated", 0o000)
+    try:
+        r = mig.import_a_state(root)
+    finally:
+        os.chmod(root / ".items-migrated", 0o700)
+    check("unmigratable" in r and r.get("fenced") is not True,
+          f"denied enumeration fails closed before fencing ({r})")
+    check(mig.read_epoch(root) != "C", "denied-source root never reaches epoch C")
+
+# --- MIXED TOKENS: one valid sibling does not launder a malformed one -----
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("ready-1", b"SAME-PAYLOAD")
+    mig.import_a_state(root)
+    check(_dead_claim(root, "ready-1"),
+          "a C claimant takes the token and dies holding it")
+    (root / "inflight" / f"{_safe_key('ready-1')}{SEP}junk").write_bytes(b"SAME-PAYLOAD")
+    _rollback(root)
+    r2 = mig.import_a_state(root)
+    check(r2.get("verified") is not True and r2.get("fenced") is not True,
+          f"a malformed sibling keeps the root unfenced ({r2})")
+    check(any("junk" in t for t in r2.get("malformed_tokens", [])),
+          f"the malformed sibling is REPORTED, not skipped forever ({r2})")
+
+# --- SYMLINKED ATTEMPTS: budget evidence must be writer state too ---------
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    external = Path(td) / "external-attempts"
+    external.write_text("2")     # SAME value as the record: only the
+    # regular-file predicate, not a value mismatch, can force the replace
+    a = DesignAClaimBackend(root)
+    a.publish("ready-1", b"pay")
+    c = DesignCClaimBackend(root, activate=True)
+    ap = c._attempts_path(_safe_key("ready-1"))
+    ap.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(external, ap)
+    # record carries attempts=2: the symlink must be REPLACED, not trusted
+    import json as _tj
+    for f in (root / ".items").glob("ready-1.*.json"):
+        rec = _tj.loads(f.read_text())
+        rec["attempts"] = 2
+        f.write_text(_tj.dumps(rec))
+    mig.import_a_state(root)
+    import stat as _stat
+    check(_stat.S_ISREG(os.lstat(ap).st_mode),
+          "the symlinked attempts entry is replaced by a regular file")
+    check(ap.read_text().strip() == "2",
+          f"the budget comes from A's record, not the symlink target ({ap.read_text()!r})")
+    external.unlink()
+    check(ap.read_text().strip() == "2",
+          "removing the external target no longer changes C's count")
+
+# --- MALFORMED COUNTER: the shared validator blocks, never measures zero --
+from ag2_sparrow.delivery_core.migration import read_fallback_counter
+with tempfile.TemporaryDirectory() as td:
+    cpath = Path(td) / "a-fallback-hits.json"
+    for bad in ('{"count": -5}', '{"count": true}', '{"count": "7"}',
+                '{"count": 10000000000000}', '[]', 'garbage'):
+        cpath.write_text(bad)
+        check(read_fallback_counter(cpath) is None,
+              f"validator rejects {bad!r}")
+    cpath.write_text('{"count": 3}')
+    check(read_fallback_counter(cpath) == 3, "control: a valid count reads")
+    # miss path leaves a malformed file untouched (probe flags it; the
+    # hit path would repair and hide that garbage happened)
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("cx", b"p")
+    mig.import_a_state(root)
+    bad_counter = root / "a-fallback-hits.json"
+    bad_counter.write_text('{"count": -5}')
+    miss = mig.dual_read(root, "no-such-id")
+    check(miss is None, "control: dual_read miss returns None")
+    check(bad_counter.read_text() == '{"count": -5}',
+          f"the miss path does not silently repair garbage ({bad_counter.read_text()!r})")
+    check(read_fallback_counter(bad_counter) is None,
+          "...and the shared validator flags it, blocking the gate")
+
 # --- THE RULE MUST STILL SAY YES ------------------------------------------
 # Without this, a predicate that conflicts on everything passes all six above.
 with tempfile.TemporaryDirectory() as td:

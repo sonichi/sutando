@@ -100,6 +100,13 @@ def _record_is_terminal_proof(rec) -> bool:
         return False                     # record's own incarnation/id split
     if len(iparts) >= 2 and _safe_component(worker) != iparts[1]:
         return False
+    # Arity is policy: native claims are EXACTLY five parts (producer
+    # grammar), imports EXACTLY two. No writer emits anything else.
+    if len(iparts) == 5:
+        if not is_producer_token(inc):
+            return False
+    elif len(iparts) != 2:
+        return False
     return True
 
 
