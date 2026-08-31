@@ -136,11 +136,14 @@ class PoolLead:
         return _FlockCtx(path)
 
     # ── explicit pins: owner-declared room -> instance (2026-08-30) ─────────
-    def pin_room(self, channel: str, instance: str) -> dict:
+    def pin_room(self, channel: str, instance: str,
+                 dedicated: bool = False) -> dict:
         with self._affinity_lock():
             table = self._load_affinity()
-            table[channel] = {"instance": instance, "ts": self.now(),
-                              "pinned": True}
+            row = {"instance": instance, "ts": self.now(), "pinned": True}
+            if dedicated:
+                row["exclusive"] = True
+            table[channel] = row
             self._save_affinity(table)
             return table[channel]
 
@@ -153,6 +156,7 @@ class PoolLead:
             if not (isinstance(row, dict) and row.get("pinned")):
                 return False
             row.pop("pinned", None)
+            row.pop("exclusive", None)
             self._save_affinity(table)
             return True
 
@@ -214,15 +218,24 @@ class PoolLead:
         eligible = [f for f in followers
                     if self.runtime_fn(f) == "claude"] or followers
         lane_core = self._lane_core_of(followers)
+        # A dedicated worker serves only its own room (owner 2026-08-30);
+        # reserved-elsewhere workers leave the general rotation entirely.
+        reserved = {r.get("instance") for ch, r in affinity.items()
+                    if isinstance(r, dict) and r.get("exclusive")
+                    and ch != channel}
         # Wedge escape: the routine pin holds only while the lane core is
         # below the busy cap and demonstrably claiming; else fall through.
         if (lane == "routine" and lane_core is not None
+                and lane_core not in reserved
                 and self._load(lane_core) < AFFINITY_BUSY_MAX
                 and self._claiming(lane_core)):
             return lane_core
         # owner prefers claude seats (codex wrapper polls, slow turnaround); a
         # sole claude doubles as lane core yet stays owner-eligible
-        primary = [f for f in eligible if f != lane_core] or eligible
+        # An all-reserved pool falls back: availability beats exclusivity
+        # in the degenerate case, never starving a task.
+        free = [f for f in eligible if f not in reserved] or eligible
+        primary = [f for f in free if f != lane_core] or free
         # A repool drops the follower's load, so least-loaded actively PREFERS
         # the core that just failed to claim. Never narrow to empty.
         primary = [f for f in primary if self._claiming(f)] or primary
@@ -239,7 +252,8 @@ class PoolLead:
         # equal load -> least-recently-picked, so an idle pool round-robins
         pick = min(primary, key=lambda f: (
             self._load(f), self._last_pick.get(str(f), 0.0), str(f)))
-        if (lane_core is not None and self._load(pick) >= AFFINITY_BUSY_MAX
+        if (lane_core is not None and lane_core not in reserved
+                and self._load(pick) >= AFFINITY_BUSY_MAX
                 and self._load(lane_core) == 0 and self._claiming(lane_core)):
             pick = lane_core  # overflow: owner lane saturated, lane idle
         self._last_pick[str(pick)] = self.now()

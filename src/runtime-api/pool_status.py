@@ -62,7 +62,8 @@ class PoolStatusWriter:
         if self.bindings_fn is not None:
             snap["bindings"] = {
                 ch: {"instance": row.get("instance"),
-                     "pinned": bool(row.get("pinned"))}
+                     "pinned": bool(row.get("pinned")),
+                     "dedicated": bool(row.get("exclusive"))}
                 for ch, row in self.bindings_fn().items()
                 if isinstance(row, dict)}
         return snap

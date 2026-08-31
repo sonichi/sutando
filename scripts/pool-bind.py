@@ -7,7 +7,7 @@ to a concurrent assignment sweep.
 
 Usage:
   python3 scripts/pool-bind.py list
-  python3 scripts/pool-bind.py pin '<channel-or-room-id>' core-2
+  python3 scripts/pool-bind.py pin '<channel-or-room-id>' core-2 [--dedicated]
   python3 scripts/pool-bind.py unpin '<channel-or-room-id>'
 """
 import json
@@ -37,8 +37,10 @@ def main(argv, workspace=None) -> int:
         print(json.dumps(lead.bindings(), indent=2, sort_keys=True))
         return 0
     if argv[0] == "pin":
+        dedicated = "--dedicated" in argv
+        argv = [a for a in argv if a != "--dedicated"]
         if len(argv) != 3:
-            print("usage: pool-bind.py pin <channel> <instance>",
+            print("usage: pool-bind.py pin <channel> <instance> [--dedicated]",
                   file=sys.stderr)
             return 2
         channel, instance = argv[1], argv[2]
@@ -46,7 +48,8 @@ def main(argv, workspace=None) -> int:
         if not beat.exists():
             print(f"warning: no liveness beat for {instance}; pinning anyway",
                   file=sys.stderr)
-        print(json.dumps({channel: lead.pin_room(channel, instance)}))
+        print(json.dumps(
+            {channel: lead.pin_room(channel, instance, dedicated=dedicated)}))
         return 0
     if len(argv) != 2:
         print("usage: pool-bind.py unpin <channel>", file=sys.stderr)

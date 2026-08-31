@@ -47,9 +47,11 @@ class PoolStatusBindingsTest(unittest.TestCase):
         self.assertTrue(w.maybe_write())
         got = self.read()["bindings"]
         self.assertEqual(got["!room:x"], {"instance": "core-1",
-                                          "pinned": True})
+                                          "pinned": True,
+                                          "dedicated": False})
         self.assertEqual(got["chan-d"], {"instance": "core-2",
-                                         "pinned": False})
+                                         "pinned": False,
+                                         "dedicated": False})
         self.assertNotIn("junk", got)
 
     def test_binding_change_writes_inside_the_throttle_window(self):
