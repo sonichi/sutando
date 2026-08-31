@@ -161,7 +161,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
-from .result_markers import parse_markers
+from .result_markers import parse_markers, render_skill_prelude
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
@@ -2407,49 +2407,11 @@ def _write_task(task: dict) -> str | None:
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
-        _chan = _one_line(task.get("channel_id") or "")
-        # shlex.quote: an unescaped quote in _chan must not close the shell
-        # string early and turn the remainder into executable shell syntax.
-        _chan_q = shlex.quote(_chan)
-        # The credential and the notify lane are per-instance: a dev-homeserver
-        # task needs ITS channel dir, not the default one this file was written for.
-        _cdir_q = shlex.quote(CHANNEL_DIR)
-        _step = 1
-        _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
-        _addr = _one_line(task.get("addressed_to") or "")
-        if _addr:
-            # Addressing gate (#649): the broker resolved this reply's target to a
-            # peer agent. State it in-band so the check cannot fail to retrieve.
-            _skill.append(
-                f"{_step}. ADDRESSING: this message replies to {_addr}'s message and "
-                f"does not mention you — it is {_addr}'s to claim. Do not process it "
-                "unless a later message hands it to you explicitly; close your copy "
-                "with [no-send].")
-            _step += 1
-        if _chan:
-            _skill.append(
-                f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
-                f"message, reconstruct the room thread — `python3 "
-                f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
-                f"reports no gateway configured, load the channel env first: `set -a; . "
-                f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a`) — and read it "
-                "back (everyone's messages including your own prior replies) until this "
-                "message stands on its own, then answer from the reconstructed thread, "
-                "NOT from memory. Do this every time; do NOT skip it because the message "
-                "looks self-contained or you feel you already understand it — felt "
-                "confidence is exactly the signal that fails. The only exception is a "
-                'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
-            _step += 1
-            # Which channel file holds REMOTE_TASK_* differs per onboarding, so the
-            # prelude resolves it by content; notify.py's own guard can refuse a symlink.
-            _skill.append(
-                f"{_step}. NOTIFY FIRST (if task takes >60s): `set -a; . "
-                f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a` then python3 "
-                f"skills/task-progress/scripts/notify.py --source {_cdir_q} "
-                f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
-            _step += 1
-        _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
-        lines.extend(_skill)
+        # Template lives in result_markers.render_skill_prelude (single owner):
+        # a dedup requeue re-renders it there from the stored header (#3613).
+        lines.extend(render_skill_prelude(
+            _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
+            _one_line(task.get("addressed_to") or "")))
     tmp = dest.with_suffix(".txt.tmp")
     from .local_task_protocol import apply_task_stamper
     tmp.write_text(apply_task_stamper("\n".join(lines) + "\n"))
