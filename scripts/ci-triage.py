@@ -140,10 +140,20 @@ def open_issues_for(subject: str, run, repo: str) -> "list[dict] | None":
                   "--search", subject, "--json", "number,title,body", "--limit", "20"])
     if j is None:
         return None
-    # `gh issue list --search` ranks; it does not match. An issue that merely
-    # scores for a path is a wrong pointer wearing the tool's authority.
-    return [{"number": i["number"], "title": i["title"]} for i in j
-            if subject in (i.get("title") or "") or subject in (i.get("body") or "")]
+
+    def _hits(needle: str) -> "list[dict]":
+        # `gh issue list --search` ranks; it does not match. An issue that merely
+        # scores for a path is a wrong pointer wearing the tool's authority.
+        return [{"number": i["number"], "title": i["title"]} for i in j
+                if needle in (i.get("title") or "") or needle in (i.get("body") or "")]
+
+    found = _hits(subject)
+    # A failure log names `tests/x.test.py`; humans title the issue `x.test.py`.
+    # Fall back to the basename so a title-only match is not missed on the prefix.
+    base = subject.rsplit("/", 1)[-1]
+    if not found and base != subject and len(base) > 6:
+        found = _hits(base)
+    return found
 
 
 def main(argv=None) -> int:

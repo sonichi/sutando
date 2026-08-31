@@ -278,6 +278,23 @@ rc, out = _main_out(["1"], _search_fails_runner)
 check("x) a failed issue search reads as UNKNOWN, not as 'no open issue'",
       rc == 0 and "issue search FAILED" in out and "no open issue" not in out, out.strip())
 
+# An issue titled with the bare filename is the COMMON shape: a CI log says
+# `tests/x.test.py`, a human titles the issue `x.test.py`. Missing that is how a
+# known issue reads as novel — measured live on #3527, whose title omits `tests/`.
+_TITLE_ONLY = json.dumps([{"number": 9999,
+                           "title": "coverage gate: outbox-race.test.py exceeds the cap",
+                           "body": "no path here"}])
+check("y) an issue naming the file by BASENAME in its title is still found",
+      [h["number"] for h in ct.open_issues_for("tests/outbox-race.test.py",
+                                               lambda a: _R(0, _TITLE_ONLY), "o/r")] == [9999])
+
+# The fallback must not become a wildcard: a short or unrelated basename that
+# appears nowhere still yields nothing.
+_UNRELATED = json.dumps([{"number": 1, "title": "something else", "body": "nothing"}])
+check("z) the basename fallback does not match an unrelated issue",
+      ct.open_issues_for("tests/outbox-race.test.py",
+                         lambda a: _R(0, _UNRELATED), "o/r") == [])
+
 print()
 if failures:
     print(f"{len(failures)} failure(s)")
