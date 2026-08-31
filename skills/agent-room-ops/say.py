@@ -68,9 +68,11 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
                 f"core-{os.environ['SUTANDO_CORE_ID']}"
                 if os.environ.get("SUTANDO_CORE_ID") else None)
         # The client renders attribution from this per-event stamp; a direct
-        # post self-declares its worker the same way delivered results do.
-        stamp = ({"extra_content": {"space.ag2.worker": {"id": worker}}}
-                 if worker else {})
+        # post self-declares its worker, and optionally its color.
+        _color = os.environ.get("SUTANDO_WORKER_COLOR")
+        _w = ({"id": worker, **({"color": _color} if _color else {})}
+              if worker else None)
+        stamp = {"extra_content": {"space.ag2.worker": _w}} if _w else {}
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
             {"op": "message", "room_id": room_id, "body": message, **rel, **stamp},
