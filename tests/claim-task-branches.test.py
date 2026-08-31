@@ -122,7 +122,7 @@ class CliTests(unittest.TestCase):
     def _run(self, argv, ws):
         out, err = io.StringIO(), io.StringIO()
         old = claim_task.resolve_workspace
-        claim_task.resolve_workspace = lambda: ws
+        claim_task.resolve_workspace = lambda *a, **kw: ws
         try:
             with redirect_stdout(out), redirect_stderr(err):
                 rc = claim_task._main(["claim_task.py", *argv])
