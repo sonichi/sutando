@@ -648,7 +648,38 @@ def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict
 
 # Bridges that import vault_intercept, and so need detect-secrets at RUNTIME.
 # Mirrors the three _vault_scanner_check call sites in src/startup.sh.
-_VAULT_SCANNER_BRIDGES = ["telegram-bridge", "discord-bridge", "slack-bridge"]
+_VAULT_SCANNER_BRIDGES = ["telegram-bridge", "discord-bridge", "slack-bridge",
+                          "remote-gateway-bridge"]
+_VAULT_SCANNER_SCRIPTS = {
+    "telegram-bridge": "telegram-bridge.py",
+    "discord-bridge": "discord-bridge.py",
+    "slack-bridge": "slack-bridge.py",
+    "remote-gateway-bridge": "remote-gateway-bridge.py",
+}
+
+
+def _live_bridge_interpreter(script: str, ps_output: "str | None" = None) -> "str | None":
+    """The interpreter a bridge is RUNNING on, or None if it is not running.
+
+    `_bridge_interpreter` answers which interpreter would launch it; a bridge the
+    app starts with its own bundled python is running on a different one.
+    """
+    if ps_output is None:
+        ps_output = _ps_snapshot()
+    if ps_output is None:
+        return None
+    me = str(os.getpid())
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] == me or script not in parts[2]:
+            continue
+        # Cut at the space before the script ARG: the interpreter path contains
+        # spaces (shlex truncates it) and the arg carries a `src/` prefix.
+        cut = parts[2].rfind(" ", 0, parts[2].index(script))
+        interp = parts[2][:cut].strip() if cut > 0 else ""
+        if interp and os.path.basename(interp).startswith("python"):
+            return interp
+    return None
 
 
 def check_secret_scanner_mode() -> dict:
@@ -660,8 +691,13 @@ def check_secret_scanner_mode() -> dict:
     prints no failures.
     """
     degraded, checked = [], []
+    ps_output = _ps_snapshot()
     for bridge in _VAULT_SCANNER_BRIDGES:
-        interp = _bridge_interpreter(bridge)
+        # A running bridge's own interpreter is the one scanning inbound text;
+        # what *would* launch it is the wrong question while it is up.
+        interp = _live_bridge_interpreter(_VAULT_SCANNER_SCRIPTS[bridge], ps_output)
+        if interp is None:
+            interp = _bridge_interpreter(bridge)
         if interp is None:
             continue  # bridge cannot launch at all; its own probe owns that
         if interp in checked:
