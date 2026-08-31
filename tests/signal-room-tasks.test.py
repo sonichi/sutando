@@ -8,8 +8,10 @@ task file needs when its body is untrusted room speech.
 
 Run: python3 tests/signal-room-tasks.test.py
 """
+import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -93,6 +95,77 @@ with tempfile.TemporaryDirectory() as td:
 ok, reason = S.submission_status("/proc/nonexistent/cannot-create")
 ck(ok is False and reason == "task_dir_unwritable",
    f"an unwritable task dir -> unavailable with a reason ({reason})")
+
+print("== the lane is bounded, and the bound is not permanent ==")
+with tempfile.TemporaryDirectory() as td:
+    ids = [S.submit_signal_room_task(f"q{i}", td, lambda t: t)
+           for i in range(S.MAX_OUTSTANDING)]
+    ck(len(ids) == S.MAX_OUTSTANDING, "admits up to MAX_OUTSTANDING")
+    try:
+        S.submit_signal_room_task("one too many", td, lambda t: t)
+        ck(False, "over the bound raises SignalRoomBusy")
+    except S.SignalRoomBusy:
+        ck(True, "over the bound raises SignalRoomBusy")
+    ck(S.submission_status(td)[1] == "busy", "a full lane advertises busy")
+
+    # A task whose core died is never cleaned up by anyone, so a slot that never
+    # expired would wedge the lane shut for good.
+    stranded = time.time() - (S.SLOT_TTL_SEC + 60)
+    for f in Path(td).glob("task-signal-*.txt"):
+        os.utime(f, (stranded, stranded))
+    ck(S.outstanding_count(td) == 0, "stranded tasks stop occupying slots")
+    ck(bool(S.submit_signal_room_task("after", td, lambda t: t)), "the lane reopens")
+
+with tempfile.TemporaryDirectory() as td:
+    # Fail CLOSED: a scan error must read as full, never as empty.
+    unreadable = Path(td) / "task-signal-broken.txt"
+    unreadable.write_text("x")
+    real_stat = Path.stat
+
+    def boom(self, *a, **k):
+        if self.name == "task-signal-broken.txt":
+            raise OSError("unreadable")
+        return real_stat(self, *a, **k)
+
+    Path.stat = boom
+    try:
+        ck(S.outstanding_count(td) == 1, "an unstattable task still occupies its slot")
+    finally:
+        Path.stat = real_stat
+
+print("== core liveness is a tri-state, and absence is not death ==")
+with tempfile.TemporaryDirectory() as td:
+    ws = Path(td)
+    ck(S.core_is_alive(ws) is None, "no state/cores -> unknown (facility not installed)")
+    cores = ws / "state" / "cores"
+    cores.mkdir(parents=True)
+    ck(S.core_is_alive(ws) is False, "an emptied cores dir -> offline (graceful shutdown unlinks)")
+    beat = cores / "host.alive"
+    beat.write_text("{}")
+    ck(S.core_is_alive(ws) is True, "a fresh heartbeat -> alive")
+    cold = time.time() - (S.CORE_STALE_SEC + 60)
+    os.utime(beat, (cold, cold))
+    ck(S.core_is_alive(ws) is False, "every heartbeat stale -> offline")
+    ck(S.submission_status(ws / "tasks", ws) == (False, "core_offline"),
+       "capability reports core_offline rather than promising an answer")
+
+print("== a failed write leaves nothing behind ==")
+with tempfile.TemporaryDirectory() as td:
+    real_replace = os.replace
+
+    def fail_replace(*a, **k):
+        raise OSError("disk full")
+
+    os.replace = fail_replace
+    try:
+        S.submit_signal_room_task("doomed", td, lambda t: t)
+        ck(False, "a failed publish propagates")
+    except OSError:
+        ck(True, "a failed publish propagates")
+    finally:
+        os.replace = real_replace
+    ck(not list(Path(td).glob(".*tmp")), "the temp file is cleaned up on failure")
+    ck(not list(Path(td).glob("task-signal-*.txt")), "no partial task is published")
 
 print()
 if FAILS:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import threading
 import tempfile
 import time
 from datetime import datetime
@@ -38,6 +39,7 @@ from pathlib import Path
 # Signal Room work runs at collaborator level. Sutando maps this to its own execution
 # path for the tier; nothing about HOW it runs is decided here.
 SIGNAL_ROOM_TIER = "team"
+SIGNAL_TASK_PREFIX = "task-signal-"
 
 # The room's request text is untrusted (participant speech plus quoted article text),
 # so cap it before it ever reaches a task file.
@@ -57,6 +59,11 @@ SLOT_TTL_SEC = 1800
 CORE_STALE_SEC = 120
 
 
+# agent-api serves on a ThreadingHTTPServer, so counting and publishing must be
+# one critical section or concurrent posts all read capacity and all admit.
+_ADMISSION = threading.Lock()
+
+
 class SignalRoomBusy(RuntimeError):
     """Raised when the Signal Room already has MAX_OUTSTANDING work in flight."""
 
@@ -72,12 +79,6 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
     task_dir = Path(task_dir)
     task_dir.mkdir(parents=True, exist_ok=True)
     task_id = f"task-signal-{int(datetime.now().timestamp() * 1000)}-{secrets.token_hex(4)}"
-
-    # Enforced here, not at the routes, so a new caller cannot bypass it.
-    if outstanding_count(task_dir) >= MAX_OUTSTANDING:
-        raise SignalRoomBusy(
-            f"{MAX_OUTSTANDING} Signal Room tasks already in flight"
-        )
 
     headers = [
         ("id", task_id),
@@ -95,18 +96,25 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
     from local_task_protocol import serialize_task_last
     content = serialize_task_last(headers, confine(task_text[:MAX_TASK_CHARS]))
 
-    # Atomic: the watcher must never observe a partially written task.
-    fd, tmp = tempfile.mkstemp(dir=str(task_dir), prefix=f".{task_id}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(content)
-        os.replace(tmp, str(task_dir / f"{task_id}.txt"))
-    except Exception:
+    # One critical section, so concurrent posts cannot all observe capacity and
+    # all admit. Here, not at the routes, so no new caller can bypass the bound.
+    with _ADMISSION:
+        if outstanding_count(task_dir) >= MAX_OUTSTANDING:
+            raise SignalRoomBusy(
+                f"{MAX_OUTSTANDING} Signal Room tasks already in flight"
+            )
+        # Atomic: the watcher must never observe a partially written task.
+        fd, tmp = tempfile.mkstemp(dir=str(task_dir), prefix=f".{task_id}.", suffix=".tmp")
         try:
-            os.unlink(tmp)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(content)
+            os.replace(tmp, str(task_dir / f"{task_id}.txt"))
         except Exception:
-            pass
-        raise
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            raise
     return task_id
 
 
@@ -132,12 +140,16 @@ def core_is_alive(workspace=None, now: float | None = None) -> bool | None:
     from workspace_default import resolve_workspace
     root = Path(workspace) if workspace is not None else resolve_workspace()
     cores = root / "state" / "cores"
+    if not cores.is_dir():
+        return None
     try:
         beats = list(cores.glob("*.alive"))
     except OSError:
-        return None
-    if not cores.is_dir() or not beats:
-        return None
+        return False
+    # A graceful core shutdown unlinks its .alive file, so an empty facility
+    # directory means offline — not "the facility was never installed".
+    if not beats:
+        return False
     stamp = now if now is not None else time.time()
     for beat in beats:
         try:
@@ -158,15 +170,14 @@ def outstanding_count(task_dir, now: float | None = None) -> int:
     """
     stamp = now if now is not None else time.time()
     live = 0
-    try:
-        for task in Path(task_dir).glob("task-signal-*.txt"):
-            try:
-                if stamp - task.stat().st_mtime <= SLOT_TTL_SEC:
-                    live += 1
-            except OSError:
-                continue
-    except Exception:
-        return 0
+    # Fail CLOSED: an unreadable task dir must read as full, not empty, or a
+    # scan error would silently lift the bound.
+    for task in Path(task_dir).glob(f"{SIGNAL_TASK_PREFIX}*.txt"):
+        try:
+            if stamp - task.stat().st_mtime <= SLOT_TTL_SEC:
+                live += 1
+        except OSError:
+            live += 1
     return live
 
 

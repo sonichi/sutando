@@ -213,6 +213,70 @@ def run() -> None:
 
         agent_api.submission_status = orig_avail
 
+        # --- the egress boundary on the way back out ----------------------------
+        # A Team result is untrusted output: scanned on BOTH read paths.
+        drain_slots()
+        secret = "token sk-ant-api03-" + "A" * 80
+        rdir = Path(agent_api.RESULT_DIR)
+        rdir.mkdir(parents=True, exist_ok=True)
+
+        tid = post("/guest-task", {"task": "research"})._responses[0][1]["task_id"]
+        (rdir / f"{tid}.txt").write_text(secret)
+        live = agent_api.get_task_result(tid)["result"]
+        check("a live team result is scanned before release", secret not in live)
+
+        # Archive both halves exactly as task-bridge does, leaving nothing live.
+        arc_r = rdir / "archive" / "2026-08"
+        arc_r.mkdir(parents=True, exist_ok=True)
+        (arc_r / f"{tid}.txt").write_text(secret)
+        (rdir / f"{tid}.txt").unlink()
+        arc_t = Path(agent_api.TASK_DIR) / "archive" / "2026-08"
+        arc_t.mkdir(parents=True, exist_ok=True)
+        (arc_t / f"{tid}.txt").write_text(f"id: {tid}\naccess_tier: team\ntask: x\n")
+        (Path(agent_api.TASK_DIR) / f"{tid}.txt").unlink()
+        archived = agent_api.get_task_result(tid)["result"]
+        check("an archived team result is scanned too (the common room poll)",
+              secret not in archived)
+
+        # No metadata at all: a Signal Room id is team by construction.
+        orphan = "task-signal-9999999999999-deadbeef"
+        (arc_r / f"{orphan}.txt").write_text(secret)
+        check("a room result with no surviving task file is still scanned",
+              secret not in agent_api.get_task_result(orphan)["result"])
+
+        # The owner's own work is not someone else's untrusted output.
+        otid = "task-owner-passthrough"
+        (Path(agent_api.TASK_DIR) / f"{otid}.txt").write_text(
+            f"id: {otid}\naccess_tier: owner\ntask: x\n")
+        (rdir / f"{otid}.txt").write_text("owner plain text")
+        check("an owner result is returned unchanged",
+              agent_api.get_task_result(otid)["result"] == "owner plain text")
+
+        # Classification failure must withhold, never fall through.
+        orig_resolve = sys.modules["policy.egress.result"].resolve_access_tier
+
+        def _explode(*a, **k):
+            raise RuntimeError("classifier down")
+
+        sys.modules["policy.egress.result"].resolve_access_tier = _explode
+        try:
+            (rdir / f"{otid}.txt").write_text(secret)
+            withheld = agent_api.get_task_result(otid)["result"]
+            check("a classifier failure withholds the body", secret not in withheld)
+        finally:
+            sys.modules["policy.egress.result"].resolve_access_tier = orig_resolve
+
+        # The compat shim answers a full lane with 429, not 500.
+        drain_slots()
+        for i in range(_srt.MAX_OUTSTANDING):
+            post("/task", {"from": "matrixrtc-voice-news", "task": f"fill{i}",
+                           "access_tier": "guest"})
+        h = post("/task", {"from": "matrixrtc-voice-news", "task": "over",
+                           "access_tier": "guest"})
+        check("/task compat shim over the bound -> 429", h._responses[0][0] == 429)
+        drain_slots()
+        post("/guest-task", {"task": "restore one task file for the closing check"})
+
         # --- the decisive property: no owner task from any guest submission ------
         # Signal Room work now lands as a normal task — at TEAM tier, never owner.
         signal_files = list(Path(agent_api.TASK_DIR).glob("task-signal-*.txt"))

@@ -129,7 +129,8 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
-from signal_room_tasks import SignalRoomBusy, submit_signal_room_task, submission_status  # noqa: E402
+from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
+                               submit_signal_room_task, submission_status)  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -631,10 +632,13 @@ def _guard_result_by_tier(task_id: str, body: str) -> str:
         if not (task_file and task_file.exists()):
             task_file = find_archived_task(TASK_DIR, task_id)
         if task_file is None:
-            # An owner-tier task is archived quickly and its result is the owner's own;
-            # only guard when we positively identify a non-owner tier.
-            return body
-        tier = resolve_access_tier(task_file)
+            # No metadata. A Signal Room id is team by construction, so guard it;
+            # anything else predates this lane and stays readable.
+            if not str(task_id).startswith(SIGNAL_TASK_PREFIX):
+                return body
+            tier = SIGNAL_ROOM_TIER
+        else:
+            tier = resolve_access_tier(task_file)
         if tier == "owner":
             return body
         safe, _reason = guard_result_for_tier(body, tier, REPO_DIR)
@@ -657,7 +661,10 @@ def get_task_result(task_id: str):
     if safe_id:
         archived = local_task_protocol.find_archived_result(RESULT_DIR, task_id)
         if archived is not None:
-            return {"task_id": safe_id, "status": "completed", "result": archived.read_text()}
+            # Guarded like the live branch: archival is where room polls usually
+            # land, so skipping it here would bypass the boundary in the common case.
+            return {"task_id": safe_id, "status": "completed",
+                    "result": _guard_result_by_tier(task_id, archived.read_text())}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}
