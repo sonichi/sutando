@@ -14,7 +14,7 @@ import json
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent  # sys.path bootstrap only — lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 

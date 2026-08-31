@@ -3,7 +3,7 @@
 to POST /v1/workers — no file is a no-op, unchanged content never re-posts,
 a change re-posts, and a 404 broker backs off instead of hammering.
 
-Run: python3 src/gateway-workers-snapshot-push.test.py   (stdlib only)
+Run: python3 tests/gateway-workers-snapshot-push.test.py   (stdlib only)
 """
 import importlib.util
 import json
@@ -34,7 +34,7 @@ def main() -> int:
     os.environ["REMOTE_TASK_PROVIDER"] = "remote-gateway"
 
     spec = importlib.util.spec_from_file_location(
-        "rtc_push", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
+        "rtc_push", Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py")
     rtc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtc)
 
