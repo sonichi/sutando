@@ -83,6 +83,35 @@ def main() -> int:
         check(bool(list((ws / "tasks").glob(f"{tw.CLASSIFIER_TASK_PREFIX}*"))),
               "stale path writes the classifier task file")
 
+        # --- slow pickup still cools for the FULL window: age measures from
+        # completion, so a long enqueue->completion latency cannot eat it
+        ws = make_workspace(tmp, "slowpickup")
+        write_state(ws, status="complete", snapshot_hash="aaaa",
+                    enqueued_at=time.time() - tw.CLASSIFIER_COOLDOWN_SECONDS - 600,
+                    completed_at=time.time() - 60, source_token="stale-token")
+        r = tw.maybe_enqueue_classifier_task(ws)
+        check(r.reason == "cooling-down",
+              f"slow pickup: fresh completion cools despite stale enqueue (got {r.reason})")
+
+        # --- a stale completed_at proceeds (the window is measured, not latched)
+        ws = make_workspace(tmp, "stalecomplete")
+        write_state(ws, status="complete", snapshot_hash="aaaa",
+                    enqueued_at=time.time() - tw.CLASSIFIER_COOLDOWN_SECONDS - 3600,
+                    completed_at=time.time() - tw.CLASSIFIER_COOLDOWN_SECONDS - 5,
+                    source_token="stale-token")
+        r = tw.maybe_enqueue_classifier_task(ws)
+        check(r.reason == "enqueued",
+              f"stale completed_at -> enqueued (got {r.reason})")
+
+        # --- an unparsable completed_at never cools (bad state proceeds)
+        ws = make_workspace(tmp, "badcomplete")
+        write_state(ws, status="complete", snapshot_hash="aaaa",
+                    enqueued_at=time.time() - 60, completed_at="not-a-number",
+                    source_token="stale-token")
+        r = tw.maybe_enqueue_classifier_task(ws)
+        check(r.reason == "enqueued",
+              f"unparsable completed_at -> not cooling (got {r.reason})")
+
         # --- cooldown_seconds=0 disables the brake entirely
         ws = make_workspace(tmp, "disabled")
         write_state(ws, status="complete", snapshot_hash="aaaa",

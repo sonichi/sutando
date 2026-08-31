@@ -955,7 +955,10 @@ def classifier_status(
     # than the cooldown absorbs that churn before the expensive discover+scan.
     if state.get("status") == "complete" and cooldown_seconds > 0:
         try:
-            age = time.time() - float(state.get("enqueued_at", 0))
+            # completed_at is absent on pre-cooldown state files and on the
+            # refresh-source-token path; fall back to enqueued_at there.
+            age = time.time() - float(
+                state.get("completed_at") or state.get("enqueued_at", 0))
         except (TypeError, ValueError):
             age = -1.0
         # A negative age means a clock step or bad state; never cool on it.
