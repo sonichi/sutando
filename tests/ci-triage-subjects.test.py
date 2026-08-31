@@ -126,7 +126,9 @@ def _raise(_a, **_k):
     raise OSError("gh not on PATH")
 
 
-_COMMENTS = json.dumps({"comments": [{"body": "first"}, {"body": "second"}]})
+_COMMENTS = json.dumps({"comments": [
+    {"author": {"login": "github-actions"}, "body": "first"},
+    {"author": {"login": "github-actions"}, "body": "second"}]})
 
 # Two failing checks pointing at the SAME run, plus a green one at another run.
 _RUNS_ROLLUP = json.dumps({"statusCheckRollup": [
@@ -171,7 +173,8 @@ def _full_runner(a, **_k):
         return _R(0, json.dumps({"statusCheckRollup": [
             {"name": "diff coverage >= 95% (python)", "conclusion": "FAILURE"}]}))
     if "comments" in a:
-        return _R(0, json.dumps({"comments": [{"body": _ACCUSING}]}))
+        return _R(0, json.dumps({"comments": [
+            {"author": {"login": "github-actions"}, "body": _ACCUSING}]}))
     if "issue" in a:
         return _R(0, json.dumps([{"number": 4242,
                                   "title": "tests/outbox-race.test.py times out",
@@ -186,7 +189,8 @@ def _no_subject_runner(a, **_k):
              "detailsUrl": "https://x/runs/77/job/1"}]}))
     # Comments, annotations and log all readable but naming no file.
     if "comments" in a:
-        return _R(0, json.dumps({"comments": [{"body": "it broke"}]}))
+        return _R(0, json.dumps({"comments": [
+            {"author": {"login": "github-actions"}, "body": "it broke"}]}))
     return _R(0, "")
 
 
@@ -293,6 +297,18 @@ _UNRELATED = json.dumps([{"number": 1, "title": "something else", "body": "nothi
 check("z) the basename fallback does not match an unrelated issue",
       ct.open_issues_for("tests/outbox-race.test.py",
                          lambda a: _R(0, _UNRELATED), "o/r") == [])
+
+# A human/agent comment can quote an unrelated failure — including this tool's
+# own output — and those names would read as the current failure's subject.
+_MIXED = json.dumps({"comments": [
+    {"author": {"login": "github-actions"}, "body": "✖ TIMED OUT: tests/real-subject.test.py"},
+    {"author": {"login": "john-the-dev"}, "body": "✖ TIMED OUT: tests/quoted-elsewhere.test.py"},
+]})
+_ft = ct.failure_text("1", lambda a: _R(0, _MIXED), "o/r")
+check("aa) failure_text takes the BOT comment's subject",
+      "tests/real-subject.test.py" in _ft)
+check("bb) and ignores a human comment quoting an unrelated failure",
+      "tests/quoted-elsewhere.test.py" not in _ft, _ft)
 
 print()
 if failures:

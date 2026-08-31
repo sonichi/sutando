@@ -84,11 +84,21 @@ def failing_checks(pr: str, run, repo: str) -> "list[str] | None":
 
 
 def failure_text(pr: str, run, repo: str) -> str:
-    """Bot comments carry the subject for gates that report to the PR, not the log."""
+    """Bot comments carry the subject for gates that report to the PR, not the log.
+
+    BOT comments only. A human or agent comment can name any file — quoting an
+    unrelated failure, or this tool's own output — and those names then read as
+    the subject of the CURRENT failure with the tool's authority behind them.
+    """
     j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "comments"])
     if j is None:
         return ""
-    return "\n".join((c.get("body") or "") for c in (j.get("comments") or []))
+    out = []
+    for c in (j.get("comments") or []):
+        login = ((c.get("author") or {}).get("login") or "")
+        if login.endswith("[bot]") or login in ("github-actions",):
+            out.append(c.get("body") or "")
+    return "\n".join(out)
 
 
 def _run_ids(pr: str, run, repo: str) -> "list[str]":
