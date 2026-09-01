@@ -102,6 +102,25 @@ class TestLocalEmptyIsNotClear(unittest.TestCase):
         self.assertTrue(self.cache.is_symlink())  # yet the path is plainly present
         self.assertIsNone(self._run())
 
+    def test_an_unreadable_cache_path_fails_closed(self):
+        """Only FileNotFoundError means absent. Any other probe failure (here
+        EACCES) must report unread, never a clear day."""
+        import errno
+        def _deny(_path):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        with patch.object(self.mod.os, "lstat", _deny):
+            self.assertIsNone(self._run())
+
+    def test_a_probe_failure_is_distinguished_from_absence(self):
+        """Control for the case above: the SAME patch point raising
+        FileNotFoundError must still yield [], or 'fail closed' would just mean
+        'never report empty' and the distinction would be untested."""
+        import errno
+        def _absent(_path):
+            raise FileNotFoundError(errno.ENOENT, "No such file")
+        with patch.object(self.mod.os, "lstat", _absent):
+            self.assertEqual(self._run(), [])
+
     def test_a_truly_absent_cache_still_reports_verified_empty(self):
         """Negative control for the case above: without it, a fix that returned
         True unconditionally would pass and leave every host permanently blind."""
