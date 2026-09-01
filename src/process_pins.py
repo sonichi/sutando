@@ -58,7 +58,19 @@ def load_pins(path) -> list:
     except Exception:  # noqa: BLE001 — see docstring: absent/broken -> no pins
         return []
     pins = data.get("pins") if isinstance(data, dict) else None
-    return [p for p in pins if isinstance(p, dict)] if isinstance(pins, list) else []
+    if not isinstance(pins, list):
+        return []
+    # Past the writer's bound the record is out of contract as a whole, and
+    # honouring a prefix would pick arbitrary winners; suppress nothing.
+    if len(pins) > MAX_PINS:
+        return []
+    out = []
+    for p in pins:
+        try:
+            out.append(_validated(p))
+        except (ValueError, TypeError):
+            continue  # per-entry fail-open: what the writer rejects cannot arm
+    return out
 
 
 def _validated(pin) -> dict:

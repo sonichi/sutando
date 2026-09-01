@@ -9915,16 +9915,19 @@ def run_all_checks() -> list[dict]:
             if c["status"] != "ok":
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
-                # This rewrite replaces check_port's whole diagnosis, so the
-                # pin composition it already made has to be re-applied.
-                _, _csls = _proc_lstarts("conversation-server")
-                _apply_pin_findings(c, _pin_verdicts("conversation-server", _csls))
             else:
                 mark_stale_if_outdated(
                     c,
                     REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts",
                     "conversation-server.ts",
                 )
+            # Read liveness before composing: a pin escalates ok->warn, and the
+            # tunnel gate below asks about liveness, not about restart policy.
+            _cs_live = c["status"] == "ok"
+            # Compose after BOTH branches — the non-ok rewrite replaces check_port's
+            # diagnosis, and the healthy branch never composed a pin at all.
+            _, _csls = _proc_lstarts("conversation-server")
+            _apply_pin_findings(c, _pin_verdicts("conversation-server", _csls))
             checks.append(c)
             # Tunnel check — depends on TWILIO_WEBHOOK_URL host (Funnel) or ngrok.
             # Skip the whole block when TWILIO_WEBHOOK_URL is unset/empty: with
@@ -9932,7 +9935,7 @@ def run_all_checks() -> list[dict]:
             # "down — phone calls won't reach server" would be a false alarm
             # (issue #710). The has_twilio gate above only requires
             # TWILIO_ACCOUNT_SID, which the owner may set for outbound-only.
-            if c["status"] == "ok":
+            if _cs_live:
                 webhook_url = ""
                 for line in env_content.splitlines():
                     if line.startswith("TWILIO_WEBHOOK_URL="):
