@@ -262,9 +262,10 @@ def _main(argv):
         res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
                                reply_to=a.reply_to)
     elif a.cmd == "say":
-        res = _say.say(a.message, a.room_id, a.agent_mxid,
-                       reply_to=a.reply_to,
-                       worker=(None if a.worker == "" else a.worker))
+        _kw = {"reply_to": a.reply_to}
+        if a.worker:
+            _kw["worker"] = a.worker
+        res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
     elif a.cmd == "grant":
         import grant as _grant
         try:
