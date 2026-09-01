@@ -161,8 +161,7 @@ check("a comment mentioning .assigned- does NOT exempt (prose is not a marker)",
           for l in _prose))
 
 # ── 4b. the scans reach real FILES, not just strings ─────────────────────────
-# Section 4 exercises the patterns. It passes with the walk pointed at nothing,
-# so plant violations on disk and run the real scan over them.
+# Section 4 exercises the patterns only, never the walk that feeds them.
 print("── the scans reach files on disk ──")
 _tmp = Path(tempfile.mkdtemp(prefix="deleg-walk-"))
 (_tmp / "src").mkdir(parents=True)
@@ -180,8 +179,7 @@ check("the id->file walk finds a planted violation on disk",
       any("planted_glob.py:2" in x for x in _b), str(_b))
 check("neither walk flags the clean file in the same tree",
       not any("clean.py" in x for x in _a + _b), str(_a + _b))
-# 4b exercises the scan FUNCTIONS on its own tree, so it cannot see ROOTS
-# pointing somewhere empty. This asserts the repo walk reached files at all.
+# 4b supplies its own roots, so it cannot see ROOTS pointing somewhere empty.
 check("the repo walk examined files under ROOTS",
       SEEN_A > 100 and SEEN_B > 100, f"examined {SEEN_A}/{SEEN_B} files")
 shutil.rmtree(_tmp, ignore_errors=True)
