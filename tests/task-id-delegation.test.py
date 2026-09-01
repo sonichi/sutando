@@ -35,7 +35,6 @@ OWNERS = ("src/task_archive.py", "packages/ag2-sparrow/ag2_sparrow/task_archive.
 # future set now. DELETE a row when its fix lands; section 6 fails on a stale one.
 KNOWN = {
     "src/runtime-api/tasks_view.py:240": "sonichi/sutando#3656",
-    "skills/schedule-crons/scripts/codex-scheduler.py:305": "sonichi/sutando#3660",
 }
 
 fails = []
