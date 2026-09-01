@@ -281,11 +281,12 @@ and loads whichever repo it reviews.
     time, which is exactly why the re-read is necessary rather than optional. The current state, not the
     remembered one, is what authorizes.
 
-17. **Read the PR's own failing checks before you approve — a red gate is usually a
-    finding the CI already made for you.** Lesson 8 says the verdict is a recommendation
-    and never the merge gate, which is true and is *not* a licence to skip looking: the
-    reason to read a failing check is not that your approval could merge something broken,
-    it is that the check is frequently reporting a defect in the diff you are reviewing.
+17. **Read the PR's own failing checks before you approve — a red gate is OFTEN a finding
+    the CI already made for you, and you cannot know which without reading it.** Lesson 8
+    says the verdict is a recommendation and never the merge gate, which is true and is
+    *not* a licence to skip looking: the reason to read a failing check is not that your
+    approval could merge something broken, it is that the check is frequently reporting a
+    defect in the diff you are reviewing.
     A coverage gate naming uncovered lines is pointing at untested behavior; a failing
     suite is naming the case the change breaks. Approving without reading it means
     shipping a review that missed a finding the repository had already surfaced, and it
@@ -300,6 +301,15 @@ and loads whichever repo it reviews.
     luck, not process. Neither review looked. The cheap form is one call before the
     verdict: `gh pr checks <PR>`, or `scripts/ci-triage.py <PR>`, which additionally maps
     a failing check to any issue already filed about it.
+    **Reading it is necessary and not sufficient — check that the job actually RAN.**
+    Sometimes a red check is naming the infrastructure rather than the diff: a job killed
+    by an Actions budget wall reports `conclusion=failure` with **`steps=0`**, which is
+    indistinguishable from a real failure by conclusion alone (reported by @qingyun-air.agent
+    from this org, on two "Engine pin staleness" failures that were the wall, not findings).
+    A check that never executed has no finding in it, and telling an author to fix one is
+    worse than not looking. Same reason `conclusion` alone is never the whole answer: an
+    IN_PROGRESS run carries `conclusion == ""`, so a filter keyed only on it calls a running
+    check failing.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
