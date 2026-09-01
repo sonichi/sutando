@@ -87,8 +87,8 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
         # caller wrote is theirs; this function never prepends one.
         if worker is None:
             worker = os.environ.get("SUTANDO_WORKER_ID") or (
-                f"core-{os.environ['SUTANDO_CORE_ID']}"
-                if os.environ.get("SUTANDO_CORE_ID") else None)
+                f"worker-{os.environ.get('SUTANDO_WORKER_SEAT') or os.environ['SUTANDO_CORE_ID']}"
+                if os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID") else None)
         # The client renders attribution from this per-event stamp; a direct
         # post self-declares its worker, and optionally its color.
         _color = (os.environ.get("SUTANDO_WORKER_ACCENT")
