@@ -558,6 +558,17 @@ def _first_ask(led: Path, canonical=None) -> dict:
     return _fold(_streams(led), per_stream, earliest, canonical=canonical)
 
 
+def retry_clause(kind: str) -> str:
+    """What an unsafe send may truthfully promise about repeating itself.
+    Only an ask claims a park, so only an ask has protection to report."""
+    if kind == "ask":
+        return ("the park holds, so a repeat is refused — check the channel "
+                "before clearing one")
+    return ("NO retry record was written (a notice does not park). Re-running "
+            "will attempt another post and MAY duplicate a delivered notice — "
+            "check the channel before resending")
+
+
 def unknown_parked(message: str, reviewer: str, actor: str = None,
                    canonical=None, endpoint: str = None) -> bool:
     """True when this ACTOR's latest row for this PR is unsafe to repeat.
@@ -1040,8 +1051,8 @@ def main() -> int:
                 _settle("unknown", "child reported an unknown outcome")
                 unknowns += 1
                 print(f"{t['name']}: OUTCOME UNKNOWN on channel {t['channel']} — "
-                      "the post may have landed; the park holds so a repeat does "
-                      f"not duplicate it. {(p.stderr or '').strip() or 'no stderr'}",
+                      f"the post may have landed; {retry_clause(a.kind)}. "
+                      f"{(p.stderr or '').strip() or 'no stderr'}",
                       file=sys.stderr)
             elif p.returncode in _PROVEN_NOT_DELIVERED:
                 # Only these prove nothing was posted. rc 1 does not: the
@@ -1056,7 +1067,8 @@ def main() -> int:
                 _settle("unknown", f"ambiguous child exit rc={p.returncode}")
                 unknowns += 1
                 print(f"{t['name']}: AMBIGUOUS EXIT rc={p.returncode} — the post may "
-                      f"have landed; parked. {(p.stderr or '').strip() or 'no stderr'}",
+                      f"have landed; {retry_clause(a.kind)}. "
+                      f"{(p.stderr or '').strip() or 'no stderr'}",
                       file=sys.stderr)
             continue
         if a.room and t["room"] != a.room:
@@ -1169,9 +1181,8 @@ def main() -> int:
               "under-reports and pr-unattended will read this PR as unasked",
               file=sys.stderr)
     if unknowns:
-        print(f"{unknowns} send(s) are UNSAFE to repeat — each landed or may have. "
-              "The park is reserved before the post, so a repeat is refused; check "
-              "the channel before clearing one.", file=sys.stderr)
+        print(f"{unknowns} send(s) are UNSAFE to repeat — each landed or may have; "
+              f"{retry_clause(a.kind)}.", file=sys.stderr)
     # Unknown outranks a definite failure in a mixed batch: a failure is safe to
     # retry and an unknown is not, so collapsing to 1 invites the duplicate.
     if unknowns:

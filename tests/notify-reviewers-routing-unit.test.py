@@ -344,8 +344,10 @@ class OneRecipientIsNotTwoPeople(unittest.TestCase):
         for k, v in (("CLAUDE_CONFIG_DIR", self._cfg), ("SUTANDO_SCI_ROSTER", self._roster)):
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
 
-    def _run_with(self, roster, names, kind=None):
-        self.tmp_led = os.path.join(tempfile.mkdtemp(), "asks.jsonl")
+    def _run_with(self, roster, names, kind=None, ledger=None):
+        # `ledger` reuses a prior run's ledger: a rerun on a FRESH one would be
+        # unprotected no matter what the code does, proving nothing.
+        self.tmp_led = ledger or os.path.join(tempfile.mkdtemp(), "asks.jsonl")
         os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = self.tmp_led
         os.environ["CLAUDE_CONFIG_DIR"] = config_with({"groups": {
             "222": {"allowFrom": ["111"]}, "333": {"allowFrom": ["111"]},
@@ -395,6 +397,40 @@ class OneRecipientIsNotTwoPeople(unittest.TestCase):
         led = pathlib.Path(self.tmp_led)
         rows = [json.loads(l) for l in led.read_text().splitlines()] if led.exists() else []
         self.assertEqual(rows, [], f"an unsafe notice entered ask history: {rows}")
+
+    def test_a_repeated_UNSAFE_notice_reports_only_what_is_proven(self):
+        # `_settle` skips notice history correctly, but the diagnostics promised
+        # a park. rc=4 proves neither delivery nor its absence, so MAY, not WILL.
+        self._rc = 4
+        roster = {"a1": {"discord_id": "111", "home_channel": "222"},
+                  "b1": {"discord_id": "999", "home_channel": "444"}}
+        _, first = self._run_with(roster, "a1,b1", kind="notice")
+        sent_once, led = len(self.seen), self.tmp_led
+        _, second = self._run_with(roster, "a1,b1", kind="notice", ledger=led)
+
+        for label, err in (("first", first), ("second", second)):
+            self.assertNotIn("the park holds, so a repeat is refused", err,
+                             f"{label} notice promised a park it never wrote: {err}")
+            self.assertIn("NO retry record was written", err,
+                          f"{label} notice hid that it is unprotected: {err}")
+            self.assertIn("MAY duplicate", err,
+                          f"{label} notice overclaimed a duplicate rc=4 cannot "
+                          f"prove: {err}")
+        # A SHARED ledger, so the resend is the code's choice, not a fresh-state
+        # artifact. Two sender invocations is all this proves — not two arrivals.
+        rows = pathlib.Path(led).read_text().splitlines() if pathlib.Path(led).exists() else []
+        self.assertEqual(rows, [], f"a notice left rows to refuse on: {rows}")
+        self.assertEqual(len(self.seen), sent_once * 2,
+                         "the rerun was refused, so the warning would be false")
+
+    def test_the_control_an_ask_still_promises_its_park(self):
+        # The guard above must not silence the ask path, where the park is real.
+        self._rc = 4
+        _, err = self._run_with(
+            {"a1": {"discord_id": "111", "home_channel": "222"},
+             "b1": {"discord_id": "999", "home_channel": "444"}}, "a1,b1")
+        self.assertIn("the park holds, so a repeat is refused", err,
+                      f"an ask lost its genuine retry protection notice: {err}")
 
     def test_the_control_an_ask_does_record(self):
         # Without this, refusing to record ANYTHING would pass the case above
