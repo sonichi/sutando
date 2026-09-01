@@ -1089,12 +1089,16 @@ def test_context_cli_accepts_a_live_pool_filename() -> None:
     assert workstreams.inherit_assignment(workspace, "task-current", "task-a1")
 
     # The bare id is the control: it never depended on the filename grammar.
+    # The pathname arm is the regression control — the parser is basename-anchored,
+    # so an unreduced path falls through and is rejected for its separator.
     for argument in ("task-current", "task-current.txt",
                      "task-current.claimed-core-3.txt",
-                     "task-current.assigned-core-2.txt"):
+                     "task-current.assigned-core-2.txt",
+                     str(tasks / "task-current.claimed-core-3.txt")):
         for stale in tasks.glob("task-current*"):
             stale.unlink()
-        on_disk = argument if argument.endswith(".txt") else f"{argument}.txt"
+        base = Path(argument).name
+        on_disk = base if base.endswith(".txt") else f"{base}.txt"
         write_task(tasks / on_disk, "task-current",
                    "2026-08-03T10:05:00Z", "continue workstream context")
         buffer = io.StringIO()
