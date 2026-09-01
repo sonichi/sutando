@@ -32,8 +32,7 @@ from delivery.readiness import read_ready_result
 from local_task_protocol import (find_archived_task, find_result,  # noqa: E402
                                  parse_task_headers_lenient)
 sys.path.insert(0, str(_HERE.parent.parent / "packages" / "ag2-sparrow"))
-from ag2_sparrow.task_archive import (find_task_file,  # noqa: E402
-                                      task_id_from_filename)
+from ag2_sparrow.task_archive import find_task_file  # noqa: E402
 
 _WS_RE = re.compile(r"[\r\n]+")
 
@@ -238,9 +237,7 @@ class TasksView:
             files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
             truncated = len(files) > limit
             for f in files[:limit]:
-                # Delegate: a local strip missed `.assigned-`, so task.list handed
-                # clients a phantom id whose result could never be fetched.
-                task_id = task_id_from_filename(f.name) or f.stem
+                task_id = f.name.split(".claimed-")[0].removesuffix(".txt")
                 entry = {"taskId": task_id,
                          "state": self.status(task_id)["state"]}
                 try:
