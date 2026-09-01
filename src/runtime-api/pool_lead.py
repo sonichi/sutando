@@ -39,6 +39,8 @@ NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S  # repool pops ledger; keep follower marked 
 _TASK_RE = re.compile(
     r"^task-(?!.*\.(?:assigned|claimed)-)[A-Za-z0-9._~-]+\.txt$")
 _CHANNEL_RE = re.compile(r"^(?:channel_id|chat_id):\s*(\S+)", re.M)
+_TARGET_RE = re.compile(r"^target_worker:\s*(\S+)", re.M)
+_FANOUT_RE = re.compile(r"^fan_out:\s*true\s*$", re.M | re.I)
 _INST_RE = re.compile(r"^[A-Za-z0-9@:._-]{1,128}$")
 _LANE_RE = re.compile(
     r"^(?P<key>access_tier|priority|interaction_type):\s*(?P<val>\S+)", re.M)
@@ -70,6 +72,21 @@ class _FlockCtx:
         finally:
             self._fh.close()
         return False
+
+
+def _read_addressing(path: Path) -> "tuple[str | None, bool]":
+    """(target_worker, fan_out) from the task header — the per-message
+    address outranks any room binding (owner semantics 2026-08-31)."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None, False
+    # Headers end at the task: delimiter — a body line can never forge
+    # routing (same containment rule as parse_task_headers).
+    m = re.search(r"^task:", text, re.M)
+    head = text[:m.start()] if m else text
+    t = _TARGET_RE.search(head)
+    return (t.group(1) if t else None), bool(_FANOUT_RE.search(head))
 
 
 def _read_lane(path: Path) -> str:
@@ -278,6 +295,54 @@ class PoolLead:
         self._last_pick[str(pick)] = self.now()
         return pick
 
+    def _fan_out(self, f: Path, followers: "list[str]") -> "list[tuple[str, str]]":
+        """One assigned COPY per claiming worker; the original is archived so
+        it can't double-assign. Each copy gets a per-worker id suffix so
+        results and dedup stay distinct."""
+        live = [i for i in followers if self._claiming(i)]
+        if not live:
+            return []
+        stem = f.name[:-len(".txt")]
+        if self._fanned_already(stem):
+            # A prior fan-out survived a failed archive: retire the original
+            # instead of re-copying, or a claimed slot gets a second assignment.
+            self._retire_original(f)
+            return []
+        try:
+            body = f.read_text(errors="replace")
+        except OSError:
+            return []
+        out = []
+        for inst in sorted(live):
+            copy = f.with_name(f"{stem}~{inst}.assigned-{inst}.txt")
+            try:
+                copy.write_text(body)
+                out.append((copy.name, inst))
+            except OSError:
+                continue
+        if out:
+            self._retire_original(f)
+        return out
+
+    def _fanned_already(self, stem: str) -> bool:
+        """~-suffixed traces of a prior fan-out: live/claimed copies in
+        tasks/, archived copies, or per-copy results in any disposition."""
+        pat = f"{stem}~*"
+        dirs = (self.tasks_dir, self.tasks_dir / "archive",
+                self.results_dir, self.results_dir / "archive",
+                self.results_dir / "undelivered")
+        return any(any(d.glob(pat)) for d in dirs)
+
+    def _retire_original(self, f: Path) -> None:
+        # Failure leaves the original for the next sweep, where the entry
+        # guard retires it again instead of re-fanning: idempotent by entry.
+        try:
+            archive = f.parent / "archive"
+            archive.mkdir(parents=True, exist_ok=True)
+            os.rename(f, archive / f.name)
+        except OSError:
+            pass
+
     # ── the sweep ───────────────────────────────────────────────────────────
     def sweep(self) -> "list[tuple[str, str]]":
         """Assign every unassigned task; returns [(task_name, instance)].
@@ -305,10 +370,18 @@ class PoolLead:
                 continue
             channel = _read_channel(f)
             lane = _read_lane(f)
+            target, fan_out = _read_addressing(f)
+            if fan_out:
+                assigned = self._fan_out(f, followers)
+                out.extend(assigned)
+                continue
             bound = None
             if channel and isinstance(affinity.get(channel), dict):
                 bound = affinity[channel].get("instance")
-            inst = self._pick(channel, followers, affinity, lane)
+            if target in followers and self._claiming(target):
+                inst = target  # explicit address outranks bindings + load
+            else:
+                inst = self._pick(channel, followers, affinity, lane)
             if lane == "owner" and (
                     (inst == self._lane_core_of(followers) and inst != bound)
                     or (bound is not None and bound not in followers)):
