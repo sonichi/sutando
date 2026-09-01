@@ -87,6 +87,31 @@ questions the user already answered; work that can proceed now with review
 later; micro implementation details. A choice card is easy to abuse into
 stopping at every step — the policy is part of the contract.
 
+## Rendering pipeline (owner-settled): compile, don't compose
+
+Agents never generate A2UI component trees. The only path from an agent to
+pixels is:
+
+```
+Agent — picks a supported interaction semantic
+  -> AG2 Interaction Schema (validated request)
+  -> deterministic compiler (one shared implementation)
+  -> A2UI surface payload
+  -> A2UI React renderer
+  -> AG2 Space native components
+```
+
+We reuse the A2UI catalog/protocol/renderer (roughly 60-70% of the existing
+UI stack) but own the semantics above it and the durable interaction
+lifecycle in the AG2 runtime. The compiler is the enforcement point: "agents
+cannot forge system UI" is structural, not a convention — the semantic
+validator + compiler are the only producers of A2UI payloads.
+
+Consequence for today's seams: the raw card pass-through
+(`SUTANDO_WORKER_A2UI` on say) is a transition seam only; once the
+`interactions` verbs exist it becomes the compiler's internal output and the
+agent-facing surface is the verbs alone.
+
 ## Current implementation status (this instance)
 
 Rendering today: the client's A2UI kit (`A2UIButtonsCard` = confirm /
