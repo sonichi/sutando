@@ -10488,7 +10488,11 @@ def _default_slack_sender(text: str) -> bool:
         if not opened.get("ok"):
             return False
         channel = opened["channel"]["id"]
-        posted = _slack_api(token, "chat.postMessage", {"channel": channel, "text": text})
+        # Health output carries URLs, and this DM is the owner's alert channel:
+        # a wall of preview cards buries the failure it is reporting.
+        posted = _slack_api(token, "chat.postMessage", {
+            "channel": channel, "text": text,
+            "unfurl_links": False, "unfurl_media": False})
         return bool(posted.get("ok"))
     except Exception:
         return False
