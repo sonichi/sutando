@@ -91,6 +91,7 @@ check("CONTROL: `| tail -1` on oldest_first yields the NEWEST message",
 
 # 6. Drive the CLI dispatch itself. String-matching room_ops.py source left the
 #    `oldest_first=a.oldest_first` line uncovered, which is how it reached CI.
+
 import room_ops  # noqa: E402
 
 _seen = {}
