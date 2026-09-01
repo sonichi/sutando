@@ -14,10 +14,18 @@ exit 49
 EOF
 cat > "$LAB/bin/py" <<'EOF'
 #!/bin/sh
-[ "$1" = "-c" ] && exit 0
+[ "$1" = "-c" ] && [ "$2" = "pass" ] && exit 0
 exit 1
 EOF
-chmod +x "$LAB/bin/python3" "$LAB/bin/py"
+cat > "$LAB/bin/python" <<'EOF'
+#!/bin/sh
+[ "$1" = "-c" ] || exit 1
+case "$2" in
+  "pass"|"import wantedmod") exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$LAB/bin/python3" "$LAB/bin/py" "$LAB/bin/python"
 
 resolved="$(
   OSTYPE=msys PATH="$LAB/bin:/bin" bash -c \
@@ -33,4 +41,13 @@ if [ ! -f "$LAB/store-probed" ]; then
   exit 1
 fi
 
-echo "PASS: rejected Store python3 alias and selected py"
+module_resolved="$(
+  OSTYPE=msys PATH="$LAB/bin:/bin" bash -c \
+    ". '$REPO/scripts/python-binary.sh'; resolve_python_for_module '$REPO' wantedmod"
+)"
+if [ "$module_resolved" != "$LAB/bin/python" ]; then
+  echo "FAIL: expected module resolver to continue to python, got: $module_resolved" >&2
+  exit 1
+fi
+
+echo "PASS: selected Windows PATH interpreters by runtime and module capability"

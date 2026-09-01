@@ -73,18 +73,19 @@ resolve_python() {
 		return 0
 	fi
 
-	# Windows commonly exposes `python3` as the Microsoft Store app-execution
-	# alias. `command -v` and `[ -x ]` both accept it, but running it exits 49
-	# without executing Python. Unlike the macOS CLT stub, probing this alias
-	# does not raise an OS modal, so a functional `-c pass` probe is the only
-	# reliable discriminator. The python.org installer may expose only `py`.
+	_sutando_safe_path_python
+}
+
+# Echo every safe PATH interpreter in preference order, one per line.
+_sutando_safe_path_pythons() {
+	# Windows aliases are safe to probe; keep every runnable candidate so
+	# module-aware callers can continue past one that lacks their dependency.
 	case "${OSTYPE:-$(uname -s 2>/dev/null)}" in
 		msys*|cygwin*|win32*|mingw*|MINGW*|MSYS*|CYGWIN*)
 			for _candidate in python3 py python; do
 				_candidate_path="$(command -v "$_candidate" 2>/dev/null)" || _candidate_path=""
 				if [ -n "$_candidate_path" ] && "$_candidate_path" -c "pass" >/dev/null 2>&1; then
-					printf '%s' "$_candidate_path"
-					return 0
+					printf '%s\n' "$_candidate_path"
 				fi
 			done
 			return 0
@@ -112,21 +113,63 @@ resolve_python() {
 		*) _is_mac=0 ;;
 	esac
 	if [ "$_is_mac" -ne 1 ]; then
-		printf '%s' "$_path_py"
+		printf '%s\n' "$_path_py"
 		return 0
 	fi
 
 	# Homebrew / python.org / pyenv — a real interpreter, use it as-is with no
 	# toolchain requirement.
 	if ! _sutando_is_system_stub "$_path_py"; then
-		printf '%s' "$_path_py"
+		printf '%s\n' "$_path_py"
 		return 0
 	fi
 
 	# It IS the system location. Only safe if the tools are actually installed.
 	if _sutando_developer_tools_installed; then
-		printf '%s' "$_path_py"
+		printf '%s\n' "$_path_py"
 	fi
+	return 0
+}
+
+# Echo the first safe PATH interpreter, or NOTHING.
+_sutando_safe_path_python() {
+	while IFS= read -r _candidate_path; do
+		printf '%s' "$_candidate_path"
+		return 0
+	done < <(_sutando_safe_path_pythons)
+	return 0
+}
+
+# Echo a runnable python3 that can `import $2`, or NOTHING. Same candidate order
+# and same stub rules as resolve_python, but a candidate that cannot import the
+# module is SKIPPED rather than returned.
+#
+# resolve_python answers "which interpreter runs", which is a different question
+# from "which interpreter runs THIS". A bundled runtime without a channel's
+# third-party dep satisfies the first and fails the second, and a caller that
+# probes only the first answer concludes no interpreter exists while a usable
+# one sits further down the same list.
+#
+# $1 = repo root. $2 = module the caller needs (e.g. slack_bolt).
+resolve_python_for_module() {
+	_repo="${1:-.}"
+	_mod="${2:-}"
+	[ -n "$_mod" ] || { resolve_python "$_repo"; return 0; }
+
+	for _cand in "${SUTANDO_PY:-}" "$_repo/../runtime/python/bin/python3"; do
+		[ -n "$_cand" ] && [ -x "$_cand" ] || continue
+		if "$_cand" -c "import $_mod" >/dev/null 2>&1; then
+			printf '%s' "$_cand"
+			return 0
+		fi
+	done
+
+	while IFS= read -r _cand; do
+		if "$_cand" -c "import $_mod" >/dev/null 2>&1; then
+			printf '%s' "$_cand"
+			return 0
+		fi
+	done < <(_sutando_safe_path_pythons)
 	return 0
 }
 

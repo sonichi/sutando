@@ -109,6 +109,26 @@ _INLINE_RESOLVED = re.compile(
 )
 
 
+def section_is_waiting(title: str, body: str) -> bool:
+    """One rule for "this entry still wants an answer", used on BOTH regions.
+
+    `zero_reason()` asks it about the archive; a second rule there would let one
+    entry read as resolved in one region and open in the other.
+
+    `open` is the word writers naturally reach for, and it used to fall through
+    to the resolved skip — filing a live question as though it were answered.
+    The section stayed on disk and readable while never being surfaced, which is
+    the worst failure mode here.
+    """
+    if not title or _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
+        return False
+    status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
+    if status_m:
+        return status_m.group(1).strip().lower().startswith(
+            ('unanswered', 'waiting', 'open'))
+    return True  # no status field: free-form prose is unanswered by convention
+
+
 def get_waiting_questions():
     """Parse pending-questions.md — matches the legacy `## Q1 — Title` and
     `## Title` / `- **Status:** unanswered` section formats AND the free-form
@@ -140,18 +160,8 @@ def get_waiting_questions():
         title = title_line.strip()
         if not title:
             continue
-        if _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
+        if not section_is_waiting(title, body):
             continue
-        status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
-        if status_m:
-            status = status_m.group(1).strip().lower()
-            # `open` is the word writers naturally reach for, and it used to
-            # fall through to the skip below — filing a live question as though
-            # it were resolved. The section stayed on disk and readable while
-            # never being surfaced, which is the worst failure mode here.
-            if not status.startswith(('unanswered', 'waiting', 'open')):
-                continue  # explicitly resolved/done/answered — skip
-        # No status field, or status is unanswered/waiting/open → notify.
         # Capture first non-empty, non-strikethrough, non-status-metadata body
         # line as a one-line action hint so notifications tell the user what
         # to do, not just that something is waiting (avoids "what do I do
@@ -453,6 +463,19 @@ def deliver(questions, count, titles):
     return summary
 
 
+def _active_region_lost(active_text: str) -> bool:
+    """True when the active-region HEADER is absent, not merely empty.
+
+    Below the divider, resolution is expressed by POSITION, so "this entry lacks
+    a resolved marker" is not evidence. What a swept file cannot fake is having no
+    top-level heading left above the divider at all.
+
+    Takes the ALREADY-PARSED active region: re-splitting here would be a second
+    definition of the divider, which `active_region()` alone owns.
+    """
+    return not re.search(r'^#\s+\S', active_text, flags=re.MULTILINE)
+
+
 def zero_reason():
     """Explain a zero so a parse fault cannot look like a quiet day.
 
@@ -504,14 +527,20 @@ def zero_reason():
     if file_total == 0:
         return "0 pending questions — the file holds no sections or bullets at all"
 
-    # Suspicious shape: the file has entries, the ACTIVE region has none. Fires for
-    # sections, bullets, or any mix — the population that vanished does not matter.
+    # An empty active region is the parse-fault shape AND, permanently, a fully
+    # answered file. The header tells them apart; the entries cannot.
     if act_total == 0:
+        if not _active_region_lost(active_text):
+            return (
+                f"0 pending questions — the active region is empty and all "
+                f"{_describe(file_secs, file_bullets)} sit below the archive divider"
+            )
         return (
-            f"0 pending questions, but {PQ_FILE.name} holds {_describe(file_secs, file_bullets)} "
-            f"and NONE are in the active region (above the archive divider). "
-            f"That is the shape of a parse fault, not a quiet day — check the "
-            f"'# Resolved' divider before trusting this zero."
+            f"0 pending questions, but {PQ_FILE.name} holds "
+            f"{_describe(file_secs, file_bullets)} and has NO active-region header "
+            f"at all — the '# Open' heading is gone, so there is no region left for "
+            f"them to be in. That is the shape of a parse fault, not a quiet day — "
+            f"check the '# Resolved' divider before trusting this zero."
         )
 
     return (
