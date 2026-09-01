@@ -398,14 +398,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    this step exists to prevent. That is also what the "don't hand-roll a process check" rule below
    means: the probe is the authority for ownership as well as for liveness.
 
-   **Do NOT scope this by counting `state/cores/*.alive`.** That directory is SYNCED ACROSS HOSTS, so a
-   peer's fresh heartbeat inflates the count on a single-core machine and suppresses cleanup of
-   genuinely orphaned local watchers — the inverse failure, equally bad. Measured on a live host: a
-   remote `Mac-186.alive` carried the *same pid* as the local record. The probe verifies ownership
-   from the local tmux session→pane map instead, which sync cannot reach — pool records carry no
-   `host` field at all, so they cannot be filtered back to this machine even in principle.
+   **Do NOT scope this by counting `state/cores/*.alive`.** Those records are not a process census:
+   the sync layer now hard-denies `*.alive` (`scripts/sync-workspace.sh`), so the directory holds
+   whatever landed historically — including cross-host records from before the deny, one of which
+   (`Mac-186.alive`) was measured carrying the *same pid* as the local record. Stale-or-foreign
+   either way, a file count can inflate the census and suppress cleanup of genuinely orphaned local
+   watchers. The probe verifies ownership from the local tmux session→pane map instead — pool
+   records carry no `host` field at all, so they cannot be filtered back to this machine even in
+   principle.
 
-   | probe says | action (apply the two-group test above first) |
+   | probe says | action (apply the three-group split above first: session-owned / unverified / ownerless) |
    |---|---|
    | `ok` | nothing to do. |
    | watcher(s) running with **no PID sentinel** | **Do NOT start another** — that is what creates the duplicate. Apply the group rules: stop only `ownerless`. |
