@@ -848,6 +848,25 @@ def identity_components(roster) -> dict:
     return {name: find(("actor", actor_of.get(name, name))) for name, _ in rows}
 
 
+def component_resolver(roster):
+    """Any roster name, canonical actor or durable endpoint -> ONE person key.
+
+    The ledger stores raw spellings — sometimes a name, sometimes an endpoint —
+    so both axes must land on the same key or an alias steps around a park.
+    """
+    comp = identity_components(roster)
+    actor_of = _actor_map(roster or {})
+    index = {}
+    for name, root in comp.items():
+        key = f"person:{root[0]}:{root[1]}"
+        index[name] = key
+        index[actor_of.get(name, name)] = key
+        endpoint = durable_endpoint((roster or {}).get(name) or {})
+        if endpoint:
+            index[endpoint] = key
+    return lambda w: index.get(w, w)
+
+
 def _actor_map(roster) -> dict:
     """key -> canonical actor, over the CONNECTED COMPONENT of same_actor_as.
 
@@ -1065,6 +1084,9 @@ def main() -> int:
     # One person may hold several roster spellings; the park keys the endpoint,
     # so resolve the canonical actor once rather than per send.
     actors = _actor_map(load_roster())
+    # Retry admission keys the PERSON, not a spelling: an outcome-unknown park
+    # must block every alias and endpoint in that person's component.
+    person_of = component_resolver(load_roster())
     for t in targets:
         if t["transport"] == "discord":
             # No room-relocation branch: a Discord mention is channel-scoped and
@@ -1098,7 +1120,7 @@ def main() -> int:
             if a.kind == "ask":
                 try:
                     reserved = claim_park(a.message, t["name"], who,
-                                          canonical=lambda w: actors.get(w, w),
+                                          canonical=person_of,
                                           endpoint=t.get("endpoint"))
                 except OSError as e:
                     print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
