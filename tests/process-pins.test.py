@@ -190,7 +190,11 @@ check("wiring: expired pin -> the lost pin is SURFACED", "expired" in c["detail"
 with tempfile.TemporaryDirectory() as td:
     ws = Path(td)
     (ws / "state").mkdir()
-    (ws / "state" / "process-pins.json").write_text(json.dumps({"pins": [pin()]}))
+    # This case evaluates on the WALL CLOCK (real _pin_verdicts passes
+    # time.time()), so its expiry must outlive the calendar, not the frozen NOW.
+    _wall_future = (datetime.now(timezone.utc) + timedelta(days=3650)).isoformat()
+    (ws / "state" / "process-pins.json").write_text(
+        json.dumps({"pins": [pin(expires_at=_wall_future)]}))
     orig_ws = hc.WORKSPACE_DIR
     hc.WORKSPACE_DIR = ws
     try:

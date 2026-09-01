@@ -46,7 +46,8 @@ def _arm_release_cycles(path: str, worker: int, cycles: int) -> None:
         process_pins.arm_pin(path, f"svc-{worker}", str(1000 + worker),
                              f"lstart {worker}", f"cycle {i}",
                              "2026-12-31T00:00:00Z")
-        process_pins.release_pin(path, f"svc-{worker}", str(1000 + worker))
+        process_pins.release_pin(path, f"svc-{worker}", str(1000 + worker),
+                                 lstart=f"lstart {worker}")
 
 
 class WriterValidatesAndBounds(unittest.TestCase):
@@ -99,8 +100,46 @@ class WriterValidatesAndBounds(unittest.TestCase):
         pins = process_pins.load_pins(self.path)
         self.assertEqual(len(pins), 1)
         self.assertEqual(pins[0]["reason"], "second")
-        self.assertEqual(process_pins.release_pin(self.path, "svc", "9"), 1)
+        self.assertEqual(
+            process_pins.release_pin(self.path, "svc", "9", lstart="l2"), 1)
         self.assertEqual(process_pins.load_pins(self.path), [])
+
+    def test_release_requires_lstart_and_survives_PID_REUSE(self) -> None:
+        """A bare pid cannot tell a reused pid's NEW process from the pinned one."""
+        process_pins.arm_pin(self.path, "svc", "77", "OLD lstart", "old witness",
+                             "2099-01-01T00:00:00Z")
+        process_pins.release_pin(self.path, "svc", "77", lstart="OLD lstart")
+        process_pins.arm_pin(self.path, "svc", "77", "NEW lstart", "new witness",
+                             "2099-01-01T00:00:00Z")
+        # A stale cleanup carrying the OLD identity must remove NOTHING.
+        self.assertEqual(
+            process_pins.release_pin(self.path, "svc", "77", lstart="OLD lstart"), 0)
+        pins = process_pins.load_pins(self.path)
+        self.assertEqual([p["reason"] for p in pins], ["new witness"], pins)
+        # A bare pid is refused outright rather than guessing.
+        with self.assertRaises(ValueError):
+            process_pins.release_pin(self.path, "svc", "77")
+        # CONTROL: the CURRENT identity does remove it.
+        self.assertEqual(
+            process_pins.release_pin(self.path, "svc", "77", lstart="NEW lstart"), 1)
+        self.assertEqual(process_pins.load_pins(self.path), [])
+        # Service-wide release stays available as an EXPLICIT choice.
+        process_pins.arm_pin(self.path, "svc", "78", "l", "r", "2099-01-01T00:00:00Z")
+        self.assertEqual(process_pins.release_pin(self.path, "svc"), 1)
+
+    def test_writers_refuse_a_malformed_ENTRY_leaving_bytes_untouched(self) -> None:
+        """A wrong-shaped entry inside a well-formed list is still malformed."""
+        for bad in ('{"pins": ["not-a-dict"]}',
+                    '{"pins": [{"service": "svc", "pid": "1"}]}'):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                process_pins.arm_pin(self.path, "svc", "9", "l", "r",
+                                     "2099-01-01T00:00:00Z")
+            self.assertEqual(self.path.read_text(), bad, "arm rewrote bad state")
+            with self.assertRaises(ValueError, msg=bad):
+                process_pins.release_pin(self.path, "svc", "9", lstart="l")
+            self.assertEqual(self.path.read_text(), bad, "release rewrote bad state")
 
     def test_CONTROL_torn_snapshot_is_detectable_and_fails_open(self) -> None:
         process_pins.save_pins(self.path, [GOOD])

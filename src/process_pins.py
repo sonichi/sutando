@@ -111,7 +111,9 @@ def _load_strict(path) -> list:
     pins = data.get("pins") if isinstance(data, dict) else None
     if not isinstance(pins, list):
         raise ValueError(f"{target}: existing pin record is malformed")
-    return [p for p in pins if isinstance(p, dict)]
+    # Every entry through the production schema: dropping a bad one would
+    # rewrite the record around it — the reader's fail-open, not a writer's.
+    return [_validated(p) for p in pins]
 
 
 @contextmanager
@@ -142,13 +144,30 @@ def arm_pin(path, service, pid, lstart, reason, expires_at) -> dict:
     return pin
 
 
-def release_pin(path, service, pid=None) -> int:
-    """The supported release entry point. Returns how many pins it removed."""
+def release_pin(path, service, pid=None, lstart=None) -> int:
+    """The supported release entry point. Returns how many pins it removed.
+
+    Identity is (pid, lstart), never a bare pid: after PID reuse a stale
+    cleanup carrying only the number would delete the NEW process's pin.
+    A service-wide release stays available, but only as an explicit choice
+    (pid=None) — never as the accidental result of an unmatched pid.
+    """
+    if pid is not None and not str(lstart or "").strip():
+        raise ValueError(
+            "release_pin: a pid-targeted release requires lstart — a bare pid "
+            "cannot tell a reused pid's new process from the pinned one")
     with _locked(path):
         pins = _load_strict(path)
-        keep = [p for p in pins
-                if not (str(p.get("service") or "") == str(service)
-                        and (pid is None or str(p.get("pid") or "") == str(pid)))]
+
+        def _targeted(p) -> bool:
+            if str(p.get("service") or "") != str(service):
+                return False
+            if pid is None:
+                return True
+            return (str(p.get("pid") or "") == str(pid)
+                    and str(p.get("lstart") or "").strip() == str(lstart).strip())
+
+        keep = [p for p in pins if not _targeted(p)]
         if len(keep) != len(pins):
             save_pins(path, keep)
     return len(pins) - len(keep)

@@ -3526,11 +3526,17 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
     for c in checks:
         # The name gate is NOT redundant with the detail match: for an unknown
         # name the lookup is None, and a check with no detail is also None.
+        # Prefix, not equality: the row may carry an appended pin finding, and
+        # a lost-pin note must not silently disqualify a dead bridge from repair.
         if not (
             c["name"] in DOWN_BRIDGE_DETAILS
             and c["status"] == "warn"
-            and c.get("detail") == DOWN_BRIDGE_DETAILS[c["name"]]
+            and str(c.get("detail") or "").startswith(DOWN_BRIDGE_DETAILS[c["name"]])
         ):
+            continue
+        if c.get("restart_veto"):
+            # A pin forbids exactly this act; the diagnosis still stands.
+            print(f"  {c['name']}: not restarted — {c['restart_veto']}")
             continue
         name = c["name"]
 
@@ -3796,11 +3802,15 @@ def _apply_pin_findings(check, results):
     veto = process_pins.veto_detail(results)
     if veto and not check.get("restart_veto"):
         check["restart_veto"] = veto
+    # The renderer prints status+detail only, so a veto living solely in
+    # restart_veto protects --fix and leaves the MANUAL restart surface blind.
+    if veto and veto not in str(check.get("detail") or ""):
+        check["detail"] = f"{check.get('detail') or ''} — {veto}".strip(" —")
     others = process_pins.other_notes(results)
     if others and others not in str(check.get("detail") or ""):
         check["detail"] = f"{check.get('detail') or ''}{others}".strip()
-        if check.get("status") == "ok":
-            check["status"] = "warn"
+    if (veto or others) and check.get("status") == "ok":
+        check["status"] = "warn"
 
 
 def _apply_pin_verdict(check, results, status, detail):
@@ -9725,6 +9735,10 @@ def run_all_checks() -> list[dict]:
             if c["status"] != "ok":
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
+                # This rewrite replaces check_port's whole diagnosis, so the
+                # pin composition it already made has to be re-applied.
+                _, _csls = _proc_lstarts("conversation-server")
+                _apply_pin_findings(c, _pin_verdicts("conversation-server", _csls))
             else:
                 mark_stale_if_outdated(
                     c,
@@ -9813,10 +9827,12 @@ def run_all_checks() -> list[dict]:
                 checks.append(_row)
                 continue
             # This exact detail string is a contract: fix_down_bridges()
-            # matches it verbatim to pick restart candidates (and the
+            # matches it as a PREFIX to pick restart candidates (and the
             # health-check-fix-down-bridges test locks it). Change both
             # together or --fix goes blind to dead bridges again.
-            checks.append({"name": name, "status": "warn", "detail": "configured but not running"})
+            _row = {"name": name, "status": "warn", "detail": "configured but not running"}
+            _apply_pin_findings(_row, _pin_verdicts(name, {}))
+            checks.append(_row)
             continue
 
         # Check 1: Multiple processes (zombie/duplicate)

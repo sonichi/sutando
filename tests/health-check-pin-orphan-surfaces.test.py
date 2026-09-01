@@ -233,6 +233,55 @@ class OrphanSurfacesOnServicePaths(unittest.TestCase):
             self.assertEqual(launched, ["slack-bridge"],
                              "the authoritative no-match row must stay a candidate")
 
+    def test_ARMED_veto_is_visible_in_ordinary_human_output(self) -> None:
+        """restart_veto alone protects --fix and leaves MANUAL restarts blind."""
+        process_pins.arm_pin(self.pin_file, "credential-proxy", "222",
+                             LSTART, "branch witness", EXP)
+        self._port("down")
+        hc._proc_lstarts = lambda pat: ([0.0], {"222": LSTART})
+        check = hc.check_credential_proxy()
+        self.assertIn("DO NOT RESTART", check["detail"], check)
+        self.assertIn("DO NOT RESTART", check.get("restart_veto", ""), check)
+        # The existing diagnosis must survive beside the veto, not be replaced.
+        self.assertIn("not running (optional)", check["detail"], check)
+
+    def test_CONTROL_unpinned_down_row_gains_no_veto_text(self) -> None:
+        self._port("down")
+        hc._proc_lstarts = lambda pat: ([0.0], {"222": LSTART})
+        check = hc.check_credential_proxy()
+        self.assertNotIn("DO NOT RESTART", check["detail"], check)
+        self.assertNotIn("restart_veto", check, check)
+
+    def test_bridge_no_match_row_keeps_orphan_and_stays_a_candidate(self) -> None:
+        from unittest import mock
+        process_pins.arm_pin(self.pin_file, "slack-bridge", "111",
+                             LSTART, "bridge witness", EXP)
+        row = {"name": "slack-bridge", "status": "warn",
+               "detail": "configured but not running"}
+        hc._apply_pin_findings(row, hc._pin_verdicts("slack-bridge", {}))
+        self.assertIn("no longer running", row["detail"], row)
+        launched = []
+        with mock.patch.object(hc, "_bridge_launch_plan",
+                               side_effect=lambda n: (launched.append(n), None)[1]):
+            hc.fix_down_bridges([row], action="restart",
+                                guard=lambda repo: (True, "t"),
+                                sender=lambda m: True, notifier=lambda m: True)
+        self.assertEqual(launched, ["slack-bridge"],
+                         "an appended orphan note must not disqualify the repair")
+
+    def test_armed_bridge_row_is_NOT_restarted_by_fix_down_bridges(self) -> None:
+        from unittest import mock
+        row = {"name": "slack-bridge", "status": "warn",
+               "detail": "configured but not running",
+               "restart_veto": "DO NOT RESTART slack-bridge pid 1 — witness"}
+        launched = []
+        with mock.patch.object(hc, "_bridge_launch_plan",
+                               side_effect=lambda n: (launched.append(n), None)[1]):
+            hc.fix_down_bridges([row], action="restart",
+                                guard=lambda repo: (True, "t"),
+                                sender=lambda m: True, notifier=lambda m: True)
+        self.assertEqual(launched, [], "a pin must veto the bridge repair too")
+
     def test_CONTROL_no_pins_healthy_stays_plain_ok(self) -> None:
         self._port("ok")
         hc._proc_lstarts = lambda pat: ([0.0], {"222": LSTART})
