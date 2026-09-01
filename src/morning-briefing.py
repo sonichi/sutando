@@ -82,12 +82,17 @@ def get_weather() -> str:
             lat = float(_lat_cfg)
             lon = float(_lon_cfg)
 
+        unit = (config_get("WEATHER_UNIT", "fahrenheit") or "fahrenheit").strip().lower()
+        if unit not in ("fahrenheit", "celsius"):
+            unit = "fahrenheit"
+        unit_symbol = "°F" if unit == "fahrenheit" else "°C"
+
         url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
             f"&current=temperature_2m,weather_code"
             f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-            f"&timezone=auto&forecast_days=1&temperature_unit=fahrenheit"
+            f"&timezone=auto&forecast_days=1&temperature_unit={unit}"
         )
         with urlopen(url, timeout=8) as resp:
             d = json.loads(resp.read())
@@ -102,7 +107,7 @@ def get_weather() -> str:
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
         # Spoken aloud, so the label stays short and the remedy goes to the log.
         where = "" if configured else " in San Francisco (default location)"
-        return f"{temp}°F and {desc}{where}, high of {high}, low of {low}{rain_note}"
+        return f"{temp}{unit_symbol} and {desc}{where}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
 
