@@ -13,7 +13,8 @@ from datetime import datetime
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from task_archive import (archive_file, declared_task_id, find_task_file,
-                          task_id_for, task_id_from_filename)
+                          lookup_id_from_filename, task_id_for,
+                          task_id_from_filename)
 import task_archive as _task_archive  # noqa: E402
 
 
@@ -118,6 +119,24 @@ class TestArchiveNeverOverwrites(unittest.TestCase):
         self.assertEqual((self.live / "task-z.txt.archive-failed").read_text(), "FIRST")
         self.assertEqual((self.live / "task-z.txt.archive-failed.1").read_text(), "SECOND")
         self.assertFalse(src.exists())
+
+
+class TestLookupIdFromFilename(unittest.TestCase):
+    def test_task_names_use_the_anchored_grammar(self) -> None:
+        self.assertEqual(lookup_id_from_filename("task-a.txt"), "task-a")
+        self.assertEqual(
+            lookup_id_from_filename("task-a.claimed-core-3.txt"), "task-a")
+
+    def test_historic_prefixes_strip_the_plain_suffix(self) -> None:
+        self.assertEqual(lookup_id_from_filename("ask-9.txt"), "ask-9")
+        self.assertEqual(lookup_id_from_filename("sc-ask-9.txt.2"), "sc-ask-9")
+        self.assertEqual(
+            lookup_id_from_filename("reco-skill-x.txt.archive-failed"),
+            "reco-skill-x")
+
+    def test_a_bare_id_with_dots_passes_through_unmangled(self) -> None:
+        # Path.stem would return "ask-1" here; dots are legal inside ids.
+        self.assertEqual(lookup_id_from_filename("ask-1.2"), "ask-1.2")
 
 
 class TestFindTaskFile(unittest.TestCase):

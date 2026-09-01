@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 
 from sutando_config import resolve_workspace  # noqa: E402
-from task_archive import task_id_from_filename  # noqa: E402
+from task_archive import lookup_id_from_filename  # noqa: E402
 from task_workstreams import (  # noqa: E402
     apply_inference,
     build_classifier_snapshot,
@@ -40,10 +40,9 @@ def main(argv=None) -> int:
         print(json.dumps(build_classifier_snapshot(workspace), ensure_ascii=False, indent=2))
         return 0
     if args.command == "context":
-        # The parser is basename-anchored: an unreduced path falls through and is
-        # then rejected for its separator, silently yielding no context.
-        basename = Path(args.task).name
-        task_id = task_id_from_filename(basename) or basename
+        # Reduce to a basename (a raw path is rejected for its separator), then
+        # normalize through the archive grammar -- it covers non-task-* forms too.
+        task_id = lookup_id_from_filename(Path(args.task).name)
         context = build_workstream_context(workspace, task_id, limit=args.limit)
         if context is not None:
             sys.stdout.write(json.dumps(context, ensure_ascii=False, separators=(",", ":")))

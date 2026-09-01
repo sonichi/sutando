@@ -1109,6 +1109,20 @@ def test_context_cli_accepts_a_live_pool_filename() -> None:
         assert payload, f"no context for {argument}"
         assert json.loads(payload)["current_task_id"] == "task-current", argument
 
+    # Historic non-task-* producer ids (the valid_archive_lookup_id contract):
+    # the filename must normalize even though the task-* grammar rejects it.
+    write_task(tasks / "ask-current.txt", "ask-current",
+               "2026-08-03T10:06:00Z", "continue historic-id context")
+    assert workstreams.inherit_assignment(workspace, "ask-current", "task-a1")
+    buffer = io.StringIO()
+    with mock.patch.object(cli, "resolve_workspace", return_value=workspace):
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(["context", "ask-current.txt"])
+    assert code == 0
+    payload = buffer.getvalue()
+    assert payload, "no context for ask-current.txt"
+    assert json.loads(payload)["current_task_id"] == "ask-current"
+
 
 def test_concurrent_inheritance_keeps_every_assignment() -> None:
     workspace = fixture_workspace()
