@@ -302,10 +302,13 @@ class FailurePaths(unittest.TestCase):
         def fake_run(cmd, *a, **k):
             if "members" in cmd:
                 return type("R", (), {"stdout": ok, "stderr": "", "returncode": 0})()
-            # Capability probe, like `members` above: not a send, so it must not
-            # be counted by a proxy whose subject is send attempts.
+            # Identity and capability probes, like `members` above: not sends,
+            # so a proxy whose subject is send attempts must not count them.
             if any("collaborators" in str(x) for x in cmd):
                 return type("R", (), {"stdout": "write", "stderr": "", "returncode": 0})()
+            if any(str(x).startswith("users/") for x in cmd):
+                login = next(str(x)[6:] for x in cmd if str(x).startswith("users/"))
+                return type("R", (), {"stdout": login, "stderr": "", "returncode": 0})()
             calls["n"] += 1
             if send_effect and calls["n"] == 1:
                 raise send_effect
@@ -435,6 +438,9 @@ class GateCapabilityFiltersBeforeTheCountGate(unittest.TestCase):
     def _run(self, caps, argv_extra=()):
         m = _load()
         m.gate_capability = lambda repo, login: caps[login]
+        # Stub the identity probe too: a test that needs the network can fail
+        # for a reason it is not about.
+        m._github_login = lambda name, roster: (name, "stubbed")
         m.load_roster = lambda: self.ROSTER
         m.stand_present_in_room = lambda t: (True, "2 members")
         buf = io.StringIO()
@@ -465,6 +471,53 @@ class GateCapabilityFiltersBeforeTheCountGate(unittest.TestCase):
                              "bob": (True, "write")})
         self.assertIn("gate capability unverified", err)
         self.assertNotIn("CANNOT GATE", err)
+
+
+class GateCapabilityProbesAGitHubLogin(unittest.TestCase):
+    """A roster key is not always a login; probing one that is not is a no-op."""
+
+    ROSTER = {"stand-only": {"stand": "@s:x", "room": "!r",
+                             "same_actor_as": "real-login"},
+              "real-login": {"stand": "@r:x", "room": "!r",
+                             "same_actor_as": "stand-only"},
+              "plain": {"stand": "@p:x", "room": "!r"}}
+
+    def _resolve(self, name, users):
+        m = _load()
+        m._is_github_user = lambda login: login in users
+        return m._github_login(name, self.ROSTER)
+
+    def test_a_stand_only_key_resolves_through_same_actor_as(self):
+        login, why = self._resolve("stand-only", {"real-login"})
+        self.assertEqual(login, "real-login")
+        self.assertIn("same_actor_as", why)
+
+    def test_a_key_that_is_a_login_is_used_directly(self):
+        # Control: without this the mapping could rewrite every name.
+        login, why = self._resolve("plain", {"plain"})
+        self.assertEqual(login, "plain")
+        self.assertNotIn("same_actor_as", why)
+
+    def test_no_login_anywhere_returns_the_key_and_says_so(self):
+        login, why = self._resolve("stand-only", set())
+        self.assertEqual(login, "stand-only")
+        self.assertIn("no login found", why)
+
+
+class GateCapabilitySkipIsAnnounced(unittest.TestCase):
+    """The one case the tool cannot check must not be the one it is silent about."""
+
+    def test_a_message_without_a_pr_url_says_the_check_was_skipped(self):
+        m = _load()
+        m.load_roster = lambda: {"a": {"stand": "@a:x", "room": "!r"},
+                                 "b": {"stand": "@b:x", "room": "!r"}}
+        m.stand_present_in_room = lambda t: (True, "2 members")
+        buf = io.StringIO()
+        argv = ["nr", "--reviewers", "a,b", "--kind", "ask", "--message", "no url"]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(buf), \
+                contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+        self.assertIn("gate capability NOT CHECKED", buf.getvalue())
 
 
 if __name__ == "__main__":

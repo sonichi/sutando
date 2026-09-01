@@ -147,6 +147,31 @@ def gate_capability(repo: str, login: str) -> "tuple[bool | None, str]":
     return None, f"unverified (permission={perm!r})"
 
 
+def _github_login(name: str, roster: dict) -> "tuple[str, str]":
+    """(login GitHub can answer for, why) — a roster key is not always one.
+
+    `johnm-desktop` is a Stand handle, not a login; probing it 404s and the
+    capability check degrades to a silent no-op on exactly the aliased keys
+    `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
+    """
+    entry = (roster or {}).get(name) or {}
+    if _is_github_user(name):
+        return name, "key is a login"
+    sib = entry.get("same_actor_as")
+    if sib and _is_github_user(sib):
+        return sib, f"via same_actor_as -> {sib}"
+    return name, "no login found for this key"
+
+
+def _is_github_user(login: str) -> bool:
+    try:
+        p = subprocess.run(["gh", "api", f"users/{login}", "-q", ".login"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:                            # noqa: BLE001 - probe must not raise
+        return False
+    return p.returncode == 0 and p.stdout.strip().lower() == login.lower()
+
+
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     """Is this stand actually a member of the room we are about to mention it in?
 
@@ -348,11 +373,23 @@ def main() -> int:
     # ask the repo named in the message rather than trusting a cached tier.
     if a.kind == "ask" and targets:
         refs = _PR_URL.findall(a.message or "")
+        if not refs:
+            # Every other refusal path here prints; the one case that cannot be
+            # checked must not be the one case that is silent.
+            print("gate capability NOT CHECKED: the message names no "
+                  "github.com/<owner>/<repo>/pull/<n> URL, so there is no repo to "
+                  "ask about — an unchecked send is not a checked one",
+                  file=sys.stderr)
         if refs:
             repo = refs[0][0]
+            roster_now = load_roster()
             kept = []
             for t in targets:
-                can, why_cap = gate_capability(repo, t["name"])
+                login, why_login = _github_login(t["name"], roster_now)
+                can, why_cap = gate_capability(repo, login)
+                if login != t["name"]:
+                    print(f"{t['name']}: probing GitHub as {login} ({why_login})",
+                          file=sys.stderr)
                 if can is False:
                     print(f"CANNOT GATE '{t['name']}': {why_cap}-only on {repo} — an "
                           f"approval from this account does not count toward the "
