@@ -1824,5 +1824,64 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
             "a slot the writer never erases must not be carried as one")
 
 
+
+class TwoPassShapeRepairDoesNotDischargeASeed(unittest.TestCase):
+    """A shape-only repair must not clear a refusal (keweichen, #3537).
+
+    The malformed source changes REPRESENTATION (scalar <-> list); its stated
+    referent and id do not. Before the seed was attached on every unresolved
+    outcome, pass 2 published the opposite referent with rc 0.
+    """
+
+    X = "1504316176686120980"
+
+    def _two_pass(self, roster, triage_bad, triage_ok):
+        script = str(Path(__file__).resolve().parents[1]
+                     / "skills/collaboration-intelligence/scripts/migrate_roster_identity.py")
+        def run(r, tri):
+            d = Path(tempfile.mkdtemp())
+            (d / "r.json").write_text(json.dumps(r))
+            (d / "t.json").write_text(json.dumps(tri))
+            out = d / "o.json"
+            rc = subprocess.run([sys.executable, script, "--roster", str(d / "r.json"),
+                                 "--triage-config", str(d / "t.json"), "--out", str(out)],
+                                capture_output=True, text=True).returncode
+            return rc, (json.loads(out.read_text()) if out.exists() else {})
+        rc1, o1 = run(roster, triage_bad)
+        rc2, o2 = run(o1, triage_ok)
+        return rc1, o1, rc2, (o2.get("alice") or {})
+
+    def test_a_malformed_list_repaired_to_a_scalar_keeps_the_refusal(self):
+        rc1, o1, rc2, rec = self._two_pass(
+            {"alice": {"stand_discord_id": self.X}},
+            {"people": {"alice": {"discord": [self.X]}}},
+            {"people": {"alice": {"discord": self.X}}})
+        self.assertEqual(rc1, 5, "pass 1 must refuse: two sources, opposite referents")
+        seeded = [u for u in (o1["alice"]["unresolved_discord_ids"]) if u.get("seeded_by")]
+        self.assertTrue(seeded, "the erased writer-owned claim must leave provenance")
+        self.assertEqual(rc2, 5, "a shape-only repair must not discharge the seed")
+        self.assertIsNone(rec.get("human_discord_id"), "must not publish the contested id")
+
+    def test_a_malformed_scalar_repaired_to_a_list_keeps_the_refusal(self):
+        rc1, o1, rc2, rec = self._two_pass(
+            {"alice": {"human_discord_id": self.X}},
+            {"people": {"alice": {"bots": self.X}}},
+            {"people": {"alice": {"bots": [self.X]}}})
+        self.assertEqual(rc1, 5, "pass 1 must refuse in the other direction too")
+        self.assertEqual(rc2, 5, "a shape-only repair must not discharge the seed")
+        self.assertIsNone(rec.get("stand_discord_id"), "must not publish the contested id")
+
+    def test_a_valid_same_slot_conflict_stays_unresolved(self):
+        # Negative control: nothing malformed, so the refusal is not an artifact
+        # of the shape path -- it must persist across a second pass regardless.
+        rc1, _o1, rc2, rec = self._two_pass(
+            {"alice": {"stand_discord_id": self.X}},
+            {"people": {"alice": {"discord": self.X}}},
+            {"people": {"alice": {"discord": self.X}}})
+        self.assertEqual(rc1, 5)
+        self.assertEqual(rc2, 5, "a genuine conflict never self-clears")
+        self.assertIsNone(rec.get("human_discord_id"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

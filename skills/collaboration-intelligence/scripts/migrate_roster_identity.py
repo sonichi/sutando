@@ -647,6 +647,13 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
             basis.pop(ri.STAND_FIELD, None)
         others = [o for o in others if o["id"] != b["id"]]
         unresolved.append(b)
+    # Every unresolved outcome drops a writer-owned claim, so each keeps its
+    # seeds; stamping only the two-verdict branch let a re-pass publish rc 0.
+    for rec in unresolved:
+        sid = rec.get("id")
+        if sid in seeds and not rec.get("seeded_by"):
+            rec["seeded_by"] = _canonical_seeds(seeds[sid])
+
     resolved = {i for i in (human_id, stand_id) if i} | {o["id"] for o in others}
     assert not (resolved & {u["id"] for u in unresolved}), (
         "an id cannot be both resolved and unresolved")
