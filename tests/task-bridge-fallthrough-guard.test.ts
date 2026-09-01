@@ -35,6 +35,10 @@ describe('_shouldFallthrough — belt-suspenders guard for result-watcher fallth
 		assert.equal(_shouldFallthrough('voice-draft-abc.txt'), true);
 	});
 
+	it('REJECTS task-signal-* (Signal Room results are archived, never spoken)', () => {
+		assert.equal(_shouldFallthrough('task-signal-1234567890-abcdef.txt'), false);
+	});
+
 	it('REJECTS the PR #1033 per-channel-pull namespace (the bug this guard closes)', () => {
 		// Discord voice channel id (17-20 digits)
 		assert.equal(_shouldFallthrough('1234567890123456789.task-1234567890.txt'), false);

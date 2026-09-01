@@ -125,7 +125,12 @@ and loads whichever repo it reviews.
    times and the harness was wrong. (d) A peer's probe reported `1 pending question` against
    a true 38 and delivered that number to the owner.
    The tell is that a broken instrument and a clean result are *byte-identical*, so the
-   author's confidence carries no information.
+   author's confidence carries no information. Reinforced 2026-08-17, three more in one
+   hour, all failing in the *reassuring* direction: a timeline query filtered on
+   `auto_merge_enabled` missed arms logged as `auto_squash_enabled` ("never armed");
+   a hand-typed abbreviated SHA returned an empty check-run list ("no runs"); a
+   banner-verification piped through `cut -c1-120` truncated the appended banner
+   ("did not fire"). Each empty result would have closed its investigation.
 
 10. **A fix that changes a decision rule is itself a decision rule — enumerate the
     adjacent inputs before pushing.** When a patch changes *how something is judged*
@@ -254,7 +259,83 @@ and loads whichever repo it reviews.
     the restarted delivery loop end-to-end could have shown whether a recreated result is
     actually suppressed after a real delivery.
 
-16. **On a shared review login, check the existing reviews before you spend one —
+16. **An authorization or approval is a statement about the object as it stood at its
+    timestamp — re-read the current state before acting on it.** Approvals, owner
+    go-aheads, and "it's green, land it" messages all describe a specific head and
+    review state. Before any merge-adjacent action (arming auto-merge, merging,
+    dismissing a review), fetch the CURRENT `reviewDecision` and check whether any
+    block, push, or review postdates the authorization being executed. A stored intent
+    executed against a moved PR is unauthorized in substance even when the words were
+    genuine.
+    *Grounded by:* sonichi/sutando#3056 (2026-08-17) — an agent re-armed auto-merge
+    citing an owner-side message sent when the PR had two approvals and zero blocks;
+    by arm time a `CHANGES_REQUESTED` was 39 seconds old, nothing consulted the review
+    state at the arm site, and a maintainer had to disarm manually 78 seconds later.
+    The same night's counter-example proves the cheap check works: a half-written
+    "armed over a stale approval" bug report was discarded by reading
+    `reviewDecision` first — it was `REVIEW_REQUIRED`, so no authorization was
+    outstanding to be stale. Blocks survive pushes; in this repo so do approvals
+    (approvals are not dismissed on push on either gate surface — classic
+    `dismiss_stale_reviews: false`, ruleset 19110427
+    `dismiss_stale_reviews_on_push: false`) — an approval CAN be stale at arm
+    time, which is exactly why the re-read is necessary rather than optional. The current state, not the
+    remembered one, is what authorizes.
+
+17. **`reviewDecision: APPROVED` is not the merge gate — check the base branch and
+    whether the approvers can approve.** The ruleset that requires two approvals scopes
+    `ref_name.include` to `refs/heads/main` only, and GitHub counts an approval toward it
+    only from an account with write access. `reviewDecision` is GitHub's summary of the
+    review conversation, so it reads `APPROVED` on a single approval when the PR targets a
+    feature or rescue branch, and it renders a non-collaborator's approval identically to a
+    counting one. Before treating a PR as review-ready, read `baseRefName`, and resolve each
+    approver with the **membership** endpoint `repos/{o}/{r}/collaborators/{user}` (204 vs
+    404). Do not use `collaborators/{user}/permission` for this — it answers `read` for
+    accounts that are not collaborators at all, so it cannot distinguish them. **The
+    membership endpoint needs write access to answer at all**: without it every lookup
+    returns `403`, including for the repo owner, so a reader applying "not 204 → not a
+    collaborator" marks every approver non-counting. Treat `403` as *undetermined* and say
+    so, never as a negative — the check is only usable by an account that already has
+    push access.
+    *Grounded by:* a scan of 132 open sonichi/sutando PRs (2026-09-01). The predicate "≥2
+    collaborator approvals and no standing `CHANGES_REQUESTED`" matched `reviewDecision ==
+    APPROVED` on 124 and disagreed on 8 — every disagreement `APPROVED` on ONE counting
+    approval, and not one of the 8 based off `main` — their bases were
+    `feat/sutando-server`, `feat/pool-operability`, `rescue/pool-uncommitted-2026-08-26`,
+    `feat/sparrow-b1-identity-contract` and `fix/pool-wakeup-runtime-aware`. Restricted to
+    main-based PRs the predicate holds without exception, and the failure is one-directional
+    — never a PR predicted ready that isn't. The second half is measured separately: two
+    accounts hold 21 approvals across those PRs whose membership endpoint returns 404, and 8
+    PRs carry only such approvals while reporting `REVIEW_REQUIRED` and `BLOCKED` with zero
+    failing checks and no standing block — visibly reviewed, actually at 0-of-2. A peer
+    validated the same predicate over 35 PRs with no exceptions and stated it unscoped; all
+    35 were `base=main`, so their population could not have exposed the base dependency at
+    any sample size.
+
+18. **A test that never ran cannot fail — verify the runner collected the expected new tests,
+    by count and, where available, by name, before you interpret a discrimination result.** The standard proof that a new test earns its place is: revert the
+    source, keep the test, watch it fail. That inference is sound only if the test *ran*, and the
+    two failure modes are invisible in the diff and produce output identical to "the test does not
+    discriminate" — which is a blocking review finding. Read the runner's own count, and require it
+    to move by the number of tests added.
+    *Grounded by:* two independent instances on 2026-09-01, in different runner idioms, neither
+    detectable by reading the change. In `tests/morning-briefing-pending-extract.test.py` a new
+    class was appended *below* the file's `if __name__ == "__main__": unittest.main()`. Run as
+    `__main__` that call raises `SystemExit`, so execution stops there and **the class is never
+    even defined** (verified: a `print` on the following line does not fire, and `runpy` with
+    `run_name="__main__"` exits at that point; the same file *imported* defines both classes).
+    The suite reported `Ran 8 tests OK` with the source reverted AND restored, which reads exactly
+    like a non-discriminating test. Moving the class above the guard
+    gave `Ran 10 tests` and the reverted arm then failed with `'Top item' unexpectedly found`. On a
+    peer's host the same night, `tests/task-workstreams.test.py` drives an explicit list at the
+    bottom of the file; a test added without registering in that list was defined, never called,
+    and passed at the parent commit. Different mechanisms, one symptom: **the file changed and the
+    executed set did not.** Outcomes cannot separate them — "passed" and "never ran" render the
+    same — so use the runner's own report of what it collected: the count always, and the test
+    NAMES where the runner prints them (`-v`, or a per-test tick). Name enumeration is the stronger
+    signal when available, because it identifies *which* test is missing rather than only that one
+    is.
+
+19. **On a shared review login, check the existing reviews before you spend one —
     the count does not move and you overwrite a peer.** Several agents review through the
     same GitHub account here. GitHub resolves a PR's decision by latest-state-per-USER, so
     two APPROVED reviews from that one account are **one** approver, not two, and the later
@@ -324,6 +405,22 @@ checks:
       - 'nohup.out'
 
   hardcoded-paths:
+    # Files matching these globs get a narrower exemption, not blanket exclusion
+    # (checked against the WHOLE path, matched full-diff-line via fnmatch, so
+    # '*.patch' also matches a nested path like 'skills/x/y.patch'). Within a
+    # match, only a line whose SECOND character (the nested diff's own syntax)
+    # is '-' is skipped — a stored .patch/.diff's own removal line reads as an
+    # ADDED line in the outer PR diff, and that second character distinguishes
+    # it from a real hardcoded path without inspecting content. An inner
+    # addition or inner-context line stays in scope, since that's what a
+    # re-applied patch (skills/plugin-patches/) actually introduces. Omitting
+    # the key uses these defaults rather than disabling the exemption. Mirrors
+    # the analogous glob under root-artifacts above, which lists the same two
+    # extensions for the same underlying reason (a stored patch's own diff
+    # syntax is not code to police).
+    skip_glob:
+      - '*.patch'
+      - '*.diff'
     # Added lines containing any of these substrings are flagged as errors...
     flag:
       - '/Users/'

@@ -79,6 +79,13 @@ class DesignAClaimBackend:
             return ClaimToken(item_id=item_id, worker=worker,
                               incarnation=incarnation)
 
+    def is_terminal(self, item_id: str) -> bool:
+        with outbox._item_lock(self.root, item_id):
+            if not outbox._item_path(self.root, item_id).exists():
+                return False
+            return outbox._read_item(
+                self.root, item_id).get("status") in self.TERMINAL
+
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
