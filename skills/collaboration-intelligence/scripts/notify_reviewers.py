@@ -104,6 +104,11 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             worst = max(worst, 2)
             continue
         stand, room = entry.get("stand"), entry.get("room")
+        why = stated_reason(entry)
+        # A caveat nobody prints is a note, not a step. Shared-login entries
+        # look like one actor from GitHub; surface it here, before the send.
+        if entry.get("identity_caveat"):
+            print(f"IDENTITY CAVEAT '{name}': {entry['identity_caveat']}", file=sys.stderr)
         dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
         channel = entry.get("home_channel")
         if stand and room:
@@ -123,9 +128,8 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
                 detail = ("carries no addressable route at all (a human handle "
                           "alone triggers no Stand)")
             print(f"UNUSABLE entry '{name}': {detail}", file=sys.stderr)
-            # From main: the roster's own words, so the obvious repair
-            # (populate the fields) cannot silently override a refusal.
-            why = stated_reason(entry)
+            # The roster's own words, so the obvious repair (populate the
+            # fields) cannot silently override a stated refusal.
             if why:
                 print(f"  roster says: {why}", file=sys.stderr)
             worst = max(worst, 3)
