@@ -61,6 +61,34 @@ check("CONTROL: tail of newest-first is the OLDEST (the trap)",
 check("tail of oldest-first is the NEWEST (the fix)",
       oldest_first_tail == "newest", f"got {oldest_first_tail}")
 
+# 5. Drive read_room itself, so the reversal executes. The checks above exercise
+#    _result and the CLI source — neither runs the code this PR changes.
+PAYLOAD = [{"sender": "@a:x", "ts": 300, "body": "newest", "event_id": "$3"},
+           {"sender": "@a:x", "ts": 200, "body": "middle", "event_id": "$2"},
+           {"sender": "@a:x", "ts": 100, "body": "oldest", "event_id": "$1"}]
+
+rr.gateway = lambda: ("https://gw.test", {})
+rr.http_request = lambda *a, **k: (200, __import__("json").dumps({"messages": PAYLOAD}).encode(), {})
+# gate is DEFAULT-DENY when a dict is passed (see _gateway.gate_allows);
+# `None` would load the host's real gate, so grant explicitly.
+_open_gate = {"@me:x": {"all_member_rooms": True}}
+
+r_new = rr.read_room("!r:x", "@me:x", limit=3, gate=_open_gate)
+check("read_room default is newest-first",
+      [m["body"] for m in r_new["messages"]] == ["newest", "middle", "oldest"],
+      f"got {[m['body'] for m in r_new['messages']]}")
+check("...and declares it", r_new.get("order") == "newest_first", f"got {r_new.get('order')!r}")
+
+r_old = rr.read_room("!r:x", "@me:x", limit=3, gate=_open_gate, oldest_first=True)
+check("read_room oldest_first REVERSES the rendering",
+      [m["body"] for m in r_old["messages"]] == ["oldest", "middle", "newest"],
+      f"got {[m['body'] for m in r_old['messages']]}")
+check("...and declares it", r_old.get("order") == "oldest_first", f"got {r_old.get('order')!r}")
+check("same messages either way — selection is unchanged, only rendering",
+      {m["event_id"] for m in r_old["messages"]} == {m["event_id"] for m in r_new["messages"]})
+check("CONTROL: `| tail -1` on oldest_first yields the NEWEST message",
+      r_old["messages"][-1]["body"] == "newest", f"got {r_old['messages'][-1]['body']}")
+
 print()
 if failures:
     print(f"{len(failures)} failure(s): {', '.join(failures)}")
