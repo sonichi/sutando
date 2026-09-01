@@ -95,6 +95,7 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     batch — resolvable reviewers are still notified, the worst refusal code
     is carried to the exit so the caller sees somebody was skipped."""
     out, worst = [], 0
+    actor_of, covered = _actor_map(roster), {}
     for name in names:
         entry = roster.get(name)
         if entry is None:
@@ -140,11 +141,89 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             worst = max(worst, 4)
             continue
         endpoint = durable_endpoint(entry)
+        # One person can hold several roster keys, so counting NAMES lets the
+        # two-reviewer gate in main() pass on one recipient addressed twice.
+        # EITHER axis alone is one person: a composite key collapses only when
+        # BOTH match, which is not the case that pings a Stand twice.
+        actor = actor_of.get(name, name)
+        ident = [("actor", actor_of.get(name, name))]
+        if endpoint:
+            ident.append(("endpoint", endpoint))
+        prior = next((covered[k] for k in ident if k in covered), None)
+        if prior is not None:
+            print(f"DUPLICATE '{name}': same person as '{prior}' "
+                  f"({endpoint or actor}) — already covered, not a second reviewer",
+                  file=sys.stderr)
+            continue
+        for k in ident:
+            covered[k] = name
         out.append({"name": name, "transport": transport, "stand": stand,
                     "room": room, "discord_id": dm_id, "channel": channel,
                     "endpoint": endpoint, "human": entry.get("human")})
     return out, worst
 
+
+def gate_capability(repo: str, login: str) -> "tuple[bool | None, str]":
+    """(can this login's approval discharge repo's approval gate?, why).
+
+    Asked of GitHub, not of the roster: a cached tier goes stale silently and an
+    approval from a read-only account is indistinguishable in the UI from one
+    that counts. None = could not determine; the caller prints, never refuses.
+    """
+    try:
+        p = subprocess.run(
+            ["gh", "api", f"repos/{repo}/collaborators/{login}/permission",
+             "-q", ".permission"],
+            capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return None, f"unverified ({type(exc).__name__})"
+    if p.returncode != 0:
+        return None, f"unverified (gh rc={p.returncode})"
+    perm = p.stdout.strip()
+    if perm in ("write", "admin", "maintain"):
+        return True, perm
+    if perm in ("read", "none", "triage"):
+        # `read` is also what this endpoint returns for someone who is not a
+        # collaborator at all, so the reason needs the membership check.
+        return False, perm if _is_collaborator(repo, login) else "not a collaborator"
+    return None, f"unverified (permission={perm!r})"
+
+
+
+def _is_collaborator(repo: str, login: str) -> bool:
+    try:
+        p = subprocess.run(["gh", "api", f"repos/{repo}/collaborators/{login}"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:                            # noqa: BLE001 - probe must not raise
+        return True                              # unknown -> the milder wording
+    return p.returncode == 0
+
+
+
+def _github_login(name: str, roster: dict) -> "tuple[str, str]":
+    """(login GitHub can answer for, why) — a roster key is not always one.
+
+    `johnm-desktop` is a Stand handle, not a login; probing it 404s and the
+    capability check degrades to a silent no-op on exactly the aliased keys
+    `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
+    """
+    entry = (roster or {}).get(name) or {}
+    if _is_github_user(name):
+        return name, "key is a login"
+    sib = entry.get("same_actor_as")
+    if sib and _is_github_user(sib):
+        return sib, f"via same_actor_as -> {sib}"
+    return name, "no login found for this key"
+
+
+
+def _is_github_user(login: str) -> bool:
+    try:
+        p = subprocess.run(["gh", "api", f"users/{login}", "-q", ".login"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:                            # noqa: BLE001 - probe must not raise
+        return False
+    return p.returncode == 0 and p.stdout.strip().lower() == login.lower()
 
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     """Is this stand actually a member of the room we are about to mention it in?
@@ -885,25 +964,44 @@ def main() -> int:
     a = ap.parse_args()
     names = list(dict.fromkeys(n.strip() for n in a.reviewers.split(",") if n.strip()))
     roster = load_roster()
+    # resolve() owns per-person dedup (actor OR durable endpoint) so the
+    # two-reviewer gate below counts PEOPLE, not roster rows.
     targets, refusal_rc = resolve(names, roster)
-    # "At least TWO" means two PEOPLE, not two roster rows: `--reviewers d,d`
-    # and two same_actor_as aliases share one endpoint and ping one Stand twice.
-    _actors = _actor_map(roster)
-    # EITHER axis is one person: a composite key collapses only when BOTH
-    # match, which is the easy case and not the one that pings a Stand twice.
-    _seen_actor, _seen_endpoint, _deduped = set(), set(), []
-    for t in targets:
-        actor = _actors.get(t["name"], t["name"])
-        # The DURABLE endpoint, not the route: a channel key counted one
-        # person in two channels as two, and relocation happens after this.
-        endpoint = t.get("endpoint") or (t.get("channel") or t.get("room"),
-                                         t.get("discord_id") or t.get("stand"))
-        if actor in _seen_actor or endpoint in _seen_endpoint:
-            continue
-        _seen_actor.add(actor)
-        _seen_endpoint.add(endpoint)
-        _deduped.append(t)
-    targets = _deduped
+    # A read-only approval looks identical in the UI and discharges nothing, so
+    # ask the repo named in the message rather than trusting a cached tier.
+    if a.kind == "ask" and targets:
+        refs = _PR_URL.findall(a.message or "")
+        if not refs:
+            # Every other refusal path here prints; the one case that cannot be
+            # checked must not be the one case that is silent.
+            print("gate capability NOT CHECKED: the message names no "
+                  "github.com/<owner>/<repo>/pull/<n> URL, so there is no repo to "
+                  "ask about — an unchecked send is not a checked one",
+                  file=sys.stderr)
+        if refs:
+            repo = refs[0][0]
+            roster_now = load_roster()
+            kept = []
+            for t in targets:
+                login, why_login = _github_login(t["name"], roster_now)
+                can, why_cap = gate_capability(repo, login)
+                if login != t["name"]:
+                    print(f"{t['name']}: probing GitHub as {login} ({why_login})",
+                          file=sys.stderr)
+                if can is False:
+                    detail = (why_cap if why_cap == "not a collaborator"
+                              else f"{why_cap}-only")
+                    print(f"CANNOT GATE '{t['name']}': {detail} on {repo} — an "
+                          f"approval from this account does not count toward the "
+                          f"required approvals", file=sys.stderr)
+                    refusal_rc = max(refusal_rc, 7)
+                    continue
+                if can is None:
+                    print(f"{t['name']}: gate capability {why_cap} on {repo} — "
+                          f"sending, but this is not a confirmation it can approve",
+                          file=sys.stderr)
+                kept.append(t)
+            targets = kept
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
     # one person; plan mode is exempt because only a real ASK can strand a PR.
     # The two-reviewer rule exists so one person being busy cannot stall a PR.
