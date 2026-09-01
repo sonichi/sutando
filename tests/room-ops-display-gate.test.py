@@ -59,6 +59,18 @@ class DisplayGateBinds(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(self._req_calls)
 
+    def test_profile_plus_room_avatar_is_rejected_with_zero_requests(self):
+        # The pair is incoherent AND was the gate-bypass shape (review on 0df10599):
+        # profile mode must never carry the room-scoped avatar write past the gate.
+        self._gate({"@other:test": {"all_member_rooms": True}})
+        rc = display.main(["!room:test", "--profile", "--room-avatar", "mxc://hs/x"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(self._req_calls, [])
+        self._gate({"@a:test": {"rooms": ["!room:test"]}})
+        rc = display.main(["!room:test", "--profile", "--room-avatar", "mxc://hs/x"])
+        self.assertEqual(rc, 2, "incompatible even when the gate allows")
+        self.assertEqual(self._req_calls, [])
+
     def test_profile_write_skips_the_room_gate(self):
         self._gate({"@other:test": {"all_member_rooms": True}})
         rc = display.main(["!room:test", "--profile", "--description", "d"])

@@ -21,7 +21,8 @@ token), AGENT_MXID (user to act as). Usage:
              [--worker-color <id>=<#rrggbb> ...] [--worker-name <id>=<Name> ...]
              [--description TEXT]
              [--room-avatar <mxc-uri>] [--clear]
-Merges onto the existing document unless --clear is given. With --profile the
+Merges onto the existing document unless --clear is given (--clear discards the
+ENTIRE existing document, not just this run's keys). With --profile the
 room_id is ignored for the write but still required positionally.
 """
 import argparse
@@ -68,6 +69,11 @@ def main(argv=None) -> int:
     ap.add_argument("--clear", action="store_true")
     a = ap.parse_args(argv)
 
+    if a.profile and a.room_avatar:
+        print("display.py: --profile and --room-avatar are incompatible "
+              "(one writes the agent profile, the other room state)", file=sys.stderr)
+        return 2
+
     hs = os.environ.get("MATRIX_HS_URL", "").rstrip("/")
     token = os.environ.get("MATRIX_AS_TOKEN", "")
     mxid = os.environ.get("AGENT_MXID", "")
@@ -76,7 +82,7 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
-    if not a.profile and not gate_allows(mxid, a.room_id, load_gate()):
+    if (a.room_avatar or not a.profile) and not gate_allows(mxid, a.room_id, load_gate()):
         print(f"display.py: client gate denied for {mxid} in {a.room_id}",
               file=sys.stderr)
         return 2
