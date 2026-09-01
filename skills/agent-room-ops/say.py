@@ -91,7 +91,8 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
                 if os.environ.get("SUTANDO_CORE_ID") else None)
         # The client renders attribution from this per-event stamp; a direct
         # post self-declares its worker, and optionally its color.
-        _color = os.environ.get("SUTANDO_WORKER_COLOR")
+        _color = (os.environ.get("SUTANDO_WORKER_ACCENT")
+                  or os.environ.get("SUTANDO_WORKER_COLOR"))  # COLOR: one-release alias
         _stripe = os.environ.get("SUTANDO_WORKER_STRIPE")
         _attn = os.environ.get("SUTANDO_WORKER_ATTENTION") == "1"
         _style = os.environ.get("SUTANDO_WORKER_STYLE")

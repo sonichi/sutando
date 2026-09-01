@@ -82,7 +82,8 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         # moment the broker honors it (a peer-review ask, ties to broker #151).
         cid = os.environ.get("SUTANDO_CORE_ID")
         worker = os.environ.get("SUTANDO_WORKER_ID") or (f"core-{cid}" if cid else None)
-        _color = os.environ.get("SUTANDO_WORKER_COLOR")
+        _color = (os.environ.get("SUTANDO_WORKER_ACCENT")
+                  or os.environ.get("SUTANDO_WORKER_COLOR"))  # COLOR: one-release alias
         _stripe = os.environ.get("SUTANDO_WORKER_STRIPE")
         _attn = os.environ.get("SUTANDO_WORKER_ATTENTION") == "1"
         _style = os.environ.get("SUTANDO_WORKER_STYLE")
