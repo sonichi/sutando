@@ -6203,20 +6203,22 @@ def check_daily_cron_punctuality() -> dict:
         launchd = bool(e.get("launchd"))
         # Each lane is a preference, not a restriction: `launchd` says how a job is
         # SCHEDULED, which does not determine what dated evidence it leaves behind.
-        arts = (_daily_completion_minutes(ws / "state", jname) if launchd
-                else _daily_artifact_minutes(ws / "results", stem))
-        used_artifact_lane = not launchd
-        # Both directions, so neither lane's absence reads as the job's silence:
-        # without the launchd arm a daily artifact reports "no dated artifact" forever.
-        if not arts:
-            arts = (_daily_artifact_minutes(ws / "results", stem) if launchd
-                    else _daily_completion_minutes(ws / "state", jname))
-            used_artifact_lane = bool(arts) and launchd
-        # Last resort, and the only lane needing no per-job config: a job that
-        # publishes nothing dated still leaves a task-cron result when it finishes.
-        if not arts:
-            arts = _daily_task_record_minutes(ws / "results", jname)
-            used_artifact_lane = False
+        # Lanes are a preference, but a lane that is merely STALE must not shadow a
+        # later one holding today: fall through on freshness, not just emptiness.
+        today_str = now.strftime("%Y-%m-%d")
+        lanes = [
+            ((_daily_completion_minutes(ws / "state", jname) if launchd
+              else _daily_artifact_minutes(ws / "results", stem)), not launchd),
+            ((_daily_artifact_minutes(ws / "results", stem) if launchd
+              else _daily_completion_minutes(ws / "state", jname)),
+             launchd),
+            (_daily_task_record_minutes(ws / "results", jname), False),
+        ]
+        def _has_today(rows):
+            return any(d == today_str for d, _ in rows)
+        arts, used_artifact_lane = next(
+            ((a, f and bool(a)) for a, f in lanes if _has_today(a)),
+            next(((a, f and bool(a)) for a, f in lanes if a), ([], False)))
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         dispatched = _daily_dispatch_minutes(ws / "tasks", jname)
