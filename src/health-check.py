@@ -6206,19 +6206,26 @@ def check_daily_cron_punctuality() -> dict:
         # Lanes are a preference, but a lane that is merely STALE must not shadow a
         # later one holding today: fall through on freshness, not just emptiness.
         today_str = now.strftime("%Y-%m-%d")
-        lanes = [
-            ((_daily_completion_minutes(ws / "state", jname) if launchd
-              else _daily_artifact_minutes(ws / "results", stem)), not launchd),
-            ((_daily_artifact_minutes(ws / "results", stem) if launchd
-              else _daily_completion_minutes(ws / "state", jname)),
-             launchd),
-            (_daily_task_record_minutes(ws / "results", jname), False),
+        lane_thunks = [
+            (lambda: (_daily_completion_minutes(ws / "state", jname) if launchd
+                      else _daily_artifact_minutes(ws / "results", stem)), not launchd),
+            (lambda: (_daily_artifact_minutes(ws / "results", stem) if launchd
+                      else _daily_completion_minutes(ws / "state", jname)), launchd),
+            (lambda: _daily_task_record_minutes(ws / "results", jname), False),
         ]
-        def _has_today(rows):
-            return any(d == today_str for d, _ in rows)
-        arts, used_artifact_lane = next(
-            ((a, f and bool(a)) for a, f in lanes if _has_today(a)),
-            next(((a, f and bool(a)) for a, f in lanes if a), ([], False)))
+        # Lazy: a lane holding today stops the scan, so the common case still costs
+        # one lane. Only a job with no fresh record anywhere pays for all three.
+        arts, used_artifact_lane, fallback = [], False, None
+        for thunk, flag in lane_thunks:
+            rows = thunk()
+            if any(d == today_str for d, _ in rows):
+                arts, used_artifact_lane = rows, flag
+                break
+            if fallback is None and rows:
+                fallback = (rows, flag)
+        else:
+            if fallback:
+                arts, used_artifact_lane = fallback
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
         dispatched = _daily_dispatch_minutes(ws / "tasks", jname)
