@@ -126,5 +126,51 @@ with tempfile.TemporaryDirectory() as td:
     r = hc.check_a_fallback_hits(ws)
     check(r["status"] == "ok", "control: replacing the symlink restores ok")
 
+    # An UNAVAILABLE validator (import failure) must fail closed to warn,
+    # never let the gate read a zero it could not validate.
+    import sys as _sys
+    import types as _types
+    _saved = {k: _sys.modules.get(k) for k in
+              ("ag2_sparrow", "ag2_sparrow.delivery_core",
+               "ag2_sparrow.delivery_core.migration")}
+    try:
+        for k in _saved:
+            _sys.modules[k] = _types.ModuleType(k)   # no read_fallback_counter
+        r = hc.check_a_fallback_hits(ws)
+        check(r["status"] == "warn" and "malformed" in r["detail"],
+              "validator import failure -> warn (fail closed), never ok")
+    finally:
+        for k, v in _saved.items():
+            if v is None:
+                _sys.modules.pop(k, None)
+            else:
+                _sys.modules[k] = v
+    r = hc.check_a_fallback_hits(ws)
+    check(r["status"] == "ok", "control: validator restored -> ok again")
+
+    # TOCTOU on the detail re-read: validated count stands, missing detail
+    # fields degrade to '?' — the warn must still fire, never crash.
+    (root / "a-fallback-hits.json").write_text(
+        json.dumps({"count": 2, "last_item": "it-9", "last_hit_ts": 1.0}))
+    from pathlib import Path as _P
+    _orig_read = _P.read_text
+    _n = {"c": 0}
+    _target = root / "a-fallback-hits.json"
+    def _flaky(self, *a, **kw):
+        if self == _target:
+            _n["c"] += 1
+            if _n["c"] > 1:              # validator's read passes, detail read fails
+                raise OSError("vanished between reads")
+        return _orig_read(self, *a, **kw)
+    _P.read_text = _flaky
+    try:
+        r = hc.check_a_fallback_hits(ws)
+    finally:
+        _P.read_text = _orig_read
+    check(r["status"] == "warn" and "2 hit(s)" in r["detail"]
+          and "?" in r["detail"],
+          f"detail re-read failure degrades to '?' but the warn still fires ({r['detail'][-90:]})")
+    (root / "a-fallback-hits.json").write_text(json.dumps({"count": 0}))
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
