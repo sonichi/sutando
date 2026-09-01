@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import pathlib
@@ -22,6 +23,16 @@ SCRIPT = (REPO / "skills" / "collaboration-intelligence" / "scripts"
 # One managed root for every fixture; NamedTemporaryFile(delete=False) leaked
 # one roster JSON per call, six per run, for the lifetime of the machine.
 _TMP = tempfile.TemporaryDirectory()
+
+
+def _stage(root):
+    # Copy the WHOLE scripts dir: notify_reviewers loads siblings via
+    # Path(__file__).with_name(), so a per-file copy omits whatever it gains next.
+    shutil.copytree(SCRIPT.parent,
+                    root / "skills" / "collaboration-intelligence" / "scripts",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (root / "skills" / "agent-room-ops").mkdir(parents=True)
+    return root / "skills/collaboration-intelligence/scripts" / SCRIPT.name
 
 
 def run(roster: "dict | None", *args):
@@ -84,10 +95,7 @@ def run_send(stub_payload, roster=None, stub_stderr=""):
     """Drive --send against a STUB room_ops. The script resolves room_ops as
     parents[3] of its own path, so the copy must sit in a matching tree."""
     root = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name))
-    (root / "skills" / "collaboration-intelligence" / "scripts").mkdir(parents=True)
-    (root / "skills" / "agent-room-ops").mkdir(parents=True)
-    copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
-    copy.write_text(SCRIPT.read_text())
+    copy = _stage(root)
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
         f"sys.stdout.write({stub_payload!r})\n"
@@ -172,10 +180,7 @@ def run_room(members_payload, *extra, roster=None, env_overrides=None):
     and `mention` DIFFERENTLY — the single-payload stub above cannot express a
     roster read and a send in one run."""
     root = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name))
-    (root / "skills" / "collaboration-intelligence" / "scripts").mkdir(parents=True)
-    (root / "skills" / "agent-room-ops").mkdir(parents=True)
-    copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
-    copy.write_text(SCRIPT.read_text())
+    copy = _stage(root)
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
         "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
@@ -204,10 +209,7 @@ def run_room_per_room(per_room: dict, default, *extra, roster=None):
     The single-payload stub cannot express "absent here, present there", so a test
     written on it passes whether or not the recorded room was ever queried."""
     root = pathlib.Path(tempfile.mkdtemp(dir=_TMP.name))
-    (root / "skills" / "collaboration-intelligence" / "scripts").mkdir(parents=True)
-    (root / "skills" / "agent-room-ops").mkdir(parents=True)
-    copy = root / "skills/collaboration-intelligence/scripts/notify_reviewers.py"
-    copy.write_text(SCRIPT.read_text())
+    copy = _stage(root)
     seen = root / "queried.txt"
     (root / "skills/agent-room-ops/room_ops.py").write_text(
         "import sys\n"
