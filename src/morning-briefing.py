@@ -25,6 +25,7 @@ _SRC_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SRC_DIR))
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import personal_path  # noqa: E402
+from delivery.publication import publish_result  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 RESULTS_DIR = WORKSPACE / "results"
@@ -773,7 +774,7 @@ def main():
     # suppresses any `[channel:]` redirect at the bridge, so this can never be
     # posted to a shared channel (result_markers.parse_markers). The marker is
     # stripped before delivery/voice, so the owner never sees it.
-    result_file.write_text(f"[dm-only]\n{narrative}")
+    publish_result(result_file, f"[dm-only]\n{narrative}")
     print(f"  → {result_file.name}")
 
     # Mark as done today

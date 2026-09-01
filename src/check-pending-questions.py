@@ -22,6 +22,7 @@ from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
+from delivery.publication import publish_result  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 PQ_FILE = Path(personal_path("pending-questions.md", WORKSPACE))
@@ -371,17 +372,7 @@ def notify_discord_dm(questions):
     # Each body is a whole snapshot, so a stale one is wrong, not redundant. Look
     # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
     superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
-    # Appear at the deliverable name in one step, from a scratch name no other run
-    # can hold: a poll claims proactive-*.txt on sight and would DM a partial body.
-    fd, tmp_name = tempfile.mkstemp(dir=RESULTS_DIR, prefix=f".{path.name}.", suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write("\n".join(lines))
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    publish_result(path, "\n".join(lines))
     for old in superseded:
         old.unlink(missing_ok=True)
 
