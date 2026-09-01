@@ -23,7 +23,7 @@ STEP="${2-}"
 # Discord bridge renders `step` live and graceful-restart gates busy() on it.
 # NUMERIC only — the pool plist assigns 1..N, while a main core carries
 # something else ('legacy' here) or nothing, and silence authorises a kill.
-case "${SUTANDO_CORE_ID-}" in
+case "${SUTANDO_WORKER_SEAT-${SUTANDO_CORE_ID-}}" in
 	'' | *[!0-9]* ) ;;                 # unset / non-numeric -> a main core, write
 	* ) exit 0 ;;                      # 1, 2, 3... -> a pool follower, no-op
 esac

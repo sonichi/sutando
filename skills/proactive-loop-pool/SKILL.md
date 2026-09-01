@@ -66,7 +66,7 @@ The affinity machinery is **inside** `claim_task.py` — your only responsibilit
 
 Use the renamed `task-<id>.claimed-core-<n>.txt` path for all subsequent reads + result writes.
 
-**Core attribution (required, owner request 2026-08-23):** end every user-facing result body with a final line naming your core, em-dash form: `— core-<n>`. Plain text only — never a bracketed form (`[core-N]` would trip ag2space's `team_result_guard`, which withholds bodies carrying bracketed control markers). Skip the signature only on `[deduped:]`/`[no-send]` bodies, which no user reads.
+**Core attribution (required, owner request 2026-08-23):** end every user-facing result body with a final line naming your worker, em-dash form: `— worker-<n>` (formerly core-<n>; owner renamed 2026-08-31 — one core, N workers). Plain text only — never a bracketed form (`[core-N]` would trip ag2space's `team_result_guard`, which withholds bodies carrying bracketed control markers). Skip the signature only on `[deduped:]`/`[no-send]` bodies, which no user reads.
 
 **Completion step (required):** compose every result body starting with the line `task: <id>` (the id from your claimed file's name), then complete via the helper — one command replaces the manual write/flag/archive trio:
 

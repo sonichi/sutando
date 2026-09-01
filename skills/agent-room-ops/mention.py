@@ -80,8 +80,8 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
         # triggers via the broker's localpart text-match, so this is harmlessly
         # ignored today — but it auto-activates structured push-notifications the
         # moment the broker honors it (a peer-review ask, ties to broker #151).
-        cid = os.environ.get("SUTANDO_CORE_ID")
-        worker = os.environ.get("SUTANDO_WORKER_ID") or (f"core-{cid}" if cid else None)
+        cid = os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID")
+        worker = os.environ.get("SUTANDO_WORKER_ID") or (f"worker-{cid}" if cid else None)
         _color = (os.environ.get("SUTANDO_WORKER_ACCENT")
                   or os.environ.get("SUTANDO_WORKER_COLOR"))  # COLOR: one-release alias
         _stripe = os.environ.get("SUTANDO_WORKER_STRIPE")

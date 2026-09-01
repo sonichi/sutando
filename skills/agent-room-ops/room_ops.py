@@ -201,7 +201,7 @@ def _main(argv):
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
     p.add_argument("--worker", default=None,
                    help="worker id to stamp on the event (space.ag2.worker) so the "
-                        "client renders attribution; defaults to core-$SUTANDO_CORE_ID "
+                        "client renders attribution; defaults to worker-$SUTANDO_WORKER_SEAT "
                         "when that env var is set, pass '' to post unstamped")
     p.add_argument("--reply-to", dest="reply_to", default=None,
                    help="event id ($abc) to cite as the message replied to. This is a "

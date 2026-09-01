@@ -314,8 +314,8 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     # Progress updates carry the same worker stamp as results, so a notify
     # renders with the sender's attribution instead of stripping it.
     worker = os.environ.get("SUTANDO_WORKER_ID") or (
-        f"core-{os.environ['SUTANDO_CORE_ID']}"
-        if os.environ.get("SUTANDO_CORE_ID") else None)
+        f"worker-{os.environ.get('SUTANDO_WORKER_SEAT') or os.environ['SUTANDO_CORE_ID']}"
+        if os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID") else None)
     payload = {"op": "message", "room_id": channel_id, "body": message}
     if worker:
         payload["extra_content"] = {"space.ag2.worker": {"id": worker}}

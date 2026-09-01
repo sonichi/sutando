@@ -46,7 +46,7 @@ class NotifyWorkerStampTests(unittest.TestCase):
 
     def test_core_id_env_derives_the_stamp(self):
         p = self._payload({"SUTANDO_CORE_ID": "3", "SUTANDO_WORKER_ID": ""})
-        self.assertEqual(p["extra_content"], {"space.ag2.worker": {"id": "core-3"}})
+        self.assertEqual(p["extra_content"], {"space.ag2.worker": {"id": "worker-3"}})
 
     def test_no_worker_env_sends_no_stamp(self):
         p = self._payload({})
