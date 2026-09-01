@@ -10015,6 +10015,9 @@ def run_all_checks() -> list[dict]:
         skip_phone = "SKIP_PHONE=1" in env_content or config_get("SKIP_PHONE") == "1"  # pragma: no cover — call-site in untested mega-function
         if has_twilio and not skip_phone:
             c = check_port(3100, "conversation-server")
+            # Liveness is the port answering, read before staleness AND the pin
+            # rewrite status; the tunnel gate asks if it is up, not if it is current.
+            _cs_live = c["status"] == "ok"
             if c["status"] != "ok":
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
@@ -10024,9 +10027,6 @@ def run_all_checks() -> list[dict]:
                     REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts",
                     "conversation-server.ts",
                 )
-            # Read liveness before composing: a pin escalates ok->warn, and the
-            # tunnel gate below asks about liveness, not about restart policy.
-            _cs_live = c["status"] == "ok"
             # Compose after BOTH branches — the non-ok rewrite replaces check_port's
             # diagnosis, and the healthy branch never composed a pin at all.
             _, _csls = _proc_lstarts("conversation-server")
