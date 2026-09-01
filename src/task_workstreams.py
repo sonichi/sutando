@@ -382,7 +382,13 @@ def build_workstream_context(
     task_id = str(task_id)
     if not local_task_protocol.valid_archive_lookup_id(task_id):
         return None
-    current = _task_record_from_path(workspace / "tasks" / f"{task_id}.txt")
+    # Same function-local import rationale as valid_archive_lookup_id below.
+    from task_archive import find_task_file
+
+    # Not a bare name: an in-flight task is renamed .claimed-/.assigned-<inst>,
+    # which is exactly when prior context is wanted.
+    current_path = find_task_file(workspace / "tasks", task_id)
+    current = _task_record_from_path(current_path) if current_path else None
     # Never attach owner history to a sandboxed/non-owner task.  Missing or
     # malformed records also fail open with no injected context.
     if current is None or current.id != task_id or current.access_tier != "owner":

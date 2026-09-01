@@ -85,6 +85,27 @@ def test_history_uses_invocation_time_and_owner_candidates() -> None:
     assert "task-team" not in json.dumps(snapshot)
 
 
+def test_context_is_built_for_a_claimed_or_assigned_task() -> None:
+    # An in-flight task is renamed .claimed-/.assigned-<inst>, which is exactly
+    # when prior context is wanted; a bare-name lookup misses and fails open.
+    for name in ("task-a1.txt", "task-a1.claimed-core-3.txt", "task-a1.assigned-core-2.txt"):
+        workspace = fixture_workspace()
+        live = workspace / "tasks" / name
+        live.parent.mkdir(parents=True, exist_ok=True)
+        write_task(live, "task-a1", "2026-08-03T11:00:00Z", "continue the grouping work")
+        store = workspace / "data" / "task-workstreams.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({
+            "schema_version": 1,
+            "workstreams": {"w": {"title": "Grouping", "summary": "s"}},
+            "assignments": {"task-a1": {"workstream_id": "w"},
+                            "task-a2": {"workstream_id": "w"}},
+            "reviews": {},
+        }))
+        context = workstreams.build_workstream_context(workspace, "task-a1", limit=5)
+        assert context is not None, f"no context for {name}"
+
+
 def test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count() -> None:
     # The pool renames task-<id>.txt -> task-<id>.claimed-core-N.txt while a
     # worker holds it; path.stem then yields an id nothing else ever writes.
@@ -1149,6 +1170,7 @@ def test_reused_workstream_id_does_not_require_a_redundant_name() -> None:
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
+        test_context_is_built_for_a_claimed_or_assigned_task,
         test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count,
         test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes,
         test_a_gateway_id_that_looks_claimed_is_its_own_task_beside_the_short_one,
