@@ -590,17 +590,15 @@ class ProbeFailureDefaultsAreDeliberate(unittest.TestCase):
     def test_is_collaborator_defaults_to_TRUE_so_the_wording_stays_milder(self):
         m = _load()
         m.subprocess = self._raising(OSError("boom"))
-        # True keeps gate_capability saying "read", the weaker claim. False would
-        # print "not a collaborator" — asserting an absent relationship on no
-        # evidence, which is the bug 63d18d2c fixed in the other direction.
+        # True keeps the weaker word ("read"); False would assert an absent
+        # relationship on no evidence — the bug 63d18d2c fixed, reversed.
         self.assertIs(m._is_collaborator("o/r", "who"), True)
 
     def test_is_github_user_defaults_to_FALSE_and_that_is_not_a_contradiction(self):
         m = _load()
         m.subprocess = self._raising(OSError("boom"))
-        # Opposite literal, same rule: True here would assert an unprobed key IS
-        # a login. False degrades to "no login found", and the capability probe
-        # then reports unverified rather than refusing.
+        # Opposite literal, same rule: True would assert an unprobed key IS a
+        # login. False degrades to "no login found", then to unverified.
         self.assertIs(m._is_github_user("who"), False)
 
     def test_the_two_defaults_compose_to_send_with_a_caveat_not_to_refuse(self):
