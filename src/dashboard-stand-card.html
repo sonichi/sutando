@@ -1,0 +1,1209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Stand Card</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Spectral:wght@400;500;600&display=swap">
+</head>
+<body>
+<style>
+/* ── tokens ─────────────────────────────────────────────── */
+:root {
+  --ground: #F0F2EE; --surface: #FBFBF8; --surface-2: #E9ECE6;
+  --ink: #141918; --ink-2: #4E5754; --ink-3: #7B837F;
+  --line: #D9DCD5; --line-2: #C7CBC3;
+  --accent: #2E3C87; --accent-soft: #E2E5F4;
+  --ok: #2A6A4A; --ok-soft: #DFEBE3;
+  --warn: #9C5A16; --warn-soft: #F4E8D8;
+  --crit: #8B2F3C; --crit-soft: #F1DFE1;
+  --idle: #6A7280; --idle-soft: #E4E7E6;
+  --shadow: 0 1px 2px rgba(20,25,24,.06), 0 12px 32px -18px rgba(20,25,24,.28);
+  --shadow-lift: 0 2px 6px rgba(20,25,24,.08), 0 26px 60px -28px rgba(20,25,24,.42);
+  --radius: 4px;
+  --sans: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --serif: "Spectral", Georgia, "Times New Roman", serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground: #0E1211; --surface: #161A19; --surface-2: #1E2322;
+    --ink: #E9EBE6; --ink-2: #A6AEA9; --ink-3: #7C847F;
+    --line: #272D2B; --line-2: #343B39;
+    --accent: #97A6F0; --accent-soft: #1D2340;
+    --ok: #62B48A; --ok-soft: #17281F;
+    --warn: #D29A57; --warn-soft: #2A2013;
+    --crit: #DB7683; --crit-soft: #2C171B;
+    --idle: #8B939C; --idle-soft: #1F2423;
+    --shadow: 0 1px 2px rgba(0,0,0,.5), 0 12px 32px -18px rgba(0,0,0,.8);
+    --shadow-lift: 0 2px 6px rgba(0,0,0,.55), 0 26px 60px -28px rgba(0,0,0,.9);
+  }
+}
+:root[data-theme="dark"] {
+  --ground: #0E1211; --surface: #161A19; --surface-2: #1E2322;
+  --ink: #E9EBE6; --ink-2: #A6AEA9; --ink-3: #7C847F;
+  --line: #272D2B; --line-2: #343B39;
+  --accent: #97A6F0; --accent-soft: #1D2340;
+  --ok: #62B48A; --ok-soft: #17281F;
+  --warn: #D29A57; --warn-soft: #2A2013;
+  --crit: #DB7683; --crit-soft: #2C171B;
+  --idle: #8B939C; --idle-soft: #1F2423;
+  --shadow: 0 1px 2px rgba(0,0,0,.5), 0 12px 32px -18px rgba(0,0,0,.8);
+  --shadow-lift: 0 2px 6px rgba(0,0,0,.55), 0 26px 60px -28px rgba(0,0,0,.9);
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--ground); color: var(--ink); font-family: var(--sans); font-size: 14px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+@media (prefers-reduced-motion: reduce) { * { animation-duration: .001ms !important; transition-duration: .001ms !important; } }
+
+.eyebrow { font-size: 10px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); margin: 0; }
+.mono { font-family: var(--mono); font-variant-ligatures: none; }
+.unreported { color: var(--ink-3); font-style: italic; font-size: 12.5px; }
+
+/* ── top bar ────────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 40;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  padding: 14px 28px; background: color-mix(in srgb, var(--ground) 88%, transparent);
+  backdrop-filter: blur(10px); border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand-mark { font-family: var(--serif); font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
+.brand-note { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); }
+.switch { display: flex; align-items: center; gap: 10px; }
+.switch-label { font-size: 10px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); }
+.seg { display: flex; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 2px; }
+.seg button { border: 0; background: transparent; cursor: pointer; padding: 5px 13px; border-radius: 2px; font-size: 12px; font-weight: 500; color: var(--ink-2); transition: background .16s ease, color .16s ease; }
+.seg button:hover { color: var(--ink); }
+.seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.12); font-weight: 600; }
+
+/* ── shell ──────────────────────────────────────────────── */
+.shell { display: grid; grid-template-columns: 372px minmax(0, 1fr); gap: 34px; align-items: start; max-width: 1240px; margin: 0 auto; padding: 30px 28px 96px; }
+@media (max-width: 980px) { .shell { grid-template-columns: minmax(0,1fr); gap: 26px; padding: 22px 18px 80px; } }
+.rail { position: sticky; top: 84px; display: flex; flex-direction: column; gap: 16px; }
+@media (max-width: 980px) { .rail { position: static; } }
+
+/* ── the card ───────────────────────────────────────────── */
+.card { position: relative; overflow: hidden; background: var(--surface); border: 1px solid var(--line-2); border-radius: 6px; box-shadow: var(--shadow); }
+.card-guilloche {
+  position: absolute; inset: 0 0 auto 0; height: 138px; width: 100%; pointer-events: none;
+  -webkit-mask-image: linear-gradient(to left, #000 0%, #000 34%, transparent 78%);
+  mask-image: linear-gradient(to left, #000 0%, #000 34%, transparent 78%);
+}
+.card-top { position: relative; display: flex; gap: 15px; align-items: flex-start; padding: 20px 20px 16px; border-bottom: 1px solid var(--line); }
+.avatar { flex: none; width: 58px; height: 58px; border-radius: 3px; background: linear-gradient(160deg, var(--accent) 0%, color-mix(in srgb, var(--accent) 62%, #000) 100%); color: #fff; display: grid; place-items: center; font-family: var(--serif); font-size: 25px; font-weight: 600; letter-spacing: -.02em; box-shadow: inset 0 0 0 1px rgba(255,255,255,.18); }
+.card-id { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.card-name-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.card-name { font-family: var(--serif); font-size: 27px; font-weight: 600; letter-spacing: -.015em; line-height: 1.08; }
+.card-handle { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); word-break: break-all; }
+.card-claim { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; margin-top: 6px; }
+.claim-none { color: var(--warn); }
+.claim-ok { color: var(--ok); }
+.livedot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); flex: none; }
+.live { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--ok); letter-spacing: .02em; }
+
+.card-body { position: relative; display: flex; flex-direction: column; }
+.card-row { display: grid; grid-template-columns: 82px minmax(0,1fr); gap: 14px; padding: 13px 20px; border-bottom: 1px solid var(--line); }
+.card-row .eyebrow { padding-top: 2px; }
+.owner-name { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.owner-handle { font-family: var(--mono); font-size: 11px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tally { display: flex; align-items: stretch; border-bottom: 1px solid var(--line); }
+.tally div { flex: 1; padding: 12px 8px 13px 20px; border-right: 1px solid var(--line); }
+.tally div:last-child { border-right: 0; }
+.tally b { display: block; font-family: var(--mono); font-size: 19px; font-weight: 600; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+.tally b.zero { color: var(--warn); }
+.tally span { font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+.card-actions { display: flex; gap: 8px; padding: 14px 20px 16px; flex-wrap: wrap; }
+
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 8px 13px; border-radius: var(--radius); cursor: pointer; border: 1px solid var(--line-2); background: var(--surface); color: var(--ink); font-size: 12.5px; font-weight: 550; transition: background .15s ease, border-color .15s ease, transform .1s ease; }
+.btn:hover { background: var(--surface-2); border-color: var(--ink-3); }
+.btn:active { transform: translateY(1px); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--ground); }
+.btn-primary:hover { background: color-mix(in srgb, var(--accent) 84%, var(--ink)); border-color: color-mix(in srgb, var(--accent) 84%, var(--ink)); }
+.btn-danger { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 40%, var(--line)); }
+.btn-danger:hover { background: var(--crit-soft); border-color: var(--crit); }
+.btn-sm { padding: 6px 10px; font-size: 11.5px; }
+
+.mrz { font-family: var(--mono); font-size: 9.5px; letter-spacing: .03em; color: var(--ink-3); background: var(--surface-2); padding: 9px 20px; border-top: 1px solid var(--line); white-space: nowrap; overflow-x: auto; overflow-y: hidden; -webkit-mask-image: linear-gradient(to right, #000 86%, transparent 100%); mask-image: linear-gradient(to right, #000 86%, transparent 100%); }
+.mrz::-webkit-scrollbar { height: 0; }
+
+.rail-block { background: var(--surface); border: 1px solid var(--line); border-radius: 5px; padding: 15px 17px; }
+.rail-block .eyebrow { margin-bottom: 9px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font-family: var(--mono); font-size: 10.5px; padding: 3px 8px; border-radius: 3px; background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line); }
+
+/* ── inspector ──────────────────────────────────────────── */
+.inspector { display: flex; flex-direction: column; gap: 30px; min-width: 0; }
+.sec { display: flex; flex-direction: column; gap: 12px; }
+.sec-head { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; flex-wrap: wrap; border-bottom: 1px solid var(--line-2); padding-bottom: 8px; }
+.sec-title { font-family: var(--serif); font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
+.sec-note { font-size: 12px; color: var(--ink-3); }
+.sec-note b { color: var(--ink-2); font-weight: 600; }
+
+.rows { display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+.row { display: grid; grid-template-columns: 118px minmax(0,1fr) auto; gap: 14px; align-items: center; text-align: left; width: 100%; padding: 13px 16px 13px 18px; border: 0; border-bottom: 1px solid var(--line); background: transparent; cursor: pointer; transition: background .13s ease; }
+.row:last-child { border-bottom: 0; }
+.row:hover { background: var(--surface-2); }
+.row-inforce { box-shadow: inset 3px 0 0 var(--ok); }
+.row-action { box-shadow: inset 3px 0 0 var(--warn); }
+.row-inert { box-shadow: inset 3px 0 0 var(--line-2); }
+.row-dead { box-shadow: inset 3px 0 0 var(--crit); }
+.row-provider { font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-2); display: flex; flex-direction: column; gap: 2px; }
+.row-variant { font-size: 9.5px; font-weight: 600; letter-spacing: .08em; color: var(--ink-3); }
+.row-main { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.row-title { font-size: 13.5px; font-weight: 550; }
+.row-sub { font-family: var(--mono); font-size: 11px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-right { display: flex; align-items: center; gap: 10px; }
+.row-caret { color: var(--ink-3); font-size: 14px; }
+
+/* fused two-axis pill */
+.dual { display: inline-flex; align-items: stretch; border-radius: 3px; overflow: hidden; border: 1px solid var(--line-2); white-space: nowrap; }
+.dual > span { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; font-size: 11px; font-weight: 600; }
+.dual > span + span { border-left: 1px solid var(--line-2); }
+.dual i { font-style: normal; line-height: 1; }
+.ax-ok { background: var(--ok-soft); color: var(--ok); }
+.ax-idle { background: var(--idle-soft); color: var(--idle); }
+.ax-warn { background: var(--warn-soft); color: var(--warn); }
+.ax-crit { background: var(--crit-soft); color: var(--crit); }
+.ax-blank { background: transparent; color: var(--ink-3); }
+
+/* binding matrix */
+.matrix { display: grid; grid-template-columns: 108px repeat(3, minmax(0,1fr)); background: var(--surface); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+.matrix > div { padding: 11px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); min-height: 64px; }
+.matrix > div:nth-child(4n) { border-right: 0; }
+.matrix > div.mh { background: var(--surface-2); min-height: 0; padding: 8px 12px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+.matrix > div.rh { background: var(--surface-2); font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); display: flex; align-items: center; }
+.cell-ok { background: color-mix(in srgb, var(--ok-soft) 60%, var(--surface)); }
+.cell-action { background: color-mix(in srgb, var(--warn-soft) 60%, var(--surface)); }
+.cell-chip { display: inline-block; font-family: var(--mono); font-size: 10.5px; padding: 2px 7px; border-radius: 3px; background: var(--surface); border: 1px solid var(--line-2); margin: 0 4px 4px 0; }
+.cell-note { font-size: 10.5px; color: var(--ink-3); }
+
+.notice { display: flex; gap: 10px; align-items: flex-start; padding: 11px 14px; border-radius: 4px; font-size: 12.5px; line-height: 1.45; background: var(--surface-2); border: 1px solid var(--line); color: var(--ink-2); }
+.notice b { color: var(--ink); font-weight: 600; }
+.notice-warn { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 30%, transparent); color: color-mix(in srgb, var(--warn) 82%, var(--ink)); }
+.notice-warn b { color: var(--warn); }
+
+.kv { display: grid; grid-template-columns: 132px minmax(0,1fr); gap: 7px 16px; font-size: 13px; }
+.kv dt { font-size: 10px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); padding-top: 3px; }
+.kv dd { margin: 0; min-width: 0; word-break: break-word; }
+
+.owner-grid { display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+.owner-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; padding: 15px 16px; border-bottom: 1px solid var(--line); }
+.ident { display: grid; grid-template-columns: 96px minmax(0,1fr) auto; gap: 14px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.ident:last-child { border-bottom: 0; }
+.ident-val { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; }
+.tick { color: var(--ok); font-size: 12px; font-weight: 600; }
+.priv { font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+
+.stack { display: flex; flex-direction: column; gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: 5px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+.tile-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.tile-name { font-size: 13.5px; font-weight: 600; font-family: var(--mono); }
+.tile-kind { font-size: 10px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); }
+.tile-line { font-size: 12.5px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.resolve { background: var(--surface); border: 1px solid var(--line); border-radius: 5px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.resolve-form { display: flex; gap: 8px; flex-wrap: wrap; }
+.resolve input { flex: 1 1 260px; min-width: 0; padding: 9px 11px; font-family: var(--mono); font-size: 12.5px; background: var(--ground); color: var(--ink); border: 1px solid var(--line-2); border-radius: var(--radius); }
+.resolve input::placeholder { color: var(--ink-3); }
+.samples { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.samples button { font-family: var(--mono); font-size: 10.5px; padding: 3px 8px; border-radius: 3px; background: var(--surface-2); border: 1px solid var(--line); color: var(--ink-2); cursor: pointer; }
+.samples button:hover { border-color: var(--ink-3); color: var(--ink); }
+.result { border-radius: 4px; border: 1px solid var(--line); padding: 13px 15px; display: flex; flex-direction: column; gap: 6px; background: var(--ground); }
+.result-hit { border-color: color-mix(in srgb, var(--ok) 34%, transparent); background: var(--ok-soft); }
+.result-partial { border-color: color-mix(in srgb, var(--warn) 34%, transparent); background: var(--warn-soft); }
+.result-miss { border-color: var(--line-2); }
+.result-conflict { border-color: color-mix(in srgb, var(--crit) 40%, transparent); background: var(--crit-soft); }
+.result-title { font-size: 14px; font-weight: 600; }
+.result-hit .result-title { color: var(--ok); }
+.result-partial .result-title { color: var(--warn); }
+.result-conflict .result-title { color: var(--crit); }
+.result-line { font-size: 12.5px; color: var(--ink-2); }
+
+.gaps { display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+.gap { display: grid; grid-template-columns: 168px minmax(0,1fr); gap: 14px; padding: 11px 16px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.gap:last-child { border-bottom: 0; }
+.gap-field { font-family: var(--mono); font-size: 11.5px; color: var(--accent); }
+.gap-why { color: var(--ink-2); }
+
+.json-wrap { background: var(--surface); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+.json-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 15px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.json-cmd { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+.json-cmd b { color: var(--accent); font-weight: 600; }
+pre.json { margin: 0; padding: 15px; overflow-x: auto; font-family: var(--mono); font-size: 11.5px; line-height: 1.6; color: var(--ink-2); max-height: 400px; overflow-y: auto; }
+pre.json .k { color: var(--accent); }
+pre.json .s { color: var(--ok); }
+pre.json .n { color: var(--warn); }
+
+.scrim { position: fixed; inset: 0; background: rgba(10,14,13,.42); opacity: 0; pointer-events: none; transition: opacity .22s ease; z-index: 60; }
+.scrim.open { opacity: 1; pointer-events: auto; }
+.drawer { position: fixed; top: 0; right: 0; height: 100%; width: min(452px, 100%); background: var(--surface); border-left: 1px solid var(--line-2); box-shadow: var(--shadow-lift); z-index: 70; transform: translateX(101%); transition: transform .26s cubic-bezier(.32,.72,.28,1); display: flex; flex-direction: column; overflow: hidden; }
+.drawer.open { transform: translateX(0); }
+.drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
+.drawer-title { font-family: var(--serif); font-size: 20px; font-weight: 600; letter-spacing: -.01em; line-height: 1.15; }
+.drawer-body { padding: 18px 20px 28px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
+.iconbtn { border: 1px solid var(--line-2); background: var(--surface); border-radius: 4px; width: 28px; height: 28px; cursor: pointer; display: grid; place-items: center; color: var(--ink-2); flex: none; }
+.iconbtn:hover { background: var(--surface-2); color: var(--ink); }
+
+.chain { display: flex; flex-direction: column; }
+.chain-step { display: grid; grid-template-columns: 22px minmax(0,1fr); gap: 12px; }
+.chain-gutter { display: flex; flex-direction: column; align-items: center; }
+.chain-node { width: 9px; height: 9px; border-radius: 50%; border: 2px solid var(--line-2); background: var(--surface); margin-top: 5px; flex: none; }
+.chain-node.filled { border-color: var(--ok); background: var(--ok); }
+.chain-node.broken { border-color: var(--warn); background: var(--surface); border-style: dashed; }
+.chain-line { width: 1px; flex: 1; background: var(--line-2); margin: 3px 0; }
+.chain-content { padding-bottom: 16px; display: flex; flex-direction: column; gap: 2px; }
+.chain-step:last-child .chain-content { padding-bottom: 0; }
+.chain-label { font-size: 10px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); }
+.chain-value { font-size: 13.5px; font-weight: 550; word-break: break-word; }
+.chain-value.absent { color: var(--warn); }
+.chain-meta { font-family: var(--mono); font-size: 11px; color: var(--ink-3); word-break: break-all; }
+.drawer-actions { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 4px; }
+
+.modal { position: fixed; z-index: 80; top: 50%; left: 50%; transform: translate(-50%, -48%) scale(.98); width: min(400px, calc(100% - 32px)); background: var(--surface); border: 1px solid var(--line-2); border-radius: 7px; box-shadow: var(--shadow-lift); opacity: 0; pointer-events: none; transition: opacity .18s ease, transform .18s ease; display: flex; flex-direction: column; }
+.modal.open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%) scale(1); }
+.modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 16px 18px 12px; border-bottom: 1px solid var(--line); }
+.modal-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; align-items: center; }
+.qr-frame { padding: 14px; background: #fff; border: 1px solid var(--line-2); border-radius: 5px; }
+.qr-frame canvas { display: block; image-rendering: pixelated; width: 196px; height: 196px; }
+.qr-uris { width: 100%; display: flex; flex-direction: column; gap: 7px; }
+.qr-uri { font-family: var(--mono); font-size: 11px; color: var(--ink-2); background: var(--ground); border: 1px solid var(--line); border-radius: 3px; padding: 7px 9px; word-break: break-all; }
+.flow { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 11.5px; color: var(--ink-2); }
+.flow span { background: var(--surface-2); border: 1px solid var(--line); border-radius: 3px; padding: 2px 7px; font-family: var(--mono); font-size: 10.5px; }
+.flow em { font-style: normal; color: var(--ink-3); }
+
+.toast { position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 12px); background: var(--ink); color: var(--ground); padding: 9px 16px; border-radius: 4px; font-size: 12.5px; font-weight: 500; opacity: 0; pointer-events: none; transition: opacity .2s ease, transform .2s ease; z-index: 90; box-shadow: var(--shadow-lift); }
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+.divider { display: flex; flex-direction: column; gap: 8px; border-top: 2px solid var(--line-2); padding-top: 16px; margin-top: 6px; }
+.divider-label { font-size: 10px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-3); }
+.footnote { font-size: 12px; color: var(--ink-3); line-height: 1.6; max-width: 68ch; }
+.footnote b { color: var(--ink-2); font-weight: 600; }
+.hidden { display: none !important; }
+</style>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">Stand Card</span>
+    <span class="brand-note" id="view-source">live state · bin/sutando stand</span>
+  </div>
+  <div class="switch">
+    <span class="switch-label">Viewing as</span>
+    <div class="seg" role="group" aria-label="Card visibility level">
+      <button type="button" data-level="public" aria-pressed="false">Public</button>
+      <button type="button" data-level="owner" aria-pressed="true">Owner</button>
+      <button type="button" data-level="diagnostics" aria-pressed="false">Diagnostics</button>
+    </div>
+  </div>
+</header>
+
+<main class="shell">
+  <aside class="rail">
+    <section class="card" aria-label="Stand Card">
+      <canvas class="card-guilloche" id="guilloche" aria-hidden="true"></canvas>
+      <div class="card-top">
+        <div class="avatar" aria-hidden="true">S</div>
+        <div class="card-id">
+          <div class="card-name-row">
+            <span class="card-name">Sutando</span>
+            <span class="live"><span class="livedot"></span>Active</span>
+          </div>
+          <span class="card-handle">@sutando-qingyun-001:ag2.space</span>
+          <span class="card-claim" id="card-claim"></span>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-row">
+          <p class="eyebrow">Owner</p>
+          <div>
+            <div class="owner-name">Qingyun Wu</div>
+            <div class="owner-handle" id="owner-handle-line"></div>
+          </div>
+        </div>
+        <div class="tally" id="tally"></div>
+        <div class="card-actions">
+          <button type="button" class="btn btn-primary" id="copy-id">Copy Stand ID</button>
+          <button type="button" class="btn" id="show-qr">Show QR</button>
+        </div>
+        <div class="mrz" id="mrz"></div>
+      </div>
+    </section>
+
+    <section class="rail-block">
+      <p class="eyebrow">Stand proof</p>
+      <p class="unreported" style="margin:0">Not reported by <span class="mono">sutando stand</span>. Without a Stand key, a shared card carries nothing a recipient can check.</p>
+    </section>
+
+    <section class="rail-block">
+      <p class="eyebrow">Snapshot</p>
+      <div class="chips">
+        <span class="chip">5 channels</span>
+        <span class="chip">1 verified identity</span>
+        <span class="chip">0 bindings</span>
+        <span class="chip">3 devices</span>
+      </div>
+    </section>
+  </aside>
+
+  <div class="inspector">
+    <section class="sec">
+      <div class="sec-head">
+        <h2 class="sec-title">Channels</h2>
+        <p class="sec-note" id="channels-note"></p>
+      </div>
+      <div class="rows" id="channel-rows"></div>
+      <div class="notice notice-warn" id="channels-notice"></div>
+    </section>
+
+    <section class="sec" id="sec-owner">
+      <div class="sec-head">
+        <h2 class="sec-title">Owner</h2>
+        <p class="sec-note">Owner evidence found on channels is listed separately, and stays there.</p>
+      </div>
+      <div class="owner-grid" id="owner-grid"></div>
+    </section>
+
+    <section class="sec" id="sec-devices">
+      <div class="sec-head">
+        <h2 class="sec-title">Devices</h2>
+        <p class="sec-note">Three enrolled. No installations or runtime instances are reported.</p>
+      </div>
+      <div class="stack" id="device-stack"></div>
+    </section>
+
+    <section class="sec" id="sec-resolve">
+      <div class="sec-head">
+        <h2 class="sec-title">Resolve identity</h2>
+        <p class="sec-note">Provider identity → binding → Stand. Verification alone is not enough.</p>
+      </div>
+      <div class="resolve">
+        <form class="resolve-form" id="resolve-form">
+          <input type="text" id="resolve-input" placeholder="bot_user:1504316176686120980" aria-label="Provider identity to resolve" autocomplete="off" spellcheck="false">
+          <button type="submit" class="btn btn-primary">Resolve</button>
+        </form>
+        <div class="samples" id="resolve-samples"></div>
+        <div id="resolve-result"></div>
+      </div>
+    </section>
+
+    <div class="divider">
+      <span class="divider-label">Design notes</span>
+      <p class="footnote" style="margin:0">Everything below explains the model behind the card. It is prototype commentary, not part of any visibility level — a real Public card ends above this line.</p>
+    </div>
+
+    <section class="sec" id="sec-matrix">
+      <div class="sec-head">
+        <h2 class="sec-title">Two axes, not one status</h2>
+        <p class="sec-note">Verification proves an identity exists. Binding admits it as this Stand.</p>
+      </div>
+      <div class="matrix" id="matrix"></div>
+      <p class="footnote">The CLI collapses these into single strings — <b>configured_unverified</b>, <b>verified_unlinked</b>. Both are combinations of the two axes above, and the card can only be honest if the view exposes them separately. Only the middle-right cell may render green.</p>
+    </section>
+
+    <section class="sec">
+      <div class="sec-head">
+        <h2 class="sec-title">What the card needs that the CLI does not emit</h2>
+        <p class="sec-note">Every row here is currently rendered as <span class="unreported">not reported</span>.</p>
+      </div>
+      <div class="gaps" id="gaps"></div>
+    </section>
+
+    <section class="sec" id="sec-json">
+      <div class="sec-head">
+        <h2 class="sec-title">The view behind the card</h2>
+        <p class="sec-note"><span class="mono">stand</span> → Owner card · <span class="mono">stand --detail</span> → Diagnostics.</p>
+      </div>
+      <div class="json-wrap">
+        <div class="json-head">
+          <span class="json-cmd">$ <b>bin/sutando stand</b> --json<span id="json-flag"></span></span>
+          <button type="button" class="btn btn-sm" id="copy-json">Copy</button>
+        </div>
+        <pre class="json" id="json-out"></pre>
+      </div>
+      <p class="footnote">The card renders this object and nothing else. It does not read <span class="mono">.claude-sutando/channels/</span>, so a folder on disk can never produce a green row — which is exactly why <b>ag2space [production]</b> stays grey even though its subject evidence already spells out the Stand ID.</p>
+    </section>
+  </div>
+</main>
+
+<div class="scrim" id="scrim"></div>
+
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
+  <div class="drawer-head">
+    <div>
+      <p class="eyebrow">Why is this trusted?</p>
+      <div class="drawer-title" id="drawer-title">Channel</div>
+    </div>
+    <button type="button" class="iconbtn" id="drawer-close" aria-label="Close">✕</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<div class="modal" id="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title" aria-hidden="true">
+  <div class="modal-head">
+    <div>
+      <p class="eyebrow">Share</p>
+      <div class="drawer-title" id="qr-title">Sutando</div>
+    </div>
+    <button type="button" class="iconbtn" id="qr-close" aria-label="Close">✕</button>
+  </div>
+  <div class="modal-body">
+    <div class="qr-frame"><canvas id="qr-canvas" width="196" height="196"></canvas></div>
+    <div class="qr-uris">
+      <div class="qr-uri">sutando://stand/@sutando-qingyun-001:ag2.space</div>
+      <div class="qr-uri">https://ag2.space/stand/@sutando-qingyun-001</div>
+    </div>
+    <div class="notice"><span>Scanning identifies a Stand. It grants nothing.</span></div>
+    <div class="flow"><span>authenticate</span><em>→</em><span>owner approval</span><em>→</em><span>create binding</span></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+/* Adapter: current `bin/sutando stand --json` shape -> the card's VIEW shape.
+   The baked VIEW below stays as the sample fallback when no live data is injected. */
+function adaptStandJson(raw){
+  try{
+    const s=raw.stand||{}, o=(raw.owners||[])[0]||{};
+    const ev={}; (raw.owner_evidence||[]).forEach(e=>{ev[e.provider]=e.subject;});
+    return {
+      stand:{id:s.stand_id||s.id||"", displayName:s.display_name||"", status:s.status||""},
+      owner:{name:o.display_name||"", id:o.person_id||"", role:o.role||""},
+      channels:(raw.channels||[]).map(c=>{
+        const st=c.status||""; const ver=c.verification||{}; const evd=c.evidence||{};
+        const idn=c.identity||null;
+        let provider=c.provider||"", variant=null, base=provider;
+        if(provider.indexOf("dev-")===0){variant="dev";base=provider.slice(4);}
+        else if(provider.indexOf("local-")===0){variant="local";base=provider.slice(6);}
+        return {
+          key:provider, provider:base, variant,
+          cliState:st,
+          identity: st.indexOf("verified")===0?"verified":"unverified",
+          binding:"unlinked",
+          identityLabel:(c.display||{}).name,
+          subject: idn?`${idn.type}:${idn.id}`:undefined,
+          verifiedBy:ver.method, verifiedAt:ver.verified_at,
+          verifiedLocal:ver.verified_at, fingerprint:ver.fingerprint,
+          subjectEvidence:evd.subject_evidence||null,
+          ownerEvidence:evd.owner_id||ev[provider]||null,
+          credential:evd.credential_present?"present":null,
+          policy:evd.policy_present?"present":null,
+          storage:`~/Documents/github/sutando/workspace/.claude-sutando/channels/${provider}`
+        };
+      }),
+      devices:(raw.devices||[]).map(d=>({id:d.label||d.device_id, platform:d.device_type||"unknown", status:d.status||""})),
+      instances:raw.instances||[]
+    };
+  }catch(e){return null;}
+}
+</script>
+<script>
+/* ── IdentityView, populated from bin/sutando stand (Aug 23, 2026) ── */
+const VIEW = (window.SUTANDO_STAND_RAW ? adaptStandJson(window.SUTANDO_STAND_RAW) : null) || {
+  stand: { id: "@sutando-qingyun-001:ag2.space", displayName: "Sutando", status: "active" },
+  owner: { name: "Qingyun Wu", id: "@qingyun:ag2.space", role: "primary_owner" },
+  channels: [
+    {
+      key: "ag2space:production", provider: "ag2space", variant: "production",
+      cliState: "configured_unverified", identity: "unverified", binding: "unlinked",
+      subjectEvidence: "@sutando-qingyun-001:ag2.space",
+      ownerEvidence: "@qingyun:ag2.space",
+      credential: "present", policy: "present",
+      storage: "~/Documents/github/sutando/workspace/.claude-sutando/channels/ag2space"
+    },
+    {
+      key: "ag2space:dev", provider: "ag2space", variant: "dev",
+      cliState: "configured_unverified", identity: "unverified", binding: "unlinked",
+      subjectEvidence: null, ownerEvidence: null,
+      credential: "present", policy: null,
+      storage: "~/Documents/github/sutando/workspace/.claude-sutando/channels/dev-ag2space"
+    },
+    {
+      key: "discord", provider: "discord", variant: null,
+      cliState: "verified_unlinked", identity: "verified", binding: "unlinked",
+      identityLabel: "qingyun-sutando", subject: "bot_user:1504316176686120980",
+      verifiedBy: "discord_token_introspection", verifiedAt: "2026-08-23T00:36:33+00:00",
+      verifiedLocal: "Aug 22, 2026 · 5:36 PM PDT",
+      fingerprint: "sha256:780bd2b4e6db8e3a",
+      subjectEvidence: null, ownerEvidence: null,
+      credential: "present", policy: "present",
+      storage: "~/Documents/github/sutando/workspace/.claude-sutando/channels/discord"
+    },
+    {
+      key: "slack", provider: "slack", variant: null,
+      cliState: "configured_unverified", identity: "unverified", binding: "unlinked",
+      subjectEvidence: null, ownerEvidence: "slack:user:U081446333M",
+      credential: "present", policy: "present",
+      storage: "~/Documents/github/sutando/workspace/.claude-sutando/channels/slack"
+    },
+    {
+      key: "telegram", provider: "telegram", variant: null,
+      cliState: "configured_unverified", identity: "unverified", binding: "unlinked",
+      subjectEvidence: null, ownerEvidence: "telegram:user:8674402296",
+      credential: "present", policy: "present",
+      storage: "~/Documents/github/sutando/workspace/.claude-sutando/channels/telegram"
+    }
+  ],
+  devices: [
+    { id: "web-companion", platform: "web", status: "enrolled" },
+    { id: "m5-watch", platform: "unknown", status: "enrolled" },
+    { id: "m5-stopwatch", platform: "unknown", status: "enrolled" }
+  ],
+  instances: []
+};
+
+const GAPS = [
+  ["stand.proof", "Nothing a recipient of a shared card or QR can verify against. Without it the public card is an assertion, not a credential."],
+  ["channel.binding", "Every channel reports Stand binding: absent. There is no record type yet for the link the card is built to display."],
+  ["channel.capabilities", "The card cannot answer \"what may this entrance do\" — the question that makes a binding worth reviewing."],
+  ["channel.runtime", "No connection status or last-seen, so a live entrance and a dormant one look identical."],
+  ["channel.verified_at", "Only discord carries a timestamp. Verification with no age cannot expire or be re-checked on a schedule."],
+  ["channel.last_error", "A failed check leaves no trace, so auth_failed and unreachable cannot be told apart."],
+  ["owner.binding_id", "The Owner line has no record behind it. The card shows an owner it cannot yet prove was ever bound."],
+  ["device.platform", "Two of three devices report unknown. Also missing: last-seen, permissions, enrolment time."],
+  ["instances[]", "Not emitted at all, so the card cannot separate a device from the software running on it."]
+];
+
+const RESOLVER = {
+  "bot_user:1504316176686120980": { kind: "verified_unlinked", channel: "discord" },
+  "discord:1504316176686120980": { kind: "verified_unlinked", channel: "discord" },
+  "slack:user:u081446333m": { kind: "owner_evidence", channel: "slack" },
+  "telegram:user:8674402296": { kind: "owner_evidence", channel: "telegram" },
+  "@sutando-qingyun-001:ag2.space": { kind: "self_claim", channel: "ag2space:production" }
+};
+
+const IDENTITY_AX = {
+  unverified: { icon: "○", text: "Unverified", cls: "ax-idle" },
+  verified: { icon: "✓", text: "Verified", cls: "ax-ok" },
+  failed: { icon: "!", text: "Rejected", cls: "ax-warn" },
+  unreachable: { icon: "↯", text: "Unreachable", cls: "ax-warn" }
+};
+const BINDING_AX = {
+  unlinked: { icon: "⊗", text: "Unlinked", cls: "ax-idle" },
+  linked: { icon: "◆", text: "Linked", cls: "ax-ok" },
+  revoked: { icon: "⊘", text: "Revoked", cls: "ax-crit" }
+};
+
+document.getElementById("view-source").textContent =
+  window.SUTANDO_STAND_RAW ? "live state \u00b7 bin/sutando stand" : "sample snapshot \u00b7 Aug 23 2026";
+let level = "owner";
+let currentChannel = null;
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const label = (c) => c.provider + (c.variant ? ` [${c.variant}]` : "");
+const inForce = (c) => c.identity === "verified" && c.binding === "linked";
+const needsAction = (c) => c.identity === "verified" && c.binding === "unlinked";
+
+function dualPill(c) {
+  const a = IDENTITY_AX[c.identity], b = BINDING_AX[c.binding];
+  return `<span class="dual"><span class="${a.cls}"><i>${a.icon}</i>${a.text}</span><span class="${b.cls}"><i>${b.icon}</i>${b.text}</span></span>`;
+}
+function rowTone(c) {
+  if (inForce(c)) return "row-inforce";
+  if (needsAction(c)) return "row-action";
+  if (c.binding === "revoked" || c.identity === "failed") return "row-dead";
+  return "row-inert";
+}
+function publicChannels() { return VIEW.channels.filter(inForce); }
+
+/* ── render ─────────────────────────────────────────────── */
+function render() {
+  const linked = VIEW.channels.filter(inForce);
+  const pending = VIEW.channels.filter(needsAction);
+
+  $("#card-claim").className = "card-claim " + (linked.length ? "claim-ok" : "claim-none");
+  $("#card-claim").textContent = linked.length
+    ? `✓ ${linked.length} verified entrance${linked.length > 1 ? "s" : ""}`
+    : "○ No verified entrance yet";
+
+  $("#owner-handle-line").innerHTML = level === "public"
+    ? `<span class="priv">Identities hidden</span>`
+    : `<span>@qingyun:ag2.space</span><span class="chip">primary_owner</span>`;
+
+  $("#tally").innerHTML = level === "public"
+    ? `<div><b class="${linked.length ? "" : "zero"}">${linked.length}</b><span>Entrances</span></div><div><b>—</b><span>Capabilities</span></div><div><b>—</b><span>Proof</span></div>`
+    : `<div><b>${VIEW.channels.length}</b><span>Channels</span></div><div><b class="${linked.length ? "" : "zero"}">${linked.length}</b><span>Linked</span></div><div><b>${VIEW.devices.length}</b><span>Devices</span></div>`;
+
+  $("#mrz").textContent = level === "diagnostics"
+    ? "STAND<<SUTANDO<<QINGYUN<<001<<AG2.SPACE<<ACTIVE<<CH:5<<LINKED:" + linked.length + "<<DEV:3<<PROOF:NONE"
+    : "STAND<<SUTANDO<<QINGYUN<<001<<AG2.SPACE<<ACTIVE<<BINDINGS:" + linked.length;
+
+  const list = level === "public" ? publicChannels() : VIEW.channels;
+  $("#channels-note").innerHTML = level === "public"
+    ? `<b>${list.length}</b> published · a channel appears here only once verified <b>and</b> linked`
+    : `<b>${linked.length}</b> linked of ${VIEW.channels.length} · click a row for its trust chain`;
+
+  $("#channel-rows").innerHTML = list.length ? list.map((c) => `
+    <button type="button" class="row ${rowTone(c)}" data-channel="${c.key}">
+      <span class="row-provider">${esc(c.provider)}${c.variant ? `<span class="row-variant">${esc(c.variant)}</span>` : ""}</span>
+      <span class="row-main">
+        <span class="row-title">${esc(c.identityLabel || c.subjectEvidence || (c.ownerEvidence ? "Owner evidence only" : "No provider identity yet"))}</span>
+        <span class="row-sub">${esc(c.subject || c.ownerEvidence || c.storage.split("/").pop())}</span>
+      </span>
+      <span class="row-right">${dualPill(c)}<span class="row-caret" aria-hidden="true">›</span></span>
+    </button>`).join("")
+    : `<div style="padding:22px 18px" class="sec-note">No channel is both verified and linked, so the public card publishes none.</div>`;
+
+  const notice = $("#channels-notice");
+  if (level === "public") {
+    notice.className = "notice";
+    notice.innerHTML = "<span>This is what a collaborator sees today: a named Stand with an owner, and <b>no provable entrance</b>. One channel has a verified provider identity, but no binding claims it — publishing that channel would assert a relationship no record supports.</span>";
+  } else {
+    notice.className = "notice notice-warn";
+    notice.innerHTML = `<span><b>${pending.length ? "discord is verified but unlinked" : "Nothing awaiting approval"}</b> — the identity <span class="mono">bot_user:1504316176686120980</span> is proven to exist and to be controlled by this credential. Nothing yet says it speaks for Sutando. That link is an owner decision, and it is the one action the card exists to prompt.</span>`;
+  }
+
+  renderMatrix();
+
+  // owner
+  const evidence = VIEW.channels.filter((c) => c.ownerEvidence);
+  $("#owner-grid").innerHTML = `
+    <div class="owner-head">
+      <div>
+        <div class="owner-name">${esc(VIEW.owner.name)}</div>
+        <div class="sec-note">${esc(VIEW.owner.role)}${level === "public" ? "" : " · " + esc(VIEW.owner.id)}</div>
+      </div>
+      ${level === "public" ? `<span class="priv">Owner identities are private</span>` : `<span class="chip unreported" style="font-style:italic">no OwnerBinding id reported</span>`}
+    </div>
+    ${level === "public"
+      ? `<div class="ident"><span class="priv">Public card</span><span class="ident-val">Owner display name only.</span><span></span></div>`
+      : `<div class="ident">
+          <span class="row-provider">AG2</span>
+          <span class="ident-val">${esc(VIEW.owner.id)}</span>
+          <span class="row-right"><span class="unreported">unverified</span></span>
+        </div>
+        <div class="ident" style="grid-template-columns:1fr">
+          <span class="sec-note" style="padding-top:4px"><b style="color:var(--ink-2)">Owner evidence — not bindings.</b> Found on channels, kept out of the Owner record until someone approves it.</span>
+        </div>
+        ${evidence.map((c) => `
+          <div class="ident">
+            <span class="row-provider">${esc(label(c))}</span>
+            <span class="ident-val">${esc(c.ownerEvidence)}</span>
+            <span class="row-right"><span class="priv">Evidence</span></span>
+          </div>`).join("")}`}
+  `;
+
+  // devices
+  $("#sec-devices").classList.toggle("hidden", level === "public");
+  $("#device-stack").innerHTML = VIEW.devices.map((d) => `
+    <div class="tile">
+      <div class="tile-head">
+        <span class="tile-name">${esc(d.id)}</span>
+        <span class="tile-kind">${d.platform === "unknown" ? "platform unknown" : esc(d.platform)}</span>
+        <span class="dual"><span class="ax-ok"><i>✓</i>${esc(d.status)}</span></span>
+      </div>
+      <div class="tile-line"><span class="unreported">No last-seen, permissions or enrolment time reported.</span></div>
+    </div>`).join("")
+    + `<div class="tile"><div class="tile-head"><span class="tile-kind">Runtime instances</span></div><div class="tile-line"><span class="unreported">None reported. A device, an installation and a running instance are three different things; the view currently has only the first.</span></div></div>`;
+
+  // gaps
+  $("#gaps").innerHTML = GAPS.map(([f, why]) => `<div class="gap"><span class="gap-field">${esc(f)}</span><span class="gap-why">${esc(why)}</span></div>`).join("");
+
+  $("#json-flag").textContent = level === "diagnostics" ? " --detail" : "";
+  $("#json-out").innerHTML = highlight(JSON.stringify(buildPayload(), null, 2));
+}
+
+function renderMatrix() {
+  const cols = [["unverified", "Unverified"], ["verified", "Verified"], ["failed", "Rejected"]];
+  const rows = [["unlinked", "Unlinked"], ["linked", "Linked"], ["revoked", "Revoked"]];
+  let html = `<div class="mh"></div>` + cols.map(([, t]) => `<div class="mh">${t}</div>`).join("");
+  rows.forEach(([rk, rt]) => {
+    html += `<div class="rh">${rt}</div>`;
+    cols.forEach(([ck]) => {
+      const here = VIEW.channels.filter((c) => c.identity === ck && c.binding === rk);
+      const isOk = ck === "verified" && rk === "linked";
+      const isAction = ck === "verified" && rk === "unlinked";
+      const cls = isOk ? "cell-ok" : isAction && here.length ? "cell-action" : "";
+      const body = here.length
+        ? here.map((c) => `<span class="cell-chip">${esc(label(c))}</span>`).join("")
+        : `<span class="cell-note">${isOk ? "the only green state" : ""}</span>`;
+      html += `<div class="${cls}">${body}</div>`;
+    });
+  });
+  $("#matrix").innerHTML = html;
+}
+
+function buildPayload() {
+  const slim = (c) => ({
+    key: c.key, provider: c.provider, ...(c.variant ? { variant: c.variant } : {}),
+    identity: c.identity, binding: c.binding, cliState: c.cliState,
+    ...(c.subject ? { subject: c.subject, identityLabel: c.identityLabel } : {}),
+    ...(c.verifiedBy ? { verification: { method: c.verifiedBy, at: c.verifiedAt } } : {}),
+    ...(c.subjectEvidence ? { subjectEvidence: c.subjectEvidence } : {}),
+    ...(c.ownerEvidence ? { ownerEvidence: c.ownerEvidence } : {}),
+    ...(level === "public" ? {} : { credential: c.credential, policy: c.policy || "absent" }),
+    ...(level === "diagnostics" ? { fingerprint: c.fingerprint || null, storage: c.storage } : {})
+  });
+  if (level === "public") {
+    return {
+      stand: { id: VIEW.stand.id, displayName: VIEW.stand.displayName, status: VIEW.stand.status },
+      owner: { name: VIEW.owner.name },
+      entrances: publicChannels().map(slim),
+      proof: null
+    };
+  }
+  return {
+    stand: VIEW.stand,
+    owner: { ...VIEW.owner, bindingId: null },
+    channels: VIEW.channels.map(slim),
+    devices: VIEW.devices,
+    instances: VIEW.instances
+  };
+}
+
+function highlight(json) {
+  return esc(json)
+    .replace(/&quot;([^&]+?)&quot;(\s*:)/g, '<span class="k">"$1"</span>$2')
+    .replace(/:\s&quot;([^&]*?)&quot;/g, ': <span class="s">"$1"</span>')
+    .replace(/:\s(-?\d+(?:\.\d+)?|true|false|null)/g, ': <span class="n">$1</span>');
+}
+
+/* ── drawer ─────────────────────────────────────────────── */
+function openDrawer(key) {
+  const c = VIEW.channels.find((x) => x.key === key);
+  if (!c) return;
+  const verified = c.identity === "verified";
+  const linked = c.binding === "linked";
+
+  const steps = [
+    {
+      label: "Provider subject",
+      value: c.subject || (c.subjectEvidence ? c.subjectEvidence + "  (self-declared)" : "None"),
+      meta: c.subject ? `${c.provider} · ${c.identityLabel}` : "No provider has confirmed an identity for this channel",
+      node: c.subject ? "filled" : ""
+    },
+    {
+      label: "Verification",
+      value: c.verifiedBy || "Never attempted",
+      meta: c.verifiedAt ? `${c.verifiedLocal}  ·  ${c.verifiedAt}` : "Credential present but never exchanged with the provider",
+      node: verified ? "filled" : ""
+    },
+    {
+      label: "Authorized by",
+      value: linked ? VIEW.owner.name : "Nobody",
+      meta: linked ? "OwnerBinding — created in this prototype" : "No OwnerBinding references this channel",
+      node: linked ? "filled" : "broken"
+    },
+    {
+      label: "Linked Stand",
+      value: linked ? VIEW.stand.displayName : "None",
+      meta: linked ? VIEW.stand.id : "Stand binding: absent",
+      node: linked ? "filled" : "broken",
+      absent: !linked
+    }
+  ];
+
+  $("#drawer-title").textContent = label(c);
+  $("#drawer-body").innerHTML = `
+    <div>${dualPill(c)} <span class="chip">${esc(c.cliState)}</span></div>
+    ${verified && !linked ? `<div class="notice notice-warn"><span><b>Verified is not linked.</b> Discord confirms this bot exists and that the stored token controls it. That says nothing about whether it represents Sutando — only an owner decision can say that.</span></div>` : ""}
+    ${c.subjectEvidence ? `<div class="notice"><span><b>Self-declared subject.</b> This channel's config names <span class="mono">${esc(c.subjectEvidence)}</span> — the Stand's own ID. It is a claim written locally, not a fact a provider confirmed, and must not shortcut verification.</span></div>` : ""}
+    <div class="chain">
+      ${steps.map((s, i) => `
+        <div class="chain-step">
+          <div class="chain-gutter">
+            <div class="chain-node ${s.node}"></div>
+            ${i < steps.length - 1 ? '<div class="chain-line"></div>' : ""}
+          </div>
+          <div class="chain-content">
+            <div class="chain-label">${esc(s.label)}</div>
+            <div class="chain-value ${s.absent ? "absent" : ""}">${esc(s.value)}</div>
+            <div class="chain-meta">${esc(s.meta)}</div>
+          </div>
+        </div>`).join("")}
+    </div>
+    ${c.ownerEvidence ? `<div>
+      <p class="eyebrow" style="margin-bottom:6px">Owner evidence — not a binding</p>
+      <div class="notice"><span><b>${esc(c.ownerEvidence)}</b><br>Recorded from this channel's config. It supports a future OwnerBinding decision; it never becomes the Owner field on its own.</span></div>
+    </div>` : ""}
+    <dl class="kv">
+      <dt>Credential</dt><dd>${esc(c.credential)}${c.fingerprint && level !== "public" ? ` · <span class="mono">${esc(c.fingerprint)}</span>` : ""}<br><span class="sec-note">Secret hidden</span></dd>
+      <dt>Policy</dt><dd>${c.policy ? esc(c.policy) : '<span class="unreported">absent</span>'}</dd>
+      <dt>Capabilities</dt><dd><span class="unreported">not reported</span></dd>
+      <dt>Runtime</dt><dd><span class="unreported">not reported</span></dd>
+      ${level === "diagnostics" ? `<dt>Storage</dt><dd class="mono" style="font-size:11px">${esc(c.storage)}</dd>` : ""}
+    </dl>
+    <div class="drawer-actions">
+      ${verified && !linked ? `<button type="button" class="btn btn-primary btn-sm" data-act="link" data-key="${c.key}">Link to Stand</button>` : ""}
+      ${!verified ? `<button type="button" class="btn btn-sm" data-act="verify" data-key="${c.key}">Verify identity</button>` : ""}
+      ${linked ? `<button type="button" class="btn btn-sm btn-danger" data-act="unlink" data-key="${c.key}">Revoke binding</button>` : ""}
+    </div>
+    <p class="footnote">${verified && !linked
+      ? "Linking is a two-step action: the card asks, the owner approves. Nothing in this drawer can create a binding on its own."
+      : "Verifying exchanges the stored credential with the provider. Success moves the left axis only — the binding still needs an owner."}</p>
+  `;
+  $("#drawer").classList.add("open");
+  $("#drawer").setAttribute("aria-hidden", "false");
+  $("#scrim").classList.add("open");
+  $("#drawer-close").focus();
+  currentChannel = key;
+}
+
+function closeOverlays() {
+  $("#drawer").classList.remove("open");
+  $("#drawer").setAttribute("aria-hidden", "true");
+  $("#qr-modal").classList.remove("open");
+  $("#qr-modal").setAttribute("aria-hidden", "true");
+  $("#scrim").classList.remove("open");
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+/* ── events ─────────────────────────────────────────────── */
+document.querySelectorAll(".seg button").forEach((b) => {
+  b.addEventListener("click", () => {
+    level = b.dataset.level;
+    document.querySelectorAll(".seg button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    render();
+    if (currentChannel && $("#drawer").classList.contains("open")) openDrawer(currentChannel);
+  });
+});
+
+document.addEventListener("click", (ev) => {
+  const row = ev.target.closest("[data-channel]");
+  if (row) { openDrawer(row.dataset.channel); return; }
+
+  const act = ev.target.closest("[data-act]");
+  if (!act) return;
+  const c = VIEW.channels.find((x) => x.key === act.dataset.key);
+  if (!c) return;
+
+  if (act.dataset.act === "link") {
+    if (act.dataset.confirm !== "1") {
+      act.dataset.confirm = "1";
+      act.textContent = `Approve as ${VIEW.owner.name}`;
+      return;
+    }
+    c.binding = "linked";
+    c.cliState = "verified_linked";
+    toast("Binding created — discord now resolves to Sutando.");
+    render(); openDrawer(c.key); return;
+  }
+  if (act.dataset.act === "verify") {
+    act.textContent = "Contacting provider…";
+    setTimeout(() => {
+      c.identity = "verified";
+      c.cliState = "verified_unlinked";
+      c.verifiedBy = c.provider + "_credential_exchange";
+      c.verifiedAt = "2026-08-23T16:40:00+00:00";
+      c.verifiedLocal = "Aug 23, 2026 · 9:40 AM PDT";
+      c.identityLabel = c.identityLabel || (c.provider + " identity");
+      c.subject = c.subject || (c.provider + ":verified-subject");
+      toast(`${label(c)} verified — still unlinked until you approve it.`);
+      render(); openDrawer(c.key);
+    }, 900);
+    return;
+  }
+  if (act.dataset.act === "unlink") {
+    if (act.dataset.confirm !== "1") { act.dataset.confirm = "1"; act.textContent = "Confirm revoke"; return; }
+    c.binding = "revoked";
+    c.cliState = "verified_revoked";
+    toast(`${label(c)} binding revoked.`);
+    render(); openDrawer(c.key); return;
+  }
+});
+
+$("#copy-id").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(VIEW.stand.id); toast("Stand ID copied"); }
+  catch { toast(VIEW.stand.id); }
+});
+$("#copy-json").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(JSON.stringify(buildPayload(), null, 2)); toast(`IdentityView (${level}) copied`); }
+  catch { toast("Copy unavailable in this context"); }
+});
+$("#show-qr").addEventListener("click", () => {
+  $("#qr-modal").classList.add("open");
+  $("#qr-modal").setAttribute("aria-hidden", "false");
+  $("#scrim").classList.add("open");
+  $("#qr-close").focus();
+});
+$("#qr-close").addEventListener("click", closeOverlays);
+$("#drawer-close").addEventListener("click", closeOverlays);
+$("#scrim").addEventListener("click", closeOverlays);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeOverlays(); });
+
+/* resolve */
+const SAMPLES = ["bot_user:1504316176686120980", "slack:user:U081446333M", "@sutando-qingyun-001:ag2.space", "discord:998877665"];
+$("#resolve-samples").innerHTML = `<span class="sec-note">Demo inputs (prototype scaffolding, not card content):</span>` + SAMPLES.map((s) => `<button type="button" data-sample="${esc(s)}">${esc(s)}</button>`).join("");
+$("#resolve-samples").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-sample]");
+  if (!b) return;
+  $("#resolve-input").value = b.dataset.sample;
+  doResolve();
+});
+$("#resolve-form").addEventListener("submit", (e) => { e.preventDefault(); doResolve(); });
+
+function doResolve() {
+  const q = $("#resolve-input").value.trim().toLowerCase();
+  const out = $("#resolve-result");
+  if (!q) { out.innerHTML = ""; return; }
+  const hit = RESOLVER[q];
+  if (!hit) {
+    out.innerHTML = `<div class="result result-miss">
+      <div class="result-title">Not linked</div>
+      <div class="result-line">This identity is not linked to a verified Stand. Nothing is inferred from name similarity.</div>
+    </div>`;
+    return;
+  }
+  const c = VIEW.channels.find((x) => x.key === hit.channel);
+  if (hit.kind === "verified_unlinked") {
+    if (c.binding === "linked") {
+      out.innerHTML = `<div class="result result-hit">
+        <div class="result-title">This is ${esc(VIEW.stand.displayName)}</div>
+        <div class="result-line">Owned by <b>${esc(VIEW.owner.name)}</b> · verified and linked ${esc(c.provider)} entrance</div>
+        <div class="result-line mono">${esc(c.subject)} → ${esc(VIEW.stand.id)}</div>
+      </div>`;
+      return;
+    }
+    out.innerHTML = `<div class="result result-partial">
+      <div class="result-title">Verified identity — no Stand</div>
+      <div class="result-line">${esc(c.provider)} confirms <span class="mono">${esc(c.subject)}</span> as <b>${esc(c.identityLabel)}</b>, verified ${esc(c.verifiedLocal)}.</div>
+      <div class="result-line">No binding claims it, so it resolves to no Stand. This is the honest answer, not an error.</div>
+      <div class="result-line"><button type="button" class="btn btn-sm" data-channel="${c.key}">Open trust chain</button></div>
+    </div>`;
+    return;
+  }
+  if (hit.kind === "owner_evidence") {
+    out.innerHTML = `<div class="result result-miss">
+      <div class="result-title">Owner evidence, not an entrance</div>
+      <div class="result-line"><span class="mono">${esc(c.ownerEvidence)}</span> appears in the ${esc(label(c))} channel config as an owner hint. It identifies a person, not this Stand, and it has not been verified.</div>
+    </div>`;
+    return;
+  }
+  if (hit.kind === "self_claim") {
+    out.innerHTML = `<div class="result result-miss">
+      <div class="result-title">Self-declared, unverified</div>
+      <div class="result-line">The ${esc(label(c))} config names this Stand ID as its subject. Local config claiming to be the Stand is not evidence the Stand accepts it — it resolves to nothing until a provider confirms the identity and an owner links it.</div>
+    </div>`;
+    return;
+  }
+}
+
+/* ── guilloché ──────────────────────────────────────────── */
+function drawGuilloche() {
+  const cv = $("#guilloche");
+  const parent = cv.parentElement;
+  const w = parent.clientWidth, h = 138, dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = w * dpr; cv.height = h * dpr;
+  cv.style.width = w + "px"; cv.style.height = h + "px";
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2E3C87";
+  ctx.strokeStyle = accent;
+  ctx.globalAlpha = 0.085;
+  ctx.lineWidth = 0.5;
+  const cx = w - 34, cy = 20;
+  for (let k = 0; k < 22; k++) {
+    const R = 74 + k * 2.1, r = 21 + k * 0.46, d = 40 - k * 0.5;
+    ctx.beginPath();
+    for (let t = 0; t <= Math.PI * 2 * 7; t += 0.05) {
+      const x = cx + (R - r) * Math.cos(t) + d * Math.cos(((R - r) / r) * t);
+      const y = cy + (R - r) * Math.sin(t) - d * Math.sin(((R - r) / r) * t);
+      t === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+
+/* ── QR (byte mode, ECC M, v1–10) ───────────────────────── */
+function qrEncode(text) {
+  const EXP = new Uint8Array(512), LOG = new Uint8Array(256);
+  for (let i = 0, x = 1; i < 255; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if (x & 256) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+  const mul = (a, b) => (a === 0 || b === 0) ? 0 : EXP[LOG[a] + LOG[b]];
+  const SPEC = { 1: [10,1,16,0,0], 2: [16,1,28,0,0], 3: [26,1,44,0,0], 4: [18,2,32,0,0], 5: [24,2,43,0,0],
+    6: [16,4,27,0,0], 7: [18,4,31,0,0], 8: [22,2,38,2,39], 9: [22,3,36,2,37], 10: [26,4,43,1,44] };
+  const ALIGN = { 1: [], 2: [6,18], 3: [6,22], 4: [6,26], 5: [6,30], 6: [6,34], 7: [6,22,38], 8: [6,24,42], 9: [6,26,46], 10: [6,28,50] };
+  const bytes = [];
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    if (cp < 0x80) bytes.push(cp);
+    else if (cp < 0x800) bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 63));
+    else bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+  }
+  let version = 0;
+  for (let v = 1; v <= 10; v++) {
+    const s = SPEC[v], cap = s[1] * s[2] + s[3] * s[4], cc = v < 10 ? 8 : 16;
+    if (4 + cc + bytes.length * 8 <= cap * 8) { version = v; break; }
+  }
+  if (!version) throw new Error("payload too long");
+  const spec = SPEC[version], countBits = version < 10 ? 8 : 16;
+  const totalData = spec[1] * spec[2] + spec[3] * spec[4];
+  const bits = [];
+  const push = (val, len) => { for (let b = len - 1; b >= 0; b--) bits.push((val >> b) & 1); };
+  push(4, 4); push(bytes.length, countBits);
+  bytes.forEach((b) => push(b, 8));
+  push(0, Math.min(4, totalData * 8 - bits.length));
+  while (bits.length % 8) bits.push(0);
+  const data = [];
+  for (let q = 0; q < bits.length; q += 8) { let byte = 0; for (let r = 0; r < 8; r++) byte = (byte << 1) | bits[q + r]; data.push(byte); }
+  const pad = [0xEC, 0x11]; let pi = 0;
+  while (data.length < totalData) data.push(pad[pi++ % 2]);
+  const ecLen = spec[0];
+  let gen = [1];
+  for (let g = 0; g < ecLen; g++) {
+    const next = new Array(gen.length + 1).fill(0);
+    for (let j = 0; j < gen.length; j++) { next[j] ^= gen[j]; next[j + 1] ^= mul(gen[j], EXP[g]); }
+    gen = next;
+  }
+  const ecc = (block) => {
+    const rem = block.concat(new Array(ecLen).fill(0));
+    for (let i = 0; i < block.length; i++) {
+      const f = rem[i]; if (!f) continue;
+      for (let j = 0; j < gen.length; j++) rem[i + j] ^= mul(gen[j], f);
+    }
+    return rem.slice(block.length);
+  };
+  const blocks = [], eccs = []; let off = 0;
+  for (let b = 0; b < spec[1]; b++) { blocks.push(data.slice(off, off + spec[2])); off += spec[2]; }
+  for (let b = 0; b < spec[3]; b++) { blocks.push(data.slice(off, off + spec[4])); off += spec[4]; }
+  blocks.forEach((b) => eccs.push(ecc(b)));
+  const inter = [], maxLen = Math.max(spec[2], spec[4]);
+  for (let c = 0; c < maxLen; c++) for (let b = 0; b < blocks.length; b++) if (c < blocks[b].length) inter.push(blocks[b][c]);
+  for (let c = 0; c < ecLen; c++) for (let b = 0; b < eccs.length; b++) inter.push(eccs[b][c]);
+  const size = version * 4 + 17;
+  const m = [], fn = [];
+  for (let y = 0; y < size; y++) { m.push(new Array(size).fill(0)); fn.push(new Array(size).fill(0)); }
+  const set = (x, y, v) => { m[y][x] = v ? 1 : 0; fn[y][x] = 1; };
+  const finder = (cx, cy) => {
+    for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+      const x = cx + dx, y = cy + dy;
+      if (x < 0 || y < 0 || x >= size || y >= size) continue;
+      set(x, y, Math.max(Math.abs(dx), Math.abs(dy)) !== 2 && Math.max(Math.abs(dx), Math.abs(dy)) !== 4);
+    }
+  };
+  finder(3, 3); finder(size - 4, 3); finder(3, size - 4);
+  for (let t = 8; t < size - 8; t++) { set(t, 6, t % 2 === 0); set(6, t, t % 2 === 0); }
+  const ap = ALIGN[version];
+  for (let i = 0; i < ap.length; i++) for (let j = 0; j < ap.length; j++) {
+    const ax = ap[i], ay = ap[j];
+    if ((ax === 6 && ay === 6) || (ax === 6 && ay === size - 7) || (ax === size - 7 && ay === 6)) continue;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) set(ax + dx, ay + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+  }
+  set(8, size - 8, 1);
+  for (let f = 0; f <= 8; f++) { if (!fn[f][8]) set(8, f, 0); if (!fn[8][f]) set(f, 8, 0); }
+  for (let f = 0; f < 8; f++) { if (!fn[8][size - 1 - f]) set(size - 1 - f, 8, 0); if (!fn[size - 1 - f][8]) set(8, size - 1 - f, 0); }
+  if (version >= 7) {
+    let rem = version;
+    for (let i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >>> 11) * 0x1f25);
+    const vbits = (version << 12) | rem;
+    for (let vb = 0; vb < 18; vb++) {
+      const bit = (vbits >> vb) & 1, a = Math.floor(vb / 3), c = vb % 3;
+      set(a, size - 11 + c, bit); set(size - 11 + c, a, bit);
+    }
+  }
+  let idx = 0, bitIdx = 0, upward = true;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < size; vert++) {
+      const y = upward ? size - 1 - vert : vert;
+      for (let c = 0; c < 2; c++) {
+        const x = right - c;
+        if (fn[y][x]) continue;
+        let bit = 0;
+        if (idx < inter.length) bit = (inter[idx] >> (7 - bitIdx)) & 1;
+        m[y][x] = bit;
+        if (++bitIdx === 8) { bitIdx = 0; idx++; }
+      }
+    }
+    upward = !upward;
+  }
+  const maskFn = (k, x, y) => {
+    switch (k) {
+      case 0: return (x + y) % 2 === 0;
+      case 1: return y % 2 === 0;
+      case 2: return x % 3 === 0;
+      case 3: return (x + y) % 3 === 0;
+      case 4: return (Math.floor(y / 2) + Math.floor(x / 3)) % 2 === 0;
+      case 5: return (x * y) % 2 + (x * y) % 3 === 0;
+      case 6: return ((x * y) % 2 + (x * y) % 3) % 2 === 0;
+      default: return ((x + y) % 2 + (x * y) % 3) % 2 === 0;
+    }
+  };
+  const applyFormat = (grid, maskNum) => {
+    let rem = maskNum;
+    for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+    const val = ((maskNum << 10) | rem) ^ 0x5412;
+    for (let i = 0; i <= 5; i++) grid[i][8] = (val >> i) & 1;
+    grid[7][8] = (val >> 6) & 1; grid[8][8] = (val >> 7) & 1; grid[8][7] = (val >> 8) & 1;
+    for (let i = 9; i < 15; i++) grid[8][14 - i] = (val >> i) & 1;
+    for (let i = 0; i < 8; i++) grid[8][size - 1 - i] = (val >> i) & 1;
+    for (let i = 8; i < 15; i++) grid[size - 15 + i][8] = (val >> i) & 1;
+    grid[size - 8][8] = 1;
+  };
+  const penalty = (grid) => {
+    let score = 0;
+    for (let pass = 0; pass < 2; pass++) for (let a = 0; a < size; a++) {
+      let run = 1;
+      for (let b = 1; b < size; b++) {
+        const cur = pass ? grid[b][a] : grid[a][b], prev = pass ? grid[b - 1][a] : grid[a][b - 1];
+        if (cur === prev) { run++; if (run === 5) score += 3; else if (run > 5) score += 1; } else run = 1;
+      }
+    }
+    for (let y = 0; y < size - 1; y++) for (let x = 0; x < size - 1; x++) {
+      const s = grid[y][x] + grid[y][x + 1] + grid[y + 1][x] + grid[y + 1][x + 1];
+      if (s === 0 || s === 4) score += 3;
+    }
+    const p1 = [1,0,1,1,1,0,1,0,0,0,0], p2 = [0,0,0,0,1,0,1,1,1,0,1];
+    for (let pass = 0; pass < 2; pass++) for (let a = 0; a < size; a++) for (let b = 0; b <= size - 11; b++) {
+      let ok1 = true, ok2 = true;
+      for (let d = 0; d < 11; d++) {
+        const v = pass ? grid[b + d][a] : grid[a][b + d];
+        if (v !== p1[d]) ok1 = false;
+        if (v !== p2[d]) ok2 = false;
+      }
+      if (ok1) score += 40;
+      if (ok2) score += 40;
+    }
+    let dark = 0;
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) dark += grid[y][x];
+    score += Math.floor(Math.abs(dark * 100 / (size * size) - 50) / 5) * 10;
+    return score;
+  };
+  let best = null, bestScore = Infinity;
+  for (let mk = 0; mk < 8; mk++) {
+    const grid = m.map((r) => r.slice());
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!fn[y][x] && maskFn(mk, x, y)) grid[y][x] ^= 1;
+    applyFormat(grid, mk);
+    const sc = penalty(grid);
+    if (sc < bestScore) { bestScore = sc; best = grid; }
+  }
+  return best;
+}
+
+function drawQR() {
+  const matrix = qrEncode("sutando://stand/" + VIEW.stand.id);
+  const n = matrix.length, quiet = 3, px = 5;
+  const cv = $("#qr-canvas");
+  cv.width = (n + quiet * 2) * px; cv.height = (n + quiet * 2) * px;
+  cv.style.width = "196px"; cv.style.height = "196px";
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = "#14191A";
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++)
+    if (matrix[y][x]) ctx.fillRect((x + quiet) * px, (y + quiet) * px, px, px);
+}
+
+/* ── boot ───────────────────────────────────────────────── */
+render();
+drawQR();
+drawGuilloche();
+window.addEventListener("resize", drawGuilloche);
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawGuilloche);
+new MutationObserver(drawGuilloche).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+</script>
+</body>
+</html>

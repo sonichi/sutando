@@ -872,6 +872,29 @@ def mutation_request_allowed(origin, host, content_type, *, expect_body,
     return True, None
 
 
+def stand_card_response() -> tuple[int, str, bytes]:
+    """The Stand Card page (owner design 2026-08-31), fed by `bin/sutando stand
+    --json` when the runtime answers; the page falls back to its baked sample
+    and labels itself accordingly, so this route never 500s on a dead daemon."""
+    page = Path(__file__).parent / "dashboard-stand-card.html"
+    if not page.exists():
+        return 404, "text/plain", b"dashboard-stand-card.html missing"
+    html = page.read_text()
+    try:
+        out = subprocess.run(
+            [str(Path(__file__).parent.parent / "bin" / "sutando"), "stand", "--json"],
+            capture_output=True, text=True, timeout=6,
+            cwd=str(Path(__file__).parent.parent),
+        ).stdout
+        data = json.loads(out)
+        if isinstance(data, dict) and "stand" in data:
+            inject = "<script>window.SUTANDO_STAND_RAW = %s;</script>\n<script>" % json.dumps(data)
+            html = html.replace("<script>", inject, 1)
+    except Exception:
+        pass
+    return 200, "text/html; charset=utf-8", html.encode()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     # Drop connections that go silent (e.g. browser speculative preconnects
     # that open TCP and never send a request line). Without this, readline()
@@ -954,6 +977,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_response(404)
                 self.end_headers()
+        elif urlparse(self.path).path == "/stand-card":
+            code, ctype, body = stand_card_response()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.end_headers()
+            self.wfile.write(body)
         elif urlparse(self.path).path == "/stand-identity":
             si_file = personal_path("stand-identity.json")
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
