@@ -291,14 +291,6 @@ pre.json .n { color: var(--warn); }
     <span class="brand-mark">Stand Card</span>
     <span class="brand-note" id="view-source">live state · bin/sutando stand</span>
   </div>
-  <div class="switch">
-    <span class="switch-label">Viewing as</span>
-    <div class="seg" role="group" aria-label="Card visibility level">
-      <button type="button" data-level="public" aria-pressed="false">Public</button>
-      <button type="button" data-level="owner" aria-pressed="true">Owner</button>
-      <button type="button" data-level="diagnostics" aria-pressed="false">Diagnostics</button>
-    </div>
-  </div>
 </header>
 
 <main class="shell">
@@ -315,6 +307,7 @@ pre.json .n { color: var(--warn); }
           </div>
           <span class="card-handle">@sutando-qingyun-001:ag2.space</span>
           <span class="card-about" id="card-about" style="display:none;font-size:12px;color:var(--ink-2)"></span>
+          <span id="card-meta" style="display:none;gap:6px;flex-wrap:wrap;margin-top:4px"></span>
           <span class="card-claim" id="card-claim"></span>
         </div>
       </div>
@@ -360,7 +353,6 @@ pre.json .n { color: var(--warn); }
         <p class="sec-note" id="channels-note"></p>
       </div>
       <div class="rows" id="channel-rows"></div>
-      <div class="notice notice-warn" id="channels-notice"></div>
     </section>
 
 </div>
@@ -577,9 +569,7 @@ function render() {
     : "STAND<<SUTANDO<<QINGYUN<<001<<AG2.SPACE<<ACTIVE<<BINDINGS:" + linked.length;
 
   const list = level === "public" ? publicChannels() : VIEW.channels;
-  $("#channels-note").innerHTML = level === "public"
-    ? `<b>${list.length}</b> published · a channel appears here only once verified <b>and</b> linked`
-    : `<b>${linked.length}</b> linked of ${VIEW.channels.length} · click a row for its trust chain`;
+  $("#channels-note").innerHTML = `<b>${linked.length}</b> linked of ${VIEW.channels.length} \u00b7 click a row for its trust chain`;
 
   $("#channel-rows").innerHTML = list.length ? list.map((c) => `
     <button type="button" class="row ${rowTone(c)}" data-channel="${c.key}">
@@ -592,14 +582,7 @@ function render() {
     </button>`).join("")
     : `<div style="padding:22px 18px" class="sec-note">No channel is both verified and linked, so the public card publishes none.</div>`;
 
-  const notice = $("#channels-notice");
-  if (level === "public") {
-    notice.className = "notice";
-    notice.innerHTML = "<span>This is what a collaborator sees today: a named Stand with an owner, and <b>no provable entrance</b>. One channel has a verified provider identity, but no binding claims it — publishing that channel would assert a relationship no record supports.</span>";
-  } else {
-    notice.className = "notice notice-warn";
-    notice.innerHTML = `<span><b>${pending.length ? "discord is verified but unlinked" : "Nothing awaiting approval"}</b> — the identity <span class="mono">bot_user:1504316176686120980</span> is proven to exist and to be controlled by this credential. Nothing yet says it speaks for Sutando. That link is an owner decision, and it is the one action the card exists to prompt.</span>`;
-  }
+
 
 
   // owner
@@ -805,23 +788,13 @@ function toast(msg) {
 }
 
 /* ── events ─────────────────────────────────────────────── */
-document.querySelectorAll(".seg button").forEach((b) => {
-  b.addEventListener("click", () => {
-    level = b.dataset.level;
-    document.querySelectorAll(".seg button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
-    render();
-    if (currentChannel && $("#drawer").classList.contains("open")) openDrawer(currentChannel);
-  });
-});
-
-
 /* Live profile from the hosting client (space.ag2.identity via postMessage).
    The client owns the write path (update-agent API); the card only renders. */
 let PROFILE = null;
 window.addEventListener("message", (ev) => {
   const d = ev.data;
   if (!d || d.type !== "stand-profile" || !d.profile) return;
-  PROFILE = d.profile;
+  PROFILE = Object.assign(PROFILE || {}, d.profile);
   if (PROFILE.names) {
     WORKERS.forEach((w) => { if (PROFILE.names[w.seat]) w.name = PROFILE.names[w.seat]; });
     renderWorkersSection();
@@ -835,11 +808,27 @@ window.addEventListener("message", (ev) => {
     el.textContent = PROFILE.description;
     el.style.display = "";
   }
+  const meta = $("#card-meta");
+  if (meta) {
+    const chips = [];
+    if (PROFILE.messageStyle) chips.push(`style: ${PROFILE.messageStyle}`);
+    if (PROFILE.decorators) chips.push(`decorators: ${PROFILE.decorators}`);
+    if (PROFILE.canonicalDmName) chips.push(`DM: ${PROFILE.canonicalDmName}`);
+    meta.innerHTML = chips.map((c) => `<span class="chip">${esc(c)}</span>`).join("");
+    meta.style.display = chips.length ? "flex" : "none";
+  }
   const src = document.getElementById("view-source");
   if (src) src.textContent = "live state \u00b7 sutando stand + identity document";
 });
 $("#card-avatar").addEventListener("click", () => {
-  if (window.parent !== window) window.parent.postMessage({ type: "stand-card:edit-profile" }, "*");
+  if (window.parent !== window) window.parent.postMessage({ type: "stand-card:pick-avatar" }, "*");
+});
+window.addEventListener("message", (ev) => {
+  const d = ev.data;
+  if (!d || d.type !== "stand-card:avatar-status") return;
+  if (d.status === "uploading") toast("Uploading avatar\u2026");
+  else if (d.status === "done") toast("Avatar updated");
+  else if (d.status === "error") toast(d.message || "Avatar upload failed");
 });
 
 document.addEventListener("click", (ev) => {
