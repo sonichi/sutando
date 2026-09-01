@@ -390,42 +390,6 @@ pre.json .n { color: var(--warn); }
       </div>
     </section>
 
-    <div class="divider">
-      <span class="divider-label">Design notes</span>
-      <p class="footnote" style="margin:0">Everything below explains the model behind the card. It is prototype commentary, not part of any visibility level — a real Public card ends above this line.</p>
-    </div>
-
-    <section class="sec" id="sec-matrix">
-      <div class="sec-head">
-        <h2 class="sec-title">Two axes, not one status</h2>
-        <p class="sec-note">Verification proves an identity exists. Binding admits it as this Stand.</p>
-      </div>
-      <div class="matrix" id="matrix"></div>
-      <p class="footnote">The CLI collapses these into single strings — <b>configured_unverified</b>, <b>verified_unlinked</b>. Both are combinations of the two axes above, and the card can only be honest if the view exposes them separately. Only the middle-right cell may render green.</p>
-    </section>
-
-    <section class="sec">
-      <div class="sec-head">
-        <h2 class="sec-title">What the card needs that the CLI does not emit</h2>
-        <p class="sec-note">Every row here is currently rendered as <span class="unreported">not reported</span>.</p>
-      </div>
-      <div class="gaps" id="gaps"></div>
-    </section>
-
-    <section class="sec" id="sec-json">
-      <div class="sec-head">
-        <h2 class="sec-title">The view behind the card</h2>
-        <p class="sec-note"><span class="mono">stand</span> → Owner card · <span class="mono">stand --detail</span> → Diagnostics.</p>
-      </div>
-      <div class="json-wrap">
-        <div class="json-head">
-          <span class="json-cmd">$ <b>bin/sutando stand</b> --json<span id="json-flag"></span></span>
-          <button type="button" class="btn btn-sm" id="copy-json">Copy</button>
-        </div>
-        <pre class="json" id="json-out"></pre>
-      </div>
-      <p class="footnote">The card renders this object and nothing else. It does not read <span class="mono">.claude-sutando/channels/</span>, so a folder on disk can never produce a green row — which is exactly why <b>ag2space [production]</b> stays grey even though its subject evidence already spells out the Stand ID.</p>
-    </section>
   </div>
 </main>
 
@@ -657,7 +621,6 @@ function render() {
     notice.innerHTML = `<span><b>${pending.length ? "discord is verified but unlinked" : "Nothing awaiting approval"}</b> — the identity <span class="mono">bot_user:1504316176686120980</span> is proven to exist and to be controlled by this credential. Nothing yet says it speaks for Sutando. That link is an owner decision, and it is the one action the card exists to prompt.</span>`;
   }
 
-  renderMatrix();
 
   // owner
   const evidence = VIEW.channels.filter((c) => c.ownerEvidence);
@@ -700,31 +663,6 @@ function render() {
     </div>`).join("")
     + `<div class="tile"><div class="tile-head"><span class="tile-kind">Runtime instances</span></div><div class="tile-line"><span class="unreported">None reported. A device, an installation and a running instance are three different things; the view currently has only the first.</span></div></div>`;
 
-  // gaps
-  $("#gaps").innerHTML = GAPS.map(([f, why]) => `<div class="gap"><span class="gap-field">${esc(f)}</span><span class="gap-why">${esc(why)}</span></div>`).join("");
-
-  $("#json-flag").textContent = level === "diagnostics" ? " --detail" : "";
-  $("#json-out").innerHTML = highlight(JSON.stringify(buildPayload(), null, 2));
-}
-
-function renderMatrix() {
-  const cols = [["unverified", "Unverified"], ["verified", "Verified"], ["failed", "Rejected"]];
-  const rows = [["unlinked", "Unlinked"], ["linked", "Linked"], ["revoked", "Revoked"]];
-  let html = `<div class="mh"></div>` + cols.map(([, t]) => `<div class="mh">${t}</div>`).join("");
-  rows.forEach(([rk, rt]) => {
-    html += `<div class="rh">${rt}</div>`;
-    cols.forEach(([ck]) => {
-      const here = VIEW.channels.filter((c) => c.identity === ck && c.binding === rk);
-      const isOk = ck === "verified" && rk === "linked";
-      const isAction = ck === "verified" && rk === "unlinked";
-      const cls = isOk ? "cell-ok" : isAction && here.length ? "cell-action" : "";
-      const body = here.length
-        ? here.map((c) => `<span class="cell-chip">${esc(label(c))}</span>`).join("")
-        : `<span class="cell-note">${isOk ? "the only green state" : ""}</span>`;
-      html += `<div class="${cls}">${body}</div>`;
-    });
-  });
-  $("#matrix").innerHTML = html;
 }
 
 function buildPayload() {
@@ -917,10 +855,6 @@ document.addEventListener("click", (ev) => {
 $("#copy-id").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText(VIEW.stand.id); toast("Stand ID copied"); }
   catch { toast(VIEW.stand.id); }
-});
-$("#copy-json").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText(JSON.stringify(buildPayload(), null, 2)); toast(`IdentityView (${level}) copied`); }
-  catch { toast("Copy unavailable in this context"); }
 });
 $("#show-qr").addEventListener("click", () => {
   $("#qr-modal").classList.add("open");
