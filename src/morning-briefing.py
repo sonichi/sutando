@@ -10,6 +10,7 @@ Output: results/proactive-<ts>.txt (voice speaks it) + Discord DM.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -154,7 +155,16 @@ def _google_cache_configured() -> bool:
     off the schema — means blind, and a blind source is never a clear day.
     Parsing it to decide this inverted the answer on exactly those hosts.
     """
-    return CALENDAR_CACHE_FILE.exists()
+    try:
+        # Lexical: a dangling symlink is a BROKEN cache, and exists() calls it
+        # absent — the one filesystem shape that renders a false clear day.
+        os.lstat(CALENDAR_CACHE_FILE)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A probe that cannot answer is not evidence of absence.
+        return True
+    return True
 
 
 def _parse_start(ev: dict):

@@ -94,6 +94,21 @@ class TestLocalEmptyIsNotClear(unittest.TestCase):
         self.cache.write_text("")
         self.assertIsNone(self._run())
 
+    def test_a_dangling_symlink_is_blind_not_clear(self):
+        """A broken symlink IS a cache this host writes, but `exists()` follows
+        it and answers False — the false-clear reached by filesystem shape."""
+        self.cache.symlink_to(Path(self.tmp.name) / "never-written.json")
+        self.assertFalse(self.cache.exists())     # the trap the old check fell into
+        self.assertTrue(self.cache.is_symlink())  # yet the path is plainly present
+        self.assertIsNone(self._run())
+
+    def test_a_truly_absent_cache_still_reports_verified_empty(self):
+        """Negative control for the case above: without it, a fix that returned
+        True unconditionally would pass and leave every host permanently blind."""
+        self.assertFalse(self.cache.is_symlink())
+        self.assertFalse(self.cache.exists())
+        self.assertEqual(self._run(), [])
+
     def test_rendering_differs_between_the_two_states(self):
         """Pin the user-visible property: one says clear, the other does not."""
         def line(events):
