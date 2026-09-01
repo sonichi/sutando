@@ -553,5 +553,92 @@ class GateCapabilitySkipIsAnnounced(unittest.TestCase):
         self.assertIn("gate capability NOT CHECKED", buf.getvalue())
 
 
+class ProbeFailureDefaultsAreDeliberate(unittest.TestCase):
+    """Every probe here can fail, and the three defaults disagree on purpose.
+
+    Each probe feeds an assertion of a different polarity, and each default is
+    the one that declines to assert: never refuse a reviewer, and never claim a
+    relationship, on the strength of a probe that did not answer. Read as return
+    values alone the trio looks inconsistent, which is why the direction is
+    pinned here per probe rather than left to be re-derived.
+    """
+
+    @staticmethod
+    def _raising(exc):
+        return type("S", (), {"run": staticmethod(lambda *a, **k: (_ for _ in ()).throw(exc)),
+                              "TimeoutExpired": Exception})
+
+    def test_gate_capability_returns_unverified_when_the_probe_raises(self):
+        m = _load()
+        m.subprocess = self._raising(OSError("boom"))
+        can, why = m.gate_capability("o/r", "who")
+        # None, not False: a probe that did not run has not shown anyone unable
+        # to approve, and main() prints on None while refusing on False.
+        self.assertIsNone(can)
+        self.assertIn("OSError", why)
+
+    def test_gate_capability_returns_unverified_when_gh_exits_nonzero(self):
+        m = _load()
+        m.subprocess = type("S", (), {
+            "run": staticmethod(lambda *a, **k: type("R", (), {
+                "stdout": "", "stderr": "", "returncode": 4})()),
+            "TimeoutExpired": Exception})
+        can, why = m.gate_capability("o/r", "who")
+        self.assertIsNone(can)
+        self.assertIn("rc=4", why)
+
+    def test_is_collaborator_defaults_to_TRUE_so_the_wording_stays_milder(self):
+        m = _load()
+        m.subprocess = self._raising(OSError("boom"))
+        # True keeps gate_capability saying "read", the weaker claim. False would
+        # print "not a collaborator" — asserting an absent relationship on no
+        # evidence, which is the bug 63d18d2c fixed in the other direction.
+        self.assertIs(m._is_collaborator("o/r", "who"), True)
+
+    def test_is_github_user_defaults_to_FALSE_and_that_is_not_a_contradiction(self):
+        m = _load()
+        m.subprocess = self._raising(OSError("boom"))
+        # Opposite literal, same rule: True here would assert an unprobed key IS
+        # a login. False degrades to "no login found", and the capability probe
+        # then reports unverified rather than refusing.
+        self.assertIs(m._is_github_user("who"), False)
+
+    def test_the_two_defaults_compose_to_send_with_a_caveat_not_to_refuse(self):
+        # The property that matters is not either literal but their composition:
+        # with every probe failing, a reviewer is still notified.
+        m = _load()
+        m.subprocess = self._raising(OSError("boom"))
+        login, _ = m._github_login("who", {"who": {"stand": "@w:x", "room": "!r"}})
+        can, _ = m.gate_capability("o/r", login)
+        self.assertIsNot(can, False)
+
+
+class AliasProbeIsAnnounced(unittest.TestCase):
+    """Probing under a different name than the one asked for must be visible."""
+
+    def test_the_substituted_login_is_named_on_stderr(self):
+        m = _load()
+        m.load_roster = lambda: {
+            "stand-only": {"stand": "@s:x", "room": "!r", "same_actor_as": "real-login"},
+            "b": {"stand": "@b:x", "room": "!r"}}
+        m.stand_present_in_room = lambda t: (True, "2 members")
+        m._is_github_user = lambda login: login == "real-login"
+        m.gate_capability = lambda repo, login: (True, "write")
+        m.send_to_stand = lambda *a, **k: type("R", (), {
+            "returncode": 0, "stdout": "ok", "stderr": ""})()
+        m.record_asks = lambda *a, **k: 1
+        buf = io.StringIO()
+        argv = ["nr", "--reviewers", "stand-only,b", "--kind", "ask",
+                "--message", "please review https://github.com/o/r/pull/1"]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(buf), \
+                contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+        err = buf.getvalue()
+        self.assertIn("stand-only: probing GitHub as real-login", err)
+        # Control: the reviewer whose key IS the login gets no such line, so the
+        # assertion above cannot be satisfied by a message printed for everyone.
+        self.assertNotIn("b: probing GitHub as", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
