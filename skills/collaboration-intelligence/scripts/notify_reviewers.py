@@ -110,13 +110,14 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
         # One person can hold several roster keys, so counting NAMES lets the
         # two-reviewer gate in main() pass on one recipient addressed twice.
         actor = actor_of.get(name, name)
-        prior = covered.get(actor) or covered.get(stand)
+        # Tagged keys: a single dict would alias a roster key against an mxid.
+        prior = covered.get(("actor", actor)) or covered.get(("stand", stand))
         if prior is not None:
             print(f"DUPLICATE '{name}': same person as '{prior}' "
                   f"({stand}) — already covered, not a second reviewer",
                   file=sys.stderr)
             continue
-        covered[actor] = covered[stand] = name
+        covered[("actor", actor)] = covered[("stand", stand)] = name
         out.append({"name": name, "stand": stand, "room": room,
                     "human": entry.get("human")})
     return out, worst
