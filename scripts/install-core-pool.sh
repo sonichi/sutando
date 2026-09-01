@@ -438,6 +438,8 @@ for i in $CORE_INDICES; do
   <key>EnvironmentVariables</key>
   <dict>
     <key>SUTANDO_CORE_ID</key><string>$i</string>
+    <key>SUTANDO_WORKER_SEAT</key><string>$i</string>
+    <key>SUTANDO_WORKER_ID</key><string>worker-$i</string>
     <key>SUTANDO_CORE_POOL_SIZE</key><string>$N</string>
 $SWEEP_NUDGE_ENTRY
     <key>POOL_REPO_DIR</key><string>$REPO_DIR</string>

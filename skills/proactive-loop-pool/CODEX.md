@@ -113,7 +113,7 @@ task: <id>
 EOF
 ```
 
-End every user-facing body with `— core-<n>`, plain text, never bracketed.
+End every user-facing body with `— worker-<n>` (formerly core-<n>; owner renamed 2026-08-31), plain text, never bracketed.
 
 ## What a Codex follower must not do
 
