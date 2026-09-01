@@ -9018,8 +9018,8 @@ def check_vault_manifest_integrity(
                            f"'{account}' — treating as an unverifiable keychain, not as divergence")}
     src = " (read via the LEGACY fallback — canonical manifest absent)" if via_legacy else ""
     if not phantom:
-        # Name them, don't just count them: this line is where an agent about to
-        # say "I can't, it needs credential X" finds out that X is already here.
+        # Where an agent about to say "I can't, it needs X" learns X is held. 12,
+        # not the warn branch's 6: that answers only if the roster is near-whole.
         held = ", ".join(sorted(backed)[:12]) + (f", +{len(backed) - 12} more" if len(backed) > 12 else "")
         return {"name": name, "status": "ok",
                 "detail": f"all {len(backed)} advertised key(s) resolve in Keychain{src} — {held}"}

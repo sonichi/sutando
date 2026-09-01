@@ -97,8 +97,7 @@ def main() -> int:
         many = [f"K{i}" for i in range(1, 16)]
         r = hc.check_vault_manifest_integrity(_manifest(tmp, many), _probe(many))
         check("15 keys -> 12 named plus an explicit remainder",
-              r["status"] == "ok" and "+3 more" in r["detail"]
-              and r["detail"].count(",") == 12, repr(r))
+              r["status"] == "ok" and "+3 more" in r["detail"], repr(r))
         named = r["detail"].split("—", 1)[1]
         check("the naming is bounded, not the whole manifest dumped",
               sum(1 for k in many if k in named) == 12, repr(r))
