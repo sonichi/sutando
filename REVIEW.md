@@ -281,23 +281,29 @@ and loads whichever repo it reviews.
     time, which is exactly why the re-read is necessary rather than optional. The current state, not the
     remembered one, is what authorizes.
 
-18. **A test that never ran cannot fail — assert the collected COUNT moved before you interpret
-    a discrimination result.** The standard proof that a new test earns its place is: revert the
+18. **A test that never ran cannot fail — verify the runner collected the expected new tests,
+    by count and, where available, by name, before you interpret a discrimination result.** The standard proof that a new test earns its place is: revert the
     source, keep the test, watch it fail. That inference is sound only if the test *ran*, and the
     two failure modes are invisible in the diff and produce output identical to "the test does not
     discriminate" — which is a blocking review finding. Read the runner's own count, and require it
     to move by the number of tests added.
     *Grounded by:* two independent instances on 2026-09-01, in different runner idioms, neither
     detectable by reading the change. In `tests/morning-briefing-pending-extract.test.py` a new
-    class was appended *below* the file's `if __name__ == "__main__": unittest.main()`, so it was
-    defined and never collected — the suite reported `Ran 8 tests OK` with the source reverted AND
-    restored, which reads exactly like a non-discriminating test. Moving the class above the guard
+    class was appended *below* the file's `if __name__ == "__main__": unittest.main()`. Run as
+    `__main__` that call raises `SystemExit`, so execution stops there and **the class is never
+    even defined** (verified: a `print` on the following line does not fire, and `runpy` with
+    `run_name="__main__"` exits at that point; the same file *imported* defines both classes).
+    The suite reported `Ran 8 tests OK` with the source reverted AND restored, which reads exactly
+    like a non-discriminating test. Moving the class above the guard
     gave `Ran 10 tests` and the reverted arm then failed with `'Top item' unexpectedly found`. On a
     peer's host the same night, `tests/task-workstreams.test.py` drives an explicit list at the
     bottom of the file; a test added without registering in that list was defined, never called,
     and passed at the parent commit. Different mechanisms, one symptom: **the file changed and the
-    executed set did not.** The count is the only signal that separates them — outcomes cannot,
-    because "passed" and "never ran" render the same.
+    executed set did not.** Outcomes cannot separate them — "passed" and "never ran" render the
+    same — so use the runner's own report of what it collected: the count always, and the test
+    NAMES where the runner prints them (`-v`, or a per-test tick). Name enumeration is the stronger
+    signal when available, because it identifies *which* test is missing rather than only that one
+    is.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
