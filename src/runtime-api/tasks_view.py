@@ -32,7 +32,8 @@ from delivery.readiness import read_ready_result
 from local_task_protocol import (find_archived_task, find_result,  # noqa: E402
                                  parse_task_headers_lenient)
 sys.path.insert(0, str(_HERE.parent.parent / "packages" / "ag2-sparrow"))
-from ag2_sparrow.task_archive import find_task_file  # noqa: E402
+from ag2_sparrow.task_archive import (find_task_file,  # noqa: E402
+                                      task_id_from_filename)
 
 _WS_RE = re.compile(r"[\r\n]+")
 
@@ -237,7 +238,9 @@ class TasksView:
             files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
             truncated = len(files) > limit
             for f in files[:limit]:
-                task_id = f.name.split(".claimed-")[0].removesuffix(".txt")
+                # Not a .claimed- split: the lead also renames to .assigned-<inst>,
+                # and a compound id has no result written under it, ever.
+                task_id = task_id_from_filename(f.name) or ""
                 entry = {"taskId": task_id,
                          "state": self.status(task_id)["state"]}
                 try:
