@@ -51,6 +51,7 @@ def main(argv=None) -> int:
     ap.add_argument("--message-style", choices=["stripe", "highlight", "none"])
     ap.add_argument("--highlight-weight", choices=["subtle", "medium", "strong"])
     ap.add_argument("--description")
+    ap.add_argument("--canonical-dm")
     ap.add_argument("--room-avatar")
     ap.add_argument("--clear", action="store_true")
     a = ap.parse_args(argv)
@@ -108,6 +109,8 @@ def main(argv=None) -> int:
         content.setdefault("colors", {})[wid] = col
     if a.description is not None:
         content["description"] = a.description
+    if a.canonical_dm:
+        content["canonicalDm"] = a.canonical_dm
     if a.decorators:
         content["decorators"] = a.decorators
     if a.message_style:
