@@ -18,7 +18,8 @@ Env: MATRIX_HS_URL (e.g. http://localhost:8080), MATRIX_AS_TOKEN (appservice
 token), AGENT_MXID (user to act as). Usage:
   display.py <room_id> [--profile] [--stripe on|off] [--base-color '#rrggbb']
              [--corner tl|tr|bl|br] [--shape corner|star]
-             [--worker-color <id>=<#rrggbb> ...] [--description TEXT]
+             [--worker-color <id>=<#rrggbb> ...] [--worker-name <id>=<Name> ...]
+             [--description TEXT]
              [--room-avatar <mxc-uri>] [--clear]
 Merges onto the existing document unless --clear is given. With --profile the
 room_id is ignored for the write but still required positionally.
@@ -56,6 +57,7 @@ def main(argv=None) -> int:
     ap.add_argument("--corner", choices=["tl", "tr", "bl", "br"])
     ap.add_argument("--shape", choices=["corner", "star"])
     ap.add_argument("--worker-color", action="append", default=[])
+    ap.add_argument("--worker-name", action="append", default=[])
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--decorators", choices=["on", "off", "auto"])
     ap.add_argument("--message-style", choices=["stripe", "highlight", "none"])
@@ -122,6 +124,12 @@ def main(argv=None) -> int:
             print(f"display.py: bad --worker-color {wc!r}", file=sys.stderr)
             return 2
         content.setdefault("colors", {})[wid] = col
+    for wn in a.worker_name:
+        wid, _, name = wn.partition("=")
+        if not (wid and name.strip()):
+            print(f"display.py: bad --worker-name {wn!r} (want id=Name)", file=sys.stderr)
+            return 2
+        content.setdefault("names", {})[wid] = name.strip()
     if a.description is not None:
         content["description"] = a.description
     if a.canonical_dm:

@@ -117,6 +117,15 @@ class DisplayBranches(unittest.TestCase):
         self.assertEqual(display.main(["!r:test", "--base-color", "red"]), 2)
         self.assertEqual(display.main(["!r:test", "--worker-color", "w1=red"]), 2)
 
+    def test_worker_name_persists_and_blank_is_usage_error(self):
+        seen = {}
+        display._req = lambda url, tok, method="GET", body=None: (
+            seen.update({"body": body}) or (200, {}))
+        rc = display.main(["!r:test", "--clear", "--worker-name", "worker-1=Scout"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["body"]["names"], {"worker-1": "Scout"})
+        self.assertEqual(display.main(["!r:test", "--worker-name", "worker-1=  "]), 2)
+
     def test_profile_merge_reads_existing_inner_document(self):
         def req(url, tok, method="GET", body=None):
             if method == "GET":
