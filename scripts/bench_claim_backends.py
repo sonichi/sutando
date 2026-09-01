@@ -302,11 +302,8 @@ def main(argv=None) -> int:
         for w in proc_counts:
             s[f"procs_{w}"] = bench_procs(kind, proc_items, w, k1)
         s["unknown_recover"] = bench_unknown_recover(kind, 100, k1)
-        # Archive history is a THROUGHPUT measurement, and --quick is the CI smoke
-        # path where no caller asserts archive_*. At 2000 it costs ~4000 claims,
-        # each a locked acquire plus a flushed write (~16ms), which is where the
-        # smoke test spends nearly all of its wall time. Keep the shape, drop the
-        # scale: the same code paths run, the numbers just stop being publishable.
+        # archive_* is a throughput number no caller asserts, and 2000 history is
+        # ~4000 claims at ~16ms each — 60% of the --quick smoke run.
         _arch_hist = 20 if args.quick else 2000
         s["archive_0"] = bench_archive_scale(kind, 0, 50, k1)
         s[f"archive_{_arch_hist}"] = bench_archive_scale(kind, _arch_hist, 50, k1)
