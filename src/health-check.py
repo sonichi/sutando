@@ -561,6 +561,9 @@ def check_voice_stack(
             REPO_DIR / "src" / "voice-agent.ts",
             "voice-agent.ts",
         )
+    # Read liveness before composing: a non-veto pin (EXPIRED/ORPHAN) escalates
+    # ok->warn, and the dependent checks below ask about liveness, not remedy.
+    voice_check["live"] = voice_check["status"] == "ok"
     # Full composition on EVERY branch: a healthy replacement still owes any
     # ORPHAN/MISMATCH/EXPIRED finding, and a failed probe still owes the veto.
     _, _vls = _proc_lstarts("voice-agent[.]ts|voice-agent[.]js")
@@ -4137,7 +4140,12 @@ def check_voice_watchers(voice_check: dict) -> dict:
     # A pinned process is running, so the parse below still holds. Returning
     # early here would let the pin suppress the diagnosis, not just the remedy.
     _veto = voice_check.get("restart_veto")
-    if vs != "ok" and not _veto:
+    # `live` is the pre-composition read; absent (direct callers) fall back to
+    # status. A non-veto pin must not suppress the diagnosis, only the remedy.
+    _live = voice_check.get("live")
+    if _live is None:
+        _live = vs == "ok"
+    if not _live and not _veto:
         check["status"] = "warn"
         check["detail"] = _voice_dep_detail(voice_check)
         return check
@@ -4222,7 +4230,12 @@ def check_voice_transport(voice_check: dict) -> dict:
     # A pinned process is running, so the parse below still holds. Returning
     # early here would let the pin suppress the diagnosis, not just the remedy.
     _veto = voice_check.get("restart_veto")
-    if vs != "ok" and not _veto:
+    # `live` is the pre-composition read; absent (direct callers) fall back to
+    # status. A non-veto pin must not suppress the diagnosis, only the remedy.
+    _live = voice_check.get("live")
+    if _live is None:
+        _live = vs == "ok"
+    if not _live and not _veto:
         check["status"] = "warn"
         check["detail"] = _voice_dep_detail(voice_check)
         return check
