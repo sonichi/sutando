@@ -106,8 +106,13 @@ state.
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
 
-    ↻ = a cron job fires the `/proactive-loop` skill every 15 minutes
-        (`*/15 * * * *` in the per-host `crons.json`). The skill
+    ↻ = a cron job normally fires the `/proactive-loop` skill every 15 minutes
+        (`*/15 * * * *` in the per-host `crons.json`). On Claude, Sutando
+        automatically backs that loop off to every 30 minutes when 7-day
+        quota utilization reaches 80%, then restores the configured cadence
+        after an authoritative, routed quota reading drops below the threshold.
+        Missing, stale, rejected, or unrouted telemetry holds the safer 30-minute
+        cadence and reports the reason instead of silently restoring a fast loop. The skill
         runs as a 10-minute pass that keeps a persistent watcher on
         `tasks/` via Claude Code's `Monitor` tool — pending tasks are
         processed the moment they arrive, not just on the cron tick.
@@ -365,7 +370,13 @@ To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sut
 - Learns from your corrections and adapts over time
 - Notifies you on Discord and voice when it completes autonomous work
 
-It consumes API quota proportional to how much work it finds to do.
+It consumes API quota proportional to how much work it finds to do. The Claude
+core protects weekly headroom by changing the autonomous loop to a 30-minute
+cadence at 80% 7-day utilization and restoring the configured cadence after the
+quota window resets and an authoritative routed reading confirms recovery. Unavailable
+telemetry reports whether it is stale, rejected, or unrouted while retaining the safer
+cadence. Owner tasks still arrive immediately through the streaming
+watcher while the autonomous loop is throttled.
 
 Autonomous self-development is enabled by default. To run Sutando in a stable
 product context without idle-time code evolution, set

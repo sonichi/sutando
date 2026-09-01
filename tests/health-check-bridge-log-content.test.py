@@ -45,6 +45,20 @@ startup_only = [
 result = hc.bridge_log_content_status("slack-bridge", "ok", startup_only)
 check("startup hint with no events after it → warns", result is not None and result[0] == "warn")
 
+# ── slack-bridge: the remedy RANKS causes, it does not assert one (#3230) ──────
+# slack_state injected: uninjected resolves the host's access.json, so CI differs.
+_enrolled = hc.bridge_log_content_status("slack-bridge", "ok", startup_only,
+                                         slack_state="enrolled")
+msg = _enrolled[1] if _enrolled else ""
+check("remedy states what was measured, not a presumed cause",
+      "since this bridge started" in msg, msg)
+check("remedy offers the benign restart explanation first",
+      "restarted" in msg, msg)
+check("remedy still names the config cause as the conditional one",
+      "Event Subscriptions" in msg, msg)
+check("remedy does not read as a bare config imperative",
+      not msg.startswith("connected but events not arriving — enable"), msg)
+
 # ── slack-bridge: startup hint followed by real activity → false positive fixed ──
 
 with_activity = startup_only + [

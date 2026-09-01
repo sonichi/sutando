@@ -393,6 +393,9 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-user::before { content: 'You: '; font-weight: 600; color: #5a9fd4; }
   .t-assistant { color: #a8d8b0; }
   .t-assistant::before { content: 'Sutando: '; font-weight: 600; color: #6dbe82; }
+  .t-working { opacity: 0.6; font-style: italic; }
+  @keyframes t-working-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.7; } }
+  .t-working { animation: t-working-pulse 1.4s ease-in-out infinite; }
   .t-system { color: var(--ui-text-2); font-size: 14px; }
   .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 16px; }
   .t-interim::before { content: 'You: '; font-weight: 600; }
@@ -934,6 +937,13 @@ function getDefaultWsUrl() {
   return protocol + '//' + hostname + ':' + WS_PORT;
 }
 
+// #bottom-panel is position:fixed and grows to 50vh, so a static body
+// padding-bottom cannot reserve its space — keep the two in sync.
+function syncBottomPad() {
+  const bp = $('bottom-panel');
+  if (bp) document.body.style.paddingBottom = (bp.offsetHeight + 12) + 'px';
+}
+
 // Set default WebSocket URL on page load + init Chrome STT
 // Descriptions are local UI copy keyed by the stable action name; the KEY
 // bindings come from /hotkeys (the app's published config) so they never drift.
@@ -961,6 +971,14 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Reserve bottom space equal to the fixed panel's height so the chat history
+  // never covers the dashboard (e.g. the Questions panel).
+  try {
+    const bp = $('bottom-panel');
+    if (bp && window.ResizeObserver) { new ResizeObserver(syncBottomPad).observe(bp); }
+    syncBottomPad();
+    window.addEventListener('resize', syncBottomPad);
+  } catch {}
   // Restore the chat transcript saved before the last reload, then watch for
   // new entries to persist.
   try { initTranscriptPersistence(); } catch {}
@@ -2969,6 +2987,127 @@ window.toggleActivity = toggleActivity;
 window.showNotesInDR = showNotesInDR;
 window.showNoteInDR = showNoteInDR;
 
+// ─── Web-chat send-path persistence ──────────────────────
+// When voice is disconnected, sendText() routes through the task bridge and
+// polls /result for the late reply (core pickup is 10-32s). The poll used to
+// live in an in-page setInterval closure that died on page reload, so a refresh
+// during the wait dropped the reply forever. Persist {task_id, text} to
+// localStorage and resume polling on load so a reload re-attaches and renders
+// the reply. /result/<id> serves from results/archive too, so the reply
+// survives the bridge archiving the file before the resumed poll runs.
+const PERSIST_KEY_CHAT_PENDING = 'sutando-dashboard-chat-pending-v1';
+// Long-running agent tasks (PR creation, research, multi-step analysis) routinely
+// take many minutes. A short poll cap orphaned the reply: the result landed in the
+// Tasks tab but the transcript was stuck on a dead "(No response yet…)" line forever.
+// Keep polling well past the first minute (backing the cadence off once past the
+// fast window), and on the hard ceiling stop the in-page timer but KEEP the
+// persisted entry so a reload re-attaches and still renders the late reply.
+const CHAT_POLL_FAST_MS = 2 * 1000;            // cadence during the fast window
+const CHAT_POLL_SLOW_MS = 15 * 1000;           // cadence after the fast window
+const CHAT_POLL_FAST_WINDOW_MS = 2 * 60 * 1000;// poll every 2s for the first 2 min
+const CHAT_POLL_MAX_MS = 30 * 60 * 1000;       // ceiling for ONE page session's polling
+// Must stay strictly greater than the poll ceiling: an entry kept for a reload
+// to recover is by definition already older than the ceiling that stopped it.
+const CHAT_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+function loadPendingChatSends() {
+  try {
+    const cutoff = Date.now() - CHAT_PENDING_TTL_MS;
+    return JSON.parse(localStorage.getItem(PERSIST_KEY_CHAT_PENDING) || '[]')
+      .filter(p => p && p.task_id && (p.ts || 0) >= cutoff);
+  } catch { return []; }
+}
+function addPendingChatSend(taskId, text) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    list.push({ task_id: taskId, text, ts: Date.now() });
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function removePendingChatSend(taskId) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function renderChatReply(el, resultText) {
+  // Same markdown-or-escaped-text rendering the inline poll used. marked +
+  // DOMPurify both required — marked alone would be unsafe innerHTML on agent
+  // results that originate from external task channels.
+  if (window.marked && window.DOMPurify) {
+    try {
+      el.innerHTML = window.DOMPurify.sanitize(
+        window.marked.parse(resultText, { breaks: true, gfm: true })
+      );
+    } catch (e) {
+      el.textContent = resultText;
+    }
+  } else {
+    el.textContent = resultText;
+  }
+  el.classList.remove('t-working');
+  addCopyBtn(el);
+}
+// Poll the task bridge for a chat reply and render it into placeholderEl when
+// it arrives. Backs the cadence off after the fast window. On completion it
+// clears the persisted entry; on the ceiling it stops this session's timer but
+// KEEPS the entry so a reload re-attaches and still renders the reply (the
+// result is served from results/archive indefinitely).
+// sentAt is display/context only. The ceiling deliberately runs from THIS
+// session's start: measuring it from the original send made a resumed poll
+// exceed it on its first tick and return without ever calling /result.
+function pollChatReply(taskId, placeholderEl, sentAt) {
+  const apiBase = 'http://' + location.hostname + ':7843';
+  const begin = Date.now();
+  let timer = null;
+  const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const schedule = (elapsed) => {
+    const delay = elapsed < CHAT_POLL_FAST_WINDOW_MS ? CHAT_POLL_FAST_MS : CHAT_POLL_SLOW_MS;
+    timer = setTimeout(tick, delay);
+  };
+  const tick = () => {
+    const elapsed = Date.now() - begin;
+    if (elapsed > CHAT_POLL_MAX_MS) {
+      stop();
+      // Keep the persisted entry — a reload resumes the poll and can still
+      // render the reply once the (slow) task finishes.
+      if (placeholderEl && placeholderEl.classList.contains('t-working')) {
+        placeholderEl.textContent = '(Still working — the reply will appear here when it lands, or refresh. It is also in the Tasks tab.)';
+        placeholderEl.classList.remove('t-working');
+      }
+      return;
+    }
+    fetch(apiBase + '/result/' + taskId).then(r => r.json()).then(r => {
+      if (r.status === 'completed') {
+        stop();
+        removePendingChatSend(taskId);
+        renderChatReply(placeholderEl, r.result);
+        scrollTranscript();
+      } else {
+        schedule(elapsed);
+      }
+    }).catch(() => { schedule(elapsed); });
+  };
+  tick();
+}
+// On page load, re-render any in-flight chat sends and resume polling so a
+// reload during the core-pickup wait still surfaces the reply.
+function resumePendingChatSends() {
+  const pending = loadPendingChatSends();
+  if (!pending.length) return;
+  pending.forEach(p => {
+    const ue = document.createElement('div');
+    ue.className = 't-entry t-user';
+    ue.textContent = p.text;
+    $('transcript').appendChild(ue);
+    const placeholder = document.createElement('div');
+    placeholder.className = 't-entry t-assistant t-working';
+    placeholder.textContent = 'working…';
+    $('transcript').appendChild(placeholder);
+    pollChatReply(p.task_id, placeholder, p.ts);
+  });
+  scrollTranscript(true);
+}
+
 // ─── Text input ──────────────────────────────────────────
 function sendText() {
   const input = $('textInput');
@@ -2995,36 +3134,18 @@ function sendText() {
       .then(d => {
         if (d.ok) {
           dbg('Sent text via task bridge: ' + d.task_id, 'event');
-          // Poll for result
-          const poll = setInterval(() => {
-            fetch(apiBase + '/result/' + d.task_id).then(r => r.json()).then(r => {
-              if (r.status === 'completed') {
-                clearInterval(poll);
-                const re = document.createElement('div');
-                re.className = 't-entry t-assistant';
-                // Render markdown if marked.js + DOMPurify both loaded; fall
-                // back to escaped textContent otherwise. Both required — marked
-                // alone would be unsafe innerHTML on agent results that
-                // originate from external task channels.
-                // Before this, headings/lists in long replies (e.g. skill
-                // suggestions) came through as raw "###" / "*" characters.
-                if (window.marked && window.DOMPurify) {
-                  try {
-                    re.innerHTML = window.DOMPurify.sanitize(
-                      window.marked.parse(r.result, { breaks: true, gfm: true })
-                    );
-                  } catch (e) {
-                    re.textContent = r.result;
-                  }
-                } else {
-                  re.textContent = r.result;
-                }
-                addCopyBtn(re);
-                $('transcript').appendChild(re);
-                scrollTranscript();
-              }
-            }).catch(() => {});
-          }, 2000);
+          // Persist the in-flight send so a page reload during the core-pickup
+          // wait re-attaches and renders the reply instead of dropping it.
+          addPendingChatSend(d.task_id, text);
+          // Show a "working…" placeholder immediately so the 10-32s wait reads
+          // as in-progress, not failure. The placeholder is filled in place
+          // when the reply arrives.
+          const placeholder = document.createElement('div');
+          placeholder.className = 't-entry t-assistant t-working';
+          placeholder.textContent = 'working…';
+          $('transcript').appendChild(placeholder);
+          scrollTranscript();
+          pollChatReply(d.task_id, placeholder);
         }
       })
       .catch(() => {
@@ -3035,6 +3156,8 @@ function sendText() {
       });
   }
 }
+
+try { resumePendingChatSends(); } catch {}
 
 // ─── Dynamic region: contextual generative UI ────────────
 // Priority: dynamic-content.json > pending questions > proactive status > chips

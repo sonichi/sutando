@@ -41,6 +41,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -75,7 +76,7 @@ def validate_twilio_signature(handler, body: str) -> bool:
 
     # Prefer static base URL to prevent Host header injection bypass.
     # TWILIO_WEBHOOK_URL is the public ngrok/funnel URL Twilio sends webhooks to.
-    base_url = os.environ.get("TWILIO_WEBHOOK_URL", "")
+    base_url = config_get("TWILIO_WEBHOOK_URL", "")
     if base_url:
         url = base_url.rstrip("/") + handler.path
     else:
@@ -105,6 +106,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_config import config_get  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
@@ -127,6 +129,8 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
+                               submit_signal_room_task, submission_status)  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -612,20 +616,55 @@ def delegation_archive_result(data: dict):
     return 200, {"ok": True}
 
 
+def _guard_result_by_tier(task_id: str, body: str) -> str:
+    """Apply the egress secret-scan for a NON-OWNER task's result.
+
+    The deleted Signal Room worker guarded its own output before publishing. Now that
+    results come back through the ordinary result path, the boundary has to live here
+    or untrusted-content work would return raw text to the room. Fail-closed: if the
+    tier cannot be resolved or the scanner errors, the body is withheld rather than
+    passed through.
+    """
+    try:
+        from policy.egress.result import guard_result_for_tier, resolve_access_tier
+        from local_task_protocol import find_archived_task
+        task_file = _safe_path(TASK_DIR, task_id)
+        if not (task_file and task_file.exists()):
+            task_file = find_archived_task(TASK_DIR, task_id)
+        if task_file is None:
+            # No metadata. A Signal Room id is team by construction, so guard it;
+            # anything else predates this lane and stays readable.
+            if not str(task_id).startswith(SIGNAL_TASK_PREFIX):
+                return body
+            tier = SIGNAL_ROOM_TIER
+        else:
+            tier = resolve_access_tier(task_file)
+        if tier == "owner":
+            return body
+        safe, _reason = guard_result_for_tier(body, tier, REPO_DIR)
+        return safe
+    except Exception:
+        return "[result withheld: could not verify it is free of secrets]"
+
+
 def get_task_result(task_id: str):
     """Check if a task result exists."""
     result_file = _safe_path(RESULT_DIR, task_id)
     if result_file and result_file.exists():
-        return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
+        return {"task_id": _safe_id(task_id), "status": "completed",
+                "result": _guard_result_by_tier(task_id, result_file.read_text())}
     # Check archive — task-bridge archives results within seconds of delivery,
     # so direct /result polls often arrive after the file has been moved.
+    # Delegated: the archive move above mints `<id>-<epoch>.txt` on collision, a
+    # layout a month-only scan cannot find. find_archived_result covers all three.
     safe_id = _safe_id(task_id)
     if safe_id:
-        filename = f"{safe_id}.txt"
-        for month_dir in sorted((RESULT_DIR / "archive").glob("*/"), reverse=True):
-            candidate = month_dir / filename
-            if candidate.exists():
-                return {"task_id": safe_id, "status": "completed", "result": candidate.read_text()}
+        archived = local_task_protocol.find_archived_result(RESULT_DIR, task_id)
+        if archived is not None:
+            # Guarded like the live branch: archival is where room polls usually
+            # land, so skipping it here would bypass the boundary in the common case.
+            return {"task_id": safe_id, "status": "completed",
+                    "result": _guard_result_by_tier(task_id, archived.read_text())}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}
@@ -792,6 +831,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json(200, {"status": "idle"})
             else:
                 self.send_json(200, {"status": "idle"})
+        elif path == "/capabilities":
+            # The Signal Room contract's readiness signal: the desktop supervisor asks whether a
+            # guest deep_dive can run RIGHT NOW instead of inspecting this service's internals
+            if not self.check_auth():
+                return
+            try:
+                available, reason = submission_status(TASK_DIR, WORKSPACE_DIR)
+            except Exception as e:
+                available, reason = False, f"capability_error: {e.__class__.__name__}"
+            payload = {"guest_deep_dive": {"available": bool(available)}}
+            if reason:
+                payload["guest_deep_dive"]["reason"] = reason
+            self.send_json(200, payload)
         elif path == "/voice/state":
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
@@ -1270,6 +1322,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
+        # /guest-task — the Signal Room lane.
+        if path == "/guest-task":
+            if not self.check_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
+            # Cap BEFORE reading into memory (same guard as the owner lane): an
+            # untrusted caller must not be able to exhaust memory via Content-Length.
+            if length < 0 or length > 65536:
+                self.send_json(413, {"error": "task request too large"})
+                return
+            try:
+                data = json.loads(self.rfile.read(length).decode() or "{}")
+            except Exception:
+                self.send_json(400, {"error": "invalid JSON"})
+                return
+            task = data.get("task", "")
+            if not isinstance(task, str) or not task.strip():
+                self.send_json(400, {"error": "task is required"})
+                return
+            # task-bridge excludes `task-signal-*` from the voice fallthrough,
+            # so a room result is never narrated into the owner's call.
+            try:
+                task_id = submit_signal_room_task(
+                    task, TASK_DIR, confine_user_content,
+                    room_id=str(data.get("room_id", "")),
+                    requested_by=str(data.get("requested_by", "")),
+                )
+            except SignalRoomBusy as exc:
+                self.send_json(429, {"error": str(exc), "retry_after": 30})
+                return
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (Signal Room, team tier)",
+            })
+            return
+
         if path != "/task":
             self.send_json(404, {"error": "not found"})
             return
@@ -1277,7 +1371,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.check_auth():
             return
 
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self.send_json(400, {"error": "invalid Content-Length"})
+            return
+        # Cap BEFORE reading into memory: an untrusted guest deep_dive could
+        # otherwise exhaust memory via Content-Length without taking a worker slot.
+        if length < 0 or length > 65536:
+            self.send_json(413, {"error": "task request too large"})
+            return
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
@@ -1287,6 +1390,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         from_agent = data.get("from", "unknown")
         task = data.get("task", "")
+        if not isinstance(task, str):
+            self.send_json(400, {"error": "task must be a string"})
+            return
         priority = data.get("priority", "normal")
 
         # Task-file header injection guard. `from_agent` lands on a single
@@ -1306,6 +1412,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if not task:
             self.send_json(400, {"error": "task is required"})
+            return
+
+        # Privilege is NEVER *escalated* by the request body. The route decides the tier:
+        # /guest-task always stamps guest.
+        if "access_tier" in data:
+            if data.get("access_tier") != "guest":
+                self.send_json(400, {"error": "access_tier is not accepted on /task"})
+                return
+            try:
+                task_id = submit_signal_room_task(
+                    task, TASK_DIR, confine_user_content,
+                    room_id=str(data.get("room_id", "")),
+                    # Preserve the shipped clients' attribution instead of flattening
+                    # every legacy poster to "signal-room".
+                    requested_by=str(data.get("requested_by") or from_agent or ""),
+                )
+            except SignalRoomBusy as exc:
+                self.send_json(429, {"error": str(exc), "retry_after": 30})
+                return
+            self.send_json(200, {
+                "ok": True,
+                "task_id": task_id,
+                "result_url": f"/result/{task_id}",
+                "message": "Task accepted (Signal Room, team tier)",
+            })
             return
 
         callback_url = data.get("callback_url", "")
@@ -1418,7 +1549,7 @@ def _resolve_local_ip() -> str:
 
 
 if __name__ == "__main__":
-    bind = os.environ.get("AGENT_API_BIND", "127.0.0.1")
+    bind = config_get("AGENT_API_BIND", "127.0.0.1")
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client stalled mid-request or a handler ran a slow subprocess/urlopen —
     # every later request hung on a port that still looked open to startup.sh's
@@ -1444,6 +1575,16 @@ if __name__ == "__main__":
     print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
         print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+    # A supervised replacement of this gateway (desktop token rotation / adopted-process takeover)
+    # sends SIGTERM.
+    def _reap_and_exit(_signum, _frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _reap_and_exit)
+    except Exception:
+        pass
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

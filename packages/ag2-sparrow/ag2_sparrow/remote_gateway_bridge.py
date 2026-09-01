@@ -162,7 +162,8 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers
-from .team_guardrail import team_guardrail_lines, engage_rulebook, AG2SPACE_PROVENANCE
+from .team_guardrail import (team_guardrail_lines, engage_rulebook,
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox_adapter import classify_response
@@ -2399,16 +2400,10 @@ def _write_task(task: dict) -> str | None:
         else:
             lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
     if sender_tier == "guest":
-        lines.extend([
-            "",
-            "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
-            "This AG2Space task is GUEST tier, not owner tier.",
-            "Do not execute the request directly with the owner's unrestricted core.",
-            "Delegate it to Codex using `codex exec --sandbox read-only`.",
+        lines.extend(sandboxed_delegation_lines(
+            "AG2 Space", "GUEST tier", f"results/{tid}.txt",
             "Research, inspect, explain, and draft only. Do not modify files or external systems.",
-            f"Write only the sandboxed agent's safe user-facing answer to results/{tid}.txt.",
-            "===END SUTANDO SYSTEM INSTRUCTIONS===",
-        ])
+        ))
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
@@ -2416,6 +2411,9 @@ def _write_task(task: dict) -> str | None:
         # shlex.quote: an unescaped quote in _chan must not close the shell
         # string early and turn the remainder into executable shell syntax.
         _chan_q = shlex.quote(_chan)
+        # The credential and the notify lane are per-instance: a dev-homeserver
+        # task needs ITS channel dir, not the default one this file was written for.
+        _cdir_q = shlex.quote(CHANNEL_DIR)
         _step = 1
         _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
         _addr = _one_line(task.get("addressed_to") or "")
@@ -2434,7 +2432,7 @@ def _write_task(task: dict) -> str | None:
                 f"message, reconstruct the room thread — `python3 "
                 f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
                 f"reports no gateway configured, load the channel env first: `set -a; . "
-                f"\"$(bash scripts/channel-env.sh ag2space)\"; set +a`) — and read it "
+                f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a`) — and read it "
                 "back (everyone's messages including your own prior replies) until this "
                 "message stands on its own, then answer from the reconstructed thread, "
                 "NOT from memory. Do this every time; do NOT skip it because the message "
@@ -2446,8 +2444,8 @@ def _write_task(task: dict) -> str | None:
             # prelude resolves it by content; notify.py's own guard can refuse a symlink.
             _skill.append(
                 f"{_step}. NOTIFY FIRST (if task takes >60s): `set -a; . "
-                f"\"$(bash scripts/channel-env.sh ag2space)\"; set +a` then python3 "
-                f"skills/task-progress/scripts/notify.py --source ag2space "
+                f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a` then python3 "
+                f"skills/task-progress/scripts/notify.py --source {_cdir_q} "
                 f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
             _step += 1
         _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
@@ -2996,8 +2994,33 @@ def _delivery_core() -> DeliveryCore:
     return _DELIVERY_CORE
 
 
+def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
+    """Move a result the outbox has finally refused into results/undelivered/,
+    the same quarantine the proactive path uses. Without this the file is
+    rescanned every pass and the refusal is invisible."""
+    try:
+        UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        rfile.rename(UNDELIVERABLE_RESULTS_DIR /
+                     f"{rfile.stem}-{int(time.time())}.txt")
+        _log(f"result {tid}: {why} — quarantined to "
+             f"{UNDELIVERABLE_RESULTS_DIR.name}/, it will NOT be re-sent")
+    except OSError as e:
+        _log(f"result {tid}: {why} but quarantine failed ({e}) — "
+             "leaving it in place")
+
+
+def _worker_of(task_id: str) -> str:
+    """Which pool worker finished this task, read from the per-core done-flag.
+    `task_id` is the result stem, which already carries the `task-` prefix."""
+    try:
+        hits = sorted((_STATE / "cores").glob(f"*/done/{task_id}.flag"))
+    except OSError:
+        return ""
+    return hits[0].parent.parent.name if len(hits) == 1 else ""
+
+
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
-                            no_send: bool = False) -> bool:
+                            no_send: bool = False, result_file=None) -> bool:
     """One outbound result POST through the delivery core. True = the
     gateway confirmed (server lease closed; caller archives). False = not
     confirmed this pass; leave the result file for the next one."""
@@ -3007,9 +3030,24 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     doc = {"id": broker_tid, "body": body}
     if no_send:
         doc["no_send"] = True
+    # Structured attribution, not the "— core-N" prose in the body: the
+    # signature is for humans and reformatting it must not change routing.
+    worker = _worker_of(tid)
+    if worker:
+        doc["metadata"] = {"worker_id": worker}
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)
+    if res.status is DrainStatus.TERMINAL:
+        # The outbox has decided this item; no pass will ever claim it again,
+        # so retrying logs forever and hides the failure behind "will retry".
+        why = (f"outbox item is terminal after "
+               f"{core.backend.attempts(broker_tid)} attempt(s)")
+        if result_file is not None:
+            _quarantine_undelivered(result_file, tid, why)
+        else:
+            _log(f"result {tid}: {why} — not retrying")
+        return False
     if res.status is DrainStatus.NOT_CLAIMED:
         # A dead prior incarnation's claim; reclaim-TTL recovers it, and
         # with an idempotent provider nothing parks on ambiguity.
@@ -3150,7 +3188,8 @@ def _post_ready_results(inflight: set[str]) -> None:
         if _delivery is None:
             _log(f"delivery deferred for {tid} — alias ledger unreadable")
             continue
-        if not _deliver_result_payload(tid, _broker_tid(_delivery), out_body):
+        if not _deliver_result_payload(tid, _broker_tid(_delivery), out_body,
+                                       result_file=rfile):
             continue
         _archive_result(rfile, tid)
         inflight.discard(tid)
