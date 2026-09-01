@@ -10,11 +10,6 @@
     "prompt": "Morning briefing. FIRST produce the calendar cache from the owner's REAL Google calendar (the standalone script can't reach the connector): pull today's events via the Google-calendar connector (e.g. sutando-station composio_exec GOOGLECALENDAR_EVENTS_LIST, calendarId=primary, today's local-day window), then pipe them as a JSON array of {raw,calendar} to `python3 src/write_calendar_cache.py` (or `python3 src/write_calendar_cache.py --empty` if genuinely no events today). THEN run `MORNING_BRIEFING_CALENDAR_SOURCE=google python3 src/morning-briefing.py` to deliver the briefing (weather, calendar, reminders, overnight Discord, pending questions, health). Producing the cache first makes the briefing read the owner's real Google Workspace calendar instead of falsely reporting 'clear' off an empty local macOS-Calendar read (#2256). If you have no Google connector, drop the cache step and the env var to fall back to the local macOS Calendar. Speak the result if voice is connected, send as Discord DM otherwise."
   },
   {
-    "name": "daily-insight",
-    "cron": "50 6 * * *",
-    "prompt": "Run python3 src/daily-insight.py to generate today's behavioral insight. If it produces output, include it in the morning briefing."
-  },
-  {
     "name": "pending-questions",
     "cron": "*/30 * * * *",
     "prompt": "Run: bash scripts/cron-gate.sh pending-questions python3 src/check-pending-questions.py — notifies about unanswered pending questions (deferred when owner tasks are queued; next */30 retry covers a skipped fire)."

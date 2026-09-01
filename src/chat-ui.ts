@@ -267,10 +267,43 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
   }
 
   const HISTORY_KEY = 'sutando-chat-history-v1';
+  const PENDING_KEY = 'sutando-chat-page-pending-v1';
   let history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+  let pendingTasks = loadPendingTasks();
+  const pendingPolls = {};
 
   function saveHistory() {
     try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-100))); } catch (e) {}
+  }
+
+  function loadPendingTasks() {
+    try {
+      const raw = localStorage.getItem(PENDING_KEY);
+      if (!raw) return [];
+      const cutoff = Date.now() - 30 * 60 * 1000;
+      return JSON.parse(raw).filter(function(t) {
+        return t && t.id && (t.createdAt || 0) >= cutoff;
+      });
+    } catch (e) { return []; }
+  }
+
+  function savePendingTasks() {
+    try { localStorage.setItem(PENDING_KEY, JSON.stringify(pendingTasks.slice(-20))); } catch (e) {}
+  }
+
+  function rememberPendingTask(taskId, text) {
+    pendingTasks = pendingTasks.filter(function(t) { return t.id !== taskId; });
+    pendingTasks.push({ id: taskId, text: text || '', createdAt: Date.now() });
+    savePendingTasks();
+  }
+
+  function forgetPendingTask(taskId) {
+    pendingTasks = pendingTasks.filter(function(t) { return t.id !== taskId; });
+    savePendingTasks();
+    if (pendingPolls[taskId]) {
+      clearInterval(pendingPolls[taskId]);
+      delete pendingPolls[taskId];
+    }
   }
 
   function renderMarkdown(text) {
@@ -312,6 +345,53 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
       saveHistory();
     }
     return bubble;
+  }
+
+  function appendPendingMessage(taskId) {
+    if (taskId) {
+      const existing = document.querySelector('[data-pending-task="' + taskId + '"]');
+      if (existing) return existing;
+    }
+    empty.style.display = 'none';
+    const pendingMsg = document.createElement('div');
+    pendingMsg.className = 'msg assistant';
+    if (taskId) pendingMsg.dataset.pendingTask = taskId;
+    pendingMsg.innerHTML = '<div class="avatar">S</div><div class="bubble pending"><div class="typing"><span></span><span></span><span></span></div></div>';
+    chatInner.appendChild(pendingMsg);
+    scrollToBottom();
+    return pendingMsg;
+  }
+
+  function completePendingTask(taskId, result, pendingMsg) {
+    if (pendingMsg && pendingMsg.parentNode) pendingMsg.remove();
+    appendMessage('assistant', result || '*(empty response)*');
+    forgetPendingTask(taskId);
+    sendBtn.disabled = false;
+    input.focus();
+  }
+
+  function pollPendingTask(taskId, pendingMsg) {
+    if (!taskId || pendingPolls[taskId]) return;
+    const check = function() {
+      fetch(apiBase + '/result/' + taskId)
+        .then(function(r) { return r.json(); })
+        .then(function(j) {
+          if (j.status === 'completed') completePendingTask(taskId, j.result, pendingMsg);
+        })
+        .catch(function() {});
+    };
+    check();
+    pendingPolls[taskId] = setInterval(check, 2000);
+  }
+
+  function resumePendingTasks() {
+    pendingTasks = loadPendingTasks();
+    savePendingTasks();
+    pendingTasks.forEach(function(task) {
+      if (!task || !task.id) return;
+      const pendingMsg = appendPendingMessage(task.id);
+      pollPendingTask(task.id, pendingMsg);
+    });
   }
 
   function scrollToBottom() {
@@ -361,15 +441,7 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
 
     appendMessage('user', text);
 
-    const pendingMsg = document.createElement('div');
-    pendingMsg.className = 'msg assistant';
-    pendingMsg.innerHTML = '<div class="avatar">S</div><div class="bubble pending"><div class="typing"><span></span><span></span><span></span></div></div>';
-    chatInner.appendChild(pendingMsg);
-    scrollToBottom();
-
-    let pollInterval;
-    let timeoutHandle;
-    const cleanup = () => { clearInterval(pollInterval); clearTimeout(timeoutHandle); };
+    const pendingMsg = appendPendingMessage();
 
     try {
       const resp = await fetch(apiBase + '/task', {
@@ -380,32 +452,10 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
       const data = await resp.json();
       if (!data.ok) throw new Error('task creation failed');
       const taskId = data.task_id;
-
-      pollInterval = setInterval(async () => {
-        try {
-          const r = await fetch(apiBase + '/result/' + taskId);
-          const j = await r.json();
-          if (j.status === 'completed') {
-            cleanup();
-            pendingMsg.remove();
-            appendMessage('assistant', j.result || '*(empty response)*');
-            sendBtn.disabled = false;
-            input.focus();
-          }
-        } catch (e) {}
-      }, 2000);
-
-      // 5-minute safety timeout
-      timeoutHandle = setTimeout(() => {
-        cleanup();
-        if (pendingMsg.parentNode) {
-          pendingMsg.remove();
-          appendMessage('assistant', '*(timeout — agent took longer than 5 minutes. Result may still arrive in \`results/\` — refresh to retry.)*');
-          sendBtn.disabled = false;
-        }
-      }, 300000);
+      pendingMsg.dataset.pendingTask = taskId;
+      rememberPendingTask(taskId, text);
+      pollPendingTask(taskId, pendingMsg);
     } catch (e) {
-      cleanup();
       pendingMsg.remove();
       appendMessage('assistant', '*(failed to reach agent API at \`' + apiBase + '\`. Make sure the bridge is running.)*');
       sendBtn.disabled = false;
@@ -413,6 +463,7 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
   }
 
   renderHistory();
+  resumePendingTasks();
 
   // Live agent state via SSE (same channel as dashboard)
   try {
