@@ -19,6 +19,15 @@ set -euo pipefail
 STATUS="${1:?usage: core-status.sh <status> [step]}"
 STEP="${2-}"
 
+# Pool followers must not overwrite the MAIN core's owner-facing status: the
+# Discord bridge renders `step` live and graceful-restart gates busy() on it.
+# NUMERIC only — the pool plist assigns 1..N, while a main core carries
+# something else ('legacy' here) or nothing, and silence authorises a kill.
+case "${SUTANDO_WORKER_SEAT-${SUTANDO_CORE_ID-}}" in
+	'' | *[!0-9]* ) ;;                 # unset / non-numeric -> a main core, write
+	* ) exit 0 ;;                      # 1, 2, 3... -> a pool follower, no-op
+esac
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Bare `python3` is Apple's stub on a Mac without Command Line Tools: executing
