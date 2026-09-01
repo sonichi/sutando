@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 sys.path.insert(0, str(ROOT / "src"))
 
 from tasks_view import TasksView  # noqa: E402
+from ag2_sparrow.task_archive import task_id_from_filename  # noqa: E402
 from dispatcher import RuntimeDispatcher  # noqa: E402
 
 from protocol import ProtocolError  # noqa: E402
@@ -74,6 +75,26 @@ class TasksViewTests(unittest.TestCase):
 
     def test_get_result_no_id_empty_is_none(self):
         self.assertIsNone(self.view.get_result(None))  # no results yet
+
+    def test_list_reports_canonical_ids_for_every_pool_suffix(self):
+        """A local strip handled `.claimed-` only, so an assigned task listed as
+        `task-X.assigned-core-N` — an id whose result can never be fetched."""
+        self.tasks.mkdir(parents=True, exist_ok=True)
+        for name in ("task-rtapi-plain.txt",
+                     "task-rtapi-held.claimed-core-3.txt",
+                     "task-rtapi-given.assigned-core-2.txt"):
+            (self.tasks / name).write_text("task: body\n")
+        ids = sorted(t["taskId"] for t in self.view.list_tasks()["tasks"])
+        self.assertEqual(ids, ["task-rtapi-given", "task-rtapi-held",
+                               "task-rtapi-plain"])
+        for tid in ids:
+            self.assertNotIn(".", tid)  # a suffix left on is the phantom shape
+
+    def test_list_delegates_id_parsing_to_the_shared_parser(self):
+        """Delegation pin: the grammar has one owner, so a private copy here
+        cannot drift from it."""
+        import tasks_view as tv
+        self.assertIs(tv.task_id_from_filename, task_id_from_filename)
 
     def test_list_results_runtime_api_only_newest_first(self):
         import os
