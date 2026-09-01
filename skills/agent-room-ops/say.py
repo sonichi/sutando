@@ -13,6 +13,7 @@ here too.
 """
 from __future__ import annotations
 
+import json
 import os
 
 from _gateway import gate_allows, load_gate, gateway, http_json, degrade_reason, HTTPError, URLError
@@ -23,6 +24,27 @@ from relations import RelationError, relation_fields
 def _result(ok, *, room_id=None, event_id=None, reason=None, state=None):
     return {"ok": bool(ok), "room_id": room_id, "event_id": event_id,
             "reason": reason, "state": state or (_receipt.CONFIRMED if ok else _receipt.FAILED)}
+
+
+def _a2ui_card(raw):
+    """Validated buttons card from SUTANDO_WORKER_A2UI (JSON). The client
+    renders {type:"buttons"} and a tap sends the option's action as a message."""
+    if not raw:
+        return None
+    try:
+        card = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(card, dict) or card.get("type") != "buttons":
+        return None
+    opts = card.get("options")
+    if not (isinstance(opts, list) and opts and all(
+            isinstance(o, dict) and isinstance(o.get("label"), str)
+            and isinstance(o.get("action"), str) for o in opts)):
+        return None
+    return {"version": "0.9", "type": "buttons",
+            "prompt": str(card.get("prompt") or ""),
+            "options": [{"label": o["label"], "action": o["action"]} for o in opts]}
 
 
 def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
@@ -80,7 +102,11 @@ def say(message: str, room_id: str, agent_mxid: str | None = None, gate=None,
                **({"style": _style} if _style in _styles else {}),
                **({"attention": True} if _attn else {})}
               if worker else None)
-        stamp = {"extra_content": {"space.ag2.worker": _w}} if _w else {}
+        _extra = {"space.ag2.worker": _w} if _w else {}
+        _card = _a2ui_card(os.environ.get("SUTANDO_WORKER_A2UI"))
+        if _card:
+            _extra["space.ag2.a2ui"] = _card
+        stamp = {"extra_content": _extra} if _extra else {}
         _status, parsed = http_json(
             "POST", f"{base}/v1/room", headers,
             {"op": "message", "room_id": room_id, "body": message, **rel, **stamp},
