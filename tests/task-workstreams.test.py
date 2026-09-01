@@ -1061,6 +1061,52 @@ def test_workstream_context_index_fail_open_edges() -> None:
     assert stored["context_history"]["workstream-chain"][0]["id"] == "task-parent"
 
 
+def test_context_cli_accepts_a_live_pool_filename() -> None:
+    """task-notifier.sh passes the on-disk name; the pool renames it while held."""
+    import contextlib
+    import importlib.util
+    import io
+
+    workspace = fixture_workspace()
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [{
+            "name": "Sutando task management",
+            "summary": "group related task history",
+            "confidence": 0.95,
+            "task_ids": ["task-a1", "task-a2"],
+        }],
+    })
+    script = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
+    spec = importlib.util.spec_from_file_location("workstreams_cli", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    tasks = workspace / "tasks"
+    write_task(tasks / "task-current.txt", "task-current",
+               "2026-08-03T10:05:00Z", "continue workstream context")
+    assert workstreams.inherit_assignment(workspace, "task-current", "task-a1")
+
+    # The bare id is the control: it never depended on the filename grammar.
+    for argument in ("task-current", "task-current.txt",
+                     "task-current.claimed-core-3.txt",
+                     "task-current.assigned-core-2.txt"):
+        for stale in tasks.glob("task-current*"):
+            stale.unlink()
+        on_disk = argument if argument.endswith(".txt") else f"{argument}.txt"
+        write_task(tasks / on_disk, "task-current",
+                   "2026-08-03T10:05:00Z", "continue workstream context")
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "resolve_workspace", return_value=workspace):
+            with contextlib.redirect_stdout(buffer):
+                code = cli.main(["context", argument])
+        assert code == 0, argument
+        payload = buffer.getvalue()
+        assert payload, f"no context for {argument}"
+        assert json.loads(payload)["current_task_id"] == "task-current", argument
+
+
 def test_concurrent_inheritance_keeps_every_assignment() -> None:
     workspace = fixture_workspace()
     snapshot = workstreams.build_classifier_snapshot(workspace)
@@ -1199,6 +1245,7 @@ def main() -> None:
         test_workstream_context_has_a_total_serialized_byte_cap,
         test_remembered_context_history_keeps_only_the_newest_entries,
         test_workstream_context_index_fail_open_edges,
+        test_context_cli_accepts_a_live_pool_filename,
         test_concurrent_inheritance_keeps_every_assignment,
         test_reused_workstream_id_does_not_require_a_redundant_name,
     ]
