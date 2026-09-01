@@ -82,6 +82,9 @@ def clean_relay_token(value: object) -> str:
     here and nowhere else: this shape is url|hex, so a quote or backslash at
     either edge is never content (unlike a bot token — see
     tests/discord-token-delegation.test.py's one-layer contract).
+
+    The gate is `|`-SHAPED, not provenance-based: any future value containing a
+    pipe inherits this peel, so check that before adding one to RELAY_TOKEN_VARS.
     """
     v = _clean(value)
     if "|" not in v:
