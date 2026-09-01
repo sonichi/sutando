@@ -59,6 +59,27 @@ class TestOwnerContract(unittest.TestCase):
             "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
         self.assertIn("NO NETWORK", "\n".join(lines))
 
+    def test_unavailable_sandbox_has_no_fallback(self):
+        """`assert the OUTPUT is non-empty` had no next step, so the branch where
+        codex cannot answer was unstated everywhere but Discord — whose bridge
+        carries a two-sentinel Stage-2 contract the shared owner never learned."""
+        self.assertIn("NO permitted fallback", SANDBOXED_DELEGATION_CODEX)
+        self.assertIn("unrestricted core", SANDBOXED_DELEGATION_CODEX)
+        for symptom in ("absent", "exiting non-zero", "exiting 0 having written nothing"):
+            self.assertIn(symptom, SANDBOXED_DELEGATION_CODEX)
+        lines = sandboxed_delegation_lines(
+            "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
+        self.assertIn("NO permitted fallback", "\n".join(lines))
+
+    def test_silence_is_not_an_outcome(self):
+        """A guest cannot distinguish a refusal from a dropped task, so the
+        unavailable branch must produce a reply rather than nothing."""
+        self.assertIn("do not silently skip", SANDBOXED_DELEGATION_CODEX)
+        self.assertIn("no inspection was performed", SANDBOXED_DELEGATION_CODEX)
+        lines = sandboxed_delegation_lines(
+            "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
+        self.assertIn("no inspection was performed", "\n".join(lines))
+
     def test_scope_is_a_parameter_not_baked_in(self):
         """Slack's per-tier limits must not leak into the shared text."""
         self.assertNotIn("information-only", SANDBOXED_DELEGATION_CODEX)

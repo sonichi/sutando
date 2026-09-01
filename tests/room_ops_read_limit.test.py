@@ -167,6 +167,23 @@ class ReadLimitCountsMessages(unittest.TestCase):
         self.assertLessEqual(max(seen), rd.MAX_LIMIT, "never request beyond MAX_LIMIT")
         self.assertFalse(res["complete"], "stopped early -> NOT complete")
 
+    def test_widening_reaches_the_cap_in_a_bounded_number_of_calls(self):
+        """Raising MAX_LIMIT must actually widen the reach AND stay cheap.
+
+        The schedule is geometric with a `_MAX_WIDENINGS` guard, so a bigger
+        cap could in principle be unreachable (guard truncates before the top)
+        or reachable only via many round trips. Pin both: the widest window IS
+        the cap, and getting there costs a handful of calls, not dozens.
+        """
+        for cap in (100, 1000):
+            w = rd._windows(rd.DEFAULT_LIMIT, cap)
+            self.assertEqual(w[-1], cap, f"schedule must reach cap {cap}")
+            self.assertEqual(sorted(set(w)), w, "strictly increasing, no repeats")
+            self.assertLessEqual(len(w), 8, f"too many round trips for cap {cap}")
+        # The floor start is the worst case — smallest first window, so the
+        # most doublings to climb. It is the one that would blow the budget.
+        self.assertLessEqual(len(rd._windows(1, rd.MAX_LIMIT)), 8)
+
     def test_leading_noise_wider_than_the_first_windows(self):
         """Two consecutive ZERO windows must not be read as an empty room.
 
