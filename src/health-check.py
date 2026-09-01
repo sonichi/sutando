@@ -5959,9 +5959,15 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
-    unconsumed, trailing = [], []
+    unconsumed, trailing, dead = [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
+        # A deleted script cannot produce output, and every completion lane still
+        # reports the job finishing on time (the handler runs and writes a no-op),
+        # so scoring punctuality here names the wrong defect in both directions.
+        if j.get("missing_script"):
+            dead.append((j["name"], j["missing_script"]))
+            continue
         if not j["artifacts"]:
             # `conditional` declares that absence is expected, so it cannot also
             # be the blind spot that pins this probe to warn with no path back.
@@ -5996,7 +6002,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
                 missed.append((j["name"], j["minutes_since_due"]))
             else:
                 unconsumed.append((j["name"], fired, j["minutes_since_due"]))
-    if not late and not missed and not drifted and not unconsumed:
+    if not late and not missed and not drifted and not unconsumed and not dead:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
@@ -6025,6 +6031,11 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             bits.append(f"{n}: {c} run(s), median +{m} min late, measured from output "
                         f"— no dispatch record retained for this job, so a late "
                         f"schedule and a slow pickup cannot be told apart here")
+    for n, ref in sorted(dead):
+        bits.append(f"{n}: SCHEDULED BUT CANNOT RUN — {ref} does not exist. Its slot "
+                    f"still fires and the handler still writes a result, so every "
+                    f"completion lane reports it finishing on time; the schedule "
+                    f"entry outlived the script and needs removing or restoring")
     for n, m in missed:
         bits.append(f"{n}: no output today, {m} min past due, and no task was "
                     f"dispatched — the schedule itself did not fire")
@@ -6091,6 +6102,24 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
         out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
+
+
+def _cron_missing_script(entry: dict) -> str | None:
+    """First script path a cron entry invokes that is not on disk, else None.
+
+    A job whose script was deleted still leaves a task-cron RESULT — the handler
+    runs, finds nothing, and writes a no-op — so every completion lane reports it
+    as finishing on time. Only the schedule's own command distinguishes "ran and
+    produced nothing" from "cannot run at all", which is why this is read here
+    and not inferred from a result body: `[no-send]` is also what a job writes
+    when it delivered by another route (a DM), so the marker does not separate
+    the two cases and the referenced path does.
+    """
+    cmd = " ".join(str(entry.get(k) or "") for k in ("prompt", "prompt_skill"))
+    for ref in re.findall(r"(?:src|scripts|skills)/[\w\-./]+\.(?:py|sh|ts|mjs)", cmd):
+        if not (REPO_DIR / ref).exists():
+            return ref
+    return None
 
 
 def _daily_dispatch_minutes(tasks: Path, job: str, limit: int = 7) -> list:
@@ -6239,6 +6268,7 @@ def check_daily_cron_punctuality() -> dict:
         jobs.append({
             "name": jname, "hour": int(f[1]), "minute": int(f[0]), "artifacts": arts,
             "newest_artifact": newest, "artifact_age_days": age_days,
+            "missing_script": _cron_missing_script(e),
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
