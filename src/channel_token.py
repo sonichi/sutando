@@ -53,6 +53,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Both spellings the gateway contract accepts (docs/remote-gateway-protocol.md);
+# AG2_REMOTE_TOKEN is the legacy alias still present on older installs.
+RELAY_TOKEN_VARS: tuple[str, ...] = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+
 
 def _clean(value: object) -> str:
     """Strip whitespace and one layer of matching quotes; '' if not usable.
@@ -88,6 +92,14 @@ def clean_relay_token(value: object) -> str:
         if v == prev:
             return v
 
+
+def _clean_for(var: str, value: object) -> str:
+    """Apply the contract that `var` requires: relay vars peel, everything else
+    keeps the one-matching-layer rule. Keyed here so the three readers below
+    cannot disagree and a new one inherits it without remembering."""
+    return clean_relay_token(value) if var in RELAY_TOKEN_VARS else _clean(value)
+
+
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
     try:
@@ -100,7 +112,7 @@ def token_from_env_file(var: str, env_file: Path) -> str:
             continue
         key, _, value = line.partition("=")
         if key.strip() == var:
-            return _clean(value)
+            return _clean_for(var, value)
     return ""
 
 
@@ -118,7 +130,7 @@ def token_from_vault(var: str, vault_get=None) -> str:
         except Exception:
             return ""
     try:
-        return _clean(vault_get(var))
+        return _clean_for(var, vault_get(var))
     except Exception:
         return ""
 
@@ -132,7 +144,7 @@ def resolve_channel_token(var: str, env_file: Path | None = None,
     conventional sources have nothing usable.
     """
     environ = os.environ if environ is None else environ
-    found = _clean(environ.get(var, ""))
+    found = _clean_for(var, environ.get(var, ""))
     if found:
         return found
     if env_file is not None:
