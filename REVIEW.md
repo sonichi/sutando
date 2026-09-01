@@ -281,6 +281,31 @@ and loads whichever repo it reviews.
     time, which is exactly why the re-read is necessary rather than optional. The current state, not the
     remembered one, is what authorizes.
 
+17. **`reviewDecision: APPROVED` is not the merge gate — check the base branch and
+    whether the approvers can approve.** The ruleset that requires two approvals scopes
+    `ref_name.include` to `refs/heads/main` only, and GitHub counts an approval toward it
+    only from an account with write access. `reviewDecision` is GitHub's summary of the
+    review conversation, so it reads `APPROVED` on a single approval when the PR targets a
+    feature or rescue branch, and it renders a non-collaborator's approval identically to a
+    counting one. Before treating a PR as review-ready, read `baseRefName`, and resolve each
+    approver with the **membership** endpoint `repos/{o}/{r}/collaborators/{user}` (204 vs
+    404). Do not use `collaborators/{user}/permission` for this — it answers `read` for
+    accounts that are not collaborators at all, so it cannot distinguish them.
+    *Grounded by:* a scan of 132 open sonichi/sutando PRs (2026-09-01). The predicate "≥2
+    collaborator approvals and no standing `CHANGES_REQUESTED`" matched `reviewDecision ==
+    APPROVED` on 124 and disagreed on 8 — every disagreement `APPROVED` on ONE counting
+    approval, and every one of the 8 based off `main` (`feat/sutando-server`,
+    `feat/pool-operability`, `rescue/pool-uncommitted-2026-08-26`,
+    `feat/sparrow-b1-identity-contract`, `fix/pool-wakeup-runtime-aware`). Restricted to
+    main-based PRs the predicate holds without exception, and the failure is one-directional
+    — never a PR predicted ready that isn't. The second half is measured separately: two
+    accounts hold 21 approvals across those PRs whose membership endpoint returns 404, and 8
+    PRs carry only such approvals while reporting `REVIEW_REQUIRED` and `BLOCKED` with zero
+    failing checks and no standing block — visibly reviewed, actually at 0-of-2. A peer
+    validated the same predicate over 35 PRs with no exceptions and stated it unscoped; all
+    35 were `base=main`, so their population could not have exposed the base dependency at
+    any sample size.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
