@@ -190,11 +190,23 @@ def _main(argv):
     p.add_argument("message")
     p.add_argument("room_id")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--reply-to", dest="reply_to", default=None,
+                   help="event id ($abc) to cite as the message replied to. This is a "
+                        "CITATION: the post stays in the main timeline. It does NOT put "
+                        "the post in a Matrix thread — the gateway has no field for that.")
 
     p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
     p.add_argument("room_id")
     p.add_argument("message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--worker", default=None,
+                   help="worker id to stamp on the event (space.ag2.worker) so the "
+                        "client renders attribution; defaults to worker-$SUTANDO_WORKER_SEAT "
+                        "when that env var is set, pass '' to post unstamped")
+    p.add_argument("--reply-to", dest="reply_to", default=None,
+                   help="event id ($abc) to cite as the message replied to. This is a "
+                        "CITATION: the post stays in the main timeline. It does NOT put "
+                        "the post in a Matrix thread — the gateway has no field for that.")
 
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
                                      "GRANTS access, overriding agents' local allowFrom (#429)")
@@ -247,9 +259,13 @@ def _main(argv):
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
-        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid)
+        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
+                               reply_to=a.reply_to)
     elif a.cmd == "say":
-        res = _say.say(a.message, a.room_id, a.agent_mxid)
+        _kw = {"reply_to": a.reply_to}
+        if a.worker:
+            _kw["worker"] = a.worker
+        res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
     elif a.cmd == "grant":
         import grant as _grant
         try:

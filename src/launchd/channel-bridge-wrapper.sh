@@ -32,8 +32,9 @@ PYTHON="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
 if [ -z "$PYTHON" ] && [ -r "$REPO/scripts/python-binary.sh" ]; then
   # shellcheck source=../../scripts/python-binary.sh
   . "$REPO/scripts/python-binary.sh"
-  _candidate="$(resolve_python "$REPO")"
-  [ -n "$_candidate" ] && "$_candidate" -c "import $MODULE" >/dev/null 2>&1 && PYTHON="$_candidate"
+  # Module-aware: the contract candidate can be a bundled runtime that simply
+  # lacks this channel's dep, while a later candidate in the same order has it.
+  PYTHON="$(resolve_python_for_module "$REPO" "$MODULE")"
 fi
 
 # The bridge resolves env -> .env -> vault, so an .env-only gate here is NARROWER
@@ -63,7 +64,7 @@ fi
 # fatal check stays HERE, after the idle branch: a deconfigured channel with no
 # usable interpreter must still park quietly rather than exit 1 into a respawn.
 if [ -z "$PYTHON" ]; then
-  echo "[$CHANNEL-bridge-wrapper] no usable Python interpreter" >&2
+  echo "[$CHANNEL-bridge-wrapper] no python3 can 'import $MODULE' (tried \$SUTANDO_PY, the bundled runtime, then PATH) — install it for one of those, or set SUTANDO_CHANNEL_BRIDGE_PYTHON" >&2
   exit 1
 fi
 
@@ -116,9 +117,17 @@ while [ "$STOPPING" = 0 ]; do
   CHILD_PID=$!
   set +e
   wait "$CHILD_PID"
+  CHILD_RC=$?
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
+  # 75 == single_instance.EXIT_STANDDOWN: a peer holds the lock. Gate on THAT,
+  # never on 0 -- a bridge whose main loop returns also exits 0, and treating
+  # that as deliberate would leave it down silently, with the alert suppressed.
+  # Clear the marker too: launchd KeepAlive is unconditional, so exiting hands
+  # the respawn back to launchd, which re-enters above and alerts off a marker
+  # this run left behind.
+  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
   emit_restart_alert
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!

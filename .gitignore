@@ -72,6 +72,8 @@ tests/**/htmlcov/
 !tests/*.test.ts
 !tests/*.test.py
 !tests/*.test.sh
+!tests/*.test.mjs
+tests/__pycache__/
 !tests/*.txt
 !tests/_helpers/
 !tests/_helpers/*.ts
@@ -141,3 +143,6 @@ ag2-onboarding.txt
 coverage.xml
 diff-cover.md
 coverage-summary.md
+
+# Built locally from a GAIA copy; carries the answer key -- never commit.
+benchmarks/gaia-100.json
