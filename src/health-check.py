@@ -10176,6 +10176,9 @@ def _local_core_stopped(workspace: Optional[Path] = None) -> bool:
     return (workspace / "state" / "cores" / f"{label}.stopped").exists()
 
 
+_WARN_SUPPRESS_CACHE = None
+
+
 def _alerts_suppressed(check: dict) -> bool:
     """True when a check must NOT wake anyone, whatever its status says.
 
@@ -10196,7 +10199,18 @@ def _alerts_suppressed(check: dict) -> bool:
     alerts, so no existing check changes behavior by omission, and a typo cannot
     silence a real failure.
     """
-    return check.get("alerting") is False
+    if check.get("alerting") is False:
+        return True
+    # A host may quiet a chronic WARN it judged inapplicable (a retired service,
+    # an optional dep). Never another status: a list must not hide an outage.
+    if check.get("status") != "warn":
+        return False
+    global _WARN_SUPPRESS_CACHE
+    if _WARN_SUPPRESS_CACHE is None:
+        from sutando_config import resolve_suppressed_alerts  # noqa: PLC0415
+
+        _WARN_SUPPRESS_CACHE = resolve_suppressed_alerts(REPO_DIR)
+    return check.get("name") in _WARN_SUPPRESS_CACHE
 
 
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
