@@ -368,5 +368,57 @@ class FailurePaths(unittest.TestCase):
         self.assertFalse(refuse)
 
 
+class ResolveDedupesOneActor(unittest.TestCase):
+    """Two roster keys for one person must not satisfy the two-reviewer gate."""
+
+    ROSTER = {
+        "alice": {"stand": "@a:x", "room": "!r"},
+        "bob": {"stand": "@a:x", "room": "!r"},              # same stand, no link
+        "carol": {"stand": "@c:x", "room": "!r"},
+        "dave": {"stand": "@d:x", "room": "!r", "same_actor_as": "erin"},
+        "erin": {"stand": "@e:x", "room": "!r", "same_actor_as": "dave"},
+    }
+
+    def names(self, *keys):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            targets, _ = _load().resolve(list(keys), self.ROSTER)
+        return sorted(t["name"] for t in targets), buf.getvalue()
+
+    def test_two_keys_sharing_a_stand_count_once(self):
+        got, err = self.names("alice", "bob", "carol")
+        self.assertEqual(got, ["alice", "carol"])
+        self.assertIn("DUPLICATE 'bob'", err)
+
+    def test_two_keys_linked_by_same_actor_as_count_once(self):
+        # Distinct stands, one human — the link is the only signal.
+        got, err = self.names("dave", "erin", "carol")
+        self.assertEqual(got, ["carol", "dave"])
+        self.assertIn("DUPLICATE 'erin'", err)
+
+    def test_distinct_people_are_not_deduped(self):
+        # Control: without this the assertions above pass on a resolve() that
+        # simply drops every second name.
+        got, err = self.names("alice", "carol")
+        self.assertEqual(got, ["alice", "carol"])
+        self.assertNotIn("DUPLICATE", err)
+
+    def test_an_mxid_shaped_roster_key_does_not_alias_a_stand(self):
+        # A flat keyspace lets a roster key collide with someone else's stand,
+        # and a false DUPLICATE drops a real second reviewer with no error.
+        roster = {"@shared:x": {"stand": "@a-stand:x", "room": "!r"},
+                  "bob": {"stand": "@shared:x", "room": "!r"}}
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            targets, _ = _load().resolve(["@shared:x", "bob"], roster)
+        self.assertEqual(sorted(t["name"] for t in targets), ["@shared:x", "bob"])
+        self.assertNotIn("DUPLICATE", buf.getvalue())
+
+    def test_the_refusal_names_who_already_covers_the_slot(self):
+        # "already addressed" and "unreachable" need different follow-ups.
+        _, err = self.names("alice", "bob")
+        self.assertIn("same person as 'alice'", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -1102,8 +1102,8 @@ def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
     # file-type guard: a same-named DIRECTORY must not be os.replace'd away.
     if task_path is None or not task_path.is_file():
         return False
-    # Ask whether ANY claimed variant exists, not whether the returned one is
-    # claimed: find_task_file sorts, and `.assigned-` sorts before `.claimed-`.
+    # claimed-only: asks whether ANY claimed variant exists, not whether the
+    # returned one is claimed — find_task_file sorts `.assigned-` first.
     if any(tasks_dir.glob(f"{task_id}.claimed-*")):
         return False
     archive_dir = task_path.parent / "archive" / datetime.now(timezone.utc).strftime("%Y-%m")
