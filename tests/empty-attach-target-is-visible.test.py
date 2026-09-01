@@ -35,7 +35,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from result_markers import parse_markers  # noqa: E402
-from send_allowlist import is_path_sendable  # noqa: E402
+from policy.egress.attachment import is_path_sendable  # noqa: E402
 
 FAILS: list[str] = []
 

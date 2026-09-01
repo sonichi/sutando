@@ -69,7 +69,7 @@ def _load(name: str, path: Path):
 
 
 dm = _load("dm_result", REPO / "src" / "dm-result.py")
-import discord_rest_client as _rest  # noqa: E402  — the seam the fakes install into
+import channels.discord.client as _rest  # noqa: E402  — the seam the fakes install into
 
 
 class _FakeResponse:

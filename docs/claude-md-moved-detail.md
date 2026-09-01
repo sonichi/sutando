@@ -52,3 +52,60 @@ don't know the field are unaffected.
 answer to "which socket?" — read by `sutando-config.sh runtime` so the
 AgentRuntime descriptor reports the real socket (custom sockets included)
 without trusting a foreign caller's ambient env.
+
+## Durable per-host install state: `state/auth/`
+
+`<workspace>/state/auth/` holds **per-host install/identity state**
+that survives across upgrades and MUST NOT be wiped by transient-state cleanup
+jobs (or by clear-on-restart logic that targets `state/*.json` generically).
+Current contents (the protection is DIRECTORY-level — everything under
+`state/auth/` is exempt, including additions after this list):
+- `cloud-auth.json` — per-host cloud-side auth credentials
+- `device.json` — per-host device identity (UUID + provisioning metadata)
+- `ag2space.json` — enrolled agent identity (stand_id source)
+- `stand.json` — Stand record + OwnerBinding (owner-confirmed, 2026-08-23)
+- `entrance-links.json` — verified EntranceLink records (I2)
+- `task-hmac.key` — task-envelope trust root
+- `devices/`, `pairing/`, `scp-tls/`, `scp-wss.token` — SCP device auth
+
+Both are placed via M1 Part 2 (`scripts/sutando-migrate.sh`); pre-M1 they
+were loose at workspace root, mistreated as transient JSON snapshots and
+sometimes wiped. Treat `state/auth/` like `state/cores/<hostname>.alive` —
+per-host, structural, never overwritten by newest-mtime resolution across
+sources. Codex + Mini confirmed the destination + the exemption from cleanup
+in #design 2026-06-02.
+## Result-marker semantics (full detail)
+
+Moved verbatim from CLAUDE.md "Task bridge" (2026-08-21 context-budget diet).
+The bridge handles delivery specially when the result body STARTS with one of
+these markers. Use them when multiple related tasks should produce ONE
+user-facing reply instead of N separate ones:
+
+- `[deduped: task-<other-id>]` — both voice (task-bridge) and Discord (discord-bridge) silently archive this task as done, no narration, no DM. Put the full reply in the other task's result file and put this marker in each superseded task's result. The canonical way to handle thread-consolidated replies (e.g. when voice over-delegates 3 tasks for the same continuation utterance — see `src/task-bridge.ts:527`).
+- `[no-send]` — Discord bridge skips delivery for this task (still archives). Use when the task is internally handled but produces no user-visible reply.
+- `[REPLIED]` — Discord bridge skips delivery (already sent through another path).
+- `[channel: <channel-id>]` — when this is the first non-empty line of the body, the bridge delivers the rest of the body to `<channel-id>` instead of the originating channel (and drops `thread_ts` since the post is moving threads). Discord ids are 17-20 digits; Slack ids match `[CDG][A-Z0-9]+`. Use when a task arrives in a noisy channel but the reply belongs somewhere else (e.g. #dev). Telegram silently drops it — no concept of "channels" on that surface.
+- `[dm-only]` — privacy guard: suppresses any `[channel:]` redirect on the same body (regardless of marker order), so a body carrying private data can never be *redirected* out to a shared channel. It marks dm-only intent but does not by itself force a DM — that stays the consumer's job. In practice the private producer (the morning briefing's calendar + email) is emitted as a proactive result (`results/proactive-*.txt`), which every bridge already delivers to the owner's DM; `[dm-only]` reinforces that by guaranteeing no stray `[channel:]` redirect overrides it. **Detected anywhere in the body** — that is what makes the guard undefeatable by marker order, and over-triggering it fails safe. **Stripped only when the marker stands alone on its line**, before delivery and before voice speaks it; a marker mentioned inline in prose is detected but the text is delivered verbatim. Parsed by `result_markers.parse_markers`.
+- `[file: /path]` / `[send: /path]` / `[attach: /path]` — Discord bridge extracts and attaches the file alongside the text body.
+
+Why private parsers are forbidden (incident history): private copies drift —
+`discord-bridge.py` and `dm-result.py` each carried a regex that only matched
+`/...` or `~/...` values, so a marker every other consumer stripped was
+delivered to the owner as literal text. Guarded by
+`tests/bridge-marker-no-leak.test.py`; see also "Result-marker parser migration
+status" above and `docs/architecture-boundaries.md` "HTTP route boundaries".
+
+## Workspace env-var deprecation + historic fallback anti-pattern
+
+Moved verbatim from CLAUDE.md "Workspace contract" (2026-08-21 context-budget diet):
+
+> The `$SUTANDO_WORKSPACE` env var is no longer honored for workspace resolution
+> as of v0.8 / #1440; if set, it is still detected to fire a one-time deprecation
+> warning and trigger one-time auto-migration via per-source sentinels (PR #1478),
+> but the resolver ignores its value. Historic anti-pattern: bridges fell back to
+> the script's repo root via `Path(__file__).resolve().parent.parent`, which
+> polluted `git status` and — when invoked from an app-bundled `src/` symlink —
+> stranded owner DMs in a bundle-tasks/ dir while the watcher polled
+> workspace-tasks/.
+
+Current policy + protection layers: `docs/workspace-config.md`.

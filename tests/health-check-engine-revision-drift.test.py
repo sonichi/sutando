@@ -14,6 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -134,12 +135,15 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertIn("no sha", r["detail"])
 
     def test_ok_when_not_a_git_checkout(self) -> None:
+        """Still ok — but it now names the bundle instead of saying nothing."""
         with tempfile.TemporaryDirectory() as plain:
             self._write_manifest(sha=self.first)
             r = hc.check_engine_revision_drift(
                 repo_dir=Path(plain), manifest_path=self.manifest)
         self.assertEqual(r["status"], "ok", r)
-        self.assertIn("skipping", r["detail"])
+        self.assertIn(self.first[:9], r["detail"])
+        self.assertIn("UNDETERMINED", r["detail"])
+        self.assertNotIn("skipping", r["detail"])
 
     # --- the degrade branches -------------------------------------------
 
@@ -274,7 +278,7 @@ class EngineRevisionDriftTest(unittest.TestCase):
         man = d / "ENGINE_MANIFEST.json"; man.write_text('{"sha": "abc123"}')
         with mock.patch.object(Path, "is_file",
                                side_effect=PermissionError(13, "Permission denied")):
-            sha, why = hc.engine_manifest_sha(man)
+            sha, why, _meta = hc.engine_manifest_sha(man)
             self.assertIsNone(sha)
             self.assertIn("unreadable", why)
             r = hc.check_engine_revision_drift(repo_dir=repo, manifest_path=man)
@@ -293,8 +297,86 @@ class EngineRevisionDriftTest(unittest.TestCase):
             with self.subTest(manifest=body):
                 d = Path(tempfile.mkdtemp())
                 man = d / "ENGINE_MANIFEST.json"; man.write_text(body)
-                sha, _why = hc.engine_manifest_sha(man)
+                sha, _why, _meta = hc.engine_manifest_sha(man)
                 self.assertEqual(hc._valid_engine_manifest(man), sha is not None)
+    # --- no git: report the bundle, do not claim silence -----------------
+
+    def test_non_git_install_names_the_bundled_revision_and_its_age(self) -> None:
+        """"skipping" reports neither WHICH revision runs nor how old it is.
+
+        On a bundled install there is no clone to diff against, so drift is
+        undetectable — but the manifest still knows the sha, branch and build
+        time, and an operator seeing only "skipping" has none of it.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "engine" / "sutando"     # deliberately NOT a git repo
+            repo.mkdir(parents=True)
+            manifest = root / "engine" / "ENGINE_MANIFEST.json"
+            built = datetime.now(timezone.utc) - timedelta(hours=35)
+            manifest.write_text(json.dumps({
+                "sha": "21192de9261bb5f6b1e177e0ab046048394c2d3f",
+                "branch": "main",
+                "built_at": built.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }))
+            r = hc.check_engine_revision_drift(repo_dir=repo, manifest_path=manifest)
+
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("21192de92", r["detail"])
+        self.assertIn("(main)", r["detail"])
+        self.assertIn("35h ago", r["detail"])
+        # The gap is stated, not implied by omission.
+        self.assertIn("UNDETERMINED", r["detail"])
+        self.assertNotIn("skipping", r["detail"])
+
+    def test_a_manifest_without_built_at_does_not_invent_an_age(self) -> None:
+        """An absent timestamp must render as absent, not as a default age."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "engine" / "sutando"
+            repo.mkdir(parents=True)
+            manifest = root / "engine" / "ENGINE_MANIFEST.json"
+            manifest.write_text(json.dumps({"sha": "abc123def456789"}))
+            r = hc.check_engine_revision_drift(repo_dir=repo, manifest_path=manifest)
+
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("abc123def", r["detail"])
+        self.assertNotIn("ago", r["detail"])
+        self.assertNotIn("()", r["detail"])   # empty branch must not render
+
+    def test_a_malformed_built_at_is_shown_verbatim_not_computed(self) -> None:
+        """An unparseable stamp is still a fact; do not silently drop it."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "engine" / "sutando"
+            repo.mkdir(parents=True)
+            manifest = root / "engine" / "ENGINE_MANIFEST.json"
+            manifest.write_text(json.dumps({
+                "sha": "21192de9261bb5f6b1e177e0ab046048394c2d3f",
+                "built_at": "last Tuesday",
+            }))
+            r = hc.check_engine_revision_drift(repo_dir=repo, manifest_path=manifest)
+
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("built last Tuesday", r["detail"])
+        self.assertNotIn("ago", r["detail"])
+
+    def test_an_old_bundle_reads_in_days_not_hours(self) -> None:
+        """400h is a number nobody converts in their head."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "engine" / "sutando"
+            repo.mkdir(parents=True)
+            manifest = root / "engine" / "ENGINE_MANIFEST.json"
+            built = datetime.now(timezone.utc) - timedelta(days=17)
+            manifest.write_text(json.dumps({
+                "sha": "21192de9261bb5f6b1e177e0ab046048394c2d3f",
+                "built_at": built.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }))
+            r = hc.check_engine_revision_drift(repo_dir=repo, manifest_path=manifest)
+
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("built 17d ago", r["detail"])
 
     # --- wiring ----------------------------------------------------------
 

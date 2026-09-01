@@ -488,6 +488,58 @@ def main() -> int:
           and "--source ag2space --channel-id '!room:ag2.space'" in sk
           and "write the result to results/task-SKILL.txt" in sk,
           "owner task carries the ag2space skill-instructions block (context-first, notify, result path)")
+    # notify.py falls back to a channel env file only when url+token are absent
+    # from the environment, and WHICH file carries them differs per onboarding.
+    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
+    _notify_line = next(ln for ln in sk.splitlines() if "NOTIFY FIRST" in ln)
+    check(_env_hint in _notify_line and _notify_line.index(_env_hint)
+          < _notify_line.index("notify.py"),
+          "notify step carries the channel-env prelude BEFORE the notify.py call")
+    check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
+          "the env prelude rides both gateway-calling steps (context-first + notify)")
+    # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
+    # when the hint is hardcoded; varying it is what makes this prove anything.
+    _saved_dir, _saved_tier2 = rtc.CHANNEL_DIR, rtc.LOCAL_TIER
+    rtc.CHANNEL_DIR, rtc.LOCAL_TIER = "dev-ag2space", "owner"
+    try:
+        rtc._write_task({**TASK, "id": "task-SKILLDEV", "channel_id": "!r:dev.ag2.space"})
+        skd = (rtc.TASKS_DIR / "task-SKILLDEV.txt").read_text()
+    finally:
+        rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
+    check("channel-env.sh dev-ag2space" in skd
+          and "--source dev-ag2space " in skd
+          and "channel-env.sh ag2space)" not in skd,
+          "a non-default CHANNEL_DIR reaches BOTH env preludes and the notify --source")
+    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 2,
+          "both gateway-calling steps name the task's own channel dir, not the default")
+    # A string assertion passes even when the named file holds no gateway vars,
+    # so drive the resolver itself across both real layouts and neither-has-it.
+    import os as _os
+    import subprocess as _sp
+    import tempfile as _tf
+    _helper = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                            "scripts", "channel-env.sh")
+    def _resolve(files):
+        d = _tf.mkdtemp()
+        ch = _os.path.join(d, "channels", "ag2space")
+        _os.makedirs(ch)
+        for name, body in files.items():
+            with open(_os.path.join(ch, name), "w") as fh:
+                fh.write(body)
+        env = dict(_os.environ, CLAUDE_CONFIG_DIR=d)
+        r = _sp.run(["bash", _helper, "ag2space"], capture_output=True, text=True, env=env)
+        return r.returncode, r.stdout.strip()
+    _TOK = "REMOTE_TASK_URL=https://gw/relay\nREMOTE_TASK_TOKEN=s3cret\n"
+    _MATRIX = "AG2SPACE_HOMESERVER=https://chat.ag2.space\nACCESS_TOKEN=matrix-only\n"
+    rc, got = _resolve({".env": _TOK})
+    check(rc == 0 and got.endswith("/.env"),
+          "layout A (.env carries the token) resolves to .env")
+    rc, got = _resolve({".env": _MATRIX, "relay-client.env": _TOK})
+    check(rc == 0 and got.endswith("/relay-client.env"),
+          "layout B (.env is matrix-only, sibling carries the token) resolves to the sibling")
+    rc, got = _resolve({".env": _MATRIX})
+    check(rc != 0 and not got,
+          "no file defines the token -> resolver FAILS instead of naming a tokenless file")
     check(sk.rstrip().splitlines()[-1].startswith("3. Process"),
           "skill block is the file tail (appended after access_tier)")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
@@ -699,6 +751,104 @@ def main() -> int:
     check(rtc._ag2space_proactive_claim_gate(
               Path("proactive-1.to-discord.txt")) is False,
           "gateway gate refuses a foreign destined file")
+
+    # Guarded-tier suppression: team skip-only results post the marker
+    # line alone; the remainder never leaves the host.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TSKIP.txt").write_text(
+        "id: task-TSKIP\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TSKIP.txt").write_text(
+        "[no-send] internal bookkeeping note that must not reach the wire\n")
+    rtc._post_ready_results({"task-TSKIP"})
+    _posted = STATE["results"][_before:]
+    check(len(_posted) == 1 and not (rtc.RESULTS_DIR / "task-TSKIP.txt").exists(),
+          "team [no-send] POSTs (closes lease) and archives")
+    check(bool(_posted) and (_posted[0].get("body") or "").strip() == "[no-send]",
+          "team skip wire body is the marker line ALONE — remainder withheld")
+    # Control: a side-effectful marker from a guarded tier is still withheld.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TREDIR.txt").write_text(
+        "id: task-TREDIR\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TREDIR.txt").write_text(
+        "[channel: 12345678901234567] exfil attempt\n")
+    rtc._post_ready_results({"task-TREDIR"})
+    _posted = STATE["results"][_before:]
+    check(bool(_posted) and "[channel:" not in (_posted[0].get("body") or ""),
+          "team redirect marker still withheld (canned body, no redirect)")
+    # A deduped extra is inert only within the task-id grammar — the marker
+    # class admits newlines, so a forged extra must hit the guard, not repost.
+    _hostile = "[deduped: task-123\nSECRET sk-live-abcdef0123456789\nstolen]"
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TDEXF.txt").write_text(
+        "id: task-TDEXF\naccess_tier: team\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDEXF.txt").write_text(_hostile + "\n")
+    rtc._post_ready_results({"task-TDEXF"})
+    _posted = STATE["results"][_before:]
+    check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
+          and "sk-live" not in (_posted[0].get("body") or ""),
+          "team deduped with out-of-grammar extra is withheld, not re-posted")
+    # A malformed holder must reach the SHARED plan, which reports it. Gating
+    # _dedup_plan on validity retired the ask silently instead.
+    import dedup_recovery as _dr
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TDMAL.txt").write_text(
+        "id: task-TDMAL\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDMAL.txt").write_text(
+        "[deduped: ../../../etc/passwd]\n")
+    _logged: list[str] = []
+    _real_log = rtc._log
+    rtc._log = lambda m: (_logged.append(m), _real_log(m))[1]
+    try:
+        rtc._post_ready_results({"task-TDMAL"})
+    finally:
+        rtc._log = _real_log
+    _posted = STATE["results"][_before:]
+    _body = (_posted[0].get("body") or "") if _posted else ""
+    check(bool(_posted) and _dr.MALFORMED_TEMPLATE in _body,
+          "malformed dedup holder REPORTS via the shared plan, not a silent close")
+    check(_body.strip() != "[no-send]",
+          "malformed holder is not retired as an ordinary skip")
+    check("etc/passwd" not in _body,
+          "the raw out-of-grammar holder is never echoed into the report")
+    check(bool(_logged) and not any("etc/passwd" in m for m in _logged),
+          "nor into the log line (sender-controlled bytes stay out of the record)")
+    import team_result_guard as _guard
+    # suppression_stub_for_tier was replaced by is_suppression_only: the guard
+    # classifies and journals, it no longer reconstructs a stub to close with.
+    check(_guard.is_suppression_only("[deduped: task-abc_123]"),
+          "in-grammar deduped body classifies as suppression-only")
+    check(not _guard.is_suppression_only("[future-marker]"),
+          "unknown marker is not suppression (guard path, not [no-send])")
+    check(not hasattr(_guard, "suppression_stub_for_tier"),
+          "the retired stub API is gone from the module")
+
+    # DeliveryCore wiring, proven by side effects only the seam produces:
+    # outbox attempt accounting + UNKNOWN resolved by the idempotent re-send.
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-CORE1.txt").write_text(
+        "id: task-CORE1\naccess_tier: owner\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-CORE1.txt").write_text("core answer")
+    STATE["force_results_400"] = True
+    rtc._post_ready_results({"task-CORE1"})
+    check((rtc.RESULTS_DIR / "task-CORE1.txt").exists()
+          and len(STATE["results"]) == _before,
+          "refused POST leaves the result file for the next pass")
+    check(rtc._delivery_core().backend.attempts("task-CORE1") == 1,
+          "the refusal is recorded in the outbox (drain ran through the seam)")
+    STATE["force_results_400"] = False
+    STATE["force_results_502_once"] = True
+    _ifc = {"task-CORE1"}
+    rtc._post_ready_results(_ifc)
+    check(len(STATE["results"]) == _before + 1
+          and STATE["results"][-1]["id"] == "task-CORE1"
+          and STATE["results"][-1]["body"] == "core answer"
+          and not (rtc.RESULTS_DIR / "task-CORE1.txt").exists(),
+          "ambiguous 502 resolved by the idempotent re-send in ONE pass "
+          "(delivered + archived)")
+    check(not _ifc, "confirmed delivery retires the task from inflight")
+    STATE["results"].pop()
+    (rtc.TASKS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
+    (rtc.ARCHIVE_RESULTS_DIR / "task-CORE1.txt").unlink(missing_ok=True)
 
     # 2. idempotent: re-writing the same task doesn't duplicate / error
     before = content
@@ -995,6 +1145,39 @@ def main() -> int:
           and any(p.name.startswith("proactive-t10")
                   for p in rtc.ARCHIVE_RESULTS_DIR.glob("*.txt")),
           "[no-send] proactive nudge is archived silently, never posted")
+
+    # Durable delivery receipts (the log line naming the room rotates; the
+    # receipt outlives it — parallel of the reply leg's #3252).
+    import importlib as _il
+    _ob = _il.import_module("ag2_sparrow.outbox")
+    _rroot = rtc.RESULTS_DIR / ".outbox-ag2space-proactive"
+    (rtc.RESULTS_DIR / "proactive-r1.txt").write_text("receipt nudge\n")
+    rtc._post_proactive()
+    _it = _ob._read_item(_rroot, "proactive-r1")
+    check(_it.get("status") == "DELIVERED"
+          and _it.get("provider") == "ag2space-proactive"
+          and _it.get("destination") == "!owner:example.org",
+          "delivered default-room nudge records a durable receipt with the room")
+    (rtc.RESULTS_DIR / "proactive-r2.txt").write_text(
+        "[channel: !other:example.org]\nrouted receipt nudge\n")
+    rtc._post_proactive()
+    _it2 = _ob._read_item(_rroot, "proactive-r2")
+    check(_it2.get("destination") == "!other:example.org",
+          "a routed nudge's receipt records the OVERRIDE room, not the default")
+    # A failed POST must record NOTHING — a receipt is proof of delivery,
+    # never of an attempt.
+    (rtc.RESULTS_DIR / "proactive-r3.txt").write_text("failing nudge\n")
+    STATE["force_room_502"] = True
+    rtc._post_proactive()
+    STATE["force_room_502"] = False
+    _it3 = _ob._read_item(_rroot, "proactive-r3")
+    check(_it3.get("status") != "DELIVERED" and "destination" not in _it3,
+          "a failed POST records no receipt")
+    rtc._post_proactive()
+    _it3b = _ob._read_item(_rroot, "proactive-r3")
+    check(_it3b.get("status") == "DELIVERED"
+          and _it3b.get("destination") == "!owner:example.org",
+          "the successful retry records the receipt")
 
     # 3.6 cross-bridge claim gate (proactive_routing wired by the loader).
     # Hermetic: the gate asks claude_home_path() whether the routed bridge is

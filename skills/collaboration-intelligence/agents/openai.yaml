@@ -1,0 +1,14 @@
+interface:
+  display_name: Collaboration Intelligence
+  short_description: Map rooms, people, agents, ownership, and expertise
+  default_prompt: Use $collaboration-intelligence to update the room map and identify who should
+    help with this work.
+  icon_small: "./assets/icon.svg"
+  icon_large: "./assets/icon.svg"
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

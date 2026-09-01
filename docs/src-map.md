@@ -10,10 +10,12 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-One entry per agent-facing module.
+One entry per agent-facing module. 4 without a usable header comment.
 
 ## `src/`
 
+- **`access_store.py`** — Single writer contract for Discord access.json.
+- **`accessibility_probe.sh`** — Unbounded, this probe blocks forever on a session with nobody to answer the AppleScript prompt, and startup never reaches the services after it.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
@@ -26,12 +28,15 @@ One entry per agent-facing module.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
 - **`cartesia-stt-provider.ts`** — Cartesia ink-whisper STT provider — drop-in replacement for GeminiBatchSTTProvider.
 - **`cartesia-tts.ts`** — Cartesia sonic-3 TTS — generates WAV audio files from text.
+- **`channel_env_containment.py`** — Shared containment policy for a channel's `.env` credential file.
+- **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
 - **`chat_redaction.py`** — The chat-body redaction CHAIN, owned in one place.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
+- **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).
 - **`conversation-store-migrations.ts`** — Startup-only SQLite migration policy for the conversation store.
@@ -46,7 +51,7 @@ One entry per agent-facing module.
 - **`credential_resolver.py`** — Credential resolver — capability, not key (G8, desktop-parity plan).
 - **`cron-runner.py`** — OS-supervised cron runner — emits task files for due crons.json entries.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
-- **`daily-insight.py`** — Daily insight generator for Sutando's behavioral flywheel.
+- **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
@@ -54,17 +59,21 @@ One entry per agent-facing module.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_addressee.py`** — Shared-channel addressee gate (pure) — companion to `discord-bridge.py`.
 - **`discord_config.py`** — Workspace-local Sutando-specific Discord configuration (closes #1147).
-- **`discord_context_policy.py`** — contextNotFrom gate — the single policy deciding whether a serving channel may pull another Discord channel's content into context.
-- **`discord_delivery_provider.py`** — DiscordDeliveryProvider: binds the shared DiscordRestClient into the 3013 delivery-core seam — the first production provider behind it.
-- **`discord_http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
+- **`discord_context_policy.py`** — Alias of `policy.context.discord` (phase-1a restructure); one transition window.
+- **`discord_delivery_provider.py`** — Alias of `channels.discord.delivery_provider` (phase-1a restructure); one transition window.
+- **`discord_http.py`** — Alias of `channels.discord.http` (phase-1a restructure); one transition window.
+- **`discord_post_gate.py`** — Alias of `channels.discord.post_gate` (phase-1a restructure); one transition window.
 - **`discord_proactive_send.py`** — Send-leg of proactive text delivery through the shared DeliveryProvider.
-- **`discord_reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
-- **`discord_rest_client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
+- **`discord_reader.py`** — Alias of `channels.discord.reader` (phase-1a restructure); one transition window.
+- **`discord_rest_client.py`** — Alias of `channels.discord.client` (phase-1a restructure); one transition window.
+- **`discord_result_delivery.py`** — Discord result-delivery state, bound to the shared outbox (#3279 action 2).
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
+- **`entrance_links.py`** — EntranceLink records — verified provider-identity ↔ Stand bindings (I2).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
 - **`fix-setup.sh`** — One-shot fix for Mac Mini after migration bundle setup
 - **`friction-detector.py`** — Proactive friction detector for Sutando.
+- **`gateway_serving.py`** — Shared owner for the `gateway-status.json` sidecar verdict.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
@@ -83,6 +92,7 @@ One entry per agent-facing module.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
+- **`mention_gate.py`** — Owner @-mention ingestion trigger: shared policy for whether a message that tags the OWNER counts as a mention of the bot.
 - **`message_chunking.py`** — Shared message chunking — one fence-aware chunker for every outbound surface.
 - **`migrate-plists-to-logs-dir.sh`** — Migrate ~/Library/LaunchAgents/com.sutando.*.plist StandardOutPath / StandardErrorPath entries from /Desktop/sutando/src/*.log to /Desktop/sutando/logs/*.log, matching PR #251's runtime-artifacts refactor.
 - **`migrate.sh`** — Sutando Migration Script — bundle current machine state for transfer to new Mac
@@ -96,6 +106,7 @@ One entry per agent-facing module.
 - **`outbox.py`** — Sparrow Outbox: durable delivery claims for an already-created outbound item.
 - **`outbox_adapter.py`** — The Outbox's transport seam: turn a provider response into a DeliveryReceipt.
 - **`outbox_log.py`** — Outbox visibility log — single append-only sink for outbound messages.
+- **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
@@ -108,6 +119,7 @@ One entry per agent-facing module.
 - **`proactive_routing.py`** — Channel routing for proactive owner-notification messages.
 - **`progress_stream.py`** — Progress-streaming helpers for the messaging bridges (issue: Hermes-style streaming tool output, 2026-06-05).
 - **`python-binary.ts`** — Resolve a python3 interpreter that will actually run.
+- **`quota_projection.py`** — Quota usage history + even-pace projection series for the dashboard chart.
 - **`reachability-endpoints.ts`** — Direct-reachability endpoint detection (US-10, Tier 2b) — "call your agent from another device and still reach YOUR core, directly, without routing through the cloud."
 - **`read_discord_channel.py`** — Gated Discord channel reader — compatibility wrapper over the shared reader and the shared contextNotFrom policy.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
@@ -120,27 +132,31 @@ One entry per agent-facing module.
 - **`restart.sh`** — Sutando restart — stops all background services, then restarts via startup.sh.
 - **`result-channel-key.ts`** — Per-channel pull path for task-result files in `results/`.
 - **`result_audit.py`** — Result-delivery audit ledger (Result Router spec §7) — the append-only sink.
-- **`result_channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`result_channel_key.py`** — Alias of `delivery.channel_key` (phase-1a restructure); one transition window.
 - **`result_markers.py`** — Unified parsing for the result-body protocol markers used by every delivery consumer (discord, slack, telegram, remote-gateway, voice/task-bridge, and the `src/dm-result.py` REST fallback).
-- **`result_ready.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
-- **`result_router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
+- **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
+- **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
-- **`send_allowlist.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
+- **`send_allowlist.py`** — Alias of `policy.egress.attachment` (phase-1a restructure); one transition window.
 - **`send_failure_policy.py`** — Classify an outbound-send failure as transient (retry) or permanent (park).
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
+- **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
+- **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
+- **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
 - **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
+- **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
@@ -156,8 +172,8 @@ One entry per agent-facing module.
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
-- **`team_guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
-- **`team_result_guard.py`** — Final scan applied to a Team-tier result before any router reads its markers.
+- **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.
+- **`team_result_guard.py`** — Alias of `policy.egress.result` (phase-1a restructure); one transition window.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
@@ -211,6 +227,7 @@ One entry per agent-facing module.
 ## `src/agent/`
 
 - **`graceful-restart.sh`** — Graceful core-restart orchestrator.
+- **`restart-guard.sh`** — Shared policy for both runtime launchers: a `--restart` issued from inside the core session kill-sessions the very agent running the command.
 - **`restart-prep.sh`** — Graceful-restart Phase-1 prep; see notes/graceful-restart-design.md.
 - **`start-cli.sh`** — Canonical persistent-core launcher.
 - **`stop-core.sh`** — src/agent/stop-core.sh — stop ONLY the core CLI tmux session (sonichi#2401).
@@ -226,6 +243,27 @@ One entry per agent-facing module.
 - **`start-cli.sh`** — Persistent Codex CLI implementation of the Sutando core.
 - **`task-notifier-supervisor.sh`** — Keep the Codex task notifier alive for as long as the core tmux session lives.
 - **`task-notifier.sh`** — Convert watcher events into queued prompts for the interactive Codex core.
+
+## `src/channels/`
+
+- **`__init__.py`** — AG2 Space / Sutando channel adapters.
+
+## `src/channels/discord/`
+
+- **`__init__.py`** — Discord channel: API mechanics + injected post-gate (bridge, client, http, reader, post_gate).
+- **`client.py`** — Outcome-aware Discord REST client — one transport, three request classes.
+- **`delivery_provider.py`** — DiscordDeliveryProvider: binds the shared DiscordRestClient into the 3013 delivery-core seam — the first production provider behind it.
+- **`entrance_verify.py`** — Discord entrance verification — the provider-I/O edge of EntranceLink.
+- **`http.py`** — Shared Discord REST helper: urlopen with 429 Retry-After + 5xx backoff.
+- **`post_gate.py`** — Production injection seam for the Discord post-gate.
+- **`reader.py`** — Shared Discord message fetch + rendering — the single implementation behind both reader CLIs.
+
+## `src/delivery/`
+
+- **`__init__.py`** — _(no header comment)_
+- **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
+- **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 
 ## `src/launchd/`
 
@@ -286,15 +324,42 @@ One entry per agent-facing module.
 - **`normalizer.ts`** — Normalizer — turns ONE source's raw payload into the universal spine vocabulary (ObsEvent / UsageRecord).
 - **`server.ts`** — HTTP shell for the Collector — the long-running local daemon.
 
+## `src/policy/`
+
+- **`__init__.py`** — _(no header comment)_
+- **`guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
+
+## `src/policy/context/`
+
+- **`__init__.py`** — _(no header comment)_
+- **`discord.py`** — contextNotFrom gate — the single policy deciding whether a serving channel may pull another Discord channel's content into context.
+
+## `src/policy/egress/`
+
+- **`__init__.py`** — _(no header comment)_
+- **`attachment.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
+- **`result.py`** — Final scan applied to a Team-tier result before any router reads its markers.
+
 ## `src/runtime-api/`
 
+- **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
+- **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
+- **`identity_view.py`** — Read-only identity surface for THIS agent (the Sutando Server "smallest slice"): sutando.info / sutando.status / sutando.owner / sutando.allowlist.
+- **`instance_key.py`** — Composite (agent_id, instance_id) identity encoding — the ONE owner shared by the durable registry (flat manifest filenames) and the live run dir (the directory holding this instance's socket and lock).
+- **`instance_registry.py`** — Sutando Instance Manifest registry — persistent "this agent exists here" records, M1 of the manifest spec (taxonomy part 4/5): Agent existence ≠ agent process existence.
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.
 - **`request_store.py`** — runtime-api request store — durable request lifecycle in SQLite.
-- **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py) and the CLI (src/runtime-cli/sutando-runtime.py).
+- **`rundir.py`** — Canonical run-dir + runtime-socket resolution — the ONE definition shared by the daemon (server.py), the CLI (src/runtime-cli/sutando-runtime.py) and the shell descriptor (scripts/sutando-config.sh, which execs this module).
+- **`runtime_view.py`** — Runtime surface for THIS agent: runtime.health / runtime.details.
+- **`schedules_view.py`** — Schedule surface for the Sutando Server: schedule.list.
 - **`server.py`** — sutando-runtime-server — local runtime-API daemon (v0).
+- **`state_records.py`** — Reading the workspace state records the runtime-API views project.
+- **`tasks_view.py`** — Task-pipeline surface for the Sutando Server: task.submit / task.status / task.get_result / task.details / task.cancel.
 
 ## `src/runtime-cli/`
 
 - **`sutando-runtime.py`** — sutando-runtime — CLI face of the local runtime API (v0).
+- **`terminal_open.py`** — Terminal adapter for `sutando open` — spawn `sutando attach <id>` in a new terminal tab/window so the Sutando control TUI can stay in the current tab (owner v1).
+- **`tui.py`** — sutando tui — a deliberately DUMB reference client + architecture probe.

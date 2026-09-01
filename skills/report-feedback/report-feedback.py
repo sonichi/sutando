@@ -10,17 +10,20 @@ task delegation) — so there's no per-surface duplication.
 Usage:
   python3 skills/report-feedback/report-feedback.py \
       --title "..." [--body "..."] [--kind bug|feature|other] \
-      [--severity low|medium|high|critical] [--no-logs]
+      [--severity low|medium|high|critical] [--no-logs] [--auto]
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
 import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,6 +36,21 @@ TRUSTED_API_HOSTS = frozenset({"sutando.ag2.ai", "sutando.ag2.space"})
 # Test seam. Empty in production: a redirect that downgrades to plaintext must
 # never replay the bearer token, so http is allowed only where a test opts in.
 INSECURE_REDIRECT_HOSTS: frozenset[str] = frozenset()
+
+DEFAULT_CLOUD_ORIGIN = "https://sutando.ag2.space"
+# sutando.ag2.ai 307s to .space and clients drop Authorization across the
+# cross-origin redirect, so a bearer sent there reads back as a bogus 401.
+RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)
+# What the desktop host overwrites the Keychain token with on sign-out (its
+# vault CLI has no delete verb); must read as "not signed in".
+SIGNED_OUT_SENTINEL = "__signed_out__"
+
+# Owner prefs written by the desktop Settings UI (host is the single writer).
+PREFS_DEFAULTS = {"autoReport": True, "sendLogs": True}
+# Auto-report throttle state (this script is the single writer).
+AUTO_STATE_FILE = "feedback-auto-reports.json"
+AUTO_DEDUPE_WINDOW_S = 24 * 3600
+AUTO_DAILY_CAP = 5
 
 
 def _redact(text: str) -> str:
@@ -83,6 +101,74 @@ def resolve_workspace() -> Path:
         return Path(__file__).resolve().parents[2] / "workspace"
 
 
+def _normalize_base(base: str) -> str:
+    """A retired production origin IS the current one — never send a bearer to
+    it (the 307 to the new host drops Authorization → a misleading 401)."""
+    base = (base or "").strip().rstrip("/")
+    if base in RETIRED_CLOUD_ORIGINS or not base:
+        return DEFAULT_CLOUD_ORIGIN
+    return base
+
+
+def _fnv1a64(s: str) -> int:
+    """FNV-1a 64-bit, byte-for-byte the desktop host's (cloud_session.rs)."""
+    h = 0xCBF29CE484222325
+    for b in s.encode():
+        h ^= b
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def origin_vault_key(origin: str) -> str:
+    """Origin-scoped Keychain key, matching cloud_session.rs origin_key_suffix."""
+    slug = "".join(c.upper() if (c.isascii() and c.isalnum()) else "_" for c in origin)
+    return f"AG2_CLOUD_TOKEN_{slug}_{_fnv1a64(origin):016X}"
+
+
+def resolve_cloud_origin() -> str:
+    env = os.environ.get("AG2_CLOUD_ORIGIN", "").strip().rstrip("/")
+    return env or DEFAULT_CLOUD_ORIGIN
+
+
+def _keychain_get(key: str):
+    """Read one Keychain secret the way the engine vault does; None if absent."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-a", "sutando", "-s", key, "-w"],
+            capture_output=True,
+            timeout=10,
+        )
+        if r.returncode != 0:
+            return None
+        return r.stdout.decode().strip() or None
+    except Exception:
+        return None
+
+
+def read_keychain_auth():
+    """(apiBase, token) from the Tauri host's origin-scoped Keychain session.
+
+    The desktop host stores the sutk_ ONLY in the Keychain, under a key bound
+    to the cloud origin it was minted against (no cross-origin fallback except
+    the host's own retired-production carry-over, mirrored here).
+    """
+    origin = resolve_cloud_origin()
+    candidates = [origin]
+    if origin == DEFAULT_CLOUD_ORIGIN:
+        candidates.extend(RETIRED_CLOUD_ORIGINS)
+    for o in candidates:
+        tok = _keychain_get(origin_vault_key(o))
+        if tok and tok != SIGNED_OUT_SENTINEL:
+            return origin, tok
+    # Pre-origin-scoping installs stored a bare, unscoped key.
+    tok = _keychain_get("AG2_CLOUD_TOKEN")
+    if tok and tok != SIGNED_OUT_SENTINEL:
+        return origin, tok
+    return None, None
+
+
 def read_cloud_auth(ws: Path):
     """Return (apiBase, token) if signed in to Sutando Cloud, else (None, None).
 
@@ -90,8 +176,9 @@ def read_cloud_auth(ws: Path):
     lives at ``<workspace>/state/auth/cloud-auth.json``; the pre-M1 root
     ``<workspace>/cloud-auth.json`` is probed as a 30-day reader fallback. Both
     packaged-app workspace equivalents are also probed so the skill finds the
-    token even when running from a different checkout. Falls back to the metering
-    env the supervisor injects for signed-in runs.
+    token even when running from a different checkout. The Tauri desktop writes
+    no auth file at all — its session lives in the Keychain, probed next.
+    Falls back to the metering env the supervisor injects for signed-in runs.
     """
     seen: set[str] = set()
     _app_ws = Path.home() / ".sutando" / "repo" / "workspace"
@@ -110,18 +197,22 @@ def read_cloud_auth(ws: Path):
             if p.exists():
                 d = json.loads(p.read_text())
                 if d.get("token"):  # signed in == has token (matches desktop)
-                    return (d.get("apiBase") or "https://sutando.ag2.ai"), d["token"]
+                    return _normalize_base(d.get("apiBase") or ""), d["token"]
         except Exception:
             continue
+
+    base, tok = read_keychain_auth()
+    if tok:
+        return base, tok
 
     hdrs = os.environ.get("SUTANDO_METERING_HEADERS")
     if hdrs:
         try:
             auth = json.loads(hdrs).get("Authorization", "")
             tok = auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else auth
-            base = os.environ.get("SUTANDO_METERING_ENDPOINT", "").replace("/api/usage/v2", "").rstrip("/")
+            base = os.environ.get("SUTANDO_METERING_ENDPOINT", "").replace("/api/usage/v2", "")
             if tok:
-                return (base or "https://sutando.ag2.ai"), tok
+                return _normalize_base(base), tok
         except Exception:
             pass
     return None, None
@@ -145,6 +236,66 @@ def why_no_logs(ws: Path) -> str:
     except Exception:  # noqa: BLE001 - the explanation must not outrank the report
         return f"{logs} could not be inspected"
     return f"{logs} exists but its log files could not be read"
+
+
+def read_prefs(ws: Path) -> dict:
+    """Owner bug-report prefs from <workspace>/state/feedback-prefs.json.
+
+    Written by the desktop Settings toggles ("File automatic bug reports",
+    "Send logs with bug reports"). Missing file, missing key, or a non-bool
+    value all read as the default (both ON) — absence of the file must never
+    disable reporting on installs that predate the toggles.
+    """
+    prefs = dict(PREFS_DEFAULTS)
+    try:
+        d = json.loads((ws / "state" / "feedback-prefs.json").read_text())
+        for k in prefs:
+            if isinstance(d.get(k), bool):
+                prefs[k] = d[k]
+    except Exception:
+        pass
+    return prefs
+
+
+def _auto_state_path(ws: Path) -> Path:
+    return ws / "state" / AUTO_STATE_FILE
+
+
+def _read_auto_state(ws: Path) -> list:
+    try:
+        d = json.loads(_auto_state_path(ws).read_text())
+        return [r for r in d.get("reports", []) if isinstance(r, dict)]
+    except Exception:
+        return []
+
+
+def _auto_key(title: str) -> str:
+    return hashlib.sha1(" ".join(title.lower().split()).encode()).hexdigest()
+
+
+def check_auto_gate(ws: Path, title: str, now: float | None = None):
+    """(ok, reason) — dedupe identical titles and cap volume in a 24h window."""
+    now = now or time.time()
+    recent = [r for r in _read_auto_state(ws) if now - r.get("ts", 0) < AUTO_DEDUPE_WINDOW_S]
+    if any(r.get("key") == _auto_key(title) for r in recent):
+        return False, "an identical report was already filed in the last 24h"
+    if len(recent) >= AUTO_DAILY_CAP:
+        return False, f"auto-report cap reached ({AUTO_DAILY_CAP} per 24h)"
+    return True, ""
+
+
+def record_auto_report(ws: Path, title: str, now: float | None = None) -> None:
+    now = now or time.time()
+    recent = [r for r in _read_auto_state(ws) if now - r.get("ts", 0) < AUTO_DEDUPE_WINDOW_S]
+    recent.append({"key": _auto_key(title), "ts": now})
+    path = _auto_state_path(ws)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"reports": recent}))
+        os.replace(tmp, path)
+    except Exception:
+        pass  # throttle state is best-effort; never fail the report over it
 
 
 def logs_excerpt(ws: Path):
@@ -220,6 +371,12 @@ def main() -> None:
     ap.add_argument("--kind", choices=["bug", "feature", "other"], default="bug")
     ap.add_argument("--severity", choices=["low", "medium", "high", "critical"], default="medium")
     ap.add_argument("--no-logs", action="store_true", help="Omit the diagnostic log excerpt.")
+    ap.add_argument(
+        "--auto",
+        action="store_true",
+        help="Agent-initiated automatic report: honors the owner's auto-report "
+        "setting and is deduped/rate-limited. Exits 3 (SKIPPED) when gated.",
+    )
     a = ap.parse_args()
 
     if not a.title.strip():
@@ -227,13 +384,25 @@ def main() -> None:
         sys.exit(1)
 
     ws = resolve_workspace()
+    prefs = read_prefs(ws)
+    if a.auto:
+        if not prefs["autoReport"]:
+            print("SKIPPED: automatic bug reports are disabled (Settings → Agent → Bug reports).")
+            sys.exit(3)
+        ok, reason = check_auto_gate(ws, a.title)
+        if not ok:
+            print(f"SKIPPED: {reason}.")
+            sys.exit(3)
+
     base, token = read_cloud_auth(ws)
     if not token:
         print("NOT_SIGNED_IN: not signed in to Sutando Cloud — ask the user to sign in (Settings → Sutando Cloud), then retry.")
         sys.exit(2)
 
     ctx: dict = {"source": "core-agent", "platform": platform.platform(), "python": platform.python_version()}
-    if not a.no_logs:
+    if a.auto:
+        ctx["auto"] = True
+    if not a.no_logs and prefs["sendLogs"]:
         excerpt, names = logs_excerpt(ws)
         if excerpt:
             ctx["last_logs_excerpt"] = excerpt
@@ -256,6 +425,8 @@ def main() -> None:
     }
     try:
         status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token)
+        if a.auto:
+            record_auto_report(ws, a.title)
         print(f"OK: filed {a.kind} report ({status}).")
     except urllib.error.HTTPError as e:
         print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")

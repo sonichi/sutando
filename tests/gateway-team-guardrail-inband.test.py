@@ -84,9 +84,9 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
         # The guardrail is one text in src/, mirrored into the wheel. A fork here
         # is how the two surfaces drift back apart without any test noticing.
         root = Path(__file__).resolve().parent.parent
-        a = (root / "src" / "team_guardrail.py").read_text()
+        a = (root / "src" / "policy" / "guardrail.py").read_text()
         b = (root / "packages" / "ag2-sparrow" / "ag2_sparrow" / "team_guardrail.py").read_text()
-        self.assertEqual(a, b, "src/team_guardrail.py and the packaged copy have diverged")
+        self.assertEqual(a, b, "src/policy/guardrail.py and the packaged copy have diverged")
 
 
 

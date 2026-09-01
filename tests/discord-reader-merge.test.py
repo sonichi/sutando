@@ -110,11 +110,11 @@ def main() -> int:
     # 3. Single implementation: both CLIs' _render IS the shared one — the same
     #    forward renders byte-identically through both module namespaces.
     check("one renderer behind both CLIs",
-          dr._render(FORWARD_MSG) == sys.modules["discord_reader"]._render(FORWARD_MSG)
+          dr._render(FORWARD_MSG) == sys.modules["channels.discord.reader"]._render(FORWARD_MSG)
           and "[forwarded]" in dr._render(FORWARD_MSG))
 
     # 4. Shared policy fail-closed: blacklist present + unresolvable guild -> block.
-    policy = sys.modules["discord_context_policy"]
+    policy = sys.modules["policy.context.discord"]
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
         json.dump({"groups": {"srv": {"contextNotFrom": ["private-guild"]}}}, tf)
         acc = Path(tf.name)
@@ -152,7 +152,7 @@ def main() -> int:
     finally:
         policy.request_json = real_rj
 
-    reader = sys.modules["discord_reader"]
+    reader = sys.modules["channels.discord.reader"]
     line = reader.render_line({"id": "1", "timestamp": "2026-08-18T00:00:00.000",
                                "author": {"username": "u"}, "content": "x" * 300})
     check("render_line clips by default", "[2026-08-18T00:00:00] u: " in line and len(line) < 240)
@@ -163,12 +163,12 @@ def main() -> int:
     rdc.ACCESS_FILE = acc2
     check("rdc loader wrapper binds module ACCESS_FILE",
           rdc.load_channel_context_blacklist("srv") == {"g1"})
-    real_pol_rg = sys.modules["discord_context_policy"].resolve_guild
+    real_pol_rg = sys.modules["policy.context.discord"].resolve_guild
     try:
-        sys.modules["discord_context_policy"].resolve_guild = lambda t, tok: "g9"
+        sys.modules["policy.context.discord"].resolve_guild = lambda t, tok: "g9"
         check("rdc.resolve_guild delegates to policy", rdc.resolve_guild("t", "tok") == "g9")
     finally:
-        sys.modules["discord_context_policy"].resolve_guild = real_pol_rg
+        sys.modules["policy.context.discord"].resolve_guild = real_pol_rg
     real_rdc_rj = rdc.request_json
     try:
         rdc.request_json = lambda req, timeout=10: [{"author": {"username": "a"}, "content": "hi"}]

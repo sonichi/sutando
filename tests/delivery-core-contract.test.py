@@ -331,8 +331,11 @@ class CorePolicy(unittest.TestCase):
         self.assertEqual(outbox._read_item(root, ITEM).get("status"), "PARKED",
                          "ambiguity parks for a human; it does not stay READY")
         second = core.deliver_one(ITEM, b"body")
-        self.assertIs(second.status, DrainStatus.NOT_CLAIMED,
+        self.assertIs(second.status, DrainStatus.TERMINAL,
                       "a parked item is not re-drained")
+        self.assertIsNot(second.status, DrainStatus.NOT_CLAIMED,
+                         "and it is not contention: NOT_CLAIMED invites the "
+                         "caller to retry an item no pass can ever claim")
         self.assertEqual(prov.effects, 1,
                          "exactly one user-visible delivery, not two")
 
@@ -471,8 +474,8 @@ class CorePolicy(unittest.TestCase):
                             RetryPolicy(max_attempts=1))
         real_complete, fired, confirmed = self.backend.complete, [], []
 
-        def racing_complete(token, outcome, park_at_attempts=None):
-            ok = real_complete(token, outcome, park_at_attempts)
+        def racing_complete(token, outcome, park_at_attempts=None, **kw):
+            ok = real_complete(token, outcome, park_at_attempts, **kw)
             if not fired:                     # the gap: successor gets in
                 fired.append(True)
                 t2 = self.backend.claim(ITEM, "successor")
