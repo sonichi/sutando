@@ -23,6 +23,9 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP — jq not installed"; exit 0; }
 
 # --- build a fake clone whose path contains spaces ---------------------------
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks test.XXXXXX")"
+# The installer creates the archive hook's destination under $HOME, so every
+# invocation below must run against a throwaway home, not the developer's.
+export HOME="$ROOT/home"; mkdir -p "$HOME"
 REPO="$ROOT/repo with spaces"
 mkdir -p "$REPO/src" "$REPO/.claude"
 cp "$INSTALLER" "$REPO/src/install-claude-hooks.sh"
@@ -78,6 +81,18 @@ PC_CMD="$(cmds PreCompact | grep session-handoff || true)"
 RUN_OUT3="$(TRANSCRIPT_PATH=/dev/null bash -c "$PC_CMD" 2>&1)"
 ok "PreCompact handoff stored command executes the intended script" \
    "$([ "$RUN_OUT3" = "HANDOFF-RAN" ] && echo 0 || echo 1)"
+
+# The archive hook is a bare `cp`, so it cannot create its own destination. The
+# assertion that matters is not "the directory exists" but "the stored command
+# executed by a shell actually archives a file" — the same standard as above.
+ok "installer created the archive hook's destination directory" \
+   "$([ -d "$HOME/Desktop/sutando-conversations" ] && echo 0 || echo 1)"
+
+AR_CMD="$(cmds PreCompact | grep sutando-conversations || true)"
+printf 'transcript\n' > "$ROOT/transcript.jsonl"
+TRANSCRIPT_PATH="$ROOT/transcript.jsonl" bash -c "$AR_CMD" >/dev/null 2>&1
+ok "PreCompact archive stored command actually writes a transcript" \
+   "$([ "$(ls "$HOME/Desktop/sutando-conversations" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
 
 # --- 2. legacy Desktop repo hooks are migrated away -------------------------
 ok "legacy Desktop session-handoff hook removed (PreCompact)" \

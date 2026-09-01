@@ -114,7 +114,9 @@ trap 'rm -rf "$RECDIR"' EXIT
 COVERAGE_GATE_FILE_TIMEOUT="${COVERAGE_GATE_FILE_TIMEOUT:-240}"
 COVGATE_TIMEOUT=""
 if command -v timeout >/dev/null 2>&1; then
-    COVGATE_TIMEOUT="timeout -k 5 $COVERAGE_GATE_FILE_TIMEOUT"
+    # ABRT, not the default TERM: with PYTHONFAULTHANDLER=1 the dying process
+    # prints every thread's stack, so a capped file names WHERE it sat. rc stays 124.
+    COVGATE_TIMEOUT="timeout -k 5 -s ABRT $COVERAGE_GATE_FILE_TIMEOUT"
 else
     echo "coverage-gate: no \`timeout\` binary — per-file cap disabled (local run)." >&2
 fi
@@ -130,7 +132,7 @@ _covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
 # It also brings the worktrees' .coverage.* fragments home for the combine.
 # shellcheck disable=SC2086
 bash "$(dirname "$0")/parallel-suite-lane.sh" "$COVGATE_WORKERS" "$RECDIR/files" "$RECDIR" \
-    env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc
+    env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 PYTHONFAULTHANDLER=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc
 
 _covgate_idx=0
 while IFS= read -r f; do
