@@ -25,6 +25,7 @@ from typing import Optional
 
 import local_task_protocol
 from result_markers import parse_markers
+from task_archive import task_id_from_filename
 from workspace_default import status_read_path
 
 
@@ -222,11 +223,13 @@ def _task_paths(tasks_dir: Path):
     candidates = list(tasks_dir.glob("task-*.txt"))
     candidates.extend((tasks_dir / "processed").glob("task-*.txt"))
     candidates.extend(local_task_protocol.iter_archived_tasks(tasks_dir))
-    # Prefer the live copy when duplicate ids exist; archive copies follow.
+    # Prefer the live copy per id; keyed on the canonical id because a claimed
+    # file's stem differs from its archived copy's, hiding that they are one.
     for path in candidates:
-        if path.stem in seen:
+        task_id = task_id_from_filename(path.name)
+        if task_id is None or task_id in seen:
             continue
-        seen.add(path.stem)
+        seen.add(task_id)
         yield path
 
 
@@ -259,7 +262,11 @@ def scan_task_history(workspace: Path) -> list[TaskRecord]:
     results = _result_index(workspace / "results")
     rows: list[TaskRecord] = []
     for path in _task_paths(tasks_dir):
-        task_id = path.stem
+        # Not path.stem: a claimed/assigned file's stem is the compound name, so
+        # the row gets an id nothing else ever writes. task_archive owns this.
+        task_id = task_id_from_filename(path.name)
+        if task_id is None:
+            continue
         if task_id.startswith((CLASSIFIER_TASK_PREFIX, LEGACY_CLASSIFIER_TASK_PREFIX)):
             continue
         try:

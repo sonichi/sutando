@@ -83,6 +83,40 @@ def test_history_uses_invocation_time_and_owner_candidates() -> None:
     assert "task-team" not in json.dumps(snapshot)
 
 
+def test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count() -> None:
+    # The pool renames task-<id>.txt -> task-<id>.claimed-core-N.txt while a
+    # worker holds it; path.stem then yields an id nothing else ever writes.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-claimed-id-"))
+    write_task(
+        workspace / "tasks" / "task-c1.claimed-core-3.txt",
+        "task-c1", "2026-08-03T10:00:00Z", "in-flight claimed work",
+    )
+    write_task(
+        workspace / "tasks" / "task-c2.assigned-core-2.txt",
+        "task-c2", "2026-08-03T10:01:00Z", "assigned but unclaimed",
+    )
+    (workspace / "results").mkdir(parents=True, exist_ok=True)
+
+    ids = [row.id for row in workstreams.scan_task_history(workspace)]
+    assert ids == ["task-c2", "task-c1"], ids
+
+    # Same task, live claim plus its archived copy: one row, and the live one,
+    # which is what the "prefer the live copy" dedupe was always meant to do.
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "task-c1.txt",
+        "task-c1", "2026-08-03T10:00:00Z", "in-flight claimed work",
+    )
+    rows = workstreams.scan_task_history(workspace)
+    assert [row.id for row in rows].count("task-c1") == 1
+    assert next(row for row in rows if row.id == "task-c1").status == "working"
+
+    # A claimed task's result is written under the canonical id, so resolving
+    # the id is what lets history see the task as done at all.
+    write_result(workspace, "task-c1")
+    done = next(row for row in workstreams.scan_task_history(workspace) if row.id == "task-c1")
+    assert done.result == "done"
+
+
 def test_loader_parser_and_history_fail_open_edges() -> None:
     workspace = fixture_workspace()
     store_path = workspace / "data" / "task-workstreams.json"
@@ -947,6 +981,7 @@ def test_reused_workstream_id_does_not_require_a_redundant_name() -> None:
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
+        test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count,
         test_loader_parser_and_history_fail_open_edges,
         test_task_text_keeps_the_whole_body_not_just_its_first_line,
         test_task_text_stops_at_headers_that_follow_the_task_line,
