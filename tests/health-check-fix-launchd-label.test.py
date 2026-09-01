@@ -6,7 +6,10 @@ starting with "com.sutando." while those checks are named by service.
 
 Guards:
   a) LAUNCHD_BACKED_CHECKS maps both service names to their launchd labels
-  b) fix_launchd() with a mapped label kickstarts gui/<uid>/<label>
+  b) fix_launchd() with a mapped label restarts the job — voice-agent through
+     the GUARDED restart wrapper (amendment T4: never a direct
+     `launchctl kickstart -k` of voice-agent; the wrapper runs the
+     voice-lock.py takeover validation first), web-client via kickstart
      (verified via recorded subprocess calls against a temp LaunchAgents)
   c) fix_launchd() falls back to bootstrap when kickstart fails
   d) the --fix dispatch in main() actually routes LAUNCHD_BACKED_CHECKS
@@ -84,14 +87,27 @@ def main() -> int:
             hc.Path.home = staticmethod(lambda: Path(tmp))  # type: ignore[assignment]
             with_fake_home(tmp, make_plists=True)
 
-            # b) kickstart path
+            # b) restart path. voice-agent: NEVER a direct kickstart -k — the
+            # repair goes through the guarded wrapper (amendment T4), which
+            # runs the voice-lock.py takeover validation before its kickstart.
             rec = _Recorder(kickstart_rc=0)
             hc.subprocess.run = rec
             out = hc.fix_launchd(hc.LAUNCHD_BACKED_CHECKS["voice-agent"])
             kicks = [c for c in rec.calls if c[:2] == ["/bin/launchctl", "kickstart"]]
-            check(out == "restarted com.sutando.voice-agent"
-                  and kicks and kicks[0][-1].endswith("/com.sutando.voice-agent"),
-                  f"mapped label kickstarts the launchd job (got {out!r})")
+            wraps = [c for c in rec.calls
+                     if any(str(part).endswith("restart-voice-agent.sh") for part in c)]
+            check(out == "restarted com.sutando.voice-agent (guarded restart wrapper)"
+                  and wraps and not kicks,
+                  f"voice-agent repair uses the guarded wrapper, no direct kickstart (got {out!r}, kicks={kicks})")
+            # web-client keeps the direct kickstart (its label never names
+            # voice-agent, so the T4 gate does not apply).
+            rec_wc = _Recorder(kickstart_rc=0)
+            hc.subprocess.run = rec_wc
+            out_wc = hc.fix_launchd(hc.LAUNCHD_BACKED_CHECKS["web-client"])
+            kicks_wc = [c for c in rec_wc.calls if c[:2] == ["/bin/launchctl", "kickstart"]]
+            check(out_wc == "restarted com.sutando.web-client"
+                  and kicks_wc and kicks_wc[0][-1].endswith("/com.sutando.web-client"),
+                  f"web-client mapped label kickstarts the launchd job (got {out_wc!r})")
 
             # c) bootstrap fallback
             rec2 = _Recorder(kickstart_rc=1, bootstrap_rc=0)
@@ -101,14 +117,32 @@ def main() -> int:
             check(out2 == "bootstrapped com.sutando.web-client" and bool(boots),
                   f"kickstart failure falls back to bootstrap (got {out2!r})")
 
-        # missing plist → graceful string, no subprocess calls needed
+        # A KNOWN service whose plist is absent is not launchd-managed here —
+        # startup.sh launches it directly. The old assertion accepted "no plist
+        # found for com.sutando.voice-agent", which reads like a launchd failure
+        # and names nothing the operator can run; a stale voice-agent survived
+        # repeated --fix runs behind exactly that line.
         with tempfile.TemporaryDirectory() as tmp2:
             hc.Path.home = staticmethod(lambda: Path(tmp2))  # type: ignore[assignment]
             with_fake_home(tmp2, make_plists=False)
-            hc.subprocess.run = _Recorder()
+            rec3 = _Recorder()
+            hc.subprocess.run = rec3
             out3 = hc.fix_launchd("com.sutando.voice-agent")
-            check(out3.startswith("no plist found"),
-                  "missing plist reported gracefully")
+            check("not launchd-managed" in out3,
+                  f"known service, no plist → says it is not launchd-managed (got {out3!r})")
+            check("bash src/restart.sh" in out3,
+                  f"...and names a runnable remedy (got {out3!r})")
+            # The remedy must exist, or this message rots into a second dead end.
+            check((REPO / "src" / "restart.sh").is_file(),
+                  "the remedy the message names actually exists in the repo")
+            check(not rec3.calls,
+                  f"no launchctl call is attempted for an unmanaged service (got {rec3.calls})")
+
+            # The genuinely-unknown label keeps the old wording: there is no
+            # remedy to name because we do not know the job at all.
+            out4 = hc.fix_launchd("com.sutando.not-a-real-job")
+            check(out4 == "no plist found for com.sutando.not-a-real-job",
+                  f"unknown label still reports plainly (got {out4!r})")
     finally:
         hc.Path.home = saved_home
         hc.subprocess.run = saved_run

@@ -60,6 +60,11 @@ Usage:
 """
 from __future__ import annotations
 
+import os.path as _osp
+import sys as _sys
+_sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
+from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
+
 import argparse
 import importlib.util
 import json
@@ -257,23 +262,47 @@ def _pgrep(pattern):
 # genuinely stalled bridge read as alive.
 GATEWAY_STATUS_MAX_AGE_S = 90.0
 
+# How long a reconnecting link may go without a SUCCESSFUL poll before it reads
+# down. Independent of the staleness bound above; equal today, retune separately.
+GATEWAY_OUTAGE_MAX_AGE_S = 90.0
+
 
 def _gateway_status(state_dir):
     """Read the bridge's own liveness sidecar. Returns True/False if the file
     is present and fresh, else None (meaning: no opinion, fall back to pgrep).
+
+    `connected: false` covers three different conditions and only two are down.
+    A retryable transport failure (`network: …` / `HTTP 5xx`) writes a growing
+    `backoff_s`; the initial auth rejection writes 0; a sustained outage ages
+    `last_ok_ts` past the window while backoff grows. So a retry whose last
+    success is still inside GATEWAY_OUTAGE_MAX_AGE_S is a reconnecting-but-
+    serving link, not a dead one — the sidecar preserves `last_ok_ts` across
+    reconnect writes specifically so a consumer can tell.
+
+    Known bound: the bridge's auth re-check loop ALSO writes a non-zero
+    `backoff_s`, so a mid-session token revocation reads alive until
+    `last_ok_ts` ages past the window, then reads down.
     """
     if not state_dir:
         return None
     try:
-        p = os.path.join(state_dir, "gateway-status.json")
-        with open(p) as fh:
-            data = json.load(fh)
-        ts = data.get("ts")
-        if not isinstance(ts, (int, float)):
+        now = time.time()
+        # Serving verdict is gateway_serving's; the freshness window and the
+        # reconnect grace below are this reader's. Stale -> None, as before.
+        v = read_gateway_verdict(
+            os.path.join(state_dir, "gateway-status.json"),
+            now=now,
+            max_age=GATEWAY_STATUS_MAX_AGE_S,
+        )
+        if v is None:
             return None
-        if time.time() - ts > GATEWAY_STATUS_MAX_AGE_S:
-            return None      # stale — the bridge may be wedged; let pgrep answer
-        return bool(data.get("connected"))
+        if v.serving:
+            return True
+        # Reconnect grace: a lane that HAS served and is backing off stays alive
+        # until its last success ages out. A never-polled lane has none to age.
+        if v.backoff_s and v.last_ok_ts is not None:
+            return now - v.last_ok_ts <= GATEWAY_OUTAGE_MAX_AGE_S
+        return False
     except Exception:
         return None
 
@@ -305,6 +334,10 @@ def gateway_alive(app_data, state_dir=None):
     # detail string; here it is elevated to its own state, so it stays local.
     if app_data:
         return _pgrep(os.path.join(app_data, "engine", "runtime", "python"))
+    # KNOWINGLY PRIMARY-ONLY (#2503): identity-blind pgrep — a live named
+    # GATEWAY_INSTANCE secondary matches this pattern and can mask a dead
+    # primary. Same reasoning as startup.sh's launcher P1; instance-aware
+    # probing tracked separately.
     return _pgrep("remote-gateway-bridge")
 
 

@@ -66,7 +66,10 @@ PATTERN='(\$HOME|~|/Users/[^/]+|/home/[^/]+)/\.sutando/|home\(\)[[:space:]]*/[[:
 # fallback after resolve_workspace() / a doc comment). They're allowed because
 # the reference is intentional and reviewed; a brand-new file copying the
 # literal is what this lint is for.
-ALLOWED='^(scripts/sutando-config\.sh|src/util_paths\.py|src/workspace_default\.(py|ts)|src/startup\.sh|scripts/install-git-hooks\.sh|scripts/install-session-start-hook\.sh|src/agent/claude/cli/start-cli\.sh|src/health-check\.py|scripts/sync-memory\.sh|scripts/sync-workspace\.sh|scripts/sutando-migrate\.sh|src/migrate\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/probe-team-sandbox\.sh|skills/report-feedback/report-feedback\.py|src/telemetry\.py|src/inline-tools\.ts|tests/lint-sutando-home-path\.test\.sh|tests/credential-proxy-refresh\.test\.ts|tests/migration-safety-helpers\.test\.sh|tests/state-paths-adoption\.test\.py|tests/sync-memory-migration\.test\.sh|tests/sync-workspace\.test\.sh|tests/workspace-default\.test\.py|packages/ag2-sparrow/.*\.py)$'
+# src/runtime-api/rundir.py OWNS the runtime run-dir resolution (daemon + CLI
+# both import it); its ~/.sutando/run is the documented last-resort fallback
+# in that one owner file — exactly the "one place to change" the lint wants.
+ALLOWED='^(scripts/sutando-config\.sh|src/util_paths\.py|src/workspace_default\.(py|ts)|src/startup\.sh|scripts/install-git-hooks\.sh|scripts/install-session-start-hook\.sh|src/agent/claude/cli/start-cli\.sh|src/health-check\.py|scripts/sync-memory\.sh|scripts/sync-workspace\.sh|scripts/sutando-migrate\.sh|src/migrate\.sh|src/migration_safety_helpers\.sh|scripts/lint-workspace-resolution\.sh|scripts/lint-sutando-home-path\.sh|scripts/probe-team-sandbox\.sh|skills/report-feedback/report-feedback\.py|src/telemetry\.py|src/runtime-api/rundir\.py|src/inline-tools\.ts|tests/lint-sutando-home-path\.test\.sh|tests/runtime-rundir-resolver\.test\.sh|tests/credential-proxy-refresh\.test\.ts|tests/migration-safety-helpers\.test\.sh|tests/state-paths-adoption\.test\.py|tests/sync-memory-migration\.test\.sh|tests/sync-workspace\.test\.sh|tests/workspace-default\.test\.py|tests/runtime-api-rundir\.test\.py|packages/ag2-sparrow/.*\.py)$'
 
 if [[ "$mode" == "--diff" ]]; then
   base="${BASE_REF:-origin/main}"

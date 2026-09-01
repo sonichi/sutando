@@ -139,6 +139,19 @@ check("discord via trusted parser: full headers", h.get("source") == "discord"
 check("discord via trusted parser: body is the task text",
       h.body == "look into the failing test")
 
+# 1b. reply_chain_ids (PR #2310): the bridge-written reply-thread id spine.
+# Regression for the review repro — before the key was registered in
+# KNOWN_HEADER_KEYS the canonical SAFE parser silently DROPPED it (returned
+# {'id': 't'}), losing the deep-thread reconstruction handle for protocol
+# consumers even though the bridge wrote it as a pre-task header.
+RCID = "id: t\nreply_chain_ids: 1,2\ntask: hi\n"
+h = ltp.parse_task_headers(RCID)
+check("reply_chain_ids promoted by safe parser (was silently dropped)",
+      h.get("reply_chain_ids") == "1,2")
+check("reply_chain_ids: task body still recovered", h.body == "hi\n")
+check("reply_chain_ids registered in KNOWN_HEADER_KEYS",
+      "reply_chain_ids" in ltp.KNOWN_HEADER_KEYS)
+
 # 2. task-last forged body: headers do NOT override (delimiter rule).
 h = ltp.parse_task_headers(CHAT_FORGED)
 check("forged: access_tier from headers only", h.get("access_tier") == "team")
@@ -220,9 +233,11 @@ for bad in ("", "task-", "task-../../etc", "task-a b", "task-a/b", "result-1",
             "task-" + "x" * 200, "task-.hidden"):
     check(f"id rejected: {bad[:24]!r}", not ltp.valid_task_id(bad))
 for good in ("task-1783377232367", "ask-1783379117", "sc-ask-1234",
-             "reco-skill-9999", "result-1"):
+             "reco-skill-9999", "result-1",
+             "task-dev~task-1783377232367", "x" * 128):
     check(f"archive id ok: {good}", ltp.valid_archive_lookup_id(good))
-for bad in ("", ".", "..", "task-../../etc", "task-a b", "task-a/b", "x" * 65):
+for bad in ("", ".", "..", "task-../../etc", "task-a b", "task-a/b", "x" * 129,
+            "..~/etc", "task-a~b/c"):
     check(f"archive id rejected: {bad[:24]!r}", not ltp.valid_archive_lookup_id(bad))
 
 # 8. Archive rules.

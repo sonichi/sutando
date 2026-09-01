@@ -10,8 +10,10 @@ import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statS
 import { join, extname, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { requirePython } from './python-binary.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
+import { presenterModeActive } from './presenter-mode.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -22,7 +24,11 @@ const WORKSPACE_DIR = resolveWorkspace();
 
 // Gate slide-control + fullscreen on presenter-mode.sentinel.
 // Issue #1171: registering these globally causes Gemini to fire them on greetings.
-const _presenterActive = existsSync(join(WORKSPACE_DIR, 'state', 'presenter-mode.sentinel'));
+// Expiry-aware (#2501 policy twin): bare existsSync re-activated the gate
+// forever after a talk window lapsed without `presenter-mode.sh stop`, because
+// a naturally-expired sentinel stays on disk. Still evaluated once at module
+// load — the per-session registration semantics are unchanged.
+const _presenterActive = presenterModeActive(WORKSPACE_DIR);
 
 // Code-adjacent paths (skills/, etc.) ship with the repo checkout, NOT the
 // workspace. Compute REPO_ROOT from this file's URL so the resolution
@@ -33,6 +39,7 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
 // Re-export recording/screen/browser tools from browser-tools
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
+import { keystrokeOutcome } from './osascript-setup-hint.js';
 import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
 // Vision: one-shot frame + start/stop live screen-to-Gemini video.
@@ -209,14 +216,14 @@ export const pressKeyTool: ToolDefinition = {
 			try {
 				execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeKey}"${modStr}`], { timeout: 3_000 });
 			} catch (err) {
-				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 			}
 		} else {
 			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
 			try {
 				execFileSync('osascript', ['-e', `tell application "System Events" to key code ${keyCode}${modStr}`], { timeout: 3_000 });
 			} catch (err) {
-				return { error: `press_key failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 			}
 		}
 		console.log(`${ts()} [PressKey] ${app ? `(${app}) ` : ''}${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
@@ -373,7 +380,7 @@ export const typeTextTool: ToolDefinition = {
 				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
 			} catch (err) {
-				return { error: `Paste failed: ${err instanceof Error ? err.message : err}` };
+				return keystrokeOutcome('Paste', err instanceof Error ? err.message : String(err));
 			}
 		}
 		// Single-line short text: use keystroke
@@ -392,7 +399,7 @@ export const typeTextTool: ToolDefinition = {
 			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
-			return { error: `Type failed: ${err instanceof Error ? err.message : err}` };
+			return keystrokeOutcome('Type', err instanceof Error ? err.message : String(err));
 		}
 	},
 };
@@ -433,6 +440,98 @@ export const volumeTool: ToolDefinition = {
 	},
 };
 
+// The smooth ramp lands within a rounding step of the request; wider than that
+// means the display did not take the change.
+const BRIGHTNESS_TOLERANCE_PCT = 2;
+
+// Identifies the target display before choosing a mechanism: DisplayServices
+// drives the built-in panel only, and external panels need DDC over I2C. Prints
+// "<kind> <level>" so the caller can report which path ran; exits 2 for an
+// external display, which it cannot drive itself.
+const BRIGHTNESS_PY = `
+import ctypes, ctypes.util, sys, time
+cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+cg.CGMainDisplayID.restype = ctypes.c_uint32
+cg.CGDisplayIsBuiltin.argtypes = [ctypes.c_uint32]
+did = cg.CGMainDisplayID()
+if not cg.CGDisplayIsBuiltin(did):
+    # Report how many displays are attached: the caller cannot safely pick one
+    # for DDC when several are, so it refuses rather than driving the wrong panel.
+    n = ctypes.c_uint32()
+    arr = (ctypes.c_uint32 * 16)()
+    cg.CGGetActiveDisplayList(16, arr, ctypes.byref(n))
+    print("external", n.value)
+    sys.exit(2)
+ds = ctypes.CDLL("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices")
+ds.DisplayServicesGetBrightness.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
+ds.DisplayServicesSetBrightnessSmooth.argtypes = [ctypes.c_uint32, ctypes.c_float]
+before = ctypes.c_float()
+if ds.DisplayServicesGetBrightness(did, ctypes.byref(before)) != 0:
+    sys.exit(1)
+if ds.DisplayServicesSetBrightnessSmooth(did, ctypes.c_float(float(sys.argv[1]) - before.value)) != 0:
+    sys.exit(1)
+time.sleep(0.6)
+after = ctypes.c_float()
+if ds.DisplayServicesGetBrightness(did, ctypes.byref(after)) != 0:
+    sys.exit(1)
+print("builtin", after.value, before.value)
+`;
+
+/**
+ * DDC brightness for a single external panel, 0-100. Both tools address a
+ * display by their own index, which no CoreGraphics id maps onto, so this
+ * refuses when more than one display is attached rather than guessing which
+ * panel `display 1` denotes.
+ *
+ * Reads the level back where the tool supports it. DDC is widely half-implemented
+ * in monitor firmware, so a command can be accepted and ignored — reporting the
+ * REQUESTED level here would reproduce the silent-success bug this file exists to
+ * fix, on the one path that cannot be hardware-tested. When no readback is
+ * available the result says `requested`, never `set`.
+ */
+type ExternalResult =
+	| { status: 'set' | 'partial' | 'requested'; method: string; level: number; requested: number; verified: boolean }
+	| { error: string };
+
+function setExternalBrightness(level: number, displayCount: number): ExternalResult {
+	if (displayCount > 1) {
+		return { error: `${displayCount} displays attached — refusing to guess which external panel to dim. Set it on the monitor, or attach one display.` };
+	}
+	const failures: string[] = [];
+	for (const [bin, setArgs, getArgs] of [
+		['m1ddc', ['display', '1', 'set', 'luminance', String(level)], ['display', '1', 'get', 'luminance']],
+		['ddcctl', ['-d', '1', '-b', String(level)], null],
+	] as const) {
+		try {
+			execFileSync(bin, [...setArgs], { timeout: 5_000, stdio: ['ignore', 'ignore', 'pipe'] });
+		} catch (err) {
+			// ENOENT (absent) and a non-zero exit (present but refused) are different
+			// diagnoses; collapsing them tells a user who HAS the tool to install it.
+			const e = err as { code?: string; stderr?: Buffer; status?: number };
+			if (e?.code === 'ENOENT') continue;
+			failures.push(`${bin} exited ${e?.status ?? '?'}: ${String(e?.stderr ?? '').trim() || 'no stderr'}`);
+			continue;
+		}
+		if (getArgs) {
+			try {
+				const out = execFileSync(bin, [...getArgs], { timeout: 5_000, encoding: 'utf8' });
+				const actual = parseInt(out.trim(), 10);
+				if (Number.isFinite(actual)) {
+					return Math.abs(actual - level) <= BRIGHTNESS_TOLERANCE_PCT
+						? { status: 'set', method: bin, level: actual, requested: level, verified: true }
+						: { status: 'partial', method: bin, level: actual, requested: level, verified: true };
+				}
+			} catch { /* readback unsupported by this panel — fall through unverified */ }
+		}
+		return { status: 'requested', method: bin, level, requested: level, verified: false };
+	}
+	return {
+		error: failures.length
+			? `External display: DDC command failed — ${failures.join('; ')}`
+			: 'External display needs a DDC tool. Install one with: brew install m1ddc',
+	};
+}
+
 export const brightnessTool: ToolDefinition = {
 	name: 'brightness',
 	description:
@@ -445,22 +544,48 @@ export const brightnessTool: ToolDefinition = {
 		let { level } = args as { level: number };
 		// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 		if (level <= 1 && level > 0) level = Math.round(level * 100);
+		level = Math.max(0, Math.min(100, level));
 		const bLevel = (level / 100).toFixed(2);
 		try {
-			execFileSync('brightness', [bLevel], { timeout: 5_000 });
-			console.log(`${ts()} [Brightness] set to ${level}%`);
-			return { status: 'set', level };
-		} catch {
-			// Fallback: use AppleScript key codes
+			// DisplayServicesSetBrightnessSmooth takes a RELATIVE delta and persists;
+			// the absolute setter is reverted by the display daemon within ~30s.
+			const out = execFileSync(requirePython(), ['-c', BRIGHTNESS_PY, bLevel], { timeout: 5_000, encoding: 'utf8' });
+			const [, afterRaw, beforeRaw] = out.trim().split(/\s+/);
+			const actual = Math.round(parseFloat(afterRaw) * 100);
+			const before = Math.round(parseFloat(beforeRaw) * 100);
+			if (!Number.isFinite(actual) || !Number.isFinite(before)) throw new Error(`unreadable brightness: ${out.trim()}`);
+			// A readback alone cannot tell "set" from "did nothing" — that was the
+			// original silent-success bug. Require the display to have reached the
+			// target, or at least moved toward it.
+			if (Math.abs(actual - level) > BRIGHTNESS_TOLERANCE_PCT) {
+				const moved = actual !== before;
+				console.log(`${ts()} [Brightness] builtin: requested ${level}%, reads ${actual}% (was ${before}%) — ${moved ? 'partial' : 'no movement'}`);
+				return moved
+					? { status: 'partial', level: actual, requested: level, was: before, display: 'builtin' }
+					: { error: `Brightness did not move: still ${actual}% after requesting ${level}%.` };
+			}
+			console.log(`${ts()} [Brightness] builtin: requested ${level}%, display reads ${actual}%`);
+			return { status: 'set', level: actual, requested: level, display: 'builtin' };
+		} catch (err) {
+			// Exit 2 means the probe identified an EXTERNAL main display, which
+			// DisplayServices cannot drive at all — route to DDC rather than retrying.
+			if ((err as { status?: number })?.status === 2) {
+				const count = parseInt(String((err as { stdout?: string }).stdout ?? '').trim().split(/\s+/)[1] ?? '1', 10);
+				const outcome = setExternalBrightness(level, Number.isFinite(count) ? count : 1);
+				if ('error' in outcome) return outcome;
+				console.log(`${ts()} [Brightness] external: requested ${level}% via ${outcome.method} — ${outcome.verified ? `display reads ${outcome.level}%` : 'NOT verified (no readback)'}`);
+				return { ...outcome, display: 'external' };
+			}
+			// Last resort when the probe itself could not run. nriley/brightness has no
+			// readback we use here, so this reports `requested`, never `set` — the same
+			// rule the external path follows, and the reason the review found this
+			// class in the first place.
 			try {
-				const steps = Math.round(level / 100 * 16);
-				// Reset to 0 then go up
-				for (let i = 0; i < 16; i++) execFileSync('osascript', ['-e', 'tell application "System Events" to key code 107'], { timeout: 1_000 }); // brightness down
-				for (let i = 0; i < steps; i++) execFileSync('osascript', ['-e', 'tell application "System Events" to key code 113'], { timeout: 1_000 }); // brightness up
-				console.log(`${ts()} [Brightness] set to ~${level}% via key codes`);
-				return { status: 'set', level, method: 'key_codes' };
-			} catch (err) {
-				return { error: `Brightness failed: ${err instanceof Error ? err.message : err}` };
+				execFileSync('brightness', [bLevel], { timeout: 5_000 });
+				console.log(`${ts()} [Brightness] requested ${level}% via brightness CLI — NOT verified`);
+				return { status: 'requested', level, requested: level, method: 'cli', verified: false };
+			} catch (e) {
+				return { error: `Brightness failed: ${e instanceof Error ? e.message : e}` };
 			}
 		}
 	},
@@ -940,6 +1065,95 @@ export const deleteNoteTool: ToolDefinition = {
 
 const VOICE_SESSION_CONTEXT_PATH = join(WORKSPACE_DIR, 'state', 'voice-session-context.json');
 
+// Anything older than this is almost certainly a PREVIOUS session's context.
+// The file exists to bridge voice's ~10-minute Gemini window inside one live
+// session, so a multi-hour gap means the session that wrote it is long gone.
+export const VOICE_CONTEXT_STALE_HOURS = 6;
+
+// Clocks between the writing process and the reading one disagree by seconds in
+// practice. Inside this window a future timestamp is ordinary skew and the age is
+// clamped to 0; beyond it the stamp is untrustworthy and degrades to 'unknown'.
+export const VOICE_CONTEXT_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
+ * Stamp the context payload with its own age.
+ *
+ * WHY: the writer is a PROSE INSTRUCTION, not code — CLAUDE.md tells core to
+ * update this file "whenever a durable decision lands". That is a discipline,
+ * and disciplines lapse silently. Measured 2026-08-03: the canonical file was
+ * **97 hours old and still carried `pending_action`**, and the legacy copy was
+ * 878 hours old. `recent_context` returned both verbatim, so voice would answer
+ * "what's pending?" with a four-day-old action stated as current — while the
+ * tool's own description promises "the CURRENT voice-session context".
+ *
+ * The payload is deliberately NOT withheld when stale: dropping it would hide
+ * context that is often still correct, and the failure this guards against is
+ * voice asserting currency it cannot verify. So it returns everything and adds
+ * the one fact the caller could not otherwise know.
+ */
+export function annotateContextFreshness(
+	parsed: Record<string, unknown> | null | undefined,
+	nowMs: number = Date.now(),
+): Record<string, unknown> {
+	const base: Record<string, unknown> = { ...(parsed ?? {}) };
+	const rawTs = base.updated_at;
+	const updatedMs = typeof rawTs === 'string' ? Date.parse(rawTs) : Number.NaN;
+	if (!Number.isFinite(updatedMs)) {
+		base.freshness = 'unknown';
+		base.note =
+			'context has no parseable updated_at — age unknown, so treat pending_action and active_drafts as historical unless the user confirms them.';
+		return base;
+	}
+	// A FUTURE timestamp fails both branches below unless it is caught here: the age
+	// goes negative, so it is never >= the stale threshold, and Number.isFinite() is
+	// true so it never reaches 'unknown'. A skewed or corrupt clock would therefore
+	// bypass the guard completely and let voice assert an old pending_action as
+	// current until wall time caught up — the very defect this function exists to
+	// close, through the one input I had not considered (qingyun-wu + john-the-dev,
+	// review of #2560).
+	//
+	// The tolerance matters as much as the check: machine clocks routinely disagree
+	// by seconds, so treating ANY future stamp as untrusted would flag healthy
+	// contexts and train the reader to ignore the marker. Inside the window the age
+	// is clamped to 0 (healthy, never negative); beyond it the stamp cannot be
+	// trusted at all, so it degrades to unknown rather than to fresh.
+	const ageMs = nowMs - updatedMs;
+	// Close the CLASS, not the case. The reviewed defect was a future timestamp
+	// producing a negative age that satisfied neither branch; a non-finite `nowMs`
+	// (NaN/Infinity, e.g. a caller passing a parsed value) fails both the same way
+	// and reads as fresh. Found by enumerating this function's inputs rather than
+	// waiting for a fourth review round. Any age arithmetic that is not a finite
+	// number means the age is unknowable, so it degrades to unknown — never fresh.
+	if (!Number.isFinite(ageMs)) {
+		base.freshness = 'unknown';
+		base.note =
+			'context age could not be computed (the current time was not a finite value), so it ' +
+			'cannot be trusted. Treat pending_action and active_drafts as historical unless the ' +
+			'user confirms them.';
+		return base;
+	}
+	if (ageMs < -VOICE_CONTEXT_SKEW_TOLERANCE_MS) {
+		const aheadHours = Math.round((-ageMs / 3_600_000) * 10) / 10;
+		base.age_hours = Math.round((ageMs / 3_600_000) * 10) / 10;
+		base.freshness = 'unknown';
+		base.note =
+			`this context is timestamped ${aheadHours}h in the FUTURE — a skewed or corrupt clock, ` +
+			'so its age cannot be trusted. Treat pending_action and active_drafts as historical ' +
+			'unless the user confirms them.';
+		return base;
+	}
+	const ageHours = Math.max(0, ageMs) / 3_600_000;
+	base.age_hours = Math.round(ageHours * 10) / 10;
+	if (ageHours >= VOICE_CONTEXT_STALE_HOURS) {
+		base.stale = true;
+		base.note =
+			`this context is ${base.age_hours}h old — almost certainly written by an EARLIER session, ` +
+			'not the one you are in. Do not present pending_action or active_drafts as current; ' +
+			'say how old it is, or confirm with the user before acting on it.';
+	}
+	return base;
+}
+
 export const recentContextTool: ToolDefinition = {
 	name: 'recent_context',
 	description:
@@ -947,7 +1161,10 @@ export const recentContextTool: ToolDefinition = {
 		'Call this when the user references something with a deictic pronoun ("the post", "the draft", "the one I just typed") that you can\'t place from your own recent transcript. ' +
 		'Also fine to call proactively at the start of an active session to ground yourself. ' +
 		'Returns JSON with keys: active_drafts (array), pending_action (object|null), last_results (array of {task_id, subject, ts}). ' +
-		'If the file is missing or empty, returns {note: "no context recorded yet"}.',
+		'If the file is missing or empty, returns {note: "no context recorded yet"}. ' +
+		'The response also carries age_hours, and stale:true with a note when the context predates this session. ' +
+		'Age is load-bearing: when stale is set, do NOT state pending_action or active_drafts as current — ' +
+		'say how old it is, or ask the user to confirm, before acting on it.',
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
@@ -956,8 +1173,8 @@ export const recentContextTool: ToolDefinition = {
 				return { note: 'no context recorded yet — core hasn\'t written voice-session-context.json' };
 			}
 			const raw = readFileSync(VOICE_SESSION_CONTEXT_PATH, 'utf-8');
-			const parsed = JSON.parse(raw);
-			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, ${(parsed.active_drafts || []).length} drafts, ${(parsed.last_results || []).length} results)`);
+			const parsed = annotateContextFreshness(JSON.parse(raw));
+			console.log(`${ts()} [RecentContext] returned (updated_at=${parsed.updated_at || 'unknown'}, age=${parsed.age_hours ?? '?'}h${parsed.stale ? ' STALE' : ''}, ${((parsed.active_drafts as unknown[]) || []).length} drafts, ${((parsed.last_results as unknown[]) || []).length} results)`);
 			return parsed;
 		} catch (err) {
 			return { error: `recent_context read failed: ${err instanceof Error ? err.message : err}` };
@@ -1006,7 +1223,12 @@ function assertUniqueToolNames(tools: ToolDefinition[]): ToolDefinition[] {
 // Split by manifest `access_tier` so phone-conversation can include
 // owner-tier tools only when the caller is the verified owner. Manifest
 // access_tier values: "owner" (default if omitted) | "any_caller".
-async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[] }> {
+// OPTIONAL hook a skill's tools.ts may export; core calls it once per voice
+// session so the skill registers session handlers without importing core.
+export type { SkillSetupCtx, SkillSetup } from './skill-setup-runner.js';
+import type { SkillSetup } from './skill-setup-runner.js';
+
+async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyCaller: ToolDefinition[]; setups: SkillSetup[] }> {
 	// Scan the public-repo `skills/` dir, the per-user workspace
 	// `$SUTANDO_WORKSPACE/skills/`, AND the optional private skills dir
 	// pointed to by `$SUTANDO_MEMORY_DIR/skills/` (legacy `$SUTANDO_PRIVATE_DIR`
@@ -1038,6 +1260,9 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 	} catch { /* siblings root unreadable — skip */ }
 	const owner: ToolDefinition[] = [];
 	const anyCaller: ToolDefinition[] = [];
+	// Keyed by skill identity (manifest.name || dirName), not tool name: the same
+	// skill scanned from two roots must attach its handler ONCE, last-write-wins.
+	const setups = new Map<string, SkillSetup>();
 	for (const skillsDir of dirsToScan) {
 		if (!existsSync(skillsDir)) continue;
 		let dirs: string[];
@@ -1070,6 +1295,12 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 					(tier === 'any_caller' ? anyCaller : owner).push(...mod.tools);
 					console.log(`[skill-loader] loaded ${mod.tools.length} tool(s) from ${manifest.name || dirName} [tier=${tier}] (${skillsDir})`);
 				}
+				if (typeof mod.setup === 'function') {
+					// DISCOVERY, not registration: a skill in N roots hits this line N times
+					// but registers once. The authoritative count is logged after the scan.
+					console.log(`[skill-loader] found setup() hook in ${manifest.name || dirName} (${skillsDir})`);
+					setups.set(manifest.name || dirName, mod.setup as SkillSetup);
+				}
 			} catch (err) {
 				console.warn(`[skill-loader] failed to import ${dirName}/${manifest.tools} from ${skillsDir}:`, err instanceof Error ? err.message : err);
 			}
@@ -1086,7 +1317,9 @@ async function loadSkillManifestTools(): Promise<{ owner: ToolDefinition[]; anyC
 		for (const t of arr) byName.set(t.name, t);
 		return [...byName.values()];
 	};
-	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller) };
+	// One authoritative line for what actually got registered, after dedupe.
+	if (setups.size) console.log(`[skill-loader] registered ${setups.size} setup() hook(s): ${[...setups.keys()].join(', ')}`);
+	return { owner: dedupeByName(owner), anyCaller: dedupeByName(anyCaller), setups: [...setups.values()] };
 }
 const personalTools = await loadSkillManifestTools();
 // Also dedupe across the owner+anyCaller union (a tool declared in both tiers).
@@ -1102,6 +1335,9 @@ const personalAllTools = (() => {
 export const envDependentToolNames: ReadonlySet<string> = new Set([
 	...personalAllTools.map(t => t.name), 'slide_control', 'fullscreen',
 ]);
+// voice-agent invokes each once per session with {session, injectText}.
+// Empty when no skill exports setup().
+export const personalSkillSetups: SkillSetup[] = personalTools.setups;
 
 // Manifest-driven discovery of skills that core (not voice-inline) runs.
 // When a manifest has `documented_for_core: true` and a `core_description`,

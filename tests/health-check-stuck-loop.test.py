@@ -212,6 +212,19 @@ def case_i_small_fresh_queue() -> list[str]:
     return fails
 
 
+def case_j0_one_task_stuck_long() -> list[str]:
+    """A SINGLE task stuck far past the age threshold must warn. The count and
+    age conditions were ANDed, so 1-3 aged tasks were unreachable and green."""
+    fails = []
+    def setup(d):
+        write_task(d, "task-stuck.txt", age_sec=3600)
+    r = with_tasks_override(setup)
+    if r["status"] != "warn":
+        fails.append(
+            f"j0) 1 task aged 3600s should warn, got {r['status']} ({r['detail']})")
+    return fails
+
+
 def case_j_large_fresh_queue() -> list[str]:
     fails = []
     # Many tasks but all fresh — count alone shouldn't alarm.
@@ -226,8 +239,8 @@ def case_j_large_fresh_queue() -> list[str]:
 
 def case_k_small_old_queue() -> list[str]:
     fails = []
-    # Small queue but old — age alone shouldn't alarm. The user might have
-    # 1-2 long-tail tasks that take a while; not stuck.
+    # Age alone shouldn't alarm BELOW the bar: 600s is under stuck_age_sec
+    # (900), which is what separates this from j0 where age alone must warn.
     def setup(d):
         for i in range(2):
             write_task(d, f"task-{i}.txt", age_sec=600)
@@ -282,6 +295,25 @@ def case_m2_completed_tasks_excluded() -> list[str]:
     return fails
 
 
+def case_m2b_retention_archived_tasks_excluded() -> list[str]:
+    fails = []
+    def setup(d):
+        results = d.parent / "results"
+        archive = results / "archive-2026-07-26"
+        archive.mkdir(parents=True)
+        # Non-file *.txt entries and non-directory archive-* entries are
+        # ignored without affecting the completed-task set.
+        (archive / "ignored.txt").mkdir()
+        (results / "archive-not-a-directory").write_text("fixture")
+        for i in range(8):
+            task = write_task(d, f"task-{i}.txt", age_sec=600)
+            (archive / task.name).write_text("complete")
+    r = with_tasks_override(setup)
+    if r["status"] != "ok" or "empty" not in r["detail"]:
+        fails.append(f"m2b) retention-archived tasks counted as pending: {r['detail']}")
+    return fails
+
+
 def case_m3_completed_tasks_excluded_from_recovery() -> list[str]:
     fails = []
     with tempfile.TemporaryDirectory() as td:
@@ -325,6 +357,21 @@ def case_m3c_gateway_archived_results_excluded_from_recovery() -> list[str]:
         (archive / "task-complete-1784690000.txt").write_text("complete")
         if hc._oldest_pending_task(time.time(), tasks) is not None:
             fails.append("m3c) gateway-archived result triggered recovery detection")
+    return fails
+
+
+def case_m3d_retention_archived_results_excluded_from_recovery() -> list[str]:
+    fails = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tasks = root / "tasks"
+        archive = root / "results" / "archive-2026-07-26"
+        tasks.mkdir()
+        archive.mkdir(parents=True)
+        task = write_task(tasks, "task-complete.txt", age_sec=600)
+        (archive / "task-complete-1784690000.txt").write_text("complete")
+        if hc._oldest_pending_task(time.time(), tasks) is not None:
+            fails.append("m3d) retention-archived result triggered recovery detection")
     return fails
 
 
@@ -468,12 +515,15 @@ def main() -> int:
         ("i", case_i_small_fresh_queue),
         ("j", case_j_large_fresh_queue),
         ("k", case_k_small_old_queue),
+        ("j0", case_j0_one_task_stuck_long),
         ("l", case_l_pileup),
         ("m", case_m_archive_excluded),
         ("m2", case_m2_completed_tasks_excluded),
+        ("m2b", case_m2b_retention_archived_tasks_excluded),
         ("m3", case_m3_completed_tasks_excluded_from_recovery),
         ("m3b", case_m3b_archived_results_excluded_from_recovery),
         ("m3c", case_m3c_gateway_archived_results_excluded_from_recovery),
+        ("m3d", case_m3d_retention_archived_results_excluded_from_recovery),
         ("m4", case_m4_task_scan_error_fails_open),
         ("n", case_n_notify_empty_no_call),
         ("o", case_o_dedup_within_cooldown),

@@ -1,0 +1,59 @@
+# Enforce the interpreter floor that production actually runs.
+#
+# The live discord-bridge on the 24/7 node runs CommandLineTools system
+# python 3.9.6. No other workflow validates that version: ci.yml uses the
+# runner's stock python3 with no setup-python, and every pin in this
+# directory is 3.11 or 3.12. Without this job, a 3.10+ syntax regression is
+# green everywhere and only fails at bridge restart.
+name: python39-compat
+
+on:
+  pull_request:
+    paths:
+      - 'src/**/*.py'
+      - 'scripts/check-python39-compat.py'
+      - 'tests/check-python39-compat.test.py'
+      - '.github/workflows/python39-compat.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**/*.py'
+      - 'scripts/check-python39-compat.py'
+      - 'tests/check-python39-compat.test.py'
+      - '.github/workflows/python39-compat.yml'
+
+# Tests must never emit product telemetry (no PostHog writes from CI).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SUTANDO_TELEMETRY: "0"
+
+jobs:
+  parse-on-the-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.9 exactly — the version the bridge runs. Using anything newer makes
+      # the scan vacuous, which the self-test below turns into a hard failure
+      # rather than a silent pass.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Confirm the interpreter is the floor
+        run: python3 -c "import sys; assert sys.version_info[:2] == (3, 9), sys.version; print(sys.version)"
+
+      # Positive control BEFORE the real scan: prove the detector still
+      # rejects 3.10+ syntax. A broken probe reports zero failures and is
+      # indistinguishable from a healthy tree.
+      - name: Self-test the detector
+        run: python3 scripts/check-python39-compat.py --self-test
+
+      - name: Unit tests
+        run: python3 tests/check-python39-compat.test.py
+
+      - name: Scan src/ on the floor interpreter
+        run: python3 scripts/check-python39-compat.py

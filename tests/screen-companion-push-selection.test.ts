@@ -24,30 +24,37 @@ function makeCtx() {
 	return { calls, sendUserCtx };
 }
 
-function withSelection(
+async function withSelection(
 	result: SelectionResult | null,
 	fn: () => void,
-): void {
+): Promise<void> {
 	_setVisionQueryDeps({ readSelection: () => result });
-	try { fn(); } finally { _resetVisionQueryDeps(); }
+	try {
+		fn();
+		// P7: the hook's probe is fire-and-forget async — flush the microtask
+		// queue so injections land before the assertions run.
+		await new Promise((r) => setImmediate(r));
+	} finally {
+		_resetVisionQueryDeps();
+	}
 }
 
 // Each test resets module state first.
 
-test('does not call sendUserCtx on ticks 1 and 2 (below interval)', () => {
+test('does not call sendUserCtx on ticks 1 and 2 (below interval)', async () => {
 	_resetFrameHookState();
 	const { calls, sendUserCtx } = makeCtx();
-	withSelection({ text: 'hello', source: 'ax_selection' }, () => {
+	await withSelection({ text: 'hello', source: 'ax_selection' }, () => {
 		_frameHook(sendUserCtx); // tick 1
 		_frameHook(sendUserCtx); // tick 2
 	});
 	assert.deepEqual(calls, []);
 });
 
-test('injects selection on tick 3 when text is present', () => {
+test('injects selection on tick 3 when text is present', async () => {
 	_resetFrameHookState();
 	const { calls, sendUserCtx } = makeCtx();
-	withSelection({ text: 'hello', source: 'ax_selection' }, () => {
+	await withSelection({ text: 'hello', source: 'ax_selection' }, () => {
 		_frameHook(sendUserCtx); // 1
 		_frameHook(sendUserCtx); // 2
 		_frameHook(sendUserCtx); // 3 — probe fires
@@ -55,34 +62,34 @@ test('injects selection on tick 3 when text is present', () => {
 	assert.deepEqual(calls, ['[Selected text: hello]']);
 });
 
-test('does NOT inject again when selection unchanged on next interval', () => {
+test('does NOT inject again when selection unchanged on next interval', async () => {
 	_resetFrameHookState();
 	const { calls, sendUserCtx } = makeCtx();
-	withSelection({ text: 'hello', source: 'ax_selection' }, () => {
+	await withSelection({ text: 'hello', source: 'ax_selection' }, () => {
 		for (let i = 0; i < 6; i++) _frameHook(sendUserCtx); // ticks 1–6 (probes at 3, 6)
 	});
 	// Both probes return 'hello'; should inject only once (first change: '' → 'hello')
 	assert.deepEqual(calls, ['[Selected text: hello]']);
 });
 
-test('injects again when selection text changes', () => {
+test('injects again when selection text changes', async () => {
 	_resetFrameHookState();
 	const { calls, sendUserCtx } = makeCtx();
 	// First probe: 'hello'
-	withSelection({ text: 'hello', source: 'ax_selection' }, () => {
+	await withSelection({ text: 'hello', source: 'ax_selection' }, () => {
 		for (let i = 0; i < 3; i++) _frameHook(sendUserCtx);
 	});
 	// Second probe interval: 'world'
-	withSelection({ text: 'world', source: 'ax_selection' }, () => {
+	await withSelection({ text: 'world', source: 'ax_selection' }, () => {
 		for (let i = 0; i < 3; i++) _frameHook(sendUserCtx);
 	});
 	assert.deepEqual(calls, ['[Selected text: hello]', '[Selected text: world]']);
 });
 
-test('does not inject when no selection is found', () => {
+test('does not inject when no selection is found', async () => {
 	_resetFrameHookState();
 	const { calls, sendUserCtx } = makeCtx();
-	withSelection(null, () => {
+	await withSelection(null, () => {
 		for (let i = 0; i < 3; i++) _frameHook(sendUserCtx); // probe fires on tick 3, returns null
 	});
 	assert.deepEqual(calls, []);

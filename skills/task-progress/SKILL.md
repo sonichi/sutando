@@ -112,9 +112,23 @@ Optional for Slack @mentions: `reply_thread_ts:` → `--thread-ts`
 
 ## Supported channels
 
-- **Slack** — `chat.postMessage`, token from `$CLAUDE_CONFIG_DIR/channels/slack/.env` (`SLACK_BOT_TOKEN`)
-- **Discord** — REST v10 messages, token from `$CLAUDE_CONFIG_DIR/channels/discord/.env` (`DISCORD_BOT_TOKEN`)
-- **Telegram** — `sendMessage`, token from `$CLAUDE_CONFIG_DIR/channels/telegram/.env` (`TELEGRAM_BOT_TOKEN`)
+- **Slack** — `chat.postMessage`, `SLACK_BOT_TOKEN` resolved **process env → `$CLAUDE_CONFIG_DIR/channels/slack/.env` → vault**
+- **Discord** — REST v10 messages, `DISCORD_BOT_TOKEN` resolved **process env → `$CLAUDE_CONFIG_DIR/channels/discord/.env` → vault**
+- **Telegram** — `sendMessage`, `TELEGRAM_BOT_TOKEN` resolved **process env → `$CLAUDE_CONFIG_DIR/channels/telegram/.env` → vault**
+
+All three share one resolver (`src/channel_token.resolve_channel_token`), the same one the bridges
+use, so a token stored only via `vault set` resolves here too. If `src/` is not importable the
+vault tier is skipped rather than raising — a progress notification never fails a task.
+
+### Discord mentions
+
+Discord mention validation is on by default. Use a resolved user snowflake
+(`<@USER_ID>`), not a GitHub-style `@handle`. Before posting, `notify.py`
+checks each user ID through Discord; after posting, it verifies the response's
+`mentions` array. An unresolved mention exits 1 with an agent-visible error.
+
+For intentional plain-text handles that should not ping anyone, pass
+`--no-validate-mentions`.
 
 ## Fail-open
 

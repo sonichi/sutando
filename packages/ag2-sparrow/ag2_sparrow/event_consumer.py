@@ -21,6 +21,8 @@ import json
 import os
 import time
 
+from .chat_secret_filter import filter_chat_secrets
+
 MEANINGFUL_TYPES = frozenset({
     "message.created", "message.edited", "reaction.added",
     "member.joined", "member.left",
@@ -129,6 +131,9 @@ class TaskifyHandler:
         for ev in batch[:20]:
             content = ev.get("content") or {}
             text = str(content.get("body") or content.get("text") or "")
+            # Redact BEFORE the 120-char cut: truncating first can split a token
+            # so no pattern matches it, persisting a recognisable partial secret.
+            text = filter_chat_secrets(text).text if text else ""
             text = text.splitlines()[0][:120] if text else ""
             summaries.append(f"- [{ev.get('type')}] {ev.get('actor_id') or '?'}"
                              + (f": {text}" if text else ""))
@@ -161,6 +166,17 @@ class TaskifyHandler:
             os.fsync(dfd)                            # dir-entry flush would lose the batch
         finally:                                     # (events consumed, task file gone).
             os.close(dfd)
+        # Anonymous product telemetry — #2274 parity for the taskify surface: the
+        # promotion writes its task file directly (never through the relay loop's
+        # _write_task), so it must emit its own task_processed. Placed after the
+        # atomic publish and behind the already-promoted early return above, so
+        # idempotent re-drains aren't double-counted. Same fail-open shape as the
+        # bridges: a standalone PyPI install has no telemetry module and no-ops.
+        try:
+            from telemetry import task_processed
+            task_processed("events-promotion")
+        except Exception:
+            pass
         self._log(f"event-consumer: promoted {n} events → {task_id} (ambient)")
         return path
 
@@ -207,3 +223,5 @@ class EventConsumer:
         # crash re-drains them (no loss); the handler dedups them on re-drain.
         self._inbox.mark_consumed(settled)
         return {"seen": seen, "promoted": promoted, "consumed": len(settled)}
+
+# ci: re-trigger (squash-erased)

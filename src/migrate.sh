@@ -301,7 +301,7 @@ fi
 # Compile Sutando app
 echo "Compiling Sutando menu bar app..."
 cd "$REPO/src/Sutando"
-swiftc -O -o Sutando main.swift SutandoConfig.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null && echo "  ✓ Sutando compiled" || echo "  ⚠ Compile failed — run manually"
+swiftc -O -o Sutando main.swift SutandoConfig.swift RestartCoordinator.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null && echo "  ✓ Sutando compiled" || echo "  ⚠ Compile failed — run manually"
 cd "$REPO"
 
 # Python deps
@@ -325,9 +325,20 @@ fi
 echo "Step 7/7: mediar-ai MCP server (GUI control)..."
 if [ -f "$REPO/skills/macos-use/scripts/build.sh" ]; then
   echo "  Building mcp-server-macos-use (~35s Swift release build)..."
-  bash "$REPO/skills/macos-use/scripts/build.sh" 2>&1 | sed 's/^/  /' || {
-    echo "  ⚠ Build failed — run manually later: bash skills/macos-use/scripts/build.sh"
-  }
+  # `||` binds to the LAST command of a pipeline, and `sed` exits 0 whatever the
+  # build did — so the warning below was unreachable and a failed build produced
+  # no remediation line at all. Read PIPESTATUS instead, immediately after the
+  # pipeline (any intervening command clobbers it).
+  #
+  # Deliberately NOT `set -o pipefail`: this script runs under `set -e`, so
+  # pipefail would turn a failed optional build into an abort of the whole
+  # migration, losing the tarball. The point here is to warn and continue.
+  bash "$REPO/skills/macos-use/scripts/build.sh" 2>&1 | sed 's/^/  /'
+  _build_rc=${PIPESTATUS[0]}
+  if [ "$_build_rc" -ne 0 ]; then
+    echo "  ⚠ Build failed (exit $_build_rc) — run manually later: bash skills/macos-use/scripts/build.sh"
+  fi
+  unset _build_rc
   # Register the MCP server in Claude Code config
   if [ -f "$HOME/.macos-use-mcp/.build/release/mcp-server-macos-use" ]; then
     bash "$REPO/skills/macos-use/scripts/install-mcp.sh" 2>&1 | sed 's/^/  /' || true

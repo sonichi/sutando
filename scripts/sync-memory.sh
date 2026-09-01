@@ -166,7 +166,9 @@ fi
 # back via `find … | head -1` to whichever sibling memory dir landed first
 # (alphabetical). Bug silently skipped real memory writes for 5+ weeks
 # before being caught. See docs/workspace-contract.md.
-MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(echo "$SCRIPT_PARENT" | sed 's|/|-|g')/memory")"
+# Claude Code dashes EVERY non-alphanumeric char, not just `/` — a slash-only
+# derivation resolves to a slug it never creates on a spaced/dotted path.
+MEMORY_DIR="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" claude-home-path "projects/$(printf '%s' "$SCRIPT_PARENT" | tr -c 'A-Za-z0-9' '-')/memory")"
 NOTES_DIR="$REPO_DIR/notes"
 LOG="/tmp/sync-memory.log"
 LOCK_DIR="/tmp/sync-memory.lock.d"
@@ -405,6 +407,8 @@ fi
 HOST="$(bash "$SCRIPT_DIR/sutando-config.sh" host-label 2>/dev/null || true)"
 if [ -z "$HOST" ]; then
     HOST="${SUTANDO_HOST_LABEL:-${SUTANDO_HOST_OVERRIDE:-}}"
+    # Blank-but-set is non-empty to `[ -z ]`, so it would become the label.
+    HOST="${HOST#"${HOST%%[![:space:]]*}"}"; HOST="${HOST%"${HOST##*[![:space:]]}"}"
     if [ -z "$HOST" ]; then
         if command -v scutil >/dev/null 2>&1; then
             HOST="$(scutil --get LocalHostName 2>/dev/null)"
@@ -440,7 +444,7 @@ done
 # gap so a rebuilt host restores its plugin/hook/permission config. Sourced
 # from the Claude Code config dir (CLAUDE_CONFIG_DIR canonical; CLAUDE_HOME
 # legacy; ~/.claude fallback) to work on both new and pre-migration hosts.
-SETTINGS_SRC="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}/settings.json"
+SETTINGS_SRC="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-home-path settings.json)"
 if [ -f "$SETTINGS_SRC" ]; then
     copy_if_newer "$SETTINGS_SRC" "$MACHINE_DIR/settings.json"
 fi
@@ -517,11 +521,17 @@ else
         exit 1
     fi
     git commit -m "Sync $(hostname) $(date +%Y-%m-%dT%H:%M)" 2>&1 | tee -a "$LOG" >/dev/null
-    if git push 2>&1 | tee -a "$LOG" >/dev/null; then
+    # NOTE: do not test a `cmd | tee` pipeline — without pipefail the if sees
+    # tee's exit status (always 0) and a FAILED push prints "Pushed changes"
+    # (observed 2026-07-28: 115-commit backlog reported as pushed while the
+    # origin was unreachable). tee's stdout went to /dev/null anyway, so a
+    # plain append-redirect keeps the log and tests git push itself.
+    if git push >>"$LOG" 2>&1; then
         log "Pushed changes"
         echo "Pushed changes from $(hostname)."
     else
         log "Push failed"
+        PUSH_FAILED=1
     fi
 fi
 
@@ -543,5 +553,10 @@ fi
 
 NOTES_COUNT=$(find notes -type f 2>/dev/null | wc -l | tr -d ' ')
 MEMORY_COUNT=$(ls memory/*.md 2>/dev/null | wc -l | tr -d ' ')
+if [ "${PUSH_FAILED:-0}" = "1" ]; then
+    log "Sync FAILED: git push failed ($MEMORY_COUNT memory, $NOTES_COUNT notes committed locally, NOT pushed)"
+    echo "Sync FAILED: git push failed — changes committed locally but NOT pushed. Memory: $MEMORY_COUNT files, Notes: $NOTES_COUNT files." >&2
+    exit 1
+fi
 log "Sync complete: $MEMORY_COUNT memory, $NOTES_COUNT notes"
 echo "Sync complete. Memory: $MEMORY_COUNT files, Notes: $NOTES_COUNT files."

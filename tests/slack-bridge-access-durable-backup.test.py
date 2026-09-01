@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import stat
 import sys
 import tempfile
 import types
@@ -194,7 +195,10 @@ check("restore returns False when backup is schema-invalid", slack._restore_acce
 
 # restore: valid backup but ACCESS_FILE write fails → False (exception branch)
 slack.ACCESS_BACKUP_FILE.write_text('{"tofuOwner": "U", "allowFrom": ["U"]}')
-with _mock.patch.object(slack.ACCESS_FILE.__class__, "write_text", side_effect=OSError("readonly")):
+# NOTE: the write now goes through util_paths.write_private_text (born-0600), so the
+# failure must be injected at that seam rather than Path.write_text. Same intent:
+# simulate an unwritable access.json and assert the exception branch returns False.
+with _mock.patch.object(slack, "write_private_text", side_effect=OSError("readonly")):
     check("restore returns False when access.json write fails", slack._restore_access_from_disk() is False)
 
 # ── migration states the old tofuOwner predicate left unprotected (CR #2163) ──
@@ -230,6 +234,30 @@ restored_lockdown = json.loads(slack.ACCESS_FILE.read_text())
 check("empty lockdown restored on wipe+restart, stranger not enrolled",
       restored_lockdown.get("allowFrom") == [] and "U_STRANGER2" not in restored_lockdown.get("allowFrom", []),
       str(restored_lockdown))
+
+
+# --- _restore_access_from_cache: the in-memory path (#899 external-deletion) ----
+# Distinct from _restore_access_from_disk above: this one rewrites ACCESS_FILE from
+# the live cache when the file is deleted out from under a running bridge. It writes
+# authorization data, so assert the file comes back owner-only as well as correct.
+slack._update_access_cache({"tofuOwner": "UCACHE", "allowFrom": ["UCACHE"]})
+slack.ACCESS_FILE.unlink(missing_ok=True)
+_restored = slack._restore_access_from_cache()
+check("cache restore returns True when a cached owner exists", _restored is True)
+check("cache restore recreates access.json", slack.ACCESS_FILE.exists())
+check("cache-restored access.json keeps the cached owner",
+      json.loads(slack.ACCESS_FILE.read_text()).get("tofuOwner") == "UCACHE")
+check("cache-restored access.json is owner-only (0600)",
+      stat.S_IMODE(os.stat(slack.ACCESS_FILE).st_mode) == 0o600)
+
+# and the negative: an empty cache must not fabricate a file
+slack._update_access_cache({})
+slack.ACCESS_FILE.unlink(missing_ok=True)
+check("cache restore returns False with no cached owner",
+      slack._restore_access_from_cache() is False)
+check("cache restore did not create a file when it returned False",
+      not slack.ACCESS_FILE.exists())
+
 
 print()
 if failures:

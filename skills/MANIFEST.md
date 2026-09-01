@@ -199,3 +199,19 @@ Phase 1 migrates the manifest-loaded skills (`zoom`, `screen-companion`,
 slash-command skills (adding a minimal `manifest.json` with `version`/`owner`/
 `stability`) is the mechanical follow-up. Later phases add the registry index,
 `skill.lock` + precedence resolution, and per-skill evals in CI.
+
+### Trusted GitHub resolver
+
+`skills/trusted-capabilities/` provides the first allowlisted GitHub resolver
+for the package model. It discovers `SKILL.md` packages in the repositories
+declared by its manifest, statically surfaces risk signals, resolves an exact
+upstream commit, and installs file-by-file into the runtime skills directory.
+Managed installs carry `.sutando-source.json`, which makes later update checks
+repeatable and preserves source, path, and commit provenance.
+
+Only sources marked `installable` may write files, and only below each source's
+declared root. Tool repositories can be discovered and inspected but, like
+awesome-list indexes, remain install-disabled: their install procedures and
+runtime permissions are too source-specific for the generic skill installer.
+Writes require `--yes` and replace the destination atomically; omitting it
+performs an inspection-only dry run.

@@ -1,0 +1,19 @@
+{
+  "name": "trusted-capabilities",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Discover, inspect, install, and update reusable agent skills from an explicit trusted-source catalog.",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "TRUSTED_CAPABILITY_SOURCES": "[{\"id\":\"anthropic-skills\",\"repo\":\"anthropics/skills\",\"root\":\"skills\",\"kind\":\"skill\",\"installable\":true},{\"id\":\"openai-skills\",\"repo\":\"openai/skills\",\"root\":\"skills\",\"kind\":\"skill\",\"installable\":true},{\"id\":\"superpowers\",\"repo\":\"obra/superpowers\",\"root\":\"skills\",\"kind\":\"skill\",\"installable\":true},{\"id\":\"awesome-copilot\",\"repo\":\"github/awesome-copilot\",\"root\":\"skills\",\"kind\":\"skill\",\"installable\":true},{\"id\":\"ag2-skills\",\"repo\":\"ag2ai/ag2-skills\",\"root\":\".\",\"kind\":\"skill\",\"installable\":true},{\"id\":\"awesome-claude-code\",\"repo\":\"hesreallyhim/awesome-claude-code\",\"root\":\".\",\"kind\":\"index\",\"installable\":false},{\"id\":\"mcp-reference-servers\",\"repo\":\"modelcontextprotocol/servers\",\"root\":\"src\",\"kind\":\"tool\",\"installable\":false},{\"id\":\"awesome-mcp-servers\",\"repo\":\"punkpeye/awesome-mcp-servers\",\"root\":\".\",\"kind\":\"index\",\"installable\":false}]"
+  }
+}

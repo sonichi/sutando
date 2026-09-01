@@ -313,6 +313,11 @@ if _have_discord:
     spec.loader.exec_module(dmod)
     _df = Path(tempfile.mkdtemp(prefix="dc-acl-")) / "access.json"
     dmod.ACCESS_FILE = _df
+    # Isolate the durable access backup too — ensure_tier_map_seeded() now
+    # mirrors every valid write to ACCESS_BACKUP_FILE. Without this override the
+    # grandfather write below would scribble test data into the real workspace
+    # state/auth/discord-access-backup.json (mirrors the slack override above).
+    dmod.ACCESS_BACKUP_FILE = _df.parent / "discord-access-backup.json"
 
     # 5. grandfather
     _df.write_text(json.dumps({"allowFrom": ["111", "222"]}))
@@ -443,8 +448,15 @@ if _have_discord:
     dmod.ACCESS_FILE = _df
 
     # 8. load_tier_map / seed swallow a read failure (except -> {} / return)
+    # _locked() touches path.parent/.with_suffix before any read, so this
+    # double delegates everything but read_text() to a real tmp Path.
     class _DReadRaises:
-        def read_text(self):
+        def __init__(self):
+            self._real = Path(tempfile.mkdtemp(prefix="dc-unreadable-")) / "access.json"
+            self._real.write_text("{}")
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+        def read_text(self, *a, **k):
             raise OSError("access.json unreadable")
     dmod.ACCESS_FILE = _DReadRaises()
     check("discord: load_tier_map swallows a read failure", dmod.load_tier_map() == {})

@@ -5,12 +5,19 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# A staged repo, not the real one: configure_startup_runtime resolves .env
+# relative to the script, so sourcing $REPO's copy would read the dev's secrets.
+STAGE="$TMP/repo-under-test"
+mkdir -p "$STAGE/src"
+cp "$REPO/src/startup-runtime.sh" "$STAGE/src/startup-runtime.sh"
+cp "$REPO/src/repo_root.sh" "$STAGE/src/"
+
 run_runtime_config() {
   local gemini_key="${1:-}"
   local voice_key="${2:-}"
   env -i PATH="/usr/bin:/bin" GEMINI_API_KEY="$gemini_key" GEMINI_VOICE_API_KEY="$voice_key" \
-    bash -c 'cd "$1"; source "$2/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
-    _ "$TMP" "$REPO"
+    bash -c 'cd "$1"; source "$1/src/startup-runtime.sh"; configure_startup_runtime; printf "SKIP_VOICE=%s\n" "${SKIP_VOICE:-0}"' \
+    _ "$STAGE"
 }
 
 without_key="$(run_runtime_config)"
@@ -29,6 +36,15 @@ with_voice_key="$(run_runtime_config '' voice-test-key)"
 grep -q 'SKIP_VOICE=0' <<<"$with_voice_key"
 if grep -q 'voice agent disabled' <<<"$with_voice_key"; then
   echo "voice was disabled despite a dedicated voice credential" >&2
+  exit 1
+fi
+
+printf 'SKIP_VOICE=1\nGEMINI_API_KEY=file-key\n' > "$STAGE/.env"
+with_key_and_skip="$(run_runtime_config)"
+rm "$STAGE/.env"
+grep -q 'SKIP_VOICE=0' <<<"$with_key_and_skip"
+if grep -q 'voice agent disabled' <<<"$with_key_and_skip"; then
+  echo "voice was disabled despite a configured credential overriding SKIP_VOICE" >&2
   exit 1
 fi
 
@@ -51,6 +67,8 @@ BIN="$TMP/bin"
 mkdir -p "$BIN" "$TMP/repo/src" "$TMP/repo/scripts" "$TMP/repo/node_modules"
 cp "$REPO/src/verify-setup.sh" "$TMP/repo/src/"
 cp "$REPO/scripts/sutando-config.sh" "$TMP/repo/scripts/"
+# sutando-config.sh sources this helper (#2599)
+cp "$REPO/scripts/python-binary.sh" "$TMP/repo/scripts/"
 cp "$REPO/src/sutando_config.py" "$TMP/repo/src/"
 touch "$TMP/repo/src/__init__.py"
 printf '{"core":{"runtime":"codex"}}\n' > "$TMP/repo/sutando.config.json"

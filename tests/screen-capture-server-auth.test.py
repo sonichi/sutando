@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import os
 import stat
 import sys
@@ -91,8 +92,8 @@ class _FakeHandler(sc.Handler):
         pass
 
 
-def _run_auth(path: str, token_header: str | None, capture_token: str | None) -> tuple[int | None, bool]:
-    """Run do_GET() up to the auth gate and return (response_code, early_return).
+def _run_auth(path: str, token_header: str | None, capture_token: str | None):
+    """Run do_GET() up to the auth gate and return its captured response.
 
     Patches CAPTURE_TOKEN and stubs out everything past the auth check so we
     never attempt a real screencapture subprocess call.
@@ -107,7 +108,12 @@ def _run_auth(path: str, token_header: str | None, capture_token: str | None) ->
             handler.do_GET()
         except Exception:
             pass
-    return handler._response_code, handler._response_code == 403
+    return (
+        handler._response_code,
+        handler._response_code == 403,
+        handler._response_headers,
+        handler._buf.getvalue(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -115,35 +121,39 @@ def _run_auth(path: str, token_header: str | None, capture_token: str | None) ->
 # ---------------------------------------------------------------------------
 
 # 1. Missing header → 403
-code, is_403 = _run_auth("/capture", None, "secret-token")
+code, is_403, headers, body = _run_auth("/capture", None, "secret-token")
 ok("missing header → 403", is_403, f"got code={code}")
+ok("403 uses JSON response contract", headers.get("Content-Type") == "application/json",
+   f"got headers={headers}")
+ok("403 returns stable payload", json.loads(body) == {"status": "error", "error": "forbidden"},
+   f"got body={body!r}")
 
 # 2. Empty header → 403
-code, is_403 = _run_auth("/capture", "", "secret-token")
+code, is_403, _, _ = _run_auth("/capture", "", "secret-token")
 ok("empty header → 403", is_403, f"got code={code}")
 
 # 3. Wrong token → 403
-code, is_403 = _run_auth("/capture", "wrong-token", "secret-token")
+code, is_403, _, _ = _run_auth("/capture", "wrong-token", "secret-token")
 ok("wrong token → 403", is_403, f"got code={code}")
 
 # 4. Correct token → NOT 403 (auth passes, proceed to capture logic)
-code, is_403 = _run_auth("/capture", "secret-token", "secret-token")
+code, is_403, _, _ = _run_auth("/capture", "secret-token", "secret-token")
 ok("correct token → not 403", not is_403, f"got code={code}")
 
 # 5. No CAPTURE_TOKEN (None) → fail-closed, 403 (token-load failure must not open the gate)
-code, is_403 = _run_auth("/capture", None, None)
+code, is_403, _, _ = _run_auth("/capture", None, None)
 ok("CAPTURE_TOKEN=None → 403 (fail-closed)", is_403, f"got code={code}")
 
 # 6. Correct token with query params → still passes
-code, is_403 = _run_auth("/capture?display=1&format=jpeg", "secret-token", "secret-token")
+code, is_403, _, _ = _run_auth("/capture?display=1&format=jpeg", "secret-token", "secret-token")
 ok("correct token + query params → not 403", not is_403, f"got code={code}")
 
 # 7. Timing-safe comparison: partial prefix match is rejected
-code, is_403 = _run_auth("/capture", "secret-tok", "secret-token")
+code, is_403, _, _ = _run_auth("/capture", "secret-tok", "secret-token")
 ok("partial token prefix → 403", is_403, f"got code={code}")
 
 # 8. Non-capture paths don't hit the auth gate (e.g. /health)
-code, is_403 = _run_auth("/health", None, "secret-token")
+code, is_403, _, _ = _run_auth("/health", None, "secret-token")
 ok("non-/capture path → no 403", not is_403, f"got code={code}")
 
 # ---------------------------------------------------------------------------
@@ -192,6 +202,64 @@ def test_load_rejects_wrong_permissions() -> None:
 test_load_creates_new_token_when_missing()
 test_load_reuses_existing_valid_token()
 test_load_rejects_wrong_permissions()
+
+# ---------------------------------------------------------------------------
+# Downscale budget tests
+# ---------------------------------------------------------------------------
+
+def test_downscale_invokes_sips_with_bounds() -> None:
+    with tempfile.NamedTemporaryFile() as frame:
+        with unittest.mock.patch.object(sc.subprocess, "run") as run:
+            ok_result = sc._downscale_frame(frame.name, 1280, 60)
+        ok("downscale succeeds when sips succeeds", ok_result)
+        ok("downscale bounds reach sips", run.call_args.args[0] == [
+            "sips", "--resampleHeightWidthMax", "1280", "-s", "format",
+            "jpeg", "-s", "formatOptions", "60", frame.name,
+        ], f"got {run.call_args.args[0] if run.call_args else None}")
+
+
+def test_downscale_failure_only_allows_small_original() -> None:
+    with tempfile.NamedTemporaryFile() as small, tempfile.NamedTemporaryFile() as large:
+        small.write(b"x")
+        small.flush()
+        large.write(b"x" * (sc.DOWNSCALE_FAIL_MAX_BYTES + 1))
+        large.flush()
+        with unittest.mock.patch.object(sc.subprocess, "run", side_effect=RuntimeError("sips failed")):
+            ok("downscale failure permits a small original", sc._downscale_frame(small.name, 1280, 60))
+            ok("downscale failure rejects an over-budget original", not sc._downscale_frame(large.name, 1280, 60))
+    with unittest.mock.patch.object(sc.subprocess, "run", side_effect=RuntimeError("sips failed")), \
+         unittest.mock.patch.object(sc.os.path, "getsize", side_effect=OSError("stat failed")):
+        ok("downscale failure rejects an unreadable original", not sc._downscale_frame("missing.jpg", 1280, 60))
+
+
+def test_capture_downscale_options_and_failure_are_visible() -> None:
+    handler = _FakeHandler("/capture?format=jpeg&maxdim=1280&quality=60&silent=true", "secret-token")
+    with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
+         unittest.mock.patch("os.makedirs"), \
+         unittest.mock.patch("subprocess.run"), \
+         unittest.mock.patch.object(sc, "_downscale_frame", return_value=True) as downscale:
+        handler._handle_capture()
+    ok("capture passes bounded JPEG options to downscale", downscale.call_args.args[1:] == (1280, 60),
+       f"got {downscale.call_args.args if downscale.call_args else None}")
+    ok("capture returns success after downscale", handler._response_code == 200,
+       f"got code={handler._response_code}")
+
+    failed = _FakeHandler("/capture?format=jpeg&maxdim=1280&quality=60&silent=true", "secret-token")
+    with unittest.mock.patch.object(sc, "CAPTURE_TOKEN", "secret-token"), \
+         unittest.mock.patch("os.makedirs"), \
+         unittest.mock.patch("subprocess.run"), \
+         unittest.mock.patch.object(sc, "_downscale_frame", return_value=False):
+        failed._handle_capture()
+    ok("capture rejects a frame that cannot meet the downscale budget", failed._response_code == 500,
+       f"got code={failed._response_code}")
+    ok("downscale budget failure has a stable error", json.loads(failed._buf.getvalue()) == {
+        "status": "error", "error": "downscale failed and frame exceeds budget"
+    }, f"got body={failed._buf.getvalue()!r}")
+
+
+test_downscale_invokes_sips_with_bounds()
+test_downscale_failure_only_allows_small_original()
+test_capture_downscale_options_and_failure_are_visible()
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -30,6 +30,8 @@ is a later slice (needs metering).
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -126,9 +128,56 @@ def evaluate_standing_approval(draft: dict, *, owner_mxid: str,
     return True, "within standing approval (self + scoped room + notify-only + default cap)"
 
 
+class StoreLockUnavailable(RuntimeError):
+    """The store lock could not be taken within its timeout — an error, never a
+    silent fall-through into the critical section."""
+
+
+_STORE_LOCKS: "dict[str, list]" = {}
+
+
+@contextlib.contextmanager
+def store_lock(store_dir: str, *, timeout: float = 10.0):
+    """Process-wide re-entrant exclusive lock per store directory (flock, bounded
+    wait). Not thread-aware; re-entrancy does not make nested calls atomic."""
+    key = os.path.realpath(store_dir)
+    held = _STORE_LOCKS.get(key)
+    if held is not None and held[1] > 0:
+        held[1] += 1
+        try:
+            yield
+        finally:
+            held[1] -= 1
+        return
+
+    os.makedirs(store_dir, exist_ok=True)
+    fd = os.open(os.path.join(key, ".store.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise StoreLockUnavailable(
+                    f"store lock busy for >{timeout}s: {key}")
+            time.sleep(0.02)
+
+    _STORE_LOCKS[key] = [fd, 1]
+    try:
+        yield
+    finally:
+        _STORE_LOCKS.pop(key, None)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 class SubscriptionStore:
     """File-per-policy store — same inspectable pattern as the human-action
-    store. Single-writer (the core), so no lock protocol needed."""
+    store. NOT single-writer: mutating sequences run under store_lock(self.dir)."""
 
     def __init__(self, store_dir: str):
         self.dir = store_dir
@@ -178,20 +227,21 @@ class SubscriptionStore:
         return out
 
     def transition(self, policy_id: str, to: str, note: str = "") -> bool:
-        """draft->active|cancelled, active->cancelled|expired. Terminal states
-        immutable (same discipline as human-actions)."""
-        rec = self.get(policy_id)
-        if not rec:
-            return False
-        allowed = {"draft": {"active", "cancelled"},
-                   "active": {"cancelled", "expired"}}
-        if to not in allowed.get(rec.get("status", ""), set()):
-            return False
-        rec["status"] = to
-        rec.setdefault("audit", []).append(
-            {"at": time.time(), "to": to, **({"note": note} if note else {})})
-        self.save(rec)
-        return True
+        """draft->active|cancelled, active->cancelled|expired; terminal states
+        immutable. Read and write are one critical section under the store lock."""
+        with store_lock(self.dir):
+            rec = self.get(policy_id)
+            if not rec:
+                return False
+            allowed = {"draft": {"active", "cancelled"},
+                       "active": {"cancelled", "expired"}}
+            if to not in allowed.get(rec.get("status", ""), set()):
+                return False
+            rec["status"] = to
+            rec.setdefault("audit", []).append(
+                {"at": time.time(), "to": to, **({"note": note} if note else {})})
+            self.save(rec)
+            return True
 
 
 def render_card(rec: dict, *, auto_activated: bool = False,

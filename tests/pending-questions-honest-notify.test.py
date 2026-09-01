@@ -8,6 +8,7 @@ outcome is how a blocked decision sits unseen for a day.
 """
 import importlib.util
 import time
+import re
 import unittest
 from pathlib import Path
 
@@ -20,6 +21,27 @@ def _load(results_dir):
     spec.loader.exec_module(m)
     m.RESULTS_DIR = Path(results_dir)
     return m
+
+
+def _notification_body(applescript):
+    """The notification text inside `display notification "..." with title ...`.
+
+    The captured argv is the whole AppleScript; asserting on it measures a
+    constant ~44 chars of wrapper as if it were the body macOS truncates.
+    """
+    m = re.search(r'display notification "(.*)" with title', applescript, re.S)
+    return m.group(1) if m else applescript
+
+
+class _Capture:
+    """Records the AppleScript body notify_macos hands to osascript."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def run(self, argv, **kw):
+        self.sink.append(argv[-1])
+        return type("R", (), {"returncode": 0})()
 
 
 class TestUndrainedDetection(unittest.TestCase):
@@ -206,7 +228,15 @@ class TestReviewFindings(unittest.TestCase):
         self.m.should_notify = lambda *a, **k: True
         self.m.main()
         self.assertTrue(stamp.exists(), "a successful delivery MUST set the cooldown")
-        self.assertGreater(int(stamp.read_text()), 0)
+        # The marker carries "<epoch> <content-key>" as of 2026-08-01: the cooldown
+        # gates on the SET rather than only the clock, so the key must persist next
+        # to the timestamp. Assert BOTH — if a later change drops the key the file
+        # still parses as an int, and hourly re-notification of an unchanged queue
+        # would come back silently.
+        ts, _, key = stamp.read_text().partition(" ")
+        self.assertGreater(int(ts), 0)
+        self.assertTrue(key.strip(),
+                        "the content key must be stamped alongside the timestamp")
 
     # --- finding 2: only THIS notifier's files are evidence ---
     def test_b_unrelated_stale_proactive_file_is_ignored(self):
@@ -219,6 +249,111 @@ class TestReviewFindings(unittest.TestCase):
         self._age(f"{self.m.PROACTIVE_PREFIX}abc.txt", self.m.UNDRAINED_AGE_S + 60)
         self.assertEqual(self.m.undrained_proactive_files(),
                          [f"{self.m.PROACTIVE_PREFIX}abc.txt"])
+
+    # --- finding 3: the body is bounded by TITLE COUNT and title LENGTH ---
+    def test_f_notify_body_sends_slugs_not_whole_titles(self):
+        """A title carries its ask; three of them overran the macOS body."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        # A real no-comma title from another host leads: the shape this notifier
+        # sees is not guaranteed to be `slug, date`, so the cap must be the bound.
+        titles = ["[2026-08-17 14:4x ET] relay/ never carried by vault — 30 handoff "
+                  "notes exist only on this machine " + ("y" * 60)]
+        titles += [f"slug-{i}, 2026-08-18 — " + ("x" * 90) for i in range(25)]
+        self.m.notify_macos(26, titles)
+        body = sent[0]
+        self.assertLess(len(body), 160, f"body must stay short, got {len(body)}: {body}")
+        # The comma-less title is bounded by the cap, not by a delimiter it lacks.
+        self.assertIn("[2026-08-17 14:4x ET] relay/ never carri", body, "comma-less title still identifies")
+        self.assertNotIn("yyyyyyyyyy", body, "a title without a comma must still be capped")
+        for i in range(2):
+            self.assertIn(f"slug-{i}", body, "the remaining names identify the queue")
+        self.assertNotIn("xxxxxxxxxx", body, "no title prose may ride in the body")
+        self.assertIn("(+23 more)", body, "the remainder must be counted, not dropped silently")
+
+    def test_f2_cap_bounds_every_measured_title_vocabulary(self):
+        """Three comma-less shapes measured on a second host (44 of 61 titles
+        there carry no comma). The cap must bound each, delimiter or not."""
+        for lead in (
+            "[2026-08-07 03:4x UTC] approve #2701/#2702 — blocked on " + ("z" * 50),
+            "2026-08-17 07:1x — `sutando-app` stale is real but NOT a fault " + ("z" * 50),
+            "[2026-07-30 14:10] ngrok (phone tunnel) is DOWN and conflicts " + ("z" * 50),
+        ):
+            with self.subTest(lead=lead[:26]):
+                sent = []
+                self.m.subprocess = _Capture(sent)
+                titles = [lead] + [f"slug-{i}, 2026-08-18 — " + ("x" * 90)
+                                   for i in range(25)]
+                self.m.notify_macos(26, titles)
+                body = sent[0]
+                self.assertLess(len(body), 160, f"body must stay short, got {len(body)}: {body}")
+                self.assertNotIn("zzzzzzzzzz", body,
+                                 "no comma exists in this shape; only the cap can bound it")
+                self.assertIn("(+23 more)", body, "the remainder must still be counted")
+
+    def test_f3_body_stays_bounded_as_the_count_widens(self):
+        """Per-name caps leave the total arithmetic: the count and the `(+N more)`
+        both widen with the queue. The assembled body is what must be bounded."""
+        for count in (26, 126, 1226, 12226):
+            with self.subTest(count=count):
+                sent = []
+                self.m.subprocess = _Capture(sent)
+                titles = [("q" * 60) + f"-{i}" for i in range(count)]
+                self.m.notify_macos(count, titles)
+                # The NOTIFICATION body, not the AppleScript around it: macOS
+                # truncates the former, and the wrapper is a constant ~44 chars.
+                body = _notification_body(sent[0])
+                self.assertLess(len(body), self.m.BODY_MAX,
+                                f"count={count} must not overrun the bound, got {len(body)}: {body}")
+                self.assertIn(f"(+{count - 3} more)", body,
+                              "the remainder must survive the cap — it is the honest part")
+
+    def test_f4_worst_case_names_stay_bounded(self):
+        """Three maximal 40-char names — the shape the other fixtures never make."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        self.m.notify_macos(26, [("z" * 90) + f"-{i}" for i in range(26)])
+        body = _notification_body(sent[0])
+        self.assertLess(len(body), self.m.BODY_MAX,
+                        f"three maximal names must still fit, got {len(body)}: {body}")
+
+    def test_f6_blank_names_are_dropped_not_joined_as_bare_commas(self):
+        """An empty or whitespace-only title contributes no name, so the join
+        cannot emit `, ,` with nothing between the separators."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        self.m.notify_macos(5, ["", "   ", "real-slug, 2026-08-19 — the ask"])
+        body = _notification_body(sent[0])
+        self.assertNotRegex(body, r",\s*,", f"blank names must not render as bare commas: {body}")
+        self.assertNotRegex(body, r":\s*,", f"body must not open on a separator: {body}")
+        self.assertIn("real-slug", body, "the surviving name still identifies the queue")
+        # Dropping two names moves them into the remainder rather than losing them.
+        self.assertIn("(+4 more)", body, "dropped blanks must be counted, not vanish")
+
+    def test_f7_all_blank_names_leave_no_double_space(self):
+        """Every candidate blank: the join is empty and `head` ends in a space, so
+        without stripping it the body renders `N pending questions:  (+N more)`."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        self.m.notify_macos(9, ["", "   ", ","])
+        body = _notification_body(sent[0])
+        self.assertNotIn("  ", body, f"empty join must not leave a double space: {body}")
+        self.assertIn("(+9 more)", body, "the overflow must still account for every question")
+
+    def test_f5_no_room_for_names_drops_them_rather_than_slicing_backwards(self):
+        """A budget too small for the prefix must yield no names, not a negative
+        slice: `joined[:room - 1]` at room==0 is `[:-1]`, which silently eats a char."""
+        sent = []
+        self.m.subprocess = _Capture(sent)
+        original = self.m.BODY_MAX
+        try:
+            self.m.BODY_MAX = 20            # smaller than the prefix + overflow alone
+            self.m.notify_macos(26, [("q" * 60) + f"-{i}" for i in range(26)])
+        finally:
+            self.m.BODY_MAX = original
+        body = _notification_body(sent[0])
+        self.assertNotIn("qqq", body, "no name may survive a budget that cannot hold one")
+        self.assertIn("(+23 more)", body, "the count and overflow are never dropped")
 
     def test_d_written_name_matches_the_scanned_prefix(self):
         """Writer and detector must agree, or the check silently never fires."""

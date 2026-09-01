@@ -3,13 +3,17 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, existsSync, readFileSync, mkdtempSync, rmSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
+import { claudeProjectSlug } from '../src/util_paths.js';
 
 /**
  * Tests for bootstrapMemoryDir() in src/voice-agent.ts.
  *
  * The predicate is replicated locally rather than imported because pulling
  * voice-agent.ts loads the entire bodhi runtime + ts-side env reads — same
- * pattern as end-session-gate.test.ts and replay-gate.test.ts.
+ * pattern as end-session-gate.test.ts and replay-gate.test.ts. It still
+ * derives the slug through the real claudeProjectSlug() helper (a lightweight
+ * leaf module, unlike voice-agent.ts itself) so this replica can't silently
+ * drift from the fix the way the old hand-rolled "/" -> "-" regex did.
  *
  * Coverage: directory creation, placeholder MEMORY.md content, no-clobber
  * on existing index, SUTANDO_MEMORY_DIR env override, silent failure when
@@ -17,7 +21,7 @@ import { homedir, tmpdir } from 'node:os';
  */
 
 function bootstrapMemoryDir(workspaceDir: string, envOverride?: string): { memDir: string; created: boolean; error?: string } {
-	const slug = '-' + workspaceDir.replace(/\/$/, '').split('/').filter(Boolean).join('-');
+	const slug = claudeProjectSlug(workspaceDir.replace(/\/$/, ''));
 	const memDir = envOverride || join(homedir(), '.claude', 'projects', slug, 'memory');
 	let created = false;
 	try {
@@ -109,6 +113,21 @@ describe('bootstrapMemoryDir — env override', () => {
 	it('strips a trailing slash from the workspace dir before slugging', () => {
 		const out = bootstrapMemoryDir('/Users/test/GitHub/sutando/');
 		const expected = join(homedir(), '.claude', 'projects', '-Users-test-GitHub-sutando', 'memory');
+		assert.equal(out.memDir, expected);
+	});
+
+	it('dashes spaces and dots in the workspace dir, not just slashes', () => {
+		// The bug: a slash-only regex resolved this to a projects/<slug>/
+		// dir that doesn't exist because Claude Code dashes every
+		// non-alphanumeric character, including the space in "Application
+		// Support" and the dots in "space.ag2.app".
+		const bundled = '/Users/u/Library/Application Support/space.ag2.app/engine/sutando';
+		const out = bootstrapMemoryDir(bundled);
+		const expected = join(
+			homedir(), '.claude', 'projects',
+			'-Users-u-Library-Application-Support-space-ag2-app-engine-sutando',
+			'memory',
+		);
 		assert.equal(out.memDir, expected);
 	});
 });

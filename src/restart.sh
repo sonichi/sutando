@@ -7,7 +7,30 @@
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "Stopping Sutando services..."
-pkill -f "voice-agent" 2>/dev/null
+# Voice-agent stop goes through the GUARDED lock takeover, never a broad
+# `pkill -f voice-agent` (voice-reliability plan amendment U2): the old blind
+# pkill could kill an unvalidated process and leave a live lock behind (or
+# race a concurrent guarded acquisition). The whole validate → TERM → wait →
+# KILL → revalidate → unlink transaction runs inside one voice-lock.py
+# invocation under the fcntl guard; identity mismatch → takeover-blocked and
+# nothing is signaled. Interpreter unavailable ⇒ fail closed (skip, warn) —
+# never signal without validation.
+if _VOICE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)"; then
+    _VOICE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+    _VOICE_PIDFILE="$(bash "$REPO/scripts/sutando-config.sh" voice-pidfile "$_VOICE_WS" 2>/dev/null || true)"
+    if [ -n "$_VOICE_WS" ] && [ -n "$_VOICE_PIDFILE" ] && [ -f "$_VOICE_PIDFILE" ]; then
+        "$_VOICE_PY" "$REPO/scripts/voice-lock.py" takeover \
+            --pidfile "$_VOICE_PIDFILE" \
+            --guard "$_VOICE_WS/.voice-agent.lock.guard" \
+            --workspace "$_VOICE_WS" \
+            --mode adopted --port 9900 \
+            --entry "$REPO/src/voice-agent.ts" \
+            --entry "$REPO/dist/voice-agent.js" \
+            || echo "  WARN voice-agent takeover blocked/failed — not killing blindly (lock left untouched)"
+    fi
+else
+    echo "  WARN no usable python3 for the guarded voice lock helper — skipping voice-agent stop (fail closed)"
+fi
 pkill -f "web-client.ts" 2>/dev/null
 pkill -f "dashboard.py" 2>/dev/null
 pkill -f "agent-api.py" 2>/dev/null
@@ -16,6 +39,12 @@ pkill -f "telegram-bridge" 2>/dev/null
 pkill -f "discord-bridge" 2>/dev/null
 pkill -f "slack-bridge" 2>/dev/null
 pkill -f "remote-gateway-bridge" 2>/dev/null
+# The deprecated `remote-relay-bridge.py` stub runpy-execs the gateway bridge
+# IN-PROCESS, so its argv keeps the OLD filename while it runs the NEW code.
+# `pkill -f remote-gateway-bridge` therefore cannot see it: measured on a peer
+# host 2026-08-03, a stub-launched instance had been up 39 DAYS, survived every
+# restart, and kept stamping tasks from 39-day-old code. Kill both names.
+pkill -f "remote-relay-bridge" 2>/dev/null
 pkill -f "observability/boot" 2>/dev/null
 pkill -f "watch-tasks" 2>/dev/null
 pkill -f "conversation-server" 2>/dev/null
@@ -59,7 +88,7 @@ fi
 STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
-    "remote-gateway-bridge" "observability/boot" "watch-tasks"
+    "remote-gateway-bridge" "remote-relay-bridge" "observability/boot" "watch-tasks"
     "conversation-server" "ngrok" "src/Sutando/Sutando"
 )
 for _ in $(seq 1 30); do
@@ -70,6 +99,25 @@ for _ in $(seq 1 30); do
     [ $still -eq 0 ] && break
     sleep 0.1
 done
+
+# Relaunch what line 73 killed. This belongs here, not in startup.sh: that file
+# is guarded headless (tests/startup-headless.test.sh) and owns no desktop UI.
+APP_BIN="$REPO/src/Sutando/Sutando"
+if pgrep -x Sutando > /dev/null 2>&1; then
+    echo "  ✓ Sutando.app (already running)"
+elif [ -x "$APP_BIN" ]; then
+    nohup "$APP_BIN" > /tmp/sutando-app.log 2>&1 &
+    sleep 1
+    # `pgrep -x`, never `-f`: -f matches this script's own argv and would report
+    # a launch that did not happen. The ✓ stays inside the verified branch.
+    if pgrep -x Sutando > /dev/null 2>&1; then
+        echo "  ✓ Sutando.app relaunched"
+    else
+        echo "  ✗ Sutando.app — launched but not running; see /tmp/sutando-app.log"
+    fi
+else
+    echo "  ⊘ Sutando.app skipped — no binary at $APP_BIN"
+fi
 
 echo "Starting..."
 exec bash "$REPO/src/startup.sh"

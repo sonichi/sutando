@@ -3,8 +3,8 @@
 
 Emits ONE anonymous ``feature_used {feature: "skill:<name>"}`` product-telemetry
 event every time the core invokes a skill (the `Skill` tool). This is the
-chokepoint that broadens feature-usage coverage from the two hand-instrumented
-scripts (morning-briefing, daily-insight) to the *entire* skill surface without
+chokepoint that broadens feature-usage coverage from hand-instrumented scripts
+(morning-briefing) to the *entire* skill surface without
 touching each skill — the loop already runs dozens of skills (proactive-loop,
 people-analysis, context-reconstruct, session-recap, task-orphan-check, …) and
 none of them reported until now.
@@ -24,9 +24,10 @@ Fail-OPEN, ALWAYS. Telemetry must never break a tool: any error (bad stdin,
 missing telemetry module, network) is swallowed and the hook exits 0 with no
 output. A PostToolUse observability hook has no decision to make — it observes.
 
-Registration: ``build-hook-settings.mjs`` registers this repo file's absolute
-path under PostToolUse for the ``Skill`` matcher. Repo root is found from this
-file's location, or via ``$SUTANDO_REPO_ROOT`` for tests.
+Registration: ``start-cli.sh`` passes this repo file's absolute path to
+``build-core-settings.mjs``, which registers it under PostToolUse for the
+``Skill`` matcher independently of the observability opt-in. Repo root is found
+from this file's location, or via ``$SUTANDO_REPO_ROOT`` for tests.
 """
 import sys
 import os

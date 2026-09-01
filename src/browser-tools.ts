@@ -4,6 +4,7 @@
  */
 
 import { execSync, execFileSync } from 'node:child_process';
+import { resolveCredential } from './credential-resolver.js';
 import { writeFileSync, unlinkSync, readFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -11,6 +12,8 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
 import { readCaptureToken } from './util_paths.js';
+import { setupHint, scrollOutcome } from './osascript-setup-hint.js';
+import { withScheme } from './url-scheme.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -32,6 +35,19 @@ export function injectText(session: any, text: string) {
 
 // Vision model — override via .env (default: flash-lite for this trivial 20-word task)
 const VISION_MODEL = process.env.VISION_MODEL || 'gemini-3.1-flash-lite';
+
+/** Accessibility trust as System Events reports it, memoized per process.
+ *  OBSERVATION ONLY — nothing branches on this; see the call site's comment. */
+let _axTrustedCache: boolean | null | undefined;
+function axTrusted(): boolean | null {
+	if (_axTrustedCache !== undefined) return _axTrustedCache;
+	try {
+		const out = execSync(`osascript -e 'tell application "System Events" to return UI elements enabled'`,
+			{ timeout: 3_000 }).toString().trim();
+		_axTrustedCache = out === 'true' ? true : out === 'false' ? false : null;
+	} catch { _axTrustedCache = null; }
+	return _axTrustedCache;
+}
 
 // --- Scroll ---
 
@@ -65,6 +81,12 @@ export const scrollTool: ToolDefinition = {
 			console.log(`${ts()} [Scroll] frontApp=${frontApp} direction=${direction} isChrome=${isChrome}`);
 
 			let _scrollMoved: boolean | null = null;  // null = couldn't determine (no AppleEvent result)
+			// Setup faults the OS already explained, surfaced when nothing scrolled.
+			const _hints: string[] = [];
+			const _noteHint = (e: unknown) => {
+				const h = setupHint(e instanceof Error ? e.message : String(e));
+				if (h && !_hints.includes(h)) _hints.push(h);
+			};
 			if (isChrome && !target) {
 				// Chrome: try EACH scrollable element (widest first) until one ACTUALLY
 				// MOVES, then fall back to window scroll. The old code scrolled only the
@@ -91,7 +113,7 @@ export const scrollTool: ToolDefinition = {
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				let _out = '';
 				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
-				catch (e) { console.log(`${ts()} [Scroll] osascript error: ${e instanceof Error ? e.message : e}`); }
+				catch (e) { _noteHint(e); console.log(`${ts()} [Scroll] osascript error: ${e instanceof Error ? e.message : e}`); }
 				try { unlinkSync(tmpScroll); } catch {}
 				if (_out) {
 					try {
@@ -118,7 +140,7 @@ export const scrollTool: ToolDefinition = {
 				writeFileSync(tmpScroll, `tell application "Google Chrome" to tell active tab of front window to execute javascript "${js.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
 				let _out = '';
 				try { _out = execSync(`osascript ${tmpScroll}`, { timeout: 5_000 }).toString().trim(); }
-				catch (e) { console.log(`${ts()} [Scroll] osascript error (target branch): ${e instanceof Error ? e.message : e}`); }
+				catch (e) { _noteHint(e); console.log(`${ts()} [Scroll] osascript error (target branch): ${e instanceof Error ? e.message : e}`); }
 				try { unlinkSync(tmpScroll); } catch {}
 				try {
 					const d = JSON.parse(_out);
@@ -129,19 +151,20 @@ export const scrollTool: ToolDefinition = {
 
 			// Keyboard scroll on the frontmost app (works in any app, no focus steal)
 			const keyCode = direction === 'down' ? '121' : direction === 'up' ? '116' : direction === 'top' ? '115 using command down' : '119 using command down';
+			let _keyDenied = false;
 			try {
 				execSync(`osascript -e 'tell application "System Events" to key code ${keyCode}'`, { timeout: 3_000 });
-			} catch { /* keyboard fallback is best-effort */ }
+			} catch (e) { _noteHint(e); _keyDenied = true; }
 
 			console.log(`${ts()} [Scroll] ${direction} (app: ${frontApp})`);
-			// Honest result: if the JS pass found nothing moved (page already at the
-			// direction's limit), say so instead of falsely claiming a scroll — so the
-			// model can tell the user "looks like we're at the bottom" rather than insist.
-			if (_scrollMoved === false) {
-				return { status: 'at_limit', direction, app: frontApp, moved: false,
-				         message: `Nothing scrolled — the page appears to be at the ${direction === 'down' ? 'bottom' : direction === 'up' ? 'top' : direction}. Tell the user it can't scroll further that way.` };
+			// Record the probe wherever the scroll was NOT positively confirmed: on a host
+			// with Accessibility off, `axTrusted=false moved=null denied=false` is the
+			// observation this bug cannot be fixed without.
+			if (_scrollMoved !== true) {
+				console.log(`${ts()} [Scroll] probe: axTrusted=${axTrusted()} moved=${_scrollMoved} denied=${_keyDenied} hints=${_hints.length}`);
 			}
-			return { status: 'scrolled', direction, app: frontApp, moved: _scrollMoved };
+			return { ...scrollOutcome({ scrollMoved: _scrollMoved, keyDenied: _keyDenied, hints: _hints, direction }),
+			         direction, app: frontApp };
 		} catch (err) {
 			return { error: `Scroll failed: ${err instanceof Error ? err.message : err}` };
 		}
@@ -312,11 +335,14 @@ export const openUrlTool: ToolDefinition = {
 			console.log(`${ts()} [OpenURL] rejected url with zero-width char: ${redactQuery(url)}`);
 			return { error: `Failed to open: URL contains zero-width character (got ${JSON.stringify(url)})` };
 		}
+		// AppleScript rejects a bare host ("Invalid URL entered. (5)"); only the
+		// omnibox infers a scheme, and this tool advertises the bare-host form.
+		const target = withScheme(url);
 		// Escape backslashes first, then quotes — prevents shell injection via osascript
-		const safeUrl = url.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
+		const safeUrl = target.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/"/g, '\\"');
 		// Parse target origin (scheme + host + port). If unparseable, fall back to new-tab behavior.
 		let targetOrigin = '';
-		try { targetOrigin = new URL(url).origin; } catch { /* not a real URL, e.g. "about:blank" — let Chrome handle */ }
+		try { targetOrigin = new URL(target).origin; } catch { /* not a real URL, e.g. "about:blank" — let Chrome handle */ }
 		try {
 			// Query active-tab URL to decide reuse vs new-tab. If origin matches, set URL on active
 			// tab; otherwise open a new tab. Falls back to new-tab on any error so callers never
@@ -338,16 +364,16 @@ export const openUrlTool: ToolDefinition = {
 			if (!reused) {
 				execSync(`osascript -e 'tell application "Google Chrome" to tell front window to make new tab with properties {URL:"${safeUrl}"}'`, { timeout: 5_000 });
 			}
-			console.log(`${ts()} [OpenURL] ${reused ? 'reused active tab' : 'opened new tab'}: ${url}`);
-			return { status: reused ? 'reused' : 'opened', url };
+			console.log(`${ts()} [OpenURL] ${reused ? 'reused active tab' : 'opened new tab'}: ${target}`);
+			return { status: reused ? 'reused' : 'opened', url: target };
 		} catch (err) {
 			// Log the URL too — the prior version returned the URL only in the
 			// error string, which voice-agent's stdout strips by the time it
 			// reaches the log, leaving "Invalid URL entered. (5)" with no
 			// hint of what URL voice actually passed. 2026-05-19 incident:
 			// three back-to-back open_url failures with no observable arg.
-			console.log(`${ts()} [OpenURL] FAILED url=${redactQuery(url)} err=${err instanceof Error ? err.message : err}`);
-			return { error: `Failed to open ${url}: ${err instanceof Error ? err.message : err}` };
+			console.log(`${ts()} [OpenURL] FAILED url=${redactQuery(target)} err=${err instanceof Error ? err.message : err}`);
+			return { error: `Failed to open ${target}: ${err instanceof Error ? err.message : err}` };
 		}
 	},
 };
@@ -362,7 +388,7 @@ export const openUrlTool: ToolDefinition = {
 async function describeScreenshot(imagePath: string, previousDescs: string[] = []): Promise<string> {
 	// Prefer free-tier voice key (gemini-3.1-flash-lite-preview is free-tier eligible on REST
 	// generateContent — verified 2026-05-14). Falls back to paid GEMINI_API_KEY if voice key absent.
-	const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+	const apiKey = resolveCredential('gemini-voice').key;
 	if (!apiKey) return 'Vision description unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)';
 	try {
 		// Fixes CodeQL #27 (js/command-line-injection): use execFileSync argv array instead of shell string
@@ -536,7 +562,7 @@ export const pointAtTool: ToolDefinition = {
 		const { query } = args as { query: string };
 		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
 		// works on it); falls back to the paid key. Same precedence as describe_screen.
-		const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;
+		const apiKey = resolveCredential('gemini-voice').key;
 		if (!apiKey) return { error: 'point_at unavailable (no GEMINI_VOICE_API_KEY or GEMINI_API_KEY)' };
 		if (!query?.trim()) return { error: 'point_at needs a query (what to point at)' };
 		try {

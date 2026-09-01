@@ -68,8 +68,9 @@ check("offline: authenticated is null", out.get("authenticated") is None)
 check("offline: core_running is false", out.get("core_running") is False)
 check(
     "contract keys present",
-    set(out) == {"health", "authenticated", "core_running", "gateway_running",
-                 "tmux_socket", "session", "detail"},
+    set(out) == {"health", "severity", "authenticated", "core_running",
+                 "gateway_running", "ag2space_app_running", "station_available",
+                 "tmux_socket", "session", "detail", "signals"},
 )
 
 # 4) derive() maps every state correctly — drive it by patching the probes so we
@@ -108,8 +109,42 @@ check("derive: running with no ts -> working (can't prove stale)", d["health"] =
 d = _derive_with(core=True, pane="", status="idle")
 check("derive: idle status -> idle", d["health"] == "idle" and d["authenticated"] is True)
 
-d = _derive_with(core=True, pane=STUCK_PANE, status="running")
-check("derive: login pane wins over status -> needs_login", d["health"] == "needs_login" and d["authenticated"] is False)
+# CHANGED by #2456. This previously asserted "login pane wins over status" with a
+# FRESH status — which is the short-circuit the issue reports: the agent is
+# demonstrably advancing, so a sign-in prompt cannot also be true, and the
+# needs_login verdict erased the wedge signal. The code comment justifying cheap
+# false positives is about an UNRESPONSIVE agent; it does not reach a fresh one.
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts="fresh")
+check("derive: login marker + FRESH status -> not needs_login (false positive)",
+      d["health"] == "working" and d["authenticated"] is True)
+check("derive: ...and the marker is still reported, not silently dropped",
+      "false positive" in d["detail"])
+
+# The marker is still authoritative wherever there is no positive evidence of
+# progress — a real sign-in prompt stops the loop, so these corroborate.
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts="stale")
+check("derive: login marker + STALE status -> needs_login",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+check("derive: ...and the wedge signal survives in the detail",
+      "stale" in d["detail"].lower())
+
+d = _derive_with(core=True, pane=STUCK_PANE, status="running", ts=None)
+check("derive: login marker + NO timestamp -> needs_login (absence of evidence is not freshness)",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+
+d = _derive_with(core=True, pane=STUCK_PANE, status="idle", ts="fresh")
+check("derive: login marker + fresh IDLE -> idle, not needs_login",
+      d["health"] == "idle" and d["authenticated"] is True)
+
+d = _derive_with(core=True, pane=STUCK_PANE, status=None, ts="fresh")
+check("derive: login marker + unknown status -> needs_login (no proof of acting)",
+      d["health"] == "needs_login" and d["authenticated"] is False)
+
+# CONTROL: a clean pane must be unaffected in every one of those shapes.
+check("derive: CONTROL clean pane + stale running -> unknown (wedge preserved)",
+      _derive_with(core=True, pane="", status="running", ts="stale")["health"] == "unknown")
+check("derive: CONTROL clean pane + fresh running -> working",
+      _derive_with(core=True, pane="", status="running", ts="fresh")["health"] == "working")
 
 d = _derive_with(core=True, pane="", status=None)
 check("derive: running but no status -> unknown", d["health"] == "unknown")
@@ -151,7 +186,23 @@ _orig_socket = rh.TMUX_SOCKET
 rh.TMUX_SOCKET = "/tmp/rh-inproc-nonexistent-%d.sock" % os.getpid()
 try:
     check("real _core_running: false on bogus socket", rh._core_running() is False)
-    check("real _gateway_running returns a bool", isinstance(rh._gateway_running(), bool))
+    # _gateway_running() short-circuits to None unless a gateway is CONFIGURED
+    # (src/runtime-health.py:229). Clean-install CI has none, so the real probe
+    # branch is only reachable when we force the precondition — otherwise this
+    # asserts a bool against None and fails host-dependently (qingyun CR #2527).
+    _ogc = rh._gateway_configured
+    rh._gateway_configured = lambda: True
+    try:
+        check("real _gateway_running returns a bool (configured host)",
+              isinstance(rh._gateway_running(), bool))
+    finally:
+        rh._gateway_configured = _ogc
+    # Explicit unconfigured-host control: not-configured -> None, never a down-vote.
+    rh._gateway_configured = lambda: False
+    try:
+        check("_gateway_running: unconfigured host -> None", rh._gateway_running() is None)
+    finally:
+        rh._gateway_configured = _ogc
     check("real _pane_text returns a str", isinstance(rh._pane_text(), str))
     check("real _resolve_workspace returns a path", rh._resolve_workspace(REPO).startswith("/"))
     d = rh.derive()
@@ -163,8 +214,11 @@ finally:
     rh.TMUX_SOCKET = _orig_socket
 
 # 7) Defensive branches (the degrade-not-crash paths).
+# A command that cannot execute returns rc None (UNKNOWN — distinct from a
+# command that ran and returned non-zero) so a probe outage is never counted as
+# a positive "down" observation (qingyun CR on #2527).
 rc, out = rh._run(["/nonexistent-rh-binary-xyz"])
-check("_run: missing binary -> (127, '')", rc == 127 and out == "")
+check("_run: missing binary -> (None, '')", rc is None and out == "")
 
 
 def _fake_run_gw(cmd):
@@ -176,11 +230,17 @@ def _fake_run_gw(cmd):
 
 
 _o = rh._run
+_ogc2 = rh._gateway_configured
 rh._run = _fake_run_gw
+# The window-scan fallback is only reached past the configured short-circuit
+# (src/runtime-health.py:229), so mark the gateway configured here too — else
+# this returns None on a clean host and never exercises the fallback (qingyun CR #2527).
+rh._gateway_configured = lambda: True
 try:
     check("_gateway_running: window-scan fallback", rh._gateway_running() is True)
 finally:
     rh._run = _o
+    rh._gateway_configured = _ogc2
 
 _ow = rh._resolve_workspace
 rh._resolve_workspace = lambda repo: "/dev/null/cannot-mkdir-here"

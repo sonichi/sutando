@@ -1,10 +1,13 @@
 {
   "name": "proactive-loop",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "stable",
   "description": "Start Sutando's autonomous proactive loop. Monitors tasks, runs health checks, and builds missing capabilities on a recurring schedule.",
+  "config": {
+    "SUTANDO_SELF_DEVELOPMENT_ENABLED": "1"
+  },
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

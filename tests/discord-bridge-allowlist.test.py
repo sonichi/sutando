@@ -35,7 +35,7 @@ import sys
 
 REPO = Path(__file__).resolve().parent.parent
 BRIDGE = REPO / "src" / "discord-bridge.py"
-ALLOWLIST_MODULE = REPO / "src" / "send_allowlist.py"
+ALLOWLIST_MODULE = REPO / "src" / "policy" / "egress" / "attachment.py"
 
 
 def fail(msg: str, context: str = "") -> int:
@@ -57,13 +57,13 @@ def main() -> int:
     # (post-refactor, PR #1029) — both shapes satisfy the contract. We
     # scan both sources and use whichever has the function definition.
     HELPER_RE = re.compile(
-        r"def (?:_)?is_path_sendable\(fpath:\s*str\)\s*->\s*bool:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\n\n[A-Z]|\Z)",
+        r"def (?:_)?is_path_sendable\(fpath:\s*str.*?\)\s*->\s*bool:\s*\n([\s\S]{0,2000}?)(?=\n\ndef |\n\n[A-Z]|\Z)",
     )
     helper_body = None
     found_in = None
     for candidate_src, label in (
         (src, "discord-bridge.py"),
-        (ALLOWLIST_MODULE.read_text() if ALLOWLIST_MODULE.exists() else "", "send_allowlist.py"),
+        (ALLOWLIST_MODULE.read_text() if ALLOWLIST_MODULE.exists() else "", "policy/egress/attachment.py"),
     ):
         m = HELPER_RE.search(candidate_src)
         if m:
@@ -73,22 +73,22 @@ def main() -> int:
     if helper_body is None:
         return fail(
             "`_is_path_sendable` / `is_path_sendable` function not found in either "
-            "src/discord-bridge.py or src/send_allowlist.py"
+            "src/discord-bridge.py or src/policy/egress/attachment.py"
         )
     # If the implementation lives in send_allowlist.py, discord-bridge
     # must import it (otherwise the file-send sites have a dangling
     # name). Verify the import is present.
-    if found_in == "send_allowlist.py":
-        # The import may use `from send_allowlist import is_path_sendable`
-        # OR `from send_allowlist import (is_path_sendable as _alias, ...)`
+    if found_in == "policy/egress/attachment.py":
+        # The import may use `from policy.egress.attachment import is_path_sendable`
+        # OR `from policy.egress.attachment import (is_path_sendable as _alias, ...)`
         # — both shapes satisfy the contract. Use DOTALL so multi-line
         # parenthesized imports match.
         if not re.search(
-            r"from\s+send_allowlist\s+import[\s\S]*?is_path_sendable",
+            r"from\s+policy\.egress\.attachment\s+import[\s\S]*?is_path_sendable",
             src,
         ):
             return fail(
-                "send_allowlist.py defines is_path_sendable but discord-bridge.py "
+                "policy/egress/attachment.py defines is_path_sendable but discord-bridge.py "
                 "does not import it — the gate sites would reference an undefined name."
             )
 
@@ -126,7 +126,12 @@ def main() -> int:
                 break
             start = prev
         window = src[start:match.end()]
-        if f"_is_path_sendable({arg})" not in window and f"_is_path_sendable( {arg}" not in window:
+        # `_classify_attachment` returns ATTACH_SEND only when is_path_sendable
+        # is true, so gating on that outcome is the same authorization decision.
+        gated = (f"_is_path_sendable({arg})" in window
+                 or f"_is_path_sendable( {arg}" in window
+                 or ("_ATTACH_SEND" in window and f"_classify_attachment({arg})" in window))
+        if not gated:
             return fail(
                 f"discord.File({arg}) sink found without preceding _is_path_sendable gate",
                 window,

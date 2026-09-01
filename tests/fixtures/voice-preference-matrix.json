@@ -1,0 +1,464 @@
+{
+  "comment": [
+    "Cross-consumer agreement matrix for the S1 credential-source truth table",
+    "(design 2b; impl plan WS2 Step 6). One row per combination of",
+    "{managed voice+text entries present|absent} x {voicePreference unset|managed|byok}",
+    "x {quarantined yes|no} x {BYO env key present|absent}; every credential",
+    "consumer must produce the SAME column for the same row:",
+    "  - resolverSource / resolvedKey / credentialGeneration: the TS resolver",
+    "    (src/credential-resolver.ts) and its python twin",
+    "    (src/credential_resolver.py) — internal vocabulary ('env' = BYOK).",
+    "  - effectiveSourceLabel: credentialSourceLabel(resolverSource) — the",
+    "    design's user-facing 'managed'|'byok'|'none' vocabulary.",
+    "  - managedGatePresent: startup-runtime.sh _managed_voice_credential_present",
+    "    AND health-check.py managed_voice_credential_present — true iff a",
+    "    non-quarantined managed entry may satisfy the voice capability.",
+    "  - voiceEnabled: the launch/enable decision — configure_startup_runtime",
+    "    (SKIP_VOICE unset) and health-check.py resolve_voice_health_config.",
+    "  - supervisorInjectedManagedKey: DESKTOP-SIDE column — what the",
+    "    ag2space-cinny-desktop supervisor's managedGeminiVoiceKey() may inject",
+    "    into the spawn env ('' = no injection). Asserted by that repo's twin",
+    "    engine/backend-supervisor.voice-preference.test.mjs, which copies this",
+    "    fixture verbatim; the engine-side driver",
+    "    (tests/voice-preference-consumers.test.sh) does not execute it.",
+    "S1 semantics pinned here: unset => legacy managed->env; managed => ONLY a",
+    "non-quarantined managed entry satisfies (env keys never silently satisfy",
+    "it); byok => env only; quarantined entries are absent in EVERY mode.",
+    "Files carry preferenceRevision/sessionRevision (amendment R15) and a",
+    "managed generation (S3) so every consumer proves it tolerates them.",
+    "Rows with managedFile: null exercise the FILE-ABSENT branch (every",
+    "pre-managed install): the harness materializes no managed-credentials.json",
+    "at all, and resolution must be byte-for-byte the legacy env chain.",
+    "noEntries.* rows keep the file present but capabilities empty, across",
+    "prefUnset/prefManaged/prefByok — an empty managed tier must never be",
+    "satisfied by an env key under 'managed', and must fall through to env",
+    "under unset/'byok'."
+  ],
+  "envKeyValue": "byo-mk",
+  "rows": [
+    {
+      "name": "entries.prefUnset.fresh.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "preferenceRevision": 4,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "managed",
+        "resolvedKey": "managed-v",
+        "credentialGeneration": "cg1-matrix-0001",
+        "effectiveSourceLabel": "managed",
+        "managedGatePresent": true,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": "managed-v"
+      }
+    },
+    {
+      "name": "entries.prefUnset.fresh.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "preferenceRevision": 4,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "managed",
+        "resolvedKey": "managed-v",
+        "credentialGeneration": "cg1-matrix-0001",
+        "effectiveSourceLabel": "managed",
+        "managedGatePresent": true,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": "managed-v"
+      }
+    },
+    {
+      "name": "entries.prefUnset.quarantined.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "quarantined": true,
+        "preferenceRevision": 4,
+        "sessionRevision": 3
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "entries.prefUnset.quarantined.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "quarantined": true,
+        "preferenceRevision": 4,
+        "sessionRevision": 3
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "entries.prefManaged.fresh.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "voicePreference": "managed",
+        "preferenceRevision": 5,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "managed",
+        "resolvedKey": "managed-v",
+        "credentialGeneration": "cg1-matrix-0001",
+        "effectiveSourceLabel": "managed",
+        "managedGatePresent": true,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": "managed-v"
+      }
+    },
+    {
+      "name": "entries.prefManaged.fresh.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "voicePreference": "managed",
+        "preferenceRevision": 5,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "managed",
+        "resolvedKey": "managed-v",
+        "credentialGeneration": "cg1-matrix-0001",
+        "effectiveSourceLabel": "managed",
+        "managedGatePresent": true,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": "managed-v"
+      }
+    },
+    {
+      "name": "entries.prefManaged.quarantined.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "voicePreference": "managed",
+        "quarantined": true,
+        "preferenceRevision": 5,
+        "sessionRevision": 3
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "entries.prefManaged.quarantined.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "voicePreference": "managed",
+        "quarantined": true,
+        "preferenceRevision": 5,
+        "sessionRevision": 3
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "entries.prefByok.fresh.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "voicePreference": "byok",
+        "preferenceRevision": 6,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "entries.prefByok.fresh.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "voicePreference": "byok",
+        "preferenceRevision": 6,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "entries.prefByok.quarantined.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "voicePreference": "byok",
+        "quarantined": true,
+        "preferenceRevision": 6,
+        "sessionRevision": 3
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "entries.prefByok.quarantined.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {
+          "gemini-voice": { "key": "managed-v", "generation": "cg1-matrix-0001" },
+          "gemini-text": { "key": "managed-t" }
+        },
+        "voicePreference": "byok",
+        "quarantined": true,
+        "preferenceRevision": 6,
+        "sessionRevision": 3
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefUnset.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "preferenceRevision": 4,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefUnset.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "preferenceRevision": 4,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefManaged.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "voicePreference": "managed",
+        "preferenceRevision": 5,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefManaged.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "voicePreference": "managed",
+        "preferenceRevision": 5,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefByok.envKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "voicePreference": "byok",
+        "preferenceRevision": 6,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noEntries.prefByok.noEnvKey",
+      "managedFile": {
+        "version": 1,
+        "capabilities": {},
+        "voicePreference": "byok",
+        "preferenceRevision": 6,
+        "sessionRevision": 2
+      },
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noFile.envKey",
+      "managedFile": null,
+      "envKeyPresent": true,
+      "expected": {
+        "resolverSource": "env",
+        "resolvedKey": "byo-mk",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "byok",
+        "managedGatePresent": false,
+        "voiceEnabled": true,
+        "supervisorInjectedManagedKey": ""
+      }
+    },
+    {
+      "name": "noFile.noEnvKey",
+      "managedFile": null,
+      "envKeyPresent": false,
+      "expected": {
+        "resolverSource": "none",
+        "resolvedKey": "",
+        "credentialGeneration": null,
+        "effectiveSourceLabel": "none",
+        "managedGatePresent": false,
+        "voiceEnabled": false,
+        "supervisorInjectedManagedKey": ""
+      }
+    }
+  ]
+}

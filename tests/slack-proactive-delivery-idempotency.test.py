@@ -133,7 +133,7 @@ def main():
 
     bridge = (REPO / "src" / "slack-bridge.py").read_text()
     check_pos = bridge.index("proactive_was_delivered(STATE_DIR, delivery_id)")
-    claim_pos = bridge.index("f.rename(claim)", check_pos)
+    claim_pos = bridge.index("claim_for_delivery(f, owner_id)", check_pos)
     send_pos = bridge.index("_send_reply(dm_channel", claim_pos)
     mark_pos = bridge.index("mark_proactive_delivered(STATE_DIR, delivery_id)", send_pos)
     assert check_pos < claim_pos < send_pos < mark_pos

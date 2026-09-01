@@ -12,7 +12,6 @@ import argparse
 import fcntl
 import json
 import os
-import plistlib
 import re
 import subprocess
 import sys
@@ -24,7 +23,9 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from sutando_config import resolve_core_runtime  # noqa: E402
 
 
 LABEL = "com.sutando.codex-schedules"
@@ -158,16 +159,37 @@ def cron_matches(expression: str, local_dt: datetime) -> bool:
     )
 
 
-def load_jobs(config_path: Path) -> list[dict[str, Any]]:
+def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dict[str, Any]]:
     raw = json.loads(config_path.read_text())
     if not isinstance(raw, list):
         raise ValueError("crons.json must contain a JSON array")
     jobs: list[dict[str, Any]] = []
     names: set[str] = set()
     slugs: dict[str, str] = {}
-    for entry in raw:
-        if not isinstance(entry, dict) or entry.get("execution") != "codex-task":
+    for raw_entry in raw:
+        if not isinstance(raw_entry, dict):
             continue
+        canonical_main_loop = (
+            raw_entry.get("name") == "main-loop"
+            and raw_entry.get("prompt_skill") == "proactive-loop"
+            and not raw_entry.get("launchd")
+        )
+        implicit_main_loop = (
+            include_main_loop and canonical_main_loop and raw_entry.get("execution") is None
+        )
+        if raw_entry.get("execution") != "codex-task" and not implicit_main_loop:
+            continue
+        entry = dict(raw_entry)
+        if canonical_main_loop:
+            # Codex has no session CronCreate surface. Turn the canonical loop
+            # into one low-priority task per fire while keeping crons.json
+            # unchanged so switching back to Claude restores session ownership.
+            entry.pop("prompt_skill", None)
+            entry["prompt"] = (
+                "Run exactly one proactive-loop pass using skills/proactive-loop/SKILL.md. "
+                "Do not arm another recurring loop; the durable Codex scheduler owns the cadence."
+            )
+            entry["_silent_result"] = True
         name = entry.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ValueError("codex-task entries require a non-empty name")
@@ -194,6 +216,10 @@ def load_jobs(config_path: Path) -> list[dict[str, Any]]:
     return jobs
 
 
+def codex_runtime_selected(repo: Path | None = None) -> bool:
+    return resolve_core_runtime(repo or repo_root()) == "codex"
+
+
 def _task_paths(
     workspace: Path, job: dict[str, Any], slot: datetime, attempt: int = 1
 ) -> tuple[str, Path, Path, Path]:
@@ -217,17 +243,21 @@ def _task_body(
             f" Write the concise owner-facing result to {proactive_path}, then write "
             f"[no-send] to {result_path} so this scheduled task is archived without a duplicate reply."
         )
-    body = (
-        f"id: {task_id}\n"
-        f"timestamp: {iso(now)}\n"
-        "source: cron\n"
-        "interaction_type: system_event\n"
-        "access_tier: owner\n"
-        "priority: low\n"
-        f"schedule_name: {job['name']}\n"
-        f"schedule_slot: {iso(slot)}\n"
-        f"task: {prompt}\n"
-    )
+    elif job.get("_silent_result"):
+        prompt += (
+            f" When the pass is complete, write [no-send] to {result_path} "
+            "so the scheduler records completion without messaging the owner."
+        )
+    body = serialize_task_last(
+        [("id", task_id),
+         ("timestamp", iso(now)),
+         ("source", "cron"),
+         ("interaction_type", "system_event"),
+         ("access_tier", "owner"),
+         ("priority", "low"),
+         ("schedule_name", job["name"]),
+         ("schedule_slot", iso(slot))],
+        prompt)
     return task_id, body
 
 
@@ -298,12 +328,23 @@ def _minute_slots(previous: datetime | None, now: datetime) -> list[datetime]:
     return [start + timedelta(minutes=i) for i in range(count)]
 
 
-def tick(workspace: Path, host_label: str, now: datetime | None = None) -> dict[str, Any]:
+def tick(
+    workspace: Path,
+    host_label: str,
+    now: datetime | None = None,
+    *,
+    include_main_loop: bool | None = None,
+) -> dict[str, Any]:
     now = (now or utc_now()).astimezone(timezone.utc)
     config_path = workspace / "hosts" / host_label / "crons.json"
     state_path = workspace / "state" / "schedules" / "codex-scheduler.json"
     with scheduler_lock(workspace):
-        jobs = load_jobs(config_path)
+        jobs = load_jobs(
+            config_path,
+            include_main_loop=(
+                codex_runtime_selected() if include_main_loop is None else include_main_loop
+            ),
+        )
         try:
             state = json.loads(state_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
@@ -438,9 +479,21 @@ def health(workspace: Path, host_label: str, now: datetime | None = None) -> tup
     }
 
 
-def install(workspace: Path, host_label: str, repo: Path, *, write_only: bool = False) -> Path:
+def install(
+    workspace: Path,
+    host_label: str,
+    repo: Path,
+    *,
+    write_only: bool = False,
+    include_main_loop: bool | None = None,
+) -> Path:
     config_path = workspace / "hosts" / host_label / "crons.json"
-    jobs = load_jobs(config_path)
+    jobs = load_jobs(
+        config_path,
+        include_main_loop=(
+            codex_runtime_selected(repo) if include_main_loop is None else include_main_loop
+        ),
+    )
     if not jobs:
         raise ValueError("no crons.json entries opt in with execution=codex-task")
     logs = workspace / "logs"
@@ -467,6 +520,33 @@ def install(workspace: Path, host_label: str, repo: Path, *, write_only: bool = 
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         },
     }
+    # Imported HERE rather than at module scope, and only `install` ever needs
+    # it. `plistlib` pulls in `xml.parsers.expat` -> the `pyexpat` C extension,
+    # which dlopens libexpat: a Python whose pyexpat was built against a
+    # different libexpat than it finds at runtime raises ImportError at import
+    # time. At module scope that killed EVERY subcommand — including `tick`,
+    # which launchd invokes once a minute, and `health`, whose entire job is to
+    # report that the scheduler is broken. Neither writes a plist.
+    #
+    # Measured on a live host 2026-08-03, same file, same commit:
+    #
+    #   /opt/homebrew/bin/python3 3.14.5 -> `tick` and `health` both die with
+    #                                       ImportError: dlopen … pyexpat …
+    #                                       _XML_SetAllocTrackerActivationThreshold
+    #   /usr/bin/python3          3.9.6  -> both reach real logic
+    #
+    # A durable scheduler that cannot run is worse than one that is absent: the
+    # launchd job stays loaded and `--status` still reports it. Sibling fix to
+    # #2588 (same defect shape in src/health-check.py).
+    try:
+        import plistlib
+    except ImportError as exc:  # pragma: no cover - platform-dependent
+        raise SystemExit(
+            f"codex-scheduler: cannot write the launchd plist — this Python "
+            f"cannot import plistlib ({exc.__class__.__name__}: {exc}). "
+            f"Re-run `install` with an interpreter whose pyexpat works — the "
+            f"system python usually does. `tick` and `health` are unaffected."
+        )
     tmp = plist_path.with_name(f".{plist_path.name}.{os.getpid()}.tmp")
     with tmp.open("wb") as handle:
         plistlib.dump(payload, handle, sort_keys=True)

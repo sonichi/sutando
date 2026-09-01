@@ -13,15 +13,30 @@
       "properties": {
         "runtime": {
           "type": "string",
-          "enum": ["claude", "codex"],
+          "enum": [
+            "claude",
+            "codex"
+          ],
           "default": "claude"
+        },
+        "expected_branch": {
+          "type": "string",
+          "minLength": 1,
+          "default": "main",
+          "description": "Branch the live checkout is expected to be on; health-check's live-checkout-branch probe warns on drift. Set on hosts intentionally pinned to a non-main branch (e.g. dual-run pinned nodes). SUTANDO_EXPECTED_BRANCH env var overrides per-invocation."
+        },
+        "checkout_behind_warn": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "Commits behind origin/<expected_branch> before health-check's live-checkout-branch probe warns that the checkout is stale. Being ON the right branch is only half of being current \u2014 a checkout can sit on main and still run weeks-old code. Deliberately not 1: main moves several times a day, so warning on any delta trains the reader to ignore the probe. Invalid values (non-integer, zero, negative) fall back to 10 rather than crashing the health check or warning on a current checkout. No env-var override."
         }
       }
     },
     "workspace": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Workspace location config. Resolution order: $SUTANDO_WORKSPACE env (legacy escape hatch, warn) > sutando.config.local.json > sutando.config.json > baked-in default ${REPO_DIR}/workspace.",
+      "description": "Workspace location config. Resolution order: sutando.config.local.json > sutando.config.json > baked-in default ${REPO_DIR}/workspace. $SUTANDO_WORKSPACE is NOT honored (removed in v0.8); setting it only warns.",
       "properties": {
         "path": {
           "type": "string",
@@ -33,14 +48,14 @@
     "claude_sutando_config_dir": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Where the Sutando-scoped Claude Code config lives — set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
+      "description": "Where the Sutando-scoped Claude Code config lives \u2014 set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
       "properties": {
         "subdir": {
           "type": "string",
           "minLength": 1,
           "default": ".claude-sutando",
           "pattern": "^(?!.*\\.\\.)(?!/)[^/].*$",
-          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace — absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
+          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace \u2014 absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
         }
       }
     },
@@ -50,12 +65,32 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "type", "env_name", "value"],
+        "required": [
+          "id",
+          "type",
+          "env_name",
+          "value"
+        ],
         "properties": {
-          "id": { "type": "string", "minLength": 1 },
-          "type": { "type": "string", "enum": ["claude", "codex"] },
-          "env_name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-          "synced": { "type": "boolean", "default": true },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "codex"
+            ]
+          },
+          "env_name": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "synced": {
+            "type": "boolean",
+            "default": true
+          },
           "value": {
             "type": "string",
             "minLength": 1,
@@ -81,17 +116,31 @@
         "sync": {
           "type": "object",
           "additionalProperties": false,
-          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. Arrays REPLACE on merge (not unioned) — overriding in .local.json wipes the defaults for that array.",
+          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. include/exclude arrays REPLACE on merge (not unioned) \u2014 overriding either in .local.json wipes the defaults for that array. Use exclude_extra to ADD a carve-out while keeping the shipped ones.",
           "properties": {
             "include": {
               "type": "array",
-              "items": { "type": "string", "minLength": 1 },
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
               "description": "Workspace-relative paths to sync. Trailing slash convention indicates a directory."
             },
             "exclude": {
               "type": "array",
-              "items": { "type": "string", "minLength": 1 },
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
               "description": "Workspace-relative paths to skip during sync. Glob patterns supported (e.g. '*.heartbeat')."
+            },
+            "exclude_extra": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Workspace-relative paths APPENDED to exclude rather than replacing it. Shipped denies stay first (gitignore is last-match-wins) and duplicates are dropped. There is no include_extra: include is the whitelist, and unioning it would widen what the vault carries."
             }
           }
         },
@@ -101,6 +150,91 @@
           "default": 1800,
           "description": "Seconds between sync runs when sync is enabled. Minimum 60 to avoid hammering the remote."
         }
+      }
+    },
+    "health_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Behavior of src/health-check.py.",
+      "properties": {
+        "down_bridge_action": {
+          "type": "string",
+          "enum": ["restart", "alert", "off"],
+          "default": "alert",
+          "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout — clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
+        }
+      }
+    },
+    "bridges": {
+      "type": "object",
+      "description": "Bridge-wide toggles shared by the Discord/Telegram/Slack bridges.",
+      "additionalProperties": false,
+      "properties": {
+        "progress_stream": {
+          "type": "boolean",
+          "description": "Emit in-channel '\u23f3 working\u2026 (Ns)' progress placeholders while a task runs."
+        },
+        "discord_post_gate": {
+          "description": "Discord post-gate policy resolved by src/channels/discord/post_gate.py for every Discord sender. Either one path applied to every channel, or a {channel_id: path} map. Unset: ungated. A configured path that fails to load refuses sends (fail-closed). Env override: $SUTANDO_DISCORD_POST_GATE.",
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Path to a Python file exporting validate(channel_id, payload). Applied to every channel. Blank is the legacy UNCONFIGURED form: the resolver strips and treats it as unset, so the schema must not reject it."
+            },
+            {
+              "type": "object",
+              "description": "Per-channel policy files. `*` is REQUIRED and is the fallback for any channel not listed: without it an unlisted channel would send unvalidated, so the resolver refuses the whole mapping. An entry with a null/blank path refuses that one channel.",
+              "required": ["*"],
+              "propertyNames": {
+                "pattern": "^\\S+$",
+                "description": "Channel ids carry no surrounding whitespace. The resolver strips keys; an untrimmed one would route that channel to `*` instead of its own policy."
+              },
+              "properties": {
+                "*": {
+                  "type": "string",
+                  "pattern": "\\S",
+                  "description": "Fallback policy file for every channel not named above."
+                }
+              },
+              "additionalProperties": {
+                "type": ["string", "null"],
+                "description": "Policy file for this channel id."
+              }
+            }
+          ]
+        }
+      }
+    },
+    "migrate": {
+      "type": "object",
+      "description": "Per-clone migration hints consumed by scripts/sutando-config.sh (migrate-stale-hosts, migrate-skip-skills).",
+      "additionalProperties": false,
+      "properties": {
+        "stale_hosts": {
+          "type": "array",
+          "description": "Per-clone machine-<host> dirs treated as stale during migration.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skip_skills": {
+          "type": "array",
+          "description": "Host-only skill names excluded from the migration sweep.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "stand": {
+      "type": "string",
+      "description": "This instance's `Stand:` commit-trailer value (e.g. \"Echo Act IV Mini\"). Per-clone identity, so it belongs in sutando.config.local.json rather than the tracked default config. Read by scripts/sutando-config.sh stand to tell co-located Sutando instances apart, since both commit under the owner's GH-mapped email so --author cannot separate them."
+    },
+    "env": {
+      "type": "object",
+      "description": "Non-secret config values mirroring the flat env-var namespace (issue #1724). Read by config_get(); secrets stay in .env / vault.",
+      "additionalProperties": {
+        "type": "string"
       }
     }
   }

@@ -35,6 +35,13 @@ def check(cond: bool, msg: str) -> None:
 
 
 orig_home = os.environ.get("HOME")
+# The probe resolves its destination via claude_home_path(), which prefers
+# CLAUDE_CONFIG_DIR/CLAUDE_HOME over $HOME — on a dev machine running Sutando
+# those are SET, and without clearing them the fix cases would write real
+# symlinks into the live skills dir (happened 2026-07-25: dangling foo/bar/zap
+# links landed in the workspace claude-home). Redirect ALL three.
+orig_ccd = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+orig_chome = os.environ.pop("CLAUDE_HOME", None)
 td = Path(tempfile.mkdtemp(prefix="skill-symlinks-live-"))
 try:
     fake_repo = td / "repo"
@@ -48,7 +55,10 @@ try:
     check(r["status"] == "ok" and "skipped" in r["detail"], f"A: no skills/ dir -> skipped ({r['detail']})")
 
     # Case B: ~/.claude/skills missing -> ok/skipped
+    # Fixture skills carry SKILL.md: the probe applies skills/install.sh's
+    # filter (only SKILL.md dirs are slash-invocable and get linked).
     (fake_repo / "skills" / "foo").mkdir(parents=True)
+    (fake_repo / "skills" / "foo" / "SKILL.md").write_text("# foo\n")
     r = hc.check_skill_symlinks()
     check(r["status"] == "ok" and "skipped" in r["detail"], f"B: no dst dir -> skipped ({r['detail']})")
 
@@ -56,6 +66,7 @@ try:
     dst = fake_home / ".claude" / "skills"
     dst.mkdir(parents=True)
     (fake_repo / "skills" / "bar").mkdir()
+    (fake_repo / "skills" / "bar" / "SKILL.md").write_text("# bar\n")
     (dst / "foo").symlink_to(fake_repo / "skills" / "foo")
     r = hc.check_skill_symlinks()
     check(r["status"] == "warn" and "bar" in r["detail"], f"C: unlinked bar -> warn ({r['detail']})")
@@ -82,6 +93,7 @@ try:
 
     # Case H: the --fix dispatch helper routes only _unlinked skill-symlinks rows
     (fake_repo / "skills" / "zap").mkdir()
+    (fake_repo / "skills" / "zap" / "SKILL.md").write_text("# zap\n")
     r = hc.check_skill_symlinks()
     hc.apply_skill_symlink_fixes([{"name": "other", "status": "ok"}, r])
     check((dst / "zap").is_symlink(), "H: dispatch helper linked zap")
@@ -89,6 +101,10 @@ try:
 finally:
     if orig_home is not None:
         os.environ["HOME"] = orig_home
+    if orig_ccd is not None:
+        os.environ["CLAUDE_CONFIG_DIR"] = orig_ccd
+    if orig_chome is not None:
+        os.environ["CLAUDE_HOME"] = orig_chome
 
 if errors:
     print(f"FAILED: {errors} check(s) failed", file=sys.stderr)

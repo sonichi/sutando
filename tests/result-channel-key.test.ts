@@ -237,7 +237,7 @@ describe('typed key constructors', () => {
 // ── Cross-language parity ──────────────────────────────────────────────────
 // The SAME shared fixture the Python twin (tests/result-channel-key.test.py)
 // loads. One input/output table, asserted in both languages, so the TS impl
-// (src/result-channel-key.ts) and the Python impl (src/result_channel_key.py)
+// (src/result-channel-key.ts) and the Python impl (src/delivery/channel_key.py)
 // can never silently drift. Change an impl → the matching row fails in the
 // OTHER language's test too. (Lucy's flag on PR #1595.)
 describe('cross-language parity fixture', () => {

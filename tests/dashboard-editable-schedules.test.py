@@ -235,16 +235,25 @@ _errs: list[str] = []
 
 # Widen the read→write window so an unlocked implementation reliably races; under
 # the real lock this sleep simply runs inside the critical section (still serial).
-_orig_read = dash._read_crons
+#
+# Patch the SCHEDULES module, not dash: the read→merge→write transaction moved to
+# dashboard_schedules, so patching dash._read_crons (a thin wrapper the transaction
+# no longer calls) leaves this widening inert. The race is still detected without
+# it — measured 1/24 persisted under a removed lock — but only incidentally, on
+# this filesystem and scheduler. Patching here keeps the detection *engineered*
+# rather than luck, which is what the original author wired it up for.
+import dashboard_schedules as _ds
+
+_orig_read = _ds.read_crons
 
 
-def _slow_read():
-    r = _orig_read()
+def _slow_read(path):
+    r = _orig_read(path)
     _time.sleep(0.003)
     return r
 
 
-dash._read_crons = _slow_read
+_ds.read_crons = _slow_read
 
 
 def _worker(i):
@@ -263,7 +272,7 @@ for _t in _threads:
     _t.start()
 for _t in _threads:
     _t.join(timeout=15)
-dash._read_crons = _orig_read
+_ds.read_crons = _orig_read
 
 _final = {j["name"] for j in dash._read_crons()}
 check("concurrent upserts: no writer raised (no shared-temp FileNotFoundError)",

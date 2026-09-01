@@ -44,6 +44,19 @@ class TestSkipMarkers(unittest.TestCase):
         self.assertEqual(r.actions[0].value, "deduped")
         self.assertEqual(r.actions[0].extra, "task-1779164273868")
 
+    def test_deduped_empty_target_parses_like_its_spaced_twin(self):
+        # One space apart: the spaced form parsed, the bare one did not, so
+        # the bare one shipped its marker text and body to the channel.
+        for src in ("[deduped:]\nfull reply elsewhere",
+                    "[deduped: ]\nfull reply elsewhere"):
+            with self.subTest(src=src.splitlines()[0]):
+                r = parse_markers(src)
+                self.assertEqual(len(r.actions), 1, "must parse as exactly one skip")
+                self.assertEqual(r.actions[0].kind, "skip")
+                self.assertEqual(r.actions[0].value, "deduped")
+                self.assertEqual(r.actions[0].extra, "")
+                self.assertNotIn("[deduped", r.body)
+
     def test_skip_strips_leading_whitespace(self):
         r = parse_markers("  [no-send]\nbody")
         self.assertEqual(r.actions[0].kind, "skip")
@@ -79,6 +92,56 @@ class TestRedirectMarker(unittest.TestCase):
         self.assertEqual(first_action(r, "redirect"), None)
         # And the literal text stays (bridges may strip if they want)
         self.assertIn("[channel: 12345]", r.body)
+
+
+class TestDmOnlyMarker(unittest.TestCase):
+    """The `[dm-only]` privacy guard: forces DM, suppresses any [channel:]
+    redirect so private content (calendar/email briefing) can't be posted to a
+    shared channel. Added 2026-07-18 after a morning briefing leaked to a
+    channel via a [channel:] redirect."""
+
+    def test_dm_only_emits_action_and_strips_marker(self):
+        r = parse_markers("[dm-only]\nCalendar today: 7:30am write")
+        self.assertEqual(r.body, "Calendar today: 7:30am write")
+        self.assertEqual(first_action(r, "dm-only").kind, "dm-only")
+        # No literal marker leaks into the delivered body.
+        self.assertNotIn("[dm-only]", r.body)
+
+    def test_dm_only_suppresses_redirect_marker_first(self):
+        # BEFORE (no dm-only): the [channel:] redirect IS honored →
+        # private content would be posted to the channel.
+        before = parse_markers("[channel: 1527723291324842135]\nCalendar: 7:30am")
+        self.assertEqual(first_action(before, "redirect").value, "1527723291324842135")
+
+        # AFTER (dm-only present, redirect first): NO redirect action is
+        # emitted — the body stays in the owner's DM — and both markers are
+        # stripped so neither leaks.
+        after = parse_markers("[dm-only]\n[channel: 1527723291324842135]\nCalendar: 7:30am")
+        self.assertIsNone(first_action(after, "redirect"))
+        self.assertEqual(first_action(after, "dm-only").kind, "dm-only")
+        self.assertEqual(after.body, "Calendar: 7:30am")
+        self.assertNotIn("[channel:", after.body)
+        self.assertNotIn("[dm-only]", after.body)
+
+    def test_dm_only_suppresses_redirect_regardless_of_order(self):
+        # dm-only AFTER the channel marker still wins (matched anywhere).
+        r = parse_markers("[channel: 1527723291324842135]\nsecret [dm-only] stuff")
+        self.assertIsNone(first_action(r, "redirect"))
+        self.assertEqual(first_action(r, "dm-only").kind, "dm-only")
+        # The marker STAYS in the body here, on purpose: it is inline prose,
+        # and stripping it rewrote the owner's sentence ("secret  stuff").
+        # Only a standalone marker is stripped now. Detection is unchanged —
+        # the two assertions above, which are what this test is named for,
+        # still prove dm-only wins regardless of order.
+        self.assertIn("[dm-only]", r.body)
+        self.assertNotIn("[channel:", r.body)
+
+    def test_skip_still_beats_dm_only(self):
+        # A skipped body is delivered nowhere; dm-only is moot but must not
+        # break the terminal skip.
+        r = parse_markers("[no-send]\n[dm-only]\nnothing")
+        self.assertEqual(r.body, "")
+        self.assertEqual(r.actions[0].kind, "skip")
 
 
 class TestAttachMarkers(unittest.TestCase):
@@ -156,6 +219,18 @@ class TestNoLeakInvariant(unittest.TestCase):
     in the parsed `body` field. Whatever a bridge passes through, the user
     sees clean output.
     """
+
+    def test_empty_target_markers_never_leak_in_any_family(self):
+        # Redirect expects NO action — empty target is not a target (pinned
+        # end-to-end in empty-redirect-target-default-route.test.py).
+        for src, kinds in (("[deduped:]\nbody", ["skip"]),
+                           ("[channel:]\nbody", []),
+                           ("[file:]\nbody", ["attach"])):
+            with self.subTest(src=src.splitlines()[0]):
+                r = parse_markers(src)
+                self.assertEqual([a.kind for a in r.actions], kinds)
+                for marker in ("[deduped:", "[channel:", "[file:"):
+                    self.assertNotIn(marker, r.body)
 
     def test_no_attach_marker_in_body(self):
         r = parse_markers("body [file: /a] [send: /b] [attach: /c] end")
@@ -247,6 +322,95 @@ class TestD7HeaderTolerance(unittest.TestCase):
         self.assertNotIn("[channel:", r.body)
         self.assertNotIn("[file:", r.body)
         self.assertIn("**[core: 2]**", r.body)
+
+
+class UnknownAttachKeywords(unittest.TestCase):
+    """Only file/send/attach are attachment aliases.
+
+    Migrated from tests/discord-bridge-file-markers.test.py, which tested the
+    Discord bridge's private `_split_file_markers()` helper. That helper is
+    gone (the grammar now lives solely here), so the case moved to the
+    canonical suite rather than being dropped.
+
+    NOTE: that file's `test_relative_path_does_not_match` was deliberately NOT
+    migrated. It asserted the *legacy* private regex's `(?:/|~/)`-only shape.
+    The canonical parser extracts any marker value and defers path
+    authorization to src/send_allowlist.py, so a relative value is recognised,
+    stripped from the body, and then rejected at the allowlist — see
+    tests/dm-result-adoption-gap.test.py.
+    """
+
+    def test_unknown_keyword_is_not_an_attachment(self):
+        for bad in ("reply", "foo", "channel-x", "files"):
+            with self.subTest(keyword=bad):
+                r = parse_markers(f"body [{bad}: /tmp/sutando-x.png]")
+                self.assertEqual([a for a in r.actions if a.kind == "attach"], [])
+
+    def test_unknown_keyword_is_left_in_the_body(self):
+        """Not an attachment marker => not our protocol => don't mangle prose."""
+        text = "body [reply: 12345678901234567890]"
+        self.assertEqual(parse_markers(text).body, text)
+
+    def test_aliases_extract_and_strip(self):
+        for kw in ("file", "send", "attach"):
+            with self.subTest(alias=kw):
+                r = parse_markers(f"body [{kw}: /tmp/sutando-x.png]")
+                self.assertEqual(
+                    [a.value for a in r.actions if a.kind == "attach"],
+                    ["/tmp/sutando-x.png"],
+                )
+                self.assertNotIn(f"[{kw}:", r.body)
+
+
+class BacktickedMarkerIsProse(unittest.TestCase):
+    """A marker inside a markdown code span is prose ABOUT the feature.
+
+    Treating it as a directive strips it from the sentence and pushes an
+    invented path at the allowlist. Inline markers OUTSIDE backticks stay
+    directives -- that shape is relied on and pinned elsewhere in this file.
+    """
+
+    def _attach(self, body):
+        return [a.value for a in parse_markers(body).actions if a.kind == "attach"]
+
+    def test_backticked_marker_is_not_an_action(self):
+        self.assertEqual(self._attach("the `[file: /path]` marker uploads"), [])
+
+    def test_backticked_marker_survives_in_the_body(self):
+        body = "explain: `[attach: /p]` sends a file."
+        self.assertEqual(parse_markers(body).body, body)
+
+    def test_bare_inline_marker_is_still_a_directive(self):
+        self.assertEqual(self._attach("see this [file: /tmp/x.png] thanks"),
+                         ["/tmp/x.png"])
+
+    def test_standalone_marker_is_still_a_directive(self):
+        self.assertEqual(self._attach("text\n[send: /tmp/a.png]\n"), ["/tmp/a.png"])
+
+    def test_marker_in_the_middle_of_a_span_is_prose(self):
+        # Backtick-ADJACENCY is only a proxy for span membership: a marker that
+        # sits inside a longer span touches no backtick.
+        self.assertEqual(self._attach("run `foo [file: /p.png] bar` now"), [])
+        self.assertEqual(self._attach("run ``foo [file: /p.png] bar`` now"), [])
+
+    def test_fenced_block_is_prose(self):
+        # The commonest way to DOCUMENT the marker, so the case that matters most.
+        for fence in ("```", "~~~"):
+            self.assertEqual(
+                self._attach(f"example:\n{fence}\n[file: /p.png]\n{fence}\ndone"), [])
+
+    def test_indented_block_is_prose(self):
+        self.assertEqual(self._attach("example:\n\n    [file: /p.png]\n\ndone"), [])
+        self.assertEqual(self._attach("example:\n\n\t[file: /p.png]\n\ndone"), [])
+
+    def test_code_block_does_not_swallow_a_later_directive(self):
+        r = self._attach("```\nshown [file: /a.png]\n```\nreal:\n[file: /b.png]")
+        self.assertEqual(r, ["/b.png"])
+
+    def test_unmatched_backtick_does_not_disarm_a_directive(self):
+        # A stray backtick opens no span; failing the other way would silently
+        # drop a real attachment.
+        self.assertEqual(self._attach("a ` stray and [file: /b.png]"), ["/b.png"])
 
 
 if __name__ == "__main__":

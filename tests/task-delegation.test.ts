@@ -14,9 +14,52 @@ import assert from 'node:assert';
 import { mkdtempSync, readFileSync, writeFileSync, chmodSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { LocalTaskBackend, RelayTaskBackend, selectBackend } from '../src/task-delegation.js';
+import { LocalTaskBackend, RelayTaskBackend, selectBackend, parseTaskSource } from '../src/task-delegation.js';
 
 const noopArchive = () => {};
+
+test('parseTaskSource reads the surface bucket that task_processed telemetry is tagged with', () => {
+	// Every locally-created task carries a `source:` header; the emit keys on it
+	// so voice/chat/context-drop each count under their own bucket (the gap the
+	// messaging bridges never had). Missing header → a safe `unknown` bucket.
+	assert.strictEqual(parseTaskSource('id: t\nsource: voice\ntask: hi\n'), 'voice');
+	assert.strictEqual(parseTaskSource('id: t\nsource: chat\ntask: hi\n'), 'chat');
+	assert.strictEqual(parseTaskSource('source: context-drop\ntask: x\n'), 'context-drop');
+	assert.strictEqual(parseTaskSource('id: t\ntask: no source header\n'), 'unknown');
+	// Must anchor to line start — not match `resource:` or an inline word.
+	assert.strictEqual(parseTaskSource('id: t\nresource: pool\nsource: phone\n'), 'phone');
+});
+
+test('context-drop writer emits telemetry from the exact serialized task body', () => {
+	const src = readFileSync(
+		join(import.meta.dirname ?? '.', '..', 'src', 'task-bridge.ts'),
+		'utf-8',
+	);
+	// The invariant is telemetry-sees-the-written-bytes: the stamped content
+	// is what lands on disk, and the same variable feeds the emit.
+	assert.match(
+		src,
+		/const stampedContent = tryStampText\(taskContent\);[\s\S]*?writeFileSync\([\s\S]*?stampedContent,[\s\S]*?\);\s*emitTaskProcessed\(stampedContent\);/,
+	);
+});
+
+test('phone telemetry child errors are handled and cannot crash a live call', () => {
+	const src = readFileSync(
+		join(
+			import.meta.dirname ?? '.',
+			'..',
+			'skills',
+			'phone-conversation',
+			'scripts',
+			'conversation-server.ts',
+		),
+		'utf-8',
+	);
+	assert.match(
+		src,
+		/spawn\('python3', \[telemetryPy, 'task_processed', 'phone'\][\s\S]*?\.on\('error', \(\) => \{[\s\S]*?\}\)[\s\S]*?\.unref\(\)/,
+	);
+});
 
 test('LocalTaskBackend.submitTask is byte-identical to the pre-seam write', () => {
 	const dir = mkdtempSync(join(tmpdir(), 'deleg-'));
@@ -29,9 +72,14 @@ test('LocalTaskBackend.submitTask is byte-identical to the pre-seam write', () =
 		'user_id: o\naccess_tier: owner\npriority: urgent\ntask: hello\n\n--- ctx ---\nline\n';
 	const backend = new LocalTaskBackend(taskDir, resultDir, noopArchive);
 	backend.submitTask('task-1', content);
-	// The exact bytes the old inline writeFileSync produced:
-	const expected = join(taskDir, 'task-1.txt');
-	assert.strictEqual(readFileSync(expected, 'utf-8'), content);
+	// Since the #3058 writer-edge stamping, the write is the input PLUS one
+	// canonical stamp line after `id:` — stripping it must restore the input
+	// byte-identically (the pre-seam contract, modulo the stamp).
+	const written = readFileSync(join(taskDir, 'task-1.txt'), 'utf-8');
+	const lines = written.split('\n');
+	assert.match(lines[1], /^envelope_hmac: v1:[0-9a-f]{64}$/);
+	lines.splice(1, 1);
+	assert.strictEqual(lines.join('\n'), content);
 });
 
 test('LocalTaskBackend result primitives mirror the watcher I/O', () => {

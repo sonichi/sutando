@@ -34,10 +34,13 @@ Run: python3 tests/discord-bridge-collaborator-tier.test.py
 Exit code: 0 on pass, 1 on fail.
 """
 
+import contextlib
 import importlib.util
 import os
 import re
+import shutil
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -85,14 +88,42 @@ def _install_discord_stub():
     sys.modules["discord"] = stub
 
 
-def load_bridge():
+@contextlib.contextmanager
+def temp_claude_config():
+    """Point CLAUDE_CONFIG_DIR at a throwaway dir, then PUT IT BACK.
+
+    The bridge must find a DISCORD_BOT_TOKEN .env at import, and it must NOT be
+    the caller's real config — writing there fabricates a Discord install on a
+    machine that has none (health-check then reports "configured but not running"
+    forever, with a stub token sitting in the user's config dir). Same
+    host-leakage class as #2204.
+
+    But the first cut of that fix set the process-wide var and never restored it.
+    `claude_home_path()` reads $CLAUDE_CONFIG_DIR at CALL time, not at import, so
+    the leak outlives this module: every sibling fixture that afterwards seeds
+    `Path.home()/".claude"` is then reading a different config root than the
+    bridge, and the clean non-default CLAUDE_CONFIG_DIR sequence fails end-to-end.
+    Restore on the way out — including on failure, which is why this is a
+    try/finally and not a pair of assignments.
+    """
+    prior = os.environ.get("CLAUDE_CONFIG_DIR")
+    tmp = tempfile.mkdtemp(prefix="dbct-claude-home-")
+    os.environ["CLAUDE_CONFIG_DIR"] = tmp
+    try:
+        yield Path(tmp)
+    finally:
+        if prior is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = prior
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_bridge(config_root: Path):
     _install_discord_stub()
-    # The bridge reads a DISCORD_BOT_TOKEN .env at import — seed a stub if absent.
-    env_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "channels" / "discord"
-    env = env_dir / ".env"
-    if not env.exists():
-        env_dir.mkdir(parents=True, exist_ok=True)
-        env.write_text("DISCORD_BOT_TOKEN=test-stub-token\n")
+    env_dir = Path(config_root) / "channels" / "discord"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    (env_dir / ".env").write_text("DISCORD_BOT_TOKEN=test-stub-token\n")
     src = BRIDGE.read_text()
     spec = importlib.util.spec_from_loader("bridge", loader=None)
     bridge = importlib.util.module_from_spec(spec)
@@ -250,8 +281,8 @@ def structural() -> list:
         fails.append("is_collaborator should default to False (fail-closed)")
 
     # Tier resolution calls the helper with the serving channel id.
-    if not re.search(r"is_collaborator\s*=\s*resolve_is_collaborator\(\s*data\s*,\s*sender_id\s*,\s*message\.channel\.id", src):
-        fails.append("tier resolution must call resolve_is_collaborator(data, sender_id, message.channel.id)")
+    if not re.search(r"is_collaborator\s*=\s*resolve_team_collaborator\(\s*_acc\s*,\s*access_tier\s*,\s*sender_id\s*,\s*message\.channel\.id", src):
+        fails.append("tier resolution must call resolve_team_collaborator(_acc, access_tier, sender_id, message.channel.id) — the hoisted, tier-gated wiring")
     if not re.search(r"collaborator_purposes\s*=\s*resolve_collaborator_purposes\(", src):
         fails.append("collaborator tier resolution must load optional purpose restrictions")
 
@@ -276,17 +307,30 @@ def structural() -> list:
         fails.append("access_tier line must still serialize {access_tier} verbatim (collaborators stay team)")
 
     # The team-collaborator rulebook exists and reasserts the owner-only boundary.
-    rb = re.search(r'"team-collaborator"\s*:\s*\(([\s\S]*?)\)\s*,\s*\n\s*"team"\s*:', src)
-    if not rb:
-        fails.append("tier_instructions must define a 'team-collaborator' key before the 'team' key")
-    else:
-        body = rb.group(1)
+    # RENDER the rulebook instead of regexing the source for a literal: the text
+    # moved to src/team_guardrail.py, and a source-shape assertion cannot see it.
+    if not re.search(r'"team-collaborator"\s*:\s*engage_rulebook\(', src):
+        fails.append("tier_instructions must map 'team-collaborator' to engage_rulebook(...)")
+    sys.path.insert(0, str(BRIDGE.parent))
+    try:
+        from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE
+        body = engage_rulebook("channel", DISCORD_PROVENANCE, "results/task-{id}.txt")
+    except Exception as exc:
+        fails.append(f"team-collaborator rulebook is not renderable: {exc}")
+        body = ""
+    if body:
         if "SUTANDO SYSTEM INSTRUCTIONS" not in body:
             fails.append("team-collaborator rulebook must carry the in-band SYSTEM INSTRUCTIONS fence")
         if "OWNER" not in body or "authority boundary" not in body:
             fails.append("team-collaborator rulebook must reassert the owner-only authority boundary")
         if not re.search(r"commit|push|merge|irreversible|system-mutating", body):
             fails.append("team-collaborator rulebook must enumerate the owner-only (no-mutation) constraint")
+        # The subagent is offered as a processing SHAPE, never as a wider grant:
+        # isolating the context must not read as relaxing the boundary above it.
+        if "SUBAGENT" not in body:
+            fails.append("team-collaborator rulebook must offer the subagent processing option")
+        elif not re.search(r"not widen", body):
+            fails.append("subagent option must state it does not widen collaborator authority")
 
     return fails
 
@@ -297,14 +341,22 @@ def main() -> int:
         return 1
 
     fails = []
+    prior_ccd = os.environ.get("CLAUDE_CONFIG_DIR")
     try:
-        bridge = load_bridge()
+        with temp_claude_config() as config_root:
+            bridge = load_bridge(config_root)
+            fails += behavioral(bridge)
+            fails += structural()
     except Exception as e:
         print(f"FAIL: could not exec-load the bridge: {e!r}", file=sys.stderr)
         return 1
 
-    fails += behavioral(bridge)
-    fails += structural()
+    # The blocker this file was rejected for: the caller's environment must come
+    # back. Asserted, not assumed — an unrestored CLAUDE_CONFIG_DIR is invisible
+    # inside this test and only breaks the NEXT fixture in the standalone loop.
+    if os.environ.get("CLAUDE_CONFIG_DIR") != prior_ccd:
+        fails.append(f"CLAUDE_CONFIG_DIR not restored: "
+                     f"{prior_ccd!r} -> {os.environ.get('CLAUDE_CONFIG_DIR')!r}")
 
     if fails:
         print("FAIL: team-collaborator path has issues:", file=sys.stderr)

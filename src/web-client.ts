@@ -11,12 +11,13 @@
 import { createServer, request as httpRequest } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
 import { OVERLAY_MANAGER_HTML } from './overlay-manager-ui.js';
 import { resolveWorkspace, statusReadPath } from './workspace_default.js';
+import { readBodyCapped } from './http-body-limit.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -37,6 +38,60 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TASK_DIR = join(WORKSPACE_DIR, 'tasks');
 const STATE_DIR = join(WORKSPACE_DIR, 'state');
 const SUBSCRIPTIONS_PATH = join(REPO_ROOT, 'skills/subscription-scanner/state/subscriptions.json');
+
+// ─── Browser voice-transport delivery ──────────────────────────────────────
+//
+// The page loads src/web-voice-transport.ts — the canonical transport — as a
+// plain <script>. Getting real TypeScript into the browser needs a build step,
+// and the two runtime modes need different ones:
+//
+//   BUNDLED (packaged desktop app): this file IS dist/web-client.js, running
+//     under the pinned node with no tsx and no devDependencies. It serves the
+//     prebuilt dist/web-voice-transport.browser.js that build:bundle produced.
+//     A missing artifact is a PACKAGING ERROR — 503, never a silent fallback.
+//
+//   SOURCE (tsx src/web-client.ts): devDependencies are present, so the
+//     transport is compiled on demand from the TypeScript and cached in memory
+//     for the process. Compiling rather than reading dist/ is deliberate — it
+//     is what guarantees source mode cannot serve a stale artifact left behind
+//     by an old build:bundle run.
+//
+// Distinguishing the modes by where this module is running from is exact:
+// esbuild writes the bundle to dist/, tsx runs it from src/.
+const RUNNING_BUNDLED = basename(dirname(fileURLToPath(import.meta.url))) === 'dist';
+const BROWSER_TRANSPORT_ARTIFACT = 'web-voice-transport.browser.js';
+const BROWSER_TRANSPORT_ROUTE = '/web-voice-transport.js';
+const BROWSER_TRANSPORT_DIST = join(REPO_ROOT, 'dist', BROWSER_TRANSPORT_ARTIFACT);
+let _browserTransportCache: string | null = null;
+
+/**
+ * Resolve the browser transport JS for the current mode. Throws with a
+ * diagnostic message rather than returning a fallback: there is no second
+ * implementation to fall back TO, so a silent empty response would surface as
+ * an unexplained dead Connect button.
+ */
+async function loadBrowserTransport(): Promise<string> {
+	if (_browserTransportCache) return _browserTransportCache;
+
+	if (RUNNING_BUNDLED) {
+		if (!existsSync(BROWSER_TRANSPORT_DIST)) {
+			throw new Error(
+				`bundled mode: ${BROWSER_TRANSPORT_ARTIFACT} missing from ${dirname(BROWSER_TRANSPORT_DIST)} — ` +
+					'desktop packaging error (npm run build:bundle did not run or did not ship this artifact)',
+			);
+		}
+		_browserTransportCache = readFileSync(BROWSER_TRANSPORT_DIST, 'utf8');
+		return _browserTransportCache;
+	}
+
+	// Source mode. The specifier is built at runtime so esbuild cannot follow it
+	// when bundling this file — that keeps the esbuild devDependency out of
+	// dist/web-client.js, which must run without a development node_modules.
+	const specifier = ['..', 'scripts', 'browser-transport-build.mjs'].join('/');
+	const mod = await import(new URL(specifier, import.meta.url).href);
+	_browserTransportCache = await mod.buildBrowserTransportSource();
+	return _browserTransportCache!;
+}
 
 const HTML = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -298,6 +353,9 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-user::before { content: 'You: '; font-weight: 600; color: #5a9fd4; }
   .t-assistant { color: #a8d8b0; }
   .t-assistant::before { content: 'Sutando: '; font-weight: 600; color: #6dbe82; }
+  .t-working { opacity: 0.6; font-style: italic; }
+  @keyframes t-working-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.7; } }
+  .t-working { animation: t-working-pulse 1.4s ease-in-out infinite; }
   .t-system { color: #888; font-size: 14px; }
   .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 16px; }
   .t-interim::before { content: 'You: '; font-weight: 600; }
@@ -335,6 +393,21 @@ const HTML = /* html */ `<!DOCTYPE html>
   }
   .task-item:last-child { border-bottom: none; }
   .task-item:hover { background: #1a1a2a; cursor: pointer; }
+  .task-workstream + .task-workstream { margin-top: 7px; }
+  .task-workstream-header {
+    appearance: none; width: 100%; display: flex; align-items: center;
+    justify-content: space-between; gap: 8px; padding: 9px 10px;
+    color: #aeb4ff; background: #11111d; cursor: pointer;
+    border: 1px solid #24243a; border-radius: 8px; font-family: inherit;
+    text-align: left; font-size: 12px;
+    font-weight: 600; letter-spacing: 0.02em;
+  }
+  .task-workstream-header:hover { background: #18182a; border-color: #39395d; }
+  .task-workstream-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .task-workstream-chevron { color: #6f75ba; width: 10px; flex-shrink: 0; }
+  .task-workstream-count { color: #666; font-size: 11px; font-weight: 400; }
+  .task-workstream-tasks { padding-top: 3px; }
+  .task-workstream--collapsed .task-workstream-tasks { display: none; }
   .note-item:hover { background: #1a1a2a; }
   .task-status {
     width: 22px; height: 22px; border-radius: 50%;
@@ -791,6 +864,12 @@ fetch('http://localhost:7844/stand-identity').then(r=>r.json()).then(s=>{
 <div style="height:80px"></div>
 </div>
 
+<!-- The ONE canonical browser voice transport (src/web-voice-transport.ts),
+     served as a classic-script IIFE that installs the SutandoVoice global.
+     Loaded before the page script so SutandoVoice is defined when voice
+     wiring below runs. A 503 here (packaging error) logs to the console and
+     connectWs() reports it to the user. -->
+<script src="${BROWSER_TRANSPORT_ROUTE}"></script>
 <script>
 // ─── Config ───────────────────────────────────────────────
 let INPUT_RATE  = 16000;
@@ -816,6 +895,13 @@ function getDefaultWsUrl() {
     return protocol + '//' + window.location.host + '/ws';
   }
   return protocol + '//' + hostname + ':' + WS_PORT;
+}
+
+// #bottom-panel is position:fixed and grows to 50vh, so a static body
+// padding-bottom cannot reserve its space — keep the two in sync.
+function syncBottomPad() {
+  const bp = $('bottom-panel');
+  if (bp) document.body.style.paddingBottom = (bp.offsetHeight + 12) + 'px';
 }
 
 // Set default WebSocket URL on page load + init Chrome STT
@@ -845,6 +931,17 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Reserve bottom space equal to the fixed panel's height so the chat history
+  // never covers the dashboard (e.g. the Questions panel).
+  try {
+    const bp = $('bottom-panel');
+    if (bp && window.ResizeObserver) { new ResizeObserver(syncBottomPad).observe(bp); }
+    syncBottomPad();
+    window.addEventListener('resize', syncBottomPad);
+  } catch {}
+  // Restore the chat transcript saved before the last reload, then watch for
+  // new entries to persist.
+  try { initTranscriptPersistence(); } catch {}
 });
 
 // ─── Remote toggle via SSE ────────────────────────────────
@@ -900,7 +997,8 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ─── State ────────────────────────────────────────────────
-let ws = null;
+// Page-level AudioContext is for tool cues ONLY — the voice audio graph
+// (mic capture + playback) lives inside the canonical transport.
 let audioCtx = null;
 // Play a short, low-volume Web Audio blip to signal a tool/core invocation
 // (owner ask 2026-07-09). Reuses the AudioContext created on the call's user
@@ -937,22 +1035,22 @@ function playToolCue(kind) {
     });
   } catch (e) {}
 }
-let micStream = null;
-let processor = null;
+// Voice session surface state. The audio pipeline + WS protocol live in the
+// canonical transport (SutandoVoice.VoiceTransport, loaded from
+// /web-voice-transport.js); the page keeps ONLY surface concerns: transcript
+// DOM, status text, stats mirror, reconnect policy, avatar analyser.
+let voice = null;               // SutandoVoice.VoiceTransport of the active session
 let connected = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
-let nextPlayTime = 0;
-let analyserNode = null;
+let analyserNode = null;        // playback AnalyserNode handed over via onAnalyser
 let speakingRAF = null;
-let activeSources = [];
-let playbackRate = 1.0;
-let bytesSent = 0;
+let bytesSent = 0;              // onStats mirror (stats panel + debug dump)
 let bytesRecv = 0;
-let audioChunksRecv = 0;
-let playChunkCount = 0;
-let statsTimer = null;
 let muted = false;
+let micAnnounced = false;       // one "Microphone active" system line per session
+let cleanupDone = true;         // doCleanup idempotence latch (reset on connect)
+let _voiceUrlOverride = null;   // takeoverVoice() one-shot URL override
 
 // Chrome STT state — provides real-time interim display; server STT replaces with final
 let recognition = null;
@@ -1116,6 +1214,17 @@ function setStatus(text, state) {
 const PERSIST_KEY_TASKS = 'sutando-taskmap-v1';
 const PERSIST_KEY_EXPAND = 'sutando-expanded-v1';
 const PERSIST_KEY_SHOW_DONE = 'sutando-show-done-v1';
+const PERSIST_KEY_WORKSTREAM_DISPLAY = 'sutando-task-workstream-display-v1';
+// Durable schedulers and health probes use normal task records for claiming,
+// retries, and audit. Archive-backed history must keep those records available
+// to the API without turning them into owner work in the Tasks UI.
+function isOwnerVisibleTask(taskId, task) {
+  const id = String(taskId || '');
+  const source = String((task && task.source) || '').toLowerCase();
+  return source !== 'cron' && source !== 'health-check' &&
+    !id.startsWith('task-cron-') && !id.startsWith('task-health-') &&
+    !id.startsWith('task-smoke-') && !id.startsWith('task-discord-e2e-');
+}
 // Default-hide done tasks. With Tasks growing to top-30, completed work was
 // crowding out active items and the watcher-glance use case ("what's still
 // running?") got lost. Toggle persists across reloads.
@@ -1132,6 +1241,9 @@ function loadPersistedTaskMap() {
     const raw = localStorage.getItem(PERSIST_KEY_TASKS);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
+    Object.keys(parsed).forEach(function(taskId) {
+      if (!isOwnerVisibleTask(taskId, parsed[taskId])) delete parsed[taskId];
+    });
     // Reconstruct Date objects on time fields
     Object.values(parsed).forEach(t => { if (t && t.time) t.time = new Date(t.time); });
     return parsed;
@@ -1150,11 +1262,179 @@ function persistTaskMap() {
 function persistExpanded() {
   try { localStorage.setItem(PERSIST_KEY_EXPAND, JSON.stringify(Array.from(expandedTasks))); } catch {}
 }
+
+// ─── Transcript persistence ──────────────────────────────
+// A MutationObserver is used so every append path is captured without editing
+// each call site.
+const PERSIST_KEY_TRANSCRIPT = 'sutando-transcript-v1';
+const TRANSCRIPT_MAX_ENTRIES = 50;
+const TRANSCRIPT_MAX_ENTRY_LEN = 20000; // skip oversized entries (e.g. data-URL images) to stay under localStorage quota
+let _transcriptRestoring = false;
+let _snapshotTimer = null;
+function snapshotTranscript() {
+  try {
+    const t = $('transcript');
+    if (!t) return;
+    const kids = Array.from(t.children).slice(-TRANSCRIPT_MAX_ENTRIES);
+    const entries = kids.map(el => {
+      // Drop the injected copy button (its onclick can't survive an innerHTML
+      // round-trip) — a live one is re-added on restore.
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('.copy-btn').forEach(b => b.remove());
+      return { cls: el.className, html: clone.innerHTML };
+    }).map(e => {
+      if (!e.html) return null;
+      // Oversized entries get a static placeholder, not a silent drop: omitting
+      // the bubble would make the restored transcript lie. Never user content.
+      if (e.html.length >= TRANSCRIPT_MAX_ENTRY_LEN) {
+        return { cls: e.cls, html: '<em class="t-not-persisted">[image/attachment not kept across reloads — too large for local storage]</em>' };
+      }
+      return e;
+    }).filter(Boolean);
+    try {
+      localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries));
+    } catch {
+      // Quota exceeded — keep only the most recent half and retry once.
+      try { localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries.slice(-Math.ceil(entries.length / 2)))); } catch {}
+    }
+  } catch {}
+}
+function scheduleSnapshot() {
+  if (_transcriptRestoring) return;
+  if (_snapshotTimer) clearTimeout(_snapshotTimer);
+  _snapshotTimer = setTimeout(snapshotTranscript, 400);
+}
+function restoreTranscript() {
+  let entries;
+  try { entries = JSON.parse(localStorage.getItem(PERSIST_KEY_TRANSCRIPT) || '[]'); } catch { return; }
+  if (!Array.isArray(entries) || !entries.length) return;
+  _transcriptRestoring = true;
+  const t = $('transcript');
+  // Clear the freshly-rendered default seed so it isn't duplicated by the
+  // seed entry captured in the snapshot.
+  t.innerHTML = '';
+  entries.forEach(e => {
+    const el = document.createElement('div');
+    el.className = e.cls || 't-entry';
+    // Sanitize on restore — stored html may include agent-origin markdown.
+    if (window.DOMPurify) {
+      try { el.innerHTML = window.DOMPurify.sanitize(e.html); } catch { el.textContent = e.html; }
+    } else {
+      el.textContent = e.html;
+    }
+    t.appendChild(el);
+    // Re-attach a live copy button on user/assistant bubbles.
+    if (el.classList.contains('t-assistant') || el.classList.contains('t-user')) addCopyBtn(el);
+  });
+  _transcriptRestoring = false;
+  scrollTranscript(true);
+}
+function initTranscriptPersistence() {
+  restoreTranscript();
+  try {
+    const t = $('transcript');
+    if (t && window.MutationObserver) {
+      new MutationObserver(scheduleSnapshot).observe(t, { childList: true, subtree: true, characterData: true });
+    }
+  } catch {}
+}
+
 const taskMap = window.taskMap = loadPersistedTaskMap();
+let taskWorkstreamNames = Object.create(null);
+
+function loadTaskWorkstreamDisplayState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PERSIST_KEY_WORKSTREAM_DISPLAY) || '{}');
+    return {
+      collapsed: new Set(Array.isArray(parsed.collapsed) ? parsed.collapsed : []),
+      seen: new Set(Array.isArray(parsed.seen) ? parsed.seen : []),
+      manual: new Set(Array.isArray(parsed.manual) ? parsed.manual : []),
+    };
+  } catch {
+    return { collapsed: new Set(), seen: new Set(), manual: new Set() };
+  }
+}
+const taskWorkstreamDisplayState = loadTaskWorkstreamDisplayState();
+const collapsedTaskWorkstreams = taskWorkstreamDisplayState.collapsed;
+const seenTaskWorkstreams = taskWorkstreamDisplayState.seen;
+const manuallyCollapsedTaskWorkstreams = taskWorkstreamDisplayState.manual;
+function persistTaskWorkstreamDisplayState() {
+  try {
+    localStorage.setItem(PERSIST_KEY_WORKSTREAM_DISPLAY, JSON.stringify({
+      collapsed: Array.from(collapsedTaskWorkstreams),
+      seen: Array.from(seenTaskWorkstreams),
+      manual: Array.from(manuallyCollapsedTaskWorkstreams),
+    }));
+  } catch {}
+}
+
+function toggleTaskWorkstream(workstreamId) {
+  if (collapsedTaskWorkstreams.has(workstreamId)) {
+    collapsedTaskWorkstreams.delete(workstreamId);
+    manuallyCollapsedTaskWorkstreams.delete(workstreamId);
+  } else {
+    collapsedTaskWorkstreams.add(workstreamId);
+    manuallyCollapsedTaskWorkstreams.add(workstreamId);
+  }
+  persistTaskWorkstreamDisplayState();
+  renderTasks();
+  updateDynamicRegion();
+}
+
+function rememberTaskWorkstreams(workstreams) {
+  if (!Array.isArray(workstreams)) return;
+  workstreams.forEach(function(workstream) {
+    if (workstream && workstream.id && workstream.name) {
+      taskWorkstreamNames[String(workstream.id)] = String(workstream.name);
+    }
+  });
+}
+
+function taskTimeFromRow(row, existing) {
+  if (row.time instanceof Date && !Number.isNaN(row.time.getTime())) return row.time;
+  if (typeof row.time === 'number') {
+    const date = new Date(row.time * 1000);
+    if (!Number.isNaN(date.getTime())) return date;
+  } else if (row.time) {
+    const date = new Date(row.time);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  if (existing.time) {
+    const date = existing.time instanceof Date ? existing.time : new Date(existing.time);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  return new Date();
+}
+
+function mergeTaskRow(existing, row) {
+  const hasWorkstreamId = Object.prototype.hasOwnProperty.call(row, 'workstream_id');
+  const hasWorkstreamName = Object.prototype.hasOwnProperty.call(row, 'workstream_name');
+  if (row.status === 'working' && row.workstream_id &&
+      !manuallyCollapsedTaskWorkstreams.has(String(row.workstream_id)) &&
+      collapsedTaskWorkstreams.delete(String(row.workstream_id))) {
+    persistTaskWorkstreamDisplayState();
+  }
+  return Object.assign({}, existing, {
+    status: row.status || existing.status || 'done',
+    text: row.text || existing.text || row.id,
+    time: taskTimeFromRow(row, existing),
+    result: row.result || existing.result || '',
+    source: row.source || existing.source || '',
+    workstream_id: hasWorkstreamId ? (row.workstream_id || '') : (existing.workstream_id || ''),
+    workstream_name: hasWorkstreamName ? (row.workstream_name || '') : (existing.workstream_name || ''),
+  });
+}
+
 function updateTask(taskId, status, text, result) {
+  if (!isOwnerVisibleTask(taskId, null)) return;
   const existing = taskMap[taskId] || {};
   const isNew = !existing.status;
-  taskMap[taskId] = { status, text: text || existing.text, time: new Date(), result: result || existing.result || '' };
+  taskMap[taskId] = Object.assign({}, existing, {
+    status,
+    text: text || existing.text,
+    time: existing.time || new Date(),
+    result: result || existing.result || '',
+  });
   // Auto-switch to tasks tab if new task arrives and user is on starter
   if (isNew && window._drActiveTab === 'starter') { switchDRTab('tasks'); }
   // Auto-expand ongoing tasks so the user sees progress, AND newly-finished
@@ -1178,24 +1458,15 @@ new MutationObserver(() => {
   const [verb, idxStr] = a.split(':');
   const idx = idxStr ? parseInt(idxStr, 10) : NaN;
   // Per-task ops ("expand:3") must use the SAME ordering the user actually sees.
-  // The primary #tasks container is display:none — only the dr-content "tasks"
-  // sub-tab is visible, which renders top-10 by time desc with no filter
-  // (line 2308 below). Voice "expand task N" hitting a different list than
-  // what the user can see produces the bug Chi caught — voice targeted a
-  // 3-day-old timeout task because it ranked 3rd in the unsliced filtered
-  // observer list, but the user's "task 3" was a recent done task that
-  // wasn't in the filtered set.
-  const visibleIds = Object.entries(taskMap)
-    .sort((a, b) => b[1].time - a[1].time)
-    .slice(0, 10)
-    .map(([id]) => id);
+  // The primary #tasks container is hidden; use the same grouped ordering as
+  // the visible Tasks tab so workstream headers cannot shift voice numbering.
+  const visibleIds = groupedTaskDisplay(Object.entries(taskMap)).entries.map(([id]) => id);
   // All-tasks ops ("expand"/"collapse" with no index) still use the broader
   // filtered list — "expand all" should reach everything non-done, not just
   // the visible 10.
-  const allIds = Object.entries(taskMap)
-    .filter(([, t]) => showDone || t.status !== 'done')
-    .sort((a, b) => b[1].time - a[1].time)
-    .map(([id]) => id);
+  const allIds = groupedTaskDisplay(
+    Object.entries(taskMap).filter(([, t]) => showDone || t.status !== 'done')
+  ).entries.map(([id]) => id);
   if (Number.isInteger(idx) && idx >= 1 && idx <= visibleIds.length) {
     const targetId = visibleIds[idx - 1];
     if (verb === 'expand') {
@@ -1247,6 +1518,11 @@ function toggleAllTasks() {
   renderTasks();
 }
 document.addEventListener('click', function(e) {
+  const workstreamHeader = e.target.closest && e.target.closest('.task-workstream-header[data-workstream-id]');
+  if (workstreamHeader) {
+    toggleTaskWorkstream(workstreamHeader.dataset.workstreamId);
+    return;
+  }
   // Don't toggle if clicking inside the result text (allow text selection)
   if (e.target.closest && e.target.closest('[id^="result-"]')) return;
   // Don't toggle if the click ended a drag-to-select on the task title.
@@ -1299,9 +1575,82 @@ function summarizeTaskText(raw) {
   return s;
 }
 
+// ─── Workstream-grouped task display helpers ─────────────────
+// Sort once, then build workstream buckets in encounter order. Because the input
+// is newest-first, workstream groups are ordered by latest activity and each
+// group's tasks remain newest-first. The flattened entries array is the
+// canonical numbered display order used by rendering and voice expand:N.
+const UNGROUPED_WORKSTREAM_ID = '__ungrouped__';
+function groupedTaskDisplay(entries, limit) {
+  let chronological = entries.filter(function(entry) {
+    return isOwnerVisibleTask(entry[0], entry[1]);
+  }).sort(function(a, b) {
+    return b[1].time - a[1].time;
+  });
+  if (Number.isInteger(limit) && limit >= 0) chronological = chronological.slice(0, limit);
+
+  const byWorkstream = new Map();
+  let hasInferredWorkstream = false;
+  chronological.forEach(function(entry) {
+    const task = entry[1] || {};
+    const rawId = task.workstream_id;
+    const hasWorkstream = rawId !== undefined && rawId !== null && String(rawId).trim() !== '';
+    const workstreamId = hasWorkstream ? String(rawId) : UNGROUPED_WORKSTREAM_ID;
+    if (hasWorkstream) hasInferredWorkstream = true;
+    if (!byWorkstream.has(workstreamId)) {
+      const workstreamName = hasWorkstream
+        ? (taskWorkstreamNames[workstreamId] || task.workstream_name || 'Workstream')
+        : 'Ungrouped';
+      byWorkstream.set(workstreamId, { id: workstreamId, name: String(workstreamName), entries: [] });
+    }
+    byWorkstream.get(workstreamId).entries.push(entry);
+  });
+
+  const groups = Array.from(byWorkstream.values());
+  return {
+    grouped: hasInferredWorkstream,
+    groups,
+    entries: groups.reduce(function(all, group) { return all.concat(group.entries); }, []),
+  };
+}
+
+function renderTaskWorkstreamGroups(display, renderEntry) {
+  let defaultsChanged = false;
+  if (display.grouped) {
+    display.groups.forEach(function(group) {
+      if (seenTaskWorkstreams.has(group.id)) return;
+      seenTaskWorkstreams.add(group.id);
+      // Make the whole workstream taxonomy visible at a glance. Completed-only
+      // workstreams start compact; a workstream with current work starts open.
+      if (group.entries.every(function(entry) { return entry[1].status === 'done'; })) {
+        collapsedTaskWorkstreams.add(group.id);
+      }
+      defaultsChanged = true;
+    });
+  }
+  if (defaultsChanged) persistTaskWorkstreamDisplayState();
+  let displayIndex = 0;
+  return display.groups.map(function(group) {
+    const rows = group.entries.map(function(entry) {
+      return renderEntry(entry, displayIndex++);
+    }).join('');
+    if (!display.grouped) return rows;
+    const count = group.entries.length;
+    const collapsed = collapsedTaskWorkstreams.has(group.id);
+    return '<section class="task-workstream' + (collapsed ? ' task-workstream--collapsed' : '') + '">' +
+      '<button type="button" class="task-workstream-header" data-workstream-id="' + esc(group.id) + '" aria-expanded="' + (!collapsed) + '">' +
+      '<span class="task-workstream-title"><span class="task-workstream-chevron">' + (collapsed ? '&#9656;' : '&#9662;') + '</span>' + esc(group.name) + '</span>' +
+      '<span class="task-workstream-count">' + count + (count === 1 ? ' task' : ' tasks') + '</span></button>' +
+      '<div class="task-workstream-tasks">' + rows + '</div></section>';
+  }).join('');
+}
+// ─── End workstream-grouped task display helpers ─────────────
+
 function renderTasks() {
   const container = $('tasks');
-  const entries = Object.entries(taskMap);
+  const entries = Object.entries(taskMap).filter(function(entry) {
+    return isOwnerVisibleTask(entry[0], entry[1]);
+  });
   window._drTaskCount = entries.length;
   const hdr = $('tasks-header');
   if (entries.length === 0) { container.innerHTML = ''; if (hdr) hdr.style.display = 'none'; return; }
@@ -1331,8 +1680,8 @@ function renderTasks() {
   // iterating on a party plan) new tasks pushed earlier valuable results out
   // of view within seconds. 30 keeps a longer history visible; localStorage
   // persistence above keeps results from being lost across refreshes.
-  const sorted = visible.sort((a, b) => b[1].time - a[1].time).slice(0, 30);
-  container.innerHTML = sorted.map(([id, t], i) => {
+  const display = groupedTaskDisplay(visible, 30);
+  container.innerHTML = renderTaskWorkstreamGroups(display, ([id, t], i) => {
     const icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
     const ago = Math.round((Date.now() - t.time) / 1000);
     const timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
@@ -1378,11 +1727,11 @@ function renderTasks() {
     const expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide ▾' : 'Show details ▸') + '</span>' : '';
     return '<div class="task-item"' + clickAttr + '>' +
       '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
-      '<span class="' + textClass + '">' + displayText + '</span>' +
+      '<span class="' + textClass + '">' + esc(displayText) + '</span>' +
       '<span class="task-time">' + timeStr + '</span>' +
       expandChip +
       '</div>' + resultHtml + actionsHtml;
-  }).join('');
+  });
 }
 
 // ─── Toast notifications ────────────────────────────────
@@ -1397,6 +1746,62 @@ function showToast(msg) {
 }
 const knownTaskIds = new Set(Object.keys(taskMap));
 
+// Hydrate durable history once at startup. The always-on agent API performs
+// inference independently of this page; while it is still backfilling inferred
+// workstreams, re-read the snapshot so tasks move into their canonical groups
+// without a reload. Historical rows are marked known before merging, so the live
+// poll never announces them as newly received work.
+let taskHistoryRetryTimer = null;
+let taskHistoryHydrating = false;
+let taskHistoryInitialLoadComplete = false;
+const taskWorkstreamRefreshRequested = new Set();
+function scheduleTaskHistoryHydration(delayMs) {
+  if (taskHistoryRetryTimer) return;
+  taskHistoryRetryTimer = setTimeout(function() {
+    taskHistoryRetryTimer = null;
+    if (taskHistoryHydrating) {
+      scheduleTaskHistoryHydration(delayMs);
+      return;
+    }
+    hydrateTaskHistory();
+  }, delayMs || 3000);
+}
+async function hydrateTaskHistory() {
+  if (taskHistoryHydrating) return;
+  taskHistoryHydrating = true;
+  if (taskHistoryRetryTimer) {
+    clearTimeout(taskHistoryRetryTimer);
+    taskHistoryRetryTimer = null;
+  }
+  try {
+    const resp = await fetch('/api/task-history');
+    if (!resp.ok) {
+      scheduleTaskHistoryHydration(30000);
+      return;
+    }
+    const data = await resp.json();
+    rememberTaskWorkstreams(data.workstreams);
+    for (const row of (data.tasks || [])) {
+      if (!row || !row.id || !isOwnerVisibleTask(row.id, row)) continue;
+      knownTaskIds.add(row.id);
+      taskMap[row.id] = mergeTaskRow(taskMap[row.id] || {}, row);
+      if (row.workstream_id) taskWorkstreamRefreshRequested.delete(row.id);
+    }
+    persistTaskMap();
+    renderTasks();
+    updateDynamicRegion();
+    taskHistoryInitialLoadComplete = true;
+    if (data.inference && data.inference.pending) {
+      scheduleTaskHistoryHydration(10000);
+    }
+  } catch {
+    scheduleTaskHistoryHydration(30000);
+  }
+  finally {
+    taskHistoryHydrating = false;
+  }
+}
+
 // ─── Poll agent API for task status ───────────────────────
 let taskPollTimer = null;
 function startTaskPolling() {
@@ -1409,16 +1814,25 @@ function startTaskPolling() {
       // Replace taskMap with API data (preserve expanded state and WebSocket-delivered results)
       const apiTasks = new Set();
       for (const t of (data.tasks || [])) {
+        if (!t || !isOwnerVisibleTask(t.id, t)) continue;
         apiTasks.add(t.id);
         const existing = taskMap[t.id] || {};
+        if (t.workstream_id) {
+          taskWorkstreamRefreshRequested.delete(t.id);
+        } else if (!existing.workstream_id && !taskWorkstreamRefreshRequested.has(t.id)) {
+          taskWorkstreamRefreshRequested.add(t.id);
+          scheduleTaskHistoryHydration(1000);
+        }
         // Toast for new tasks
         if (!knownTaskIds.has(t.id)) {
           knownTaskIds.add(t.id);
-          const snippet = (t.text || '').slice(0, 60);
-          showToast('<span class="toast-label">Context received</span> ' + snippet);
+          if (taskHistoryInitialLoadComplete) {
+            const snippet = (t.text || '').slice(0, 60);
+            showToast('<span class="toast-label">Context received</span> ' + snippet);
+          }
         }
         // Toast for completed tasks
-        if (t.status === 'done' && existing.status && existing.status !== 'done') {
+        if (taskHistoryInitialLoadComplete && t.status === 'done' && existing.status && existing.status !== 'done') {
           showToast('<span class="toast-label">Done</span> ' + (t.text || t.id).slice(0, 60));
         }
         // Auto-expand working tasks every poll; auto-expand done tasks ONLY
@@ -1434,7 +1848,7 @@ function startTaskPolling() {
         if (t.status === 'done' && existing.status !== 'done' && !expandedTasks.has(t.id) && !userCollapsed) {
           expandedTasks.add(t.id);
         }
-        taskMap[t.id] = { status: t.status, text: t.text, time: new Date(t.time * 1000), result: t.result || existing.result || '', source: t.source || existing.source || '' };
+        taskMap[t.id] = mergeTaskRow(existing, t);
       }
       // Remove tasks no longer in API (stale)
       for (const id of Object.keys(taskMap)) {
@@ -1460,13 +1874,15 @@ function stopTaskPolling() {
   if (taskPollTimer) { clearInterval(taskPollTimer); taskPollTimer = null; }
 }
 
-// Start polling on page load
+// Hydrate history immediately, then keep the lightweight active-task poll.
+hydrateTaskHistory();
 startTaskPolling();
 
 function updateStats() {
+  // Fed by the transport's onStats (byte totals). Per-chunk detail lives in
+  // the debug log via the transport's onDebug audio channel.
   $('stats').textContent =
-    'Sent ' + fmtBytes(bytesSent) + ' / Recv ' + fmtBytes(bytesRecv) +
-    ' (' + audioChunksRecv + ' chunks, ' + playChunkCount + ' played)';
+    'Sent ' + fmtBytes(bytesSent) + ' / Recv ' + fmtBytes(bytesRecv);
 }
 
 function fmtBytes(n) {
@@ -1481,7 +1897,7 @@ function saveDebug() {
     config: { INPUT_RATE, OUTPUT_RATE, CAPTURE_BUF },
     audioCtxState: audioCtx?.state ?? null,
     audioCtxSampleRate: audioCtx?.sampleRate ?? null,
-    bytesSent, bytesRecv, audioChunksRecv, playChunkCount,
+    bytesSent, bytesRecv,
     log: debugLog,
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1493,94 +1909,9 @@ function saveDebug() {
   dbg('Debug data saved');
 }
 
-// ─── PCM helpers ──────────────────────────────────────────
-function downsample(input, fromRate, toRate) {
-  if (fromRate === toRate) return input;
-  const ratio = fromRate / toRate;
-  const len = Math.floor(input.length / ratio);
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    const pos = i * ratio;
-    const idx = Math.floor(pos);
-    const frac = pos - idx;
-    out[i] = input[idx] * (1 - frac) + (input[idx + 1] || 0) * frac;
-  }
-  return out;
-}
-
-function float32ToInt16(f32) {
-  const i16 = new Int16Array(f32.length);
-  for (let i = 0; i < f32.length; i++) {
-    const s = Math.max(-1, Math.min(1, f32[i]));
-    i16[i] = s < 0 ? (s * 0x8000) | 0 : (s * 0x7FFF) | 0;
-  }
-  return i16;
-}
-
-function int16ToFloat32(buf) {
-  const view = new DataView(buf);
-  const len = buf.byteLength / 2;
-  const out = new Float32Array(len);
-  for (let i = 0; i < len; i++) {
-    out[i] = view.getInt16(i * 2, true) / 32768;
-  }
-  return out;
-}
-
-// ─── Audio playback (gapless scheduling) ──────────────────
-function playChunk(arrayBuf) {
-  if (!audioCtx || audioCtx.state === 'closed') {
-    try {
-      audioCtx = new AudioContext();
-      dbg('playChunk: created new AudioContext: ' + audioCtx.sampleRate + ' Hz');
-    } catch (e) {
-      dbg('playChunk: failed to create AudioContext: ' + e, 'err');
-      return;
-    }
-  }
-  if (audioCtx.state === 'suspended') {
-    audioCtx.resume();
-    dbg('playChunk: resumed suspended audioCtx');
-  }
-
-  const f32 = int16ToFloat32(arrayBuf);
-  if (f32.length === 0) return;
-
-  try {
-    const audioBuf = audioCtx.createBuffer(1, f32.length, OUTPUT_RATE);
-    audioBuf.getChannelData(0).set(f32);
-
-    const src = audioCtx.createBufferSource();
-    src.buffer = audioBuf;
-    src.playbackRate.value = playbackRate;
-    if (!analyserNode) {
-      analyserNode = audioCtx.createAnalyser();
-      analyserNode.fftSize = 256;
-      analyserNode.connect(audioCtx.destination);
-      startSpeakingDetection();
-    }
-    src.connect(analyserNode);
-
-    const now = audioCtx.currentTime;
-    if (nextPlayTime < now) {
-      nextPlayTime = now + 0.05;
-    }
-    src.start(nextPlayTime);
-    nextPlayTime += audioBuf.duration / playbackRate;
-    activeSources.push(src);
-    src.onended = () => {
-      const idx = activeSources.indexOf(src);
-      if (idx >= 0) activeSources.splice(idx, 1);
-    };
-    playChunkCount++;
-
-    if (playChunkCount <= 5) {
-      dbg('Played chunk #' + playChunkCount + ': ' + f32.length + ' samples, scheduled at ' + nextPlayTime.toFixed(3) + 's (ctx.state=' + audioCtx.state + ')', 'audio');
-    }
-  } catch (err) {
-    dbg('playChunk error: ' + err.message, 'err');
-  }
-}
+// PCM DSP + gapless playback live in the canonical transport
+// (SutandoVoice — src/web-voice-transport.ts). The page receives the
+// playback AnalyserNode via onAnalyser for the avatar animation below.
 
 // ─── Speaking detection (avatar animation) ────────────────
 function startSpeakingDetection() {
@@ -1694,288 +2025,105 @@ function stopSpeakingDetection() {
   if (canvas) { var ctx = canvas.getContext('2d'); if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height); }
 }
 
-// ─── Microphone capture ───────────────────────────────────
-async function startMic() {
-  // Check if getUserMedia is available (requires HTTPS or localhost)
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    const isLocalhost = window.location.hostname === 'localhost' || 
-                       window.location.hostname === '127.0.0.1' ||
-                       window.location.hostname === '[::1]';
-    const isHttps = window.location.protocol === 'https:';
-    
-    if (!isLocalhost && !isHttps) {
-      throw new Error('Microphone access requires HTTPS. Please access this page via HTTPS (https://your-domain.com) or use localhost. Modern browsers block getUserMedia on HTTP for security.');
-    } else {
-      throw new Error('Microphone access is not available in this browser. Please use a modern browser that supports getUserMedia.');
-    }
-  }
+// ─── Voice session wiring (canonical transport) ───────────
+// Mic capture, playback, WS protocol, connect timeout, and failure
+// classification all live in SutandoVoice.VoiceTransport (the canonical
+// src/web-voice-transport.ts served at /web-voice-transport.js). The page
+// supplies callbacks for its surface concerns and keeps reconnect policy.
 
-  micStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    }
-  });
-
-  const trackSettings = micStream.getAudioTracks()[0].getSettings();
-  dbg('Mic stream: ' + (trackSettings.sampleRate || '?') + ' Hz, device=' + (trackSettings.deviceId || '?').slice(0, 8));
-
-  // Reuse AudioContext created in toggle() on user gesture
-  if (!audioCtx || audioCtx.state === 'closed') {
-    audioCtx = new AudioContext();
-    dbg('Created new AudioContext: ' + audioCtx.sampleRate + ' Hz');
-  }
-  dbg('AudioContext state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
-
-  if (audioCtx.state === 'suspended') {
-    await audioCtx.resume();
-    dbg('AudioContext resumed');
-  }
-
-  const source = audioCtx.createMediaStreamSource(micStream);
-
-  processor = audioCtx.createScriptProcessor(CAPTURE_BUF, 1, 1);
-  let sendCount = 0;
-  processor.onaudioprocess = (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const raw = e.inputBuffer.getChannelData(0);
-    const down = downsample(raw, audioCtx.sampleRate, INPUT_RATE);
-    const pcm = float32ToInt16(down);
-    ws.send(pcm.buffer);
-    bytesSent += pcm.buffer.byteLength;
-    sendCount++;
-    if (sendCount <= 3) {
-      dbg('Sent mic #' + sendCount + ': ' + pcm.buffer.byteLength + 'B (' + down.length + ' samples @ ' + INPUT_RATE + 'Hz)', 'audio');
-    }
-  };
-
-  source.connect(processor);
-  const silence = audioCtx.createGain();
-  silence.gain.value = 0;
-  processor.connect(silence);
-  silence.connect(audioCtx.destination);
-
-  dbg('Mic capture started');
-  reconnectAttempts = 0;
-  addSystem('Microphone active — speak now.');
-
-  // Start Chrome STT for real-time interim display (server final replaces)
-  startChromeStt();
-}
-
-function stopMic() {
-  stopChromeStt();
-  if (processor) { processor.disconnect(); processor = null; }
-  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-  // Don't close audioCtx here — playback may still be draining
-}
-
-// ─── WebSocket ────────────────────────────────────────────
 function connectWs() {
-  const url = $('wsUrl').value.trim();
+  const url = _voiceUrlOverride || $('wsUrl').value.trim();
+  _voiceUrlOverride = null;
   if (!url) return;
+  if (typeof SutandoVoice === 'undefined' || !SutandoVoice.VoiceTransport) {
+    // The classic <script> for /web-voice-transport.js failed (packaging
+    // error → 503; console already has the server-side reason).
+    setStatus('Voice unavailable', 'error');
+    addSystem('Voice transport failed to load (/web-voice-transport.js) — check the server logs, then reload this page.');
+    doCleanup({ keepStatus: true });
+    return;
+  }
 
   dbg('Connecting to ' + url);
   setStatus('Connecting...', '');
 
-  ws = new WebSocket(url);
-  ws.binaryType = 'arraybuffer';
+  voice = new SutandoVoice.VoiceTransport({
+    captureBuf: CAPTURE_BUF,
+    inputRate: INPUT_RATE,
+    outputRate: OUTPUT_RATE,
+    onStatus: onVoiceStatus,
+    onConnectFailure: onVoiceConnectFailure,
+    onDebug: function (msg, kind) { dbg(msg, kind); },
+    onTranscript: function (role, text, partial) { handleTranscript(role, text, partial); },
+    // turn.end and turn.interrupted need the same per-turn transcript reset
+    // here; the transport already handles the barge-in playback flush itself.
+    onTurnEnd: resetTurnTranscriptState,
+    onInterrupted: resetTurnTranscriptState,
+    onSessionConfig: function (inRate, outRate) {
+      INPUT_RATE = inRate;
+      OUTPUT_RATE = outRate;
+      dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
+    },
+    onProtocolMessage: handleProtocolMessage,
+    onMicError: function (name, message, friendly) { addSystem(friendly); },
+    onAnalyser: function (node) { analyserNode = node; startSpeakingDetection(); },
+    onStats: function (s) { bytesSent = s.bytesSent; bytesRecv = s.bytesRecv; updateStats(); },
+  });
+  // Fire-and-forget by contract: async outcomes arrive via the callbacks.
+  voice.connect(url).catch(function (e) {
+    dbg('connect failed: ' + e, 'err');
+    setStatus('Connection failed', 'error');
+    doCleanup({ keepStatus: true });
+  });
+}
 
-  ws.onopen = async () => {
-    dbg('WebSocket connected');
-    setStatus('Starting mic...', 'live');
-    try {
-      await startMic();
-      setStatus('Live — speak now', 'live');
-      statsTimer = setInterval(updateStats, 500);
-    } catch (err) {
-      dbg('Mic error: ' + (err && err.name ? err.name + ': ' : '') + err.message, 'err');
-      setStatus('Mic error', 'error');
-      // Not every failure is a permission denial — name the real cause so the user
-      // isn't sent to "browser settings" when the mic is merely busy or absent.
-      let micMsg;
-      switch (err && err.name) {
-        case 'NotAllowedError':
-        case 'SecurityError':
-          micMsg = 'Microphone access denied. Allow mic for this site in browser settings, then click Connect again.';
-          break;
-        case 'NotReadableError':
-        case 'AbortError':
-          micMsg = 'Microphone is in use by another app or tab (Zoom, Photo Booth, another tab, or a prior session). Close it, then click Connect again.';
-          break;
-        case 'NotFoundError':
-        case 'OverconstrainedError':
-          micMsg = 'No microphone found. Connect an input device and select it as the default in your OS sound settings, then Connect.';
-          break;
-        default:
-          micMsg = 'Microphone error (' + (err && err.name ? err.name : 'unknown') + '): ' + (err && err.message ? err.message : 'could not start capture') + '. Click Connect to retry.';
-      }
-      addSystem(micMsg);
-      connected = false;  // prevent auto-reconnect loop
-      ws.close();
+function resetTurnTranscriptState() {
+  // Remove orphaned Chrome STT interim — if server never finalized it,
+  // it's echo from the assistant's voice picked up by mic.
+  if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
+    currentUserEl.remove();
+  }
+  currentUserEl = null;
+  currentAssistantEl = null;
+  serverUserTextReceived = false;
+}
+
+function onVoiceStatus(status, detail, close) {
+  if (status === 'connecting') {
+    setStatus(detail || 'Connecting...', '');
+    return;
+  }
+  if (status === 'live') {
+    setStatus(detail || 'Live', 'live');
+    // The transport emits exactly this detail when mic capture is up;
+    // announce once per session and start the Chrome interim-STT display.
+    if (!micAnnounced && detail === 'Live — speak now') {
+      micAnnounced = true;
+      reconnectAttempts = 0;
+      addSystem('Microphone active — speak now.');
+      startChromeStt();
     }
-  };
-
-  ws.onmessage = (event) => {
-    if (event.data instanceof ArrayBuffer) {
-      bytesRecv += event.data.byteLength;
-      audioChunksRecv++;
-      if (audioChunksRecv <= 5) {
-        dbg('Recv audio #' + audioChunksRecv + ': ' + event.data.byteLength + 'B', 'audio');
-      }
-      playChunk(event.data);
-    } else {
-      try {
-        const msg = JSON.parse(event.data);
-        dbg('Recv: ' + JSON.stringify(msg), 'event');
-
-        if (msg.type === 'session.config' && msg.audioFormat) {
-          INPUT_RATE = msg.audioFormat.inputSampleRate;
-          OUTPUT_RATE = msg.audioFormat.outputSampleRate;
-          dbg('Audio format configured: input=' + INPUT_RATE + 'Hz output=' + OUTPUT_RATE + 'Hz', 'event');
-        } else if (msg.type === 'transcript') {
-          handleTranscript(msg.role, msg.text, msg.partial !== false);
-        } else if (msg.type === 'turn.end') {
-          // Remove orphaned Chrome STT interim — if server never finalized it,
-          // it's echo from the assistant's voice picked up by mic.
-          if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
-            currentUserEl.remove();
-          }
-          currentUserEl = null;
-          currentAssistantEl = null;
-          serverUserTextReceived = false;
-        } else if (msg.type === 'turn.interrupted') {
-          for (const s of activeSources) {
-            try { s.stop(); } catch {}
-          }
-          activeSources = [];
-          nextPlayTime = 0;
-          if (currentUserEl && currentUserEl.classList.contains('t-interim')) {
-            currentUserEl.remove();
-          }
-          currentUserEl = null;
-          currentAssistantEl = null;
-          serverUserTextReceived = false;
-        } else if (msg.type === 'gui.update') {
-          const guiData = msg.payload?.data;
-          if (guiData?.type === 'subprocess_log' && guiData.line) {
-            dbg('subprocess  ' + guiData.line, 'audio');
-          } else if (guiData?.type === 'image' && guiData.base64) {
-            const imgEl = document.createElement('div');
-            imgEl.className = 't-entry t-system';
-            const img = document.createElement('img');
-            const imgDataUrl = 'data:' + (guiData.mimeType || 'image/png') + ';base64,' + guiData.base64;
-            img.src = imgDataUrl;
-            img.alt = guiData.description || 'Generated image';
-            img.style.maxWidth = '100%';
-            img.style.borderRadius = '8px';
-            img.style.marginTop = '8px';
-            imgEl.appendChild(img);
-            const dlLink = document.createElement('a');
-            dlLink.className = 'btn-download';
-            dlLink.href = imgDataUrl;
-            const ext = (guiData.mimeType || 'image/png').split('/')[1] || 'png';
-            dlLink.download = 'generated-image-' + Date.now() + '.' + ext;
-            dlLink.textContent = 'Download image';
-            imgEl.appendChild(dlLink);
-            $('transcript').appendChild(imgEl);
-            scrollTranscript();
-            dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
-          } else if (guiData?.type === 'video' && guiData.base64) {
-            const vidEl = document.createElement('div');
-            vidEl.className = 't-entry t-system';
-            const vidDataUrl = 'data:' + (guiData.mimeType || 'video/mp4') + ';base64,' + guiData.base64;
-            const video = document.createElement('video');
-            video.src = vidDataUrl;
-            video.controls = true;
-            video.autoplay = true;
-            video.muted = true;
-            video.style.maxWidth = '100%';
-            video.style.borderRadius = '8px';
-            video.style.marginTop = '8px';
-            if (guiData.description) {
-              const caption = document.createElement('div');
-              caption.style.fontSize = '12px';
-              caption.style.color = '#888';
-              caption.style.marginTop = '4px';
-              caption.textContent = guiData.description;
-              vidEl.appendChild(caption);
-            }
-            vidEl.appendChild(video);
-            const dlLink = document.createElement('a');
-            dlLink.className = 'btn-download';
-            dlLink.href = vidDataUrl;
-            const vidExt = (guiData.mimeType || 'video/mp4').split('/')[1] || 'mp4';
-            dlLink.download = 'generated-video-' + Date.now() + '.' + vidExt;
-            dlLink.textContent = 'Download video';
-            vidEl.appendChild(dlLink);
-            $('transcript').appendChild(vidEl);
-            scrollTranscript();
-            dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
-          } else {
-            addSystem('[gui] ' + JSON.stringify(guiData));
-          }
-        } else if (msg.type === 'gui.command') {
-          if (msg.command === 'collapse_tasks') { collapseAllTasks(); }
-          else if (msg.command === 'expand_tasks') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); renderTasks(); }
-        } else if (msg.type === 'gui.notification') {
-          addSystem('[notification] ' + (msg.payload?.message || ''));
-        } else if (msg.type === 'image') {
-          const imgEl = document.createElement('div');
-          imgEl.className = 't-entry t-system';
-          const img = document.createElement('img');
-          const legacyDataUrl = 'data:' + (msg.data.mimeType || 'image/png') + ';base64,' + msg.data.base64;
-          img.src = legacyDataUrl;
-          img.alt = msg.data.description || 'Generated image';
-          img.style.maxWidth = '100%';
-          img.style.borderRadius = '8px';
-          img.style.marginTop = '8px';
-          imgEl.appendChild(img);
-          const dlLink2 = document.createElement('a');
-          dlLink2.className = 'btn-download';
-          dlLink2.href = legacyDataUrl;
-          const ext2 = (msg.data.mimeType || 'image/png').split('/')[1] || 'png';
-          dlLink2.download = 'generated-image-' + Date.now() + '.' + ext2;
-          dlLink2.textContent = 'Download image';
-          imgEl.appendChild(dlLink2);
-          $('transcript').appendChild(imgEl);
-          scrollTranscript();
-          dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
-        } else if (msg.type === 'speech_speed') {
-          const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
-          playbackRate = speeds[msg.speed] || 1.0;
-          addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + playbackRate + 'x)');
-        } else if (msg.type === 'session_end') {
-          addSystem('Session ended by voice command.');
-          dbg('session_end received — disconnecting', 'event');
-          connected = false; // prevent auto-reconnect
-          if (ws) { ws.close(); ws = null; }
-          doCleanup();
-        } else if (msg.type === 'task.status') {
-          updateTask(msg.taskId, msg.status, msg.text, msg.result);
-        } else if (msg.type === 'grounding') {
-          const chunks = msg.payload?.groundingChunks;
-          if (Array.isArray(chunks) && chunks.length > 0) {
-            const sources = chunks.map(c => c.web?.title || c.web?.uri || '').filter(Boolean).join(', ');
-            if (sources) addSystem('[sources] ' + sources);
-          }
-        }
-      } catch {
-        dbg('Bad JSON text frame', 'warn');
-      }
-    }
-  };
-
-  ws.onclose = (e) => {
-    dbg('WS closed: code=' + e.code + ' reason=' + e.reason);
+    return;
+  }
+  if (status === 'error') {
+    setStatus(detail || 'Error', 'error');
+    return;
+  }
+  if (status === 'superseded') {
+    // Close 4410 (superseded-by-takeover): a user-confirmed takeover moved
+    // the call to another surface. Terminal — never auto-reconnect into a
+    // fight over the call.
+    addSystem('Voice call moved to another surface (window or device).');
+    doCleanup({ keepStatus: true });
+    setStatus('Call moved', 'error');
+    return;
+  }
+  if (status === 'closed') {
     // Server-initiated clean close (goodbye code 4000) or user clicked Disconnect
-    const wasCleanDisconnect = !connected || e.code === 4000;
+    const wasCleanDisconnect = !connected || (close && close.code === 4000);
     // Always reset connected here so subsequent toggle calls (from auto-
     // reconnect or the external SSE toggle path) take the open-new-ws
-    // branch instead of seeing stale state. Without this, an unclean drop
-    // (e.g. voice-agent restart) leaves the page in a wedged state where
-    // ws=null but connected=true, requiring a hard reload to recover.
+    // branch instead of seeing stale state.
     connected = false;
     doCleanup();
     if (wasCleanDisconnect) {
@@ -1984,12 +2132,7 @@ function connectWs() {
       // Unexpected drop (Gemini timeout, voice-agent restart) — auto-reconnect with limit
       reconnectAttempts++;
       if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-        addSystem('Still trying to connect. Common causes:');
-        addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
-        addSystem('2. Voice agent not running — run: bash src/startup.sh');
-        addSystem('3. Port 9900 blocked — check: lsof -i :9900');
-        addSystem('You can type commands below while reconnecting.');
-        addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+        showVoiceTroubleshooting('Still trying to connect. Common causes:');
         setStatus('Reconnecting...', 'error');
         reconnectAttempts = 0;  // reset counter and keep retrying
       } else {
@@ -2004,23 +2147,176 @@ function connectWs() {
         }
       }, 3000);
     }
-  };
-
-  ws.onerror = () => {
-    dbg('WS error', 'err');
-    setStatus('Connection failed', 'error');
-    addSystem('Connection error — is the agent server running?');
-  };
+  }
 }
 
-function doCleanup() {
-  stopMic();
-  if (audioCtx && audioCtx.state !== 'closed') {
-    // Close audio context immediately — don't use a delayed timeout
-    // (a delayed null can race with reconnect and kill the new AudioContext)
-    if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
+function showVoiceTroubleshooting(lead) {
+  addSystem(lead);
+  addSystem('1. GEMINI_API_KEY not set — edit .env and add your key from ai.google.dev');
+  addSystem('2. Voice agent not running — run: bash src/startup.sh');
+  addSystem('3. Port 9900 blocked — check: lsof -i :9900');
+  addSystem('You can type commands below in the meantime.');
+  addSystem('<a href="https://discord.gg/uZHWXXmrCS" target="_blank" style="color:#5865F2">Ask for help on Discord</a> · <a href="https://github.com/sonichi/sutando/issues" target="_blank" style="color:#4ecca3">Report an issue</a> · <span style="color:#8899a6;cursor:pointer;text-decoration:underline" onclick="copyLogs()">Copy logs</span>', true);
+}
+
+// Terminal connect-attempt failures (design 1e): the transport latched the
+// 'error' status and suppressed its own close, so the page resets its UI here
+// — fail fast with actionable copy instead of the eternal reconnect spinner.
+function onVoiceConnectFailure(f) {
+  dbg('Voice connect failure: ' + f.kind + ' — ' + f.detail, 'err');
+  doCleanup({ keepStatus: true });
+  if (f.kind === 'mic-permission' || f.kind === 'mic-device' || f.kind === 'mic-other') {
+    return; // onMicError already printed the classified mic guidance
   }
-  setStatus('Text only', '');
+  if (f.kind === 'client-busy') {
+    // W5: voice is in use elsewhere — offer the user-confirmed take-over.
+    addSystem(f.detail + ' <span style="color:#4ecca3;cursor:pointer;text-decoration:underline" onclick="takeoverVoice()">Take over the call here</span>', true);
+    return;
+  }
+  addSystem(f.detail + (f.remediation ? ' ' + f.remediation : ''));
+  if (f.kind === 'timeout' || f.kind === 'connect-error') {
+    showVoiceTroubleshooting('Voice did not come up. Common causes:');
+  }
+}
+
+// W5 take-over affordance: the click IS the user confirmation. The challenger
+// reconnects with ?takeover=1; the server closes the incumbent with 4410
+// (its surface shows "call moved") and attaches us.
+function takeoverVoice() {
+  if (connected) return; // already in a call here
+  const url = $('wsUrl').value.trim();
+  if (!url) return;
+  const sep = url.indexOf('?') >= 0 ? '&' : '?';
+  _voiceUrlOverride = url + sep + 'takeover=1';
+  toggle();
+}
+window.takeoverVoice = takeoverVoice;
+
+// Non-audio protocol frames the transport forwards raw. Types the transport
+// itself owns (session.config, transcript, turn.*, agent.state) are handled
+// via the typed callbacks above and deliberately NOT re-handled here.
+function handleProtocolMessage(msg) {
+  if (!msg || !msg.type) return;
+  if (msg.type === 'gui.update') {
+    const guiData = msg.payload?.data;
+    if (guiData?.type === 'subprocess_log' && guiData.line) {
+      dbg('subprocess  ' + guiData.line, 'audio');
+    } else if (guiData?.type === 'image' && guiData.base64) {
+      const imgEl = document.createElement('div');
+      imgEl.className = 't-entry t-system';
+      const img = document.createElement('img');
+      const imgDataUrl = 'data:' + (guiData.mimeType || 'image/png') + ';base64,' + guiData.base64;
+      img.src = imgDataUrl;
+      img.alt = guiData.description || 'Generated image';
+      img.style.maxWidth = '100%';
+      img.style.borderRadius = '8px';
+      img.style.marginTop = '8px';
+      imgEl.appendChild(img);
+      const dlLink = document.createElement('a');
+      dlLink.className = 'btn-download';
+      dlLink.href = imgDataUrl;
+      const ext = (guiData.mimeType || 'image/png').split('/')[1] || 'png';
+      dlLink.download = 'generated-image-' + Date.now() + '.' + ext;
+      dlLink.textContent = 'Download image';
+      imgEl.appendChild(dlLink);
+      $('transcript').appendChild(imgEl);
+      scrollTranscript();
+      dbg('Image received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
+    } else if (guiData?.type === 'video' && guiData.base64) {
+      const vidEl = document.createElement('div');
+      vidEl.className = 't-entry t-system';
+      const vidDataUrl = 'data:' + (guiData.mimeType || 'video/mp4') + ';base64,' + guiData.base64;
+      const video = document.createElement('video');
+      video.src = vidDataUrl;
+      video.controls = true;
+      video.autoplay = true;
+      video.muted = true;
+      video.style.maxWidth = '100%';
+      video.style.borderRadius = '8px';
+      video.style.marginTop = '8px';
+      if (guiData.description) {
+        const caption = document.createElement('div');
+        caption.style.fontSize = '12px';
+        caption.style.color = '#888';
+        caption.style.marginTop = '4px';
+        caption.textContent = guiData.description;
+        vidEl.appendChild(caption);
+      }
+      vidEl.appendChild(video);
+      const dlLink = document.createElement('a');
+      dlLink.className = 'btn-download';
+      dlLink.href = vidDataUrl;
+      const vidExt = (guiData.mimeType || 'video/mp4').split('/')[1] || 'mp4';
+      dlLink.download = 'generated-video-' + Date.now() + '.' + vidExt;
+      dlLink.textContent = 'Download video';
+      vidEl.appendChild(dlLink);
+      $('transcript').appendChild(vidEl);
+      scrollTranscript();
+      dbg('Video received via gui.update: ' + (guiData.description || '').slice(0, 50), 'event');
+    } else {
+      addSystem('[gui] ' + JSON.stringify(guiData));
+    }
+  } else if (msg.type === 'gui.command') {
+    if (msg.command === 'collapse_tasks') { collapseAllTasks(); }
+    else if (msg.command === 'expand_tasks') { Object.keys(taskMap).forEach(id => { if (taskMap[id].result) expandedTasks.add(id); }); renderTasks(); }
+  } else if (msg.type === 'gui.notification') {
+    addSystem('[notification] ' + (msg.payload?.message || ''));
+  } else if (msg.type === 'image') {
+    const imgEl = document.createElement('div');
+    imgEl.className = 't-entry t-system';
+    const img = document.createElement('img');
+    const legacyDataUrl = 'data:' + (msg.data.mimeType || 'image/png') + ';base64,' + msg.data.base64;
+    img.src = legacyDataUrl;
+    img.alt = msg.data.description || 'Generated image';
+    img.style.maxWidth = '100%';
+    img.style.borderRadius = '8px';
+    img.style.marginTop = '8px';
+    imgEl.appendChild(img);
+    const dlLink2 = document.createElement('a');
+    dlLink2.className = 'btn-download';
+    dlLink2.href = legacyDataUrl;
+    const ext2 = (msg.data.mimeType || 'image/png').split('/')[1] || 'png';
+    dlLink2.download = 'generated-image-' + Date.now() + '.' + ext2;
+    dlLink2.textContent = 'Download image';
+    imgEl.appendChild(dlLink2);
+    $('transcript').appendChild(imgEl);
+    scrollTranscript();
+    dbg('Image received: ' + (msg.data.description || '').slice(0, 50), 'event');
+  } else if (msg.type === 'speech_speed') {
+    const speeds = { slow: 0.85, normal: 1.0, fast: 1.2 };
+    const rate = speeds[msg.speed] || 1.0;
+    if (voice) voice.setPlaybackRate(rate);
+    addSystem('[speed] Speech speed set to ' + msg.speed + ' (' + rate + 'x)');
+  } else if (msg.type === 'session_end') {
+    addSystem('Session ended by voice command.');
+    dbg('session_end received — disconnecting', 'event');
+    connected = false; // prevent auto-reconnect
+    // disconnect() emits one synchronous 'closed'; the status handler
+    // sees connected=false → clean path ("Disconnected.", no retry).
+    if (voice) { voice.disconnect(); }
+    doCleanup();
+  } else if (msg.type === 'task.status') {
+    updateTask(msg.taskId, msg.status, msg.text, msg.result);
+  } else if (msg.type === 'grounding') {
+    const chunks = msg.payload?.groundingChunks;
+    if (Array.isArray(chunks) && chunks.length > 0) {
+      const sources = chunks.map(c => c.web?.title || c.web?.uri || '').filter(Boolean).join(', ');
+      if (sources) addSystem('[sources] ' + sources);
+    }
+  }
+}
+
+// Page-surface reset after a voice session ends (any path: user disconnect,
+// server close, terminal failure, takeover). The TRANSPORT owns mic/playback/
+// audio-graph teardown; this only resets what the page itself put up.
+// Idempotent via cleanupDone — several paths may reach it for one session.
+function doCleanup(opts) {
+  if (cleanupDone) return;
+  cleanupDone = true;
+  const keepStatus = opts && opts.keepStatus; // preserve an error status line
+  voice = null; // drop the handle — a dead session must not be reused
+  stopChromeStt();
+  if (!keepStatus) setStatus('Text only', '');
   connected = false;
   muted = false;
   fetch('/mute-state?muted=false&voice=false').catch(() => {}); // Reset state on disconnect
@@ -2036,7 +2332,6 @@ function doCleanup() {
   stopVisionPoll();
   $('voice-status').className = 'status-pill voice-off';
   try { sessionStorage.removeItem('sutando-voice'); } catch {}
-  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   updateStats();
 }
 
@@ -2063,6 +2358,9 @@ var _visionCanvas = null;            // hidden canvas reused for toBlob
 // Capped to prevent thrashing if recovery genuinely fails.
 var _visionRearmInFlight = false;
 var _visionRearmCount = 0;
+// Latched when the server reports a terminal stop; cleared only by a fresh
+// user-initiated start, so no recovery path can undo that decision.
+var _visionTerminalStop = false;
 var _VISION_REARM_LIMIT = 3;
 
 function applyVisionState(state) {
@@ -2087,7 +2385,13 @@ function applyVisionState(state) {
   // is gone, just tear down our side.
   var ourSideStale = _visionPushActive && (!streaming || state.source !== 'browser');
   if (ourSideStale) {
-    if (_visionStream && _visionStream.active) {
+    // A terminal stop is a decision, not a glitch — re-arming would restart the
+    // capture the server just stopped, and the voice session it fed is gone.
+    if (state.stoppedReason === 'no-client') {
+      console.log('[Vision] server stopped push mode: no voice client — tearing down');
+      _visionTerminalStop = true;
+      teardownPushSession();
+    } else if (_visionStream && _visionStream.active) {
       rearmPushMode();
     } else {
       teardownPushSession();
@@ -2104,6 +2408,9 @@ function applyVisionState(state) {
 // _VISION_REARM_LIMIT consecutive attempts to prevent thrashing if
 // recovery genuinely fails (e.g., voice session is gone).
 function rearmPushMode() {
+  // A terminal stop is a decision. Re-arming would restart the capture the
+  // server just stopped, so it outranks every recovery guard below.
+  if (_visionTerminalStop) return;
   if (_visionRearmInFlight || _visionRearmCount >= _VISION_REARM_LIMIT) return;
   if (!_visionStream || !_visionStream.active) return;
   _visionRearmInFlight = true;
@@ -2151,17 +2458,59 @@ function updateVisionPreviewStats() {
   if (stats) stats.textContent = _visionFrameCount + ' frame' + (_visionFrameCount === 1 ? '' : 's');
 }
 
+// P7 D7.4: this page's main thread also runs the voice capture
+// (ScriptProcessor in the vendored transport) — drawImage + JPEG encode
+// there competes with audio. A tiny Blob-URL worker does the draw + encode
+// in an OffscreenCanvas; the main thread only grabs a cheap ImageBitmap.
+// One frame in flight at a time (latest-frame discipline, no backlog).
+var _visionWorker = null;
+var _visionWorkerBusy = false;
+function ensureVisionWorker() {
+  if (_visionWorker !== null) return _visionWorker;
+  if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined' || typeof Worker === 'undefined') {
+    _visionWorker = false; // feature-detected once; falsy → main-thread fallback
+    return _visionWorker;
+  }
+  var src = 'onmessage=async function(e){var d=e.data;try{' +
+    'var c=new OffscreenCanvas(d.w,d.h);var x=c.getContext("2d");' +
+    'x.drawImage(d.bmp,0,0,d.w,d.h);d.bmp.close();' +
+    'var b=await c.convertToBlob({type:"image/jpeg",quality:d.q});' +
+    'postMessage({ok:true,blob:b});}catch(err){postMessage({ok:false});}}';
+  try {
+    _visionWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    _visionWorker.onmessage = function(e) {
+      _visionWorkerBusy = false;
+      if (e.data && e.data.ok && e.data.blob) _postVisionBlob(e.data.blob);
+    };
+    _visionWorker.onerror = function() { _visionWorkerBusy = false; };
+  } catch (e) { _visionWorker = false; }
+  return _visionWorker;
+}
+
 function captureAndSendFrame() {
   var preview = document.getElementById('vision-preview');
   if (!preview || !_visionStream) return;
   // Wait for the video to actually have pixels — readyState >= HAVE_CURRENT_DATA (2)
   if (preview.readyState < 2 || !preview.videoWidth || !preview.videoHeight) return;
+  var worker = ensureVisionWorker();
+  if (worker) {
+    if (_visionWorkerBusy) return; // latest-frame: skip, never queue
+    _visionWorkerBusy = true;
+    createImageBitmap(preview).then(function(bmp) {
+      worker.postMessage({ bmp: bmp, w: VISION_FRAME_WIDTH, h: VISION_FRAME_HEIGHT, q: VISION_FRAME_QUALITY }, [bmp]);
+    }).catch(function() { _visionWorkerBusy = false; });
+    return;
+  }
+  // Fallback (no OffscreenCanvas): the original main-thread canvas path.
   if (!_visionCanvas) _visionCanvas = document.createElement('canvas');
   _visionCanvas.width = VISION_FRAME_WIDTH;
   _visionCanvas.height = VISION_FRAME_HEIGHT;
   var ctx = _visionCanvas.getContext('2d');
   ctx.drawImage(preview, 0, 0, VISION_FRAME_WIDTH, VISION_FRAME_HEIGHT);
-  _visionCanvas.toBlob(function(blob) {
+  _visionCanvas.toBlob(function(blob) { _postVisionBlob(blob); }, 'image/jpeg', VISION_FRAME_QUALITY);
+}
+
+function _postVisionBlob(blob) {
     if (!blob) return;
     // Skip blank frames — getDisplayMedia sometimes paints a black frame
     // for the first tick when the user switches surfaces; uploading a
@@ -2182,7 +2531,16 @@ function captureAndSendFrame() {
         // 409 means the server's pushMode flag is false (voice-agent
         // restart) — try to re-arm without waiting for the 2s state poll.
         if (r.status === 409 && _visionPushActive) {
-          rearmPushMode();
+          // The 2s poll usually loses this race at >=1fps, so read the reason
+          // off the rejection itself rather than waiting for the next poll.
+          r.clone().json().then(function(d) {
+            if (d && d.stoppedReason === 'no-client') {
+              _visionTerminalStop = true;
+              teardownPushSession();
+            } else {
+              rearmPushMode();
+            }
+          }).catch(function() { rearmPushMode(); });
         }
         // Surface the first rejection so the user sees why Sutando doesn't
         // see frames (e.g. push mode not active because voice isn't ready).
@@ -2191,11 +2549,11 @@ function captureAndSendFrame() {
         }
       }
     }).catch(function() { /* network blip — next tick will retry */ });
-  }, 'image/jpeg', VISION_FRAME_QUALITY);
 }
 
 function teardownPushSession() {
   _visionPushActive = false;
+  _visionWorkerBusy = false; // an in-flight encode must not block the next session's first frame
   if (_visionFrameTimer) { clearInterval(_visionFrameTimer); _visionFrameTimer = null; }
   if (_visionStream) {
     try { _visionStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
@@ -2260,6 +2618,7 @@ async function startWatch() {
     pollVisionState();
     return;
   }
+  _visionTerminalStop = false;   // a user-initiated start supersedes it
   _visionPushActive = true;
   _visionFrameCount = 0;
   updateVisionPreviewStats();
@@ -2316,9 +2675,11 @@ window.toggleWatch = toggleWatch;
 
 // ─── Mute toggle ──────────────────────────────────────────
 function toggleMute() {
-  if (!micStream) return;
+  if (!voice || !connected) return;
   muted = !muted;
-  micStream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+  // Transport call-control gate (also flips the track so the OS mic
+  // indicator reflects the mute).
+  voice.setMicMuted(muted);
   const btn = document.getElementById('btn-mute');
   btn.textContent = muted ? 'Unmute' : 'Mute';
   btn.className = muted ? 'btn-mute muted' : 'btn-mute';
@@ -2371,10 +2732,17 @@ setInterval(reportAgentState, 1000);
 // ─── UI toggle (user gesture context!) ────────────────────
 function toggle() {
   if (connected) {
-    if (ws) { ws.close(); ws = null; }
-    doCleanup();
+    // Set connected=false BEFORE disconnect(): the transport synchronously
+    // emits one 'closed', and the status handler must read it as a clean
+    // user stop (no auto-reconnect).
+    connected = false;
+    const v = voice;
+    if (v) v.disconnect();
+    doCleanup(); // idempotent — no-op when the closed handler already ran
   } else {
-    // Create AudioContext if not already created (may exist from page load or prior toggle)
+    // Page-level AudioContext (tool cues) on the user gesture; the transport
+    // creates its own voice audio graph inside connect(), also within this
+    // gesture's synchronous call stack.
     if (!audioCtx || audioCtx.state === 'closed') {
       audioCtx = new AudioContext();
     } else if (audioCtx.state === 'suspended') {
@@ -2382,12 +2750,11 @@ function toggle() {
     }
     dbg('AudioContext: state=' + audioCtx.state + ' sampleRate=' + audioCtx.sampleRate);
 
-    // Reset counters
-    nextPlayTime = 0;
+    // Reset per-session surface state
     bytesSent = 0;
     bytesRecv = 0;
-    audioChunksRecv = 0;
-    playChunkCount = 0;
+    micAnnounced = false;
+    cleanupDone = false;
 
     connected = true;
     muted = false;
@@ -2580,6 +2947,127 @@ window.toggleActivity = toggleActivity;
 window.showNotesInDR = showNotesInDR;
 window.showNoteInDR = showNoteInDR;
 
+// ─── Web-chat send-path persistence ──────────────────────
+// When voice is disconnected, sendText() routes through the task bridge and
+// polls /result for the late reply (core pickup is 10-32s). The poll used to
+// live in an in-page setInterval closure that died on page reload, so a refresh
+// during the wait dropped the reply forever. Persist {task_id, text} to
+// localStorage and resume polling on load so a reload re-attaches and renders
+// the reply. /result/<id> serves from results/archive too, so the reply
+// survives the bridge archiving the file before the resumed poll runs.
+const PERSIST_KEY_CHAT_PENDING = 'sutando-dashboard-chat-pending-v1';
+// Long-running agent tasks (PR creation, research, multi-step analysis) routinely
+// take many minutes. A short poll cap orphaned the reply: the result landed in the
+// Tasks tab but the transcript was stuck on a dead "(No response yet…)" line forever.
+// Keep polling well past the first minute (backing the cadence off once past the
+// fast window), and on the hard ceiling stop the in-page timer but KEEP the
+// persisted entry so a reload re-attaches and still renders the late reply.
+const CHAT_POLL_FAST_MS = 2 * 1000;            // cadence during the fast window
+const CHAT_POLL_SLOW_MS = 15 * 1000;           // cadence after the fast window
+const CHAT_POLL_FAST_WINDOW_MS = 2 * 60 * 1000;// poll every 2s for the first 2 min
+const CHAT_POLL_MAX_MS = 30 * 60 * 1000;       // ceiling for ONE page session's polling
+// Must stay strictly greater than the poll ceiling: an entry kept for a reload
+// to recover is by definition already older than the ceiling that stopped it.
+const CHAT_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+function loadPendingChatSends() {
+  try {
+    const cutoff = Date.now() - CHAT_PENDING_TTL_MS;
+    return JSON.parse(localStorage.getItem(PERSIST_KEY_CHAT_PENDING) || '[]')
+      .filter(p => p && p.task_id && (p.ts || 0) >= cutoff);
+  } catch { return []; }
+}
+function addPendingChatSend(taskId, text) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    list.push({ task_id: taskId, text, ts: Date.now() });
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function removePendingChatSend(taskId) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function renderChatReply(el, resultText) {
+  // Same markdown-or-escaped-text rendering the inline poll used. marked +
+  // DOMPurify both required — marked alone would be unsafe innerHTML on agent
+  // results that originate from external task channels.
+  if (window.marked && window.DOMPurify) {
+    try {
+      el.innerHTML = window.DOMPurify.sanitize(
+        window.marked.parse(resultText, { breaks: true, gfm: true })
+      );
+    } catch (e) {
+      el.textContent = resultText;
+    }
+  } else {
+    el.textContent = resultText;
+  }
+  el.classList.remove('t-working');
+  addCopyBtn(el);
+}
+// Poll the task bridge for a chat reply and render it into placeholderEl when
+// it arrives. Backs the cadence off after the fast window. On completion it
+// clears the persisted entry; on the ceiling it stops this session's timer but
+// KEEPS the entry so a reload re-attaches and still renders the reply (the
+// result is served from results/archive indefinitely).
+// sentAt is display/context only. The ceiling deliberately runs from THIS
+// session's start: measuring it from the original send made a resumed poll
+// exceed it on its first tick and return without ever calling /result.
+function pollChatReply(taskId, placeholderEl, sentAt) {
+  const apiBase = 'http://' + location.hostname + ':7843';
+  const begin = Date.now();
+  let timer = null;
+  const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const schedule = (elapsed) => {
+    const delay = elapsed < CHAT_POLL_FAST_WINDOW_MS ? CHAT_POLL_FAST_MS : CHAT_POLL_SLOW_MS;
+    timer = setTimeout(tick, delay);
+  };
+  const tick = () => {
+    const elapsed = Date.now() - begin;
+    if (elapsed > CHAT_POLL_MAX_MS) {
+      stop();
+      // Keep the persisted entry — a reload resumes the poll and can still
+      // render the reply once the (slow) task finishes.
+      if (placeholderEl && placeholderEl.classList.contains('t-working')) {
+        placeholderEl.textContent = '(Still working — the reply will appear here when it lands, or refresh. It is also in the Tasks tab.)';
+        placeholderEl.classList.remove('t-working');
+      }
+      return;
+    }
+    fetch(apiBase + '/result/' + taskId).then(r => r.json()).then(r => {
+      if (r.status === 'completed') {
+        stop();
+        removePendingChatSend(taskId);
+        renderChatReply(placeholderEl, r.result);
+        scrollTranscript();
+      } else {
+        schedule(elapsed);
+      }
+    }).catch(() => { schedule(elapsed); });
+  };
+  tick();
+}
+// On page load, re-render any in-flight chat sends and resume polling so a
+// reload during the core-pickup wait still surfaces the reply.
+function resumePendingChatSends() {
+  const pending = loadPendingChatSends();
+  if (!pending.length) return;
+  pending.forEach(p => {
+    const ue = document.createElement('div');
+    ue.className = 't-entry t-user';
+    ue.textContent = p.text;
+    $('transcript').appendChild(ue);
+    const placeholder = document.createElement('div');
+    placeholder.className = 't-entry t-assistant t-working';
+    placeholder.textContent = 'working…';
+    $('transcript').appendChild(placeholder);
+    pollChatReply(p.task_id, placeholder, p.ts);
+  });
+  scrollTranscript(true);
+}
+
 // ─── Text input ──────────────────────────────────────────
 function sendText() {
   const input = $('textInput');
@@ -2595,9 +3083,8 @@ function sendText() {
   scrollTranscript(true);
   input.value = '';
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    // Voice connected — send through voice agent
-    ws.send(JSON.stringify({ type: 'text_input', text }));
+  if (voice && voice.sendTextInput(text)) {
+    // Voice connected — sent through the voice agent's live socket
     dbg('Sent text via voice: "' + text.slice(0, 50) + '"', 'event');
   } else {
     // Voice disconnected — route through task bridge (same as Telegram/Discord)
@@ -2607,36 +3094,18 @@ function sendText() {
       .then(d => {
         if (d.ok) {
           dbg('Sent text via task bridge: ' + d.task_id, 'event');
-          // Poll for result
-          const poll = setInterval(() => {
-            fetch(apiBase + '/result/' + d.task_id).then(r => r.json()).then(r => {
-              if (r.status === 'completed') {
-                clearInterval(poll);
-                const re = document.createElement('div');
-                re.className = 't-entry t-assistant';
-                // Render markdown if marked.js + DOMPurify both loaded; fall
-                // back to escaped textContent otherwise. Both required — marked
-                // alone would be unsafe innerHTML on agent results that
-                // originate from external task channels.
-                // Before this, headings/lists in long replies (e.g. skill
-                // suggestions) came through as raw "###" / "*" characters.
-                if (window.marked && window.DOMPurify) {
-                  try {
-                    re.innerHTML = window.DOMPurify.sanitize(
-                      window.marked.parse(r.result, { breaks: true, gfm: true })
-                    );
-                  } catch (e) {
-                    re.textContent = r.result;
-                  }
-                } else {
-                  re.textContent = r.result;
-                }
-                addCopyBtn(re);
-                $('transcript').appendChild(re);
-                scrollTranscript();
-              }
-            }).catch(() => {});
-          }, 2000);
+          // Persist the in-flight send so a page reload during the core-pickup
+          // wait re-attaches and renders the reply instead of dropping it.
+          addPendingChatSend(d.task_id, text);
+          // Show a "working…" placeholder immediately so the 10-32s wait reads
+          // as in-progress, not failure. The placeholder is filled in place
+          // when the reply arrives.
+          const placeholder = document.createElement('div');
+          placeholder.className = 't-entry t-assistant t-working';
+          placeholder.textContent = 'working…';
+          $('transcript').appendChild(placeholder);
+          scrollTranscript();
+          pollChatReply(d.task_id, placeholder);
         }
       })
       .catch(() => {
@@ -2647,6 +3116,8 @@ function sendText() {
       });
   }
 }
+
+try { resumePendingChatSends(); } catch {}
 
 // ─── Dynamic region: contextual generative UI ────────────
 // Priority: dynamic-content.json > pending questions > proactive status > chips
@@ -2819,9 +3290,9 @@ function renderTabContent() {
     if (entries.length === 0) {
       container.innerHTML = '<div style="color:#666;font-size:12px;text-align:center;padding:12px">No recent tasks</div>';
     } else {
-      var sorted = entries.sort(function(a,b) { return b[1].time - a[1].time; }).slice(0, 10);
+      var display = groupedTaskDisplay(entries);
       var icons = { pending: '&#8987;', working: '&#9881;', done: '&#10003;', error: '&#10007;' };
-      container.innerHTML = sorted.map(function(entry, i) {
+      container.innerHTML = renderTaskWorkstreamGroups(display, function(entry, i) {
         var id = entry[0], t = entry[1];
         var ago = Math.round((Date.now() - t.time) / 1000);
         var timeStr = ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago';
@@ -2849,11 +3320,11 @@ function renderTabContent() {
         var expandChip = hasResult ? '<span class="task-expand">' + (isExpanded ? 'Hide &#9662;' : 'Show details &#9656;') + '</span>' : '';
         return '<div class="task-item"' + clickAttr + '>' +
           '<div class="task-status ' + t.status + '">' + (icons[t.status] || '?') + '</div>' +
-          '<span class="' + textClass + '">' + displayText + '</span>' +
+          '<span class="' + textClass + '">' + esc(displayText) + '</span>' +
           '<span class="task-time">' + timeStr + '</span>' +
           expandChip +
           '</div>' + resultHtml;
-      }).join('');
+      });
     }
     window._drLocalContent = false;
 
@@ -3596,8 +4067,78 @@ function escapeHtml(s: string): string {
 	return String(s).replace(/[<>&"']/g, c => (({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'} as Record<string, string>)[c] || c));
 }
 
+function isLoopbackAddress(address: string | undefined): boolean {
+	return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
 const server = createServer((req, res) => {
 	const url = new URL(req.url || '/', `http://${req.headers.host}`);
+
+	// Task history carries owner prompts and result bodies. Keep it behind the
+	// dashboard's same-origin server, forward the configured bearer token, and
+	// reject LAN callers unless the owner explicitly enabled LAN sharing.
+	if (url.pathname === '/api/task-history' || url.pathname === '/api/task-workstreams/infer') {
+		const isHistory = url.pathname === '/api/task-history';
+		const expectedMethod = isHistory ? 'GET' : 'POST';
+		if (req.method !== expectedMethod) {
+			res.writeHead(405, { 'Content-Type': 'application/json', 'Allow': expectedMethod });
+			res.end(JSON.stringify({ error: 'method not allowed' }));
+			return;
+		}
+		if (!LAN_SHARE && !isLoopbackAddress(req.socket.remoteAddress)) {
+			res.writeHead(403, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ error: 'task history is local-only' }));
+			return;
+		}
+		const token = process.env.SUTANDO_API_TOKEN || '';
+		const headers: Record<string, string> = { 'Accept': 'application/json' };
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const proxyReq = httpRequest({
+			host: '127.0.0.1',
+			port: 7843,
+			path: isHistory ? '/tasks/history' : '/tasks/workstreams/infer',
+			method: expectedMethod,
+			headers,
+		}, (proxyRes) => {
+			res.writeHead(proxyRes.statusCode || 502, {
+				'Content-Type': 'application/json',
+				'Cache-Control': 'no-store',
+			});
+			proxyRes.pipe(res);
+		});
+		proxyReq.on('error', () => {
+			res.writeHead(502, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify({ error: 'agent api unavailable' }));
+		});
+		proxyReq.end();
+		return;
+	}
+
+	if (url.pathname === BROWSER_TRANSPORT_ROUTE) {
+		loadBrowserTransport().then(
+			js => {
+				res.writeHead(200, {
+					'Content-Type': 'application/javascript; charset=utf-8',
+					// Source mode recompiles per process; bundled mode ships a new
+					// artifact per release. Neither wants a browser holding an old
+					// copy across a restart, and this file is 14KB.
+					'Cache-Control': 'no-store',
+				});
+				res.end(js);
+			},
+			(err: Error) => {
+				// Fail loudly and in two places: the HTTP status so the page's
+				// loader can show the user something, and the server log so the
+				// operator sees the packaging error even if nobody opened the UI.
+				console.error(`[web-client] ${BROWSER_TRANSPORT_ROUTE} unavailable: ${err.message}`);
+				res.writeHead(503, { 'Content-Type': 'application/javascript; charset=utf-8' });
+				res.end(
+					`console.error(${JSON.stringify('Sutando voice transport unavailable: ' + err.message)});\n`,
+				);
+			},
+		);
+		return;
+	}
 
 	if (url.pathname === '/sse') {
 		res.writeHead(200, {
@@ -3831,15 +4372,23 @@ const server = createServer((req, res) => {
 		const port = Number(process.env.VISION_CONTROL_PORT) || 7847;
 		const method = req.method === 'POST' ? 'POST' : 'GET';
 		const isFrame = url.pathname === '/vision/frame';
-		const chunks: Buffer[] = [];
-		req.on('data', (c: Buffer) => chunks.push(c));
-		req.on('end', async () => {
+		// This surface binds 0.0.0.0 by default, and every oversized frame it
+		// forwards costs a subprocess downstream — so the body is capped here,
+		// not just at the control server.
+		void readBodyCapped(req).then(async (body) => {
+			if (!body) {
+				res.writeHead(413, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ status: 'failed', error: 'body too large' }));
+				return;
+			}
 			try {
 				const incomingType = (req.headers['content-type'] as string | undefined) || (isFrame ? 'image/jpeg' : 'application/json');
 				const r = await fetch(`http://127.0.0.1:${port}${url.pathname}`, {
 					method,
 					headers: method === 'POST' ? { 'Content-Type': incomingType } : undefined,
-					body: method === 'POST' ? (chunks.length ? Buffer.concat(chunks) : (isFrame ? Buffer.alloc(0) : '{}')) : undefined,
+					// Uint8Array view, not the Buffer itself: fetch's BodyInit does not
+					// accept Buffer under @types/node's generic-backed Buffer type.
+					body: method === 'POST' ? (body.byteLength ? new Uint8Array(body) : (isFrame ? new Uint8Array(0) : '{}')) : undefined,
 				});
 				const text = await r.text();
 				res.writeHead(r.status, { 'Content-Type': 'application/json' });

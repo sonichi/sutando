@@ -21,19 +21,41 @@ included — so the test can assert on the actual envelope shape that
 goes over the wire.
 """
 
+import contextlib
+import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
+
+# Isolate the channel config BEFORE importing the bridge, and SEED it.
+#
+# This file used to write a fake DISCORD_BOT_TOKEN into the operator's real
+# `~/.claude/channels/discord/.env` whenever that file was absent. On a machine
+# that has the file the write is a no-op, which is why it survived — the damage
+# lands only on a host that has LOST its token, which is the host you least want
+# a fake one planted on. A fake token also satisfies startup.sh's
+# `grep -q "DISCORD_BOT_TOKEN="` and defeats the #2638 vault fallback, which
+# fires only when no `.env` value exists.
+#
+# Seeding matters as much as redirecting: `channel_access_path()` falls back to
+# the legacy real-home `access.json` when the canonical path is missing, so an
+# EMPTY temp config dir still reads the operator's live allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-dm-result-multipar-")
+_ccd_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd_discord.mkdir(parents=True, exist_ok=True)
+(_ccd_discord / "access.json").write_text('{"allowFrom": []}')
+(_ccd_discord / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 
 REPO = Path(__file__).resolve().parent.parent
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token-not-real")
 os.environ.setdefault("SUTANDO_WORKSPACE", tempfile.mkdtemp(prefix="sutando-dm-mp-test-ws-"))
 
-_channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
+_channels_env = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord" / ".env"
 if not _channels_env.exists():
     _channels_env.parent.mkdir(parents=True, exist_ok=True)
     _channels_env.write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
@@ -47,6 +69,7 @@ def _load(name: str, path: Path):
 
 
 dm = _load("dm_result", REPO / "src" / "dm-result.py")
+import channels.discord.client as _rest  # noqa: E402  — the seam the fakes install into
 
 
 class _FakeResponse:
@@ -89,14 +112,35 @@ class _FakeTransport:
         raise AssertionError(f"unmocked request: {method} {url}")
 
 
+_SEAM = None
+
+
 def _install_transport(transport):
-    original = dm.urllib.request.urlopen
-    dm.urllib.request.urlopen = transport.urlopen
-    return original
+    """Route the shared client through the fake (dm-result delivers via
+    DiscordRestClient now, so the module's urlopen is no longer the seam)."""
+    global _SEAM
+
+    def _tuple(req, timeout):
+        resp = transport.urlopen(req, timeout=timeout)
+        raw = resp.read().decode("utf-8", "replace")
+        return getattr(resp, "status", 200), (json.loads(raw) if raw else None)
+
+    def _read_json(req, timeout=None):
+        resp = transport.urlopen(req, timeout=timeout)
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+    _SEAM = (dm._client, _rest.request_json)
+    dm._client = lambda token: _rest.DiscordRestClient(
+        token, transport=_tuple, timeout=30)
+    _rest.request_json = _read_json
+    return _SEAM
 
 
-def _restore_transport(original):
-    dm.urllib.request.urlopen = original
+def _restore_transport(_original=None):
+    global _SEAM
+    if _SEAM is not None:
+        dm._client, _rest.request_json = _SEAM
+        _SEAM = None
 
 
 def _with_access_json(content, fn):
@@ -315,19 +359,179 @@ def test_filename_crlf_quote_sanitized_in_header():
         bad_name_path.unlink(missing_ok=True)
 
 
+
+# --- live-workspace isolation -------------------------------------------------
+_LIVE_BASELINE: dict = {}
+
+
+def _workspace_fingerprint(ws) -> dict:
+    """(size, mtime) per file; CONTENT HASH under results/.
+
+    Whole-tree rather than an enumerated list of the paths this fixture is known
+    to touch — an assertion only catches what it looks at. Union-compared below
+    so a DELETION is visible too (#2619 shipped both lessons the hard way).
+    """
+    out = {}
+    if not ws.is_dir():
+        return out
+    for f in ws.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            if "results" in f.parts:
+                out[str(f)] = ("sha", hashlib.sha256(f.read_bytes()).hexdigest())
+            else:
+                st = f.stat()
+                out[str(f)] = (st.st_size, st.st_mtime)
+        except OSError:
+            pass
+    return out
+
+
+@contextlib.contextmanager
+def _outbox_redirected():
+    """Send `outbox_log.append()` to a throwaway file for the duration.
+
+    `dm-result.py` late-imports `outbox_log` and appends after every successful
+    send, and `_outbox_path()` resolves `resolve_workspace()/state/outbox.log`
+    at CALL time — so untouched, this suite writes real rows into the owner's
+    live delivery audit log, the file the dashboard's Outbox card reads.
+
+    Patches the name in EVERY module holding it, not just where it is defined:
+    `from workspace_default import resolve_workspace` binds into the IMPORTER's
+    namespace, so patching only the source module leaves consumers pointing at
+    the original (#2619).
+
+    Restores in a `finally` so a mid-run failure cannot leave globals patched
+    for whatever runs next in the same interpreter (#2614).
+    """
+    import workspace_default
+
+    tmp = Path(tempfile.mkdtemp(prefix="multipart-outbox-test-"))
+    (tmp / "state").mkdir(parents=True, exist_ok=True)
+    orig = workspace_default.resolve_workspace
+    # Accept and IGNORE any args — observability calls
+    # `resolve_workspace(migrate=False)`, and a zero-arg stub raises TypeError
+    # there, which the best-effort facade swallows: that DISABLES the write path
+    # instead of redirecting it (qingyun-wu, #2619).
+    fake = lambda *a, **kw: tmp
+    patched = [m for m in list(sys.modules.values())
+               if getattr(m, "resolve_workspace", None) is orig]
+    for m in patched:
+        m.resolve_workspace = fake
+    workspace_default.resolve_workspace = fake
+    try:
+        yield tmp
+    finally:
+        workspace_default.resolve_workspace = orig
+        for m in patched:
+            m.resolve_workspace = orig
+        # ALSO restore modules that bound `fake` DURING the context. `patched` is
+        # built before the body runs, and this fixture imports `outbox_log`
+        # LAZILY inside `dm.send_dm()` — so it binds `fake` afterwards and was
+        # never restored, leaving `_outbox_path()` pointed at a deleted temp dir
+        # for the rest of the interpreter (qingyun-wu, #2620).
+        for m in list(sys.modules.values()):
+            if getattr(m, "resolve_workspace", None) is fake:
+                m.resolve_workspace = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_resolver_bindings_restored_after_the_context(tmp_root_prefix="multipart-outbox-test-") -> None:
+    """The fix for the lazy-import restore leak must itself be protected.
+
+    Both reviewers made the same point on #2620 and they were right: deleting
+    the late-import sweep left the whole suite GREEN while
+    `outbox_log.resolve_workspace` stayed bound to the throwaway stub and
+    `_outbox_path()` still pointed into the REMOVED temp tree. A fix with no
+    activated assertion can regress silently — which is exactly the standard I
+    apply to other people's guards.
+
+    Asserts BOTH halves they asked for: identity restored, and the resolved
+    path is outside the deleted temp root.
+    """
+    import outbox_log
+    import workspace_default
+
+    assert outbox_log.resolve_workspace is workspace_default.resolve_workspace, (
+        "outbox_log.resolve_workspace was NOT restored after _outbox_redirected() — "
+        "it is still bound to the throwaway stub, so later same-interpreter writes "
+        "land in a deleted directory"
+    )
+    resolved = str(outbox_log._outbox_path())
+    assert tmp_root_prefix not in resolved, (
+        f"_outbox_path() still points into the removed throwaway tree: {resolved}"
+    )
+    print("  ✓ resolver bindings restored after the context "
+          f"(outbox_log -> {resolved})")
+
+
+def test_no_writes_reach_the_live_workspace(live_ws) -> None:
+    """The baseline is taken by main() BEFORE any case runs, so this covers
+    every write the file triggers rather than only its own."""
+    now = _workspace_fingerprint(live_ws)
+    before = _LIVE_BASELINE
+    deleted = sorted(k for k in before if k not in now)
+    added = sorted(k for k in now if k not in before)
+    modified = sorted(k for k in (set(before) & set(now)) if before[k] != now[k])
+    assert not (deleted or added or modified), (
+        f"fixture escaped to the live workspace at {live_ws}: "
+        f"{len(deleted)} deleted, {len(modified)} modified, {len(added)} added — "
+        f"{(deleted + modified + added)[:4]}"
+    )
+    print(f"  ✓ live workspace untouched "
+          f"({len(set(before) | set(now))} paths compared, union of before+after)")
+
+
+def test_vanished_file_after_allowlist_check_returns_false():
+    """TOCTOU: an allowlisted path that disappears before the blob read must
+    abort with the bounded batch diagnostic, not an uncaught traceback."""
+    transport = _FakeTransport({
+        ("POST", "/users/@me/channels"): {"id": "dm-9"},
+        ("POST", "/channels/dm-9/messages"): {"id": "msg-9"},
+    })
+    original = _install_transport(transport)
+    orig_gate = dm._is_path_sendable
+    dm._is_path_sendable = lambda p: True   # force the check TRUE for a path that is gone
+    def run():
+        try:
+            ok = dm.send_dm("body [file: /tmp/sutando-vanished-after-check.bin]")
+        finally:
+            dm._is_path_sendable = orig_gate
+            _restore_transport(original)
+        assert ok is False, "unreadable batch must return False through the delivery contract"
+        mp_calls = [c for c in transport.calls if c["is_multipart"]]
+        assert mp_calls == [], "no upload attempt may be made for an unreadable batch"
+    _with_access_json(
+        {"allowFrom": ["human-id"], "tierMap": {"human-id": "owner"}},
+        run,
+    )
+
+
 def main():
-    test_allowlisted_file_uploaded_via_multipart()
-    print("  ✓ test_allowlisted_file_uploaded_via_multipart")
-    test_non_allowlisted_file_rejected_not_uploaded()
-    print("  ✓ test_non_allowlisted_file_rejected_not_uploaded")
-    test_file_only_message_with_empty_text()
-    print("  ✓ test_file_only_message_with_empty_text")
-    test_eleven_files_split_into_two_batches()
-    print("  ✓ test_eleven_files_split_into_two_batches")
-    test_filename_crlf_quote_sanitized_in_header()
-    print("  ✓ test_filename_crlf_quote_sanitized_in_header")
+    from workspace_default import resolve_workspace
+
+    global _LIVE_BASELINE
+    live_ws = resolve_workspace()
+    _LIVE_BASELINE = _workspace_fingerprint(live_ws)
+
+    with _outbox_redirected():
+        test_allowlisted_file_uploaded_via_multipart()
+        print("  ✓ test_allowlisted_file_uploaded_via_multipart")
+        test_non_allowlisted_file_rejected_not_uploaded()
+        print("  ✓ test_non_allowlisted_file_rejected_not_uploaded")
+        test_file_only_message_with_empty_text()
+        print("  ✓ test_file_only_message_with_empty_text")
+        test_eleven_files_split_into_two_batches()
+        print("  ✓ test_eleven_files_split_into_two_batches")
+        test_filename_crlf_quote_sanitized_in_header()
+        print("  ✓ test_filename_crlf_quote_sanitized_in_header")
+        test_vanished_file_after_allowlist_check_returns_false()
+        print("  ✓ test_vanished_file_after_allowlist_check_returns_false")
+    test_resolver_bindings_restored_after_the_context()
+    test_no_writes_reach_the_live_workspace(live_ws)
     print("All dm-result multipart-upload tests passed.")
 
 
 if __name__ == "__main__":
-    main()
+        main()

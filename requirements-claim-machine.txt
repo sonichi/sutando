@@ -1,0 +1,3 @@
+# ClaimMachine test-scope only, never a production dependency. Exact pin:
+# engine upgrades are deliberate PRs, not nightly drift.
+hypothesis==6.165.10

@@ -1,10 +1,66 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh
+# Usage: bash src/startup.sh [--with-app]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job).
 
 set -e
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# --with-app is opt-in and parsed here so an unknown flag cannot silently do
+# nothing: every other argument is still ignored exactly as before.
+WITH_APP=0
+for _arg in "$@"; do
+    case "$_arg" in --with-app) WITH_APP=1 ;; esac
+done
+
+# Resolve python3 ONCE, refusing Apple's Xcode-CLT stub. On a Mac without the
+# developer tools `/usr/bin/python3` exists but raises a modal install dialog
+# when executed, and this script spawns python3 ~15 times — dashboard.py and
+# agent-api.py on a respawn backoff, so each retry re-raised it. Measured on a
+# clean macOS 26.5 VM against Sutando 0.5.0-rc.2.
+#
+# $PY is empty when nothing runnable exists; no call site below may fall back to
+# the bare name (that IS the stub).
+#
+# This used to promise "Python-backed services will be skipped" and continue.
+# That promise could never be kept (CR #2599, @qingyun-wu): startup resolves the
+# WORKSPACE at :586 via `sutando-config.sh workspace`, which is Python, and every
+# Python-backed launch is downstream of it. So a no-interpreter run could not
+# reach a single one of those skip branches — under `set -e` it died at the first
+# required config lookup having just claimed it would carry on. Sutando has no
+# meaningful degraded mode without an interpreter: the workspace, host label,
+# core runtime and CLAUDE_CONFIG_DIR are all resolved through it.
+#
+# So fail once, here, with the fix — which still achieves this PR's actual goal.
+# The goal was never "start anyway"; it was "never execute the stub", because
+# executing it raises a ~19 GB modal that no exit-code check or 2>/dev/null can
+# suppress. An actionable message beats that dialog.
+. "$REPO/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO")"
+
+if [ -z "$PY" ]; then
+  {
+    echo "✗ no runnable python3 (no \$SUTANDO_PY, no bundled runtime, no developer tools)"
+    # Deliberately no literal system-interpreter path in this text: the
+    # repo's hardcoded-path gate flags that token, and an allow-listed
+    # exception here would weaken the scan for every other line in the file.
+    echo "  Sutando cannot start: the workspace, host label and core runtime are"
+    echo "  all resolved through Python. Deliberately not falling back to the"
+    echo "  system python3 — on a Mac without the developer tools that is the"
+    echo "  Xcode-CLT stub, and running it raises the install dialog rather"
+    echo "  than returning an error."
+    echo "  Fix: brew install python — or set \$SUTANDO_PY to an interpreter."
+  } >&2
+  exit 1
+fi
+
+# Must run after the PY-validity abort but before ANY workspace-derived write:
+# a write below on a broken link materializes an unhealable real dir.
+_wl_out="$("$PY" "$REPO/src/workspace_layout.py" --ensure)" || {
+  echo "✗ workspace wiring broken and not auto-healable — refusing to start services onto a stranded workspace. Diagnose: $PY $REPO/src/workspace_layout.py --check" >&2
+  exit 1
+}
+case "$_wl_out" in *'"action": "healed-'*) echo "🔧 workspace wiring healed: $_wl_out" >&2 ;; esac
 cd "$REPO"
 
 # Belt-and-suspenders startup log → always recoverable from /tmp (Lucy's Bug #5
@@ -41,7 +97,10 @@ export SUTANDO_ROOT="$REPO"
 # such hosts (web-client outage 2026-07-17).
 _APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
 [ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
-_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin)"
+# `|| true`: tsx-bin prints nothing AND returns nonzero on a bare bundled
+# runtime (no tsx anywhere) — under set -e that exited startup at this line
+# before the bundled-mode gate could run (Codex blocking finding #2).
+_TSX_BIN="$(bash "$REPO/scripts/sutando-config.sh" tsx-bin || true)"
 run_tsx() {
   if [ -n "$_TSX_BIN" ]; then
     "$_TSX_BIN" "$@"
@@ -49,6 +108,84 @@ run_tsx() {
     npx tsx "$@"
   fi
 }
+
+# G1.5 node-bundle (owner-adopted design + owner review 2026-07-19).
+# Bundled and dev are MUTUALLY EXCLUSIVE modes, not a preference (P1-2):
+#   BUNDLED = the desktop-managed runtime is present — SUTANDO_NODE exported
+#   (fail-closed if invalid, see node-bin) OR the bundled runtime discovered
+#   at its canonical home (app-node-dir; covers launchd jobs without the env
+#   var) — AND dist artifacts are shipped. Services run dist/<name>.js under
+#   the pinned node; a missing artifact is an explicit PACKAGING ERROR, never
+#   a tsx fallback (tsx/npm/node_modules deliberately don't exist here).
+#   DEV = everything else; tsx-over-src exactly as before, so a stale dist/
+#   can never shadow live src edits.
+_NODE_BIN="$(bash "$REPO/scripts/sutando-config.sh" node-bin)" || {
+  echo "✗ SUTANDO_NODE is set but invalid — desktop packaging error; refusing PATH fallback (G1.5 fail-closed)"
+  exit 1
+}
+# At-rest discovery is scoped to the PACKAGED ENGINE COPY ONLY: the checkout
+# must itself live inside the engine root that owns the runtime
+# (<engine-root>/runtime/node/bin + <engine-root>/.../this repo). A dev
+# checkout on a machine that merely HAS the app installed must stay dev even
+# after `npm run build:bundle` — stale dist can never shadow live src
+# (Codex finding #3).
+_APP_ENGINE_ROOT="${_APP_NODE_DIR%/node/bin}"
+_APP_ENGINE_ROOT="${_APP_ENGINE_ROOT%/runtime}"
+# Mode comes from the MANAGED-RUNTIME SIGNAL ALONE (Codex re-review F2):
+# explicit SUTANDO_NODE, or the at-rest runtime discovered while running AS
+# the packaged engine copy. Artifact presence is then VALIDATED separately —
+# a managed runtime with missing dist is a packaging error that fails closed,
+# never a silent slide into dev/npm/tsx.
+BUNDLED_MODE=0
+if [ -n "${SUTANDO_NODE:-}" ]; then
+  BUNDLED_MODE=1
+elif [ -x "$_APP_NODE_DIR/node" ] && [ "${REPO#"$_APP_ENGINE_ROOT"/}" != "$REPO" ]; then
+  BUNDLED_MODE=1
+fi
+if [ "$BUNDLED_MODE" = "1" ]; then
+  # Validate EVERY artifact of the build:bundle contract, not a representative
+  # one (external review on #2182): a missing voice/proxy/etc artifact would
+  # otherwise fail inside a background job while boot still prints ✓.
+  _MISSING_DIST=""
+  # web-voice-transport.browser is the browser-side artifact the web UI loads
+  # for voice; it is built by the same build:bundle contract but is NOT a node
+  # service, so it has no run_node_service entry to catch its absence later.
+  for _artifact in web-client voice-agent conversation-server credential-proxy boot emit-call-tiers web-voice-transport.browser; do
+    [ -f "$REPO/dist/$_artifact.js" ] || _MISSING_DIST="$_MISSING_DIST $_artifact.js"
+  done
+  if [ -n "$_MISSING_DIST" ]; then
+    echo "✗ bundled mode: required dist artifacts missing ($REPO/dist:$_MISSING_DIST) — desktop packaging error; refusing dev fallback (G1.5 fail-closed)"
+    exit 1
+  fi
+fi
+if [ -n "${SUTANDO_NODE:-}" ]; then
+  _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
+  case ":$PATH:" in *":$_SUTANDO_NODE_DIR:"*) ;; *) PATH="$_SUTANDO_NODE_DIR:$PATH"; export PATH ;; esac
+fi
+run_node_service() {
+  # $1 = dist basename (build-bundle artifact), $2 = ts entry (as run_tsx
+  # expects it today — relative or absolute), rest = service args.
+  _rns_dist="$REPO/dist/$1.js"
+  _rns_entry="$2"
+  shift 2
+  if [ "$BUNDLED_MODE" = "1" ]; then
+    if [ ! -f "$_rns_dist" ]; then
+      echo "  ✗ bundled mode: dist artifact missing: $_rns_dist (packaging error — refusing tsx fallback)"
+      return 1
+    fi
+    "$_NODE_BIN" "$_rns_dist" "$@"
+  else
+    run_tsx "$_rns_entry" "$@"
+  fi
+}
+
+# Resolve the configured core BEFORE touching runtime-specific credentials or
+# running an auth probe. .env remains loaded at its established point below;
+# the helper consults it in a subshell only for SUTANDO_CORE_RUNTIME parity.
+# shellcheck source=startup-runtime.sh
+source "$REPO/src/startup-runtime.sh"
+core_runtime="$(resolve_startup_core_runtime)"
+[ -n "$core_runtime" ] || core_runtime="claude"
 
 # Export workspace-scoped CLAUDE_CONFIG_DIR before services launch. Without it,
 # init.sh + the bridge-launcher blocks below (L~262 proxy, L~429 telegram,
@@ -58,13 +195,9 @@ run_tsx() {
 # successful `claude-sutando --migrate`. Mirrors src/agent/claude/cli/start-cli.sh
 # (Sutando.app's tmux-wrapped CLI launcher) — same machine-spawn pattern.
 #
-# Defense in depth (matches start-cli):
-#   - Helper missing → silent fallback (legacy install).
-#   - Helper present + config valid → export.
-#   - Helper present + config invalid → refuse to start (don't scatter state).
-if [ -x "$REPO/scripts/sutando-config.sh" ]; then
-  _ccd_err="$(mktemp -t startup-ccd.XXXXXX)"
-  if _ccd="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>"$_ccd_err")"; then
+# Resolve-or-refuse is shared with start-cli; only the credential seeding is ours.
+source "$REPO/src/claude_config_dir.sh"
+if _ccd="$(resolve_claude_config_dir "$REPO" startup)"; then
     mkdir -p "$_ccd"
     # NOTE: the claude core-agent launcher + the `claude-sutando` config-dir
     # onboarding alias now live under src/agent/claude/ (start-cli.sh /
@@ -91,6 +224,7 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
     # entries keyed by absolute checkout path don't collide between hosts.
     # Followup: consider narrowing CLAUDE_CONFIG_DIR to a per-host non-synced
     # subdir.
+    if claude_auth_carry_enabled "$core_runtime"; then
     for _seed in .credentials.json .claude.json; do
       if [ ! -f "$_ccd/$_seed" ] && [ -f "$HOME/.claude/$_seed" ]; then
         # Mini 21:23Z: defensive log on cp failure (read-only target, disk full).
@@ -138,7 +272,7 @@ if [ -x "$REPO/scripts/sutando-config.sh" ]; then
         # python3 -c is the most portable jq-free way to write a tiny JSON
         # without shell-quoting hazards on the token value. Env vars
         # prefixed to the command (not appended as args) per POSIX.
-        if _p="$_ccd/.credentials.json" _t="$_env_token" python3 -c "
+        if _p="$_ccd/.credentials.json" _t="$_env_token" ${PY:-false} -c "
 import json,os
 p=os.environ['_p']
 t=os.environ['_t']
@@ -148,7 +282,7 @@ json.dump({'claudeAiOauth':{'accessToken':t}}, open(p,'w'))
           echo "  ~ env-token-persist: wrote .credentials.json from \$$_env_var_used (mode 600)"
           # Sidecar provenance file (#1504) — never read by Claude Code.
           # Records how this credentials file was produced for audit/migration tools.
-          _p="$_ccd/.credentials.source.json" _v="$_env_var_used" python3 -c "
+          _p="$_ccd/.credentials.source.json" _v="$_env_var_used" ${PY:-false} -c "
 import json,os,datetime
 p=os.environ['_p']; v=os.environ['_v']
 json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),'persist_block_version':1},open(p,'w'))
@@ -159,15 +293,21 @@ json.dump({'source':'env','env_var':v,'carried_at':datetime.datetime.now(datetim
         unset _env_token
       fi
     fi
+    fi
     export CLAUDE_CONFIG_DIR="$_ccd"
-  else
-    echo "startup: claude_sutando_config_dir invalid — refusing to start" >&2
-    cat "$_ccd_err" >&2
-    rm -f "$_ccd_err"
-    exit 1
-  fi
-  rm -f "$_ccd_err"
+else
+  _ccd_rc=$?
+  # 2 = caller already scoped the config dir; nothing to seed, and the services
+  # below still reach the intended credential store.
+  [ "$_ccd_rc" = "2" ] || exit 1
+  echo "  ~ CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR (caller-provided; config helper absent)"
 fi
+
+# Boot gate (#2396): verify the SELECTED core can boot authenticated BEFORE any
+# service launches. Claude retains its rich login-state gate; Codex checks the
+# configured CODEX_HOME with `codex login status`. The shared escape hatch is
+# SUTANDO_SKIP_AUTH_PREFLIGHT=1.
+preflight_selected_core_auth "$core_runtime" "${CLAUDE_CONFIG_DIR:-}" || exit $?
 
 # Git committer attribution: REMOVED (2026-05-21). This block used to set
 # committer.name/committer.email from stand-identity.json so `git log %cn`
@@ -189,7 +329,7 @@ git -C "$REPO" config --unset committer.email 2>/dev/null || true
 # so a kept local edit must be re-applied per host. The applier is idempotent +
 # fail-loud: it never force-applies and a stale/missing patch WARNs without
 # failing startup. See skills/plugin-patches/README.md.
-python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
+[ -n "$PY" ] && "$PY" "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 
 # Load optional .env configuration BEFORE init.sh. Two reasons must both hold:
 #  1) init.sh resolves the workspace via `${SUTANDO_WORKSPACE/#~/$HOME}` with
@@ -200,8 +340,6 @@ python3 "$REPO/skills/plugin-patches/apply-plugin-patches.py" || true
 #  2) Voice needs a Gemini key, but the Codex core, text web UI, dashboard,
 #     API, and configured message bridges do not. Missing voice credentials
 #     disable only the voice service instead of blocking the whole product.
-# shellcheck source=startup-runtime.sh
-source "$REPO/src/startup-runtime.sh"
 configure_startup_runtime
 
 # v0.8 auto-migration helpers (PR #1440 safety hardening — Mini review).
@@ -323,7 +461,7 @@ fi
 # Note: the actual workspace path used below in `WORKSPACE=...` still comes
 # from the legacy resolver in this file. Wiring it to come from the loader
 # is a follow-up change — this banner is the early-warning layer.
-if ! python3 -m src.sutando_config >/dev/null; then
+if [ -n "$PY" ] && ! "$PY" -m src.sutando_config >/dev/null; then
   echo "  ✗ sutando.config.json is malformed — fix the parse error above."
   exit 1
 fi
@@ -341,12 +479,8 @@ bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 # dark whenever a session restarts without an explicit /schedule-crons invocation.
 bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
 
-# Re-inject PERSONAL_CLAUDE.md after context compaction (SessionStart
-# "compact" matcher). CLAUDE.md + the memory index survive compaction via the
-# system prompt; PERSONAL_CLAUDE.md only enters context via an explicit Read,
-# which compaction summarizes away — so long sessions silently lose per-user
-# rules. Idempotent — safe to run on every start.
-bash "$REPO/scripts/install-personal-claude-hook.sh" 2>&1 || true
+# PERSONAL_CLAUDE.md compaction-reinject hook is Claude-only policy — wired
+# at src/agent/claude/cli/start-cli.sh, the Claude launch chokepoint, not here.
 
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
@@ -363,8 +497,18 @@ echo ""
 # things piece by piece.
 bash "$REPO/src/init.sh" --preflight | tail -1
 
-# Install dependencies if needed
-if [ ! -d node_modules ]; then
+# Bundled mode (G1.5): BUNDLED_MODE is computed ONCE next to
+# run_node_service (single source of truth — owner review P1-2: app-node-dir
+# discovery counts as bundled too, not just the env var). The npm bootstrap
+# + node/npx prereq blocks below are gated on it because a bundled runtime
+# deliberately has NO npm/npx/node_modules (Codex finding #1).
+if [ "$BUNDLED_MODE" = "1" ]; then
+  echo "  ✓ bundled mode (pinned runtime + dist artifacts) — skipping dependency bootstrap"
+fi
+
+# Install dependencies if needed (dev/source mode only — bundled installs
+# run dist artifacts under the pinned node and need no node_modules).
+if [ "$BUNDLED_MODE" != "1" ] && [ ! -d node_modules ]; then
   if command -v npm > /dev/null 2>&1 && npm install 2>/dev/null; then
     echo "  ✓ Dependencies installed (npm)"
   elif command -v pnpm > /dev/null 2>&1 && pnpm install 2>/dev/null; then
@@ -381,11 +525,19 @@ fi
 
 # Check CLI prerequisites. node/npx/python3, the selected core runtime, and
 # fswatch are checked here because they are not needed for init.sh bootstrap.
+# Bundled mode: node is $SUTANDO_NODE (its dir already heads PATH) and npx is
+# intentionally absent (bare-node runtime, dist-first services) — skip both.
 missing=0
-if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
-if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
+if [ "$BUNDLED_MODE" != "1" ]; then
+  if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
+  if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
+fi
 if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
-core_runtime="$(bash "$REPO/scripts/sutando-config.sh" core-runtime)"
+# sutando-config.sh REQUIRES python and exits 1 without it. Under `set -e` a
+# bare command substitution here aborted the whole startup — after we had
+# just printed that Python-backed services would be skipped (CR #2599,
+# @qingyun-wu). Tolerate the failure and fall back, so the skip actually
+# happens instead of being promised.
 if ! command -v "$core_runtime" > /dev/null 2>&1; then
   echo "  ✗ $core_runtime CLI not found — required by core.runtime"
   missing=1
@@ -443,13 +595,27 @@ else
 fi
 
 # Check Accessibility (needed for context drop shortcut)
-if ! osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' > /dev/null 2>&1; then
-  echo "  ⚠ Accessibility not granted"
-  echo "    → System Settings → Privacy & Security → Accessibility"
-  echo "    → Add Terminal.app or Shortcuts.app"
-else
-  echo "  ✓ Accessibility"
+# $REPO is overridable, so fall back to alongside this script: an unguarded
+# source under `set -e` aborts the whole run.
+__probe="$REPO/src/accessibility_probe.sh"
+[ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
+# 125 = could not check. NOT 0: a missing probe would otherwise print
+# "✓ Accessibility", asserting a grant on a run where nothing was probed.
+acc_rc=125
+if [ -f "$__probe" ]; then
+  # `|| rc=$?` keeps this exempt from `set -e`; a bare non-zero call aborts.
+  source "$__probe"
+  acc_rc=0; accessibility_probe || acc_rc=$?
 fi
+case $acc_rc in
+  0)   echo "  ✓ Accessibility" ;;
+  125) echo "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked" ;;
+  124) echo "  ⚠ Accessibility UNKNOWN — probe timed out after ${ACCESSIBILITY_PROBE_TIMEOUT_S}s"
+       echo "    This session cannot answer the prompt (headless/SSH); the grant may be fine." ;;
+  *)   echo "  ⚠ Accessibility not granted"
+       echo "    → System Settings → Privacy & Security → Accessibility"
+       echo "    → Add Terminal.app or Shortcuts.app" ;;
+esac
 echo ""
 
 # Install Claude Code skills (runs every startup, idempotent)
@@ -498,24 +664,7 @@ if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
   bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
-# Reap any stale watch-tasks-stream watcher from a prior session. The
-# in-session Stop hook (.claude/settings.json) handles clean shutdown, but
-# a hard crash (SIGKILL, panic, force-quit, power loss) skips it and leaves
-# an orphan fswatch process + stale PID file. On a fresh startup we kill
-# the orphan (if the PID still names a live `watch-tasks-stream` process)
-# and remove the PID file so the new session's watcher writes a fresh one.
-# Skipping kills when the PID has been recycled by an unrelated process is
-# important — `kill $PID` without the cmdline check would target whatever
-# new program happens to hold the recycled PID.
-WATCHER_PID_FILE="$WORKSPACE/state/watch-tasks-stream.pid"
-if [ -f "$WATCHER_PID_FILE" ]; then
-  STALE_PID="$(cat "$WATCHER_PID_FILE" 2>/dev/null || true)"
-  if [ -n "$STALE_PID" ] && ps -p "$STALE_PID" -o args= 2>/dev/null | grep -q "watch-tasks-stream"; then
-    kill "$STALE_PID" 2>/dev/null || true
-    echo "  ✓ reaped stale watch-tasks-stream watcher (pid $STALE_PID)"
-  fi
-  rm -f "$WATCHER_PID_FILE"
-fi
+reap_stale_task_watcher "$WORKSPACE/state/watch-tasks-stream.pid"
 
 # Post-M0: repo-root tasks/results/data are NOT created. Pre-M0 this block
 # ran `mkdir -p tasks results data` as back-compat for unmigrated scripts —
@@ -530,15 +679,23 @@ fi
 # freshly-restarted task-bridge or discord-bridge poll loop sees a backlog
 # of long-dead result files and re-delivers them. Post-mortem:
 # notes/post-mortem-dm-flood-2026-04-15.md.
-python3 "$REPO/src/archive-stale-results.py" || true
+[ -n "$PY" ] && "$PY" "$REPO/src/archive-stale-results.py" || true
 
 # Core heartbeat — per-host alive signal under state/cores/<hostname>.alive.
 # Foundation for multi-core / cross-machine "who's running?" checks. Single
 # instance per host; gracefully cleans up its .alive file on SIGTERM.
 if ! pgrep -f "src/core_heartbeat.py" > /dev/null 2>&1; then
   echo "  Starting core heartbeat..."
-  python3 "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
-  echo "  ✓ core heartbeat"
+  # The ✓ must live INSIDE the guard. `[ -n "$PY" ] && cmd &` followed by an
+  # unconditional echo claims a start that never happened when no interpreter
+  # resolved — and this one is the per-host liveness signal, so a false ✓ makes
+  # the node look alive with nothing writing .alive.
+  if [ -n "$PY" ]; then
+    "$PY" "$REPO/src/core_heartbeat.py" > /tmp/core-heartbeat.log 2>&1 &
+    echo "  ✓ core heartbeat"
+  else
+    echo "  ⊘ core heartbeat skipped — no runnable python3"
+  fi
 else
   echo "  ✓ core heartbeat (already running)"
 fi
@@ -548,8 +705,12 @@ fi
 # Single instance per host; ~30s cadence; SIGTERM-clean like the heartbeat.
 if ! pgrep -f "$REPO/src/services_status.py" > /dev/null 2>&1; then
   echo "  Starting services-status emitter..."
-  python3 "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
-  echo "  ✓ services-status emitter"
+  if [ -n "$PY" ]; then
+    "$PY" "$REPO/src/services_status.py" > /tmp/services-status.log 2>&1 &
+    echo "  ✓ services-status emitter"
+  else
+    echo "  ⊘ services-status emitter skipped — no runnable python3"
+  fi
 else
   echo "  ✓ services-status emitter (already running)"
 fi
@@ -564,10 +725,12 @@ fi
 _PROXY_LABEL="com.sutando.credential-proxy"
 _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
 if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
-  if launchctl print "gui/$(id -u)/$_PROXY_LABEL" > /dev/null 2>&1; then
-    echo "  ✓ credential proxy (launchd-supervised, already loaded)"
+  # An already-loaded job may carry a plist generated before the current pins existed;
+  # the installer owns that comparison because it owns what the plist renders.
+  if bash "$_PROXY_INSTALLER" is-current > /dev/null 2>&1; then
+    echo "  ✓ credential proxy (launchd-supervised, already loaded, config current)"
   else
-    echo "  Installing launchd-supervised credential proxy..."
+    echo "  Installing launchd-supervised credential proxy (fresh or runtime drift)..."
     if bash "$_PROXY_INSTALLER" install > /dev/null 2>&1; then
       # Wait for the supervised proxy to bind before the legacy-launch guard.
       for _ in $(seq 1 10); do lsof -i :7846 > /dev/null 2>&1 && break; sleep 0.5; done
@@ -579,8 +742,19 @@ if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ];
 fi
 if ! lsof -i :7846 > /dev/null 2>&1; then
   echo "  Starting credential proxy (port 7846)..."
-  _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
-  run_tsx "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
+  # Same dist-only contract as the wrapper and the installer: a bundled host
+  # ships dist/ and has no quota-tracker skill dir, so resolving the TS source
+  # here would hand run_node_service a path that does not exist and leave the
+  # host with no proxy at all ("Claude will connect directly").
+  if [ "$BUNDLED_MODE" = "1" ]; then
+    _PROXY_SCRIPT="$REPO/dist/credential-proxy.js"
+  else
+    # Run the proxy from THIS checkout so it resolves the same workspace as the
+    # core/dashboard; fall back to the claude-home copy if the skill is absent.
+    _PROXY_SCRIPT="$REPO/skills/quota-tracker/scripts/credential-proxy.ts"
+    [ -f "$_PROXY_SCRIPT" ] || _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+  fi
+  run_node_service credential-proxy "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then
     echo "  ✓ credential proxy"
@@ -593,32 +767,42 @@ else
   export ANTHROPIC_BASE_URL=http://localhost:7846
 fi
 
-# 0b. Obs collector (OPTIONAL — opt-in via SUTANDO_OBS_COLLECTOR=1).
-# The single, source-agnostic local collector: it receives Claude Code hooks
-# (and, later, voice / filewatcher / bridge events) on /ingest/<source>,
-# normalizes them into the one event schema, and writes the durable JSONL floor
-# at <workspace>/logs/events-*.jsonl (the visualizer tails that). Off by default
-# — it's an observability/dev tool, not required for the agent to run.
-#
-# When enabled we also point the core's hooks at it (SUTANDO_OBS_ENDPOINT) UNLESS
-# an endpoint is already set — e.g. a remote upstream collector — so the "always
-# set hooks, only export when told where" contract still holds.
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+# 0b. Local usage collector. Token/cost metrics are on by default so dashboard
+# usage panels work out of the box; plaintext prompt/tool hooks retain their
+# previous explicit SUTANDO_OBS_COLLECTOR=1 opt-in. Set the flag to 0 to disable
+# the local collector entirely. Cloud forwarding remains separately opt-in.
+# shellcheck source=src/observability/startup-policy.sh
+source "$REPO/src/observability/startup-policy.sh"
+OBS_COLLECTOR_READY=0
+if obs_collector_enabled; then
   OBS_PORT="${SUTANDO_OBS_PORT:-4000}"
   if ! lsof -i :"$OBS_PORT" > /dev/null 2>&1; then
     echo "  Starting obs collector (port $OBS_PORT)..."
     SUTANDO_WORKSPACE="$WORKSPACE" SUTANDO_OBS_PORT="$OBS_PORT" \
-      run_tsx "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
-    echo "  ✓ obs collector"
-  else
-    echo "  ✓ obs collector (already running on $OBS_PORT)"
+      run_node_service boot "$REPO/src/observability/boot.ts" > "$LOGS_DIR/collector.log" 2>&1 &
+    for _obs_wait in 1 2 3 4 5 6 7 8 9 10; do
+      obs_collector_healthy "$OBS_PORT" && break
+      sleep 0.2
+    done
   fi
-  # Wire the core's hooks to the local collector unless an endpoint is already set.
-  if [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
-    export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+  if obs_collector_healthy "$OBS_PORT"; then
+    OBS_COLLECTOR_READY=1
+    echo "  ✓ obs collector (verified on $OBS_PORT)"
+  else
+    echo "  ⚠ obs collector unavailable or foreign listener on $OBS_PORT — metrics/hook capture disabled" >&2
+  fi
+  if [ "$OBS_COLLECTOR_READY" = "1" ]; then
+    # Default-on path is metrics-only. Preserve the old explicit =1 behavior
+    # for operators who intentionally opted into prompt/tool hook capture.
+    if [ -z "${SUTANDO_OBS_METRICS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_METRICS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
+    if obs_hooks_enabled && [ -z "${SUTANDO_OBS_ENDPOINT:-}" ]; then
+      export SUTANDO_OBS_ENDPOINT="http://localhost:$OBS_PORT"
+    fi
   fi
 else
-  echo "  ~ obs collector (disabled — set SUTANDO_OBS_COLLECTOR=1 to enable)"
+  echo "  ~ obs collector (disabled via SUTANDO_OBS_COLLECTOR=0)"
 fi
 # A port can LISTEN while the service never responds (single-threaded server
 # blocked on a silent connection, hung event loop). The lsof guards below only
@@ -650,11 +834,14 @@ else
   # don't fight over port 9900 (issue #1888 bug 2 — duplicate listeners when
   # launchd respawns while startup.sh's direct process still holds the port).
   #
-  # reap_wedged_listener runs BEFORE the launchd ownership check intentionally:
+  # The wedge reap runs BEFORE the launchd ownership check intentionally:
   # KeepAlive only triggers on process exit, not on hang. A hung process can hold
   # the port indefinitely — reaping it first frees the port so the subsequent
   # kickstart (or launchd's own respawn on exit) gets a clean bind.
-  reap_wedged_listener 9900 voice-agent
+  # NOT the generic reap_wedged_listener: voice-agent's kill path goes through
+  # the guarded voice-lock.py takeover (startup-runtime.sh, amendment T4) —
+  # identity mismatch means nothing is signaled.
+  reap_wedged_voice_agent 9900
   if launchctl print "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1; then
     if ! lsof -i :9900 > /dev/null 2>&1; then
       launchctl kickstart "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1 || true
@@ -673,7 +860,7 @@ else
     fi
   elif ! lsof -i :9900 > /dev/null 2>&1; then
     echo "  Starting voice agent (port 9900)..."
-    run_tsx src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
+    run_node_service voice-agent src/voice-agent.ts > "$LOGS_DIR/voice-agent.log" 2>&1 &
     echo "  ✓ voice agent"
   else
     echo "  ✓ voice agent (already running)"
@@ -688,7 +875,7 @@ fi
 # back to cloud). `--interval 60` keeps it resident and re-emits every 60s so the
 # advertisement tracks reachability changes AFTER boot (tailnet/VPN coming up
 # post-startup would otherwise leave Direct(Tailscale) greyed until a restart).
-run_tsx src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
+run_node_service emit-call-tiers src/emit-call-tiers.ts --interval 60 > "$LOGS_DIR/emit-call-tiers.log" 2>&1 &
 echo "  ✓ call-tiers advertisement (re-emit 60s)"
 
 # 2. Web client (port 8080 by default; CLIENT_PORT may avoid a local conflict)
@@ -713,7 +900,7 @@ if [ "$WEB_CLIENT_PORT" = "8080" ] && launchctl print "gui/$(id -u)/com.sutando.
   fi
 elif ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
   echo "  Starting web client (port $WEB_CLIENT_PORT)..."
-  run_tsx src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
+  run_node_service web-client src/web-client.ts > "$LOGS_DIR/web-client.log" 2>&1 &
   echo "  ✓ web client"
 else
   echo "  ✓ web client (already running on $WEB_CLIENT_PORT)"
@@ -740,8 +927,12 @@ fi
 reap_wedged_listener 7844 dashboard
 if ! lsof -i :7844 > /dev/null 2>&1; then
   echo "  Starting dashboard (port 7844)..."
-  python3 src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
-  echo "  ✓ dashboard"
+  if [ -n "$PY" ]; then
+    "$PY" src/dashboard.py > "$LOGS_DIR/dashboard.log" 2>&1 &
+    echo "  ✓ dashboard"
+  else
+    echo "  ~ dashboard skipped (no runnable python3)"
+  fi
 else
   echo "  ✓ dashboard (already running)"
 fi
@@ -750,8 +941,12 @@ fi
 reap_wedged_listener 7843 agent-api
 if ! lsof -i :7843 > /dev/null 2>&1; then
   echo "  Starting agent API (port 7843)..."
-  python3 src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
-  echo "  ✓ agent API"
+  if [ -n "$PY" ]; then
+    "$PY" src/agent-api.py > "$LOGS_DIR/agent-api.log" 2>&1 &
+    echo "  ✓ agent API"
+  else
+    echo "  ~ agent API skipped (no runnable python3)"
+  fi
 else
   echo "  ✓ agent API (already running)"
 fi
@@ -764,8 +959,12 @@ reap_wedged_listener 7845 screen-capture
 if ! lsof -i :7845 > /dev/null 2>&1; then
   if [ "$PERM_OK" -eq 1 ]; then
     echo "  Starting screen capture (port 7845)..."
-    python3 src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
-    echo "  ✓ screen capture"
+    if [ -n "$PY" ]; then
+      "$PY" src/screen-capture-server.py > "$LOGS_DIR/screen-capture.log" 2>&1 &
+      echo "  ✓ screen capture"
+    else
+      echo "  ⊘ screen capture skipped — no runnable python3"
+    fi
   else
     echo "  ⊘ screen capture skipped — grant Screen Recording perm first, then re-run startup.sh"
   fi
@@ -785,105 +984,6 @@ if [ -d "$REPO/skills/portfolio-research" ]; then
     >> "$LOGS_DIR/portfolio-dashboard.log" 2>&1 || true
   echo "  ✓ portfolio dashboard (port 8899)"
 fi
-
-# 5b. Sutando context drop app (hotkey configurable via state/hotkeys.json)
-SUT_SRC="$REPO/src/Sutando/main.swift"
-SUT_BIN="$REPO/src/Sutando/Sutando"
-
-# Build the public ax-read CLI if missing or older than any of its source
-# files. Sutando.app's resolveAxReadPath() prefers private personal-deictic
-# when installed; this public binary is the text-only fallback so public-repo
-# users still get the context-drop experience.
-#
-# Staleness widened (per Mini's PR #907 review): trigger a rebuild when
-# Package.swift / build.sh / any *.swift under Sources/ is newer than the
-# binary, not just the main entry-point. Build failures are surfaced loudly
-# (not >/dev/null 2>&1) — silent failure here was the exact regression class
-# this skill is meant to prevent.
-AXR_DIR="$REPO/skills/context-drop"
-AXR_BIN="$AXR_DIR/ax-read"
-AXR_NEWEST_SRC="$(find "$AXR_DIR/Sources" "$AXR_DIR/Package.swift" "$AXR_DIR/build.sh" -type f \( -name '*.swift' -o -name 'Package.swift' -o -name 'build.sh' \) 2>/dev/null | xargs -I{} stat -f '%m {}' {} 2>/dev/null | sort -rn | head -1 | awk '{print $2}')"
-if [ -n "$AXR_NEWEST_SRC" ] && { [ ! -f "$AXR_BIN" ] || [ "$AXR_NEWEST_SRC" -nt "$AXR_BIN" ]; }; then
-  echo "  Compiling public ax-read (skills/context-drop)..."
-  if ! command -v swift >/dev/null 2>&1; then
-    echo "  ⚠ ax-read build skipped: 'swift' not in PATH"
-    echo "    → install Xcode Command Line Tools (xcode-select --install) for context drops on public-repo installs"
-  elif (cd "$AXR_DIR" && bash build.sh); then
-    echo "  ✓ ax-read built at $AXR_BIN"
-  else
-    echo "  ⚠ ax-read build FAILED — see Swift compiler output above"
-    echo "    → Sutando.app will fall back to legacy in-process AX (broken for Electron under LSUIElement context)"
-  fi
-fi
-
-# Rebuild if source is newer than binary, or binary is missing.
-# Kill any running instance so the fresh binary can take over.
-if [ -f "$SUT_SRC" ] && { [ ! -f "$SUT_BIN" ] || [ "$SUT_SRC" -nt "$SUT_BIN" ]; }; then
-  echo "  Compiling Sutando (source newer than binary)..."
-  if (cd "$REPO/src/Sutando" && swiftc -O -o Sutando main.swift SutandoConfig.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation 2>/dev/null); then
-    echo "  ✓ Sutando compiled"
-
-    # Sync the fresh binary into the .app bundle if one exists, ensure the
-    # AppleEvents usage-description key is present, and re-sign so the
-    # cdhash matches. Without NSAppleEventsUsageDescription macOS silently
-    # denies AppleEvents — getFinderSelection() returns [] and the context
-    # drop handler logs "Nothing selected" with no permission prompt.
-    SUT_APP="$REPO/src/Sutando/Sutando.app"
-    if [ -d "$SUT_APP" ]; then
-      cp "$SUT_BIN" "$SUT_APP/Contents/MacOS/Sutando"
-      /usr/libexec/PlistBuddy \
-        -c "Add :NSAppleEventsUsageDescription string 'Sutando reads your Finder selection to drop files into the agent task queue.'" \
-        "$SUT_APP/Contents/Info.plist" 2>/dev/null || true
-      # Prefer a stable signing identity when one is installed so the TCC
-      # Accessibility grant survives rebuilds (cdhash churn). Falls back to
-      # ad-hoc when no such identity exists — public-repo users without a
-      # personal signing cert get the same behavior as before.
-      #
-      # The designated requirement is identifier-only on purpose: the
-      # grant binds to the bundle ID rather than cdhash, so a rebuild
-      # against the same identity satisfies the requirement without
-      # re-prompting. For installs without a cert, ad-hoc still requires
-      # re-grant on each rebuild — same as the legacy behavior.
-      SUT_SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk '/"Sutando Dev"/{print $2; exit}')"
-      if [ -n "$SUT_SIGN_ID" ]; then
-        codesign --force --sign "$SUT_SIGN_ID" --identifier com.sutando.menubar \
-          --requirements '=designated => identifier "com.sutando.menubar"' \
-          "$SUT_APP" 2>/dev/null || codesign --force --sign - "$SUT_APP" 2>/dev/null || true
-        echo "  ✓ Sutando.app synced + signed (Sutando Dev + identifier-only DR)"
-      else
-        codesign --force --sign - "$SUT_APP" 2>/dev/null || true
-        echo "  ✓ Sutando.app synced + signed (ad-hoc; install \"Sutando Dev\" cert for stable TCC)"
-      fi
-    fi
-
-    if pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
-      pkill -f "src/Sutando/Sutando" 2>/dev/null || true
-      # Wait for kernel cleanup to drain before relaunch — fixed sleep 1
-      # raced with slow shutdown on 2026-04-21, leaving dual Sutando.app
-      # instances with ghost menu-bar icons.
-      for _ in $(seq 1 30); do
-        pgrep -f "src/Sutando/Sutando" >/dev/null 2>&1 || break
-        sleep 0.1
-      done
-    fi
-  else
-    echo "  ⚠ Sutando compile failed — keeping existing binary if any"
-  fi
-fi
-
-if ! pgrep -f "src/Sutando/Sutando" > /dev/null 2>&1; then
-  if [ -f "$SUT_BIN" ]; then
-    echo "  Starting Sutando..."
-    "$SUT_BIN" > /dev/null 2>&1 &
-    echo "  ✓ Sutando (hotkeys via state/hotkeys.json)"
-  else
-    echo "  ⚠ Sutando binary missing — hotkeys disabled"
-  fi
-else
-  echo "  ✓ Sutando (already running)"
-fi
-
-echo ""
 
 # Vault scanner preflight, shared by the three bridges that intercept secrets
 # (telegram, discord, slack — all import src/vault_intercept.py).
@@ -912,11 +1012,41 @@ _vault_scanner_check() {
   fi
 }
 
+# Prefer one launchd job per configured channel bridge. A loaded job is not
+# necessarily a running bridge: when a token is removed, the wrapper stays as
+# an idle launchd sentinel. Kickstart that state after credentials return, and
+# only report success once the actual bridge process exists.
+channel_bridge_supervised() {
+  local channel="$1"
+  local label="com.sutando.$channel-bridge"
+  local service="gui/$(id -u)/$label"
+  local installer="$REPO/src/install-channel-bridge-launchd.sh"
+  local template="$REPO/src/launchd/com.sutando.channel-bridge.plist"
+  local pattern="src/$channel-bridge\\.py$"
+
+  [ -f "$installer" ] && [ -f "$template" ] || return 1
+  if launchctl print "$service" >/dev/null 2>&1; then
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+      return 0
+    fi
+    launchctl kickstart -k "$service" >/dev/null 2>&1 || return 1
+  else
+    bash "$installer" "$channel" >/dev/null 2>&1 || return 1
+  fi
+  for _ in $(seq 1 12); do
+    pgrep -f "$pattern" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
 # 6. Telegram bridge (optional — needs TELEGRAM_BOT_TOKEN, skip with SKIP_TELEGRAM=1)
 if [ "${SKIP_TELEGRAM:-}" = "1" ]; then
   echo "  ~ telegram bridge (skipped via SKIP_TELEGRAM)"
-elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/telegram/.env)"; [ -f "$_TG_ENV" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$_TG_ENV" 2>/dev/null; then
-  if ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
+elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/telegram/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has TELEGRAM_BOT_TOKEN --env-file "$_TG_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_TG_ENV" ] && grep -q "TELEGRAM_BOT_TOKEN=" "$_TG_ENV" 2>/dev/null; fi; then
+  if channel_bridge_supervised telegram; then
+    echo "  ✓ telegram bridge (launchd-supervised)"
+  elif ! pgrep -f "telegram-bridge" > /dev/null 2>&1; then
     echo "  Starting Telegram bridge..."
     # Pick an interpreter that can actually verify TLS. A cert-less framework
     # python (e.g. /Library/Frameworks/.../3.13 without certifi) resolves first
@@ -924,15 +1054,22 @@ elif _TG_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
     # CERTIFICATE_VERIFY_FAILED — silently dropping all messages (cost us ~10h
     # on 2026-06-15, caught only by a stale-heartbeat health warning).
     _tg_tls_ok() { "$1" -c 'import urllib.request as u; u.urlopen("https://api.telegram.org",timeout=8)' >/dev/null 2>&1; }
-    TGPY="python3"
-    if ! _tg_tls_ok "$TGPY"; then
+    # Seed from the resolved interpreter, not the bare name: _tg_tls_ok EXECUTES
+    # its argument, so a bare "python3" here runs the CLT stub before the probe
+    # can judge anything.
+    TGPY="$PY"
+    if [ -n "$TGPY" ] && ! _tg_tls_ok "$TGPY"; then
       for _c in "$(pyenv which python3 2>/dev/null)" python3.12 python3.11; do
         [ -n "$_c" ] && command -v "$_c" >/dev/null 2>&1 && _tg_tls_ok "$_c" && TGPY="$_c" && break
       done
     fi
-    "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
-    echo "  ✓ telegram bridge ($TGPY)"
-    _vault_scanner_check "$TGPY" "telegram bridge"
+    if [ -n "$TGPY" ]; then
+      "$TGPY" src/telegram-bridge.py > "$LOGS_DIR/telegram-bridge.log" 2>&1 &
+      echo "  ✓ telegram bridge ($TGPY)"
+      _vault_scanner_check "$TGPY" "telegram bridge"
+    else
+      echo "  ~ telegram bridge skipped (no runnable python3)"
+    fi
   else
     echo "  ✓ telegram bridge (already running)"
   fi
@@ -940,36 +1077,13 @@ else
   echo "  ~ telegram bridge (no token — optional)"
 fi
 
-# Remote gateway bridge (optional channel — generic, same shape as the discord/
-# telegram/slack blocks below). Config + token live in the channel .env, resolved
-# via the same claude-home-path helper; the bridge itself ships in src/ (provider-
-# neutral, like the others). Relay protocol: docs/remote-gateway-protocol.md.
-# Deliberately silent when unconfigured — a Sutando-only user never sees it.
-# Back-compat: also detect/honor a legacy AG2_REMOTE_* token written to the repo
-# .env by older onboarding, so existing agents keep reconnecting after this lands
-# (until they re-onboard onto channels/ag2space/.env).
-if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
-   { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
-   || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
-  [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
-  # Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads). The
-  # legacy token may be the combined "url|secret" form, which the bridge splits.
-  REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-  # Default tier is "owner" for the personal-agent model (2026-07-08): a user's
-  # own gateway authenticates with their own owner bearer and the broker
-  # owner-scopes every pull, so its tasks are the owner's own (e.g. voice
-  # delegations). Must match the bridge's own default — otherwise startup.sh
-  # would export a value and the bridge's default never fires. A shared /
-  # multi-user gateway sets REMOTE_TASK_TIER=team explicitly.
-  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
-  if ! pgrep -f "remote-gateway-bridge" > /dev/null 2>&1; then
-    python3 "$REPO/src/remote-gateway-bridge.py" > "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
-    echo "  ✓ gateway bridge"
-  else
-    echo "  ✓ gateway bridge (already running)"
-  fi
-fi
+# Remote gateway bridge (optional channel — primary + every named secondary
+# lane). Defined as start_gateway_lanes() in startup-runtime.sh so it can also
+# be invoked standalone via scripts/restart-gateway-lanes.sh, without the rest
+# of this boot sequence (in particular without reap_stale_task_watcher above —
+# see that function's call site for why re-running the whole of startup.sh
+# just to reconnect a dropped lane is unsafe mid-session).
+start_gateway_lanes
 
 # 7. Discord bridge (optional — needs DISCORD_BOT_TOKEN + discord.py)
 #
@@ -981,9 +1095,13 @@ fi
 # wins. Same probe is also what's used in the bridge's rescue fallback.
 if [ "${SKIP_DISCORD:-}" = "1" ]; then
   echo "  ~ discord bridge (skipped via SKIP_DISCORD)"
-elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; then
+elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/discord/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has DISCORD_BOT_TOKEN --env-file "$_DC_ENV" 2>/dev/null || _tok_rc=$?; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_DC_ENV" ] && grep -q "DISCORD_BOT_TOKEN=" "$_DC_ENV" 2>/dev/null; fi; then
   PYTHON_WITH_DISCORD=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    # Same substitution as the slack loop below: probing EXECUTES the candidate,
+    # so a bare `python3` here is the CLT stub on a Mac without developer tools.
+    [ "$_p" = "python3" ] && _p="$PY"
+    [ -n "$_p" ] || continue
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import discord" 2>/dev/null; then
       PYTHON_WITH_DISCORD="$_p"
       break
@@ -997,12 +1115,19 @@ elif _DC_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
   # interpreter that would crash-loop on every boot. If THAT probe also
   # fails, keep the labeled skip with the pip-install hint (names the
   # missing dep + fix at the startup console).
-  if [ -z "$PYTHON_WITH_DISCORD" ] && command -v python3 >/dev/null 2>&1 && python3 -c "import discord" 2>/dev/null; then
-    PYTHON_WITH_DISCORD="python3"
-    echo "  ~ discord bridge using PATH python3 (no probed interp matched; PATH python3 has discord.py)"
+  # Probe the RESOLVED interpreter, never a bare `python3`. `command -v python3`
+  # succeeds against the Xcode-CLT stub and the `-c "import discord"` that
+  # follows EXECUTES it — raising the modal this PR exists to remove (CR #2599,
+  # @qingyun-wu). $PY is empty when nothing runnable exists, so the probe is
+  # skipped entirely rather than falling back to the stub.
+  if [ -z "$PYTHON_WITH_DISCORD" ] && [ -n "$PY" ] && "$PY" -c "import discord" 2>/dev/null; then
+    PYTHON_WITH_DISCORD="$PY"
+    echo "  ~ discord bridge using resolved python3 ($PY — no probed interp matched; it has discord.py)"
   fi
   if [ -z "$PYTHON_WITH_DISCORD" ]; then
     echo "  ~ discord bridge (no python with discord.py — run: /opt/homebrew/bin/pip3 install discord.py)"
+  elif channel_bridge_supervised discord; then
+    echo "  ✓ discord bridge (launchd-supervised)"
   elif ! pgrep -f "discord-bridge" > /dev/null 2>&1; then
     echo "  Starting Discord bridge with $PYTHON_WITH_DISCORD..."
     PYTHONUNBUFFERED=1 "$PYTHON_WITH_DISCORD" src/discord-bridge.py > "$LOGS_DIR/discord-bridge.log" 2>&1 &
@@ -1020,9 +1145,19 @@ fi
 # fresh-install miniconda env doesn't silently miss slack_bolt.
 if [ "${SKIP_SLACK:-}" = "1" ]; then
   echo "  ~ slack bridge (skipped via SKIP_SLACK)"
-elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; then
+elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/slack/.env)"; _tok_rc=0; "$PY" "$REPO/src/channel_token.py" --has SLACK_BOT_TOKEN --env-file "$_SL_ENV" 2>/dev/null || _tok_rc=$?; _tok_rc2=0; "$PY" "$REPO/src/channel_token.py" --has SLACK_APP_TOKEN --env-file "$_SL_ENV" 2>/dev/null || _tok_rc2=$?; [ "$_tok_rc" -eq 0 ] && [ "$_tok_rc2" -ne 0 ] && _tok_rc=3; if [ "$_tok_rc" -eq 0 ]; then true; elif [ "$_tok_rc" -eq 3 ]; then false; else [ -f "$_SL_ENV" ] && grep -q "SLACK_BOT_TOKEN=" "$_SL_ENV" 2>/dev/null; fi; then
   PYTHON_WITH_SLACK=""
   for _p in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+    # Substitute the RESOLVED interpreter for the bare `python3` candidate:
+    # probing a candidate EXECUTES it, and a bare `python3` on a Mac without
+    # developer tools is the CLT stub (CR #2599, @qingyun-wu). Empty $PY drops
+    # out of the list rather than degrading to the stub.
+    #
+    # Done inside the loop rather than in the `for` list so the pre-existing
+    # /opt/... literals stay on an UNCHANGED line — rewriting that line re-adds
+    # them as new, and REVIEW.md's path scan flags added /opt/ paths.
+    [ "$_p" = "python3" ] && _p="$PY"
+    [ -n "$_p" ] || continue
     if command -v "$_p" >/dev/null 2>&1 && "$_p" -c "import slack_bolt" 2>/dev/null; then
       PYTHON_WITH_SLACK="$_p"
       break
@@ -1030,10 +1165,17 @@ elif _SL_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels
   done
   if [ -z "$PYTHON_WITH_SLACK" ]; then
     echo "  ~ slack bridge (no python with slack_bolt — run: /opt/homebrew/bin/pip3 install slack_bolt)"
+  elif channel_bridge_supervised slack; then
+    echo "  ✓ slack bridge (launchd-supervised)"
   elif ! pgrep -f "slack-bridge" > /dev/null 2>&1; then
     echo "  Starting Slack bridge with $PYTHON_WITH_SLACK..."
     # Source the env file so SLACK_BOT_TOKEN / SLACK_APP_TOKEN reach the child.
-    set -a; . "$_SL_ENV"; set +a
+    # The gate can now pass on a vault-only token, so this file need not exist.
+    # Sourcing a missing path under the top-level `set -e` aborts ALL of startup
+    # — every service after this line — to launch an OPTIONAL bridge. Guarded
+    # with if/then/fi, not `&&`: a failing `&&` chain is itself non-zero and
+    # would abort identically. (@john-the-dev on #2638.)
+    if [ -f "$_SL_ENV" ]; then set -a; . "$_SL_ENV"; set +a; fi
     "$PYTHON_WITH_SLACK" src/slack-bridge.py > "$LOGS_DIR/slack-bridge.log" 2>&1 &
     echo "  ✓ slack bridge"
     _vault_scanner_check "$PYTHON_WITH_SLACK" "slack bridge"
@@ -1056,7 +1198,7 @@ elif ! phone_stack_enabled; then
 elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   if ! pgrep -f "conversation-server" > /dev/null 2>&1; then
     echo "  Starting conversation server..."
-    run_tsx skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
+    run_node_service conversation-server skills/phone-conversation/scripts/conversation-server.ts > /tmp/conversation-server.log 2>&1 &
     echo "  ✓ conversation server (port 3100)"
   else
     echo "  ✓ conversation server (already running)"
@@ -1073,7 +1215,17 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
       ngrok http 3100 --log=stdout > /tmp/ngrok.log 2>&1 &
     fi
     sleep 3
-    NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    # `${PY:-cat} -c` was not a fallback: with no interpreter it runs `cat -c`,
+    # which is not a valid cat invocation on either BSD or GNU. It fails, the
+    # `|| echo ""` swallows it, and the operator is left with a running ngrok
+    # tunnel and a stale WEBHOOK_BASE_URL — Twilio then posts to the previous
+    # session's URL. Skip explicitly and say why instead.
+    if [ -n "$PY" ]; then
+      NGROK_URL=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d['tunnels'][0]['public_url'])" 2>/dev/null || echo "")
+    else
+      NGROK_URL=""
+      echo "  ⊘ ngrok URL not parsed — no runnable python3; set WEBHOOK_BASE_URL in .env manually"
+    fi
     if [ -n "$NGROK_URL" ]; then
       # Update WEBHOOK_BASE_URL in .env — portable in-place edit.
       # `sed -i ''` is BSD-only; on Macs with Homebrew gnu-sed in PATH it
@@ -1089,7 +1241,29 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
         echo "  ✓ ngrok ($NGROK_URL — reserved domain, no Twilio update needed)"
       else
         echo "  ✓ ngrok ($NGROK_URL)"
-        echo "  ⚠ Update Twilio webhook to: $NGROK_URL"
+        # Trailing slash is stripped because conversation-server.ts strips it
+        # before binding WEBHOOK_BASE_URL; comparing unnormalised reads as drift.
+        TWILIO_CFG_URL=$(grep -E '^TWILIO_WEBHOOK_URL=' .env 2>/dev/null | head -1 \
+          | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs | sed 's:/*$::')
+        NGROK_CMP="${NGROK_URL%/}"
+        if [ -z "$TWILIO_CFG_URL" ]; then
+          echo "  ⚠ Point the Twilio webhook at: $NGROK_URL (no TWILIO_WEBHOOK_URL recorded)"
+        elif [ "$TWILIO_CFG_URL" = "$NGROK_CMP" ]; then
+          :
+        elif ! printf '%s' "$TWILIO_CFG_URL" | grep -qE '\.ngrok(-free)?\.(app|io)$'; then
+          # A non-ngrok tunnel (e.g. Funnel) is authoritative: the phone server
+          # binds it and never starts ngrok, so this ngrok is not its tunnel.
+          :
+        else
+          # The server binds WEBHOOK_BASE_URL from this var, so a stale value
+          # leaves TwiML and <Stream> pointing at a tunnel that no longer exists.
+          echo "  ⚠ ngrok URL moved — BOTH sides are stale:"
+          echo "      was: $TWILIO_CFG_URL"
+          echo "      now: $NGROK_URL"
+          echo "      1. update the Twilio console webhook to the new URL"
+          echo "      2. set TWILIO_WEBHOOK_URL=$NGROK_URL in .env and restart the"
+          echo "         phone conversation server — it binds this at startup"
+        fi
       fi
     else
       echo "  ✗ ngrok (failed to start)"
@@ -1106,27 +1280,47 @@ echo ""
 # Verify services actually started (wait a moment, then check ports)
 sleep 3
 echo "Verifying services..."
-VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
+VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api"
+# Only verify 7845 when we actually tried to start it. Same condition as the start
+# branch: a deliberate skip must not render as a crash pointing at an empty log.
+if [ "${PERM_OK:-0}" = "1" ]; then
+  VERIFY_PORTS="$VERIFY_PORTS 7845:screen-capture"
+fi
 if [ "${SKIP_VOICE:-}" != "1" ]; then
   VERIFY_PORTS="9900:voice-agent $VERIFY_PORTS"
 fi
 if phone_stack_enabled && grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; then
   VERIFY_PORTS="$VERIFY_PORTS 3100:conversation-server"
 fi
-if [ "${SUTANDO_OBS_COLLECTOR:-}" = "1" ]; then
+if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
+# A single probe races a service still binding, so retry briefly. The deadline is
+# GLOBAL: per-port it would serialise to ports x settle seconds before core launch.
+VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
+verify_deadline=$(( $(date +%s) + VERIFY_SETTLE_S ))
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
+  # COUNT SLEEPS, never two `date` samples: at 1s granularity the two can
+  # straddle a boundary and report 1s for a port that never waited at all.
+  waited=0
+  while ! lsof -i :"$port" > /dev/null 2>&1 && [ "$(date +%s)" -lt "$verify_deadline" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
   if lsof -i :"$port" > /dev/null 2>&1; then
-    echo "  ✓ $name (port $port)"
+    if [ "$waited" -gt 0 ]; then
+      echo "  ✓ $name (port $port, after ${waited}s)"
+    else
+      echo "  ✓ $name (port $port)"
+    fi
   else
     echo "  ✗ $name (port $port) — check $LOGS_DIR/${name}.log"
   fi
 done
 echo ""
-open "http://localhost:$WEB_CLIENT_PORT"
+
 
 # Delegate to the runtime dispatcher — canonical sutando-core launch command.
 # Sutando.app and health recovery use this same Claude-or-Codex selection.
@@ -1143,6 +1337,20 @@ open "http://localhost:$WEB_CLIENT_PORT"
 # must stay detached. Restoring /dev/tty there makes the runtime launcher try
 # to attach to sutando-core from inside tmux, which blocks startup forever and
 # leaves the old core running without completing recovery.
+# --with-app runs BEFORE the exec below (which replaces this process) and is
+# guarded: its installer must never take the core down (`set -e` is on).
+if [ "$WITH_APP" -eq 1 ]; then
+    # --launch, not --supervise: a login-persistent launchd job is a separate
+    # decision the user makes explicitly.
+    echo "→ menu-bar app (--with-app): building + launching" >&2
+    if bash "$REPO/scripts/install-menu-bar-app.sh" --launch; then
+        echo "  ✓ menu-bar app launched" >&2
+        echo "    auto-start at login is opt-in: bash scripts/install-menu-bar-app.sh --supervise" >&2
+    else
+        echo "  ✗ menu-bar app setup failed (exit $?) — the core is unaffected and still starting." >&2
+    fi
+fi
+
 if [ -t 0 ] && [ -z "${TMUX:-}" ]; then
     exec >/dev/tty 2>&1
 fi

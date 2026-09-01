@@ -2,12 +2,17 @@
 """Tests for src/vault_intercept.py — bridge-level secret interception.
 
 All Keychain writes are mocked: no real 'security' subprocess is spawned,
-secrets never touch the test runner's Keychain.
+secrets never touch the test runner's Keychain. The manifest is redirected to
+a temp dir for the whole module (setUpModule) — mocking `subprocess.run` stops
+the Keychain half of a store, but `_store_in_keychain` calls `_register_key`
+afterwards, so an unredirected run writes fake key names into the real
+`<workspace>/state/secret-vault/keys.json`.
 """
 
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -48,9 +53,79 @@ import vault_intercept
 from vault_intercept import InterceptResult, intercept_vault_commands, redact_vault_commands
 
 
+_manifest_tmp = None
+_manifest_patches = []
+
+
+def setUpModule():
+    """Point the manifest at a temp dir before any test can write one.
+
+    Redirection is module-wide, not per-test: only 14 of the ~44 store-path
+    call sites here go through `_mock_store`, and a test added later that
+    forgets it would write the real manifest again.
+    """
+    global _manifest_tmp
+    _manifest_tmp = tempfile.TemporaryDirectory(prefix="vault-intercept-test-")
+    fake = os.path.join(_manifest_tmp.name, "keys.json")
+    _manifest_patches.extend([
+        patch.object(vault_intercept, "_manifest_path", return_value=fake),
+        # _read_manifest consults the legacy home-dir path directly, so a real
+        # one on the runner would still be read (and re-written) without this.
+        patch.object(vault_intercept, "_LEGACY_MANIFEST_PATH", fake),
+    ])
+    for p in _manifest_patches:
+        p.start()
+
+
+def tearDownModule():
+    for p in reversed(_manifest_patches):
+        p.stop()
+    _manifest_patches.clear()
+    if _manifest_tmp is not None:
+        _manifest_tmp.cleanup()
+
+
 def _mock_store(monkeypatch=None):
     """Return a patcher for subprocess.run that always succeeds."""
     return patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=0))
+
+
+class TestHermeticManifest(unittest.TestCase):
+    """The suite must not register key names in the real vault manifest.
+
+    `_mock_store` stops the `security` subprocess, which is why no secret VALUE
+    leaks — but `_store_in_keychain` treats returncode 0 as success and calls
+    `_register_key`, so the NAME still lands in whatever manifest resolves.
+    """
+
+    def _real_manifest_path(self):
+        from workspace_default import resolve_workspace
+        return os.path.join(
+            str(resolve_workspace()), "state", "secret-vault", "keys.json"
+        )
+
+    def test_manifest_path_is_redirected(self):
+        self.assertNotEqual(vault_intercept._manifest_path(), self._real_manifest_path())
+
+    def test_store_writes_the_temp_manifest_and_not_the_real_one(self):
+        real = self._real_manifest_path()
+        before = None
+        if os.path.exists(real):
+            with open(real) as f:
+                before = f.read()
+
+        with _mock_store():
+            vault_intercept.set_vault_key("HERMETIC_PROBE", "sk-" + "a" * 20)
+
+        # Positive control: a redirection that silently swallowed the write
+        # would pass the real-file-unchanged assertion below on its own.
+        self.assertIn("HERMETIC_PROBE", vault_intercept.list_vault_keys())
+
+        after = None
+        if os.path.exists(real):
+            with open(real) as f:
+                after = f.read()
+        self.assertEqual(before, after, f"suite wrote the real manifest at {real}")
 
 
 class TestNoVaultCommands(unittest.TestCase):
@@ -214,8 +289,52 @@ class TestUnrecognizedValueFailsClosed(unittest.TestCase):
         self.assertNotIn(value, result.text)
         self.assertEqual(result.stored, [])
         self.assertEqual(result.failed, ["PR_TRIAGE_ACTIVITY_SECRET"])
-        self.assertIn("unrecognized value", result.text)
-        self.assertIn("resend quoted", result.text.lower())
+        # Assert the PROPERTIES the refusal must carry, not its exact wording —
+        # the previous version pinned the literal phrases "unrecognized value"
+        # and "resend quoted", so any rewording broke the test without any
+        # behaviour changing, which is a test that guards prose instead of
+        # contract. What must never regress is that the owner is told all three
+        # of: it was not stored, the value is GONE, and quoting is the fix.
+        low = result.text.lower()
+        self.assertIn("not stored", low, "must say it was not stored")
+        self.assertTrue(
+            any(w in low for w in ("discard", "gone", "not kept", "gone anywhere")),
+            f"must say the VALUE IS GONE — the destructive half. Without it the "
+            f"refusal reads as a harmless no-op and the owner does not know they "
+            f"have to fetch the secret again. Got: {result.text!r}",
+        )
+        self.assertIn("quot", low, "must tell the owner that quoting is the fix")
+        # NEGATIVE CONTROL — the remedy must not promise unconditional storage.
+        # My first version of this message said "quoting skips this check and
+        # ALWAYS STORES". Quoting does skip the classifier, but the very next
+        # thing that runs is `_store_in_keychain()`, which can raise: with the
+        # store failing, a QUOTED set returns `[VAULT-STORE-FAILED]`,
+        # stored=[], failed=[key]. So the promise was false, in the one PR
+        # whose entire purpose is not to mislead an owner about recovery — an
+        # owner following it against a locked Keychain loses the fetched value
+        # a SECOND time. (Caught by john-the-dev at head 4f5b27ec; he exercised
+        # the branch rather than reading the sentence, which is why he found it
+        # and I didn't.) This assertion exists so the promise cannot come back.
+        self.assertNotIn(
+            "always store", low,
+            "the refusal must not promise unconditional storage: quoting skips "
+            "the CLASSIFIER, not the Keychain write, and that write can fail",
+        )
+
+    def test_quoted_value_can_still_fail_to_store(self):
+        """The behaviour the negative control above is about, pinned directly.
+
+        Quoting bypasses the shape classifier — it does not guarantee the
+        secret lands. If this ever starts passing `stored=[KEY]`, the recovery
+        sentence's hedge ("ATTEMPTS storage") would be understating a real
+        guarantee, and the message should be revisited deliberately."""
+        with patch.object(vault_intercept, "_store_in_keychain",
+                          side_effect=RuntimeError("keychain locked")):
+            r = intercept_vault_commands(
+                'vault set TELEGRAM_BOT_TOKEN "123456789:AAFAKEfakeFAKEfakeFAKEfakeFAKEfake"')
+        self.assertEqual(r.stored, [], "a failed Keychain write must not report stored")
+        self.assertEqual(r.failed, ["TELEGRAM_BOT_TOKEN"])
+        self.assertNotIn("123456789", r.text, "plaintext must not survive a failed store")
 
     def test_pa_prefixed_key_not_leaked(self):
         value = "pa-1234567890abcdefghijklmnopqrstuvwx"
@@ -387,6 +506,15 @@ class TestKeychainInteraction(unittest.TestCase):
         self.assertEqual(args[s_idx + 1], "MY_SECRET")
         self.assertEqual(args[w_idx + 1], "pa$$word")
 
+    def test_bare_value_trailing_sentence_punctuation_not_stored(self):
+        # Bare sentence punctuation after an unquoted value must not become part of the stored secret.
+        value = "sk-" + "a"*20 + "T3BlbkFJ" + "b"*20
+        with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+            intercept_vault_commands(f"vault set MY_KEY {value}.")
+        args = mock_run.call_args[0][0]
+        w_idx = args.index("-w")
+        self.assertEqual(args[w_idx + 1], value)
+
 
 class TestRedactVaultCommands(unittest.TestCase):
     """redact_vault_commands — scrubs vault patterns without touching Keychain."""
@@ -470,6 +598,7 @@ if __name__ == "__main__":
         TestSingleVaultSet,
         TestUnrecognizedValueFailsClosed,
         TestMultipleVaultSets,
+        TestHermeticManifest,
         TestKeychainInteraction,
         TestRedactVaultCommands,
         TestErrorHandling,

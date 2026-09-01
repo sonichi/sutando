@@ -31,13 +31,28 @@ class TestTelegramBridgeReplyParsedBody(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def _pending_replies_block(self) -> str:
-        """Return the source of the pending_replies result-polling loop."""
-        start = SRC.find("pending_replies.keys()")
+        """Return the source of the pending_replies result-polling loop.
+
+        Anchored on the loop's `for` line rather than a bare
+        `pending_replies.keys()` substring: orphaned-task-routing recovery
+        (restart-safety fix, see tests/telegram-bridge-orphaned-routing-recovery.test.py)
+        introduced `_gather_pending_task_ids()`, whose own (earlier-in-file)
+        definition references `pending_replies` without `.keys()` — a bare
+        substring search for `.keys()` would find nothing at all, or could
+        match the wrong location if the internals change again.
+        """
+        start = SRC.find("for task_id in _gather_pending_task_ids(pending_replies, RESULTS_DIR, TASKS_DIR):")
         self.assertGreater(start, 0, "pending_replies loop not found in telegram-bridge.py")
-        # Grab a generous window covering the whole loop body (now includes the
-        # per-reply channel.telegram.out obs emit, so the confirmation print sits
-        # ~3.6k chars in). Still ends well before any unrelated code.
-        return SRC[start : start + 4500]
+        # End on the loop's own dedent, not a character count. A fixed window is
+        # a latent break: any insertion pushes the last assertion off its edge.
+        head = SRC.rfind("\n", 0, start) + 1
+        indent = len(SRC[head:start])
+        end = len(SRC)
+        for m in re.finditer(r"^[ \t]*(?=\S)", SRC[start:], re.M):
+            if m.start() and len(m.group()) <= indent:
+                end = start + m.start()
+                break
+        return SRC[start:end]
 
     def test_send_reply_uses_parsed_body_not_reply_text(self):
         """send_reply() must receive parsed.body, not the raw reply_text.

@@ -40,6 +40,36 @@ class TestChatSecretFilter(unittest.TestCase):
         self.assertNotIn(token, result.text)
         self.assertIn("Remote Task Token", result.secret_types)
 
+    def test_google_api_key_is_redacted(self):
+        # This repo's own GEMINI_API_KEY has this shape. Before the pattern
+        # existed the probe below returned the input unchanged with
+        # secret_types=(), so a pasted model key was persisted to the task
+        # file and owner-activity state.
+        token = "AIza" + "S" * 35
+        result = filter_chat_secrets(f"my key is {token} thanks")
+        self.assertTrue(result.detected)
+        self.assertNotIn(token, result.text)
+        self.assertIn("Google API Key", result.secret_types)
+
+    def test_google_api_key_redacted_end_to_end_in_persisted_text(self):
+        # End-to-end persistence regression: the redacted form is what would
+        # be written, so assert the raw key survives nowhere in the output.
+        token = "AIza" + "0aZ_-" * 7
+        persisted = filter_chat_secrets(
+            f"GEMINI_API_KEY={token}\nplease configure it"
+        ).text
+        self.assertNotIn(token, persisted)
+        self.assertNotIn("AIza" + "0aZ_-", persisted)
+        self.assertIn("please configure it", persisted)
+
+    def test_aiza_prose_is_not_flagged(self):
+        # CONTROL: the 35-char tail is what makes the pattern high-precision.
+        # Prose that merely contains "AIza" must NOT be redacted, or the
+        # filter would be "detecting" by matching everything.
+        result = filter_chat_secrets("the AIza prefix identifies Google keys")
+        self.assertNotIn("Google API Key", result.secret_types)
+        self.assertIn("AIza prefix", result.text)
+
     def test_unhandled_detector_hit_redacts_the_whole_line(self):
         class Hit:
             secret_type = "High Entropy Secret"
@@ -106,7 +136,10 @@ class TestPersistenceWiring(unittest.TestCase):
 
     def test_discord_filters_logs_task_context_and_adds_cleanup_notice(self):
         source = (REPO / "src" / "discord-bridge.py").read_text()
-        self.assertIn("safe_log_text = redact_vault_commands(initial_secret_filter.text)", source)
+        # The composition moved into src/chat_redaction.py so the reader and this
+        # writer cannot drift; the log line calls the chain rather than half of it.
+        self.assertIn("safe_log_text = redact_chat_body(text)", source)
+        self.assertIn("from chat_redaction import redact_chat_body", source)
         self.assertIn("filtered_reply_context = filter_chat_secrets(reply_context)", source)
         self.assertIn("filtered_enriched = filter_chat_secrets(enriched)", source)
         self.assertIn('secret_handling_instruction("Discord"', source)

@@ -1,16 +1,18 @@
-# Shell suites that fail on ubuntu-latest CI runners due to macOS-specific
-# tooling (launchctl, BSD stat/readlink, TMPDIR shape) or timing sensitivity.
+# Shell suites that fail DETERMINISTICALLY on ubuntu-latest CI runners due to
+# macOS-specific tooling (launchctl, BSD stat/readlink, TMPDIR shape).
 # Listed suites still run in CI and their output is printed, but a failure
 # does NOT set the overall exit code — so new regressions in the other suites
 # still fail CI immediately.
 #
+# An entry whose suite PASSES fails CI — see the "stale allowlist entry" branch
+# in .github/workflows/ci.yml. Suppression that outlives its failure un-gates a
+# suite nobody thinks is un-gated, so the list has to expire on its own.
+#
+# That is why "deterministically" above is a requirement and not a description:
+# an INTERMITTENT suite listed here inverts the rule — its failing runs are
+# excused and green, its passing runs turn CI red. A flake needs fixing or
+# quarantining, not an entry here.
+#
 # Burn this list to zero: https://github.com/sonichi/sutando/issues/1934
-# qingyun-wu volunteered to fix cron-gate.test.sh and track the portability work.
-tests/codex-bounded.test.sh
-tests/cron-gate.test.sh
-tests/migration-safety-helpers.test.sh
-tests/start-cli-claude-config-dir.test.sh
-tests/startup-env-token-persist.test.sh
-tests/startup-self-log-tmp.test.sh
 tests/sutando-migrate.test.sh
 tests/sync-workspace.test.sh

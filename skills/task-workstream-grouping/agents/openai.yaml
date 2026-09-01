@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task Workstream Grouping"
+  short_description: "Group task history into inferred workstreams"
+  default_prompt: "Use $task-workstream-grouping to classify ungrouped task history into stable inferred workstreams."

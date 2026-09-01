@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
-Only the PURE shared utilities (task_archive/local_task_protocol/result_markers) are
-bundled verbatim from sonichi/sutando `src/` (option A). The transport-specific
-modules (remote_gateway_bridge, _dirs, send_allowlist) are package-canonical and
-intentionally diverge from src (dir-interface, no workspace-resolution).
+Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
+canonical for those modules — currently 14 of them, including outbox.py and its
+transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
+and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
+dir-interface, no workspace-resolution).
+
+MAP is the authority on which is which. This docstring named three modules for a
+long time after MAP grew past them, so it read as "outbox is not covered" — the
+opposite of what --check does. When you add an entry, the count above is the only
+thing here that needs updating; better still, read MAP.
 
 The relay client lives canonically in sonichi/sutando `src/` (the core
 runs it directly). This package is a *distribution* of those exact files — never
@@ -22,7 +28,21 @@ MAP = {
     "task_archive.py": "task_archive.py",
     "local_task_protocol.py": "local_task_protocol.py",
     "result_markers.py": "result_markers.py",
+    "delivery/readiness.py": "result_ready.py",
+    "dedup_recovery.py": "dedup_recovery.py",
     "workspace_lock.py": "workspace_lock.py",
+    "chat_secret_filter.py": "chat_secret_filter.py",
+    "policy/egress/result.py": "team_result_guard.py",
+    "policy/guardrail.py": "team_guardrail.py",
+    "vault_set_grammar.py": "vault_set_grammar.py",
+    "send_failure_policy.py": "send_failure_policy.py",
+    # send_failure_policy.resolve_failed_send imports it; vendoring one without
+    # the other ships a copy that dies on first call (ModuleNotFoundError).
+    "proactive_recovery.py": "proactive_recovery.py",
+    # outbox core + its transport seam: src-canonical like send_failure_policy,
+    # so the coverage gate (source = src) can see them.
+    "outbox.py": "outbox.py",
+    "outbox_adapter.py": "outbox_adapter.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 SRC_DIR = Path(__file__).resolve().parents[3] / "src"

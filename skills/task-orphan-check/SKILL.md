@@ -37,7 +37,7 @@ If no live tasks, emit "orphan-check: no live tasks, nothing to recover" and idl
 
 For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g. `task-1779570142563`). The file is `tasks/<id>.txt`. Per-task paths below use `<id>` consistently — note `<id>` already includes the `task-` prefix; do NOT add it again.
 
-1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (if Discord), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner).
+1. **Parse the header** — extract `id`, `timestamp`, `source`, `channel_id` (Discord channel or ag2.space room id — both producers supply it, and the later `contextNotFrom`/requeue workflow needs the exact id, so never discard it in favor of the friendly name), `chat_id` (Telegram), `room_name` / `channel_name` (whichever the surface carries — ag2.space sends `room_name` and no `channel_name`, so a reader that parses only the latter gets nothing and step 3b falls back to the raw id), `user_id`, `access_tier` (`owner` / `team` / `other`; default to `owner` if the field is absent — pre-tier task files predate the field and were authored by the owner).
 
 2. **Cross-reference completion markers** (any single match = task already completed):
    - **`<workspace>/results/<id>.txt`** exists → **DONE**. The result file is the canonical completion marker; if it exists the task was processed.
@@ -46,8 +46,16 @@ For each file in `tasks/`, let `<id>` be the value of the `id:` header line (e.g
 
    **Step 2b — `.sending` contract clarification** (per qingyun-sutando review of #1074):
    - `results/<id>.txt` (no suffix) → task completed AND result body written. **DONE.**
-   - `results/<id>.txt.sending` → the discord-bridge picked the result up and is mid-delivery (per #1046/#1048's lifecycle). Treat as **DONE** for orphan-check purposes — the bridge already owns post-crash recovery for these via its own startup `.sending` sweep, so we don't second-guess. Read-only either way.
-   - `results/proactive-<id>.txt[.sending]` → same pattern for proactive DMs.
+   - `results/proactive-<id>.txt[.sending]` → the bridge claimed the proactive DM by rename and is mid-delivery. Treat as **DONE** for orphan-check purposes — the bridge owns post-crash recovery via its own startup `.sending` sweep, so we don't second-guess. Read-only either way.
+   - **`results/<id>.txt.sending` (a TASK result) does not occur — do not classify on it.** Every claim-by-rename site gates on the proactive family *before* applying the suffix, so no `task-*` result is ever renamed:
+
+     | site | gate applied before `.sending` |
+     |---|---|
+     | `src/discord-bridge.py` claim loop | `f.name.startswith("proactive-")` |
+     | `src/slack-bridge.py` claim loop | `f.name.startswith("proactive-")` |
+     | `src/telegram-bridge.py` claim loop | `PROACTIVE_PREFIXES` = `("proactive-", "briefing-", "insight-", "friction-")` |
+
+     This line previously described the task form as a live mid-delivery state. It is a dead branch, and not a harmless one: on 2026-08-02 it was cited as a real completion namespace while reviewing #2525, which would have added handling for a case that cannot arise. `tests/sending-suffix-is-proactive-only.test.py` pins the invariant; if a future change *does* start claiming task results by rename, that test fails and this row must be restored **with the producing site named**.
 
 3. **Compute age** — use the IMMUTABLE arrival time, NOT file mtime (mtime gets reset by rsync, `git checkout`, `touch`, or workspace sync, which would make a genuinely old orphan look FRESH and re-fire its side effect — exactly the bug this skill exists to prevent):
    - Preferred: parse the header `timestamp:` ISO field → `task_age_s = now - parse(timestamp)`.
@@ -97,7 +105,23 @@ Otherwise:
 
    The system-instructions block is only **stripped for the preview** — the archived task file body remains intact (see step 5), so re-queueing via `mv tasks/archive/<id>.txt tasks/` preserves sandboxing for non-owner tiers.
 
-3. Group `deferred_orphans` by `access_tier` (owner / team / other) → per-tier counts; and by `channel_name` → per-channel counts.
+3. Resolve a **readable channel label** for each orphan, then group.
+
+   `channel_id` alone is unreadable in a report — `!JzcRmAhNYbiWhIWNCL:ag2.space`
+   tells the owner nothing about which conversation stalled. The task file already
+   carries the name the bridge saw:
+
+   ```python
+   name = header.get("room_name") or header.get("channel_name")   # bridges write one of these
+   cid  = header.get("channel_id") or header.get("chat_id") or ""
+   label = f"{name} ({cid})" if name else (cid or "DM")
+   ```
+
+   Use `label` everywhere the report shows a channel. Keep the id: it is what
+   `contextNotFrom` and re-queue commands key on, so dropping it trades one
+   unreadable report for an unactionable one. Group `deferred_orphans` by
+   `access_tier` (owner / team / other) → per-tier counts; and by `label` →
+   per-channel counts.
 
 4. Apply step 3c bomb-guard (see below) to decide whether to truncate the preview list.
 
@@ -107,10 +131,10 @@ Otherwise:
    Orphan recovery — N stale tasks from a prior session (oldest <Nm>, newest <Nm>, no completion markers).
 
    By tier: owner (<o>), team (<t>), other (<r>).
-   By channel: <ch1> (<x>), <ch2> (<y>), DM (<z>), ...
+   By channel: <name> (<id>) — <x>; <name2> (<id2>) — <y>; DM — <z>; ...
 
    Previews (most-recent first, first ~100 chars of task body; in-band system instructions stripped):
-   - task-<id> [<tier>, <channel>, <Nm ago>]: <preview>
+   - task-<id> [<tier>, <channel label>, <Nm ago>]: <preview>
    - ...
    [If truncated by step 3c: "+<N-20> more — see tasks/archive/ for the full list."]
 

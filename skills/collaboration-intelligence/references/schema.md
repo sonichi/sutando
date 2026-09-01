@@ -1,0 +1,284 @@
+# Collaboration Intelligence record schema
+
+Use this conceptual schema with any available durable store. Preserve stable IDs and timestamps. JSON/YAML examples are illustrative; adapt to the provider without changing semantics.
+
+## Contents
+
+- [Entity](#entity)
+- [Room](#room)
+- [Relationship](#relationship)
+- [Evidenced fact](#evidenced-fact)
+- [Candidate identity link](#candidate-identity-link)
+- [Alert](#alert)
+- [Merge rules](#merge-rules)
+- [Suggested freshness windows](#suggested-freshness-windows)
+
+## Entity
+
+```yaml
+entity_id: stable-local-id
+kind: human | agent | service | organization | unknown
+canonical_name: string | null
+aliases: [string]
+identities:
+  - provider: matrix | slack | discord | teams | email | github | other
+    user_id: stable-provider-native-user-id
+    display_name: string | null
+    bridge_origin: string | null
+    verified: false
+    activity:                       # WHERE this identity is live, not merely that it exists
+      last_seen_at: timestamp | null
+      rooms: [room-id]              # where it was actually observed
+      relative: primary | secondary | dormant | unknown
+      exclusive: true | false | unknown   # true = this person is reachable ONLY here
+owner_links:
+  - owner_entity_id: stable-local-id
+    relation: owner | operator | manager | sponsor | unknown
+    status: explicit | inferred | historical | disputed
+    fact: {source_ref: string, observed_at: timestamp, confidence: 0.0-1.0}
+affiliations:
+  - organization_entity_id: stable-local-organization-id | null
+    collaboration_role: internal | customer | external_collaborator | partner | vendor | unknown
+    scope_ref: organization-project-feature-contract-or-room-id | null
+    status: active | historical | disputed
+    fact: {source_ref: string, observed_at: timestamp, confidence: 0.0-1.0}
+attention_profile:
+  tier: standard | priority
+  label: VIP | string | null
+  designated_by_entity_id: stable-local-id | null
+  reason: string | null
+  scope_ref: organization-account-project-room-or-global-id | null
+  valid_from: timestamp | null
+  valid_until: timestamp | null
+  handling_preferences: [string]
+  source_ref: authoritative-reference | null
+roles: [evidenced_fact]
+expertise: [evidenced_fact]
+responsibilities: [evidenced_fact]
+behavior_patterns: [evidenced_fact]
+first_seen_at: timestamp
+last_seen_at: timestamp
+```
+
+## Room
+
+```yaml
+room_id: stable-local-room-id
+provider: string
+provider_room_id: stable-provider-native-room-or-channel-id
+provider_container_id: workspace-guild-server-community-id | null
+name: string | null
+topic: string | null              # the room's SELF-DECLARED purpose, read from provider state
+kind: dm | group_dm | channel | room | issue | pr | email_thread | other
+bridge_origin: string | null
+visibility: private | internal | public | unknown
+audience: internal_only | mixed_external | external_only | public | unknown
+size_band: small_under_100 | large_100_or_more | unknown
+attention_priority: high | normal | low
+attention_reasons: [string]
+purpose: [evidenced_fact]
+workstreams: [evidenced_fact]
+membership:
+  completeness: full | partial | unknown
+  sync_mode: sweep | incremental | task_snapshot | observed_only
+  observed_at: timestamp
+  last_sweep_at: timestamp | null
+  last_incremental_at: timestamp | null
+  reported_member_count: integer | null
+  listed_member_count: integer | null
+  truncated: boolean | null
+  source_ref: string
+  members:
+    - entity_id: stable-local-id
+      provider_user_id: stable-provider-native-user-id
+      collaboration_role: internal | customer | external_collaborator | partner | vendor | unknown
+      membership: joined | invited | left | observed | unknown
+latest_context:
+  summary: string
+  decisions: [string]
+  blockers: [string]
+  handoffs: [string]
+  unresolved: [string]
+  through_at: timestamp
+  source_refs: [string]
+last_seen_at: timestamp
+```
+
+## Relationship
+
+Store durable organizational relationships separately from scoped work-item collaboration.
+
+```yaml
+relationship_id: stable-local-id
+from_entity_id: stable-local-id
+to_entity_id: stable-local-id
+relation: owner | operator | manager | teammate | customer_contact | external_collaborator | collaborator | reviewer | assignee | expert | other
+timescale: durable | scoped
+scope_type: team | organization | project | feature | pr | issue | incident | room | other
+scope_ref: stable-project-feature-pr-issue-or-room-id | null
+state: active | dormant | completed | historical | disputed
+valid_from: timestamp | null
+valid_until: timestamp | null
+last_observed_at: timestamp
+last_confirmed_at: timestamp | null
+facts: [evidenced_fact]
+```
+
+- Use `durable` for team, reporting, ownership, and recurring functional relationships that usually persist for weeks or months.
+- Use `scoped` for project, feature, PR, issue, or incident collaboration that commonly persists for days or weeks.
+- Tie every scoped relationship to `scope_ref` when available. On merge, close, resolution, cancellation, or another terminal event, mark it `completed` or `historical`; do not delete it or let it imply current responsibility.
+- Do not infer the end of a durable relationship from short-term inactivity. Require explicit change, contradictory evidence, or a much longer review interval.
+- Interpret `customer` and `external_collaborator` relative to an organization or owner and, when applicable, a project/contract scope. Do not encode them as human/agent entity kinds.
+- Keep priority/VIP status orthogonal to entity kind, affiliation, trust, and authority. Accept it only from explicit designation; never infer it from behavior or public status.
+
+## Evidenced fact
+
+```yaml
+value: string
+status: explicit | observed | inferred | disputed | superseded
+source_ref: provider-specific-stable-reference
+observed_at: timestamp
+valid_from: timestamp | null
+valid_until: timestamp | null
+confidence: 0.0-1.0
+access_scope: room-id | private | organization | public
+```
+
+## Store freshness
+
+Per-record `observed_at` says how old a fact you *have* is. It cannot say anything about a fact you do **not** have — and an empty result is the most common thing a map returns. Without store-level freshness, "this person is not in the map" and "the map has not looked since Tuesday" are the same answer, and the second one silently reads as the first.
+
+Record it per source, not once for the whole store: sources go stale independently, and a store that swept AG2 Space an hour ago and GitHub last week is fresh and stale at the same time.
+
+```yaml
+store_freshness:
+  - source: provider-or-feed-id        # e.g. "matrix:ag2.space", "github:owner/repo"
+    last_swept_at: timestamp
+    cursor: opaque-provider-cursor | null   # resume point; null = full sweep only
+    coverage: full | partial | unknown      # partial when the provider truncated
+    coverage_note: string | null            # e.g. "roster capped at 10 members"
+    last_error_at: timestamp | null         # a failed sweep must not look like a quiet one
+    unknown_kind: unreachable_here | unsupported_by_provider | null
+```
+
+**`unknown_kind` answers the only question a miss actually raises: is it worth asking
+again?** Without it, a provider that structurally cannot enumerate members and one that
+merely lacks a token on this host return the same empty result, and the skill gives both
+the same advice — go look. For the structural case that sends the caller into a wall that
+produces no error, just another empty result indistinguishable from "not asked yet".
+
+- `unsupported_by_provider` — retrying is pointless anywhere. The gap is in the provider.
+- `unreachable_here` — retrying is pointless *on this host*, and may succeed on another
+  or after configuration. **It is host-local, so it must not be synced across hosts as a
+  fact**; one machine's "cannot reach" is another's ordinary success. Only
+  `unsupported_by_provider` is safely shareable.
+
+Record it per source at sweep time, not per lookup — it is a property of the source's
+capability, not of any one sweep, and re-deriving it per lookup means deriving it
+unverified every time.
+
+**Report freshness with every miss.** When a lookup returns nothing, the answer is "not in the map; this source last swept at `<t>`, coverage `<c>`", never a bare "not found". A miss against a stale or partial source is usually a *reason to go look*, not a fact about the world — and the caller cannot make that distinction unless you hand it over.
+
+The exception is `unknown_kind: unsupported_by_provider`, where going to look is the wall described above: report the miss as a property of the source, and do not advise a retry that cannot succeed. Hand over `unknown_kind` alongside `last_swept_at` and `coverage` so the caller can tell the two apart.
+
+`coverage: partial` is not a lesser `full`. A provider that caps a roster returns a complete-looking list, so partial coverage must be recorded at write time by comparing what was returned against the count the provider reported — it cannot be recovered afterwards by inspecting the stored data, which looks consistent either way.
+
+`last_error_at` exists because a sweep that failed and a sweep that found nothing new both leave the store unchanged. Only the error field separates them.
+
+## Candidate identity link
+
+```yaml
+left_identity: provider:id
+right_identity: provider:id
+confidence: 0.0-1.0
+evidence: [source_ref]
+conflicts: [string]
+state: proposed | confirmed | rejected
+```
+
+## Alert
+
+```yaml
+alert_key: unfamiliar:provider:id:room-id
+type: unfamiliar_identity | identity_conflict | ownership_change | stale_context | scope_risk
+severity: info | attention | urgent
+entity_or_room_id: string
+reason: string
+first_seen_at: timestamp
+last_seen_at: timestamp
+acknowledged: false
+```
+
+## Quick lookup index
+
+A compact, bounded cache loaded first (see SKILL.md "Quick lookup index"). Never
+authoritative — a miss means consult the full store, not that the entity is absent.
+
+```yaml
+quick_lookup:
+  updated_at: timestamp
+  recent_entities:            # capped, most-recent first; VIP/priority pinned
+    - entity_id: stable-local-id
+      kind: human | agent | service
+      one_line: "role/expertise, e.g. reviews backend delivery changes"
+      owner_entity_id: stable-local-id | null   # for agents
+      active_rooms: [room_id]
+      priority: none | priority | vip
+      last_seen_at: timestamp
+  active_rooms:               # capped, most-recent first
+    - room_id: provider:stable-channel-id
+      name: string
+      purpose: string
+      latest_context_line: string
+      size_band: small | large
+  active_scopes:              # open collaborations
+    - scope_ref: pr|issue|incident|feature:id
+      participants: [entity_id]
+  open_unknowns: [alert_key]
+```
+
+## Merge rules
+
+- Upsert identities by `(provider, user_id)` and rooms by `(provider, provider_room_id)` plus the provider container when required for uniqueness.
+- Never key an identity or room by display name, handle, nickname, or room title.
+- Merge cross-provider identities only with explicit confirmation or multiple independent strong signals totaling at least `0.9` confidence.
+- Never use display-name equality alone. Two people can render the same name on one homeserver, so a display-name join does not merely lose precision — it returns *a* stable ID with full confidence, and the wrong one is indistinguishable from the right one downstream.
+- **An owner-stated mapping outranks any derived one.** Record it as an evidenced fact with `source: owner_stated` and the time it was stated, and do not let a later derivation silently supersede it. A derivation that disagrees with an owner statement is a conflict to surface, not a correction to apply.
+- Keep aliases after a verified rename; do not treat a rename as a new entity.
+- `name` and `topic` are mutable aliases, never keys. **`topic` is the room's self-declared
+  purpose (provider state); `purpose` is what the map inferred from traffic.** Store both, and
+  treat a divergence between them as a signal in its own right — usually a room whose real use
+  drifted while nobody updated the topic. Do not silently overwrite either with the other.
+- Supersede time-varying facts rather than deleting them silently.
+- Decay inferred operational facts when not reconfirmed: room context quickly, active responsibility moderately, identity and explicit ownership slowly.
+- Deduplicate alerts by `alert_key`; update `last_seen_at` instead of repeatedly notifying.
+
+## Suggested freshness windows
+
+Treat these as defaults, not truth:
+
+| Fact | Review after |
+|---|---:|
+| Latest room context | 7 days or after a major decision |
+| Active workstream / blocker | 14 days |
+| PR/issue/incident collaboration | 3–7 days or at terminal state |
+| Project/feature collaboration | 7–30 days or at terminal state |
+| Durable team collaboration | 30–90 days |
+| Priority/VIP designation | At explicit expiry or every 90 days |
+| Feature responsibility | 30 days unless explicitly durable |
+| Behavior pattern | 60 days |
+| Explicit identity / ownership | 180 days |
+
+Explicit end dates and newer contradictory evidence override these windows.
+
+## Roster refusal keys
+
+`allowlisted` (bool | null) — whether a mention to this Stand has been observed to
+trigger it. `false` REFUSES the send. **It records an observation, not a cause**:
+nothing in the tree sets it after a detected bounce, so no message may claim one.
+`null`/absent means never observed — send, then record.
+
+`refusal_basis` / `note` (string) — the entry's own words for why it refuses, printed
+verbatim by `notify_reviewers.resolve()`. Required whenever a blank `stand`/`room` is
+DELIBERATE: without it the refusal reads as missing data and the obvious repair —
+populating the fields — silently overrides it (#3468). `refusal_basis` wins over `note`.

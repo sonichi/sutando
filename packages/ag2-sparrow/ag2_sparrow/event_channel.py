@@ -53,10 +53,14 @@ def _sse_events(resp):
 
 class EventChannel:
     def __init__(self, inbox, base_url: str, headers: dict,
-                 log=print, max_backoff: float = 30.0):
+                 log=print, max_backoff: float = 30.0, auth_retry: bool = False):
         self._inbox = inbox
         self._base = base_url.rstrip("/")
-        self._headers = dict(headers)
+        # Held BY REFERENCE, not copied: the owning bridge mutates this dict
+        # in place when the bearer rotates (auth-rejection recovery), and the
+        # next (re)connect must carry the new token without a restart. Every
+        # request already works on a per-request copy (dict(self._headers)).
+        self._headers = headers
         # Cloudflare rejects urllib's default UA with 403 — which _consume_once
         # classifies as FATAL, so without this the channel would stop
         # permanently on first real-gateway connect (review P1). Same explicit
@@ -64,6 +68,16 @@ class EventChannel:
         self._headers.setdefault("User-Agent", "sutando-gateway-client/1.0")
         self._log = log
         self._max_backoff = max_backoff
+        # auth_retry: the owning bridge has file-based token-rotation recovery
+        # armed, so a 401/403 is a WINDOW (revoked key awaiting re-connect),
+        # not a terminal condition — keep reconnecting with backoff; the next
+        # attempt reads the shared header dict, which the bridge hot-swaps
+        # when the rotated token lands. Without it (default), 401/403 stays
+        # fatal exactly as before. 404 is fatal either way (no such route —
+        # rotation can't fix a missing endpoint). Review P1: during a
+        # recovery window the SSE channel could 401, stop permanently, and
+        # nothing restarted it after the poller resumed.
+        self._auth_retry = auth_retry
         self.health = {"status": "init", "last_cursor": inbox.durable_cursor(),
                        "last_event_at": None, "retry_count": 0, "error": None}
 
@@ -88,6 +102,11 @@ class EventChannel:
             resp = self._open()
         except urllib.error.HTTPError as e:
             if e.code in _FATAL_HTTP:
+                if self._auth_retry and e.code in (401, 403):
+                    self._set(status="auth_failed", error=f"HTTP {e.code}")
+                    self._log(f"event-channel: auth rejected HTTP {e.code} — "
+                              "retrying (token-rotation recovery armed)")
+                    return True
                 self._set(status="auth_failed", error=f"HTTP {e.code}")
                 self._log(f"event-channel: fatal HTTP {e.code} — stopping")
                 return False

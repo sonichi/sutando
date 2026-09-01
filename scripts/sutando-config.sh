@@ -33,22 +33,73 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Resolve the Python interpreter. On a fresh Mac there is NO system python3 — the
+# bare `python3` name resolves to Apple's Xcode-CLT stub, which prints an "install
+# developer tools" notice and returns NOTHING, so callers that don't export
+# SUTANDO_PY (e.g. the desktop's Tauri sign-in, which shells this to resolve
+# CLAUDE_CONFIG_DIR) got an empty result and failed with "could not resolve the
+# bundled CLAUDE_CONFIG_DIR". Prefer, in order: an explicit SUTANDO_PY (set by
+# launch-sutando.sh), the bundle-vendored relocatable python next to the engine
+# copy (`<engine>/runtime/python`, i.e. REPO_ROOT/../runtime), then system python3.
+# Single-sourced in scripts/python-binary.sh so this cascade cannot drift from
+# start-cli.sh / startup.sh. The `else PY="python3"` this replaced still shelled
+# the CLT stub when neither earlier tier existed, which is the dialog itself.
+. "$REPO_ROOT/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO_ROOT")"
+
+# Demand Python LAZILY, at the point of use. Requiring it up front was wrong:
+# 8 of this script's subcommands are pure shell (app-node-dir, node-bin,
+# tsx-bin, claude-home-path, subdirs, bootstrap, tmux-socket, run-dir)
+# and answering them needs no interpreter — yet an eager
+# `require_python … || exit 1` failed them too. src/startup.sh:57 asks for
+# `app-node-dir` under `set -e`, so on a Darwin/no-CLT host that eager demand
+# terminated startup at the very first config lookup (CR #2599, @qingyun-wu).
+#
+# Routing every interpreter call through this wrapper keeps the demand honest
+# without a hand-maintained list of which subcommands need Python: a branch
+# that calls `py` requires it, a branch that does not, does not. A list would
+# drift from the bodies the moment a subcommand gained or dropped a `-c`.
+# Failing once, with a fix, still beats letting each call degrade into the
+# shell's opaque `: command not found` (CR #2599, @john-the-dev).
+py() {
+  if [ -z "$PY" ]; then
+    PY="$(require_python "$REPO_ROOT" "resolve Sutando configuration")" || exit 1
+  fi
+  "$PY" "$@"
+}
+
 cmd="${1:-workspace}"
 
 case "$cmd" in
   workspace)
     # `python3 -c` instead of `-m` so we don't pollute argv[0] with a module
     # path that confuses the loader's exe-anchored repo discovery.
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_workspace
 print(resolve_workspace(), end='')
 "
     ;;
+  voice-pidfile)
+    # Single resolver for the voice-agent pid metadata file (#2722). Canonical
+    # lives under state/locks/; the root path is a ~30-day reader fallback so an
+    # agent started under pre-move code stays stoppable (docs/migration-transition-window.md).
+    # $2 (optional): an already-resolved workspace root — callers that hold one
+    # inject it so this cannot disagree with the tree they operate on.
+    if [ -n "${2:-}" ]; then _ws="$2"; else _ws="$(bash "$0" workspace)" || exit 1; fi
+    _canon="$_ws/state/locks/voice-agent.pid"
+    _legacy="$_ws/.voice-agent.pid"
+    if [ ! -f "$_canon" ] && [ -f "$_legacy" ]; then
+      echo "sutando-config: voice-pidfile using legacy $_legacy (pre-move agent; transition window per #2722)" >&2
+      printf '%s' "$_legacy"
+    else
+      printf '%s' "$_canon"
+    fi
+    ;;
 
   vault-enabled)
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -57,7 +108,7 @@ print('true' if resolve_vault().get('enabled') else 'false', end='')
     ;;
 
   vault-url)
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -69,7 +120,7 @@ print(resolve_vault().get('remote_url', ''), end='')
     # PR-3: print sync.include paths one-per-line. Consumed by
     # sync-workspace.sh::_compose_gitignore_content to drive the carrier-set
     # whitelist. Schema in sutando_config.py::resolve_vault.
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -82,7 +133,7 @@ for p in resolve_vault().get('sync', {}).get('include', []):
     # PR-3: print sync.exclude paths one-per-line. Explicit denies emitted
     # AFTER the include whitelist (gitignore last-match wins), so user can
     # carve out subpaths from an otherwise-included directory.
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -95,7 +146,7 @@ for p in resolve_vault().get('sync', {}).get('exclude', []):
     # Print migrate.stale_hosts (one per line) — per-clone machine-<host> dirs
     # the legacy import should DROP. Lives in sutando.config.local.json (gitignored,
     # per-clone), NOT .env: this is config, not a secret. Default empty.
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import load_config
@@ -108,7 +159,7 @@ for h in load_config().get('migrate', {}).get('stale_hosts', []):
     # Print migrate.skip_skills (one per line) — per-clone host-only skill names
     # the legacy import should NOT salvage to shared (stale/superseded). Same
     # gitignored per-clone config home as migrate-stale-hosts. Default empty.
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import load_config
@@ -123,7 +174,7 @@ for s in load_config().get('migrate', {}).get('skip_skills', []):
     # legacy `claude_sutando_config_dir.subdir` (deprecation-warned) →
     # `<workspace>/.claude-sutando` baked default. `synced=true` entries are
     # validated to be under the workspace at load time.
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_claude_sutando_config_dir
@@ -179,7 +230,7 @@ print(resolve_claude_sutando_config_dir(), end='')
     # Optional second arg picks by id or type; defaults to first type=claude.
     # Example: `bash sutando-config.sh core-config-dir-env-name` → CLAUDE_CONFIG_DIR
     _selector="${2:-claude}"
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import find_core_config_dir
@@ -191,7 +242,7 @@ print(entry['env_name'], end='')
     ;;
 
   core-runtime)
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_core_runtime
@@ -204,7 +255,7 @@ print(resolve_core_runtime(), end='')
     # core_config_dirs entry. Selector semantics identical to
     # core-config-dir-env-name.
     _selector="${2:-claude}"
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import find_core_config_dir
@@ -219,12 +270,32 @@ print(entry['value'], end='')
     # v0.9 — print all resolved core_config_dirs entries as JSON (one object
     # per line — JSON Lines). For tooling that wants to enumerate without
     # parsing the full merged config.
-    python3 -c "
+    py -c "
 import json, sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_core_config_dirs
 for entry in resolve_core_config_dirs():
     print(json.dumps(entry))
+"
+    ;;
+
+  stand)
+    # This instance's `Stand:` commit-trailer value, from the per-clone config
+    # key `stand` (sutando.config.local.json). Empty when unset.
+    #
+    # Both fleet instances commit under the owner's GH-mapped email (CLA), so no
+    # git field distinguishes them; the trailer is the only discriminator, and
+    # consumers need it WITHOUT an environment (the scheduled cron exports
+    # nothing — john-the-dev, sutando#2484). Deliberately has NO fallback guess:
+    # an unset key must read as "unknown" so callers decline rather than
+    # attribute a foreign identity. Never infer it from the host name — that is
+    # installation-specific policy and would assign this owner's Stand values on
+    # someone else's machine.
+    py -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT')
+from src.sutando_config import load_config
+print(str(load_config().get('stand', '') or '').strip(), end='')
 "
     ;;
 
@@ -239,7 +310,7 @@ for entry in resolve_core_config_dirs():
     #   1. $SUTANDO_HOST_LABEL (or legacy $SUTANDO_HOST_OVERRIDE)
     #   2. macOS `scutil --get LocalHostName` (stable Bonjour name)
     #   3. short `hostname`
-    python3 -c "
+    py -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.util_paths import _host_label
@@ -252,6 +323,90 @@ print(_host_label(), end='')
     # for hosts with no homebrew/nvm/volta). CONFIG-RESOLVED, not hardcoded:
     # override via $SUTANDO_APP_NODE_DIR; default = the app-support engine path.
     printf '%s' "${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}"
+    ;;
+
+  python-bin)
+    # SINGLE SOURCE OF TRUTH for the Python interpreter, mirroring node-bin.
+    # $PY is resolved at the top of this file with the documented precedence:
+    #   1. $SUTANDO_PY               (exported by launch-sutando.sh)
+    #   2. <engine>/runtime/python   (the bundle-vendored relocatable python)
+    #   3. system `python3`          (may be Apple's CLT stub — see below)
+    #
+    # Exposed because callers were re-deriving it and getting it WRONG in a way
+    # that fails silently. src/startup-runtime.sh's managed-credential gate
+    # probed `command -v python3` then Homebrew, skipping tiers 1 and 2, so a
+    # host with a broken `python3` first on PATH and a perfectly good $SUTANDO_PY
+    # concluded "no usable python3" and left voice disabled while a valid managed
+    # credential sat on disk (sonichi/sutando#2197 review, 2026-08-02).
+    #
+    # FAIL-CLOSED with a SMOKE TEST (voice-reliability plan amendment T1): this
+    # prints an ABSOLUTE interpreter path only after executing it and importing
+    # `fcntl`, else exits non-zero with a fix. Callers building on the voice
+    # lock helper (scripts/voice-lock.py) must never receive an unverified
+    # interpreter — the previous contract ("prints the interpreter to TRY
+    # FIRST") pushed the execution probe to every caller, and the ones that
+    # skipped it shelled the Xcode-CLT stub. resolve_python() never returns
+    # the stub itself (it checks `xcode-select -p` before trusting the system
+    # location), so executing $PY here cannot raise the CLT install dialog.
+    if [ -z "$PY" ]; then
+      # Reuse require_python's actionable multi-line message, then fail.
+      require_python "$REPO_ROOT" "resolve python-bin" >/dev/null || exit 1
+      exit 1
+    fi
+    # Normalize to an absolute, physically-resolved path (the bundled tier is
+    # "<repo>/../runtime/python/bin/python3", which contains a `..`).
+    _pb="$PY"
+    case "$_pb" in
+      */*) : ;;
+      *) _pb="$(command -v "$_pb" 2>/dev/null || true)" ;;
+    esac
+    _pb_dir="$(cd "$(dirname "$_pb")" 2>/dev/null && pwd -P || true)"
+    if [ -z "$_pb_dir" ]; then
+      echo "sutando: python-bin: resolved interpreter '$PY' has no resolvable directory" >&2
+      exit 1
+    fi
+    _pb="$_pb_dir/$(basename "$_pb")"
+    if ! "$_pb" -c 'import fcntl' >/dev/null 2>&1; then
+      {
+        echo "sutando: python-bin: '$_pb' failed the smoke test (execute + import fcntl)."
+        echo "  The interpreter exists but does not run or lacks the stdlib."
+        echo "  Fix: install python3 (brew install python), set SUTANDO_PY to a"
+        echo "  working interpreter, or run xcode-select --install."
+      } >&2
+      exit 1
+    fi
+    printf '%s' "$_pb"
+    ;;
+  node-bin)
+    # SINGLE SOURCE OF TRUTH for the Node executable (G1.5 node-bundle,
+    # owner-adopted design + owner review 2026-07-19). Precedence:
+    #   1. $SUTANDO_NODE — the EXACT executable, exported by the desktop app.
+    #      AUTHORITATIVE ONCE SET: if it is set but not executable, that is a
+    #      desktop packaging error — FAIL CLOSED (stderr + exit 1) instead of
+    #      silently rescuing via whatever node the host happens to have, which
+    #      would mask the packaging bug and void the deterministic-runtime
+    #      guarantee (owner review P1-1).
+    #   2. app-node-dir/node — the bundled runtime at its canonical home
+    #      <engine-root>/runtime/node/bin (covers launchd jobs whose plist
+    #      doesn't export SUTANDO_NODE).
+    #   3. first `node` on PATH — dev/OSS hosts, unchanged behavior.
+    # Prints the resolved path; empty output + exit 0 when nothing resolves
+    # (caller decides), exit 1 ONLY for the invalid-explicit case.
+    if [ -n "${SUTANDO_NODE:-}" ]; then
+      if [ -x "${SUTANDO_NODE}" ]; then
+        printf '%s' "$SUTANDO_NODE"
+      else
+        echo "sutando-config: SUTANDO_NODE is set but not an executable: $SUTANDO_NODE (desktop packaging error — refusing PATH fallback)" >&2
+        exit 1
+      fi
+    else
+      _app_node="${SUTANDO_APP_NODE_DIR:-$HOME/Library/Application Support/space.ag2.app/engine/runtime/node/bin}/node"
+      if [ -x "$_app_node" ]; then
+        printf '%s' "$_app_node"
+      else
+        command -v node 2>/dev/null || true
+      fi
+    fi
     ;;
 
   tsx-bin)
@@ -281,7 +436,7 @@ print(_host_label(), end='')
     ;;
 
   dump)
-    python3 -m src.sutando_config
+    py -m src.sutando_config
     ;;
 
   subdirs)
@@ -319,6 +474,40 @@ print(_host_label(), end='')
     printf '%s' "${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
     ;;
 
+  run-dir)
+    # The runtime run-dir — where the per-runtime sockets/pids live. MIRRORS
+    # #2325's ag2space runtime-api rundir.py EXACTLY, so the shell (this getter,
+    # start-cli, health-check) and the daemon/CLI can never disagree on the path.
+    # Resolution order (must match rundir.py.run_dir()):
+    #   1. SUTANDO_RUN_DIR                                   explicit override
+    #   2. darwin: ~/Library/Application Support/space.ag2.app/run   (Desktop root)
+    #   3. $XDG_RUNTIME_DIR/sutando                          Linux/systemd per-user
+    #   4. ~/.sutando/run                                    portable fallback
+    if [ -n "${SUTANDO_RUN_DIR:-}" ]; then
+      printf '%s' "$SUTANDO_RUN_DIR"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+      printf '%s' "$HOME/Library/Application Support/space.ag2.app/run"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+      printf '%s' "$XDG_RUNTIME_DIR/sutando"
+    else
+      printf '%s' "$HOME/.sutando/run"
+    fi
+    ;;
+
+  runtime-socket)
+    # The runtime-API daemon's Unix socket. The default is (actor, instance)
+    # scoped, so this EXECS rundir.py rather than mirroring it: a shell copy of
+    # the chain published the pre-actor flat socket while the daemon listened on
+    # the scoped one, and no client could reach a fresh daemon (review P1).
+    # No fallback on failure: a synthesized flat endpoint is a plausible WRONG
+    # answer, and rc=0 beside it is worse than no answer at all.
+    if [ -n "${SUTANDO_RUNTIME_SOCKET:-}" ]; then
+      printf '%s' "$SUTANDO_RUNTIME_SOCKET"
+    else
+      py "$REPO_ROOT/src/runtime-api/rundir.py" --socket
+    fi
+    ;;
+
   runtime)
     # Emit this install's AgentRuntime descriptor as one JSON object — the single
     # OSS-side contract the desktop app reads to resolve which runtime to attach
@@ -336,7 +525,7 @@ print(_host_label(), end='')
     # socket. Reuses src/runtime-health.py for alive/health/authenticated (single
     # liveness source of truth) and the canonical resolve_claude_sutando_config_dir()
     # for brain (honors core_config_dirs[type=claude] customization).
-    python3 -c "
+    py -c "
 import sys, os, json, time, subprocess
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_workspace, resolve_claude_sutando_config_dir
@@ -458,24 +647,97 @@ except Exception:
 # code: the source-version identity of the runtime — 'which Sutando is this,
 # behaviorally?' Prompts + skills + scripts in the repo determine behavior, so
 # the desktop app (and fleet tooling) wants this to reason about version-compat
-# and to spot a locally-modified core. All git-native + best-effort (None when
-# not a git checkout). tree_sha is the content hash of TRACKED files (version-
-# independent); dirty flags uncommitted edits. A stronger working-tree
+# and to spot a locally-modified core. Git is authoritative for checkouts;
+# packaged engines fall back to the build-authored ENGINE_MANIFEST beside the
+# copied repo. tree_sha is the content hash of TRACKED files (version-
+# independent); packaged consumers use tree_digest instead. dirty flags
+# uncommitted edits. A stronger working-tree
 # 'source_sha' (hashes uncommitted + untracked behavior files) is a documented
 # follow-up alongside the identity block.
-def _git(*a):
+# Resolve ONCE, before any spawn. Two gates, both required:
+#   1. No .git marker -> not a checkout, so every field below would be None
+#      anyway. The packaged app ships the engine as an rsync copy WITHOUT .git,
+#      so on that install these five calls did no useful work at all.
+#      os.path.exists, NOT isdir: a linked worktree or submodule has .git as a
+#      FILE containing a gitdir: pointer, and isdir() blanked the identity
+#      fields on those perfectly valid checkouts (@john-the-dev, #2478).
+#   2. No runnable git -> on a Mac without developer tools /usr/bin/git is the
+#      Xcode-CLT stub, and SPAWNING it raises the modal install dialog before it
+#      can fail. Catching a non-zero exit is too late; the prompt already fired.
+# The desktop app polls this descriptor (core_terminal.rs), so the old code
+# leaked that dialog on every poll of a packaged, toolchain-free install.
+_git_bin = None
+if os.path.exists(os.path.join(repo, '.git')):
     try:
-        r = subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, timeout=5)
+        sys.path.insert(0, os.path.join(repo, 'src'))
+        from git_binary import resolve_git
+        _git_bin = resolve_git()
+    except Exception:
+        _git_bin = None
+
+def _git(*a):
+    if _git_bin is None:
+        return None
+    try:
+        r = subprocess.run([_git_bin, '-C', repo, *a], capture_output=True, text=True, timeout=5)
         return (r.stdout.strip() or None) if r.returncode == 0 else None
     except Exception:
         return None
+
+def _engine_manifest():
+    # Packaging authors the parent manifest; the in-repo path is compatibility-only.
+    for path in (os.path.join(os.path.dirname(repo), 'ENGINE_MANIFEST.json'),
+                 os.path.join(repo, 'ENGINE_MANIFEST.json')):
+        try:
+            with open(path) as f:
+                value = json.load(f)
+            if isinstance(value, dict):
+                return value
+        except (OSError, ValueError):
+            pass
+    return {}
+
+_git_revision = _git('rev-parse', 'HEAD')
+_manifest = {} if _git_revision else _engine_manifest()
+_manifest_revision = _manifest.get('sha')
+if not (isinstance(_manifest_revision, str) and len(_manifest_revision) >= 8
+        and all(c in '0123456789abcdefABCDEF' for c in _manifest_revision)):
+    _manifest_revision = None
+_revision = _git_revision or _manifest_revision
+_git_describe = _git('describe', '--tags', '--always', '--dirty')
+_manifest_branch = _manifest.get('branch')
+if not isinstance(_manifest_branch, str):
+    _manifest_branch = None
+_manifest_dirty = _manifest.get('dirty')
+if not isinstance(_manifest_dirty, bool):
+    _manifest_dirty = False
 code = {
-    'commit': _git('rev-parse', '--short', 'HEAD'),
-    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD'),
-    'describe': _git('describe', '--tags', '--always', '--dirty'),
+    'commit': _revision[:7] if _revision else None,
+    'revision': _revision,
+    'branch': _git('rev-parse', '--abbrev-ref', 'HEAD') or _manifest_branch,
+    'describe': _git_describe or (_revision[:7] if _revision else None),
     'tree_sha': _git('rev-parse', 'HEAD^{tree}'),
-    'dirty': bool(_git('status', '--porcelain')),
+    'dirty': bool(_git('status', '--porcelain')) if _git_revision else _manifest_dirty,
+    'source': 'git' if _git_revision else ('engine-manifest' if _manifest_revision else None),
+    'built_at': _manifest.get('built_at') if isinstance(_manifest.get('built_at'), str) else None,
+    'tree_digest': (_manifest.get('post_build_tree_digest')
+                    if isinstance(_manifest.get('post_build_tree_digest'), str) else None),
 }
+# run-dir + runtime-api socket: IMPORT rundir.py instead of re-deriving it. The
+# socket default is (actor, instance) scoped, so a hand-mirrored copy of that
+# chain published a socket no daemon listens on (review P1). NOTE: no
+# shell-active chars in this comment block -- the python runs inside a bash
+# double-quoted -c string, so a dollar-var or backtick here would be
+# bash-expanded and break the program.
+sys.path.insert(0, os.path.join(repo, 'src', 'runtime-api'))
+import rundir as _rd
+_rundir = str(_rd.run_dir())
+_runtime_socket = _rd.socket_path()
+# runtimeRoot = parent of run/ when run-dir is <root>/run (darwin App-Support,
+# portable dot-sutando); for the XDG case the run-dir (XDG_RUNTIME_DIR/sutando) IS
+# the app dir (its parent is the shared XDG base), so use the run-dir itself.
+_runtime_root = os.path.dirname(_rundir) if os.path.basename(_rundir) == 'run' else _rundir
+
 print(json.dumps({
     'alive': bool(h.get('core_running', False)),
     'repo': repo,
@@ -503,12 +765,31 @@ print(json.dumps({
     'call_tiers': probe_call_tiers,
     'health': h.get('health', 'unknown'),
     'authenticated': h.get('authenticated'),
+    # ── additive runtime-standardization fields (standard.md task A P1; air
+    # confirmed ADDITIVE 2026-07-26). Old readers ignore unknown keys, and the
+    # existing socket/session fields stay for desktop back-compat. The components
+    # field (the 4-window topology) is intentionally NOT emitted yet — it lands in P2
+    # (NOTE: no backticks/$-vars anywhere in this python -c comment block — it runs
+    # inside a bash double-quoted -c string, so a backtick would command-substitute
+    # and a $-var would expand; both break the program / execute PATH binaries.)
+    # with the session rename (sutando-core -> sutando + core/gateway/runtime-api/
+    # monitor windows); emitting it now would misrepresent the single current
+    # session.
+    'schemaVersion': 1,
+    'runtimeId': os.environ.get('SUTANDO_RUNTIME_ID', 'primary'),
+    'runtimeRoot': _runtime_root,
+    'runtimeSocket': _runtime_socket,
+    'backend': {
+        'type': 'tmux',
+        'socket': h.get('tmux_socket') or probe_socket,
+        'session': h.get('session', 'sutando-core'),
+    },
 }))
 "
     ;;
 
   *)
-    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|runtime|dump|subdirs|bootstrap}" >&2
+    echo "usage: $0 {workspace|core-runtime|vault-enabled|vault-url|vault-sync-include|vault-sync-exclude|claude-sutando-config-dir|claude-home-path <subpath>|core-config-dir-env-name [type|id]|core-config-dir-value [type|id]|core-config-dirs|host-label|tmux-socket|run-dir|runtime-socket|runtime|dump|subdirs|bootstrap}" >&2
     exit 2
     ;;
 esac

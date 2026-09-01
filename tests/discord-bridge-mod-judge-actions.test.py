@@ -14,11 +14,32 @@ Exit 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+import tempfile
+import os
 import asyncio
 import importlib.util
 import sys
 import types
 from pathlib import Path
+
+# Isolate the channel config BEFORE importing the bridge, and SEED it.
+#
+# This file used to write a fake DISCORD_BOT_TOKEN into the operator's real
+# `~/.claude/channels/discord/.env` whenever that file was absent. On a machine
+# that has the file the write is a no-op, which is why it survived — the damage
+# lands only on a host that has LOST its token, which is the host you least want
+# a fake one planted on. A fake token also satisfies startup.sh's
+# `grep -q "DISCORD_BOT_TOKEN="` and defeats the #2638 vault fallback, which
+# fires only when no `.env` value exists.
+#
+# Seeding matters as much as redirecting: `channel_access_path()` falls back to
+# the legacy real-home `access.json` when the canonical path is missing, so an
+# EMPTY temp config dir still reads the operator's live allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-discord-bridge-mod-")
+_ccd_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd_discord.mkdir(parents=True, exist_ok=True)
+(_ccd_discord / "access.json").write_text('{"allowFrom": []}')
+(_ccd_discord / ".env").write_text("DISCORD_BOT_TOKEN=test-token-not-real\n")
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -58,7 +79,7 @@ sys.modules["discord"] = _discord_stub
 
 def load_bridge():
     src = (REPO / "src" / "discord-bridge.py").read_text()
-    fake_env_dir = Path.home() / ".claude" / "channels" / "discord"
+    fake_env_dir = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
     fake_env = fake_env_dir / ".env"
     if not fake_env.exists():
         fake_env_dir.mkdir(parents=True, exist_ok=True)
@@ -66,7 +87,7 @@ def load_bridge():
     spec = importlib.util.spec_from_loader("bridge", loader=None)
     bridge = importlib.util.module_from_spec(spec)
     bridge.__file__ = str(REPO / "src" / "discord-bridge.py")
-    exec(src, bridge.__dict__)
+    exec(compile(src, bridge.__file__, "exec"), bridge.__dict__)
     return bridge
 
 

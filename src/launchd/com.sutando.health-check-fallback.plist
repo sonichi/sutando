@@ -15,19 +15,26 @@
   thresholds make sub-5min polling redundant.
 
   Installed by `bash src/install-health-check-launchd.sh` after the install
-  script substitutes __REPO__, __PYTHON__, and __HOMEBREW_BIN__ with the
-  user's actual paths. Do NOT load this template directly — paths must be
-  expanded first.
+  script substitutes __REPO__, __WORKSPACE__, __PYTHON__, __HOMEBREW_BIN__, and
+  __CLAUDE_CONFIG_DIR__ with the user's actual paths. Do NOT load this template
+  directly — paths must be expanded first.
 
   Behavior:
     - Fires every 300s (StartInterval).
     - Runs `python3 src/health-check.py --emit-task --notify-on-fail
-      --notify-slack --quiet`.
-    - Surfaces failures as tasks/task-health-*.txt, macOS notifications, AND
-      a direct Slack DM to the owner (remote-visible; fires even when the core
-      session is wedged but its heartbeat process still ticks). The Slack DM
-      no-ops cleanly if SLACK_BOT_TOKEN (channel .env / $REPO/.env / env) or the
-      owner id in ~/.claude/channels/slack/access.json is missing.
+      --notify-slack --notify-gateway --quiet`.
+    - Surfaces failures as tasks/task-health-*.txt, macOS notifications, and
+      direct Slack + gateway owner messages (remote-visible; fire even when the
+      core session is wedged but its heartbeat process still ticks). Each
+      remote sender no-ops cleanly when its credentials or owner target are
+      unavailable.
+    - FLAG-ENABLE GATE (#2160, Chi-authorized conversion 2026-08-28): re-adding
+      --recover-core here is what turns the dead-core relaunch ON. Before doing
+      so, a LIVE witness is REQUIRED: a real `start-cli.sh --restart` round trip
+      on this host proving the runtime comes back, a fresh local heartbeat is
+      written, and queued work resumes (CONTRIBUTING live-path rule). The merge
+      gate was converted to this enable gate on john-the-dev's argument; do not
+      flip the flag on unit tests alone.
     - NOTE (#2246): --recover-core was REMOVED from the default args. It decided
       "core wedged" almost entirely from core-status.json ts freshness — a
       best-effort *voluntary* signal — and false-positived when the core was
@@ -56,6 +63,7 @@
         <string>--emit-task</string>
         <string>--notify-on-fail</string>
         <string>--notify-slack</string>
+        <string>--notify-gateway</string>
         <string>--quiet</string>
     </array>
 
@@ -75,6 +83,13 @@
     <dict>
         <key>PATH</key>
         <string>__HOMEBREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- launchd does NOT inherit the login-shell env, so the canonical
+             config dir must be baked in — otherwise claude_home_path() falls
+             back to the legacy default config dir and the gateway-notify path
+             can't find channels/ag2space/.env on a workspace-scoped install
+             (#2487 P1). -->
+        <key>CLAUDE_CONFIG_DIR</key>
+        <string>__CLAUDE_CONFIG_DIR__</string>
     </dict>
 
     <key>StandardOutPath</key>

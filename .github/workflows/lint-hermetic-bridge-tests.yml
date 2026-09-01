@@ -1,0 +1,42 @@
+name: lint-hermetic-bridge-tests
+
+# CI lint: refuse tests that import a bridge without isolating CLAUDE_CONFIG_DIR.
+#
+# The bridges resolve channel config at MODULE level (discord-bridge.py:205 channels_env,
+# :555 ACCESS_FILE), so it happens during exec_module. A test that does not set
+# CLAUDE_CONFIG_DIR inherits the developer's, and reads their real ~/.claude channel
+# allowlist. The symptom is machine-dependent — legacy-fallback warning on a clean box,
+# silent live-config read on an operator box — which is why it stayed green everywhere.
+#
+# 26 pre-existing offenders are grandfathered in KNOWN_UNISOLATED inside the script and are
+# being migrated onto a shared helper separately. This gate exists so #27 cannot be added.
+#
+# Companion to lint-claude-home-path.yml (that one guards production shell path resolution;
+# this one guards test-side config isolation).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint-hermetic-bridge-tests:
+    name: refuse bridge tests that read host config
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint
+        run: python3 scripts/lint-hermetic-bridge-tests.py

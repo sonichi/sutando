@@ -62,6 +62,22 @@ class FakePopen:
         return 0
 
 
+class FailingStopProc:
+    def send_signal(self, sig):
+        pass
+
+    def wait(self, timeout=None):
+        raise RuntimeError("stop failed")
+
+
+class EmptyStopProc:
+    def send_signal(self, sig):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+
 class TestCaptureVideoRouting(unittest.TestCase):
     def setUp(self):
         self.mod = load_module()
@@ -111,12 +127,63 @@ class TestCaptureVideoRouting(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 400)
         ctx.exception.close()
 
+    def test_dispatch_delegates_capture_routes(self):
+        # Keep do_GET as routing only; endpoint behavior belongs to the named
+        # handlers where each path can evolve without growing one shared block.
+        handler = object.__new__(self.mod.Handler)
+        with mock.patch.object(self.mod.Handler, "_handle_capture") as still, \
+             mock.patch.object(self.mod.Handler, "_handle_capture_video") as video:
+            handler.path = "/capture?silent=true"
+            handler.do_GET()
+            still.assert_called_once_with()
+            video.assert_not_called()
+
+            still.reset_mock()
+            handler.path = "/capture-video?action=start&silent=true"
+            handler.do_GET()
+            video.assert_called_once_with()
+            still.assert_not_called()
+
+    def test_ping_route_keeps_wire_payload(self):
+        status, body = self._get("/ping")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"pong": True})
+
     def test_capture_still_returns_png(self):
         # The screenshot branch still works for the plain /capture path.
         status, body = self._get("/capture?silent=true", token=self.token)
         self.assertEqual(status, 200)
         self.assertTrue(body["path"].endswith(".png"),
                         f"/capture must return a .png, got {body['path']}")
+
+    def test_capture_all_displays_returns_every_path(self):
+        status, body = self._get("/capture?all=true&silent=true", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["displays"], 4)
+        self.assertEqual(len(body["all_paths"]), 4)
+
+    def test_capture_all_stops_at_first_missing_display(self):
+        calls = 0
+
+        def run_until_missing(cmd, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            out = Path(cmd[-1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if calls == 1:
+                out.write_bytes(b"\x00fakemediabytes")
+                return type("Result", (), {"returncode": 0})()
+            out.write_bytes(b"")
+            return type("Result", (), {"returncode": 1})()
+
+        with mock.patch.object(self.mod.subprocess, "run", run_until_missing):
+            status, body = self._get(
+                "/capture?all=true&format=invalid&silent=true", token=self.token
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(calls, 2)
+        self.assertNotIn("all_paths", body)
+        self.assertTrue(body["path"].endswith(".png"))
 
     def test_capture_video_requires_token(self):
         # Drive-by defense: no token / wrong token -> 403, no recording.
@@ -139,6 +206,20 @@ class TestCaptureVideoRouting(unittest.TestCase):
         self.assertEqual(body["path"], path)
         self.assertTrue(Path(path).exists() and Path(path).stat().st_size > 0)
 
+    def test_toggle_non_silent_display_signals_and_records(self):
+        with mock.patch.object(self.mod, "_signal_seeing") as signal_seeing, \
+             mock.patch.object(self.mod, "_notify_capture") as notify_capture:
+            status, body = self._get(
+                "/capture-video?action=start&display=2&audio=off", token=self.token
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["status"], "recording")
+            status, body = self._get("/capture-video?action=stop", token=self.token)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["status"], "ok")
+        self.assertEqual(signal_seeing.call_count, 2)
+        self.assertEqual(notify_capture.call_count, 2)
+
     def test_toggle_stop_when_idle(self):
         # Stop with nothing recording is a harmless no-op, not an error.
         _, body = self._get("/capture-video?action=stop&silent=true", token=self.token)
@@ -157,6 +238,49 @@ class TestCaptureVideoRouting(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._get("/capture-video?action=start&silent=true", token="wrong-token")
         self.assertEqual(ctx.exception.code, 403)
+        ctx.exception.close()
+
+    def test_toggle_start_failure_uses_json_error_contract(self):
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=RuntimeError("start failed")):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._get("/capture-video?action=start&silent=true", token=self.token)
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertEqual(ctx.exception.headers.get_content_type(), "application/json")
+        self.assertEqual(
+            json.loads(ctx.exception.read()),
+            {"status": "error", "error": "start failed"},
+        )
+        ctx.exception.close()
+
+    def test_toggle_stop_failure_uses_json_error_contract(self):
+        self.mod._active_recording = {
+            "proc": FailingStopProc(),
+            "path": "/unused/failed-recording.mov",
+            "watchdog": None,
+        }
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/capture-video?action=stop&silent=true", token=self.token)
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertEqual(ctx.exception.headers.get_content_type(), "application/json")
+        self.assertEqual(
+            json.loads(ctx.exception.read()),
+            {"status": "error", "error": "stop failed"},
+        )
+        ctx.exception.close()
+
+    def test_toggle_stop_rejects_empty_recording(self):
+        self.mod._active_recording = {
+            "proc": EmptyStopProc(),
+            "path": "/unused/empty-recording.mov",
+            "watchdog": None,
+        }
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._get("/capture-video?action=stop&silent=true", token=self.token)
+        self.assertEqual(ctx.exception.code, 500)
+        self.assertEqual(
+            json.loads(ctx.exception.read()),
+            {"status": "error", "error": "recording produced no file"},
+        )
         ctx.exception.close()
 
     def test_routing_guard_present_in_source(self):

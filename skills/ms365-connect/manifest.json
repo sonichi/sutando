@@ -1,0 +1,21 @@
+{
+ "name": "ms365-connect",
+ "version": "1.0.0",
+ "owner": "github:sonichi/sutando",
+ "license": "MIT",
+ "stability": "experimental",
+ "description": "Microsoft 365 connectivity (OneDrive, Outlook mail, Calendar, Teams) via Microsoft Graph using the open-source python-o365 library.",
+ "permissions": {
+  "network": true,
+  "filesystem": "read-write",
+  "secrets": ["MS365_CLIENT_ID", "MS365_CLIENT_SECRET", "MS365_TENANT_ID"]
+ },
+ "config": {
+  "MS365_STATE_DIR": {
+   "description": "Override for the cached OAuth token directory (default: <workspace>/state/ms365-token). Must be an owner-only (0700) path."
+  }
+ },
+ "provenance": {
+  "source_repo": "https://github.com/sonichi/sutando"
+ }
+}
