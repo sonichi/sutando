@@ -88,7 +88,7 @@ def scan_handrolled(base, roots, bucket):
     seen = 0
     for root in roots:
         for p in sorted((base / root).rglob("*.py")):
-            rel = str(p.relative_to(base))
+            rel = p.relative_to(base).as_posix()
             if rel in OWNERS:
                 continue
             seen += 1
@@ -115,7 +115,7 @@ def scan_unpaired(base, roots, bucket):
     seen = 0
     for root in roots:
         for p in sorted((base / root).rglob("*.py")):
-            rel = str(p.relative_to(base))
+            rel = p.relative_to(base).as_posix()
             if rel in OWNERS:
                 continue
             seen += 1
@@ -195,7 +195,8 @@ for root in ROOTS:
             if SH.search(ln) and not ln.strip().startswith("#"):
                 win = "\n".join(lines[max(0, i - 3):i + 4])
                 tag = "" if ".assigned-" in win else "  (claimed-only)"
-                sh_sites.append(f"{p.relative_to(REPO)}:{i + 1}{tag}")
+                rel = p.relative_to(REPO).as_posix()
+                sh_sites.append(f"{rel}:{i + 1}{tag}")
 for site in sh_sites:
     print(f"  note {site}")
 print(f"  ({len(sh_sites)} shell site(s), not gated)")
