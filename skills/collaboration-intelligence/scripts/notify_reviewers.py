@@ -78,6 +78,7 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     batch — resolvable reviewers are still notified, the worst refusal code
     is carried to the exit so the caller sees somebody was skipped."""
     out, worst = [], 0
+    actor_of, covered = _actor_map(roster), {}
     for name in names:
         entry = roster.get(name)
         if entry is None:
@@ -106,6 +107,16 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
+        # One person can hold several roster keys, so counting NAMES lets the
+        # two-reviewer gate in main() pass on one recipient addressed twice.
+        actor = actor_of.get(name, name)
+        prior = covered.get(actor) or covered.get(stand)
+        if prior is not None:
+            print(f"DUPLICATE '{name}': same person as '{prior}' "
+                  f"({stand}) — already covered, not a second reviewer",
+                  file=sys.stderr)
+            continue
+        covered[actor] = covered[stand] = name
         out.append({"name": name, "stand": stand, "room": room,
                     "human": entry.get("human")})
     return out, worst
