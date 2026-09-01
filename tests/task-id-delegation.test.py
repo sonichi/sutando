@@ -164,8 +164,13 @@ print(f"  ({len(sh_sites)} shell site(s), not gated)")
 print("── the allowlist is live ──")
 matched = {h.split("  ")[0] for h in known_hit}
 stale = sorted(set(KNOWN) - matched)
+# Routed, not just reported: whoever merges the fix trips this, and they are not
+# the person who knows why an unrelated test went red.
+detail = "; ".join(
+    f"{site} no longer matches — its fix ({KNOWN[site]}) has landed, so DELETE "
+    f"this row from KNOWN in {Path(__file__).name}" for site in stale)
 check("no stale allowlist rows (delete a row once its fix lands)",
-      not stale, f"these sites no longer match: {stale}")
+      not stale, detail)
 for site in sorted(matched):
     print(f"  note allowlisted: {site}  -> {KNOWN[site]}")
 
