@@ -199,7 +199,7 @@ const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 /** U+200B — zero-width space; not whitespace, so it survives .trimStart(). */
 const _ZWSP = '​';
-// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (41 keys) — injection-guard-sweep
+// Mirrors local_task_protocol.KNOWN_HEADER_KEYS (46 keys) — injection-guard-sweep
 // asserts this regex covers every py key. reply_chain_ids added with PR #2310.
 const _CONF_HEADER_RE = new RegExp(
 	'^(?:id|timestamp|session_scope|task|source|access_tier|user_id|channel_id|priority|' +
@@ -210,7 +210,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'thread_root|source_room_id|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id)\\s*:',
+	'attachments|platform_card|instance_id|target_worker|fan_out)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
