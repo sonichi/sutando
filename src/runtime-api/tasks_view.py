@@ -240,7 +240,7 @@ class TasksView:
             for f in files[:limit]:
                 # Not a .claimed- split: the lead also renames to .assigned-<inst>,
                 # and a compound id has no result written under it, ever.
-                task_id = task_id_from_filename(f.name) or ""
+                task_id = task_id_from_filename(f.name)
                 entry = {"taskId": task_id,
                          "state": self.status(task_id)["state"]}
                 try:
