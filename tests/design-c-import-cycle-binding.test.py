@@ -436,5 +436,88 @@ with tempfile.TemporaryDirectory() as td:
           f"an identical re-run still verifies and fences ({r2})")
 
 
+# --- FRESH CYCLE, IDENTICAL CONTENT: published_at is the discriminator ----
+# A republish differing ONLY in published_at must conflict, never skip.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("fresh-1", b"same-bytes")
+    t1 = a.claim("fresh-1", "w0")
+    a.complete(t1, DeliveryOutcome.CONFIRMED, provider="p1", destination="D1")
+    r1 = mig.import_a_state(root)
+    check(r1.get("delivered") == 1 and r1.get("fenced") is True,
+          f"fresh-cycle setup: first import records the terminal ({r1})")
+
+    _rollback(root)
+    a2 = DesignAClaimBackend(root)
+    check(a2.publish("fresh-1", b"same-bytes") is True,
+          "a completed lifecycle legally republishes")
+    t2 = a2.claim("fresh-1", "w0")
+    a2.complete(t2, DeliveryOutcome.CONFIRMED, provider="p1", destination="D1")
+
+    r2 = mig.import_a_state(root)
+    check(r2.get("conflicts") == [_safe_key("fresh-1")],
+          f"a fresh cycle with identical content is a conflict, not a skip ({r2})")
+    check(r2.get("fenced") is not True,
+          "the fence is withheld for the fresh-cycle collision")
+    check(not r2.get("skipped"),
+          f"the new outbound cycle is never silently discarded ({r2})")
+
+# --- NO-WRITER 2-PART TERMINAL: provenance, not shape, is the proof -------
+# A key+worker artifact with no importer provenance is nobody's receipt.
+with tempfile.TemporaryDirectory() as td:
+    import json as _fj
+    from ag2_sparrow.delivery_core.backend_c import read_terminal_records
+    root = Path(td) / "root"
+    DesignCClaimBackend(root, activate=True)
+    key = _safe_key("forged-1")
+    forged = {"schema": 1, "item_id": "forged-1", "outcome": "confirmed",
+              "receipt": {"provider": "p1", "destination": "EXTERNAL"},
+              "completed_ns": 123, "worker": "w0", "attempts": 1, "cycle": 1,
+              "incarnation": SEP.join((key, "w0"))}
+    (root / "archive" / f"{key}.json").write_text(_fj.dumps(forged))
+    check(read_terminal_records(root, "forged-1") == [],
+          "a 2-part record without importer provenance is not a terminal")
+    rd = mig.resolve_delivery(root, "forged-1")
+    check(rd.get("source") != "c" and not rd.get("delivered"),
+          f"resolve_delivery never answers from a no-writer artifact ({rd})")
+    # control: the importer's own terminal still validates end-to-end
+    root2 = Path(td) / "root2"
+    a = DesignAClaimBackend(root2)
+    a.publish("real-1", b"p")
+    tk = a.claim("real-1", "w0")
+    a.complete(tk, DeliveryOutcome.CONFIRMED, provider="p1", destination="D1")
+    mig.import_a_state(root2)
+    rd2 = mig.resolve_delivery(root2, "real-1")
+    check(rd2.get("source") == "c" and rd2.get("delivered") is True,
+          f"control: a genuine imported terminal answers from C ({rd2})")
+
+# --- SYMLINKED COUNTER: valid-zero bytes outside the store never gate -----
+# is_file() follows links, and the miss path never replaces one.
+with tempfile.TemporaryDirectory() as td:
+    ext = Path(td) / "external.json"
+    ext.write_text('{"count": 0}')
+    link = Path(td) / "a-fallback-hits.json"
+    link.symlink_to(ext)
+    check(read_fallback_counter(link) is None,
+          "a symlinked counter is unreadable to the validator, even valid-zero")
+    reg = Path(td) / "regular.json"
+    reg.write_text('{"count": 0}')
+    check(read_fallback_counter(reg) == 0,
+          "control: a regular valid-zero counter reads as 0")
+    # the miss path leaves the symlink in place — and it must still block
+    root = Path(td) / "root"
+    a = DesignAClaimBackend(root)
+    a.publish("sx", b"p")
+    mig.import_a_state(root)
+    cpath = root / "a-fallback-hits.json"
+    cpath.unlink(missing_ok=True)
+    cpath.symlink_to(ext)
+    miss = mig.dual_read(root, "no-such-id")
+    check(miss is None and cpath.is_symlink(),
+          "the miss path does not replace the symlink")
+    check(read_fallback_counter(cpath) is None,
+          "...and the surviving symlink still blocks the gate")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

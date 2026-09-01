@@ -112,5 +112,19 @@ with tempfile.TemporaryDirectory() as td:
     r = hc.check_a_fallback_hits(ws)
     check(r["status"] == "ok", "control: valid zero still measures ok")
 
+    # A SYMLINK to external valid-zero bytes passes is_file() but is not
+    # writer state; it must block the gate, not read as a measured zero.
+    ext = ws / "external-zero.json"
+    ext.write_text(json.dumps({"count": 0}))
+    (root / "a-fallback-hits.json").unlink()
+    (root / "a-fallback-hits.json").symlink_to(ext)
+    r = hc.check_a_fallback_hits(ws)
+    check(r["status"] == "warn" and "malformed" in r["detail"],
+          "symlinked valid-zero counter -> warn (gate blocked), not zero")
+    (root / "a-fallback-hits.json").unlink()
+    (root / "a-fallback-hits.json").write_text(json.dumps({"count": 0}))
+    r = hc.check_a_fallback_hits(ws)
+    check(r["status"] == "ok", "control: replacing the symlink restores ok")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

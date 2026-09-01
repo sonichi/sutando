@@ -108,14 +108,15 @@ def _reconcile_marker(c, marker: Path, payload: bytes, key: str,
 
 
 def _a_record_digest(rec) -> str:
-    """Canonical digest binding a terminal to the COMPLETE A record/cycle —
-    a route alone matches any later cycle confirmed to the same place."""
+    """Canonical digest binding a terminal to the A LIFECYCLE, not just its
+    content: published_at stamps the cycle, so a republish never collides."""
     import hashlib
     basis = _json.dumps(
         {"item_id": rec.get("item_id"), "payload": rec.get("payload"),
          "provider": rec.get("provider"),
          "destination": rec.get("destination"),
-         "attempts": rec.get("attempts")},
+         "attempts": rec.get("attempts"),
+         "published_at": rec.get("published_at")},
         sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
@@ -124,7 +125,8 @@ def _terminal_proves_record(records, rec) -> bool:
     """Reuse only on importer provenance + full-record digest. A terminal
     without a digest (native, or pre-digest import) proves a DIFFERENT cycle."""
     want = _a_record_digest(rec)
-    return any(r.get("a_record_digest") == want for r in records)
+    return any(r.get("imported") is True and r.get("worker") == "a-import"
+               and r.get("a_record_digest") == want for r in records)
 
 
 def _attempts_value(ap: Path) -> Optional[int]:
@@ -487,7 +489,12 @@ def read_fallback_counter(path) -> Optional[int]:
     """Schema/bounds validator shared by the RMW writer and the release
     probe. None = malformed/unreadable and must BLOCK deletion — a
     permissive reader turns garbage into a measured zero."""
+    import stat as _stat
     try:
+        # Symlinked evidence is not writer state: the miss path never
+        # replaces it, so it would gate deletion on external bytes.
+        if not _stat.S_ISREG(os.lstat(path).st_mode):
+            return None
         rec = _json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None

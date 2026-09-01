@@ -105,7 +105,16 @@ def _record_is_terminal_proof(rec) -> bool:
     if len(iparts) == 5:
         if not is_producer_token(inc):
             return False
-    elif len(iparts) != 2:
+    elif len(iparts) == 2:
+        # The importer is the ONLY 2-part writer: require its full
+        # provenance, or arbitrary on-disk JSON becomes delivery proof.
+        if rec.get("imported") is not True or worker != "a-import":
+            return False
+        dig = rec.get("a_record_digest")
+        if not isinstance(dig, str) or len(dig) != 64 \
+                or any(ch not in "0123456789abcdef" for ch in dig):
+            return False
+    else:
         return False
     return True
 

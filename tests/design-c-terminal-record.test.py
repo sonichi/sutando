@@ -588,9 +588,30 @@ with tempfile.TemporaryDirectory() as td:
     check(bv._record_is_terminal_proof(
         rec(incarnation=SEP.join((_k, _w, "notapid", "b", "n")))) is False,
         "a 5-part incarnation with a non-numeric pid is rejected")
+    # The importer is the only 2-part writer, so the 2-part arm demands its
+    # exact provenance; a bare key+worker JSON is no writer's output.
     check(bv._record_is_terminal_proof(
-        rec(incarnation=SEP.join((_k, _w)))) is True,
-        "control: the imported 2-part pseudo shape still validates")
+        rec(incarnation=SEP.join((_k, _w)))) is False,
+        "a 2-part shape WITHOUT importer provenance is rejected")
+    _ai = _safe_component("a-import")
+    _imp = dict(worker="a-import", imported=True,
+                a_record_digest="ab" * 32,
+                incarnation=SEP.join((_k, _ai)))
+    check(bv._record_is_terminal_proof(rec(**_imp)) is True,
+          "control: the genuine imported 2-part shape validates")
+    for miss in ("imported", "a_record_digest"):
+        broken = {k: v for k, v in _imp.items() if k != miss}
+        check(bv._record_is_terminal_proof(rec(**broken)) is False,
+              f"a 2-part record missing {miss} is rejected")
+    check(bv._record_is_terminal_proof(
+        rec(**{**_imp, "imported": 1})) is False,
+        "imported=1 (not True) is rejected on the 2-part arm")
+    check(bv._record_is_terminal_proof(
+        rec(**{**_imp, "a_record_digest": "AB" * 32})) is False,
+        "an uppercase-hex digest is rejected (writer emits lowercase)")
+    check(bv._record_is_terminal_proof(
+        rec(**{**_imp, "a_record_digest": "ab" * 31})) is False,
+        "a short digest is rejected")
     for field in ("schema", "completed_ns", "attempts"):
         for val in (True, False):
             check(bv._record_is_terminal_proof(rec(**{field: val})) is False,
