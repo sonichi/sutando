@@ -7705,6 +7705,10 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
+# The one owned hook whose effect leaves the workspace; excluded from unattended repair.
+_TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
+
+
 def apply_claude_hooks_fix(checks: list, stream=None) -> None:
     """--fix dispatch for claude-hooks: warn-level, so it never reaches the issues
     loop and needs its own pass (same shape as the task-watcher one).
@@ -7716,21 +7720,34 @@ def apply_claude_hooks_fix(checks: list, stream=None) -> None:
 
     Keys on `_unregistered_hooks`, not the detail text. The check is RE-RUN rather
     than assumed repaired — a fixer's self-report is not evidence of the result.
+
+    Scoped: the ~/Desktop transcript archiver is the one owned hook whose effect
+    leaves the workspace, and the dominant caller of `--fix` is an unattended
+    30-minute Timer in Sutando.app (`src/Sutando/main.swift`), not a terminal. A
+    routine timer must not make that egress decision, so it is left to explicit
+    opt-in and its absence keeps warning.
     """
     out = stream if stream is not None else sys.stdout
     for c in checks:
         if c["name"] != "claude-hooks" or not c.get("_unregistered_hooks"):
             continue
         installer = REPO_DIR / "src" / "install-claude-hooks.sh"
-        # The installer is all-or-nothing: it restores every owned hook, including a
-        # PreCompact archiver that copies full transcripts to ~/Desktop. Say so first.
-        print(f"  {c['name']}: repairing {', '.join(c['_unregistered_hooks'])} via "
-              f"{installer.name} (all-or-nothing: also restores the ~/Desktop "
-              f"transcript archiver)", file=out)
+        # Sutando.app runs `--fix` on a 30-minute Timer, so this repair is normally
+        # unattended: it may restore only hooks whose effects stay in the workspace.
+        scoped = [h for h in c["_unregistered_hooks"] if h != _TRANSCRIPT_ARCHIVE_HOOK]
+        if not scoped:
+            print(f"  {c['name']}: not repairing — the only unregistered hook copies full "
+                  f"transcripts to ~/Desktop. Opt in with `bash src/{installer.name}`",
+                  file=out)
+            continue
+        print(f"  {c['name']}: repairing {', '.join(scoped)} via {installer.name}"
+              + (f" (leaving {_TRANSCRIPT_ARCHIVE_HOOK} to explicit opt-in)"
+                 if len(scoped) != len(c["_unregistered_hooks"]) else ""), file=out)
         try:
             proc = subprocess.run(
                 ["bash", str(installer)],
                 capture_output=True, text=True, timeout=60,
+                env={**os.environ, "SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE": "1"},
             )
             emitted = (proc.stdout or "") + (proc.stderr or "")
             lines = [ln for ln in emitted.splitlines() if ln.strip()]
