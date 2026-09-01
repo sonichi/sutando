@@ -37,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import contextlib
 import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -762,28 +763,48 @@ def case_r_restart_guard_ok_restarts_and_alerts() -> list[str]:
 
 
 def case_s_checkout_is_canonical() -> list[str]:
-    """_checkout_is_canonical: True only for clean + on main; False for a
-    branch, a dirty tree, or unreadable git state (fail-closed)."""
+    """_checkout_is_canonical: True only for clean + on the expected branch;
+    False for a branch, a dirty tree, unreadable git state, or a non-git dir
+    (the last two under DISTINCT reason prefixes — they authorize differently)."""
     fails = []
+    # REPO has a real .git, so the mocked probes are actually reached; a
+    # gitless literal like "/repo" would short-circuit at the bundle check.
+    gitful = str(REPO)
+    env_no_pin = {k: v for k, v in os.environ.items() if k != "SUTANDO_EXPECTED_BRANCH"}
 
     def fake_run(argv, **kwargs):
         if "rev-parse" in argv:
             return subprocess.CompletedProcess(argv, 0, stdout=fake_run.branch + "\n", stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout=fake_run.dirty, stderr="")
 
-    with mock.patch.object(hc.subprocess, "run", side_effect=fake_run):
+    with mock.patch.object(hc.subprocess, "run", side_effect=fake_run), \
+         mock.patch.object(hc, "_resolve_expected_branch", return_value="main"), \
+         mock.patch.dict(os.environ, env_no_pin, clear=True):
         fake_run.branch, fake_run.dirty = "main", ""
-        ok, why = hc._checkout_is_canonical("/repo")
+        ok, why = hc._checkout_is_canonical(gitful)
         if not ok:
             fails.append(f"s) clean+main should be canonical, got {why}")
         fake_run.branch, fake_run.dirty = "feature-x", ""
-        ok, why = hc._checkout_is_canonical("/repo")
+        ok, why = hc._checkout_is_canonical(gitful)
         if ok or "not main" not in why:
             fails.append(f"s) non-main should fail, got ({ok},{why})")
         fake_run.branch, fake_run.dirty = "main", " M src/x.py"
-        ok, why = hc._checkout_is_canonical("/repo")
+        ok, why = hc._checkout_is_canonical(gitful)
         if ok or "uncommitted" not in why:
             fails.append(f"s) dirty tree should fail, got ({ok},{why})")
+
+    # The expected branch comes from the resolver, not a hardcoded "main" —
+    # the same mocked git state flips verdict when the resolver names its branch.
+    with mock.patch.object(hc.subprocess, "run", side_effect=fake_run), \
+         mock.patch.object(hc, "_resolve_expected_branch", return_value="pinned-branch"):
+        fake_run.branch, fake_run.dirty = "pinned-branch", ""
+        ok, why = hc._checkout_is_canonical(gitful)
+        if not ok:
+            fails.append(f"s) resolver's pinned-branch should be canonical, got {why}")
+        fake_run.branch, fake_run.dirty = "main", ""
+        ok, why = hc._checkout_is_canonical(gitful)
+        if ok or "not pinned-branch" not in why:
+            fails.append(f"s) main under a pinned resolver should fail, got ({ok},{why})")
 
     # A NONZERO git exit with empty stdout must fail closed — an errored `git status
     # --porcelain` (empty output) must not read as "clean" and green-light an auto-restart
@@ -792,16 +813,43 @@ def case_s_checkout_is_canonical() -> list[str]:
             return subprocess.CompletedProcess(argv, 0, stdout="main\n", stderr="")
         return subprocess.CompletedProcess(argv, 128, stdout="", stderr="fatal")
     with mock.patch.object(hc.subprocess, "run", side_effect=fail_status):
-        ok, why = hc._checkout_is_canonical("/repo")
+        ok, why = hc._checkout_is_canonical(gitful)
         if ok or "unreadable" not in why:
             fails.append(f"s) nonzero git exit should fail-closed, got ({ok},{why})")
 
     def boom(*a, **k):
         raise OSError("git missing")
     with mock.patch.object(hc.subprocess, "run", side_effect=boom):
-        ok, why = hc._checkout_is_canonical("/repo")
+        ok, why = hc._checkout_is_canonical(gitful)
         if ok or "unreadable" not in why:
             fails.append(f"s) unreadable git state should fail-closed, got ({ok},{why})")
+
+    # No .git is decided BEFORE any git call, and it is a bundle only with
+    # the parent-dir engine manifest; bare absence stays fail-closed.
+    def no_calls(*a, **k):
+        raise AssertionError("git must not be invoked for a non-git dir")
+    with tempfile.TemporaryDirectory() as td, \
+         mock.patch.object(hc.subprocess, "run", side_effect=no_calls):
+        inner = Path(td) / "engine" / "sutando"
+        inner.mkdir(parents=True)
+        ok, why = hc._checkout_is_canonical(inner)
+        if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):
+            fails.append(f"s) no .git + no manifest should be UNREADABLE, got ({ok},{why})")
+        for bad in ('{bad', '{}', '"x"', 'true', '42', '[1]'):
+            (inner.parent / "ENGINE_MANIFEST.json").write_text(bad)
+            ok, why = hc._checkout_is_canonical(inner)
+            if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):
+                fails.append(f"s) manifest {bad!r} should be UNREADABLE, got ({ok},{why})")
+        (inner.parent / "ENGINE_MANIFEST.json").write_text('{"sha": "x"}')
+        ok, why = hc._checkout_is_canonical(inner)
+        if ok or not why.startswith(hc.CHECKOUT_NONGIT):
+            fails.append(f"s) valid manifest bundle should report {hc.CHECKOUT_NONGIT!r}, got ({ok},{why})")
+        broken = Path(td) / "broken"
+        broken.mkdir()
+        (broken / ".git").symlink_to(Path(td) / "gone")
+        ok, why = hc._checkout_is_canonical(broken)
+        if ok or not why.startswith(hc.CHECKOUT_UNREADABLE):
+            fails.append(f"s) broken .git symlink should be UNREADABLE, got ({ok},{why})")
     return fails
 
 
@@ -847,15 +895,26 @@ def case_t_resolve_down_bridge_action() -> list[str]:
                 fails.append("t) explicit config opt-in to 'restart' ignored")
     return fails
 
-def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambient_env=None):
+def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambient_env=None,
+                             stale_guard=(True, "clean + on main"), repo_dir=None):
     """Drive main() --fix with `checks` in issues; return (stdout, spawns, kills).
-    plan="REAL" resolves the real plan (interpreter stubbed, channel env/ambient injectable)."""
+    plan="REAL" resolves the real plan (interpreter stubbed, channel env/ambient injectable).
+    `stale_guard` is the canonical-checkout verdict main() sees — explicit, so no
+    case rides an accidental branch of the real guard; None runs the REAL guard
+    (pair with `repo_dir` patching REPO_DIR at a purpose-built checkout)."""
     spawned, killed = [], []
     real_run = hc.subprocess.run
+    real_popen = hc.subprocess.Popen
 
     def fake_popen(argv, **kwargs):
-        spawned.append(argv)
-        return mock.MagicMock()
+        # Bridge spawns only: a blanket MagicMock also swallows the Popen
+        # inside stdlib subprocess.run, breaking every passthrough git probe.
+        head = str(argv[0]) if isinstance(argv, (list, tuple)) and argv else str(argv)
+        tail = str(argv[-1]) if isinstance(argv, (list, tuple)) and argv else ""
+        if tail.endswith("-bridge.py") or head.endswith("python3-probed"):
+            spawned.append(argv)
+            return mock.MagicMock()
+        return real_popen(argv, **kwargs)
 
     def fake_run(argv, *args, **kwargs):
         if isinstance(argv, list) and argv and argv[0] == "/usr/bin/pgrep":
@@ -876,6 +935,12 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
         env_patch = mock.patch.object(hc, "_load_channel_env", return_value={})
         os_patch = mock.patch.dict(hc.os.environ, dict(os.environ), clear=True)
 
+    if stale_guard is None:
+        guard_patch = mock.patch.object(hc, "REPO_DIR", Path(repo_dir)) if repo_dir \
+            else contextlib.nullcontext()
+    else:
+        guard_patch = mock.patch.object(hc, "_checkout_is_canonical",
+                                        side_effect=lambda _d: stale_guard)
     captured = io.StringIO()
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(sys, "argv", ["health-check.py", "--fix"]), \
@@ -883,7 +948,7 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
              mock.patch.object(hc, "run_all_checks", return_value=checks), \
              mock.patch.object(hc, "fix_down_bridges", return_value=[]), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
-             plan_patch, env_patch, os_patch, \
+             plan_patch, env_patch, os_patch, guard_patch, \
              mock.patch.object(hc.subprocess, "run", side_effect=fake_run), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen), \
              mock.patch("time.sleep", lambda *_: None):
@@ -906,9 +971,12 @@ def case_o_stale_restart_uses_launch_plan() -> list[str]:
         fails.append(f"o) missing 'restarted (stale code)' line; got: {out!r}")
     if killed != ["4242"]:
         fails.append(f"o) expected old pid 4242 killed, got {killed}")
-    if len(spawned) != 1 or spawned[0][0] != "/usr/local/bin/python3-probed":
+    # The canonical-checkout guard probes git before the relaunch, so filter to
+    # the bridge spawn itself rather than asserting on the whole recorded list.
+    bridge = [a for a in spawned if str(a[-1]).endswith("slack-bridge.py")]
+    if len(bridge) != 1 or bridge[0][0] != "/usr/local/bin/python3-probed":
         fails.append(f"o) spawn must use the plan's interpreter, got {spawned}")
-    if any(argv[0] == sys.executable for argv in spawned):
+    if any(argv[0] == sys.executable for argv in bridge):
         fails.append("o) stale restart still used sys.executable")
     return fails
 
@@ -925,6 +993,77 @@ def case_p_stale_no_plan_skips_without_kill() -> list[str]:
         fails.append(f"p) spawned despite missing plan: {spawned}")
     if "restart skipped" not in out:
         fails.append(f"p) missing skip message; got: {out!r}")
+    return fails
+
+
+def case_p2_stale_guard_verdicts_wire_through_main() -> list[str]:
+    """main() --fix kill/spawn per canonical-guard verdict: canonical and
+    BUNDLE restart; determined-non-canonical and PROBE-FAILURE leave the
+    running bridge alone (keweichen P1: a transient git failure must not
+    re-authorize the restart)."""
+    fails = []
+    stale = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
+    plan = ("/usr/local/bin/python3-probed", dict(os.environ))
+    hcm = hc  # alias for brevity
+    cases = [
+        ("canonical", (True, "clean + on main"), True),
+        ("bundle", (False, f"{hcm.CHECKOUT_NONGIT} (no .git in /x)"), True),
+        ("non-canonical", (False, "checkout on 'feat/x', not main"), False),
+        ("probe-failure", (False, f"{hcm.CHECKOUT_UNREADABLE} (git exit 128)"), False),
+        ("broken-git-link", (False, f"{hcm.CHECKOUT_UNREADABLE} (.git is a broken link)"), False),
+    ]
+    for label, verdict, restarts in cases:
+        out, spawned, killed = _run_main_fix_with_stale(stale, plan, stale_guard=verdict)
+        if restarts:
+            if killed != ["4242"] or not spawned:
+                fails.append(f"p2/{label}) expected kill+spawn, got killed={killed} spawned={len(spawned)}")
+        else:
+            if killed or spawned:
+                fails.append(f"p2/{label}) expected NO kill/spawn, got killed={killed} spawned={len(spawned)}")
+            if "NOT auto-restarted" not in out:
+                fails.append(f"p2/{label}) missing refusal line; got: {out!r}")
+    return fails
+
+
+def case_p3_pinned_config_full_wiring() -> list[str]:
+    """FULL wiring, real guard, real git: REPO_DIR at a clean checkout on
+    'pinned-branch' with core.expected_branch=pinned-branch restarts the stale
+    bridge (keweichen P2: the config contract, not a hardcoded main)."""
+    fails = []
+    stale = [check("slack-bridge", "stale", "running but code is 99 min newer than process — restart needed")]
+    plan = ("/usr/local/bin/python3-probed", dict(os.environ))
+    ambient = {k: v for k, v in os.environ.items()
+               if k not in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SUTANDO_EXPECTED_BRANCH")}
+    with tempfile.TemporaryDirectory() as td:
+        pinned = Path(td) / "pinned"
+        pinned.mkdir()
+        (pinned / ".gitignore").write_text("sutando.config.local.json\n")
+        try:
+            hc.git_argv("--version")
+        except FileNotFoundError:
+            print("  SKIP p3: no runnable git (resolver)")
+            return fails
+        for argv in (hc.git_argv("init", "-q"),
+                     hc.git_argv("checkout", "-q", "-b", "pinned-branch"),
+                     hc.git_argv("add", ".gitignore"),
+                     hc.git_argv("-c", "user.email=t@t", "-c", "user.name=t",
+                                 "commit", "-q", "-m", "seed")):
+            subprocess.run(argv, cwd=pinned, check=True, capture_output=True)
+        (pinned / "sutando.config.local.json").write_text(
+            '{"core": {"expected_branch": "pinned-branch"}}')
+        sc = sys.modules.get("sutando_config")
+        if sc is None:
+            sys.path.insert(0, str(REPO / "src"))
+            import sutando_config as sc
+        sc._CACHE = None  # memoized per repo_root; a stale cache hides the pin
+        # Outer env patch (no branch override) is what the harness snapshots.
+        with mock.patch.dict(os.environ, ambient, clear=True):
+            out, spawned, killed = _run_main_fix_with_stale(
+                stale, plan, stale_guard=None, repo_dir=pinned)
+        sc._CACHE = None
+        if killed != ["4242"] or not spawned:
+            fails.append(f"p3) pinned-config checkout should restart, got killed={killed} "
+                         f"spawned={len(spawned)} out={out!r}")
     return fails
 
 
@@ -1151,6 +1290,8 @@ def main() -> int:
                  case_x_failed_sender_falls_back_to_a_local_owner_surface,
                  case_o_stale_restart_uses_launch_plan,
                  case_p_stale_no_plan_skips_without_kill,
+                 case_p2_stale_guard_verdicts_wire_through_main,
+                 case_p3_pinned_config_full_wiring,
                  case_q_down_path_requires_both_slack_tokens,
                  case_r_stale_missing_app_token_no_kill_no_spawn,
                  case_s_vault_only_slack_tokens_launchable,

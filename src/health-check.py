@@ -2975,6 +2975,21 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+def _resolve_expected_branch(repo) -> str:
+    """One resolver for the expected-branch contract: env override, then
+    ``core.expected_branch`` in config, then ``main``. Shared by the
+    live-checkout probe and the canonical-checkout guard so a pinned host
+    cannot pass one and fail the other."""
+    expected = os.environ.get("SUTANDO_EXPECTED_BRANCH")
+    if not expected:
+        try:
+            from sutando_config import load_config  # noqa: PLC0415
+            expected = (load_config(repo_root=Path(repo)).get("core") or {}).get("expected_branch")
+        except Exception:
+            expected = None  # config unreadable — fall through to the default
+    return expected or "main"
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -3000,14 +3015,7 @@ def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """
     name = "live-checkout-branch"
     repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
-    expected = os.environ.get("SUTANDO_EXPECTED_BRANCH")
-    if not expected:
-        try:
-            from sutando_config import load_config  # noqa: PLC0415
-            expected = (load_config(repo_root=repo).get("core") or {}).get("expected_branch")
-        except Exception:
-            expected = None  # config unreadable — fall through to the default
-    expected = expected or "main"
+    expected = _resolve_expected_branch(repo)
     # Resolve the git binary ONCE for both subprocesses in this probe.
     #
     # This used to be `git_bin = "git"` with a comment promising that #2469's
@@ -3165,19 +3173,11 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
     repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
     manifest = Path(manifest_path) if manifest_path is not None else repo.parent / "ENGINE_MANIFEST.json"
 
-    if not manifest.is_file():
-        # A plain source clone has no bundle manifest — nothing to compare.
-        return {"name": name, "status": "ok",
-                "detail": "no ENGINE_MANIFEST.json — not a bundled engine, skipping"}
-    try:
-        meta = json.loads(manifest.read_text()) or {}
-        built = meta.get("sha")
-    except (OSError, ValueError) as e:
-        return {"name": name, "status": "ok",
-                "detail": f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]}) — skipping"}
-    if not isinstance(built, str) or not built.strip():
-        return {"name": name, "status": "ok",
-                "detail": "ENGINE_MANIFEST.json has no sha — skipping"}
+    built, why, meta = engine_manifest_sha(manifest)
+    if built is None:
+        # Shared with the restart guard: a damaged manifest is "no provenance",
+        # never an exception that aborts the rest of the always-on pass.
+        return {"name": name, "status": "ok", "detail": f"{why} — skipping"}
     built = built.strip()
 
     # A resolver failure must degrade like resolve_git() -> None, never to bare
@@ -3456,8 +3456,68 @@ def fix_screen_capture() -> str:
         f"restart attempted but port check says {after['status']} — see {log_path}")
 
 
+# Reasons beginning with this are "we could not determine the branch", NOT
+# "the branch is wrong" — the two justify different actions.
+CHECKOUT_UNREADABLE = "git state unreadable"
+
+# A shipped install with no .git at all (desktop bundle, CI tarball). Distinct
+# from CHECKOUT_UNREADABLE: there git EXISTS to probe and the probe failed.
+CHECKOUT_NONGIT = "non-git install"
+
+
+def engine_manifest_sha(manifest) -> tuple:
+    """The single owner of manifest parse + shape validation.
+
+    Returns (sha, reason, meta). `sha` is None whenever the file cannot supply
+    provenance; `reason` is the caller-facing phrase; `meta` is the parsed
+    object ({} when there is none) so a caller reporting build metadata does
+    not re-read and re-parse the file behind this one.
+    """
+    manifest = Path(manifest)
+    try:
+        # is_file() re-raises non-ignorable stat errors (PermissionError), so it
+        # belongs INSIDE the boundary — every caller must see "no provenance".
+        if not manifest.is_file():
+            return None, "no ENGINE_MANIFEST.json — not a bundled engine", {}
+        parsed = json.loads(manifest.read_text())
+    except (OSError, ValueError) as e:
+        return None, f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]})", {}
+    if not isinstance(parsed, dict):
+        # Valid JSON scalar/list is still not a manifest. Both callers must see
+        # this as "no provenance", never as an exception.
+        return None, f"ENGINE_MANIFEST.json is {type(parsed).__name__}, not an object", {}
+    sha = parsed.get("sha")
+    if not isinstance(sha, str) or not sha.strip():
+        return None, "ENGINE_MANIFEST.json has no sha", parsed
+    return sha, "", parsed
+
+
+def _valid_engine_manifest(manifest) -> bool:
+    """Existence alone is not provenance — bind the shared parser."""
+    return engine_manifest_sha(manifest)[0] is not None
+
+
 def _checkout_is_canonical(repo_dir) -> tuple:
     """(ok, reason): is the code checkout safe to auto-restart a bridge FROM?"""
+    # Decided BEFORE any git call, and the bundle exception needs POSITIVE
+    # provenance: the parent-dir manifest check_engine_revision_drift keys on.
+    git_meta = Path(repo_dir) / ".git"
+    try:
+        # stat/access can raise (PermissionError on a locked-down checkout) before
+        # the git boundary below — fail closed here too, never propagate.
+        meta_exists = git_meta.exists()
+        meta_lexists = os.path.lexists(git_meta)
+        bundled = (not meta_exists) and _valid_engine_manifest(
+            Path(repo_dir).parent / "ENGINE_MANIFEST.json")
+    except OSError as e:
+        return (False, f"{CHECKOUT_UNREADABLE} ({e})")
+    if not meta_exists:
+        if meta_lexists:
+            # A name that resolves nowhere is damaged metadata, not a bundle.
+            return (False, f"{CHECKOUT_UNREADABLE} (.git is a broken link)")
+        if bundled:
+            return (False, f"{CHECKOUT_NONGIT} (bundled engine manifest present)")
+        return (False, f"{CHECKOUT_UNREADABLE} (no .git and no valid engine manifest)")
     try:
         # Route through git_argv, never a bare "git": a bare-string PATH lookup resolves to
         # the /usr/bin/git SHIM on a macOS host without the Xcode command line tools, which
@@ -3470,19 +3530,22 @@ def _checkout_is_canonical(repo_dir) -> tuple:
             capture_output=True, text=True, timeout=10,
         )
     except Exception as e:  # noqa: BLE001 — any git failure → fail closed
-        return (False, f"git state unreadable ({e})")
+        return (False, f"{CHECKOUT_UNREADABLE} ({e})")
     # A nonzero git exit means the (possibly empty) stdout can't be trusted — an empty
     # `status --porcelain` from a FAILED call must not read as "clean" and green-light an
     if branch_proc.returncode != 0 or dirty_proc.returncode != 0:
         rc = branch_proc.returncode or dirty_proc.returncode
-        return (False, f"git state unreadable (git exit {rc})")
+        return (False, f"{CHECKOUT_UNREADABLE} (git exit {rc})")
     branch = branch_proc.stdout.strip()
     dirty = dirty_proc.stdout.strip()
-    if branch != "main":
-        return (False, f"checkout on '{branch or 'detached HEAD'}', not main")
+    # Pinned hosts declare core.expected_branch; hardcoding "main" here would
+    # permanently refuse stale recovery on every intentionally pinned node.
+    expected = _resolve_expected_branch(repo_dir)
+    if branch != expected:
+        return (False, f"checkout on '{branch or 'detached HEAD'}', not {expected}")
     if dirty:
         return (False, "checkout has uncommitted changes")
-    return (True, "clean + on main")
+    return (True, f"clean + on {expected}")
 
 
 # Printed when an owner alert could not be delivered
@@ -3621,6 +3684,30 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
 
 # Check name → src/<script>.py, for the bridges whose two names differ.
 _BRIDGE_SCRIPT = {"gateway-bridge": "remote-gateway-bridge"}
+
+
+def stale_restart_allowed(repo_dir, *, guard=None) -> "tuple[bool, str]":
+    """Whether a STALE bridge may be auto-restarted from this checkout.
+
+    The canonical-checkout guard belongs to every auto-restart path, not only
+    the down path: a stale restart boots whatever is checked out HERE, so on a
+    feature branch it silently ships unreviewed code (2026-07-29: four days of
+    bridge restarts booted a branch 75 commits behind main).
+
+    Allows a canonical checkout and a NONGIT install (a shipped bundle has no
+    branch to be wrong on, and the pre-guard stale path always restarted it).
+    Everything else refuses — including CHECKOUT_UNREADABLE: there .git exists,
+    so the checkout MAY be a feature branch, and a transient git failure must
+    not re-authorize exactly the restart this guard exists to prevent. The
+    refused bridge keeps running; the next pass retries with readable state.
+    """
+    guard = guard or _checkout_is_canonical
+    ok, why = guard(repo_dir)
+    if ok:
+        return (True, "")
+    if str(why).startswith(CHECKOUT_NONGIT):
+        return (True, why)
+    return (False, why)
 
 
 def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
@@ -11619,8 +11706,20 @@ def main():
         if do_fix:
             print()
             print("Attempting fixes...")
+            # LAZY + memoized: one evaluation, and only if a source-backed
+            # branch is actually reached — --fix must not probe git otherwise.
+            _gate: dict = {}
+
+            def _restart_gate():
+                if "v" not in _gate:
+                    _gate["v"] = stale_restart_allowed(REPO_DIR)
+                return _gate["v"]
             for c in issues:
                 if c["name"].startswith("com.sutando."):
+                    _ok, _why = _restart_gate()
+                    if not _ok:
+                        print(f"  {c['name']}: refused — {_why}")
+                        continue
                     result = fix_launchd(c["name"])
                     print(f"  {c['name']}: {result}")
                 elif c["name"] in LAUNCHD_BACKED_CHECKS:  # pragma: no cover — dispatch in untested main()
@@ -11632,6 +11731,10 @@ def main():
                     # launchd-owned listener. A rogue non-launchd port-holder
                     # (issue #1888 bug 2, double-management) is out of scope
                     # here — the result string will say the restart failed.
+                    _ok, _why = _restart_gate()
+                    if not _ok:
+                        print(f"  {c['name']}: refused — {_why}")
+                        continue
                     result = fix_launchd(LAUNCHD_BACKED_CHECKS[c["name"]])  # pragma: no cover
                     print(f"  {c['name']}: {result}")  # pragma: no cover
                 elif c["name"] in DOWN_BRIDGE_DETAILS:  # pragma: no cover - --fix restart path spawns real subprocesses; not unit-tested
@@ -11646,6 +11749,13 @@ def main():
                         if plan is None:
                             print(f"  {c['name']}: no capable interpreter/env — restart skipped (see startup.sh launch requirements)")
                             continue
+                        if c["status"] == "stale":
+                            _ok, _why = stale_restart_allowed(REPO_DIR)
+                            if not _ok:
+                                print(f"  {c['name']}: stale, but NOT auto-restarted "
+                                      f"({_why}) — restarting here would ship whatever is "
+                                      "checked out. Restart deliberately once the checkout is canonical.")
+                                continue
                         # If stale (process older than source code), kill old PID first
                         # so the new process doesn't conflict with a still-running zombie.
                         if c["status"] == "stale":
@@ -11723,9 +11833,17 @@ def main():
                                    capture_output=True, timeout=10)
                     print(f"  {c['name']}: restarted")
                 elif c["name"] == "voice-transport" and c.get("_stuck_connecting"):
+                    _ok, _why = _restart_gate()
+                    if not _ok:
+                        print(f"  voice-agent (stuck CONNECTING): refused — {_why}")
+                        continue
                     result = fix_launchd("com.sutando.voice-agent")
                     print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
+                    _ok, _why = _restart_gate()
+                    if not _ok:
+                        print(f"  {c['name']}: refused — {_why}")
+                        continue
                     # If stale, kill old PIDs first so the new process doesn't
                     # bind-fail or end up alongside a still-running zombie.
                     if c["status"] == "stale":

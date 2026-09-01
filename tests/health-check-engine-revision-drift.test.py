@@ -249,6 +249,56 @@ class EngineRevisionDriftTest(unittest.TestCase):
         self.assertNotIn("!=", r["detail"])
         self.assertNotIn("0 commits ahead", r["detail"])
 
+    # --- damaged manifest: one shared policy, never an exception ----------
+
+    def test_scalar_manifest_does_not_abort_the_always_on_pass(self) -> None:
+        """A non-object manifest is "no provenance", not an AttributeError.
+
+        The drift check runs on every health pass; raising here aborts the
+        remaining checks and disables --fix remediation for that pass.
+        """
+        for bad in ('"x"', "true", "42", "[1]"):
+            with self.subTest(manifest=bad):
+                d = Path(tempfile.mkdtemp())
+                repo = d / "repo"; repo.mkdir()
+                man = d / "ENGINE_MANIFEST.json"; man.write_text(bad)
+                r = hc.check_engine_revision_drift(repo_dir=repo, manifest_path=man)
+                self.assertEqual(r["status"], "ok", r)
+                self.assertIn("not an object", r["detail"])
+
+    def test_both_callers_agree_when_stat_itself_raises(self) -> None:
+        """An access error on the manifest is "no provenance", for BOTH callers.
+
+        `Path.is_file()` re-raises PermissionError, so a probe outside the
+        parser's boundary makes the always-on drift check throw while the
+        restart guard — which has its own outer boundary — returns cleanly.
+        """
+        d = Path(tempfile.mkdtemp())
+        repo = d / "repo"; repo.mkdir()
+        man = d / "ENGINE_MANIFEST.json"; man.write_text('{"sha": "abc123"}')
+        with mock.patch.object(Path, "is_file",
+                               side_effect=PermissionError(13, "Permission denied")):
+            sha, why, _meta = hc.engine_manifest_sha(man)
+            self.assertIsNone(sha)
+            self.assertIn("unreadable", why)
+            r = hc.check_engine_revision_drift(repo_dir=repo, manifest_path=man)
+            self.assertEqual(r["status"], "ok", r)
+            ok, _reason = hc._checkout_is_canonical(repo)
+            self.assertFalse(ok)
+
+    def test_drift_check_and_restart_guard_share_one_verdict(self) -> None:
+        """Both callers bind engine_manifest_sha, so they cannot disagree.
+
+        The defect this pins: two independent parses, where the guard rejected a
+        scalar manifest while the drift check threw on the same input.
+        """
+        cases = ('"x"', "true", "42", "[1]", "{}", '{"sha": ""}', '{"sha": "abc123"}')
+        for body in cases:
+            with self.subTest(manifest=body):
+                d = Path(tempfile.mkdtemp())
+                man = d / "ENGINE_MANIFEST.json"; man.write_text(body)
+                sha, _why, _meta = hc.engine_manifest_sha(man)
+                self.assertEqual(hc._valid_engine_manifest(man), sha is not None)
     # --- no git: report the bundle, do not claim silence -----------------
 
     def test_non_git_install_names_the_bundled_revision_and_its_age(self) -> None:
