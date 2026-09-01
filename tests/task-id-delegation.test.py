@@ -20,7 +20,9 @@ cannot false-positive on a results/, processed/ or archive/ path, none of which
 is ever renamed to a claimed or assigned name.
 """
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
@@ -82,15 +84,22 @@ for pat in ("_ID_STATE", "_ID_PLAIN"):
 # ── 2. file -> id is never hand-rolled ───────────────────────────────────────
 print("── file -> id goes through task_id_from_filename ──")
 HANDROLLED = re.compile(r'\.(?:split|partition)\(\s*["\']\.(?:claimed|assigned)-')
+def scan_handrolled(base, roots, bucket):
+    seen = 0
+    for root in roots:
+        for p in sorted((base / root).rglob("*.py")):
+            rel = str(p.relative_to(base))
+            if rel in OWNERS:
+                continue
+            seen += 1
+            for i, ln in code_lines(p):
+                if HANDROLLED.search(ln):
+                    record(f"{rel}:{i}", ln.strip(), bucket)
+    return seen
+
+
 hits = []
-for root in ROOTS:
-    for p in sorted((REPO / root).rglob("*.py")):
-        rel = str(p.relative_to(REPO))
-        if rel in OWNERS:
-            continue
-        for i, ln in code_lines(p):
-            if HANDROLLED.search(ln):
-                record(f"{rel}:{i}", ln.strip(), hits)
+SEEN_A = scan_handrolled(REPO, ROOTS, hits)
 check("no call site splits a filename on a claim suffix to derive an id",
       not hits, "; ".join(hits))
 
@@ -102,23 +111,30 @@ ASSIGNED = re.compile(r"\.assigned-")
 # A deliberate claimed-only check declares itself with a greppable token: prose
 # would make the exemption self-granting by the very author who needs it.
 MARKER = re.compile(r"#\s*claimed-only:")
+def scan_unpaired(base, roots, bucket):
+    seen = 0
+    for root in roots:
+        for p in sorted((base / root).rglob("*.py")):
+            rel = str(p.relative_to(base))
+            if rel in OWNERS:
+                continue
+            seen += 1
+            lines = p.read_text(errors="replace").splitlines()
+            for i, ln in enumerate(lines):
+                if ln.strip().startswith("#") or not CLAIMED_GLOB.search(ln):
+                    continue
+                window = lines[max(0, i - 3):i + 4]
+                # Pairing must be visible in CODE, so strip comments first.
+                if ASSIGNED.search("\n".join(x.split("#", 1)[0] for x in window)):
+                    continue
+                if any(MARKER.search(x) for x in window):
+                    continue
+                record(f"{rel}:{i + 1}", ln.strip(), bucket)
+    return seen
+
+
 unpaired = []
-for root in ROOTS:
-    for p in sorted((REPO / root).rglob("*.py")):
-        rel = str(p.relative_to(REPO))
-        if rel in OWNERS:
-            continue
-        lines = p.read_text(errors="replace").splitlines()
-        for i, ln in enumerate(lines):
-            if ln.strip().startswith("#") or not CLAIMED_GLOB.search(ln):
-                continue
-            window = lines[max(0, i - 3):i + 4]
-            # Pairing must be visible in CODE, so strip comments first.
-            if ASSIGNED.search("\n".join(x.split("#", 1)[0] for x in window)):
-                continue
-            if any(MARKER.search(x) for x in window):
-                continue
-            record(f"{rel}:{i + 1}", ln.strip(), unpaired)
+SEEN_B = scan_unpaired(REPO, ROOTS, unpaired)
 check("no call site globs .claimed- without .assigned- or a `# claimed-only:` marker",
       not unpaired, "; ".join(unpaired))
 
@@ -143,6 +159,32 @@ check("a comment mentioning .assigned- does NOT exempt (prose is not a marker)",
           and not ASSIGNED.search("\n".join(x.split("#", 1)[0] for x in _prose))
           and not any(MARKER.search(x) for x in _prose)
           for l in _prose))
+
+# ── 4b. the scans reach real FILES, not just strings ─────────────────────────
+# Section 4 exercises the patterns. It passes with the walk pointed at nothing,
+# so plant violations on disk and run the real scan over them.
+print("── the scans reach files on disk ──")
+_tmp = Path(tempfile.mkdtemp(prefix="deleg-walk-"))
+(_tmp / "src").mkdir(parents=True)
+(_tmp / "src" / "planted_split.py").write_text(
+    'def f(n):\n    return n.split(".claimed-")[0]\n')
+(_tmp / "src" / "planted_glob.py").write_text(
+    'def g(d, t):\n    return next(d.glob(f"{t}.claimed-core-*.txt"), None)\n')
+(_tmp / "src" / "clean.py").write_text('def h():\n    return 1\n')
+_a, _b = [], []
+scan_handrolled(_tmp, ["src"], _a)
+scan_unpaired(_tmp, ["src"], _b)
+check("the file->id walk finds a planted violation on disk",
+      any("planted_split.py:2" in x for x in _a), str(_a))
+check("the id->file walk finds a planted violation on disk",
+      any("planted_glob.py:2" in x for x in _b), str(_b))
+check("neither walk flags the clean file in the same tree",
+      not any("clean.py" in x for x in _a + _b), str(_a + _b))
+# 4b exercises the scan FUNCTIONS on its own tree, so it cannot see ROOTS
+# pointing somewhere empty. This asserts the repo walk reached files at all.
+check("the repo walk examined files under ROOTS",
+      SEEN_A > 100 and SEEN_B > 100, f"examined {SEEN_A}/{SEEN_B} files")
+shutil.rmtree(_tmp, ignore_errors=True)
 
 # ── 5. shell sites: enumerated, not gated ────────────────────────────────────
 print("── shell sites (reported, not gated — see the docstring) ──")
