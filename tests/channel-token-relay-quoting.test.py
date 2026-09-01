@@ -50,10 +50,8 @@ check("_clean itself is untouched: mismatched quotes kept verbatim",
 check("non-str is not usable", clean_relay_token(None) == "")
 
 
-# --- through the REAL readers -------------------------------------------------
-# The peel is only a fix if the function that actually presents the token calls
-# it. These drive the corruption through the readers a bridge uses, not through
-# clean_relay_token directly.
+# Through the REAL readers: a peel nothing calls is not a fix, so drive the
+# corruption through the readers a bridge uses, not clean_relay_token directly.
 with tempfile.TemporaryDirectory() as d:
     env = os.path.join(d, ".env")
     with open(env, "w") as fh:
