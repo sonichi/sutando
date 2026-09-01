@@ -98,9 +98,11 @@ def main() -> int:
         r = hc.check_vault_manifest_integrity(_manifest(tmp, many), _probe(many))
         check("15 keys -> 12 named plus an explicit remainder",
               r["status"] == "ok" and "+3 more" in r["detail"], repr(r))
-        named = r["detail"].split("—", 1)[1]
+        # Set membership, not substring containment: with a key that is a prefix
+        # of another, `in` over-counts and reports a failure that is not there.
+        named = {t.strip() for t in r["detail"].split("—", 1)[1].split(",")}
         check("the naming is bounded, not the whole manifest dumped",
-              sum(1 for k in many if k in named) == 12, repr(r))
+              len(named & set(many)) == 12, repr(r))
 
         # CONTROL: the naming branch needs >=1 backed key — empty returns
         # earlier, zero-resolved hits "unverifiable". Pins the unconditional append.
