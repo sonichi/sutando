@@ -85,6 +85,23 @@ WORKSPACE_DIR = resolve_workspace()
 _LAST_HASH_KEY = "_last_hash"
 
 
+def _prune_alert_history(history: dict, cutoff: int) -> dict:
+    """Drop alert-history entries older than `cutoff`, tolerating bad values.
+
+    A non-numeric value raises inside a dict comprehension and kills the whole
+    run — measured 2026-09-01: a malformed entry crashed `main()` through
+    `notify_for_failures`, so every later step, `--recover-core` included,
+    never ran. An unreadable entry is dropped, never fatal.
+    """
+    kept = {}
+    for k, v in history.items():
+        if k == _LAST_HASH_KEY:
+            kept[k] = v
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and v >= cutoff:
+            kept[k] = v
+    return kept
+
+
 def _load_alert_history(state_file: Path) -> dict:
     """Read a failure-alert dedup file, dropping entries this build cannot use.
 
@@ -10304,7 +10321,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10373,7 +10390,7 @@ def notify_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10622,7 +10639,7 @@ def notify_slack_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10675,7 +10692,7 @@ def notify_gateway_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
