@@ -185,6 +185,29 @@ def test_enqueue_retry_complete_and_no_duplicate():
         assert state["jobs"]["daily-news"]["current"] is None
 
 
+def test_an_assigned_task_is_active_so_no_duplicate_retry_fires():
+    # `.assigned-<inst>` is the claimed rename's sibling state; a `.claimed-`
+    # glob cannot see it, so the retry fires while the original is still live.
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        config(ws)
+        scheduler.tick(ws, "test-host", at(6, 0))
+        task = next((ws / "tasks").glob("*.txt"))
+
+        assigned = task.with_name(f"{task.stem}.assigned-core-2.txt")
+        task.rename(assigned)
+        assert scheduler._task_is_active(ws, [task.stem]) is True
+        assert scheduler.tick(ws, "test-host", at(6, 7))["events"] == []
+        assert [p.name for p in (ws / "tasks").iterdir()] == [assigned.name]
+
+        # Control: once it is genuinely gone, the retry the assigned state was
+        # suppressing does fire — so the assertion above is not vacuous.
+        assigned.unlink()
+        retry = scheduler.tick(ws, "test-host", at(6, 8))
+        assert retry["events"] == [
+            {"job": "daily-news", "event": "retried", "attempt": 2}]
+
+
 def test_failure_alert_and_health():
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
@@ -321,6 +344,7 @@ def main():
         test_codex_runtime_owns_legacy_main_loop_without_mutating_config,
         test_helpers_and_config_validation,
         test_enqueue_retry_complete_and_no_duplicate,
+        test_an_assigned_task_is_active_so_no_duplicate_retry_fires,
         test_failure_alert_and_health,
         test_stale_active_task_fails_instead_of_stalling_or_duplicating,
         test_wake_catchup_and_timezone,
