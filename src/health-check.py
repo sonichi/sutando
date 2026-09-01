@@ -3170,7 +3170,8 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
         return {"name": name, "status": "ok",
                 "detail": "no ENGINE_MANIFEST.json — not a bundled engine, skipping"}
     try:
-        built = (json.loads(manifest.read_text()) or {}).get("sha")
+        meta = json.loads(manifest.read_text()) or {}
+        built = meta.get("sha")
     except (OSError, ValueError) as e:
         return {"name": name, "status": "ok",
                 "detail": f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]}) — skipping"}
@@ -3186,8 +3187,28 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
         git_bin = resolve_git()
     except Exception:
         git_bin = None
+
+    def _bundle_only(why: str) -> dict:
+        """No clone to diff against — report the revision the manifest knows."""
+        # Local import: datetime is deliberately not at module scope here.
+        from datetime import datetime, timezone  # noqa: PLC0415
+        built_at = ""
+        stamp = str(meta.get("built_at") or "")
+        branch = str(meta.get("branch") or "")
+        if stamp:
+            try:
+                when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                hours = (datetime.now(timezone.utc) - when).total_seconds() / 3600
+                built_at = f", built {hours:.0f}h ago" if hours < 48 else f", built {hours/24:.0f}d ago"
+            except ValueError:
+                built_at = f", built {stamp}"
+        on = f" ({branch})" if branch else ""
+        return {"name": name, "status": "ok",
+                "detail": f"{why} — running bundled {built[:9]}{on}{built_at}; "
+                          f"drift from source is UNDETERMINED here, not absent"}
+
     if git_bin is None:
-        return {"name": name, "status": "ok", "detail": "no runnable git — skipping"}
+        return _bundle_only("no runnable git")
 
     def _git(*args):
         return subprocess.run([git_bin, "-C", str(repo), *args],
@@ -3196,9 +3217,9 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
     try:
         head = _git("rev-parse", "HEAD")
     except (OSError, subprocess.TimeoutExpired):
-        return {"name": name, "status": "ok", "detail": "git not runnable — skipping"}
+        return _bundle_only("git not runnable")
     if head.returncode != 0:
-        return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
+        return _bundle_only("not a git checkout")
     head_sha = head.stdout.strip()
     # Normalise first: an abbreviated sha (or a tag) of the checked-out commit
     # would otherwise compare unequal and print "X != X (0 commits ahead)".
@@ -5938,6 +5959,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
+    unconsumed, trailing = [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
         if not j["artifacts"]:
@@ -5955,16 +5977,33 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         # -1417 early. The filename date is logical, often a day off the mtime.
         deltas = sorted(((w - due + 720) % 1440) - 720 for _, w in j["artifacts"])
         median = statistics.median(deltas)
-        if median > DAILY_LATE_TOLERANCE_MIN:
-            late.append((j["name"], median, len(deltas)))
+        # Artifact mtimes date COMPLETION. Where the schedule's own dispatch
+        # record exists, it answers punctuality and the output time does not.
+        disp = [((w - due + 720) % 1440) - 720 for _, w in (j.get("dispatch_history") or [])]
+        if disp:
+            d_median = statistics.median(sorted(disp))
+            if d_median > DAILY_LATE_TOLERANCE_MIN:
+                late.append((j["name"], d_median, len(disp), "dispatch"))
+            elif median > DAILY_LATE_TOLERANCE_MIN:
+                trailing.append((j["name"], median, d_median, len(deltas)))
+        elif median > DAILY_LATE_TOLERANCE_MIN:
+            late.append((j["name"], median, len(deltas), "output"))
         if (not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN
                 and not j.get("conditional")
                 and (j.get("stem_declared") or j["artifacts"])):
-            missed.append((j["name"], j["minutes_since_due"]))
-    if not late and not missed and not drifted:
+            fired = j.get("dispatched_today")
+            if fired is None:
+                missed.append((j["name"], j["minutes_since_due"]))
+            else:
+                unconsumed.append((j["name"], fired, j["minutes_since_due"]))
+    if not late and not missed and not drifted and not unconsumed:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
+        for n, m, dm, c in sorted(trailing):
+            detail += (f"; {n} dispatches on time (median {dm:+g} min) and its output "
+                       f"trails by median {m:+g} min over {c} run(s) — pickup and "
+                       f"execution latency, not the schedule")
         if quiet:
             detail += (f"; conditional, nothing produced to score: "
                        f"{', '.join(sorted(quiet))}")
@@ -5978,17 +6017,30 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             return {"name": name, "status": "warn", "detail": f"{detail} — {scope}"}
         return {"name": name, "status": "ok", "detail": detail}
     bits = []
-    for n, m, c in late:
-        bits.append(f"{n}: {c} run(s), median +{m} min late — the schedule is not what "
-                    f"produced these; something else is covering for it")
+    for n, m, c, src in late:
+        if src == "dispatch":
+            bits.append(f"{n}: {c} run(s), median +{m} min late at DISPATCH — the "
+                        f"schedule itself is running late")
+        else:
+            bits.append(f"{n}: {c} run(s), median +{m} min late, measured from output "
+                        f"— no dispatch record retained for this job, so a late "
+                        f"schedule and a slow pickup cannot be told apart here")
     for n, m in missed:
-        bits.append(f"{n}: no output today, {m} min past due")
+        bits.append(f"{n}: no output today, {m} min past due, and no task was "
+                    f"dispatched — the schedule itself did not fire")
+    for n, fired, m in unconsumed:
+        bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} but produced "
+                    f"no output {m} min past due — the schedule fired and the task was "
+                    f"never consumed, so this is the consumer, not the cron")
     for n, newest, age in sorted(drifted):
         age_txt = f", {age}d ago" if age is not None else ""
         bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
                     f"probe's filename match has drifted off this job's output; "
                     f"punctuality cannot be scored and a missed-today verdict would "
                     f"blame the job for the probe's own blind spot")
+    for n, m, dm, c in sorted(trailing):
+        bits.append(f"{n}: dispatches on time (median {dm:+g} min); output trails by "
+                    f"median {m:+g} min over {c} run(s) — latency, not the schedule")
     if quiet:
         bits.append(f"conditional, nothing produced to score: {', '.join(sorted(quiet))}")
     if unknown:
@@ -6036,6 +6088,34 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
         if not f.is_file() or not anchored.match(f.name):
             continue
         lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def _daily_dispatch_minutes(tasks: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-dispatched) from `tasks/**/task-cron-<job>-<epoch>.txt`.
+
+    The epoch in the NAME is emit time, so this reads when the SCHEDULE FIRED.
+    Every other lane here dates OUTPUT, which is why none of them can tell a
+    schedule that never ran from one that ran and was never picked up.
+    """
+    from datetime import datetime
+    out = []
+    if not tasks.is_dir():
+        return out
+    prefix = f"{cron_task_id.TASK_PREFIX}{cron_task_id.sanitize_name(job)}-"
+    anchored = cron_task_id.record_matcher(job)
+    for f in tasks.rglob(cron_task_id.DISCOVERY_GLOB):
+        if not f.is_file() or not anchored.match(f.name):
+            continue
+        stamp = f.name[len(prefix):].split(".")[0].split("-")[0]
+        try:
+            # int() carries the non-digit case: the matcher already anchors a
+            # digit run, so a separate isdigit guard is unreachable by construction.
+            lt = datetime.fromtimestamp(int(stamp) / 1000)
+        except (OverflowError, OSError, ValueError):
+            continue
         out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
@@ -6139,6 +6219,7 @@ def check_daily_cron_punctuality() -> dict:
             used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
+        dispatched = _daily_dispatch_minutes(ws / "tasks", jname)
         newest = max((d for d, _ in arts), default=None)
         age_days = None
         if newest:
@@ -6152,6 +6233,11 @@ def check_daily_cron_punctuality() -> dict:
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
+            # Dispatch is the schedule's own evidence: it is what "on time"
+            # means, and it is what an output mtime cannot report.
+            "dispatch_history": dispatched,
+            "dispatched_today": next(
+                (m for d, m in dispatched if d == now.strftime("%Y-%m-%d")), None),
             # `artifact` names a results file, so it cannot vouch for a sentinel:
             # only an observed history makes a missing sentinel today actionable.
             "stem": stem, "stem_declared": bool(declared) and used_artifact_lane,
