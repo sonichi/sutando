@@ -241,6 +241,10 @@ class TasksView:
                 # Not a .claimed- split: the lead also renames to .assigned-<inst>,
                 # and a compound id has no result written under it, ever.
                 task_id = task_id_from_filename(f.name)
+                # A filename the grammar rejects (e.g. an embedded LF) still
+                # matches the glob; emitting it would put null in a public id.
+                if task_id is None:
+                    continue
                 entry = {"taskId": task_id,
                          "state": self.status(task_id)["state"]}
                 try:

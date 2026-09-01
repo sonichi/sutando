@@ -198,6 +198,26 @@ def test_failure_alert_and_health():
         assert code == 1 and "latest run failed" in report["problems"][0]
 
 
+def test_an_assigned_task_counts_as_active_so_no_duplicate_retry() -> None:
+    """The lead renames to .assigned-<inst>; a .claimed-only check read that as
+    gone and retried, which the retry guard's own comment calls duplicating
+    irreversible side effects."""
+    import tempfile
+    for name, label in (("task-x.txt", "bare"),
+                        ("task-x.claimed-core-2.txt", "claimed"),
+                        ("task-x.assigned-core-2.txt", "assigned")):
+        ws = Path(tempfile.mkdtemp())
+        (ws / "tasks" / "processed").mkdir(parents=True)
+        (ws / "tasks" / name).write_text("id: task-x\ntask: y\n")
+        assert scheduler._task_is_active(ws, ["task-x"]), f"{label} must read active"
+
+    ws = Path(tempfile.mkdtemp())
+    (ws / "tasks" / "processed").mkdir(parents=True)
+    assert not scheduler._task_is_active(ws, ["task-x"]), "absent must read inactive"
+    (ws / "tasks" / "processed" / "task-x.txt").write_text("x")
+    assert scheduler._task_is_active(ws, ["task-x"]), "processed check must be retained"
+
+
 def test_stale_active_task_fails_instead_of_stalling_or_duplicating():
     with tempfile.TemporaryDirectory() as td:
         ws = Path(td)
@@ -322,6 +342,7 @@ def main():
         test_helpers_and_config_validation,
         test_enqueue_retry_complete_and_no_duplicate,
         test_failure_alert_and_health,
+        test_an_assigned_task_counts_as_active_so_no_duplicate_retry,
         test_stale_active_task_fails_instead_of_stalling_or_duplicating,
         test_wake_catchup_and_timezone,
         test_prompt_cannot_forge_task_headers,

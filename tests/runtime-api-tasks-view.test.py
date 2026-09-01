@@ -544,6 +544,17 @@ class TasksViewAssignedIdTests(unittest.TestCase):
         listed = sorted(e["taskId"] for e in self.view.list_tasks()["tasks"])
         self.assertEqual(listed, ["task-rtapi-A1", "task-rtapi-C1", "task-rtapi-P1"])
 
+    def test_a_name_the_grammar_rejects_is_skipped_not_emitted_as_null(self):
+        # An LF is legal in a POSIX filename and matches the glob, but the id
+        # grammar rejects it; a null taskId breaks the string-ID contract.
+        self._write("task-rtapi-ok.txt", "task-rtapi-ok")
+        (self.tasks / "task-rtapi-A\nB.txt").write_text("id: x\ntask: y\n")
+
+        rows = self.view.list_tasks()["tasks"]
+        self.assertEqual([e["taskId"] for e in rows], ["task-rtapi-ok"])
+        for e in rows:
+            self.assertIsInstance(e["taskId"], str)
+
     def test_a_listed_id_can_fetch_its_result(self):
         # The defect: the compound id is listed, no result is ever written under
         # it, and status() reads pending forever because the file does exist.
