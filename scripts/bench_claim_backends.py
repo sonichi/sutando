@@ -337,7 +337,7 @@ def main(argv=None) -> int:
               f"{pc['per_item_us']:26.0f}   exactly-once A={pa['exactly_once']} C={pc['exactly_once']}")
     print(f"{'UNKNOWN complete (us/item)':34} {a['unknown_recover']['unknown_us']:26.0f} "
           f"{c['unknown_recover']['unknown_us']:26.0f}")
-    print(f"{'complete @ 2k archive (us/item)':34} "
+    print(f"{f'complete @ {_arch_hist} archive (us/item)':34} "
           f"{a['archive_2k']['complete_us_at_history']:26.0f} "
           f"{c['archive_2k']['complete_us_at_history']:26.0f}")
     for label in ("crash", "conflict"):
