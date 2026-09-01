@@ -141,9 +141,8 @@ if r["status"] != "warn":
 if BUNDLED not in r["detail"]:
     failures.append("warn must NAME the live interpreter it probed, not a would-launch one")
 
-# Same path, healthy interpreter -> ok. Without this the warn above is free.
-# The health of the probed interpreter is STUBBED, not borrowed from the runner:
-# keying it on sys.executable failed wherever detect-secrets is not installed.
+# Healthy interpreter -> ok, or the warn above is free. Health is STUBBED, not
+# borrowed: keying it on sys.executable failed where detect-secrets is absent.
 _run = hc.subprocess.run
 hc._proc_executable = lambda pid: sys.executable if pid == "76550" else None
 hc.subprocess.run = lambda *a, **k: types.SimpleNamespace(
