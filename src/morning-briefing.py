@@ -693,7 +693,9 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         if len(pending_qs) == 1:
             parts.append(f"One pending question waiting: {pending_qs[0]}.")
         else:
-            parts.append(f"{len(pending_qs)} pending questions. Top item: {pending_qs[0]}.")
+            # "Top item" asserted a ranking this code does not perform: get_waiting_questions()
+            # yields FILE order, so index 0 is first-listed, not most important.
+            parts.append(f"{len(pending_qs)} pending questions. First on the list: {pending_qs[0]}.")
 
     # Overnight Discord
     if discord_msgs:
