@@ -156,10 +156,8 @@ def setUpModule():
     global _LEDGER_ISOLATION, _GATE_ISOLATION
     _LEDGER_ISOLATION = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
     os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = tempfile.mkdtemp() + "/asks.jsonl"
-    # Same reason as the ledger: these cases exercise ROUTING. Both halves of
-    # the capability gate shell out to `gh`, so a fixture login is answered by
-    # the real repo and the target is dropped before the branch under test
-    # runs. Both are covered by tests/sci-notify-reviewers-inproc.test.py.
+    # Routing cases only: the gate shells out to `gh`, so a fixture login is
+    # answered by the real repo and dropped before the branch under test runs.
     _GATE_ISOLATION = (nr.gate_capability, nr._github_login)
     nr.gate_capability = lambda repo, login: (True, "stubbed-in-unit-test")
     nr._github_login = lambda name, roster: (name, "stubbed-in-unit-test")
