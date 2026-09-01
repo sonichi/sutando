@@ -58,6 +58,32 @@ bash "$CAP" "$TMP/gh" "$TMP/unk.txt" 20 '.[]' --state open --json number
 check "uncountable population still warns the file may be truncated" \
 	grep -q 'population unknown' "$TMP/unk.txt"
 
+# --- primary FAILED, count SUCCEEDED: the footer must not assert rows the file lacks ---
+# The two gh calls are independent, so a transient 5xx on the capture alone leaves an
+# empty file that the count would otherwise label "20 of 117 shown".
+cat > "$TMP/gh" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = "1000" ] && { echo 117; exit 0; }; done
+exit 1
+STUB
+chmod +x "$TMP/gh"
+bash "$CAP" "$TMP/gh" "$TMP/failed.txt" 20 '.[]' --state open --json number
+check "failed primary capture does NOT claim a count over an empty file" \
+	bash -c '! grep -q "20 of 117 shown" "$1"' _ "$TMP/failed.txt"
+check "failed primary capture says the capture may be incomplete" \
+	grep -q 'capture may be incomplete' "$TMP/failed.txt"
+
+# --- primary EXITS 0 but emits nothing, count succeeds: rc alone cannot catch this ---
+cat > "$TMP/gh" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = "1000" ] && { echo 117; exit 0; }; done
+exit 0
+STUB
+chmod +x "$TMP/gh"
+bash "$CAP" "$TMP/gh" "$TMP/silent.txt" 20 '.[]' --state open --json number
+check "silent-empty capture does NOT claim a count either" \
+	bash -c '! grep -q "20 of 117 shown" "$1"' _ "$TMP/silent.txt"
+
 # --- the caller must be wired to the helper, with the gh binary in place ---
 G="$REPO_ROOT/skills/self-diagnose/scripts/gather.sh"
 # Match the dispatch as WRITTEN: the helper path is held in $_cap, so a grep for
