@@ -142,7 +142,8 @@ def test_loader_parser_and_history_fail_open_edges() -> None:
 
     duplicate = workspace / "tasks" / "task-a1.txt"
     write_task(duplicate, "task-a1", "2026-08-03T11:00:00Z", "live duplicate")
-    assert [path.stem for path in workstreams._task_paths(workspace / "tasks")].count("task-a1") == 1
+    ids = [task_id for task_id, _ in workstreams._task_paths(workspace / "tasks")]
+    assert ids.count("task-a1") == 1
 
     no_text = workspace / "tasks" / "task-no-text.txt"
     no_text.write_text("id: task-no-text\nsource: discord\n")

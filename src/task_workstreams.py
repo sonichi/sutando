@@ -219,6 +219,7 @@ def _parse_timestamp(raw: str, fallback: float) -> float:
 
 
 def _task_paths(tasks_dir: Path):
+    """Yield (canonical task id, path) for each distinct task, live copy first."""
     seen = set()
     candidates = list(tasks_dir.glob("task-*.txt"))
     candidates.extend((tasks_dir / "processed").glob("task-*.txt"))
@@ -230,7 +231,7 @@ def _task_paths(tasks_dir: Path):
         if task_id is None or task_id in seen:
             continue
         seen.add(task_id)
-        yield path
+        yield task_id, path
 
 
 def _result_index(results_dir: Path) -> dict[str, Path]:
@@ -261,12 +262,7 @@ def scan_task_history(workspace: Path) -> list[TaskRecord]:
     tasks_dir = workspace / "tasks"
     results = _result_index(workspace / "results")
     rows: list[TaskRecord] = []
-    for path in _task_paths(tasks_dir):
-        # Not path.stem: a claimed/assigned file's stem is the compound name, so
-        # the row gets an id nothing else ever writes. task_archive owns this.
-        task_id = task_id_from_filename(path.name)
-        if task_id is None:
-            continue
+    for task_id, path in _task_paths(tasks_dir):
         if task_id.startswith((CLASSIFIER_TASK_PREFIX, LEGACY_CLASSIFIER_TASK_PREFIX)):
             continue
         try:
