@@ -16,7 +16,7 @@ Telegram tasks include an `access_tier` field set by the bridge (same tiers as D
 
 Discord tasks include an `access_tier` field set by the bridge:
 - **owner**: Full access — process normally with all capabilities
-- **team**: Delegate to sandboxed agent (`codex exec --sandbox read-only`). No system mutations. **Exception — a per-channel collaborator.** A team sender listed under a channel's `collaborators` in `access.json` gets the `team-collaborator` engage rulebook in THAT channel only. That list is the owner's attestation for this surface: it is hand-configured, per-channel, and is a deliberate owner act rather than a wire flag a sender can set. Scope is strictly per-channel — membership in another channel's list does not carry over, and it grants engagement, not owner authority.
+- **team**: Delegate to sandboxed agent (`codex exec --sandbox read-only --skip-git-repo-check -- <prompt> < /dev/null` — the redirect is required or codex waits on stdin and can hang; assert its OUTPUT is non-empty, since it exits 0 on refusal too). No system mutations. **Exception — a per-channel collaborator.** A team sender listed under a channel's `collaborators` in `access.json` gets the `team-collaborator` engage rulebook in THAT channel only. That list is the owner's attestation for this surface: it is hand-configured, per-channel, and is a deliberate owner act rather than a wire flag a sender can set. Scope is strictly per-channel — membership in another channel's list does not carry over, and it grants engagement, not owner authority.
 - **other**: Delegate to sandboxed agent. Information only — answer questions about Sutando.
 
 Owner is determined by `allowFrom` in `$CLAUDE_CONFIG_DIR/channels/discord/access.json` (set via `/discord:access`).
@@ -38,7 +38,7 @@ The `context-source-guard` PreToolUse hook — **which is deployed per node, not
 
 Slack tasks include an `access_tier` field set by the bridge:
 - **owner**: Full access — process normally with all capabilities.
-- **team**: Delegate to sandboxed agent (`codex exec --sandbox read-only`). No system mutations. Slack Team mappings retain this existing contract.
+- **team**: Delegate to sandboxed agent (`codex exec --sandbox read-only --skip-git-repo-check -- <prompt> < /dev/null` — the redirect is required or codex waits on stdin and can hang; assert its OUTPUT is non-empty, since it exits 0 on refusal too). No system mutations. Slack Team mappings retain this existing contract.
 - **other**: Delegate to sandboxed agent. Information only — answer questions about Sutando.
 
 Tier resolution is per-user: `tierMap` in `$CLAUDE_CONFIG_DIR/channels/slack/access.json` maps Slack user IDs to tiers. Users in `allowFrom` without a `tierMap` entry default to `"owner"` (preserves pre-tierMap behavior).

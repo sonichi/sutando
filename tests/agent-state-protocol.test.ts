@@ -689,7 +689,7 @@ describe('agent.state emission (integration, spawned agent)', () => {
 			// acquisition — pid and lockId equal the structured lock's.
 			const marker = JSON.parse(readFileSync(voiceCapabilitiesPath(ws), 'utf-8'));
 			assert.equal(marker.probeIsolation, true);
-			const lock = JSON.parse(readFileSync(join(ws, '.voice-agent.pid'), 'utf-8'));
+			const lock = JSON.parse(readFileSync(join(ws, 'state', 'locks', 'voice-agent.pid'), 'utf-8'));
 			assert.equal(marker.pid, lock.pid, 'marker.pid = lock holder pid');
 			assert.equal(marker.lockId, lock.lockId, 'marker.lockId = lock acquisition token');
 		} finally {

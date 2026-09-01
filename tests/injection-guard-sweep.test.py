@@ -336,6 +336,9 @@ _GUARDED_PY_WRITERS = {
     # Sparrow gateway bridge: guarded by a DIFFERENT documented mechanism —
     # every interpolated value passes _one_line() (newline-strip).
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",
+    # Room speech + quoted article text: every value goes through confine(),
+    # and task: is written last so body newlines cannot forge fields.
+    "src/signal_room_tasks.py",
 }
 
 _TASK_FIELD_PATTERN = 'f"task: {'
