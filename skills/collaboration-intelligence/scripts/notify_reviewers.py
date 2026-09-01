@@ -96,20 +96,10 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     is carried to the exit so the caller sees somebody was skipped."""
     out, worst = [], 0
     actor_of, covered = _actor_map(roster), {}
-    parent, cands = {}, []
-
-    def _find(k):
-        parent.setdefault(k, k)
-        while parent[k] != k:
-            parent[k] = parent[parent[k]]
-            k = parent[k]
-        return k
-
-    def _union(a, b):
-        ra, rb = _find(a), _find(b)
-        if ra != rb:
-            parent[ra] = rb
-        return _find(a)
+    # The component comes from the WHOLE roster, so a connector row that is
+    # unrequested, unroutable or off-allowlist still joins the people it links.
+    component = identity_components(roster)
+    cands = []
 
     for name in names:
         entry = roster.get(name)
@@ -163,25 +153,17 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
         # One person can hold several roster keys, so counting NAMES lets the
         # two-reviewer gate in main() pass on one recipient addressed twice.
         actor = actor_of.get(name, name)
-        ident = [("actor", actor)]
-        if endpoint:
-            ident.append(("endpoint", endpoint))
-        for k in ident[1:]:
-            _union(ident[0], k)
-        cands.append((ident[0], name, {
+        cands.append((component.get(name, ("actor", actor)), name, {
             "name": name, "transport": transport, "stand": stand,
             "room": room, "discord_id": dm_id, "channel": channel,
             "endpoint": endpoint, "human": entry.get("human")}))
 
-    # Emit only after every row is unioned: the row connecting two others can
-    # arrive last, and a streaming emit has already sent both by then.
-    for key, name, target in cands:
-        root = _find(key)
+    for root, name, target in cands:
         prior = covered.get(root)
         if prior is not None:
             print(f"DUPLICATE '{name}': same person as '{prior}' "
-                  f"({target['endpoint'] or key[1]}) — already covered, "
-                  "not a second reviewer", file=sys.stderr)
+                  f"({target['endpoint'] or actor_of.get(name, name)}) — "
+                  "already covered, not a second reviewer", file=sys.stderr)
             continue
         covered[root] = name
         out.append(target)
@@ -830,6 +812,40 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
         print(f"  WARNING: ledger compaction failed ({type(exc).__name__}: {exc}); "
               "the append stands", file=sys.stderr)
     return len(refs)
+
+
+def identity_components(roster) -> dict:
+    """name -> canonical identity key, over the WHOLE roster and BOTH axes.
+
+    Built before ANY selection, route, capability or allowlist filtering:
+    filtering decides which endpoint may send, never who the person is.
+    """
+    actor_of = _actor_map(roster or {})
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            parent[hi] = lo
+        return find(a)
+
+    rows = [(k, v) for k, v in (roster or {}).items()
+            if isinstance(v, dict) and not k.startswith("_")]
+    for name, entry in rows:
+        akey = ("actor", actor_of.get(name, name))
+        endpoint = durable_endpoint(entry)
+        # An off-allowlist or unroutable row still NAMES its person, so it still
+        # carries the link; dropping it here is what let a connector disappear.
+        union(akey, ("endpoint", endpoint)) if endpoint else find(akey)
+    return {name: find(("actor", actor_of.get(name, name))) for name, _ in rows}
 
 
 def _actor_map(roster) -> dict:

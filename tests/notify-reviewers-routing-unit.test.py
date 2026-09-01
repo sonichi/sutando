@@ -1256,6 +1256,30 @@ class TheTwoReviewerGateCountsPeopleNotRows(unittest.TestCase):
                           f"{order}: one connected person passed the two-reviewer gate")
             self.assertEqual(sends, 0, f"{order}: the same person was sent to twice")
 
+    def test_an_omitted_connector_still_joins_the_people_it_links(self):
+        # The component is built from the ROSTER, so a row that is never
+        # requested still carries the link between the two rows that are.
+        roster = {"alpha": self.D,
+                  "bridge": dict(self.D, same_actor_as="charlie"),
+                  "charlie": {"discord_id": "333", "home_channel": "222"}}
+        for order in ("alpha,charlie", "charlie,alpha"):
+            rc, sends, err = self._run_main(roster, order)
+            self.assertIn("at least TWO", err,
+                          f"{order}: omitting the connector passed one person as two")
+            self.assertEqual(sends, 0, f"{order}: one person was sent to twice")
+
+    def test_an_off_allowlist_connector_still_joins_them(self):
+        # Filtering decides which endpoint may SEND; it never decides who the
+        # person is, so an off-allowlist row still carries its link.
+        roster = {"alpha": self.D,
+                  "bridge": dict(self.D, same_actor_as="charlie", allowlisted=False),
+                  "charlie": {"discord_id": "333", "home_channel": "222"}}
+        for order in ("alpha,bridge,charlie", "charlie,bridge,alpha", "alpha,charlie"):
+            rc, sends, err = self._run_main(roster, order)
+            self.assertIn("at least TWO", err,
+                          f"{order}: off-allowlist connector was dropped from the component")
+            self.assertEqual(sends, 0, f"{order}: one person was sent to twice")
+
     def test_the_transitive_close_does_not_merge_distinct_people(self):
         # Control for the case above: three unrelated rows must stay three.
         roster = {"alpha": self.D,
