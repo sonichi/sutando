@@ -89,6 +89,26 @@ check("same messages either way — selection is unchanged, only rendering",
 check("CONTROL: `| tail -1` on oldest_first yields the NEWEST message",
       r_old["messages"][-1]["body"] == "newest", f"got {r_old['messages'][-1]['body']}")
 
+# 6. Drive the CLI dispatch itself. String-matching room_ops.py source left the
+#    `oldest_first=a.oldest_first` line uncovered, which is how it reached CI.
+import room_ops  # noqa: E402
+
+_seen = {}
+room_ops._read.read_room = lambda *a, **k: (_seen.update(k), {"ok": True, "messages": []})[1]
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+with contextlib.redirect_stdout(io.StringIO()):
+    room_ops._main(["read", "!r:x", "--agent", "@me:x", "--oldest-first"])
+check("CLI --oldest-first reaches read_room as oldest_first=True",
+      _seen.get("oldest_first") is True, f"got {_seen.get('oldest_first')!r}")
+
+_seen.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    room_ops._main(["read", "!r:x", "--agent", "@me:x"])
+check("CONTROL: without the flag the default is False, not absent",
+      _seen.get("oldest_first") is False, f"got {_seen.get('oldest_first')!r}")
+
 print()
 if failures:
     print(f"{len(failures)} failure(s): {', '.join(failures)}")
