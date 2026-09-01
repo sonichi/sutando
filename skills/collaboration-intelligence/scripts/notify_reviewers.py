@@ -88,6 +88,10 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             continue
         stand, room = entry.get("stand"), entry.get("room")
         why = stated_reason(entry)
+        # A caveat nobody prints is a note, not a step. Shared-login entries
+        # look like one actor from GitHub; surface it here, before the send.
+        if entry.get("identity_caveat"):
+            print(f"IDENTITY CAVEAT '{name}': {entry['identity_caveat']}", file=sys.stderr)
         if not stand or not room:
             # a human id alone cannot be a target: person-mentions trigger no Stand
             print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
