@@ -333,10 +333,6 @@ pre.json .n { color: var(--warn); }
       </div>
     </section>
 
-    <section class="rail-block">
-      <p class="eyebrow">Workers</p>
-      <div id="worker-roster" style="display:flex;flex-direction:column;gap:8px"></div>
-    </section>
   </aside>
 
   <div class="inspector">
@@ -357,12 +353,12 @@ pre.json .n { color: var(--warn); }
       <div class="owner-grid" id="owner-grid"></div>
     </section>
 
-    <section class="sec" id="sec-devices">
+    <section class="sec" id="sec-workers">
       <div class="sec-head">
-        <h2 class="sec-title">Devices</h2>
-        <p class="sec-note">Three enrolled. No installations or runtime instances are reported.</p>
+        <h2 class="sec-title">Workers</h2>
+        <p class="sec-note" id="workers-note"></p>
       </div>
-      <div class="stack" id="device-stack"></div>
+      <div class="rows" id="worker-rows"></div>
     </section>
 
     <section class="sec" id="sec-resolve">
@@ -549,17 +545,6 @@ const WORKERS = window.SUTANDO_WORKERS || [
   { seat: "worker-3", name: "Ada-the-triager", runtime: "claude" },
   { seat: "worker-4", name: "Alan-the-ops", runtime: "codex" }
 ];
-(function renderWorkerRoster(){
-  const host = document.getElementById("worker-roster");
-  if (!host) return;
-  host.innerHTML = WORKERS.map(w => `
-    <div style="display:flex;align-items:center;gap:9px">
-      <span class="livedot" style="${w.alive === false ? "background:var(--idle);box-shadow:0 0 0 3px var(--idle-soft)" : ""}"></span>
-      <span style="font-weight:600;font-size:13px">${w.name}</span>
-      <span class="mono" style="font-size:10.5px;color:var(--ink-3);margin-left:auto">${w.seat} · ${w.runtime}</span>
-    </div>`).join("");
-})();
-
 document.getElementById("view-source").textContent =
   window.SUTANDO_STAND_RAW ? "live state \u00b7 bin/sutando stand" : "sample snapshot \u00b7 Aug 23 2026";
 let level = "owner";
@@ -598,7 +583,7 @@ function render() {
 
   $("#tally").innerHTML = level === "public"
     ? `<div><b class="${linked.length ? "" : "zero"}">${linked.length}</b><span>Entrances</span></div><div><b>—</b><span>Capabilities</span></div><div><b>—</b><span>Proof</span></div>`
-    : `<div><b>${VIEW.channels.length}</b><span>Channels</span></div><div><b class="${linked.length ? "" : "zero"}">${linked.length}</b><span>Linked</span></div><div><b>${VIEW.devices.length}</b><span>Devices</span></div>`;
+    : `<div><b>${VIEW.channels.length}</b><span>Channels</span></div><div><b class="${linked.length ? "" : "zero"}">${linked.length}</b><span>Linked</span></div><div><b>${WORKERS.length}</b><span>Workers</span></div>`;
 
   $("#mrz").textContent = level === "diagnostics"
     ? "STAND<<SUTANDO<<QINGYUN<<001<<AG2.SPACE<<ACTIVE<<CH:5<<LINKED:" + linked.length + "<<DEV:3<<PROOF:NONE"
@@ -658,18 +643,17 @@ function render() {
           </div>`).join("")}`}
   `;
 
-  // devices
-  $("#sec-devices").classList.toggle("hidden", level === "public");
-  $("#device-stack").innerHTML = VIEW.devices.map((d) => `
-    <div class="tile">
-      <div class="tile-head">
-        <span class="tile-name">${esc(d.id)}</span>
-        <span class="tile-kind">${d.platform === "unknown" ? "platform unknown" : esc(d.platform)}</span>
-        <span class="dual"><span class="ax-ok"><i>✓</i>${esc(d.status)}</span></span>
-      </div>
-      <div class="tile-line"><span class="unreported">No last-seen, permissions or enrolment time reported.</span></div>
-    </div>`).join("")
-    + `<div class="tile"><div class="tile-head"><span class="tile-kind">Runtime instances</span></div><div class="tile-line"><span class="unreported">None reported. A device, an installation and a running instance are three different things; the view currently has only the first.</span></div></div>`;
+  // workers
+  $("#workers-note").innerHTML = `<b>${WORKERS.length}</b> workers \u00b7 names persist in the identity document`;
+  $("#worker-rows").innerHTML = WORKERS.map((w) => `
+    <div class="row" style="cursor:default">
+      <span class="row-provider">${esc(w.seat)}</span>
+      <span class="row-main">
+        <span class="row-title">${esc(w.name)}</span>
+        <span class="row-sub">${esc(w.runtime)} runtime</span>
+      </span>
+      <span class="row-right"><span class="dual"><span class="${w.alive === false ? "ax-idle" : "ax-ok"}"><i>${w.alive === false ? "\u25cb" : "\u2713"}</i>${w.alive === false ? "idle" : "active"}</span></span></span>
+    </div>`).join("");
 
 }
 
