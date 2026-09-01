@@ -530,14 +530,14 @@ class DiscordLedgerBranchesRun(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def test_a_logged_ask_reports_the_count(self):
-        rc, out, err = self._send(0, lambda msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None: 2)
+        rc, out, err = self._send(0, lambda msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None, membership=None: 2)
         self.assertIn("SENT to channel", out)
         self.assertIn("logged 2 PR ask(s)", err)
 
     def test_a_writer_that_cannot_reserve_refuses_before_sending(self):
         # The park is reserved BEFORE the post. If that write fails there is no
         # safe way to send: the post would be unrepeatable and unrecorded.
-        def boom(msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None):
+        def boom(msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None, membership=None):
             raise OSError("disk full")
         rc, out, err = self._send(0, boom)
         self.assertIn("REFUSED", err)
@@ -547,7 +547,7 @@ class DiscordLedgerBranchesRun(unittest.TestCase):
     def test_a_write_failure_after_a_successful_reserve_is_loud_but_not_fatal(self):
         # The ask already happened; losing the record makes pr-unattended
         # report it as never asked, so this must warn rather than swallow.
-        def boom(msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None):
+        def boom(msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None, membership=None):
             if outcome == "pending":
                 return 1
             raise OSError("disk full")
@@ -557,7 +557,7 @@ class DiscordLedgerBranchesRun(unittest.TestCase):
         self.assertIn("under-report", err)
 
     def test_unknown_outcome_is_not_reported_as_a_plain_failure(self):
-        rc, _, err = self._send(4, lambda msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None: 1)
+        rc, _, err = self._send(4, lambda msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None, membership=None: 1)
         self.assertIn("OUTCOME UNKNOWN", err)
         self.assertNotIn("SEND FAILED", err)
 
@@ -797,7 +797,7 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
             raise subprocess.TimeoutExpired(cmd="x", timeout=60)
         nr.subprocess.run = boom
         orig = nr.record_asks
-        def bad(msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None):
+        def bad(msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None, membership=None):
             if outcome == "pending":
                 return orig(msg, who, outcome=outcome, actor=actor, detail=detail)
             raise OSError("disk full")
@@ -829,7 +829,7 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
             returncode, stdout, stderr = 4, "", ""
         nr.subprocess.run = lambda *a, **k: _R()
         orig = nr.record_asks
-        def bad(msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None):
+        def bad(msg, who, outcome='confirmed', actor=None, detail=None, endpoint=None, membership=None):
             if outcome == "pending":
                 return orig(msg, who, outcome=outcome, actor=actor, detail=detail)
             raise OSError("disk full")

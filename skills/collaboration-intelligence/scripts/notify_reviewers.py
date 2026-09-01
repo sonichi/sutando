@@ -442,6 +442,9 @@ def _row(d) -> "tuple | None":
     if outcome is not None and (not isinstance(outcome, str)
                                 or outcome not in _KNOWN_OUTCOMES):
         return None                     # type first: a list is unhashable
+    # Malformed persisted identity drops the row; a park is never guessed.
+    if "membership" in d and valid_tags(d.get("membership")) is None:
+        return None
     return _canon_repo(repo), str(pr), who, outcome, ts or ""
 
 
@@ -725,7 +728,8 @@ def _ledger_lock(led: Path):
 
 
 def claim_park(message: str, reviewer: str, actor: str = None,
-               canonical=None, endpoint: str = None) -> "int | None":
+               canonical=None, endpoint: str = None,
+               membership=None) -> "int | None":
     """Atomically claim the park, or None if someone else already holds it.
 
     Check-then-append is not a claim: two callers both read "not parked", both
@@ -738,28 +742,77 @@ def claim_park(message: str, reviewer: str, actor: str = None,
     if not led.exists():
         os.close(os.open(led, os.O_CREAT | os.O_WRONLY, _LEDGER_MODE))
     with _ledger_lock(led):
+        # Overlap-then-UNION runs BEFORE the spelling check: returning early
+        # on a spelling match skips the union, losing the history it carries.
+        hit = _membership_overlap(led, message, membership) if membership else None
+        if hit is not None:
+            prior, ident = hit
+            record_asks(message, ident.get("reviewer") or reviewer,
+                        outcome="unknown", actor=ident.get("actor"),
+                        endpoint=ident.get("endpoint"),
+                        membership=prior | set(membership))
+            return None
         if unknown_parked(message, reviewer, who, canonical=canonical,
                           endpoint=endpoint):
             return None
         return record_asks(message, reviewer, outcome="pending", actor=who,
-                           endpoint=endpoint)
+                           endpoint=endpoint, membership=membership)
 
+
+def _membership_overlap(led: Path, message: str, cand) -> "tuple | None":
+    """An unresolved OUTCOME_UNKNOWN record for this notice whose persisted
+    membership intersects the candidate's component, with its identity."""
+    refs = {(_canon_repo(r), str(n)) for r, n in _refs(message)}
+    if not refs or not led.exists():
+        return None
+    # LAST row per stream, never any matching row: a definite failure settles
+    # its endpoint, and its earlier `pending` must not keep parking the person.
+    streams, best = {}, None
+    try:
+        for line in led.read_text().splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if (_canon_repo(d.get("repo")), str(d.get("pr"))) not in refs:
+                if (None, str(d.get("pr"))) not in refs:
+                    continue
+            who = d.get("endpoint") or d.get("actor") or d.get("reviewer")
+            if not isinstance(who, str) or not who:
+                continue
+            key = (_canon_repo(d.get("repo")), str(d.get("pr")), who)
+            # Membership is carried FORWARD within its stream: a settle row
+            # supersedes the claim's outcome but does not restate its identity.
+            seen = valid_tags(d.get("membership"))
+            prior = streams.get(key, (None, None))[1]
+            streams[key] = (d, seen if seen is not None else prior)
+    except OSError:
+        return None
+    for d, tags in streams.values():
+        if d.get("outcome") not in _UNSAFE_OUTCOMES:
+            continue
+        if not tags or not (tags & set(cand)):
+            continue
+        best = (tags, {k: d.get(k) for k in ("reviewer", "actor", "endpoint")})
+    return best
 
 def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
                 actor: str = None, detail: str = None,
-                endpoint: str = None) -> int:
+                endpoint: str = None, membership=None) -> int:
     """Locked public writer. Every append serialises against the compactor."""
     if not _PR_URL.search(message or ""):
         return 0        # nothing to write, so no path to resolve and no lock
     led = ledger_path()
     with _ledger_lock(led):
         return _append(led, message, reviewer, outcome, actor, detail,
-                       endpoint)
+                       endpoint, membership)
 
 
 def _append(p: Path, message: str, reviewer: str, outcome: str,
             actor: str = None, detail: str = None,
-            endpoint: str = None) -> int:
+            endpoint: str = None, membership=None) -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED.
@@ -789,6 +842,8 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
             row["endpoint"] = endpoint
         if detail:
             row["detail"] = detail
+        if membership:
+            row["membership"] = sorted(membership)
         # The COMPLETE row, through the reader's own validator: appending one
         # the reader drops is a silent write, and a list outcome raised instead.
         if _row(row) is None:
@@ -846,6 +901,44 @@ def identity_components(roster) -> dict:
         # carries the link; dropping it here is what let a connector disappear.
         union(akey, ("endpoint", endpoint)) if endpoint else find(akey)
     return {name: find(("actor", actor_of.get(name, name))) for name, _ in rows}
+
+
+#: A persisted membership is attacker-adjacent state read back into a safety
+#: decision, so it is bounded and typed; anything else fails closed.
+_MAX_TAGS = 512
+_TAG_RE = re.compile(r"^(actor:[^\s:]+|endpoint:[^\s:]+:.+)$")
+
+
+def valid_tags(value) -> "set | None":
+    """The persisted tag set, or None when it is malformed (park stays on)."""
+    if not isinstance(value, list) or len(value) > _MAX_TAGS:
+        return None
+    out = set()
+    for t in value:
+        if not isinstance(t, str) or not _TAG_RE.match(t):
+            return None
+        out.add(t)
+    return out
+
+
+def component_tags(roster, name: str) -> set:
+    """The candidate's full-roster component, as bounded typed tags.
+
+    Namespaced so an actor named like an id cannot collide with an endpoint.
+    """
+    comp = identity_components(roster)
+    actor_of = _actor_map(roster or {})
+    root = comp.get(name)
+    tags = {f"actor:{actor_of.get(name, name)}"}
+    for other, r in comp.items():
+        if root is not None and r != root:
+            continue
+        tags.add(f"actor:{actor_of.get(other, other)}")
+        endpoint = durable_endpoint((roster or {}).get(other) or {})
+        if endpoint:
+            tags.add(f"endpoint:{endpoint}"
+                     if endpoint.startswith("discord:") else f"endpoint:mx:{endpoint}")
+    return set(sorted(tags)[:_MAX_TAGS])
 
 
 def component_resolver(roster):
@@ -1121,7 +1214,9 @@ def main() -> int:
                 try:
                     reserved = claim_park(a.message, t["name"], who,
                                           canonical=person_of,
-                                          endpoint=t.get("endpoint"))
+                                          endpoint=t.get("endpoint"),
+                                          membership=component_tags(
+                                              load_roster(), t["name"]))
                 except OSError as e:
                     print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
                           "sending now would be unrepeatable-but-unrecorded. Nothing "
