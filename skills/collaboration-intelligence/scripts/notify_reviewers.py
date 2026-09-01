@@ -96,6 +96,21 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     is carried to the exit so the caller sees somebody was skipped."""
     out, worst = [], 0
     actor_of, covered = _actor_map(roster), {}
+    parent, cands = {}, []
+
+    def _find(k):
+        parent.setdefault(k, k)
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+        return _find(a)
+
     for name in names:
         entry = roster.get(name)
         if entry is None:
@@ -147,23 +162,29 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
         endpoint = durable_endpoint(entry)
         # One person can hold several roster keys, so counting NAMES lets the
         # two-reviewer gate in main() pass on one recipient addressed twice.
-        # EITHER axis alone is one person: a composite key collapses only when
-        # BOTH match, which is not the case that pings a Stand twice.
         actor = actor_of.get(name, name)
-        ident = [("actor", actor_of.get(name, name))]
+        ident = [("actor", actor)]
         if endpoint:
             ident.append(("endpoint", endpoint))
-        prior = next((covered[k] for k in ident if k in covered), None)
+        for k in ident[1:]:
+            _union(ident[0], k)
+        cands.append((ident[0], name, {
+            "name": name, "transport": transport, "stand": stand,
+            "room": room, "discord_id": dm_id, "channel": channel,
+            "endpoint": endpoint, "human": entry.get("human")}))
+
+    # Emit only after every row is unioned: the row connecting two others can
+    # arrive last, and a streaming emit has already sent both by then.
+    for key, name, target in cands:
+        root = _find(key)
+        prior = covered.get(root)
         if prior is not None:
             print(f"DUPLICATE '{name}': same person as '{prior}' "
-                  f"({endpoint or actor}) — already covered, not a second reviewer",
-                  file=sys.stderr)
+                  f"({target['endpoint'] or key[1]}) — already covered, "
+                  "not a second reviewer", file=sys.stderr)
             continue
-        for k in ident:
-            covered[k] = name
-        out.append({"name": name, "transport": transport, "stand": stand,
-                    "room": room, "discord_id": dm_id, "channel": channel,
-                    "endpoint": endpoint, "human": entry.get("human")})
+        covered[root] = name
+        out.append(target)
     return out, worst
 
 

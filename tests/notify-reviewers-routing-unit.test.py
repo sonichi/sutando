@@ -1243,6 +1243,28 @@ class TheTwoReviewerGateCountsPeopleNotRows(unittest.TestCase):
         self.assertNotIn("at least TWO", err)
         self.assertEqual(sends, 2)
 
+    def test_identity_is_transitive_across_the_two_axes(self):
+        # alpha~bridge by endpoint and bridge~charlie by actor is ONE person.
+        # Skipping bridge must not disconnect alpha from charlie, in ANY order.
+        roster = {"alpha": self.D,
+                  "bridge": dict(self.D, same_actor_as="charlie"),
+                  "charlie": {"discord_id": "333", "home_channel": "222"}}
+        for order in ("alpha,bridge,charlie", "bridge,alpha,charlie",
+                      "charlie,bridge,alpha", "charlie,alpha,bridge"):
+            rc, sends, err = self._run_main(roster, order)
+            self.assertIn("at least TWO", err,
+                          f"{order}: one connected person passed the two-reviewer gate")
+            self.assertEqual(sends, 0, f"{order}: the same person was sent to twice")
+
+    def test_the_transitive_close_does_not_merge_distinct_people(self):
+        # Control for the case above: three unrelated rows must stay three.
+        roster = {"alpha": self.D,
+                  "solo1": {"discord_id": "901", "home_channel": "222"},
+                  "solo2": {"discord_id": "902", "home_channel": "222"}}
+        rc, sends, err = self._run_main(roster, "alpha,solo1,solo2")
+        self.assertNotIn("at least TWO", err)
+        self.assertEqual(sends, 3, "transitive dedup swallowed unrelated people")
+
 
 class AnAllowFromHitIsNotMembership(unittest.TestCase):
     """The positive-hit direction, previously reported as verified reachability."""
