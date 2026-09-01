@@ -5962,9 +5962,8 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     unconsumed, trailing, dead = [], [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
-        # A deleted script cannot produce output, and every completion lane still
-        # reports the job finishing on time (the handler runs and writes a no-op),
-        # so scoring punctuality here names the wrong defect in both directions.
+        # A deleted script still completes — the handler runs and writes a no-op —
+        # so every completion lane reports it on time and lateness is the wrong verdict.
         if j.get("missing_script"):
             dead.append((j["name"], j["missing_script"]))
             continue
@@ -6104,7 +6103,7 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
     return out[-limit:]
 
 
-def _cron_missing_script(entry: dict) -> str | None:
+def _cron_missing_script(entry: dict) -> Optional[str]:
     """First script path a cron entry invokes that is not on disk, else None.
 
     A job whose script was deleted still leaves a task-cron RESULT — the handler
