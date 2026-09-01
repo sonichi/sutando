@@ -88,12 +88,16 @@ def _channel_env_file():
     providers' — `channel_token.py` states the rule: each bridge reads its own
     `channels/<name>/.env`. Returned rather than inlined so tests can shadow this
     boundary the way they already shadow the vault.
+
+    The dir is REMOTE_TASK_CHANNEL_DIR, the same expression the gateway bridge
+    uses; hardcoding "ag2space" made every lane read PROD's credential.
     """
     try:
         if not _core_src_on_path():
             return None
         from util_paths import claude_home_path
-        p = claude_home_path("channels", "ag2space", ".env")
+        channel_dir = os.environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+        p = claude_home_path("channels", channel_dir, ".env")
         return p if os.path.isfile(p) else None
     except Exception:
         return None

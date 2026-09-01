@@ -86,6 +86,39 @@ class ChannelEnvLocator(_Base):
         # existing path, which is the failure this test exists to catch.
         self.assertEqual(os.path.realpath(str(got)), os.path.realpath(env))
 
+    def test_honors_the_lane_channel_dir(self):
+        # The gateway bridge already keys its config on REMOTE_TASK_CHANNEL_DIR;
+        # a hardcoded "ag2space" here served PROD's credential to every lane.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        envs = {}
+        for name in ("ag2space", "dev-ag2space"):
+            ch = os.path.join(d, "channels", name)
+            os.makedirs(ch)
+            envs[name] = os.path.join(ch, ".env")
+            with open(envs[name], "w") as fh:
+                fh.write("REMOTE_TASK_TOKEN=%s\n" % name)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d,
+                                          "REMOTE_TASK_CHANNEL_DIR": "dev-ag2space"}):
+            got = _gateway._channel_env_file()
+        self.assertIsNotNone(got, "lane dir exists but the locator returned None")
+        self.assertEqual(os.path.realpath(str(got)), os.path.realpath(envs["dev-ag2space"]))
+        # Both files exist, so a locator that ignores the lane returns the PROD
+        # one rather than None — the assertion above is what discriminates.
+        self.assertNotEqual(os.path.realpath(str(got)), os.path.realpath(envs["ag2space"]))
+
+    def test_lane_dir_absent_is_none_not_prod(self):
+        # Fail closed: an unconfigured lane must NOT inherit prod's credential.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        ch = os.path.join(d, "channels", "ag2space")
+        os.makedirs(ch)
+        with open(os.path.join(ch, ".env"), "w") as fh:
+            fh.write("REMOTE_TASK_TOKEN=prod\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d,
+                                          "REMOTE_TASK_CHANNEL_DIR": "dev-ag2space"}):
+            self.assertIsNone(_gateway._channel_env_file())
+
     def test_none_when_absent(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
