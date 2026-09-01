@@ -143,8 +143,19 @@ def gate_capability(repo: str, login: str) -> "tuple[bool | None, str]":
     if perm in ("write", "admin", "maintain"):
         return True, perm
     if perm in ("read", "none", "triage"):
-        return False, perm
+        # `read` is also what this endpoint returns for someone who is not a
+        # collaborator at all, so the reason needs the membership check.
+        return False, perm if _is_collaborator(repo, login) else "not a collaborator"
     return None, f"unverified (permission={perm!r})"
+
+
+def _is_collaborator(repo: str, login: str) -> bool:
+    try:
+        p = subprocess.run(["gh", "api", f"repos/{repo}/collaborators/{login}"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:                            # noqa: BLE001 - probe must not raise
+        return True                              # unknown -> the milder wording
+    return p.returncode == 0
 
 
 def _github_login(name: str, roster: dict) -> "tuple[str, str]":
@@ -391,7 +402,9 @@ def main() -> int:
                     print(f"{t['name']}: probing GitHub as {login} ({why_login})",
                           file=sys.stderr)
                 if can is False:
-                    print(f"CANNOT GATE '{t['name']}': {why_cap}-only on {repo} — an "
+                    detail = (why_cap if why_cap == "not a collaborator"
+                              else f"{why_cap}-only")
+                    print(f"CANNOT GATE '{t['name']}': {detail} on {repo} — an "
                           f"approval from this account does not count toward the "
                           f"required approvals", file=sys.stderr)
                     refusal_rc = max(refusal_rc, 7)

@@ -504,6 +504,39 @@ class GateCapabilityProbesAGitHubLogin(unittest.TestCase):
         self.assertIn("no login found", why)
 
 
+class GateCapabilityNamesTheRightReason(unittest.TestCase):
+    """`read` is also the endpoint's answer for a non-collaborator."""
+
+    def _cap(self, perm, is_collab):
+        # The two calls differ only by URL, so the stub must too — keying both
+        # on one return code makes the permission read fail as well.
+        def run(cmd, **k):
+            membership = not any("permission" in str(x) for x in cmd)
+            rc = (0 if is_collab else 1) if membership else 0
+            return type("R", (), {"stdout": "" if membership else perm,
+                                  "stderr": "", "returncode": rc})()
+        m = _load()
+        m.subprocess = type("S", (), {"run": staticmethod(run),
+                                      "TimeoutExpired": Exception})
+        return m.gate_capability("o/r", "who")
+
+    def test_a_non_collaborator_is_not_described_as_read_only(self):
+        can, why = self._cap("read", is_collab=False)
+        self.assertIs(can, False)
+        self.assertEqual(why, "not a collaborator")
+
+    def test_a_real_read_collaborator_keeps_its_permission_word(self):
+        # Control: without this the reason collapses to one string for both.
+        can, why = self._cap("read", is_collab=True)
+        self.assertIs(can, False)
+        self.assertEqual(why, "read")
+
+    def test_write_is_unaffected_by_the_membership_probe(self):
+        can, why = self._cap("write", is_collab=False)
+        self.assertIs(can, True)
+        self.assertEqual(why, "write")
+
+
 class GateCapabilitySkipIsAnnounced(unittest.TestCase):
     """The one case the tool cannot check must not be the one it is silent about."""
 
