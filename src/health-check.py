@@ -9790,6 +9790,10 @@ def run_all_checks() -> list[dict]:
             c["detail"] = "not running (optional)"
         # "wedged" is NOT downgraded: listening-but-dead is worse than down —
         # startup.sh's lsof guard sees the port as occupied and won't restart it.
+        # Compose LAST: the downgrade above overwrites detail, and a healthy
+        # port never evaluated pins at all, so only here do both reach.
+        _, _ols = _proc_lstarts(name)
+        _apply_pin_findings(c, _pin_verdicts(name, _ols))
         checks.append(c)
 
     # Previously unmonitored, so a dead proxy (= broken auth/quota for
@@ -11929,7 +11933,12 @@ def main():
         sc = next((c for c in checks if c["name"] == "screen-capture" and c["status"] == "warn"
                    and "not running" in (c.get("detail") or "")), None)
         if sc:
-            print(f"  screen-capture: {fix_screen_capture()}")
+            # fix_screen_capture() kills the :7845 listener before it checks
+            # anything else; a pin forbids exactly that act.
+            if sc.get("restart_veto"):
+                print(f"  screen-capture: not restarted — {sc['restart_veto']}")
+            else:
+                print(f"  screen-capture: {fix_screen_capture()}")
 
     # The managed Codex notifier is warn-only, like the generic task watcher:
     # a missing bridge does not mean Core itself is down. It is still safe to
