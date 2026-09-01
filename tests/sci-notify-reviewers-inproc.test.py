@@ -403,6 +403,17 @@ class ResolveDedupesOneActor(unittest.TestCase):
         self.assertEqual(got, ["alice", "carol"])
         self.assertNotIn("DUPLICATE", err)
 
+    def test_an_mxid_shaped_roster_key_does_not_alias_a_stand(self):
+        # A flat keyspace lets a roster key collide with someone else's stand,
+        # and a false DUPLICATE drops a real second reviewer with no error.
+        roster = {"@shared:x": {"stand": "@a-stand:x", "room": "!r"},
+                  "bob": {"stand": "@shared:x", "room": "!r"}}
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            targets, _ = _load().resolve(["@shared:x", "bob"], roster)
+        self.assertEqual(sorted(t["name"] for t in targets), ["@shared:x", "bob"])
+        self.assertNotIn("DUPLICATE", buf.getvalue())
+
     def test_the_refusal_names_who_already_covers_the_slot(self):
         # "already addressed" and "unreachable" need different follow-ups.
         _, err = self.names("alice", "bob")
