@@ -1088,9 +1088,8 @@ def test_context_cli_accepts_a_live_pool_filename() -> None:
                "2026-08-03T10:05:00Z", "continue workstream context")
     assert workstreams.inherit_assignment(workspace, "task-current", "task-a1")
 
-    # The bare id is the control: it never depended on the filename grammar.
-    # The pathname arm is the regression control — the parser is basename-anchored,
-    # so an unreduced path falls through and is rejected for its separator.
+    # Bare id is the control; the pathname arm is the regression control — an
+    # unreduced path is rejected for its separator and yields no context.
     for argument in ("task-current", "task-current.txt",
                      "task-current.claimed-core-3.txt",
                      "task-current.assigned-core-2.txt",

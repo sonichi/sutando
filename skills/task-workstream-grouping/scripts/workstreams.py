@@ -40,9 +40,8 @@ def main(argv=None) -> int:
         print(json.dumps(build_classifier_snapshot(workspace), ensure_ascii=False, indent=2))
         return 0
     if args.command == "context":
-        # task-notifier.sh passes the on-disk filename and the pool renames it to
-        # .assigned-/.claimed-<inst>; the parser is basename-anchored, so a path
-        # must be reduced first or it falls through and is rejected for its `/`.
+        # The parser is basename-anchored: an unreduced path falls through and is
+        # then rejected for its separator, silently yielding no context.
         basename = Path(args.task).name
         task_id = task_id_from_filename(basename) or basename
         context = build_workstream_context(workspace, task_id, limit=args.limit)
