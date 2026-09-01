@@ -405,6 +405,12 @@ def _handle_signal(signum: int, frame) -> None:
     global _SHUTDOWN_REQUESTED
     _SHUTDOWN_REQUESTED = True
     try:
+        # Tombstone BEFORE the unlink: recover-core must not read a graceful
+        # stop as death and relaunch a core someone stopped on purpose (#2160).
+        mark_stopped()
+    except Exception:  # pragma: no cover — best-effort
+        pass
+    try:
         _alive_path().unlink(missing_ok=True)
     except Exception:  # pragma: no cover — best-effort cleanup
         pass
@@ -428,6 +434,11 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     # a failed boot as healthy. Keep waiting (so a late core can still arm the
     # gate), but remove any stale prior record until the real core is observed.
     saw_core = False
+    try:
+        # A new run supersedes any prior graceful-stop tombstone.
+        _alive_path().with_suffix(".stopped").unlink(missing_ok=True)
+    except Exception:  # pragma: no cover — best-effort
+        pass
     absent_streak = 0
     while not _SHUTDOWN_REQUESTED:
         present = core_pid() is not None
@@ -468,16 +479,35 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     return 0
 
 
+def mark_stopped() -> None:
+    """Publish the durable graceful-stop tombstone for THIS host.
+
+    The one shared implementation behind both writers: the sidecar's own
+    SIGTERM/SIGINT handler, and stop-core.sh's --mark-stopped call — the
+    canonical stop path kills tmux sessions and never signals the sidecar,
+    so without this the sidecar's core-gone exit reads as a crash and
+    recover-core may relaunch a deliberately stopped core (#2160)."""
+    # mkdir: a stop can precede the first beat, and the signal handler's
+    # best-effort except would swallow the miss — tombstone silently absent.
+    CORES_DIR.mkdir(parents=True, exist_ok=True)
+    _alive_path().with_suffix(".stopped").write_text(str(time.time()))
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--interval", type=float, default=30.0, help="seconds between beats (default: 30)")
     p.add_argument("--status", type=str, default="running", help="status string written into the .alive file")
     p.add_argument("--once", action="store_true", help="write a single beat and exit (for tests/debugging)")
+    p.add_argument("--mark-stopped", action="store_true",
+                   help="write the graceful-stop tombstone and exit (called by stop-core.sh)")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.mark_stopped:
+        mark_stopped()
+        return 0
     if args.once:
         write_beat(status=args.status)
         return 0

@@ -488,6 +488,58 @@ def main() -> int:
           and "--source ag2space --channel-id '!room:ag2.space'" in sk
           and "write the result to results/task-SKILL.txt" in sk,
           "owner task carries the ag2space skill-instructions block (context-first, notify, result path)")
+    # notify.py falls back to a channel env file only when url+token are absent
+    # from the environment, and WHICH file carries them differs per onboarding.
+    _env_hint = 'set -a; . "$(bash scripts/channel-env.sh ag2space)"; set +a'
+    _notify_line = next(ln for ln in sk.splitlines() if "NOTIFY FIRST" in ln)
+    check(_env_hint in _notify_line and _notify_line.index(_env_hint)
+          < _notify_line.index("notify.py"),
+          "notify step carries the channel-env prelude BEFORE the notify.py call")
+    check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
+          "the env prelude rides both gateway-calling steps (context-first + notify)")
+    # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
+    # when the hint is hardcoded; varying it is what makes this prove anything.
+    _saved_dir, _saved_tier2 = rtc.CHANNEL_DIR, rtc.LOCAL_TIER
+    rtc.CHANNEL_DIR, rtc.LOCAL_TIER = "dev-ag2space", "owner"
+    try:
+        rtc._write_task({**TASK, "id": "task-SKILLDEV", "channel_id": "!r:dev.ag2.space"})
+        skd = (rtc.TASKS_DIR / "task-SKILLDEV.txt").read_text()
+    finally:
+        rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
+    check("channel-env.sh dev-ag2space" in skd
+          and "--source dev-ag2space " in skd
+          and "channel-env.sh ag2space)" not in skd,
+          "a non-default CHANNEL_DIR reaches BOTH env preludes and the notify --source")
+    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 2,
+          "both gateway-calling steps name the task's own channel dir, not the default")
+    # A string assertion passes even when the named file holds no gateway vars,
+    # so drive the resolver itself across both real layouts and neither-has-it.
+    import os as _os
+    import subprocess as _sp
+    import tempfile as _tf
+    _helper = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                            "scripts", "channel-env.sh")
+    def _resolve(files):
+        d = _tf.mkdtemp()
+        ch = _os.path.join(d, "channels", "ag2space")
+        _os.makedirs(ch)
+        for name, body in files.items():
+            with open(_os.path.join(ch, name), "w") as fh:
+                fh.write(body)
+        env = dict(_os.environ, CLAUDE_CONFIG_DIR=d)
+        r = _sp.run(["bash", _helper, "ag2space"], capture_output=True, text=True, env=env)
+        return r.returncode, r.stdout.strip()
+    _TOK = "REMOTE_TASK_URL=https://gw/relay\nREMOTE_TASK_TOKEN=s3cret\n"
+    _MATRIX = "AG2SPACE_HOMESERVER=https://chat.ag2.space\nACCESS_TOKEN=matrix-only\n"
+    rc, got = _resolve({".env": _TOK})
+    check(rc == 0 and got.endswith("/.env"),
+          "layout A (.env carries the token) resolves to .env")
+    rc, got = _resolve({".env": _MATRIX, "relay-client.env": _TOK})
+    check(rc == 0 and got.endswith("/relay-client.env"),
+          "layout B (.env is matrix-only, sibling carries the token) resolves to the sibling")
+    rc, got = _resolve({".env": _MATRIX})
+    check(rc != 0 and not got,
+          "no file defines the token -> resolver FAILS instead of naming a tokenless file")
     check(sk.rstrip().splitlines()[-1].startswith("3. Process"),
           "skill block is the file tail (appended after access_tier)")
     tiers_sk = [ln for ln in sk.splitlines() if ln.startswith("access_tier:")]
@@ -735,12 +787,40 @@ def main() -> int:
     check(bool(_posted) and "SECRET" not in (_posted[0].get("body") or "")
           and "sk-live" not in (_posted[0].get("body") or ""),
           "team deduped with out-of-grammar extra is withheld, not re-posted")
+    # A malformed holder must reach the SHARED plan, which reports it. Gating
+    # _dedup_plan on validity retired the ask silently instead.
+    import dedup_recovery as _dr
+    _before = len(STATE["results"])
+    (rtc.TASKS_DIR / "task-TDMAL.txt").write_text(
+        "id: task-TDMAL\ntask: fixture\n")
+    (rtc.RESULTS_DIR / "task-TDMAL.txt").write_text(
+        "[deduped: ../../../etc/passwd]\n")
+    _logged: list[str] = []
+    _real_log = rtc._log
+    rtc._log = lambda m: (_logged.append(m), _real_log(m))[1]
+    try:
+        rtc._post_ready_results({"task-TDMAL"})
+    finally:
+        rtc._log = _real_log
+    _posted = STATE["results"][_before:]
+    _body = (_posted[0].get("body") or "") if _posted else ""
+    check(bool(_posted) and _dr.MALFORMED_TEMPLATE in _body,
+          "malformed dedup holder REPORTS via the shared plan, not a silent close")
+    check(_body.strip() != "[no-send]",
+          "malformed holder is not retired as an ordinary skip")
+    check("etc/passwd" not in _body,
+          "the raw out-of-grammar holder is never echoed into the report")
+    check(bool(_logged) and not any("etc/passwd" in m for m in _logged),
+          "nor into the log line (sender-controlled bytes stay out of the record)")
     import team_result_guard as _guard
-    check(_guard.suppression_stub_for_tier("[deduped: task-abc_123]", "team")
-          == "[deduped: task-abc_123]",
-          "in-grammar deduped body reconstructs the exact marker line")
-    check(_guard.suppression_stub_for_tier("[future-marker]", "team") is None,
-          "unknown skip marker yields no stub (guard path, not [no-send])")
+    # suppression_stub_for_tier was replaced by is_suppression_only: the guard
+    # classifies and journals, it no longer reconstructs a stub to close with.
+    check(_guard.is_suppression_only("[deduped: task-abc_123]"),
+          "in-grammar deduped body classifies as suppression-only")
+    check(not _guard.is_suppression_only("[future-marker]"),
+          "unknown marker is not suppression (guard path, not [no-send])")
+    check(not hasattr(_guard, "suppression_stub_for_tier"),
+          "the retired stub API is gone from the module")
 
     # DeliveryCore wiring, proven by side effects only the seam produces:
     # outbox attempt accounting + UNKNOWN resolved by the idempotent re-send.
