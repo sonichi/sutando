@@ -59,7 +59,8 @@ def _clean(value: object) -> str:
 
     `.env` conventions allow `VAR="abc"`, and the literal quotes reaching an API
     URL is a real bug this repo has already hit (telegram 404s on
-    `.../bot"abc"/getUpdates`).
+    `.../bot"abc"/getUpdates`). Exactly ONE layer: a token may legitimately
+    contain quote characters, so peeling further would corrupt it.
     """
     if not isinstance(value, str):
         return ""
@@ -68,6 +69,24 @@ def _clean(value: object) -> str:
         v = v[1:-1].strip()
     return v
 
+
+def clean_relay_token(value: object) -> str:
+    """`_clean` plus repair for a re-rendered `<url>|<secret>` relay token.
+
+    A writer that quoted an already-quoted value leaves stacked layers and
+    shell escapes, and the polluted secret 401s on every relay. Safe to peel
+    here and nowhere else: this shape is url|hex, so a quote or backslash at
+    either edge is never content (unlike a bot token — see
+    tests/discord-token-delegation.test.py's one-layer contract).
+    """
+    v = _clean(value)
+    if "|" not in v:
+        return v
+    while True:
+        prev = v
+        v = v.strip().strip("\\'\"").strip()
+        if v == prev:
+            return v
 
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
