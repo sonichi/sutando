@@ -108,7 +108,8 @@ class ChannelEnvLocator(_Base):
         self.assertNotEqual(os.path.realpath(str(got)), os.path.realpath(envs["ag2space"]))
 
     def test_lane_dir_absent_is_none_not_prod(self):
-        # Fail closed: an unconfigured lane must NOT inherit prod's credential.
+        # Pins the LOCATOR, not the resolved credential: gateway()'s vault tier
+        # sits below this one and is lane-agnostic, so it can still serve prod.
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         ch = os.path.join(d, "channels", "ag2space")
