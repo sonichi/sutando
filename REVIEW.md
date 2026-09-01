@@ -305,7 +305,8 @@ and loads whichever repo it reviews.
     Sometimes a red check is naming the infrastructure rather than the diff: a job killed
     by an Actions budget wall reports `conclusion=failure` with **`steps=0`**, which is
     indistinguishable from a real failure by conclusion alone (reported by @qingyun-air.agent
-    from this org, on two "Engine pin staleness" failures that were the wall, not findings).
+    from a SIBLING org — not this one — on two "Engine pin staleness" failures that were the
+    wall, not findings).
     A check that never executed has no finding in it, and telling an author to fix one is
     worse than not looking. Same reason `conclusion` alone is never the whole answer: an
     IN_PROGRESS run carries `conclusion == ""`, so a filter keyed only on it calls a running
