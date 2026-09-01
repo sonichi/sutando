@@ -7,6 +7,13 @@ Default target is the 'space.ag2.display' room state event (room-scoped);
 standard m.room.avatar state (power level permitting). User localStorage
 overrides still win client-side.
 
+Transport note: this is the package's one direct client-API path — the gateway
+exposes no room-state/profile write op yet, and an appservice token + ?user_id=
+masquerade is the only way to write these events. Bounds: acts only as
+AGENT_MXID, and every room-scoped write is gated by the same `gate_allows`
+allowlist say/mention/media consult; profile writes touch only the agent's own
+profile field.
+
 Env: MATRIX_HS_URL (e.g. http://localhost:8080), MATRIX_AS_TOKEN (appservice
 token), AGENT_MXID (user to act as). Usage:
   display.py <room_id> [--profile] [--stripe on|off] [--base-color '#rrggbb']
@@ -23,6 +30,9 @@ import re
 import sys
 import urllib.parse
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _gateway import gate_allows, load_gate  # noqa: E402
 
 HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -61,6 +71,11 @@ def main(argv=None) -> int:
     mxid = os.environ.get("AGENT_MXID", "")
     if not (hs and token and mxid):
         print("display.py: MATRIX_HS_URL, MATRIX_AS_TOKEN and AGENT_MXID must be set",
+              file=sys.stderr)
+        return 2
+
+    if not a.profile and not gate_allows(mxid, a.room_id, load_gate()):
+        print(f"display.py: client gate denied for {mxid} in {a.room_id}",
               file=sys.stderr)
         return 2
 
