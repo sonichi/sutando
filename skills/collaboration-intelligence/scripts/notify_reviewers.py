@@ -123,6 +123,30 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     return out, worst
 
 
+def gate_capability(repo: str, login: str) -> "tuple[bool | None, str]":
+    """(can this login's approval discharge repo's approval gate?, why).
+
+    Asked of GitHub, not of the roster: a cached tier goes stale silently and an
+    approval from a read-only account is indistinguishable in the UI from one
+    that counts. None = could not determine; the caller prints, never refuses.
+    """
+    try:
+        p = subprocess.run(
+            ["gh", "api", f"repos/{repo}/collaborators/{login}/permission",
+             "-q", ".permission"],
+            capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return None, f"unverified ({type(exc).__name__})"
+    if p.returncode != 0:
+        return None, f"unverified (gh rc={p.returncode})"
+    perm = p.stdout.strip()
+    if perm in ("write", "admin", "maintain"):
+        return True, perm
+    if perm in ("read", "none", "triage"):
+        return False, perm
+    return None, f"unverified (permission={perm!r})"
+
+
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     """Is this stand actually a member of the room we are about to mention it in?
 
@@ -320,6 +344,27 @@ def main() -> int:
     targets, refusal_rc = resolve(names, load_roster())
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
     # one person; plan mode is exempt because only a real ASK can strand a PR.
+    # A read-only approval looks identical in the UI and discharges nothing, so
+    # ask the repo named in the message rather than trusting a cached tier.
+    if a.kind == "ask" and targets:
+        refs = _PR_URL.findall(a.message or "")
+        if refs:
+            repo = refs[0][0]
+            kept = []
+            for t in targets:
+                can, why_cap = gate_capability(repo, t["name"])
+                if can is False:
+                    print(f"CANNOT GATE '{t['name']}': {why_cap}-only on {repo} — an "
+                          f"approval from this account does not count toward the "
+                          f"required approvals", file=sys.stderr)
+                    refusal_rc = max(refusal_rc, 7)
+                    continue
+                if can is None:
+                    print(f"{t['name']}: gate capability {why_cap} on {repo} — "
+                          f"sending, but this is not a confirmation it can approve",
+                          file=sys.stderr)
+                kept.append(t)
+            targets = kept
     # The two-reviewer rule exists so one person being busy cannot stall a PR.
     # A notice asks for nothing, so it cannot stall anything by going to one.
     if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:

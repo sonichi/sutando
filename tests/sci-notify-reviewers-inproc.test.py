@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -301,6 +302,10 @@ class FailurePaths(unittest.TestCase):
         def fake_run(cmd, *a, **k):
             if "members" in cmd:
                 return type("R", (), {"stdout": ok, "stderr": "", "returncode": 0})()
+            # Capability probe, like `members` above: not a send, so it must not
+            # be counted by a proxy whose subject is send attempts.
+            if any("collaborators" in str(x) for x in cmd):
+                return type("R", (), {"stdout": "write", "stderr": "", "returncode": 0})()
             calls["n"] += 1
             if send_effect and calls["n"] == 1:
                 raise send_effect
@@ -418,6 +423,48 @@ class ResolveDedupesOneActor(unittest.TestCase):
         # "already addressed" and "unreachable" need different follow-ups.
         _, err = self.names("alice", "bob")
         self.assertIn("same person as 'alice'", err)
+
+
+class GateCapabilityFiltersBeforeTheCountGate(unittest.TestCase):
+    """A read-only approval looks identical in the UI and discharges nothing."""
+
+    ROSTER = {"alice": {"stand": "@a:x", "room": "!r"},
+              "bob": {"stand": "@b:x", "room": "!r"}}
+    MSG = "see https://github.com/o/r/pull/7"
+
+    def _run(self, caps, argv_extra=()):
+        m = _load()
+        m.gate_capability = lambda repo, login: caps[login]
+        m.load_roster = lambda: self.ROSTER
+        m.stand_present_in_room = lambda t: (True, "2 members")
+        buf = io.StringIO()
+        argv = ["nr", "--reviewers", "alice,bob", "--kind", "ask",
+                "--message", self.MSG, *argv_extra]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(buf), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = m.main()
+        return rc, buf.getvalue()
+
+    def test_a_read_only_reviewer_is_dropped_and_the_count_gate_sees_it(self):
+        rc, err = self._run({"alice": (False, "read"), "bob": (True, "write")},
+                            ("--send",))
+        self.assertIn("CANNOT GATE 'alice'", err)
+        self.assertIn("REFUSED: 1 reviewer(s)", err)   # the gate saw the FILTERED list
+        self.assertNotEqual(rc, 0)
+
+    def test_two_write_tier_reviewers_are_not_filtered(self):
+        # Control: without this the assertions above pass on a filter that
+        # drops everyone.
+        rc, err = self._run({"alice": (True, "write"), "bob": (True, "write")})
+        self.assertNotIn("CANNOT GATE", err)
+        self.assertNotIn("REFUSED", err)
+
+    def test_an_undeterminable_capability_prints_but_does_not_refuse(self):
+        # Refusing on absent would block every reviewer whose tier we cannot read.
+        rc, err = self._run({"alice": (None, "unverified (gh rc=1)"),
+                             "bob": (True, "write")})
+        self.assertIn("gate capability unverified", err)
+        self.assertNotIn("CANNOT GATE", err)
 
 
 if __name__ == "__main__":
