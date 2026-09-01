@@ -334,18 +334,8 @@ pre.json .n { color: var(--warn); }
     </section>
 
     <section class="rail-block">
-      <p class="eyebrow">Stand proof</p>
-      <p class="unreported" style="margin:0">Not reported by <span class="mono">sutando stand</span>. Without a Stand key, a shared card carries nothing a recipient can check.</p>
-    </section>
-
-    <section class="rail-block">
-      <p class="eyebrow">Snapshot</p>
-      <div class="chips">
-        <span class="chip">5 channels</span>
-        <span class="chip">1 verified identity</span>
-        <span class="chip">0 bindings</span>
-        <span class="chip">3 devices</span>
-      </div>
+      <p class="eyebrow">Workers</p>
+      <div id="worker-roster" style="display:flex;flex-direction:column;gap:8px"></div>
     </section>
   </aside>
 
@@ -551,6 +541,24 @@ const BINDING_AX = {
   linked: { icon: "◆", text: "Linked", cls: "ax-ok" },
   revoked: { icon: "⊘", text: "Revoked", cls: "ax-crit" }
 };
+
+
+const WORKERS = window.SUTANDO_WORKERS || [
+  { seat: "worker-1", name: "Linus-the-dev", runtime: "claude" },
+  { seat: "worker-2", name: "Grace-the-verifier", runtime: "claude" },
+  { seat: "worker-3", name: "Ada-the-triager", runtime: "claude" },
+  { seat: "worker-4", name: "Alan-the-ops", runtime: "codex" }
+];
+(function renderWorkerRoster(){
+  const host = document.getElementById("worker-roster");
+  if (!host) return;
+  host.innerHTML = WORKERS.map(w => `
+    <div style="display:flex;align-items:center;gap:9px">
+      <span class="livedot" style="${w.alive === false ? "background:var(--idle);box-shadow:0 0 0 3px var(--idle-soft)" : ""}"></span>
+      <span style="font-weight:600;font-size:13px">${w.name}</span>
+      <span class="mono" style="font-size:10.5px;color:var(--ink-3);margin-left:auto">${w.seat} · ${w.runtime}</span>
+    </div>`).join("");
+})();
 
 document.getElementById("view-source").textContent =
   window.SUTANDO_STAND_RAW ? "live state \u00b7 bin/sutando stand" : "sample snapshot \u00b7 Aug 23 2026";
