@@ -86,9 +86,8 @@ class PlanRefusesCrossSenderDedup(unittest.TestCase):
 
 
     def test_cross_sender_requeue_is_capped_like_the_other_branch(self):
-        # `dedup_decision` short-circuits on holder-delivered, so its
-        # `dedup_requeue_count >= 1 -> report` cap never runs for this path.
-        # Without an explicit cap here a cross-sender fold re-asks forever.
+        # `dedup_decision` short-circuits on holder-delivered, so its own
+        # requeue cap never runs here and the fold would re-ask forever.
         first, _ = self._plan("@bob:ag2.space")
         self.assertEqual(first, "requeue")
         second, msg = self._plan("@bob:ag2.space", count=1)
