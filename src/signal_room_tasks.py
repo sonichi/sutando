@@ -127,6 +127,7 @@ def delegation_lines(task_id: str, output_root) -> list[str]:
         f"reaches the room only as the standalone `[file: {root}/<name>]` line you relay "
         f"verbatim.",
         sandbox="workspace-write", workdir=root, env={OUTPUT_ROOT_ENV: root},
+        network=True,  # the wrapper's provider call; the gate opened image generation
     )
 
 

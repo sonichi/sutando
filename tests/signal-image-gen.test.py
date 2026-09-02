@@ -237,10 +237,10 @@ finally:
     os.replace = real_replace
 root = S.worker_output_root(RESULTS, tid)
 body = (LAUNCH_TASKS / f"{tid}.txt").read_text()
-argv = sandboxed_delegation_command("workspace-write", root, {gen.OUTPUT_ROOT_ENV: root})
+argv = sandboxed_delegation_command("workspace-write", root, {gen.OUTPUT_ROOT_ENV: root}, network=True)
 check("the block's invocation: codex workspace-write, the task root as its cwd (-C), the variable exported",
       argv in body and argv == (f"{gen.OUTPUT_ROOT_ENV}={root} codex exec --sandbox workspace-write -C {root} "
-                                f"--skip-git-repo-check -- \"$(cat <prompt-file>)\" < /dev/null"), argv)
+                                f"-c sandbox_workspace_write.network_access=true --skip-git-repo-check -- \"$(cat <prompt-file>)\" < /dev/null"), argv)
 check("never read-only, and exactly one launch", "read-only" not in body and body.count("codex exec") == 1)
 check("the root is the CANONICAL results dir spelling the wrapper accepts",
       root == os.path.join(CANON, tid) and body.count(root) >= 4, root)
