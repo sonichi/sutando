@@ -25,8 +25,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from workspace_default import resolve_workspace  # noqa: E402
 
 _RECORD_KEY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
@@ -244,7 +242,14 @@ def main(argv: list[str] | None = None) -> int:
     m = sub.add_parser("canary"); m.add_argument("key"); m.add_argument("--host", required=True)
     x = sub.add_parser("close"); x.add_argument("key"); x.add_argument("--witness", required=True)
     a = ap.parse_args(argv)
-    ws = Path(a.workspace) if a.workspace else resolve_workspace(migrate=False)
+    if a.workspace:
+        ws = Path(a.workspace)
+    else:
+        # Resolved lazily: with --workspace given, the helper must run in any
+        # checkout, including one that ships without the resolver module.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from workspace_default import resolve_workspace
+        ws = resolve_workspace(migrate=False)
     if a.cmd == "open":
         repo, pr = _split(a.key)
         print(open_record(ws, repo, pr, a.head, a.host, a.reason, a.by)); return 0
