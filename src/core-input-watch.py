@@ -110,6 +110,8 @@ def _load_runtime_health():
 # Claude Code's weekly Fable-consent dialog (title / body); Enter is safe there only
 # with the caret on its "Switch to <fallback> and continue" row.
 _FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this week", re.I)
+#: Lines allowed between the nearest Fable text and the focused switch row (body may wrap).
+_FABLE_CARET_GAP = 3
 
 # ---- ESCALATE-detection: interactive-prompt signatures. First match classifies.
 # Specific so the idle "❯ " prompt (ready for a task) is NEVER flagged. This is
@@ -187,9 +189,11 @@ def classify(pane: str):
             for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
     if hits:
         start, _, kind = max(hits, key=lambda h: (h[0], -h[1]))
-        # A focused switch row is Enter-safe only under the Fable text; on any other
-        # dialog it is an unforeseen prompt and gets the human treatment.
-        if kind == "fable-limit" and not any(m.start() < start for m in _FABLE_TEXT.finditer(tail)):
+        # A focused switch row is Enter-safe only right under the Fable text (title, body,
+        # caret); a resolved Fable dialog higher up must not vouch for some other dialog's row.
+        if kind == "fable-limit" and not any(
+                m.start() < start and tail.count("\n", m.start(), start) <= _FABLE_CARET_GAP
+                for m in _FABLE_TEXT.finditer(tail)):
             return "unknown", tail
         return kind, tail
     # No specific signature — but an input affordance IS present and this is NOT

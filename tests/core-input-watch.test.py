@@ -168,6 +168,20 @@ class TestClassify(unittest.TestCase):
         self.assertNotIn(kind, ("fable-limit", "fable-limit-unfocused"))
         self.assertIsNone(auto_answer(kind))
 
+    def test_a_resolved_fable_dialog_above_another_dialog_does_not_vouch_for_it(self):
+        # sonichi's residual: the Fable text still inside the tail, then a NEW dialog
+        # with its own focused switch row. Co-presence is not adjacency.
+        pane = (_FABLE_LIMIT.replace("  ❯ Switch to Opus 5 and continue", "    Switch to Opus 5 and continue")
+                .rsplit("\n", 1)[0]
+                + "\n  [resolved]\n  This will discard local changes\n"
+                  "  ❯ Switch to origin/main and continue\n    Cancel\n  Esc to cancel")
+        kind, _ = classify(pane)
+        self.assertEqual(kind, "unknown")
+        self.assertIsNone(auto_answer(kind))
+        # ...while the real dialog, whose body wraps onto a second line, still qualifies.
+        wrapped = _FABLE_LIMIT.replace("uses\n  usage credits", "uses\n  usage\n  credits")
+        self.assertEqual(classify(wrapped)[0], "fable-limit")
+
     def test_fable_limit_and_session_limit_stay_distinct(self):
         # One is a switch the monitor may take; the other is a wait/spend decision.
         self.assertEqual(classify(_FABLE_LIMIT)[0], "fable-limit")
