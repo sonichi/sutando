@@ -17,9 +17,21 @@ A deliberately empty reply is expressed with the `[no-send]` marker, parsed by
 """
 from __future__ import annotations
 
+import importlib.util
+import time
 from pathlib import Path
 
-__all__ = ["read_ready_result", "is_ready_body", "retire_claim_if_unchanged"]
+try:
+    from .publication import publish_result
+except ImportError:
+    # Loaded by file path (tests, standalone tools): bind the sibling directly.
+    _spec = importlib.util.spec_from_file_location("publication", Path(__file__).with_name("publication.py"))
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    publish_result = _mod.publish_result
+
+__all__ = ["read_ready_result", "is_ready_body", "retire_claim_if_unchanged",
+           "sweep_retired"]
 
 
 def is_ready_body(text: str | None) -> bool:
@@ -96,7 +108,8 @@ def retire_claim_if_unchanged(claim: str | Path, delivered: str) -> bool:
         # Vanished or unmovable: release rather than act on a path we cannot verify.
         return False
     try:
-        if retired.read_bytes().decode().strip() != delivered:
+        final = retired.read_bytes()
+        if final.decode().strip() != delivered:
             retired.replace(p)   # grew between the check and the move: undo, resend whole
             return False
     except (OSError, UnicodeDecodeError):
@@ -105,7 +118,64 @@ def retire_claim_if_unchanged(claim: str | Path, delivered: str) -> bool:
         except OSError:
             pass
         return False
+    # Record how much of the inode was delivered: bytes a stale descriptor
+    # appends after this point are republished by sweep_retired, not marooned.
+    try:
+        _delivered_marker(retired).write_text(str(len(final)))
+    except OSError:
+        pass
     return True
+
+
+def _delivered_marker(retired: Path) -> Path:
+    return retired.with_name(retired.name + ".delivered")
+
+
+def sweep_retired(results_dir: str | Path, quiesce_s: float = 600.0,
+                  now: float | None = None) -> list[Path]:
+    """Managed lifecycle for retired inodes: republish any bytes appended
+    after retirement as a new proactive file, and drop an inode only once it
+    has been quiescent for `quiesce_s`. Returns the republished paths.
+
+    A producer holding the original descriptor can append after the retire
+    re-read; the claim protocol cannot prove writer completion, so the
+    remainder is delivered as its own message instead of being preserved in
+    a directory no consumer reads. A retired file with no marker predates
+    this lifecycle: its delivered length is unknown, so it is never
+    republished (a duplicate is worse than the loss) and only aged out.
+    """
+    results = Path(results_dir)
+    retired_dir = results / "retired"
+    if not retired_dir.is_dir():
+        return []
+    now = time.time() if now is None else now
+    published: list[Path] = []
+    for inode in sorted(retired_dir.glob("*.txt")):
+        marker = _delivered_marker(inode)
+        try:
+            raw = inode.read_bytes()
+            delivered = int(marker.read_text()) if marker.exists() else None
+            mtime = inode.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        if delivered is not None and len(raw) > delivered:
+            remainder = raw[delivered:].decode(errors="replace").strip()
+            if remainder:
+                target = results / f"proactive-late-{inode.stem}-{int(now)}.txt"
+                try:
+                    publish_result(target, remainder + "\n")
+                except OSError:
+                    continue
+                published.append(target)
+            try:
+                marker.write_text(str(len(raw)))
+            except OSError:
+                pass
+            continue
+        if now - mtime >= quiesce_s:
+            inode.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+    return published
 
 
 def _retired_path(claim: Path) -> Path:
