@@ -86,7 +86,7 @@ def failing_checks(pr: str, run, repo: str) -> "list[str] | None":
     for c in (j.get("statusCheckRollup") or []):
         # CANCELLED is capacity (job cap or a superseded run), not a defect — and
         # triaging it sends the reader after a cause that does not exist.
-        bad = c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") == "FAILURE"
+        bad = c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") in ("FAILURE", "ERROR")
         if bad:
             out.append(c.get("name") or c.get("context") or "?")
     return out
@@ -114,7 +114,7 @@ def _run_ids(pr: str, run, repo: str) -> "list[str]":
     j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "statusCheckRollup"])
     ids, seen = [], set()
     for c in ((j or {}).get("statusCheckRollup") or []):
-        bad = c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") == "FAILURE"
+        bad = c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") in ("FAILURE", "ERROR")
         m = re.search(r"/runs/(\d+)", c.get("detailsUrl") or "")
         if bad and m and m.group(1) not in seen:
             seen.add(m.group(1))
@@ -131,11 +131,11 @@ def annotation_text(pr: str, run, repo: str) -> str:
     """
     out = []
     for rid in _run_ids(pr, run, repo)[:2]:
-        jobs = _gh(run, ["api", f"repos/{repo}/actions/runs/{rid}/jobs"])
+        jobs = _gh(run, ["api", f"repos/{repo}/actions/runs/{rid}/jobs?per_page=100"])
         for j in ((jobs or {}).get("jobs") or []):
             if j.get("conclusion") not in ("failure", "timed_out"):
                 continue
-            ann = _gh(run, ["api", f"repos/{repo}/check-runs/{j.get('id')}/annotations"])
+            ann = _gh(run, ["api", f"repos/{repo}/check-runs/{j.get('id')}/annotations?per_page=100"])
             for a in (ann or []):
                 out.append(str(a.get("message") or ""))
     return "\n".join(out)
