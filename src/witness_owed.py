@@ -8,9 +8,11 @@ record the deployment path reads: `self-upgrade` refuses to activate a head
 that contains an owed PR until the record is closed with the witness, or the
 activation is an explicit canary on the host that owes it.
 
-Records live under <workspace>/state/witness-owed/<owner>-<repo>#<pr>.json and
-move to closed/ once the witness is posted. Policy only: no transport, no
-provider calls, no workspace resolution beyond the path handed in.
+Records live under <workspace>/hosts/<host>/witness-owed/<owner>-<repo>#<pr>.json
+— inside the per-host subtree the vault carries to every host — and move to
+closed/ once the witness is posted. Readers scan every host's directory, so a
+record opened on one host refuses activation on all of them. Policy only: no
+transport, no provider calls, no workspace resolution beyond what is handed in.
 """
 from __future__ import annotations
 
@@ -31,12 +33,29 @@ _SHA = re.compile(r"^[0-9a-f]{7,40}$")
 FIELDS = ("repo", "pr", "head", "host", "reason", "opened_by", "opened_at")
 
 
-def records_dir(workspace: Path) -> Path:
-    return Path(workspace) / "state" / "witness-owed"
+def records_dir(workspace: Path, host: str) -> Path:
+    """Where THIS host writes: the carried per-host subtree, never state/."""
+    return Path(workspace) / "hosts" / host / "witness-owed"
 
 
-def record_path(workspace: Path, repo: str, pr: int) -> Path:
-    return records_dir(workspace) / f"{repo.replace('/', '-')}#{int(pr)}.json"
+def all_records_dirs(workspace: Path) -> list[Path]:
+    """Every host's record directory present in this workspace."""
+    hosts = Path(workspace) / "hosts"
+    if not hosts.is_dir():
+        return []
+    return sorted(d / "witness-owed" for d in hosts.iterdir() if (d / "witness-owed").is_dir())
+
+
+def record_path(workspace: Path, host: str, repo: str, pr: int) -> Path:
+    return records_dir(workspace, host) / f"{repo.replace('/', '-')}#{int(pr)}.json"
+
+
+def find_record(workspace: Path, repo: str, pr: int) -> Path | None:
+    name = f"{repo.replace('/', '-')}#{int(pr)}.json"
+    for d in all_records_dirs(workspace):
+        if (d / name).is_file():
+            return d / name
+    return None
 
 
 def _now() -> str:
@@ -61,7 +80,7 @@ def open_record(workspace: Path, repo: str, pr: int, head: str, host: str,
     for name, value in (("host", host), ("reason", reason), ("opened_by", opened_by)):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{name} must be a non-empty string")
-    path = record_path(workspace, repo, pr)
+    path = record_path(workspace, host, repo, pr)
     _atomic_write(path, {"repo": repo, "pr": int(pr), "head": head, "host": host,
                          "reason": reason.strip(), "opened_by": opened_by,
                          "opened_at": _now(), "canary": None})
@@ -69,58 +88,117 @@ def open_record(workspace: Path, repo: str, pr: int, head: str, host: str,
 
 
 def list_open(workspace: Path) -> list[dict]:
-    """Open records, malformed ones included as blocking: a record that
-    cannot be read is not evidence the witness was posted."""
+    """Open records from EVERY host directory; malformed ones are included as
+    blocking, since a record that cannot be read is not evidence the witness
+    was posted."""
     out = []
-    d = records_dir(workspace)
-    if not d.is_dir():
-        return out
-    for p in sorted(d.glob("*.json")):
-        try:
-            data = json.loads(p.read_text())
-            if not isinstance(data, dict) or any(k not in data for k in FIELDS):
-                raise ValueError("missing fields")
-        except (OSError, ValueError) as exc:
-            data = {"repo": "?", "pr": 0, "head": "", "host": "?", "opened_by": "?",
-                    "opened_at": "?", "reason": f"unreadable record {p.name}: {exc}",
-                    "canary": None, "malformed": True}
-        data["path"] = str(p)
-        out.append(data)
+    for d in all_records_dirs(workspace):
+        for p in sorted(d.glob("*.json")):
+            try:
+                data = json.loads(p.read_text())
+                if not isinstance(data, dict) or any(k not in data for k in FIELDS):
+                    raise ValueError("missing fields")
+            except (OSError, ValueError) as exc:
+                data = {"repo": "?", "pr": 0, "head": "", "host": "?", "opened_by": "?",
+                        "opened_at": "?", "reason": f"unreadable record {p.name}: {exc}",
+                        "canary": None, "malformed": True}
+            data["path"] = str(p)
+            out.append(data)
     return out
 
 
-def _is_ancestor(repo_root: Path, ancestor: str, ref: str) -> bool:
-    r = subprocess.run(["git", "-C", str(repo_root), "merge-base", "--is-ancestor",
-                        ancestor, ref], capture_output=True, text=True)
+def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo_root), *args],
+                          capture_output=True, text=True)
+
+
+def _is_ancestor(repo_root: Path, ancestor: str, ref: str) -> bool | None:
+    """True / False, or None when Git could not answer. A head this clone has
+    never fetched is the normal squash/rebase case, not an error: an absent
+    object cannot be an ancestor, so that is False and the subject scan
+    decides. A bad ref or a broken repository is None; callers fail closed."""
+    if _git(repo_root, "cat-file", "-e", f"{ancestor}^{{commit}}").returncode != 0:
+        if _git(repo_root, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}").returncode != 0:
+            return None
+        return False
+    r = _git(repo_root, "merge-base", "--is-ancestor", ancestor, ref)
     if r.returncode in (0, 1):
         return r.returncode == 0
-    # An unknown sha is not proof of absence; treat as contained (fail closed).
-    return True
+    return None
+
+
+_MERGE_SUBJECT = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def _contains(repo_root: Path, rec: dict, ref: str, since: str | None = None
+              ) -> bool | None:
+    """Does `ref` (optionally only the range since..ref) contain the owed PR?
+
+    A merge commit keeps the PR head as an ancestor; a squash or rebase merge
+    does not, so the PR is also recognised by its merge subject `(#N)` and by a
+    commit body naming the recorded head. None when Git could not answer."""
+    anc = _is_ancestor(repo_root, rec["head"], ref)
+    if anc is None:
+        return None
+    if anc:
+        if since is None:
+            return True
+        prior = _is_ancestor(repo_root, rec["head"], since)
+        if prior is None:
+            return None
+        if not prior:
+            return True
+    rng = f"{since}..{ref}" if since else ref
+    r = _git(repo_root, "log", "--format=%H%x1f%s%x1f%b%x1e", rng)
+    if r.returncode != 0:
+        return None
+    pr = str(int(rec["pr"]))
+    for entry in r.stdout.split("\x1e"):
+        parts = entry.strip("\n").split("\x1f")
+        if len(parts) < 2:
+            continue
+        subject = parts[1]
+        body = parts[2] if len(parts) > 2 else ""
+        m = _MERGE_SUBJECT.search(subject)
+        if (m and m.group(1) == pr) or (rec["head"] and rec["head"] in body):
+            return True
+    return False
 
 
 def blocking(workspace: Path, repo_root: Path, target_ref: str,
              current_ref: str | None = None, host: str | None = None) -> list[dict]:
-    """Open records whose head is contained in target_ref and not already in
-    current_ref. A canary record for THIS host does not block: that host is
-    the one producing the witness, and it cannot do so without activating."""
+    """Open records whose PR is contained in target_ref and not already in
+    current_ref. A Git error on either question blocks (fail closed). A canary
+    record releases only the host it names, and only when that is the host
+    that owes the witness."""
     hits = []
     for rec in list_open(workspace):
         if rec.get("malformed"):
             hits.append(rec)
             continue
-        if not _is_ancestor(repo_root, rec["head"], target_ref):
+        verdict = _contains(repo_root, rec, target_ref, current_ref)
+        if verdict is None:
+            rec["reason"] = f"git could not answer for head {rec['head'][:8]}: {rec['reason']}"
+            hits.append(rec)
             continue
-        if current_ref and _is_ancestor(repo_root, rec["head"], current_ref):
+        if not verdict:
             continue
-        if host and rec.get("canary") == host:
+        if host and rec.get("canary") == host and rec.get("host") == host:
             continue
         hits.append(rec)
     return hits
 
 
 def mark_canary(workspace: Path, repo: str, pr: int, host: str) -> Path:
-    path = record_path(workspace, repo, pr)
+    """Declare `host` the canary. Only the host that owes the witness may:
+    a record marked by any other host would release an activation the
+    deferral never covered."""
+    path = find_record(workspace, repo, pr)
+    if path is None:
+        raise FileNotFoundError(f"no open witness-owed record for {repo}#{pr}")
     data = json.loads(path.read_text())
+    if data.get("host") != host:
+        raise ValueError(f"{repo}#{pr} is owed by {data.get('host')!r}, not {host!r}")
     data["canary"] = host
     data["canary_at"] = _now()
     _atomic_write(path, data)
@@ -132,11 +210,13 @@ def close_record(workspace: Path, repo: str, pr: int, witness: str) -> Path:
     the audit trail beside the open ones."""
     if not isinstance(witness, str) or not witness.strip():
         raise ValueError("witness must name where the round trip was posted")
-    path = record_path(workspace, repo, pr)
+    path = find_record(workspace, repo, pr)
+    if path is None:
+        raise FileNotFoundError(f"no open witness-owed record for {repo}#{pr}")
     data = json.loads(path.read_text())
     data["witness"] = witness.strip()
     data["closed_at"] = _now()
-    closed = records_dir(workspace) / "closed" / path.name
+    closed = path.parent / "closed" / path.name
     _atomic_write(closed, data)
     path.unlink()
     return closed
@@ -180,9 +260,17 @@ def main(argv: list[str] | None = None) -> int:
                   f"host={rec['host']} — {rec['reason']}", file=sys.stderr)
         return 3 if hits else 0
     if a.cmd == "canary":
-        repo, pr = _split(a.key); print(mark_canary(ws, repo, pr, a.host)); return 0
+        repo, pr = _split(a.key)
+        try:
+            print(mark_canary(ws, repo, pr, a.host)); return 0
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"witness-owed: {exc}", file=sys.stderr); return 5
     if a.cmd == "close":
-        repo, pr = _split(a.key); print(close_record(ws, repo, pr, a.witness)); return 0
+        repo, pr = _split(a.key)
+        try:
+            print(close_record(ws, repo, pr, a.witness)); return 0
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"witness-owed: {exc}", file=sys.stderr); return 5
     return 2
 
 
