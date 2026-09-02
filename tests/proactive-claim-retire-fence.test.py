@@ -245,6 +245,50 @@ def _retire_rows() -> None:
           kept and c4.exists(),
           "the late bytes were destroyed")
 
+    # The remaining branches. Each is a distinct decision, and each was a way
+    # bytes got destroyed or kept before, so none is filler for a coverage gate.
+    c5 = d / "missing.txt"
+    check("a missing claim retires (nothing to lose)",
+          rd.retire_claim_if_unchanged(c5, "body") is True and not c5.exists())
+
+    c6 = d / "emptied.txt"; c6.write_text("   \n")
+    check("an emptied claim retires (nothing to resend)",
+          rd.retire_claim_if_unchanged(c6, "body") is True and not c6.exists())
+
+    c7 = d / "unreadable.txt"; c7.write_text("body\n")
+    real = Path.read_bytes
+
+    def _boom(self, *a, **k):
+        if str(self) == str(c7):
+            raise PermissionError(13, "Permission denied")
+        return real(self, *a, **k)
+
+    Path.read_bytes = _boom
+    try:
+        kept7 = rd.retire_claim_if_unchanged(c7, "body") is False
+    finally:
+        Path.read_bytes = real
+    check("an unreadable claim is kept, never destroyed unverified",
+          kept7 and c7.exists())
+
+    # Another consumer unlinked the claim between the read and the size check:
+    # stat() raises, and releasing beats unlinking a path we cannot verify.
+    c8 = d / "vanished.txt"; c8.write_text("body\n")
+    real_stat = Path.stat
+
+    def _gone(self, *a, **k):
+        if str(self) == str(c8):
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_stat(self, *a, **k)
+
+    Path.stat = _gone
+    try:
+        released = rd.retire_claim_if_unchanged(c8, "body") is False
+    finally:
+        Path.stat = real_stat
+    check("a claim that vanishes before the size check is released, not unlinked",
+          released)
+
 
 if __name__ == "__main__":
     sys.exit(main())
