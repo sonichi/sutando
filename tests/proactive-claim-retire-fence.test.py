@@ -324,6 +324,61 @@ def _retire_rows() -> None:
     check("an unmarked retired inode ages out once quiescent",
           rd.sweep_retired(d, quiesce_s=0, now=time.time() + 1) == [] and not legacy.exists())
 
+    # Failure branches: an unwritable marker never fails the retirement, an
+    # unreadable or unpublishable inode is skipped, a raising sweep is contained.
+    import errno as _errno
+    c11 = d / "marker-unwritable.txt"; c11.write_text("body\n")
+    real_write_text = Path.write_text
+    def _wt_hook(self, *a, **k):
+        if self.name.endswith(".delivered"):
+            raise OSError(_errno.EACCES, "marker unwritable")
+        return real_write_text(self, *a, **k)
+    Path.write_text = _wt_hook
+    try:
+        check("an unwritable delivered-marker does not fail the retirement",
+              rd.retire_claim_if_unchanged(c11, "body") is True and rd._retired_path(c11).exists())
+    finally:
+        Path.write_text = real_write_text
+    check("an inode without a marker only ages out (unwritable marker case)",
+          rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [])
+    rd._retired_path(c11).unlink()
+
+    c12 = d / "unreadable.txt"; c12.write_text("body\n")
+    assert rd.retire_claim_if_unchanged(c12, "body") is True
+    r12 = rd._retired_path(c12)
+    with open(r12, "a") as fh: fh.write("LATE\n")
+    real_read_bytes = Path.read_bytes
+    def _rb_hook(self, *a, **k):
+        if self == r12:
+            raise OSError(_errno.EIO, "unreadable inode")
+        return real_read_bytes(self, *a, **k)
+    Path.read_bytes = _rb_hook
+    try:
+        check("an unreadable retired inode is skipped, not raised, and kept",
+              rd.sweep_retired(d, quiesce_s=0, now=time.time() + 1) == [] and r12.exists())
+    finally:
+        Path.read_bytes = real_read_bytes
+    real_publish = rd.publish_result
+    rd.publish_result = lambda *a, **k: (_ for _ in ()).throw(OSError(_errno.ENOSPC, "no space"))
+    try:
+        check("a failed republish keeps the inode and marker for the next pass",
+              rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [] and r12.exists()
+              and rd._delivered_marker(r12).read_text() == str(len(b"body\n")))
+    finally:
+        rd.publish_result = real_publish
+    real_marker_write = Path.write_text
+    def _mw_hook(self, *a, **k):
+        if self.name.endswith(".delivered"):
+            raise OSError(_errno.EACCES, "marker unwritable")
+        return real_marker_write(self, *a, **k)
+    Path.write_text = _mw_hook
+    try:
+        pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+        check("a republish still lands when the marker cannot advance",
+              len(pub) == 1 and pub[0].read_text().strip() == "LATE")
+    finally:
+        Path.write_text = real_marker_write
+
     # Wiring: every proactive poller runs the sweep each pass, so "eventual"
     # is bounded by one poll interval, not by a tool nobody runs.
     for bridge in ("slack-bridge.py", "telegram-bridge.py", "discord-bridge.py"):
@@ -331,6 +386,23 @@ def _retire_rows() -> None:
         check(f"{bridge} sweeps retired inodes every proactive pass",
               "sweep_retired(RESULTS_DIR)" in src and src.count("_sweep_retired_pass()") >= 1,
               "the sweep helper is not called from the poll loop")
+    # The helper is the same shape in each bridge; drive the loaded Slack
+    # module's copy with a raising sweep — the poll loop must not die.
+    _b = _load_bridge("sweepref")
+    _saved = _b.sweep_retired
+    _b.sweep_retired = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("sweep blew up"))
+    try:
+        _b._sweep_retired_pass()
+        check("a raising sweep does not escape the bridge's per-pass helper", True)
+    except Exception as e:
+        check("a raising sweep does not escape the bridge's per-pass helper", False, repr(e))
+    finally:
+        _b.sweep_retired = _saved
+    _b.sweep_retired = lambda *_a, **_k: [Path("/x/proactive-late-y.txt")]
+    try:
+        _b._sweep_retired_pass(); check("the helper reports a republished remainder", True)
+    finally:
+        _b.sweep_retired = _saved
 
     # The remaining branches. Each is a distinct decision, and each was a way
     # bytes got destroyed or kept before, so none is filler for a coverage gate.
