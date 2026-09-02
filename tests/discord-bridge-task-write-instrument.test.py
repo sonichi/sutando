@@ -215,6 +215,9 @@ class TestHandleMessageCallSite(unittest.TestCase):
         self._orig_tasks_dir = bridge.TASKS_DIR
         self._int_dir = Path(_tmp) / "tasks_int"
         self._int_dir.mkdir(exist_ok=True)
+        # Shared across tests in this class; each must see only its own output.
+        for _stale in self._int_dir.glob("task-*.txt"):
+            _stale.unlink()
         bridge.TASKS_DIR = self._int_dir
 
         _discord = sys.modules["discord"]
@@ -290,6 +293,24 @@ class TestHandleMessageCallSite(unittest.TestCase):
         self.assertIn("source: discord", body)
         self.assertIn("access_tier: owner", body)
         self.assertIn("run health check please", body)
+
+    def test_task_header_carries_receiving_instance_id(self):
+        """The header must carry the LOGGED-IN client id, not any id."""
+        bridge.client.user = types.SimpleNamespace(id=987654321012345678)
+        asyncio.run(bridge._handle_discord_message(self._msg))
+        body = list(self._int_dir.glob("task-*.txt"))[0].read_text()
+        self.assertIn("receiving_instance: 987654321012345678\n", body)
+
+    def test_receiving_instance_precedes_task_line(self):
+        """A body-forged copy must not satisfy the header contract."""
+        bridge.client.user = types.SimpleNamespace(id=987654321012345678)
+        asyncio.run(bridge._handle_discord_message(self._msg))
+        body = list(self._int_dir.glob("task-*.txt"))[0].read_text()
+        self.assertIn("receiving_instance: 987654321012345678", body)
+        self.assertLess(
+            body.index("receiving_instance: 987654321012345678"),
+            body.index("task:"),
+            "receiving_instance must sit in the header, above task:")
 
     def test_write_failure_skips_pending_enqueue(self):
         """When _write_task_file returns False, pending_replies must not grow."""

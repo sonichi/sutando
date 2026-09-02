@@ -68,6 +68,7 @@ def _load(name: str, path: Path):
 
 
 dm = _load("dm_result", REPO / "src" / "dm-result.py")
+import channels.discord.client as _rest  # noqa: E402  — the seam the fakes install into
 
 
 class _FakeResponse:
@@ -108,12 +109,35 @@ class _FakeTransport:
         raise AssertionError(f"unmocked request: {method} {url}")
 
 
+_SEAM = None
+
+
 def _install_transport(transport):
-    dm.urllib.request.urlopen = transport.urlopen
+    """Route the shared client through the fake (dm-result delivers via
+    DiscordRestClient now, so the module's urlopen is no longer the seam)."""
+    global _SEAM
+
+    def _tuple(req, timeout):
+        resp = transport.urlopen(req, timeout=timeout)
+        raw = resp.read().decode("utf-8", "replace")
+        return getattr(resp, "status", 200), (json.loads(raw) if raw else None)
+
+    def _read_json(req, timeout=None):
+        resp = transport.urlopen(req, timeout=timeout)
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+    _SEAM = (dm._client, _rest.request_json)
+    dm._client = lambda token: _rest.DiscordRestClient(
+        token, transport=_tuple, timeout=30)
+    _rest.request_json = _read_json
+    return _SEAM
 
 
-def _restore_transport(original):
-    dm.urllib.request.urlopen = original
+def _restore_transport(_original=None):
+    global _SEAM
+    if _SEAM is not None:
+        dm._client, _rest.request_json = _SEAM
+        _SEAM = None
 
 
 def _with_access_json(content, fn):

@@ -1,10 +1,21 @@
 // Suppression is universal; retirement authority is scoped to the consumer
 // that dispatched the task. One predicate for both narrowed both.
 
-export const SKIP_MARKER_RE = /^\s*\[(?:no-send|REPLIED)\]/i;
+// All three are ONE `skip` kind in parse_markers(); grammar mirrors it.
+// `*` not `+`: `[deduped:]` and `[deduped: ]` both parse (result_markers.py:119).
+export const SKIP_MARKER_RE = /^\s*(?:\[(?:no-send|REPLIED)\]|\[deduped:\s*[^\]]*\])/i;
+
+// Pool cores prepend `**[core: N]**` + optional `_(...)_`; parse_markers peels
+// it before any marker scan (result_markers.py:135), so this must too.
+export const D7_HEADER_RE = /^\*\*\[core:\s*[^\]]+\]\*\*\s*\n(?:_[^\n]*_\s*\n)?\s*/;
+
+/** True iff `result`'s body carries a skip marker, D7 header peeled first. */
+export function bodyIsSkipMarked(result: string): boolean {
+	return SKIP_MARKER_RE.test(String(result ?? "").replace(D7_HEADER_RE, ""));
+}
 
 export function isSkipMarked(file: string, result: string): boolean {
-	return file.startsWith('task-') && SKIP_MARKER_RE.test(result);
+	return file.startsWith('task-') && bodyIsSkipMarked(result);
 }
 
 // Evidence that some OTHER consumer will deliver and archive this result.

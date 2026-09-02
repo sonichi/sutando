@@ -40,10 +40,16 @@ class DeliveryOutcome(str, Enum):
 
 
 class DrainStatus(str, Enum):
-    """Why a drain attempt ended, locally. NOT_CLAIMED means another worker
-    owns the item: no provider call was made, so nothing external is
-    ambiguous."""
+    """Why a drain attempt ended, locally. Neither non-ATTEMPTED status made
+    a provider call, so nothing external is ambiguous in either.
+
+    NOT_CLAIMED and TERMINAL are split because they differ in whether a later
+    pass can ever succeed: NOT_CLAIMED is contention (another worker owns it;
+    a reclaim recovers it), TERMINAL is the item's own final state. Collapsing
+    them makes a drainer retry a decided item forever.
+    """
     NOT_CLAIMED = "not_claimed"
+    TERMINAL = "terminal"
     ATTEMPTED = "attempted"
 
 
@@ -80,6 +86,19 @@ class DeliveryReceipt:
     outcome: DeliveryOutcome
     provider_ref: Optional[str] = None
     detail: str = ""
+    # Where the side effect landed, in the provider's own address space.
+    # Only the provider knows this; the core must not infer it.
+    destination: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DeliveryAttempt:
+    """The full attempt an UNKNOWN outcome refers to. reconcile takes this,
+    not bare ids: a provider whose only receipt store is the send itself
+    (idempotent) reconciles BY safe re-send, which needs the payload."""
+    item_id: str
+    payload: bytes
+    idempotency_key: str
 
 
 @dataclass(frozen=True)
@@ -130,6 +149,7 @@ class DrainReport:
 class RecoverReport:
     recovered: list = field(default_factory=list)   # item_ids re-claimable
     quarantined: list = field(default_factory=list)
+    retired: list = field(default_factory=list)     # dead claims on TERMINAL items
 
 
 @runtime_checkable
@@ -155,11 +175,34 @@ class ClaimBackend(Protocol):
         ...
 
     def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:
-        """Acquire exclusive local ownership, or None on a lost race."""
+        """Acquire exclusive local ownership, or None when it was not taken.
+
+        None does NOT mean "another worker owns it" — it also covers an item
+        that is already terminal, absent, or whose incarnation vanished. Ask
+        `is_terminal` to tell a decided item from a contended one.
+        """
         ...
 
+    def is_terminal(self, item_id: str) -> bool:
+        """True when this item has reached its own final state (delivered or
+        parked) and no drain will ever claim it again.
+
+        Only meaningful after a failed `claim`, and read separately because a
+        terminal item and a contended one are indistinguishable from `claim`
+        alone. Terminal is absorbing except via the administrative requeue
+        path, which resets the attempt budget — so a `True` that goes stale
+        that way costs one extra pass, never a stuck item.
+        """
+        ...
+
+    # False = complete() accepts provider/destination and DROPS them.
+    # Check this; a signature does not imply durable storage.
+    persists_receipt_metadata: bool = False
+
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
-                 park_at_attempts: Optional[int] = None) -> bool:
+                 park_at_attempts: Optional[int] = None,
+                 provider: Optional[str] = None,
+                 destination: Optional[str] = None) -> bool:
         """Validate the exact incarnation, apply the outcome transition, and
         retire the claim — ALL inside one backend critical section, in that
         order. A stale token must change nothing: validating after mutating
@@ -212,8 +255,8 @@ class DeliveryProvider(Protocol):
     def deliver(self, item_id: str, payload: bytes,
                 idempotency_key: str) -> DeliveryReceipt: ...
 
-    def reconcile(self, item_id: str,
-                  idempotency_key: str) -> Optional[DeliveryReceipt]:
-        """Resolve an OUTCOME_UNKNOWN via the provider's receipt store;
-        None where the provider cannot answer (capability-gated)."""
+    def reconcile(self, attempt: DeliveryAttempt) -> Optional[DeliveryReceipt]:
+        """Resolve an OUTCOME_UNKNOWN for `attempt`; None where the provider
+        cannot answer (capability-gated). The attempt carries the payload so
+        a keyed-dedup provider may reconcile by safe re-send."""
         ...

@@ -109,6 +109,26 @@ _INLINE_RESOLVED = re.compile(
 )
 
 
+def section_is_waiting(title: str, body: str) -> bool:
+    """One rule for "this entry still wants an answer", used on BOTH regions.
+
+    `zero_reason()` asks it about the archive; a second rule there would let one
+    entry read as resolved in one region and open in the other.
+
+    `open` is the word writers naturally reach for, and it used to fall through
+    to the resolved skip — filing a live question as though it were answered.
+    The section stayed on disk and readable while never being surfaced, which is
+    the worst failure mode here.
+    """
+    if not title or _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
+        return False
+    status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
+    if status_m:
+        return status_m.group(1).strip().lower().startswith(
+            ('unanswered', 'waiting', 'open'))
+    return True  # no status field: free-form prose is unanswered by convention
+
+
 def get_waiting_questions():
     """Parse pending-questions.md — matches the legacy `## Q1 — Title` and
     `## Title` / `- **Status:** unanswered` section formats AND the free-form
@@ -140,18 +160,8 @@ def get_waiting_questions():
         title = title_line.strip()
         if not title:
             continue
-        if _ORG_HEADING.match(title) or _INLINE_RESOLVED.match(title):
+        if not section_is_waiting(title, body):
             continue
-        status_m = re.search(r'\*\*Status:\*\*\s*(.+)', body)
-        if status_m:
-            status = status_m.group(1).strip().lower()
-            # `open` is the word writers naturally reach for, and it used to
-            # fall through to the skip below — filing a live question as though
-            # it were resolved. The section stayed on disk and readable while
-            # never being surfaced, which is the worst failure mode here.
-            if not status.startswith(('unanswered', 'waiting', 'open')):
-                continue  # explicitly resolved/done/answered — skip
-        # No status field, or status is unanswered/waiting/open → notify.
         # Capture first non-empty, non-strikethrough, non-status-metadata body
         # line as a one-line action hint so notifications tell the user what
         # to do, not just that something is waiting (avoids "what do I do
@@ -196,9 +206,13 @@ def get_waiting_questions():
             # that blank line and a start-anchored slice comes back empty.
             line_start = content.rfind("\n", 0, m.end()) + 1
             line_end = content.find("\n", m.end())
-            body = content[line_start:line_end if line_end != -1 else len(content)].strip()
+            stop = line_end if line_end != -1 else len(content)
+            body = content[line_start:stop].strip()
+            # The DM renders `snippet`, not `body`; an empty one delivered the
+            # bracketed label alone, so options and defaults never reached anyone.
+            ask = content[m.end():stop].strip().lstrip("*").strip()
             questions.append({"id": title[:40], "title": title,
-                              "snippet": "", "body": body or title})
+                              "snippet": ask[:120], "body": body or title})
     return questions
 
 
@@ -253,9 +267,29 @@ def should_notify(key=None):
     return (time.time() - mtime) > UNCHANGED_REMINDER_SEC
 
 
+#: Body budget for the macOS notification. Not a hard OS limit — a chosen bound
+#: the assembled body is held under, so no count width can overrun it.
+BODY_MAX = 160
+
+
 def notify_macos(count, titles):
     """Returns True only if osascript actually accepted the notification."""
-    msg = f"{count} pending question{'s' if count > 1 else ''}: {', '.join(titles[:3])}"
+    # macOS truncates the body: the [:40] cap is the bound, since a title need
+    # not contain a comma; blanks are dropped so the join cannot emit a bare `, ,`.
+    names = [n for n in (t.split(",", 1)[0].strip()[:40] for t in titles[:3]) if n]
+    extra = f" (+{count - len(names)} more)" if count > len(names) else ""
+    head = f"{count} pending question{'s' if count > 1 else ''}: "
+    # Cap the ASSEMBLED body, not just each name: the count and the overflow both
+    # widen with the queue, so per-name bounds alone leave the total arithmetic.
+    room = BODY_MAX - len(head) - len(extra) - 1
+    joined = ", ".join(names)
+    if room <= 0:
+        joined = ""
+    elif len(joined) > room:
+        joined = joined[:room - 1] + "…"
+    # When every candidate name is blank there is nothing between the colon and the
+    # overflow, and `head` already ends in a space — so join on the stripped head.
+    msg = f"{head}{joined}{extra}" if joined else f"{head.rstrip()}{extra}"
     # AppleScript string literal: backslashes and double quotes in question
     # titles must be escaped, or osascript rejects the script and the
     # notification silently reports FAILED (bit us 2026-07-26 — a title
@@ -426,6 +460,19 @@ def deliver(questions, count, titles):
     return summary
 
 
+def _active_region_lost(active_text: str) -> bool:
+    """True when the active-region HEADER is absent, not merely empty.
+
+    Below the divider, resolution is expressed by POSITION, so "this entry lacks
+    a resolved marker" is not evidence. What a swept file cannot fake is having no
+    top-level heading left above the divider at all.
+
+    Takes the ALREADY-PARSED active region: re-splitting here would be a second
+    definition of the divider, which `active_region()` alone owns.
+    """
+    return not re.search(r'^#\s+\S', active_text, flags=re.MULTILINE)
+
+
 def zero_reason():
     """Explain a zero so a parse fault cannot look like a quiet day.
 
@@ -477,14 +524,20 @@ def zero_reason():
     if file_total == 0:
         return "0 pending questions — the file holds no sections or bullets at all"
 
-    # Suspicious shape: the file has entries, the ACTIVE region has none. Fires for
-    # sections, bullets, or any mix — the population that vanished does not matter.
+    # An empty active region is the parse-fault shape AND, permanently, a fully
+    # answered file. The header tells them apart; the entries cannot.
     if act_total == 0:
+        if not _active_region_lost(active_text):
+            return (
+                f"0 pending questions — the active region is empty and all "
+                f"{_describe(file_secs, file_bullets)} sit below the archive divider"
+            )
         return (
-            f"0 pending questions, but {PQ_FILE.name} holds {_describe(file_secs, file_bullets)} "
-            f"and NONE are in the active region (above the archive divider). "
-            f"That is the shape of a parse fault, not a quiet day — check the "
-            f"'# Resolved' divider before trusting this zero."
+            f"0 pending questions, but {PQ_FILE.name} holds "
+            f"{_describe(file_secs, file_bullets)} and has NO active-region header "
+            f"at all — the '# Open' heading is gone, so there is no region left for "
+            f"them to be in. That is the shape of a parse fault, not a quiet day — "
+            f"check the '# Resolved' divider before trusting this zero."
         )
 
     return (

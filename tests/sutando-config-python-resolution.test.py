@@ -150,7 +150,11 @@ class ResolvePython(unittest.TestCase):
         )
         cls.probe = probe_dir / "probe"
         env = os.environ.copy()
-        env["CLANG_MODULE_CACHE_PATH"] = str(cls.tmp / "module-cache")
+        # Persistent, NOT under cls.tmp: a per-run cache is deleted in teardown, so
+        # every run rebuilt Foundation's modules cold — measured 4.9x the warm cost.
+        cache = Path(tempfile.gettempdir()) / "sutando-swift-module-cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        env["CLANG_MODULE_CACHE_PATH"] = str(cache)
         subprocess.run(
             ["swiftc", str(SWIFT_CONFIG), str(probe_dir / "main.swift"), "-o", str(cls.probe)],
             env=env,

@@ -34,6 +34,7 @@ CLASSIFIER_TASK_PREFIX = "task-workstream-grouping-"
 LEGACY_CLASSIFIER_TASK_PREFIX = "task-project-grouping-"
 MIN_CONFIDENCE = 0.65
 MAX_RESULT_CHARS = 4_000
+MAX_TASK_TEXT_CHARS = 4_000
 CONTEXT_MAX_TASKS = 5
 CONTEXT_TASK_CHARS = 500
 CONTEXT_RESULT_CHARS = 2_000
@@ -177,10 +178,30 @@ def load_workstream_store(workspace: Path) -> dict:
     }
 
 
+def _header_stop_pattern(keys) -> "re.Pattern[str]":
+    # Keys are interpolated into a regex, so a future key holding a metacharacter
+    # would silently widen the stop set. Escaping makes that impossible.
+    return re.compile(
+        r"^(?:={3,}.*={3,}$|("
+        + "|".join(re.escape(k) for k in keys)
+        + r"):)")
+
+
+_TASK_BODY_STOP = _header_stop_pattern(local_task_protocol.KNOWN_HEADER_KEYS)
+
+
 def _task_text(content: str) -> str:
-    for line in content.splitlines():
+    # `task:` is mid-file for several producers, so the body ends at the next
+    # known header key as well as at the bridge's `===` block.
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
         if line.startswith("task:"):
-            return line[5:].strip()
+            body = [line[5:]]
+            for rest in lines[i + 1:]:
+                if _TASK_BODY_STOP.match(rest):
+                    break
+                body.append(rest)
+            return "\n".join(body).strip()[:MAX_TASK_TEXT_CHARS]
     return ""
 
 
@@ -671,7 +692,13 @@ def _apply_inference_locked(
         if not isinstance(group, dict):
             skipped += 1
             continue
-        title = _safe_title(group.get("name"))
+        requested_id = str(group.get("workstream_id") or "")
+        reused = workstreams.get(requested_id) if requested_id else None
+        # A reused workstream already stores its title; demanding `name` again would
+        # drop an otherwise valid proposal into the skip branch below.
+        title = _safe_title(group.get("name")) or (
+            _safe_title(reused.get("title")) if isinstance(reused, dict) else ""
+        )
         task_ids = group.get("task_ids")
         try:
             confidence = float(group.get("confidence", 0))
@@ -687,7 +714,6 @@ def _apply_inference_locked(
         skipped += len(task_ids) - len(valid_task_ids)
         if not valid_task_ids:
             continue
-        requested_id = str(group.get("workstream_id") or "")
         if requested_id and requested_id in workstreams:
             workstream_id = requested_id
         else:
@@ -1067,8 +1093,21 @@ def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
         return False
     if not re.fullmatch(r"task-[a-zA-Z0-9_.-]+", task_id):
         return False
-    task_path = Path(workspace) / "tasks" / f"{task_id}.txt"
-    if not task_path.is_file():
+    # Function-local: task_archive is also loaded BY PATH with src/ off
+    # sys.path, where a module-scope import here would take its caller down.
+    from task_archive import find_task_file
+
+    # The lead renames queued work to `.assigned-<inst>`, so a bare-name
+    # lookup here misses and the supersede silently no-ops.
+    tasks_dir = Path(workspace) / "tasks"
+    task_path = find_task_file(tasks_dir, task_id)
+    # find_task_file resolves by name, not by type, so keep the parent's
+    # file-type guard: a same-named DIRECTORY must not be os.replace'd away.
+    if task_path is None or not task_path.is_file():
+        return False
+    # claimed-only: asks whether ANY claimed variant exists, not whether the
+    # returned one is claimed — find_task_file sorts `.assigned-` first.
+    if any(tasks_dir.glob(f"{task_id}.claimed-*")):
         return False
     archive_dir = task_path.parent / "archive" / datetime.now(timezone.utc).strftime("%Y-%m")
     archive_dir.mkdir(parents=True, exist_ok=True)

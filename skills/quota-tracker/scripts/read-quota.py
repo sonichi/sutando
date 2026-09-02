@@ -5,7 +5,7 @@ Read Claude Code quota state from quota-state.json.
 Usage:
   python3 read-quota.py              # human readable
   python3 read-quota.py --json       # machine readable
-  python3 read-quota.py --gate       # exit 1 if exhausted OR not routed
+  python3 read-quota.py --gate       # exit 1 if exhausted, not routed, OR stale
 
 Burn-rate tracking (closes #1087):
   On each human/json read, tracks per-5min utilization delta via an EWMA
@@ -27,8 +27,8 @@ import os
 import sys
 import time
 from datetime import datetime
-from urllib.parse import urlparse
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Canonical (and only) home is <workspace>/state/quota-state.json, written by
 # the credential proxy. The skill-dir / cwd fallbacks were removed: a stale
@@ -42,6 +42,14 @@ from pathlib import Path
 # regardless of where the proxy wrote. Walk up four to reach <repo>/src.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from quota_availability import (  # noqa: E402
+    PROXY_PORT as _PROXY_PORT,
+    PROXY_SCHEME as _PROXY_SCHEME,
+    availability_decision,
+    points_at_credential_proxy,
+    resolve_available as _resolve_available,
+)
 try:
     from workspace_default import status_read_path  # noqa: E402
     _canonical = status_read_path("quota-state.json")
@@ -70,11 +78,6 @@ _MIN_SAMPLES = 2
 
 # The credential proxy writes quota-state.json; 7846 is its port everywhere else
 # in the tree (restart.sh, health-check.py, services_status.py).
-_PROXY_PORT = 7846
-_PROXY_SCHEME = "http"          # the proxy speaks plain HTTP; https/ftp do not reach it
-_PROXY_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
-
-
 def _redacted_endpoint(base_url: str) -> str:
     """scheme://host:port only — userinfo, path, query and fragment carry secrets.
 
@@ -92,24 +95,8 @@ def _redacted_endpoint(base_url: str) -> str:
 
 
 def _points_at_credential_proxy(base_url: "str | None") -> bool:
-    """True only when base_url is THIS host's credential proxy.
-
-    Fails closed: anything unset, unparseable or elsewhere is not routed.
-    """
-    if not base_url:
-        return False
-    try:
-        u = urlparse(base_url if "//" in base_url else "//" + base_url)
-    except ValueError:
-        return False
-    host = (u.hostname or "").strip().lower()
-    try:
-        port = u.port
-    except ValueError:      # non-numeric port in the authority
-        return False
-    scheme = (u.scheme or _PROXY_SCHEME).lower()
-    return (scheme == _PROXY_SCHEME and host in _PROXY_HOSTS
-            and port == _PROXY_PORT)
+    """Compatibility wrapper for tests and callers of the historic helper."""
+    return points_at_credential_proxy(base_url)
 
 def _load_burn_history() -> dict:
     if not BURN_HISTORY_FILE:
@@ -265,13 +252,8 @@ def _update_burn_rate(current_util_5h: float, current_util_7d=None,
 
 
 def resolve_available(status: str, proxy_available) -> bool:
-    """Trust the proxy's `available` bool over the status string, whose vocabulary
-    grows; explicit "rejected" still wins, and absent a bool require "allowed"."""
-    if status == "rejected":
-        return False
-    if isinstance(proxy_available, bool):
-        return proxy_available
-    return status == "allowed"
+    """Compatibility wrapper around the shared availability policy owner."""
+    return _resolve_available(status, proxy_available)
 
 
 def main():
@@ -287,8 +269,6 @@ def main():
 
     # Presence is not destination: the launcher honours a caller-set URL verbatim,
     # so only the proxy's own host:port proves these numbers describe this session.
-    routed = _points_at_credential_proxy(os.environ.get("ANTHROPIC_BASE_URL"))
-
     status = headers.get("anthropic-ratelimit-unified-status", "unknown")
     util_5h = float(headers.get("anthropic-ratelimit-unified-5h-utilization", 0))
     util_7d = float(headers.get("anthropic-ratelimit-unified-7d-utilization", 0))
@@ -297,14 +277,20 @@ def main():
 
     # Stated once: a second copy of this predicate drifts the moment either is
     # extended, and the two fields then contradict each other in one payload.
-    # Composition of two policies: trust the proxy's flag over the status string,
-    # AND fail closed when this session is not routed through the proxy.
-    available = resolve_available(status, data.get("available")) and routed
+    # Fails closed on unrouted or stale: a routed proxy that stopped writing keeps
+    # `routed` true while every number is a fossil.
+    decision = availability_decision(
+        data,
+        base_url=os.environ.get("ANTHROPIC_BASE_URL"),
+        stale=stale,
+    )
+    routed = decision["routed"]
+    available = decision["available"]
 
     result = {
         "status": status,
-        # Fails closed when unrouted: --gate exits on this field, and a machine
-        # consumer is the one that never sees the human NOT ROUTED banner.
+        # Fails closed when unrouted OR stale: --gate exits on this field, and a
+        # machine consumer never sees the human NOT ROUTED / STALE banner.
         "available": available,
         "utilization_5h": util_5h,
         "utilization_7d": util_7d,
@@ -313,10 +299,9 @@ def main():
         "state_age_seconds": int(age_s),
         "stale": stale,
         "routed": routed,
-        # Distinguishes "not this session's data" from "quota exhausted"; both
-        # are unavailable, and a caller retries only one of them.
-        "unavailable_reason": None if available
-                              else ("not-routed" if not routed else "exhausted"),
+        # Three unavailable states, three different remedies; not-routed outranks
+        # stale because a foreign file's age says nothing about this session.
+        "unavailable_reason": decision["unavailable_reason"],
     }
 
     if reset_5h:

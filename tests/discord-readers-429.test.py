@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for the Discord reader scripts now that their REST calls route through
-the shared 429-backoff helper (src/discord_http.request_json).
+the shared 429-backoff helper (src/channels/discord/http.py request_json).
 
 Covers:
   * src/discord-read.py         — _fetch wire-in, main() single-page + --until
@@ -74,7 +74,11 @@ def main() -> int:
                          "_strictly_older: ISO older → True"))
 
     # --- _load_token ------------------------------------------------------
+    # The resolver's third tier is the Keychain vault, which is host state — on a
+    # machine holding this key, "no file, no env" is not empty. Stub it to zero.
     import os as _os
+    import channel_token as _ct
+    _ct.token_from_vault = lambda var, vault_get=None: ""
     _os.environ.pop("DISCORD_BOT_TOKEN", None)
     with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
         f.write('# comment\nDISCORD_BOT_TOKEN=tok-123\n')

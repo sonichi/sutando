@@ -1,0 +1,38 @@
+# Nightly ClaimMachine exploration; hypothesis REQUIRED (missing dep FAILS the
+# job, never a silent pass). Deterministic regressions stay in plain CI.
+name: claim-machine-nightly
+
+on:
+  schedule:
+    - cron: '43 9 * * *'
+  workflow_dispatch:
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install hypothesis (required — absence fails the run; exact pin
+              so the nightly engine only changes by deliberate PR)
+        run: python3 -m pip install -r requirements-claim-machine.txt
+      - name: Deterministic frozen-schedule regressions (sanity)
+        run: python3 tests/outbox-claim-regressions.test.py
+      - name: ClaimMachine exploration
+        env:
+          CLAIM_MACHINE_REQUIRED: '1'
+          CLAIM_MACHINE_EXAMPLES: '2000'
+          CLAIM_MACHINE_STEPS: '60'
+          CLAIM_MACHINE_DB: 'tests/.claim-machine-db'
+        run: python3 tests/outbox-claim-machine.test.py
+      - name: Upload failure traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claim-machine-failure-${{ github.run_id }}
+          path: |
+            tests/.claim-machine-db
+          if-no-files-found: ignore

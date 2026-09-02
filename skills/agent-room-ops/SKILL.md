@@ -32,11 +32,23 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' 'deploy finished, 3 
 #   event id came back. `unconfirmed` is a 200 with no proof: the send probably landed, so do
 #   NOT re-send blindly, but do not drop a fallback/result path on it either.
 #   Use `mention` instead when a specific agent must be triggered; `say` never pings.
+python3 skills/agent-room-ops/room_ops.py say '!room:hs' 'on it' --reply-to '$evt' --agent '@a:hs'
+#   --reply-to (on `say` and `mention`) CITES the message being replied to. The post stays
+#   in the MAIN TIMELINE — it is not thread membership. Only a relation with
+#   rel_type m.thread puts an event in a thread, and the gateway has no field for that,
+#   so room-ops deliberately offers no way to ask for one: a call that reported success
+#   while landing outside the requested thread is the failure worth refusing. A malformed
+#   event id is REFUSED before the network rather than posted uncited.
 python3 skills/agent-room-ops/room_ops.py join   '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc get '!room:hs' --folder room-todo --name TODO.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc put '!room:hs' --folder room-memo --name note.md --file /tmp/note.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py doc rm  '!room:hs' --folder room-memo --name note.md --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py grant '!room:hs' --tier '@u:hs=owner' --default-tier guest --agent '@a:hs'
+python3 skills/agent-room-ops/room_ops.py events emit '!room:hs' --type space.ag2.app.card --content '{"k":1}' --agent '@a:hs'
+#   -> one typed space.ag2.* TIMELINE event sent AS this agent. Same
+#   confirmed/unconfirmed receipt as `say`. Which type namespaces are accepted is the
+#   server's rule, not restated here — a refusal arrives as `reason`.
+#   Timeline needs no power-level grant; `op:state` (roomtype/widget) does.
 ```
 
 `grant` makes a room **authoritative** (design-response-policy-v0.2 / #429): it writes

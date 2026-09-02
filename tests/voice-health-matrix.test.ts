@@ -496,7 +496,15 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 			losslessWindowWithSpeechQueued: true,
 			transportGenerationChanged: false,
 			echoSuppressedAdvanced: false,
+			// ACTIVE-silence family: this window HAS a same-epoch baseline, so
+			// factsAvailable holds and speech/ingress report what they observed.
+			factsAvailable: true,
+			speechInWindow: true,
+			speechObservedAt: r.facts.speechObservedAt,
+			ingressAdvanced: true,
+			modelSilentFor15s: true,
 		});
+		assert.equal(typeof r.facts.speechObservedAt, 'number');
 	});
 
 	it('facts: a generation change is a fact; a windowless tick carries all-false facts', () => {
@@ -520,6 +528,12 @@ describe('P7 D7.2 matrix — structural outcomes (row 0 + honesty)', () => {
 			losslessWindowWithSpeechQueued: false,
 			transportGenerationChanged: false,
 			echoSuppressedAdvanced: false,
+			// No baseline ⇒ the ACTIVE-silence family fails closed as a unit.
+			factsAvailable: false,
+			speechInWindow: false,
+			speechObservedAt: null,
+			ingressAdvanced: false,
+			modelSilentFor15s: false,
 		});
 	});
 

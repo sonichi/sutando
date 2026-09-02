@@ -145,6 +145,14 @@ sc._reset_cache_for_tests()
 
 # --- should_stream_task (owner-only) ---
 check("owner streams", ps.should_stream_task("owner") is True)
+check("collaborator streams despite team tier",
+      ps.should_stream_task("team", True) is True)
+check("team WITHOUT collaborator does not stream",
+      ps.should_stream_task("team", False) is False)
+check("collaborator flag defaults off (unchanged callers keep owner-only)",
+      ps.should_stream_task("team") is False)
+check("other tier never streams even as collaborator=False",
+      ps.should_stream_task("other") is False)
 check("owner streams (caps/space)", ps.should_stream_task("  Owner ") is True)
 check("None tier streams (legacy owner)", ps.should_stream_task(None) is True)
 check("team does NOT stream", ps.should_stream_task("team") is False)
@@ -330,6 +338,21 @@ with tempfile.TemporaryDirectory() as d:
     (ws / "tasks").mkdir()
     _db.STATE_DIR = ws / "state"
     _db.TASKS_DIR = ws / "tasks"
+
+    # The owner-tier gate asks who SENT the task, never who can READ the channel,
+    # and the step is rendered verbatim into whatever channel it arrived on.
+    check("step_visible_in: DM yes", ps.step_visible_in(True) is True)
+    check("step_visible_in: guild no", ps.step_visible_in(False) is False)
+    _leak = "SENSITIVE-STEP-TEXT"
+    _priv = ps.format_progress(_leak if ps.step_visible_in(True) else None, 12)
+    _shar = ps.format_progress(_leak if ps.step_visible_in(False) else None, 12)
+    check("DM still shows the live step", _leak in _priv)
+    check("shared channel leaks NO fragment of the step",
+          _leak not in _shar and "calendar" not in _shar and "Chi" not in _shar)
+    # ...and the placeholder must STILL post — liveness is the whole feature, so
+    # this must not quietly become "no placeholder outside DMs".
+    check("shared channel still gets a contentless placeholder",
+          _shar.startswith("⏳") and "12s" in _shar)
     now = time.time()
 
     # _newest_alive_mtime
@@ -353,8 +376,14 @@ with tempfile.TemporaryDirectory() as d:
     # _render_progress_content — live core → normal progress copy
     (ws / "state" / "core-status.json").write_text(
         json.dumps({"status": "running", "step": "building", "ts": now - 10}))
-    out_live = _db._render_progress_content(now, 42)
+    # A DM may carry the live step...
+    out_live = _db._render_progress_content(now, 42, True)
     check("bridge: live core renders progress copy", out_live.startswith("⏳") and "building" in out_live and "(42s)" in out_live)
+    # ...and the DEFAULT is fail-closed: an unknown audience must suppress the step
+    # rather than assume a DM, since the tier gate answers who SENT, not who reads.
+    out_shared = _db._render_progress_content(now, 42)
+    check("bridge: step suppressed when audience unknown",
+          out_shared.startswith("⏳") and "building" not in out_shared and "(42s)" in out_shared)
 
     # _render_progress_content — frozen status + only-stale heartbeats → outage copy
     (ws / "state" / "core-status.json").write_text(
@@ -373,6 +402,30 @@ with tempfile.TemporaryDirectory() as d:
     check("bridge: queue-count fail-soft -> 0", _db._queued_task_count() == 0)
     _db.STATE_DIR = ws / "state"
     _db.TASKS_DIR = ws / "tasks"
+
+# --- resolve_team_collaborator: the hoist ---
+
+# Collaborator status must not depend on WHICH arm produced team tier: the
+# globally-allowlisted arm never ran the old arm-local check.
+_ACC = {"groups": {"123": {"allowFrom": ["u1"], "collaborators": ["u1"]}}}
+check("hoist: globally-allowlisted team sender IS collaborator",
+      _db.resolve_team_collaborator(_ACC, "team", "u1", 123) is True)
+check("hoist: owner/other/guest never collaborate",
+      not any(_db.resolve_team_collaborator(_ACC, t_, "u1", 123)
+              for t_ in ("owner", "other", "guest", "ambient")))
+check("hoist: unlisted team sender is NOT collaborator",
+      _db.resolve_team_collaborator(_ACC, "team", "u2", 123) is False)
+
+# --- should_stream_task: the collaborator flag must not bypass the tier ---
+
+# The reviewer's exact table: with is_collaborator=True, only team streams
+# (owner streams via its own arm; None is the platform's missing-field=owner).
+for _tier, _want in [("owner", True), ("team", True), ("other", False),
+                     ("guest", False), ("ambient", False), (None, True)]:
+    check(f"tier-gate: collab flag with tier={_tier} -> {_want}",
+          ps.should_stream_task(_tier, is_collaborator=True) is _want)
+check("tier-gate: plain team (no flag) does NOT stream",
+      ps.should_stream_task("team") is False)
 
 if _fails:
     print(f"{len(_fails)} test(s) FAILED: {_fails}")

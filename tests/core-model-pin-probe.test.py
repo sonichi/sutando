@@ -627,5 +627,208 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("opus", r["detail"])
 
+
+class SettingsJsonIsAThirdWayTheModelIsChosen(unittest.TestCase):
+    """settings.json `model` is invisible to both tmux env and argv, so the clean
+    line used to claim "core uses the default window" on a host where a settings
+    pin WAS selecting opus[1m]. Literally true about its scope, materially false
+    about its subject."""
+
+    def setUp(self):
+        self.hc = _load()
+
+    def test_clean_line_does_NOT_claim_default_window_when_settings_selects_one(self):
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", (), [("CLAUDE_CONFIG_DIR", "opus[1m]")])
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("opus[1m]", r["detail"])
+        self.assertIn("not on the default window", r["detail"])
+
+    def test_CONTROL_no_settings_pin_still_claims_the_default_window(self):
+        """The control that proves the branch above discriminates: same inputs,
+        empty settings, and the ORIGINAL claim must come back. Without this, a
+        detail string that always mentions settings would pass the test above."""
+        r = self.hc._interpret_core_model_pin([], "/s", (), [])
+        self.assertEqual(r["status"], "ok", r)
+        self.assertIn("core uses the default window", r["detail"])
+        self.assertNotIn("opus", r["detail"])
+
+    def test_a_settings_pin_never_downgrades_a_REAL_argv_warn(self):
+        """settings is informational; it must not mask a live pinned core."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", [("sutando-core", "opus")], [("~/.claude", "opus[1m]")])
+        self.assertEqual(r["status"], "warn", r)
+        self.assertIn("LIVE core", r["detail"])
+
+    def test_a_settings_pin_never_downgrades_the_UNREADABLE_argv_warn(self):
+        """The unknown-argv warn is the one that guards a core we could not read."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", [("sutando-core", None)], [("~/.claude", "opus[1m]")])
+        self.assertEqual(r["status"], "warn", r)
+
+    def test_reader_body_over_the_REAL_function(self):
+        """Drives _settings_model_pins itself. The previous version of this test
+        re-implemented the read inline, so it asserted on a copy (REVIEW.md L14)
+        and left the shipped body at 71.4% in CI, where neither candidate exists."""
+        import json as _json
+        with tempfile.TemporaryDirectory() as d:
+            dd = Path(d)
+            (dd / "good.json").write_text(_json.dumps({"model": "sonnet"}))
+            (dd / "pad.json").write_text(_json.dumps({"model": "  opus[1m]  "}))
+            (dd / "bad.json").write_text("{not json")
+            (dd / "blank.json").write_text(_json.dumps({"model": "   "}))
+            (dd / "none.json").write_text(_json.dumps({"other": 1}))
+            (dd / "nonstr.json").write_text(_json.dumps({"model": 7}))
+            (dd / "adir.json").mkdir()
+
+            got = self.hc._settings_model_pins([
+                ("good", dd / "good.json"),
+                ("pad", dd / "pad.json"),
+                ("bad", dd / "bad.json"),
+                ("blank", dd / "blank.json"),
+                ("none", dd / "none.json"),
+                ("nonstr", dd / "nonstr.json"),
+                ("adir", dd / "adir.json"),
+                ("missing", dd / "missing.json"),
+            ])
+            self.assertEqual(got, [("good", "sonnet"), ("pad", "opus[1m]")], got)
+
+    def test_reader_dedups_two_labels_on_ONE_resolved_file(self):
+        """CLAUDE_CONFIG_DIR unset makes both candidates the same path; without
+        the resolve()-keyed seen set the same pin would be reported twice."""
+        import json as _json
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "settings.json"
+            real.write_text(_json.dumps({"model": "sonnet"}))
+            link = Path(d) / "alias.json"
+            link.symlink_to(real)
+            got = self.hc._settings_model_pins(
+                [("user", real), ("project", link)])
+            self.assertEqual(got, [("user", "sonnet")], got)
+
+    @contextlib.contextmanager
+    def _probe_on_any_host(self, runtime, settings):
+        """check_core_model_pin() early-returns 'no core tmux socket' when the
+        socket file is absent — true in CI, false on a dev box. Give it a real
+        temp file and stub only the tmux/OS edges so the decision under test runs."""
+        with tempfile.TemporaryDirectory() as d:
+            sock = Path(d) / "probe.sock"
+            sock.write_text("")
+            old = os.environ.get("SUTANDO_TMUX_SOCKET")
+            os.environ["SUTANDO_TMUX_SOCKET"] = str(sock)
+            try:
+                with mock.patch.object(self.hc, "_tmux_sessions", lambda s: ["sutando-core"]), \
+                     mock.patch.object(self.hc, "_query_pin", lambda s, a: ""), \
+                     mock.patch.object(self.hc, "_core_argv_pins", lambda s, ss: []), \
+                     mock.patch.object(self.hc, "_live_core_runtime", lambda s, ss: runtime), \
+                     mock.patch.object(self.hc, "_settings_model_pins",
+                                       lambda *a, **k: settings):
+                    yield
+            finally:
+                if old is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = old
+
+    def test_claude_settings_must_not_vouch_for_a_CODEX_core(self):
+        """The argv scan skips any pane without `claude`, so a Codex core supplies
+        no running evidence; a Claude-only settings.json must not then be read as
+        proof about its window."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", (), [("user", "opus[1m]")], "codex")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("not on the default window", r["detail"])
+        self.assertNotIn("opus[1m]", r["detail"])
+        self.assertIn("codex", r["detail"])
+        self.assertIn("NOT consulted", r["detail"])
+
+    def test_CONTROL_the_same_settings_DO_qualify_a_claude_core(self):
+        """Without this, a detail string that never mentioned settings would pass
+        the Codex test above."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", (), [("user", "opus[1m]")], "claude")
+        self.assertIn("opus[1m]", r["detail"])
+        self.assertIn("not on the default window", r["detail"])
+
+    def test_unknown_runtime_fails_CLOSED_not_to_claude(self):
+        """Missing/unreadable/conflicting stamps must not default to Claude."""
+        r = self.hc._interpret_core_model_pin(
+            [], "/s", (), [("user", "opus[1m]")], "unknown")
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("opus[1m]", r["detail"])
+        self.assertIn("unassessed", r["detail"])
+
+    def test_live_runtime_reader_semantics(self):
+        """One stamp wins; none or CONFLICTING stamps are unknown, never Claude."""
+        class _R:
+            def __init__(self, rc, out): self.returncode, self.stdout = rc, out
+
+        def mk(mapping):
+            return lambda sock, *a: _R(0, mapping[a[2][1:]]) if a[2][1:] in mapping else _R(1, "")
+
+        with mock.patch.object(self.hc, "_run_tmux",
+                               mk({"s1": "SUTANDO_CORE_RUNTIME=codex"})):
+            self.assertEqual(self.hc._live_core_runtime("/s", ["s1"]), "codex")
+        with mock.patch.object(self.hc, "_run_tmux",
+                               mk({"s1": "SUTANDO_CORE_RUNTIME=codex",
+                                   "s2": "SUTANDO_CORE_RUNTIME=claude"})):
+            self.assertIsNone(self.hc._live_core_runtime("/s", ["s1", "s2"]),
+                              "conflicting stamps must be unknown, not a pick")
+        with mock.patch.object(self.hc, "_run_tmux", lambda *a, **k: None):
+            self.assertIsNone(self.hc._live_core_runtime("/s", ["s1"]))
+
+    def test_SHIPPED_path_unresolvable_runtime_must_not_default_to_claude(self):
+        """The call-site fallback itself. Mutating `or "unknown"` to `or "claude"`
+        passed every other test here — the unknown test drives the interpreter
+        directly and the mirror test resolves a real value, so neither reaches the
+        fallback. This one does."""
+        with self._probe_on_any_host(None, [("user", "opus[1m]")]):
+            r = self.hc.check_core_model_pin()
+        self.assertNotIn("opus[1m]", r["detail"],
+                         "an unresolvable runtime must not consume Claude settings")
+        self.assertIn("unassessed", r["detail"])
+
+    def test_MIRROR_live_codex_pane_beats_a_claude_CONFIG(self):
+        """Config says claude (what an invalid config also collapses to) while the
+        live pane is codex. Settings must still not be consulted."""
+        with mock.patch.object(self.hc, "_codex_runtime_selected", lambda: False), \
+             self._probe_on_any_host("codex", [("user", "opus[1m]")]):
+            r = self.hc.check_core_model_pin()
+        self.assertNotIn("opus[1m]", r["detail"],
+                         "a live codex pane must veto the Claude settings value")
+        self.assertIn("codex", r["detail"])
+
+    def test_codex_core_through_the_SHIPPED_check_path(self):
+        """Drives check_core_model_pin() itself with the LIVE stamp reading codex.
+
+        This previously mocked _codex_runtime_selected(); when the source of truth
+        moved to the live pane that mock went inert and this test failed — which is
+        the test noticing its own premise had been removed.
+        """
+        with self._probe_on_any_host("codex", [("user", "opus[1m]")]):
+            r = self.hc.check_core_model_pin()
+        self.assertEqual(r["status"], "ok", r)
+        self.assertNotIn("opus[1m]", r["detail"],
+                         "a Claude settings value must not appear in a codex verdict")
+
+    def test_default_candidates_are_the_runtime_ones(self):
+        """The injectable default must still be what the probe reads live."""
+        labels = [lbl for lbl, _ in self.hc._settings_candidates()]
+        self.assertEqual(labels, ["user", "project"])
+        self.assertEqual(self.hc._settings_model_pins(),
+                         self.hc._settings_model_pins(self.hc._settings_candidates()))
+
+    def test_live_reader_returns_pairs_and_dedups_by_resolved_path(self):
+        """Shape contract on the real reader: labelled pairs, no duplicate file."""
+        pins = self.hc._settings_model_pins()
+        self.assertIsInstance(pins, list)
+        for entry in pins:
+            self.assertEqual(len(entry), 2, entry)
+            self.assertIsInstance(entry[1], str)
+            self.assertTrue(entry[1].strip())
+        self.assertEqual(len(pins), len({lbl for lbl, _ in pins}),
+                         "one label must not appear twice")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-language parity fixture for the result-channel-key helpers. ONE shared input/output table that BOTH tests/result-channel-key.test.ts and tests/result-channel-key.test.py load and assert against — so the TypeScript impl (src/result-channel-key.ts) and the Python impl (src/result_channel_key.py) can never silently drift. If you change one impl, the matching case here fails in the OTHER language's test too. Add a row here, not a per-language assertion, when extending behavior. (Lucy's flag on PR #1595.)",
+  "_comment": "Cross-language parity fixture for the result-channel-key helpers. ONE shared input/output table that BOTH tests/result-channel-key.test.ts and tests/result-channel-key.test.py load and assert against — so the TypeScript impl (src/result-channel-key.ts) and the Python impl (src/delivery/channel_key.py) can never silently drift. If you change one impl, the matching case here fails in the OTHER language's test too. Add a row here, not a per-language assertion, when extending behavior. (Lucy's flag on PR #1595.)",
 
   "sanitizeKey": [
     {"in": "1485653767402553457", "out": "1485653767402553457"},

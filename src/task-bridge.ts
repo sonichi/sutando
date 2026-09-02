@@ -15,7 +15,7 @@ import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace } from './workspace_default.js';
 import { tryStampText } from './task_envelope.js';
 import { claudeHomePath } from './util_paths.js';
-import { isSkipMarked, mayRetireSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
+import { isSkipMarked, mayRetireSkipMarked, bodyIsSkipMarked, type TaskOrigin } from './skip_marker_ownership.js';
 import { recordConversation, recordSessionBoundary } from './conversation-store.js';
 import {
 	emitTaskProcessed,
@@ -85,17 +85,21 @@ const _ZWSP = '​';
 // Kept in lockstep with local_task_protocol.KNOWN_HEADER_KEYS (the Python
 // guard's source of truth). TS can't import the Python tuple, so this list is
 // the mirror; injection-guard-sweep asserts parity so drift fails CI. Synced to
-// the full 34-key set on the 2026-07-13 main merge (main widened the Python side
-// from 14 → 34; the TS guard must defang the same keys or forged interaction_type:
+// the full 38-key set on the 2026-07-13 main merge (main widened the Python side
+// from 14 → 38; the TS guard must defang the same keys or forged interaction_type:
 // / attachments: / media_form: lines slip through here).
 const _HEADER_KEYS = [
-	'id', 'timestamp', 'task', 'source', 'access_tier', 'user_id',
+	'id', 'timestamp', 'session_scope', 'task', 'source', 'access_tier', 'user_id',
 	'channel_id', 'priority', 'interaction_type', 'source_message_id',
 	'channel_name', 'guild_name', 'attempts', 'sender_name', 'room_name',
 	'parent_message_id', 'reply_chain_ids', 'reminder', 'author_name', 'author_id', 'chat_id',
 	'thread_ts', 'reply_to_event', 'reply_to_me', 'reply_to_sender', 'addressed_to', 'callSid', 'caller',
+	'thread_root', 'source_room_id',
+	'receiving_instance',
 	'from', 'call_sid', 'hint', 'instructions', 'transcript',
+	'schedule_name', 'schedule_slot',
 	'content_modalities', 'media_form', 'attachments', 'platform_card',
+	'instance_id',
 ];
 const _HEADER_RE = new RegExp(`^(?:${_HEADER_KEYS.join('|')})\\s*:`, 'i');
 const _FENCE_RE = /^={3,}/;
@@ -294,6 +298,11 @@ export function _taskOrigin(taskId: string): TaskOrigin | null {
 	};
 }
 
+/** Id prefix minted by `submit_signal_room_task` (src/signal_room_tasks.py).
+ * Task-bridge delivers NO Signal Room result: the room daemon polls agent-api
+ * `GET /result/{id}` for its own. Kept in sync with the Python writer. */
+export const SIGNAL_TASK_PREFIX = 'task-signal-';
+
 /** Belt-suspenders guard for the result-watcher's unconditional fallthrough
  * (issue #1035, follow-up to PR #1033). Returns true iff the filename is one
  * that task-bridge legitimately delivers via `onResult()`. Rejects everything
@@ -311,6 +320,9 @@ export function _taskOrigin(taskId: string): TaskOrigin | null {
  * Exported for unit testing — the watcher's setInterval body is otherwise
  * awkward to exercise in isolation. */
 export function _shouldFallthrough(file: string): boolean {
+	// Signal Room results belong to the room daemon's `/result` poll, not to
+	// voice. See SIGNAL_TASK_PREFIX and the dedicated branch in the watcher.
+	if (file.startsWith(SIGNAL_TASK_PREFIX)) return false;
 	return file.startsWith('task-') || file.startsWith('voice-') || file.startsWith('proactive-');
 }
 
@@ -767,8 +779,9 @@ function startRelayResultWatcher(onResult: (result: string) => void): void {
 				if (!result) continue;
 				_deliveredResults.add(file);
 				_pendingTasks.delete(taskId);
-				const skip = /^\s*\[(deduped:[^\]]*|no-send|REPLIED)\]/.exec(result);
-				if (!skip) {
+				// Shared predicate, not a local regex: this grammar must stay identical to
+				// src/result_markers.py, which is case-insensitive and accepts `[deduped:]`.
+				if (!bodyIsSkipMarked(result)) {
 					_sendTaskStatus?.(taskId, 'done', 'Task complete', result);
 					onResult(`[Task result for ${taskId}]\n${result}`);
 				}
@@ -926,31 +939,8 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					setTimeout(() => archiveFile(path, 'results', `voice-${Date.now()}`), 10_000);
 					continue;
 				}
-				// Deduped-marker result: agent consolidated this task's reply
-				// into another task's result file. Mark this task done silently
-				// and archive — no Discord post, no voice narration, no timeout.
-				// Format: first line is "[deduped: <other-task-id>]" (rest of
-				// file optional, displayed as the result body in the UI).
-				if (file.startsWith('task-') && /^\s*\[deduped:\s*task-/i.test(result)) {
-					console.log(`${ts()} [TaskBridge] ${taskId} is deduped marker; archiving silently`);
-					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
-					_deliveredResults.add(file);
-					_pendingTasks.delete(taskId);
-					try {
-						fetch('http://localhost:7843/task-done', {
-							method: 'POST',
-							headers: _apiHeaders(),
-							body: JSON.stringify({ taskId, result }),
-						}).catch(() => {});
-					} catch {}
-					setTimeout(() => {
-						archiveFile(path, 'results', taskId);
-						const taskFile = join(TASK_DIR, `${taskId}.txt`);
-						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
-					}, 5_000);
-					continue;
-				}
-				// Skip markers: [no-send] / [REPLIED] — archive silently with no voice narration.
+				// [no-send] / [REPLIED] / [deduped: <id>] — archive silently, no voice.
+				// deduped had its own branch above this one, bypassing the ownership gate.
 				// These are set by the core agent when delivery already happened via another path
 				// (e.g. Discord bridge already replied) or the result should be suppressed entirely.
 				// Parity with Python bridges: discord-bridge.py and telegram-bridge.py both honor
@@ -978,6 +968,32 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 						const taskFile = join(TASK_DIR, `${taskId}.txt`);
 						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
 					}, 5_000);
+					continue;
+				}
+				// Signal Room: the room daemon polls agent-api `GET /result/{id}`, so
+				// task-bridge owns no delivery here. Falling through would speak
+				// untrusted room speech into the owner's private call, and the
+				// `foreignOrigin` path below would leave the files for a bridge that
+				// does not exist. Register the owner-visible Task row, then archive —
+				// `/result` falls back to find_archived_result, so a later poll by the
+				// daemon still finds the body.
+				if (taskId.startsWith(SIGNAL_TASK_PREFIX)) {
+					console.log(`${ts()} [TaskBridge] ${taskId} is a Signal Room task; room daemon polls /result — archiving without voice`);
+					_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+					_deliveredResults.add(file);
+					_pendingTasks.delete(taskId);
+					try {
+						fetch('http://localhost:7843/task-done', {
+							method: 'POST',
+							headers: _apiHeaders(),
+							body: JSON.stringify({ taskId, result }),
+						}).catch(() => {});
+					} catch {}
+					setTimeout(() => {
+						archiveFile(path, 'results', taskId);
+						const taskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
+					}, 10_000);
 					continue;
 				}
 				// Voice client offline → forward voice-task results to Discord DM

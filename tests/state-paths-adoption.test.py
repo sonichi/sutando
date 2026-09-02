@@ -136,6 +136,17 @@ TS_CANONICAL = re.compile(
 # non-workspace purposes (e.g. walking the checkout for git operations).
 # Each entry is justified, not silently allowed.
 ALLOWLIST = {
+    # runtime-api views + registry never resolve the workspace — server.py
+    # (the composition root) imports the canonical resolver and injects dirs.
+    "src/runtime-api/instance_registry.py",
+    "src/runtime-api/runtime_view.py",
+    # tasks_view: flagged tokens are RPC status fields ("state": "pending"),
+    # not filesystem paths; tasks/results dirs are injected by server.py.
+    "src/runtime-api/tasks_view.py",
+    # runtime-cli talks to the daemon over the socket only — it renders the
+    # daemon's "state" fields and owns no workspace paths.
+    "src/runtime-cli/sutando-runtime.py",
+    "src/runtime-cli/tui.py",
     # workspace_layout cannot import the resolver it exists to repair; its
     # flagged tokens are JSON report field names, not runtime-state paths.
     "src/workspace_layout.py",
@@ -177,6 +188,9 @@ ALLOWLIST = {
     # token composes the tasks dir FROM that injected value, mirroring
     # task_archive.py's caller-supplies-the-path rationale.
     "src/agent_endpoint.py",
+    # mention_gate.py: every path is composed FROM a caller-injected workspace
+    # (bridge/CLI resolve it) — task_archive.py's caller-supplies-the-path rationale.
+    "src/mention_gate.py",
 }
 
 
