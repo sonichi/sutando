@@ -5,6 +5,7 @@ Run: python3 tests/discord-ingress-identity.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tempfile
@@ -14,6 +15,16 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+
+# discord-bridge resolves channel config at import, so this must precede any
+# load of it: without isolation the test reads the developer's real allowlist.
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="d1-ingress-cfg-")
+_ccd_discord = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_ccd_discord.mkdir(parents=True, exist_ok=True)
+(_ccd_discord / "access.json").write_text("{}")
+_ccd_slack = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_ccd_slack.mkdir(parents=True, exist_ok=True)
+(_ccd_slack / "access.json").write_text("{}")
 
 from ingress_identity import already_admitted, provider_task_id  # noqa: E402
 
