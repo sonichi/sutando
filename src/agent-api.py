@@ -1341,6 +1341,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 self.send_json(400, {"error": "invalid JSON"})
                 return
+            # json.loads accepts any JSON value; a non-object would reach .get()
+            # and raise outside the except above — a 500 instead of this 400.
+            if not isinstance(data, dict):
+                self.send_json(400, {"error": "body must be a JSON object"})
+                return
             task = data.get("task", "")
             if not isinstance(task, str) or not task.strip():
                 self.send_json(400, {"error": "task is required"})
@@ -1384,8 +1389,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Invalid UTF-8 raises UnicodeDecodeError, not a JSONDecodeError
+            # subclass: without it the authenticated lane 500s on such a body.
             self.send_json(400, {"error": "invalid JSON"})
+            return
+        if not isinstance(data, dict):
+            self.send_json(400, {"error": "body must be a JSON object"})
             return
 
         from_agent = data.get("from", "unknown")

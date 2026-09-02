@@ -294,6 +294,24 @@ def run() -> None:
         if orig_emit is not None:
             agent_api._emit_task_processed = orig_emit
 
+    # ── JSON bodies that parse but are not objects, and bodies that do not parse
+    #    as UTF-8 at all, must be 400s on BOTH lanes (worker-3, 2026-09-02) ──
+    def raw(path: str, body: bytes):
+        h = make_handler(path, {"Content-Length": str(len(body))}, body, auth=True)
+        try:
+            h.do_POST()
+        except Exception as e:  # the parent 500s here; report it as a value
+            return f"raised {type(e).__name__}"
+        return h._responses[0][0] if h._responses else None
+    check("/guest-task: a JSON array body is a 400, not a 500", raw("/guest-task", b"[1]") == 400)
+    check("/guest-task: a JSON string body is a 400, not a 500", raw("/guest-task", b'"hi"') == 400)
+    # NEGATIVE CONTROL: the guest lane already catches bare Exception around the
+    # decode, so this is green before AND after — it pins that the lanes differ.
+    check("/guest-task: invalid UTF-8 is a 400 (negative control)", raw("/guest-task", b"\xff\xfe{") == 400)
+    check("/task: a JSON array body is a 400, not a 500", raw("/task", b"[1]") == 400)
+    # UnicodeDecodeError is not a JSONDecodeError subclass; this one was a 500.
+    check("/task: invalid UTF-8 is a 400, not a 500", raw("/task", b"\xff\xfe{") == 400)
+
     print()
     if failures:
         print(f"FAILED ({failures})")
