@@ -152,6 +152,34 @@ class MergeTests(unittest.TestCase):
         merged, applied, conflicts = ds.merge(BASE, mine, BASE, "me")
         self.assertEqual(applied, []); self.assertIn("structure", conflicts[0]); self.assertEqual(merged, BASE)
 
+    def test_retire_already_gone_remotely_is_absorbed_and_edit_of_a_removed_row_conflicts(self):
+        gone = "\n".join(l for l in BASE.split("\n") if not l.startswith("org/repo#9 "))
+        merged, applied, conflicts = ds.merge(BASE, gone, gone, "me")  # I retired #9; remote already did
+        self.assertEqual((applied, conflicts, merged), (["already-present org/repo#9"], [], gone))
+        mine = edit(BASE, "org/repo#1", "org/repo#1 | mine")
+        removed = "\n".join(l for l in BASE.split("\n") if not l.startswith("org/repo#1 "))
+        merged, applied, conflicts = ds.merge(BASE, mine, removed, "me")
+        self.assertEqual(applied, []); self.assertEqual(merged, removed)
+        self.assertEqual(conflicts, ["org/repo#1: edited by me, removed remotely"])
+
+    def test_move_into_a_section_the_remote_lacks_conflicts(self):
+        base = BASE + "\n## Parked"                      # base and mine share the header: no structure change
+        mine = "\n".join(l for l in base.split("\n") if not l.startswith("org/repo#9 ")) + "\norg/repo#9 | shepherd: a | status: merged | nine"
+        merged, applied, conflicts = ds.merge(base, mine, BASE, "me")  # remote never had ## Parked
+        self.assertEqual(applied, []); self.assertEqual(merged, BASE)
+        self.assertEqual(conflicts, ["org/repo#9: section '## Parked' not found remotely"])
+
+    def test_add_already_present_remotely_is_absorbed_and_add_into_a_missing_section_conflicts(self):
+        row = "org/repo#3 | shepherd: a | status: active | three"
+        mine = BASE.replace("## Active\n", "## Active\n" + row + "\n")
+        merged, applied, conflicts = ds.merge(BASE, mine, mine, "me")   # remote already carries my add
+        self.assertEqual((applied, conflicts, merged), (["already-present org/repo#3"], [], mine))
+        base = BASE + "\n## Parked"
+        mine = base + "\norg/repo#4 | parked by me"
+        merged, applied, conflicts = ds.merge(base, mine, BASE, "me")     # remote never had ## Parked
+        self.assertEqual((applied, merged), ([], BASE))
+        self.assertEqual(conflicts, ["org/repo#4: section '## Parked' not found remotely"])
+
     def test_writer_stamp_is_honest_when_unset_and_replaces_an_old_stamp(self):
         self.assertEqual(ds.writer_id(None, env={}), "unknown")
         self.assertEqual(ds.writer_id(None, env={"SUTANDO_CORE_ID": "3"}), "3")
@@ -162,12 +190,15 @@ class MergeTests(unittest.TestCase):
 class FakeOps:
     def __init__(self, gets, puts=None):
         self.gets, self.puts, self.calls = list(gets), list(puts or []), []
+        self.unqueued = 0
 
     def get(self, room, folder, name):
         self.calls.append(("get", folder, name)); return self.gets.pop(0)
 
     def put(self, room, folder, name, content):
-        self.calls.append(("put", folder, name, content)); return self.puts.pop(0)
+        self.calls.append(("put", folder, name, content))
+        if self.puts: return self.puts.pop(0)
+        self.unqueued += 1; return {"ok": True}
 
 
 def ok(content): return {"ok": True, "content": content}
@@ -183,7 +214,11 @@ class PutFlowTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _wire(self, fake):
+        real_get, real_put = ds.run_get, ds.run_put
         ds.run_get, ds.run_put = fake.get, fake.put
+        self.addCleanup(lambda: setattr(ds, "run_get", real_get) or setattr(ds, "run_put", real_put))
+        self.addCleanup(lambda: self.assertEqual(
+            fake.unqueued, 0, "a put ran with no queued response — mis-wired test"))
 
     def test_get_writes_base_and_retries_a_false_not_found_once(self):
         fake = FakeOps([NOT_FOUND, ok(BASE)]); self._wire(fake)
@@ -219,6 +254,34 @@ class PutFlowTests(unittest.TestCase):
             self.assertEqual(ds.cmd_put("!r", "ops", "X.md", self.ws, f, "me"), 4)
         self.assertFalse(any(c[0] == "put" for c in fake.calls))
 
+    def test_a_writer_landing_between_the_pre_put_read_and_the_put_is_lost_undetectably(self):
+        # The known-lost case: the window is one round trip, not zero. B edits a DIFFERENT row after
+        # our pre-put read; the unconditional put overwrites it and the re-get verifies our bytes.
+        ds.base_path(self.ws, "ops", "X.md").parent.mkdir(parents=True)
+        ds.base_path(self.ws, "ops", "X.md").write_text(BASE)
+        f = self.ws / "e.md"; f.write_text(edit(BASE, "org/repo#1", "org/repo#1 | mine"))
+        b_row = "org/repo#2 | theirs, IMPORTANT EDIT (w:b)"
+        state = {"remote": BASE, "puts": 0, "b_landed": False}
+
+        def get(room, folder, name):
+            content = state["remote"]
+            if not state["b_landed"]:  # B lands exactly once, right after our pre-put read
+                state["remote"] = edit(state["remote"], "org/repo#2", b_row); state["b_landed"] = True
+            return ok(content)
+
+        def put(room, folder, name, content):
+            state["puts"] += 1; state["remote"] = content; return {"ok": True}
+
+        real_get, real_put = ds.run_get, ds.run_put
+        ds.run_get, ds.run_put = get, put
+        self.addCleanup(lambda: setattr(ds, "run_get", real_get) or setattr(ds, "run_put", real_put))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ds.cmd_put("!r", "ops", "X.md", self.ws, f, "me"), 0)  # reports success
+        self.assertEqual(state["puts"], 1)
+        self.assertIn("org/repo#1 | mine (w:me)", state["remote"])
+        self.assertNotIn("IMPORTANT EDIT", state["remote"])  # B's row is gone, and nothing said so
+        # Fails only once a conditional write closes the window: then fix the docstring, then this.
+
     def test_unverified_reget_is_5_and_base_untouched(self):
         ds.base_path(self.ws, "ops", "X.md").parent.mkdir(parents=True)
         ds.base_path(self.ws, "ops", "X.md").write_text(BASE)
@@ -247,6 +310,60 @@ class PutFlowTests(unittest.TestCase):
         self.assertIn("already present remotely", out.getvalue()); self.assertIn("org/repo#1", out.getvalue())
         self.assertFalse(any(c[0] == "put" for c in fake.calls))  # nothing written
         self.assertEqual(ds.base_path(self.ws, "ops", "X.md").read_text(), mine)  # base advanced to the remote
+
+    def test_transport_seams_pass_room_folder_name_through_to_doc(self):
+        import types
+        calls = []
+        fake_doc = types.SimpleNamespace(
+            doc_get=lambda room, folder, name: calls.append(("get", room, folder, name)) or {"ok": True, "content": "x"},
+            doc_put=lambda room, content, folder, name: calls.append(("put", room, folder, name, content)) or {"ok": True})
+        saved = sys.modules.get("doc"); sys.modules["doc"] = fake_doc
+        try:
+            self.assertEqual(ds.run_get("!r", "ops", "X.md")["content"], "x")
+            self.assertTrue(ds.run_put("!r", "ops", "X.md", "body")["ok"])
+        finally:
+            if saved is None: del sys.modules["doc"]
+            else: sys.modules["doc"] = saved
+        self.assertEqual(calls, [("get", "!r", "ops", "X.md"), ("put", "!r", "ops", "X.md", "body")])
+
+    def test_not_found_twice_is_3_and_a_plain_failure_is_1(self):
+        fake = FakeOps([NOT_FOUND, NOT_FOUND]); self._wire(fake)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.cmd_get("!r", "ops", "X.md", self.ws), 3)
+        self.assertEqual(len(fake.calls), 2)
+        fake = FakeOps([{"ok": False, "reason": "gateway 502"}]); self._wire(fake)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.cmd_duplicates("!r", "ops", "X.md"), 1)
+
+    def test_duplicates_command_reports_count_and_main_dispatches_with_and_without_workspace(self):
+        twice = BASE + "\norg/repo#1 | copied into History"
+        fake = FakeOps([ok(twice), ok(BASE), ok(BASE)]); self._wire(fake)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(ds.main(["duplicates", "--room", "!r", "--folder", "ops", "--name", "X.md"]), 0)
+            self.assertEqual(ds.main(["get", "--room", "!r", "--folder", "ops", "--name", "X.md", "--workspace", str(self.ws)]), 0)
+        self.assertIn("1 duplicated key(s) in ops/X.md", out.getvalue())
+        self.assertIn("org/repo#1:", out.getvalue())
+        self.assertEqual(ds.base_path(self.ws, "ops", "X.md").read_text(), BASE)
+        with self.assertRaises(SystemExit) as cm, redirect_stderr(io.StringIO()):
+            ds._required(None, "--name", "ROOM_DOC_NAME")
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_transport_failures_are_1_at_each_step_ok_without_content_pre_put_read_and_put(self):
+        fake = FakeOps([{"ok": True}]); self._wire(fake)                       # ok=true, no content string
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.cmd_get("!r", "ops", "X.md", self.ws), 1)
+        ds.base_path(self.ws, "ops", "X.md").parent.mkdir(parents=True)
+        ds.base_path(self.ws, "ops", "X.md").write_text(BASE)
+        f = self.ws / "e.md"; f.write_text(edit(BASE, "org/repo#1", "org/repo#1 | mine"))
+        fake = FakeOps([{"ok": False, "reason": "gateway 502"}]); self._wire(fake)   # pre-put read fails
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.cmd_put("!r", "ops", "X.md", self.ws, f, "me"), 1)
+        self.assertFalse(any(c[0] == "put" for c in fake.calls))
+        fake = FakeOps([ok(BASE)], puts=[{"ok": False, "reason": "denied"}]); self._wire(fake)  # put refused
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.cmd_put("!r", "ops", "X.md", self.ws, f, "me"), 1)
+        self.assertEqual(ds.base_path(self.ws, "ops", "X.md").read_text(), BASE)   # base untouched
 
     def test_missing_room_fails_naming_the_key(self):
         err = io.StringIO()

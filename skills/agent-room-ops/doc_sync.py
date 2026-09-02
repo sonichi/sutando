@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""room-ops · doc_sync — get/put a shared Room Context doc without last-writer-wins.
+"""room-ops · doc_sync — get/put a shared Room Context doc with the last-writer-wins window
+narrowed to one round trip.
 
 A shared record doc (rows keyed `owner/repo#N | ...` under `## Section` headers) has
 many writers; a full-content `doc put` from a stale read silently erases every edit
 made since that read. `doc_sync` keeps a base copy per (folder, name) from the last
 `get`, and `put` applies the caller's ROW-LEVEL changes (add, edit, move, retire)
 onto the CURRENT remote, refusing only when the same row changed on both sides.
-Structure lines (headers, prose) are never merged: a change there refuses.
+Structure lines (headers, prose) are never merged: a change there refuses. Added and
+moved rows land at the top of their section, newest first.
+
+What this does NOT do: close the window. The transport put is an unconditional
+full-content write and the re-get verifies OUR bytes, which is what a clobber also
+looks like — so a writer landing between the pre-put read and the put is still lost,
+undetectably. That window is one round trip instead of "since your last get"; closing
+it needs a conditional write at the doc layer, not anything in this module.
 
 Every row the caller adds or edits is stamped `(w:<writer>)` from SUTANDO_CORE_ID
 (or --writer); an unset id stamps `unknown`, never a shape-valid empty slot.
@@ -32,8 +40,8 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-# A record is any line whose first token is a `owner/repo#N` key, whatever separator follows:
-# active rows use ` | `, the History convention retires a row as `key — MERGED <date> … was: …`.
+# A record is any line whose first token is a `owner/repo#N` key, whatever follows (` | ` rows, the
+# `key — MERGED <date> …` retirement, even prose) — fail-closed: a stray key then counts in `duplicates`.
 RECORD_RE = re.compile(r"^([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+#\d+)(?=\s|$)")
 SECTION_RE = re.compile(r"^## (.+?)\s*$")
 STAMP_RE = re.compile(r"\s*\(w:[^)]*\)\s*$")
@@ -76,6 +84,7 @@ def _stamp_of(line: str) -> str:
 
 
 def _insert_into_section(lines: List[str], section: str, text: str) -> bool:
+    """Insert right after the section header: adds and moves land at the top, newest first."""
     for i, line in enumerate(lines):
         m = SECTION_RE.match(line)
         if m and m.group(1) == section:
@@ -95,6 +104,7 @@ def duplicates(text: str) -> Dict[str, int]:
 
 
 def _significant(structure: List[str]) -> List[str]:
+    # Blank lines are not structure: whitespace-only reformatting must not refuse.
     return [l.rstrip() for l in structure if l.strip()]
 
 
@@ -115,6 +125,7 @@ def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str
     applied, conflicts, absorbed = [], [], []
 
     def find(key: str) -> int:
+        # A rescan per key makes merge O(rows²); fine at Room Context size (dozens of rows).
         for i, line in enumerate(lines):
             k = RECORD_RE.match(line)
             if k and k.group(1) == key:
@@ -193,6 +204,7 @@ def run_put(room: str, folder: str, name: str, content: str) -> dict:
 
 def fetch(room: str, folder: str, name: str, sleep=time.sleep) -> Tuple[int, dict]:
     # A transient failure has been observed to render as "not found"; one retry tells them apart.
+    # The substring test is a heuristic on a human-readable reason; it fails toward retry-then-3.
     res = run_get(room, folder, name)
     if not res.get("ok") and "not found" in str(res.get("reason") or ""):
         sleep(RETRY_AFTER_S)
