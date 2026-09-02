@@ -5,9 +5,10 @@ Drives the real Handler.do_POST / do_GET with a registry in a temp workspace:
 
   * BEFORE any per-room row exists the legacy global token still enqueues and
     polls (an old daemon keeps working mid-upgrade);
-  * once a live row exists the global token is refused on /guest-task, the /task
-    guest shim and /result of a Signal Room task — and re-admitted when every
-    row is revoked (both capability directions);
+  * once the registry is PROVISIONED (any row, live or revoked) the global token
+    is refused on /guest-task, the /task guest shim and /result of a Signal Room
+    task — revoking every row keeps it refused; an INVALID registry file refuses
+    everything on those routes (503) while owner routes are untouched;
   * the token's room is authoritative: `source_room_id` is stamped from it, a
     body room_id must EQUAL it (403), a read-scope token cannot enqueue, and a
     room token never reaches the owner lane;
@@ -191,17 +192,50 @@ code, data = post("/guest-task", "tok-a-enq-2", {"task": "q"})
 check("rotated-in token enqueues, stamped with the same room",
       code == 200 and source_room(data["task_id"]) == "!a:hs", str(data))
 
-print("== every row revoked: the legacy token is re-admitted ==")
+print("== every row revoked: the registry stays provisioned, the global token stays out ==")
 st.write_registry(registry, [dict(r, revoked_at=12) for r in (a_enq2, rows["a_read"], rows["b_enq"])])
 for stale in api.TASK_DIR.glob("task-signal-*.txt"):
     park(stale.stem)
 code, data = post("/guest-task", "global-token", {"task": "q", "room_id": "!c:hs"})
-check("global token enqueues again with no live rows", code == 200, str(data))
+check("global token still refused on /guest-task with every row revoked", code == 403, str(data))
+code, data = post("/task", "global-token", {"task": "q", "access_tier": "guest", "room_id": "!c:hs"})
+check("global token still refused on the guest shim with every row revoked", code == 403, str(data))
 code, data = get(f"/result/{task_a}", "global-token")
-check("global token polls Signal Room results again (parked task reads 404, never 403)",
-      code == 404, str((code, data)))
+check("global token still refused on a Signal Room result with every row revoked", code == 403, str(data))
 code, data = post("/guest-task", "tok-a-enq-2", {"task": "q"})
-check("a revoked room token stays refused (ordinary gate: 401)", code == 401, str(data))
+check("a revoked room token is refused as unscoped (403, never the legacy gate)", code == 403, str(data))
+check("refusals wrote no task file", not list(api.TASK_DIR.glob("task-signal-*.txt")))
+code, data = get("/result/task-1", "global-token")
+check("owner /result unaffected", code == 200, str(data))
+
+print("== invalid registry file: every scoped route fails closed (503) ==")
+for label, content in (("corrupt", "{not json"),
+                       ("wrong version", json.dumps({"v": 2, "tokens": [rows["a_enq"]]})),
+                       ("malformed row", json.dumps({"v": 1, "tokens": [rows["a_enq"], {"room_id": "!z:hs"}]}))):
+    registry.write_text(content)
+    code, data = post("/guest-task", "tok-a-enq", {"task": "q"})
+    check(f"{label}: a would-be-valid room token is refused (503)", code == 503, str(data))
+    code, data = post("/guest-task", "global-token", {"task": "q", "room_id": "!a:hs"})
+    check(f"{label}: the global token is refused (503)", code == 503, str(data))
+    code, data = post("/task", "global-token", {"task": "q", "access_tier": "guest"})
+    check(f"{label}: the guest shim is refused (503)", code == 503, str(data))
+    code, data = get(f"/result/{task_a}", "global-token")
+    check(f"{label}: /result of a Signal Room task is refused (503)", code == 503, str(data))
+    check(f"{label}: the response carries no reason", data == {"error": "room token registry unavailable"}, str(data))
+    code, data = get("/result/task-1", "global-token")
+    check(f"{label}: owner /result still served", code == 200, str(data))
+    code, data = post("/task", "global-token", {"from": "x", "task": "owner work 2"})
+    check(f"{label}: owner /task still accepted", code == 200, str(data))
+check("refusals wrote no Signal Room task file", not list(api.TASK_DIR.glob("task-signal-*.txt")))
+st.write_registry(registry, [rows["a_enq"]])
+code, data = post("/guest-task", "tok-a-enq", {"task": "q"})
+check("a rewritten valid registry recovers without restart", code == 200, str(data))
+park(data["task_id"])
+
+print("== a valid document that never held a row is unprovisioned ==")
+st.write_registry(registry, [])
+code, data = post("/guest-task", "global-token", {"task": "q", "room_id": "!c:hs"})
+check("empty token list: the global token enqueues (legacy)", code == 200, str(data))
 
 print()
 if failures:

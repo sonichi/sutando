@@ -3,9 +3,11 @@
 
 Covers: verify() maps a plaintext to its {room_id, scope} through sha256(salt +
 token); a revoked row never matches; rotation (new row, then old revoked) hands
-over without a gap; the file is re-read on change without restart; a missing,
-corrupt or wrong-version file yields no rows (fail closed) and no capability
-flip; the writer helper produces a 0600 file.
+over without a gap; the file is re-read on change without restart; the three
+registry states — `unprovisioned` (no file, or no row ever), `provisioned` (any
+row, live or revoked: all-revoked stays provisioned) and `invalid` (unreadable,
+wrong version, ANY malformed row — every contract field is validated) — and that
+an invalid file verifies nothing; the writer helper produces a 0600 file.
 
 Run: python3 tests/signal-tokens.test.py
 """
@@ -36,8 +38,10 @@ check("registry path is <workspace>/state/signal-room-tokens.json",
       path == ws / "state" / "signal-room-tokens.json")
 
 reg = st.TokenRegistry(path)
-check("missing file: no active rows", reg.has_active_rows() is False)
+check("missing file: unprovisioned", reg.state() == st.STATE_UNPROVISIONED)
 check("missing file: nothing verifies", reg.verify("anything") is None)
+st.write_registry(path, [])
+check("valid document with no row ever: still unprovisioned", reg.state() == st.STATE_UNPROVISIONED)
 
 a_enq = st.make_row("!a:hs", "enqueue", "tok-a-enqueue", created_at_ms=1, salt="00" * 8)
 a_read = st.make_row("!a:hs", "read", "tok-a-read", created_at_ms=2)
@@ -63,7 +67,7 @@ check("other room's token -> its own room", reg.verify("tok-b-enqueue")["room_id
 check("unknown token -> None", reg.verify("tok-nope") is None)
 check("empty token -> None", reg.verify("") is None)
 check("non-string token -> None", reg.verify(None) is None)
-check("has_active_rows once rows exist", reg.has_active_rows() is True)
+check("provisioned once a row exists", reg.state() == st.STATE_PROVISIONED)
 
 # Revocation: set revoked_at; the row stops matching immediately (mtime reload).
 a_enq_revoked = dict(a_enq, revoked_at=1000)
@@ -81,22 +85,54 @@ check("rotation step 2: only the new token verifies",
       reg.verify("tok-a-enqueue") is None
       and reg.verify("tok-a-enqueue-2") == {"room_id": "!a:hs", "scope": "enqueue"})
 
-# All revoked -> the capability flip is OFF again (legacy token re-admitted upstream).
+# All revoked -> STILL provisioned: the flip stays on, nothing verifies.
 st.write_registry(path, [dict(r, revoked_at=9) for r in (a_enq2, a_read, b_enq)])
-check("all rows revoked: no active rows", reg.has_active_rows() is False)
+check("all rows revoked: no active rows", reg.active_rows() == [])
+check("all rows revoked: registry stays provisioned", reg.state() == st.STATE_PROVISIONED)
 
-# Fail closed on garbage: no rows verify, no flip.
+print("== invalid: unreadable, wrong version, any malformed row ==")
 path.write_text("{not json")
 check("corrupt file: nothing verifies", reg.verify("tok-a-read") is None)
-check("corrupt file: no capability flip", reg.has_active_rows() is False)
+check("corrupt file: state invalid with a reason", reg.state() == st.STATE_INVALID
+      and "unparseable" in reg.invalid_reason(), reg.invalid_reason())
 path.write_text(json.dumps({"v": 2, "tokens": [a_read]}))
-check("unknown version: rows ignored", reg.verify("tok-a-read") is None)
-path.write_text(json.dumps({"v": 1, "tokens": [
-    {"room_id": "", "scope": "read", "salt": "ab", "sha256": "cd"},
-    {"room_id": "!x:hs", "scope": "admin", "salt": "ab", "sha256": "cd"},
-    "junk", a_read]}))
-check("malformed rows dropped, valid row kept", reg.verify("tok-a-read") is not None
-      and len(reg.active_rows()) == 1)
+check("unknown version: invalid, rows ignored",
+      reg.verify("tok-a-read") is None and reg.state() == st.STATE_INVALID)
+path.write_text(json.dumps({"v": 1, "tokens": {"a": 1}}))
+check("tokens not a list: invalid", reg.state() == st.STATE_INVALID)
+path.write_text(json.dumps([a_read]))
+check("document not an object: invalid", reg.state() == st.STATE_INVALID)
+bad_rows = {
+    "empty room_id": dict(a_read, room_id=""),
+    "non-string room_id": dict(a_read, room_id=7),
+    "unknown scope": dict(a_read, scope="admin"),
+    "short salt": dict(a_read, salt="ab"),
+    "uppercase salt": dict(a_read, salt="AB" * 8),
+    "short sha256": dict(a_read, sha256="cd"),
+    "uppercase sha256": dict(a_read, sha256=a_read["sha256"].upper()),
+    "string created_at": dict(a_read, created_at="1"),
+    "bool created_at": dict(a_read, created_at=True),
+    "string revoked_at": dict(a_read, revoked_at="9"),
+    "bool revoked_at": dict(a_read, revoked_at=False),
+    "non-dict row": "junk",
+}
+for label, bad in bad_rows.items():
+    path.write_text(json.dumps({"v": 1, "tokens": [b_enq, bad]}))
+    check(f"{label}: whole file invalid, the sibling row verifies nothing",
+          reg.state() == st.STATE_INVALID and reg.verify("tok-b-enqueue") is None
+          and "row 1" in reg.invalid_reason(), reg.invalid_reason())
+check("invalid reason never carries token material",
+      "tok-" not in reg.invalid_reason() and b_enq["sha256"] not in reg.invalid_reason())
+if os.geteuid() != 0:
+    st.write_registry(path, [a_read])
+    os.chmod(path, 0)
+    check("unreadable file: invalid", reg.state() == st.STATE_INVALID, reg.invalid_reason())
+    os.chmod(path, 0o600)
+st.write_registry(path, [a_read])
+check("a rewritten valid file recovers without restart",
+      reg.state() == st.STATE_PROVISIONED and reg.verify("tok-a-read") is not None)
+path.unlink()
+check("file removed again: back to unprovisioned", reg.state() == st.STATE_UNPROVISIONED)
 
 try:
     st.make_row("!a:hs", "admin", "t", created_at_ms=1)

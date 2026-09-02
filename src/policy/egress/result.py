@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
@@ -160,16 +161,37 @@ def load_team_result_scanner(repo: Path):
     return filter_chat_secrets
 
 
+def task_output_authority(task_output_root) -> "str | None":
+    """`<canonical results dir>/<task_id>` for a root whose LAST component is a
+    plain directory — a symlinked task dir is no authority for any path."""
+    root = os.path.normpath(str(task_output_root))
+    if not os.path.isabs(root):
+        return None
+    parent, name = os.path.split(root)
+    if not name:
+        return None
+    authority = os.path.join(os.path.realpath(parent), name)
+    try:
+        if not stat.S_ISDIR(os.lstat(authority).st_mode):
+            return None
+    except OSError:
+        return None
+    return authority
+
+
 def only_task_output_attachments(body: str, task_output_root) -> bool:
     """The task-scoped output allowance: True when EVERY attach marker in `body`
     is a standalone `[file: <absolute path>]` line whose realpath sits under
-    `task_output_root`. Aliases, inline mentions and out-of-root paths keep the
-    body a delivery-control withhold. Grammar comes from parse_markers, per line.
+    `task_output_root`, itself a plain directory under the canonical results dir.
+    Aliases, inline mentions and out-of-root paths keep the body a
+    delivery-control withhold. Grammar comes from parse_markers, per line.
     """
-    root = os.path.realpath(str(task_output_root))
     live = sorted(a.value for a in parse_markers(body or "").actions if a.kind == "attach")
     if not live:
         return True
+    root = task_output_authority(task_output_root)
+    if root is None:
+        return False
     # Multiset equality: every LIVE marker must be one of the standalone in-root
     # lines, so a shown (fenced) marker can never stand in for an issued one.
     standalone = []

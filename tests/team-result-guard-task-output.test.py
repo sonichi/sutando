@@ -7,6 +7,9 @@ own `<results>/<task_id>/`. Everything the guard withheld before it still
 withholds: out-of-root paths, inline mentions, the send/attach aliases, redirects,
 relative paths, symlink escapes, and any body where even one marker fails.
 
+The root itself is never realpath'd as authority: it must be a plain (non-symlink)
+directory under the canonical results dir, or no marker survives.
+
 Part 1 drives the policy module directly. Part 2 drives agent-api's
 `_guard_result_by_tier`, which passes the allowance for Signal Room tasks ONLY —
 a team task from any other lane sees the unchanged guard.
@@ -103,6 +106,30 @@ verdict = guard.classify_result_for_tier(f"[file: {outside}]", "team", REPO, _cl
                                          task_output_root=root)
 check("classify_result_for_tier withholds out-of-root", verdict.kind == guard.VERDICT_LEAK)
 
+# The root is authority only as a plain directory: a symlinked task dir, a file,
+# a missing or relative root accept nothing — even a marker naming the REAL dir.
+link_root = results / "task-signal-2-link"
+link_root.symlink_to(root)
+canon = os.path.join(os.path.realpath(results), "task-signal-1-abcd")
+check("task_output_authority: the real dir, canonicalized through its parent only",
+      guard.task_output_authority(root) == canon and guard.task_output_authority(str(root) + "/") == canon)
+check("task_output_authority: a symlinked task dir is no authority",
+      guard.task_output_authority(link_root) is None)
+check("task_output_authority: file, missing and relative roots are no authority",
+      guard.task_output_authority(root / "chart.png") is None
+      and guard.task_output_authority(results / "task-signal-9-none") is None
+      and guard.task_output_authority("results/task-signal-1-abcd") is None)
+for name, body, why_root in (
+        ("symlinked root: marker through the link withheld", f"[file: {link_root / 'chart.png'}]", link_root),
+        ("symlinked root: marker naming the real dir withheld", f"[file: {in_root}]", link_root),
+        ("file as root: withheld", f"[file: {in_root}]", root / "chart.png"),
+        ("missing root: withheld", f"[file: {in_root}]", results / "task-signal-9-none"),
+        ("relative root: withheld", f"[file: {in_root}]", "results/task-signal-1-abcd")):
+    out, why = run(body, task_output_root=why_root)
+    check(name, why is not None and out == guard.TEAM_LEAK_RESULT_MARKER, f"why={why!r}")
+out, why = run("no markers here", task_output_root=link_root)
+check("symlinked root: a marker-free body still passes", why is None and out == "no markers here")
+
 # A marker whose only "standalone" appearance is fenced code is SHOWN, not issued:
 # the full parse ignores it, so the count mismatch keeps the body a withhold.
 out, why = run(f"```\n[file: {in_root}]\n```\n[file: {outside}]")
@@ -132,6 +159,14 @@ check("Signal Room task: out-of-root marker withheld",
 check("Signal Room task: another task's dir withheld",
       api._guard_result_by_tier("task-signal-1-abcd", f"[file: {sibling / 'x.png'}]")
       == guard.TEAM_LEAK_RESULT_MARKER)
+
+(api.TASK_DIR / "task-signal-2-link.txt").write_text(
+    "id: task-signal-2-link\nsource: signal-room\naccess_tier: team\n"
+    "source_room_id: !a:hs\ntask: draw it\n")
+check("Signal Room task whose output dir is a symlink: marker withheld through /result's guard",
+      api._guard_result_by_tier("task-signal-2-link", f"[file: {link_root / 'chart.png'}]")
+      == guard.TEAM_LEAK_RESULT_MARKER
+      and api._guard_result_by_tier("task-signal-2-link", body) == guard.TEAM_LEAK_RESULT_MARKER)
 
 # A team task from any other lane: no allowance, even for a path under results/<id>/.
 other = results / "task-777"

@@ -147,7 +147,9 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
+- **`signal_image_gen.py`** — Trusted image generation for Signal Room tasks — the enforced half of the output contract.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
+- **`signal_worker_launch.py`** — Launch a Signal Room task's worker with its output root pinned server-side.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).
@@ -170,6 +172,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_envelope.py`** — Task-envelope authentication: an HMAC stamp that makes access_tier a verified claim instead of an honor-system header.
 - **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
+- **`task_output_retention.py`** — Steady-state retention for Signal Room task-output dirs (R3).
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.
@@ -340,6 +343,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`guardrail.py`** — The Team-tier guardrail prose, shared by every surface that admits Team work.
+- **`signal_tokens.py`** — Per-room Signal Room token registry — the read side (R2).
 
 ## `src/policy/context/`
 

@@ -16,9 +16,15 @@ Revocation sets `revoked_at`; rotation appends a new row, republishes the
 roster, then revokes the old row. The file is re-read whenever its mtime/size
 changes, so a rotation lands without restarting the gateway.
 
-Capability flip: `has_active_rows()` is True once the file exists with at least
-one non-revoked row. Only then may a route refuse the legacy global token — an
-older daemon keeps working until the engine has actually provisioned rows.
+Registry state drives the capability flip (`state()`):
+
+* `unprovisioned` — no file, or a valid document that never held a row: the
+  legacy global token is still accepted (an older daemon keeps working);
+* `provisioned` — at least one row, live OR revoked: only room tokens are
+  accepted. Revoking every row does NOT re-admit the global token — a fully
+  revoked registry is a locked door, not a missing one;
+* `invalid` — unreadable, wrong version, or any malformed row: every scoped
+  route fails closed until the engine rewrites the file.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -36,6 +43,11 @@ SCOPE_ENQUEUE = "enqueue"
 SCOPE_READ = "read"
 SCOPES = frozenset({SCOPE_ENQUEUE, SCOPE_READ})
 LEGACY_GLOBAL = "legacy_global"
+STATE_UNPROVISIONED = "unprovisioned"
+STATE_PROVISIONED = "provisioned"
+STATE_INVALID = "invalid"
+_HEX16 = re.compile(r"^[0-9a-f]{16}\Z")
+_HEX64 = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 def registry_path(workspace) -> Path:
@@ -46,13 +58,20 @@ def token_digest(salt: str, token: str) -> str:
     return hashlib.sha256((salt + token).encode("utf-8")).hexdigest()
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _valid_row(row) -> bool:
+    """Every contract field, strictly: one bad row makes the whole file invalid."""
     if not isinstance(row, dict):
         return False
     return (isinstance(row.get("room_id"), str) and bool(row.get("room_id"))
             and row.get("scope") in SCOPES
-            and isinstance(row.get("salt"), str)
-            and isinstance(row.get("sha256"), str))
+            and isinstance(row.get("salt"), str) and bool(_HEX16.match(row["salt"]))
+            and isinstance(row.get("sha256"), str) and bool(_HEX64.match(row["sha256"]))
+            and _is_int(row.get("created_at"))
+            and (row.get("revoked_at") is None or _is_int(row.get("revoked_at"))))
 
 
 class TokenRegistry:
@@ -63,33 +82,61 @@ class TokenRegistry:
         self._lock = threading.Lock()
         self._stamp = None
         self._rows: list[dict] = []
+        self._state = STATE_UNPROVISIONED
+        self._reason = ""
+
+    def _set_invalid(self, reason: str) -> None:
+        # Unstamped so a rewrite is re-read at once; no row verifies meanwhile.
+        self._stamp, self._rows, self._state, self._reason = None, [], STATE_INVALID, reason
 
     def _refresh(self) -> None:
         try:
             st = os.stat(self.path)
             stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
-        except OSError:
-            self._stamp, self._rows = None, []
+        except FileNotFoundError:
+            self._stamp, self._rows, self._state, self._reason = None, [], STATE_UNPROVISIONED, ""
+            return
+        except OSError as exc:
+            self._set_invalid(f"unreadable: {exc.__class__.__name__}")
             return
         if stamp == self._stamp:
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # Fail CLOSED on a torn/corrupt file: no rows verify, no flip fires.
-            self._stamp, self._rows = None, []
+        except (OSError, ValueError) as exc:
+            self._set_invalid(f"unparseable: {exc.__class__.__name__}")
             return
-        rows = data.get("tokens") if isinstance(data, dict) and data.get("v") == 1 else None
-        self._rows = [r for r in (rows or []) if _valid_row(r)]
+        if not isinstance(data, dict) or data.get("v") != 1:
+            self._set_invalid("wrong document version")
+            return
+        rows = data.get("tokens")
+        if not isinstance(rows, list):
+            self._set_invalid("tokens is not a list")
+            return
+        for index, row in enumerate(rows):
+            if not _valid_row(row):
+                self._set_invalid(f"malformed row {index}")
+                return
+        self._rows = list(rows)
+        self._state = STATE_PROVISIONED if rows else STATE_UNPROVISIONED
+        self._reason = ""
         self._stamp = stamp
+
+    def state(self) -> str:
+        with self._lock:
+            self._refresh()
+            return self._state
+
+    def invalid_reason(self) -> str:
+        """Why the file is `invalid` — for the server log; never carries token material."""
+        with self._lock:
+            self._refresh()
+            return self._reason
 
     def active_rows(self) -> list[dict]:
         with self._lock:
             self._refresh()
             return [r for r in self._rows if r.get("revoked_at") is None]
-
-    def has_active_rows(self) -> bool:
-        return bool(self.active_rows())
 
     def verify(self, token: str) -> dict | None:
         """`{room_id, scope}` for a live token, else None (revoked rows never match)."""

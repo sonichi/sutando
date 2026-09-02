@@ -34,6 +34,7 @@ Security: Set SUTANDO_API_TOKEN in .env for token auth (Authorization: Bearer <t
 For remote access: use ngrok or SSH tunnel.
 """
 
+import fcntl
 import hashlib
 import http.server
 import ipaddress
@@ -136,7 +137,8 @@ from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomB
                                submit_signal_room_task, submission_status,
                                task_output_dir)  # noqa: E402
 from policy.signal_tokens import (LEGACY_GLOBAL, SCOPE_ENQUEUE, SCOPE_READ,  # noqa: E402
-                                  TokenRegistry, registry_path as _registry_path)
+                                  STATE_INVALID, STATE_PROVISIONED, TokenRegistry,
+                                  registry_path as _registry_path)
 import task_output_retention  # noqa: E402
 
 
@@ -222,8 +224,9 @@ FILE_SERVE_MAX_FILES = 10
 FILE_SERVE_MAX_FILE_BYTES = 5 * 1024 * 1024
 FILE_SERVE_MAX_SERVES = 80
 FILE_SERVE_MAX_TOTAL_BYTES = 400 * 1024 * 1024
-SERVE_QUOTA_NAME = ".serve-quota.json"
 _serve_quota_lock = threading.Lock()
+# Per-task high-water mark (serves, bytes, files): persisted counters may never fall below it.
+_serve_quota_seen: dict[str, tuple[int, int, int]] = {}
 
 _IMAGE_MAGIC = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),
@@ -252,18 +255,20 @@ class FileServeDenied(Exception):
 def _open_task_output_file(task_id: str, raw_path: str) -> tuple[int, int, str]:
     """Open-then-verify: (fd, size, content_type) for a file under the task's own dir.
 
-    Root is checked on the lexical path AND its realpath, then the file is
-    opened component-by-component through the confined dir with O_NOFOLLOW
-    (any symlink, at any level, refuses) and the DESCRIPTOR is what gets
-    verified (regular, dev/inode match, size cap, image magic) — a swap between
-    validation and open surfaces as a refusal, never as served bytes.
+    Root is checked on the lexical path AND its realpath, then the canonical
+    results dir is opened O_NOFOLLOW, the task dir relative to it O_NOFOLLOW,
+    and the file component-by-component the same way (any symlink, at any
+    level, refuses). The DESCRIPTOR is what gets verified (regular, single
+    link, dev/inode match, size cap, image magic) — a swap between validation
+    and open surfaces as a refusal, never as served bytes.
     """
     if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
         raise FileServeDenied(403, "path must be absolute")
     # The task root in both spellings (resolved and as configured), never
     # realpath'd itself — a symlinked task dir must fail the O_NOFOLLOW open.
+    canonical = os.path.realpath(RESULT_DIR)
     roots = []
-    for base in (os.path.realpath(RESULT_DIR), os.path.abspath(RESULT_DIR)):
+    for base in (canonical, os.path.abspath(RESULT_DIR)):
         root = os.path.join(base, task_id)
         if root not in roots:
             roots.append(root)
@@ -273,11 +278,17 @@ def _open_task_output_file(task_id: str, raw_path: str) -> tuple[int, int, str]:
         raise FileServeDenied(403, "path outside the task's output dir")
     parts = norm[len(root) + 1:].split(os.sep)
     try:
-        dir_fd = os.open(roots[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        base_fd = os.open(canonical, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise FileServeDenied(403, "results dir is not a plain directory")
+    try:
+        dir_fd = os.open(task_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base_fd)
     except FileNotFoundError:
         raise FileServeDenied(404, "task output dir not found")
     except OSError:
         raise FileServeDenied(403, "task output dir is not a plain directory")
+    finally:
+        os.close(base_fd)
     fd = None
     try:
         for name in parts[:-1]:
@@ -296,6 +307,8 @@ def _open_task_output_file(task_id: str, raw_path: str) -> tuple[int, int, str]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise FileServeDenied(403, "not a regular file")
+        if st.st_nlink != 1:
+            raise FileServeDenied(403, "file is hard-linked")
         try:
             on_disk = os.lstat(norm)
         except OSError:
@@ -313,43 +326,57 @@ def _open_task_output_file(task_id: str, raw_path: str) -> tuple[int, int, str]:
     return fd, st.st_size, ctype
 
 
-def _acquire_excl(lock: Path, *, stale_sec: float = 30.0, wait_sec: float = 5.0) -> int:
-    deadline = time.monotonic() + wait_sec
-    while True:
-        try:
-            return os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            try:
-                if time.time() - os.stat(lock).st_mtime > stale_sec:
-                    os.unlink(lock)
-                    continue
-            except OSError:
-                pass
-            if time.monotonic() > deadline:
-                raise FileServeDenied(503, "serve quota lock busy")
-            time.sleep(0.002)
+def _is_count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _load_serve_quota(quota: Path, seen: tuple[int, int, int] | None) -> dict | None:
+    """The persisted counters, or None when the state is corrupt: any shape or
+    value outside the contract, or a decrease against this process's high-water mark."""
+    try:
+        raw = quota.read_bytes()
+    except FileNotFoundError:
+        return None if seen is not None else {"files": [], "serves": 0, "bytes": 0}
+    except OSError:
+        return None
+    try:
+        state = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(state, dict) or state.get("v") != 1:
+        return None
+    files, serves, total = state.get("files"), state.get("serves"), state.get("bytes")
+    if not (isinstance(files, list) and all(isinstance(f, str) for f in files)):
+        return None
+    if not (_is_count(serves) and _is_count(total)):
+        return None
+    if seen is not None and any(cur < prev for cur, prev in zip((serves, total, len(files)), seen)):
+        return None
+    return {"files": files, "serves": serves, "bytes": total}
 
 
 def _reserve_serve_quota(task_id: str, real_path: str, size: int) -> tuple[bool, str]:
-    """Charge one serve of `size` bytes against the task's envelope; False = exhausted.
+    """Charge one serve of `size` bytes against the task's envelope; False = exhausted
+    or unreadable state (fail closed).
 
-    Persisted in `<results>/<task_id>/.serve-quota.json`, replaced atomically under
-    an O_EXCL lockfile plus the in-process lock, so concurrent serves and a
-    restart both see one consistent counter. Called BEFORE any header is sent.
+    Persisted in `<workspace>/state/serve-quota/<task_id>.json` (0600, dir 0700 —
+    never in the task-writable dir), replaced atomically under a kernel flock on
+    the sibling `.lock` plus the in-process lock, so concurrent serves, another
+    process and a restart all see one consistent counter. Called BEFORE any
+    header is sent.
     """
-    task_dir = Path(os.path.realpath(RESULT_DIR)) / task_id
-    quota = task_dir / SERVE_QUOTA_NAME
-    lock = task_dir / (SERVE_QUOTA_NAME + ".lock")
+    quota, lock = task_output_retention.serve_quota_paths(WORKSPACE_DIR / "state", task_id)
     with _serve_quota_lock:
-        lock_fd = _acquire_excl(lock)
+        lock_fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
-            try:
-                state = json.loads(quota.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                state = {}
-            files = [f for f in (state.get("files") or []) if isinstance(f, str)]
-            serves = int(state.get("serves") or 0)
-            total = int(state.get("bytes") or 0)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            state = _load_serve_quota(quota, _serve_quota_seen.get(task_id))
+            if state is None:
+                print(f"[api] serve quota state for {task_id} is corrupt or missing; "
+                      f"refusing until it is repaired", file=sys.stderr)
+                return False, "serve quota state unavailable"
+            files, serves, total = state["files"], state["serves"], state["bytes"]
+            _serve_quota_seen[task_id] = (serves, total, len(files))
             if real_path not in files:
                 files.append(real_path)
             if len(files) > FILE_SERVE_MAX_FILES:
@@ -359,8 +386,9 @@ def _reserve_serve_quota(task_id: str, real_path: str, size: int) -> tuple[bool,
             if total + size > FILE_SERVE_MAX_TOTAL_BYTES:
                 return False, "byte budget exhausted"
             payload = {"v": 1, "files": files, "serves": serves + 1, "bytes": total + size}
-            fd, tmp = tempfile.mkstemp(dir=str(task_dir), prefix=".serve-quota.", suffix=".tmp")
+            fd, tmp = tempfile.mkstemp(dir=str(quota.parent), prefix=f".{task_id}.", suffix=".tmp")
             try:
+                os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     json.dump(payload, fh)
                     fh.flush()
@@ -372,13 +400,10 @@ def _reserve_serve_quota(task_id: str, real_path: str, size: int) -> tuple[bool,
                 except OSError:
                     pass
                 raise
+            _serve_quota_seen[task_id] = (serves + 1, total + size, len(files))
             return True, ""
         finally:
             os.close(lock_fd)
-            try:
-                os.unlink(lock)
-            except OSError:
-                pass
 
 
 def _archive_stale_results() -> None:
@@ -1292,22 +1317,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(401, {"error": "unauthorized"})
         return False
 
+    def _refuse_invalid_registry(self, registry: TokenRegistry) -> bool:
+        """True (503 sent) when the registry file is invalid: scoped routes fail closed."""
+        if registry.state() != STATE_INVALID:
+            return False
+        print(f"[api] signal token registry invalid ({registry.invalid_reason()}); "
+              f"refusing every scoped route until it is rewritten", file=sys.stderr)
+        self.send_json(503, {"error": "room token registry unavailable"})
+        return True
+
     def check_scoped_auth(self, required_scope: str):
         """Registry-aware auth for room-bearing Signal Room routes.
 
         Returns the token's `{room_id, scope}` row, LEGACY_GLOBAL when the
-        ordinary gateway token still applies (no per-room rows provisioned yet),
-        or None after a refusal was sent. Once the registry holds a live row the
-        global token is refused here — the roster's capability flag sequences that.
+        ordinary gateway token still applies (registry unprovisioned), or None
+        after a refusal was sent. A provisioned registry — live or fully revoked
+        rows alike — refuses the global token; an invalid one refuses everything.
         """
         registry = _signal_token_registry()
+        if self._refuse_invalid_registry(registry):
+            return None
         row = registry.verify(_bearer(self.headers))
         if row is not None:
             if row["scope"] != required_scope:
                 self.send_json(403, {"error": f"token scope {row['scope']!r} cannot use this route"})
                 return None
             return row
-        if registry.has_active_rows():
+        if registry.state() == STATE_PROVISIONED:
             self.send_json(403, {"error": "a room-scoped token is required on this route"})
             return None
         if not self.check_auth():
@@ -1316,15 +1352,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def check_result_auth(self, task_id: str) -> bool:
         """/result: a room token reads only its own room's task; the global token
-        keeps owner tasks and loses Signal Room tasks once per-room rows exist."""
+        keeps owner tasks and loses Signal Room tasks once the registry is provisioned."""
         registry = _signal_token_registry()
+        if _signal_task_id(task_id) and self._refuse_invalid_registry(registry):
+            return False
         row = registry.verify(_bearer(self.headers))
         if row is not None:
             if _task_source_room(task_id) != row["room_id"]:
                 self.send_json(403, {"error": "token is not bound to this task's room"})
                 return False
             return True
-        if _signal_task_id(task_id) and registry.has_active_rows():
+        if _signal_task_id(task_id) and registry.state() == STATE_PROVISIONED:
             self.send_json(403, {"error": "a room-scoped token is required for Signal Room results"})
             return False
         return self.check_auth()
@@ -1341,44 +1379,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
         params = parse_qs(urlparse(self.path).query)
         task_id = (params.get("gateway_task_id") or [""])[0]
         raw_path = (params.get("path") or [""])[0]
-        if _signal_task_id(task_id) is None or _task_source_room(task_id) is None:
-            self.send_json(404, {"error": "task not found"})
-            return
-        if _task_source_room(task_id) != auth["room_id"]:
+        # One answer for unknown, malformed, roomless and foreign-room ids — as /result.
+        if _signal_task_id(task_id) is None or _task_source_room(task_id) != auth["room_id"]:
             self.send_json(403, {"error": "token is not bound to this task's room"})
             return
-        try:
-            fd, size, ctype = _open_task_output_file(task_id, raw_path)
-        except FileServeDenied as exc:
-            self.send_json(exc.status, {"error": exc.error})
-            return
+        lease_fd = task_output_retention.hold_task_lease(WORKSPACE_DIR / "state", task_id)
         try:
             try:
-                ok, why = _reserve_serve_quota(task_id, os.path.realpath(raw_path), size)
+                fd, size, ctype = _open_task_output_file(task_id, raw_path)
             except FileServeDenied as exc:
                 self.send_json(exc.status, {"error": exc.error})
                 return
-            if not ok:
-                self.send_json(429, {"error": why})
-                return
-            task_output_retention.touch_lease(task_output_dir(RESULT_DIR, task_id))
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(size))
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            remaining = size
-            while remaining > 0:
-                chunk = os.read(fd, min(65536, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass  # a partial or disconnected response stays charged
+            try:
+                ok, why = _reserve_serve_quota(task_id, os.path.realpath(raw_path), size)
+                if not ok:
+                    self.send_json(429, {"error": why})
+                    return
+                try:
+                    task_output_retention.touch_lease(task_output_dir(RESULT_DIR, task_id))
+                except OSError:
+                    self.send_json(403, {"error": "task lease is not a plain file"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(size))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                remaining = size
+                while remaining > 0:
+                    chunk = os.read(fd, min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass  # a partial or disconnected response stays charged
+            finally:
+                os.close(fd)
         finally:
-            os.close(fd)
+            os.close(lease_fd)
 
     def send_twiml(self, twiml: str):
         """Send TwiML response for Twilio webhooks."""
@@ -1974,7 +2014,7 @@ if __name__ == "__main__":
     retention = threading.Thread(
         target=task_output_retention.run_hourly,
         args=(RESULT_DIR, retention_stop),
-        kwargs={"archive_results": _archive_stale_results},
+        kwargs={"archive_results": _archive_stale_results, "state_dir": WORKSPACE_DIR / "state"},
         name="task-output-retention",
         daemon=True,
     )

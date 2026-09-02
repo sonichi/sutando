@@ -10,7 +10,7 @@ Exercises the real Handler.do_POST (same harness as agent-api-guest-routes):
   * auth is registry-scoped exactly like /guest-task: the legacy global token
     works until a live per-room row exists, then only a per-room ENQUEUE token
     whose room equals the body room_id (cross-room 403, read scope 403), and
-    the global token is re-admitted once every row is revoked;
+    it stays refused once every row is revoked, and an invalid file is a 503;
   * input validation: bearer, Content-Length caps, texts shape/limits.
 
 Run: `python3 tests/agent-api-scan-text.test.py`
@@ -181,9 +181,17 @@ def run() -> None:
 
         st.write_registry(registry, [dict(r, revoked_at=9) for r in rows])
         h = post({"texts": ["x"], "room_id": "!a:hs"}, token=GLOBAL)
-        check("every row revoked: the global token is re-admitted", h._responses[0][0] == 200)
+        check("every row revoked: the global token stays refused (403)", h._responses[0][0] == 403)
         h = post({"texts": ["x"]}, token="tok-a-enq")
-        check("a revoked room token falls to the ordinary gate (401)", h._responses[0][0] == 401)
+        check("a revoked room token is refused as unscoped (403)", h._responses[0][0] == 403)
+        registry.write_text("{not json")
+        h = post({"texts": ["x"], "room_id": "!a:hs"}, token=GLOBAL)
+        check("invalid registry: the global token is refused (503)", h._responses[0][0] == 503)
+        h = post({"texts": ["x"]}, token="tok-a-enq")
+        check("invalid registry: a room token is refused (503)", h._responses[0][0] == 503)
+        st.write_registry(registry, [])
+        h = post({"texts": ["x"], "room_id": "!a:hs"}, token=GLOBAL)
+        check("empty token list: unprovisioned, the global token is accepted", h._responses[0][0] == 200)
     finally:
         egress.guard_result_for_tier = real_guard
         registry.unlink(missing_ok=True)

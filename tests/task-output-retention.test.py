@@ -7,6 +7,10 @@
   * a crash-abandoned dir (no lease ever touched) ages by its newest mtime;
   * sweep-vs-consuming-job: a lease renewed at the moment of the sweep wins;
   * the lock keeps two sweeps apart, and a stale lock is broken;
+  * serve vs sweep: a serve holding the per-task SHARED flock makes the sweep
+    skip that dir (`busy`); the sweep's EXCLUSIVE flock makes a serve wait; a
+    removed dir takes its serve-quota and lease-lock state with it; the lease
+    file is never followed through a symlink;
   * only `task-signal-*` REAL directories are candidates — symlinks, files and
     the archive dirs are untouched;
   * run_hourly reclaims WITHOUT a restart (injected clock, short interval) and
@@ -14,7 +18,9 @@
 
 Run: python3 tests/task-output-retention.test.py
 """
+import fcntl
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -123,6 +129,65 @@ check("a live lock skips the sweep", report["skipped"] == "locked" and victim.ex
 os.utime(lock, (T0 - 2 * H, T0 - 2 * H))
 report = ret.sweep_task_outputs(results, now=T0)
 check("a stale lock is broken and the sweep runs", not victim.exists() and report["skipped"] is None)
+
+print("== serve vs sweep: the per-task flock ==")
+results = fresh()
+state = results.parent / "state"
+served = make_dir(results, "task-signal-20-served", lease_at=T0 - 30 * H)
+quota_json, quota_lock = ret.serve_quota_paths(state, "task-signal-20-served")
+quota_json.write_text('{"v": 1, "files": [], "serves": 1, "bytes": 1}')
+fd = ret.hold_task_lease(state, "task-signal-20-served")
+report = ret.sweep_task_outputs(results, now=T0, state_dir=state)
+check("a serve holding the shared lease makes the sweep skip the dir",
+      served.exists() and report["busy"] == ["task-signal-20-served"] and report["removed"] == [], str(report))
+lock_path = ret.lease_lock_path(state, "task-signal-20-served")
+check("lease lock is <state>/task-leases/<task_id>.lock, 0600 in a 0700 dir",
+      lock_path == state / ret.LEASE_LOCK_DIRNAME / "task-signal-20-served.lock"
+      and stat.S_IMODE(os.stat(lock_path).st_mode) == 0o600
+      and stat.S_IMODE(os.stat(lock_path.parent).st_mode) == 0o700)
+os.close(fd)
+report = ret.sweep_task_outputs(results, now=T0, state_dir=state)
+check("once the serve releases, the sweep removes the dir", not served.exists()
+      and report["removed"] == ["task-signal-20-served"], str(report))
+check("the removed dir's serve-quota state and lease lock go with it",
+      not quota_json.exists() and not quota_lock.exists() and not lock_path.exists())
+
+waiter = make_dir(results, "task-signal-21-waiter", lease_at=T0)
+raw = os.open(ret.lease_lock_path(state, "task-signal-21-waiter"), os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(raw, fcntl.LOCK_EX)
+got = []
+thread = threading.Thread(target=lambda: got.append(ret.hold_task_lease(state, "task-signal-21-waiter")), daemon=True)
+thread.start()
+thread.join(0.3)
+check("a serve waits while the sweep holds the exclusive lock", thread.is_alive() and not got)
+fcntl.flock(raw, fcntl.LOCK_UN)
+thread.join(2)
+check("and proceeds once the sweep releases it", not thread.is_alive() and got)
+for h in got:
+    os.close(h)
+os.close(raw)
+check("state dir defaults to the workspace state/ beside results/",
+      ret.sweep_task_outputs(results, now=T0)["skipped"] is None
+      and (results.parent / "state" / ret.LEASE_LOCK_DIRNAME).is_dir())
+
+print("== the lease file is never followed ==")
+results = fresh()
+bait = results.parent / "bait"
+bait.write_text("x")
+os.utime(bait, (T0 - 40 * H, T0 - 40 * H))
+planted = results / "task-signal-22-planted"
+planted.mkdir()
+(planted / ret.LEASE_NAME).symlink_to(bait)
+try:
+    ret.touch_lease(planted, now=T0)
+    check("touch_lease refuses a symlinked lease", False)
+except OSError:
+    check("touch_lease refuses a symlinked lease", True)
+check("the symlink's target was not touched", os.stat(bait).st_mtime == T0 - 40 * H)
+os.utime(bait, (T0, T0))
+os.utime(planted, (T0 - 40 * H, T0 - 40 * H))
+check("liveness reads the link itself, not a fresh target",
+      ret._lease_mtime(planted) == os.lstat(planted / ret.LEASE_NAME).st_mtime != T0)
 
 print("== only real task-signal-* directories are candidates ==")
 results = fresh()

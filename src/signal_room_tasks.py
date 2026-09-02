@@ -74,18 +74,23 @@ def task_output_dir(output_root, task_id: str) -> Path:
 
 
 def output_contract(task_id: str, output_root) -> str:
-    """Trusted preamble telling the worker where generated files may go.
+    """Trusted preamble naming the ONE way a generated file may be produced.
 
-    Narrow by design: the image-generation skill is the one tool the lane gains,
-    its files land only in the task's own output dir, and each is announced on
-    its own `[file: <path>]` line — the one marker shape the egress preserves.
+    Narrow by design: image generation is the one tool the lane gains, and it is
+    enforced in code, not prose — `signal_image_gen.py` takes a prompt and a bare
+    name, learns the output dir only from the environment `signal_worker_launch.py`
+    pins to `<results>/<task_id>/`, and writes nowhere else. Each file is announced
+    on its own `[file: <path>]` line — the one marker shape the egress preserves.
     """
     out_dir = task_output_dir(output_root, task_id)
+    src = Path(__file__).resolve().parent
     return (
-        f"[Signal Room task {task_id}] If an image is requested, generate it with the "
-        f"image-generation skill and save it ONLY under {out_dir}/ — write no other "
-        f"files anywhere. Announce each saved file on its own line, exactly as "
-        f"[file: {out_dir}/<name>]. The request follows.\n\n"
+        f"[Signal Room task {task_id}] If an image is requested, generate it ONLY through "
+        f"the image-generation wrapper: run `python3 {src}/signal_worker_launch.py {task_id} -- "
+        f"python3 {src}/signal_image_gen.py --prompt <text> --name <name>.png` (optional "
+        f"--size square|landscape|portrait). It writes ONLY under {out_dir}/ and accepts no "
+        f"path; write no other files anywhere. Announce each saved file on its own line, "
+        f"exactly as [file: {out_dir}/<name>]. The request follows.\n\n"
     )
 
 
