@@ -262,6 +262,26 @@ def _valid_local_tid(tid: str) -> bool:
     return bool(m) and m.group(1) not in (".", "..")
 
 
+def _owns_local_tid(tid: str) -> bool:
+    """Is this LOCAL task id inside THIS bridge's namespace?
+
+    `_local_tid` mints `task-<inst>~<broker_id>` for a named instance and leaves
+    the primary's ids unscoped, so ownership is decidable from the id alone. A
+    shared `RESULTS_DIR` therefore needs no coordination — each lane can tell its
+    own files from a sibling's.
+
+    Both directions matter. A named instance must not touch unscoped ids, and the
+    primary must not touch `~`-scoped ones: `task-*` matches `task-dev~1` too, so
+    filtering only the instance side would leave the primary cannibalising every
+    named lane — the same defect mirrored.
+    """
+    if GATEWAY_INSTANCE:
+        return tid.startswith(f"task-{GATEWAY_INSTANCE}~")
+    # `~` is outside the broker-id alphabet, so any scoped id — including an
+    # instance this build does not know — is someone else's. Unowned > misrouted.
+    return "~" not in tid
+
+
 def _task_pending(tid: str) -> bool:
     """Is this task still live in tasks/, under ANY of its names?
 
@@ -291,7 +311,9 @@ GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
 _LAUNCHED_VIA = "supervised" if os.environ.get("SUTANDO_SUPERVISED") else "bare"
 _LOG_DIR = _STATE.parent / "logs"
-_LOG_FILE = _LOG_DIR / "gateway-bridge.log"
+# Per-lane like every other artifact above — an unsuffixed shared log makes
+# sweep lines unattributable, which is circular for the ownership witness.
+_LOG_FILE = _LOG_DIR / f"gateway-bridge{_INST_SUFFIX}.log"
 _LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # AWP P0: the persistent event channel (if enabled) — a module-level handle so
@@ -2963,9 +2985,11 @@ def _dedup_plan(tid: str, holder_id: str | None):
         _save_task_rooms(rooms)
         return True
 
+    # The re-ask id must live in THIS lane's namespace (`_owns_local_tid`):
+    # an unscoped mint on a named instance is orphaned to the primary's sweep.
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+        _local_tid(f"task-{uuid.uuid4().hex[:18]}"), commit_identity=_commit)
     return action, payload, room
 
 
@@ -3333,7 +3357,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         return
     _last_orphan_sweep = now
     try:
-        candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
+        # RESULTS_DIR is shared across lanes; the glob is not namespace-aware.
+        candidates = sorted(p for p in RESULTS_DIR.glob("task-*.txt")
+                            if _owns_local_tid(p.stem))
     except OSError:
         return
     for rfile in candidates:
