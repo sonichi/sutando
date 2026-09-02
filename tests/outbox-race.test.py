@@ -54,9 +54,8 @@ if __name__ == "__main__":
     # oversubscribed on a 2-core runner, and the thrash is what timed out.
     N = max(8, (os.cpu_count() or 2) * 3)
     MIN_ROUNDS, MAX_ROUNDS = 3, 12
-    # The budget bounds round STARTS, and the floor rounds run unconditionally,
-    # so the true worst case is floor + budget + in-flight round durations —
-    # far below the old 36 unconditional rounds, not a hard ceiling.
+    # Bounds round STARTS only: worst case is floor + budget + in-flight
+    # round durations — far below 36 unconditional rounds, not a ceiling.
     PHASE_BUDGET_S = float(os.environ.get("OUTBOX_RACE_PHASE_BUDGET_S", "35"))
     totals = []
     # ONE warm pool here too, for the reason phase 2 already states: a fresh pool
