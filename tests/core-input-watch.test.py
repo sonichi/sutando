@@ -339,11 +339,55 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         self.assertEqual((payload["state"], payload["kind"]), ("blocked-human", "fable-limit-unfocused"))
         self.assertNotIn("auto_answered", payload)
 
+    def test_an_expired_answer_record_is_dropped_from_the_signal(self):
+        # The record rides along for AUTO_ANSWER_CARRY_S; past that it is gone.
+        from unittest.mock import patch
+        with patch.object(_mod, "AUTO_ANSWER_CARRY_S", -1.0):
+            sent, payload = self._tick([])
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("auto_answered", payload)
+
     def test_no_auto_answer_flag_reports_only(self):
         sent, payload = self._tick(["--no-auto-answer"])
         self.assertEqual(sent, [])
         self.assertEqual(payload["kind"], "fable-limit")
         self.assertNotIn("auto_answered", payload)
+
+
+class TestSendKeys(unittest.TestCase):
+    """send_keys reports what tmux did: True only on a zero exit, False on a
+    non-zero exit or when tmux cannot be run at all — never an exception."""
+
+    def _with_fake_tmux(self, script):
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "argv.log")
+        p = os.path.join(d, "tmux")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n" + script + "\n")
+        os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+        return d, log
+
+    def test_zero_exit_is_true_and_the_key_reaches_the_session_pane(self):
+        from unittest.mock import patch
+        d, log = self._with_fake_tmux("exit 0")
+        with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
+            self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+        with open(log) as f:
+            self.assertEqual(f.read().split("\n")[:6],
+                             ["-S", "/tmp/x.sock", "send-keys", "-t", "sutando-core:0", "Enter"])
+
+    def test_non_zero_exit_is_false(self):
+        from unittest.mock import patch
+        d, _ = self._with_fake_tmux("exit 1")
+        with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
+            self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+
+    def test_an_unrunnable_tmux_is_false_not_an_exception(self):
+        from unittest.mock import patch
+        with patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
+            self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
 
 
 class TestEnsureTmuxOnPath(unittest.TestCase):
