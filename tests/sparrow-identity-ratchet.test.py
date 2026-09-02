@@ -214,10 +214,11 @@ def _rebound_names(tree, import_nodes) -> set:
     return out
 
 
-# Names from the canonical package that actually MINT a delivery identity.
-# Importing a sibling type (TaskId) says nothing about delivery ids.
-_DELIVERY_CTORS = frozenset({"DeliveryId", "delivery_id", "parse_delivery_id",
-                             "identity"})
+# Only the pure derivations certify a delivery id: `DeliveryId(...)` wraps
+# any string and `parse_delivery_id` reads one back, so neither proves derivation.
+_PURE_DERIVATIONS = frozenset({"delivery_id", "legacy_delivery_id",
+                               "resend_delivery_id"})
+_DELIVERY_CTORS = _PURE_DERIVATIONS
 
 
 def canonical_delivery_bindings(tree) -> set:
@@ -245,6 +246,26 @@ def canonical_delivery_bindings(tree) -> set:
     return out
 
 
+def _assigned_here(node) -> set:
+    """Names this scope rebinds directly, not counting nested scopes — a
+    sibling function's local cannot shadow the import for this one."""
+    out = set()
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef)):
+            out.add(child.name)
+            continue
+        for sub in ast.walk(child):
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                ast.ClassDef)):
+                break
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx,
+                                                        (ast.Store, ast.Del)):
+                out.add(sub.id)
+    return out
+
+
+
 def _canonical_scopes(tree, bindings: set) -> set:
     """Scope names in which a canonical constructor is actually CALLED. A file
     that merely imports one does not thereby make every scope in it canonical."""
@@ -256,24 +277,6 @@ def _canonical_scopes(tree, bindings: set) -> set:
         while isinstance(fn, ast.Attribute):
             fn = fn.value
         return isinstance(fn, ast.Name) and fn.id in bindings
-
-    def _assigned_here(node) -> set:
-        """Names this scope rebinds directly, not counting nested scopes — a
-        sibling function's local cannot shadow the import for this one."""
-        out = set()
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                  ast.ClassDef)):
-                out.add(child.name)
-                continue
-            for sub in ast.walk(child):
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                    ast.ClassDef)):
-                    break
-                if isinstance(sub, ast.Name) and isinstance(sub.ctx,
-                                                            (ast.Store, ast.Del)):
-                    out.add(sub.id)
-        return out
 
     class C(ast.NodeVisitor):
         def _scoped(self, n):
@@ -306,6 +309,76 @@ def has_canonical_binding(tree) -> bool:
     return bool(_canonical_scopes(tree, canonical_delivery_bindings(tree)))
 
 
+def _certified_nodes(tree, bindings: set) -> set:
+    """ids of AST nodes exempt from the delivery gate: the callee of a pure
+    derivation, and any target/keyword/dict key whose value is that call or a
+    local the same scope certified from one. Certification is per construction
+    and per use — never per scope."""
+    out = set()
+    if not bindings:
+        return out
+    module_rebound = _assigned_here(tree)
+
+    def pure_call(node, rebound) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        fn = node.func
+        if isinstance(fn, ast.Name):
+            return (fn.id in bindings and fn.id in _PURE_DERIVATIONS
+                    and fn.id not in rebound and fn.id not in module_rebound)
+        if isinstance(fn, ast.Attribute) and fn.attr in _PURE_DERIVATIONS:
+            root = fn.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            return (isinstance(root, ast.Name) and root.id in bindings
+                    and root.id not in rebound and root.id not in module_rebound)
+        return False
+
+    def mark(node):
+        out.update(id(n) for n in ast.walk(node))
+
+    def walk_scope(body_node, rebound):
+        cert = set()
+
+        def certified(v):
+            return pure_call(v, rebound) or (isinstance(v, ast.Name) and v.id in cert)
+
+        for node in ast.walk(body_node):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                    and node is not body_node:
+                continue
+            if isinstance(node, ast.Call) and pure_call(node, rebound):
+                mark(node.func)
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if node.value is not None and certified(node.value):
+                    for tg in targets:
+                        mark(tg)
+                        if isinstance(tg, ast.Name):
+                            cert.add(tg.id)
+                else:
+                    for tg in targets:
+                        if isinstance(tg, ast.Name):
+                            cert.discard(tg.id)
+            elif isinstance(node, ast.keyword) and certified(node.value):
+                out.add(id(node))
+            elif isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if k is not None and certified(v):
+                        mark(k)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) \
+                    and node.id in cert:
+                out.add(id(node))
+
+    # ast.walk is breadth-first, so a nested scope's nodes are reached after
+    # its parent's; each scope is walked once with its own rebinding set.
+    walk_scope(tree, module_rebound)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            walk_scope(node, _assigned_here(node))
+    return out
+
+
 def scan_delivery_id_sites(root: Path) -> dict:
     """(relpath, enclosing function) -> count of delivery_id SITES, for every
     .py under root (recursive). A site is an identifier or string constant
@@ -320,13 +393,13 @@ def scan_delivery_id_sites(root: Path) -> dict:
             counts[(rel, "<unparseable>")] = 1
             continue
         bindings = canonical_delivery_bindings(tree)
-        exempt = _canonical_scopes(tree, bindings)
+        exempt = _certified_nodes(tree, bindings)
         stack = ["<module>"]
 
-        def record():
-            # Site-aware: only the scopes that actually call a canonical
-            # constructor are exempt, never the whole file.
-            if stack[-1] in exempt:
+        def record(node=None):
+            # Per construction/use: only a node certified by a pure derivation
+            # is exempt — never a scope, never a file.
+            if node is not None and id(node) in exempt:
                 return
             key = (rel, stack[-1])
             counts[key] = counts.get(key, 0) + 1
@@ -334,7 +407,7 @@ def scan_delivery_id_sites(root: Path) -> dict:
         class V(ast.NodeVisitor):
             def _scoped(self, n):
                 if n.name == _DELIVERY_NAME:
-                    record()
+                    record(n)
                 stack.append(n.name)
                 self.generic_visit(n)
                 stack.pop()
@@ -344,22 +417,22 @@ def scan_delivery_id_sites(root: Path) -> dict:
 
             def visit_Name(self, n):
                 if n.id == _DELIVERY_NAME:
-                    record()
+                    record(n)
                 self.generic_visit(n)
 
             def visit_Attribute(self, n):
                 if n.attr == _DELIVERY_NAME:
-                    record()
+                    record(n)
                 self.generic_visit(n)
 
             def visit_arg(self, n):
                 if n.arg == _DELIVERY_NAME:
-                    record()
+                    record(n)
                 self.generic_visit(n)
 
             def visit_keyword(self, n):
                 if n.arg == _DELIVERY_NAME:
-                    record()
+                    record(n)
                 self.generic_visit(n)
 
             def visit_alias(self, n):
@@ -367,12 +440,12 @@ def scan_delivery_id_sites(root: Path) -> dict:
                 # site — counting it would penalise the migration it exists for.
                 name = n.asname or n.name
                 if name == _DELIVERY_NAME and name not in bindings:
-                    record()
+                    record(n)
                 self.generic_visit(n)
 
             def visit_Constant(self, n):
                 if isinstance(n.value, str) and _DELIVERY_NAME in n.value:
-                    record()
+                    record(n)
                 self.generic_visit(n)
 
         V().visit(tree)
@@ -543,6 +616,44 @@ class DeliveryGateHostileControls(unittest.TestCase):
                         "def good():\n"
                         '    return delivery_id("t", "g")\n'),
             {})
+
+    # --- certification is per construction/use, and only pure derivations certify ---
+
+    RAW_CTOR = ("from ag2_sparrow.identity import DeliveryId\n"
+                "import time\n"
+                "def f():\n"
+                '    delivery_id = DeliveryId(f"d:task-{time.time_ns()}@gw")\n'
+                "    return delivery_id\n")
+    RAW_RECORD_BESIDE_PURE = ("from ag2_sparrow.identity import delivery_id\n"
+                              "def f(task, rec):\n"
+                              '    d = delivery_id(task, "gw")\n'
+                              '    rec["delivery_id"] = "raw"\n'
+                              "    return d\n")
+    PARSER_IS_NOT_A_DERIVATION = ("from ag2_sparrow.identity import parse_delivery_id\n"
+                                  "def f(s):\n"
+                                  "    delivery_id = parse_delivery_id(s)\n"
+                                  "    return delivery_id\n")
+    CERTIFIED_FLOW = ("from ag2_sparrow.identity import delivery_id\n"
+                      "def f(task, send):\n"
+                      '    delivery_id = delivery_id(task, "gw")\n'
+                      "    send(delivery_id=delivery_id)\n"
+                      '    return {"delivery_id": delivery_id}\n')
+
+    def test_raw_constructor_in_a_canonical_file_is_a_site(self):
+        """R1's forbidden shape: a restart-derived string wrapped in the
+        canonical type. The wrapper certifies nothing."""
+        self.assertEqual(self._sites(self.RAW_CTOR), {"f": 2})
+
+    def test_a_pure_call_does_not_clear_a_raw_record_beside_it(self):
+        self.assertEqual(self._sites(self.RAW_RECORD_BESIDE_PURE), {"f": 1})
+
+    def test_parsing_a_stored_value_is_not_a_derivation(self):
+        self.assertEqual(self._sites(self.PARSER_IS_NOT_A_DERIVATION), {"f": 2})
+
+    def test_a_certified_local_flows_into_keywords_and_records(self):
+        """Positive control: adoption must stay free, including the uses of a
+        value the same scope derived purely."""
+        self.assertEqual(self._sites(self.CERTIFIED_FLOW), {})
 
     def test_private_constructor_in_a_legacy_file_reds_the_ratchet(self):
         """The exemption is per SITE, not per file: future delivery work
