@@ -190,6 +190,8 @@ def run() -> None:
               body.get("guest_deep_dive", {}).get("available") is True)
         check("/capabilities omits reason when ready",
               "reason" not in body.get("guest_deep_dive", {}))
+        check("GET /capabilities advertises the versioned token registry (signal_room_tokens.v == 1)",
+              body.get("signal_room_tokens", {}).get("v") == 1)
 
         agent_api.submission_status = lambda *a, **k: (False, "task_dir_unwritable")
         h = get("/capabilities")

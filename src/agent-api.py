@@ -1079,6 +1079,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = {"guest_deep_dive": {"available": bool(available)}}
             if reason:
                 payload["guest_deep_dive"]["reason"] = reason
+            # Versioned registry capability: the engine mints per-room tokens only after seeing it
+            payload["signal_room_tokens"] = {"v": 1}
             self.send_json(200, payload)
         elif path == "/voice/state":
             self.send_json(200, {"state": voice_desired_state})
