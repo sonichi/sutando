@@ -92,39 +92,63 @@ _snapshot_per_host_config
 check "root-live refresh works after the upgrade bootstrap" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root moved after upgrade" ]'
 
-# A copy with NO USABLE record (absent, empty, malformed, NUL-damaged) is not
-# evidence of a second writer: it is adopted — stamped, then refreshed from root.
+# A copy with NO USABLE record (absent, empty, malformed, NUL-damaged) grants nothing by
+# itself: writer direction comes from the append-only relationship, and ambiguity refuses.
 _sha_of() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
-adopts() {   # $1 = case label; the sig file has already been arranged by the caller
-    echo "root is the writer" > "$WORKSPACE_DIR/build_log.md"
-    echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+_SIGF="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+adopts() {   # $1 = case label; root STRICTLY EXTENDS the copy (root-live lag) -> adopted
+    printf 'root baseline\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+    printf 'root baseline\nroot moved on\n' > "$WORKSPACE_DIR/build_log.md"
     : > "$LOG"
     _out="$(_snapshot_per_host_config 2>&1 >/dev/null)"
-    check "$1: per-host copy is refreshed from root in the SAME tick" \
-          '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root is the writer" ]'
+    check "$1: root-live lag: per-host copy is refreshed from root in the SAME tick" \
+          '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "$(printf "root baseline\nroot moved on")" ]'
     check "$1: provenance now records the refreshed copy" \
-          '[ "$(tr -d "\n" < "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")" = "$(_sha_of "$WORKSPACE_DIR/build_log.md")" ]'
+          '[ "$(tr -d "\n" < "$_SIGF")" = "$(_sha_of "$WORKSPACE_DIR/build_log.md")" ]'
     check "$1: the adoption is logged as such" \
           'grep -q "adopted hosts/testhost/build_log.md" "$LOG"'
     check "$1: nothing is refused and no copy is called an independent writer" \
           '[ -z "$_out" ] && ! grep -q "pick ONE writer" "$LOG"'
 }
+refuses() {  # $1 = label, $2 = root bytes, $3 = per-host bytes, $4 = expected refusal phrase
+    _phrase="$4"
+    printf '%b' "$2" > "$WORKSPACE_DIR/build_log.md"
+    printf '%b' "$3" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+    _host_was="$(od -An -v -tx1 "$WORKSPACE_DIR/hosts/testhost/build_log.md" | tr -d " \n")"
+    _sig_was="$(cat "$_SIGF" 2>/dev/null | od -An -v -tx1 | tr -d " \n")"
+    : > "$LOG"
+    _out="$(_snapshot_per_host_config 2>&1 >/dev/null)"
+    check "$1: the per-host copy is left EXACTLY as it was (byte for byte)" \
+          '[ "$(od -An -v -tx1 "$WORKSPACE_DIR/hosts/testhost/build_log.md" | tr -d " \n")" = "$_host_was" ]'
+    check "$1: no provenance record is invented or repaired" \
+          '[ "$(cat "$_SIGF" 2>/dev/null | od -An -v -tx1 | tr -d " \n")" = "$_sig_was" ]'
+    check "$1: the refusal names the shape and reaches the operator" \
+          'printf "%s" "$_out" | grep -q "not clobbering" && printf "%s" "$_out" | grep -q "$_phrase"'
+    check "$1: nothing is adopted" '! grep -q "adopted hosts/testhost" "$LOG"'
+}
+# Both mirror cases, driven with no record; the second is the motivating deployment.
+norecord_cases() {  # $1 = label, $2 = command re-arranging the unusable record (adoption stamps)
+    eval "$2"; adopts "$1"
+    eval "$2"; refuses "$1 / host-live" 'stale relic\n' 'stale relic\nper-host live entry\n' "stale relic"
+    eval "$2"; refuses "$1 / diverged" 'root is the writer\n' 'independent content\n' "DIVERGED"
+}
 
-echo "5c. pre-provenance DIVERGED copy is ADOPTED, not refused"
-rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-adopts "absent record"
-: > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"     # exists, but empty
-adopts "EMPTY record"
+echo "5c. no record: root-live lag is adopted; per-host-live and diverged are REFUSED"
+norecord_cases "absent record" 'rm -f "$_SIGF"'
+norecord_cases "EMPTY record" ': > "$_SIGF"'
+# Both mirror cases must also hold at the byte level: a shared prefix that ends
+# mid-line is still an extension, and a one-byte edit inside root's span is divergence.
+rm -f "$_SIGF"
+refuses "absent record / host-live mid-line extension" 'stale re' 'stale relic\n' "stale relic"
+refuses "absent record / diverged in-span edit" 'stale relic\n' 'stale relix\nmore\n' "DIVERGED"
+refuses "absent record / EMPTY root beside a live copy" '' 'per-host live entry\n' "stale relic"
 
 echo "5d. present-but-MALFORMED signature is not usable provenance either"
 # A 63-char partial (torn write, stray copy, manual edit) satisfies a bare
 # equality test; any non-sha256 content must take the no-record branch.
-printf '%063d' 0 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-adopts "63-char partial signature"
-printf 'not hex at all\n' > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-adopts "arbitrary foreign content"
-printf '%064d ' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-adopts "trailing SPACE after the sha"
+norecord_cases "63-char partial signature" 'printf "%063d" 0 > "$_SIGF"'
+norecord_cases "arbitrary foreign content" 'printf "not hex at all\n" > "$_SIGF"'
+norecord_cases "trailing SPACE after the sha" 'printf "%064d " 1 > "$_SIGF"'
 # Positive control for the validator: a VALID 64-hex stale sha must still be
 # read as a genuine independent writer — adoption must not widen past no-record.
 echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
@@ -144,21 +168,19 @@ echo "5e. NUL damage must be judged on the on-disk bytes, not post-\$() text"
 # clean hex chars; the validator must reject the bytes before that happens.
 printf 'per-host live entry\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
 _live_sha="$(_sha_of "$WORKSPACE_DIR/hosts/testhost/build_log.md")"
-printf '%s\0' "$_live_sha" > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-adopts "trailing-NUL signature"
-printf '%.32s\0%.32s' "$_live_sha" "${_live_sha:32}" \
-    > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-adopts "embedded-NUL signature"
+norecord_cases "trailing-NUL signature" 'printf "%s\0" "$_live_sha" > "$_SIGF"'
+norecord_cases "embedded-NUL signature" \
+    'printf "%.32s\0%.32s" "$_live_sha" "${_live_sha:32}" > "$_SIGF"'
 
 echo "5f. an adoption whose record cannot be made durable does NOT touch the copy"
 rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-echo "root is the writer" > "$WORKSPACE_DIR/build_log.md"
-echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+printf 'root baseline\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+printf 'root baseline\nroot moved on\n' > "$WORKSPACE_DIR/build_log.md"
 chmod 555 "$WORKSPACE_DIR/hosts/testhost"        # the stamp's temp cannot be staged
 _out="$(_snapshot_per_host_config 2>&1 >/dev/null)"
 chmod 755 "$WORKSPACE_DIR/hosts/testhost"
-check "no durable record -> the diverged copy is left exactly as it was" \
-      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "independent content" ]'
+check "no durable record -> the lagging copy is left exactly as it was" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root baseline" ]'
 check "...and the operator hears it could not be adopted, not that it was refused as a writer" \
       'printf "%s" "$_out" | grep -q "could not be adopted this tick" && ! printf "%s" "$_out" | grep -q "pick ONE writer"'
 check "...and no provenance record was invented" \
@@ -211,25 +233,30 @@ _snapshot_per_host_config
 check "root-live refresh works once provenance self-healed" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root moved after self-heal" ]'
 
-echo "9. a FAILED atomic replace must clean up and say so (hosts/*/ is a carried vault path)"
+echo "9. a FAILED in-place replace must clean up and say so (hosts/*/ is a carried vault path)"
 printf 'root advanced\n' > "$WORKSPACE_DIR/build_log.md"
 printf 'ours\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
 shasum -a 256 "$WORKSPACE_DIR/hosts/testhost/build_log.md" | cut -d" " -f1 \
     > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 _sig_before="$(cat "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")"
-mv() { return 1; }   # the swap fails (full disk, EXDEV, immutable dest, ...)
-_out9="$(_snapshot_per_host_config 2>&1)"
-unset -f mv
+# The replace runs through the resolved interpreter; fail it there (full disk, EIO, ...).
+_rs="$(mktemp -d)"
+printf '#!/bin/sh\ncase "$2" in --replace) exit 1 ;; esac\nexec "%s" "$@"\n' "$(command -v python3)" > "$_rs/python3"
+chmod +x "$_rs/python3"
+_out9="$(SYNC_PY="$_rs/python3" _snapshot_per_host_config 2>&1)"
+rm -rf "$_rs"
 check "no orphan temp is left behind for the vault to carry" \
       '[ -z "$(ls "$WORKSPACE_DIR/hosts/testhost"/build_log.md.snap.* 2>/dev/null)" ]'
 # Log-only BY DESIGN: the temp was removed and nothing lost, so it is a
 # diagnostic, not an operator action. Asserted against $LOG for that reason.
 check "the failed replace is recorded in \$LOG, not swallowed" \
-      'grep -qi "atomic replace of" "$LOG"'
+      'grep -qi "in-place replace of" "$LOG"'
 check "and it stays OUT of the operator stream (not every failure is an action)" \
       '[ -z "$(printf %s "$_out9")" ]'
-check "provenance is not stamped for a swap that did not happen" \
+check "provenance is not stamped for a replace that did not happen" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")" = "$_sig_before" ]'
+check "and the destination is untouched" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "ours" ]'
 
 
 # --- control 6: an INTERRUPTED stage must not survive into the next tick ---
@@ -530,6 +557,32 @@ _arm_stale_sig_equal_content
 _snapshot_per_host_config >/dev/null 2>&1
 check "c) the promoted signature is a whole 64-hex record, never truncated" \
       '[ "$(od -An -v -tx1 "$_SIG" | tr -d " \n" | sed "s/0a*$//" | wc -c | tr -d " ")" = "128" ]'
+
+echo "15. an appender's ALREADY-OPEN descriptor survives the refresh (inode preserved)"
+# Opened before the snapshot, written after it returns: the bytes must land in the
+# destination, not in a detached inode. The merge-base kept this; an inode swap loses it.
+_arm_owned_snapshot
+_ino_before="$(ls -i "$_DST" | awk "{print \$1}")"
+exec 7>>"$_DST"
+_snapshot_per_host_config >/dev/null 2>&1
+printf 'late append through the old descriptor\n' >&7
+exec 7>&-
+check "the refresh itself landed" 'grep -q "root moved on" "$_DST"'
+check "the late append is IN the destination (destination_append_count=1)" \
+      '[ "$(grep -c "late append through the old descriptor" "$_DST")" = "1" ]'
+check "the destination inode is unchanged" \
+      '[ "$(ls -i "$_DST" | awk "{print \$1}")" = "$_ino_before" ]'
+check "and provenance records the refreshed bytes, not the appended ones" \
+      '[ "$(cat "$_SIG")" = "$(printf "root moved on\n" | shasum -a 256 | cut -d" " -f1)" ]'
+# Control: the same descriptor pattern on the PRE-fix shape (rename over the inode)
+# must FAIL this check, or the probe cannot discriminate.
+_arm_owned_snapshot
+exec 7>>"$_DST"
+cp "$WORKSPACE_DIR/build_log.md" "$_DST.ctl" && /bin/mv -f "$_DST.ctl" "$_DST"
+printf 'late append through the old descriptor\n' >&7
+exec 7>&-
+check "control: a rename-over replace DOES lose the late append" \
+      '[ "$(grep -c "late append through the old descriptor" "$_DST")" = "0" ]'
 
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

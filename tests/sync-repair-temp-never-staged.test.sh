@@ -68,11 +68,8 @@ env "${SYNC_ENV[@]}" bash "$SYNC" --vault-url "$FIXTURE_VAULT" --push-only >/dev
 refute "the sweep reclaims an aged interrupted repair temp"  test -f "$H/.build_log.snapshot-sha.repair.AB12CD"
 check  "the sweep leaves a temp inside the grace window"     test -f "$H/.build_log.snapshot-sha.repair.EF34GH"
 
-# THE UPGRADE PATH. Everything above runs against a FRESH --init, where the deny is
-# written by the generator. An existing host instead reaches the deny through
-# _adoptable_builtin_denies(), which the fresh fixture never exercises — removing the
-# repair entry from that list left this whole file green. It is also the privileged
-# path ("adopted without operator review"), so it is the one that must be pinned.
+# UPGRADE PATH: an existing host reaches the deny via _adoptable_builtin_denies(), which a
+# fresh --init never exercises; it is the unreviewed "adopted" path, so pin it here.
 UP="$TEST_ROOT/upgrade"; UP_WS="$UP/workspace"; UP_VAULT="$UP/vault.git"
 mkdir -p "$UP_WS/hosts/$HOST"; git init -q --bare "$UP_VAULT"
 cat > "$FIXTURE_REPO/sutando.config.local.json" <<JSON

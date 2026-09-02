@@ -902,6 +902,57 @@ _snapshot_per_host_config() {
         printf '%s' "$_hex" | LC_ALL=C grep -qE '^(3[0-9]|6[1-6]){64}(0a)*$' || return 0
         tr -d '\n' < "$1" 2>/dev/null
     }
+    # With no record, writer direction comes only from the append-only relationship:
+    # root-live (dest is a prefix of root), host-live (root is a prefix of dest), diverged.
+    _append_only_direction() {
+        local _r="$1" _d="$2" _rn _dn
+        _rn="$(wc -c < "$_r" 2>/dev/null | tr -d ' ')"
+        _dn="$(wc -c < "$_d" 2>/dev/null | tr -d ' ')"
+        if [ -z "$_rn" ] || [ -z "$_dn" ]; then
+            echo diverged
+        elif [ "$_dn" -eq 0 ]; then
+            echo root-live           # an empty copy holds nothing that root could lose
+        elif [ "$_rn" -eq 0 ]; then
+            echo host-live
+        elif [ "$_dn" -le "$_rn" ] && head -c "$_dn" "$_r" | cmp -s - "$_d"; then
+            echo root-live
+        elif head -c "$_rn" "$_d" | cmp -s - "$_r"; then
+            echo host-live
+        else
+            echo diverged
+        fi
+    }
+    # Replace the destination's BYTES, never its inode: an appender holding an open
+    # O_APPEND descriptor keeps landing in the file. Exit 2 = changed under the lock.
+    _replace_in_place() {
+        local _py="${SYNC_PY:-}"
+        if [ -z "$_py" ] || [ ! -f "$_py" ] || [ ! -x "$_py" ]; then
+            _py="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+        fi
+        [ -n "$_py" ] && [ -f "$_py" ] && [ -x "$_py" ] || return 1
+        "$_py" - --replace "$1" "$2" "$3" <<'PY' 2>/dev/null
+import fcntl, hashlib, os, sys
+_, src, dst, expected = sys.argv[1:]
+with open(src, "rb") as f:
+    data = f.read()
+fd = os.open(dst, os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    with open(fd, "rb", closefd=False) as f:
+        cur = f.read()
+    # An empty `expected` means the caller saw NO destination: only a fresh, empty file qualifies.
+    if hashlib.sha256(cur).hexdigest() != expected and not (expected == "" and not cur):
+        sys.exit(2)
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+    }
     # fsync a path AND its directory: a rename is only durable once the parent
     # directory entry is on disk.
     _fsync_path_and_dir() {
@@ -1000,12 +1051,14 @@ PY
         # Validate raw bytes BEFORE any $(): substitution strips NULs, so a
         # NUL-damaged record would collapse to 64 clean hex and gain authority.
         [ -f "$_sig" ] && _rec="$(_usable_sig_record "$_sig")"
+        local _dir=""
         if [ -f "$_dst" ] && [ -n "$_cur" ] && [ -z "$_rec" ] && ! cmp -s "$_src" "$_dst" 2>/dev/null; then
-            # No usable record is not evidence of a second writer (the pre-provenance script
-            # copied here unconditionally): claim the copy now; this tick then refreshes it.
-            if _stamp_snapshot_sig "$_sig" "$_cur"; then
+            # A missing or damaged record grants nothing by itself: only a copy that root
+            # strictly extends is adopted (nothing in it can be lost); every other shape refuses.
+            _dir="$(_append_only_direction "$_src" "$_dst")"
+            if [ "$_dir" = root-live ] && _stamp_snapshot_sig "$_sig" "$_cur"; then
                 _rec="$_cur"
-                log "snapshot: adopted hosts/$(_host)/build_log.md — no usable provenance record; stamped its current sha and refreshing from root"
+                log "snapshot: adopted hosts/$(_host)/build_log.md — no usable provenance record and root strictly extends it; stamped its current sha and refreshing from root"
             fi
         fi
         if [ -f "$_dst" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
@@ -1029,7 +1082,8 @@ PY
                         ! _fsync_path_and_dir "$_int"; then
                         rm -f "$_tmp" "$_int" 2>/dev/null || true
                         warn_operator "snapshot refused: could not durably record the publish intent for hosts/$(_host)/build_log.md; per-host copy and provenance left unchanged"
-                    elif mv -f "$_tmp" "$_dst" 2>/dev/null; then
+                    elif _replace_in_place "$_tmp" "$_dst" "$_cur"; then
+                        rm -f "$_tmp" 2>/dev/null || true
                         # The destination must be durable BEFORE the signature claims it; if it is not,
                         # leave the intent for the next tick to verify or discard.
                         if ! _fsync_path_and_dir "$_dst"; then
@@ -1048,10 +1102,15 @@ PY
                             fi
                         fi
                     else
+                        local _rrc=$?
                         # hosts/*/ is a carried vault path: a temp left here is
                         # committed and pushed again on every subsequent sync.
                         rm -f "$_tmp" "$_int" 2>/dev/null || true
-                        log "snapshot: atomic replace of hosts/$(_host)/build_log.md failed; temp removed, per-host copy and provenance left unchanged"
+                        if [ "$_rrc" -eq 2 ]; then
+                            warn_operator "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
+                        else
+                            log "snapshot: in-place replace of hosts/$(_host)/build_log.md failed; temp removed, per-host copy and provenance left unchanged"
+                        fi
                     fi
                 else
                     rm -f "$_tmp" 2>/dev/null || true
@@ -1061,7 +1120,11 @@ PY
                 [ -n "$_tmp" ] && rm -f "$_tmp" 2>/dev/null || true
             fi
         elif ! cmp -s "$_src" "$_dst" 2>/dev/null; then
-            if [ -z "$_rec" ]; then
+            if [ "$_dir" = host-live ]; then
+                warn_operator "snapshot refused: hosts/$(_host)/build_log.md extends root and has NO USABLE provenance record — root is a stale relic beside a live per-host log; not clobbering. pick ONE writer and archive the other"
+            elif [ "$_dir" = diverged ]; then
+                warn_operator "snapshot refused: hosts/$(_host)/build_log.md and root have DIVERGED with NO USABLE provenance record — writer direction cannot be established; not clobbering. pick ONE writer and archive the other"
+            elif [ -z "$_rec" ]; then
                 # Only reachable when the adoption stamp above was not confirmed durable.
                 warn_operator "snapshot: hosts/$(_host)/build_log.md has NO USABLE provenance record and could not be adopted this tick (its new record was not confirmed durable) — per-host copy left unchanged, retried next sync; this is NOT evidence of an independent writer"
             else
