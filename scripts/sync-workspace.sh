@@ -1226,6 +1226,17 @@ _migrate_flat_anchor() {
     echo "sync-workspace: migrated the per-host anchor to hosts/$(_host)/current-track.md (was at the shared flat path; #2567)" >&2
 }
 
+# Commit modified + new carrier files before a pull. Runs generate_exclude first
+# so an out-of-carrier path cannot ride into the vault on this commit.
+_commit_local_pre_pull() {
+    generate_exclude 2>/dev/null || true
+    git add --ignore-removal . 2>/dev/null || true
+    if ! git diff --cached --quiet 2>/dev/null; then
+        git commit -q -m "Sync ${SUTANDO_HOST_OVERRIDE:-$(hostname)} $(date +%Y-%m-%dT%H:%M) path=${WORKSPACE_DIR}" \
+            && log "_pull_only_impl: committed local edits before the pull (a refused pull now resets to a commit that holds them)"
+    fi
+}
+
 _pull_only_impl() {
     cd "$WORKSPACE_DIR" || die "pull-only: cannot cd to $WORKSPACE_DIR"
     [ -d ".git" ] || die "pull-only: $WORKSPACE_DIR is not a git repo; run --init first"
@@ -1273,6 +1284,10 @@ _pull_only_impl() {
         fi
         [ "$_co_rc" -eq 0 ] || die "pull-only: failed to switch to $current_branch (git checkout exit $_co_rc); see $LOG"
     fi
+
+    # A refused pull resets to pre_pull_sha, so local edits must already be IN
+    # it; deletions stay unstaged for the push-side tripwire to count.
+    _commit_local_pre_pull
 
     # Pro #1445 review fix #2: snapshot pre-pull state for the mass-deletion
     # tripwire on the pull side. The push-side tripwire only catches staged
