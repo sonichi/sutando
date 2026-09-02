@@ -541,12 +541,21 @@ class RollbackAndIdentityControls(unittest.TestCase):
         os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None)
 
     def _old_reader(self):
-        """origin/main's module, its own bytes, loaded fresh — the rollback."""
+        """origin/main's module, its own bytes, loaded fresh — the rollback.
+
+        CI runs suites from a git-less COPY of the tree, where no revision but
+        the one on disk exists; there the cross-revision half is unreachable
+        and is SKIPPED with its reason, not faked. It runs on any checkout
+        with history (dev worktrees, the repo itself)."""
         import subprocess
-        src = subprocess.run(
+        got = subprocess.run(
             ["git", "-C", str(REPO), "show",
              "origin/main:skills/collaboration-intelligence/scripts/notify_reviewers.py"],
-            capture_output=True, text=True, check=True).stdout
+            capture_output=True, text=True)
+        if got.returncode != 0:
+            self.skipTest("no origin/main ref here (git-less CI copy) — "
+                          "cross-revision control needs a real checkout")
+        src = got.stdout
         f = pathlib.Path(self.tmp) / "nr_main.py"
         f.write_text(src)
         spec = importlib.util.spec_from_file_location("nr_main", f)

@@ -804,11 +804,8 @@ def _membership_overlap(led: Path, message: str, cand) -> "tuple | None":
     refs = {(r, str(n)) for r, n in _refs(message)}
     if not refs or not led.exists():
         return None
-    # Through _streams(), THE one ledger reader: it already folds last-outcome,
-    # replace-carried membership and STRING-validated identity per stream, so a
-    # raw shape can neither crash this check nor be re-emitted into a new row —
-    # and memory stays at the folded state, not the file (measured 44 KB vs
-    # 6.7 MB on a 2.86 MB ledger through the raw reparse this replaces).
+    # _streams() is the one reader: folded state, string-validated identity —
+    # a raw shape cannot crash this or be re-emitted (44 KB vs 6.7 MB reparse).
     best = None
     try:
         streams = _streams(led)
