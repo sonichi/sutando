@@ -9,6 +9,7 @@ caller decide whether the failure is fatal.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -126,6 +127,100 @@ def clipboard_write(text: str) -> None:
 # ---------- Process listing / killing ----------
 
 WINDOWS_CIM_TIMEOUT = 15.0
+
+
+def process_executable(pid: str | int) -> str | None:
+    """Return the executable path for a PID, or None when unavailable."""
+    try:
+        if is_windows():
+            pid_value = int(pid)
+            if pid_value < 0:
+                return None
+            script = (
+                "[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); "
+                f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid_value}' "
+                "-ErrorAction Stop; if ($p) { $p.ExecutablePath }"
+            )
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                timeout=WINDOWS_CIM_TIMEOUT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        elif is_macos() or is_linux():
+            result = subprocess.run(
+                ["/bin/ps", "-o", "comm=", "-p", str(pid)],
+                timeout=5.0,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            return None
+        if result.returncode != 0:
+            return None
+        return (result.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def process_snapshot() -> str | None:
+    """Return a `PID PPID ARGS` process table, or None when unavailable."""
+    try:
+        if is_macos() or is_linux():
+            result = subprocess.run(
+                ["ps", "-Ao", "pid,ppid,args"],
+                timeout=5.0,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.stdout if result.returncode == 0 else None
+        if not is_windows():
+            return None
+        script = (
+            "[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); "
+            "$rows = @(Get-CimInstance Win32_Process -ErrorAction Stop | "
+            "Where-Object { $_.CommandLine } | "
+            "Select-Object ProcessId, ParentProcessId, CommandLine); "
+            "ConvertTo-Json -Compress -InputObject $rows"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            timeout=WINDOWS_CIM_TIMEOUT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        raw = (result.stdout or "").strip().lstrip("\ufeff")
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        records = payload if isinstance(payload, list) else [payload]
+        rows: list[tuple[int, int, str]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            command = record.get("CommandLine")
+            if not isinstance(command, str) or not command.strip():
+                continue
+            rows.append((
+                int(record["ProcessId"]),
+                int(record.get("ParentProcessId") or 0),
+                " ".join(command.splitlines()),
+            ))
+        rows.sort(key=lambda row: row[0])
+        return "PID PPID ARGS\n" + "".join(
+            f"{pid} {ppid} {command}\n" for pid, ppid, command in rows)
+    except Exception:
+        return None
 
 
 def find_pids(pattern: str) -> list[str]:

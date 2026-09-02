@@ -1,10 +1,13 @@
-"""Tests for find_pids() in src/sutando_platform.py.
+"""Tests for process inspection in src/sutando_platform.py.
 
 find_pids underpins health-check's bridge/service detection. On Windows it
 shells to Get-CimInstance (no pgrep); on macOS/Linux it uses pgrep -f. Both
 honor a trailing `$` as an end-of-command-line anchor so a real
 `python …/foo.py` process matches `foo\\.py$` while a shell that merely
 mentions `foo.py` mid-command-line does not.
+
+The snapshot and executable helpers expose the same normalized process facts
+to health-check on every supported OS.
 
 These tests spawn controlled child processes with identifiable command lines
 (rather than asserting against ambient processes) so they're deterministic on
@@ -14,6 +17,7 @@ command line to avoid self-matching the harness.
 Run: `python tests/find-pids.test.py`  (use `python`, not `python3`, on Windows)
 """
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -106,6 +110,48 @@ class TestFindPids(unittest.TestCase):
                 mock.patch.object(self.mod.subprocess, "run", return_value=completed) as run:
             self.assertEqual(self.mod.find_pids("marker"), ["4242"])
         self.assertGreaterEqual(run.call_args.kwargs["timeout"], 15)
+
+    def test_process_executable_finds_current_python(self):
+        executable = self.mod.process_executable(os.getpid())
+        self.assertIsNotNone(executable)
+        self.assertIn("python", Path(executable).name.lower())
+
+    def test_process_snapshot_lists_current_process(self):
+        snapshot = self.mod.process_snapshot()
+        self.assertIsNotNone(snapshot)
+        pids = {line.split(None, 1)[0] for line in snapshot.splitlines()[1:]}
+        self.assertIn(str(os.getpid()), pids)
+
+    def test_windows_process_snapshot_normalizes_cim_json(self):
+        payload = json.dumps([{
+            "ProcessId": 4242,
+            "ParentProcessId": 7,
+            "CommandLine": "C:\\Program Files\\Python\\python.exe bridge.py",
+        }])
+        completed = subprocess.CompletedProcess([], 0, stdout=payload, stderr="")
+        with mock.patch.object(self.mod, "is_macos", return_value=False), \
+                mock.patch.object(self.mod, "is_linux", return_value=False), \
+                mock.patch.object(self.mod, "is_windows", return_value=True), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=completed) as run:
+            snapshot = self.mod.process_snapshot()
+        self.assertIn(
+            "4242 7 C:\\Program Files\\Python\\python.exe bridge.py", snapshot)
+        self.assertGreaterEqual(run.call_args.kwargs["timeout"], 15)
+
+    def test_process_snapshot_distinguishes_empty_success_from_failure(self):
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        bad = subprocess.CompletedProcess([], 1, stdout="", stderr="denied")
+        platform = (
+            mock.patch.object(self.mod, "is_macos", return_value=True),
+            mock.patch.object(self.mod, "is_linux", return_value=False),
+            mock.patch.object(self.mod, "is_windows", return_value=False),
+        )
+        with platform[0], platform[1], platform[2], \
+                mock.patch.object(self.mod.subprocess, "run", return_value=ok):
+            self.assertEqual(self.mod.process_snapshot(), "")
+        with platform[0], platform[1], platform[2], \
+                mock.patch.object(self.mod.subprocess, "run", return_value=bad):
+            self.assertIsNone(self.mod.process_snapshot())
 
 
 if __name__ == "__main__":

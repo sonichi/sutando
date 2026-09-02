@@ -395,20 +395,13 @@ class TestWhyNoLogs(unittest.TestCase):
         An unreadable `logs/` would otherwise turn "filed without logs" into
         "not filed at all", for exactly the users whose logs are unreachable.
         """
-        if os.geteuid() == 0:
-            self.skipTest("root bypasses the permission bit")
         with tempfile.TemporaryDirectory() as td:
             logs = Path(td) / "logs"
             logs.mkdir()
             (logs / "a.log").write_text("x\n")
-            os.chmod(logs, 0o000)
-            try:
-                if os.access(logs, os.R_OK):
-                    self.skipTest("filesystem does not enforce the permission bit")
+            with mock.patch.object(Path, "iterdir", side_effect=OSError("denied")):
                 self.assertEqual(report_feedback.logs_excerpt(Path(td)), (None, []))
                 why = report_feedback.why_no_logs(Path(td))
-            finally:
-                os.chmod(logs, 0o755)
         self.assertIn("could not be listed", why)
 
     def test_a_non_oserror_also_degrades(self):

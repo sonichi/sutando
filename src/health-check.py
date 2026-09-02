@@ -57,7 +57,11 @@ from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
-from sutando_platform import find_pids  # noqa: E402
+from sutando_platform import (  # noqa: E402
+    find_pids,
+    process_executable as _platform_process_executable,
+    process_snapshot as _platform_process_snapshot,
+)
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
@@ -686,12 +690,7 @@ _VAULT_SCANNER_SCRIPTS = {
 def _proc_executable(pid: "str | int") -> "str | None":
     """Executable path of `pid`, or None. `comm` is one field, so a path with
     spaces survives it — argv cannot be split back apart reliably."""
-    try:
-        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
-                             capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return out.stdout.strip() or None
+    return _platform_process_executable(pid)
 
 
 # The script must appear as its own argv token — a `-c` payload that merely
@@ -7647,12 +7646,7 @@ def _ps_snapshot() -> "str | None":
     a nonzero exit: its empty stdout would otherwise read as a successful scan
     that found nothing, which is the absence callers must not assert.
     """
-    try:
-        done = subprocess.run(["ps", "-Ao", "pid,ppid,args"],
-                              capture_output=True, text=True, timeout=5)
-    except Exception:  # noqa: BLE001
-        return None
-    return done.stdout if done.returncode == 0 else None
+    return _platform_process_snapshot()
 
 
 def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None":

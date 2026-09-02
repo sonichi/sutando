@@ -122,6 +122,8 @@ jobs:
         run: |
           python tests/find-pids.test.py
           if ($LASTEXITCODE -ne 0) { throw 'find-pids.test.py failed' }
+          python tests/health-check-secret-scanner-live-interpreter.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'health-check-secret-scanner-live-interpreter.test.py failed' }
           python tests/cwd-lint.test.py
           if ($LASTEXITCODE -ne 0) { throw 'cwd-lint.test.py failed' }
           python tests/task-id-delegation.test.py
@@ -156,6 +158,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'runtime-api-identity-view.test.py failed' }
           python tests/task-workstreams.test.py
           if ($LASTEXITCODE -ne 0) { throw 'task-workstreams.test.py failed' }
+          python tests/report-feedback.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'report-feedback.test.py failed' }
           python tests/signal-room-tasks.test.py
           if ($LASTEXITCODE -ne 0) { throw 'signal-room-tasks.test.py failed' }
           python tests/voice-lock-windows.test.py
