@@ -108,6 +108,53 @@ check("mixed sections+bullets with a lost active region is a parse fault",
 check("mixed fault reports BOTH populations",
       "'## ' section(s)" in mixed_fault and "bullet entr(ies)" in mixed_fault)
 
+# --- A CLEARED FILE IS NOT A FAULT. Live host: 55 archived, 0 open, called
+#     "the shape of a parse fault" on every run.
+CLEARED_INLINE = ("# Open\n\n\n# Resolved\n\n"
+                  "## [RESOLVED 2026-08-29] shipped\n\nprose\n\n"
+                  "## [DONE] answered by the owner\n\nprose\n")
+CLEARED_STATUS = ("# Open\n\n\n# Resolved\n\n"
+                  "## Q1\n\n**Status:** resolved\n\n"
+                  "## Q2\n\n**Status:** answered\n")
+cleared_inline = reason_for("cleared_inline", CLEARED_INLINE)
+cleared_status = reason_for("cleared_status", CLEARED_STATUS)
+
+check("a fully archived file is NOT called a parse fault (inline markers)",
+      "parse fault" not in cleared_inline)
+check("a fully archived file is NOT called a parse fault (status fields)",
+      "parse fault" not in cleared_status)
+check("the all-clear says the archive is what holds the entries",
+      "below the archive divider" in cleared_inline)
+check("the all-clear still carries the denominator",
+      "2 '## ' section(s)" in cleared_inline)
+
+# An unmarked archive entry is the NORMAL shape of a resolved one, not a stranded
+# one; two hosts measured 73 and 53 false titles inferring it from absence.
+UNMARKED_ARCHIVE = ("# Open\n\n\n# Resolved\n\n"
+                    "## Should the digest include Q3 numbers?\n\nfree-form prose\n\n"
+                    "## RESOLVED 2026-08-31 - disk item is self-answered\n\nprose\n")
+unmarked = reason_for("unmarked", UNMARKED_ARCHIVE)
+check("an unmarked archived section is NOT called a parse fault",
+      "parse fault" not in unmarked)
+check("the all-clear does not claim every entry carries a resolution marker",
+      "explicitly resolved" not in unmarked)
+
+# REAL-WORLD SHAPE. Every healthy fixture above opens with '# Open', but no real
+# pending-questions.md does; both on this host start '# Pending Questions'.
+REAL_HEADING = ("# Pending Questions - HOSTNAME\n\n\n# Resolved\n\n"
+                "## [RESOLVED 2026-08-31] shipped\n\nprose\n")
+real_heading = reason_for("real_heading", REAL_HEADING)
+check("a healthy file whose heading is NOT '# Open' is not a fault",
+      "parse fault" not in real_heading)
+check("the real-world heading still reaches the all-clear",
+      "below the archive divider" in real_heading)
+
+# And the fault must still fire on what position CANNOT fake: no heading at all.
+check("a file with no active-region header IS still a fault",
+      "parse fault" in fault)
+check("the fault names the missing header rather than the entries",
+      "active-region header" in fault)
+
 # --- CONTROL: the message must DISCRIMINATE. A diagnostic that says the same thing
 #     in both cases is decoration, not a signal.
 check("fault and quiet-day messages differ", fault != quiet)
