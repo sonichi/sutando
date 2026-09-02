@@ -70,6 +70,13 @@ def durable_endpoint(entry: dict) -> "str | None":
         return None
     stand, room = entry.get("stand"), entry.get("room")
     dm_id = entry.get("discord_id") or entry.get("stand_discord_id")
+    # Truthy is not routable: a non-string here becomes a hash key downstream,
+    # and one malformed roster row then starves EVERY requested reviewer —
+    # against resolve()'s one-bad-entry isolation contract.
+    if not isinstance(stand, (str, type(None))):
+        stand = None
+    if not isinstance(dm_id, (str, int, type(None))):
+        dm_id = None
     if stand and room:
         return stand
     if dm_id and entry.get("home_channel"):
@@ -478,11 +485,12 @@ def _streams(led: Path) -> dict:
             # onto every retained row, losing asks made under an older alias.
             ident = {f: d[f] for f in ("reviewer", "actor", "endpoint")
                      if isinstance(d.get(f), str) and d.get(f)}
-            # `_membership_overlap` rereads `membership` from the RAW row, so
-            # dropping it in compaction retires every retry-admission check.
+            # `_membership_overlap` rereads `membership` from the RAW row. It
+            # REPLACES on a newer claim, exactly as the uncompacted reader does —
+            # a union revives links a proven failure retired (#3509 round 4).
             mem = valid_tags(d.get("membership"))
-            if mem:
-                st["membership"] = sorted(set(st.get("membership") or []) | set(mem))
+            if mem is not None:
+                st["membership"] = sorted(mem)
             st["identity"].update(ident)
             st["last_identity"] = ident
             # One delivery row per distinct legacy spelling survives compaction.
@@ -784,15 +792,15 @@ def _membership_overlap(led: Path, message: str, cand) -> "tuple | None":
                 d = json.loads(line)
             except ValueError:
                 continue
-            if not isinstance(d, dict):
+            # _row() owns the closed schema; reparsing raw shapes here crashed
+            # the whole batch on one malformed row (repo: [] -> unhashable key).
+            parsed = _row(d)
+            if parsed is None:
                 continue
-            if (_canon_repo(d.get("repo")), str(d.get("pr"))) not in refs:
-                if (None, str(d.get("pr"))) not in refs:
-                    continue
-            who = d.get("endpoint") or d.get("actor") or d.get("reviewer")
-            if not isinstance(who, str) or not who:
+            c_repo, c_pr, who, _outcome, _ts = parsed
+            if (c_repo, c_pr) not in refs and (None, c_pr) not in refs:
                 continue
-            key = (_canon_repo(d.get("repo")), str(d.get("pr")), who)
+            key = (c_repo, c_pr, who)
             # Membership is carried FORWARD within its stream: a settle row
             # supersedes the claim's outcome but does not restate its identity.
             seen = valid_tags(d.get("membership"))

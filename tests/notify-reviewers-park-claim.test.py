@@ -205,6 +205,42 @@ class CompactionIsIndistinguishableFromTheFullHistory(unittest.TestCase):
         self.assertEqual(self.nr._first_ask(self.led), before[1])
         self.assertLess(sum(1 for _ in open(self.led)), rows_before // 100)
 
+    def test_compaction_does_not_revive_a_retired_component(self):
+        """@keweichen round 4. The reducer must REPLACE membership as the
+        uncompacted reader does — a union stamps a retired lifecycle's component
+        onto the live row, and compaction alone then flips an unrelated claim
+        from admitted (1) to parked (None). Driven through the PRODUCTION writer."""
+        msg = "re-review https://github.com/o/r/pull/7"
+        def seed():
+            self.nr.record_asks(msg, "r1", outcome="pending", actor="X",
+                                endpoint="@x:1", membership=["actor:A", "actor:B"])
+            self.nr.record_asks(msg, "r1", outcome="failed", actor="X", endpoint="@x:1")
+            self.nr.record_asks(msg, "r1", outcome="pending", actor="X",
+                                endpoint="@x:1", membership=["actor:B"])
+            self.nr.record_asks(msg, "r1", outcome="unknown", actor="X", endpoint="@x:1")
+        seed()
+        self.assertEqual(self.nr.claim_park(msg, "A2", "A2", membership=["actor:A"]), 1,
+                         "control: uncompacted, the retired component admits A")
+        self.led.unlink(); seed(); self.nr.compact(self.led)
+        self.assertEqual(self.nr.claim_park(msg, "A2", "A2", membership=["actor:A"]), 1,
+                         "compaction alone must not park a retired component")
+        # The unrelated-person control keweichen asked for, and the LIVE side:
+        self.assertIsNone(self.nr.claim_park(msg, "B2", "B2", membership=["actor:B"]),
+                          "the live component must still park after compaction")
+
+    def test_one_malformed_row_does_not_abort_retry_admission(self):
+        """@keweichen round 4 P2. _membership_overlap reparsed raw JSON, so a
+        `repo: []` row crashed the whole batch with an unhashable-key TypeError.
+        It now projects through _row(), the schema's one owner."""
+        msg = "re-review https://github.com/o/r/pull/7"
+        self.nr.record_asks(msg, "r1", outcome="unknown", actor="X",
+                            endpoint="@x:1", membership=["actor:B"])
+        with open(self.led, "a") as fh:
+            fh.write(json.dumps({"repo": [], "pr": 7, "reviewer": "z",
+                                 "ts": "2026-09-02T02:00:00Z", "outcome": "unknown"}) + "\n")
+        got = self.nr.claim_park(msg, "C2", "C2", membership=["actor:C"])
+        self.assertEqual(got, 1, "a malformed row must be skipped, not abort the claim")
+
     def test_membership_survives_compaction(self):
         """@keweichen's P1. `_rewrite` builds retained rows from a closed field
         set; `_membership_overlap` rereads `membership` from the raw row. Drop it

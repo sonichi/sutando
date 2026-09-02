@@ -62,6 +62,16 @@ class Resolve(unittest.TestCase):
             targets, rc = nr.resolve(["x"], {"x": row})
             self.assertEqual((targets, rc), ([], 4))
 
+    def test_an_unrelated_malformed_route_does_not_starve_the_batch(self):
+        """@keweichen round 4 P2: `stand: ["@bad:x"]` on an UNRELATED row became
+        a hash key in identity_components() before selection, so one malformed
+        roster entry raised TypeError and starved every requested reviewer —
+        against resolve()'s own one-bad-entry isolation contract."""
+        roster = {"ok": DISCORD, "unrelated": {"stand": ["@bad:x"], "room": "r"}}
+        targets, rc = nr.resolve(["ok"], roster)
+        self.assertEqual(rc, 0, "the valid reviewer must still resolve")
+        self.assertEqual(len(targets), 1)
+
     def test_one_bad_entry_does_not_starve_the_batch(self):
         targets, rc = nr.resolve(["ok", "bad"], {"ok": DISCORD, "bad": {"human": "h"}})
         self.assertEqual(len(targets), 1)
