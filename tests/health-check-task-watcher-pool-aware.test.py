@@ -463,6 +463,25 @@ class TheSiblingPaneMirrorControl(unittest.TestCase):
         g = _groups(v["detail"])
         self.assertEqual(g["session-owned"], {"100"})
         self.assertEqual(g["unverified"], {"200"})
+
+    def test_a_non_runtime_exec_carrying_name_is_unverified(self):
+        """keweichen, #3328: `python3 worker.py --name sutando-core` is an
+        ordinary program. A --name on it is not launcher-authored identity."""
+        v = self._run("python3 worker.py --name sutando-core")
+        g = _groups(v["detail"])
+        self.assertEqual(g["session-owned"], {"100"}, v["detail"])
+        self.assertEqual(g["unverified"], {"200"}, v["detail"])
+        self.assertIsNone(v.get("_sentinel_restamp_pid"), v["detail"])
+
+    def test_a_name_after_the_option_terminator_is_unverified(self):
+        """keweichen, #3328: the launchers run `claude ... -- "/startup"`, so
+        every token after `--` is PROMPT TEXT. This is the discriminating form —
+        the executable IS a core runtime and the session name IS present."""
+        v = self._run("claude -- --name sutando-core")
+        g = _groups(v["detail"])
+        self.assertEqual(g["session-owned"], {"100"}, v["detail"])
+        self.assertEqual(g["unverified"], {"200"}, v["detail"])
+        self.assertIsNone(v.get("_sentinel_restamp_pid"), v["detail"])
         self.assertNotIn("_sentinel_restamp_pid", v)
 
     def test_a_runtime_sibling_without_launcher_identity_is_unverified(self):

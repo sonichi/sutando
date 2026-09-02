@@ -7090,6 +7090,15 @@ def check_task_watcher() -> dict:
                                   f"are legitimate. Do NOT stop them: they ARE draining tasks/. "
                                   f"Re-stamp the sentinel with --fix"
                                   + _ownership_groups(supervised, unverified, unowned)}
+            # Every root ownerless: "stop the ownerless ones" empties the set,
+            # so the remedy must also restore one or tasks/ goes undrained.
+            if not supervised and not unverified:
+                return {"name": name, "status": "warn",
+                        "detail": f"{len(roots)} watcher trees running with no PID sentinel, and "
+                                  f"NONE traces to a live core session. Stop them ALL, then start "
+                                  f"exactly ONE via Monitor: bash src/watch-tasks-stream.sh — "
+                                  f"stopping without restarting leaves tasks/ undrained"
+                                  + _ownership_groups(supervised, unverified, unowned)}
             return {"name": name, "status": "warn",
                     "detail": f"{len(roots)} watcher trees running with no PID sentinel; tasks/ IS "
                               f"being drained, but duplicates process each task more than once. "

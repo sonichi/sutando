@@ -410,7 +410,8 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    | probe says | action (apply the three-group split above first: session-owned / unverified / ownerless) |
    |---|---|
    | `ok` | nothing to do. |
-   | watcher(s) running with **no PID sentinel** | **Do NOT start another** — that is what creates the duplicate. Apply the group rules: stop only `ownerless`. |
+   | watcher(s) running with **no PID sentinel**, and at least one is session-owned or unverified | **Do NOT start another** — that is what creates the duplicate. Apply the group rules: stop only `ownerless`. |
+   | watcher(s) running with **no PID sentinel** and **every root ownerless** | Stop them ALL, then start exactly ONE via `Monitor`. Stopping alone leaves `tasks/` undrained — the probe says this explicitly in its detail. |
    | sentinel pid dead but **other watcher(s) still run** | same — apply the group rules. |
    | multiple trees, some **not tracked by the sentinel** | same. The sentinel's own tree is classified too, so an orphaned sentinel beside a live replacement is named for cleanup rather than protected. |
    | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |

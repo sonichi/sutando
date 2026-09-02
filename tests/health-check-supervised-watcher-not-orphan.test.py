@@ -78,14 +78,29 @@ check("does not claim supervision", "do not assume it is supervised" in vX["deta
 
 def says_stop(detail):
     """A stop REMEDY, not the substring. 'Do NOT stop them' contains 'stop
-    them', so a bare `in` check passes on the opposite verdict — it did."""
-    return "Stop ONLY the ownerless roots" in detail and "Do NOT stop" not in detail
+    them', so a bare `in` check passes on the opposite verdict — it did.
+
+    Two remedies are legitimate now: stop SOME (mixed ownership) or stop ALL
+    and restart one (every root ownerless — keweichen, #3328). The "Do NOT
+    stop" exclusion is what keeps this from matching the opposite verdict.
+    """
+    stops = ("Stop ONLY the ownerless roots" in detail
+             or "Stop them ALL, then start exactly ONE" in detail)
+    return stops and "Do NOT stop" not in detail
+
+
+def restores_a_watcher(detail):
+    """All-ownerless must not leave tasks/ undrained: stopping every root
+    without starting one is an outage, so the remedy must name the restart."""
+    return ("start exactly ONE" in detail
+            and "bash src/watch-tasks-stream.sh" in detail)
 
 
 print("single REPARENTED watcher (a true orphan):")
 v2 = _verdict({"555": {"555"}}, {"555": "1"})
 check("keeps the orphan verdict", "ownerless (1): 555" in v2["detail"], v2["detail"])
 check("keeps the stop remedy", says_stop(v2["detail"]), v2["detail"])
+check("a lone orphan is replaced, not just stopped", restores_a_watcher(v2["detail"]), v2["detail"])
 
 print("single watcher with UNKNOWN parent (must stay an orphan):")
 # An unknown ppid cannot support "runs under a live session" — saying so would
@@ -107,6 +122,8 @@ check("names both roots", "100" in v3["detail"] and "200" in v3["detail"], v3["d
 print("TWO watchers, both REPARENTED (genuine duplicates — unchanged):")
 v3b = _verdict({"100": {"100"}, "200": {"200"}}, {"100": "1", "200": "1"})
 check("still says stop", says_stop(v3b["detail"]), v3b["detail"])
+check("all-ownerless restores one watcher", restores_a_watcher(v3b["detail"]), v3b["detail"])
+check("mixed ownership does NOT get the restart line", not restores_a_watcher(v3["detail"]), v3["detail"])
 check("counts both orphans", "ownerless (2): 100, 200" in v3b["detail"], v3b["detail"])
 
 print("no watchers at all (unchanged):")
