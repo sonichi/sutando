@@ -3,6 +3,8 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
+# shellcheck source=src/portable_mtime.sh
+. "$REPO/src/portable_mtime.sh"
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 RESTART_DELAY="${SUTANDO_NOTIFIER_RESTART_DELAY:-1}"
@@ -13,12 +15,25 @@ STABLE_AFTER="${SUTANDO_NOTIFIER_STABLE_AFTER:-60}"
 # Readable session prefix plus a digest of the exact (socket, session) pair:
 # flattening punctuation to `_` made distinct sockets share one lease.
 _lease_key() {
-  printf '%s-%s' "$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-40)" \
-    "$(python3 -c 'import hashlib,sys;print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:16])' "$1" "$2")"
+  local digest
+  digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:16])' "$1" "$2" 2>/dev/null)" || digest=""
+  # An empty digest aliases every socket onto one key: fail closed, never lease.
+  case "$digest" in
+    ????????????????) ;;
+    *) echo "task-notifier-supervisor: cannot derive the lease key for ($1, $2); refusing to run" >&2; exit 1 ;;
+  esac
+  printf '%s-%s' "$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-40)" "$digest"
 }
-LOCK_DIR="${SUTANDO_NOTIFIER_LOCK_DIR:-${TMPDIR:-/tmp}/sutando-notifier-$(_lease_key "$TMUX_SOCKET" "$SESSION").lock}"
+if [ -n "${SUTANDO_NOTIFIER_LOCK_DIR:-}" ]; then
+  LOCK_DIR="$SUTANDO_NOTIFIER_LOCK_DIR"
+else
+  LOCK_KEY="$(_lease_key "$TMUX_SOCKET" "$SESSION")" || exit 1
+  LOCK_DIR="${TMPDIR:-/tmp}/sutando-notifier-$LOCK_KEY.lock"
+fi
 RECLAIM_DIR="$LOCK_DIR.reclaim"
 RECLAIM_HOOK="${SUTANDO_NOTIFIER_RECLAIM_HOOK:-}"
+RECLAIM_PUBLISH_HOOK="${SUTANDO_NOTIFIER_RECLAIM_PUBLISH_HOOK:-}"
+JUDGE_HOOK="${SUTANDO_NOTIFIER_JUDGE_HOOK:-}"
 NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}"
 # task-notifier.sh exits 2 only for a usage/configuration fault; respawning
 # re-runs the same broken invocation, so that one is terminal rather than retried.
@@ -49,14 +64,68 @@ _start_of() {
 _own_token() { printf '%s:%s' "$$" "$(_start_of "$$" || echo unknown)"; }
 OWNER_TOKEN="$(_own_token)"
 
-_lease_token() { cat "$LOCK_DIR/token" 2>/dev/null || true; }
+PUBLISH_GRACE="${SUTANDO_NOTIFIER_PUBLISH_GRACE:-10}"
+
+_token_of() { cat "$1/token" 2>/dev/null || true; }
+_lease_token() { _token_of "$LOCK_DIR"; }
+
+_age_of() {
+  local now mt
+  now="$(date +%s)"
+  # Unreadable mtime reads as just-published, so the guard defers rather than
+  # reclaiming: an unknown age must never authorise deleting a live lease.
+  mt="$(portable_mtime "$1")" || mt="$now"
+  echo $(( now - mt ))
+}
+_lease_age() { _age_of "$LOCK_DIR"; }
+
+# Verdict on the lease directory $1: live | publishing | unknown | stale |
+# absent | error. `unknown` is a live pid whose start identity cannot be
+# compared on either side; it must read as contended, never as pid reuse.
+# `absent` is a directory that vanished between mkdir and this read (retry);
+# `error` is a parent that cannot hold it at all (a real path/config fault).
+_judge_dir() {
+  local dir="$1" token owner age start parent
+  if [ ! -d "$dir" ]; then
+    parent="$(dirname "$dir")"
+    if [ -d "$parent" ] && [ -w "$parent" ]; then echo absent; else echo error; fi
+    return
+  fi
+  token="$(_token_of "$dir")"
+  owner="${token%%:*}"
+  [ -n "$token" ] || owner="$(cat "$dir/pid" 2>/dev/null || true)"
+  if [ -z "$owner" ]; then
+    age="$(_age_of "$dir")"
+    [ "$age" -lt "$PUBLISH_GRACE" ] && { echo publishing; return; }
+    echo stale; return
+  fi
+  kill -0 "$owner" 2>/dev/null || { echo stale; return; }
+  [ -n "$token" ] || { echo live; return; }
+  start="$(_start_of "$owner" || true)"
+  if [ -z "$start" ] || [ "${token#*:}" = unknown ]; then echo unknown; return; fi
+  [ "$start" = "${token#*:}" ] && echo live || echo stale
+}
+_judge() { _judge_dir "$LOCK_DIR"; }
 
 # Non-recursive by construction: remove the files we know we wrote, then rmdir,
 # which FAILS if anything else is inside. `rm -rf` on a configurable path can
-# delete a pre-existing directory and its contents.
-_lease_rm() {
-  rm -f "$LOCK_DIR/token" "$LOCK_DIR/pid" 2>/dev/null || true
-  rmdir "$LOCK_DIR" 2>/dev/null || true
+# delete a pre-existing directory and its contents. `.token.*` is the staging
+# artifact an earlier revision of this script left inside the directory.
+_dir_rm() {
+  rm -f "$1/token" "$1/pid" "$1"/.token.* 2>/dev/null || true
+  rmdir "$1" 2>/dev/null || true
+}
+_lease_rm() { _dir_rm "$LOCK_DIR"; }
+
+# Publish a token into directory $1 whole-or-not-at-all: stage OUTSIDE the
+# directory (a crash mid-publication must not leave a file that blocks rmdir),
+# then rename in. Returns nonzero if the publication did not land.
+_publish_token() {
+  local dir="$1" stage="$1.stage.$$"
+  printf '%s\n' "$$" > "$dir/pid" || return 1
+  printf '%s' "$OWNER_TOKEN" > "$stage" || { rm -f "$stage"; return 1; }
+  mv -f "$stage" "$dir/token" || { rm -f "$stage"; return 1; }
+  [ "$(_token_of "$dir")" = "$OWNER_TOKEN" ]
 }
 
 release_lease() {
@@ -69,62 +138,47 @@ release_lease() {
   lease_held=""
 }
 
-PUBLISH_GRACE="${SUTANDO_NOTIFIER_PUBLISH_GRACE:-10}"
-
-# Verdict on the lease at LOCK_DIR: live | publishing | unknown | stale.
-# `unknown` is a live pid whose start identity cannot be compared on either
-# side; it must read as contended, never as pid reuse.
-_judge() {
-  local token owner age start
-  token="$(_lease_token)"
-  owner="${token%%:*}"
-  [ -n "$token" ] || owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-  if [ -z "$owner" ]; then
-    age="$(_lease_age)"
-    [ "$age" -lt "$PUBLISH_GRACE" ] && { echo publishing; return; }
-    echo stale; return
-  fi
-  kill -0 "$owner" 2>/dev/null || { echo stale; return; }
-  [ -n "$token" ] || { echo live; return; }
-  start="$(_start_of "$owner" || true)"
-  if [ -z "$start" ] || [ "${token#*:}" = unknown ]; then echo unknown; return; fi
-  [ "$start" = "${token#*:}" ] && echo live || echo stale
+# Release the reclaim lock only if it is still OURS by exact token.
+_reclaim_release() {
+  [ "$(_token_of "$RECLAIM_DIR")" = "$OWNER_TOKEN" ] && _dir_rm "$RECLAIM_DIR"
+  return 0
 }
 
-_reclaim_unlock() { rm -f "$RECLAIM_DIR/pid" 2>/dev/null; rmdir "$RECLAIM_DIR" 2>/dev/null || true; }
+# Take the reclaim lock: mkdir is the atomic test-and-set, but an empty
+# directory is a publication in progress, not an abandoned one — it is judged
+# by the same live/publishing/stale rule as the lease, and a dead or recycled
+# holder is BROKEN by renaming its directory away (only one contender's mv
+# succeeds), never by deleting in place.
+_reclaim_lock() {
+  local verdict broken
+  if mkdir "$RECLAIM_DIR" 2>/dev/null; then
+    [ -n "$RECLAIM_PUBLISH_HOOK" ] && bash "$RECLAIM_PUBLISH_HOOK"
+    _publish_token "$RECLAIM_DIR" && return 0
+    _reclaim_release
+    return 1
+  fi
+  verdict="$(_judge_dir "$RECLAIM_DIR")"
+  case "$verdict" in
+    stale)
+      broken="$RECLAIM_DIR.broken.$$"
+      mv "$RECLAIM_DIR" "$broken" 2>/dev/null && _dir_rm "$broken"
+      ;;
+  esac
+  return 1
+}
 
 # Only the holder of RECLAIM_DIR may delete a lease, and only on a verdict taken
 # under that lock: a verdict from before the lock is a read another reclaimer
 # may already have acted on.
 _reclaim_stale() {
-  local rpid
-  if ! mkdir "$RECLAIM_DIR" 2>/dev/null; then
-    rpid="$(cat "$RECLAIM_DIR/pid" 2>/dev/null || true)"
-    if [ -n "$rpid" ] && kill -0 "$rpid" 2>/dev/null; then return 1; fi
-    _reclaim_unlock
-    return 1
-  fi
-  printf '%s\n' "$$" > "$RECLAIM_DIR/pid"
+  _reclaim_lock || return 1
   if [ -d "$LOCK_DIR" ] && [ "$(_judge)" = stale ]; then
     _lease_rm
-    _reclaim_unlock
+    _reclaim_release
     return 0
   fi
-  _reclaim_unlock
+  _reclaim_release
   return 1
-}
-
-_lease_age() {
-  local now mt
-  now="$(date +%s)"
-  # GNU first and validate: `stat -f` on GNU is --file-system and SUCCEEDS with
-  # non-numeric output, so a BSD-first probe never falls through on Linux.
-  mt="$(stat -c %Y "$LOCK_DIR" 2>/dev/null || true)"
-  case "$mt" in '' | *[!0-9]*) mt="$(stat -f %m "$LOCK_DIR" 2>/dev/null || true)" ;; esac
-  # Unreadable mtime reads as just-published, so the guard defers rather than
-  # reclaiming: an unknown age must never authorise deleting a live lease.
-  case "$mt" in '' | *[!0-9]*) mt="$now" ;; esac
-  echo $(( now - mt ))
 }
 
 # mkdir is the portable atomic test-and-set; macOS ships no flock(1).
@@ -132,13 +186,15 @@ acquire_lease() {
   local attempt verdict
   for attempt in 1 2 3 4 5 6; do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
-      # Publish via rename so a contender sees the token whole or not at all.
-      printf '%s\n' "$$" > "$LOCK_DIR/pid"
-      printf '%s' "$OWNER_TOKEN" > "$LOCK_DIR/.token.$$" \
-        && mv -f "$LOCK_DIR/.token.$$" "$LOCK_DIR/token"
-      lease_held=1
-      return 0
+      if _publish_token "$LOCK_DIR"; then
+        lease_held=1
+        return 0
+      fi
+      echo "task-notifier-supervisor: could not publish the lease token in $LOCK_DIR" >&2
+      _lease_rm
+      exit 1
     fi
+    [ -n "$JUDGE_HOOK" ] && bash "$JUDGE_HOOK"
     verdict="$(_judge)"
     case "$verdict" in
       live)
@@ -150,6 +206,12 @@ acquire_lease() {
       unknown)
         echo "task-notifier-supervisor: cannot verify the start identity of lease holder $(_lease_token | cut -d: -f1); assuming live; exiting" >&2
         exit 0 ;;
+      absent)
+        # The holder released between our mkdir and this read: try again.
+        sleep 0.1; continue ;;
+      error)
+        echo "task-notifier-supervisor: cannot create lease $LOCK_DIR (parent missing or unwritable)" >&2
+        exit 1 ;;
     esac
     # Stale by a read outside the lock. The hook is a test seam that lets a
     # control hold this reclaimer exactly here.

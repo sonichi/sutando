@@ -330,6 +330,162 @@ class LeaseOwnershipTest(unittest.TestCase):
         self.assertIsNone(r.poll())
         self.assertNotIn("999999", (self.lock / "token").read_text())
 
+    # --- P1: the reclaim lock is publication-, identity- and release-safe ---
+
+    def _hold_hook(self, name):
+        entered, go = self.d / f"{name}-entered", self.d / f"{name}-go"
+        hook = _write(self.d / f"{name}.sh", f"""
+            #!/bin/bash
+            touch "{entered}"
+            while [ ! -f "{go}" ]; do sleep 0.05; done
+        """, executable=True)
+        return hook, entered, go
+
+    def _wait_for(self, path, what, timeout=20):
+        deadline = time.monotonic() + timeout
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(path.exists(), what)
+
+    def test_an_empty_reclaim_publication_cannot_be_stolen(self):
+        """A holds RECLAIM_DIR right after mkdir, before its token lands; B must
+        defer, not unlock it and enter the critical section beside A."""
+        self._plant_stale()
+        hook, entered, go = self._hold_hook("publish")
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     SUTANDO_NOTIFIER_RECLAIM_PUBLISH_HOOK=str(hook))
+        self._wait_for(entered, "reclaimer A never reached the publication window")
+        b = self._run("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self.assertNotEqual(b.returncode, 0, b.stderr)
+        self.assertNotIn("B", self._ran(), "B entered the critical section during A's publication")
+        go.touch()
+        self._await_run("A")
+        self.assertIsNone(a.poll())
+        self.assertEqual(self._ran(), ["A"])
+
+    def test_published_reclaim_control_still_wins(self):
+        """Control: with no contender in the window, the same reclaim runs."""
+        self._plant_stale()
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("A")
+        self.assertEqual(self._ran(), ["A"])
+
+    def _plant_reclaimer(self, token):
+        r = Path(str(self.lock) + ".reclaim")
+        r.mkdir()
+        (r / "token").write_text(token)
+        (r / "pid").write_text(token.split(":")[0] + "\n")
+        old = time.time() - 600
+        os.utime(r, (old, old))
+        return r
+
+    def test_a_recycled_pid_cannot_impersonate_a_dead_reclaimer(self):
+        """The reclaim lock names a pid that is live but belongs to another
+        process (a recycled pid). Its start identity does not match, so the
+        lock is stale and is broken; recovery must not wedge."""
+        self._plant_stale()
+        self._plant_reclaimer(f"{os.getpid()}:Mon_Jan__1_00:00:00_2001")
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("A")
+        self.assertEqual(self._ran(), ["A"])
+
+    def test_a_dead_reclaimer_is_broken(self):
+        self._plant_stale()
+        self._plant_reclaimer("999999:Mon_Jan__1_00:00:00_2001")
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("A")
+        self.assertEqual(self._ran(), ["A"])
+
+    def test_a_live_reclaimer_is_respected(self):
+        """Positive control for the identity check: a lock whose holder is
+        alive AND matches its start identity is contended, never broken."""
+        # Spelled exactly as the script spells its own identity (`tr -s ' ' '_'`
+        # over the raw ps line), or a leading blank alone makes it "recycled".
+        ident = subprocess.run(["bash", "-c", "ps -o lstart= -p $1 | tr -s ' ' '_'", "_",
+                                str(os.getpid())], capture_output=True, text=True).stdout
+        if not ident.strip("_\n"):
+            self.skipTest("ps cannot report this process's start time here")
+        ident = ident.rstrip("\n")
+        self._plant_stale()
+        r = self._plant_reclaimer(f"{os.getpid()}:{ident}")
+        b = self._run("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self.assertNotEqual(b.returncode, 0)
+        self.assertNotIn("B", self._ran())
+        self.assertTrue(r.exists(), "a live reclaimer's lock was broken")
+
+    # --- P1: the primary lease has no unrecoverable or false-success state ---
+
+    def test_an_orphaned_staged_token_is_reclaimable(self):
+        """A crash between staging and rename left `.token.<pid>` inside the
+        lease directory; that artifact must not block rmdir forever."""
+        self.lock.mkdir()
+        (self.lock / ".token.999999").write_text("999999:Mon_Jan__1_00:00:00_2001")
+        old = time.time() - 600
+        os.utime(self.lock, (old, old))
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("A")
+        self.assertEqual(self._ran(), ["A"])
+        self.assertFalse((self.lock / ".token.999999").exists())
+
+    def test_staging_happens_outside_the_lease_directory(self):
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("A")
+        self.assertEqual(sorted(p.name for p in self.lock.iterdir()), ["pid", "token"])
+
+    def test_a_lease_that_disappears_after_mkdir_failed_is_retried(self):
+        """mkdir failed, then the holder released before the verdict: absence
+        is a retry, not `publishing` (age 0 of a missing path) and not exit 0."""
+        self.lock.mkdir()
+        (self.lock / "pid").write_text("999999\n")
+        hook = _write(self.d / "vanish.sh", f"""
+            #!/bin/bash
+            rm -rf "{self.lock}"
+        """, executable=True)
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     SUTANDO_NOTIFIER_JUDGE_HOOK=str(hook))
+        self._await_run("A")
+        self.assertEqual(self._ran(), ["A"])
+        self.assertTrue(self.lock.exists())
+
+    def test_absent_before_mkdir_control(self):
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("A")
+        self.assertEqual(self._ran(), ["A"])
+
+    def test_an_unwritable_lease_parent_is_an_error_not_contention(self):
+        missing = self.d / "no-such-parent" / "lease.lock"
+        r = self._run("E", SUTANDO_NOTIFIER_LOCK_DIR=str(missing))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cannot create lease", r.stderr)
+        self.assertNotIn("publishing", r.stderr)
+        self.assertEqual(self._ran(), [])
+
+    # --- P2: a failed digest must not alias sockets onto one key ---
+
+    def _python_that_fails_hashlib(self):
+        d = self.d / "badpy"
+        d.mkdir(exist_ok=True)
+        real = subprocess.run(["bash", "-c", "command -v python3"], capture_output=True,
+                              text=True).stdout.strip()
+        _write(d / "python3", f"""
+            #!/bin/bash
+            case "$*" in *hashlib*) exit 1 ;; esac
+            exec "{real}" "$@"
+        """, executable=True)
+        return d
+
+    def test_digest_failure_fails_closed_before_any_lease(self):
+        env = self._env("digest", SUTANDO_TMUX_SOCKET="/tmp/team/a.sock",
+                        SUTANDO_TMUX_SESSION="s")
+        env["PATH"] = f"{self._python_that_fails_hashlib()}:{env['PATH']}"
+        r = subprocess.run(["bash", str(SUPERVISOR)], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cannot derive the lease key", r.stderr)
+        self.assertEqual(self._ran(), [])
+        self.assertEqual(list(self.d.glob("sutando-notifier-*.lock")), [],
+                         "a lease was taken under a collapsed key")
+
     # --- P1: an unmeasurable start identity is contended, never stale ---
 
     def _blind_ps_dir(self):

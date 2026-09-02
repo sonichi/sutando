@@ -26,6 +26,9 @@
 
 # Seconds of elapsed time for a pid, or empty when it cannot be determined.
 # `etime` is [[DD-]HH:]MM:SS on both BSD and GNU ps.
+# shellcheck source=src/portable_mtime.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/portable_mtime.sh"
+
 sentinel_pid_elapsed() {
   local pid="$1" raw
   raw="$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ')" || return 1
@@ -60,16 +63,7 @@ sentinel_pid_wrote_file() {
   elapsed="$(sentinel_pid_elapsed "$pid")" || return 2
   case "$elapsed" in ''|*[!0-9]*) return 2 ;; esac   # non-numeric => UNKNOWN, never "owner"
 
-  # `stat -f %m` is BSD "modification time"; on GNU `-f` means FILESYSTEM status
-  # and SUCCEEDS with a human-readable block, so an `||` chain never reaches the
-  # GNU form and $mtime becomes text. Measured on the ubuntu runner: the value
-  # started with "File:" and `$(( now - mtime ))` died as `File: unbound
-  # variable`. macOS passed because BSD is correct there — the GNU path was
-  # never exercised locally. So validate the RESULT rather than trusting the
-  # exit status: a command that succeeds at a different question is the failure.
-  mtime="$(stat -c %Y "$pid_file" 2>/dev/null || true)"
-  case "$mtime" in ''|*[!0-9]*) mtime="$(stat -f %m "$pid_file" 2>/dev/null || true)" ;; esac
-  case "$mtime" in ''|*[!0-9]*) return 2 ;; esac   # mtime unreadable => UNKNOWN
+  mtime="$(portable_mtime "$pid_file")" || return 2   # mtime unreadable => UNKNOWN
 
   now="$(date +%s)"
   age=$(( now - mtime ))

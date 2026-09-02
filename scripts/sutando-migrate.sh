@@ -269,6 +269,8 @@ CLASS_RULES=(
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=src/portable_mtime.sh
+. "$REPO_DIR/src/portable_mtime.sh"
 . "$REPO_DIR/scripts/python-binary.sh"
 HELPER="$REPO_DIR/scripts/sutando-config.sh"
 
@@ -354,7 +356,7 @@ age_safe() {
     local file="$1"
     local now mtime age
     now="$(date +%s)"
-    mtime="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
+    mtime="$(portable_mtime "$file" || echo 0)"
     age=$((now - mtime))
     [ "$age" -ge "$INFLIGHT_GUARD_SEC" ]
 }
@@ -379,7 +381,7 @@ record_xsrc() {
     # $1=tag, $2=relpath, $3=class, $4=abs-path
     local tag="$1" rel="$2" cls="$3" file="$4"
     local mt sz
-    mt="$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || echo 0)"
+    mt="$(portable_mtime "$file" || echo 0)"
     sz="$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file" 2>/dev/null || echo 0)"
     printf '%s\t%s\t%s\t%s\t%s\n' "$rel" "$tag" "$cls" "$mt" "$sz" >> "$XSRC_INDEX"
 }
@@ -1170,9 +1172,9 @@ commit_one() {
                 # Same content (mtime+size) → identical-drop. Different →
                 # keep-both: rename source-incoming to <file>.legacy-<tag>.
                 local src_mt src_sz dst_mt dst_sz
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
+                src_mt="$(portable_mtime "$src_file" || echo 0)"
                 src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
+                dst_mt="$(portable_mtime "$dst_path" || echo 0)"
                 dst_sz="$(stat -f %z "$dst_path" 2>/dev/null || stat -c %s "$dst_path")"
                 if [ "$src_mt" = "$dst_mt" ] && [ "$src_sz" = "$dst_sz" ]; then
                     echo "identical-drop"
@@ -1213,8 +1215,8 @@ commit_one() {
             dst_path="$DEST_REAL/$rel"
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
+                src_mt="$(portable_mtime "$src_file" || echo 0)"
+                dst_mt="$(portable_mtime "$dst_path" || echo 0)"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     copy_preserving_mtime "$src_file" "$dst_path"
                     echo "src-newer"
@@ -1255,8 +1257,8 @@ commit_one() {
             # Per-mtime swap, identical-drop, or write-fresh.
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
-                src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
-                dst_mt="$(stat -f %m "$dst_path" 2>/dev/null || stat -c %Y "$dst_path")"
+                src_mt="$(portable_mtime "$src_file" || echo 0)"
+                dst_mt="$(portable_mtime "$dst_path" || echo 0)"
                 if [ "$src_mt" -gt "$dst_mt" ]; then
                     copy_preserving_mtime "$src_file" "$dst_path"
                     echo "rehomed-newer"
@@ -1286,7 +1288,7 @@ commit_one() {
             dst_path="$DEST_REAL/logs/workspace-narrative.log"
             mkdir -p "$(dirname "$dst_path")"
             local src_mt src_sz
-            src_mt="$(stat -f %m "$src_file" 2>/dev/null || stat -c %Y "$src_file")"
+            src_mt="$(portable_mtime "$src_file" || echo 0)"
             src_sz="$(stat -f %z "$src_file" 2>/dev/null || stat -c %s "$src_file")"
             # Mini #design 2026-06-02 08:10Z: an `{ ... } > tmp && mv ...`
             # compound on a single line is NOT covered by `set -e` for its
