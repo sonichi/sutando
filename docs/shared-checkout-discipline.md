@@ -202,10 +202,29 @@ second-call=main-behaviour
 ```
 
 `src/health-check.py` says the same of skills — re-read from the checkout on every
-invocation. So restoring the tree does clear the parked-tree exposure, and it does
-keep already-imported state; it does **not** make the tree safe to change under a
-live witness. For a witness that must stay stable, use CONTRIBUTING's
-detached-worktree service path rather than parking the shared checkout.
+invocation. So restoring the tree clears the parked-tree exposure **only once the
+working tree is verifiably clean**, and it keeps already-imported state; it does
+**not** make the tree safe to change under a live witness.
+
+The qualifier is load-bearing. `git switch main` moves `HEAD`; it carries any
+*compatible* uncommitted tracked edit across with it rather than discarding it. A
+reviewer switched a tree holding one such edit onto `main` and measured:
+
+```text
+distinct-branches=True branch=main
+head-bytes=main-bytes disk-bytes=uncommitted-pr-bytes status=M service.txt
+live-checkout-branch=ok: live checkout on 'main'
+```
+
+The probe answered `ok` because it reads the branch *name*; a supervised restart at
+that point loads the uncommitted bytes, which exist in no commit anyone reviewed.
+So the remedy is two steps, and the name vouches only for the first: `git switch
+main`, then `git status --porcelain` prints nothing. `health-check.py`'s
+**`live-tree-drift`** probe (`check_live_tree_drift`) is the detector for the
+second half — it was added after tracked dirty files were found running in
+production while existing in no commit. For a witness that must stay stable, use
+CONTRIBUTING's detached-worktree service path rather than parking the shared
+checkout.
 
 That is the same fact as the corollary, read in the other direction. "A running
 process is not its file" is usually stated as a warning — you cannot infer the
