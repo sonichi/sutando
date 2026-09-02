@@ -291,6 +291,38 @@ def _retire_rows() -> None:
     check("bytes appended after retirement are preserved, not destroyed",
           retired10.exists() and "LATE" in retired10.read_text(),
           f"retired inode missing or lost the late bytes: {retired10}")
+    # Preservation is not recovery: the sweep republishes the bytes past the
+    # delivered length as a new proactive file and drops the inode once quiescent.
+    late_pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+    check("a late append is republished as its own proactive file",
+          len(late_pub) == 1 and late_pub[0].parent == d
+          and late_pub[0].name.startswith("proactive-late-")
+          and late_pub[0].read_text().strip() == "LATE",
+          f"published={late_pub} bodies={[x.read_text() for x in late_pub]}")
+    check("the republished remainder carries no already-delivered bytes",
+          late_pub and "body" not in late_pub[0].read_text())
+    check("the inode stays until quiescent (a second append is still possible)",
+          retired10.exists())
+    check("a quiescent inode with nothing new is dropped",
+          rd.sweep_retired(d, quiesce_s=0, now=time.time() + 1) == []
+          and not retired10.exists() and not rd._delivered_marker(retired10).exists())
+    check("a sweep republishes nothing twice",
+          not list(d.glob("proactive-late-*.txt")) or len(list(d.glob("proactive-late-*.txt"))) == 1)
+    # A retired inode with no delivered-length marker predates this lifecycle:
+    # its prefix may already have been sent, so it is aged out, never resent.
+    legacy = d / "retired" / "legacy.txt"; legacy.write_text("body\nMAYBE-SENT\n")
+    check("an unmarked retired inode is never republished",
+          rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [] and legacy.exists())
+    check("an unmarked retired inode ages out once quiescent",
+          rd.sweep_retired(d, quiesce_s=0, now=time.time() + 1) == [] and not legacy.exists())
+
+    # Wiring: every proactive poller runs the sweep each pass, so "eventual"
+    # is bounded by one poll interval, not by a tool nobody runs.
+    for bridge in ("slack-bridge.py", "telegram-bridge.py", "discord-bridge.py"):
+        src = (REPO / "src" / bridge).read_text()
+        check(f"{bridge} sweeps retired inodes every proactive pass",
+              "sweep_retired(RESULTS_DIR)" in src and src.count("_sweep_retired_pass()") >= 1,
+              "the sweep helper is not called from the poll loop")
 
     # The remaining branches. Each is a distinct decision, and each was a way
     # bytes got destroyed or kept before, so none is filler for a coverage gate.

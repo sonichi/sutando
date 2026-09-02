@@ -58,7 +58,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
-from delivery.readiness import read_ready_result, retire_claim_if_unchanged  # noqa: E402
+from delivery.readiness import read_ready_result, retire_claim_if_unchanged, sweep_retired  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -726,6 +726,16 @@ def log_privacy_setting(get_me):
     )
 
 
+
+def _sweep_retired_pass():
+    """Republish bytes appended to a retired claim after its delivery; the
+    remainder becomes an ordinary proactive file this poller claims next pass."""
+    try:
+        for late in sweep_retired(RESULTS_DIR):
+            print(f"  [proactive] late remainder republished as {late.name}", flush=True)
+    except Exception as e:
+        print(f"  [proactive] retired sweep skipped: {e}", flush=True)
+
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
@@ -1057,6 +1067,7 @@ def main():  # pragma: no cover
 
                 # Send typing indicator
                 api("sendChatAction", chat_id=chat_id, action="typing")
+        _sweep_retired_pass()
 
         # Check for proactive messages to send to owner.
         # Presenter-mode: retain files (don't unlink, don't send) so they

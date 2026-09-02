@@ -160,7 +160,7 @@ import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/me
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
 
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import read_ready_result, sweep_retired  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel, reference_is_reply  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_parent_reference, format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, should_fetch_reply_context, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -4106,9 +4106,9 @@ async def _handle_discord_message(message, force=False):
             "2. PR-REVIEW REQUEST (the task asks you to review / look at a specific GitHub PR #N) — AUTO-REVIEW, read-only:\n"
             "   - Run: bash skills/claude-codex/scripts/review-pr.sh <N>   (fetches the diff via `gh pr diff` — READ-ONLY: no checkout, never mutates git state or fails on a dirty tree — inlines it into `codex exec --sandbox read-only` `< /dev/null`, bounded by codex-bounded.sh --stall/--max so it can't grind. The verdict is comment-only; it never merges/approves. Diff is fetched OUTSIDE the sandbox so the sandboxed agent needs no network. Note: codex is agentic — a review can take 100s+; --max defaults to 240, don't shorten it.)\n"
             "   - On SUCCESS (exit 0): stdout line 1 is `VERDICT-MARKER: <token>`; the verdict is ONLY the text after the LAST occurrence of that exact <token>. The token is a per-run nonce, so a diff or verdict that quotes a marker literal cannot truncate the extract. Everything before it is codex's exec trace (kept there deliberately so codex-bounded.sh --stall can watch it) and contains repository source the agent inlined while working — copying the whole stream, or its tail, quotes that source as the PR's own content. Extract after the last marker and write ONLY that to results/task-{id}.txt. This is information-only (the team-tier bound) — safe because the review ran sandboxed read-only and the output is just analysis.\n"
-            "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — write results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed), and do NOT write results/task-{id}.txt. Owner-ping is the FALLBACK here, not the default.\n"
+            "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — publish results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed) by writing results/.proactive-{ts}.txt.tmp and then `mv` to the final name — never write the final name in place, and do NOT write results/task-{id}.txt. Owner-ping is the FALLBACK here, not the default.\n"
             "2b. MESSAGE OWNER — when the task needs owner decision for any OTHER reason (authorization, scope question, merge direction, repeated echo):\n"
-            "   - Write a single proactive message to results/proactive-{ts}.txt summarizing what the sender asked and why it needs owner attention.\n"
+            "   - Publish a single proactive message to results/proactive-{ts}.txt (write results/.proactive-{ts}.txt.tmp, then `mv` to the final name — never write the final name in place) summarizing what the sender asked and why it needs owner attention.\n"
             "   - Do NOT write to results/task-{id}.txt (no sender reply).\n\n"
             "3. NO-REPLY — when the task is echo/noise:\n"
             "   - Content is EXACTLY a Stage-2 fallback sentinel: the legacy 'Sandbox unavailable; refusing non-owner task.', or 'Sandbox unavailable (codex exit <N>) — no reply generated.', or 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. Exact match only — a message that merely BEGINS with those words (e.g. 'Sandbox unavailable after upgrading — can you diagnose it?') is ordinary prose and goes to RUN CODEX\n"
@@ -5507,6 +5507,16 @@ def _proactive_fence():
     return _PROACTIVE_FENCE
 
 
+
+def _sweep_retired_pass():
+    """Republish bytes appended to a retired claim after its delivery; the
+    remainder becomes an ordinary proactive file this poller claims next pass."""
+    try:
+        for late in sweep_retired(RESULTS_DIR):
+            print(f"  [proactive] late remainder republished as {late.name}", flush=True)
+    except Exception as e:
+        print(f"  [proactive] retired sweep skipped: {e}", flush=True)
+
 async def poll_proactive():
     """Poll results/ for proactive messages and send to owner's DM.
 
@@ -5517,6 +5527,7 @@ async def poll_proactive():
     import re
     _presenter_log_throttle = 0
     while True:
+        _sweep_retired_pass()
         try:
             # Skip sends while presenter-mode is active. Files remain on
             # disk and are sent on a later tick once the sentinel clears.

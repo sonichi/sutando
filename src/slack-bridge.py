@@ -83,7 +83,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
-from delivery.readiness import read_ready_result, retire_claim_if_unchanged  # noqa: E402
+from delivery.readiness import read_ready_result, retire_claim_if_unchanged, sweep_retired  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
@@ -1552,6 +1552,16 @@ def _check_task_timeouts() -> None:
         print(f"  [timeout] notified Slack for {task_id} after {TASK_TIMEOUT_SEC}s", flush=True)
 
 
+
+def _sweep_retired_pass():
+    """Republish bytes appended to a retired claim after its delivery; the
+    remainder becomes an ordinary proactive file this poller claims next pass."""
+    try:
+        for late in sweep_retired(RESULTS_DIR):
+            print(f"  [proactive] late remainder republished as {late.name}", flush=True)
+    except Exception as e:
+        print(f"  [proactive] retired sweep skipped: {e}", flush=True)
+
 def result_watcher():
     """Background thread: polls results/ for replies + proactive messages."""
     heartbeat_file = REPO / "state" / "slack-bridge.heartbeat"
@@ -1561,6 +1571,7 @@ def result_watcher():
             # Surface tasks the core never answered (timeout → visible reply).
             _check_task_timeouts()
 
+            _sweep_retired_pass()
             # Replies to pending tasks
             with pending_replies_lock:
                 pending_ids = list(pending_replies.keys())
@@ -1667,6 +1678,8 @@ def result_watcher():
                             if _send_reply(dm_channel, None, text, access_tier="owner",
                                            delivery_name=delivery_id):
                                 print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                                # The receipt covers the delivered prefix; bytes appended
+                                # later are republished by sweep_retired, never marooned.
                                 if retire_claim_if_unchanged(claim, text):
                                     mark_proactive_delivered(STATE_DIR, delivery_id)
                                 else:

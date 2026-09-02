@@ -330,10 +330,11 @@ def send_telegram(body: str) -> bool:
     claims it."""
     try:
         from proactive_routing import proactive_filename
+        from delivery.publication import publish_result
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         name = proactive_filename(f"deal-finder-{int(time.time() * 1000)}",
                                   channel="telegram")
-        (RESULTS_DIR / name).write_text(body)
+        publish_result(RESULTS_DIR / name, body)
         return True
     except Exception:
         return False

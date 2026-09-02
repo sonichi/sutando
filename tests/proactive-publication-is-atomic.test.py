@@ -11,6 +11,7 @@ Run: python3 tests/proactive-publication-is-atomic.test.py   (stdlib only)
 from __future__ import annotations
 
 import ast
+import re
 import os
 import sys
 import tempfile
@@ -109,7 +110,43 @@ PRODUCERS = [
     REPO / "src" / "morning-briefing.py",
     REPO / "src" / "check-pending-questions.py",
     REPO / "skills" / "schedule-crons" / "scripts" / "codex-scheduler.py",
+    REPO / "skills" / "deal-finder" / "scripts" / "scan.py",
 ]
+# TypeScript producers write with writeFileSync; a final proactive name may
+# only be reached through renameSync from a scratch name.
+TS_PRODUCERS = [
+    REPO / "src" / "task-bridge.ts",
+    REPO / "src" / "live-agent-runtime.ts",
+]
+
+
+def ts_inplace_writes(path: Path) -> list[int]:
+    src = path.read_text().splitlines()
+    hits = []
+    for i, line in enumerate(src, 1):
+        m = re.search(r"writeFileSync\(\s*([A-Za-z_][A-Za-z0-9_]*)", line)
+        if not m:
+            continue
+        var = m.group(1)
+        if "proactive" not in var.lower():
+            continue
+        # The variable must be a scratch name (`...Tmp`) that a renameSync
+        # then moves onto the final name.
+        if var.lower().endswith("tmp"):
+            continue
+        hits.append(i)
+    return hits
+
+
+for prod in TS_PRODUCERS:
+    check(f"{prod.name} publishes proactive files through a scratch name + renameSync",
+          not ts_inplace_writes(prod), f"in-place writeFileSync at lines {ts_inplace_writes(prod)}")
+
+# Agent-facing instructions are a producer too: an LLM told to "write
+# results/proactive-{ts}.txt" writes the final name in place.
+_discord = (REPO / "src" / "discord-bridge.py").read_text()
+_bad = re.findall(r"[Ww]rite (?:a single proactive message to )?results/proactive-\{ts\}\.txt(?![^\n]*\.tmp)", _discord)
+check("discord-bridge instructions publish proactive files via temp-and-rename", not _bad, str(_bad))
 
 
 def inplace_writes(path: Path) -> list[int]:
