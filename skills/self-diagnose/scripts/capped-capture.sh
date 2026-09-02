@@ -14,10 +14,15 @@ shift 4
 
 # Count the real population separately: --limit is what hides the rest, so the
 # same capped call can never report how much it dropped.
-total="$("$GH" pr list "$@" --limit 1000 --json number --jq 'length' 2>/dev/null || echo "")"
+COUNT_LIMIT=1000
+total="$("$GH" pr list "$@" --limit "$COUNT_LIMIT" --json number --jq 'length' 2>/dev/null || echo "")"
 case "$total" in
 	''|*[!0-9]*) echo "(population unknown — could not count; this file may be truncated at $CAP)" >> "$OUT" ;;
-	*) if [ "$total" -gt "$CAP" ]; then
+	*) if [ "$total" -ge "$COUNT_LIMIT" ]; then
+		# The count saturated: length == the limit cannot be told apart from
+		# more-than-the-limit, so this is UNKNOWN, not a number.
+		echo "(population unknown — the count itself saturated at $COUNT_LIMIT; this file shows $CAP and may omit far more)" >> "$OUT"
+	elif [ "$total" -gt "$CAP" ]; then
 		echo "($CAP of $total shown — capped for bundle size, $((total - CAP)) omitted)" >> "$OUT"
 	fi ;;
 esac
