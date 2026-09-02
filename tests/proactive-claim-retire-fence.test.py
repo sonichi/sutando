@@ -179,6 +179,8 @@ def main() -> int:
 
     _retire_rows()
 
+    _guard_refusal_row()
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")
@@ -288,6 +290,42 @@ def _retire_rows() -> None:
         Path.stat = real_stat
     check("a claim that vanishes before the size check is released, not unlinked",
           released)
+
+
+def _guard_refusal_row() -> None:
+    """The POST-claim guard: body turned foreign after the peek, claim released.
+
+    The guard runs twice — a pre-claim peek that just skips, and a post-claim
+    re-check that must RELEASE. Only a body that passes the peek and then turns
+    foreign reaches the second one, which is the producer-rewrites-under-us race
+    this PR is about; a plain foreign body is rejected at the peek and never
+    claimed.
+    """
+    print("slack post-claim body-guard refusal (claim released, not deleted):")
+    bridge = _load_bridge("guardref")
+    results = Path(bridge.RESULTS_DIR)
+    results.mkdir(parents=True, exist_ok=True)
+
+    name = "proactive-turns-foreign"
+    src = results / f"{name}.txt"
+    real_claim = bridge.claim_for_delivery
+
+    def _rewrite_then_claim(path, recipient):
+        # Runs AFTER the peek and BEFORE the post-claim read: exactly the window.
+        if path.name == src.name and path.exists():
+            path.write_text("[channel: 1535008729106485288]\nturned foreign")
+        return real_claim(path, recipient)
+
+    bridge.claim_for_delivery = _rewrite_then_claim
+    threading.Thread(target=bridge.result_watcher, daemon=True).start()
+    src.write_text("benign body that passes the peek")
+
+    released = _settle(lambda: src.exists()
+                       and "turned foreign" in src.read_text()
+                       and not (results / f"{name}.sending").exists())
+    check("a post-claim guard refusal releases the claim, never deletes it",
+          released,
+          "the refused claim was consumed or left in .sending")
 
 
 if __name__ == "__main__":
