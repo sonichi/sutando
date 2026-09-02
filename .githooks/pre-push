@@ -60,7 +60,7 @@ case "$rc" in
        if printf '%s' "$out" | grep -q "review-checks: PARTIAL"; then
            printf '%s\n' "$out" | grep "review-checks:" >&2
            [ "$offtree" = "1" ] && note "pushed ref is not the checked-out tree, so post-image scans skipped"
-           git diff --quiet 2>/dev/null || note "working tree is dirty — post-image scans skip any file in the range that does not match it"
+           git diff --quiet HEAD 2>/dev/null || note "working tree is dirty — post-image scans skip any file in the range that does not match it"
            note "PARTIAL is not PASS — pushing (fail-open), CI is the verdict on what was not scanned"
        fi
        exit 0 ;;
