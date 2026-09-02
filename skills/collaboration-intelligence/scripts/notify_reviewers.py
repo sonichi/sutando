@@ -40,24 +40,82 @@ _PY = sys.executable or "python3"
 sys.path.insert(0, str(_REPO / "src"))
 
 
+_ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
+
+
+def _host_label() -> str:
+    """The canonical per-host slug, from the ONE helper that defines it.
+
+    Re-deriving the precedence here would be a second copy of a policy that
+    already drifted once; a failure to read it is not a licence to guess.
+    """
+    import subprocess
+    out = subprocess.run(["bash", "scripts/sutando-config.sh", "host-label"],
+                         capture_output=True, text=True, cwd=str(_REPO))
+    return out.stdout.strip()
+
+
 def roster_path() -> Path:
+    """The path THIS host writes. Reads union over peers (see roster_paths)."""
     override = os.environ.get("SUTANDO_SCI_ROSTER")
     if override:
         return Path(override)
     from workspace_default import resolve_workspace
-    return (Path(resolve_workspace()) / "data" / "collaboration-intelligence"
-            / "reviewer-stands.json")
+    ws = Path(resolve_workspace())
+    host = _host_label()
+    if host:
+        per_host = ws / "hosts" / host / _ROSTER_LEAF
+        if per_host.is_file() or not (ws / _ROSTER_LEAF).is_file():
+            return per_host
+    return ws / _ROSTER_LEAF          # legacy shared path, until the move lands
+
+
+def roster_paths() -> "list[tuple[str, Path]]":
+    """(host, path) for every roster on disk, LOCAL FIRST.
+
+    An override names one file and means it: globbing past it would let a
+    peer's rows answer a lookup a test pinned to a fixture.
+    """
+    override = os.environ.get("SUTANDO_SCI_ROSTER")
+    if override:
+        # An absent override is a REFUSAL, not an empty union: falling through
+        # to the glob would let host rosters answer a lookup pinned to a fixture.
+        p = Path(override)
+        return [("", p)] if p.is_file() else []
+    from workspace_default import resolve_workspace
+    ws = Path(resolve_workspace())
+    local = roster_path()
+    out = [(_host_label(), local)] if local.is_file() else []
+    for p in sorted((ws / "hosts").glob(f"*/{_ROSTER_LEAF}")):
+        if p != local:
+            out.append((p.parents[2].name, p))
+    legacy = ws / _ROSTER_LEAF
+    if legacy.is_file() and legacy != local:
+        out.append(("", legacy))
+    return out
 
 
 def load_roster() -> dict:
-    p = roster_path()
-    if not p.is_file():
-        raise SystemExit(f"no roster at {p} — seed it from the map before "
+    """Union across hosts. LOCAL WINS a key collision; the peer row is KEPT
+    under `<key>@<host>` rather than dropped — a lost row and a row nobody
+    wrote are indistinguishable afterwards, which is the failure this store
+    is least able to survive."""
+    paths = roster_paths()
+    if not paths:
+        where = os.environ.get("SUTANDO_SCI_ROSTER") or "any host"
+        raise SystemExit(f"no roster at {where} — seed it from the map before "
                          "notifying (never guess Stand identities)")
-    data = json.loads(p.read_text())
-    if not isinstance(data, dict):
-        raise SystemExit(f"roster at {p} is not an object")
-    return data
+    merged: dict = {}
+    for host, p in paths:
+        data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            raise SystemExit(f"roster at {p} is not an object")
+        for key, row in data.items():
+            if key.startswith("_") or key not in merged:
+                merged[key] = row
+            elif merged[key] != row:
+                merged[f"{key}@{host}" if host else key] = row
+    return merged
 
 
 def stated_reason(entry: dict) -> str:

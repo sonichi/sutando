@@ -54,11 +54,21 @@ def load_roster(d):
     `get("john-the-dev")` missed the entry keyed `rui`).
     """
     import json
-    p = d / "reviewer-stands.json"
-    if not p.exists():
+    # Per-host union: this host's file first, then every peer's. A peer may add
+    # a name the local host has never seen; it may never overwrite one it has.
+    paths = [d / "reviewer-stands.json"]
+    ws = d.parent.parent            # <workspace>/data/collaboration-intelligence -> <workspace>
+    paths += sorted(ws.glob("hosts/*/data/collaboration-intelligence/reviewer-stands.json"))
+    merged = {}
+    for q in paths:
+        if not q.exists():
+            continue
+        for k, v in json.loads(q.read_text()).items():
+            merged.setdefault(k, v)
+    if not merged:
         return []
     rows = []
-    for key, r in json.loads(p.read_text()).items():
+    for key, r in merged.items():
         if not isinstance(r, dict):
             continue
         rows.append({
