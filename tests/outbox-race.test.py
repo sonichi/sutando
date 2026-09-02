@@ -56,7 +56,9 @@ if __name__ == "__main__":
     # the 240s file cap fired mid-spawn on a thrashed lane (2026-09-02, x3 PRs).
     INSTRUMENTED = os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1"
     N = max(4, (os.cpu_count() or 2)) if INSTRUMENTED else max(8, (os.cpu_count() or 2) * 3)
-    MIN_ROUNDS, MAX_ROUNDS = 3, (3 if INSTRUMENTED else 12)
+    # MAX one above the floor instrumented, so the budget stays a REACHABLE
+    # backstop there instead of a line that reads like one and cannot run.
+    MIN_ROUNDS, MAX_ROUNDS = 3, (4 if INSTRUMENTED else 12)
     # Bounds round STARTS only: worst case is floor + budget + in-flight
     # round durations — far below 36 unconditional rounds, not a ceiling.
     PHASE_BUDGET_S = float(os.environ.get("OUTBOX_RACE_PHASE_BUDGET_S", "35"))
