@@ -263,7 +263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            let avatarPath = workspace + "/assets/stand-avatar.png"
+            let avatarPath = SutandoConfig.personalAssetPath("stand-avatar.png", workspace: workspace)
             if let image = NSImage(contentsOfFile: avatarPath) {
                 image.size = NSSize(width: 18, height: 18)
                 image.isTemplate = false
@@ -969,7 +969,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Composited onto the top-right corner of the 18×18 avatar so the
     /// menu bar continuously signals mode without taking an extra slot.
     func avatarImage(presenterActive: Bool, meetingActive: Bool = false) -> NSImage? {
-        let avatarPath = workspace + "/assets/stand-avatar.png"
+        let avatarPath = SutandoConfig.personalAssetPath("stand-avatar.png", workspace: workspace)
         guard let base = NSImage(contentsOfFile: avatarPath) else { return nil }
         base.size = NSSize(width: 18, height: 18)
         base.isTemplate = false
@@ -2462,59 +2462,156 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Restart the selected core CLI session (sutando-core tmux session).
-    /// Invokes src/agent/start-cli.sh --restart which kills any existing
-    /// session and starts fresh detached. User can re-attach via
-    /// "Open Core CLI" in the menu (or `tmux -S /tmp/sutando-tmux.sock
-    /// attach -t sutando-core` from a terminal).
-    ///
-    /// **Hazard** (per Mini's #608 review): this MUST be invoked from
-    /// outside the sutando-core CLI session — Sutando.app menu, terminal,
-    /// future health-check emit-task, etc. If a future agent runs this
-    /// from WITHIN the sutando-core session (e.g., processing a "restart
-    /// core" task), --restart will kill its own parent session and
-    /// terminate the agent mid-task. The menu-bar app is safe; agent
-    /// self-invocation is not.
-    ///
-    /// Per Chi 2026-05-05: voice-agent restart explicitly excluded —
-    /// this only restarts the selected core CLI session.
+    /// Restart the core CLI via `graceful-restart.sh`: prep before the kill, and
+    /// `--visible` must be forwarded or the relaunch becomes detached.
+
+    /// Hazard: run from OUTSIDE the sutando-core session — inside it, --restart
+    /// kills its own parent. Selected core CLI only; voice-agent excluded.
+
+    /// Seconds a busy core may hold the quiet gate before we say so out loud.
+    /// Not a timeout — nothing is cancelled when it elapses.
+    private static let busyNudgeAfterS: TimeInterval = 60
+
+    /// Waiter lifecycle. Lives in RestartCoordinator.swift so the click orderings
+    /// are executable in tests; `starting` covers the window before `run()`.
+    private let graceful = RestartCoordinator()
+
     @objc func restartCore() {
-        notify("Sutando", "Restarting Core CLI…")
-        let script = repoRoot + "/src/agent/start-cli.sh"
+        let epoch: Int
+        switch graceful.claimRestart() {
+        case .rejectedPastKill:
+            notify("Sutando", "A restart is already past the kill phase — ignoring this click.")
+            return
+        case .rejectedAlreadyQueued:
+            notify("Sutando", "A restart is already queued — ignoring this click.")
+            return
+        case .accepted(let claimed):
+            epoch = claimed
+        }
+
+        notify("Sutando", "Restarting Core CLI — waiting for a safe moment…")
+        let script = repoRoot + "/src/agent/graceful-restart.sh"
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-        proc.arguments = [script, "--restart", "--visible"]
-        // Capture stderr so we can surface failures via notify rather than
-        // silently swallowing (per Mini's #608 review nit #1). stdout still
-        // discarded — script's success messages aren't useful to the user.
+        // SUTANDO_RESTART_REHEARSE=1 exercises this AppKit path with the kill skipped.
+        // NOT side-effect-free: --dry-run still runs prep, including a real sync.
+        proc.arguments = GracefulRestartInvocation.args(
+            script: script, env: ProcessInfo.processInfo.environment)
+        // stdout is the phase stream, not noise: on a busy core it is the only
+        // sign the click did anything. stderr stays for the failure preview.
+        let outPipe = Pipe()
         let errPipe = Pipe()
-        proc.standardOutput = FileHandle.nullDevice
+        proc.standardOutput = outPipe
         proc.standardError = errPipe
+
+        graceful.track(proc, epoch: epoch)
+
+        // Fires once if the gate is still waiting. Epoch-checked so a superseded
+        // or cancelled waiter never nudges.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.busyNudgeAfterS) { [weak self] in
+            guard let self = self else { return }
+            guard self.graceful.nudgeApplies(epoch: epoch) else { return }
+            self.notify("Sutando", "Core is still busy — restart is queued, not stuck. "
+                                 + "Use Force Restart Core CLI to kill it now.")
+        }
+
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            do {
-                try proc.run()
-            } catch {
-                self?.notify("Sutando", "Core restart failed to start: \(error.localizedDescription)")
+            guard let self = self else { return }
+            switch self.graceful.launch(epoch: epoch, { try proc.run() }) {
+            case .aborted:
+                return                      // cancelled before we ever launched
+            case .failed(let reason):
+                self.notify("Sutando", "Core restart failed to start: \(reason)")
                 return
+            case .launched:
+                break
+            }
+            // The script exec's start-cli.sh, so the stream survives the handoff
+            // and EOF lands only once the relaunch is done.
+            var pending = ""
+            while true {
+                let chunk = outPipe.fileHandleForReading.availableData
+                if chunk.isEmpty { break }
+                pending += String(data: chunk, encoding: .utf8) ?? ""
+                while let nl = pending.firstIndex(of: "\n") {
+                    let line = String(pending[pending.startIndex..<nl])
+                    pending = String(pending[pending.index(after: nl)...])
+                    guard let phase = Self.restartPhaseMessage(for: line) else { continue }
+                    if line.contains("restarting core (") {
+                        self.graceful.enterKilling(epoch: epoch)
+                    }
+                    self.notify("Sutando", phase)
+                }
             }
             proc.waitUntilExit()
-            if proc.terminationStatus == 0 {
-                self?.notify("Sutando", "Core restarted. Attach via Open Core CLI in menu.")
-            } else {
+            let status = proc.terminationStatus
+            self.graceful.finish(epoch: epoch, proc: proc)
+
+            // 143 = cancelled by Force Restart: the TERM trap released the lock
+            // before any kill, so it is intended and stays silent.
+            if let outcome = GracefulRestartInvocation.outcomeMessage(for: status) {
+                self.notify("Sutando", outcome)
+            } else if status != 143 {
                 let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 let errStr = String(data: errData, encoding: .utf8) ?? ""
                 let preview = String(errStr.prefix(200))
-                self?.notify("Sutando", "Core restart failed (exit \(proc.terminationStatus)): \(preview)")
+                self.notify("Sutando", "Core restart failed (exit \(status)): \(preview)")
             }
         }
     }
 
-    /// Force-restart the core CLI: SIGTERM → SIGKILL escalation for a wedged /
-    /// unresponsive core that plain "Restart Core CLI" (graceful) refuses to
-    /// hammer. Separate menu item per sonichi's review — the default restart
-    /// never SIGKILLs a possibly-mid-task core; this one does, explicitly.
-    /// Same detached-bash + stderr-on-failure contract as restartCore.
+    /// Map a script log line to a user-facing phase, or nil. Matches the script's
+    /// own wording, so a reworded log degrades to silence, not a wrong message.
+    static func restartPhaseMessage(for line: String) -> String? {
+        guard line.contains("graceful-restart[") else { return nil }
+        if line.contains("core is DEAD") {
+            return "Core was already dead — restarting now (prep best-effort)."
+        }
+        if line.contains("still busy — waiting") {
+            return nil   // the 60s nudge covers this; every-30s repeats would spam
+        }
+        if line.contains("quiet gate: waiting") {
+            return "Waiting for the core to finish its current task…"
+        }
+        if line.contains("prep") && line.contains("failed") {
+            return "Prep failed — not killing the core."
+        }
+        if line.contains("restarting core (") {
+            return "Safe window reached — restarting the core now."
+        }
+        if line.contains("deferring") {
+            return "Another restart is in progress — deferring."
+        }
+        return nil
+    }
+
+    /// SIGTERM -> SIGKILL escalation for a wedged core. "Restart Core CLI" waits
+    /// for a quiet window and never SIGKILLs; this is the explicit escape hatch.
     @objc func forceRestartCore() {
+        let (claim, queued) = graceful.claimForce()
+        switch claim {
+        case .rejectedPastKill:
+            // Past the kill it has exec'd start-cli.sh; signalling would abort a
+            // relaunch already underway.
+            notify("Sutando", "A graceful restart is already past the kill phase — "
+                            + "not forcing on top of it.")
+            return
+        case .cancelledBeforeLaunch:
+            // It never launched, so there is nothing to signal — the epoch bump
+            // inside claimForce makes its closure return before `run()`.
+            notify("Sutando", "Cancelled the queued restart before it launched — forcing now.")
+        case .cancelledWhileWaiting:
+            if let queued = queued {
+                queued.terminate()
+                // Wait for the TERM trap to release the restart lock; forcing
+                // while it is held makes the replacement defer with exit 4.
+                queued.waitUntilExit()
+            }
+            notify("Sutando", "Cancelled the queued graceful restart — forcing now.")
+        case .nothingToCancel:
+            break
+        }
+
         notify("Sutando", "Force-restarting Core CLI…")
         runCoreAction(script: repoRoot + "/src/agent/start-cli.sh", args: ["--force-restart"],
                       okMessage: "Core force-restarted. Attach via Open Core CLI in menu.",
@@ -2621,7 +2718,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 /// Renders the Clicky-style cursor triangle (soft blue glow, no halo) + label.
 /// Pure view — the flight is driven by AppDelegate. Ported verbatim from
-/// pointer-teacher-tracer/pointer-overlay.swift (proven by the grill POCs).
+/// pointer-teacher-tracer/Sources/pointer-overlay/main.swift (proven by the grill POCs).
 final class PointerOverlayView: NSView {
     static let blue = NSColor(calibratedRed: 0.20, green: 0.62, blue: 1.0, alpha: 1.0)
     // Clicky-faithful pointer. Small cursor-like triangle, NO halo ring (Clicky

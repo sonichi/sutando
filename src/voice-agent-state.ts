@@ -164,7 +164,7 @@ export function createAgentStateProvider(inputs: AgentStateInputs): AgentStatePr
 // Lifecycle snapshot — state/voice-lifecycle.json (amendment A9)
 // ---------------------------------------------------------------------------
 
-/** On-disk lifecycle snapshot schema (A9 + S3). */
+/** On-disk lifecycle snapshot schema (A9 + S3; P7 D7.1 adds inputHealth). */
 export interface VoiceLifecycleSnapshot {
 	at: number;
 	clientAttached: boolean;
@@ -173,6 +173,9 @@ export interface VoiceLifecycleSnapshot {
 	category?: ProtocolFailureCategory;
 	credentialSource?: 'managed' | 'byok';
 	credentialGeneration?: string;
+	/** P7 D7.1 (additive): audio-input health verdict from the engine ledger —
+	 *  P4's evidence ladder consumes `stalled` for its degraded rows. */
+	inputHealth?: 'ok' | 'degraded' | 'stalled' | 'unknown';
 }
 
 export function voiceLifecyclePath(workspace: string): string {
@@ -226,7 +229,12 @@ let _tmpCounter = 0;
 export function publishLifecycleSnapshot(
 	workspace: string,
 	frame: AgentStateV1,
-	opts?: { now?: () => number; onError?: (err: unknown) => void },
+	opts?: {
+		now?: () => number;
+		onError?: (err: unknown) => void;
+		/** P7 D7.1: additive input-health verdict (see VoiceLifecycleSnapshot). */
+		inputHealth?: 'ok' | 'degraded' | 'stalled' | 'unknown';
+	},
 ): void {
 	const target = voiceLifecyclePath(workspace);
 	const snapshot: VoiceLifecycleSnapshot = {
@@ -238,6 +246,7 @@ export function publishLifecycleSnapshot(
 	if (frame.category !== undefined) snapshot.category = frame.category;
 	if (frame.credentialSource !== undefined) snapshot.credentialSource = frame.credentialSource;
 	if (frame.credentialGeneration !== undefined) snapshot.credentialGeneration = frame.credentialGeneration;
+	if (opts?.inputHealth !== undefined) snapshot.inputHealth = opts.inputHealth;
 	const tmp = `${target}-tmp-${process.pid}-${++_tmpCounter}`;
 	try {
 		mkdirSync(dirname(target), { recursive: true });

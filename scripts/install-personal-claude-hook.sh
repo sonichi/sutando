@@ -10,6 +10,14 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
+# shellcheck disable=SC1091
+. "$REPO/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO")"
+if [ -z "$PY" ]; then
+  echo "  ⚠ no runnable python3 — skipping PERSONAL_CLAUDE compact-reinject hook install" >&2
+  exit 0
+fi
+
 # Target the directory the core `claude` process actually launches from — that
 # is where Claude Code reads project-scoped `.claude/settings.json`. Same
 # resolution as install-session-start-hook.sh: SUTANDO_CLAUDE_WORKING_DIR when
@@ -40,7 +48,7 @@ fi
 # review on this PR — the merge never ran and settings.json stayed {"hooks":{}}),
 # while `-` reads the program from stdin portably and matches the hint
 # script's own pattern.
-python3 - "$SETTINGS" "$HOOK_CMD" <<'PYEOF'
+"$PY" - "$SETTINGS" "$HOOK_CMD" <<'PYEOF'
 import json, sys
 
 settings_path = sys.argv[1]

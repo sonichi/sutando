@@ -756,17 +756,21 @@ echo "==== Test 16: SUTANDO_VAULT env var is NO LONGER honored (PR-2 — removed
 # config-file + --vault-url cover both canonical and override cases. Setting
 # the env var alone (no flag, no config, no .env) should NOT resolve vault.
 
+ENV_ONLY_VAULT="$FIXTURE_VAULT-env-var-only"
+# Not $FIXTURE_VAULT: this workspace was --init'd against it, so its `origin`
+# supplies the same URL and a match would not say which source produced it.
+
 out_removed=$(env \
     SUTANDO_REPO_DIR="$FIXTURE_REPO" \
     SUTANDO_WORKSPACE="$FIXTURE_WS" \
     SUTANDO_TEST_MODE=1 \
-    SUTANDO_VAULT="$FIXTURE_VAULT" \
+    SUTANDO_VAULT="$ENV_ONLY_VAULT" \
     bash "$SYNC" --status 2>&1; echo "EXIT=$?")
 
 # Status should still exit 0 (it doesn't require vault to be resolved),
-# but VAULT_URL must NOT match $FIXTURE_VAULT
+# but VAULT_URL must NOT match the env-var-only URL
 case "$out_removed" in
-  *"$FIXTURE_VAULT"*)
+  *"$ENV_ONLY_VAULT"*)
     echo "  FAIL: SUTANDO_VAULT env var was still honored (should be removed)"; fail=$((fail+1)) ;;
   *)
     echo "  OK: SUTANDO_VAULT env var ignored as expected"; pass=$((pass+1)) ;;

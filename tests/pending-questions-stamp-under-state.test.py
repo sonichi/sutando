@@ -66,7 +66,17 @@ class TestWriteNotifyStamp(unittest.TestCase):
         cpq.write_notify_stamp([], now=1700000000)
         ts, key = cpq.LAST_NOTIFY_FILE.read_text().split()
         self.assertEqual(ts, "1700000000")
-        self.assertEqual(key, cpq.questions_key([]), "the key must be the reader's key")
+        self.assertEqual(key, cpq.notify_key([]), "the key must be the reader's key")
+
+    def test_the_stamp_records_the_key_the_cooldown_compares(self):
+        # Empty input cannot catch a writer pointed at the wrong function: pick a
+        # set where notify_key and questions_key provably differ, then assert both.
+        qs = [{"title": t} for t in ("a", "b", "c")]
+        self.assertNotEqual(cpq.notify_key(qs), cpq.questions_key(qs), "precondition")
+        cpq.write_notify_stamp(qs, now=1700000001)
+        _, key = cpq.LAST_NOTIFY_FILE.read_text().split()
+        self.assertEqual(key, cpq.notify_key(qs))
+        self.assertNotEqual(key, cpq.questions_key(qs))
 
     def test_it_is_idempotent_on_an_existing_state_dir(self):
         cpq.write_notify_stamp([], now=1)
@@ -147,7 +157,7 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
 
     def _root_tidy(self, hc):
         """Drives the SHIPPED probe: a local iterdir() copy would re-encode the
-        property under test and would drop WORKSPACE_ROOT_SENTINEL_GLOB."""
+        property under test and would drop WORKSPACE_ROOT_SENTINEL_GLOBS."""
         orig = hc.WORKSPACE_DIR
         hc.WORKSPACE_DIR = self.ws
         try:
@@ -175,7 +185,7 @@ class TestUpgradedWorkspaceIsCleanedUp(unittest.TestCase):
         self.assertIn(".last-pq-notify", result["detail"])
 
     def test_a_migration_sentinel_at_the_root_is_not_flagged(self):
-        """WORKSPACE_ROOT_SENTINEL_GLOB exempts `.*-migrated*`, so a sentinel that
+        """WORKSPACE_ROOT_SENTINEL_GLOBS exempts `.*-migrated*`, so a sentinel that
         production accepts must not be flagged."""
         hc = self._load_hc()
         cpq.write_notify_stamp([], now=1700000000)

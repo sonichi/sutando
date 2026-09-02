@@ -12,6 +12,19 @@
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
+// `command -v` is Node's stand-in for shutil.which(); mirrors record.py so the
+// two halves of one skill cannot drift. Bare-name fallback fails at exec time.
+const FFMPEG = (() => {
+	try {
+		const found = execFileSync('/usr/bin/env', ['sh', '-c', 'command -v ffmpeg'], {
+			encoding: 'utf8',
+		}).trim();
+		return found || 'ffmpeg';
+	} catch {
+		return 'ffmpeg';
+	}
+})();
+
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 const SCREEN_REC_PID = '/tmp/sutando-screen-record.pid';
 
@@ -39,7 +52,7 @@ export function teeAudio(pcmBuf: Buffer): void {
 					// -map 1:v -map 0:a: use video from the recording (input 1) and audio from
 					// the narration tee (input 0). Without -map, ffmpeg defaults to the video's
 					// own audio track which is silent mic ambient — not the Gemini narration.
-					execFileSync('/opt/homebrew/bin/ffmpeg', [
+					execFileSync(FFMPEG, [
 						'-y', '-f', 's16le', '-ar', '24000', '-ac', '1',
 						'-i', audioFile, '-i', videoFile,
 						'-map', '1:v', '-map', '0:a',
@@ -70,7 +83,7 @@ export function cleanup(): void {
 				// -map 1:v -map 0:a: use video from the recording (input 1) and audio from
 				// the narration tee (input 0). Without -map, ffmpeg defaults to the video's
 				// own audio track which is silent mic ambient — not the Gemini narration.
-				execFileSync('/opt/homebrew/bin/ffmpeg', [
+				execFileSync(FFMPEG, [
 					'-y', '-f', 's16le', '-ar', '24000', '-ac', '1',
 					'-i', audioFile, '-i', videoFile,
 					'-map', '1:v', '-map', '0:a',

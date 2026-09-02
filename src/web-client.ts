@@ -17,6 +17,7 @@ import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
 import { OVERLAY_MANAGER_HTML } from './overlay-manager-ui.js';
 import { resolveWorkspace, statusReadPath } from './workspace_default.js';
+import { readBodyCapped } from './http-body-limit.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -99,10 +100,50 @@ const HTML = /* html */ `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sutando Web UI</title>
 <style>
+  /* Surface tokens. The page shipped hardcoded dark; the app that embeds it is
+   * light, so ground/text/line are named here and the dark values move into a
+   * prefers-color-scheme block. Accent hues are unchanged. */
+  :root {
+    --ui-bg: #ffffff;
+    --ui-raised: #f7f7f9;
+    --ui-sunken: #f1f1f4;
+    --ui-line: #e4e4e9;
+    --ui-line-soft: #ededf1;
+    --ui-text: #1f1f25;
+    --ui-text-hi: #101014;
+    --ui-text-2: #5f5f6b;
+    --ui-text-3: #8b8b97;
+    --ui-chip: #eeeef2;
+    --ui-chip-hover: #e3e3e9;
+    --ui-live-bg: #e6f4ec;
+    --ui-live-fg: #1e5128;
+    --ui-accent: #2563eb;
+    --ui-code-bg: #f4f4f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ui-bg: #0a0a12;
+      --ui-raised: #0e0e18;
+      --ui-sunken: #12121e;
+      --ui-line: #1e1e30;
+      --ui-line-soft: #1a1a2e;
+      --ui-text: #c0c0d0;
+      --ui-text-hi: #ffffff;
+      --ui-text-2: #888888;
+      --ui-text-3: #555555;
+      --ui-chip: #2a2a3e;
+      --ui-chip-hover: #3a3a4e;
+      --ui-live-bg: #1a2e24;
+      --ui-live-fg: #4ecca3;
+      --ui-accent: #66aaff;
+      --ui-code-bg: #0a0a12;
+    }
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-user-select: text; user-select: text; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: #0a0a12; color: #c0c0d0;
+    background: var(--ui-bg); color: var(--ui-text);
     display: flex; flex-direction: column; align-items: center;
     min-height: 100vh; padding: 0 0 60px 0;
   }
@@ -110,7 +151,7 @@ const HTML = /* html */ `<!DOCTYPE html>
   .header {
     width: 100%; padding: 16px 20px;
     display: flex; align-items: center; gap: 14px;
-    background: #0e0e18; border-bottom: 1px solid #1a1a2e;
+    background: var(--ui-raised); border-bottom: 1px solid var(--ui-line);
   }
   .header .avatar-wrap {
     position: relative; width: 60px; height: 60px; flex-shrink: 0;
@@ -283,16 +324,16 @@ const HTML = /* html */ `<!DOCTYPE html>
   .hero-svg-wrap { width: 80px; height: 80px; margin-bottom: 16px; display: none; }
 
   .header .info { flex: 1; }
-  .header h1 { color: #fff; font-size: 1.15em; font-weight: 500; }
-  .header .meta { font-size: 16px; color: #888; display: flex; gap: 14px; align-items: center; margin-top: 4px; }
-  .header .meta a { color: #999; text-decoration: none; border-bottom: 1px dotted #555; }
-  .header .meta a:hover { color: #bbb; }
+  .header h1 { color: var(--ui-text-hi); font-size: 1.15em; font-weight: 500; }
+  .header .meta { font-size: 16px; color: var(--ui-text-2); display: flex; gap: 14px; align-items: center; margin-top: 4px; }
+  .header .meta a { color: var(--ui-text-2); text-decoration: none; border-bottom: 1px dotted var(--ui-text-3); }
+  .header .meta a:hover { color: var(--ui-text); }
   .status-pill {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 4px 12px; border-radius: 12px; font-size: 16px; font-weight: 500;
   }
-  .status-pill.voice-on { background: #1a2e24; color: #4ecca3; }
-  .status-pill.voice-off { background: #1a1a2e; color: #666; }
+  .status-pill.voice-on { background: var(--ui-live-bg); color: var(--ui-live-fg); }
+  .status-pill.voice-off { background: var(--ui-chip); color: var(--ui-text-3); }
   .status-pill .dot {
     width: 6px; height: 6px; border-radius: 50%; background: #333;
   }
@@ -311,12 +352,12 @@ const HTML = /* html */ `<!DOCTYPE html>
   .btn-voice:hover { background: #277334; box-shadow: 0 0 16px rgba(78, 204, 163, 0.25); }
   .btn-voice.active { background: #8b1a1a; border-color: #a52222; box-shadow: none; }
   .btn-voice.active:hover { background: #a52222; }
-  .btn-mute { background: #2a2a3e; color: #888; }
-  .btn-mute:hover { background: #3a3a4e; color: #fff; }
+  .btn-mute { background: var(--ui-chip); color: var(--ui-text-2); }
+  .btn-mute:hover { background: var(--ui-chip-hover); color: var(--ui-text-hi); }
   .btn-mute.muted { background: #4a1a1a; color: #e94560; }
   /* Watch (vision streaming) — matches the avatar 'seeing' palette (#fbbf24). */
-  .btn-watch { background: #2a2a3e; color: #888; }
-  .btn-watch:hover { background: #3a3a4e; color: #fff; }
+  .btn-watch { background: var(--ui-chip); color: var(--ui-text-2); }
+  .btn-watch:hover { background: var(--ui-chip-hover); color: var(--ui-text-hi); }
   .btn-watch.watching {
     background: #3a2e10; color: #fbbf24; border: 1px solid #7a5a14;
     box-shadow: 0 0 10px rgba(251, 191, 36, 0.35);
@@ -327,8 +368,8 @@ const HTML = /* html */ `<!DOCTYPE html>
     0%, 100% { box-shadow: 0 0 8px rgba(251, 191, 36, 0.3); }
     50%      { box-shadow: 0 0 16px rgba(251, 191, 36, 0.55); }
   }
-  .btn-subtle { background: transparent; color: #444; font-size: 11px; padding: 5px 8px; }
-  .btn-subtle:hover { color: #888; }
+  .btn-subtle { background: transparent; color: var(--ui-text-3); font-size: 11px; padding: 5px 8px; }
+  .btn-subtle:hover { color: var(--ui-text-2); }
 
   /* Main content */
   .main { width: 100%; max-width: 960px; flex: 1; display: flex; flex-direction: column; padding: 12px 24px 80px; margin: 0 auto; }
@@ -336,14 +377,14 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Conversation */
   #transcript {
     min-height: 80px; max-height: 50vh;
-    background: #0e0e18; border-radius: 12px; padding: 10px 14px;
+    background: var(--ui-raised); border-radius: 12px; padding: 10px 14px;
     overflow-y: auto; font-size: 16px; line-height: 1.6;
     margin-bottom: 6px;
   }
   .t-entry { margin-bottom: 8px; position: relative; user-select: text; }
   .t-entry .copy-btn {
     display: none; position: absolute; right: 0; top: 0;
-    background: #1e1e30; border: 1px solid #2a2a40; color: #666; font-size: 10px;
+    background: var(--ui-chip); border: 1px solid var(--ui-line); color: var(--ui-text-3); font-size: 10px;
     padding: 2px 6px; border-radius: 4px; cursor: pointer;
   }
   .t-entry:hover .copy-btn { display: inline-block; }
@@ -352,15 +393,18 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-user::before { content: 'You: '; font-weight: 600; color: #5a9fd4; }
   .t-assistant { color: #a8d8b0; }
   .t-assistant::before { content: 'Sutando: '; font-weight: 600; color: #6dbe82; }
-  .t-system { color: #888; font-size: 14px; }
+  .t-working { opacity: 0.6; font-style: italic; }
+  @keyframes t-working-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.7; } }
+  .t-working { animation: t-working-pulse 1.4s ease-in-out infinite; }
+  .t-system { color: var(--ui-text-2); font-size: 14px; }
   .t-interim { color: #7fb3e0; opacity: 0.5; font-size: 16px; }
   .t-interim::before { content: 'You: '; font-weight: 600; }
 
   /* Input bar */
   #bottom-panel {
     position: fixed; bottom: 0; left: 0; right: 0; max-width: 960px; margin: 0 auto;
-    background: #12121e; z-index: 10;
-    border-top: 1px solid #1e1e30;
+    background: var(--ui-sunken); z-index: 10;
+    border-top: 1px solid var(--ui-line);
     padding: 8px 16px 12px;
   }
   .input-bar {
@@ -368,17 +412,17 @@ const HTML = /* html */ `<!DOCTYPE html>
   }
   .input-bar input {
     flex: 1; padding: 12px 16px; border-radius: 10px;
-    border: 1px solid #1e1e30; background: #0e0e18; color: #fff; font-size: 16px;
+    border: 1px solid var(--ui-line); background: var(--ui-raised); color: var(--ui-text); font-size: 16px;
     outline: none;
   }
   .input-bar input:focus { border-color: #4ecca3; }
-  .input-bar input::placeholder { color: #444; }
+  .input-bar input::placeholder { color: var(--ui-text-3); }
   .btn-send { background: #1a2e24; color: #4ecca3; border: 1px solid #2a4a36; }
   .btn-send:hover { background: #243e30; }
 
   /* Tasks */
   #tasks {
-    background: #0e0e18; border-radius: 10px; padding: 8px 14px;
+    background: var(--ui-raised); border-radius: 10px; padding: 8px 14px;
     margin-bottom: 10px; font-size: 12px;
   }
   #tasks:empty { display: none; }
@@ -455,10 +499,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Dynamic region */
   #dynamic-region { padding: 26px 16px 8px; width: 100%; box-sizing: border-box; user-select: text; -webkit-user-select: text; }
   #dynamic-region:empty { display: none; }
-  #core-status-bar { font-size: 16px; color: #888; }
+  #core-status-bar { font-size: 16px; color: var(--ui-text-2); }
   #core-status-bar:empty { display: none; }
   #core-status-bar .core-running { color: #4ecca3; }
-  #core-status-bar .core-idle { color: #444; }
+  #core-status-bar .core-idle { color: var(--ui-text-3); }
   /* Presenter-mode badge — only visible when the /presenter same-origin
      endpoint reports active:true. The endpoint reads state/presenter-mode.sentinel
      (written by scripts/presenter-mode.sh). Mirrors the Swift menu-bar HUD's
@@ -512,21 +556,21 @@ const HTML = /* html */ `<!DOCTYPE html>
   #dynamic-region .dr-chips { text-align: center; }
   #dynamic-region .dr-chips .suggestions-label { margin-bottom: 8px; }
   #dynamic-region .dr-chips .suggestion {
-    display: inline-block; background: #1a1a2e; border: 1px solid #2a2a4e;
+    display: inline-block; background: var(--ui-chip); border: 1px solid var(--ui-line);
     border-radius: 16px; padding: 7px 15px; margin: 4px; font-size: 15px;
     color: #8899a6; cursor: pointer; transition: all 0.2s;
   }
-  #dynamic-region .dr-chips .suggestion:hover { background: #2a2a4e; color: #ccc; border-color: #4a4a6e; }
+  #dynamic-region .dr-chips .suggestion:hover { background: var(--ui-chip-hover); color: var(--ui-text); border-color: var(--ui-line); }
   #dynamic-region .dr-media {
-    background: #12121e; border: 1px solid #1e1e30; border-radius: 10px;
+    background: var(--ui-raised); border: 1px solid var(--ui-line); border-radius: 10px;
     padding: 12px 16px; text-align: center;
   }
-  #dynamic-region .dr-media-title { color: #ccc; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
-  #dynamic-region .dr-media-caption { color: #666; font-size: 11px; margin-top: 6px; }
+  #dynamic-region .dr-media-title { color: var(--ui-text); font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  #dynamic-region .dr-media-caption { color: var(--ui-text-3); font-size: 11px; margin-top: 6px; }
   #dynamic-region .dr-document {
-    background: #12121e; border: 1px solid #1e1e30; border-radius: 10px; padding: 12px 16px;
+    background: var(--ui-raised); border: 1px solid var(--ui-line); border-radius: 10px; padding: 12px 16px;
   }
-  #dynamic-region .dr-doc-body { color: #ccc; font-size: 15px; line-height: 1.6; white-space: pre-wrap; }
+  #dynamic-region .dr-doc-body { color: var(--ui-text); font-size: 15px; line-height: 1.6; white-space: pre-wrap; }
 
   /* Section labels */
   .section-label {
@@ -558,10 +602,10 @@ const HTML = /* html */ `<!DOCTYPE html>
   .d-entry.audio { color: #4db6ac; }
   .btn-download {
     display: inline-block; margin-top: 6px; padding: 4px 10px;
-    border-radius: 6px; border: 1px solid #1e1e30; background: #0e0e18;
+    border-radius: 6px; border: 1px solid var(--ui-line); background: var(--ui-raised);
     color: #555; font-size: 11px; cursor: pointer; text-decoration: none;
   }
-  .btn-download:hover { background: #1a1a2e; color: #aaa; }
+  .btn-download:hover { background: var(--ui-chip); color: var(--ui-text); }
 
   /* Hidden URL input */
   #wsUrl { display: none; }
@@ -590,8 +634,8 @@ const HTML = /* html */ `<!DOCTYPE html>
     box-shadow: 0 0 16px rgba(251,191,36,0.55);
     animation: avatar-see 1.2s ease-in-out infinite;
   }
-  .hero h2 { color: #fff; font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
-  .hero .tagline { color: #555; font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
+  .hero h2 { color: var(--ui-text-hi); font-size: 1.3em; font-weight: 500; margin-bottom: 4px; transition: all 0.6s ease; }
+  .hero .tagline { color: var(--ui-text-3); font-size: 13px; margin-bottom: 24px; transition: all 0.6s ease; }
   @keyframes avatar-glow {
     0% { box-shadow: 0 0 0 rgba(78,204,163,0); transform: scale(0.9); opacity: 0; }
     40% { box-shadow: 0 0 40px rgba(78,204,163,0.7); transform: scale(1.05); opacity: 1; }
@@ -616,24 +660,24 @@ const HTML = /* html */ `<!DOCTYPE html>
   /* Capabilities panel — shown on idle, hidden when voice is active */
   .caps-panel {
     max-width: 480px; margin: 0 auto 20px; padding: 12px 18px;
-    border: 1px solid #252540; border-radius: 8px;
-    background: rgba(26,26,60,0.4);
+    border: 1px solid var(--ui-line); border-radius: 8px;
+    background: var(--ui-raised);
   }
   body.voice-active .caps-panel { display: none; }
   .caps-panel .caps-heading {
     font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
-    color: #444; margin-bottom: 8px;
+    color: var(--ui-text-3); margin-bottom: 8px;
   }
   .caps-panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
-  .caps-panel dt { color: #6af; font-size: 12px; white-space: nowrap; padding: 2px 0; }
-  .caps-panel dd { color: #555; font-size: 12px; margin: 0; padding: 2px 0; }
+  .caps-panel dt { color: var(--ui-accent); font-size: 12px; white-space: nowrap; padding: 2px 0; }
+  .caps-panel dd { color: var(--ui-text-3); font-size: 12px; margin: 0; padding: 2px 0; }
   /* Toast notifications */
   .toast-container {
     position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
     z-index: 100; display: flex; flex-direction: column; gap: 6px; align-items: center;
   }
   .toast {
-    background: #1a2e24; border: 1px solid #2a4a36; color: #c0c0d0;
+    background: var(--ui-live-bg); border: 1px solid var(--ui-line); color: var(--ui-text);
     padding: 10px 16px; border-radius: 10px; font-size: 12px;
     box-shadow: 0 4px 16px rgba(0,0,0,0.4);
     animation: toastIn 0.3s ease, toastOut 0.3s ease 3.7s forwards;
@@ -653,15 +697,15 @@ const HTML = /* html */ `<!DOCTYPE html>
   .t-assistant p { margin: 0.4em 0; }
   .t-assistant ul, .t-assistant ol { margin: 0.4em 0; padding-left: 1.6em; }
   .t-assistant li { margin: 0.2em 0; }
-  .t-assistant code { background: #0a0a12; padding: 1px 5px; border-radius: 3px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.88em; color: #f8b878; }
-  .t-assistant pre { background: #0a0a12; padding: 10px 12px; border-radius: 6px; overflow-x: auto; margin: 0.5em 0; border: 1px solid #1e1e2a; }
-  .t-assistant pre code { background: none; padding: 0; color: #d0d0e0; font-size: 0.9em; }
+  .t-assistant code { background: var(--ui-code-bg); padding: 1px 5px; border-radius: 3px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.88em; color: #f8b878; }
+  .t-assistant pre { background: var(--ui-code-bg); padding: 10px 12px; border-radius: 6px; overflow-x: auto; margin: 0.5em 0; border: 1px solid var(--ui-line); }
+  .t-assistant pre code { background: none; padding: 0; color: var(--ui-text); font-size: 0.9em; }
   .t-assistant a { color: #6ea3ff; text-decoration: none; }
   .t-assistant a:hover { text-decoration: underline; }
   .t-assistant strong { color: #f0f0f8; font-weight: 700; }
   .t-assistant table { border-collapse: collapse; margin: 0.4em 0; font-size: 0.95em; }
-  .t-assistant th, .t-assistant td { border: 1px solid #1e1e2a; padding: 4px 8px; }
-  .t-assistant th { background: #14141e; }
+  .t-assistant th, .t-assistant td { border: 1px solid var(--ui-line); padding: 4px 8px; }
+  .t-assistant th { background: var(--ui-sunken); }
   .t-assistant blockquote { border-left: 3px solid #2a4060; padding-left: 10px; margin: 0.4em 0; color: #a0a0b0; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
@@ -893,6 +937,13 @@ function getDefaultWsUrl() {
   return protocol + '//' + hostname + ':' + WS_PORT;
 }
 
+// #bottom-panel is position:fixed and grows to 50vh, so a static body
+// padding-bottom cannot reserve its space — keep the two in sync.
+function syncBottomPad() {
+  const bp = $('bottom-panel');
+  if (bp) document.body.style.paddingBottom = (bp.offsetHeight + 12) + 'px';
+}
+
 // Set default WebSocket URL on page load + init Chrome STT
 // Descriptions are local UI copy keyed by the stable action name; the KEY
 // bindings come from /hotkeys (the app's published config) so they never drift.
@@ -920,6 +971,17 @@ window.addEventListener('DOMContentLoaded', () => {
   initChromeStt();
   // Auto-reconnect voice if it was connected before refresh
   try { if (sessionStorage.getItem('sutando-voice')) { setTimeout(() => toggle(), 500); } } catch {}
+  // Reserve bottom space equal to the fixed panel's height so the chat history
+  // never covers the dashboard (e.g. the Questions panel).
+  try {
+    const bp = $('bottom-panel');
+    if (bp && window.ResizeObserver) { new ResizeObserver(syncBottomPad).observe(bp); }
+    syncBottomPad();
+    window.addEventListener('resize', syncBottomPad);
+  } catch {}
+  // Restore the chat transcript saved before the last reload, then watch for
+  // new entries to persist.
+  try { initTranscriptPersistence(); } catch {}
 });
 
 // ─── Remote toggle via SSE ────────────────────────────────
@@ -1240,6 +1302,83 @@ function persistTaskMap() {
 function persistExpanded() {
   try { localStorage.setItem(PERSIST_KEY_EXPAND, JSON.stringify(Array.from(expandedTasks))); } catch {}
 }
+
+// ─── Transcript persistence ──────────────────────────────
+// A MutationObserver is used so every append path is captured without editing
+// each call site.
+const PERSIST_KEY_TRANSCRIPT = 'sutando-transcript-v1';
+const TRANSCRIPT_MAX_ENTRIES = 50;
+const TRANSCRIPT_MAX_ENTRY_LEN = 20000; // skip oversized entries (e.g. data-URL images) to stay under localStorage quota
+let _transcriptRestoring = false;
+let _snapshotTimer = null;
+function snapshotTranscript() {
+  try {
+    const t = $('transcript');
+    if (!t) return;
+    const kids = Array.from(t.children).slice(-TRANSCRIPT_MAX_ENTRIES);
+    const entries = kids.map(el => {
+      // Drop the injected copy button (its onclick can't survive an innerHTML
+      // round-trip) — a live one is re-added on restore.
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll('.copy-btn').forEach(b => b.remove());
+      return { cls: el.className, html: clone.innerHTML };
+    }).map(e => {
+      if (!e.html) return null;
+      // Oversized entries get a static placeholder, not a silent drop: omitting
+      // the bubble would make the restored transcript lie. Never user content.
+      if (e.html.length >= TRANSCRIPT_MAX_ENTRY_LEN) {
+        return { cls: e.cls, html: '<em class="t-not-persisted">[image/attachment not kept across reloads — too large for local storage]</em>' };
+      }
+      return e;
+    }).filter(Boolean);
+    try {
+      localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries));
+    } catch {
+      // Quota exceeded — keep only the most recent half and retry once.
+      try { localStorage.setItem(PERSIST_KEY_TRANSCRIPT, JSON.stringify(entries.slice(-Math.ceil(entries.length / 2)))); } catch {}
+    }
+  } catch {}
+}
+function scheduleSnapshot() {
+  if (_transcriptRestoring) return;
+  if (_snapshotTimer) clearTimeout(_snapshotTimer);
+  _snapshotTimer = setTimeout(snapshotTranscript, 400);
+}
+function restoreTranscript() {
+  let entries;
+  try { entries = JSON.parse(localStorage.getItem(PERSIST_KEY_TRANSCRIPT) || '[]'); } catch { return; }
+  if (!Array.isArray(entries) || !entries.length) return;
+  _transcriptRestoring = true;
+  const t = $('transcript');
+  // Clear the freshly-rendered default seed so it isn't duplicated by the
+  // seed entry captured in the snapshot.
+  t.innerHTML = '';
+  entries.forEach(e => {
+    const el = document.createElement('div');
+    el.className = e.cls || 't-entry';
+    // Sanitize on restore — stored html may include agent-origin markdown.
+    if (window.DOMPurify) {
+      try { el.innerHTML = window.DOMPurify.sanitize(e.html); } catch { el.textContent = e.html; }
+    } else {
+      el.textContent = e.html;
+    }
+    t.appendChild(el);
+    // Re-attach a live copy button on user/assistant bubbles.
+    if (el.classList.contains('t-assistant') || el.classList.contains('t-user')) addCopyBtn(el);
+  });
+  _transcriptRestoring = false;
+  scrollTranscript(true);
+}
+function initTranscriptPersistence() {
+  restoreTranscript();
+  try {
+    const t = $('transcript');
+    if (t && window.MutationObserver) {
+      new MutationObserver(scheduleSnapshot).observe(t, { childList: true, subtree: true, characterData: true });
+    }
+  } catch {}
+}
+
 const taskMap = window.taskMap = loadPersistedTaskMap();
 let taskWorkstreamNames = Object.create(null);
 
@@ -2259,6 +2398,9 @@ var _visionCanvas = null;            // hidden canvas reused for toBlob
 // Capped to prevent thrashing if recovery genuinely fails.
 var _visionRearmInFlight = false;
 var _visionRearmCount = 0;
+// Latched when the server reports a terminal stop; cleared only by a fresh
+// user-initiated start, so no recovery path can undo that decision.
+var _visionTerminalStop = false;
 var _VISION_REARM_LIMIT = 3;
 
 function applyVisionState(state) {
@@ -2283,7 +2425,13 @@ function applyVisionState(state) {
   // is gone, just tear down our side.
   var ourSideStale = _visionPushActive && (!streaming || state.source !== 'browser');
   if (ourSideStale) {
-    if (_visionStream && _visionStream.active) {
+    // A terminal stop is a decision, not a glitch — re-arming would restart the
+    // capture the server just stopped, and the voice session it fed is gone.
+    if (state.stoppedReason === 'no-client') {
+      console.log('[Vision] server stopped push mode: no voice client — tearing down');
+      _visionTerminalStop = true;
+      teardownPushSession();
+    } else if (_visionStream && _visionStream.active) {
       rearmPushMode();
     } else {
       teardownPushSession();
@@ -2300,6 +2448,9 @@ function applyVisionState(state) {
 // _VISION_REARM_LIMIT consecutive attempts to prevent thrashing if
 // recovery genuinely fails (e.g., voice session is gone).
 function rearmPushMode() {
+  // A terminal stop is a decision. Re-arming would restart the capture the
+  // server just stopped, so it outranks every recovery guard below.
+  if (_visionTerminalStop) return;
   if (_visionRearmInFlight || _visionRearmCount >= _VISION_REARM_LIMIT) return;
   if (!_visionStream || !_visionStream.active) return;
   _visionRearmInFlight = true;
@@ -2347,17 +2498,59 @@ function updateVisionPreviewStats() {
   if (stats) stats.textContent = _visionFrameCount + ' frame' + (_visionFrameCount === 1 ? '' : 's');
 }
 
+// P7 D7.4: this page's main thread also runs the voice capture
+// (ScriptProcessor in the vendored transport) — drawImage + JPEG encode
+// there competes with audio. A tiny Blob-URL worker does the draw + encode
+// in an OffscreenCanvas; the main thread only grabs a cheap ImageBitmap.
+// One frame in flight at a time (latest-frame discipline, no backlog).
+var _visionWorker = null;
+var _visionWorkerBusy = false;
+function ensureVisionWorker() {
+  if (_visionWorker !== null) return _visionWorker;
+  if (typeof OffscreenCanvas === 'undefined' || typeof createImageBitmap === 'undefined' || typeof Worker === 'undefined') {
+    _visionWorker = false; // feature-detected once; falsy → main-thread fallback
+    return _visionWorker;
+  }
+  var src = 'onmessage=async function(e){var d=e.data;try{' +
+    'var c=new OffscreenCanvas(d.w,d.h);var x=c.getContext("2d");' +
+    'x.drawImage(d.bmp,0,0,d.w,d.h);d.bmp.close();' +
+    'var b=await c.convertToBlob({type:"image/jpeg",quality:d.q});' +
+    'postMessage({ok:true,blob:b});}catch(err){postMessage({ok:false});}}';
+  try {
+    _visionWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    _visionWorker.onmessage = function(e) {
+      _visionWorkerBusy = false;
+      if (e.data && e.data.ok && e.data.blob) _postVisionBlob(e.data.blob);
+    };
+    _visionWorker.onerror = function() { _visionWorkerBusy = false; };
+  } catch (e) { _visionWorker = false; }
+  return _visionWorker;
+}
+
 function captureAndSendFrame() {
   var preview = document.getElementById('vision-preview');
   if (!preview || !_visionStream) return;
   // Wait for the video to actually have pixels — readyState >= HAVE_CURRENT_DATA (2)
   if (preview.readyState < 2 || !preview.videoWidth || !preview.videoHeight) return;
+  var worker = ensureVisionWorker();
+  if (worker) {
+    if (_visionWorkerBusy) return; // latest-frame: skip, never queue
+    _visionWorkerBusy = true;
+    createImageBitmap(preview).then(function(bmp) {
+      worker.postMessage({ bmp: bmp, w: VISION_FRAME_WIDTH, h: VISION_FRAME_HEIGHT, q: VISION_FRAME_QUALITY }, [bmp]);
+    }).catch(function() { _visionWorkerBusy = false; });
+    return;
+  }
+  // Fallback (no OffscreenCanvas): the original main-thread canvas path.
   if (!_visionCanvas) _visionCanvas = document.createElement('canvas');
   _visionCanvas.width = VISION_FRAME_WIDTH;
   _visionCanvas.height = VISION_FRAME_HEIGHT;
   var ctx = _visionCanvas.getContext('2d');
   ctx.drawImage(preview, 0, 0, VISION_FRAME_WIDTH, VISION_FRAME_HEIGHT);
-  _visionCanvas.toBlob(function(blob) {
+  _visionCanvas.toBlob(function(blob) { _postVisionBlob(blob); }, 'image/jpeg', VISION_FRAME_QUALITY);
+}
+
+function _postVisionBlob(blob) {
     if (!blob) return;
     // Skip blank frames — getDisplayMedia sometimes paints a black frame
     // for the first tick when the user switches surfaces; uploading a
@@ -2378,7 +2571,16 @@ function captureAndSendFrame() {
         // 409 means the server's pushMode flag is false (voice-agent
         // restart) — try to re-arm without waiting for the 2s state poll.
         if (r.status === 409 && _visionPushActive) {
-          rearmPushMode();
+          // The 2s poll usually loses this race at >=1fps, so read the reason
+          // off the rejection itself rather than waiting for the next poll.
+          r.clone().json().then(function(d) {
+            if (d && d.stoppedReason === 'no-client') {
+              _visionTerminalStop = true;
+              teardownPushSession();
+            } else {
+              rearmPushMode();
+            }
+          }).catch(function() { rearmPushMode(); });
         }
         // Surface the first rejection so the user sees why Sutando doesn't
         // see frames (e.g. push mode not active because voice isn't ready).
@@ -2387,11 +2589,11 @@ function captureAndSendFrame() {
         }
       }
     }).catch(function() { /* network blip — next tick will retry */ });
-  }, 'image/jpeg', VISION_FRAME_QUALITY);
 }
 
 function teardownPushSession() {
   _visionPushActive = false;
+  _visionWorkerBusy = false; // an in-flight encode must not block the next session's first frame
   if (_visionFrameTimer) { clearInterval(_visionFrameTimer); _visionFrameTimer = null; }
   if (_visionStream) {
     try { _visionStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
@@ -2456,6 +2658,7 @@ async function startWatch() {
     pollVisionState();
     return;
   }
+  _visionTerminalStop = false;   // a user-initiated start supersedes it
   _visionPushActive = true;
   _visionFrameCount = 0;
   updateVisionPreviewStats();
@@ -2784,6 +2987,127 @@ window.toggleActivity = toggleActivity;
 window.showNotesInDR = showNotesInDR;
 window.showNoteInDR = showNoteInDR;
 
+// ─── Web-chat send-path persistence ──────────────────────
+// When voice is disconnected, sendText() routes through the task bridge and
+// polls /result for the late reply (core pickup is 10-32s). The poll used to
+// live in an in-page setInterval closure that died on page reload, so a refresh
+// during the wait dropped the reply forever. Persist {task_id, text} to
+// localStorage and resume polling on load so a reload re-attaches and renders
+// the reply. /result/<id> serves from results/archive too, so the reply
+// survives the bridge archiving the file before the resumed poll runs.
+const PERSIST_KEY_CHAT_PENDING = 'sutando-dashboard-chat-pending-v1';
+// Long-running agent tasks (PR creation, research, multi-step analysis) routinely
+// take many minutes. A short poll cap orphaned the reply: the result landed in the
+// Tasks tab but the transcript was stuck on a dead "(No response yet…)" line forever.
+// Keep polling well past the first minute (backing the cadence off once past the
+// fast window), and on the hard ceiling stop the in-page timer but KEEP the
+// persisted entry so a reload re-attaches and still renders the late reply.
+const CHAT_POLL_FAST_MS = 2 * 1000;            // cadence during the fast window
+const CHAT_POLL_SLOW_MS = 15 * 1000;           // cadence after the fast window
+const CHAT_POLL_FAST_WINDOW_MS = 2 * 60 * 1000;// poll every 2s for the first 2 min
+const CHAT_POLL_MAX_MS = 30 * 60 * 1000;       // ceiling for ONE page session's polling
+// Must stay strictly greater than the poll ceiling: an entry kept for a reload
+// to recover is by definition already older than the ceiling that stopped it.
+const CHAT_PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+function loadPendingChatSends() {
+  try {
+    const cutoff = Date.now() - CHAT_PENDING_TTL_MS;
+    return JSON.parse(localStorage.getItem(PERSIST_KEY_CHAT_PENDING) || '[]')
+      .filter(p => p && p.task_id && (p.ts || 0) >= cutoff);
+  } catch { return []; }
+}
+function addPendingChatSend(taskId, text) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    list.push({ task_id: taskId, text, ts: Date.now() });
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function removePendingChatSend(taskId) {
+  try {
+    const list = loadPendingChatSends().filter(p => p.task_id !== taskId);
+    localStorage.setItem(PERSIST_KEY_CHAT_PENDING, JSON.stringify(list));
+  } catch {}
+}
+function renderChatReply(el, resultText) {
+  // Same markdown-or-escaped-text rendering the inline poll used. marked +
+  // DOMPurify both required — marked alone would be unsafe innerHTML on agent
+  // results that originate from external task channels.
+  if (window.marked && window.DOMPurify) {
+    try {
+      el.innerHTML = window.DOMPurify.sanitize(
+        window.marked.parse(resultText, { breaks: true, gfm: true })
+      );
+    } catch (e) {
+      el.textContent = resultText;
+    }
+  } else {
+    el.textContent = resultText;
+  }
+  el.classList.remove('t-working');
+  addCopyBtn(el);
+}
+// Poll the task bridge for a chat reply and render it into placeholderEl when
+// it arrives. Backs the cadence off after the fast window. On completion it
+// clears the persisted entry; on the ceiling it stops this session's timer but
+// KEEPS the entry so a reload re-attaches and still renders the reply (the
+// result is served from results/archive indefinitely).
+// sentAt is display/context only. The ceiling deliberately runs from THIS
+// session's start: measuring it from the original send made a resumed poll
+// exceed it on its first tick and return without ever calling /result.
+function pollChatReply(taskId, placeholderEl, sentAt) {
+  const apiBase = 'http://' + location.hostname + ':7843';
+  const begin = Date.now();
+  let timer = null;
+  const stop = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const schedule = (elapsed) => {
+    const delay = elapsed < CHAT_POLL_FAST_WINDOW_MS ? CHAT_POLL_FAST_MS : CHAT_POLL_SLOW_MS;
+    timer = setTimeout(tick, delay);
+  };
+  const tick = () => {
+    const elapsed = Date.now() - begin;
+    if (elapsed > CHAT_POLL_MAX_MS) {
+      stop();
+      // Keep the persisted entry — a reload resumes the poll and can still
+      // render the reply once the (slow) task finishes.
+      if (placeholderEl && placeholderEl.classList.contains('t-working')) {
+        placeholderEl.textContent = '(Still working — the reply will appear here when it lands, or refresh. It is also in the Tasks tab.)';
+        placeholderEl.classList.remove('t-working');
+      }
+      return;
+    }
+    fetch(apiBase + '/result/' + taskId).then(r => r.json()).then(r => {
+      if (r.status === 'completed') {
+        stop();
+        removePendingChatSend(taskId);
+        renderChatReply(placeholderEl, r.result);
+        scrollTranscript();
+      } else {
+        schedule(elapsed);
+      }
+    }).catch(() => { schedule(elapsed); });
+  };
+  tick();
+}
+// On page load, re-render any in-flight chat sends and resume polling so a
+// reload during the core-pickup wait still surfaces the reply.
+function resumePendingChatSends() {
+  const pending = loadPendingChatSends();
+  if (!pending.length) return;
+  pending.forEach(p => {
+    const ue = document.createElement('div');
+    ue.className = 't-entry t-user';
+    ue.textContent = p.text;
+    $('transcript').appendChild(ue);
+    const placeholder = document.createElement('div');
+    placeholder.className = 't-entry t-assistant t-working';
+    placeholder.textContent = 'working…';
+    $('transcript').appendChild(placeholder);
+    pollChatReply(p.task_id, placeholder, p.ts);
+  });
+  scrollTranscript(true);
+}
+
 // ─── Text input ──────────────────────────────────────────
 function sendText() {
   const input = $('textInput');
@@ -2810,36 +3134,18 @@ function sendText() {
       .then(d => {
         if (d.ok) {
           dbg('Sent text via task bridge: ' + d.task_id, 'event');
-          // Poll for result
-          const poll = setInterval(() => {
-            fetch(apiBase + '/result/' + d.task_id).then(r => r.json()).then(r => {
-              if (r.status === 'completed') {
-                clearInterval(poll);
-                const re = document.createElement('div');
-                re.className = 't-entry t-assistant';
-                // Render markdown if marked.js + DOMPurify both loaded; fall
-                // back to escaped textContent otherwise. Both required — marked
-                // alone would be unsafe innerHTML on agent results that
-                // originate from external task channels.
-                // Before this, headings/lists in long replies (e.g. skill
-                // suggestions) came through as raw "###" / "*" characters.
-                if (window.marked && window.DOMPurify) {
-                  try {
-                    re.innerHTML = window.DOMPurify.sanitize(
-                      window.marked.parse(r.result, { breaks: true, gfm: true })
-                    );
-                  } catch (e) {
-                    re.textContent = r.result;
-                  }
-                } else {
-                  re.textContent = r.result;
-                }
-                addCopyBtn(re);
-                $('transcript').appendChild(re);
-                scrollTranscript();
-              }
-            }).catch(() => {});
-          }, 2000);
+          // Persist the in-flight send so a page reload during the core-pickup
+          // wait re-attaches and renders the reply instead of dropping it.
+          addPendingChatSend(d.task_id, text);
+          // Show a "working…" placeholder immediately so the 10-32s wait reads
+          // as in-progress, not failure. The placeholder is filled in place
+          // when the reply arrives.
+          const placeholder = document.createElement('div');
+          placeholder.className = 't-entry t-assistant t-working';
+          placeholder.textContent = 'working…';
+          $('transcript').appendChild(placeholder);
+          scrollTranscript();
+          pollChatReply(d.task_id, placeholder);
         }
       })
       .catch(() => {
@@ -2850,6 +3156,8 @@ function sendText() {
       });
   }
 }
+
+try { resumePendingChatSends(); } catch {}
 
 // ─── Dynamic region: contextual generative UI ────────────
 // Priority: dynamic-content.json > pending questions > proactive status > chips
@@ -4104,15 +4412,23 @@ const server = createServer((req, res) => {
 		const port = Number(process.env.VISION_CONTROL_PORT) || 7847;
 		const method = req.method === 'POST' ? 'POST' : 'GET';
 		const isFrame = url.pathname === '/vision/frame';
-		const chunks: Buffer[] = [];
-		req.on('data', (c: Buffer) => chunks.push(c));
-		req.on('end', async () => {
+		// This surface binds 0.0.0.0 by default, and every oversized frame it
+		// forwards costs a subprocess downstream — so the body is capped here,
+		// not just at the control server.
+		void readBodyCapped(req).then(async (body) => {
+			if (!body) {
+				res.writeHead(413, { 'Content-Type': 'application/json' });
+				res.end(JSON.stringify({ status: 'failed', error: 'body too large' }));
+				return;
+			}
 			try {
 				const incomingType = (req.headers['content-type'] as string | undefined) || (isFrame ? 'image/jpeg' : 'application/json');
 				const r = await fetch(`http://127.0.0.1:${port}${url.pathname}`, {
 					method,
 					headers: method === 'POST' ? { 'Content-Type': incomingType } : undefined,
-					body: method === 'POST' ? (chunks.length ? Buffer.concat(chunks) : (isFrame ? Buffer.alloc(0) : '{}')) : undefined,
+					// Uint8Array view, not the Buffer itself: fetch's BodyInit does not
+					// accept Buffer under @types/node's generic-backed Buffer type.
+					body: method === 'POST' ? (body.byteLength ? new Uint8Array(body) : (isFrame ? new Uint8Array(0) : '{}')) : undefined,
 				});
 				const text = await r.text();
 				res.writeHead(r.status, { 'Content-Type': 'application/json' });

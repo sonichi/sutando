@@ -91,9 +91,13 @@ class GatewayDedupRecoveryTest(unittest.TestCase):
                 }
 
     def test_holder_that_answered_is_still_honoured(self):
-        """Normal consolidation must not regress: archive, no post, no requeue."""
+        """Honoured consolidation: no re-ask, but the raw [deduped:] body must
+        still POST — only add_result closes the server-side lease, and the
+        server's parse_result suppresses the delivery for the marker."""
         r = self._run("the full answer")
-        self.assertEqual(r["posts"], [], "honoured dedup should deliver nothing")
+        self.assertEqual(len(r["posts"]), 1, "honoured dedup must POST to close the lease")
+        self.assertIn("[deduped:", str(r["posts"][0]["payload"].get("body", "")),
+                      "marker must stay intact so the server suppresses delivery")
         self.assertEqual(r["requeued"], [], "honoured dedup should not re-ask")
         self.assertNotIn(TID, r["inflight"])
 

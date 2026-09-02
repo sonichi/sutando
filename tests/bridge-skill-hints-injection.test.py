@@ -63,19 +63,8 @@ check(
     "slack: SKILL INSTRUCTIONS sentinel present",
     "===SKILL INSTRUCTIONS" in slack_src,
 )
-check(
-    "slack: non-owner tasks do not get skill hints",
-    # guard: access_tier == "owner" AND skill exists
-    re.search(r'access_tier == .owner. and \(', slack_src) is not None,
-)
-# NOTE: the thread-reply embed (PR #1840) — the `[Replying in Slack thread to
-# @root: text]` note built from a conversations_replies fetch — is covered
-# BEHAVIORALLY in tests/slack-bridge-write-task.test.py: it calls _write_task
-# with a threaded event (thread_ts != ts), mocks conversations_replies, and
-# asserts the note is embedded (root user + truncated root text), plus a
-# best-effort path where an API failure is swallowed and the task still writes
-# with no note. The prior source-grep substring/regex checks here were redundant
-# with that and were removed per CR #1840 (source_grep_tests).
+# The owner-only gate and the thread-reply embed are covered behaviourally in
+# tests/slack-bridge-write-task.test.py; a source-grep here pinned only text.
 
 # ---------------------------------------------------------------------------
 # Discord bridge
@@ -135,10 +124,16 @@ check(
     "telegram: audio transcription command uses audio-transcribe skill",
     "audio-transcribe/scripts/transcribe.py" in telegram_src,
 )
+# The body is assembled into `_task_content` so the envelope can stamp it before
+# the write, so the hints must land there, not in write_text()'s argument list.
+_tg_assign = telegram_src.find("_task_content = (")
+_tg_hints_use = telegram_src.find('f"{tg_skill_hints}"')
+_tg_write = telegram_src.find("task_file.write_text(_task_content)")
 check(
-    "telegram: skill hints appended to task_file.write_text",
-    re.search(r'task_file\.write_text\(.*tg_skill_hints', telegram_src, re.DOTALL) is not None,
-    "tg_skill_hints not found inside write_text call",
+    "telegram: skill hints reach the content write_text consumes",
+    -1 not in (_tg_assign, _tg_hints_use, _tg_write)
+    and _tg_assign < _tg_hints_use < _tg_write,
+    "tg_skill_hints must be interpolated into _task_content before write_text(_task_content)",
 )
 check(
     "telegram: SKILL INSTRUCTIONS sentinel present",

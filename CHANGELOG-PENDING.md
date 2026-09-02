@@ -11,12 +11,12 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Added
 
 <!-- feat() PRs go here -->
+- report-feedback: `--auto` mode for agent-initiated bug reports — honors the owner's `state/feedback-prefs.json` toggles (auto-report + send-logs, both default on), dedupes identical titles (24h), and caps volume (5/day).
 
 ## Fixed
 
 <!-- fix() PRs go here -->
-
-- Pending questions listed in the web UI can be answered again. `POST /answer` skipped every free-form section, so answering any question returned "not found or already answered"; question ids are now derived from each section's own content (stable across rewrites of the file, and distinct + non-renumbering when two open questions share a title) instead of the section's position, and archived entries below the `# Resolved` divider are no longer offered as open. ([#2103])
+- report-feedback: read the desktop host's Keychain session (origin-scoped `AG2_CLOUD_TOKEN_*` key) so filing works on Tauri installs, and default the cloud origin to `sutando.ag2.space` (the retired `.ai` host drops the bearer across its redirect).
 
 ## Changed
 

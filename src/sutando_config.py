@@ -57,11 +57,55 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "core_config_dirs",
     "vault",
     "migrate",
+    "env",
+    "health_check",
     "bridges",
     "stand",          # this instance's `Stand:` commit-trailer value
 }
 
+# Blocks every consumer reads with `.get()`. A scalar here is what the schema's
+# `"type": "object"` already forbids; _load_json enforces it at read time.
+_OBJECT_TOP_LEVEL_KEYS = {
+    "core",
+    "workspace",
+    "claude_sutando_config_dir",
+    "vault",
+    "migrate",
+    "env",
+    "health_check",
+    "bridges",
+}
+
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
+
+_DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
+
+
+def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
+    """How ``health-check.py --fix`` handles a configured-but-down channel bridge."""
+    hc = load_config(repo_root).get("health_check") or {}
+    # Alert, not restart: a restart that looks successful but cannot deliver is
+    # worse than a bridge that is visibly down. Restart is an explicit opt-in.
+    configured = str(hc.get("down_bridge_action") or "alert").strip().lower()
+    action = os.environ.get("SUTANDO_DOWN_BRIDGE_ACTION", "").strip().lower() or configured
+    return action if action in _DOWN_BRIDGE_ACTIONS else "alert"
+
+
+def resolve_suppressed_alerts(repo_root: Optional[Path] = None) -> frozenset:
+    """Check names this host has declared inapplicable (`health_check.suppress_alerts`).
+
+    Only a chronic WARN can be listed; the caller refuses to apply this to any
+    other status, so a list can never hide an outage. Fails OPEN (empty) on a
+    missing or malformed value: an unreadable config must alert, never silence.
+    """
+    try:
+        hc = load_config(repo_root).get("health_check") or {}
+        listed = hc.get("suppress_alerts")
+    except Exception:
+        return frozenset()
+    if not isinstance(listed, list):
+        return frozenset()
+    return frozenset(n for n in listed if isinstance(n, str) and n)
 
 
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
@@ -139,6 +183,17 @@ def _load_json(path: Path) -> Dict[str, Any]:
         raise RuntimeError(
             f"sutando config: {path} top-level must be a JSON object, got {type(data).__name__}"
         )
+    for key in sorted(_OBJECT_TOP_LEVEL_KEYS & set(data)):
+        # null is how every consumer already spells "absent" (`or {}`), so
+        # rejecting it would break configs that work on both loaders today.
+        if data[key] is None:
+            continue
+        if not isinstance(data[key], dict):
+            raise RuntimeError(
+                f"sutando config: {path} key {key!r} must be a JSON object, got "
+                f"{type(data[key]).__name__} {data[key]!r}. Did you mean "
+                f'{{"{key}": {{...}}}}?'
+            )
     return _strip_comments(data)
 
 
@@ -192,6 +247,7 @@ _CACHE_REPO_ROOT: Optional[Path] = None
 _LEGACY_ENV_WARN_PRINTED = False
 _DOTENV_DRIFT_WARN_PRINTED = False
 _UNKNOWN_KEYS_WARN_PRINTED = False
+_CONFIG_GET_WARNED: set = set()  # keys for which the env fallback warning was already printed
 _PROGRESS_STREAM_TYPE_WARN_PRINTED = False
 
 
@@ -259,12 +315,13 @@ def _reset_cache_for_tests() -> None:
     Production code never calls this. Importing in tests is intentional —
     keeps the public surface honest.
     """
-    global _CACHE, _CACHE_REPO_ROOT, _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED, _UNKNOWN_KEYS_WARN_PRINTED, _PROGRESS_STREAM_TYPE_WARN_PRINTED
+    global _CACHE, _CACHE_REPO_ROOT, _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED, _UNKNOWN_KEYS_WARN_PRINTED, _CONFIG_GET_WARNED, _PROGRESS_STREAM_TYPE_WARN_PRINTED
     _CACHE = None
     _CACHE_REPO_ROOT = None
     _LEGACY_ENV_WARN_PRINTED = False
     _DOTENV_DRIFT_WARN_PRINTED = False
     _UNKNOWN_KEYS_WARN_PRINTED = False
+    _CONFIG_GET_WARNED = set()
     _PROGRESS_STREAM_TYPE_WARN_PRINTED = False
 
 
@@ -278,8 +335,8 @@ def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     are tolerated (defaults file optional too, in which case caller falls
     through to the hardcoded resolver default — see `resolve_workspace`).
 
-    Raises `RuntimeError` only for parse errors (malformed JSON) or
-    structurally-invalid top-level (non-object).
+    Raises `RuntimeError` for parse errors (malformed JSON), a non-object
+    top-level, or an object-typed block holding a scalar.
     """
     global _CACHE, _CACHE_REPO_ROOT
     if _CACHE is not None and (repo_root is None or repo_root == _CACHE_REPO_ROOT):
@@ -784,6 +841,64 @@ def find_core_config_dir(
         if e.get("type") == type_:
             return e
     return None
+
+
+def config_get(
+    key: str,
+    default: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Optional[str]:
+    """Read a non-secret config value, preferring the config file over the env.
+
+    Resolution order (issue #1724 — "split .env into secrets vs config"):
+      1. `sutando.config.{json,local.json}` → `env.<key>` (deep-merged).
+      2. `os.environ[key]` — legacy fallback for one release; prints a one-time
+         per-key stderr deprecation nag so operators know to migrate.
+      3. `default` — returned as-is if neither source has the key.
+
+    The `env` stanza in config mirrors the flat env-var namespace so migration
+    is mechanical: `config_get("MY_KEY")` in code, `env: {MY_KEY: value}` in
+    `sutando.config.local.json`. Secrets (`DISCORD_BOT_TOKEN` etc.) must stay
+    in `.env` / vault and MUST NOT be moved to the config file.
+
+    `repo_root` is passed through to `load_config()`; only needed in tests.
+    """
+    global _CONFIG_GET_WARNED
+    cfg = load_config(repo_root)
+    env_stanza = cfg.get("env") or {}
+    if key in env_stanza:
+        return str(env_stanza[key])
+    env_val = os.environ.get(key)
+    if env_val is not None:
+        if key not in _CONFIG_GET_WARNED:
+            _CONFIG_GET_WARNED.add(key)
+            print(
+                _color_warn(
+                    f"sutando config: {key!r} is read from os.environ (legacy). "
+                    f"Migrate: add `env: {{\"{key}\": \"<value>\"}}` to "
+                    f"sutando.config.local.json to silence this warning."
+                ),
+                file=sys.stderr,
+            )
+        return env_val
+    return default
+
+
+def config_get_env_first(
+    key: str,
+    default: Optional[str] = None,
+    repo_root: Optional[Path] = None,
+) -> Optional[str]:
+    """`config_get` with the precedence inverted — `os.environ` wins.
+
+    For documented escape hatches and bootstrap values only. An operator sets
+    these on the process to override a broken or stale config, so letting the
+    config file win would disable the very override they reached for.
+    """
+    val = os.environ.get(key)
+    if val is not None:
+        return val
+    return config_get(key, default, repo_root)
 
 
 def detect_env_workspace_in_dotenv(repo_root: Optional[Path] = None) -> Optional[str]:

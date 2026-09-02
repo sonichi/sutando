@@ -24,20 +24,23 @@ bridge needs to agree on:
      token was gone with no copy anywhere — and `vault set`, the obvious
      recovery, could not help because nothing read it.
 
-**The bridges do NOT adopt a precedence from this module — they append one tier.**
-Each bridge keeps its own env/`.env` order and calls `token_from_vault()` only
-after its existing resolution has come up empty. That distinction is deliberate:
+**Adoption is per-channel, decided by whether this module's order IS that
+channel's native order.** The DISCORD consumers (`discord-bridge.py`,
+`discord-read.py`, `read_discord_channel.py`, `dm-result.py`) resolve through
+`resolve_channel_token()` directly: their native precedence was already
+env -> `.env` -> vault, so adopting the shared resolver changes nothing but
+who owns the quoting/emptiness rules (five private parsers had already
+drifted on both). TELEGRAM does not adopt it and must not:
 `telegram-bridge.py:91` documents that its config file must WIN over a stale
 shell env (#416 — `setdefault` once let a prior session's token silently
-override a freshly-rotated one), which is the opposite of the order
-`resolve_channel_token()` uses. Declaring one policy while the bridges follow
-another would make this docstring a lie about the code beside it.
-(Caught by @Sutando-Pro reviewing the claim.)
+override a freshly-rotated one), the opposite of this module's order — it
+keeps its own order and appends `token_from_vault()` as the last tier only.
+Declaring one policy while a bridge follows another would make this docstring
+a lie about the code beside it. (Original distinction caught by @Sutando-Pro.)
 
-`resolve_channel_token()` therefore serves the GATE, not the bridges, and the
-gate asks a question precedence cannot affect: *does a usable token exist at
-all?* If more than one layer holds a value, existence is true regardless of
-which one is preferred.
+`resolve_channel_token()` also serves the GATE, which asks a question
+precedence cannot affect: *does a usable token exist at all?* If more than
+one layer holds a value, existence is true regardless of which is preferred.
 
 The value is never printed, logged, or returned in an error message.
 """

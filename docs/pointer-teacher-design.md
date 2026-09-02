@@ -48,7 +48,7 @@ The tracer (`pointer-teacher-tracer/`) proved the whole embodied loop. It is now
 | Tracer slice | Production home | Status |
 |---|---|---|
 | `resolver.py` (capture → `gemini-3-flash-preview` native format, thinking off) | **`point_at` inline tool** — `src/browser-tools.ts` | ✅ done |
-| `pointer-overlay.swift` (screenSaver click-through window + bezier flight) | **`PointerOverlayView` + `setupPointerOverlay/flyPointer/holdPointer`** — `src/Sutando/main.swift` | ✅ done |
+| `Sources/pointer-overlay/main.swift` (screenSaver click-through window + bezier flight) | **`PointerOverlayView` + `setupPointerOverlay/flyPointer/holdPointer`** — `src/Sutando/main.swift` | ✅ done |
 | `/tmp/pointer-cmd.json` file poll | **`<workspace>/state/pointer-cmd.json`**, watched with the app's existing `DispatchSource` dir-watch idiom (same as `watchResults()`) — resolves open item #4 | ✅ done |
 | `say` via `say(1)` | Voice agent narrates — `point_at` returns `say` + an instruction forcing Gemini to speak it | ✅ done |
 | Standalone binary launched from agent shell (could not reach the GUI session) | Runs inside `Sutando.app`'s real menubar GUI session — **this is the fix for the "I didn't see any pointer" visibility problem** | ✅ done |

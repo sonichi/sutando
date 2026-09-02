@@ -22,6 +22,8 @@ and succeeds is the failure mode this exists to prevent.
 from __future__ import annotations
 
 import argparse
+import os
+import json
 import re
 import subprocess
 import sys
@@ -87,13 +89,120 @@ def count_check_patterns(checks_section: str) -> "tuple[int, int]":
     return counts["flag"], counts["allow"]
 
 
-def render(guide: Path, pr: str | None) -> str:
+def resolve_repo(explicit: "str | None" = None, env: "dict | None" = None) -> str:
+    """`--repo` > $SUTANDO_REVIEW_REPO > gh's `{owner}/{repo}` remote inference.
+
+    Remote inference is LAST, not only: an app-pinned install has no `.git`, so
+    `{owner}/{repo}` cannot resolve and the prior-art check silently degrades on
+    every run. A hardcoded repo would fix that host and break every fork.
+    """
+    if explicit:
+        return explicit
+    environ = os.environ if env is None else env
+    return environ.get("SUTANDO_REVIEW_REPO") or "{owner}/{repo}"
+
+
+DECISIVE = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def prior_art(pr: str, runner=None,
+              repo: "str | None" = None) -> "tuple[list[str], list[str]] | None":
+    """(prose to read, decisive verdicts) already on the PR, oldest first.
+
+    None means COULD NOT CHECK, which is not the same as "nothing there" — a
+    reviewer told nothing and a reviewer told the check failed behave
+    differently, so the two must never render alike.
+
+    The second list is latest-state-per-login and is NOT subject to the
+    display cap, so a verdict cannot be lost to prose or to truncation.
+    """
+    run = runner or (lambda a: subprocess.run(a, capture_output=True,
+                                              text=True, timeout=20))
+    out: "list[str]" = []
+    latest: "dict[str, tuple[str, str]]" = {}
+    for kind, path, when, verdict in (
+            ("review", f"pulls/{pr}/reviews", "submitted_at", "state"),
+            ("comment", f"issues/{pr}/comments", "created_at", None)):
+        try:
+            r = run(["gh", "api", f"repos/{resolve_repo(repo)}/" + path, "--paginate"])
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        try:
+            rows = json.loads(r.stdout) if r.stdout.strip() else []
+        except ValueError:
+            return None
+        for row in rows:
+            state = row.get(verdict) if verdict else None
+            who = (row.get("user") or {}).get("login", "?")
+            ts = row.get(when, "?")
+            # An empty body is not an empty verdict, and the newest verdict
+            # wins by timestamp — arrival order is the endpoint's, not ours.
+            if (state or "").upper() in DECISIVE and ts >= latest.get(who, ("",))[0]:
+                latest[who] = (ts, state.upper())
+            if not (row.get("body") or "").strip():
+                continue
+            label = kind if not state else f"{kind}, {state}"
+            out.append(f"{ts}  {who} ({label})")
+    return sorted(out), sorted(
+        f"{ts}  {who}: {state}" for who, (ts, state) in latest.items())
+
+
+PRIOR_ART_SHOWN = 8
+
+
+def verdict_block(verdicts: "list[str] | None") -> "list[str]":
+    """Every login's current decisive state, uncapped and prose-independent.
+
+    Separate from the prose list because the two answer different questions:
+    what must I read, versus where does this PR actually stand.
+    """
+    if verdicts is None:
+        return ["DECISIVE STATE: *** COULD NOT CHECK *** — treat as unknown, not clean."]
+    if not verdicts:
+        return ["DECISIVE STATE: none — no APPROVED or CHANGES_REQUESTED on record."]
+    return (["DECISIVE STATE (latest per login; a bare verdict carries no prose to read):"]
+            + [f"  {v}" for v in verdicts])
+
+
+def prior_art_block(pr: str, seen: "list[str] | None",
+                    repo: "str | None" = None) -> "list[str]":
+    """Render prior art so "nothing there" can never read as "unchecked"."""
+    if seen is None:
+        # An unexpanded placeholder is the one COULD-NOT-CHECK with a fix the
+        # reader can apply, so it must not read as generic gh flakiness.
+        if (repo or resolve_repo()) == "{owner}/{repo}":
+            return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — no repo context.",
+                    "This install has no .git, so gh cannot expand {owner}/{repo}. Re-run",
+                    "with --repo owner/name or set $SUTANDO_REVIEW_REPO; until then this",
+                    "check is inert and every duplicate review passes it."]
+        return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — gh is unavailable or",
+                "the call failed. Read the thread yourself: an unchecked thread is not an",
+                "empty one."]
+    if not seen:
+        return ["ALREADY ON THIS THREAD: nothing to read — no prose on the thread yet."]
+    # Name the truncation: a bare count above a short list reads as the count
+    # being wrong, not the list being cut.
+    head = (f"ALREADY ON THIS THREAD — showing last {PRIOR_ART_SHOWN} of {len(seen)};"
+            " read these before writing yours." if len(seen) > PRIOR_ART_SHOWN
+            else f"ALREADY ON THIS THREAD ({len(seen)}) — read these before writing yours.")
+    return ([head,
+             "Findings hide in BOTH endpoints: an issue comment is not in the review",
+             "list, and a COMMENTED review's body is not in the comments list:"]
+            + [f"  {line}" for line in seen[-PRIOR_ART_SHOWN:]])
+
+
+def render(guide: Path, pr: str | None, repo: "str | None" = None) -> str:
     text = guide.read_text(encoding="utf-8", errors="replace")
     lessons = extract_section(text, LESSONS_HEADING)
     checks = extract_section(text, CHECKS_HEADING)
     out = [f"review-preflight: criteria from {guide}", ""]
     if pr:
         out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
+        got = prior_art(pr, repo=repo)
+        seen, verdicts = (None, None) if got is None else got
+        out += verdict_block(verdicts) + prior_art_block(pr, seen, repo=repo) + [""]
     out.append(lessons if lessons else
                "WARNING: no '## Lessons' section found — the guide's criteria could not be read.")
     n_flag, n_allow = count_check_patterns(checks)
@@ -101,7 +210,8 @@ def render(guide: Path, pr: str | None) -> str:
             f"Machine-readable checks: {n_flag} flag pattern(s), {n_allow} allow pattern(s).",
             "CI runs these; it does NOT scan an arbitrary PR diff for you. To scan one:",
             "    gh pr diff <PR> > /tmp/pr.diff && bash scripts/review-checks.sh --diff /tmp/pr.diff",
-            "Note: with no --diff it compares the WORKING TREE and reports 'empty diff'."]
+            "Note: with no --diff the runner reads the diff from STDIN — and with",
+            "nothing piped it exits 2, because an unscanned diff is not a pass."]
     return "\n".join(out)
 
 
@@ -109,6 +219,8 @@ def main(argv: "list[str] | None" = None) -> int:
     ap = argparse.ArgumentParser(description="Print review criteria before reviewing a PR.")
     ap.add_argument("pr", nargs="?", help="PR number, for the header line only")
     ap.add_argument("--guide", help="path to the review guide (default <repo>/REVIEW.md)")
+    ap.add_argument("--repo", help="owner/name for the prior-art lookup; "
+                    "defaults to $SUTANDO_REVIEW_REPO, then the git remote")
     args = ap.parse_args(argv)
 
     guide = resolve_guide(args.guide)
@@ -116,7 +228,7 @@ def main(argv: "list[str] | None" = None) -> int:
         print(f"review-preflight: guide not found at {guide}", file=sys.stderr)
         return 1
     try:
-        print(render(guide, args.pr))
+        print(render(guide, args.pr, args.repo))
     except OSError as exc:
         print(f"review-preflight: cannot read {guide}: {exc}", file=sys.stderr)
         return 1

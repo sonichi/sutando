@@ -47,7 +47,10 @@ def _load(env: dict, name: str):
 class TestChannelDir(unittest.TestCase):
     def test_default_is_ag2space(self):
         with tempfile.TemporaryDirectory() as cfg, _load(
-            {"CLAUDE_CONFIG_DIR": cfg, "REMOTE_TASK_TOKEN": "https://gw|s"},
+            # AG2_DEVICE_ENV outranks CLAUDE_CONFIG_DIR in _ag2space_access_path,
+            # so leaving it ambient points this at the operator's real install.
+            {"CLAUDE_CONFIG_DIR": cfg, "REMOTE_TASK_TOKEN": "https://gw|s",
+             "AG2_DEVICE_ENV": ""},
             "rgb_chandir_default",
         ) as mod:
             self.assertEqual(mod.CHANNEL_DIR, "ag2space")

@@ -23,6 +23,8 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from task_archive import find_task_file  # noqa: E402
+from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 
@@ -247,17 +249,16 @@ def _task_body(
             f" When the pass is complete, write [no-send] to {result_path} "
             "so the scheduler records completion without messaging the owner."
         )
-    body = (
-        f"id: {task_id}\n"
-        f"timestamp: {iso(now)}\n"
-        "source: cron\n"
-        "interaction_type: system_event\n"
-        "access_tier: owner\n"
-        "priority: low\n"
-        f"schedule_name: {job['name']}\n"
-        f"schedule_slot: {iso(slot)}\n"
-        f"task: {prompt}\n"
-    )
+    body = serialize_task_last(
+        [("id", task_id),
+         ("timestamp", iso(now)),
+         ("source", "cron"),
+         ("interaction_type", "system_event"),
+         ("access_tier", "owner"),
+         ("priority", "low"),
+         ("schedule_name", job["name"]),
+         ("schedule_slot", iso(slot))],
+        prompt)
     return task_id, body
 
 
@@ -296,13 +297,13 @@ def _find_result(workspace: Path, task_ids: list[str]) -> Path | None:
 
 
 def _task_is_active(workspace: Path, task_ids: list[str]) -> bool:
+    # find_task_file owns the live-name grammar: the lead also renames to
+    # .assigned-<inst>, which a .claimed-only check reads as gone.
     tasks = workspace / "tasks"
     for task_id in task_ids:
-        if (tasks / f"{task_id}.txt").exists():
+        if find_task_file(tasks, task_id) is not None:
             return True
         if (tasks / "processed" / f"{task_id}.txt").exists():
-            return True
-        if next(tasks.glob(f"{task_id}.claimed-core-*.txt"), None) is not None:
             return True
     return False
 

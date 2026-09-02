@@ -212,6 +212,19 @@ def case_i_small_fresh_queue() -> list[str]:
     return fails
 
 
+def case_j0_one_task_stuck_long() -> list[str]:
+    """A SINGLE task stuck far past the age threshold must warn. The count and
+    age conditions were ANDed, so 1-3 aged tasks were unreachable and green."""
+    fails = []
+    def setup(d):
+        write_task(d, "task-stuck.txt", age_sec=3600)
+    r = with_tasks_override(setup)
+    if r["status"] != "warn":
+        fails.append(
+            f"j0) 1 task aged 3600s should warn, got {r['status']} ({r['detail']})")
+    return fails
+
+
 def case_j_large_fresh_queue() -> list[str]:
     fails = []
     # Many tasks but all fresh — count alone shouldn't alarm.
@@ -226,8 +239,8 @@ def case_j_large_fresh_queue() -> list[str]:
 
 def case_k_small_old_queue() -> list[str]:
     fails = []
-    # Small queue but old — age alone shouldn't alarm. The user might have
-    # 1-2 long-tail tasks that take a while; not stuck.
+    # Age alone shouldn't alarm BELOW the bar: 600s is under stuck_age_sec
+    # (900), which is what separates this from j0 where age alone must warn.
     def setup(d):
         for i in range(2):
             write_task(d, f"task-{i}.txt", age_sec=600)
@@ -502,6 +515,7 @@ def main() -> int:
         ("i", case_i_small_fresh_queue),
         ("j", case_j_large_fresh_queue),
         ("k", case_k_small_old_queue),
+        ("j0", case_j0_one_task_stuck_long),
         ("l", case_l_pileup),
         ("m", case_m_archive_excluded),
         ("m2", case_m2_completed_tasks_excluded),

@@ -21,6 +21,14 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = (REPO / "src" / "telegram-bridge.py").read_text()
 
 
+def _claim_pos(src: str, start: int) -> int:
+    """First claim site after `start` — inline `.rename(claim)` or the delegated
+    `claim_for_delivery(`. Both are the moment the file leaves the `*.txt` glob."""
+    hits = [p for p in (src.find(".rename(claim)", start),
+                        src.find("claim_for_delivery(", start)) if p > 0]
+    return min(hits) if hits else -1
+
+
 class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
 
     def test_re_imported_at_module_level(self):
@@ -46,15 +54,32 @@ class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
             "telegram-bridge.py must contain a [channel:] guard — see #1401",
         )
 
-    def test_snowflake_pattern_present(self):
-        """The guard must use a Discord snowflake pattern (17-20 digits) to avoid
-        false-positives on Slack channel IDs (which use letter prefixes like C, D, G).
+    def test_guard_delegates_to_the_shared_classifier(self):
+        """The distinction this test is about — a Discord id is not a Slack id —
+        now lives in proactive_routing rather than as a literal here.
+
+        `\\d{17,20}` recognised Discord and NOTHING else, so a Matrix room id read
+        as unaddressed and the file was claimable by this bridge. The literal
+        pinned an implementation; the delegate plus its behaviour pins the point.
         """
         self.assertIn(
-            r"\d{17,20}",
-            SRC,
-            r"telegram-bridge.py must include snowflake regex \d{17,20} in the [channel:] guard",
-        )
+            'body_claimable_by(peek, "telegram")', SRC,
+            "the peek must delegate to proactive_routing, not spell its own grammar")
+        self.assertNotRegex(
+            SRC, r"\\d\{17,20\}",
+            "no private copy of the id grammar may survive in this adapter")
+
+        sys.path.insert(0, str(REPO / "src"))
+        from proactive_routing import body_claimable_by
+
+        self.assertFalse(body_claimable_by("[channel: 1530802402603700415]\nx", "telegram"),
+                         "a Discord snowflake belongs to discord-bridge")
+        self.assertFalse(body_claimable_by("[channel: C0123ABCD]\nx", "telegram"),
+                         "a Slack channel id belongs to slack-bridge")
+        self.assertFalse(body_claimable_by("[channel: !Room:ag2.space]\nx", "telegram"),
+                         "and a Matrix room to the gateway — the case the literal missed")
+        self.assertTrue(body_claimable_by("an ordinary proactive body", "telegram"),
+                        "an unaddressed body is still this bridge's to claim")
 
     def test_peek_occurs_before_rename(self):
         """The peek (read_text) must appear before the rename call in the
@@ -69,7 +94,7 @@ class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
         peek_pos = SRC.find("peek", proactive_block_start)
         self.assertGreater(peek_pos, 0, "peek variable not found after PROACTIVE_PREFIXES block")
 
-        rename_pos = SRC.find(".rename(claim)", proactive_block_start)
+        rename_pos = _claim_pos(SRC, proactive_block_start)
         self.assertGreater(rename_pos, 0, "rename(claim) not found after PROACTIVE_PREFIXES block")
 
         self.assertLess(
@@ -82,9 +107,12 @@ class TestTelegramBridgeChannelRedirectGuard(unittest.TestCase):
         proactive_block_start = SRC.find("PROACTIVE_PREFIXES")
         self.assertGreater(proactive_block_start, 0)
 
-        # The guard should appear before rename(claim) in source order
-        guard_continue_pos = SRC.find("continue", SRC.find("[channel:", proactive_block_start))
-        rename_pos = SRC.find(".rename(claim)", proactive_block_start)
+        # Anchor on the gate CALL, not on the string "[channel:" — that literal
+        # appears elsewhere in a 3k-line file and silently moved this assertion.
+        gate_pos = SRC.find('body_claimable_by(peek, "telegram")', proactive_block_start)
+        self.assertGreater(gate_pos, 0, "delegated peek gate not found in the proactive block")
+        guard_continue_pos = SRC.find("continue", gate_pos)
+        rename_pos = _claim_pos(SRC, proactive_block_start)
         self.assertGreater(guard_continue_pos, 0, "continue not found in guard block")
         self.assertLess(
             guard_continue_pos, rename_pos,

@@ -2,11 +2,16 @@
 """Screen recording via ffmpeg (avfoundation). Stores PID in a file for stop/status."""
 
 import subprocess
+import shutil
 import signal
 import sys
 import os
 import time
 import json
+
+# Resolved locally, not imported from src/: this skill is stdlib-only and must
+# run against any checkout. Bare-name fallback fails loudly at exec time.
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 PID_FILE = "/tmp/sutando-screen-record.pid"
 INDICATOR_PID_FILE = "/tmp/sutando-rec-indicator.pid"
@@ -56,7 +61,7 @@ def _list_audio_devices():
     Returns [] if no devices or ffmpeg fails."""
     try:
         result = subprocess.run(
-            ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            [FFMPEG, "-f", "avfoundation", "-list_devices", "true", "-i", ""],
             capture_output=True, text=True, timeout=5,
         )
         out = result.stderr
@@ -149,7 +154,7 @@ def start():
     log_path = path + ".ffmpeg.log"
     log_fh = open(log_path, "w")
     proc = subprocess.Popen(
-        ["/opt/homebrew/bin/ffmpeg", "-f", "avfoundation",
+        [FFMPEG, "-f", "avfoundation",
          "-i", input_spec,
          "-r", "15", "-pix_fmt", "yuv420p", "-y", path],
         stdin=subprocess.DEVNULL,
@@ -201,7 +206,7 @@ def stop():
     if exists and size > 1024:  # skip vanishingly-small files
         try:
             r = subprocess.run(
-                ["/opt/homebrew/bin/ffmpeg", "-i", path, "-af", "volumedetect", "-vn", "-f", "null", "/dev/null"],
+                [FFMPEG, "-i", path, "-af", "volumedetect", "-vn", "-f", "null", "/dev/null"],
                 capture_output=True, text=True, timeout=10,
             )
             mean_db = None

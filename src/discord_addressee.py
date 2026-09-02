@@ -26,6 +26,15 @@ resolves the concrete discord objects into these primitives and gates on
 from __future__ import annotations
 
 
+def reference_is_reply(has_reference: bool, reference_type_name) -> bool:
+    """Forwards carry `reference` too, matched by enum NAME so renumbering is safe;
+    a missing type is a reply, the pre-forward default."""
+    if not has_reference:
+        return False
+    name = getattr(reference_type_name, "name", reference_type_name)
+    return name != "forward"
+
+
 def is_addressed_in_shared_channel(
     *,
     author_is_bot: bool,

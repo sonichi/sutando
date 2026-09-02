@@ -233,14 +233,14 @@ case "$cmd" in
         echo "  config:  $CLAUDE_CFG"
         mkdir -p "$HOME/Library/LaunchAgents"
         mkdir -p "$WORKSPACE/logs"
-        # Render the template. Use a delimiter unlikely to appear in paths.
-        sed \
-            -e "s|__REPO__|$REPO|g" \
-            -e "s|__WORKSPACE__|$WORKSPACE|g" \
-            -e "s|__PYTHON__|$PYTHON_BIN|g" \
-            -e "s|__HOMEBREW_BIN__|$BREW_BIN|g" \
-            -e "s|__CLAUDE_CONFIG_DIR__|$CLAUDE_CFG|g" \
-            "$TEMPLATE" > "$DEST"
+        # Shared renderer: literal substitution + XML escaping + a parse
+        # check, so a path with & < > | cannot install a silently-broken job.
+        "$PYTHON_BIN" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$DEST" \
+            "REPO=$REPO" \
+            "WORKSPACE=$WORKSPACE" \
+            "PYTHON=$PYTHON_BIN" \
+            "HOMEBREW_BIN=$BREW_BIN" \
+            "CLAUDE_CONFIG_DIR=$CLAUDE_CFG" || exit 1
         bootout_if_loaded
         launchctl bootstrap "$DOMAIN" "$DEST"
         echo "  Loaded via $SERVICE"

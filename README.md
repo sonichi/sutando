@@ -106,8 +106,13 @@ state.
                                 (spoken via voice/phone,
                                  text via Telegram/Discord)
 
-    ↻ = a cron job fires the `/proactive-loop` skill every 15 minutes
-        (`*/15 * * * *` in the per-host `crons.json`). The skill
+    ↻ = a cron job normally fires the `/proactive-loop` skill every 15 minutes
+        (`*/15 * * * *` in the per-host `crons.json`). On Claude, Sutando
+        automatically backs that loop off to every 30 minutes when 7-day
+        quota utilization reaches 80%, then restores the configured cadence
+        after an authoritative, routed quota reading drops below the threshold.
+        Missing, stale, rejected, or unrouted telemetry holds the safer 30-minute
+        cadence and reports the reason instead of silently restoring a fast loop. The skill
         runs as a 10-minute pass that keeps a persistent watcher on
         `tasks/` via Claude Code's `Monitor` tool — pending tasks are
         processed the moment they arrive, not just on the cron tick.
@@ -162,11 +167,37 @@ cd sutando
 cp .env.example .env
 # Add GEMINI_API_KEY only if you want voice
 
-# Start everything
-bash src/startup.sh
+# Start everything — core, menu-bar app, and the dashboard in your browser
+./start.sh
 ```
 
-This starts the headless core services (voice agent, phone conversation server, web client, dashboard, and API). Open http://localhost:8080 when you want the browser UI; startup never opens a browser or launches a macOS app for you. The autonomous loop starts automatically.
+That is the whole first run. `start.sh` is a thin front door: it delegates to `src/startup.sh --with-app` and opens the dashboard once it answers. Extra arguments pass straight through (`./start.sh --runtime codex`). Set `SUTANDO_OPEN_DASHBOARD=0` to skip the browser, or `SUTANDO_DASHBOARD_URL` to point it elsewhere. If the dashboard never comes up the core still starts — the browser open is backgrounded and can never gate it.
+
+`src/startup.sh` remains the supported lower-level entry, and is what you want when there is no desktop to open things on:
+
+```bash
+# Headless core only — no app, no browser
+bash src/startup.sh
+
+# Core plus the macOS menu-bar app, still no browser
+bash src/startup.sh --with-app
+```
+
+Either path starts the core services (voice agent, phone conversation server, web client, dashboard, and API) and the autonomous loop. The browser UI is at http://localhost:8080 and the dashboard at http://localhost:7844; `src/startup.sh` never opens a browser for you.
+
+**The macOS menu-bar app is opt-in and separate.** Plain `bash src/startup.sh` never touches it, so the core stays headless. `--with-app` builds, signs, and **launches** the bundle; a failure there is reported and never stops the core.
+
+**Auto-start at login is a further, explicit opt-in.** Neither `./start.sh` nor `--with-app` installs a launchd job — running the app and having macOS resurrect it forever are different decisions. When you do want it, run the installer from the checkout you actually use: it records that path in the LaunchAgent, so installing from a temporary worktree leaves you with a login job pointing at a directory that will be deleted.
+
+To manage the app on its own — build only, launch once, or supervise — use its installer directly:
+
+```bash
+bash scripts/install-menu-bar-app.sh              # build + sign, print next steps
+bash scripts/install-menu-bar-app.sh --launch     # …and open it now
+bash scripts/install-menu-bar-app.sh --supervise  # …and auto-start it at login
+```
+
+First run needs Accessibility granted in System Settings → Privacy & Security. Run the installer from the checkout you actually use: it records that path in the launchd job, so running it from a temporary worktree pins the app to a directory that will be deleted.
 
 > **Why Sutando runs with elevated permissions.** Autonomous voice-driven work means `startup.sh` launches the selected core CLI with unattended approvals and full local access — permission prompts would otherwise break the voice-in / answer-out flow. In exchange:
 >
@@ -325,7 +356,7 @@ On first run:
 1. Grant **Accessibility** permission to the Sutando app in System Settings → Privacy & Security
 2. Enable **Allow JavaScript from Apple Events** in Chrome: View → Developer → Allow JavaScript from Apple Events (required for the **Toggle Voice** hotkey — default ⌃V, see [Keyboard shortcuts](#keyboard-shortcuts))
 
-To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sutando main.swift SutandoConfig.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation`, then run `./Sutando`. The app and its accessibility helper are not core boot dependencies.
+To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sutando main.swift SutandoConfig.swift RestartCoordinator.swift -framework Cocoa -framework Carbon -framework ApplicationServices -framework AVFoundation`, then run `./Sutando`. The app and its accessibility helper are not core boot dependencies.
 
 ---
 
@@ -339,7 +370,13 @@ To opt in, compile and launch it separately: `cd src/Sutando && swiftc -O -o Sut
 - Learns from your corrections and adapts over time
 - Notifies you on Discord and voice when it completes autonomous work
 
-It consumes API quota proportional to how much work it finds to do.
+It consumes API quota proportional to how much work it finds to do. The Claude
+core protects weekly headroom by changing the autonomous loop to a 30-minute
+cadence at 80% 7-day utilization and restoring the configured cadence after the
+quota window resets and an authoritative routed reading confirms recovery. Unavailable
+telemetry reports whether it is stale, rejected, or unrouted while retaining the safer
+cadence. Owner tasks still arrive immediately through the streaming
+watcher while the autonomous loop is throttled.
 
 Autonomous self-development is enabled by default. To run Sutando in a stable
 product context without idle-time code evolution, set

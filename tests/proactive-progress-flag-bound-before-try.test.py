@@ -82,7 +82,9 @@ class TestProgressFlagBinding(unittest.TestCase):
     def test_the_handler_still_passes_progress_to_the_policy(self):
         handlers = _target_trys()[0].handlers
         self.assertTrue(any(_reads_flag(h) for h in handlers))
-        self.assertTrue(any("resolve_failed_send" in _calls(h) for h in handlers),
+        # Post-5b the handler delegates through the fence's fail(), whose own
+        # consult of decide_failed_send is pinned in send-failure-delegation.
+        self.assertTrue(any("fail" in _calls(h) for h in handlers),
                         "the handler no longer delegates to the policy")
 
 

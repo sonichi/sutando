@@ -94,9 +94,58 @@ failed=0
 skipped_total=0
 fully_skipped=()
 partly_skipped=()
+# Each file writes its own .coverage.* fragment (`parallel = True`), merged
+# by the `coverage combine` below.
+COVGATE_WORKERS="${COVERAGE_GATE_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+RECDIR="$(mktemp -d)"
+trap 'rm -rf "$RECDIR"' EXIT
+
+# Per-file cap, mirroring ci.yml: without it one hung file burns the job
+# budget and the job is CANCELED mid-suite.
+
+# `timeout` is coreutils and absent on stock macOS, where this also runs by
+# hand; degrade to no cap rather than failing the local path.
+#
+# 240s, not 120s: instrumentation slows race/bench-style tests well past their
+# uninstrumented runtime, so a cap sized for a bare run fails them here and the
+# red reads as the PR's fault (#3630). Defaulted ONCE -- the fallback used to be
+# written inline at both the cap and the timeout message, so changing one left
+# the other reporting a bound that was no longer enforced.
+COVERAGE_GATE_FILE_TIMEOUT="${COVERAGE_GATE_FILE_TIMEOUT:-240}"
+COVGATE_TIMEOUT=""
+if command -v timeout >/dev/null 2>&1; then
+    # ABRT, not the default TERM: with PYTHONFAULTHANDLER=1 the dying process
+    # prints every thread's stack, so a capped file names WHERE it sat. rc stays 124.
+    COVGATE_TIMEOUT="timeout -k 5 -s ABRT $COVERAGE_GATE_FILE_TIMEOUT"
+else
+    echo "coverage-gate: no \`timeout\` binary — per-file cap disabled (local run)." >&2
+fi
+export RECDIR COVGATE_TIMEOUT
+
+find tests -name '*.test.py' -not -path '*/node_modules/*' | sort > "$RECDIR/files"
+# Key on the LINE INDEX: a name-derived key collides (`tr "/." "__"` maps
+# tests/a/b and tests/a_b alike), letting a failing rc be overwritten.
+_covgate_n="$(wc -l < "$RECDIR/files" | tr -d ' ')"
+
+# Shared scheduler: one SERIAL worker per worktree; the regression drives it.
+
+# It also brings the worktrees' .coverage.* fragments home for the combine.
+# shellcheck disable=SC2086
+bash "$(dirname "$0")/parallel-suite-lane.sh" "$COVGATE_WORKERS" "$RECDIR/files" "$RECDIR" \
+    env SUTANDO_TEST_SUBPROCESS_COVERAGE=1 PYTHONFAULTHANDLER=1 $COVGATE_TIMEOUT python3 -m coverage run --rcfile=.coveragerc
+
+_covgate_idx=0
 while IFS= read -r f; do
-    if ! output=$(SUTANDO_TEST_SUBPROCESS_COVERAGE=1 python3 -m coverage run --rcfile=.coveragerc "$f" 2>&1); then
-        echo "✖ test failed under instrumentation: $f"
+    _covgate_idx=$((_covgate_idx + 1))
+    rec="$RECDIR/$_covgate_idx"
+    rc="$(cat "$rec.rc" 2>/dev/null || echo 1)"
+    output="$(cat "$rec.out" 2>/dev/null || true)"
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            echo "✖ test TIMED OUT under instrumentation (>${COVERAGE_GATE_FILE_TIMEOUT}s): $f"
+        else
+            echo "✖ test failed under instrumentation: $f"
+        fi
         echo "$output"
         failed=1
         continue
@@ -112,7 +161,7 @@ while IFS= read -r f; do
     elif [ "$skips" -gt 0 ]; then
         partly_skipped+=("$f ($skips/$ran skipped)")
     fi
-done < <(find tests -name '*.test.py' -not -path '*/node_modules/*' | sort)
+done < "$RECDIR/files"
 
 if [ "$skipped_total" -gt 0 ]; then
     echo "coverage-gate: $skipped_total test case(s) SKIPPED in this environment."
@@ -130,6 +179,9 @@ if [ "${#fully_skipped[@]}" -gt 0 ]; then
     echo "coverage-gate: but a fully-skipped file is not a passing file. Verify that is intended."
 fi
 if [ "$failed" -ne 0 ]; then
+    # A suite that fails here but passes locally is usually an environment gap.
+    # /bin/bash is what the watcher suites spawn, so name it rather than $SHELL.
+    echo "coverage-gate: env — $(/bin/bash --version | head -1) · $(python3 -V 2>&1) · $(uname -sr)" >&2
     publish_summary "❌ **Test suite failed under instrumentation** — coverage not measurable. See the job log."
     echo "coverage-gate: suite must be green before coverage is meaningful." >&2
     exit 1
@@ -159,6 +211,30 @@ if [ "$gate_rc" -eq 0 ]; then
 else
     verdict="❌ **Diff coverage BELOW the ${FAIL_UNDER}% bar** — uncovered changed lines listed below. Whole-tree (informational): **${total}%**."
 fi
-publish_summary "$verdict" diff-cover.md
+
+# diff-cover reports only on files IN coverage.xml, so a changed file outside
+# `[run] source` is neither covered nor uncovered — the gate passes without
+# having looked at it. Report, never fail: this names the silence, it does not
+# move the bar.
+report="diff-cover.md"
+if unmeasured="$(python3 scripts/coverage_unmeasured.py "$BASE" coverage.xml)" \
+   && [ -n "$unmeasured" ]; then
+    echo
+    echo "coverage-gate: NOT MEASURED — changed, but absent from coverage.xml:"
+    printf '  %s\n' $unmeasured
+    echo "coverage-gate: their changed lines are outside the bar, not inside and clean."
+    {
+        cat diff-cover.md
+        echo
+        echo "### ⚠️ Not measured"
+        echo
+        echo "Changed, but absent from \`coverage.xml\` — outside \`[run] source\` in"
+        echo "\`.coveragerc\`, so **diff-cover never examined these lines**:"
+        echo
+        printf -- '-   `%s`\n' $unmeasured
+    } > coverage-gate-report.md
+    report="coverage-gate-report.md"
+fi
+publish_summary "$verdict" "$report"
 
 exit "$gate_rc"

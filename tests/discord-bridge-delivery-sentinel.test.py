@@ -153,17 +153,17 @@ def test_poll_results_checks_sentinel_before_main_send():
     )
     assert poll_block, "could not locate poll_results"
     body = poll_block.group(1)
-    delivered_pos = body.find("_is_delivered(task_id)")
+    delivered_pos = body.find("_drd.is_delivered(RESULTS_DIR, task_id")
     # Find the first channel.send AFTER the skip-block. The skip-block
     # has `archive_file(result_file, "results", task_id)` followed by
     # `continue`, then the sentinel check, then the try-block with
     # the send. The first `await channel.send(` should be after both.
     skip_continue_pos = body.find("Skipped (already replied or deduped)")
     first_send_pos = body.find("await channel.send(", skip_continue_pos)
-    assert delivered_pos > 0, "_is_delivered NOT called in poll_results"
+    assert delivered_pos > 0, "_drd.is_delivered NOT called in poll_results"
     assert first_send_pos > 0, "could not locate post-skip channel.send"
     assert delivered_pos < first_send_pos, (
-        "_is_delivered check must come BEFORE the first channel.send — "
+        "_drd.is_delivered check must come BEFORE the first channel.send — "
         "otherwise the send fires before the sentinel is checked, "
         "defeating the fix."
     )
@@ -182,13 +182,13 @@ def test_poll_results_marks_delivered_in_send_block():
     )
     assert poll_block
     body = poll_block.group(1)
-    mark_pos = body.find("_mark_delivered(task_id)")
+    mark_pos = body.find("_drd.confirm(RESULTS_DIR, _send_tok")
     skip_continue_pos = body.find("Skipped (already replied or deduped)")
     first_send_pos = body.find("await channel.send(", skip_continue_pos)
-    assert mark_pos > 0, "_mark_delivered NOT called in poll_results"
+    assert mark_pos > 0, "_drd.confirm NOT called in poll_results"
     assert first_send_pos > 0
     assert mark_pos > first_send_pos, (
-        "_mark_delivered must be called AFTER the first channel.send "
+        "_drd.confirm must be called AFTER the first channel.send "
         "(post-success) — otherwise a crash between mark and send "
         "marks a delivery that never happened, silently dropping the "
         "message on restart."
@@ -196,9 +196,12 @@ def test_poll_results_marks_delivered_in_send_block():
 
 
 def test_poll_results_clears_sentinel_after_archive():
-    """Architectural: `_clear_delivered` must be called AFTER both
-    archive_file calls. Without it, sentinels accumulate forever in
-    `state/discord-delivered/`."""
+    """Architectural: the sentinel must be retired after both archive_file
+    calls, or sentinels accumulate forever in `state/discord-delivered/`.
+
+    That policy now lives in `_archive_delivered_pair`, which both delivery
+    paths call, so follow it there rather than requiring the call to be
+    open-coded inside poll_results."""
     import re
     src = (REPO / "src" / "discord-bridge.py").read_text()
     poll_block = re.search(
@@ -207,8 +210,17 @@ def test_poll_results_clears_sentinel_after_archive():
     )
     assert poll_block
     body = poll_block.group(1)
-    clear_pos = body.find("_clear_delivered(task_id)")
-    assert clear_pos > 0, "_clear_delivered NOT called in poll_results"
+    assert "_archive_delivered_pair(" in body, (
+        "poll_results must route cleanup through the shared helper")
+
+    helper = re.search(r"def _archive_delivered_pair\(.*?\n\n\n", src, re.DOTALL)
+    assert helper, "the shared cleanup helper is missing"
+    h = helper.group(0)
+    clear_pos = h.find("_clear_delivered(task_id)")
+    assert clear_pos > 0, "_clear_delivered NOT called in the shared helper"
+    last_archive = h.rfind("archive_file(")
+    assert last_archive > 0 and clear_pos > last_archive, (
+        "the sentinel must be retired AFTER both archive_file calls")
 
 
 def main():

@@ -122,6 +122,45 @@ mkdir -p "$lab4/engine"
 out=$(PATH="$lab4/bin:/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$lab4/engine'")
 check "bundled <engine>/../runtime/python wins over PATH" "$out" "$lab4/engine/../runtime/python/bin/python3"
 
+# --- 6b. resolve_python_for_module skips a candidate lacking the module ------
+# The production failure this pins: a host whose BUNDLED runtime has no
+# slack_bolt. resolve_python returns it (it exists and runs), the caller's
+# import probe rejects it, and the wrapper concludes no interpreter exists —
+# while the PATH interpreter one step down the same list has the module. On a
+# real host that produced a 3-day launchd respawn loop with an inert restart
+# safety net.
+lab6=$(mklab)
+mkdir -p "$lab6/engine" "$lab6/runtime/python/bin"
+# Each fake interpreter imports exactly ONE module and refuses everything else.
+# An `exit 0` default would make any module name importable, which silently
+# turns the no-candidate case below into a pass — caught by that check failing.
+printf '#!/bin/sh\ncase "$*" in *bundledmod*) exit 0 ;; esac\nexit 1\n' > "$lab6/runtime/python/bin/python3"
+chmod +x "$lab6/runtime/python/bin/python3"
+printf '#!/bin/sh\ncase "$*" in *wantedmod*) exit 0 ;; esac\nexit 1\n' > "$lab6/bin/python3"
+chmod +x "$lab6/bin/python3"
+
+# Assert the function EXISTS before asserting what it returns. Without this the
+# "no candidate" check below passes when the function is merely absent (missing
+# -> empty output -> matches the expected empty), so a suite run against a tree
+# without the fix would report that case green.
+if PATH="$lab6/bin:/bin:/usr/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; type resolve_python_for_module" >/dev/null 2>&1; then
+  ok "resolve_python_for_module is defined"
+else
+  bad "resolve_python_for_module is defined" "function missing — the checks below cannot be trusted"
+fi
+
+out=$(PATH="$lab6/bin:/bin:/usr/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python '$lab6/engine'")
+check "control: resolve_python still returns the module-less bundled runtime" \
+      "$out" "$lab6/engine/../runtime/python/bin/python3"
+
+out=$(PATH="$lab6/bin:/bin:/usr/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python_for_module '$lab6/engine' wantedmod")
+check "resolve_python_for_module skips it and finds the PATH interpreter" \
+      "$out" "$lab6/bin/python3"
+
+# No candidate has it -> empty, so the caller still reports rather than guessing.
+out=$(PATH="$lab6/bin:/bin:/usr/bin" /bin/bash -c ". '$REPO/scripts/python-binary.sh'; resolve_python_for_module '$lab6/engine' nosuchmod_anywhere")
+check "no candidate with the module -> empty (caller must report)" "$out" ""
+
 # --- 7. every caller that used to fall through to the bare name is routed ----
 for f in src/startup.sh scripts/sutando-config.sh src/agent/claude/cli/start-cli.sh; do
   if grep -qE '^\s*PY="python3"\s*$' "$REPO/$f"; then
@@ -246,9 +285,14 @@ fi
 
 # ── 12. Every Python-backed service the reviewer named owns an explicit skip
 # branch. Counted per service, so covering one does not vouch for the rest.
+# "gateway bridge"'s skip line lives in start_gateway_lanes() in
+# src/startup-runtime.sh (startup.sh's own inline gateway block moved there so
+# it can also run standalone via scripts/restart-gateway-lanes.sh) — search
+# both files rather than only startup.sh, since startup.sh still calls it.
 missing=""
 for svc in "core heartbeat" "services-status emitter" "screen capture" "gateway bridge"; do
-  grep -qF "⊘ $svc skipped — no runnable python3" "$REPO/src/startup.sh" || missing="${missing}[$svc] "
+  grep -qF "⊘ $svc skipped — no runnable python3" "$REPO/src/startup.sh" "$REPO/src/startup-runtime.sh" \
+    || missing="${missing}[$svc] "
 done
 if [ -z "$missing" ]; then
   ok "each Python-backed service prints an explicit ⊘ skip when \$PY is empty"
@@ -266,11 +310,13 @@ fi
 #     "gateway bridge", so the PRIMARY gateway's skip branch vouched for all of
 #     them.
 # A name-based scan cannot distinguish per-instance output, so run the loop
-# instead of reading it. The block is lifted out of src/startup.sh at test time
-# rather than copied here, so the test cannot drift from the source it pins.
-gw_block=$(awk '/for _gw_var in /{f=1} f{print} f&&/^[[:space:]]*done[[:space:]]*$/{exit}' "$REPO/src/startup.sh")
+# instead of reading it. The block is lifted out of start_gateway_lanes() in
+# src/startup-runtime.sh at test time (moved out of startup.sh's inline body
+# so it can also run standalone via scripts/restart-gateway-lanes.sh) rather
+# than copied here, so the test cannot drift from the source it pins.
+gw_block=$(awk '/for _gw_var in /{f=1} f{print} f&&/^[[:space:]]*done[[:space:]]*$/{exit}' "$REPO/src/startup-runtime.sh")
 if [ -z "$gw_block" ]; then
-  bad "named-gateway loop is extractable from startup.sh" "no 'for _gw_var in' block found"
+  bad "named-gateway loop is extractable from startup-runtime.sh" "no 'for _gw_var in' block found"
 else
   gw_out=$(env -i PATH="/usr/bin:/bin" AG2_REMOTE_TOKEN_DEV=tok-dev \
     bash -c 'PY=""; REPO="'"$REPO"'"; LOGS_DIR="$(mktemp -d)"

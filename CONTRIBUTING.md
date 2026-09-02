@@ -208,6 +208,35 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
 
    **Give it a minute or two before concluding it failed.** The status is posted asynchronously: on one PR it was still `total=0` immediately after reopening and `license/cla=success` on the next check. Re-running the command above is the way to tell; an immediate zero means nothing yet.
 
+   **If the status is PRESENT and `pending`, that is a third case with its own cause.** `state=pending` with the description *"Contributor License Agreement is not signed yet."* means CLA-Assistant ran and is waiting on a signature — so close+reopen does nothing, and the `--reset-author` fix above only applies if the identity is your own. Ask GitHub which commit identities it cannot vouch for:
+
+   ```bash
+   gh api repos/<owner>/<repo>/pulls/<N>/commits \
+     --jq '.[] | "\(.sha[0:8]) \(.commit.author.email) -> \(.author.login // "NULL — maps to no account")"'
+   ```
+
+   Two shapes turn up: an email mapping to **no account** (`author: null`), and an email mapping to a **real account that has not signed**.
+
+   Neither is identifiable from a single PR — every login on it looks equally plausible. The unsigned one is the login that appears on CLA-**pending** PRs and on **no green** one, which takes a comparison across the open queue:
+
+   ```bash
+   for n in $(gh pr list --state open --limit 100 --json number --jq '.[].number'); do
+     h=$(gh pr view "$n" --json headRefOid --jq .headRefOid)
+     state=$(gh api "repos/<owner>/<repo>/commits/$h/status" \
+               --jq '[.statuses[]|select(.context=="license/cla")]
+                     | if length==0 then "absent" else (sort_by(.updated_at)|last|.state) end')
+     logins=$(gh api "repos/<owner>/<repo>/pulls/$n/commits" --jq '[.[].author.login // "NULL"]|unique|join(" ")')
+     echo "$state $logins"
+   done | awk '$1=="pending"{for(i=2;i<=NF;i++) p[$i]=1} $1=="success"{for(i=2;i<=NF;i++) g[$i]=1}
+                END{for(k in p) if(!(k in g)) print "unsigned candidate:", k}'
+   ```
+
+   Treat the output as a **candidate list, not a verdict**: confirm against the PR's CLA-Assistant page before attributing the pending status to a person.
+
+   **Do not guess from the shape of the email.** One contributor here commits under two addresses that map to two different accounts, and it is the personal-looking one that is unsigned while the institutional one is signed — the opposite of the natural assumption. A suspect that also appears on a CLA-**green** PR is disproved, which is the cheap check to run before naming anyone.
+
+   **`author: null` does not mean the commit is yours.** It proves only that GitHub could not map that email to an account. Before recommending `git commit --amend --reset-author` — or running it — establish that the commit is the current contributor's own work: the author NAME, the branch it arrived on, and where there is any doubt, their confirmation. Rewriting the author of someone else's commit misattributes it, and where the unsigned identity is a third party the only correct remedy is that account signing.
+
    Note the corollary of the status being SHA-bound: **pushing to the branch after this drops the status again.** If you reopen to fix the CLA and then push a review fix, expect to be back where you started.
 
    **When to expect it.** `license/cla` is a *commit status*, so it binds to one SHA. **Every push gives the PR a new head SHA that carries no CLA status**, which is what [`.github/workflows/cla-recheck-on-push.yml`](.github/workflows/cla-recheck-on-push.yml) exists to repair — it comments the `@cla-assistant check` trigger on each `synchronize`. That repair is not reliable, so a PR you have pushed to can end up permanently short of a required check.
@@ -240,6 +269,12 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    The practical consequence is the same either way: the trigger comment is neither sufficient nor necessary, and the check below is what tells you where you actually stand. A manual trigger comment on `#2605` did not restore it; close+reopen did, and its two approvals survived. Four PRs were recovered this way across two authors.
 3. Address every substantive review-thread comment before merge: fixed in a subsequent commit, replied with rationale for declining, or explicitly deferred to a follow-up issue.
 4. **If the PR ended up large, split it post-hoc.** If during review it becomes clear the diff covers more than one concern (a fix + a refactor, two unrelated features, etc.), close this PR and re-open it as N smaller PRs rather than negotiating reviewer patience. Easier than rebasing later; easier to revert one piece at a time.
+5. **Solicit and NOTIFY reviewers.** You need to solicit reviewers for your PR and keep making progress on their comments, change requests and blocking comments until you have enough approvals and the PR is merged. Use a GitHub review request **and** the [`collaboration-intelligence`](skills/collaboration-intelligence/SKILL.md) skill to resolve *whom* to ask and *where they read*: it maps each reviewer to the agent stand-in that acts on their behalf.
+   - **On open** — request on GitHub **and** address each reviewer in a channel they are in. Requesting on GitHub alone is filing, not asking.
+   - **On every update that changes the diff** — notify them again in a channel they are in. A push re-notifies no one, and this repo sets `dismiss_stale_reviews_on_push: false`, so a standing `CHANGES_REQUESTED` latch survives the fix and its author gets no signal to look again. **A mechanical base-merge is not such an update**: clearing BEHIND carries no author work, so there is nothing for the reviewer to look at again and the ping is pure noise. The test is whether the head moved because *you* answered something.
+   - **As the author, read `reviewDecision`, not the thread.** The same latch survives the *reviewer's own comment* saying it is resolved: a `COMMENTED` review is not decisive, so a reviewer who writes "your condition was met" has said so and not recorded it. If `gh pr view N --json reviewDecision` still reads `CHANGES_REQUESTED`, you are still blocked no matter what the thread says — tell them, because they cannot see the gap either.
+   - **Address both the human and their AI stand-in's handle** — the stand-in acts, the human decides, and only one of them is watching any given channel.
+   - Look up collaborators and their stand-in handles per platform with `python3 skills/collaboration-intelligence/scripts/lookup.py <name>`.
 
 ## Reviewing PRs
 
@@ -251,7 +286,7 @@ If you're reviewing someone else's PR (including a bot's), keep the comment thre
 - **Distinguish blockers from nits.** Mark each comment so the author knows what's gating merge vs what's deferrable.
 - **Review the current head and the right layer.** For a stacked PR, identify the parent and inspect the child-only change as well as the cumulative interaction. After an update/rebase, re-check the head SHA, required checks, and whether prior approvals still apply.
 - **Scan added lines for hardcoded host paths on every review.** Do not rely only on CI: look for `/Users/<name>`, `/home/<name>`, clone-specific absolute paths, and inline workspace/home fallbacks. Keep fixture exclusions token-specific so an allowed fixture on a line cannot hide a real production path on that same line.
-- **Clear stale formal blockers.** When the author pushes a fix, re-review the current head. If the request is genuinely resolved, dismiss/replace the stale REQUEST_CHANGES state; if it remains, cite the exact unresolved line or behavior. Do not leave a resolved change-request blocking merge through automation inertia.
+- **Clear stale formal blockers.** When the author pushes a fix, re-review the current head. If the request is genuinely resolved, dismiss/replace the stale REQUEST_CHANGES state; if it remains, cite the exact unresolved line or behavior. **"Replace" means an `APPROVED` review or a dismissal — a `COMMENTED` review does not clear your own `CHANGES_REQUESTED`.** GitHub takes the latest *decisive* review per login, and a comment is not one, so writing that the block is satisfied reads as closure in the thread while `reviewDecision` still shows it blocking. Do not leave a resolved change-request blocking merge through automation inertia.
 - **Apply the complete merge gate.** Merge only when the current head is mergeable, required CI and CLA checks are green, and two maintainers have recorded formal approvals. A comment, Discord acknowledgement, bot recommendation, stale approval on an old head, or admin bypass is not a substitute for any gate.
 
 For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC mechanics), see the `review-pr` skill if it's installed.

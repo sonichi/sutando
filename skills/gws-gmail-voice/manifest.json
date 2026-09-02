@@ -15,5 +15,12 @@
   "tools": "./tools.ts",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
-  }
+  },
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "command": "./hooks/reply-orphan-guard.py",
+      "description": "Blocks `gws gmail +send` with a reply subject; +send cannot thread."
+    }
+  ]
 }

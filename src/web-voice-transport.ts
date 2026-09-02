@@ -380,8 +380,104 @@ export interface VoiceTransportEvents {
   onMicError?(name: string, message: string, friendly: string): void;
   /** Optional live-audio AnalyserNode for avatar viz (playback path). */
   onAnalyser?(node: AnalyserNode): void;
-  /** Byte counters, ~2×/s, for a stats panel. */
-  onStats?(stats: { bytesSent: number; bytesRecv: number }): void;
+  /** Byte + audio-health counters, ~2×/s, for a stats panel. Everything beyond
+   *  `bytesSent`/`bytesRecv` is additive (P7 D7.1) — older consumers keep
+   *  reading just the byte totals. */
+  onStats?(stats: VoiceStats): void;
+  /**
+   * Capture-health lifecycle (P7 D7.5 failure contract). 'recovering' when a
+   * suspension / device loss triggers the bounded recovery FSM, 'recovered' on
+   * success, 'degraded' when recovery is exhausted. Degraded is NOT terminal
+   * and deliberately not `onConnectFailure`: the socket and the voice lease
+   * stay live (the call is alive, input is not) — surfaces render a distinct
+   * mic-error state with a retry affordance wired to `retryCapture()`.
+   */
+  onCaptureHealth?(
+    state: 'recovering' | 'recovered' | 'degraded',
+    kind: 'resume' | 'reacquire',
+    detail?: string,
+  ): void;
+}
+
+/** Recovery FSM state (P7 D7.5): recovered collapses back into 'observing'. */
+export type CaptureState = 'observing' | 'recovering' | 'degraded';
+
+/**
+ * Extended stats snapshot assembled on the 500 ms stats tick (never on the
+ * frame path). All counters are scoped to the current connection epoch — they
+ * reset on every `connect()`.
+ */
+export interface VoiceStats {
+  bytesSent: number;
+  bytesRecv: number;
+  /** Capture callbacks seen (counts even while muted — mute must not read as
+   *  a capture gap). */
+  capCallbacks: number;
+  /** Frames skipped because the socket's bufferedAmount exceeded the egress
+   *  watermark (backpressure made visible instead of deepening the stall). */
+  sendSkipped: number;
+  /** Frames whose ws.send threw (socket died mid-callback). */
+  sendFailed: number;
+  chunksRecv: number;
+  /** Chunks handed to the audio graph (schedule-time — NOT proof of playback). */
+  chunksScheduled: number;
+  /** Natural playback completions only (cancellations counted separately). */
+  chunksEnded: number;
+  /** Sources stopped by flushPlayback (barge-in/deafen/teardown) — `onended`
+   *  fires for these too, so they must not masquerade as completions. */
+  chunksCancelled: number;
+  scheduledDepth: number;
+  lastEndedAt: number | null;
+  ctxState: string | null;
+  ctxTimeMs: number | null;
+  ctxSuspendCount: number;
+  captureState: CaptureState;
+  /** Watchdog: capture gap past max(3× frame interval, 1 s) while unmuted +
+   *  connected, still open. */
+  capStalled: boolean;
+  lastCapAgoMs: number | null;
+  /** Latest frame RMS (subsampled). Client-side corroboration only — the
+   *  server's ingress tracker is the canonical speech evidence (D7.1). */
+  rms: number;
+  speechActive: boolean;
+  bufferedAmount: number;
+  bufferedHighWater: number;
+  /** Per-connection nonce echoed in every audio_health heartbeat (Tranche A:
+   *  the engine mints the server epoch and maps this nonce to it on first
+   *  sight). */
+  epochNonce: string;
+  /** D7.5 lifecycle evidence, epoch-retained (bounded rings; `*Dropped`
+   *  makes truncation visible instead of silent). */
+  ctxLastTransition: { from: string; to: string; at: number } | null;
+  deviceEvents: Array<{ kind: string; at: number }>;
+  deviceEventsDropped: number;
+  recoveryEvents: Array<{ kind: string; result: string; attempt: number; at: number }>;
+  recoveryEventsDropped: number;
+}
+
+/**
+ * One latched episode interval (P7 D7.1). Slots are preallocated and mutated
+ * in place — episode latching happens on the frame path, where allocation is
+ * forbidden (§D7.0b). `kind: 'gap'` = capture-callback gap; `'speech'` = an
+ * above-floor RMS interval. Times are ms relative to the connection epoch.
+ */
+interface EpisodeSlot {
+  /** Episode id (1-based, per epoch). 0 = slot never written. */
+  id: number;
+  kind: 'gap' | 'speech';
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  /** Speech only: capCallbacks seq at onset/offset. */
+  onsetSeq: number;
+  offsetSeq: number;
+  /** Speech only: max RMS over the interval, in permille (0–1000). */
+  maxRmsPm: number;
+  aboveFloorMs: number;
+  /** Accounted: included in a transmitted heartbeat, or already counted into
+   *  episodeOverflow (an unsent slot being evicted or aging out of the send
+   *  window is evidence loss). */
+  sent: boolean;
 }
 
 /** Default connect timeout (design 1e): if the WS has not reached `onopen`
@@ -398,6 +494,55 @@ export const AGENT_STATE_LEGACY_MS = 3000;
  *  returned teardown promise resolves anyway — a wedged handshake must not
  *  hang lease release. */
 export const DISCONNECT_CLOSE_TIMEOUT_MS = 1500;
+
+// ─── P7 D7.1/D7.5 audio-health constants ─────────────────────
+
+/** RMS floor above which a capture frame counts as speech evidence
+ *  (client-side corroboration only; the server ingress tracker is canonical). */
+export const SPEECH_RMS_FLOOR = 0.02;
+
+/** A speech interval closes after this long below the floor — the hangover
+ *  keeps word gaps from splitting one utterance into many episodes. */
+export const SPEECH_OFFSET_HANG_MS = 600;
+
+/** Capture-gap watchdog floor: a gap counts as a stall only past
+ *  max(3× expected callback interval, this) while unmuted + connected. */
+export const CAP_STALL_FLOOR_MS = 1000;
+
+/** Egress backpressure watermark: above this bufferedAmount, capture frames
+ *  are skipped (visible in `sendSkipped`) instead of piling more PCM onto a
+ *  stalled socket (FE-1). */
+export const SEND_BUFFER_WATERMARK_BYTES = 256 * 1024;
+
+/** Hard cap on one serialized audio_health frame. Assembly drops the oldest
+ *  window episodes until the frame fits, so the cap holds by construction
+ *  (≤300 B / 2 s = ≤150 B/s average on the shared socket). */
+export const AUDIO_HEALTH_MAX_BYTES = 300;
+
+/** Heartbeat cadence in 500 ms stats ticks (4 → one per 2 s). The first fires
+ *  on the first tick so the engine learns the nonce right after going live. */
+export const AUDIO_HEALTH_INTERVAL_TICKS = 4;
+
+/** Preallocated episode retention ring (per connection epoch). */
+export const EPISODE_RING_SIZE = 8;
+
+/** Newest episodes re-sent idempotently in every heartbeat (server dedups by
+ *  id; ACK-free by design — a server→client ack would queue ahead of PCM). */
+export const AUDIO_HEALTH_EPISODE_WINDOW = 4;
+
+/** Bounded single-flight capture recovery (D7.5). */
+export const RECOVERY_MAX_ATTEMPTS = 3;
+export const RECOVERY_BACKOFF_MS: readonly number[] = [0, 1000, 4000];
+export const RECOVERY_RESUME_TIMEOUT_MS = 2000;
+
+/** 8-char per-connection nonce. Tranche A epoch scheme (D7.1): the engine
+ *  mints the server-issued epoch and maps it to this nonce on first heartbeat
+ *  sight — collision-resistant randomness, no protocol change. */
+function mintNonce(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c?.randomUUID) return c.randomUUID().replace(/-/g, '').slice(0, 8);
+  return Math.random().toString(36).slice(2, 10).padEnd(8, '0');
+}
 
 export interface VoiceTransportOptions extends VoiceTransportEvents {
   /** Mic capture buffer size (ScriptProcessor). Default 2048, matching web-client. */
@@ -422,6 +567,18 @@ export interface VoiceTransportOptions extends VoiceTransportEvents {
    * cast to WebSocket.
    */
   wsFactory?: (url: string) => WebSocket;
+  /** Speech-evidence RMS floor override (tests). Default SPEECH_RMS_FLOOR. */
+  speechRmsFloor?: number;
+  /** Speech offset hangover override (tests). Default SPEECH_OFFSET_HANG_MS. */
+  speechOffsetHangMs?: number;
+  /** Egress skip watermark override (tests). Default SEND_BUFFER_WATERMARK_BYTES. */
+  sendBufferWatermark?: number;
+  /** Recovery pacing overrides (tests). Defaults RECOVERY_BACKOFF_MS /
+   *  RECOVERY_RESUME_TIMEOUT_MS. */
+  recoveryBackoffMs?: readonly number[];
+  recoveryResumeTimeoutMs?: number;
+  /** Clock seam for deterministic watchdog/episode tests. Default Date.now. */
+  nowFn?: () => number;
 }
 
 /**
@@ -446,7 +603,9 @@ export class VoiceTransport {
   private micStream: MediaStream | null = null;
   private processor: ScriptProcessorNode | null = null;
   private analyserNode: AnalyserNode | null = null;
-  private activeSources: AudioBufferSourceNode[] = [];
+  /** `cancelled` distinguishes flushPlayback stops from natural completions —
+   *  stop() fires `onended` too, and cancellation is not completion (D7.1). */
+  private activeSources: Array<{ src: AudioBufferSourceNode; cancelled: boolean }> = [];
   private nextPlayTime = 0;
 
   private bytesSent = 0;
@@ -484,10 +643,86 @@ export class VoiceTransport {
   private closeCompletion: Promise<void> = Promise.resolve();
 
   // Debug-panel counters. They exist to bound the trace output (first N only),
-  // not as protocol state — the surface reads byte totals from onStats.
+  // not as protocol state — the surface reads byte totals from onStats. Since
+  // P7 they are epoch-scoped (reset per connect), so the traces re-arm per
+  // attempt.
   private audioChunksRecv = 0;
   private micSendCount = 0;
-  private playChunkCount = 0;
+
+  // ── P7 D7.1 audio-progress ledger (all epoch-scoped; resetLedger) ──
+  private speechRmsFloor: number;
+  private speechOffsetHangMs: number;
+  private sendBufferWatermark: number;
+  private recoveryBackoffMs: readonly number[];
+  private recoveryResumeTimeoutMs: number;
+  private nowFn: () => number;
+
+  private epochNonce = '';
+  private connectAtMs = 0;
+  private capCallbacks = 0;
+  private sendSkipped = 0;
+  private sendFailed = 0;
+  private chunksScheduled = 0;
+  private chunksEnded = 0;
+  private chunksCancelled = 0;
+  private lastEndedAt: number | null = null;
+  private bufferedHighWater = 0;
+  private lastCapAt = 0;
+  /** captureBuf / ctx.sampleRate, computed when the graph wires (~43 ms). */
+  private expectedFrameMs = 43;
+  /** max(3× expectedFrameMs, CAP_STALL_FLOOR_MS), fixed at graph wire so the
+   *  frame path reads one preallocated field (§D7.0b). */
+  private stallAfterMs = CAP_STALL_FLOOR_MS;
+  private capStalled = false;
+  /** Absolute ms the open capture gap started at (0 = no open gap). */
+  private gapOpenedAt = 0;
+  private lastRms = 0;
+  private speechActive = false;
+  private speechOnsetSeq = 0;
+  private speechOnsetAtMs = 0;
+  private speechMaxRms = 0;
+  private speechAboveFloorMs = 0;
+  private speechLastAboveAt = 0;
+  private ctxSuspendCount = 0;
+  private ctxLastTransition: { from: string; to: string; at: number } | null = null;
+  private readonly episodeRing: EpisodeSlot[];
+  private episodeSeq = 0;
+  private episodeOverflow = 0;
+  private statsTickCount = 0;
+  private heartbeatsSent = 0;
+  /** Counter values at the last SUCCESSFULLY SENT heartbeat — the wire
+   *  carries deltas against these (D7.1 compact schema). Advanced only on
+   *  send success, so a failed frame's interval folds into the next one. */
+  private readonly hbPrev = {
+    capCallbacks: 0,
+    bytesSent: 0,
+    sendSkipped: 0,
+    sendFailed: 0,
+    chunksRecv: 0,
+    chunksScheduled: 0,
+    chunksEnded: 0,
+    chunksCancelled: 0,
+  };
+  private deviceEvents: Array<{ kind: string; at: number }> = [];
+  private deviceEventsDropped = 0;
+  private recoveryEvents: Array<{ kind: string; result: string; attempt: number; at: number }> = [];
+  private recoveryEventsDropped = 0;
+
+  // ── P7 D7.5 capture recovery FSM ──
+  /** Independent of attemptGen (bumping the attempt would kill the still-live
+   *  socket's callbacks): bumps on every recovery attempt, on timeout, and in
+   *  teardownAudio; every async capture continuation validates BOTH gens. */
+  private captureGen = 0;
+  private captureState: CaptureState = 'observing';
+  /** attemptGen that owns the in-flight recovery loop (-1 = none). Ownership
+   *  is attempt-scoped: a stale loop (owner ≠ current attempt) is fenced-dead
+   *  and must not swallow the live attempt's triggers. */
+  private recoveryOwner = -1;
+  /** A reacquire trigger arrived while a resume-recovery was in flight. */
+  private recoveryEscalate = false;
+  /** Sorted input-device fingerprint (null = cannot enumerate). */
+  private inputDeviceSig: string | null = null;
+  private deviceChangeHandler: (() => void) | null = null;
 
   constructor(opts: VoiceTransportOptions = {}) {
     this.ev = opts;
@@ -499,6 +734,26 @@ export class VoiceTransport {
     this.agentStateLegacyMs = opts.agentStateLegacyMs ?? AGENT_STATE_LEGACY_MS;
     this.disconnectCloseTimeoutMs = opts.disconnectCloseTimeoutMs ?? DISCONNECT_CLOSE_TIMEOUT_MS;
     this.wsFactory = opts.wsFactory ?? ((url: string) => new WebSocket(url));
+    this.speechRmsFloor = opts.speechRmsFloor ?? SPEECH_RMS_FLOOR;
+    this.speechOffsetHangMs = opts.speechOffsetHangMs ?? SPEECH_OFFSET_HANG_MS;
+    this.sendBufferWatermark = opts.sendBufferWatermark ?? SEND_BUFFER_WATERMARK_BYTES;
+    this.recoveryBackoffMs = opts.recoveryBackoffMs ?? RECOVERY_BACKOFF_MS;
+    this.recoveryResumeTimeoutMs = opts.recoveryResumeTimeoutMs ?? RECOVERY_RESUME_TIMEOUT_MS;
+    this.nowFn = opts.nowFn ?? Date.now;
+    // Preallocated: episode latching happens on the frame path, where
+    // allocation is forbidden (§D7.0b) — slots are mutated in place.
+    this.episodeRing = Array.from({ length: EPISODE_RING_SIZE }, () => ({
+      id: 0,
+      kind: 'gap' as const,
+      startMs: 0,
+      endMs: 0,
+      durationMs: 0,
+      onsetSeq: 0,
+      offsetSeq: 0,
+      maxRmsPm: 0,
+      aboveFloorMs: 0,
+      sent: false,
+    }));
   }
 
   get connected(): boolean {
@@ -556,6 +811,9 @@ export class VoiceTransport {
     // the new attempt — and nextPlayTime must restart from the new clock
     // instead of continuing the old session's schedule.
     this.flushPlayback();
+    // New connection epoch (D7.1): every counter/episode resets and a fresh
+    // nonce is minted, so ledger evidence can never span two calls.
+    this.resetLedger();
 
     this.status('connecting', 'Connecting…');
 
@@ -564,6 +822,7 @@ export class VoiceTransport {
     if (!this.audioCtx || this.audioCtx.state === 'closed') {
       this.audioCtx = new AudioContext();
     }
+    this.adoptCtx(this.audioCtx);
     if (this.audioCtx.state === 'suspended') {
       try {
         await this.audioCtx.resume();
@@ -622,10 +881,31 @@ export class VoiceTransport {
   }
 
   /** Send a typed text input over the live session (the surface's text box
-   *  during voice). Returns false when no socket is open. */
+   *  during voice). False when no socket is open or the frame did not go out. */
   sendTextInput(text: string): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify({ type: 'text_input', text }));
+    try {
+      this.ws.send(JSON.stringify({ type: 'text_input', text }));
+    } catch {
+      // readyState is sampled a statement earlier; a close landing in that
+      // window throws, and callers read false — not a throw — as "not sent".
+      return false;
+    }
+    return true;
+  }
+
+  /** Send a surface-owned protocol command (e.g. voice.retryUpstream), JSON-
+   *  serialized onto the open socket; false when no socket is open or the
+   *  frame did not go out. */
+  sendClientCommand(msg: { type: string }): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      this.ws.send(JSON.stringify(msg));
+    } catch {
+      // readyState is sampled a statement earlier; a close landing in that
+      // window throws, and callers read false — not a throw — as "not sent".
+      return false;
+    }
     return true;
   }
 
@@ -754,6 +1034,13 @@ export class VoiceTransport {
    * web-client's doCleanup(). Idempotent.
    */
   private teardownAudio(): void {
+    // D7.5: fence every in-flight recovery continuation and tear down the
+    // lifecycle listeners BEFORE closing the ctx — close() fires its own
+    // statechange, which must not trigger recovery.
+    this.captureGen++;
+    this.recoveryEscalate = false;
+    this.removeDeviceChangeListener();
+    if (this.audioCtx) this.audioCtx.onstatechange = null;
     this.stopMic();
     this.stopStats();
     this.flushPlayback();
@@ -840,9 +1127,9 @@ export class VoiceTransport {
       // may already belong to a newer attempt).
       if (gen !== this.attemptGen) return;
       this.status('live', 'Live — speak now');
-      this.statsTimer = setInterval(() => {
-        this.ev.onStats?.({ bytesSent: this.bytesSent, bytesRecv: this.bytesRecv });
-      }, 500);
+      // 500 ms cadence, off the frame path (§D7.0b): watchdog + stats +
+      // (every 4th tick) the audio_health heartbeat all ride this timer.
+      this.statsTimer = setInterval(() => this.runStatsTick(), 500);
     } catch (err: any) {
       if (gen !== this.attemptGen) return;
       const name = err?.name ?? 'unknown';
@@ -1124,7 +1411,6 @@ export class VoiceTransport {
       for (const t of stream.getTracks()) t.stop();
       return;
     }
-    this.micStream = stream;
 
     if (!this.audioCtx || this.audioCtx.state === 'closed') {
       this.audioCtx = new AudioContext();
@@ -1135,27 +1421,85 @@ export class VoiceTransport {
         // Stop OUR capture only — this.micStream may already belong to a
         // newer attempt (its connect() re-ran stopMic + startMic).
         for (const t of stream.getTracks()) t.stop();
-        if (this.micStream === stream) this.micStream = null;
         return;
       }
     }
 
-    const ctx = this.audioCtx;
-    const source = ctx.createMediaStreamSource(this.micStream);
+    this.wireCaptureGraph(stream);
+  }
+
+  /**
+   * Wire (or re-wire, on a recovery reacquire) the capture graph over an
+   * acquired stream. Synchronous — callers have already generation-fenced
+   * their awaits.
+   */
+  private wireCaptureGraph(stream: MediaStream): void {
+    this.micStream = stream;
+    const ctx = this.audioCtx!;
+    this.adoptCtx(ctx);
+    this.expectedFrameMs = Math.max(1, Math.round((this.captureBuf / ctx.sampleRate) * 1000));
+    this.stallAfterMs = Math.max(3 * this.expectedFrameMs, CAP_STALL_FLOOR_MS);
+    // Arm the gap clock at wire time: a graph whose FIRST callback never
+    // fires must still produce a gap (baseline = the moment capture should
+    // have started flowing).
+    this.lastCapAt = this.nowFn();
+    const source = ctx.createMediaStreamSource(stream);
     const processor = ctx.createScriptProcessor(this.captureBuf, 1, 1);
     this.processor = processor;
 
     processor.onaudioprocess = (e: AudioProcessingEvent) => {
+      // §D7.0b FRAME PATH: O(1) counter/latch writes plus one subsampled RMS
+      // pass on top of the pinned downsample+encode+send — no allocation
+      // beyond the pinned encode, no I/O beyond the pinned send.
+      const now = this.nowFn();
+      this.capCallbacks++;
+      if (this.gapOpenedAt > 0) {
+        this.closeGapEpisode(now);
+      } else if (this.lastCapAt > 0 && now - this.lastCapAt > this.stallAfterMs) {
+        // Foreground-overwrite (round-1 #7): when the whole thread was
+        // frozen, the watchdog timer froze WITH it — the resumed callback is
+        // the first code to observe the outage, and it must latch the gap
+        // BEFORE overwriting lastCapAt. O(1) preallocated-slot writes.
+        this.gapOpenedAt = this.lastCapAt;
+        this.closeGapEpisode(now);
+      }
+      this.lastCapAt = now;
+      const raw = e.inputBuffer.getChannelData(0);
+      let sum = 0;
+      let n = 0;
+      for (let i = 0; i < raw.length; i += 4) {
+        const v = raw[i];
+        sum += v * v;
+        n++;
+      }
+      const rms = n > 0 ? Math.sqrt(sum / n) : 0;
+      this.lastRms = rms;
+      this.trackSpeech(rms, now);
+      // Capture-health accounting above runs regardless of socket/mute state
+      // (capture health ≠ socket health); the send path gates below.
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       // Muted: keep the processor running (it must stay in the graph) but
       // don't send mic audio to the agent.
       if (this.micMuted) return;
-      const raw = e.inputBuffer.getChannelData(0);
       const down = downsample(raw, ctx.sampleRate, this.inputRate);
       const pcm = float32ToInt16(down);
+      const buffered = this.ws.bufferedAmount || 0;
+      if (buffered > this.bufferedHighWater) this.bufferedHighWater = buffered;
+      if (buffered > this.sendBufferWatermark) {
+        // Backpressure: more PCM onto a stalled socket only deepens the
+        // stall (FE-1) — skip visibly instead.
+        this.sendSkipped++;
+        return;
+      }
       // pcm.buffer is a freshly-allocated ArrayBuffer (float32ToInt16 does
       // `new Int16Array(len)`), so the ArrayBufferLike→ArrayBuffer cast is safe.
-      this.ws.send(pcm.buffer as ArrayBuffer);
+      try {
+        this.ws.send(pcm.buffer as ArrayBuffer);
+      } catch {
+        // A socket dying mid-callback must never throw off the audio graph.
+        this.sendFailed++;
+        return;
+      }
       this.bytesSent += pcm.buffer.byteLength;
       this.micSendCount++;
       if (this.micSendCount <= 3) {
@@ -1174,6 +1518,21 @@ export class VoiceTransport {
     silence.gain.value = 0;
     processor.connect(silence);
     silence.connect(ctx.destination);
+
+    // D7.5: device-loss signals drive the recovery FSM.
+    const track = stream.getAudioTracks()[0];
+    if (track) {
+      track.enabled = !this.micMuted; // a reacquired track must honor the mute
+      track.onended = () => {
+        if (this.micStream !== stream || !this.attemptActive || this.terminal) return;
+        this.recordDeviceEvent('track-ended');
+        void this.startRecovery('reacquire');
+      };
+    }
+    this.installDeviceChangeListener();
+    void this.snapshotInputDevices().then((sig) => {
+      if (this.micStream === stream) this.inputDeviceSig = sig;
+    });
   }
 
   private stopMic(): void {
@@ -1186,7 +1545,12 @@ export class VoiceTransport {
       this.processor = null;
     }
     if (this.micStream) {
-      this.micStream.getTracks().forEach((t) => t.stop());
+      this.micStream.getTracks().forEach((t) => {
+        // Clear the D7.5 listener first — a deliberate stop() must not fire
+        // `ended` into the recovery FSM.
+        t.onended = null;
+        t.stop();
+      });
       this.micStream = null;
     }
     // Don't close audioCtx here — playback may still be draining.
@@ -1251,6 +1615,7 @@ export class VoiceTransport {
       } catch {
         return;
       }
+      this.adoptCtx(this.audioCtx);
     }
     const ctx = this.audioCtx;
     if (ctx.state === 'suspended') ctx.resume();
@@ -1280,15 +1645,22 @@ export class VoiceTransport {
       }
       src.start(this.nextPlayTime);
       this.nextPlayTime += audioBuf.duration / this.playbackRate;
-      this.activeSources.push(src);
+      const entry = { src, cancelled: false };
+      this.activeSources.push(entry);
       src.onended = () => {
-        const idx = this.activeSources.indexOf(src);
+        // Natural completion only — a flushPlayback stop() also fires
+        // onended, but that chunk was cancelled, not played out (D7.1).
+        if (!entry.cancelled) {
+          this.chunksEnded++;
+          this.lastEndedAt = this.nowFn();
+        }
+        const idx = this.activeSources.indexOf(entry);
         if (idx >= 0) this.activeSources.splice(idx, 1);
       };
-      this.playChunkCount++;
-      if (this.playChunkCount <= 5) {
+      this.chunksScheduled++;
+      if (this.chunksScheduled <= 5) {
         this.debug(
-          'Played chunk #' + this.playChunkCount + ': ' + f32.length +
+          'Played chunk #' + this.chunksScheduled + ': ' + f32.length +
             ' samples, scheduled at ' + this.nextPlayTime.toFixed(3) +
             's (ctx.state=' + ctx.state + ')',
           'audio',
@@ -1302,9 +1674,14 @@ export class VoiceTransport {
 
   /** Stop and drop all scheduled playback (barge-in / disconnect). */
   private flushPlayback(): void {
-    for (const s of this.activeSources) {
+    for (const entry of this.activeSources) {
+      // Counted HERE, deterministically — not in onended (which a closed ctx
+      // may never fire). The flag keeps a trailing onended from also counting
+      // the chunk as ended.
+      entry.cancelled = true;
+      this.chunksCancelled++;
       try {
-        s.stop();
+        entry.src.stop();
       } catch {
         /* already stopped */
       }
@@ -1328,5 +1705,587 @@ export class VoiceTransport {
       clearInterval(this.statsTimer);
       this.statsTimer = null;
     }
+  }
+
+  // ─── P7 D7.1 audio-progress ledger ──────────────────────────
+
+  /** New connection epoch: zero every counter, clear the episode ring, mint
+   *  the nonce the engine maps to its server-issued epoch on first heartbeat
+   *  sight. Ledger evidence can never span two calls. */
+  private resetLedger(): void {
+    this.epochNonce = mintNonce();
+    this.connectAtMs = this.nowFn();
+    this.bytesSent = 0;
+    this.bytesRecv = 0;
+    this.audioChunksRecv = 0;
+    this.micSendCount = 0;
+    this.capCallbacks = 0;
+    this.sendSkipped = 0;
+    this.sendFailed = 0;
+    this.chunksScheduled = 0;
+    this.chunksEnded = 0;
+    this.chunksCancelled = 0;
+    this.lastEndedAt = null;
+    this.bufferedHighWater = 0;
+    this.lastCapAt = 0;
+    this.capStalled = false;
+    this.gapOpenedAt = 0;
+    this.lastRms = 0;
+    this.speechActive = false;
+    this.speechMaxRms = 0;
+    this.speechAboveFloorMs = 0;
+    this.ctxSuspendCount = 0;
+    this.ctxLastTransition = null;
+    for (const slot of this.episodeRing) {
+      slot.id = 0;
+      slot.sent = false;
+    }
+    this.episodeSeq = 0;
+    this.episodeOverflow = 0;
+    this.statsTickCount = 0;
+    this.heartbeatsSent = 0;
+    this.hbPrev.capCallbacks = 0;
+    this.hbPrev.bytesSent = 0;
+    this.hbPrev.sendSkipped = 0;
+    this.hbPrev.sendFailed = 0;
+    this.hbPrev.chunksRecv = 0;
+    this.hbPrev.chunksScheduled = 0;
+    this.hbPrev.chunksEnded = 0;
+    this.hbPrev.chunksCancelled = 0;
+    this.deviceEvents = [];
+    this.deviceEventsDropped = 0;
+    this.recoveryEvents = [];
+    this.recoveryEventsDropped = 0;
+    this.captureState = 'observing';
+    this.inputDeviceSig = null;
+  }
+
+  /** Latched speech intervals (D7.1): an utterance entirely between
+   *  heartbeats still leaves its record. O(1) — frame-path safe. */
+  private trackSpeech(rms: number, now: number): void {
+    if (rms >= this.speechRmsFloor) {
+      if (!this.speechActive) {
+        this.speechActive = true;
+        this.speechOnsetSeq = this.capCallbacks;
+        this.speechOnsetAtMs = now;
+        this.speechMaxRms = 0;
+        this.speechAboveFloorMs = 0;
+      }
+      if (rms > this.speechMaxRms) this.speechMaxRms = rms;
+      this.speechAboveFloorMs += this.expectedFrameMs;
+      this.speechLastAboveAt = now;
+    } else if (this.speechActive && now - this.speechLastAboveAt >= this.speechOffsetHangMs) {
+      this.speechActive = false;
+      this.latchEpisode('speech', this.speechOnsetAtMs, this.speechLastAboveAt);
+    }
+  }
+
+  /** Write the next preallocated ring slot (frame-path safe: field writes
+   *  only). Evicting a slot that never made a heartbeat is evidence loss —
+   *  it bumps episodeOverflow, which the matrix maps to
+   *  insufficient-evidence. */
+  private latchEpisode(kind: 'gap' | 'speech', startAbsMs: number, endAbsMs: number): void {
+    const slot = this.episodeRing[this.episodeSeq % EPISODE_RING_SIZE];
+    if (slot.id !== 0 && !slot.sent) this.episodeOverflow++;
+    this.episodeSeq++;
+    slot.id = this.episodeSeq;
+    slot.kind = kind;
+    slot.startMs = Math.max(0, Math.round(startAbsMs - this.connectAtMs));
+    slot.endMs = Math.max(0, Math.round(endAbsMs - this.connectAtMs));
+    slot.durationMs = Math.max(0, Math.round(endAbsMs - startAbsMs));
+    slot.sent = false;
+    if (kind === 'speech') {
+      slot.onsetSeq = this.speechOnsetSeq;
+      slot.offsetSeq = this.capCallbacks;
+      slot.maxRmsPm = Math.min(1000, Math.round(this.speechMaxRms * 1000));
+      slot.aboveFloorMs = Math.round(this.speechAboveFloorMs);
+    } else {
+      slot.onsetSeq = 0;
+      slot.offsetSeq = 0;
+      slot.maxRmsPm = 0;
+      slot.aboveFloorMs = 0;
+    }
+  }
+
+  /** Close the open capture gap into a latched episode (frame-path safe). */
+  private closeGapEpisode(now: number): void {
+    this.latchEpisode('gap', this.gapOpenedAt, now);
+    this.gapOpenedAt = 0;
+    this.capStalled = false;
+  }
+
+  /**
+   * 500 ms cadence, off the frame path (§D7.0b): the capture watchdog, the
+   * extended stats publication, and — every AUDIO_HEALTH_INTERVAL_TICKS-th
+   * tick, starting with the first so the engine learns the nonce right after
+   * going live — audio_health assembly + send.
+   */
+  private runStatsTick(): void {
+    const now = this.nowFn();
+    // Watchdog (D7.1): a silent capture past max(3× frame interval, 1 s)
+    // while unmuted + connected is a stall. The gap LATCHES as an episode
+    // when capture returns (the frame path also self-latches, for outages
+    // the frozen timer never saw); a permanent stall travels as the open
+    // gap (`og`). Armed while a processor exists OR recovery is in flight —
+    // a reacquire outage (stopMic cleared the processor) is still a gap.
+    if (
+      (this.processor || this.captureState !== 'observing') &&
+      !this.micMuted &&
+      this.ws &&
+      this.ws.readyState === WebSocket.OPEN &&
+      this.lastCapAt > 0 &&
+      this.gapOpenedAt === 0 &&
+      now - this.lastCapAt > this.stallAfterMs
+    ) {
+      this.gapOpenedAt = this.lastCapAt;
+      this.capStalled = true;
+    }
+    this.ev.onStats?.(this.buildStats(now));
+    if (this.statsTickCount % AUDIO_HEALTH_INTERVAL_TICKS === 0) this.sendAudioHealth(now);
+    this.statsTickCount++;
+  }
+
+  private buildStats(now: number): VoiceStats {
+    return {
+      bytesSent: this.bytesSent,
+      bytesRecv: this.bytesRecv,
+      capCallbacks: this.capCallbacks,
+      sendSkipped: this.sendSkipped,
+      sendFailed: this.sendFailed,
+      chunksRecv: this.audioChunksRecv,
+      chunksScheduled: this.chunksScheduled,
+      chunksEnded: this.chunksEnded,
+      chunksCancelled: this.chunksCancelled,
+      scheduledDepth: this.activeSources.length,
+      lastEndedAt: this.lastEndedAt,
+      ctxState: this.audioCtx?.state ?? null,
+      ctxTimeMs: this.audioCtx ? Math.round(this.audioCtx.currentTime * 1000) : null,
+      ctxSuspendCount: this.ctxSuspendCount,
+      captureState: this.captureState,
+      capStalled: this.capStalled,
+      lastCapAgoMs: this.lastCapAt > 0 ? now - this.lastCapAt : null,
+      rms: this.lastRms,
+      speechActive: this.speechActive,
+      bufferedAmount: this.ws ? this.ws.bufferedAmount || 0 : 0,
+      bufferedHighWater: this.bufferedHighWater,
+      epochNonce: this.epochNonce,
+      ctxLastTransition: this.ctxLastTransition,
+      deviceEvents: [...this.deviceEvents],
+      deviceEventsDropped: this.deviceEventsDropped,
+      recoveryEvents: [...this.recoveryEvents],
+      recoveryEventsDropped: this.recoveryEventsDropped,
+    };
+  }
+
+  /**
+   * The 2 s audio_health heartbeat (D7.1). Compact wire schema, hard-capped
+   * at AUDIO_HEALTH_MAX_BYTES by construction: window episodes are dropped
+   * oldest-first until the frame fits (an entry evicted from the ring without
+   * ever being sent surfaces via `eo`). Counters are absolute — idempotent
+   * across skipped heartbeats; episodes re-send idempotently and the server
+   * dedups by id. There are NO server→client telemetry frames (§D7.0b).
+   *
+   * Wire schema (short keys; optional keys omitted when empty):
+   *   t   'audio_health'
+   *   n   epoch nonce (engine maps nonce→server epoch on first sight)
+   *   q   heartbeat seq within the epoch
+   *   ea  epoch age: ms since connect() on the CLIENT clock at assembly —
+   *       lets the engine place epoch-relative episode intervals on its own
+   *       clock as receivedAt − ea (accurate to network latency), instead of
+   *       guessing the epoch start from first-heartbeat timing
+   *   c   DELTAS since the last successfully-sent heartbeat (lossless: a
+   *       failed/skipped frame's interval folds into the next delta):
+   *       [capCallbacks, bytesSent, sendSkipped, sendFailed, chunksRecv,
+   *        chunksScheduled, chunksEnded, chunksCancelled]
+   *   x   [ctxTimeMs|-1, scheduledDepth, lastEndedAgoMs|-1]
+   *   cs  ctx state initial ('r'unning | 's'uspended | 'c'losed)
+   *   cap capture state initial ('o'bserving | 'r'ecovering | 'd'egraded)
+   *   sc  ctxSuspendCount
+   *   ba  [bufferedAmount, bufferedHighWater]
+   *   mu  1 while mic muted
+   *   og  [gapStartRelMs, ageMs] while a capture gap is OPEN — a permanent
+   *       stall never closes an episode, so the open gap itself must travel
+   *   eo  episodes evicted unsent (matrix: insufficient-evidence)
+   *   ep  ≤4 entries, oldest→newest:
+   *       gap    [id, 'g', startRelMs, durationMs]
+   *       speech [id, 's', onsetSeq, offsetSeq, maxRmsPm, aboveFloorMs]
+   *
+   * The ≤300 B cap holds by construction: episodes trim oldest-first, and if
+   * the episode-free frame still exceeds the cap, diagnostic fields drop in
+   * the order x → ba → sc (never the core evidence: n/q/c/cs/cap/mu/og/eo).
+   */
+  private sendAudioHealth(now: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const frame: Record<string, unknown> = {
+      t: 'audio_health',
+      n: this.epochNonce,
+      q: this.heartbeatsSent,
+      ea: Math.max(0, Math.round(now - this.connectAtMs)),
+      c: [
+        this.capCallbacks - this.hbPrev.capCallbacks,
+        this.bytesSent - this.hbPrev.bytesSent,
+        this.sendSkipped - this.hbPrev.sendSkipped,
+        this.sendFailed - this.hbPrev.sendFailed,
+        this.audioChunksRecv - this.hbPrev.chunksRecv,
+        this.chunksScheduled - this.hbPrev.chunksScheduled,
+        this.chunksEnded - this.hbPrev.chunksEnded,
+        this.chunksCancelled - this.hbPrev.chunksCancelled,
+      ],
+      x: [
+        this.audioCtx ? Math.round(this.audioCtx.currentTime * 1000) : -1,
+        this.activeSources.length,
+        this.lastEndedAt != null ? Math.max(0, now - this.lastEndedAt) : -1,
+      ],
+      cs: (this.audioCtx?.state ?? 'x')[0],
+      cap: this.captureState[0],
+    };
+    if (this.ctxSuspendCount > 0) frame.sc = this.ctxSuspendCount;
+    const buffered = this.ws.bufferedAmount || 0;
+    if (buffered > 0 || this.bufferedHighWater > 0) {
+      frame.ba = [buffered, this.bufferedHighWater];
+    }
+    if (this.micMuted) frame.mu = 1;
+    if (this.gapOpenedAt > 0) {
+      frame.og = [
+        Math.max(0, Math.round(this.gapOpenedAt - this.connectAtMs)),
+        Math.max(0, Math.round(now - this.gapOpenedAt)),
+      ];
+    }
+
+    // Newest AUDIO_HEALTH_EPISODE_WINDOW episodes, oldest→newest on the wire.
+    const window: EpisodeSlot[] = [];
+    for (let i = 0; i < AUDIO_HEALTH_EPISODE_WINDOW; i++) {
+      const seq = this.episodeSeq - i;
+      if (seq <= 0) break;
+      const slot = this.episodeRing[(seq - 1) % EPISODE_RING_SIZE];
+      if (slot.id === seq) window.push(slot);
+    }
+    window.reverse();
+    // An unsent episode that has aged OUT of the window can never be sent —
+    // that is overflow now, not at ring eviction (the "5th unsent episode"
+    // rule). Marked accounted so it counts exactly once.
+    for (const slot of this.episodeRing) {
+      if (slot.id > 0 && !slot.sent && slot.id <= this.episodeSeq - AUDIO_HEALTH_EPISODE_WINDOW) {
+        this.episodeOverflow++;
+        slot.sent = true;
+      }
+    }
+    if (this.episodeOverflow > 0) frame.eo = this.episodeOverflow;
+
+    const enc = new TextEncoder();
+    let payload: string;
+    for (;;) {
+      if (window.length > 0) {
+        frame.ep = window.map((s) =>
+          s.kind === 'gap'
+            ? [s.id, 'g', s.startMs, s.durationMs]
+            : [s.id, 's', s.onsetSeq, s.offsetSeq, s.maxRmsPm, s.aboveFloorMs],
+        );
+      } else {
+        delete frame.ep;
+      }
+      payload = JSON.stringify(frame);
+      if (enc.encode(payload).byteLength <= AUDIO_HEALTH_MAX_BYTES || window.length === 0) break;
+      window.shift(); // drop oldest — it re-sends next beat (or surfaces in eo)
+    }
+    // Episode-free frame still over the cap (extreme counter widths): drop
+    // diagnostics in fixed order, keeping the core evidence intact.
+    for (const key of ['x', 'ba', 'sc'] as const) {
+      if (enc.encode(payload).byteLength <= AUDIO_HEALTH_MAX_BYTES) break;
+      if (frame[key] !== undefined) {
+        delete frame[key];
+        payload = JSON.stringify(frame);
+      }
+    }
+    try {
+      this.ws.send(payload);
+    } catch {
+      return; // heartbeat loss is itself evidence; never throw off a timer
+    }
+    this.heartbeatsSent++;
+    for (const s of window) s.sent = true;
+    // Advance the delta baseline only after a SUCCESSFUL send.
+    this.hbPrev.capCallbacks = this.capCallbacks;
+    this.hbPrev.bytesSent = this.bytesSent;
+    this.hbPrev.sendSkipped = this.sendSkipped;
+    this.hbPrev.sendFailed = this.sendFailed;
+    this.hbPrev.chunksRecv = this.audioChunksRecv;
+    this.hbPrev.chunksScheduled = this.chunksScheduled;
+    this.hbPrev.chunksEnded = this.chunksEnded;
+    this.hbPrev.chunksCancelled = this.chunksCancelled;
+  }
+
+  // ─── P7 D7.5 capture recovery FSM ───────────────────────────
+
+  /** Attach lifecycle observation to a (possibly fresh) AudioContext.
+   *  Idempotent; teardownAudio clears it before close so the close's own
+   *  statechange never triggers recovery. */
+  private adoptCtx(ctx: AudioContext): void {
+    ctx.onstatechange = () => this.handleCtxStateChange(ctx);
+  }
+
+  private handleCtxStateChange(ctx: AudioContext): void {
+    if (ctx !== this.audioCtx) return; // stale context
+    const to = ctx.state;
+    const from = this.ctxLastTransition?.to ?? 'running';
+    this.ctxLastTransition = { from, to, at: this.nowFn() };
+    if (to === 'suspended') {
+      this.ctxSuspendCount++;
+      // Unexpected suspension while a live attempt captures → recovery.
+      if (this.attemptActive && !this.terminal && this.processor) {
+        void this.startRecovery('resume');
+      }
+    }
+  }
+
+  /**
+   * Manual retry from the degraded state (the UI affordance in D7.5's
+   * failure contract). Re-arms a full bounded reacquire; no-op while a
+   * recovery is already in flight or the attempt is not live.
+   */
+  retryCapture(): void {
+    if (!this.attemptActive || this.terminal) return;
+    void this.startRecovery('reacquire');
+  }
+
+  /**
+   * Single-flight bounded capture recovery (D7.5). `captureGen` — independent
+   * of `attemptGen`, because bumping the attempt would kill the still-live
+   * socket's callbacks — fences every await: it bumps on each attempt, on
+   * timeout, and in teardownAudio, so a late resume()/getUserMedia completion
+   * from a superseded attempt can never overwrite a newer graph.
+   */
+  private async startRecovery(kind: 'resume' | 'reacquire'): Promise<void> {
+    if (this.recoveryOwner === this.attemptGen) {
+      // Coalesce into the LIVE attempt's loop: device loss during a
+      // resume-recovery upgrades its next attempt to a full reacquire; a
+      // same-kind re-trigger is already covered.
+      if (kind === 'reacquire') this.recoveryEscalate = true;
+      return;
+    }
+    // Any other owner is a stale attempt's loop — it is fenced-dead (its gen
+    // checks make every remaining await a no-op), so the live attempt takes
+    // ownership rather than letting the corpse swallow its trigger.
+    this.recoveryOwner = this.attemptGen;
+    this.recoveryEscalate = false;
+    const gen = this.attemptGen;
+    this.captureState = 'recovering';
+    this.ev.onCaptureHealth?.('recovering', kind);
+    let effectiveKind = kind;
+    let failures = 0;
+    let iterations = 0;
+    try {
+      // Failure-counted (an escalated retry after a SUCCESSFUL resume must
+      // not burn an attempt); the iteration cap is a belt against a
+      // pathological trigger storm re-arming escalation forever.
+      while (failures < RECOVERY_MAX_ATTEMPTS && ++iterations <= 10) {
+        const backoff =
+          this.recoveryBackoffMs[Math.min(failures, this.recoveryBackoffMs.length - 1)] ?? 0;
+        if (backoff > 0 && iterations > 1) {
+          await new Promise((r) => setTimeout(r, backoff));
+          if (gen !== this.attemptGen) return;
+        }
+        if (this.recoveryEscalate) {
+          effectiveKind = 'reacquire';
+          this.recoveryEscalate = false;
+        }
+        const capGen = ++this.captureGen;
+        const ok =
+          effectiveKind === 'resume'
+            ? await this.tryResume(gen, capGen)
+            : await this.tryReacquire(gen, capGen);
+        if (gen !== this.attemptGen) return;
+        if (ok) {
+          if (this.recoveryEscalate) {
+            // A reacquire request landed while this (resume) pass was in
+            // flight: the track it reported on is still dead — keep going,
+            // consuming the escalation on the next iteration.
+            continue;
+          }
+          this.recordRecoveryEvent(effectiveKind, 'recovered', failures + 1);
+          this.captureState = 'observing';
+          this.ev.onCaptureHealth?.('recovered', effectiveKind);
+          return;
+        }
+        failures++;
+        this.recordRecoveryEvent(effectiveKind, 'failed', failures);
+      }
+      // Exhausted (failure contract): degraded, NOT terminal — the socket
+      // and the voice lease stay live; the surface renders a retry
+      // affordance (retryCapture). P4's evidence ladder sees the stall via
+      // the heartbeat, not via a connection failure.
+      this.captureState = 'degraded';
+      this.ev.onCaptureHealth?.(
+        'degraded',
+        effectiveKind,
+        'Microphone input could not be recovered',
+      );
+    } finally {
+      if (this.recoveryOwner === gen) this.recoveryOwner = -1;
+    }
+  }
+
+  private async tryResume(gen: number, capGen: number): Promise<boolean> {
+    const ctx = this.audioCtx;
+    if (!ctx || ctx.state === 'closed') return false;
+    try {
+      await this.withTimeout(ctx.resume(), this.recoveryResumeTimeoutMs);
+    } catch {
+      this.captureGen++; // timeout: fence the abandoned resume (D7.5)
+      return false;
+    }
+    if (gen !== this.attemptGen || capGen !== this.captureGen) return false;
+    return this.audioCtx === ctx && ctx.state === 'running';
+  }
+
+  private async tryReacquire(gen: number, capGen: number): Promise<boolean> {
+    // Tear down the dead capture first (keep the ctx — playback drains on it).
+    this.stopMic();
+    let stream: MediaStream;
+    try {
+      const p = navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      // A timed-out acquisition can still resolve later — the late grant
+      // must not leak a live capture (R10 discipline, captureGen edition;
+      // the timeout below bumps captureGen, so this sees it stale).
+      p.then((s) => {
+        if (gen !== this.attemptGen || capGen !== this.captureGen) {
+          for (const t of s.getTracks()) t.stop();
+        }
+      }).catch(() => {});
+      stream = await this.withTimeout(p, this.recoveryResumeTimeoutMs);
+    } catch {
+      this.captureGen++; // timeout/denial: fence the late completion
+      return false;
+    }
+    if (gen !== this.attemptGen || capGen !== this.captureGen) return false; // tracks stopped above
+    if (this.audioCtx && this.audioCtx.state === 'suspended') {
+      try {
+        await this.withTimeout(this.audioCtx.resume(), this.recoveryResumeTimeoutMs);
+      } catch {
+        /* verdict below reads the actual ctx state */
+      }
+      if (gen !== this.attemptGen || capGen !== this.captureGen) {
+        for (const t of stream.getTracks()) t.stop();
+        return false;
+      }
+    }
+    // Honest verdict: a graph wired onto a non-running context captures
+    // nothing — reporting 'recovered' with the ctx still suspended would
+    // tell the UI capture is back while it stays dead.
+    if (!this.audioCtx || this.audioCtx.state !== 'running') {
+      for (const t of stream.getTracks()) t.stop();
+      return false;
+    }
+    this.wireCaptureGraph(stream);
+    return true;
+  }
+
+  private withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('recovery timeout')), ms);
+      p.then(
+        (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      );
+    });
+  }
+
+  private recordDeviceEvent(kind: string): void {
+    this.deviceEvents.push({ kind, at: this.nowFn() });
+    if (this.deviceEvents.length > 8) {
+      this.deviceEvents.shift();
+      this.deviceEventsDropped++; // truncation is evidence loss — count it
+    }
+  }
+
+  private recordRecoveryEvent(kind: string, result: string, attempt: number): void {
+    this.recoveryEvents.push({ kind, result, attempt, at: this.nowFn() });
+    if (this.recoveryEvents.length > 8) {
+      this.recoveryEvents.shift();
+      this.recoveryEventsDropped++;
+    }
+  }
+
+  private installDeviceChangeListener(): void {
+    if (this.deviceChangeHandler) return; // one per transport
+    const md = (navigator as { mediaDevices?: unknown }).mediaDevices as
+      | {
+          addEventListener?: (type: string, h: () => void) => void;
+          ondevicechange?: (() => void) | null;
+        }
+      | undefined;
+    if (!md) return;
+    const handler = (): void => {
+      void this.handleDeviceChange();
+    };
+    this.deviceChangeHandler = handler;
+    if (typeof md.addEventListener === 'function') md.addEventListener('devicechange', handler);
+    else md.ondevicechange = handler;
+  }
+
+  private removeDeviceChangeListener(): void {
+    const handler = this.deviceChangeHandler;
+    this.deviceChangeHandler = null;
+    if (!handler) return;
+    const md = (navigator as { mediaDevices?: unknown }).mediaDevices as
+      | {
+          removeEventListener?: (type: string, h: () => void) => void;
+          ondevicechange?: (() => void) | null;
+        }
+      | undefined;
+    if (!md) return;
+    if (typeof md.removeEventListener === 'function') {
+      md.removeEventListener('devicechange', handler);
+    } else if (md.ondevicechange === handler) {
+      md.ondevicechange = null;
+    }
+  }
+
+  /** Input-device fingerprint — `devicechange` fires for outputs too, and
+   *  only input-set changes justify a reacquire (D7.5). Null = cannot
+   *  enumerate (never reacquire blind). */
+  private async snapshotInputDevices(): Promise<string | null> {
+    const md = (navigator as { mediaDevices?: unknown }).mediaDevices as
+      | { enumerateDevices?: () => Promise<Array<{ kind?: string; deviceId?: string }>> }
+      | undefined;
+    if (!md || typeof md.enumerateDevices !== 'function') return null;
+    try {
+      const devices = await md.enumerateDevices();
+      return devices
+        .filter((d) => d?.kind === 'audioinput')
+        .map((d) => String(d?.deviceId ?? ''))
+        .sort()
+        .join('|');
+    } catch {
+      return null;
+    }
+  }
+
+  private async handleDeviceChange(): Promise<void> {
+    if (!this.attemptActive || this.terminal || !this.processor) return;
+    const gen = this.attemptGen;
+    const capGen = this.captureGen;
+    const sig = await this.snapshotInputDevices();
+    // Dual fence (round-1 fix #5): a recovery that replaced the graph while
+    // this enumeration was pending bumped captureGen — acting on the stale
+    // result would tear the fresh capture down again.
+    if (gen !== this.attemptGen || capGen !== this.captureGen) return;
+    if (sig === null || this.inputDeviceSig === null) return;
+    if (sig === this.inputDeviceSig) return; // output-only change
+    this.inputDeviceSig = sig;
+    this.recordDeviceEvent('input-devices-changed');
+    void this.startRecovery('reacquire');
   }
 }

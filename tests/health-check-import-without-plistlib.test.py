@@ -149,12 +149,21 @@ class TestProbeDegradesAlone(unittest.TestCase):
         """Reach the plistlib import: proxy up, core routed, config dir set, plist
         present. Routing is stated explicitly rather than inherited from the host
         — a developer machine whose core IS proxy-routed would otherwise pass
-        these for the wrong reason."""
+        these for the wrong reason.
+
+        The listener's environment is pinned UNREADABLE for the same reason.
+        Since #2896 the running process is consulted before the plist, so a
+        readable one answers first and the plist path — the only path that
+        needs plistlib — is never reached: these cases stopped exercising what
+        they exist to guard, and read the developer's live proxy while doing it.
+        """
         with mock.patch.dict(os.environ,
                              {"CLAUDE_CONFIG_DIR": "/tmp/x/.claude-sutando",
                               "ANTHROPIC_BASE_URL": "http://localhost:7846"},
                              clear=False), \
              mock.patch.object(mod.Path, "home", staticmethod(lambda: self.home)), \
+             mock.patch.object(mod, "_proxy_config_dir_from_process",
+                               return_value=mod._PROXY_ENV_UNREADABLE), \
              mock.patch.object(mod, "_runtime_may_skip_proxy", return_value=False):
             return mod.check_quota_account_identity("ok", core_env_prober=lambda: True)
 
@@ -179,6 +188,28 @@ class TestProbeDegradesAlone(unittest.TestCase):
             out = self._run(mod)
         self.assertEqual(out["status"], "ok")
         self.assertIn("not launchd-managed", out["detail"])
+
+    @unittest.skipIf(importlib.util.find_spec("plistlib") is None,
+                     "interpreter cannot import plistlib")
+    def test_launchd_valid_plist_that_strict_xml_rejects_does_not_abort_the_run(self):
+        """`--` inside an XML comment is illegal XML and fine to launchd, so such
+        a plist is a normal installed artifact. expat raises ExpatError, which
+        subclasses Exception directly — it must not escape and kill every later
+        check in the one tool whose job is noticing things are down."""
+        self.plist.write_bytes(
+            b"<?xml version='1.0' encoding='UTF-8'?>\n"
+            b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            b'"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            b'<plist version="1.0"><dict>\n'
+            b"  <!-- Runs health-check.py --emit-task --notify-on-fail -->\n"
+            b"  <key>Label</key><string>com.sutando.credential-proxy</string>\n"
+            b"  <key>EnvironmentVariables</key><dict>"
+            b"<key>CLAUDE_CONFIG_DIR</key><string>/tmp/x/.claude-sutando</string>"
+            b"</dict>\n</dict></plist>\n")
+        mod = _load_health_check("health_check_expat_fallback")
+        out = self._run(mod)          # must RETURN, not raise
+        self.assertIsInstance(out, dict)
+        self.assertEqual(out["name"], "quota-account-identity")
 
     @unittest.skipIf(importlib.util.find_spec("plistlib") is None,
                      "interpreter cannot import plistlib")

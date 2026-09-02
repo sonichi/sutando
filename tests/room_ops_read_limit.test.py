@@ -76,6 +76,10 @@ class ReadLimitCountsMessages(unittest.TestCase):
             else:
                 os.environ.pop(k, None)
 
+    def test_max_limit_matches_the_gateway_ceiling(self):
+        """A lowered ceiling loses history without making the existing tests fail."""
+        self.assertEqual(rd.MAX_LIMIT, 1000)
+
     def test_small_limit_does_not_report_an_empty_room(self):
         """The regression: limit=3 returned ZERO from a room holding fourteen."""
         with mock.patch.object(rd, "http_request", side_effect=raw_window_gateway()):
@@ -167,6 +171,23 @@ class ReadLimitCountsMessages(unittest.TestCase):
         self.assertLessEqual(max(seen), rd.MAX_LIMIT, "never request beyond MAX_LIMIT")
         self.assertFalse(res["complete"], "stopped early -> NOT complete")
 
+    def test_widening_reaches_the_cap_in_a_bounded_number_of_calls(self):
+        """Raising MAX_LIMIT must actually widen the reach AND stay cheap.
+
+        The schedule is geometric with a `_MAX_WIDENINGS` guard, so a bigger
+        cap could in principle be unreachable (guard truncates before the top)
+        or reachable only via many round trips. Pin both: the widest window IS
+        the cap, and getting there costs a handful of calls, not dozens.
+        """
+        for cap in (100, 1000):
+            w = rd._windows(rd.DEFAULT_LIMIT, cap)
+            self.assertEqual(w[-1], cap, f"schedule must reach cap {cap}")
+            self.assertEqual(sorted(set(w)), w, "strictly increasing, no repeats")
+            self.assertLessEqual(len(w), 8, f"too many round trips for cap {cap}")
+        # The floor start is the worst case — smallest first window, so the
+        # most doublings to climb. It is the one that would blow the budget.
+        self.assertLessEqual(len(rd._windows(1, rd.MAX_LIMIT)), 8)
+
     def test_leading_noise_wider_than_the_first_windows(self):
         """Two consecutive ZERO windows must not be read as an empty room.
 
@@ -227,6 +248,30 @@ class ReadLimitCountsMessages(unittest.TestCase):
         with mock.patch.object(rd, "http_request", side_effect=_http):
             rd.read_room(ROOM, HS, limit=1, gate=None, before="$evt")
         self.assertIn("before=", seen_urls[0])
+
+
+class NormalizeMediaRefTests(unittest.TestCase):
+    """`media_ref` + `msgtype` are the only handle a reader has on a room attachment,
+    so dropping them leaves it visible in `body` but unfetchable."""
+
+    def test_media_ref_and_msgtype_preserved(self):
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "doc.pdf",
+                              "msgtype": "m.file", "media_ref": "mxc://hs/abc123"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
+        self.assertEqual(out[0]["msgtype"], "m.file")
+
+    def test_media_without_msgtype_grows_no_null(self):
+        # Third case: media present, msgtype absent. The gateway is external, so this
+        # cannot be ruled out from here — keep the same additive shape as plain text.
+        out = rd._normalize([{"event_id": "$e", "sender": "@a:h", "body": "f.pdf",
+                              "media_ref": "mxc://hs/abc123"}])
+        self.assertEqual(out[0]["media_ref"], "mxc://hs/abc123")
+        self.assertNotIn("msgtype", out[0])
+
+    def test_no_media_ref_key_for_plain_message(self):
+        # A text message must not grow a null media_ref — keep the shape additive.
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "hi"}])
+        self.assertNotIn("media_ref", out[0])
 
 
 if __name__ == "__main__":

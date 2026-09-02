@@ -54,10 +54,15 @@ let _lastInjectedSelection = '';
 export function _frameHook(sendUserCtx: (text: string) => void): void {
 	_selectionTickCount++;
 	if (_selectionTickCount % SELECTION_PROBE_INTERVAL_TICKS !== 0) return;
-	const sel = _readSelection(200); // 200ms timeout — must not stall the tick
-	if (!sel || sel.text === _lastInjectedSelection) return;
-	_lastInjectedSelection = sel.text;
-	sendUserCtx(`[Selected text: ${sel.text}]`);
+	// §D7.0b: the probe shells out — fire-and-forget async so the frame-send
+	// path returns immediately; the injection lands when the probe resolves.
+	void Promise.resolve(_readSelection(200))
+		.then((sel) => {
+			if (!sel || sel.text === _lastInjectedSelection) return;
+			_lastInjectedSelection = sel.text;
+			sendUserCtx(`[Selected text: ${sel.text}]`);
+		})
+		.catch(() => {});
 }
 
 /** Reset module-level frame hook state between tests. */
@@ -224,10 +229,15 @@ const deactivateScreenCompanionTool: ToolDefinition = {
 // Gemini Live session. Designed for pull-mode (configs that don't stream).
 
 // Injection seams for tests — production code uses the imported defaults.
-let _readSelection: (timeoutMs?: number) => SelectionResult | null = defaultReadSelection;
+// readSelection is async in production (§D7.0b: the osascript probe must
+// never run synchronously on the voice loop); sync fakes are also accepted.
+type ReadSelectionFn = (
+	timeoutMs?: number
+) => SelectionResult | null | Promise<SelectionResult | null>;
+let _readSelection: ReadSelectionFn = defaultReadSelection;
 let _captureSendFrame: typeof captureSendFrame = captureSendFrame;
 export function _setVisionQueryDeps(deps: {
-	readSelection?: (timeoutMs?: number) => SelectionResult | null;
+	readSelection?: ReadSelectionFn;
 	captureSendFrame?: typeof captureSendFrame;
 }): void {
 	if (deps.readSelection) _readSelection = deps.readSelection;
@@ -267,7 +277,7 @@ const visionQueryTool: ToolDefinition = {
 		const wantSelection = mode === 'selection' || mode === 'both' || mode === 'selection-or-frame';
 		const wantFrame = mode === 'frame' || mode === 'both' || mode === 'selection-or-frame';
 
-		const selection = wantSelection ? _readSelection() : null;
+		const selection = wantSelection ? await _readSelection() : null;
 
 		// mode='selection' — only selection, no frame fallback.
 		if (mode === 'selection') {

@@ -25,8 +25,13 @@ set -uo pipefail   # NOT -e: one skill's hiccup must not strand a half-swapped s
 # Precedence: SKILLS_DST env > sutando-config helper (if reachable) > ~/.claude/skills.
 SKILLS_DST="${SKILLS_DST:-}"
 if [ -z "$SKILLS_DST" ]; then
-  _cfg="${SUTANDO_REPO_DIR:-$HOME/Desktop/sutando}/scripts/sutando-config.sh"
-  [ -x "$_cfg" ] && SKILLS_DST="$(bash "$_cfg" claude-home-path skills 2>/dev/null || true)"
+  # The helper lives in THIS script's own repo — a hardcoded path resolves to an
+  # empty dir on any clone elsewhere, and every skill then reads as absent.
+  _repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  _cfg="${SUTANDO_REPO_DIR:-$_repo}/scripts/sutando-config.sh"
+  # -f, not -x: it is invoked via `bash`, so a missing exec bit must not
+  # silently disable resolution and fall through to the wrong directory.
+  [ -f "$_cfg" ] && SKILLS_DST="$(bash "$_cfg" claude-home-path skills 2>/dev/null || true)"
   SKILLS_DST="${SKILLS_DST:-$HOME/.claude/skills}"
 fi
 SETTLE_S="${REFRESH_SKILL_SETTLE_S:-1}"
@@ -40,6 +45,9 @@ EXCLUDES=(--exclude='workspace' --exclude='node_modules' --exclude='generated'
 refresh_one() {
   local name="$1"
   local link="$SKILLS_DST/$name"
+  if [ ! -e "$link" ] && [ ! -L "$link" ]; then
+    echo "  skip $name (NOT INSTALLED at $SKILLS_DST — nothing to refresh)"; return 0
+  fi
   if [ ! -L "$link" ]; then
     echo "  skip $name (not a symlink — won't clobber a local/copy install)"; return 0
   fi

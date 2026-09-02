@@ -69,6 +69,7 @@ def _load(name: str, path: Path):
 
 
 dm = _load("dm_result", REPO / "src" / "dm-result.py")
+import channels.discord.client as _rest  # noqa: E402  — the seam the fakes install into
 
 
 class _FakeResponse:
@@ -111,14 +112,35 @@ class _FakeTransport:
         raise AssertionError(f"unmocked request: {method} {url}")
 
 
+_SEAM = None
+
+
 def _install_transport(transport):
-    original = dm.urllib.request.urlopen
-    dm.urllib.request.urlopen = transport.urlopen
-    return original
+    """Route the shared client through the fake (dm-result delivers via
+    DiscordRestClient now, so the module's urlopen is no longer the seam)."""
+    global _SEAM
+
+    def _tuple(req, timeout):
+        resp = transport.urlopen(req, timeout=timeout)
+        raw = resp.read().decode("utf-8", "replace")
+        return getattr(resp, "status", 200), (json.loads(raw) if raw else None)
+
+    def _read_json(req, timeout=None):
+        resp = transport.urlopen(req, timeout=timeout)
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+    _SEAM = (dm._client, _rest.request_json)
+    dm._client = lambda token: _rest.DiscordRestClient(
+        token, transport=_tuple, timeout=30)
+    _rest.request_json = _read_json
+    return _SEAM
 
 
-def _restore_transport(original):
-    dm.urllib.request.urlopen = original
+def _restore_transport(_original=None):
+    global _SEAM
+    if _SEAM is not None:
+        dm._client, _rest.request_json = _SEAM
+        _SEAM = None
 
 
 def _with_access_json(content, fn):
@@ -461,6 +483,31 @@ def test_no_writes_reach_the_live_workspace(live_ws) -> None:
           f"({len(set(before) | set(now))} paths compared, union of before+after)")
 
 
+def test_vanished_file_after_allowlist_check_returns_false():
+    """TOCTOU: an allowlisted path that disappears before the blob read must
+    abort with the bounded batch diagnostic, not an uncaught traceback."""
+    transport = _FakeTransport({
+        ("POST", "/users/@me/channels"): {"id": "dm-9"},
+        ("POST", "/channels/dm-9/messages"): {"id": "msg-9"},
+    })
+    original = _install_transport(transport)
+    orig_gate = dm._is_path_sendable
+    dm._is_path_sendable = lambda p: True   # force the check TRUE for a path that is gone
+    def run():
+        try:
+            ok = dm.send_dm("body [file: /tmp/sutando-vanished-after-check.bin]")
+        finally:
+            dm._is_path_sendable = orig_gate
+            _restore_transport(original)
+        assert ok is False, "unreadable batch must return False through the delivery contract"
+        mp_calls = [c for c in transport.calls if c["is_multipart"]]
+        assert mp_calls == [], "no upload attempt may be made for an unreadable batch"
+    _with_access_json(
+        {"allowFrom": ["human-id"], "tierMap": {"human-id": "owner"}},
+        run,
+    )
+
+
 def main():
     from workspace_default import resolve_workspace
 
@@ -479,6 +526,8 @@ def main():
         print("  ✓ test_eleven_files_split_into_two_batches")
         test_filename_crlf_quote_sanitized_in_header()
         print("  ✓ test_filename_crlf_quote_sanitized_in_header")
+        test_vanished_file_after_allowlist_check_returns_false()
+        print("  ✓ test_vanished_file_after_allowlist_check_returns_false")
     test_resolver_bindings_restored_after_the_context()
     test_no_writes_reach_the_live_workspace(live_ws)
     print("All dm-result multipart-upload tests passed.")
