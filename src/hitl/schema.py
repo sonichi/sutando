@@ -58,6 +58,9 @@ class HumanRequirement:
     actions: List[Action] = field(default_factory=list)
     # Task ids blocked on this requirement; resumed when it resolves.
     blocked_task_ids: List[str] = field(default_factory=list)
+    # The action id a human chose (set on apply_action) — what a blocking
+    # hook driver reads to turn a card click into its permissionDecision.
+    chosen_action: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 

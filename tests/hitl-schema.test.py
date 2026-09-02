@@ -140,6 +140,7 @@ class ManagerTests(unittest.TestCase):
         action = self.mgr.apply_action(reply_for(req))
         self.assertEqual(action.kind, "authenticate")
         self.assertEqual(self.mgr.get(req.id).status, "in_progress")
+        self.assertEqual(self.mgr.get(req.id).chosen_action, "reauth")
 
     def test_apply_action_stale_leaves_state_untouched(self):
         req = self.mgr.create(make_req())

@@ -30,6 +30,12 @@ from .schema import (
 )
 
 
+def default_store(workspace: Path) -> Path:
+    """Where every hitl component on a host keeps requirements: the hook driver
+    writes here, the supervisor projects from here. One store, one card."""
+    return Path(workspace) / "state" / "hitl" / "requirements"
+
+
 class HitlStore:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -119,6 +125,7 @@ class HitlManager:
 
             raise MalformedActionError(f"no requirement {reply.hitl_id}")
         action = validate_action(req, reply)
+        req.chosen_action = action.id
         req.transition(STATUS_IN_PROGRESS)
         self.store.save(req)
         return action
