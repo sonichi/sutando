@@ -94,6 +94,27 @@ class IngestTests(unittest.TestCase):
         self.assertEqual({a.kind for a in req.actions[:-1]}, {"tui_select"})
         self.assertEqual(req.subject, {})
 
+    def test_repaint_expires_the_old_dialog_and_mints_a_new_card_with_new_options(self):
+        # TustinOC's second repro: the guard moved to screen BBB; the old card's
+        # options must never be typed into the new screen.
+        self.drop("core-2-AAA", event(session="core-2", guard="tui:AAA",
+                                       options=[{"id": "1", "label": "Keep the file"}, {"id": "2", "label": "Delete the file"}]))
+        ingest(self.mgr, self.ws)
+        [old] = self.mgr.active()
+        self.drop("core-2-BBB", event(session="core-2", guard="tui:BBB",
+                                       options=[{"id": "1", "label": "Deploy to production"}, {"id": "2", "label": "Cancel"}]))
+        c = ingest(self.mgr, self.ws)
+        self.assertEqual((c["created"], c.get("superseded")), (1, 1))
+        self.assertEqual(self.mgr.get(old.id).status, "expired")
+        [new] = self.mgr.active()
+        self.assertNotEqual(new.id, old.id)
+        self.assertEqual((new.guard, new.revision), ("tui:BBB", 1))
+        self.assertEqual([a.label for a in new.actions[:2]], ["Deploy to production", "Cancel"])
+        # A click carrying the old card's revision+guard is rejected by the gate.
+        from hitl.schema import StaleRequirementError
+        with self.assertRaises(StaleRequirementError):
+            self.mgr.apply_action(ActionReply(hitl_id=old.id, expected_revision=old.revision, action_id="1", guard="tui:AAA"))
+
     def test_unknown_kind_still_gets_a_jump_only_card(self):
         self.drop("x", event(kind="unknown", prompt=None, options=[]))
         ingest(self.mgr, self.ws)

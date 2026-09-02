@@ -105,9 +105,21 @@ def ingest(manager: HitlManager, workspace: Path) -> Dict[str, int]:
         if existing is not None:
             counts["skipped"] += 1  # already reflected; the file is the driver's, leave it
             continue
-        manager.create(_requirement_for(ev))
+        new = _requirement_for(ev)
+        # One live dialog per session: a new guard means the screen moved on, so
+        # the older card is stale by construction — expire it, never refresh onto it.
+        for stale in manager.active():
+            if (_device_id(stale) == _device_id(new) and stale.runtime == new.runtime
+                    and stale.guard != new.guard and stale.decided_by is None):
+                manager.expire(stale.id)
+                counts["superseded"] = counts.get("superseded", 0) + 1
+        manager.create(new)
         counts["created"] += 1
     return counts
+
+
+def _device_id(req: HumanRequirement) -> str:
+    return str((req.device or {}).get("id") or "")
 
 
 def _find_by_guard(manager: HitlManager, guard: str) -> Optional[HumanRequirement]:
