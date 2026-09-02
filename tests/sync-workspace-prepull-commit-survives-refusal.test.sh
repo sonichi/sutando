@@ -6,6 +6,11 @@
 # The fix commits local edits BEFORE the pull, so the reset cannot reach them.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# The script commits with whatever identity git can derive; a CI runner whose
+# user has no GECOS name yields "empty ident name", so pass one through env -i
+# exactly as tests/sync-workspace.test.sh exports it for its own runs.
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-sync-prepull-test}"
+export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-sync-prepull-test@invalid}"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sync-prepull.XXXXXX")"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 pass=0; fail=0
@@ -22,6 +27,8 @@ mkhost() {  # name wsid -> sets ${name}_REPO ${name}_WS, runs --init
 JSON
   echo "$n note" > "$w/notes/$n-note.md"
   env -i HOME="$HOME" PATH="$PATH" SUTANDO_REPO_DIR="$r" SUTANDO_WORKSPACE="$w" SUTANDO_TEST_MODE=1 \
+      GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+      GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL" \
       SUTANDO_HOST_OVERRIDE="$n" SUTANDO_WS_ID_OVERRIDE="$wsid" \
       bash "$r/scripts/sync-workspace.sh" --vault-url "$VAULT" --init >/dev/null 2>&1
   eval "${n}_REPO=\"$r\"; ${n}_WS=\"$w\""
@@ -30,6 +37,8 @@ runsync() {  # name wsid args...
   local n="$1" wsid="$2"; shift 2
   local r="$TEST_ROOT/$n-repo" w="$TEST_ROOT/$n-ws"
   env -i HOME="$HOME" PATH="$PATH" SUTANDO_REPO_DIR="$r" SUTANDO_WORKSPACE="$w" SUTANDO_TEST_MODE=1 \
+      GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL" \
+      GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL" \
       SUTANDO_HOST_OVERRIDE="$n" SUTANDO_WS_ID_OVERRIDE="$wsid" SUTANDO_FORCE_SYNC="${FORCE:-0}" \
       bash "$r/scripts/sync-workspace.sh" --vault-url "$VAULT" "$@" 2>&1
 }
