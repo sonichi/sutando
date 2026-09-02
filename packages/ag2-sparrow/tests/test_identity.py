@@ -192,6 +192,36 @@ class OneCanonicalGrammar(unittest.TestCase):
                                        msg=f"{parse.__name__}({bad!r})"):
                     parse(bad)
 
+    def test_parsers_reject_non_canonical_escapes(self):
+        """The grammar admits any %XX; only a constructor's own output is
+        canonical. `%41` is a safe 'A' spelled the long way, `%FF` is not
+        UTF-8, and `01` is an ordinal no derivation emits."""
+        rejects = {
+            serialization.parse_delivery_id: ["d:%41@gw", "d:%FF@gw", "d:%C3%28@gw", "d:a@%25"],
+            serialization.parse_attempt_id: ["d:%41@gw#a1"],
+            serialization.parse_idempotency_key: ["e:%41@gw"],
+            serialization.parse_incarnation_id: ["%41:1:2", "w:01:2", "w:1:02"],
+        }
+        for parse, values in rejects.items():
+            for bad in values:
+                with self.assertRaises(ValueError, msg=f"{parse.__name__}({bad!r})"):
+                    parse(bad)
+        # Positive controls: reserved and non-ASCII escapes a constructor DOES
+        # emit, and ordinal zero, stay accepted.
+        for parse, good in [(serialization.parse_delivery_id, "d:%40@gw"),
+                            (serialization.parse_delivery_id, "d:%E2%80%8B@gw"),
+                            (serialization.parse_idempotency_key, "e:%40@gw"),
+                            (serialization.parse_incarnation_id, "w:0:0"),
+                            (serialization.parse_attempt_id, "d:%40@gw#a1")]:
+            parse(good)
+
+    def test_every_escaped_component_is_canonical_and_nothing_else_is(self):
+        from ag2_sparrow.identity.escape import is_canonical_component
+        for raw in ("plain", "a b", "a/b", "@#%+~:", "t\u00e9st", "\u200b", "x" * 50):
+            self.assertTrue(is_canonical_component(I.escape_component(raw)), raw)
+        for bad in ("", "%41", "%ff", "%FF", "%", "a%", "%2", "a%zz"):
+            self.assertFalse(is_canonical_component(bad), bad)
+
     def test_type_construction_matches_parse_acceptance(self):
         with self.assertRaises(ValueError):
             I.TaskId("not-a-task")

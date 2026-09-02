@@ -22,24 +22,7 @@ import re
 from .types import (AttemptId, DeliveryId, IdempotencyKey, IncarnationId,
                     TaskId)
 
-# Reserved separators; escaped in raw components so the grammar is injective.
-_RESERVED = "%@#+~:"
-
-
-def escape_component(raw: str) -> str:
-    """Injective: safe chars pass through; everything else (reserved,
-    whitespace, path separators, ALL non-ASCII) becomes fixed-width uppercase
-    %XX per UTF-8 byte. '%' itself is always escaped, so decoding is
-    unambiguous and two distinct inputs can never share an output."""
-    if not isinstance(raw, str) or not raw:
-        raise ValueError("identity component must be a non-empty string")
-    out = []
-    for ch in raw:
-        if 0x21 <= ord(ch) <= 0x7E and ch not in _RESERVED and ch not in "/\\":
-            out.append(ch)
-        else:
-            out.extend(f"%{b:02X}" for b in ch.encode("utf-8"))
-    return "".join(out)
+from .escape import escape_component  # noqa: F401  (re-exported)
 
 
 def _require(value, want, name: str):

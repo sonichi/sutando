@@ -15,12 +15,16 @@ import re
 from dataclasses import dataclass
 from typing import ClassVar, Optional
 
+from .escape import is_canonical_component
+
 _MAX_LEN = 200
 
 # One component: safe chars or fixed-width %XX escapes (uppercase hex),
 # at least one unit — empty components are constructor-impossible.
 _COMPONENT = r"(?:[^%@#+~:/\\]|%[0-9A-F]{2})+"
 _DELIVERY_BASE = rf"(?:d|legacy):{_COMPONENT}@{_COMPONENT}(?:\+r[1-9][0-9]*)*"
+_DELIVERY_PARTS = re.compile(rf"(?:d|legacy):({_COMPONENT})@({_COMPONENT})(?:\+r[1-9][0-9]*)*")
+_ORDINAL = r"(?:0|[1-9][0-9]*)"
 # delivery_core's shipped key <item_id>#<epoch>, unescaped and OPAQUE: path
 # separators included. Disjoint from "e:...@...", which has no '#'.
 _LEGACY_KEY = r".+#[0-9]+"
@@ -59,6 +63,14 @@ class _Identity:
         pattern = type(self)._PATTERN
         if pattern is not None and not pattern.fullmatch(self.value):
             raise ValueError(f"{kind} grammar rejects {self.value!r}")
+        # The grammar admits any %XX; only a constructor's own output is
+        # canonical, so `%41` for a safe 'A' or `%FF` must not parse.
+        for comp in self._components():
+            if not is_canonical_component(comp):
+                raise ValueError(f"{kind} component is not canonical: {comp!r}")
+
+    def _components(self) -> "tuple[str, ...]":
+        return ()
 
     def __str__(self) -> str:
         return self.value
@@ -68,6 +80,9 @@ class DeliveryId(_Identity):
     """One object crossing one boundary, once. Sparrow-owned."""
 
     _PATTERN = re.compile(_DELIVERY_BASE)
+
+    def _components(self):
+        return _DELIVERY_PARTS.fullmatch(self.value).groups()
 
 
 class TaskId(_Identity):
@@ -82,18 +97,27 @@ class AttemptId(_Identity):
 
     _PATTERN = re.compile(rf"{_DELIVERY_BASE}#a[1-9][0-9]*")
 
+    def _components(self):
+        return _DELIVERY_PARTS.fullmatch(self.value.rsplit("#a", 1)[0]).groups()
+
 
 class IdempotencyKey(_Identity):
     """One external side-effect, deduplicated. Stable across re-sends. Two
     admissible shapes: the canonical e:<task>@<boundary>, and the pre-B
     provider key <item_id>#<epoch> that legacy_idempotency_key preserves."""
 
-    _PATTERN = re.compile(rf"e:{_COMPONENT}@{_COMPONENT}")
+    _PATTERN = re.compile(rf"e:({_COMPONENT})@({_COMPONENT})")
     _OPAQUE = re.compile(_LEGACY_KEY, re.DOTALL)  # an item_id may hold newlines
+
+    def _components(self):
+        return self._PATTERN.fullmatch(self.value).groups()
 
 
 class IncarnationId(_Identity):
     """One process lifetime. Attribution only: names who performed an
     attempt, never the work itself (ratchet R1)."""
 
-    _PATTERN = re.compile(rf"{_COMPONENT}:[0-9]+:[0-9]+")
+    _PATTERN = re.compile(rf"({_COMPONENT}):{_ORDINAL}:{_ORDINAL}")
+
+    def _components(self):
+        return self._PATTERN.fullmatch(self.value).groups()
