@@ -337,6 +337,29 @@ def run() -> None:
     check("/guest-task: decoder RecursionError is the invalid-JSON 400 (negative control, forced)",
           raw_forced("/guest-task", DEEP) == BAD_JSON)
 
+    # An integer past sys.get_int_max_str_digits() makes json.loads raise plain
+    # ValueError, not JSONDecodeError. Natural case, then a forced control.
+    import sys as _sys
+    _digits = _sys.get_int_max_str_digits() or 4300
+    BIG = b'{"task":"x","padding":' + b"9" * (_digits + 1) + b"}"
+    OK_BIG = b'{"task":"x","padding":' + b"9" * max(_digits - 1, 1) + b"}"
+    check("/task: an integer past the digit limit is the invalid-JSON 400 (natural)", raw("/task", BIG) == BAD_JSON)
+    check("/guest-task: an integer past the digit limit is the invalid-JSON 400 (natural, negative control)",
+          raw("/guest-task", BIG) == BAD_JSON)
+    check("/task: an integer within the digit limit is not rejected as JSON (control)", raw("/task", OK_BIG)[0] != 400 or raw("/task", OK_BIG) != BAD_JSON)
+
+    def raw_forced_value_error(path: str, body: bytes):
+        real = agent_api.json.loads
+        def boom(b, *a, **k):
+            if isinstance(b, (bytes, bytearray, str)) and len(b) == len(BIG):
+                raise ValueError("Exceeds the limit (4300 digits) for integer string conversion")
+            return real(b, *a, **k)
+        with patch.object(agent_api.json, "loads", boom):
+            return raw(path, body)
+    check("/task: decoder ValueError is the invalid-JSON 400 (forced)", raw_forced_value_error("/task", BIG) == BAD_JSON)
+    check("/guest-task: decoder ValueError is the invalid-JSON 400 (negative control, forced)",
+          raw_forced_value_error("/guest-task", BIG) == BAD_JSON)
+
     print()
     if failures:
         print(f"FAILED ({failures})")
