@@ -227,6 +227,13 @@ jobs:
               fi
             else
               echo "$output" | grep -E 'FAIL|^Summary' || true
+              # A listed suite that PASSES is a stale entry, and a stale entry
+              # un-gates a suite nobody thinks is un-gated. Fail so the list
+              # cannot silently outlive the failures it excuses.
+              if grep -qxF "$f" "$known_failures_file" 2>/dev/null; then
+                echo "✖ stale allowlist entry: $f passed — delete its line from $known_failures_file"
+                failed=1
+              fi
             fi
           done < <(find tests -name '*.test.sh' -not -path '*/node_modules/*' | sort)
           exit "$failed"

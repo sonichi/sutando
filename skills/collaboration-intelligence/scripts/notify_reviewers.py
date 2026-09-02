@@ -60,11 +60,25 @@ def load_roster() -> dict:
     return data
 
 
+def stated_reason(entry: dict) -> str:
+    """The roster's own words for why an entry refuses, if it gave any.
+
+    A blank `stand` can be missing data OR a deliberate DO-NOT-ROUTE. Only the
+    entry knows which, and a refusal that omits it invites the repair that
+    overrides it (#3468)."""
+    for key in ("refusal_basis", "note"):
+        v = entry.get(key)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())
+    return ""
+
+
 def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     """(targets, refusal_rc): one bad entry must never starve the rest of the
     batch — resolvable reviewers are still notified, the worst refusal code
     is carried to the exit so the caller sees somebody was skipped."""
     out, worst = [], 0
+    actor_of, covered = _actor_map(roster), {}
     for name in names:
         entry = roster.get(name)
         if entry is None:
@@ -73,21 +87,104 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             worst = max(worst, 2)
             continue
         stand, room = entry.get("stand"), entry.get("room")
+        why = stated_reason(entry)
+        # A caveat nobody prints is a note, not a step. Shared-login entries
+        # look like one actor from GitHub; surface it here, before the send.
+        if entry.get("identity_caveat"):
+            print(f"IDENTITY CAVEAT '{name}': {entry['identity_caveat']}", file=sys.stderr)
         if not stand or not room:
             # a human id alone cannot be a target: person-mentions trigger no Stand
             print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
                   f"(human-only = not Stand addressing)", file=sys.stderr)
+            # Without this the refusal reads as a data gap, and the obvious
+            # repair — populate the fields — silently overrides the refusal.
+            if why:
+                print(f"  roster says: {why}", file=sys.stderr)
             worst = max(worst, 3)
             continue
         if entry.get("allowlisted") is False:
-            print(f"OFF-ALLOWLIST '{name}': {stand} bounced a mention before —"
-                  " route through the owner instead of re-sending",
+            # State the FLAG, never a cause: nothing sets allowlisted=False after
+            # a detected bounce, so any history claim here would be a guess.
+            print(f"OFF-ALLOWLIST '{name}': {stand} is not allowlisted for mentions"
+                  + (f" — {why}" if why else "")
+                  + " — route through the owner instead of re-sending",
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
+        # One person can hold several roster keys, so counting NAMES lets the
+        # two-reviewer gate in main() pass on one recipient addressed twice.
+        actor = actor_of.get(name, name)
+        # Tagged keys: a single dict would alias a roster key against an mxid.
+        prior = covered.get(("actor", actor)) or covered.get(("stand", stand))
+        if prior is not None:
+            print(f"DUPLICATE '{name}': same person as '{prior}' "
+                  f"({stand}) — already covered, not a second reviewer",
+                  file=sys.stderr)
+            continue
+        covered[("actor", actor)] = covered[("stand", stand)] = name
         out.append({"name": name, "stand": stand, "room": room,
                     "human": entry.get("human")})
     return out, worst
+
+
+def gate_capability(repo: str, login: str) -> "tuple[bool | None, str]":
+    """(can this login's approval discharge repo's approval gate?, why).
+
+    Asked of GitHub, not of the roster: a cached tier goes stale silently and an
+    approval from a read-only account is indistinguishable in the UI from one
+    that counts. None = could not determine; the caller prints, never refuses.
+    """
+    try:
+        p = subprocess.run(
+            ["gh", "api", f"repos/{repo}/collaborators/{login}/permission",
+             "-q", ".permission"],
+            capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return None, f"unverified ({type(exc).__name__})"
+    if p.returncode != 0:
+        return None, f"unverified (gh rc={p.returncode})"
+    perm = p.stdout.strip()
+    if perm in ("write", "admin", "maintain"):
+        return True, perm
+    if perm in ("read", "none", "triage"):
+        # `read` is also what this endpoint returns for someone who is not a
+        # collaborator at all, so the reason needs the membership check.
+        return False, perm if _is_collaborator(repo, login) else "not a collaborator"
+    return None, f"unverified (permission={perm!r})"
+
+
+def _is_collaborator(repo: str, login: str) -> bool:
+    try:
+        p = subprocess.run(["gh", "api", f"repos/{repo}/collaborators/{login}"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:                            # noqa: BLE001 - probe must not raise
+        return True                              # unknown -> the milder wording
+    return p.returncode == 0
+
+
+def _github_login(name: str, roster: dict) -> "tuple[str, str]":
+    """(login GitHub can answer for, why) — a roster key is not always one.
+
+    `johnm-desktop` is a Stand handle, not a login; probing it 404s and the
+    capability check degrades to a silent no-op on exactly the aliased keys
+    `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
+    """
+    entry = (roster or {}).get(name) or {}
+    if _is_github_user(name):
+        return name, "key is a login"
+    sib = entry.get("same_actor_as")
+    if sib and _is_github_user(sib):
+        return sib, f"via same_actor_as -> {sib}"
+    return name, "no login found for this key"
+
+
+def _is_github_user(login: str) -> bool:
+    try:
+        p = subprocess.run(["gh", "api", f"users/{login}", "-q", ".login"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:                            # noqa: BLE001 - probe must not raise
+        return False
+    return p.returncode == 0 and p.stdout.strip().lower() == login.lower()
 
 
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
@@ -275,6 +372,9 @@ def main() -> int:
                     help="deliberately notify ONE reviewer; requires a reason")
     ap.add_argument("--widen-override", metavar="REASON", default="",
                     help="deliberately re-ask the SAME reviewers after 30min")
+    ap.add_argument("--kind", choices=("ask", "notice"), default="ask",
+                    help="ask (default) requests review; notice tells reviewers "
+                         "something about a PR without asking for anything")
     ap.add_argument("--room", default=None,
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
@@ -284,7 +384,44 @@ def main() -> int:
     targets, refusal_rc = resolve(names, load_roster())
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
     # one person; plan mode is exempt because only a real ASK can strand a PR.
-    if a.send and len(targets) < 2 and not a.allow_single:
+    # A read-only approval looks identical in the UI and discharges nothing, so
+    # ask the repo named in the message rather than trusting a cached tier.
+    if a.kind == "ask" and targets:
+        refs = _PR_URL.findall(a.message or "")
+        if not refs:
+            # Every other refusal path here prints; the one case that cannot be
+            # checked must not be the one case that is silent.
+            print("gate capability NOT CHECKED: the message names no "
+                  "github.com/<owner>/<repo>/pull/<n> URL, so there is no repo to "
+                  "ask about — an unchecked send is not a checked one",
+                  file=sys.stderr)
+        if refs:
+            repo = refs[0][0]
+            roster_now = load_roster()
+            kept = []
+            for t in targets:
+                login, why_login = _github_login(t["name"], roster_now)
+                can, why_cap = gate_capability(repo, login)
+                if login != t["name"]:
+                    print(f"{t['name']}: probing GitHub as {login} ({why_login})",
+                          file=sys.stderr)
+                if can is False:
+                    detail = (why_cap if why_cap == "not a collaborator"
+                              else f"{why_cap}-only")
+                    print(f"CANNOT GATE '{t['name']}': {detail} on {repo} — an "
+                          f"approval from this account does not count toward the "
+                          f"required approvals", file=sys.stderr)
+                    refusal_rc = max(refusal_rc, 7)
+                    continue
+                if can is None:
+                    print(f"{t['name']}: gate capability {why_cap} on {repo} — "
+                          f"sending, but this is not a confirmation it can approve",
+                          file=sys.stderr)
+                kept.append(t)
+            targets = kept
+    # The two-reviewer rule exists so one person being busy cannot stall a PR.
+    # A notice asks for nothing, so it cannot stall anything by going to one.
+    if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
         print(f"REFUSED: {len(targets)} reviewer(s) resolved from {names!r}; the rule is at "
               "least TWO, so one being busy cannot stall the PR. Name another reviewer, "
               "or pass --allow-single '<reason>'.", file=sys.stderr)
@@ -293,7 +430,7 @@ def main() -> int:
         return refusal_rc if refusal_rc > 0 else 5
     if a.allow_single and len(targets) < 2:
         print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
-    stale, why = _stale_repeat_ask(a.message, targets, load_roster())
+    stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
     if stale and not a.widen_override:
         print(f"REFUSED: {why} Re-asking the same people is not escalation — "
               "name someone new, or pass --widen-override '<reason>'.", file=sys.stderr)
@@ -381,15 +518,24 @@ def main() -> int:
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
             try:
-                n_logged = record_asks(a.message, t["name"])
+                n_logged = record_asks(a.message, t["name"]) if a.kind == "ask" else 0
             except OSError as e:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
                       f"({e}) — pr-unattended will under-report this PR as unasked",
                       file=sys.stderr)
             else:
-                if n_logged:
+                if a.kind == "notice":
+                    print(f"  notice (not an ask) — nothing recorded for {t['name']}",
+                          file=sys.stderr)
+                elif n_logged:
                     print(f"  logged {n_logged} PR ask(s) for {t['name']}", file=sys.stderr)
+                else:
+                    # Not counted as a failure: an ask need not concern a PR. But it
+                    # must not be silent -- an unrecorded PR ask reads as never-asked.
+                    print(f"  note: nothing recorded for {t['name']} — the message "
+                          f"names no github.com/<owner>/<repo>/pull/<n> URL, so any "
+                          f"PR it refers to will read as unasked", file=sys.stderr)
         else:
             detail = reason or p.stderr.strip()[:120] or fallback
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)

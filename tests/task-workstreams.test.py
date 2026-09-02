@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import re
 import sys
 import tempfile
 import threading
@@ -122,6 +123,70 @@ def test_loader_parser_and_history_fail_open_edges() -> None:
     assert "task-no-text" not in ids
     assert "task-old-classifier" not in ids
 
+
+def test_task_text_keeps_the_whole_body_not_just_its_first_line() -> None:
+    # A one-line read left the ranker scoring a `cd` command's path segments.
+    content = (
+        "id: task-1\n"
+        "source: slack\n"
+        "task: [Slack DM] cd \"/Users/x/Library/Application Support/engine\"\n"
+        "PATH=\"$HOME/.local/bin:$PATH\" bash src/startup.sh\n"
+        "zsh: no such file or directory\n"
+        "\n"
+        "===SKILL INSTRUCTIONS (follow before any other action)===\n"
+        "1. NOTIFY FIRST: run notify.py --source slack\n"
+    )
+    text = workstreams._task_text(content)
+    assert "startup.sh" in text, text
+    assert "no such file or directory" in text, text
+    # The bridge block is instructions to the agent, not the user's ask.
+    assert "NOTIFY FIRST" not in text, text
+    assert "===" not in text, text
+
+    # Unchanged shapes: single-line bodies, and a file with no task: line.
+    assert workstreams._task_text("id: t\ntask: just one line\n") == "just one line"
+    assert workstreams._task_text("id: task-empty\n") == ""
+
+
+def test_task_text_stops_at_headers_that_follow_the_task_line() -> None:
+    # Real ag2space shape: `task:` is line 4 and headers follow it, so a scan
+    # that runs to `===` would score a room roster as the user's ask.
+    content = (
+        "id: task-335d10bf\n"
+        "envelope_hmac: v1:abc\n"
+        "receiving_instance: @max-sutando-max.agent:ag2.space\n"
+        "task: get me started by reading this file\n"
+        "source: ag2space\n"
+        "channel_id: !oQZbDJrYPnVKxMLECt:ag2.space\n"
+        "sender_name: Max DeNike\n"
+        "room_members: @max-sutando-max.agent:ag2.space, @max:ag2.space\n"
+        "user_id: @max:ag2.space\n"
+        "access_tier: owner\n"
+    )
+    text = workstreams._task_text(content)
+    assert text == "get me started by reading this file", text
+    for leaked in ("source:", "channel_id:", "room_members:", "ag2.space"):
+        assert leaked not in text, (leaked, text)
+
+
+
+def test_header_stop_pattern_escapes_key_metacharacters() -> None:
+    """A key holding a regex metacharacter must stop the body literally.
+
+    No shipped key contains one today, so this pins a construction property
+    rather than repairing a reachable defect.
+    """
+    hazard = re.compile(r"^(?:={3,}.*={3,}$|(" + "|".join(["a.c"]) + r"):)")
+    assert hazard.match("abc: x"), "unescaped '.' matches any char - the hazard"
+
+    safe = workstreams._header_stop_pattern(["a.c"])
+    assert safe.match("a.c: x"), "the literal key must still stop the body"
+    assert not safe.match("abc: x"), "'.' must not match an arbitrary character"
+
+    ordinary = workstreams._header_stop_pattern(["source", "user_id"])
+    assert ordinary.match("source: slack")
+    assert not ordinary.match("  user_id: x")
+    assert not ordinary.match("see user_id: x")
 
 def test_apply_is_validated_stable_sticky_and_fail_open() -> None:
     workspace = fixture_workspace()
@@ -883,6 +948,9 @@ def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
         test_loader_parser_and_history_fail_open_edges,
+        test_task_text_keeps_the_whole_body_not_just_its_first_line,
+        test_task_text_stops_at_headers_that_follow_the_task_line,
+        test_header_stop_pattern_escapes_key_metacharacters,
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
