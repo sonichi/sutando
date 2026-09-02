@@ -1522,16 +1522,27 @@ def check_env_split(repo_env: "Path | None" = None,
         except OSError:
             return None, "unreadable"
         out = set()
+        class _Unmodelled(Exception):
+            """Raised with the reason token when a line's effect is not proven."""
+        _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
         def _assign(word):
             name, sep, _ = word.partition("=")
-            if sep and name and name.replace("_", "").isalnum():
+            if not sep:
+                return None
+            if name.endswith("+"):
+                name = name[:-1]                   # `B+=old` appends to B
+            if _IDENT.match(name):
                 return name
-            return None
+            # bash runs `1BAD=old` as a COMMAND; under `set -e` the load
+            # aborts there, so it is never a key to advise merging.
+            raise _Unmodelled("invalid-identifier")
 
         # Only `;` and `&&` are split. `||` short-circuits after a successful
         # assignment, and `|`/`&` run their side in a subshell — unmodelled.
         SPLIT_OPS = {";", "&&", "\n"}
         UNKNOWN_OPS = {"||", "|", "&", "(", ")", ";;", "|&"}
+        REDIR_OPS = {">", ">>", "<", "<<", "<<<"}
+        PUNCT = set("();<>|&")
 
         def _segment(words):
             """One command's words -> (names it persists, was-pure-assignment)."""
@@ -1541,18 +1552,25 @@ def check_env_split(repo_env: "Path | None" = None,
                 # export's bare-name args only mark existing vars; every
                 # assignment among them persists, so no word ends the scan.
                 return {n for n in map(_assign, words[1:]) if n}, True
-            names, cmd_at = [], None
-            for i, w in enumerate(words):
+            names, i = [], 0
+            while i < len(words):
+                w = words[i]
                 n = _assign(w)
-                if n is None:
-                    cmd_at = i
-                    break
-                names.append(n)
-            if cmd_at is None:
-                return set(names), True            # pure assignment persists
-            if words[cmd_at] == "export":
-                return {n for n in map(_assign, words[cmd_at + 1:]) if n}, True
-            return set(), False                    # `A=1 cmd` is a PREFIX
+                if n is not None:
+                    names.append(n)
+                    i += 1
+                    continue
+                if w == "export":
+                    return {n for n in map(_assign, words[i + 1:]) if n}, True
+                # `[fd]> target` on a pure assignment leaves it an assignment.
+                fd = w.isdigit() and i + 1 < len(words) and words[i + 1] in REDIR_OPS
+                if w in REDIR_OPS or fd:
+                    i += 3 if fd else 2
+                    continue
+                if w and set(w) <= PUNCT:
+                    raise _Unmodelled("unparseable")
+                return set(), False                    # `A=1 cmd` is a PREFIX
+            return set(names), True                    # pure assignment persists
 
         for line in text.splitlines():
             lex = shlex.shlex(line, posix=True, punctuation_chars=True)
@@ -1565,22 +1583,25 @@ def check_env_split(repo_env: "Path | None" = None,
             except ValueError:
                 return None, "unparseable"  # unbalanced quote: never "absent"
 
-            words, reachable = [], True
-            for tok in tokens + [";"]:
-                if tok in UNKNOWN_OPS:
-                    return None, "unparseable"
-                if tok not in SPLIT_OPS:
-                    if tok.startswith("#") and lex.punctuation_chars:
-                        break              # comment: the rest of the line is text
-                    words.append(tok)
-                    continue
-                if reachable:
+            words = []
+            try:
+                for tok in tokens + [";"]:
+                    if tok in UNKNOWN_OPS:
+                        return None, "unparseable"
+                    if tok not in SPLIT_OPS:
+                        if tok.startswith("#") and lex.punctuation_chars:
+                            break          # comment: the rest of the line is text
+                        words.append(tok)
+                        continue
                     names, pure = _segment(words)
                     out.update(names)
-                    # `&&` after a command prefix depends on that command's exit
-                    # status, which this probe does not model.
-                    reachable = pure if tok == "&&" else True
-                words = []
+                    # `cmd && X=1` loads X only on exit 0 (and `set -e` aborts
+                    # otherwise) — an exit status this probe cannot prove.
+                    if tok == "&&" and not pure:
+                        return None, "status-dependent"
+                    words = []
+            except _Unmodelled as exc:
+                return None, str(exc)
         return out, None
 
     # The canonical resolver owns selection; a re-derivation drifts.
@@ -1625,6 +1646,17 @@ def check_env_split(repo_env: "Path | None" = None,
                 "the file is readable but its shell syntax could not be "
                 "classified (unbalanced quote, or a list operator this probe "
                 "does not model) — fix the syntax or simplify the line"
+            ),
+            frozenset({"status-dependent"}): (
+                "a `&&` follows a command, so whether its right-hand assignments "
+                "load depends on that command's exit status (and `set -e` aborts "
+                "the load on failure) — put the assignments on their own line"
+            ),
+            frozenset({"invalid-identifier"}): (
+                "a line assigns to a name bash does not accept as a variable "
+                "(e.g. a leading digit); bash runs it as a command and `set -e` "
+                "aborts the load there — fix or remove that line first, and do "
+                "not merge it anywhere"
             ),
         }.get(frozenset(causes), "resolve the reported causes and re-run")
         return {

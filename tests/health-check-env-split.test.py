@@ -309,6 +309,37 @@ for _label, _line, _persists in [
     _named = _r is not None and "DISCORD_BOT_TOKEN" in _r["detail"]
     check(f"loader grammar: {_label}", _named, _persists)
 
+# Forms bash persists (measured under `set -e; set -a; source`) must be named,
+# and forms whose effect is NOT proven must be UNKNOWN — never "absent".
+for _label, _line, _want in [
+    ("successful command then &&: exit status unmodelled -> UNKNOWN",
+     "true && DISCORD_BOT_TOKEN=old", "status-dependent"),
+    ("pure assignment then && (control): named", "GEMINI_API_KEY=o && DISCORD_BOT_TOKEN=old", "named"),
+    ("append-assignment persists", "DISCORD_BOT_TOKEN+=old", "named"),
+    ("assignment with a redirection persists", "DISCORD_BOT_TOKEN=old >/dev/null", "named"),
+    ("fd redirection before the assignment persists", "2>/dev/null DISCORD_BOT_TOKEN=old", "named"),
+    ("export with a redirection persists", "export DISCORD_BOT_TOKEN=old >/dev/null", "named"),
+    ("invalid identifier aborts the load -> UNKNOWN, never a merge target", "1BAD=old", "invalid-identifier"),
+    ("leading-digit-free identifier (control): named", "DISCORD_BOT_TOKEN1=old", "named1"),
+    ("unmodelled redirection operator -> UNKNOWN", "DISCORD_BOT_TOKEN=old &>/dev/null", "unparseable"),
+]:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "repo").mkdir(); (td / "ws").mkdir()
+        _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+        _re_.write_text("GEMINI_API_KEY=real\n")
+        _we_.write_text(_line + "\n")
+        with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+            _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    _d = "" if _r is None else _r["detail"]
+    if _want.startswith("named"):
+        _key = "DISCORD_BOT_TOKEN1" if _want == "named1" else "DISCORD_BOT_TOKEN"
+        check(f"loader grammar: {_label}", _key in _d and "is missing" in _d, True)
+    else:
+        check(f"loader grammar: {_label} (reason)", _want in _d, True)
+        check(f"loader grammar: {_label} (not absence)", "is missing" in _d, False)
+        check(f"loader grammar: {_label} (no merge advice for the bad name)", "1BAD" in _d and "merged" in _d, False)
+
 # The SELECTED side obeys the same grammar: a command-prefix assignment there
 # does not persist, so the other file's copy is genuinely stranded.
 with tempfile.TemporaryDirectory() as td:
@@ -347,7 +378,7 @@ with tempfile.TemporaryDirectory() as td:
     _we_.write_text("GEMINI_API_KEY='unbalanced\n")
     with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
         _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
-    check("unbalanced quote names the parse cause", 
+    check("unbalanced quote names the parse cause",
           _r is not None and "unparseable" in _r["detail"], True)
     check("unbalanced quote does NOT advise fixing permissions",
           _r is not None and "file permissions" in _r["detail"], False)
