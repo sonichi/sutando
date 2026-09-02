@@ -244,6 +244,50 @@ class Round4Blockers(Fixture):
         self.assertEqual(wo.blocking(ws_b, self.repo, later, self.base, host=HOST_B, target_repo="o/r", max_age_s=3600), [])
 
 
+class Round4Edges(Fixture):
+    """The error and skip branches the round-4 code added."""
+
+    def test_validation_and_publish_reject_the_shapes_they_name(self):
+        with self.assertRaises(ValueError):
+            wo.validate_record(["not", "an", "object"], self.ws / "x.json")
+        with self.assertRaises(ValueError):
+            wo.publish(self.ws, "")
+
+    def test_invalid_or_unreadable_tombstones_are_ignored(self):
+        p = self.open12(host=HOST_A)
+        tdir = wo.records_dir(self.ws, HOST_B) / "tombstones"; tdir.mkdir(parents=True)
+        (tdir / "o-r#12.json").write_text(json.dumps({"repo": "o/r", "pr": 12}))   # no head, no witness
+        (tdir / "broken.json").write_text("{not json")
+        (tdir / "dir.json").mkdir()
+        self.assertEqual(wo.tombstones(self.ws), {})
+        self.assertEqual([r["pr"] for r in wo.list_open(self.ws)], [12], "an invalid tombstone closes nothing")
+
+    def test_staleness_never_counts_this_host_and_an_unresolvable_current_ref_blocks(self):
+        self.open12(host=HOST_A)
+        self.assertEqual(wo.stale_hosts(self.ws, HOST_A, 1), [], "a host is never stale to itself")
+        later = self.merge_topology()
+        hits = wo.blocking(self.ws, self.repo, later, "no-such-ref", target_repo="o/r")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("git could not answer", hits[0]["reason"])
+
+    def test_tombstone_helper_error_branches_through_the_cli(self):
+        r = wo.main(["--workspace", str(self.ws), "tombstone", "o/r#12", "--witness", "w", "--host", HOST_B])
+        self.assertEqual(r, 5, "no open record")
+        self.open12(host=HOST_A)
+        with self.assertRaises(ValueError):
+            wo.tombstone_record(self.ws, "o/r", 12, "", HOST_B)
+        with self.assertRaises(ValueError):
+            wo.tombstone_record(self.ws, "o/r", 12, "w", "")
+        self.assertEqual(wo.main(["--workspace", str(self.ws), "publish", "--host", HOST_B]), 0)
+        self.assertTrue((wo.records_dir(self.ws, HOST_B) / wo.STAMP_NAME).exists())
+        self.assertEqual(wo.main(["--workspace", str(self.ws), "tombstone", "o/r#12", "--witness", "w", "--host", HOST_B]), 0)
+        self.assertEqual(wo.list_open(self.ws), [])
+
+    def test_cli_resolves_the_workspace_when_none_is_given(self):
+        # Read-only: `list` on the resolved (real) workspace prints open records, if any.
+        self.assertEqual(wo.main(["list"]), 0)
+
+
 class Cli(Fixture):
     def _run(self, *args):
         import contextlib
