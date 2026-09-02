@@ -40,6 +40,9 @@ _PY = sys.executable or "python3"
 sys.path.insert(0, str(_REPO / "src"))
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roster_union import host_rosters, roster_union
+
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
 
 
@@ -86,36 +89,18 @@ def roster_paths() -> "list[tuple[str, Path]]":
     ws = Path(resolve_workspace())
     local = roster_path()
     out = [(_host_label(), local)] if local.is_file() else []
-    for p in sorted((ws / "hosts").glob(f"*/{_ROSTER_LEAF}")):
-        if p != local:
-            out.append((p.parents[2].name, p))
-    legacy = ws / _ROSTER_LEAF
-    if legacy.is_file() and legacy != local:
-        out.append(("", legacy))
+    out += [(h, p) for h, p in host_rosters(ws) if p != local]
     return out
 
 
 def load_roster() -> dict:
-    """Union across hosts. LOCAL WINS a key collision; the peer row is KEPT
-    under `<key>@<host>` rather than dropped — a lost row and a row nobody
-    wrote are indistinguishable afterwards, which is the failure this store
-    is least able to survive."""
+    """Union across hosts; the merge policy is roster_union's, not restated here."""
     paths = roster_paths()
     if not paths:
         where = os.environ.get("SUTANDO_SCI_ROSTER") or "any host"
         raise SystemExit(f"no roster at {where} — seed it from the map before "
                          "notifying (never guess Stand identities)")
-    merged: dict = {}
-    for host, p in paths:
-        data = json.loads(p.read_text())
-        if not isinstance(data, dict):
-            raise SystemExit(f"roster at {p} is not an object")
-        for key, row in data.items():
-            if key.startswith("_") or key not in merged:
-                merged[key] = row
-            elif merged[key] != row:
-                merged[f"{key}@{host}" if host else key] = row
-    return merged
+    return roster_union(paths)
 
 
 def stated_reason(entry: dict) -> str:

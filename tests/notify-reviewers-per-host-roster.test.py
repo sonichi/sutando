@@ -141,6 +141,27 @@ class PerHostRoster(unittest.TestCase):
             self.nr.load_roster()
         self.assertIn(str(bad), str(caught.exception))
 
+    def test_BOTH_readers_of_this_store_resolve_a_collision_identically(self):
+        """The divergence guard. Two readers that disagree about what a
+        collision MEANS are worse than no union: one surfaces `alice@peerbox`,
+        the other silently drops it, and nothing records which was intended.
+        """
+        self._write("LOCAL", {"alice": {"stand": "@local:x"}})
+        self._write("peerbox", {"alice": {"stand": "@peer:x"}})
+
+        spec = importlib.util.spec_from_file_location(
+            "lk", REPO / "skills" / "collaboration-intelligence" / "scripts" / "lookup.py")
+        lk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lk)
+
+        via_notify = sorted(self.nr.load_roster())
+        via_lookup = sorted(r["entity_id"]
+                            for r in lk.load_roster(self.tmp / "data" / "collaboration-intelligence"))
+        self.assertEqual(via_notify, via_lookup,
+                         "the two readers of reviewer-stands.json disagree on a collision")
+        self.assertIn("alice@peerbox", via_notify,
+                      "the losing peer row was dropped instead of surfaced")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

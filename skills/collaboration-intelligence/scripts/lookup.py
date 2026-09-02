@@ -53,18 +53,11 @@ def load_roster(d):
     reviewer as absent (measured twice: 2026-08-27, 2026-08-28 — both times
     `get("john-the-dev")` missed the entry keyed `rui`).
     """
-    import json
-    # Per-host union: this host's file first, then every peer's. A peer may add
-    # a name the local host has never seen; it may never overwrite one it has.
-    paths = [d / "reviewer-stands.json"]
-    ws = d.parent.parent            # <workspace>/data/collaboration-intelligence -> <workspace>
-    paths += sorted(ws.glob("hosts/*/data/collaboration-intelligence/reviewer-stands.json"))
-    merged = {}
-    for q in paths:
-        if not q.exists():
-            continue
-        for k, v in json.loads(q.read_text()).items():
-            merged.setdefault(k, v)
+    # Same union, same collision semantics as notify_reviewers: both readers of
+    # this store delegate to roster_union so they cannot drift apart.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from roster_union import host_rosters, roster_union
+    merged = roster_union(host_rosters(d.parent.parent))
     if not merged:
         return []
     rows = []
