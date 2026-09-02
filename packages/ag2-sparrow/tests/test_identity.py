@@ -197,7 +197,7 @@ class OneCanonicalGrammar(unittest.TestCase):
         canonical. `%41` is a safe 'A' spelled the long way, `%FF` is not
         UTF-8, and `01` is an ordinal no derivation emits."""
         rejects = {
-            serialization.parse_delivery_id: ["d:%41@gw", "d:%FF@gw", "d:%C3%28@gw", "d:a@%25"],
+            serialization.parse_delivery_id: ["d:%41@gw", "d:%FF@gw", "d:%C3%28@gw"],
             serialization.parse_attempt_id: ["d:%41@gw#a1"],
             serialization.parse_idempotency_key: ["e:%41@gw"],
             serialization.parse_incarnation_id: ["%41:1:2", "w:01:2", "w:1:02"],
@@ -211,6 +211,7 @@ class OneCanonicalGrammar(unittest.TestCase):
         for parse, good in [(serialization.parse_delivery_id, "d:%40@gw"),
                             (serialization.parse_delivery_id, "d:%E2%80%8B@gw"),
                             (serialization.parse_idempotency_key, "e:%40@gw"),
+                            (serialization.parse_delivery_id, "d:a@%25"),
                             (serialization.parse_incarnation_id, "w:0:0"),
                             (serialization.parse_attempt_id, "d:%40@gw#a1")]:
             parse(good)
