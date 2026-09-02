@@ -153,7 +153,8 @@ _fallback_lock = threading.Lock()
 
 
 def _system_nameservers(path=None):
-    """IPv4 nameservers from resolv.conf in file order; [] when unreadable."""
+    """IPv4 nameservers from resolv.conf in file order; [] when unreadable.
+    IPv6 entries are skipped: the query socket is AF_INET only."""
     out = []
     try:
         with open(path or _RESOLV_CONF) as fh:
@@ -176,16 +177,28 @@ def _skip_name(data, i):
         i += 1 + n
 
 
-def _parse_a_records(data, qid):
-    """A-record IPs from one DNS response; [] on mismatch, error RCODE or junk."""
+def _encode_qname(host):
+    out = b""
+    for label in host.rstrip(".").split("."):
+        b = label.encode("idna")
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _parse_a_records(data, qid, qname=None):
+    """A-record IPs from one DNS response; [] unless id, QR bit, RCODE and
+    the echoed question all match what was asked."""
     import struct
     try:
         rid, flags, qd, an, _ns, _ar = struct.unpack("!HHHHHH", data[:12])
-        if rid != qid or flags & 0x000F:
+        if rid != qid or not flags & 0x8000 or flags & 0x000F:
             return []
         i = 12
         for _ in range(qd):
-            i = _skip_name(data, i) + 4
+            end = _skip_name(data, i)
+            if qname is not None and data[i:end].lower() != qname.lower():
+                return []
+            i = end + 4
         ips = []
         for _ in range(an):
             i = _skip_name(data, i)
@@ -201,24 +214,23 @@ def _parse_a_records(data, qid):
 
 def _dns_a_query(host, nameserver, timeout=None, port=53):
     """One UDP A query (RFC 1035), stdlib only; [] on any failure."""
-    import random
+    import secrets
     import struct
-    qid = random.randrange(1, 0xFFFF)
-    q = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0)
-    for label in host.rstrip(".").split("."):
-        b = label.encode("idna")
-        q += bytes([len(b)]) + b
-    q += b"\x00" + struct.pack("!HH", 1, 1)
+    qid = secrets.randbelow(0xFFFF) + 1
+    qname = _encode_qname(host)
+    q = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.settimeout(_FALLBACK_QUERY_TIMEOUT_S if timeout is None else timeout)
-        s.sendto(q, (nameserver, port))
-        data, _ = s.recvfrom(4096)
+        # connect(): the kernel then drops datagrams from any other peer.
+        s.connect((nameserver, port))
+        s.send(q)
+        data = s.recv(4096)
     except OSError:
         return []
     finally:
         s.close()
-    return _parse_a_records(data, qid)
+    return _parse_a_records(data, qid, qname)
 
 
 def _fallback_resolve(host):

@@ -18,6 +18,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 
 
 def _load():
@@ -42,7 +43,7 @@ def _restore(mod, saved):
         setattr(mod, k, v)
 
 
-def _response(qid, host, ips, *, rcode=0, cname=None):
+def _response(qid, host, ips, *, rcode=0, cname=None, qr=True):
     """Hand-built DNS response: question, optional CNAME, then A records that
     use a compression pointer back to the question name."""
     def name(h):
@@ -51,7 +52,7 @@ def _response(qid, host, ips, *, rcode=0, cname=None):
             out += bytes([len(label)]) + label.encode()
         return out + b"\x00"
     ancount = len(ips) + (1 if cname else 0)
-    r = struct.pack("!HHHHHH", qid, 0x8180 | rcode, 1, ancount, 0, 0)
+    r = struct.pack("!HHHHHH", qid, (0x8180 if qr else 0x0100) | rcode, 1, ancount, 0, 0)
     r += name(host) + struct.pack("!HH", 1, 1)
     ptr = b"\xc0\x0c"  # pointer to offset 12 = the question name
     if cname:
@@ -91,6 +92,12 @@ def test_parse_rejects_id_mismatch_error_rcode_and_junk():
     assert mod._parse_a_records(nx, 7) == [], "NXDOMAIN must not yield IPs"
     assert mod._parse_a_records(b"\x00\x07", 7) == []
     assert mod._parse_a_records(good[:20], 7) == [], "truncated answer must not raise"
+    query_echo = _response(7, "chat.ag2.space", ["1.2.3.4"], qr=False)
+    assert mod._parse_a_records(query_echo, 7) == [], "a query (QR=0) with a matching id is not a response"
+    other = _response(7, "evil.example", ["6.6.6.6"])
+    assert mod._parse_a_records(other, 7, mod._encode_qname("chat.ag2.space")) == [], \
+        "an answer for a different name must not be accepted for the asked one"
+    assert mod._parse_a_records(good, 7, mod._encode_qname("CHAT.ag2.space")) == ["1.2.3.4"], "QNAME match is case-insensitive"
     print("PASS test_parse_rejects_id_mismatch_error_rcode_and_junk")
 
 
@@ -185,6 +192,12 @@ def test_live_udp_query_against_a_local_nameserver():
     def serve():
         data, addr = srv.recvfrom(512)
         qid = struct.unpack("!H", data[:2])[0]
+        # Off-path first: a spoofed answer from a different source port must be dropped
+        # by the connected socket, so the real answer below is the one that lands.
+        rogue = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rogue.sendto(_response(qid, "chat.ag2.space", ["6.6.6.6"]), addr)
+        rogue.close()
+        time.sleep(0.2)
         srv.sendto(_response(qid, "chat.ag2.space", ["104.26.15.112"]), addr)
 
     t = threading.Thread(target=serve, daemon=True)
@@ -194,7 +207,7 @@ def test_live_udp_query_against_a_local_nameserver():
     finally:
         t.join(5)
         srv.close()
-    assert got == ["104.26.15.112"], got
+    assert got == ["104.26.15.112"], f"off-path datagram was accepted: {got}"
     assert mod._dns_a_query("chat.ag2.space", "127.0.0.1", timeout=0.2, port=port) == [], \
         "a silent nameserver must yield [] within the timeout, never raise"
     print("PASS test_live_udp_query_against_a_local_nameserver")
