@@ -177,6 +177,8 @@ def main() -> int:
           "appended text was delivered even with the fence disabled — "
           "this test would pass without the fix and proves nothing")
 
+    _retire_rows()
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")
@@ -185,6 +187,63 @@ def main() -> int:
         return 1
     print("all pass")
     return 0
+
+
+def _retire_rows() -> None:
+    """The helper's OWN failure modes, driven directly.
+
+    The end-to-end case above injects its append at the SDK boundary, which is
+    BEFORE the helper's final read — so it can only ever exercise "already
+    grown". These three rows are internal to `retire_claim_if_unchanged` and are
+    unreachable from that fixture (keweichen, #3305).
+    """
+    print("retire_claim_if_unchanged rows (retired / claim remains):")
+    spec = importlib.util.spec_from_file_location(
+        "_rd", REPO / "src" / "delivery" / "readiness.py")
+    rd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rd)
+
+    d = Path(tempfile.mkdtemp(prefix="retire-rows-"))
+
+    c1 = d / "unchanged.txt"; c1.write_text("body\n")
+    check("unchanged retires", rd.retire_claim_if_unchanged(c1, "body") is True
+          and not c1.exists())
+
+    c2 = d / "grown.txt"; c2.write_text("body\n")
+    with open(c2, "a") as f:
+        f.write("MORE\n")
+    check("grown is kept", rd.retire_claim_if_unchanged(c2, "body") is False
+          and c2.exists())
+
+    # A multi-byte character cut mid-sequence, exactly as a partial write leaves
+    # it. Bytes EXIST and are undelivered, so unlinking destroys them.
+    c3 = d / "partial.txt"
+    c3.write_bytes("body\n".encode() + b"\xe6\x97")
+    check("partial UTF-8 is kept, not destroyed",
+          rd.retire_claim_if_unchanged(c3, "body") is False and c3.exists(),
+          "a mid-character partial write must not be read as 'nothing to retire'")
+
+    # An append landing AFTER the helper's own final read, inside its window.
+    c4 = d / "late.txt"; c4.write_text("body\n")
+    real_read = Path.read_bytes
+    fired = {"done": False}
+
+    def _hooked(self, *a, **k):
+        out = real_read(self, *a, **k)
+        if str(self) == str(c4) and not fired["done"]:
+            fired["done"] = True
+            with open(c4, "a") as f:
+                f.write("LATE\n")
+        return out
+
+    Path.read_bytes = _hooked
+    try:
+        kept = rd.retire_claim_if_unchanged(c4, "body") is False
+    finally:
+        Path.read_bytes = real_read
+    check("append inside the read-to-unlink window is kept",
+          kept and c4.exists(),
+          "the late bytes were destroyed")
 
 
 if __name__ == "__main__":

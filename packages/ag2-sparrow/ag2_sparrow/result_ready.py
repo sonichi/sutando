@@ -52,14 +52,38 @@ def retire_claim_if_unchanged(claim: str | Path, delivered: str) -> bool:
     appending to THIS inode after the consumer read it. Unlinking then destroys
     bytes that were never guarded and never delivered. False means the body
     grew: the caller releases the claim instead, and a later pass sends it whole.
+
+    Three ways bytes were destroyed before, all "return True and unlink":
+    a partial write mid-character decoded as None; an unreadable file decoded as
+    None; and an append landing between the final read and the unlink. The size
+    re-check NARROWS that last window — it does not close it. Closing it needs
+    atomic publication by every producer, which is a separate contract.
     """
     p = Path(claim)
-    current = read_ready_result(p)
-    if current is None:
-        # Already gone, or emptied under us: nothing left to retire or resend.
+    try:
+        raw = p.read_bytes()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        # Unreadable: never destroy bytes whose content cannot be verified.
+        return False
+    try:
+        body = raw.decode()
+    except UnicodeDecodeError:
+        # A partial write mid-character. Bytes EXIST and are undelivered, so
+        # this is the opposite of "nothing to retire" — keep the claim.
+        return False
+    stripped = body.strip()
+    if not stripped:
+        # Emptied under us: nothing left to retire or resend.
         p.unlink(missing_ok=True)
         return True
-    if current != delivered:
+    if stripped != delivered:
+        return False
+    try:
+        if p.stat().st_size != len(raw):
+            return False
+    except OSError:
         return False
     p.unlink(missing_ok=True)
     return True
