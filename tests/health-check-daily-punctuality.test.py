@@ -63,8 +63,11 @@ class TestLatenessIsTheSignal(unittest.TestCase):
         r = hc._interpret_daily_punctuality([job("daily-insight", 6, 50, arts)])
         self.assertEqual(r["status"], "warn", r)
         self.assertIn("+42 min late", r["detail"])
-        self.assertIn("covering for it", r["detail"],
-                      "must say the schedule is not what produced these")
+        # Artifact mtimes date completion, so the old clause asserted a cause
+        # nothing measured; the warn must name the quantity it read (#3579).
+        self.assertIn("measured from output", r["detail"])
+        self.assertIn("cannot be told apart", r["detail"])
+        self.assertNotIn("covering for it", r["detail"])
 
     def test_median_not_mean_so_one_outlier_does_not_flip_it(self):
         arts = [("2026-08-0%d" % i, DUE + 2) for i in range(1, 7)] + [("2026-08-07", DUE + 300)]
@@ -500,7 +503,7 @@ class TestCollectorMarksStaleNaming(unittest.TestCase):
         self.assertNotIn("UNCHECKED", r["detail"], r)
 
     def test_a_shape_valid_but_impossible_date_does_not_crash_the_probe(self):
-        """`_daily_artifact_minutes` matches dates by SHAPE (\d{4}-\d{2}-\d{2}),
+        r"""`_daily_artifact_minutes` matches dates by SHAPE (\d{4}-\d{2}-\d{2}),
         so `2026-13-45` reaches the parser and raises. An unparseable date makes
         the age unknown, which must read as "cannot tell", never as stale."""
         r = self._run("2026-13-45")

@@ -24,6 +24,7 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Agent instruction detail (relocated from CLAUDE.md, 2026-08-17 context diet)
 
 - [Channel access control](access-control.md) — per-channel tier rules and gates.
+- [Core pool + standing sessions](core-pool-standing-sessions.md) — how the lead-follower pool composes with standing sessions; design record, not yet implemented.
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.

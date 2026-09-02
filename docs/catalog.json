@@ -414,6 +414,16 @@
    "canonical_for": "the 76/100 blind-scored GAIA validation result and how to rebuild the suite without republishing the answer key",
    "last_verified": "2026-08-27"
   },
+  "docs/core-pool-standing-sessions.md": {
+   "title": "Core pool + standing sessions: how they compose",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
+   "last_verified": "2026-08-25"
+  },
   "docs/lead-follower-pool.md": {
    "title": "Lead-follower agent pool — design",
    "audience": [
