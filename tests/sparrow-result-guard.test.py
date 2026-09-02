@@ -151,15 +151,21 @@ with tempfile.TemporaryDirectory() as td:
         "source_message_id": "$message-one",
         "user_id": "@requester:ag2.space",
     }
+    # glob order is filesystem order, and earlier withholds already persisted
+    # artifacts: assert on the one THIS call created, not on whichever is [0].
+    before_review = set((m._STATE / "withheld-team-results").glob("wr_*.json"))
     write_task(tasks, "task-notice-one", "team", **notice_fields)
     first_notice, first_reason = m._guarded_result_body(
         "task-notice-one", BODY_WITH_MARKERS)
     review_files = list((m._STATE / "withheld-team-results").glob("wr_*.json"))
+    new_review = sorted(set(review_files) - before_review)
     check(first_reason is not None
           and any(a.kind == "skip" for a in m.parse_markers(first_notice).actions),
           "first withhold closes the lease without posting into the shared room")
     check(bool(review_files), "first withhold persists an owner-review artifact")
-    review_record = json.loads(review_files[0].read_text(encoding="utf-8"))
+    check(len(new_review) == 1,
+          "this withhold persists exactly one new owner-review artifact")
+    review_record = json.loads(new_review[0].read_text(encoding="utf-8"))
     check(review_record.get("context", {}).get("room_name") == "Design Room",
           "the bridge retains the human-readable room name for private review")
 
