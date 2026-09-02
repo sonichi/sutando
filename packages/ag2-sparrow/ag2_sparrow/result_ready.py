@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-__all__ = ["read_ready_result", "is_ready_body"]
+__all__ = ["read_ready_result", "is_ready_body", "retire_claim_if_unchanged"]
 
 
 def is_ready_body(text: str | None) -> bool:
@@ -43,3 +43,23 @@ def read_ready_result(path: str | Path) -> str | None:
         return None
     body = body.strip()
     return body if body else None
+
+
+def retire_claim_if_unchanged(claim: str | Path, delivered: str) -> bool:
+    """Unlink `claim` only while it still holds exactly the body that was sent.
+
+    A claim is a hard link, so a producer holding the original fd keeps
+    appending to THIS inode after the consumer read it. Unlinking then destroys
+    bytes that were never guarded and never delivered. False means the body
+    grew: the caller releases the claim instead, and a later pass sends it whole.
+    """
+    p = Path(claim)
+    current = read_ready_result(p)
+    if current is None:
+        # Already gone, or emptied under us: nothing left to retire or resend.
+        p.unlink(missing_ok=True)
+        return True
+    if current != delivered:
+        return False
+    p.unlink(missing_ok=True)
+    return True
