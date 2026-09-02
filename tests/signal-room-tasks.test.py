@@ -229,8 +229,10 @@ with tempfile.TemporaryDirectory() as td:
     ck(out_dir.is_dir(), "the output dir is created at submission")
     ck(str(out_dir) in body and "image-generation" in body,
        "the task body names the skill and the ONLY permitted output dir")
-    ck(f"[file: {out_dir}/" in body, "the body shows the one marker shape egress preserves")
-    ck(body.rstrip().endswith("draw item 2"), "the untrusted request still ends the file")
+    ck(f"[file: {S.worker_output_root(results, tid)}/" in body,
+       "the body shows the one marker shape egress preserves, at the canonical root")
+    ck(body.index("draw item 2") < body.index("===SUTANDO SYSTEM INSTRUCTIONS"),
+       "the untrusted request precedes the trusted launch block, as on every other lane")
     ck(fields(body).get("access_tier") == "team", "the contract adds no header")
     ck(body.index(str(out_dir)) < body.index("draw item 2"),
        "the trusted contract precedes the untrusted request")

@@ -3,14 +3,15 @@
 
 The task body tells the worker WHERE a generated image may go; this wrapper is the
 only path that can put one there. The worker supplies a prompt (plus an optional
-size preset) and a bare output filename. The output root comes ONLY from
-SIGNAL_TASK_OUTPUT_ROOT, which `signal_worker_launch.py` derives server-side from
-the task id when it launches the worker. Nothing on the command line can name a
+size preset) and a bare output filename. The output root is SIGNAL_TASK_OUTPUT_ROOT
+— exported by the task's in-band launch (`signal_room_tasks.delegation_lines`),
+which also makes that root the worker's working directory — or, when the variable
+is absent, the working directory itself. Nothing on the command line can name a
 path: the root must be a plain (non-symlink) `<results>/<task-signal-*>` directory
 opened by descriptor, the name carries no separators and a fixed `.png`, and the
 file is created O_CREAT|O_EXCL|O_NOFOLLOW relative to that descriptor.
 
-    SIGNAL_TASK_OUTPUT_ROOT=<results>/<task_id> \\
+    cd <results>/<task_id> && \\
         python3 src/signal_image_gen.py --prompt "..." --name chart.png [--size square|landscape|portrait]
 
 Prints the absolute path of the written file — the worker announces it as
@@ -29,10 +30,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from signal_room_tasks import SIGNAL_TASK_PREFIX  # noqa: E402
+from signal_room_tasks import OUTPUT_ROOT_ENV, SIGNAL_TASK_PREFIX  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
-OUTPUT_ROOT_ENV = "SIGNAL_TASK_OUTPUT_ROOT"
 SIZE_PRESETS = {"square": "1:1", "landscape": "16:9", "portrait": "9:16"}
 OUTPUT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.png\Z")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9_\-.]+\Z")
@@ -130,7 +130,7 @@ def gemini_provider(prompt: str, aspect: str | None) -> bytes:
     raise RuntimeError("no image in response")
 
 
-def run(argv, env, provider, results_dir, out=sys.stdout, err=sys.stderr) -> int:
+def run(argv, env, provider, results_dir, out=sys.stdout, err=sys.stderr, cwd=None) -> int:
     parser = argparse.ArgumentParser(prog="signal_image_gen", add_help=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--name", required=True)
@@ -145,9 +145,8 @@ def run(argv, env, provider, results_dir, out=sys.stdout, err=sys.stderr) -> int
             raise GenerationRefused(f"prompt must be 1..{MAX_PROMPT_CHARS} characters")
         if not valid_output_name(args.name):
             raise GenerationRefused("output name must be a bare <name>.png with no separators")
-        root = env.get(OUTPUT_ROOT_ENV)
-        if not root:
-            raise GenerationRefused(f"{OUTPUT_ROOT_ENV} is not set; run under signal_worker_launch.py")
+        # The launch pins the root twice: exported, and as the cwd it points the delegate at.
+        root = env.get(OUTPUT_ROOT_ENV) or (os.getcwd() if cwd is None else cwd)
         root_fd = open_output_root(root, results_dir)
     except GenerationRefused as exc:
         print(f"signal_image_gen: refused: {exc}", file=err)

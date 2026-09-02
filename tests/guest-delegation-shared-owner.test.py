@@ -25,6 +25,7 @@ from policy.guardrail import (  # noqa: E402
 ADAPTERS = {
     "ag2space": REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py",
     "slack": REPO / "src/slack-bridge.py",
+    "signal": REPO / "src/signal_room_tasks.py",
 }
 
 

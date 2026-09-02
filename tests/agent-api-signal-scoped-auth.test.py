@@ -150,8 +150,8 @@ check("room token enqueues when body room equals its room", code == 200, str(dat
 task_a = data.get("task_id", "")
 check("source_room_id stamped from the token", source_room(task_a) == "!a:hs")
 check("the task's output dir is created", (api.RESULT_DIR / task_a).is_dir())
-check("the task body carries the output contract",
-      str(api.RESULT_DIR / task_a) in task_file(task_a).read_text())
+check("the task body carries the output contract, naming the canonical task root",
+      os.path.join(os.path.realpath(api.RESULT_DIR), task_a) in task_file(task_a).read_text())
 
 code, data = post("/guest-task", "tok-a-enq", {"task": "q", "room_id": "!b:hs"})
 check("body room != token room -> 403", code == 403, str(data))

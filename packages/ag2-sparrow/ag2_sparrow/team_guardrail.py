@@ -16,6 +16,8 @@ Do not add surface-specific wording here — a caller that needs it should say s
 around this block, not inside it.
 """
 
+import shlex
+
 # Verbatim: changing this text changes an enforcement surface, not a comment.
 TEAM_GUARDRAIL = (
     "You are handling a Sutando TEAM-tier request from a trusted collaborator, not "
@@ -70,9 +72,21 @@ AG2SPACE_PROVENANCE = "a team-tier sender the AG2 Space broker attests as a coll
 
 # Here so one edit reaches every surface: Discord learned the stdin/exit-code
 # contract and the other adapters did not. Measurement is in the PR.
-SANDBOXED_DELEGATION_CODEX = (
-    "Delegate it to Codex: `codex exec --sandbox read-only --skip-git-repo-check "
-    "-- \"$(cat <prompt-file>)\" < /dev/null`. The `< /dev/null` is REQUIRED — without it "
+def sandboxed_delegation_command(sandbox: str = "read-only", workdir=None, env=None) -> str:
+    """The codex invocation itself. `sandbox` is codex's own mode; `workdir` its `-C`
+    root — under workspace-write the ONLY tree it may write; `env` is exported to it."""
+    exports = "".join(f"{k}={shlex.quote(str(v))} " for k, v in (env or {}).items())
+    cd = f" -C {shlex.quote(str(workdir))}" if workdir else ""
+    return (f"{exports}codex exec --sandbox {sandbox}{cd} --skip-git-repo-check "
+            "-- \"$(cat <prompt-file>)\" < /dev/null")
+
+
+def sandboxed_delegation_text(sandbox: str = "read-only", workdir=None, env=None) -> str:
+    """The delegation sentence around one invocation; the default renders the read-only
+    text every existing lane carries, byte for byte."""
+    return (
+    f"Delegate it to Codex: `{sandboxed_delegation_command(sandbox, workdir, env)}`. "
+    "The `< /dev/null` is REQUIRED — without it "
     "codex waits on stdin and can hang to a timeout having produced nothing. Then assert the "
     "OUTPUT is non-empty before writing it: codex exits 0 both when it refuses and on a usage "
     "error, so the exit code is not evidence that an answer exists. The sandbox also has NO "
@@ -82,11 +96,15 @@ SANDBOXED_DELEGATION_CODEX = (
     "do NOT answer with the owner's unrestricted core, and do not silently skip. Say that the "
     "sandboxed path was unavailable and that no inspection was performed, so the requester can "
     "tell a refusal from silence."
-)
+    )
+
+
+SANDBOXED_DELEGATION_CODEX = sandboxed_delegation_text()
 
 
 def sandboxed_delegation_lines(
-    surface: str, tier_label: str, result_path: str, scope: str
+    surface: str, tier_label: str, result_path: str, scope: str, *,
+    sandbox: str = "read-only", workdir=None, env=None,
 ) -> list[str]:
     """Non-owner delegation as in-band SYSTEM INSTRUCTIONS lines for a task file.
 
@@ -95,13 +113,16 @@ def sandboxed_delegation_lines(
     `scope` the per-tier limits, which are genuinely NOT interchangeable between
     surfaces. Everything else — the do-not-process rule, the codex invocation, and
     the write-only-the-sandboxed-answer rule — is one policy and lives here once.
+    `sandbox`, `workdir` and `env` shape that one invocation for a lane whose worker
+    must write — codex's workspace-write in a root of the lane's choosing (Signal
+    Room); the default is read-only from the core's own cwd, unchanged.
     """
     return [
         "",
         "===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===",
         f"This {surface} task is {tier_label}, not owner tier.",
         "Do not execute the request directly with the owner's unrestricted core.",
-        SANDBOXED_DELEGATION_CODEX,
+        sandboxed_delegation_text(sandbox, workdir, env),
         scope,
         f"Write only the sandboxed agent's safe user-facing answer to {result_path}.",
         "===END SUTANDO SYSTEM INSTRUCTIONS===",

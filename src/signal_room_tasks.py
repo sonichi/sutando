@@ -3,7 +3,10 @@
 A Signal Room is a voice room the owner hosts and invites people into. When someone
 in the room asks the host for research, the request arrives here — and this module's
 entire job is to hand Sutando a task at the right tier. It does NOT choose an engine,
-compose a command line, supply credentials, or provision a profile.
+supply credentials, or provision a profile. Like every other non-owner lane (Slack,
+AG2 Space) it states the tier's delegation IN-BAND from the shared policy owner
+(`policy/guardrail.sandboxed_delegation_lines`), passing only what differs here: the
+sandbox mode and working root that make the generated-image capability real.
 
 That boundary is the point, and it was learned the hard way: an earlier version let
 the Signal Room lane pick the runtime (`claude -p …`) and pin it to an isolated
@@ -20,8 +23,9 @@ delegation path. A dedicated read-only `guest` execution tier is a named future 
 a label without a boundary.
 
 WHAT SUTANDO ENFORCES (not this module):
-  * the tier's execution restrictions — non-owner tasks are delegated to a sandboxed
-    agent by the core, which is where engine choice and isolation belong;
+  * the tier's execution restrictions — the core launches the sandboxed worker exactly
+    as the in-band block says, and that sandbox (not prose) bounds its writes to the
+    task's own output dir;
   * `guard_result_for_tier` on the way out — every non-owner result is secret-scanned
     before it reaches the room;
   * `confine_user_content` on the way in — untrusted text cannot forge task headers.
@@ -40,6 +44,8 @@ from pathlib import Path
 # path for the tier; nothing about HOW it runs is decided here.
 SIGNAL_ROOM_TIER = "team"
 SIGNAL_TASK_PREFIX = "task-signal-"
+# The one variable the image wrapper reads; the launch exports it and makes it the cwd.
+OUTPUT_ROOT_ENV = "SIGNAL_TASK_OUTPUT_ROOT"
 
 # The room's request text is untrusted (participant speech plus quoted article text),
 # so cap it before it ever reaches a task file.
@@ -73,24 +79,54 @@ def task_output_dir(output_root, task_id: str) -> Path:
     return Path(output_root) / task_id
 
 
+def worker_output_root(output_root, task_id: str) -> str:
+    """`task_output_dir` as the worker sees it — under the CANONICAL results dir, the one
+    spelling `signal_image_gen.py` accepts and `os.getcwd()` reports inside the sandbox."""
+    return os.path.join(os.path.realpath(str(output_root)), task_id)
+
+
 def output_contract(task_id: str, output_root) -> str:
     """Trusted preamble naming the ONE way a generated file may be produced.
 
     Narrow by design: image generation is the one tool the lane gains, and it is
     enforced in code, not prose — `signal_image_gen.py` takes a prompt and a bare
-    name, learns the output dir only from the environment `signal_worker_launch.py`
-    pins to `<results>/<task_id>/`, and writes nowhere else. Each file is announced
-    on its own `[file: <path>]` line — the one marker shape the egress preserves.
+    name and saves into the worker's working directory, `<results>/<task_id>/`,
+    which `delegation_lines` makes both the worker's cwd and its sandbox's only
+    writable tree. Each file is announced on its own `[file: <path>]` line — the
+    one marker shape the egress preserves.
     """
-    out_dir = task_output_dir(output_root, task_id)
+    root = worker_output_root(output_root, task_id)
     src = Path(__file__).resolve().parent
     return (
         f"[Signal Room task {task_id}] If an image is requested, generate it ONLY through "
-        f"the image-generation wrapper: run `python3 {src}/signal_worker_launch.py {task_id} -- "
-        f"python3 {src}/signal_image_gen.py --prompt <text> --name <name>.png` (optional "
-        f"--size square|landscape|portrait). It writes ONLY under {out_dir}/ and accepts no "
-        f"path; write no other files anywhere. Announce each saved file on its own line, "
-        f"exactly as [file: {out_dir}/<name>]. The request follows.\n\n"
+        f"the image-generation wrapper: run `python3 {src}/signal_image_gen.py --prompt <text> "
+        f"--name <name>.png` (optional --size square|landscape|portrait) from your working "
+        f"directory, {root}/ — the task output dir and the one place you may write. The "
+        f"wrapper saves the file there and accepts no path; write no other files anywhere. "
+        f"Announce each saved file on its own line, exactly as [file: {root}/<name>]. The "
+        f"request follows.\n\n"
+    )
+
+
+def delegation_lines(task_id: str, output_root) -> list[str]:
+    """The tier's in-band delegation block, from the owner every non-owner lane binds.
+
+    This lane adds the one thing it needs — a worker that may write — as the
+    delegate's own workspace-write mode rooted at the task output dir, so the
+    writable tree IS that root (plus the delegate's state dir and $TMPDIR). Chosen
+    at the launch on purpose: a nested profile under a read-only sandbox can only
+    ever narrow, so nothing below the launch could have granted the write.
+    """
+    from policy.guardrail import sandboxed_delegation_lines
+    root = worker_output_root(output_root, task_id)
+    return sandboxed_delegation_lines(
+        "Signal Room", "TEAM tier", f"results/{task_id}.txt",
+        f"The prompt is the task text above, including its [Signal Room task {task_id}] "
+        f"output contract. The working directory {root} is the ONE place the sandboxed "
+        f"worker may write — its image-generation wrapper saves there — and a saved file "
+        f"reaches the room only as the standalone `[file: {root}/<name>]` line you relay "
+        f"verbatim.",
+        sandbox="workspace-write", workdir=root, env={OUTPUT_ROOT_ENV: root},
     )
 
 
@@ -103,11 +139,12 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
     list — that visibility is the feature, not a leak.
 
     ``output_root`` (the results dir) enables the generated-image capability: the
-    task body opens with `output_contract`, the task's durable zero serve-quota
-    counter is written under ``state_dir`` (default: the workspace `state/` beside
-    the results dir), and only then is `<output_root>/<task_id>/` created for the
-    worker — nothing is servable before its counter exists. Without an output
-    root the body is the request alone.
+    task body opens with `output_contract` and closes with `delegation_lines`; the
+    task's durable zero serve-quota counter is written under ``state_dir`` (default:
+    the workspace `state/` beside the results dir), then `<output_root>/<task_id>/`
+    is created (0700) for the worker — nothing is servable before its counter
+    exists — and only then is the task published: the core launches on publish,
+    into that dir. Without an output root the body is the request alone.
     """
     task_dir = Path(task_dir)
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -129,7 +166,8 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
     from local_task_protocol import serialize_task_last
     body = confine(task_text[:MAX_TASK_CHARS])
     if output_root is not None:
-        body = output_contract(task_id, output_root) + body
+        body = (output_contract(task_id, output_root) + body + "\n"
+                + "\n".join(delegation_lines(task_id, output_root)) + "\n")
     content = serialize_task_last(headers, body)
 
     # One critical section, so concurrent posts cannot all observe capacity and
@@ -144,6 +182,13 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
         try:
             with os.fdopen(fd, "w") as fh:
                 fh.write(content)
+            if output_root is not None:
+                # Counter, then the worker's root, then publish: the core launches
+                # on publish, and the launch's `-C` needs the dir to exist.
+                import task_output_retention
+                state_dir = Path(output_root).parent / "state" if state_dir is None else Path(state_dir)
+                task_output_retention.init_serve_quota(state_dir, task_id)
+                task_output_dir(output_root, task_id).mkdir(mode=0o700, parents=True, exist_ok=True)
             os.replace(tmp, str(task_dir / f"{task_id}.txt"))
         except Exception:
             try:
@@ -151,11 +196,6 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
             except Exception:
                 pass
             raise
-    if output_root is not None:
-        import task_output_retention
-        state_dir = Path(output_root).parent / "state" if state_dir is None else Path(state_dir)
-        task_output_retention.init_serve_quota(state_dir, task_id)
-        task_output_dir(output_root, task_id).mkdir(mode=0o700, parents=True, exist_ok=True)
     return task_id
 
 

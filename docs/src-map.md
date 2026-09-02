@@ -149,7 +149,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
 - **`signal_image_gen.py`** — Trusted image generation for Signal Room tasks — the enforced half of the output contract.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
-- **`signal_worker_launch.py`** — Launch a Signal Room task's worker with its output root pinned server-side.
+- **`signal_worker_launch.py`** — Root derivation for a Signal Room worker: `<canonical results dir>/<task_id>`.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
 - **`skill_hooks.py`** — Discovery for skill-declared Claude Code hooks (`hooks` in a skill manifest).

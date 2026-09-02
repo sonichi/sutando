@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""src/signal_image_gen.py + src/signal_worker_launch.py — the enforced generation path.
+"""src/signal_image_gen.py + the Signal Room launch site — the enforced generation path.
 
 The wrapper takes a prompt (+ optional size preset) and a BARE output name; the
-output root comes only from SIGNAL_TASK_OUTPUT_ROOT, which the launcher derives
-server-side from a verified Signal Room task id. Covers: a generated artifact
+output root is SIGNAL_TASK_OUTPUT_ROOT or, absent that, its working directory —
+both pinned by the task's in-band launch, which the bridge (`signal_room_tasks`)
+writes as `codex exec --sandbox workspace-write -C <root>`: codex's own seatbelt
+then allows writes under that root and nowhere else. Covers: a generated artifact
 (stubbed provider) lands 0600 under the root and its path is printed; every
-path-shaped name (traversal, absolute, separators, wrong or missing extension)
-is refused; an unset, relative, non-normalized, out-of-results, non-Signal-Room,
+path-shaped name (traversal, absolute, separators, wrong or missing extension) is
+refused; an absent, relative, non-normalized, out-of-results, non-Signal-Room,
 nested, file, or SYMLINKED root is refused; existing names are never overwritten;
-the provider's failure writes nothing; the launcher refuses unknown, foreign-lane,
-malformed and dir-less ids and hands a real worker exactly one variable; the
-launcher runs the worker under a seatbelt profile whose ONLY write allowance is
-the server-derived task root (a forged root, another task's dir, the results dir
-and the workspace are denied by the kernel), and never launches unsandboxed.
+the provider's failure writes nothing; the cwd-derived root works exactly like the
+exported one; the id->root derivation refuses unknown, foreign-lane, malformed and
+dir-less ids; and the launch site itself: a Signal Room task's block is
+workspace-write in the task root with the variable exported — never read-only —
+the root exists 0700 before the task is published, and every other lane's block
+is unchanged byte for byte.
 
 Run: python3 tests/signal-image-gen.test.py
 """
@@ -28,7 +31,11 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import signal_image_gen as gen  # noqa: E402
+import signal_room_tasks as S  # noqa: E402
+
 import signal_worker_launch as launch  # noqa: E402
+from policy.guardrail import (SANDBOXED_DELEGATION_CODEX, sandboxed_delegation_command,  # noqa: E402
+                              sandboxed_delegation_lines, sandboxed_delegation_text)
 
 failures = []
 
@@ -56,9 +63,9 @@ def provider(prompt, aspect):
     return PNG
 
 
-def run(argv, env=None, prov=provider, results=RESULTS):
+def run(argv, env=None, prov=provider, results=RESULTS, cwd=str(WS)):
     out, err = io.StringIO(), io.StringIO()
-    rc = gen.run(argv, {gen.OUTPUT_ROOT_ENV: ROOT} if env is None else env, prov, results, out=out, err=err)
+    rc = gen.run(argv, {gen.OUTPUT_ROOT_ENV: ROOT} if env is None else env, prov, results, out=out, err=err, cwd=cwd)
     return rc, out.getvalue().strip(), err.getvalue()
 
 
@@ -125,7 +132,7 @@ rc, out, err = run(["--prompt", "x", "--name", "ok.png", "--size", "huge"])
 check("unknown size preset refused", rc == 2 and listing() == before)
 check("the provider was never called for a refused input", len(calls) == provider_calls)
 
-print("== the root comes only from the environment, and must be the real task dir ==")
+print("== the root is the exported variable or the working directory, and must be the real task dir ==")
 elsewhere = WS / "elsewhere" / "results" / TASK
 elsewhere.mkdir(parents=True)
 link_root = Path(CANON) / "task-signal-2-link"
@@ -135,7 +142,7 @@ file_root.write_text("x")
 Path(ROOT, "sub").mkdir()
 Path(CANON, "task-7-owner").mkdir()
 cases = [
-    ("unset", {}),
+    ("unset, and the working directory is not a task dir", {}),
     ("empty", {gen.OUTPUT_ROOT_ENV: ""}),
     ("relative", {gen.OUTPUT_ROOT_ENV: f"results/{TASK}"}),
     ("trailing slash (not normalized)", {gen.OUTPUT_ROOT_ENV: ROOT + "/"}),
@@ -156,18 +163,29 @@ for label, env in cases:
     rc, out, err = run(["--prompt", "x", "--name", "env.png"], env=env)
     check(f"{label}: exit 2, nothing written anywhere", rc == 2 and out == ""
           and {p: sorted(os.listdir(p)) for p in snapshot} == snapshot, f"rc={rc} err={err.strip()}")
+for label, env, cwd in (("a forged variable wins over a good working directory, and is refused",
+                         {gen.OUTPUT_ROOT_ENV: str(elsewhere)}, ROOT),
+                        ("a symlinked working directory", {}, str(link_root)),
+                        ("the non-canonical working directory spelling", {}, str(RESULTS / TASK))):
+    rc, out, err = run(["--prompt", "x", "--name", "env.png"], env=env, cwd=cwd)
+    check(f"{label}: exit 2, nothing written anywhere", rc == 2 and out == ""
+          and {p: sorted(os.listdir(p)) for p in snapshot} == snapshot, f"rc={rc} err={err.strip()}")
 rc, out, err = run(["--prompt", "x", "--name", "env.png"], env={gen.OUTPUT_ROOT_ENV: ROOT, "SIGNAL_TASK_OUTPUT_ROOT_X": "1"})
-check("the canonical real task dir is accepted", rc == 0 and Path(ROOT, "env.png").exists())
+check("the canonical real task dir is accepted by variable", rc == 0 and Path(ROOT, "env.png").exists())
+rc, out, err = run(["--prompt", "x", "--name", "cwd.png"], env={}, cwd=ROOT)
+check("the canonical real task dir is accepted as the working directory, no variable needed",
+      rc == 0 and out == os.path.join(ROOT, "cwd.png") and Path(ROOT, "cwd.png").read_bytes() == PNG, err)
 fd = gen.open_output_root(ROOT, RESULTS)
 check("open_output_root hands back a directory descriptor for the real dir",
       stat.S_ISDIR(os.fstat(fd).st_mode) and os.fstat(fd).st_ino == os.stat(ROOT).st_ino)
 os.close(fd)
 
-print("== the launcher derives the root from a verified task id ==")
+print("== the id->root derivation is verified against the task file ==")
 (TASKS / f"{TASK}.txt").write_text(f"id: {TASK}\nsource: signal-room\naccess_tier: team\nsource_room_id: !a:hs\ntask: draw\n")
 env = launch.worker_env(TASK, TASKS, RESULTS, base_env={"PATH": "/usr/bin"})
 check("exactly one variable is added, the canonical task dir",
       env == {"PATH": "/usr/bin", gen.OUTPUT_ROOT_ENV: ROOT}, str(env))
+check("it is the bridge's own spelling of the root", S.worker_output_root(RESULTS, TASK) == ROOT)
 (TASKS / "task-signal-2-link.txt").write_text("id: task-signal-2-link\nsource: signal-room\naccess_tier: team\ntask: x\n")
 (TASKS / "task-signal-4-none.txt").write_text("id: task-signal-4-none\nsource: signal-room\naccess_tier: team\ntask: x\n")
 (TASKS / "task-signal-5-lane.txt").write_text("id: task-signal-5-lane\nsource: discord\naccess_tier: team\ntask: x\n")
@@ -188,99 +206,100 @@ for label, tid in (("unknown id", "task-signal-9-zzzz"), ("non-Signal-Room id", 
         check(f"{label}: refused", True, str(exc))
 (TASKS / "processed").mkdir()
 os.replace(TASKS / f"{TASK}.txt", TASKS / "processed" / f"{TASK}.txt")
-check("a processed task still launches", launch.worker_env(TASK, TASKS, RESULTS, base_env={})[gen.OUTPUT_ROOT_ENV] == ROOT)
+check("a processed task still derives", launch.worker_env(TASK, TASKS, RESULTS, base_env={})[gen.OUTPUT_ROOT_ENV] == ROOT)
+check("nothing launches through the derivation module any more",
+      not any(hasattr(launch, n) for n in ("sandbox_profile", "sandbox_argv", "launch_argv", "SANDBOX_EXEC", "main"))
+      and "sandbox-exec" not in Path(launch.__file__).read_text())
 
-print("== the launcher's sandbox: one write allowance, the exact task root ==")
-profile = launch.sandbox_profile(ROOT)
-allows = [line for line in profile.splitlines() if line.startswith("(allow file-write")]
-check("the profile allows file-write* under exactly the task root and nothing else",
-      allows == [f'(allow file-write* (subpath "{ROOT}"))'], profile)
-check("every other write is denied; everything else is inherited",
-      "(deny file-write*)" in profile and "(allow default)" in profile
-      and profile.count("file-write") == 2 and profile.count("subpath") == 1
-      and "literal" not in profile and "regex" not in profile, profile)
-check("quotes and backslashes in the root are escaped, never a second string",
-      '(subpath "/x/a\\"b\\\\c")' in launch.sandbox_profile('/x/a"b\\c'))
-check("the worker runs under sandbox-exec with that profile, the command untouched",
-      launch.sandbox_argv(ROOT, ["cmd", "x"]) == [launch.SANDBOX_EXEC, "-p", profile, "cmd", "x"])
-forged = str(elsewhere)
-check("a forged root is outside the single allowance", not (forged + os.sep).startswith(ROOT + os.sep))
-real_sandbox = launch.SANDBOX_EXEC
-launch.SANDBOX_EXEC = str(WS / "no-sandbox-exec")
+print("== the launch site: the bridge's block runs the worker under workspace-write in the task root ==")
+LAUNCH_TASKS = WS / "launch-tasks"
+seen_at_publish = []
+real_replace = os.replace
+
+
+def spy_replace(src, dst):
+    if Path(dst).parent != LAUNCH_TASKS:      # the counter's own atomic write is not the publish
+        return real_replace(src, dst)
+    root = S.worker_output_root(RESULTS, Path(dst).stem)
+    try:
+        st = os.lstat(root)
+        seen_at_publish.append((stat.S_ISDIR(st.st_mode), stat.S_IMODE(st.st_mode)))
+    except OSError:
+        seen_at_publish.append(None)
+    return real_replace(src, dst)
+
+
+os.replace = spy_replace
 try:
-    launch.launch_argv(TASK, TASKS, RESULTS, ["cmd"], base_env={})
-    check("without a kernel sandbox the launch is refused", False)
-except launch.LaunchRefused as exc:
-    check("without a kernel sandbox the launch is refused", "unsandboxed" in str(exc), str(exc))
+    tid = S.submit_signal_room_task("draw a cat", LAUNCH_TASKS, lambda t: t, room_id="!r:hs",
+                                    output_root=RESULTS, state_dir=WS / "state")
 finally:
-    launch.SANDBOX_EXEC = real_sandbox
-if os.access(real_sandbox, os.X_OK):
-    argv, env_out = launch.launch_argv(TASK, TASKS, RESULTS, ["cmd"], base_env={})
-    check("launch_argv derives the root itself and pins it for the wrapper",
-          argv == launch.sandbox_argv(ROOT, ["cmd"]) and env_out == {gen.OUTPUT_ROOT_ENV: ROOT})
+    os.replace = real_replace
+root = S.worker_output_root(RESULTS, tid)
+body = (LAUNCH_TASKS / f"{tid}.txt").read_text()
+argv = sandboxed_delegation_command("workspace-write", root, {gen.OUTPUT_ROOT_ENV: root})
+check("the block's invocation: codex workspace-write, the task root as its cwd (-C), the variable exported",
+      argv in body and argv == (f"{gen.OUTPUT_ROOT_ENV}={root} codex exec --sandbox workspace-write -C {root} "
+                                f"--skip-git-repo-check -- \"$(cat <prompt-file>)\" < /dev/null"), argv)
+check("never read-only, and exactly one launch", "read-only" not in body and body.count("codex exec") == 1)
+check("the root is the CANONICAL results dir spelling the wrapper accepts",
+      root == os.path.join(CANON, tid) and body.count(root) >= 4, root)
+check("the root existed, a plain 0700 directory, BEFORE the task was published (the launch trigger)",
+      seen_at_publish == [(True, 0o700)] and os.path.isdir(root), str(seen_at_publish))
+check("the contract tells the worker: the wrapper saves in the working directory, announced as [file: root/name]",
+      f"[file: {root}/<name>]" in body and "signal_image_gen.py --prompt" in body
+      and "working directory" in body and "signal_worker_launch" not in body)
+check("the block follows the confined request, as on every other lane",
+      body.index("draw a cat") < body.index("===SUTANDO SYSTEM INSTRUCTIONS")
+      and body.rstrip().endswith("===END SUTANDO SYSTEM INSTRUCTIONS==="))
+check("it is the shared owner's block, stating the lane and tier",
+      "This Signal Room task is TEAM tier, not owner tier." in body
+      and f"Write only the sandboxed agent's safe user-facing answer to results/{tid}.txt." in body)
+check("the derivation module agrees with the launch", launch.output_root_for(tid, LAUNCH_TASKS, RESULTS) == root)
+plain = S.submit_signal_room_task("just a question", LAUNCH_TASKS, lambda t: t, room_id="!r:hs")
+plain_body = (LAUNCH_TASKS / f"{plain}.txt").read_text()
+check("without an output root the body is the request alone: no contract, no launch block, no dir",
+      "codex" not in plain_body and "[Signal Room task" not in plain_body
+      and not os.path.exists(S.worker_output_root(RESULTS, plain)))
 
-env = dict(os.environ, SUTANDO_WORKSPACE=str(WS), SUTANDO_TEST_MODE="1")
-launcher = str(REPO / "src" / "signal_worker_launch.py")
-probe = [sys.executable, "-c", f"import os; print(os.environ.get({gen.OUTPUT_ROOT_ENV!r}))"]
-r = subprocess.run([sys.executable, launcher, "task-signal-9-zzzz", "--", *probe], env=env, capture_output=True, text=True)
-check("CLI: an unknown id exits 2 before any command runs", r.returncode == 2 and r.stdout == "" and "refused" in r.stderr)
-r = subprocess.run([sys.executable, launcher, TASK, *probe], env=env, capture_output=True, text=True)
-check("CLI: missing `--` is a usage error", r.returncode == 2 and r.stdout == "")
-unsandboxed = [sys.executable, "-c", (
-    f"import sys; sys.path.insert(0, {str(REPO / 'src')!r}); import signal_worker_launch as l\n"
-    f"l.SANDBOX_EXEC = {str(WS / 'no-sandbox-exec')!r}; sys.exit(l.main([{TASK!r}, '--', *sys.argv[1:]]))"), *probe]
-r = subprocess.run(unsandboxed, env=env, capture_output=True, text=True)
-check("CLI: a Signal Room task never launches unsandboxed — refused and logged, the command never runs",
-      r.returncode == 2 and r.stdout == "" and "refused" in r.stderr and "unsandboxed" in r.stderr, r.stderr)
+slack = "\n".join(sandboxed_delegation_lines("Slack", "from a TEAM tier sender", "`results/{task_id}.txt`", "scope"))
+check("a non-Signal lane's block is unchanged: read-only from the core's own cwd, no -C, no variable",
+      "codex exec --sandbox read-only --skip-git-repo-check -- \"$(cat <prompt-file>)\" < /dev/null" in slack
+      and " -C " not in slack and gen.OUTPUT_ROOT_ENV not in slack and "workspace-write" not in slack)
+check("the shared owner's default text is the read-only rendering, byte for byte",
+      SANDBOXED_DELEGATION_CODEX == sandboxed_delegation_text()
+      and SANDBOXED_DELEGATION_CODEX.startswith(
+          "Delegate it to Codex: `codex exec --sandbox read-only --skip-git-repo-check "
+          "-- \"$(cat <prompt-file>)\" < /dev/null`. The `< /dev/null` is REQUIRED"))
+check("a root with shell metacharacters is quoted, never a second argument",
+      "-C '/r/a b'" in sandboxed_delegation_command("workspace-write", "/r/a b")
+      and "X='/r/a b' codex" in sandboxed_delegation_command("workspace-write", "/r/a b", {"X": "/r/a b"}))
 
-if os.access(launch.SANDBOX_EXEC, os.X_OK):
-    print("== under the launcher, the kernel decides ==")
-    r = subprocess.run([sys.executable, launcher, TASK, "--", *probe], env=env, capture_output=True, text=True)
-    check("CLI: the worker command runs with the root pinned", r.returncode == 0 and r.stdout.strip() == ROOT, r.stderr)
-    worker = [sys.executable, "-c", (
-        "import os, sys; sys.path.insert(0, sys.argv[1]); import signal_image_gen as g\n"
-        "sys.exit(g.run(sys.argv[2:], os.environ, lambda p, a: g.PNG_MAGIC + b'e2e', sys.argv[1] + '/../' + 'nonexistent'))"
-    )]
-    worker[2] = worker[2].replace("sys.argv[1] + '/../' + 'nonexistent'", f"{str(RESULTS)!r}")
-    r = subprocess.run([sys.executable, launcher, TASK, "--", *worker, str(REPO / "src"), "--prompt", "e2e", "--name", "e2e.png"],
-                       env=env, capture_output=True, text=True)
-    check("end to end: launcher -> wrapper writes under the pinned root and prints its path",
-          r.returncode == 0 and r.stdout.strip() == os.path.join(ROOT, "e2e.png")
-          and Path(ROOT, "e2e.png").read_bytes() == gen.PNG_MAGIC + b"e2e", r.stderr)
-    writer = [sys.executable, "-c", (
-        "import os, sys\n"
-        "for p in sys.argv[1:]:\n"
-        "    try:\n"
-        "        open(p, 'wb').write(b'x'); print('wrote', p)\n"
-        "    except OSError as exc:\n"
-        "        print('denied', p, exc.errno)\n")]
-    targets = [os.path.join(forged, "forged.png"), os.path.join(CANON, "task-7-owner", "other.png"),
-               os.path.join(CANON, f"{TASK}.txt"), os.path.join(CANON, "task-signal-5-lane", "x.png"),
-               os.path.join(str(WS), "anywhere.png"), os.path.join(ROOT, "direct.png")]
-    r = subprocess.run([sys.executable, launcher, TASK, "--", *writer, *targets], env=env, capture_output=True, text=True)
-    lines = r.stdout.strip().splitlines()
-    check("a direct write outside the root — another task, the results dir, the workspace — is denied by the kernel",
-          r.returncode == 0 and all(line.startswith("denied ") for line in lines[:-1])
-          and not any(os.path.exists(t) for t in targets[:-1]), r.stdout + r.stderr)
-    check("a direct write inside the root is the one thing allowed",
-          lines[-1:] == [f"wrote {targets[-1]}"] and Path(ROOT, "direct.png").exists(), r.stdout + r.stderr)
-    forged_worker = [sys.executable, "-c", (
-        f"import os, sys; sys.path.insert(0, {str(REPO / 'src')!r}); import signal_image_gen as g\n"
-        f"os.environ[g.OUTPUT_ROOT_ENV] = {forged!r}\n"
-        f"rc = g.run(['--prompt', 'x', '--name', 'forged.png'], os.environ, lambda p, a: g.PNG_MAGIC + b'f', {str(RESULTS)!r})\n"
-        f"open(os.path.join({forged!r}, 'raw.png'), 'wb').write(b'x')\n")]
-    r = subprocess.run([sys.executable, launcher, TASK, "--", *forged_worker], env=env, capture_output=True, text=True)
-    check("a forged SIGNAL_TASK_OUTPUT_ROOT: the wrapper refuses AND the kernel denies the raw write",
-          r.returncode != 0 and "refused" in r.stderr and "PermissionError" in r.stderr
-          and sorted(os.listdir(forged)) == [], r.stdout + r.stderr + str(os.listdir(forged)))
-    r = subprocess.run([sys.executable, str(REPO / "src" / "signal_image_gen.py"), "--prompt", "x", "--name", "bare.png"],
-                       env={k: v for k, v in env.items() if k != gen.OUTPUT_ROOT_ENV}, capture_output=True, text=True)
-    check("the wrapper run outside the launcher refuses (no root)", r.returncode == 2 and "bare.png" not in listing())
-else:
-    print("== no sandbox-exec on this host: the launcher must refuse, kernel checks skipped ==")
-    r = subprocess.run([sys.executable, launcher, TASK, "--", *probe], env=env, capture_output=True, text=True)
-    check("CLI: a valid task is still refused without a kernel sandbox",
-          r.returncode == 2 and r.stdout == "" and "unsandboxed" in r.stderr, r.stderr)
+print("== inside that launch, the wrapper: root by variable or by working directory, nothing else ==")
+env = {k: v for k, v in os.environ.items() if k != gen.OUTPUT_ROOT_ENV}
+env.update(SUTANDO_WORKSPACE=str(WS), SUTANDO_TEST_MODE="1")
+worker = [sys.executable, "-c", (
+    f"import os, sys; sys.path.insert(0, {str(REPO / 'src')!r}); import signal_image_gen as g\n"
+    f"sys.exit(g.run(sys.argv[1:], os.environ, lambda p, a: g.PNG_MAGIC + b'e2e', {str(RESULTS)!r}))")]
+r = subprocess.run([*worker, "--prompt", "e2e", "--name", "e2e.png"], cwd=ROOT, env=env, capture_output=True, text=True)
+check("run in the task root (codex's -C) with no variable: writes there and prints the path",
+      r.returncode == 0 and r.stdout.strip() == os.path.join(ROOT, "e2e.png")
+      and Path(ROOT, "e2e.png").read_bytes() == gen.PNG_MAGIC + b"e2e", r.stderr)
+r = subprocess.run([*worker, "--prompt", "e2e", "--name", "var.png"], cwd=str(WS),
+                   env=dict(env, **{gen.OUTPUT_ROOT_ENV: ROOT}), capture_output=True, text=True)
+check("run elsewhere with the variable exported: writes under the variable's root",
+      r.returncode == 0 and r.stdout.strip() == os.path.join(ROOT, "var.png") and Path(ROOT, "var.png").exists(), r.stderr)
+forged = str(elsewhere)
+r = subprocess.run([*worker, "--prompt", "x", "--name", "forged.png"], cwd=ROOT,
+                   env=dict(env, **{gen.OUTPUT_ROOT_ENV: forged}), capture_output=True, text=True)
+check("a forged variable is refused even from the right working directory",
+      r.returncode == 2 and "refused" in r.stderr and sorted(os.listdir(forged)) == [], r.stderr)
+r = subprocess.run([*worker, "--prompt", "x", "--name", "stray.png"], cwd=str(WS), env=env, capture_output=True, text=True)
+check("run outside any task root with no variable: refused, nothing written",
+      r.returncode == 2 and "refused" in r.stderr and not (WS / "stray.png").exists(), r.stderr)
+r = subprocess.run([sys.executable, str(REPO / "src" / "signal_image_gen.py"), "--prompt", "x", "--name", "bare.png"],
+                   cwd=str(REPO), env=env, capture_output=True, text=True)
+check("the real CLI outside the launch refuses before any provider call", r.returncode == 2 and "bare.png" not in listing())
 
 print()
 if failures:
