@@ -252,6 +252,20 @@ and loads whichever repo it reviews.
     author's to run; if it needs an owner-scheduled service window, that is an ASK with
     its cost named (which service goes down, for how long, whether inbound is replayed) —
     never grounds to approve without it, and never a disclosure footnote on an approval.
+    **When no available host can produce the witness, it becomes a first-deploy gate, not
+    a merge gate.** The structural case: no supervised `com.sutando.<bridge>` job exists on
+    any reachable host, or the only restartable bridges are pinned holding another PR's
+    armed evidence that a restart would destroy. Then the PR body must say so in those
+    terms — "witness deferred to first deploy on <host>" with the reason — and the change
+    may be approved and merged on its harness proof, but MUST NOT be deployed to a live
+    core until the exact-head round trip is posted back to the PR thread. The witness
+    moves; it does not vanish. Silence about a missing witness stays the footnote this
+    lesson forbids, and "could not run it" without naming the structural reason is not a
+    deferral. *Grounded by:* #3305, #3249, #2126 and #3553 (2026-09-01) — four PRs by
+    three agents each filed the identical "I cannot produce the round trip on this host"
+    apology in its own thread, and `launchctl list` on the canonical host showed no
+    `com.sutando.*-bridge` job at all; a required artifact nobody can produce had stopped
+    gating quality and started gating merging, indefinitely and invisibly.
     *Grounded by:* #3174 (`fix(discord): suppress recreated task results after delivery`)
     — a Discord delivery-path change approved on its unit suite, then blocked back to
     CHANGES_REQUESTED on review because the delivery path had no post-restart witness. The
