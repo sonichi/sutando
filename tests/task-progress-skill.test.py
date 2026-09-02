@@ -236,9 +236,7 @@ class TestSendSlack(unittest.TestCase):
             self.mod.send_slack("D123", "update", thread_ts="1234.56")
         self.assertEqual(captured.get("thread_ts"), "1234.56")
 
-    def test_unfurling_suppressed_in_payload(self):
-        # Slack renders a preview card per URL by default; a link-carrying
-        # progress note must not arrive as a stack of image blocks.
+    def _captured_payload(self, message):
         captured = {}
 
         def fake_post(url, payload, headers):
@@ -247,7 +245,19 @@ class TestSendSlack(unittest.TestCase):
 
         with patch.object(self.mod, "_token", return_value="xoxb-fake"), \
              patch.object(self.mod, "_post", side_effect=fake_post):
-            self.mod.send_slack("D123", "see https://example.com/a")
+            self.mod.send_slack("D123", message)
+        return captured
+
+    def test_single_link_note_keeps_its_preview(self):
+        # The preview IS the value when a note carries exactly one link.
+        captured = self._captured_payload("see https://example.com/a")
+        self.assertIs(captured.get("unfurl_links"), True)
+        self.assertIs(captured.get("unfurl_media"), True)
+
+    def test_link_dense_note_suppresses_unfurling(self):
+        # Two or more links would arrive as a stack of preview cards.
+        captured = self._captured_payload(
+            "see https://example.com/a and https://example.com/b")
         self.assertIs(captured.get("unfurl_links"), False)
         self.assertIs(captured.get("unfurl_media"), False)
 

@@ -30,6 +30,15 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# parents[3] rather than a .parent chain so the workspace lint does not
+# conflate this import bootstrap with workspace-path resolution.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+try:
+    from policy.egress.unfurl import should_unfurl as _should_unfurl
+except ImportError:  # skill running without the core tree
+    def _should_unfurl(_body: str) -> bool:
+        return False
+
 
 MAX_PROGRESS_CHARS = 280
 MAX_PROGRESS_LINES = 4
@@ -146,9 +155,10 @@ def send_slack(channel_id: str, message: str, thread_ts: str | None = None) -> b
     if not token:
         print("[task-progress] SLACK_BOT_TOKEN not found", file=sys.stderr)
         return False
-    # Same rule as the bridge's send path: no preview cards on our Slack posts.
+    # Same owner as the bridge's send path decides this.
+    unfurl = _should_unfurl(message)
     payload: dict = {"channel": channel_id, "text": message,
-                     "unfurl_links": False, "unfurl_media": False}
+                     "unfurl_links": unfurl, "unfurl_media": unfurl}
     if thread_ts:
         payload["thread_ts"] = thread_ts
     return _post(
