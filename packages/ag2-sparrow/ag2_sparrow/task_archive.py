@@ -36,6 +36,24 @@ def task_id_from_filename(name: str) -> str | None:
     match = _ID_STATE.match(name) or _ID_PLAIN.match(name)
     return match.group(1) if match else None
 
+# Same grammar, any producer prefix: archive corpora keep historic ids such as
+# ask-*, sc-ask-* and reco-skill-* (see local_task_protocol.valid_archive_lookup_id).
+_ANY_ID_STATE = re.compile(r"^(.+?)\.(?:assigned|claimed)-.+?\.txt$")
+_ANY_ID_PLAIN = re.compile(r"^(.+?)\.txt(?:\.\d+|\.archive-failed.*)?$")
+
+
+def archive_id_from_filename(name: str) -> str | None:
+    """The id an ARCHIVED file carries, whatever its producer prefix, or None.
+
+    `task_id_from_filename` is deliberately anchored to the live `task-*`
+    namespace; the archive is not, so a history reader that only knows the
+    live grammar drops every legacy row. Callers gate the result with
+    `local_task_protocol.valid_archive_lookup_id`.
+    """
+    match = _ANY_ID_STATE.match(name) or _ANY_ID_PLAIN.match(name)
+    return match.group(1) if match else None
+
+
 def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     """Return the actual task file path for task_id, or None if absent.
 
