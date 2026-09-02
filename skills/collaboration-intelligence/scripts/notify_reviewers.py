@@ -443,8 +443,7 @@ def _row(d) -> "tuple | None":
     actor = d.get("actor")
     if actor is not None and not (isinstance(actor, str) and actor):
         return None                     # PRESENT but wrong: not an absent actor
-    # EVERY present identity field, not just the one that wins the chain: a
-    # valid endpoint must not smuggle a list-valued reviewer into the state.
+    # EVERY present identity field: a valid endpoint must not smuggle a list.
     for f in ("endpoint", "reviewer"):
         v = d.get(f)
         if v is not None and not (isinstance(v, str) and v):
