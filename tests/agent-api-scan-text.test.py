@@ -154,8 +154,12 @@ def run() -> None:
     h.do_POST()
     check("malformed JSON -> 400", h._responses[0][0] == 400)
 
+    # [1] and "hi" are VALID JSON that is not an object: json.loads succeeds, so
+    # they reach .get() outside the parse except and raised AttributeError —
+    # an uncaught 500 for an authenticated caller rather than a 400.
     for bad in ({}, {"texts": []}, {"texts": "one"}, {"texts": [1]},
-                {"texts": ["x"] * 65}, {"texts": ["y" * 16385]}):
+                {"texts": ["x"] * 65}, {"texts": ["y" * 16385]},
+                [1], "hi"):
         h = post(bad)
         if h._responses[0][0] != 400:
             check(f"bad texts shape rejected: {str(bad)[:40]}", False)
