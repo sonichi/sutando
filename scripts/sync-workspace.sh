@@ -530,6 +530,7 @@ _compose_exclude_content() {
     # Cleanup runs only when control RETURNS from the replace, so a mid-stage kill
     # leaves one under a carried hosts/*/ path that `git add -A` would vault.
     echo "hosts/*/build_log.md.snap.??????"
+    echo "hosts/*/.build_log.snapshot-sha.repair.??????"
     echo ".env*"
     echo "*.heartbeat"
     echo "*.alive"
@@ -593,9 +594,8 @@ _exclude_rules_only() {
     grep -vE '^[[:space:]]*(#|$)' "$1" | sort
 }
 
-# Operator-authored COMMENTS are content too. The rule comparison cannot see
-# them, so a refresh that drops one looks safe while silently discarding the
-# operator's note — which is what a customized exclude file mostly is.
+# Operator-authored COMMENTS are content too: the rule comparison cannot see them,
+# so a refresh that drops one looks safe while discarding the operator's note.
 _exclude_comments_only() {
     grep -E '^[[:space:]]*#' "$1" | sort
 }
@@ -603,17 +603,14 @@ _exclude_comments_only() {
 # Built-in deny rules this script owns and may migrate into an existing generated
 # file. Deliberately explicit: anything listed is adopted without operator review.
 _adoptable_builtin_denies() {
-    printf '%s\n' 'hosts/*/build_log.md.snap.??????'
+    printf '%s\n' 'hosts/*/build_log.md.snap.??????' 'hosts/*/.build_log.snapshot-sha.repair.??????'
 }
 
-# A previously-generated exclude whose ONLY difference is carve-outs the shipped
-# config now adds is safe to refresh: no operator-authored rule is lost.
-# Refusing over a comment blocks every upgrade whose own header drifted. Carry
-# dropped comments forward instead: the rules refresh, the operator keeps theirs.
+# A generated exclude differing ONLY by shipped carve-outs is safe to refresh.
+# Carry dropped comments forward: the rules refresh, the operator keeps theirs.
 _preserve_dropped_comments() {
-    # The marker is OURS: counting it as a dropped operator comment would preserve
-    # each tick's marker under a fresh one and grow the file forever. Local, not a
-    # top-level constant — the test harness eval's function bodies only.
+    # The marker is OURS: counting it as a dropped operator comment would nest each
+    # tick's marker under a fresh one and grow the file forever.
     local marker='# --- preserved from the previous exclude (sync-workspace) ---'
     local existing="$1" desired="$2" dropped
     dropped="$(comm -23 <(_exclude_comments_only "$existing") <(_exclude_comments_only "$desired") \
@@ -880,6 +877,8 @@ _snapshot_per_host_config() {
     # pattern and past the grace window, so a concurrent sync's temp is never hit.
     find "$_host_dir" -maxdepth 1 -type f -name 'build_log.md.snap.??????' \
         -mmin +"${SYNC_SNAP_TMP_GRACE_MIN:-10}" -delete 2>/dev/null || true
+    find "$_host_dir" -maxdepth 1 -type f -name '.build_log.snapshot-sha.repair.??????' \
+        -mmin +"${SYNC_SNAP_TMP_GRACE_MIN:-10}" -delete 2>/dev/null || true
 
     if [ -f "$_cfg/settings.json" ]; then
         cp -p "$_cfg/settings.json" "$_host_dir/settings.json" 2>/dev/null || true
@@ -895,10 +894,8 @@ _snapshot_per_host_config() {
         cp -p "$_ch" "$_host_dir/channels/$_svc/access.json" 2>/dev/null || true
     done
 
-    # Ownership is provenance, never mtime. The re-hash before the swap refuses a
-    # writer that CHANGED the file; a writer holding an open fd is undetectable.
-    # Prints the recorded sha only when FILE's on-disk bytes are exactly one
-    # 64-char lowercase-hex token plus optional trailing newlines.
+    # Ownership is provenance, never mtime — the re-hash before the swap cannot see a
+    # writer holding an open fd. Prints the sha only for a lone 64-hex token.
     _usable_sig_record() {
         local _hex
         _hex="$(od -An -v -tx1 -- "$1" 2>/dev/null | tr -d ' \n')"
@@ -906,7 +903,7 @@ _snapshot_per_host_config() {
         tr -d '\n' < "$1" 2>/dev/null
     }
     # fsync a path AND its directory: a rename is only durable once the parent
-    # directory entry is on disk (keweichen's P1#3 acceptance condition).
+    # directory entry is on disk.
     _fsync_path_and_dir() {
         # Resolve lazily too: this function is loaded standalone by its test, so
         # it cannot assume the script-level SYNC_PY exists.
@@ -932,10 +929,8 @@ finally:
 PY
     }
 
-    # An interrupted publish leaves an INTENT beside the signature. Recovery
-    # never trusts it: the destination's own bytes must hash to the intent, or
-    # the intent is discarded. Malformed, stale and ambiguous all fail closed,
-    # and running this twice is a no-op.
+    # An interrupted publish leaves an INTENT beside the signature; recovery trusts the
+    # destination's bytes, not the intent. Malformed, stale and ambiguous fail closed.
     _recover_snapshot_publish() {
         local _d="$1" _s="$2" _i="$3" _want _have
         [ -f "$_i" ] || return 0
@@ -952,11 +947,8 @@ PY
                 log "snapshot: could not promote a verified intent; leaving it for the next tick"
                 return 0
             }
-            # The rename CONSUMED the only recovery record. If the signature is
-            # not durable, re-create the intent from the sha we still hold —
-            # otherwise a crash here leaves neither a durable signature nor
-            # anything for the next tick to recover from, and the completion
-            # line below would be a lie.
+            # The rename CONSUMED the only recovery record, so a non-durable signature must
+            # re-create the intent — otherwise the completion line below would be a lie.
             if ! _fsync_path_and_dir "$_s"; then
                 if printf '%s\n' "$_want" > "$_i" 2>/dev/null && _fsync_path_and_dir "$_i"; then
                     log "snapshot: promoted signature not confirmed durable; intent re-created for the next tick"
@@ -974,6 +966,30 @@ PY
         fi
     }
 
+    # Record a sha as the destination's provenance through the SAME durable contract as a
+    # publish (temp, fsync, rename, fsync); an in-place write risks a partial record.
+    _stamp_snapshot_sig() {
+        local _s="$1" _sha="$2" _rtmp
+        _rtmp="$(mktemp "${_s}.repair.XXXXXX" 2>/dev/null)" || _rtmp=""
+        if [ -z "$_rtmp" ]; then
+            log "snapshot: could not stage a signature repair for hosts/$(_host)/build_log.md; provenance left unchanged"
+        elif ! printf '%s\n' "$_sha" > "$_rtmp" 2>/dev/null ||
+            ! _fsync_path_and_dir "$_rtmp"; then
+            rm -f "$_rtmp" 2>/dev/null || true
+            log "snapshot: signature repair not confirmed durable before promotion; provenance left unchanged"
+        elif ! mv -f "$_rtmp" "$_s" 2>/dev/null; then
+            rm -f "$_rtmp" 2>/dev/null || true
+            log "snapshot: could not promote a signature repair for hosts/$(_host)/build_log.md; provenance left unchanged"
+        elif ! _fsync_path_and_dir "$_s"; then
+            # Nothing to recover TO — the record describes bytes already in place. Report
+            # unconfirmed and stop; the next tick re-checks it.
+            log "snapshot: repaired signature for hosts/$(_host)/build_log.md is not confirmed durable; it will be re-checked next tick"
+        else
+            return 0
+        fi
+        return 1
+    }
+
     if [ -f "$WORKSPACE_DIR/build_log.md" ]; then
         local _src="$WORKSPACE_DIR/build_log.md"
         local _dst="$_host_dir/build_log.md" _sig="$_host_dir/.build_log.snapshot-sha"
@@ -984,32 +1000,18 @@ PY
         # Validate raw bytes BEFORE any $(): substitution strips NULs, so a
         # NUL-damaged record would collapse to 64 clean hex and gain authority.
         [ -f "$_sig" ] && _rec="$(_usable_sig_record "$_sig")"
+        if [ -f "$_dst" ] && [ -n "$_cur" ] && [ -z "$_rec" ] && ! cmp -s "$_src" "$_dst" 2>/dev/null; then
+            # No usable record is not evidence of a second writer (the pre-provenance script
+            # copied here unconditionally): claim the copy now; this tick then refreshes it.
+            if _stamp_snapshot_sig "$_sig" "$_cur"; then
+                _rec="$_cur"
+                log "snapshot: adopted hosts/$(_host)/build_log.md — no usable provenance record; stamped its current sha and refreshing from root"
+            fi
+        fi
         if [ -f "$_dst" ] && cmp -s "$_src" "$_dst" 2>/dev/null; then
-            # Equal content is safe to re-own: repair a missing or stale sha so an
-            # interrupted publish self-heals. Nothing to propagate.
-            #
-            # The repair goes through the SAME durable contract as a publish —
-            # temp, fsync, atomic rename, fsync — because an in-place write here
-            # is exactly the partial signature the promote path refuses to risk,
-            # and a swallowed failure leaves that partial record authoritative.
+            # Equal content is safe to re-own; nothing to propagate.
             if [ "$_cur" != "$_rec" ]; then
-                local _rtmp
-                _rtmp="$(mktemp "${_sig}.repair.XXXXXX" 2>/dev/null)" || _rtmp=""
-                if [ -z "$_rtmp" ]; then
-                    log "snapshot: could not stage a signature repair for hosts/$(_host)/build_log.md; provenance left unchanged"
-                elif ! printf '%s\n' "$_cur" > "$_rtmp" 2>/dev/null ||
-                    ! _fsync_path_and_dir "$_rtmp"; then
-                    rm -f "$_rtmp" 2>/dev/null || true
-                    log "snapshot: signature repair not confirmed durable before promotion; provenance left unchanged"
-                elif ! mv -f "$_rtmp" "$_sig" 2>/dev/null; then
-                    rm -f "$_rtmp" 2>/dev/null || true
-                    log "snapshot: could not promote a signature repair for hosts/$(_host)/build_log.md; provenance left unchanged"
-                elif ! _fsync_path_and_dir "$_sig"; then
-                    # The content already matches, so there is nothing to
-                    # recover TO — a re-created intent would describe the state
-                    # that already holds. Say it is unconfirmed and stop.
-                    log "snapshot: repaired signature for hosts/$(_host)/build_log.md is not confirmed durable; it will be re-checked next tick"
-                fi
+                _stamp_snapshot_sig "$_sig" "$_cur" || true
             fi
         elif [ ! -f "$_dst" ] || { [ -n "$_rec" ] && [ "$_cur" = "$_rec" ]; }; then
             # Ours or absent -> stage beside the dest, swap only if the dest still
@@ -1021,21 +1023,15 @@ PY
                 _new="$(shasum -a 256 "$_tmp" 2>/dev/null | cut -d' ' -f1)"
                 [ -f "$_dst" ] && _now="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
                 if [ "$_now" = "$_cur" ]; then
-                    # Publish the INTENT first and make it durable: a crash after
-                    # the swap then leaves a record the next tick can verify and
-                    # complete, instead of a snapshot stranded with no provenance.
-                    # Every step of the durability chain fails CLOSED: a
-                    # best-effort intent lets the destination be renamed with no
-                    # durable record of it, which is the stranding this exists to
-                    # prevent. No step may be skipped and continue.
+                    # Publish the INTENT durably first: a crash after the swap then leaves a record the
+                    # next tick can complete. Every step fails CLOSED; none may be skipped.
                     if ! printf '%s\n' "$_new" > "$_int" 2>/dev/null ||
                         ! _fsync_path_and_dir "$_int"; then
                         rm -f "$_tmp" "$_int" 2>/dev/null || true
                         warn_operator "snapshot refused: could not durably record the publish intent for hosts/$(_host)/build_log.md; per-host copy and provenance left unchanged"
                     elif mv -f "$_tmp" "$_dst" 2>/dev/null; then
-                        # The destination must be durable BEFORE the signature
-                        # claims it. If it is not, leave the intent: the next
-                        # tick verifies the bytes and completes or discards.
+                        # The destination must be durable BEFORE the signature claims it; if it is not,
+                        # leave the intent for the next tick to verify or discard.
                         if ! _fsync_path_and_dir "$_dst"; then
                             log "snapshot: destination not confirmed durable; intent left for recovery, signature not promoted"
                         elif ! mv -f "$_int" "$_sig" 2>/dev/null; then
@@ -1043,9 +1039,8 @@ PY
                             # here would reintroduce the partial signature.
                             log "snapshot: could not promote the publish intent; intent left for recovery, signature unchanged"
                         elif ! _fsync_path_and_dir "$_sig"; then
-                            # Same asymmetry as the recovery path: the promote
-                            # rename consumed the intent, so a non-durable
-                            # signature must leave a fresh one behind.
+                            # Same asymmetry as the recovery path: the promote rename consumed the intent, so
+                            # a non-durable signature must leave a fresh one behind.
                             if printf '%s\n' "$_new" > "$_int" 2>/dev/null && _fsync_path_and_dir "$_int"; then
                                 log "snapshot: signature promoted but not confirmed durable; intent re-created for the next tick"
                             else
@@ -1067,9 +1062,8 @@ PY
             fi
         elif ! cmp -s "$_src" "$_dst" 2>/dev/null; then
             if [ -z "$_rec" ]; then
-                # _rec is cleared for absent, empty, unreadable AND malformed sig
-                # files alike; none of the four evidences a second writer.
-                warn_operator "snapshot refused: hosts/$(_host)/build_log.md has NO USABLE provenance record (the recorded-sha file is absent, empty, unreadable, or not a single sha256 — the copy predates provenance tracking or its record was damaged) — this is NOT evidence of an independent writer; do not archive either copy on the strength of this message"
+                # Only reachable when the adoption stamp above was not confirmed durable.
+                warn_operator "snapshot: hosts/$(_host)/build_log.md has NO USABLE provenance record and could not be adopted this tick (its new record was not confirmed durable) — per-host copy left unchanged, retried next sync; this is NOT evidence of an independent writer"
             else
                 warn_operator "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
             fi

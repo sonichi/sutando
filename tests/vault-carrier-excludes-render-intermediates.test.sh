@@ -393,9 +393,8 @@ check "...and the carve-outs landed despite the stale comment" \
 check "...and the operator's comment SURVIVES the refresh (preserved, not dropped)" \
     grep -qxF '# an older header line that no longer ships' "$UPG_CMT/.git/info/exclude"
 
-# keweichen's acceptance case on #3198: the owned deny must LAND while an
-# operator comment beside it SURVIVES. Refusing the refresh preserved the
-# comment but left the deny out, which is how the crash temp became stageable.
+# Acceptance case: the owned deny must LAND while an operator comment beside it
+# SURVIVES. Refusing the refresh preserved the comment but left the deny out.
 UPG_BOTH="$TEST_ROOT/upgrade-deny-and-comment"
 seed_older_install "$UPG_BOTH" 'notes/generated/' 'notes/media/'
 grep -vxF "$BI_RULE" "$UPG_BOTH/.git/info/exclude" > "$UPG_BOTH/.git/info/exclude.t" &&
@@ -408,9 +407,8 @@ check "...the owned deny LANDS" \
 check "...and the operator's comment survives beside it" \
     grep -qxF '# why we keep notes/raw: it is my scratch area' "$UPG_BOTH/.git/info/exclude"
 
-# keweichen's idempotency control: the preserved section is OURS, so a second
-# tick must not preserve its own marker under a fresh one. Two consecutive runs
-# on the settled file must be byte-identical, or the exclude grows every sync.
+# Idempotency: the preserved section is OURS, so two consecutive runs on the settled
+# file must be byte-identical, or the exclude grows every sync.
 _idem_before="$(cat "$UPG_BOTH/.git/info/exclude")"
 upgrade_rc "$UPG_BOTH" > /dev/null
 _idem_after="$(cat "$UPG_BOTH/.git/info/exclude")"
