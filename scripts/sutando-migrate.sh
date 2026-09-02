@@ -1193,10 +1193,23 @@ union_contains() {
     local src="$1" dst="$2" manifest="${3:-}" rel="${4:-}"
     local py; py="$(resolve_python "$REPO_DIR")"
     [ -n "$py" ] || return 1
-    "$py" - "$src" "$dst" "$manifest" "$rel" <<'PY'
+    "$py" - "$src" "$dst" "$manifest" "$rel" "${DEST_REAL:-}" <<'PY'
 import json, os, stat, sys
 
-src, dst, manifest, rel = sys.argv[1:5]
+src, dst, manifest, rel, dest_root = sys.argv[1:6]
+# A 0644 leaf under a 0755 parent discloses what a 0700 source parent protected;
+# only parents strictly inside the dest root are governed (the root is never narrowed).
+try:
+    sdir = os.path.dirname(os.path.realpath(src))
+    ddir = os.path.dirname(os.path.realpath(dst))
+    root = os.path.realpath(dest_root) if dest_root else None
+    if root and ddir != root and ddir.startswith(root + os.sep):
+        sp = stat.S_IMODE(os.stat(sdir).st_mode)
+        dp = stat.S_IMODE(os.stat(ddir).st_mode)
+        if dp & ~sp:
+            sys.exit(1)
+except OSError:
+    sys.exit(1)
 try:
     with open(src, encoding="utf-8") as fh:
         s = json.load(fh)
@@ -1387,7 +1400,17 @@ identity_match() {
 # source's mtime, or a later OLDER source outranks it and its scalars win.
 identity_drop_keeping_newest() {
     [ "$1" -nt "$2" ] || return 0
-    touch -r "$1" "$2"
+    # Never mutate the existing inode: a hard link (or a symlink touch follows)
+    # can alias a file outside DEST_REAL. Materialize a contained inode instead.
+    copy_preserving_mtime "$1" "$2"
+}
+
+# A destination leaf that is a symlink resolves to a file the rollback root does
+# not own; reading or replacing it acts outside DEST_REAL. Refuse before either.
+refuse_leaf_symlink() {
+    [ -L "$1" ] || return 0
+    echo "ERROR: $2 — destination leaf is a symlink ($1); refusing to read or replace it" >&2
+    return 1
 }
 
 # SHA-256 verify (macOS shasum / Linux sha256sum). Returns 0 if hashes match.
@@ -1414,6 +1437,7 @@ commit_one() {
         union-json-array)
             dst_path="$DEST_REAL/$rel"
             ensure_contained_destdir "$(dirname "$dst_path")" || { echo "write-failed"; return 1; }
+            refuse_leaf_symlink "$dst_path" "$rel" || { echo "write-failed"; return 1; }
             if [ ! -e "$dst_path" ]; then
                 copy_preserving_mtime "$src_file" "$dst_path" || { echo "write-failed"; return 1; }
                 # Verify's mode check runs only where a manifest exists, so a
@@ -1440,6 +1464,11 @@ commit_one() {
                 echo "write-failed"
                 return 1
             fi
+            # The union rewrote the leaf in place: its parents must take the same
+            # non-widening intersection every copied file gets, or fail closed.
+            mirror_dir_modes "$src_file" "$dst_path" || {
+                echo "ERROR: directory-mode enforcement failed for $dst_path" >&2
+                echo "write-failed"; return 1; }
             # The manifest is what lets phase three verify the scalar winner
             # when the pre-union dest won — failing to record it fails closed.
             record_union_scalars "$dst_path" "$rel" "$(union_scalar_manifest)" \
@@ -1449,6 +1478,7 @@ commit_one() {
             ;;
         structural|collision-keep-both)
             dst_path="$DEST_REAL/$rel"
+            refuse_leaf_symlink "$dst_path" "$rel" || { echo "write-failed"; return 1; }
             if [ -e "$dst_path" ]; then
                 # Identical requires bytes AND mode; a mode-only difference
                 # falls through to keep-both so the source's mode survives.
@@ -1494,6 +1524,7 @@ commit_one() {
             ;;
         newest-mtime)
             dst_path="$DEST_REAL/$rel"
+            refuse_leaf_symlink "$dst_path" "$rel" || { echo "write-failed"; return 1; }
             if [ -e "$dst_path" ]; then
                 local src_mt dst_mt
                 src_mt="$(_stat %Y %m "$src_file")"
