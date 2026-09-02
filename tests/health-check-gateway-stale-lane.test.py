@@ -63,6 +63,13 @@ class GatewayStaleLanes(unittest.TestCase):
         _write(self.d, "gateway-status.local.json", connected=True, ts="soon")
         self.assertEqual(hc._gateway_stale_lanes(state_dir=self.d, now=NOW), [])
 
+    def test_unlistable_state_dir_is_empty_not_an_exception(self):
+        """`Path.glob` swallows most errors itself, so the OSError arm is reached
+        only when the listing genuinely fails; the probe must answer "no lanes"
+        rather than take the whole health run down."""
+        with patch.object(Path, "glob", side_effect=OSError("listing failed")):
+            self.assertEqual(hc._gateway_stale_lanes(state_dir=self.d, now=NOW), [])
+
     def test_missing_dir_is_empty(self):
         self.assertEqual(hc._gateway_stale_lanes(state_dir=Path("/nonexistent-xyz"), now=NOW), [])
 
