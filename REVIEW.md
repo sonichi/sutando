@@ -335,6 +335,49 @@ and loads whichever repo it reviews.
     signal when available, because it identifies *which* test is missing rather than only that one
     is.
 
+19. **On a shared review login, check the existing reviews before you spend one —
+    the count does not move and you overwrite a peer.** Several agents review through the
+    same GitHub account here. GitHub resolves a PR's decision by latest-state-per-USER, so
+    two APPROVED reviews from that one account are **one** approver, not two, and the later
+    review *replaces* the earlier one as the effective record. Two consequences a reviewer
+    cannot see from the PR page: a second approval from the fleet moves the required count
+    by zero, and it can bury a disclosure or a dissent the first reviewer recorded. The
+    same mechanic lets the account contradict itself — an approve and a block on code that
+    never changed — where whichever landed last silently becomes the verdict. Before
+    reviewing, list that account's existing reviews on the PR, not just `reviewDecision`.
+    Judge the account's **current** decisive state, not its history. The mandatory
+    preflight prints this for you as `DECISIVE STATE`: latest verdict per login, never
+    truncated, and independent of whether the review carried any prose — a bare APPROVED
+    is a verdict with nothing to read, and it used to render as an empty thread. If a peer's APPROVED
+    is the latest decisive review, do not file another — a second approval moves the count
+    by zero and buries theirs; carry what you verified in a COMMENT, or recruit an approver
+    on a **different** login. But if the latest decisive review from that account is a
+    CHANGES_REQUESTED and you have verified the blocker fixed, an APPROVED (or a dismissal)
+    is exactly what clears it, and a comment would leave the block latched. "Never a second
+    approval" is wrong as a blanket rule for precisely that case.
+    **This is one of two failure modes on a shared login, not the whole hazard.** On a third
+    party's PR two reviews collapse into one, as above. On a PR that account itself authored,
+    GitHub refuses only the *decisive* verdicts — the author login cannot APPROVE or request
+    changes, only COMMENT — so **the author's own reviews never move `reviewDecision`, however
+    many it files.** So a self-authored PR can look unreviewed while carrying real review, and
+    `pulls/N/reviews` is **not** empty either. Read `reviewDecision` for the decision and the
+    reviews list for the substance, and never take COMMENT volume for either. Same account,
+    opposite polarity: two-becomes-one on someone else's PR, no-decision-possible on your own.
+    **And `reviewDecision` over *other* logins is a THRESHOLD, not a latest-verdict flag.** An
+    active block reads `CHANGES_REQUESTED`; approvals below the repo's required count still read
+    `REVIEW_REQUIRED`; only a met requirement reads `APPROVED`. One approval is not an approved
+    PR. Measured on #3482 with the head unchanged throughout: `john-the-dev` APPROVED at
+    12:14:45Z and the field read `REVIEW_REQUIRED` at 12:16:58Z; `sonichi` APPROVED at 12:51:36Z
+    and it read `APPROVED`.
+    *Grounded by:* #3481 (2026-08-28) — approved without looking, twenty minutes after a
+    peer had approved on the same account; the PR still read `REVIEW_REQUIRED` afterwards
+    and the peer's conflict-of-interest disclosure was left in the superseded review. A
+    sweep of 92 open PRs then found the account holding more than one review on 69 of
+    them, and 32 verdict flips across 17 PRs where **no commit landed between** the two
+    opposing reviews. Force-pushes were ruled out by the issue timeline on #3471 (zero
+    `head_ref_force_pushed` events) but not on every PR in that set, so treat 32 as the
+    measured figure for the PRs checked rather than a proven fleet-wide total.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml
