@@ -53,13 +53,18 @@ class CrossSenderPredicate(unittest.TestCase):
 class PlanRefusesCrossSenderDedup(unittest.TestCase):
     """The regression: same room, different senders, holder DID deliver."""
 
-    def _plan(self, holder_user):
-        d = Path(self.tmp)
+    def _plan(self, holder_user, holder_result="a real, delivered answer\n", count=0):
+        # a fresh workspace per call: several plans run inside one test
+        d = Path(self.tmp) / f"ws{self._n}"
+        self._n += 1
         tasks, results = d / "tasks", d / "results"
-        tasks.mkdir(), results.mkdir()
-        (tasks / "task-victim.txt").write_text(_task("task-victim", "@alice:ag2.space"))
+        tasks.mkdir(parents=True), results.mkdir(parents=True)
+        victim = _task("task-victim", "@alice:ag2.space")
+        if count:
+            victim = victim.replace("access_tier: team\n", f"access_tier: team\ndedup_requeue_count: {count}\n")
+        (tasks / "task-victim.txt").write_text(victim)
         (tasks / "task-holder.txt").write_text(_task("task-holder", holder_user))
-        (results / "task-holder.txt").write_text("a real, delivered answer\n")
+        (results / "task-holder.txt").write_text(holder_result)
         return plan_dedup_recovery(
             results, tasks, "task-victim", "task-holder", ROOM, "task-new",
         )
@@ -67,6 +72,7 @@ class PlanRefusesCrossSenderDedup(unittest.TestCase):
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
         self.tmp = self._td.name
+        self._n = 0
 
     def tearDown(self):
         self._td.cleanup()
@@ -75,8 +81,24 @@ class PlanRefusesCrossSenderDedup(unittest.TestCase):
         action, payload = self._plan("@bob:ag2.space")
         self.assertEqual(action, "requeue", "a cross-sender dedup was honoured — the asker is silenced")
         self.assertEqual(payload, "task-new")
-        body = (Path(self.tmp) / "tasks" / "task-new.txt").read_text()
+        body = (Path(self.tmp) / "ws0" / "tasks" / "task-new.txt").read_text()
         self.assertIn("DIFFERENT sender", body)
+
+
+    def test_cross_sender_requeue_is_capped_like_the_other_branch(self):
+        # `dedup_decision` short-circuits on holder-delivered, so its
+        # `dedup_requeue_count >= 1 -> report` cap never runs for this path.
+        # Without an explicit cap here a cross-sender fold re-asks forever.
+        first, _ = self._plan("@bob:ag2.space")
+        self.assertEqual(first, "requeue")
+        second, msg = self._plan("@bob:ag2.space", count=1)
+        self.assertEqual(second, "report", "cross-sender re-asks without bound")
+        self.assertIn("asked by someone else", msg)
+
+    def test_holder_empty_cap_still_works(self):
+        # Positive control: the branch the existing cap does guard.
+        self.assertEqual(self._plan("@alice:ag2.space", holder_result="[no-send]\n")[0], "requeue")
+        self.assertEqual(self._plan("@alice:ag2.space", holder_result="[no-send]\n", count=1)[0], "report")
 
     def test_same_room_same_sender_is_still_honoured(self):
         # The case dedup exists for; a fix that requeues this is worse than the bug.
