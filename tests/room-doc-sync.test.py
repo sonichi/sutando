@@ -7,7 +7,7 @@ import io
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -210,6 +210,26 @@ class PutFlowTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             self.assertEqual(ds.cmd_put("!r", "ops", "X.md", self.ws, f, "me"), 5)
         self.assertEqual(ds.base_path(self.ws, "ops", "X.md").read_text(), BASE)
+
+    def test_put_distinguishes_nothing_changed_from_already_present(self):
+        ds.base_path(self.ws, "ops", "X.md").parent.mkdir(parents=True)
+        ds.base_path(self.ws, "ops", "X.md").write_text(BASE)
+        # (a) edited == base: a genuine no-op
+        f = self.ws / "e.md"; f.write_text(BASE)
+        self._wire(FakeOps([ok(BASE)]))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(ds.cmd_put("!r", "ops", "X.md", self.ws, f, "me"), 0)
+        self.assertIn("no row changes", out.getvalue()); self.assertNotIn("already present", out.getvalue())
+        # (b) edited != base but the remote already carries my exact edit: reported by name, not silence
+        mine = edit(BASE, "org/repo#1", "org/repo#1 | mine"); f.write_text(mine)
+        fake = FakeOps([ok(mine)]); self._wire(fake)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(ds.cmd_put("!r", "ops", "X.md", self.ws, f, "me"), 0)
+        self.assertIn("already present remotely", out.getvalue()); self.assertIn("org/repo#1", out.getvalue())
+        self.assertFalse(any(c[0] == "put" for c in fake.calls))  # nothing written
+        self.assertEqual(ds.base_path(self.ws, "ops", "X.md").read_text(), mine)  # base advanced to the remote
 
     def test_missing_room_fails_naming_the_key(self):
         err = io.StringIO()
