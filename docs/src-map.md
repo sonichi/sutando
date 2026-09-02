@@ -339,6 +339,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`__init__.py`** — _(no header comment)_
 - **`attachment.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
 - **`result.py`** — Final scan applied to a Team-tier result before any router reads its markers.
+- **`unfurl.py`** — Whether an outgoing chat post should render link preview cards.
 
 ## `src/runtime-api/`
 
