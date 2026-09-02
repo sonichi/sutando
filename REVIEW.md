@@ -253,15 +253,25 @@ and loads whichever repo it reviews.
     its cost named (which service goes down, for how long, whether inbound is replayed) —
     never grounds to approve without it, and never a disclosure footnote on an approval.
     **When no available host can produce the witness, it becomes a first-deploy gate, not
-    a merge gate.** The structural case: no supervised `com.sutando.<bridge>` job exists on
-    any reachable host, or the only restartable bridges are pinned holding another PR's
-    armed evidence that a restart would destroy. Then the PR body must say so in those
-    terms — "witness deferred to first deploy on <host>" with the reason — and the change
-    may be approved and merged on its harness proof, but MUST NOT be deployed to a live
-    core until the exact-head round trip is posted back to the PR thread. The witness
-    moves; it does not vanish. Silence about a missing witness stays the footnote this
-    lesson forbids, and "could not run it" without naming the structural reason is not a
-    deferral. *Grounded by:* #3305, #3249, #2126 and #3553 (2026-09-01) — four PRs by
+    a merge gate — and a first-deploy gate is a RECORD the deployment path reads, not a
+    sentence in the thread.** Eligibility is narrow: the author has tried to provision a
+    witness target and can show why none exists — `bash src/install-channel-bridge-launchd.sh
+    <bridge>` fails or no channel is configured on any reachable host, AND the detached-worktree
+    procedure in `CONTRIBUTING.md` and a disposable target are both unavailable, with the
+    failing command pasted. "No supervised job is loaded" is not eligibility when the installer
+    can load one. When eligible, the author (1) files the owed witness as a durable record —
+    `python3 src/witness_owed.py --workspace "$WORKSPACE" open owner/repo#N --head <sha> --host
+    <host> --reason "<why no target exists>" --by <agent>` — and (2) says so in the PR body in
+    those terms. The PR may then be approved and merged on its harness proof. `self-upgrade`
+    reads the record and refuses to fast-forward a live core onto any head that newly contains
+    the owed PR (`src/witness_owed.py check`, exit 3) until the exact-head round trip is posted
+    back to the thread and the record is closed with its location (`close ... --witness <url>`).
+    The circular case — the owing host IS the first live core — is a declared canary, not an
+    exception: `upgrade.sh --canary owner/repo#N` marks the record for that host only, activates
+    there, and the witness that activation produces closes the record; every other host stays
+    refused until it does. The witness moves; it does not vanish. Silence about a missing
+    witness stays the footnote this lesson forbids, and "could not run it" without the pasted
+    provisioning failure and the record is not a deferral. *Grounded by:* #3305, #3249, #2126 and #3553 (2026-09-01) — four PRs by
     three agents each filed the identical "I cannot produce the round trip on this host"
     apology in its own thread, and `launchctl list` on the canonical host showed no
     `com.sutando.*-bridge` job at all; a required artifact nobody can produce had stopped
