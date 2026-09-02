@@ -218,6 +218,27 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         os.stat = real_stat
 
+print("== the generated-image capability is a narrow, task-scoped contract ==")
+with tempfile.TemporaryDirectory() as td:
+    tasks, results = Path(td) / "tasks", Path(td) / "results"
+    tid = S.submit_signal_room_task("draw item 2", tasks, lambda t: t,
+                                    room_id="!r:hs", output_root=results)
+    body = (tasks / f"{tid}.txt").read_text()
+    out_dir = S.task_output_dir(results, tid)
+    ck(out_dir == results / tid, "the output dir is <results>/<task_id>/")
+    ck(out_dir.is_dir(), "the output dir is created at submission")
+    ck(str(out_dir) in body and "image-generation" in body,
+       "the task body names the skill and the ONLY permitted output dir")
+    ck(f"[file: {out_dir}/" in body, "the body shows the one marker shape egress preserves")
+    ck(body.rstrip().endswith("draw item 2"), "the untrusted request still ends the file")
+    ck(fields(body).get("access_tier") == "team", "the contract adds no header")
+    ck(body.index(str(out_dir)) < body.index("draw item 2"),
+       "the trusted contract precedes the untrusted request")
+    tid2 = S.submit_signal_room_task("plain", tasks, lambda t: t)
+    (tasks / f"{tid}.txt").unlink()
+    ck("image-generation" not in (tasks / f"{tid2}.txt").read_text(),
+       "without an output root the body is the request alone")
+
 print()
 if FAILS:
     print(f"FAILED ({len(FAILS)}): " + "; ".join(FAILS))

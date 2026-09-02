@@ -160,9 +160,35 @@ def load_team_result_scanner(repo: Path):
     return filter_chat_secrets
 
 
+def only_task_output_attachments(body: str, task_output_root) -> bool:
+    """The task-scoped output allowance: True when EVERY attach marker in `body`
+    is a standalone `[file: <absolute path>]` line whose realpath sits under
+    `task_output_root`. Aliases, inline mentions and out-of-root paths keep the
+    body a delivery-control withhold. Grammar comes from parse_markers, per line.
+    """
+    root = os.path.realpath(str(task_output_root))
+    live = sorted(a.value for a in parse_markers(body or "").actions if a.kind == "attach")
+    if not live:
+        return True
+    # Multiset equality: every LIVE marker must be one of the standalone in-root
+    # lines, so a shown (fenced) marker can never stand in for an issued one.
+    standalone = []
+    for line in (body or "").split("\n"):
+        if not line.lstrip().startswith("[file:"):
+            continue
+        parsed = parse_markers(line)
+        if parsed.body.strip() or len(parsed.actions) != 1 or parsed.actions[0].kind != "attach":
+            continue
+        target = parsed.actions[0].value
+        if os.path.isabs(target) and os.path.realpath(target).startswith(root + os.sep):
+            standalone.append(target)
+    return sorted(standalone) == live
+
+
 def scan_team_result(body: str, repo: Path, secret_filter=None,
                      scan_sensitive_data: bool = True,
-                     allow_attach: bool = False) -> str:
+                     allow_attach: bool = False,
+                     task_output_root: "Path | None" = None) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
     kinds = {action.kind for action in parse_markers(body or "").actions}
     # dm-only only suppresses a redirect the guard already withholds, and a
@@ -172,7 +198,8 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     if "attach" in kinds and not allow_attach:
         # Verdict-only exemption: the adapter says whether THIS channel+sender
         # may attach; path authorization stays with the transport allowlist.
-        raise TeamResultLeakError("result delivery control marker")
+        if task_output_root is None or not only_task_output_attachments(body, task_output_root):
+            raise TeamResultLeakError("result delivery control marker")
     # Suppression is deliberately absent: redirect and attach move data
     # somewhere the sender should not reach, a skip marker moves nothing.
     # Marker checks stay above this narrow scanner opt-out.
@@ -386,7 +413,8 @@ def classify_result_for_tier(body: str, tier, repo: Path,
                              secret_filter=None,
                              scan_sensitive_data: bool = True,
                              allow_attach: bool = False,
-                             honor_suppressions: bool = True) -> TeamResultVerdict:
+                             honor_suppressions: bool = True,
+                             task_output_root: "Path | None" = None) -> TeamResultVerdict:
     """The guard-owned policy verdict. Adapters apply transport mechanics only;
     re-deciding (or bypassing) this classification in a bridge is a boundary
     violation, not an implementation choice."""
@@ -400,7 +428,8 @@ def classify_result_for_tier(body: str, tier, repo: Path,
         return TeamResultVerdict(
             VERDICT_DELIVER,
             scan_team_result(body, repo, secret_filter, scan_sensitive_data,
-                         allow_attach=allow_attach),
+                         allow_attach=allow_attach,
+                         task_output_root=task_output_root),
             None)
     except TeamResultLeakError as exc:
         if str(exc) == "result delivery control marker":
@@ -416,7 +445,8 @@ def classify_result_for_tier(body: str, tier, repo: Path,
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
                           scan_sensitive_data: bool = True, *,
                           suppress_journal=None, allow_attach: bool = False,
-                          honor_suppressions: bool = True):
+                          honor_suppressions: bool = True,
+                          task_output_root: "Path | None" = None):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
@@ -426,10 +456,15 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     suppress_journal: `(state_dir, task_id)` from an adapter that can write the
     record. A guarded suppression is journaled there and the marker is honoured;
     an adapter that omits it honours the marker with no record of its own.
+
+    task_output_root: the task's OWN output dir (`<results>/<task_id>`), passed
+    only for Signal Room tasks. Standalone `[file:]` markers under it survive;
+    every other attach/redirect marker is still withheld as delivery control.
     """
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data,
-        allow_attach=allow_attach, honor_suppressions=honor_suppressions)
+        allow_attach=allow_attach, honor_suppressions=honor_suppressions,
+        task_output_root=task_output_root)
     if (suppress_journal is not None and is_guarded_tier(tier)
             and is_suppression_only(body)):
         state_dir, task_id = suppress_journal

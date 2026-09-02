@@ -68,13 +68,38 @@ class SignalRoomBusy(RuntimeError):
     """Raised when the Signal Room already has MAX_OUTSTANDING work in flight."""
 
 
+def task_output_dir(output_root, task_id: str) -> Path:
+    """The ONLY place a Signal Room task may write files: `<results>/<task_id>/`."""
+    return Path(output_root) / task_id
+
+
+def output_contract(task_id: str, output_root) -> str:
+    """Trusted preamble telling the worker where generated files may go.
+
+    Narrow by design: the image-generation skill is the one tool the lane gains,
+    its files land only in the task's own output dir, and each is announced on
+    its own `[file: <path>]` line — the one marker shape the egress preserves.
+    """
+    out_dir = task_output_dir(output_root, task_id)
+    return (
+        f"[Signal Room task {task_id}] If an image is requested, generate it with the "
+        f"image-generation skill and save it ONLY under {out_dir}/ — write no other "
+        f"files anywhere. Announce each saved file on its own line, exactly as "
+        f"[file: {out_dir}/<name>]. The request follows.\n\n"
+    )
+
+
 def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str = "",
-                            requested_by: str = "") -> str:
+                            requested_by: str = "", output_root=None) -> str:
     """Write one Signal Room request as a normal Sutando task. Returns its id.
 
     The id is in the canonical ``task-*`` namespace because that is what the core
     picks up, and because the owner SHOULD see room-originated work in their task
     list — that visibility is the feature, not a leak.
+
+    ``output_root`` (the results dir) enables the generated-image capability: the
+    task body opens with `output_contract` and `<output_root>/<task_id>/` is
+    created for the worker. Without it the body is the request alone.
     """
     task_dir = Path(task_dir)
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -94,7 +119,10 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
     # The shared serializer owns header validation and puts `task:` last, so newlines
     # in untrusted room speech extend the body instead of forging fields.
     from local_task_protocol import serialize_task_last
-    content = serialize_task_last(headers, confine(task_text[:MAX_TASK_CHARS]))
+    body = confine(task_text[:MAX_TASK_CHARS])
+    if output_root is not None:
+        body = output_contract(task_id, output_root) + body
+    content = serialize_task_last(headers, body)
 
     # One critical section, so concurrent posts cannot all observe capacity and
     # all admit. Here, not at the routes, so no new caller can bypass the bound.
@@ -115,6 +143,8 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
             except Exception:
                 pass
             raise
+    if output_root is not None:
+        task_output_dir(output_root, task_id).mkdir(mode=0o700, parents=True, exist_ok=True)
     return task_id
 
 

@@ -8,6 +8,7 @@ for processing by the cron loop.
 Endpoints:
   POST /task              — submit a task (JSON: {from, task, priority?, callback_url?})
   GET  /result/<id>       — poll for task result
+  GET  /file-bytes?path=&gateway_task_id= — Signal Room generated-file serve (room read token)
   GET  /tasks/history     — authenticated archive-backed task history
   POST /tasks/workstreams/infer — authenticated manual workstream-classifier trigger
   GET  /status            — current health + capabilities
@@ -46,7 +47,9 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, unquote
@@ -130,7 +133,11 @@ from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
-                               submit_signal_room_task, submission_status)  # noqa: E402
+                               submit_signal_room_task, submission_status,
+                               task_output_dir)  # noqa: E402
+from policy.signal_tokens import (LEGACY_GLOBAL, SCOPE_ENQUEUE, SCOPE_READ,  # noqa: E402
+                                  TokenRegistry, registry_path as _registry_path)
+import task_output_retention  # noqa: E402
 
 
 def _emit_task_processed(content: str) -> None:
@@ -157,6 +164,231 @@ API_TOKEN = os.environ.get("SUTANDO_API_TOKEN", "")
 RESULT_DIR = WORKSPACE_DIR / "results"
 TASK_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Per-room Signal Room tokens (R2): written by the desktop engine, read here.
+SIGNAL_TOKEN_REGISTRY = _registry_path(WORKSPACE_DIR)
+_signal_registries: dict[str, TokenRegistry] = {}
+
+
+def _signal_token_registry() -> TokenRegistry:
+    key = str(SIGNAL_TOKEN_REGISTRY)
+    registry = _signal_registries.get(key)
+    if registry is None:
+        registry = _signal_registries[key] = TokenRegistry(SIGNAL_TOKEN_REGISTRY)
+    return registry
+
+
+def _bearer(headers) -> str:
+    return headers.get("Authorization", "").replace("Bearer ", "")
+
+
+def _token_bound_room(auth, data: dict) -> tuple[str, str | None]:
+    """(room_id, error) for an enqueue: the token's room wins; a body room must equal it."""
+    body_room = str(data.get("room_id", "") or "")
+    if auth == LEGACY_GLOBAL:
+        return body_room, None
+    if body_room and body_room != auth["room_id"]:
+        return "", "room_id does not match the token's room"
+    return auth["room_id"], None
+
+
+def _signal_task_id(task_id: str) -> str | None:
+    """The id itself when it is a well-formed Signal Room task id, else None."""
+    safe = _safe_id(str(task_id))
+    if safe and safe == task_id and safe.startswith(SIGNAL_TASK_PREFIX):
+        return safe
+    return None
+
+
+def _task_source_room(task_id: str) -> str | None:
+    """`source_room_id` of a Signal Room task across live, processed and archived layouts."""
+    task_file = _safe_path(TASK_DIR, task_id)
+    if not (task_file and task_file.exists()):
+        task_file = local_task_protocol.find_archived_task(TASK_DIR, task_id)
+    if task_file is None:
+        return None
+    try:
+        headers = local_task_protocol.parse_task_headers(
+            task_file.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    if headers.get("source") != "signal-room":
+        return None
+    return headers.get("source_room_id") or None
+
+
+# The pinned serve envelope (⑤a): the single quota definition for /file-bytes.
+FILE_SERVE_MAX_FILES = 10
+FILE_SERVE_MAX_FILE_BYTES = 5 * 1024 * 1024
+FILE_SERVE_MAX_SERVES = 80
+FILE_SERVE_MAX_TOTAL_BYTES = 400 * 1024 * 1024
+SERVE_QUOTA_NAME = ".serve-quota.json"
+_serve_quota_lock = threading.Lock()
+
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+
+
+def _sniff_image_type(head: bytes) -> str | None:
+    for magic, ctype in _IMAGE_MAGIC:
+        if head.startswith(magic):
+            return ctype
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+class FileServeDenied(Exception):
+    def __init__(self, status: int, error: str):
+        super().__init__(error)
+        self.status = status
+        self.error = error
+
+
+def _open_task_output_file(task_id: str, raw_path: str) -> tuple[int, int, str]:
+    """Open-then-verify: (fd, size, content_type) for a file under the task's own dir.
+
+    Root is checked on the lexical path AND its realpath, then the file is
+    opened component-by-component through the confined dir with O_NOFOLLOW
+    (any symlink, at any level, refuses) and the DESCRIPTOR is what gets
+    verified (regular, dev/inode match, size cap, image magic) — a swap between
+    validation and open surfaces as a refusal, never as served bytes.
+    """
+    if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
+        raise FileServeDenied(403, "path must be absolute")
+    # The task root in both spellings (resolved and as configured), never
+    # realpath'd itself — a symlinked task dir must fail the O_NOFOLLOW open.
+    roots = []
+    for base in (os.path.realpath(RESULT_DIR), os.path.abspath(RESULT_DIR)):
+        root = os.path.join(base, task_id)
+        if root not in roots:
+            roots.append(root)
+    norm = os.path.normpath(raw_path)
+    root = next((r for r in roots if norm.startswith(r + os.sep)), None)
+    if root is None or not os.path.realpath(raw_path).startswith(roots[0] + os.sep):
+        raise FileServeDenied(403, "path outside the task's output dir")
+    parts = norm[len(root) + 1:].split(os.sep)
+    try:
+        dir_fd = os.open(roots[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise FileServeDenied(404, "task output dir not found")
+    except OSError:
+        raise FileServeDenied(403, "task output dir is not a plain directory")
+    fd = None
+    try:
+        for name in parts[:-1]:
+            nxt = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = nxt
+        # O_NONBLOCK: a FIFO planted in the dir must not park the handler thread.
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise FileServeDenied(404, "file not found")
+    except OSError:
+        raise FileServeDenied(403, "file is not a plain file under the task's output dir")
+    finally:
+        os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise FileServeDenied(403, "not a regular file")
+        try:
+            on_disk = os.lstat(norm)
+        except OSError:
+            raise FileServeDenied(404, "file not found")
+        if (on_disk.st_dev, on_disk.st_ino) != (st.st_dev, st.st_ino):
+            raise FileServeDenied(403, "file changed during validation")
+        if st.st_size > FILE_SERVE_MAX_FILE_BYTES:
+            raise FileServeDenied(413, "file exceeds the per-file cap")
+        ctype = _sniff_image_type(os.pread(fd, 16, 0))
+        if ctype is None:
+            raise FileServeDenied(403, "not an image")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st.st_size, ctype
+
+
+def _acquire_excl(lock: Path, *, stale_sec: float = 30.0, wait_sec: float = 5.0) -> int:
+    deadline = time.monotonic() + wait_sec
+    while True:
+        try:
+            return os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > stale_sec:
+                    os.unlink(lock)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                raise FileServeDenied(503, "serve quota lock busy")
+            time.sleep(0.002)
+
+
+def _reserve_serve_quota(task_id: str, real_path: str, size: int) -> tuple[bool, str]:
+    """Charge one serve of `size` bytes against the task's envelope; False = exhausted.
+
+    Persisted in `<results>/<task_id>/.serve-quota.json`, replaced atomically under
+    an O_EXCL lockfile plus the in-process lock, so concurrent serves and a
+    restart both see one consistent counter. Called BEFORE any header is sent.
+    """
+    task_dir = Path(os.path.realpath(RESULT_DIR)) / task_id
+    quota = task_dir / SERVE_QUOTA_NAME
+    lock = task_dir / (SERVE_QUOTA_NAME + ".lock")
+    with _serve_quota_lock:
+        lock_fd = _acquire_excl(lock)
+        try:
+            try:
+                state = json.loads(quota.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                state = {}
+            files = [f for f in (state.get("files") or []) if isinstance(f, str)]
+            serves = int(state.get("serves") or 0)
+            total = int(state.get("bytes") or 0)
+            if real_path not in files:
+                files.append(real_path)
+            if len(files) > FILE_SERVE_MAX_FILES:
+                return False, "distinct-file budget exhausted"
+            if serves + 1 > FILE_SERVE_MAX_SERVES:
+                return False, "serve budget exhausted"
+            if total + size > FILE_SERVE_MAX_TOTAL_BYTES:
+                return False, "byte budget exhausted"
+            payload = {"v": 1, "files": files, "serves": serves + 1, "bytes": total + size}
+            fd, tmp = tempfile.mkstemp(dir=str(task_dir), prefix=".serve-quota.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, quota)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            return True, ""
+        finally:
+            os.close(lock_fd)
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
+
+
+def _archive_stale_results() -> None:
+    """The startup archiver's own main(), re-run hourly — shared logic, not a copy."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "archive_stale_results", Path(__file__).parent / "archive-stale-results.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.main()
 
 # In-memory task history (survives file cleanup, lost on restart)
 # {task_id: {status, text, time, result}}
@@ -641,7 +873,11 @@ def _guard_result_by_tier(task_id: str, body: str) -> str:
             tier = resolve_access_tier(task_file)
         if tier == "owner":
             return body
-        safe, _reason = guard_result_for_tier(body, tier, REPO_DIR)
+        # Signal Room tasks alone get the task-scoped output allowance (⑤a-cap).
+        signal_id = _signal_task_id(task_id)
+        output_root = task_output_dir(RESULT_DIR, signal_id) if signal_id else None
+        safe, _reason = guard_result_for_tier(body, tier, REPO_DIR,
+                                              task_output_root=output_root)
         return safe
     except Exception:
         return "[result withheld: could not verify it is free of secrets]"
@@ -908,14 +1144,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path.startswith("/result/"):
             # Owner data: gated like the write leg it belongs to (POST /task) —
             # token checked when configured. NOT delegation's refuse-outright.
-            if not self.check_auth():
-                return
             task_id = path[len("/result/"):]
+            if not self.check_result_auth(task_id):
+                return
             result = get_task_result(task_id)
             if result:
                 self.send_json(200, result)
             else:
                 self.send_json(404, {"error": "task not found"})
+        elif path == "/file-bytes":
+            self.handle_file_bytes()
         elif path == "/avatar":
             avatar_file = personal_path("stand-avatar.png", workspace=WORKSPACE_DIR)
             if avatar_file.exists():
@@ -1051,6 +1289,94 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         self.send_json(401, {"error": "unauthorized"})
         return False
+
+    def check_scoped_auth(self, required_scope: str):
+        """Registry-aware auth for room-bearing Signal Room routes.
+
+        Returns the token's `{room_id, scope}` row, LEGACY_GLOBAL when the
+        ordinary gateway token still applies (no per-room rows provisioned yet),
+        or None after a refusal was sent. Once the registry holds a live row the
+        global token is refused here — the roster's capability flag sequences that.
+        """
+        registry = _signal_token_registry()
+        row = registry.verify(_bearer(self.headers))
+        if row is not None:
+            if row["scope"] != required_scope:
+                self.send_json(403, {"error": f"token scope {row['scope']!r} cannot use this route"})
+                return None
+            return row
+        if registry.has_active_rows():
+            self.send_json(403, {"error": "a room-scoped token is required on this route"})
+            return None
+        if not self.check_auth():
+            return None
+        return LEGACY_GLOBAL
+
+    def check_result_auth(self, task_id: str) -> bool:
+        """/result: a room token reads only its own room's task; the global token
+        keeps owner tasks and loses Signal Room tasks once per-room rows exist."""
+        registry = _signal_token_registry()
+        row = registry.verify(_bearer(self.headers))
+        if row is not None:
+            if _task_source_room(task_id) != row["room_id"]:
+                self.send_json(403, {"error": "token is not bound to this task's room"})
+                return False
+            return True
+        if _signal_task_id(task_id) and registry.has_active_rows():
+            self.send_json(403, {"error": "a room-scoped token is required for Signal Room results"})
+            return False
+        return self.check_auth()
+
+    def handle_file_bytes(self):
+        """GET /file-bytes?path=&gateway_task_id= — four-way authorized byte serve."""
+        from urllib.parse import parse_qs
+        auth = self.check_scoped_auth(SCOPE_READ)
+        if auth is None:
+            return
+        if auth == LEGACY_GLOBAL:
+            self.send_json(403, {"error": "a room-scoped read token is required"})
+            return
+        params = parse_qs(urlparse(self.path).query)
+        task_id = (params.get("gateway_task_id") or [""])[0]
+        raw_path = (params.get("path") or [""])[0]
+        if _signal_task_id(task_id) is None or _task_source_room(task_id) is None:
+            self.send_json(404, {"error": "task not found"})
+            return
+        if _task_source_room(task_id) != auth["room_id"]:
+            self.send_json(403, {"error": "token is not bound to this task's room"})
+            return
+        try:
+            fd, size, ctype = _open_task_output_file(task_id, raw_path)
+        except FileServeDenied as exc:
+            self.send_json(exc.status, {"error": exc.error})
+            return
+        try:
+            try:
+                ok, why = _reserve_serve_quota(task_id, os.path.realpath(raw_path), size)
+            except FileServeDenied as exc:
+                self.send_json(exc.status, {"error": exc.error})
+                return
+            if not ok:
+                self.send_json(429, {"error": why})
+                return
+            task_output_retention.touch_lease(task_output_dir(RESULT_DIR, task_id))
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            remaining = size
+            while remaining > 0:
+                chunk = os.read(fd, min(65536, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # a partial or disconnected response stays charged
+        finally:
+            os.close(fd)
 
     def send_twiml(self, twiml: str):
         """Send TwiML response for Twilio webhooks."""
@@ -1371,7 +1697,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # /guest-task — the Signal Room lane.
         if path == "/guest-task":
-            if not self.check_auth():
+            auth = self.check_scoped_auth(SCOPE_ENQUEUE)
+            if auth is None:
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -1392,13 +1719,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not isinstance(task, str) or not task.strip():
                 self.send_json(400, {"error": "task is required"})
                 return
+            room_id, room_error = _token_bound_room(auth, data)
+            if room_error:
+                self.send_json(403, {"error": room_error})
+                return
             # task-bridge excludes `task-signal-*` from the voice fallthrough,
             # so a room result is never narrated into the owner's call.
             try:
                 task_id = submit_signal_room_task(
                     task, TASK_DIR, confine_user_content,
-                    room_id=str(data.get("room_id", "")),
+                    room_id=room_id,
                     requested_by=str(data.get("requested_by", "")),
+                    output_root=RESULT_DIR,
                 )
             except SignalRoomBusy as exc:
                 self.send_json(429, {"error": str(exc), "retry_after": 30})
@@ -1415,7 +1747,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not found"})
             return
 
-        if not self.check_auth():
+        # A room-scoped token (any scope) is only ever admitted on the guest lane below.
+        registry = _signal_token_registry()
+        scoped = registry.verify(_bearer(self.headers))
+        if scoped is None and not self.check_auth():
             return
 
         try:
@@ -1467,13 +1802,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if data.get("access_tier") != "guest":
                 self.send_json(400, {"error": "access_tier is not accepted on /task"})
                 return
+            auth = self.check_scoped_auth(SCOPE_ENQUEUE)
+            if auth is None:
+                return
+            room_id, room_error = _token_bound_room(auth, data)
+            if room_error:
+                self.send_json(403, {"error": room_error})
+                return
             try:
                 task_id = submit_signal_room_task(
                     task, TASK_DIR, confine_user_content,
-                    room_id=str(data.get("room_id", "")),
+                    room_id=room_id,
                     # Preserve the shipped clients' attribution instead of flattening
                     # every legacy poster to "signal-room".
                     requested_by=str(data.get("requested_by") or from_agent or ""),
+                    output_root=RESULT_DIR,
                 )
             except SignalRoomBusy as exc:
                 self.send_json(429, {"error": str(exc), "retry_after": 30})
@@ -1484,6 +1827,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "result_url": f"/result/{task_id}",
                 "message": "Task accepted (Signal Room, team tier)",
             })
+            return
+
+        if scoped is not None:
+            self.send_json(403, {"error": "a room-scoped token cannot submit owner tasks"})
             return
 
         callback_url = data.get("callback_url", "")
@@ -1615,6 +1962,16 @@ if __name__ == "__main__":
         daemon=True,
     )
     workstream_maintenance.start()
+    # Hourly steady-state retention (R3): the startup archiver alone never reclaims.
+    retention_stop = threading.Event()
+    retention = threading.Thread(
+        target=task_output_retention.run_hourly,
+        args=(RESULT_DIR, retention_stop),
+        kwargs={"archive_results": _archive_stale_results},
+        name="task-output-retention",
+        daemon=True,
+    )
+    retention.start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")
@@ -1639,4 +1996,6 @@ if __name__ == "__main__":
     finally:
         workstream_maintenance_stop.set()
         workstream_maintenance.join(timeout=1)
+        retention_stop.set()
+        retention.join(timeout=1)
         server.server_close()
