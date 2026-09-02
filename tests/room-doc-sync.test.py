@@ -54,6 +54,41 @@ class MergeTests(unittest.TestCase):
         self.assertIn("org/repo#1", conflicts[0]); self.assertIn("w:w3", conflicts[0])
         self.assertEqual(merged, remote)  # nothing rewritten
 
+    def test_a_pure_move_with_identical_text_is_applied(self):
+        # The resolution rule says move the row, do not retype it; the merge must see a pure move.
+        row = "org/repo#9 | shepherd: a | status: merged | nine"
+        kept = [l for l in BASE.split("\n") if l != row]
+        kept.insert(kept.index("## Active") + 1, row)
+        mine = "\n".join(kept)
+        merged, applied, conflicts = ds.merge(BASE, mine, BASE, "me")
+        self.assertEqual(conflicts, [])
+        self.assertEqual(applied, ["move org/repo#9 History -> Active"])
+        self.assertEqual(ds.parse(merged)[1]["org/repo#9"].section, "Active")
+
+    def test_every_delta_is_accounted_for_and_already_present_is_reported(self):
+        mine = edit(BASE, "org/repo#1", "org/repo#1 | mine")
+        remote = edit(BASE, "org/repo#1", "org/repo#1 | mine")  # someone landed my exact edit first
+        merged, applied, conflicts = ds.merge(BASE, mine, remote, "me")
+        self.assertEqual((merged, conflicts), (remote, []))
+        self.assertEqual(applied, ["already-present org/repo#1"])  # not silence
+
+    def test_duplicate_key_in_the_callers_file_refuses(self):
+        mine = BASE.replace("## History\n", "## History\norg/repo#2 | shepherd: a | status: merged | two\n")  # copied, not moved
+        merged, applied, conflicts = ds.merge(BASE, mine, BASE, "me")
+        self.assertEqual((merged, applied), (BASE, []))
+        self.assertIn("org/repo#2", conflicts[0]); self.assertIn("YOUR file", conflicts[0])
+
+    def test_conflict_returns_the_remote_untouched_even_after_a_partial_apply(self):
+        mine = edit(edit(BASE, "org/repo#1", "org/repo#1 | mine"), "org/repo#2", "org/repo#2 | mine2")
+        remote = edit(BASE, "org/repo#2", "org/repo#2 | theirs (w:w1)")
+        merged, applied, conflicts = ds.merge(BASE, mine, remote, "me")
+        self.assertEqual(merged, remote); self.assertEqual(applied, []); self.assertEqual(len(conflicts), 1)
+
+    def test_blank_line_changes_in_structure_do_not_refuse(self):
+        mine = BASE.replace("## History\n", "\n## History\n")
+        merged, applied, conflicts = ds.merge(BASE, mine, BASE, "me")
+        self.assertEqual((applied, conflicts), ([], []))
+
     def test_move_between_sections_is_applied_when_remote_unchanged(self):
         mine = BASE.replace("org/repo#2 | shepherd: a | status: active | two\n", "").replace(
             "## History\n", "## History\norg/repo#2 | shepherd: a | status: merged | two\n")

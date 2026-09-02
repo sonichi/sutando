@@ -92,17 +92,25 @@ def duplicates(text: str) -> Dict[str, int]:
     return {k: n for k, n in counts.items() if n > 1}
 
 
+def _significant(structure: List[str]) -> List[str]:
+    return [l.rstrip() for l in structure if l.strip()]
+
+
 def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str], List[str]]:
-    """Apply my row deltas (base->mine) onto remote. Returns (text, applied, conflicts);
-    a non-empty conflicts list means nothing should be written."""
+    """Apply my row deltas (base->mine) onto remote. Returns (text, applied, conflicts); on any
+    conflict the text is the remote unchanged and applied is empty. Every delta is accounted for
+    as applied, already present remotely, or a conflict; an unaccounted delta is a conflict."""
     sb, rb = parse(base)
     sm, rm = parse(mine)
-    if sb != sm:
+    if _significant(sb) != _significant(sm):
         return remote, [], ["structure lines changed (headers/prose); edit records only"]
+    mine_dup = duplicates(mine)
+    if mine_dup:
+        return remote, [], [f"{k}: appears {n} times in YOUR file (copy instead of move?)" for k, n in sorted(mine_dup.items())]
     _, rr = parse(remote)
     dup = duplicates(remote)
     lines = remote.split("\n")
-    applied, conflicts = [], []
+    applied, conflicts, absorbed = [], [], []
 
     def find(key: str) -> int:
         for i, line in enumerate(lines):
@@ -120,6 +128,7 @@ def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str
             continue
         if m is None:                                   # I retired the row
             if r is None:
+                absorbed.append(key)
                 continue
             if r != b:
                 conflicts.append(f"{key}: retired by me, changed remotely (w:{_stamp_of(r.text)})")
@@ -130,7 +139,8 @@ def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str
         new = Record(m.section, stamp(m.text, writer))
         if b is None:                                   # I added the row
             if r is not None:
-                if r.text == m.text or r.text == new.text:
+                if r == m or r == new:
+                    absorbed.append(key)
                     continue
                 conflicts.append(f"{key}: added by me, already present remotely (w:{_stamp_of(r.text)})")
                 continue
@@ -142,7 +152,8 @@ def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str
         if r is None:
             conflicts.append(f"{key}: edited by me, removed remotely")
             continue
-        if r.text == m.text or r.text == new.text:
+        if r == m or r == new:
+            absorbed.append(key)
             continue
         if r != b:
             conflicts.append(f"{key}: edited by me AND remotely (w:{_stamp_of(r.text)})")
@@ -152,12 +163,18 @@ def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str
             lines[i] = new.text
             applied.append(f"edit {key}")
         else:
-            del lines[i]
-            if not _insert_into_section(lines, new.section, new.text):
+            if not any(SECTION_RE.match(l) and SECTION_RE.match(l).group(1) == new.section for l in lines):
                 conflicts.append(f"{key}: section '## {new.section}' not found remotely")
                 continue
+            del lines[i]
+            _insert_into_section(lines, new.section, new.text)
             applied.append(f"move {key} {r.section} -> {new.section}")
-    return "\n".join(lines), applied, conflicts
+    deltas = [k for k in set(rb) | set(rm) if rb.get(k) != rm.get(k)]
+    unaccounted = sorted(set(deltas) - set(absorbed) - {a.split(" ")[1] for a in applied} - {c.split(":")[0] for c in conflicts})
+    conflicts += [f"{k}: changed by me but not applied, not present remotely, not a conflict — refusing" for k in unaccounted]
+    if conflicts:
+        return remote, [], conflicts
+    return "\n".join(lines), applied + [f"already-present {k}" for k in absorbed], []
 
 
 # -- transport seams (tests replace these) ---------------------------------------------
@@ -243,7 +260,10 @@ def cmd_put(room: str, folder: str, name: str, workspace: Path, edited: Path, wr
         print("put REFUSED (4): " + "; ".join(conflicts) + " — re-run `get`, re-apply, put", file=sys.stderr)
         return 4
     if merged == res["content"]:
-        print("put: no row changes to apply; nothing written")
+        if edited.read_text() == p.read_text():
+            print("put: no row changes to apply; nothing written")
+        else:
+            print("put: every change is already present remotely; nothing written — " + ", ".join(applied))
         p.write_text(merged)
         return 0
     put = run_put(room, folder, name, merged)
