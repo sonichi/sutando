@@ -1389,9 +1389,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            # Invalid UTF-8 raises UnicodeDecodeError, not a JSONDecodeError
-            # subclass: without it the authenticated lane 500s on such a body.
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            # Neither invalid UTF-8 nor a nesting depth past the decoder's limit
+            # raises JSONDecodeError; both must be the 400, not a 500.
             self.send_json(400, {"error": "invalid JSON"})
             return
         if not isinstance(data, dict):
