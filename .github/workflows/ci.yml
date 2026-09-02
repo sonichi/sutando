@@ -191,6 +191,9 @@ jobs:
       # output on failure so debugging info isn't lost.
       - name: Run shell standalone tests
         run: |
+          # PROBE (do not merge): name the command that ends this step.
+          trap 'echo "PROBE-EXIT rc=$? line=${LINENO} cmd=[$BASH_COMMAND]"; jobs -l; ps -o pid,pgid,ppid,stat,comm -e | head -40' EXIT
+          set -x
           failed=0
           # Load the known-failures allowlist (suites that fail on ubuntu-latest
           # due to macOS-specific tooling or timing). Allowlisted suites still run
