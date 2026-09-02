@@ -91,6 +91,23 @@ def resolve_down_bridge_action(repo_root: Optional[Path] = None) -> str:
     return action if action in _DOWN_BRIDGE_ACTIONS else "alert"
 
 
+def resolve_suppressed_alerts(repo_root: Optional[Path] = None) -> frozenset:
+    """Check names this host has declared inapplicable (`health_check.suppress_alerts`).
+
+    Only a chronic WARN can be listed; the caller refuses to apply this to any
+    other status, so a list can never hide an outage. Fails OPEN (empty) on a
+    missing or malformed value: an unreadable config must alert, never silence.
+    """
+    try:
+        hc = load_config(repo_root).get("health_check") or {}
+        listed = hc.get("suppress_alerts")
+    except Exception:
+        return frozenset()
+    if not isinstance(listed, list):
+        return frozenset()
+    return frozenset(n for n in listed if isinstance(n, str) and n)
+
+
 def _find_repo_root(start: Optional[Path] = None) -> Optional[Path]:
     """Walk upward from `start` (default: this module's parent) until we find
     a directory containing `sutando.config.json`. Returns None if not found
