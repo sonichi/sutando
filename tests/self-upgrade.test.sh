@@ -44,11 +44,15 @@ make_fixture() {
   local root="$1"
   local remote="$root.remote.git"
   mkdir -p "$root/skills/self-upgrade/scripts" "$root/src" "$root/scripts" "$root/workspace/state/cores"
+  # The witness-owed gate is part of the upgrade path; a fixture without it is not the shipped script.
+  cp "$REPO/src/witness_owed.py" "$root/src/witness_owed.py"
   cp "$SRC_SCRIPT" "$root/skills/self-upgrade/scripts/upgrade.sh"
   cat > "$root/scripts/sutando-config.sh" <<EOF
 #!/bin/bash
 case "\${1:-}" in
   workspace) printf '%s\n' "$root/workspace" ;;
+  python-bin) command -v python3 ;;
+  host-label) printf '%s\n' testhost ;;
   tmux-socket) printf '%s\n' "$TEST_TMUX_SOCKET" ;;
 esac
 EOF
