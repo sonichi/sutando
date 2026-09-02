@@ -103,6 +103,44 @@ class PerHostRoster(unittest.TestCase):
         finally:
             os.environ.pop("SUTANDO_SCI_ROSTER", None)
 
+    def test_roster_path_without_a_host_label_uses_the_shared_file(self):
+        """host-label can fail; guessing a per-host path would name a file that
+        never exists, turning a resolvable roster into a refusal."""
+        nr2 = _load()
+        nr2._host_label = lambda: ""
+        self.assertEqual(nr2.roster_path(), self.tmp / LEAF)
+
+    def test_roster_path_falls_back_to_the_shared_file_before_the_move(self):
+        """A host whose roster has not been moved yet must still find it."""
+        nr2 = _load()
+        nr2._host_label = lambda: "LOCAL"
+        legacy = self.tmp / LEAF
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"alice": {"stand": "@a:x"}}))
+        self.assertEqual(nr2.roster_path(), legacy)
+
+    def test_the_shared_roster_still_joins_the_union_mid_migration(self):
+        """Hosts move one at a time. If the pre-move file left the union the
+        moment this host moved, every unmoved peer would go unreachable."""
+        self._write("LOCAL", {"alice": {"stand": "@a:x"}})
+        legacy = self.tmp / LEAF
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"carol": {"stand": "@c:x"}}))
+        self.assertIn("", [h for h, _ in self.nr.roster_paths()],
+                      "the shared roster was dropped from the union")
+        self.assertEqual(self.nr.load_roster()["carol"]["stand"], "@c:x")
+
+    def test_a_roster_that_is_not_an_object_REFUSES_instead_of_being_skipped(self):
+        """A JSON list parses fine and yields no rows, so skipping it reads as
+        an empty roster — which is exactly when a lookup starts guessing."""
+        self._write("LOCAL", {"alice": {"stand": "@a:x"}})
+        bad = self.tmp / "hosts" / "PEER" / LEAF
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("[1, 2, 3]")
+        with self.assertRaises(SystemExit) as caught:
+            self.nr.load_roster()
+        self.assertIn(str(bad), str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
