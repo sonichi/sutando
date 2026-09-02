@@ -74,6 +74,26 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(self.mgr.active(), [])
         self.assertEqual(list(events_dir(self.ws).glob("*.json")), [])  # tombstones consumed
 
+    def test_acp_style_event_keeps_option_kinds_and_subject(self):
+        # An ACP driver names its option kinds and what is being asked; the
+        # Manager's policy reads the subject, the driver reads chosen_action.
+        self.drop("worker-7-tc1", event(session="worker-7", guard="toolCall:1", runtime="acp",
+                                         subject={"tool": "Read", "input": "/x"},
+                                         options=[{"id": "allow", "label": "Allow", "kind": "allow_once"},
+                                                  {"id": "deny", "label": "Deny", "kind": "reject_once"}]))
+        ingest(self.mgr, self.ws)
+        [req] = self.mgr.active()
+        self.assertEqual(req.subject, {"tool": "Read", "input": "/x"})
+        self.assertEqual([(a.id, a.kind) for a in req.actions[:2]], [("allow", "allow_once"), ("deny", "reject_once")])
+        self.assertEqual(req.actions[-1].kind, "open_terminal")  # the jump floor stays
+
+    def test_option_without_kind_is_still_a_tui_keystroke(self):
+        self.drop("core-2-g1", event())
+        ingest(self.mgr, self.ws)
+        [req] = self.mgr.active()
+        self.assertEqual({a.kind for a in req.actions[:-1]}, {"tui_select"})
+        self.assertEqual(req.subject, {})
+
     def test_unknown_kind_still_gets_a_jump_only_card(self):
         self.drop("x", event(kind="unknown", prompt=None, options=[]))
         ingest(self.mgr, self.ws)

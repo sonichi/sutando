@@ -43,8 +43,9 @@ def _actions_for(ev: Dict) -> List[Action]:
     for o in ev.get("options") or []:
         oid, label = str(o.get("id", "")), str(o.get("label", ""))
         if oid and label:
-            # The option id is the key the TUI expects; the driver types it.
-            out.append(Action(id=oid, kind="tui_select", label=label))
+            # Default: the id is the key the TUI driver types. An ACP driver names
+            # the option kind itself (allow_once / reject_once) and reads the choice.
+            out.append(Action(id=oid, kind=str(o.get("kind") or "tui_select"), label=label))
     # The floor: every TUI-sourced requirement can be finished in the terminal.
     out.append(Action(id=JUMP_ACTION_ID, kind="open_terminal", label=f"Open terminal ({ev.get('session', '?')})"))
     return out
@@ -64,6 +65,7 @@ def _requirement_for(ev: Dict) -> HumanRequirement:
         runtime=runtime,
         message=f"{prompt} — session {session}",
         guard=str(ev.get("guard") or ""),
+        subject=dict(ev.get("subject") or {}) if isinstance(ev.get("subject"), dict) else {},
         # The session is the requirement's device: it keys dedup, the jump, and
         # (with its tmux socket) the driver's action file on a click.
         device={"id": session, "name": session, "socket": str(ev.get("socket") or "")},
