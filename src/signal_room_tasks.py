@@ -6,7 +6,17 @@ entire job is to hand Sutando a task at the right tier. It does NOT choose an en
 supply credentials, or provision a profile. Like every other non-owner lane (Slack,
 AG2 Space) it states the tier's delegation IN-BAND from the shared policy owner
 (`policy/guardrail.sandboxed_delegation_lines`), passing only what differs here: the
-sandbox mode and working root that make the generated-image capability real.
+scope text, which carries the image protocol below.
+
+IMAGES ARE BROKERED BY THE TRUSTED CORE, never made by the worker. The sandboxed
+worker stays exactly as read-only and network-less as on every other lane; it may
+only REQUEST an image, as a standalone `[generate-image: <prompt>]` line in its
+answer. After it returns, the core — outside the sandbox, with its own credentials —
+runs `signal_image_gen.py --task-id <id>` once per request and swaps the line for the
+`[file: …]` marker the wrapper prints. An earlier shape gave the worker
+workspace-write plus network so it could call the wrapper itself; that was rejected
+because codex's writable roots are user-configurable (and always include /tmp) and
+an unrestricted network next to the wrapper's .env-loaded key is an exfiltration path.
 
 That boundary is the point, and it was learned the hard way: an earlier version let
 the Signal Room lane pick the runtime (`claude -p …`) and pin it to an isolated
@@ -24,8 +34,8 @@ a label without a boundary.
 
 WHAT SUTANDO ENFORCES (not this module):
   * the tier's execution restrictions — the core launches the sandboxed worker exactly
-    as the in-band block says, and that sandbox (not prose) bounds its writes to the
-    task's own output dir;
+    as the in-band block says (read-only, no network), and only the wrapper, run by
+    the core, can put a file into the task's own output dir;
   * `guard_result_for_tier` on the way out — every non-owner result is secret-scanned
     before it reaches the room;
   * `confine_user_content` on the way in — untrusted text cannot forge task headers.
@@ -33,6 +43,7 @@ WHAT SUTANDO ENFORCES (not this module):
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import threading
 import tempfile
@@ -44,8 +55,13 @@ from pathlib import Path
 # path for the tier; nothing about HOW it runs is decided here.
 SIGNAL_ROOM_TIER = "team"
 SIGNAL_TASK_PREFIX = "task-signal-"
-# The one variable the image wrapper reads; the launch exports it and makes it the cwd.
-OUTPUT_ROOT_ENV = "SIGNAL_TASK_OUTPUT_ROOT"
+
+# The image protocol: what the worker may emit, and what the core swaps in. The
+# wrapper enforces the prompt cap; `apply_generated_images` enforces the rest.
+MAX_IMAGE_REQUESTS = 2
+MAX_IMAGE_PROMPT_CHARS = 400
+IMAGE_REQUEST_RE = re.compile(r"^\[generate-image:\s*(\S.*?)\s*\]$")
+IMAGE_FAILED_NOTE = "(image could not be generated)"
 
 # The room's request text is untrusted (participant speech plus quoted article text),
 # so cap it before it ever reaches a task file.
@@ -79,56 +95,79 @@ def task_output_dir(output_root, task_id: str) -> Path:
     return Path(output_root) / task_id
 
 
-def worker_output_root(output_root, task_id: str) -> str:
-    """`task_output_dir` as the worker sees it — under the CANONICAL results dir, the one
-    spelling `signal_image_gen.py` accepts and `os.getcwd()` reports inside the sandbox."""
+def canonical_output_root(output_root, task_id: str) -> str:
+    """`task_output_dir` under the CANONICAL results dir — the one spelling the wrapper
+    derives, prints in its marker, and the egress allowance compares against."""
     return os.path.join(os.path.realpath(str(output_root)), task_id)
 
 
 def output_contract(task_id: str, output_root) -> str:
-    """Trusted preamble naming the ONE way a generated file may be produced.
+    """Trusted preamble telling the worker the ONE way an image reaches the room.
 
-    Narrow by design: image generation is the one tool the lane gains, and it is
-    enforced in code, not prose — `signal_image_gen.py` takes a prompt and a bare
-    name and saves into the worker's working directory, `<results>/<task_id>/`,
-    which `delegation_lines` makes both the worker's cwd and its sandbox's only
-    writable tree. Each file is announced on its own `[file: <path>]` line — the
-    one marker shape the egress preserves.
+    The worker can neither write nor reach a provider, so it does not generate: it
+    asks, on a standalone `[generate-image: <prompt>]` line, and the core does the
+    rest (`delegation_lines`). The `[file:]` marker is the wrapper's to print — a
+    worker-written one points nowhere the egress allowance accepts.
     """
-    root = worker_output_root(output_root, task_id)
-    src = Path(__file__).resolve().parent
     return (
-        f"[Signal Room task {task_id}] If an image is requested, generate it ONLY through "
-        f"the image-generation wrapper: run `python3 {src}/signal_image_gen.py --prompt <text> "
-        f"--name <name>.png` (optional --size square|landscape|portrait) from your working "
-        f"directory, {root}/ — the task output dir and the one place you may write. The "
-        f"wrapper saves the file there and accepts no path; write no other files anywhere. "
-        f"Announce each saved file on its own line, exactly as [file: {root}/<name>]. The "
-        f"request follows.\n\n"
+        f"[Signal Room task {task_id}] You cannot generate or save files. If an image "
+        f"would help, REQUEST it: put a standalone line `[generate-image: <prompt>]` in "
+        f"your answer — at most {MAX_IMAGE_REQUESTS} such lines, each prompt one line of "
+        f"at most {MAX_IMAGE_PROMPT_CHARS} characters. The host generates each requested "
+        f"image after you finish and replaces that line with the file's marker; never "
+        f"write a `[file: …]` line yourself. The request follows.\n\n"
     )
 
 
 def delegation_lines(task_id: str, output_root) -> list[str]:
     """The tier's in-band delegation block, from the owner every non-owner lane binds.
 
-    This lane adds the one thing it needs — a worker that may write — as the
-    delegate's own workspace-write mode rooted at the task output dir, so the
-    writable tree IS that root (plus the delegate's state dir and $TMPDIR). Chosen
-    at the launch on purpose: a nested profile under a read-only sandbox can only
-    ever narrow, so nothing below the launch could have granted the write.
+    The invocation is the shared owner's read-only default, byte for byte — this
+    lane passes no sandbox, root, env or network parameter. What differs is the
+    scope: the core-side image step it performs AFTER the delegate returns, which
+    `apply_generated_images` states in code.
     """
     from policy.guardrail import sandboxed_delegation_lines
-    root = worker_output_root(output_root, task_id)
+    root = canonical_output_root(output_root, task_id)
+    src = Path(__file__).resolve().parent
     return sandboxed_delegation_lines(
         "Signal Room", "TEAM tier", f"results/{task_id}.txt",
         f"The prompt is the task text above, including its [Signal Room task {task_id}] "
-        f"output contract. The working directory {root} is the ONE place the sandboxed "
-        f"worker may write — its image-generation wrapper saves there — and a saved file "
-        f"reaches the room only as the standalone `[file: {root}/<name>]` line you relay "
-        f"verbatim.",
-        sandbox="workspace-write", workdir=root, env={OUTPUT_ROOT_ENV: root},
-        network=True,  # the wrapper's provider call; the gate opened image generation
+        f"output contract. The sandboxed worker writes no files: it may only REQUEST "
+        f"images, as standalone `[generate-image: <prompt>]` lines in its answer. AFTER "
+        f"the sandboxed delegate returns, YOU generate them, outside the sandbox: for each "
+        f"of the first {MAX_IMAGE_REQUESTS} such lines whose prompt is one line of at most "
+        f"{MAX_IMAGE_PROMPT_CHARS} characters, run `python3 {src}/signal_image_gen.py "
+        f"--task-id {task_id} --prompt \"<prompt>\"` in your own environment, passing the "
+        f"prompt as that one argument, and replace the line with the single "
+        f"`[file: {root}/<name>]` line the wrapper prints. If the wrapper exits non-zero, "
+        f"replace the line with `{IMAGE_FAILED_NOTE}` instead. Leave every other line — "
+        f"including any further or malformed request line — exactly as it is, and never "
+        f"add a `[file:` line the wrapper did not print.",
     )
+
+
+def apply_generated_images(answer_text: str, task_id: str, runner) -> str:
+    """The core-side step `delegation_lines` instructs, in code: swap each well-formed
+    request line (the first MAX_IMAGE_REQUESTS only) for what `runner(task_id, prompt)`
+    returns — the wrapper's `[file: …]` marker — or IMAGE_FAILED_NOTE when it returns
+    nothing or raises. Every other line, malformed and over-cap requests included,
+    passes through unchanged.
+    """
+    out, used = [], 0
+    for line in answer_text.split("\n"):
+        match = IMAGE_REQUEST_RE.match(line.strip())
+        if match is None or used >= MAX_IMAGE_REQUESTS or len(match.group(1)) > MAX_IMAGE_PROMPT_CHARS:
+            out.append(line)
+            continue
+        used += 1
+        try:
+            marker = runner(task_id, match.group(1))
+        except Exception:  # noqa: BLE001 — any wrapper failure is "no image"
+            marker = None
+        marker = marker.strip() if isinstance(marker, str) else ""
+        out.append(marker if marker.startswith("[file: ") and "\n" not in marker else IMAGE_FAILED_NOTE)
+    return "\n".join(out)
 
 
 def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str = "",
@@ -143,9 +182,8 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
     task body opens with `output_contract` and closes with `delegation_lines`; the
     task's durable zero serve-quota counter is written under ``state_dir`` (default:
     the workspace `state/` beside the results dir), then `<output_root>/<task_id>/`
-    is created (0700) for the worker — nothing is servable before its counter
-    exists — and only then is the task published: the core launches on publish,
-    into that dir. Without an output root the body is the request alone.
+    is created (0700) — nothing is servable before its counter exists — and only
+    then is the task published. Without an output root the body is the request alone.
     """
     task_dir = Path(task_dir)
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -184,8 +222,8 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
             with os.fdopen(fd, "w") as fh:
                 fh.write(content)
             if output_root is not None:
-                # Counter, then the worker's root, then publish: the core launches
-                # on publish, and the launch's `-C` needs the dir to exist.
+                # Counter, then the output dir, then publish: a file must never be
+                # servable before its counter exists.
                 import task_output_retention
                 state_dir = Path(output_root).parent / "state" if state_dir is None else Path(state_dir)
                 task_output_retention.init_serve_quota(state_dir, task_id)

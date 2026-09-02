@@ -112,7 +112,7 @@ from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
-from task_archive import task_id_from_filename  # noqa: E402
+from task_archive import find_task_file, task_id_from_filename  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASK_DIR = WORKSPACE_DIR / "tasks"
@@ -201,11 +201,22 @@ def _signal_task_id(task_id: str) -> str | None:
     return None
 
 
+def _live_task_file(task_id: str) -> Path | None:
+    """The task's file in tasks/ under any LIVE name — bare, or the `.claimed-*` /
+    `.assigned-*` rename it carries while a core is processing it."""
+    if not local_task_protocol.valid_archive_lookup_id(str(task_id)):
+        return None
+    return find_task_file(TASK_DIR, task_id)
+
+
+def _find_task_file(task_id: str) -> Path | None:
+    """`_live_task_file`, then the processed and archived layouts."""
+    return _live_task_file(task_id) or local_task_protocol.find_archived_task(TASK_DIR, task_id)
+
+
 def _task_source_room(task_id: str) -> str | None:
     """`source_room_id` of a Signal Room task across live, processed and archived layouts."""
-    task_file = _safe_path(TASK_DIR, task_id)
-    if not (task_file and task_file.exists()):
-        task_file = local_task_protocol.find_archived_task(TASK_DIR, task_id)
+    task_file = _find_task_file(task_id)
     if task_file is None:
         return None
     try:
@@ -870,10 +881,7 @@ def _guard_result_by_tier(task_id: str, body: str) -> str:
     """
     try:
         from policy.egress.result import guard_result_for_tier, resolve_access_tier
-        from local_task_protocol import find_archived_task
-        task_file = _safe_path(TASK_DIR, task_id)
-        if not (task_file and task_file.exists()):
-            task_file = find_archived_task(TASK_DIR, task_id)
+        task_file = _find_task_file(task_id)
         if task_file is None:
             # No metadata. A Signal Room id is team by construction, so guard it;
             # anything else predates this lane and stays readable.
@@ -912,8 +920,8 @@ def get_task_result(task_id: str):
             # land, so skipping it here would bypass the boundary in the common case.
             return {"task_id": safe_id, "status": "completed",
                     "result": _guard_result_by_tier(task_id, archived.read_text())}
-    task_file = _safe_path(TASK_DIR, task_id)
-    if task_file and task_file.exists():
+    # Any live name: a task a core has claimed is pending, not unknown.
+    if _live_task_file(task_id) is not None:
         return {"task_id": _safe_id(task_id), "status": "pending"}
     return None
 

@@ -115,6 +115,20 @@ class TestAdaptersDelegate(unittest.TestCase):
         self.assertIsNotNone(m, "non-owner branch not found")
         self.assertIn("sandboxed_delegation_lines", m.group(1))
 
+    def test_signal_room_lane_renders_the_read_only_block(self):
+        """The lane's images are brokered by the core AFTER the delegate returns, so
+        its worker is exactly as read-only and network-less as every other lane's —
+        the shared owner's sentence, byte for byte, with no widening parameter."""
+        import tempfile
+        from signal_room_tasks import delegation_lines
+        with tempfile.TemporaryDirectory() as td:
+            lines = delegation_lines("task-signal-1-abcd", td)
+        self.assertIn(SANDBOXED_DELEGATION_CODEX, lines)
+        body = "\n".join(lines)
+        self.assertIn("This Signal Room task is TEAM tier", body)
+        for widening in ("workspace-write", " -C ", "network_access", "SIGNAL_TASK_OUTPUT_ROOT"):
+            self.assertNotIn(widening, body)
+
 
 if __name__ == "__main__":
     unittest.main()

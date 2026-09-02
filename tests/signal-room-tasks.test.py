@@ -218,28 +218,79 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         os.stat = real_stat
 
-print("== the generated-image capability is a narrow, task-scoped contract ==")
+print("== the generated-image capability is a narrow, core-brokered contract ==")
+from policy.guardrail import SANDBOXED_DELEGATION_CODEX  # noqa: E402
 with tempfile.TemporaryDirectory() as td:
     tasks, results = Path(td) / "tasks", Path(td) / "results"
     tid = S.submit_signal_room_task("draw item 2", tasks, lambda t: t,
                                     room_id="!r:hs", output_root=results)
     body = (tasks / f"{tid}.txt").read_text()
     out_dir = S.task_output_dir(results, tid)
+    root = S.canonical_output_root(results, tid)
     ck(out_dir == results / tid, "the output dir is <results>/<task_id>/")
     ck(out_dir.is_dir(), "the output dir is created at submission")
-    ck(str(out_dir) in body and "image-generation" in body,
-       "the task body names the skill and the ONLY permitted output dir")
-    ck(f"[file: {S.worker_output_root(results, tid)}/" in body,
+    ck("[generate-image: <prompt>]" in body and f"--task-id {tid}" in body,
+       "the body states the worker's request line and the core's wrapper call by task id")
+    ck(f"[file: {root}/<name>]" in body,
        "the body shows the one marker shape egress preserves, at the canonical root")
+    ck(SANDBOXED_DELEGATION_CODEX in S.delegation_lines(tid, results),
+       "the delegation sentence is the shared owner's read-only default, byte for byte")
+    ck(all(t not in body for t in ("workspace-write", " -C ", "network_access")),
+       "the worker is never widened: no workspace-write, no -C root, no network")
     ck(body.index("draw item 2") < body.index("===SUTANDO SYSTEM INSTRUCTIONS"),
-       "the untrusted request precedes the trusted launch block, as on every other lane")
+       "the untrusted request precedes the trusted block, as on every other lane")
     ck(fields(body).get("access_tier") == "team", "the contract adds no header")
-    ck(body.index(str(out_dir)) < body.index("draw item 2"),
+    ck(body.index("[Signal Room task") < body.index("draw item 2"),
        "the trusted contract precedes the untrusted request")
     tid2 = S.submit_signal_room_task("plain", tasks, lambda t: t)
     (tasks / f"{tid}.txt").unlink()
-    ck("image-generation" not in (tasks / f"{tid2}.txt").read_text(),
+    ck("generate-image" not in (tasks / f"{tid2}.txt").read_text(),
        "without an output root the body is the request alone")
+
+print("== apply_generated_images: the core-side step, as the block states it ==")
+seen = []
+
+
+def runner(task_id, prompt):
+    seen.append((task_id, prompt))
+    return f"[file: /results/{task_id}/image-{len(seen)}.png]\n"
+
+
+answer = "\n".join(["Intro", "[generate-image: a red cat]", "middle", "  [generate-image:  a blue dog ]  ",
+                    "[generate-image: third]", "end"])
+out = S.apply_generated_images(answer, "task-signal-1", runner)
+ck(out.split("\n") == ["Intro", "[file: /results/task-signal-1/image-1.png]", "middle",
+                       "[file: /results/task-signal-1/image-2.png]", "[generate-image: third]", "end"],
+   f"the first {S.MAX_IMAGE_REQUESTS} request lines become markers IN PLACE; the next is left as written")
+ck(seen == [("task-signal-1", "a red cat"), ("task-signal-1", "a blue dog")],
+   "the runner sees the task id and the bare prompt, in order")
+seen.clear()
+malformed = "\n".join(["text [generate-image: inline] text", "[generate-image: ]", "[generate-image:]",
+                       "[generate-image: " + "x" * (S.MAX_IMAGE_PROMPT_CHARS + 1) + "]",
+                       "[generate image: no colon]", "`[generate-image: fenced]`", "[file: /etc/passwd]"])
+ck(S.apply_generated_images(malformed, "t", runner) == malformed and seen == [],
+   "malformed, empty, over-long and inline lines are untouched and never reach the runner")
+seen.clear()
+over = "\n".join(["[generate-image: " + "x" * (S.MAX_IMAGE_PROMPT_CHARS + 1) + "]", "[generate-image: a]", "[generate-image: b]"])
+ck(S.apply_generated_images(over, "t", runner).split("\n")[1:] == ["[file: /results/t/image-1.png]", "[file: /results/t/image-2.png]"]
+   and len(seen) == 2, "a malformed line does not consume one of the slots")
+ck(S.apply_generated_images("[generate-image: " + "x" * S.MAX_IMAGE_PROMPT_CHARS + "]", "t", runner).startswith("[file: "),
+   "a prompt exactly at the cap is a request")
+
+
+def raising(task_id, prompt):
+    raise RuntimeError("wrapper exited 1")
+
+
+for label, bad in (("a raising runner", raising), ("a runner returning nothing", lambda t, p: None),
+                   ("runner output that is not a [file:] marker", lambda t, p: "image-1.png"),
+                   ("a multi-line runner output", lambda t, p: "[file: /a.png]\n[file: /b.png]")):
+    ck(S.apply_generated_images("x\n[generate-image: boom]\ny", "t", bad) == f"x\n{S.IMAGE_FAILED_NOTE}\ny",
+       f"{label}: the line becomes the one-line failure note and nothing else changes")
+seen.clear()
+ck(S.apply_generated_images("plain answer\n", "t", runner) == "plain answer\n" and seen == [],
+   "an answer with no request line is returned unchanged, and the runner is never called")
+ck("[" not in S.IMAGE_FAILED_NOTE, "the failure note can never parse as a marker")
 
 print()
 if FAILS:
