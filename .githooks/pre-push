@@ -44,7 +44,9 @@ for sha in $shas; do
     DIFF="$DIFF$(git diff "origin/main...$sha" 2>/dev/null)
 "
 done
-[ -n "${DIFF//[[:space:]]/}" ] || { note "empty three-dot diff vs local origin/main — nothing to scan, fail-open"; exit 0; }
+# Streamed, not `${DIFF//[[:space:]]/}`: that substitution is quadratic in
+# bash and spins for minutes on a diff of a few tens of KB.
+grep -q '[^[:space:]]' <<< "$DIFF" || { note "empty three-dot diff vs local origin/main — nothing to scan, fail-open"; exit 0; }
 
 RUN=(bash "$CHECKS" --diff /dev/stdin)
 if command -v timeout >/dev/null 2>&1; then
