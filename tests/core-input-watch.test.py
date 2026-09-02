@@ -40,6 +40,13 @@ _IDLE = ("──────── sutando-core ──\n❯ \n──────
          "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
 _IDLE_LOGGEDOUT = _IDLE + "\n     Not logged in · Run /login"
 _WORKING = ("⏺ Bash(WS=... echo WORKSPACE=...)\n  ⎿  WORKSPACE=/Users/x\n     HOST=mini\n     … +39 lines")
+# The usage-limit screen (owner screenshot 2026-09-02, Qingyuns-MacBook-Pro core):
+# a wait/spend decision that the relay had been reporting as a LOGIN gate.
+_SESSION_LIMIT = ("● Monitor event: \"Streaming task watcher\"\n"
+                  "  ⎿  You've hit your session limit · resets 12:10pm\n"
+                  "     (America/Los_Angeles)\n"
+                  "     /usage-credits to finish what you're working on.\n"
+                  "  Continuing automatically at 12:10pm · esc to cancel")
 # A real mid-session permission prompt rendered ABOVE the persistent idle footer
 # (review repro 2026-07-14). The footer's await-affordance must NOT suppress it.
 _PERMISSION_WITH_FOOTER = (
@@ -89,6 +96,21 @@ class TestClassify(unittest.TestCase):
         idle_hint = ("  ⏵⏵ bypass permissions on (shift+tab to cycle) · "
                      "press tab to accept · ← for agents")
         self.assertIsNone(classify(idle_hint))
+
+    def test_session_limit_flags_as_its_own_kind(self):
+        self.assertEqual(classify(_SESSION_LIMIT)[0], "session-limit")
+
+    def test_session_limit_wins_over_stale_login_text_above_it(self):
+        # The live misfire: an earlier /login menu still in the pane scrollback
+        # made the limit screen read as "login". The limit must win.
+        pane = _LOGIN_MENU + "\n" + _SESSION_LIMIT
+        self.assertEqual(classify(pane)[0], "session-limit")
+
+    def test_session_limit_is_a_human_gate_never_auto_answered(self):
+        st, detail, _p, kind = compose_state(_SESSION_LIMIT, "working", True)
+        self.assertEqual((st, kind), ("blocked-human", "session-limit"))
+        self.assertIn("session-limit", detail)
+        self.assertIsNone(auto_answer("session-limit"))
 
     def test_unforeseen_prompt_surfaces_as_unknown(self):
         # No matching signature, but an input affordance is present and it is NOT

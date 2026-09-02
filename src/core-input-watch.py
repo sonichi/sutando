@@ -112,6 +112,8 @@ def _load_runtime_health():
 # the net-new layer over runtime-health: it identifies WHICH gate the core is
 # stuck at so ESCALATE can show the prompt and AUTO-ANSWER can decide.
 _SIGNATURES = [
+    # First: the limit screen often sits below stale /login text in the same pane.
+    ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit|/usage-credits", re.I)),
     ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
     ("login", re.compile(r"Select login method|Paste code here|Browser didn'?t open", re.I)),
@@ -120,12 +122,13 @@ _SIGNATURES = [
     ("permission", re.compile(r"Do you want to (proceed|allow)|Allow this action|permission to", re.I)),
 ]
 _AWAIT_HINT = re.compile(
-    r"Esc to cancel|Enter to confirm|Press Enter|Paste code|to accept|❯\s*\d+\.", re.I)
+    r"Esc to cancel|Enter to confirm|Press Enter|Paste code|to accept|Continuing automatically|❯\s*\d+\.", re.I)
 _IDLE = re.compile(r"⏵⏵\s*bypass permissions on|for agents\b", re.I)
 
 # Gates that need a human (can't be auto-answered): login + any unrecognized
 # selection/permission. The rest (trust/bypass/press-enter) are known-safe.
-_HUMAN_GATES = {"login", "selection", "permission", "unknown"}
+# session-limit is a spend/wait decision: never auto-answered, never a login.
+_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "unknown"}
 
 # --- M4 AUTO-ANSWER decision (Layer 2), PURE + report-only. -----------------
 # This returns WHICH keystroke would safely dismiss a gate; it does NOT send it —
