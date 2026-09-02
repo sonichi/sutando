@@ -10,7 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from hitl.events import JUMP_ACTION_ID, SCHEMA, events_dir, ingest  # noqa: E402
+from hitl.events import (  # noqa: E402
+    JUMP_ACTION_ID,
+    SCHEMA,
+    events_dir,
+    ingest,
+)
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
 from hitl.schema import ActionReply  # noqa: E402
 

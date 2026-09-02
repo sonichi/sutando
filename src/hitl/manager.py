@@ -93,9 +93,8 @@ class HitlManager:
         self.store = store
 
     def create(self, req: HumanRequirement) -> HumanRequirement:
-        # One active requirement per (runtime, kind, device): a re-detection
-        # refreshes the guard instead of stacking duplicate cards, while two
-        # sessions (device ids) with the same dialog stay two cards.
+        # One active per (runtime, kind, device): re-detection refreshes the
+        # guard; two sessions (device ids) with one dialog stay two cards.
         for existing in self.active():
             if (existing.runtime == req.runtime and existing.kind == req.kind
                     and _device_id(existing) == _device_id(req)):
