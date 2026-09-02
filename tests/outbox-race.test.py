@@ -52,8 +52,13 @@ def run_rounds(per_phase_s, min_rounds, max_rounds, one_round):
 if __name__ == "__main__":
     # Contention is workers-per-core, not an absolute: a fixed 24 is 12x
     # oversubscribed on a 2-core runner, and the thrash is what timed out.
-    N = max(8, (os.cpu_count() or 2) * 3)
-    MIN_ROUNDS, MAX_ROUNDS = 3, 12
+    # Under the coverage gate every pool child pays instrumented startup, and
+    # the 240s file cap fired mid-spawn on a thrashed lane (2026-09-02, x3 PRs).
+    INSTRUMENTED = os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1"
+    N = max(4, (os.cpu_count() or 2)) if INSTRUMENTED else max(8, (os.cpu_count() or 2) * 3)
+    # MAX one above the floor instrumented, so the budget stays a REACHABLE
+    # backstop there instead of a line that reads like one and cannot run.
+    MIN_ROUNDS, MAX_ROUNDS = 3, (4 if INSTRUMENTED else 12)
     # Bounds round STARTS only: worst case is floor + budget + in-flight
     # round durations — far below 36 unconditional rounds, not a ceiling.
     PHASE_BUDGET_S = float(os.environ.get("OUTBOX_RACE_PHASE_BUDGET_S", "35"))
@@ -94,7 +99,7 @@ if __name__ == "__main__":
                 orphan_flags.append(
                     len(winners) == 1 and (held is None or held.drainer_id != winners[0]))
                 return len(winners)
-        rc_totals = run_rounds(PHASE_BUDGET_S, MIN_ROUNDS * 2, MAX_ROUNDS * 2, reclaim_round)
+        rc_totals = run_rounds(PHASE_BUDGET_S, MIN_ROUNDS * 2, MAX_ROUNDS * 2, reclaim_round)  # floor 6 either way
     orphaned = sum(orphan_flags)
     print(f"\n  {len(rc_totals)} of {MAX_ROUNDS * 2} rounds x {N} concurrent PROCESSES reclaiming one dead owner's claim"
           + (" (stopped at phase budget)" if len(rc_totals) < MAX_ROUNDS * 2 else ""))
