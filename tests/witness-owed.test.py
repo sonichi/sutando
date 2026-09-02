@@ -44,7 +44,9 @@ class Fixture(unittest.TestCase):
         self.tmp.cleanup()
 
     def merge_topology(self):
-        _git(self.repo, "merge", "-q", "--no-ff", "-m", "merge topic (#12)", "topic")
+        # The merge commit needs an identity too; the runner has none configured.
+        _git(self.repo, "-c", "user.email=t@t", "-c", "user.name=t",
+             "merge", "-q", "--no-ff", "-m", "merge topic (#12)", "topic")
         return _commit(self.repo, "later")
 
     def squash_topology(self):
