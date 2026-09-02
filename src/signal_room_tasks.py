@@ -12,11 +12,17 @@ IMAGES ARE BROKERED BY THE TRUSTED CORE, never made by the worker. The sandboxed
 worker stays exactly as read-only and network-less as on every other lane; it may
 only REQUEST an image, as a standalone `[generate-image: <prompt>]` line in its
 answer. After it returns, the core — outside the sandbox, with its own credentials —
-runs `signal_image_gen.py --task-id <id>` once per request and swaps the line for the
-`[file: …]` marker the wrapper prints. An earlier shape gave the worker
-workspace-write plus network so it could call the wrapper itself; that was rejected
-because codex's writable roots are user-configurable (and always include /tmp) and
-an unrestricted network next to the wrapper's .env-loaded key is an exfiltration path.
+runs ONE fixed command, `signal_image_broker.py --task-id <id>` with the answer on
+stdin, and writes its stdout as the result. Nothing the worker wrote is ever on a
+command line: the broker reads the request lines itself, launches the wrapper with
+the prompt as one argv element, removes every `[file: …]` line the worker wrote, and
+inserts only the markers of files the wrapper just created under the task root. An
+earlier shape gave the worker workspace-write plus network so it could call the
+wrapper itself; that was rejected because codex's writable roots are user-configurable
+(and always include /tmp) and an unrestricted network next to the wrapper's
+.env-loaded key is an exfiltration path. A later one had the core interpolate the
+worker's prompt into a shell command; that was rejected because `$(…)` in a prompt
+would then run in the trusted core.
 
 That boundary is the point, and it was learned the hard way: an earlier version let
 the Signal Room lane pick the runtime (`claude -p …`) and pin it to an isolated
@@ -35,7 +41,7 @@ a label without a boundary.
 WHAT SUTANDO ENFORCES (not this module):
   * the tier's execution restrictions — the core launches the sandboxed worker exactly
     as the in-band block says (read-only, no network), and only the wrapper, run by
-    the core, can put a file into the task's own output dir;
+    the core's broker, can put a file into the task's own output dir;
   * `guard_result_for_tier` on the way out — every non-owner result is secret-scanned
     before it reaches the room;
   * `confine_user_content` on the way in — untrusted text cannot forge task headers.
@@ -57,7 +63,7 @@ SIGNAL_ROOM_TIER = "team"
 SIGNAL_TASK_PREFIX = "task-signal-"
 
 # The image protocol: what the worker may emit, and what the core swaps in. The
-# wrapper enforces the prompt cap; `apply_generated_images` enforces the rest.
+# wrapper enforces the prompt cap; `signal_image_broker` enforces the rest.
 MAX_IMAGE_REQUESTS = 2
 MAX_IMAGE_PROMPT_CHARS = 400
 IMAGE_REQUEST_RE = re.compile(r"^\[generate-image:\s*(\S.*?)\s*\]$")
@@ -106,8 +112,8 @@ def output_contract(task_id: str, output_root) -> str:
 
     The worker can neither write nor reach a provider, so it does not generate: it
     asks, on a standalone `[generate-image: <prompt>]` line, and the core does the
-    rest (`delegation_lines`). The `[file:]` marker is the wrapper's to print — a
-    worker-written one points nowhere the egress allowance accepts.
+    rest (`delegation_lines`). The `[file:]` marker is the wrapper's to print — the
+    broker removes any the worker writes before the egress allowance ever sees them.
     """
     return (
         f"[Signal Room task {task_id}] You cannot generate or save files. If an image "
@@ -115,7 +121,8 @@ def output_contract(task_id: str, output_root) -> str:
         f"your answer — at most {MAX_IMAGE_REQUESTS} such lines, each prompt one line of "
         f"at most {MAX_IMAGE_PROMPT_CHARS} characters. The host generates each requested "
         f"image after you finish and replaces that line with the file's marker; never "
-        f"write a `[file: …]` line yourself. The request follows.\n\n"
+        f"write a `[file: …]` line yourself — any you write is removed. The request "
+        f"follows.\n\n"
     )
 
 
@@ -124,8 +131,9 @@ def delegation_lines(task_id: str, output_root) -> list[str]:
 
     The invocation is the shared owner's read-only default, byte for byte — this
     lane passes no sandbox, root, env or network parameter. What differs is the
-    scope: the core-side image step it performs AFTER the delegate returns, which
-    `apply_generated_images` states in code.
+    scope: the ONE fixed core-side command it runs AFTER the delegate returns —
+    `signal_image_broker.py`, the answer on stdin, nothing from it on the command
+    line — whose behaviour the broker module states in code.
     """
     from policy.guardrail import sandboxed_delegation_lines
     root = canonical_output_root(output_root, task_id)
@@ -135,39 +143,17 @@ def delegation_lines(task_id: str, output_root) -> list[str]:
         f"The prompt is the task text above, including its [Signal Room task {task_id}] "
         f"output contract. The sandboxed worker writes no files: it may only REQUEST "
         f"images, as standalone `[generate-image: <prompt>]` lines in its answer. AFTER "
-        f"the sandboxed delegate returns, YOU generate them, outside the sandbox: for each "
-        f"of the first {MAX_IMAGE_REQUESTS} such lines whose prompt is one line of at most "
-        f"{MAX_IMAGE_PROMPT_CHARS} characters, run `python3 {src}/signal_image_gen.py "
-        f"--task-id {task_id} --prompt \"<prompt>\"` in your own environment, passing the "
-        f"prompt as that one argument, and replace the line with the single "
-        f"`[file: {root}/<name>]` line the wrapper prints. If the wrapper exits non-zero, "
-        f"replace the line with `{IMAGE_FAILED_NOTE}` instead. Leave every other line — "
-        f"including any further or malformed request line — exactly as it is, and never "
-        f"add a `[file:` line the wrapper did not print.",
+        f"the sandboxed delegate returns, save its answer verbatim to a temporary file and, "
+        f"outside the sandbox, run exactly `python3 {src}/signal_image_broker.py "
+        f"--task-id {task_id} < <the delegate's answer file>` — one fixed command, with "
+        f"nothing from the answer on the command line. The broker honours the first "
+        f"{MAX_IMAGE_REQUESTS} such lines whose prompt is one line of at most "
+        f"{MAX_IMAGE_PROMPT_CHARS} characters, generates each image in your environment, "
+        f"replaces the line with the `[file: {root}/<name>]` marker of the file it wrote "
+        f"(or with `{IMAGE_FAILED_NOTE}`), removes any `[file:` line the worker wrote, and "
+        f"leaves every other line exactly as it is. Write the broker's stdout, and only "
+        f"that, as the result — never the delegate's raw answer.",
     )
-
-
-def apply_generated_images(answer_text: str, task_id: str, runner) -> str:
-    """The core-side step `delegation_lines` instructs, in code: swap each well-formed
-    request line (the first MAX_IMAGE_REQUESTS only) for what `runner(task_id, prompt)`
-    returns — the wrapper's `[file: …]` marker — or IMAGE_FAILED_NOTE when it returns
-    nothing or raises. Every other line, malformed and over-cap requests included,
-    passes through unchanged.
-    """
-    out, used = [], 0
-    for line in answer_text.split("\n"):
-        match = IMAGE_REQUEST_RE.match(line.strip())
-        if match is None or used >= MAX_IMAGE_REQUESTS or len(match.group(1)) > MAX_IMAGE_PROMPT_CHARS:
-            out.append(line)
-            continue
-        used += 1
-        try:
-            marker = runner(task_id, match.group(1))
-        except Exception:  # noqa: BLE001 — any wrapper failure is "no image"
-            marker = None
-        marker = marker.strip() if isinstance(marker, str) else ""
-        out.append(marker if marker.startswith("[file: ") and "\n" not in marker else IMAGE_FAILED_NOTE)
-    return "\n".join(out)
 
 
 def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str = "",

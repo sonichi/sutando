@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Trusted image generation for Signal Room tasks — the enforced half of the output contract.
 
-Run by the TRUSTED CORE, never by the sandboxed worker: the worker only asks for an
-image (`[generate-image: <prompt>]`), and after it returns the core runs this once
-per request, in its own environment, with its own provider credentials. The
-command line carries a task id and a prompt — never a path. The output root is
-derived HERE from the id (`signal_worker_launch.output_root_for`: a verified task
-file under the configured tasks dir → `<results>/<task_id>`, created 0700 if
-absent), using the same workspace resolution agent-api uses for TASK_DIR and
+Run by the TRUSTED CORE's broker (`signal_image_broker.py`), never by the sandboxed
+worker: the worker only asks for an image (`[generate-image: <prompt>]`), and after
+it returns the broker launches this once per request with a fixed argv — the prompt
+one element, no shell — in the core's own environment, with its own provider
+credentials. The command line carries a task id and a prompt — never a path. The
+output root is derived HERE from the id (`signal_worker_launch.output_root_for`: a
+verified task file under the configured tasks dir → `<results>/<task_id>`, created
+0700 if absent), using the same workspace resolution agent-api uses for TASK_DIR and
 RESULT_DIR. The root must be a plain (non-symlink) `<results>/<task-signal-*>`
-directory opened by descriptor; the name carries no separators and a fixed
-`.png`; the file is created O_CREAT|O_EXCL|O_NOFOLLOW relative to that descriptor.
+directory opened by descriptor; the name carries no separators and a fixed `.png`;
+the file is created O_CREAT|O_EXCL|O_NOFOLLOW relative to that descriptor, so an
+existing name is never overwritten.
 
     python3 src/signal_image_gen.py --task-id <task-signal-…> --prompt "<text>" \\
         [--name <name>.png] [--size square|landscape|portrait]

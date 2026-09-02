@@ -1,13 +1,14 @@
 """Root derivation for a Signal Room task: `<canonical results dir>/<task_id>`.
 
 Nothing launches through this module, and nothing here reaches the sandboxed
-worker. The trusted core runs `signal_image_gen.py --task-id <id>` AFTER the
-worker returns, and the wrapper derives its root here from the id alone: the
-task file is found under the configured tasks dir — any live name first
-(`task_archive.find_task_file` knows the `.claimed-*` / `.assigned-*` renames a
-task carries while it is being processed), then the processed and archived
-layouts — its `source:` header must say `signal-room`, and the root is created
-0700 when absent and refused unless it is a plain (non-symlink) directory.
+worker. AFTER the worker returns, the trusted core runs `signal_image_broker.py
+--task-id <id>`, which launches `signal_image_gen.py --task-id <id>` per request;
+both derive their root here from the id alone: the task file is found under the
+configured tasks dir — any live name first (`task_archive.find_task_file` knows the
+`.claimed-*` / `.assigned-*` renames a task carries while it is being processed),
+then the processed and archived layouts — its `source:` header must say
+`signal-room`, and the root is created 0700 when absent and refused unless it is a
+plain (non-symlink) directory.
 """
 
 from __future__ import annotations

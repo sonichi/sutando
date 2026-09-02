@@ -3,8 +3,9 @@
 
 The sandboxed worker never generates: its block carries the shared owner's read-only,
 network-less invocation byte for byte, and the worker may only emit
-`[generate-image: <prompt>]` request lines. AFTER it returns, the core runs the
-wrapper — `--task-id <id> --prompt <text>` — in its own environment. The wrapper
+`[generate-image: <prompt>]` request lines. AFTER it returns, the core's broker
+(`signal_image_broker.py`, one fixed command) runs the wrapper — `--task-id <id>
+--prompt <text>`, the prompt one argv element — in its own environment. The wrapper
 derives the root ITSELF from the id (`signal_worker_launch.output_root_for`: a
 verified task file under the tasks dir, live names included, → `<results>/<task_id>`,
 created 0700 when absent) and prints the `[file: <root>/<name>]` marker the core
@@ -264,9 +265,11 @@ check("the delegation sentence IS the shared owner's read-only default, byte for
 check("the invocation is read-only from the core's own cwd: no -C, no variable, no network, exactly one launch",
       "codex exec --sandbox read-only --skip-git-repo-check -- \"$(cat <prompt-file>)\" < /dev/null" in body
       and body.count("codex exec") == 1 and all(t not in body for t in ("workspace-write", " -C ", "network_access", "SIGNAL_TASK_OUTPUT_ROOT")))
-check("the block tells the CORE to run the wrapper by task id after the delegate returns",
-      f"signal_image_gen.py --task-id {tid} --prompt" in body and "AFTER the sandboxed delegate returns" in body
-      and "outside the sandbox" in body)
+check("the block tells the CORE to run ONE fixed broker command by task id, the answer on stdin, after the delegate returns",
+      f"`python3 {Path(S.__file__).resolve().parent}/signal_image_broker.py --task-id {tid} < <the delegate's answer file>`" in body
+      and "AFTER the sandboxed delegate returns" in body and "outside the sandbox" in body)
+check("nothing from the answer is ever on a command line: no --prompt, no wrapper call in the block",
+      "--prompt" not in body and "signal_image_gen" not in body and "nothing from the answer on the command line" in body)
 check("the block states the request line, the cap, the prompt bound and the failure note",
       "[generate-image: <prompt>]" in body and f"first {S.MAX_IMAGE_REQUESTS} such lines" in body
       and f"at most {S.MAX_IMAGE_PROMPT_CHARS} characters" in body and S.IMAGE_FAILED_NOTE in body)

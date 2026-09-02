@@ -229,8 +229,10 @@ with tempfile.TemporaryDirectory() as td:
     root = S.canonical_output_root(results, tid)
     ck(out_dir == results / tid, "the output dir is <results>/<task_id>/")
     ck(out_dir.is_dir(), "the output dir is created at submission")
-    ck("[generate-image: <prompt>]" in body and f"--task-id {tid}" in body,
-       "the body states the worker's request line and the core's wrapper call by task id")
+    ck("[generate-image: <prompt>]" in body and f"signal_image_broker.py --task-id {tid} < " in body,
+       "the body states the worker's request line and the core's ONE broker command by task id, answer on stdin")
+    ck("--prompt" not in body and "signal_image_gen" not in body,
+       "nothing the worker writes is ever on a command line: no --prompt, no wrapper call in the block")
     ck(f"[file: {root}/<name>]" in body,
        "the body shows the one marker shape egress preserves, at the canonical root")
     ck(SANDBOXED_DELEGATION_CODEX in S.delegation_lines(tid, results),
@@ -247,49 +249,9 @@ with tempfile.TemporaryDirectory() as td:
     ck("generate-image" not in (tasks / f"{tid2}.txt").read_text(),
        "without an output root the body is the request alone")
 
-print("== apply_generated_images: the core-side step, as the block states it ==")
-seen = []
-
-
-def runner(task_id, prompt):
-    seen.append((task_id, prompt))
-    return f"[file: /results/{task_id}/image-{len(seen)}.png]\n"
-
-
-answer = "\n".join(["Intro", "[generate-image: a red cat]", "middle", "  [generate-image:  a blue dog ]  ",
-                    "[generate-image: third]", "end"])
-out = S.apply_generated_images(answer, "task-signal-1", runner)
-ck(out.split("\n") == ["Intro", "[file: /results/task-signal-1/image-1.png]", "middle",
-                       "[file: /results/task-signal-1/image-2.png]", "[generate-image: third]", "end"],
-   f"the first {S.MAX_IMAGE_REQUESTS} request lines become markers IN PLACE; the next is left as written")
-ck(seen == [("task-signal-1", "a red cat"), ("task-signal-1", "a blue dog")],
-   "the runner sees the task id and the bare prompt, in order")
-seen.clear()
-malformed = "\n".join(["text [generate-image: inline] text", "[generate-image: ]", "[generate-image:]",
-                       "[generate-image: " + "x" * (S.MAX_IMAGE_PROMPT_CHARS + 1) + "]",
-                       "[generate image: no colon]", "`[generate-image: fenced]`", "[file: /etc/passwd]"])
-ck(S.apply_generated_images(malformed, "t", runner) == malformed and seen == [],
-   "malformed, empty, over-long and inline lines are untouched and never reach the runner")
-seen.clear()
-over = "\n".join(["[generate-image: " + "x" * (S.MAX_IMAGE_PROMPT_CHARS + 1) + "]", "[generate-image: a]", "[generate-image: b]"])
-ck(S.apply_generated_images(over, "t", runner).split("\n")[1:] == ["[file: /results/t/image-1.png]", "[file: /results/t/image-2.png]"]
-   and len(seen) == 2, "a malformed line does not consume one of the slots")
-ck(S.apply_generated_images("[generate-image: " + "x" * S.MAX_IMAGE_PROMPT_CHARS + "]", "t", runner).startswith("[file: "),
-   "a prompt exactly at the cap is a request")
-
-
-def raising(task_id, prompt):
-    raise RuntimeError("wrapper exited 1")
-
-
-for label, bad in (("a raising runner", raising), ("a runner returning nothing", lambda t, p: None),
-                   ("runner output that is not a [file:] marker", lambda t, p: "image-1.png"),
-                   ("a multi-line runner output", lambda t, p: "[file: /a.png]\n[file: /b.png]")):
-    ck(S.apply_generated_images("x\n[generate-image: boom]\ny", "t", bad) == f"x\n{S.IMAGE_FAILED_NOTE}\ny",
-       f"{label}: the line becomes the one-line failure note and nothing else changes")
-seen.clear()
-ck(S.apply_generated_images("plain answer\n", "t", runner) == "plain answer\n" and seen == [],
-   "an answer with no request line is returned unchanged, and the runner is never called")
+print("== the core-side step has one home: the broker module the block runs ==")
+ck(not hasattr(S, "apply_generated_images"),
+   "the submission module states no image step of its own (see tests/signal-image-broker.test.py)")
 ck("[" not in S.IMAGE_FAILED_NOTE, "the failure note can never parse as a marker")
 
 print()

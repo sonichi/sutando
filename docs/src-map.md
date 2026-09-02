@@ -147,6 +147,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
+- **`signal_image_broker.py`** — The trusted core's image broker for a Signal Room answer: one fixed command, and worker text is only ever data.
 - **`signal_image_gen.py`** — Trusted image generation for Signal Room tasks — the enforced half of the output contract.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
 - **`signal_worker_launch.py`** — Root derivation for a Signal Room task: `<canonical results dir>/<task_id>`.
