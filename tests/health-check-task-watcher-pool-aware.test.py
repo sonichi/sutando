@@ -517,5 +517,34 @@ class TheSiblingPaneMirrorControl(unittest.TestCase):
         self.assertEqual(g["unverified"], set())
 
 
+class AllOwnerlessCleanupRestartsExactlyOne(unittest.TestCase):
+    """The post-cleanup contract is one sentence in every sentinel branch: stop
+    the ownerless roots, rerun the probe, start exactly ONE only if none remains.
+    Before, only the no-sentinel branch said so; following step 9 in the dead-
+    or live-sentinel state stopped every watcher and started none."""
+
+    RESTART = "start exactly ONE"
+
+    def test_every_root_ownerless_restarts_in_all_three_branches(self):
+        for nm, kw in EveryMultiRootVerdictNamesEveryGroup.CASES.items():
+            for roots in (["100"], ["100", "200"]):
+                with self.subTest(f"{nm} / {len(roots)} root(s)"):
+                    ps = {r: "1" for r in roots}
+                    v = _probe(ps, roots=roots, core_pids={"9"}, **kw)
+                    self.assertIn(self.RESTART, v["detail"], v["detail"])
+                    self.assertEqual(_groups(v["detail"])["ownerless"], set(roots))
+
+    def test_mixed_ownership_stops_ownerless_and_starts_none(self):
+        for nm, kw in EveryMultiRootVerdictNamesEveryGroup.CASES.items():
+            with self.subTest(nm):
+                v = _probe({"100": "1", "200": "500", "500": "1"},
+                           roots=["100", "200"], core_pids={"500"}, **kw)
+                d = v["detail"]
+                self.assertNotIn(self.RESTART, d, d)
+                self.assertIn("rerun this probe", d, d)
+                self.assertEqual(_groups(d)["ownerless"], {"100"}, d)
+                self.assertEqual(_groups(d)["session-owned"], {"200"}, d)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

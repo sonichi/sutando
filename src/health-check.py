@@ -7014,6 +7014,17 @@ def _ownership_groups(owned, unverified, ownerless) -> str:
     return _g("session-owned", owned) + _g("unverified", unverified) + _g("ownerless", ownerless)
 
 
+def _watcher_cleanup_remedy(owned, unverified, ownerless, keep: str = "") -> str:
+    """The one post-cleanup contract every sentinel branch appends: stop only the
+    ownerless roots, rerun this probe, start exactly ONE only if no tree remains."""
+    if not owned and not unverified:
+        return ("Stop them ALL, then start exactly ONE via Monitor: bash src/watch-tasks-stream.sh "
+                "(rerun this probe in between and start only if no tree remains) — stopping "
+                "without restarting leaves tasks/ undrained")
+    return (f"Stop ONLY the ownerless roots{keep}, then rerun this probe — while any tree "
+            f"remains, start none")
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -7090,19 +7101,16 @@ def check_task_watcher() -> dict:
                                   f"are legitimate. Do NOT stop them: they ARE draining tasks/. "
                                   f"Re-stamp the sentinel with --fix"
                                   + _ownership_groups(supervised, unverified, unowned)}
-            # Every root ownerless: "stop the ownerless ones" empties the set,
-            # so the remedy must also restore one or tasks/ goes undrained.
             if not supervised and not unverified:
                 return {"name": name, "status": "warn",
                         "detail": f"{len(roots)} watcher trees running with no PID sentinel, and "
-                                  f"NONE traces to a live core session. Stop them ALL, then start "
-                                  f"exactly ONE via Monitor: bash src/watch-tasks-stream.sh — "
-                                  f"stopping without restarting leaves tasks/ undrained"
+                                  f"NONE traces to a live core session. "
+                                  + _watcher_cleanup_remedy(supervised, unverified, unowned)
                                   + _ownership_groups(supervised, unverified, unowned)}
             return {"name": name, "status": "warn",
                     "detail": f"{len(roots)} watcher trees running with no PID sentinel; tasks/ IS "
                               f"being drained, but duplicates process each task more than once. "
-                              f"Stop ONLY the ownerless roots"
+                              + _watcher_cleanup_remedy(supervised, unverified, unowned)
                               + _ownership_groups(supervised, unverified, unowned)}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
@@ -7127,8 +7135,9 @@ def check_task_watcher() -> dict:
                                   f"NOT stop them: tasks/ IS being drained"
                                   + _ownership_groups(owned, unverified, unowned)}
             return {"name": name, "status": "warn",
-                    "detail": f"sentinel pid {pid} is dead; tasks/ IS being drained, but duplicates "
-                              f"process each task more than once. Stop ONLY the ownerless roots"
+                    "detail": f"sentinel pid {pid} is dead; tasks/ IS being drained by "
+                              f"{len(roots)} tree(s), but duplicates process each task more than once. "
+                              + _watcher_cleanup_remedy(owned, unverified, unowned)
                               + _ownership_groups(owned, unverified, unowned)}
         return {"name": name, "status": "warn",
                 "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
@@ -7166,8 +7175,8 @@ def check_task_watcher() -> dict:
                               + _ownership_groups(owned, unverified, orphaned)}
         return {"name": name, "status": "warn",
                 "detail": f"{len(trees)} watcher trees running, {len(extras)} not tracked by the "
-                          f"sentinel; duplicates process each task more than once. Stop ONLY the "
-                          f"ownerless roots{keep}"
+                          f"sentinel; duplicates process each task more than once. "
+                          + _watcher_cleanup_remedy(owned, unverified, orphaned, keep)
                           + _ownership_groups(owned, unverified, orphaned)}
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
