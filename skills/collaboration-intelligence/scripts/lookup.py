@@ -134,7 +134,10 @@ def main():
         print(f"KNOWN ENTITIES ({len(rows)})\n{stale}")
         for r in rows:
             st = r.get("agent_mxid") or "-- no Stand recorded --"
-            print(f"  {r.get('entity_id',''):<28} {r.get('kind',''):<6} {st}")
+            # quick-lookup.yaml rows key the name as `id`; match() already reads
+            # both, so a row findable by name must not render nameless here.
+            nm = r.get("entity_id") or r.get("id") or ""
+            print(f"  {nm:<28} {r.get('kind',''):<6} {st}")
         return 0
 
     hits = match(rows, a.query, ents)
