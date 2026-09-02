@@ -66,8 +66,8 @@ def delegation() -> None:
     print("delegation pins (no consumer re-implements the policy):")
     consumers = {
         "runtime-api/tasks_view": REPO / "src" / "runtime-api" / "tasks_view.py",
-        "workstream-grouping CLI": (REPO / "skills" / "task-workstream-grouping"
-                                    / "scripts" / "workstreams.py"),
+        # The workstream-grouping CLI is absent on purpose: its delegation
+        # lands together with the live-file lookup it needs (#3658).
         "codex-scheduler": (REPO / "skills" / "schedule-crons" / "scripts"
                             / "codex-scheduler.py"),
     }
