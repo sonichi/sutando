@@ -61,8 +61,9 @@ def _requirement_for(ev: Dict) -> HumanRequirement:
         runtime=runtime,
         message=f"{prompt} — session {session}",
         guard=str(ev.get("guard") or ""),
-        # The session is the requirement's device: it keys dedup and the jump.
-        device={"id": session, "name": session},
+        # The session is the requirement's device: it keys dedup, the jump, and
+        # (with its tmux socket) the driver's action file on a click.
+        device={"id": session, "name": session, "socket": str(ev.get("socket") or "")},
         title=f"{runtime} · {session}",
         actions=_actions_for(ev),
     )
