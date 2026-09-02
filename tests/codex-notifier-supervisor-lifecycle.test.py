@@ -363,6 +363,62 @@ class LeaseOwnershipTest(unittest.TestCase):
         self.assertIsNone(a.poll())
         self.assertEqual(self._ran(), ["A"])
 
+    def _pause_shim(self, name, tools, pattern):
+        """PATH shim for ONE contender: the named tools pause on a go-file when
+        their arguments match `pattern`, then exec the real binary. Holding a
+        contender at its own filesystem action needs no seam in the script, so
+        the same control drives the pre-fix and post-fix supervisor alike."""
+        d = self.d / f"{name}-shim"
+        d.mkdir(exist_ok=True)
+        entered, go = self.d / f"{name}-shim-entered", self.d / f"{name}-shim-go"
+        for tool in tools:
+            _write(d / tool, f"""
+                #!/bin/bash
+                case "$*" in {pattern}) touch "{entered}"; while [ ! -f "{go}" ]; do sleep 0.05; done ;; esac
+                exec /bin/{tool} "$@"
+            """, executable=True)
+        return d, entered, go
+
+    def _settle(self, cond, timeout=20):
+        deadline = time.monotonic() + timeout
+        while not cond() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        return cond()
+
+    def test_a_late_reclaim_publisher_cannot_proceed_after_its_directory_is_recovered(self):
+        """The reviewer's interleaving. A holds RECLAIM_DIR empty past the
+        publication grace. B judges it stale and is held before acting on that
+        verdict (its mv, or its claim). A then publishes, verifies ownership,
+        judges the lease stale and is held at its lease delete. B resumes and
+        recovers the directory; A resumes. With rename-based recovery both
+        launched: B took a fresh lease and A deleted it and launched too."""
+        self._plant_stale()
+        a_pub, a_pub_entered, a_pub_go = self._hold_hook("publish")
+        a_shim, a_rm_entered, a_rm_go = self._pause_shim("A", ("rm",), "*lease.lock/token*")
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     SUTANDO_NOTIFIER_PUBLISH_GRACE="1",
+                     SUTANDO_NOTIFIER_RECLAIM_PUBLISH_HOOK=str(a_pub),
+                     PATH=f"{a_shim}:{self.d}:{os.environ['PATH']}")
+        self._wait_for(a_pub_entered, "A never reached the publication window")
+        time.sleep(1.5)  # past the grace: A's empty directory now judges stale
+        b_shim, b_entered, b_go = self._pause_shim("B", ("mv", "ln"), "*.reclaim*")
+        b = self._bg("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     SUTANDO_NOTIFIER_PUBLISH_GRACE="1",
+                     PATH=f"{b_shim}:{self.d}:{os.environ['PATH']}")
+        self._wait_for(b_entered, "B never judged the empty directory stale")
+        a_pub_go.touch()
+        self._wait_for(a_rm_entered, "A never published and reached its lease delete")
+        b_go.touch()
+        self._settle(lambda: b.poll() is not None or "B" in self._ran())
+        a_rm_go.touch()
+        self._await_run("A")
+        self._settle(lambda: b.poll() is not None or "B" in self._ran())
+        self.assertIsNone(a.poll(), "A did not keep running")
+        self.assertEqual(self._ran(), ["A"], "B launched beside A: two live supervisors")
+        self.assertEqual((self.lock / "token").read_text().split(":")[0], str(a.pid),
+                         "the lease is not A's")
+        self.assertIsNotNone(b.poll(), "B neither launched nor withdrew")
+
     def test_published_reclaim_control_still_wins(self):
         """Control: with no contender in the window, the same reclaim runs."""
         self._plant_stale()
@@ -485,6 +541,34 @@ class LeaseOwnershipTest(unittest.TestCase):
         self.assertEqual(self._ran(), [])
         self.assertEqual(list(self.d.glob("sutando-notifier-*.lock")), [],
                          "a lease was taken under a collapsed key")
+
+    def _python_with_malformed_digest(self):
+        """hashlib succeeds but prints sixteen non-hex bytes; every other python3
+        invocation is delegated, so only the digest guard is under test."""
+        d = self.d / "zpy"
+        d.mkdir(exist_ok=True)
+        real = subprocess.run(["bash", "-c", "command -v python3"], capture_output=True,
+                              text=True).stdout.strip()
+        _write(d / "python3", f"""
+            #!/bin/bash
+            case "$*" in *hashlib*) echo zzzzzzzzzzzzzzzz; exit 0 ;; esac
+            exec "{real}" "$@"
+        """, executable=True)
+        return d
+
+    def test_a_malformed_successful_digest_refuses(self):
+        """Sixteen bytes that are not hex is not a digest: two sockets would
+        collapse onto one lease exactly as an empty digest would."""
+        env = self._env("zdigest", SUTANDO_TMUX_SOCKET="/tmp/team/a.sock",
+                        SUTANDO_TMUX_SESSION="s")
+        env["PATH"] = f"{self._python_with_malformed_digest()}:{env['PATH']}"
+        r = subprocess.run(["bash", str(SUPERVISOR)], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cannot derive the lease key", r.stderr)
+        self.assertEqual(self._ran(), [])
+        self.assertEqual(list(self.d.glob("sutando-notifier-*.lock")), [],
+                         "a lease was taken under a malformed key")
 
     # --- P1: an unmeasurable start identity is contended, never stale ---
 
