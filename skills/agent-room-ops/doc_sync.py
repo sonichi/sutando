@@ -81,6 +81,16 @@ def _insert_into_section(lines: List[str], section: str, text: str) -> bool:
     return False
 
 
+def duplicates(text: str) -> Dict[str, int]:
+    """Keys that occur more than once (a row present in two sections has no single identity)."""
+    counts: Dict[str, int] = {}
+    for line in text.split("\n"):
+        k = RECORD_RE.match(line)
+        if k:
+            counts[k.group(1)] = counts.get(k.group(1), 0) + 1
+    return {k: n for k, n in counts.items() if n > 1}
+
+
 def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str], List[str]]:
     """Apply my row deltas (base->mine) onto remote. Returns (text, applied, conflicts);
     a non-empty conflicts list means nothing should be written."""
@@ -89,6 +99,7 @@ def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str
     if sb != sm:
         return remote, [], ["structure lines changed (headers/prose); edit records only"]
     _, rr = parse(remote)
+    dup = duplicates(remote)
     lines = remote.split("\n")
     applied, conflicts = [], []
 
@@ -102,6 +113,9 @@ def merge(base: str, mine: str, remote: str, writer: str) -> Tuple[str, List[str
     for key in sorted(set(rb) | set(rm)):
         b, m, r = rb.get(key), rm.get(key), rr.get(key)
         if b == m:
+            continue
+        if key in dup:
+            conflicts.append(f"{key}: appears {dup[key]} times remotely; resolve the duplicate by hand first")
             continue
         if m is None:                                   # I retired the row
             if r is None:
