@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import hashlib
 import unittest
 from pathlib import Path
 
@@ -360,6 +361,31 @@ class LegacyDeliveryIdStaysBounded(unittest.TestCase):
                 I.resend_delivery_id(m.delivery_id, 1)
                 self.assertEqual(m.idempotency_key.value, f"{item}#0",
                                  "the provider key must stay byte-for-byte")
+
+    def test_readable_and_digest_forms_are_disjoint(self):
+        """A valid short key whose escaped form spells `<80 readable>.<16 hex>`
+        must not equal the digest form of a different long key. Both live in
+        one component grammar, so disjointness is by length: readable <= 80,
+        digest 95-97."""
+        long_item = "x" * 191
+        digest = hashlib.sha256(long_item.encode()).hexdigest()[:16]
+        short_item = "x" * 80 + "." + digest
+        a = I.legacy_delivery_id(long_item, "gw")
+        b = I.legacy_delivery_id(short_item, "gw")
+        self.assertNotEqual(a, b, "two distinct outbox items share one delivery identity")
+        comp = a.value[len("legacy:"):-len("@gw")]
+        self.assertGreaterEqual(len(comp), 95)
+        for key in ("a", "x" * 80, "%" * 26, "\u00e9" * 8):
+            comp = I.legacy_delivery_id(key, "gw").value[len("legacy:"):-len("@gw")]
+            self.assertLessEqual(len(comp), 80, key)
+
+    def test_the_empty_content_key_has_a_deterministic_delivery_form(self):
+        a = I.legacy_delivery_id("", "gw")
+        self.assertEqual(a, I.legacy_delivery_id("", "gw"))
+        self.assertNotEqual(a, I.legacy_delivery_id("empty-content-key-" * 5, "gw"))
+        m = legacy.from_outbox_item("", "gw")
+        self.assertEqual(m.delivery_id, a)
+        self.assertEqual(m.idempotency_key.value, "#0")
 
     def test_digest_form_is_pure_and_injective(self):
         a = legacy.from_outbox_item("x" * 191, "gw").delivery_id

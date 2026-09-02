@@ -65,23 +65,37 @@ def delivery_id(task: TaskId, boundary: str) -> DeliveryId:
                       f"{escape_component(boundary)}")
 
 
-# Mirrors the outbox's _safe_key: past this, a readable prefix plus a digest
-# of the RAW key — the prefix is lossy, the digest decides identity.
+# Readable <= 80 units; digest form is 95-97 (fill 78-80, '.', 16 hex): the
+# two encodings share one grammar and are disjoint by length alone.
 _LEGACY_READABLE = 80
+_LEGACY_DIGEST = 16
+# An empty content key has no readable prefix of its own; this sentinel fills
+# it so the empty key still takes the length-disjoint digest form.
+_EMPTY_KEY_FILL = "empty-content-key-" * 5
 
 
-def _bounded_legacy_component(content_key: str) -> str:
-    esc = escape_component(content_key)
-    if len(esc) <= _LEGACY_READABLE + 17:
-        return esc
+def _readable_prefix(esc: str) -> str:
     out, n = [], 0
     for tok in re.findall(r"%[0-9A-F]{2}|.", esc):   # never split an escape
         if n + len(tok) > _LEGACY_READABLE:
             break
         out.append(tok)
         n += len(tok)
-    digest = hashlib.sha256(content_key.encode("utf-8")).hexdigest()[:16]
-    return f"{''.join(out)}.{digest}"
+    return "".join(out)
+
+
+def _bounded_legacy_component(content_key: str) -> str:
+    if not isinstance(content_key, str):
+        raise ValueError("legacy content key must be a string")
+    if content_key == "":
+        prefix = _readable_prefix(escape_component(_EMPTY_KEY_FILL))
+    else:
+        esc = escape_component(content_key)
+        if len(esc) <= _LEGACY_READABLE:
+            return esc
+        prefix = _readable_prefix(esc)
+    digest = hashlib.sha256(content_key.encode("utf-8")).hexdigest()[:_LEGACY_DIGEST]
+    return f"{prefix}.{digest}"
 
 
 def legacy_delivery_id(content_key: str, boundary: str) -> DeliveryId:

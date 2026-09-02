@@ -99,24 +99,56 @@ def scan_task_mints(root: Path) -> dict:
             counts[(rel, "<unparseable>")] = 1
             return
         stack = ["<module>"]
-        # A mint literal can hide behind a module constant (TASK_PREFIX = "task-cron-"),
-        # so resolve one level — else a delegating refactor hides the construction.
-        const_names = {
-            t.id for node in tree.body if isinstance(node, ast.Assign)
-            for t in node.targets if isinstance(t, ast.Name)
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-            and node.value.value.startswith("task-")
-        }
+
+        # A template may be bound in ANY lexical scope: resolve innermost
+        # first; a name rebound here to a non-template shadows an outer one.
+        def _bindings(scope) -> dict:
+            out = {}
+            def _bind(target, value):
+                if isinstance(target, ast.Name):
+                    out[target.id] = _is_task_literal(value)
+            def _own(node):
+                # This scope's statements, not a nested scope's: a nested
+                # function's local cannot bind a template for its parent.
+                yield node
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef, ast.Lambda)):
+                    return
+                for ch in ast.iter_child_nodes(node):
+                    yield from _own(ch)
+            for child in ast.iter_child_nodes(scope):
+                for sub in _own(child):
+                    if sub is child and isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                                         ast.ClassDef, ast.Lambda)):
+                        continue
+                    if isinstance(sub, ast.Assign):
+                        for tg in sub.targets:
+                            _bind(tg, sub.value)
+                    elif isinstance(sub, ast.AnnAssign) and sub.value is not None:
+                        _bind(sub.target, sub.value)
+                    elif isinstance(sub, (ast.AugAssign, ast.For, ast.AsyncFor,
+                                          ast.withitem, ast.NamedExpr)):
+                        tg = getattr(sub, "target", None) or getattr(sub, "optional_vars", None)
+                        if isinstance(tg, ast.Name):
+                            out[tg.id] = False
+            return out
+
+        scopes = [_bindings(tree)]
+
+        def _is_template(name: str) -> bool:
+            for sc in reversed(scopes):
+                if name in sc:
+                    return sc[name]
+            return False
 
         def _leads_task(node) -> bool:
             if _is_task_literal(node):
                 return True
-            if isinstance(node, ast.Name) and node.id in const_names:
+            if isinstance(node, ast.Name) and _is_template(node.id):
                 return True
             if (isinstance(node, ast.FormattedValue)
                     and isinstance(node.value, ast.Name)
-                    and node.value.id in const_names):
+                    and _is_template(node.value.id)):
                 return True
             return False
 
@@ -127,9 +159,16 @@ def scan_task_mints(root: Path) -> dict:
         class V(ast.NodeVisitor):
             def visit_FunctionDef(self, n):
                 stack.append(n.name)
+                scopes.append(_bindings(n))
                 self.generic_visit(n)
+                scopes.pop()
                 stack.pop()
             visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, n):
+                scopes.append(_bindings(n))
+                self.generic_visit(n)
+                scopes.pop()
 
             def visit_JoinedStr(self, n):
                 # A glob metacharacter in the literal half makes this a MATCHER
@@ -593,6 +632,30 @@ class ScannerPositiveControls(unittest.TestCase):
                              src)
         self.assertEqual(self._scan_fixture("a.py", 'T = "task-static"\nx = T\n'),
                          {}, "a bare constant reference is not a mint")
+
+    def test_catches_a_template_bound_one_lexical_scope_away(self):
+        """A local template and a module-level annotated assignment both mint
+        restart-unstable ids; a scanner that only reads top-level ast.Assign
+        stays green on both. Positional shadowing: a name rebound in the
+        function to a non-template does not resolve to the module template."""
+        counts = self._scan_fixture("probe.py", (
+            'import time\n'
+            'TEMPLATE: str = "task-cron-{stamp}"\n'
+            'OUTER = "task-{stamp}"\n'
+            'def annotated():\n'
+            '    return TEMPLATE.format(stamp=time.time())\n'
+            'def local():\n'
+            '    template = "task-{stamp}"\n'
+            '    return template.format_map({"stamp": time.time()})\n'
+            'def shadowed(name):\n'
+            '    OUTER = name\n'
+            '    return OUTER.format(stamp=time.time())\n'
+            'def literal():\n'
+            '    return f"task-{time.time()}"\n'
+        ))
+        self.assertEqual(counts, {("probe.py", "annotated"): 1,
+                                  ("probe.py", "local"): 1,
+                                  ("probe.py", "literal"): 1})
 
     def test_ignores_non_mint_task_strings(self):
         self.assertEqual(
