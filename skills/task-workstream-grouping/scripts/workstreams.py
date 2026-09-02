@@ -14,6 +14,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 
 from sutando_config import resolve_workspace  # noqa: E402
+from task_archive import task_id_from_filename  # noqa: E402
 from task_workstreams import (  # noqa: E402
     apply_inference,
     build_classifier_snapshot,
@@ -39,7 +40,9 @@ def main(argv=None) -> int:
         print(json.dumps(build_classifier_snapshot(workspace), ensure_ascii=False, indent=2))
         return 0
     if args.command == "context":
-        task_id = Path(args.task).stem
+        # A bare ID passed by the CLI has no suffix to strip, so the owner
+        # returns None and the stem fallback preserves that contract.
+        task_id = task_id_from_filename(Path(args.task).name) or Path(args.task).stem
         context = build_workstream_context(workspace, task_id, limit=args.limit)
         if context is not None:
             sys.stdout.write(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
