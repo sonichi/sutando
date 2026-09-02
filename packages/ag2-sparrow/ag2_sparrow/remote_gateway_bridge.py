@@ -468,16 +468,7 @@ def _token_from_vault_ag2space(vault_get=None):
     without touching a real Keychain.
     """
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        src = _monorepo_src("channel_token.py")
         if not src:
             return ""
         if src not in sys.path:
@@ -956,6 +947,38 @@ def _guarded_result_body(tid: str, body: str):
 _VAULT_INTERCEPT_FNS: "tuple | None" = None
 
 
+def _monorepo_src(marker: str) -> str:
+    """The monorepo `src/` that holds `marker`, walking up from this file;
+    '' when sparrow runs standalone (pyproject install, no monorepo around it)."""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.isfile(os.path.join(cur, "src", marker)):
+            return os.path.join(cur, "src")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+
+
+def _hitl_reply_handler(owner_mxid: str, log=print):
+    """Owner card-click handler for HITL cards, or None when `src/hitl` is not
+    around (standalone sparrow) — the chain then simply lacks it, like the vault tier."""
+    try:
+        src = _monorepo_src(os.path.join("hitl", "replies.py"))
+        if not src:
+            return None
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl.manager import HitlManager, HitlStore, default_store
+        from hitl.replies import HitlReplyHandler
+        workspace = _STATE.parent
+        return HitlReplyHandler(HitlManager(HitlStore(default_store(workspace))), owner_mxid,
+                                workspace=workspace, log=log)
+    except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
+        log(f"hitl: reply handler unavailable ({e}); card clicks will not be applied")
+        return None
+
+
 def _vault_intercept_fns():
     """Lazily locate the monorepo `src/vault_intercept.py` helpers; memoized.
     Returns (None, None) on failure so a caller can fall back to `_local_redact_vault_set`."""
@@ -963,16 +986,7 @@ def _vault_intercept_fns():
     if _VAULT_INTERCEPT_FNS is not None:
         return _VAULT_INTERCEPT_FNS
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "vault_intercept.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        src = _monorepo_src("vault_intercept.py")
         if not src:
             _VAULT_INTERCEPT_FNS = (None, None)
             return _VAULT_INTERCEPT_FNS
@@ -3480,7 +3494,12 @@ def _maybe_start_event_channel() -> None:
         if ha_owner:
             from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
             store = ActionStore(str(_STATE / "human-actions"))
-            handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
+            # HITL card clicks ride the same owner-only chain, ahead of taskify.
+            claimants = [DecisionHandler(store, ha_owner, log=_log)]
+            hitl = _hitl_reply_handler(ha_owner, log=_log)
+            if hitl is not None:
+                claimants.append(hitl)
+            handler = HandlerChain(claimants + [handler])
             if ha_room:
                 poster = CardPoster(store, URL, _AUTH_HEADERS,
                                     ha_room, log=_log,
