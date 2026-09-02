@@ -33,12 +33,14 @@ def plant_stale_claim(root, item):
     }, sort_keys=True), encoding="utf-8")
 
 
-def run_rounds(pool, target, per_phase_s, min_rounds, max_rounds, one_round):
+def run_rounds(per_phase_s, min_rounds, max_rounds, one_round):
     """Repeat one_round until max_rounds or the phase budget runs out.
 
     A broken lock fails on nearly every round, so min_rounds keeps the power;
     the extra rounds only chase rare interleavings and are the first thing a
     thrashing 2-core CI runner can no longer afford inside its 120s file cap.
+    The budget gates round STARTS: worst case is min_rounds + one budget's
+    worth of starts, each running to completion.
     """
     results, t0 = [], time.monotonic()
     for r in range(max_rounds):
@@ -52,8 +54,9 @@ if __name__ == "__main__":
     # oversubscribed on a 2-core runner, and the thrash is what timed out.
     N = max(8, (os.cpu_count() or 2) * 3)
     MIN_ROUNDS, MAX_ROUNDS = 3, 12
-    # Well under CI's 120s per-file cap even with both phases at the budget,
-    # so a slow lane finishes early instead of being killed reportless.
+    # The budget bounds round STARTS, and the floor rounds run unconditionally,
+    # so the true worst case is floor + budget + in-flight round durations —
+    # far below the old 36 unconditional rounds, not a hard ceiling.
     PHASE_BUDGET_S = float(os.environ.get("OUTBOX_RACE_PHASE_BUDGET_S", "35"))
     totals = []
     # ONE warm pool here too, for the reason phase 2 already states: a fresh pool
@@ -64,7 +67,7 @@ if __name__ == "__main__":
                 os.makedirs(os.path.join(tmp, ".claims"), exist_ok=True)  # pre-make so mkdir isn't the serializer
                 got = pool.map(worker, [(tmp, f"item-race-{r}", i) for i in range(N)])
             return sum(got)
-        totals = run_rounds(pool, totals, PHASE_BUDGET_S, MIN_ROUNDS, MAX_ROUNDS, acquire_round)
+        totals = run_rounds(PHASE_BUDGET_S, MIN_ROUNDS, MAX_ROUNDS, acquire_round)
     print(f"  {len(totals)} of {MAX_ROUNDS} rounds x {N} concurrent PROCESSES racing one item"
           + (" (stopped at phase budget)" if len(totals) < MAX_ROUNDS else ""))
     print(f"  winners per round: {totals}")
@@ -92,7 +95,7 @@ if __name__ == "__main__":
                 orphan_flags.append(
                     len(winners) == 1 and (held is None or held.drainer_id != winners[0]))
                 return len(winners)
-        rc_totals = run_rounds(pool, None, PHASE_BUDGET_S, MIN_ROUNDS * 2, MAX_ROUNDS * 2, reclaim_round)
+        rc_totals = run_rounds(PHASE_BUDGET_S, MIN_ROUNDS * 2, MAX_ROUNDS * 2, reclaim_round)
     orphaned = sum(orphan_flags)
     print(f"\n  {len(rc_totals)} of {MAX_ROUNDS * 2} rounds x {N} concurrent PROCESSES reclaiming one dead owner's claim"
           + (" (stopped at phase budget)" if len(rc_totals) < MAX_ROUNDS * 2 else ""))
