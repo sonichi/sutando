@@ -27,7 +27,6 @@ from task_archive import find_task_file  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
-from task_archive import find_task_file  # noqa: E402
 from delivery.publication import publish_result  # noqa: E402
 
 
