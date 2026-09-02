@@ -63,6 +63,9 @@ TASK_MINT_PIN = {
     # Origination, not ingress: a client submits text over the local socket, so
     # there is no provider_event_id for ingress_task_id to be injective over.
     ("runtime-api/tasks_view.py", "submit"): 1,
+    # Same shape: the Signal Room originates a task from room speech; nothing
+    # upstream carries a provider_event_id, so ingress_task_id has no domain.
+    ("signal_room_tasks.py", "submit_signal_room_task"): 1,
 }
 
 # Pre-canonical delivery_id sites, pinned per (file, function) like
@@ -143,7 +146,10 @@ def scan_task_mints(root: Path) -> dict:
 
             def visit_Call(self, n):
                 f = n.func
-                if (isinstance(f, ast.Attribute) and f.attr == "format"
+                # format_map mints exactly what format does; a scanner that
+                # names one spelling invites the other.
+                if (isinstance(f, ast.Attribute)
+                        and f.attr in ("format", "format_map")
                         and _is_task_literal(f.value)):
                     record()
                 self.generic_visit(n)
@@ -436,6 +442,7 @@ class ScannerPositiveControls(unittest.TestCase):
             "nested file": ("runtime-api/a.py",
                             'def f():\n    return f"task-{ts}"\n'),
             "str.format": ("a.py", 'x = "task-{}".format(ts)\n'),
+            "str.format_map": ("a.py", 'x = "task-{ts}".format_map(d)\n'),
             "concatenation": ("a.py", 'x = "task-" + str(ts)\n'),
             "percent-format": ("a.py", 'x = "task-%s" % ts\n'),
         }
