@@ -11,7 +11,7 @@
 #   - run the post-upgrade health check / report to the owner
 #
 # Usage:
-#   bash skills/self-upgrade/scripts/upgrade.sh [--remote <name>] [--branch <name>] [--no-restart]
+#   bash skills/self-upgrade/scripts/upgrade.sh [--remote <name>] [--branch <name>] [--no-restart] [--canary owner/repo#N]
 # Exit codes: 0 = upgraded (or already latest); 2 = aborted (dirty tree / not FF-able)
 
 set -uo pipefail
@@ -19,6 +19,7 @@ set -uo pipefail
 REMOTE="origin"
 BRANCH="main"
 DO_RESTART=1
+CANARY=""
 SERVICE_SESSION="sutando-services"
 DONE_MARKER=""
 while [ $# -gt 0 ]; do
@@ -26,6 +27,7 @@ while [ $# -gt 0 ]; do
     --remote) REMOTE="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
     --no-restart) DO_RESTART=0; shift ;;
+    --canary) CANARY="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -90,6 +92,25 @@ REBUILD="$(git diff --name-only "HEAD..$REMOTE/$BRANCH" | grep -iE 'package.*\.j
 if [ -n "$REBUILD" ]; then
   echo "self-upgrade: NOTE — dependency/build files changed; a rebuild (npm ci / tsc) may be needed after restart:"
   echo "$REBUILD" | sed 's/^/    /'
+fi
+
+# 3.5 Witness-owed gate: a merged live-path PR that still owes its post-restart
+#     round trip (REVIEW.md lesson 15) is not activated here, except as a declared
+#     canary on the host that owes it. Runs BEFORE the pull so a refusal leaves HEAD alone.
+GATE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+GATE_HOST="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null || hostname -s)"
+if [ -n "$GATE_WS" ] && [ -f "$REPO/src/witness_owed.py" ]; then
+  if [ -n "$CANARY" ]; then
+    python3 "$REPO/src/witness_owed.py" --workspace "$GATE_WS" canary "$CANARY" --host "$GATE_HOST" >/dev/null ||
+      { echo "self-upgrade: ABORT — no open witness-owed record for $CANARY" >&2; exit 4; }
+    echo "self-upgrade: canary activation of $CANARY declared for $GATE_HOST — post the round trip and close the record"
+  fi
+  if ! python3 "$REPO/src/witness_owed.py" --workspace "$GATE_WS" check --ref "$REMOTE/$BRANCH" --current HEAD --repo-root "$REPO" --host "$GATE_HOST"; then
+    echo "self-upgrade: ABORT — the target head newly contains a live-path PR that still owes its witness (listed above)." >&2
+    echo "  Post the exact-head round trip to the PR thread and close the record: python3 src/witness_owed.py --workspace <ws> close owner/repo#N --witness <url>" >&2
+    echo "  Or, on the host that owes it, activate as the declared canary: $0 --canary owner/repo#N" >&2
+    exit 4
+  fi
 fi
 
 # 4. Fast-forward pull — the actual code upgrade.
