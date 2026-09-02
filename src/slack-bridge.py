@@ -83,7 +83,8 @@ except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
 from result_markers import parse_markers  # noqa: E402
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import (read_ready_result,  # noqa: E402
+                                retire_claim_if_unchanged)
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 import local_task_protocol  # noqa: E402
@@ -1666,9 +1667,13 @@ def result_watcher():
                             dm_channel = resp["channel"]["id"]
                             if _send_reply(dm_channel, None, text, access_tier="owner",
                                            delivery_name=delivery_id):
-                                mark_proactive_delivered(STATE_DIR, delivery_id)
                                 print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
-                                claim.unlink(missing_ok=True)
+                                if retire_claim_if_unchanged(claim, text):
+                                    mark_proactive_delivered(STATE_DIR, delivery_id)
+                                else:
+                                    # Producer appended after the read. Leave the
+                                    # rest unsuppressed or no pass can ever send it.
+                                    release_claim(claim)
                             else:
                                 # Slack refused WITHOUT raising, which is the ordinary
                                 # failure; the except below never sees it.

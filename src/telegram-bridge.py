@@ -58,7 +58,8 @@ except Exception:  # pragma: no cover — best-effort telemetry
 import local_task_protocol  # noqa: E402
 from result_markers import parse_markers
 from message_chunking import chunk_plain_text  # plain transport: byte-identical chunking  # noqa: E402
-from delivery.readiness import read_ready_result  # noqa: E402
+from delivery.readiness import (read_ready_result,  # noqa: E402
+                                retire_claim_if_unchanged)
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -1138,7 +1139,10 @@ def main():  # pragma: no cover
                                 )
                             if _s.get("ok"):
                                 print(f"  [proactive] sent to {owner_id}: {text[:80]}")
-                                f.unlink(missing_ok=True)
+                                if not retire_claim_if_unchanged(f, text):
+                                    # Producer appended after the read; releasing
+                                    # keeps the rest for a pass that sends it whole.
+                                    release_claim(f)
                             else:
                                 # send_reply reports refusal by returning ok=False
                                 # without raising; the except below never sees it.
