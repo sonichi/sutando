@@ -148,11 +148,12 @@ class HookDriverTests(unittest.TestCase):
         [req] = self.mgr.store.all()
         self.assertEqual(req.status, "expired")
 
-    def test_exit_plan_mode_is_a_confirmation(self):
-        _, out, _ = run_hook(self.ws, {"tool_name": "ExitPlanMode", "tool_input": {}}, timeout="1")
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")  # timed out
-        [req] = self.mgr.store.all()
-        self.assertEqual(req.kind, "confirmation")
+    def test_exit_plan_mode_is_left_to_the_screen_layer(self):
+        # An allow here does not dismiss the plan-approval dialog; filing a card
+        # would raise a requirement nothing can resolve.
+        rc, out, _ = run_hook(self.ws, {"tool_name": "ExitPlanMode", "tool_input": {}}, timeout="1")
+        self.assertEqual((rc, out), (0, None))
+        self.assertEqual(self.mgr.store.all(), [])
 
 
 if __name__ == "__main__":
