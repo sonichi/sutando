@@ -472,11 +472,18 @@ def _streams(led: Path) -> dict:
                                 {"last": None, "first_ask": None,
                                  "first_ask_outcome": None, "n": 0,
                                  "identity": {}, "first_identity": {},
-                                 "last_identity": {}, "by_reviewer": {}})
+                                 "last_identity": {}, "by_reviewer": {},
+                                 "membership": []})
             # PER EVENT, not per stream: one slot stamped the newest spelling
             # onto every retained row, losing asks made under an older alias.
             ident = {f: d[f] for f in ("reviewer", "actor", "endpoint")
                      if isinstance(d.get(f), str) and d.get(f)}
+            # `membership` is the component a park was reserved for, and
+            # `_membership_overlap` rereads it from the RAW row. Dropping it in
+            # compaction silently retires every retry-admission check.
+            mem = valid_tags(d.get("membership"))
+            if mem:
+                st["membership"] = sorted(set(st.get("membership") or []) | set(mem))
             st["identity"].update(ident)
             st["last_identity"] = ident
             # One delivery row per distinct legacy spelling survives compaction.
@@ -584,6 +591,10 @@ def _rewrite(led: Path, streams: dict) -> int:
             # field IS a delivery, so compacting it must not drop `reviewer`.
             if outcome is None or outcome in _DELIVERY_OUTCOMES:
                 row["reviewer"] = identity.get("reviewer") or who
+            # Only the UNRESOLVED rows need it: those are what a later retry
+            # admission reads, and a settled row's component is spent.
+            if outcome in _ACTIVE and st.get("membership"):
+                row["membership"] = st["membership"]
             rows.append(json.dumps(row))
     tmp = led.with_suffix(led.suffix + ".compact")
     mode = led.stat().st_mode & 0o777 if led.exists() else _LEDGER_MODE

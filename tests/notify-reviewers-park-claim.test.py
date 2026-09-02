@@ -205,6 +205,30 @@ class CompactionIsIndistinguishableFromTheFullHistory(unittest.TestCase):
         self.assertEqual(self.nr._first_ask(self.led), before[1])
         self.assertLess(sum(1 for _ in open(self.led)), rows_before // 100)
 
+    def test_membership_survives_compaction(self):
+        """@keweichen's P1. `_rewrite` builds retained rows from a closed field
+        set; `_membership_overlap` rereads `membership` from the raw row. Drop it
+        in compaction and retry admission silently never matches again."""
+        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        td = __import__("datetime").timedelta
+        msg = "see https://github.com/o/r/pull/7"
+        rows = [{"repo": "o/r", "pr": 7, "reviewer": "A", "actor": "A",
+                 "channel": "room", "outcome": "unknown", "membership": ["actor:A", "actor:B"],
+                 "ts": (now - td(seconds=9000)).strftime("%Y-%m-%dT%H:%M:%SZ")}]
+        # A SECOND stream carries the bulk, so the park's own stream is not
+        # collapsed into it — same-stream padding hides the field under `last`.
+        for i in range(2100):
+            rows.append({"repo": "o/r", "pr": 9, "reviewer": "Z", "actor": "Z",
+                         "channel": "room", "outcome": "pending",
+                         "ts": (now - td(seconds=8000 - i)).strftime("%Y-%m-%dT%H:%M:%SZ")})
+        self.led.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        before = self.nr._membership_overlap(self.led, msg, {"actor:A"})
+        self.assertIsNotNone(before, "fixture never established an overlap to lose")
+        self.nr._maybe_compact(self.led)
+        self.assertIsNotNone(
+            self.nr._membership_overlap(self.led, msg, {"actor:A"}),
+            "compaction dropped the membership retry admission depends on")
+
     def test_an_unsafe_unresolved_state_survives_compaction(self):
         # The property that matters: compaction must never clear a park.
         msg = "see https://github.com/o/r/pull/7"
