@@ -984,12 +984,27 @@ def classifier_status(
     return _queue_result(True, False, "ready", snapshot_hash, "", source_state)
 
 
+#: Dashboard-driven enqueue is OFF by default (owner request 2026-09-02, pending
+#: a redesign). Set SUTANDO_WORKSTREAM_CLASSIFIER truthy to re-enable.
+_CLASSIFIER_ENABLE_VALUES = frozenset({"1", "on", "true", "yes", "enabled"})
+
+
+def classifier_enqueue_enabled() -> bool:
+    """Whether the classifier may enqueue a maintenance task. Default: no."""
+    return (os.environ.get("SUTANDO_WORKSTREAM_CLASSIFIER", "")
+            .strip().lower() in _CLASSIFIER_ENABLE_VALUES)
+
+
 def maybe_enqueue_classifier_task(
     workspace: Path,
     ttl_seconds: int = 900,
     limit: int = 100,
     skill_file: Optional[Path] = None,
 ) -> ClassifierQueueResult:
+    # Off by default gates EVERY caller — the dashboard POST and the manual
+    # endpoint alike; read-only classifier_status is unaffected.
+    if not classifier_enqueue_enabled():
+        return ClassifierQueueResult(False, False, "disabled")
     if skill_file is not None and not Path(skill_file).is_file():
         return ClassifierQueueResult(False, False, "skill-unavailable")
     with _workstream_store_lock(Path(workspace)):
