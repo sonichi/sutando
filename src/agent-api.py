@@ -48,7 +48,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -331,12 +330,11 @@ def _is_count(value) -> bool:
 
 
 def _load_serve_quota(quota: Path, seen: tuple[int, int, int] | None) -> dict | None:
-    """The persisted counters, or None when the state is corrupt: any shape or
-    value outside the contract, or a decrease against this process's high-water mark."""
+    """The persisted counters, or None when the state is corrupt: missing (publish
+    wrote a durable zero), any shape or value outside the contract, or a decrease
+    against this process's high-water mark."""
     try:
         raw = quota.read_bytes()
-    except FileNotFoundError:
-        return None if seen is not None else {"files": [], "serves": 0, "bytes": 0}
     except OSError:
         return None
     try:
@@ -360,8 +358,9 @@ def _reserve_serve_quota(task_id: str, real_path: str, size: int) -> tuple[bool,
     or unreadable state (fail closed).
 
     Persisted in `<workspace>/state/serve-quota/<task_id>.json` (0600, dir 0700 —
-    never in the task-writable dir), replaced atomically under a kernel flock on
-    the sibling `.lock` plus the in-process lock, so concurrent serves, another
+    never in the task-writable dir; the zero counter is written at publish),
+    replaced atomically with the directory fsync'd, under a kernel flock on the
+    sibling `.lock` plus the in-process lock, so concurrent serves, another
     process and a restart all see one consistent counter. Called BEFORE any
     header is sent.
     """
@@ -385,21 +384,8 @@ def _reserve_serve_quota(task_id: str, real_path: str, size: int) -> tuple[bool,
                 return False, "serve budget exhausted"
             if total + size > FILE_SERVE_MAX_TOTAL_BYTES:
                 return False, "byte budget exhausted"
-            payload = {"v": 1, "files": files, "serves": serves + 1, "bytes": total + size}
-            fd, tmp = tempfile.mkstemp(dir=str(quota.parent), prefix=f".{task_id}.", suffix=".tmp")
-            try:
-                os.fchmod(fd, 0o600)
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(payload, fh)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp, quota)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+            task_output_retention.write_serve_quota(
+                quota, {"v": 1, "files": files, "serves": serves + 1, "bytes": total + size})
             _serve_quota_seen[task_id] = (serves + 1, total + size, len(files))
             return True, ""
         finally:
@@ -1317,33 +1303,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_json(401, {"error": "unauthorized"})
         return False
 
-    def _refuse_invalid_registry(self, registry: TokenRegistry) -> bool:
-        """True (503 sent) when the registry file is invalid: scoped routes fail closed."""
-        if registry.state() != STATE_INVALID:
+    def _registry_verdict(self) -> dict:
+        """The ONE registry read for this request: `authorize()` on the presented bearer."""
+        return _signal_token_registry().authorize(_bearer(self.headers))
+
+    def _refuse_invalid_registry(self, verdict: dict) -> bool:
+        """True (503 sent) when the registry is invalid: scoped routes fail closed."""
+        if verdict["state"] != STATE_INVALID:
             return False
-        print(f"[api] signal token registry invalid ({registry.invalid_reason()}); "
+        print(f"[api] signal token registry invalid ({verdict['reason']}); "
               f"refusing every scoped route until it is rewritten", file=sys.stderr)
         self.send_json(503, {"error": "room token registry unavailable"})
         return True
 
-    def check_scoped_auth(self, required_scope: str):
+    def check_scoped_auth(self, required_scope: str, verdict: dict | None = None):
         """Registry-aware auth for room-bearing Signal Room routes.
 
         Returns the token's `{room_id, scope}` row, LEGACY_GLOBAL when the
         ordinary gateway token still applies (registry unprovisioned), or None
         after a refusal was sent. A provisioned registry — live or fully revoked
         rows alike — refuses the global token; an invalid one refuses everything.
+        `verdict` lets a route that already took its snapshot reuse it.
         """
-        registry = _signal_token_registry()
-        if self._refuse_invalid_registry(registry):
+        if verdict is None:
+            verdict = self._registry_verdict()
+        if self._refuse_invalid_registry(verdict):
             return None
-        row = registry.verify(_bearer(self.headers))
+        row = verdict["match"]
         if row is not None:
             if row["scope"] != required_scope:
                 self.send_json(403, {"error": f"token scope {row['scope']!r} cannot use this route"})
                 return None
             return row
-        if registry.state() == STATE_PROVISIONED:
+        if verdict["state"] == STATE_PROVISIONED:
             self.send_json(403, {"error": "a room-scoped token is required on this route"})
             return None
         if not self.check_auth():
@@ -1353,16 +1345,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def check_result_auth(self, task_id: str) -> bool:
         """/result: a room token reads only its own room's task; the global token
         keeps owner tasks and loses Signal Room tasks once the registry is provisioned."""
-        registry = _signal_token_registry()
-        if _signal_task_id(task_id) and self._refuse_invalid_registry(registry):
+        verdict = self._registry_verdict()
+        if _signal_task_id(task_id) and self._refuse_invalid_registry(verdict):
             return False
-        row = registry.verify(_bearer(self.headers))
+        row = verdict["match"]
         if row is not None:
             if _task_source_room(task_id) != row["room_id"]:
                 self.send_json(403, {"error": "token is not bound to this task's room"})
                 return False
             return True
-        if _signal_task_id(task_id) and registry.state() == STATE_PROVISIONED:
+        if _signal_task_id(task_id) and verdict["state"] == STATE_PROVISIONED:
             self.send_json(403, {"error": "a room-scoped token is required for Signal Room results"})
             return False
         return self.check_auth()
@@ -1777,7 +1769,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     task, TASK_DIR, confine_user_content,
                     room_id=room_id,
                     requested_by=str(data.get("requested_by", "")),
-                    output_root=RESULT_DIR,
+                    output_root=RESULT_DIR, state_dir=WORKSPACE_DIR / "state",
                 )
             except SignalRoomBusy as exc:
                 self.send_json(429, {"error": str(exc), "retry_after": 30})
@@ -1795,8 +1787,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         # A room-scoped token (any scope) is only ever admitted on the guest lane below.
-        registry = _signal_token_registry()
-        scoped = registry.verify(_bearer(self.headers))
+        verdict = self._registry_verdict()
+        scoped = verdict["match"]
         if scoped is None and not self.check_auth():
             return
 
@@ -1849,7 +1841,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if data.get("access_tier") != "guest":
                 self.send_json(400, {"error": "access_tier is not accepted on /task"})
                 return
-            auth = self.check_scoped_auth(SCOPE_ENQUEUE)
+            auth = self.check_scoped_auth(SCOPE_ENQUEUE, verdict)
             if auth is None:
                 return
             room_id, room_error = _token_bound_room(auth, data)
@@ -1863,7 +1855,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # Preserve the shipped clients' attribution instead of flattening
                     # every legacy poster to "signal-room".
                     requested_by=str(data.get("requested_by") or from_agent or ""),
-                    output_root=RESULT_DIR,
+                    output_root=RESULT_DIR, state_dir=WORKSPACE_DIR / "state",
                 )
             except SignalRoomBusy as exc:
                 self.send_json(429, {"error": str(exc), "retry_after": 30})

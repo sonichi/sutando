@@ -131,8 +131,54 @@ if os.geteuid() != 0:
 st.write_registry(path, [a_read])
 check("a rewritten valid file recovers without restart",
       reg.state() == st.STATE_PROVISIONED and reg.verify("tok-a-read") is not None)
+
+print("== provisioning is irreversible: the marker outlives the file ==")
+marker = st.marker_path(ws)
+check("marker is <workspace>/state/signal-room-tokens.provisioned, 0600",
+      marker == ws / "state" / "signal-room-tokens.provisioned" and marker.is_file()
+      and stat.S_IMODE(os.stat(marker).st_mode) == 0o600)
+check("authorize(): state, match and reason from one snapshot",
+      reg.authorize("tok-a-read") == {"state": st.STATE_PROVISIONED, "reason": "",
+                                      "match": {"room_id": "!a:hs", "scope": "read"}}
+      and reg.authorize("nope") == {"state": st.STATE_PROVISIONED, "match": None, "reason": ""}
+      and reg.authorize(None)["match"] is None)
 path.unlink()
-check("file removed again: back to unprovisioned", reg.state() == st.STATE_UNPROVISIONED)
+check("file removed after provisioning: invalid, never unprovisioned",
+      reg.state() == st.STATE_INVALID and "missing" in reg.invalid_reason()
+      and reg.verify("tok-a-read") is None, reg.invalid_reason())
+st.write_registry(path, [])
+check("a valid document emptied after provisioning: invalid",
+      reg.state() == st.STATE_INVALID and "emptied" in reg.invalid_reason(), reg.invalid_reason())
+st.write_registry(path, [a_read])
+check("rows again: provisioned, the token verifies", reg.verify("tok-a-read") is not None)
+path.unlink()
+fresh = st.TokenRegistry(path)
+check("restart (a fresh reader), file missing: still invalid — the marker survives",
+      fresh.state() == st.STATE_INVALID and fresh.verify("tok-a-read") is None, fresh.invalid_reason())
+marker.unlink()
+check("even with the marker removed, a reader that saw a row never goes back",
+      reg.state() == st.STATE_INVALID and fresh.state() == st.STATE_INVALID)
+st.write_registry(path, [a_read])
+check("the marker self-heals the next time a row is read", reg.verify("tok-a-read") is not None and marker.is_file())
+
+print("== torn read: state and match come from ONE snapshot ==")
+real_refresh = reg._refresh
+
+
+def refresh_then_replace():
+    real_refresh()
+    path.write_text("{not json")
+
+
+reg._refresh = refresh_then_replace
+verdict = reg.authorize("tok-a-read")
+reg._refresh = real_refresh
+check("a registry replaced right after the snapshot cannot split the verdict",
+      verdict == {"state": st.STATE_PROVISIONED, "match": {"room_id": "!a:hs", "scope": "read"}, "reason": ""},
+      str(verdict))
+check("the next call sees the replacement whole: invalid AND no match",
+      reg.authorize("tok-a-read") == {"state": st.STATE_INVALID, "match": None, "reason": "unparseable: JSONDecodeError"},
+      str(reg.authorize("tok-a-read")))
 
 try:
     st.make_row("!a:hs", "admin", "t", created_at_ms=1)

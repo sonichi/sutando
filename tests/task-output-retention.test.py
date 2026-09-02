@@ -9,7 +9,10 @@
   * the lock keeps two sweeps apart, and a stale lock is broken;
   * serve vs sweep: a serve holding the per-task SHARED flock makes the sweep
     skip that dir (`busy`); the sweep's EXCLUSIVE flock makes a serve wait; a
-    removed dir takes its serve-quota and lease-lock state with it; the lease
+    removed dir takes its serve-quota counter with it while the flock files
+    stay (a serve after the sweep locks the same inode); an rmtree that fails
+    or leaves the dir behind removes nothing else and is retried next pass —
+    the counter goes only after ENOENT confirms the dir is gone; the lease
     file is never followed through a symlink;
   * only `task-signal-*` REAL directories are candidates — symlinks, files and
     the archive dirs are untouched;
@@ -136,7 +139,10 @@ state = results.parent / "state"
 served = make_dir(results, "task-signal-20-served", lease_at=T0 - 30 * H)
 quota_json, quota_lock = ret.serve_quota_paths(state, "task-signal-20-served")
 quota_json.write_text('{"v": 1, "files": [], "serves": 1, "bytes": 1}')
+quota_lock.touch()
 fd = ret.hold_task_lease(state, "task-signal-20-served")
+serve_ino = os.fstat(fd).st_ino
+quota_lock_ino = os.stat(quota_lock).st_ino
 report = ret.sweep_task_outputs(results, now=T0, state_dir=state)
 check("a serve holding the shared lease makes the sweep skip the dir",
       served.exists() and report["busy"] == ["task-signal-20-served"] and report["removed"] == [], str(report))
@@ -149,8 +155,60 @@ os.close(fd)
 report = ret.sweep_task_outputs(results, now=T0, state_dir=state)
 check("once the serve releases, the sweep removes the dir", not served.exists()
       and report["removed"] == ["task-signal-20-served"], str(report))
-check("the removed dir's serve-quota state and lease lock go with it",
-      not quota_json.exists() and not quota_lock.exists() and not lock_path.exists())
+check("the removed dir's serve-quota counter goes with it; the flock files stay",
+      not quota_json.exists() and quota_lock.is_file() and lock_path.is_file())
+after = ret.hold_task_lease(state, "task-signal-20-served")
+check("a serve after the sweep holds the SAME lock inode as the one before it",
+      os.fstat(after).st_ino == serve_ino == os.stat(lock_path).st_ino
+      and os.stat(quota_lock).st_ino == quota_lock_ino)
+os.close(after)
+
+print("== removal must be confirmed before any state goes ==")
+stuck = make_dir(results, "task-signal-23-stuck", lease_at=T0 - 30 * H)
+stuck_json, stuck_lock = ret.serve_quota_paths(state, "task-signal-23-stuck")
+stuck_json.write_text('{"v": 1, "files": [], "serves": 2, "bytes": 2}')
+stuck_lock.touch()
+stuck_lease_lock = ret.lease_lock_path(state, "task-signal-23-stuck")
+holder = ret.hold_task_lease(state, "task-signal-23-stuck")
+stuck_inos = (os.fstat(holder).st_ino, os.stat(stuck_lock).st_ino)
+os.close(holder)
+real_rmtree = ret.shutil.rmtree
+
+
+def failing_rmtree(path, *a, **k):
+    raise OSError(16, "Resource busy")
+
+
+def silent_rmtree(path, *a, **k):
+    return None
+
+
+for label, fake in (("rmtree raises", failing_rmtree), ("rmtree returns but the dir is still there", silent_rmtree)):
+    ret.shutil.rmtree = fake
+    try:
+        report = ret.sweep_task_outputs(results, now=T0, state_dir=state)
+    finally:
+        ret.shutil.rmtree = real_rmtree
+    check(f"{label}: reported failed, not removed", report["failed"] == ["task-signal-23-stuck"]
+          and "task-signal-23-stuck" not in report["removed"], str(report))
+    check(f"{label}: the dir, its counter and its flock files are all untouched",
+          stuck.is_dir() and stuck_json.read_text() == '{"v": 1, "files": [], "serves": 2, "bytes": 2}'
+          and os.stat(stuck_lease_lock).st_ino == stuck_inos[0] and os.stat(stuck_lock).st_ino == stuck_inos[1])
+order = []
+real_gone, real_remove = ret._gone, ret._remove_serve_quota
+ret._gone = lambda path: (order.append(("gone", os.path.lexists(path))), real_gone(path))[1]
+ret._remove_serve_quota = lambda sd, tid: (order.append(("quota", tid)), real_remove(sd, tid))[1]
+try:
+    report = ret.sweep_task_outputs(results, now=T0, state_dir=state)
+finally:
+    ret._gone, ret._remove_serve_quota = real_gone, real_remove
+check("next pass: removed for real, ENOENT confirmed BEFORE the counter went",
+      report["removed"] == ["task-signal-23-stuck"] and not stuck.exists() and not stuck_json.exists()
+      and order == [("gone", False), ("quota", "task-signal-23-stuck")], str((report, order)))
+retry = ret.hold_task_lease(state, "task-signal-23-stuck")
+check("and the flock files survived with their inodes",
+      os.fstat(retry).st_ino == stuck_inos[0] and os.stat(stuck_lock).st_ino == stuck_inos[1])
+os.close(retry)
 
 waiter = make_dir(results, "task-signal-21-waiter", lease_at=T0)
 raw = os.open(ret.lease_lock_path(state, "task-signal-21-waiter"), os.O_RDWR | os.O_CREAT, 0o600)

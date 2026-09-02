@@ -18,7 +18,11 @@ live, processed and archived layouts (the pre-archive window), concurrent serves
 are counted exactly once each (threads AND processes), counters survive a
 restart, corrupt or regressing quota state is refused, over-quota is never
 served, a serve holds the task lease against the sweeper, and the happy path
-streams the exact bytes with the contract headers.
+streams the exact bytes with the contract headers. The counter is written as a
+durable zero at publish, before the task dir exists; a task whose counter is
+missing is refused (a deleted counter cannot reset the envelope, restart or
+not), and the flock files are never unlinked — a serve after a sweep locks the
+same inode.
 
 Run: python3 tests/agent-api-file-bytes.test.py
 """
@@ -73,12 +77,15 @@ PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 40
 TASK_A = "task-signal-1-aaaa"
 TASK_A2 = "task-signal-2-aaaa"     # same room, different task
 TASK_B = "task-signal-3-bbbb"      # other room
+STATE = WS / "state"
 
 
 def write_task(task_id, room):
+    """A published task by hand: task file, the durable zero counter, then the dir."""
     (api.TASK_DIR / f"{task_id}.txt").write_text(
         f"id: {task_id}\nsource: signal-room\naccess_tier: team\n"
         f"source_room_id: {room}\ntask: draw\n")
+    retention.init_serve_quota(STATE, task_id)
     (api.RESULT_DIR / task_id).mkdir(exist_ok=True)
 
 
@@ -116,7 +123,6 @@ def fetch(path, task_id=TASK_A, token="tok-a-read", raw_query=None):
     return resp.status, hdrs, body
 
 
-STATE = WS / "state"
 QUOTA_A, LOCK_A = retention.serve_quota_paths(STATE, TASK_A)
 _modules = [api]
 
@@ -349,6 +355,59 @@ check("deleted file with an in-process record does NOT reset: 429, not recreated
 set_quota(dict(quota(), v=1, serves=mark["serves"] + 1, bytes=mark["bytes"] + len(PNG), files=mark["files"]))
 check("repaired state serves again", fetch(IMG_A)[0] == 200)
 
+print("== the counter is durable: written at publish, and missing means corruption ==")
+import signal_room_tasks  # noqa: E402
+seen_at_init = []
+real_init = retention.init_serve_quota
+
+
+def spy_init(state_dir, task_id):
+    seen_at_init.append((task_id, (api.RESULT_DIR / task_id).exists(),
+                         os.path.realpath(state_dir) == os.path.realpath(STATE)))
+    return real_init(state_dir, task_id)
+
+
+retention.init_serve_quota = spy_init
+(api.TASK_DIR / "processed").mkdir(exist_ok=True)
+for live_task in api.TASK_DIR.glob("task-signal-*.txt"):
+    if live_task.stem != TASK_A:      # free the admission slots; processed tasks stay bound
+        shutil.move(str(live_task), str(api.TASK_DIR / "processed" / live_task.name))
+try:
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    conn.request("POST", "/guest-task", body=json.dumps({"task": "draw", "room_id": "!a:hs"}),
+                 headers={"Authorization": "Bearer tok-a-enq", "Content-Type": "application/json"})
+    resp = conn.getresponse()
+    published = json.loads(resp.read())
+    conn.close()
+finally:
+    retention.init_serve_quota = real_init
+new_task = published.get("task_id", "")
+new_quota, new_lock = retention.serve_quota_paths(STATE, new_task)
+check("publish (POST /guest-task) accepted", resp.status == 200 and new_task.startswith("task-signal-"), str(published))
+check("publish wrote the zero counter, 0600, in the workspace state dir",
+      new_quota.is_file() and json.loads(new_quota.read_text()) == {"v": 1, "files": [], "serves": 0, "bytes": 0}
+      and stat.S_IMODE(os.stat(new_quota).st_mode) == 0o600, str(new_quota))
+check("the counter was written BEFORE the task's output dir existed",
+      seen_at_init == [(new_task, False, True)] and (api.RESULT_DIR / new_task).is_dir(), str(seen_at_init))
+(api.RESULT_DIR / new_task / "fresh.png").write_bytes(PNG)
+check("a freshly published task serves from its zero counter", fetch(api.RESULT_DIR / new_task / "fresh.png", task_id=new_task)[0] == 200)
+retention.init_serve_quota(STATE, new_task)
+check("init on an existing counter never resets it", json.loads(new_quota.read_text())["serves"] == 1)
+QUOTA_A.unlink()
+for mod in _modules:
+    mod._serve_quota_seen.pop(TASK_A, None)
+code, _h, body = fetch(IMG_A)
+check("counter deleted, no in-process record (a restart): 429, never served, not recreated",
+      code == 429 and body != PNG and not QUOTA_A.exists(), f"code={code}")
+api3 = _load("agent_api_restart_missing")
+api3.RESULT_DIR = api.RESULT_DIR
+ok, why = api3._reserve_serve_quota(TASK_A, os.path.realpath(IMG_A), len(PNG))
+check("a fresh process refuses a task whose counter is missing", ok is False and "unavailable" in why and not QUOTA_A.exists(), why)
+retention.init_serve_quota(STATE, TASK_A)
+check("a repaired (re-published) counter serves again", fetch(IMG_A)[0] == 200 and quota()["serves"] == 1)
+set_quota(dict(mark, v=1))
+check("the normal path is unchanged", fetch(IMG_A)[0] == 200 and quota()["serves"] == mark["serves"] + 1)
+
 print("== two processes contending ==")
 CHILD = f"""
 import importlib.util, os, sys, time
@@ -415,13 +474,19 @@ far = time.time() + 30 * 3600
 DIR_A2 = api.RESULT_DIR / TASK_A2
 LEASE_LOCK_A2 = retention.lease_lock_path(STATE, TASK_A2)
 held = retention.hold_task_lease(STATE, TASK_A2)
+held_ino = os.fstat(held).st_ino
+lock_inodes = (os.stat(LOCK_A).st_ino, os.stat(retention.lease_lock_path(STATE, TASK_A)).st_ino)
 report = retention.sweep_task_outputs(api.RESULT_DIR, now=far, state_dir=STATE)
 check("a serve in progress makes the sweep skip its dir",
       DIR_A2.exists() and TASK_A2 in report["busy"], str(report))
 check("the same sweep reclaims the dirs no serve holds",
       TASK_A in report["removed"] and not DIR_A.exists(), str(report))
-check("a removed task's quota counters and locks are gone",
-      not QUOTA_A.exists() and not LOCK_A.exists() and not retention.lease_lock_path(STATE, TASK_A).exists())
+check("a removed task's quota counter is gone; its flock files stay, same inodes",
+      not QUOTA_A.exists() and os.stat(LOCK_A).st_ino == lock_inodes[0]
+      and os.stat(retention.lease_lock_path(STATE, TASK_A)).st_ino == lock_inodes[1])
+later = retention.hold_task_lease(STATE, TASK_A)
+check("a serve after the sweep locks the SAME lease inode as before it", os.fstat(later).st_ino == lock_inodes[1])
+os.close(later)
 os.close(held)
 raw = os.open(LEASE_LOCK_A2, os.O_RDWR)
 fcntl.flock(raw, fcntl.LOCK_EX)
@@ -447,6 +512,10 @@ check("a serve that waited on a sweep which removed the dir gets 404, no bytes",
 os.close(raw)
 report = retention.sweep_task_outputs(api.RESULT_DIR, now=far, state_dir=STATE)
 check("nothing is busy once no serve holds a lease", report["busy"] == [] and not DIR_A2.exists(), str(report))
+again = retention.hold_task_lease(STATE, TASK_A2)
+check("the serve that held the lease through a sweep and the one after it share one lock inode",
+      os.fstat(again).st_ino == held_ino == os.stat(LEASE_LOCK_A2).st_ino)
+os.close(again)
 
 server.shutdown()
 server.server_close()

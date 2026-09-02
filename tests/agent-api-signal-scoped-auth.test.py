@@ -13,7 +13,12 @@ Drives the real Handler.do_POST / do_GET with a registry in a temp workspace:
     body room_id must EQUAL it (403), a read-scope token cannot enqueue, and a
     room token never reaches the owner lane;
   * /result: a room token reads only its own room's task; cross-room is 403;
-  * revocation and rotation take effect without a restart.
+  * revocation and rotation take effect without a restart;
+  * every route takes ONE registry snapshot per request (`authorize()`), so a
+    file replaced mid-request cannot split the verdict;
+  * provisioning is irreversible: once a row was seen, an emptied or deleted
+    registry is `invalid` (503 on every scoped route, legacy never re-admitted),
+    and the on-disk marker keeps it that way across a restart.
 
 Run: python3 tests/agent-api-signal-scoped-auth.test.py
 """
@@ -21,6 +26,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -30,19 +36,27 @@ os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ["SUTANDO_WORKSPACE"] = _TEST_WS
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-_spec = importlib.util.spec_from_file_location("agent_api", str(REPO / "src" / "agent-api.py"))
-api = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(api)
 from policy import signal_tokens as st  # noqa: E402
 
 WS = Path(_TEST_WS)
-api.TASK_DIR = WS / "tasks"
-api.RESULT_DIR = WS / "results"
-api.TASK_DIR.mkdir(exist_ok=True)
-api.RESULT_DIR.mkdir(exist_ok=True)
-api.API_TOKEN = "global-token"
-api.SIGNAL_TOKEN_REGISTRY = WS / "state" / "signal-room-tokens.json"
-api._emit_task_processed = lambda *a, **k: None
+
+
+def load_api(name):
+    """A fresh agent-api module on the same workspace — what a restart sees."""
+    spec = importlib.util.spec_from_file_location(name, str(REPO / "src" / "agent-api.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.TASK_DIR = WS / "tasks"
+    mod.RESULT_DIR = WS / "results"
+    mod.TASK_DIR.mkdir(exist_ok=True)
+    mod.RESULT_DIR.mkdir(exist_ok=True)
+    mod.API_TOKEN = "global-token"
+    mod.SIGNAL_TOKEN_REGISTRY = WS / "state" / "signal-room-tokens.json"
+    mod._emit_task_processed = lambda *a, **k: None
+    return mod
+
+
+api = load_api("agent_api")
 
 failures = []
 
@@ -61,8 +75,9 @@ class FakeRFile:
         return self.body
 
 
-def handler(path, token, body=None):
-    h = api.Handler.__new__(api.Handler)
+def handler(path, token, body=None, mod=None):
+    mod = api if mod is None else mod
+    h = mod.Handler.__new__(mod.Handler)
     h.path = path
     raw = b"" if body is None else json.dumps(body).encode()
     h.headers = {"Content-Length": str(len(raw))}
@@ -75,14 +90,14 @@ def handler(path, token, body=None):
     return h
 
 
-def post(path, token, body):
-    h = handler(path, token, body)
+def post(path, token, body, mod=None):
+    h = handler(path, token, body, mod)
     h.do_POST()
     return h._responses[0]
 
 
-def get(path, token):
-    h = handler(path, token)
+def get(path, token, mod=None):
+    h = handler(path, token, mod=mod)
     h.do_GET()
     return h._responses[0]
 
@@ -180,6 +195,23 @@ code, data = get("/result/task-1", "tok-a-enq")
 check("room token cannot poll an owner task (403)", code == 403, str(data))
 park(task_b)
 
+print("== one registry snapshot per request ==")
+reg = api._signal_token_registry()
+snapshots = []
+real_authorize = reg.authorize
+reg.authorize = lambda token: (snapshots.append(token), real_authorize(token))[1]
+live_before = sorted(api.TASK_DIR.glob("task-signal-*.txt"))
+for label, fn in (("/guest-task", lambda: post("/guest-task", "tok-a-read", {"task": "q"})),
+                  ("the /task guest shim", lambda: post("/task", "tok-a-read", {"task": "q", "access_tier": "guest"})),
+                  ("/result", lambda: get(f"/result/{task_a}", "tok-a-enq")),
+                  ("/scan-text", lambda: post("/scan-text", "tok-a-read", {"texts": ["x"]}))):
+    snapshots.clear()
+    code, data = fn()
+    check(f"{label}: exactly one authorize() per request, on the presented bearer",
+          len(snapshots) == 1 and snapshots[0].startswith("tok-a-"), f"{code} {snapshots}")
+reg.authorize = real_authorize
+check("no task was written by the scope refusals", sorted(api.TASK_DIR.glob("task-signal-*.txt")) == live_before)
+
 print("== revocation and rotation, live ==")
 st.write_registry(registry, [dict(rows["a_enq"], revoked_at=10), rows["a_read"], rows["b_enq"]])
 code, data = post("/guest-task", "tok-a-enq", {"task": "q"})
@@ -232,10 +264,42 @@ code, data = post("/guest-task", "tok-a-enq", {"task": "q"})
 check("a rewritten valid registry recovers without restart", code == 200, str(data))
 park(data["task_id"])
 
-print("== a valid document that never held a row is unprovisioned ==")
+print("== provisioning is irreversible: emptied or deleted, the registry denies; legacy stays out ==")
+marker = st.marker_path(WS)
+check("the marker was written on first observation, 0600",
+      marker == WS / "state" / "signal-room-tokens.provisioned" and marker.is_file()
+      and stat.S_IMODE(os.stat(marker).st_mode) == 0o600)
 st.write_registry(registry, [])
 code, data = post("/guest-task", "global-token", {"task": "q", "room_id": "!c:hs"})
-check("empty token list: the global token enqueues (legacy)", code == 200, str(data))
+check("emptied after provisioning: the global token is refused (503), never re-admitted", code == 503, str(data))
+code, data = post("/task", "global-token", {"task": "q", "access_tier": "guest", "room_id": "!c:hs"})
+check("emptied: the guest shim refuses (503)", code == 503, str(data))
+registry.unlink()
+scoped_routes = (
+    ("/guest-task with the global token", lambda m: post("/guest-task", "global-token", {"task": "q", "room_id": "!a:hs"}, m)),
+    ("/guest-task with a would-be room token", lambda m: post("/guest-task", "tok-a-enq", {"task": "q"}, m)),
+    ("the guest shim", lambda m: post("/task", "global-token", {"task": "q", "access_tier": "guest"}, m)),
+    ("/result of a Signal Room task", lambda m: get(f"/result/{task_a}", "global-token", m)),
+    ("/scan-text", lambda m: post("/scan-text", "global-token", {"texts": ["x"]}, m)),
+)
+for label, fn in scoped_routes:
+    code, data = fn(api)
+    check(f"registry deleted after provisioning: {label} is refused (503)", code == 503, str(data))
+check("refusals wrote no Signal Room task file", not list(api.TASK_DIR.glob("task-signal-*.txt")))
+code, data = get("/result/task-1", "global-token")
+check("owner /result still served", code == 200, str(data))
+code, data = post("/task", "global-token", {"from": "x", "task": "owner work 3"})
+check("owner /task still accepted", code == 200, str(data))
+restarted = load_api("agent_api_restarted")
+for label, fn in scoped_routes:
+    code, data = fn(restarted)
+    check(f"after a restart the marker still denies: {label} (503)", code == 503, str(data))
+st.write_registry(registry, [rows["a_enq"]])
+code, data = post("/guest-task", "tok-a-enq", {"task": "q"}, restarted)
+check("a rewritten registry with rows recovers after the restart", code == 200, str(data))
+park(data["task_id"])
+code, data = post("/guest-task", "global-token", {"task": "q", "room_id": "!a:hs"}, restarted)
+check("and the legacy token stays out", code == 403, str(data))
 
 print()
 if failures:

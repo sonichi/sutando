@@ -16,15 +16,23 @@ Revocation sets `revoked_at`; rotation appends a new row, republishes the
 roster, then revokes the old row. The file is re-read whenever its mtime/size
 changes, so a rotation lands without restarting the gateway.
 
-Registry state drives the capability flip (`state()`):
+Registry state drives the capability flip:
 
 * `unprovisioned` — no file, or a valid document that never held a row: the
   legacy global token is still accepted (an older daemon keeps working);
 * `provisioned` — at least one row, live OR revoked: only room tokens are
   accepted. Revoking every row does NOT re-admit the global token — a fully
   revoked registry is a locked door, not a missing one;
-* `invalid` — unreadable, wrong version, or any malformed row: every scoped
-  route fails closed until the engine rewrites the file.
+* `invalid` — unreadable, wrong version, any malformed row, OR a registry that
+  is missing/empty AFTER it was once provisioned: every scoped route fails
+  closed until the engine rewrites the file.
+
+Provisioning is irreversible. The first time a reader observes a row it writes
+`<workspace>/state/signal-room-tokens.provisioned` (0600, atomic); from then
+on — across restarts — a missing or emptied registry is a fault, never a
+return to the legacy gate. `authorize()` is the one entry point: state and
+match are computed from a single locked snapshot, so a file replaced between
+two reads can never split the verdict.
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ import threading
 from pathlib import Path
 
 REGISTRY_RELPATH = ("state", "signal-room-tokens.json")
+MARKER_SUFFIX = ".provisioned"
 SCOPE_ENQUEUE = "enqueue"
 SCOPE_READ = "read"
 SCOPES = frozenset({SCOPE_ENQUEUE, SCOPE_READ})
@@ -52,6 +61,11 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}\Z")
 
 def registry_path(workspace) -> Path:
     return Path(workspace).joinpath(*REGISTRY_RELPATH)
+
+
+def marker_path(workspace) -> Path:
+    """`<workspace>/state/signal-room-tokens.provisioned` — written once, never removed."""
+    return registry_path(workspace).with_suffix(MARKER_SUFFIX)
 
 
 def token_digest(salt: str, token: str) -> str:
@@ -74,27 +88,78 @@ def _valid_row(row) -> bool:
             and (row.get("revoked_at") is None or _is_int(row.get("revoked_at"))))
 
 
+def _atomic_write(path: Path, payload: str, prefix: str) -> None:
+    """0600 temp + fsync + rename, then fsync the directory — the engine's write shape."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=prefix, suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 class TokenRegistry:
     """mtime-cached view of the registry file; safe under the threaded server."""
 
-    def __init__(self, path):
+    def __init__(self, path, marker=None):
         self.path = Path(path)
+        self.marker = self.path.with_suffix(MARKER_SUFFIX) if marker is None else Path(marker)
         self._lock = threading.Lock()
         self._stamp = None
         self._rows: list[dict] = []
         self._state = STATE_UNPROVISIONED
         self._reason = ""
+        self._marked = False
 
     def _set_invalid(self, reason: str) -> None:
         # Unstamped so a rewrite is re-read at once; no row verifies meanwhile.
         self._stamp, self._rows, self._state, self._reason = None, [], STATE_INVALID, reason
 
+    def _provisioned_before(self) -> bool:
+        """Has any row ever been observed — in this process, or by the marker on disk?"""
+        if self._marked:
+            return True
+        try:
+            os.lstat(self.marker)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        self._marked = True
+        return True
+
+    def _mark_provisioned(self) -> None:
+        """Ensure the marker exists — re-checked on every registry change, so it self-heals."""
+        try:
+            os.lstat(self.marker)
+        except FileNotFoundError:
+            _atomic_write(self.marker, "provisioned\n", ".signal-room-tokens.provisioned.")
+        self._marked = True
+
     def _refresh(self) -> None:
+        marked = self._provisioned_before()
         try:
             st = os.stat(self.path)
             stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
         except FileNotFoundError:
-            self._stamp, self._rows, self._state, self._reason = None, [], STATE_UNPROVISIONED, ""
+            if marked:
+                self._set_invalid("registry missing after provisioning")
+            else:
+                self._stamp, self._rows, self._state, self._reason = None, [], STATE_UNPROVISIONED, ""
             return
         except OSError as exc:
             self._set_invalid(f"unreadable: {exc.__class__.__name__}")
@@ -117,21 +182,43 @@ class TokenRegistry:
             if not _valid_row(row):
                 self._set_invalid(f"malformed row {index}")
                 return
+        if rows:
+            try:
+                self._mark_provisioned()
+            except OSError as exc:
+                self._set_invalid(f"provisioning marker unwritable: {exc.__class__.__name__}")
+                return
+        elif marked:
+            self._set_invalid("registry emptied after provisioning")
+            return
         self._rows = list(rows)
         self._state = STATE_PROVISIONED if rows else STATE_UNPROVISIONED
         self._reason = ""
         self._stamp = stamp
 
-    def state(self) -> str:
+    def authorize(self, token) -> dict:
+        """One locked snapshot -> {"state", "match": {room_id, scope} | None, "reason"}.
+
+        The only read path: state and match come from the same parse of the
+        same file, so a registry replaced between two calls cannot flip a verdict.
+        `reason` says why the file is `invalid` (server log only; never token material).
+        """
         with self._lock:
             self._refresh()
-            return self._state
+            match = None
+            if isinstance(token, str) and token and self._state == STATE_PROVISIONED:
+                for row in self._rows:
+                    if row.get("revoked_at") is None and hmac.compare_digest(
+                            token_digest(row["salt"], token), row["sha256"]):
+                        match = {"room_id": row["room_id"], "scope": row["scope"]}
+                        break
+            return {"state": self._state, "match": match, "reason": self._reason}
+
+    def state(self) -> str:
+        return self.authorize(None)["state"]
 
     def invalid_reason(self) -> str:
-        """Why the file is `invalid` — for the server log; never carries token material."""
-        with self._lock:
-            self._refresh()
-            return self._reason
+        return self.authorize(None)["reason"]
 
     def active_rows(self) -> list[dict]:
         with self._lock:
@@ -140,32 +227,13 @@ class TokenRegistry:
 
     def verify(self, token: str) -> dict | None:
         """`{room_id, scope}` for a live token, else None (revoked rows never match)."""
-        if not isinstance(token, str) or not token:
-            return None
-        for row in self.active_rows():
-            if hmac.compare_digest(token_digest(row["salt"], token), row["sha256"]):
-                return {"room_id": row["room_id"], "scope": row["scope"]}
-        return None
+        return self.authorize(token)["match"]
 
 
 def write_registry(path, rows: list[dict]) -> None:
     """Atomic 0600 replace (temp + fsync + rename) — the engine's write shape."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".signal-room-tokens.", suffix=".tmp")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"v": 1, "tokens": list(rows)}, fh, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _atomic_write(Path(path), json.dumps({"v": 1, "tokens": list(rows)}, sort_keys=True),
+                  ".signal-room-tokens.")
 
 
 def make_row(room_id: str, scope: str, token: str, *, created_at_ms: int,

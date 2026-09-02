@@ -15,16 +15,26 @@ sweeps (threads or processes) from racing.
 Serve vs. sweep is a per-task flock on `<state>/task-leases/<task_id>.lock`: a
 serve holds it SHARED for its whole open/reserve/touch/stream, the sweeper takes
 it EXCLUSIVE (non-blocking — a busy task is skipped), re-reads the lease under
-it and deletes while holding it. The serve-quota counters agent-api keeps in
-`<state>/serve-quota/` go with the dir.
+it and deletes while holding it. The flock files — this one and the serve-quota
+`.lock` — are NEVER unlinked: unlinking a held lock file lets the next opener
+create a second inode, and two holders stop excluding each other. The sweeper
+removes the task dir, confirms deletion by ENOENT on a fresh stat, and only then
+removes the serve-quota counter agent-api keeps in `<state>/serve-quota/`; an
+rmtree failure is logged and the dir simply waits for the next pass.
+
+The counter itself is written as a durable zero at publish (`init_serve_quota`),
+before the task dir exists — so a serve that finds no counter for a task that
+exists is looking at corruption and refuses, not at a fresh task.
 """
 
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -69,6 +79,42 @@ def serve_quota_paths(state_dir, task_id: str) -> tuple[Path, Path]:
             _state_file(state_dir, SERVE_QUOTA_DIRNAME, f"{task_id}.lock"))
 
 
+def _fsync_dir(directory) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_serve_quota(quota, payload: dict) -> None:
+    """Atomic 0600 replace of the counter (temp + fsync + rename), then fsync of its dir."""
+    quota = Path(quota)
+    fd, tmp = tempfile.mkstemp(dir=str(quota.parent), prefix=f".{quota.stem}.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, quota)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(quota.parent)
+
+
+def init_serve_quota(state_dir, task_id: str) -> Path:
+    """The durable zero counter, written at publish BEFORE the task dir exists; never resets one."""
+    quota, _lock = serve_quota_paths(state_dir, task_id)
+    if not quota.exists():
+        write_serve_quota(quota, {"v": 1, "files": [], "serves": 0, "bytes": 0})
+    return quota
+
+
 def _open_lease_lock(state_dir, task_id: str) -> int:
     return os.open(lease_lock_path(state_dir, task_id), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 
@@ -84,12 +130,23 @@ def hold_task_lease(state_dir, task_id: str) -> int:
     return fd
 
 
-def _remove_task_state(state_dir, task_id: str) -> None:
-    for path in (*serve_quota_paths(state_dir, task_id), lease_lock_path(state_dir, task_id)):
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+def _remove_serve_quota(state_dir, task_id: str) -> None:
+    """The counter goes with the dir; the flock files beside it stay (stable inodes)."""
+    try:
+        os.unlink(serve_quota_paths(state_dir, task_id)[0])
+    except OSError:
+        pass
+
+
+def _gone(path) -> bool:
+    """Deletion is confirmed only by ENOENT on a fresh stat; any other answer is 'still there'."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _lease_mtime(task_dir: Path) -> float | None:
@@ -139,15 +196,17 @@ def _acquire_lock(results_dir: Path, now: float) -> bool:
 def sweep_task_outputs(results_dir, now: float | None = None, *, state_dir=None) -> dict:
     """One pass: remove abandoned `task-signal-*` dirs, keep live ones.
 
-    Returns {"removed": [...], "kept": [...], "busy": [...], "skipped": reason|None}
-    with dir names, so a caller (or test) can see exactly what happened. `busy`
-    lists dirs a serve held at that moment. `state_dir` defaults to the
-    workspace `state/` beside the results dir.
+    Returns {"removed": [...], "kept": [...], "busy": [...], "failed": [...],
+    "skipped": reason|None} with dir names, so a caller (or test) can see exactly
+    what happened. `busy` lists dirs a serve held at that moment; `failed` lists
+    dirs whose removal did not complete — their state is untouched and they are
+    retried next pass. `state_dir` defaults to the workspace `state/` beside the
+    results dir.
     """
     results_dir = Path(results_dir)
     state_dir = results_dir.parent / "state" if state_dir is None else Path(state_dir)
     stamp = time.time() if now is None else now
-    report: dict = {"removed": [], "kept": [], "busy": [], "skipped": None}
+    report: dict = {"removed": [], "kept": [], "busy": [], "failed": [], "skipped": None}
     if not results_dir.is_dir():
         report["skipped"] = "no results dir"
         return report
@@ -179,8 +238,19 @@ def sweep_task_outputs(results_dir, now: float | None = None, *, state_dir=None)
                 if lease is not None and stamp - lease <= LEASE_STALE_SEC:
                     report["kept"].append(task_dir.name)
                     continue
-                shutil.rmtree(task_dir, ignore_errors=True)
-                _remove_task_state(state_dir, task_dir.name)
+                try:
+                    shutil.rmtree(task_dir)
+                except OSError as exc:
+                    print(f"  [retention] could not remove {task_dir.name} "
+                          f"({exc.__class__.__name__}); retrying next pass", file=sys.stderr)
+                    report["failed"].append(task_dir.name)
+                    continue
+                if not _gone(task_dir):
+                    print(f"  [retention] {task_dir.name} still present after rmtree; "
+                          f"state kept, retrying next pass", file=sys.stderr)
+                    report["failed"].append(task_dir.name)
+                    continue
+                _remove_serve_quota(state_dir, task_dir.name)
                 report["removed"].append(task_dir.name)
             finally:
                 os.close(lock_fd)

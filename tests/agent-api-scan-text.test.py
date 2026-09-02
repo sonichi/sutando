@@ -10,8 +10,11 @@ Exercises the real Handler.do_POST (same harness as agent-api-guest-routes):
   * auth is registry-scoped exactly like /guest-task: the legacy global token
     works until a live per-room row exists, then only a per-room ENQUEUE token
     whose room equals the body room_id (cross-room 403, read scope 403), and
-    it stays refused once every row is revoked, and an invalid file is a 503;
-  * input validation: bearer, Content-Length caps, texts shape/limits.
+    it stays refused once every row is revoked, an invalid file is a 503, and
+    provisioning is irreversible — an emptied or deleted registry is a 503,
+    never a return to the legacy gate;
+  * input validation (run while still unprovisioned): bearer, Content-Length
+    caps, texts shape/limits.
 
 Run: `python3 tests/agent-api-scan-text.test.py`
 """
@@ -147,6 +150,38 @@ def run() -> None:
     finally:
         egress.guard_result_for_tier = real_guard
 
+    # --- input validation -----------------------------------------------------
+    h = post({"texts": ["x"]}, token="wrong")
+    check("wrong bearer -> 401", h._responses[0][0] == 401)
+    h = post({"texts": ["x"]}, token=None)
+    check("missing bearer -> 401", h._responses[0][0] == 401)
+
+    h = make_handler("/scan-text", {"Content-Length": "999999"})
+    h.do_POST()
+    check("oversized request -> 413 before the body is read",
+          h._responses[0][0] == 413 and h.rfile.read_calls == 0)
+
+    h = make_handler("/scan-text", {"Content-Length": "nope"})
+    h.do_POST()
+    check("invalid Content-Length -> 400", h._responses[0][0] == 400)
+
+    h = make_handler("/scan-text", {"Content-Length": "5"}, b"{oops")
+    h.do_POST()
+    check("malformed JSON -> 400", h._responses[0][0] == 400)
+
+    # [1] and "hi" are valid JSON that is not an object: they parse, then reach
+    # .get() outside the except and raised instead of returning 400.
+    for bad in ({}, {"texts": []}, {"texts": "one"}, {"texts": [1]},
+                {"texts": ["x"] * 65}, {"texts": ["y" * 16385]},
+                [1], "hi"):
+        h = post(bad)
+        if h._responses[0][0] != 400:
+            check(f"bad texts shape rejected: {str(bad)[:40]}", False)
+            break
+    else:
+        check("every bad texts shape -> 400", True)
+
+
     # --- registry-scoped auth, mirroring /guest-task ---------------------------
     egress.guard_result_for_tier = lambda body, tier, repo, *a, **kw: (body, None)
     registry = agent_api.SIGNAL_TOKEN_REGISTRY
@@ -191,41 +226,16 @@ def run() -> None:
         check("invalid registry: a room token is refused (503)", h._responses[0][0] == 503)
         st.write_registry(registry, [])
         h = post({"texts": ["x"], "room_id": "!a:hs"}, token=GLOBAL)
-        check("empty token list: unprovisioned, the global token is accepted", h._responses[0][0] == 200)
+        check("emptied after provisioning: the global token is refused (503), never re-admitted",
+              h._responses[0][0] == 503)
+        registry.unlink()
+        h = post({"texts": ["x"], "room_id": "!a:hs"}, token=GLOBAL)
+        check("deleted after provisioning: still 503 — the marker outlives the file",
+              h._responses[0][0] == 503 and st.marker_path(_TEST_WS).is_file())
+        h = post({"texts": ["x"]}, token="tok-a-enq")
+        check("deleted after provisioning: a would-be room token is refused too (503)", h._responses[0][0] == 503)
     finally:
         egress.guard_result_for_tier = real_guard
-        registry.unlink(missing_ok=True)
-
-    # --- input validation -----------------------------------------------------
-    h = post({"texts": ["x"]}, token="wrong")
-    check("wrong bearer -> 401", h._responses[0][0] == 401)
-    h = post({"texts": ["x"]}, token=None)
-    check("missing bearer -> 401", h._responses[0][0] == 401)
-
-    h = make_handler("/scan-text", {"Content-Length": "999999"})
-    h.do_POST()
-    check("oversized request -> 413 before the body is read",
-          h._responses[0][0] == 413 and h.rfile.read_calls == 0)
-
-    h = make_handler("/scan-text", {"Content-Length": "nope"})
-    h.do_POST()
-    check("invalid Content-Length -> 400", h._responses[0][0] == 400)
-
-    h = make_handler("/scan-text", {"Content-Length": "5"}, b"{oops")
-    h.do_POST()
-    check("malformed JSON -> 400", h._responses[0][0] == 400)
-
-    # [1] and "hi" are valid JSON that is not an object: they parse, then reach
-    # .get() outside the except and raised instead of returning 400.
-    for bad in ({}, {"texts": []}, {"texts": "one"}, {"texts": [1]},
-                {"texts": ["x"] * 65}, {"texts": ["y" * 16385]},
-                [1], "hi"):
-        h = post(bad)
-        if h._responses[0][0] != 400:
-            check(f"bad texts shape rejected: {str(bad)[:40]}", False)
-            break
-    else:
-        check("every bad texts shape -> 400", True)
 
 
 run()

@@ -95,7 +95,7 @@ def output_contract(task_id: str, output_root) -> str:
 
 
 def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str = "",
-                            requested_by: str = "", output_root=None) -> str:
+                            requested_by: str = "", output_root=None, state_dir=None) -> str:
     """Write one Signal Room request as a normal Sutando task. Returns its id.
 
     The id is in the canonical ``task-*`` namespace because that is what the core
@@ -103,8 +103,11 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
     list — that visibility is the feature, not a leak.
 
     ``output_root`` (the results dir) enables the generated-image capability: the
-    task body opens with `output_contract` and `<output_root>/<task_id>/` is
-    created for the worker. Without it the body is the request alone.
+    task body opens with `output_contract`, the task's durable zero serve-quota
+    counter is written under ``state_dir`` (default: the workspace `state/` beside
+    the results dir), and only then is `<output_root>/<task_id>/` created for the
+    worker — nothing is servable before its counter exists. Without an output
+    root the body is the request alone.
     """
     task_dir = Path(task_dir)
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -149,6 +152,9 @@ def submit_signal_room_task(task_text: str, task_dir, confine, *, room_id: str =
                 pass
             raise
     if output_root is not None:
+        import task_output_retention
+        state_dir = Path(output_root).parent / "state" if state_dir is None else Path(state_dir)
+        task_output_retention.init_serve_quota(state_dir, task_id)
         task_output_dir(output_root, task_id).mkdir(mode=0o700, parents=True, exist_ok=True)
     return task_id
 
