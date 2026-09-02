@@ -1340,9 +1340,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 self.send_json(400, {"error": "invalid JSON"})
                 return
-            # json.loads succeeds on any JSON VALUE, so a well-formed `[1]` or
-            # `"hi"` reaches .get() and raises AttributeError outside the except
-            # above — an uncaught 500 for an authenticated caller, not a 400.
+            # json.loads accepts any JSON value, so `[1]` reaches .get() outside
+            # the except above and raises instead of returning this 400.
             if not isinstance(data, dict):
                 self.send_json(400, {"error": "body must be a JSON object"})
                 return
