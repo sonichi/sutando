@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import time
 import multiprocessing
+import os
 import re
 import sys
 import tempfile
@@ -18,6 +19,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import task_workstreams as workstreams  # noqa: E402
+
+# The enqueue is off by default; its gate is exercised directly in
+# test_classifier_enqueue_is_off_by_default. Every other test assumes it on.
+os.environ["SUTANDO_WORKSTREAM_CLASSIFIER"] = "on"
 
 
 def inherit_worker(workspace: str, child_id: str, start) -> None:
@@ -337,6 +342,20 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
     ):
         settled = workstreams.maybe_enqueue_classifier_task(workspace)
     assert not settled.pending and not settled.enqueued and settled.reason == "complete"
+
+
+def test_classifier_enqueue_is_off_by_default() -> None:
+    workspace = fixture_workspace()
+    # Unset: the gate refuses before any work; nothing is queued.
+    with mock.patch.dict(os.environ, {"SUTANDO_WORKSTREAM_CLASSIFIER": ""}):
+        off = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert not off.pending and not off.enqueued and off.reason == "disabled"
+    assert not list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
+    # A truthy value re-enables it; the same ready workspace now queues one.
+    with mock.patch.dict(os.environ, {"SUTANDO_WORKSTREAM_CLASSIFIER": "on"}):
+        on = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert on.pending and on.enqueued and on.reason == "enqueued"
+    assert list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
 
     write_task(
         workspace / "tasks" / "archive" / "2026-08" / "task-new.txt",
@@ -980,6 +999,7 @@ def main() -> None:
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
+        test_classifier_enqueue_is_off_by_default,
         test_classifier_task_is_envelope_stamped,
         test_classifier_task_survives_a_raising_stamper,
         test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
