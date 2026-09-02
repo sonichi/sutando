@@ -371,13 +371,13 @@ _SIG="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 _INT="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha.next"
 _DST="$WORKSPACE_DIR/hosts/testhost/build_log.md"
 
-# Inject a durability failure with no seam in production code: the fsync helper runs
-# `python3 - <path>`, so shim SYNC_PY — the seam the resolver itself honours.
+# Inject a durability failure through SYNC_PY, the seam the resolver honours. The argument
+# is a full glob: `<dst>.snap.XXXXXX` is fsynced first, so a bare substring hits staging.
 _fsync_shim() {
     _fs="$(mktemp -d)"
     cat > "$_fs/python3" <<SHIM
 #!/bin/sh
-case "\$2" in *"$1"*) exit 1 ;; esac
+case "\$2" in $1) exit 1 ;; esac
 exec "$(command -v python3)" "\$@"
 SHIM
     chmod +x "$_fs/python3"
@@ -396,7 +396,7 @@ _arm_owned_snapshot() {
 # (a) the INTENT cannot be made durable -> the swap must not happen at all.
 _arm_owned_snapshot
 _before="$(cat "$_DST")"
-_fs="$(_fsync_shim ".snapshot-sha.next")"
+_fs="$(_fsync_shim "*.snapshot-sha.next")"
 SYNC_PY="$_fs/python3" _snapshot_per_host_config >/dev/null 2>&1
 rm -rf "$_fs"
 check "a) intent not durable: the destination is NOT replaced" \
@@ -407,7 +407,7 @@ check "...and no intent is left behind" '[ ! -f "$_INT" ]'
 # promoted; the intent survives so the next tick can verify and finish.
 _arm_owned_snapshot
 _sig_before="$(cat "$_SIG")"
-_fs="$(_fsync_shim "/build_log.md")"
+_fs="$(_fsync_shim "*/build_log.md")"
 SYNC_PY="$_fs/python3" _snapshot_per_host_config > "$SB/b.out" 2>&1
 rm -rf "$_fs"
 check "b) destination not confirmed durable: the signature is NOT promoted" \
@@ -541,7 +541,7 @@ check "...and no repair temp is left in the carried vault path" \
 #     stands. An in-place write would already have overwritten it here.
 _arm_stale_sig_equal_content
 _stale="$(cat "$_SIG")"
-_fs="$(_fsync_shim ".snapshot-sha.repair")"
+_fs="$(_fsync_shim "*.snapshot-sha.repair.*")"
 SYNC_PY="$_fs/python3" _snapshot_per_host_config >/dev/null 2>&1
 rm -rf "$_fs"
 check "b) repair not durable: the previous signature is untouched" \
@@ -583,6 +583,106 @@ printf 'late append through the old descriptor\n' >&7
 exec 7>&-
 check "control: a rename-over replace DOES lose the late append" \
       '[ "$(grep -c "late append through the old descriptor" "$_DST")" = "0" ]'
+
+echo "16. a SHORT WRITE after the truncate is rolled forward, never left partial"
+# A one-block soft RLIMIT_FSIZE applied ONLY to the named python mode(s): staging (cp) and
+# the fsync helper run unlimited, so the truncate happens and the write stops after one block.
+_fsize_shim() {
+    _fz="$(mktemp -d)"
+    cat > "$_fz/python3" <<SHIM
+#!/bin/bash
+case "\$2" in $1) ulimit -S -f 1 ;; esac
+exec "$(command -v python3)" "\$@"
+SHIM
+    chmod +x "$_fz/python3"
+    printf '%s' "$_fz"
+}
+_arm_big_root() {
+    # an owned snapshot whose root then grows well past one block
+    printf 'owned baseline\n' > "$WORKSPACE_DIR/build_log.md"
+    printf 'owned baseline\n' > "$_DST"
+    shasum -a 256 "$_DST" | cut -d' ' -f1 > "$_SIG"
+    rm -f "$_INT" "$_DST".snap.??????
+    { printf 'owned baseline\n'
+      awk 'BEGIN{for(i=0;i<200;i++)printf "root advanced line %04d ........................................\n", i}'
+    } > "$WORKSPACE_DIR/build_log.md"
+}
+_root_sha() { shasum -a 256 "$WORKSPACE_DIR/build_log.md" | cut -d' ' -f1; }
+_dst_is_strict_prefix_of_root() {
+    _n="$(wc -c < "$_DST" | tr -d ' ')"
+    [ "$_n" -gt 0 ] && [ "$_n" -lt "$(wc -c < "$WORKSPACE_DIR/build_log.md" | tr -d ' ')" ] &&
+        head -c "$_n" "$WORKSPACE_DIR/build_log.md" | cmp -s - "$_DST"
+}
+
+# (a) same tick: --replace stops short, --rollforward (unlimited) finishes it.
+_arm_big_root
+_fz="$(_fsize_shim "--replace")"
+SYNC_PY="$_fz/python3" _snapshot_per_host_config > "$SB/16a.out" 2>&1; _rc16a=$?
+rm -rf "$_fz"
+check "a) after a short write the destination holds the WHOLE root" \
+      'cmp -s "$WORKSPACE_DIR/build_log.md" "$_DST"'
+check "...provenance records the whole bytes" '[ "$(cat "$_SIG")" = "$(_root_sha)" ]'
+check "...no staged copy or intent is left behind" \
+      '[ ! -f "$_INT" ] && [ -z "$(ls "$_DST".snap.* 2>/dev/null)" ]'
+check "...the function reports success (nothing for the tick to withhold)" '[ "$_rc16a" -eq 0 ]'
+check "...and the same-tick roll-forward is recorded in \$LOG" \
+      'grep -q "stopped short; rolled forward from the staged copy in the same tick" "$LOG"'
+
+# (b) the roll-forward ALSO stops short: partial is reported, kept recoverable, withheld from the push.
+_arm_big_root
+_fz="$(_fsize_shim "--replace|--rollforward")"
+SYNC_PY="$_fz/python3" _snapshot_per_host_config > "$SB/16b.out" 2>&1; _rc16b=$?
+rm -rf "$_fz"
+check "b) both writes short: the destination is a strict PREFIX of root" '_dst_is_strict_prefix_of_root'
+check "...the signature still names the OLD bytes (nothing claimed that is not there)" \
+      '[ "$(cat "$_SIG")" = "$(printf "owned baseline\n" | shasum -a 256 | cut -d" " -f1)" ]'
+check "...the staged copy and the intent are KEPT for recovery" \
+      '[ -f "$_INT" ] && [ -n "$(ls "$_DST".snap.* 2>/dev/null)" ]'
+check "...the function returns 3 so the tick withholds the push" '[ "$_rc16b" -eq 3 ]'
+check "...and the operator is told on stderr" 'grep -q "PARTIAL" "$SB/16b.out"'
+# ...next tick, unlimited: recovery rolls forward from the kept copy and promotes.
+_snapshot_per_host_config > "$SB/16b2.out" 2>&1; _rc16b2=$?
+check "...the next tick rolls forward to the WHOLE root" 'cmp -s "$WORKSPACE_DIR/build_log.md" "$_DST"'
+check "...promotes provenance" '[ "$(cat "$_SIG")" = "$(_root_sha)" ]'
+check "...cleans up and reports success" \
+      '[ ! -f "$_INT" ] && [ -z "$(ls "$_DST".snap.* 2>/dev/null)" ] && [ "$_rc16b2" -eq 0 ]'
+check "...and the recovery is recorded in \$LOG" \
+      'grep -q "rolled hosts/testhost/build_log.md forward from its staged copy" "$LOG"'
+
+# (c) KILL mid-write: only the on-disk state survives — a prefix, a durable intent, a staged copy.
+_arm_big_root
+_ino="$(ls -i "$_DST" | awk "{print \$1}")"
+_stg="$(mktemp "$_DST.snap.XXXXXX")"; cp "$WORKSPACE_DIR/build_log.md" "$_stg"; _root_sha > "$_INT"
+head -c 700 "$WORKSPACE_DIR/build_log.md" > "$_DST"
+_snapshot_per_host_config > /dev/null 2>&1; _rc16c=$?
+check "c) a kill mid-write is completed from the staged copy on the next tick" \
+      'cmp -s "$WORKSPACE_DIR/build_log.md" "$_DST" && [ "$_rc16c" -eq 0 ]'
+check "...with provenance promoted and nothing left behind" \
+      '[ "$(cat "$_SIG")" = "$(_root_sha)" ] && [ ! -f "$_INT" ] && [ -z "$(ls "$_DST".snap.* 2>/dev/null)" ]'
+check "...and the destination inode is unchanged by the roll-forward" \
+      '[ "$(ls -i "$_DST" | awk "{print \$1}")" = "$_ino" ]'
+
+# (d) control: a destination that is NOT a prefix of the staged copy is never written over.
+_arm_big_root
+_stg="$(mktemp "$_DST.snap.XXXXXX")"; cp "$WORKSPACE_DIR/build_log.md" "$_stg"; _root_sha > "$_INT"
+{ head -c 700 "$WORKSPACE_DIR/build_log.md"; printf 'foreign append\n'; } > "$_DST"
+_before="$(shasum -a 256 < "$_DST")"
+_snapshot_per_host_config > "$SB/16d.out" 2>&1
+check "d) control: a non-prefix destination is left exactly as found" \
+      '[ "$(shasum -a 256 < "$_DST")" = "$_before" ]'
+check "...the intent and staged copy are discarded, loudly" \
+      '[ ! -f "$_INT" ] && [ -z "$(ls "$_DST".snap.* 2>/dev/null)" ] && grep -q "neither its publish intent" "$SB/16d.out"'
+check "...and the signature is not promoted to bytes that are not there" \
+      '[ "$(cat "$_SIG")" != "$(_root_sha)" ]'
+
+# (e) control: a staged copy whose sha is NOT the intent's grants nothing.
+_arm_big_root
+_stg="$(mktemp "$_DST.snap.XXXXXX")"; printf 'unrelated staged bytes\n' > "$_stg"; _root_sha > "$_INT"
+head -c 700 "$WORKSPACE_DIR/build_log.md" > "$_DST"
+_snapshot_per_host_config > /dev/null 2>&1
+check "e) control: an unmatched staged copy is ignored (intent discarded, destination untouched)" \
+      '[ ! -f "$_INT" ] && [ "$(wc -c < "$_DST" | tr -d " ")" = "700" ]'
+rm -f "$_stg"
 
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

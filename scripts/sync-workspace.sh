@@ -922,17 +922,18 @@ _snapshot_per_host_config() {
             echo diverged
         fi
     }
-    # Replace the destination's BYTES, never its inode: an appender holding an open
-    # O_APPEND descriptor keeps landing in the file. Exit 2 = changed under the lock.
+    # Replace the destination's BYTES, never its inode (an open O_APPEND descriptor keeps landing).
+    # Exit 2 = refused under the lock; exit 3 = dst left a PREFIX of staged (--rollforward finishes it).
     _replace_in_place() {
         local _py="${SYNC_PY:-}"
         if [ -z "$_py" ] || [ ! -f "$_py" ] || [ ! -x "$_py" ]; then
             _py="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
         fi
         [ -n "$_py" ] && [ -f "$_py" ] && [ -x "$_py" ] || return 1
-        "$_py" - --replace "$1" "$2" "$3" <<'PY' 2>/dev/null
+        "$_py" - "$@" <<'PY' 2>/dev/null
 import fcntl, hashlib, os, sys
-_, src, dst, expected = sys.argv[1:]
+mode, src, dst = sys.argv[1:4]
+expected = sys.argv[4] if len(sys.argv) > 4 else None
 with open(src, "rb") as f:
     data = f.read()
 fd = os.open(dst, os.O_RDWR | os.O_CREAT, 0o644)
@@ -940,15 +941,32 @@ try:
     fcntl.flock(fd, fcntl.LOCK_EX)
     with open(fd, "rb", closefd=False) as f:
         cur = f.read()
-    # An empty `expected` means the caller saw NO destination: only a fresh, empty file qualifies.
-    if hashlib.sha256(cur).hexdigest() != expected and not (expected == "" and not cur):
-        sys.exit(2)
-    os.ftruncate(fd, 0)
-    os.lseek(fd, 0, os.SEEK_SET)
-    view = memoryview(data)
-    while view:
-        view = view[os.write(fd, view):]
-    os.fsync(fd)
+    if mode == "--replace":
+        # An empty `expected` means the caller saw NO destination: only a fresh, empty file qualifies.
+        if hashlib.sha256(cur).hexdigest() != expected and not (expected == "" and not cur):
+            sys.exit(2)
+        view = memoryview(data)
+    else:
+        if cur == data:
+            sys.exit(0)
+        # A short write leaves a prefix; anything else is not ours to finish. Only the
+        # missing suffix is written, so a second failure still leaves a longer prefix.
+        if not data.startswith(cur):
+            sys.exit(2)
+        view = memoryview(data)[len(cur):]
+    partial = mode != "--replace"
+    try:
+        if mode == "--replace":
+            os.ftruncate(fd, 0)
+            partial = True
+            os.lseek(fd, 0, os.SEEK_SET)
+        else:
+            os.lseek(fd, len(cur), os.SEEK_SET)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    except OSError:
+        sys.exit(3 if partial else 1)
 finally:
     os.close(fd)
 PY
@@ -980,6 +998,19 @@ finally:
 PY
     }
 
+    # The staged copy whose bytes the intent names, if one survived; empty otherwise.
+    _staged_copy_matching() {
+        local _f
+        for _f in "$1".snap.??????; do
+            [ -f "$_f" ] || continue
+            if [ "$(shasum -a 256 "$_f" 2>/dev/null | cut -d' ' -f1)" = "$2" ]; then
+                printf '%s' "$_f"
+                return 0
+            fi
+        done
+        return 1
+    }
+
     # An interrupted publish leaves an INTENT beside the signature; recovery trusts the
     # destination's bytes, not the intent. Malformed, stale and ambiguous fail closed.
     _recover_snapshot_publish() {
@@ -992,6 +1023,31 @@ PY
             return 0
         fi
         [ -f "$_d" ] && _have="$(shasum -a 256 "$_d" 2>/dev/null | cut -d' ' -f1)"
+        if [ "$_have" != "$_want" ]; then
+            # A durable staged copy that matches the intent turns a partial destination
+            # (short write, kill mid-write) into a roll-forward instead of a discard.
+            local _staged _rrc=0
+            _staged="$(_staged_copy_matching "$_d" "$_want")" || _staged=""
+            if [ -n "$_staged" ]; then
+                _replace_in_place --rollforward "$_staged" "$_d" || _rrc=$?
+                if [ "$_rrc" -eq 0 ]; then
+                    rm -f "$_staged" 2>/dev/null || true
+                    if ! _fsync_path_and_dir "$_d"; then
+                        log "snapshot: rolled-forward destination not confirmed durable; intent left for the next tick"
+                        return 0
+                    fi
+                    _have="$_want"
+                    log "snapshot: rolled hosts/$(_host)/build_log.md forward from its staged copy"
+                elif [ "$_rrc" -eq 2 ]; then
+                    rm -f "$_i" "$_staged" 2>/dev/null || true
+                    warn_operator "snapshot: hosts/$(_host)/build_log.md matches neither its publish intent nor a prefix of the staged copy — a writer changed it mid-publish; intent and staged copy discarded, per-host copy left as found (root build_log.md still holds the intended content)"
+                    return 0
+                else
+                    log "snapshot: roll-forward of hosts/$(_host)/build_log.md failed; staged copy and intent kept for the next tick"
+                    return 3
+                fi
+            fi
+        fi
         if [ -n "$_have" ] && [ "$_have" = "$_want" ]; then
             # The move landed; only the promote was lost. Finish it.
             mv -f "$_i" "$_s" 2>/dev/null || {
@@ -1045,7 +1101,10 @@ PY
         local _src="$WORKSPACE_DIR/build_log.md"
         local _dst="$_host_dir/build_log.md" _sig="$_host_dir/.build_log.snapshot-sha"
         local _int="$_host_dir/.build_log.snapshot-sha.next"
-        _recover_snapshot_publish "$_dst" "$_sig" "$_int"
+        local _partial=0
+        _recover_snapshot_publish "$_dst" "$_sig" "$_int" || _partial=$?
+        # A destination still partial after recovery must not be pushed as if it were whole.
+        [ "$_partial" -eq 3 ] && return 3
         local _cur="" _rec=""
         [ -f "$_dst" ] && _cur="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
         # Validate raw bytes BEFORE any $(): substitution strips NULs, so a
@@ -1076,13 +1135,24 @@ PY
                 _new="$(shasum -a 256 "$_tmp" 2>/dev/null | cut -d' ' -f1)"
                 [ -f "$_dst" ] && _now="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
                 if [ "$_now" = "$_cur" ]; then
-                    # Publish the INTENT durably first: a crash after the swap then leaves a record the
-                    # next tick can complete. Every step fails CLOSED; none may be skipped.
-                    if ! printf '%s\n' "$_new" > "$_int" 2>/dev/null ||
+                    # The staged copy is the roll-forward source and the INTENT names it; both must be
+                    # durable BEFORE the destination is truncated. Every step fails CLOSED; none may be skipped.
+                    local _rrc=0
+                    if ! _fsync_path_and_dir "$_tmp"; then
+                        rm -f "$_tmp" 2>/dev/null || true
+                        warn_operator "snapshot refused: could not make the staged copy of hosts/$(_host)/build_log.md durable; per-host copy and provenance left unchanged"
+                    elif ! printf '%s\n' "$_new" > "$_int" 2>/dev/null ||
                         ! _fsync_path_and_dir "$_int"; then
                         rm -f "$_tmp" "$_int" 2>/dev/null || true
                         warn_operator "snapshot refused: could not durably record the publish intent for hosts/$(_host)/build_log.md; per-host copy and provenance left unchanged"
-                    elif _replace_in_place "$_tmp" "$_dst" "$_cur"; then
+                    elif _replace_in_place --replace "$_tmp" "$_dst" "$_cur" || {
+                            _rrc=$?
+                            # Partial destination: finish from the durable copy now, not next tick.
+                            [ "$_rrc" -eq 3 ] && _replace_in_place --rollforward "$_tmp" "$_dst" && {
+                                _rrc=0
+                                log "snapshot: in-place write of hosts/$(_host)/build_log.md stopped short; rolled forward from the staged copy in the same tick"
+                            }
+                        }; then
                         rm -f "$_tmp" 2>/dev/null || true
                         # The destination must be durable BEFORE the signature claims it; if it is not,
                         # leave the intent for the next tick to verify or discard.
@@ -1101,10 +1171,12 @@ PY
                                 warn_operator "snapshot: signature for hosts/$(_host)/build_log.md is NOT confirmed durable and the recovery intent could not be re-created; provenance may be lost on a crash"
                             fi
                         fi
+                    elif [ "$_rrc" -eq 3 ]; then
+                        # The staged copy is vault-excluded and the intent names it: both stay so the
+                        # next tick's recovery rolls forward. Returning 3 keeps this tick from pushing.
+                        _partial=3
+                        warn_operator "snapshot: hosts/$(_host)/build_log.md is PARTIAL — the in-place write failed after the truncate and the roll-forward also failed; staged copy and intent kept for the next tick, this sync will not push it"
                     else
-                        local _rrc=$?
-                        # hosts/*/ is a carried vault path: a temp left here is
-                        # committed and pushed again on every subsequent sync.
                         rm -f "$_tmp" "$_int" 2>/dev/null || true
                         if [ "$_rrc" -eq 2 ]; then
                             warn_operator "snapshot refused: hosts/$(_host)/build_log.md changed between check and replace; a live writer is active — not clobbering"
@@ -1131,6 +1203,7 @@ PY
                 warn_operator "snapshot refused: hosts/$(_host)/build_log.md has an independent writer (content differs from the recorded snapshot); root and per-host both claim build_log — pick ONE writer and archive the other"
             fi
         fi
+        return "$_partial"
     fi
     return 0
 }
@@ -1679,7 +1752,15 @@ _push_only_impl() {
     # Back up per-host config ($CLAUDE_CONFIG_DIR settings.json + channel
     # access.json) into hosts/<host>/ before staging, so it's carried + survives
     # a rebuild. Non-fatal: never blocks the push.
-    _snapshot_per_host_config || color_warn "sync-workspace: per-host config snapshot failed (non-fatal); push continues"
+    local _snap_rc=0
+    _snapshot_per_host_config || _snap_rc=$?
+    if [ "$_snap_rc" -eq 3 ]; then
+        # A partial per-host build_log must not be vaulted as if whole; the next tick rolls it forward.
+        color_warn "sync-workspace: per-host build_log snapshot is PARTIAL after a failed write; not pushing this tick"
+        return 1
+    elif [ "$_snap_rc" -ne 0 ]; then
+        color_warn "sync-workspace: per-host config snapshot failed (non-fatal); push continues"
+    fi
     # Rescue this host's anchor BEFORE carrier enforcement can untrack it
     # (#2567/#2607). `--push-only` never reaches `_pull_only_impl`, so without
     # this call the enforcement below regenerates the exclude, untracks the

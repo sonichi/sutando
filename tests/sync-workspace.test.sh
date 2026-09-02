@@ -332,6 +332,73 @@ fi
 
 # ============================================================================
 echo
+echo "==== Test 2c: a PARTIAL per-host build_log is withheld from the push, then rolled forward ===="
+# Publish root once cleanly so the per-host copy is an owned, recorded snapshot.
+printf 'seeded build log\n' > "$FIXTURE_WS/build_log.md"
+run_sync --push-only >/dev/null 2>&1 || true
+PARTIAL_DST="$FIXTURE_WS/hosts/$HOST/build_log.md"
+if cmp -s "$FIXTURE_WS/build_log.md" "$PARTIAL_DST"; then
+  echo "  OK: precondition — per-host copy published from root"; pass=$((pass+1))
+else
+  echo "  FAIL: precondition — per-host copy not published from root"; fail=$((fail+1))
+fi
+# Grow root past one block, then make every in-place write stop short AFTER the truncate:
+# a one-block RLIMIT_FSIZE on the --replace/--rollforward interpreters only, injected
+# through the resolver the script itself honours (`sutando-config.sh python-bin`).
+awk 'BEGIN{for(i=0;i<200;i++)printf "vault-visible line %04d ........................................\n", i}' \
+  >> "$FIXTURE_WS/build_log.md"
+SHIM_DIR="$TEST_ROOT/fsize-shim"; mkdir -p "$SHIM_DIR"
+cat > "$SHIM_DIR/python3" <<SHIM
+#!/bin/bash
+case "\$2" in --replace|--rollforward) ulimit -S -f 1 ;; esac
+exec "$(command -v python3)" "\$@"
+SHIM
+chmod +x "$SHIM_DIR/python3"
+mv "$FIXTURE_REPO/scripts/sutando-config.sh" "$FIXTURE_REPO/scripts/sutando-config.real.sh"
+cat > "$FIXTURE_REPO/scripts/sutando-config.sh" <<WRAP
+#!/bin/bash
+case "\$1" in python-bin) echo "$SHIM_DIR/python3"; exit 0 ;; esac
+exec bash "$FIXTURE_REPO/scripts/sutando-config.real.sh" "\$@"
+WRAP
+chmod +x "$FIXTURE_REPO/scripts/sutando-config.sh"
+VAULT_BEFORE=$(git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH")
+partial_out=$(run_sync --push-only 2>&1 || true)
+mv -f "$FIXTURE_REPO/scripts/sutando-config.real.sh" "$FIXTURE_REPO/scripts/sutando-config.sh"
+assert_contains "the tick says why it is not pushing" "not pushing this tick" "$partial_out"
+VAULT_AFTER=$(git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH")
+if [ "$VAULT_BEFORE" = "$VAULT_AFTER" ]; then
+  echo "  OK: the vault branch did NOT advance while the per-host copy was partial"; pass=$((pass+1))
+else
+  echo "  FAIL: a partial per-host build_log was pushed ($VAULT_BEFORE -> $VAULT_AFTER)"; fail=$((fail+1))
+fi
+dst_n=$(wc -c < "$PARTIAL_DST" | tr -d ' '); root_n=$(wc -c < "$FIXTURE_WS/build_log.md" | tr -d ' ')
+if [ "$dst_n" -gt 0 ] && [ "$dst_n" -lt "$root_n" ] && head -c "$dst_n" "$FIXTURE_WS/build_log.md" | cmp -s - "$PARTIAL_DST"; then
+  echo "  OK: the per-host copy is a strict prefix of root (partial, recoverable)"; pass=$((pass+1))
+else
+  echo "  FAIL: the per-host copy is not a partial prefix of root (dst=$dst_n root=$root_n)"; fail=$((fail+1))
+fi
+# The next tick, with a working interpreter, rolls forward and pushes the whole file.
+rollfwd_out=$(run_sync --push-only 2>&1 || true)
+if cmp -s "$FIXTURE_WS/build_log.md" "$PARTIAL_DST"; then
+  echo "  OK: the next tick rolled the per-host copy forward to the whole root"; pass=$((pass+1))
+else
+  echo "  FAIL: the per-host copy was not rolled forward: $rollfwd_out"; fail=$((fail+1))
+fi
+VAULT_ROLLED=$(git --git-dir="$FIXTURE_VAULT" rev-parse "$HOST_BRANCH")
+if [ "$VAULT_ROLLED" != "$VAULT_AFTER" ]; then
+  echo "  OK: the roll-forward tick pushed"; pass=$((pass+1))
+else
+  echo "  FAIL: the roll-forward tick did not push: $rollfwd_out"; fail=$((fail+1))
+fi
+if [ "$(git --git-dir="$FIXTURE_VAULT" ls-tree -r --name-only "$HOST_BRANCH" | grep -c 'build_log\.md\.snap\.')" = "0" ]; then
+  echo "  OK: no staged copy reached the vault"; pass=$((pass+1))
+else
+  echo "  FAIL: a staged copy was vaulted"; fail=$((fail+1))
+fi
+rm -rf "$SHIM_DIR"
+
+# ============================================================================
+echo
 echo "==== Test 3: idempotent re-init ===="
 out_reinit=$(run_sync --init 2>&1)
 if echo "$out_reinit" | grep -q "already a git repo"; then
