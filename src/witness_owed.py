@@ -27,8 +27,42 @@ from pathlib import Path
 
 
 _RECORD_KEY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
+_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
+_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 FIELDS = ("repo", "pr", "head", "host", "reason", "opened_by", "opened_at")
+STAMP_NAME = ".published"
+DEFAULT_MAX_AGE_S = 3600.0
+
+
+def validate_record(data: object, path: Path) -> dict:
+    """The full schema, and the file's place against its payload: a record
+    whose name, directory host or any value disagrees is not a record."""
+    if not isinstance(data, dict):
+        raise ValueError("not an object")
+    for k in FIELDS:
+        if k not in data:
+            raise ValueError(f"missing field {k}")
+    repo, pr, head, host = data["repo"], data["pr"], data["head"], data["host"]
+    if not isinstance(repo, str) or not _REPO.match(repo):
+        raise ValueError("repo must be owner/name")
+    if isinstance(pr, bool) or not isinstance(pr, int) or pr < 1:
+        raise ValueError("pr must be a positive integer")
+    if not isinstance(head, str) or not _SHA.match(head):
+        raise ValueError("head must be a commit sha")
+    for k in ("host", "reason", "opened_by"):
+        if not isinstance(data[k], str) or not data[k].strip():
+            raise ValueError(f"{k} must be a non-empty string")
+    if not isinstance(data["opened_at"], str) or not _STAMP.match(data["opened_at"]):
+        raise ValueError("opened_at must be an ISO-8601 UTC stamp")
+    canary = data.get("canary")
+    if canary is not None and canary != host:
+        raise ValueError("canary may only name the owing host")
+    if path.name != f"{repo.replace('/', '-')}#{pr}.json":
+        raise ValueError(f"file name does not match {repo}#{pr}")
+    if path.parent.name != "witness-owed" or path.parent.parent.name != host:
+        raise ValueError(f"record is not under hosts/{host}/witness-owed/")
+    return data
 
 
 def records_dir(workspace: Path, host: str) -> Path:
@@ -85,23 +119,74 @@ def open_record(workspace: Path, repo: str, pr: int, head: str, host: str,
     return path
 
 
+def tombstones(workspace: Path) -> dict[tuple[str, int], dict]:
+    """(repo, pr) -> tombstone written by a NON-owning host into its own
+    subtree; it closes the record it names without touching a peer's files."""
+    out = {}
+    for d in all_records_dirs(workspace):
+        for p in sorted((d / "tombstones").glob("*.json")):
+            try:
+                t = json.loads(p.read_text())
+                if not isinstance(t, dict) or not _REPO.match(str(t.get("repo"))) \
+                        or not _SHA.match(str(t.get("head"))) or not str(t.get("witness", "")).strip():
+                    continue
+                out[(t["repo"], int(t["pr"]))] = t
+            except (OSError, ValueError, TypeError):
+                continue
+    return out
+
+
 def list_open(workspace: Path) -> list[dict]:
-    """Open records from EVERY host directory; malformed ones are included as
-    blocking, since a record that cannot be read is not evidence the witness
-    was posted."""
+    """Open records from EVERY host directory, fully validated on every read.
+    Malformed ones are included as blocking: a record that cannot be read or
+    does not agree with its own path is not evidence the witness was posted.
+    A record closed by another host's tombstone for the same head is closed."""
     out = []
+    stones = tombstones(workspace)
     for d in all_records_dirs(workspace):
         for p in sorted(d.glob("*.json")):
             try:
-                data = json.loads(p.read_text())
-                if not isinstance(data, dict) or any(k not in data for k in FIELDS):
-                    raise ValueError("missing fields")
+                data = validate_record(json.loads(p.read_text()), p)
             except (OSError, ValueError) as exc:
                 data = {"repo": "?", "pr": 0, "head": "", "host": "?", "opened_by": "?",
                         "opened_at": "?", "reason": f"unreadable record {p.name}: {exc}",
                         "canary": None, "malformed": True}
+            else:
+                stone = stones.get((data["repo"], data["pr"]))
+                if stone and stone.get("head") == data["head"]:
+                    continue
             data["path"] = str(p)
             out.append(data)
+    return out
+
+
+def publish(workspace: Path, host: str) -> Path:
+    """Stamp this host's subtree so peers can tell a fresh view from a stale one."""
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("host must be a non-empty string")
+    p = records_dir(workspace, host) / STAMP_NAME
+    _atomic_write(p, {"host": host, "published_at": _now()})
+    return p
+
+
+def stale_hosts(workspace: Path, host: str | None, max_age_s: float,
+                now: datetime | None = None) -> list[str]:
+    """Foreign hosts whose stamp is missing or older than max_age_s: the view
+    of THEIR records cannot be called fresh, so a gate must fail closed."""
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for d in all_records_dirs(workspace):
+        h = d.parent.name
+        if h == host:
+            continue
+        try:
+            t = json.loads((d / STAMP_NAME).read_text()).get("published_at")
+            age = (now - datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
+        except (OSError, ValueError, TypeError):
+            out.append(h)
+            continue
+        if age > max_age_s or age < -60:
+            out.append(h)
     return out
 
 
@@ -128,13 +213,17 @@ def _is_ancestor(repo_root: Path, ancestor: str, ref: str) -> bool | None:
 _MERGE_SUBJECT = re.compile(r"\(#(\d+)\)\s*$")
 
 
-def _contains(repo_root: Path, rec: dict, ref: str, since: str | None = None
-              ) -> bool | None:
+def _contains(repo_root: Path, rec: dict, ref: str, since: str | None = None,
+              target_repo: str | None = None) -> bool | None:
     """Does `ref` (optionally only the range since..ref) contain the owed PR?
 
     A merge commit keeps the PR head as an ancestor; a squash or rebase merge
     does not, so the PR is also recognised by its merge subject `(#N)` and by a
-    commit body naming the recorded head. None when Git could not answer."""
+    commit body naming the recorded head. The `(#N)` match counts only for the
+    target repository: another project's #N is not this one's. None when Git
+    could not answer."""
+    if target_repo is not None and rec["repo"] != target_repo:
+        return False
     anc = _is_ancestor(repo_root, rec["head"], ref)
     if anc is None:
         return None
@@ -164,17 +253,24 @@ def _contains(repo_root: Path, rec: dict, ref: str, since: str | None = None
 
 
 def blocking(workspace: Path, repo_root: Path, target_ref: str,
-             current_ref: str | None = None, host: str | None = None) -> list[dict]:
+             current_ref: str | None = None, host: str | None = None,
+             target_repo: str | None = None, max_age_s: float | None = None) -> list[dict]:
     """Open records whose PR is contained in target_ref and not already in
     current_ref. A Git error on either question blocks (fail closed). A canary
     record releases only the host it names, and only when that is the host
-    that owes the witness."""
+    that owes the witness. With max_age_s, a foreign host whose stamp is
+    missing or older blocks by itself: its records cannot be called fresh."""
     hits = []
+    if max_age_s is not None:
+        for h in stale_hosts(workspace, host, max_age_s):
+            hits.append({"repo": "?", "pr": 0, "head": "", "host": h, "opened_by": "?",
+                         "opened_at": "?", "canary": None, "stale": True,
+                         "reason": f"host {h} has no fresh publication stamp (max age {max_age_s:.0f}s)"})
     for rec in list_open(workspace):
         if rec.get("malformed"):
             hits.append(rec)
             continue
-        verdict = _contains(repo_root, rec, target_ref, current_ref)
+        verdict = _contains(repo_root, rec, target_ref, current_ref, target_repo)
         if verdict is None:
             rec["reason"] = f"git could not answer for head {rec['head'][:8]}: {rec['reason']}"
             hits.append(rec)
@@ -203,21 +299,42 @@ def mark_canary(workspace: Path, repo: str, pr: int, host: str) -> Path:
     return path
 
 
-def close_record(workspace: Path, repo: str, pr: int, witness: str) -> Path:
+def close_record(workspace: Path, repo: str, pr: int, witness: str, host: str) -> Path:
     """Retire the record with the witness's location; the closed copy keeps
-    the audit trail beside the open ones."""
+    the audit trail beside the open ones. Only the owing host may: the vault
+    refuses a foreign-host deletion, so any other host must tombstone."""
     if not isinstance(witness, str) or not witness.strip():
         raise ValueError("witness must name where the round trip was posted")
     path = find_record(workspace, repo, pr)
     if path is None:
         raise FileNotFoundError(f"no open witness-owed record for {repo}#{pr}")
     data = json.loads(path.read_text())
+    if data.get("host") != host:
+        raise ValueError(f"{repo}#{pr} is owed by {data.get('host')!r}, not {host!r}: "
+                         "tombstone it from this host instead")
     data["witness"] = witness.strip()
     data["closed_at"] = _now()
     closed = path.parent / "closed" / path.name
     _atomic_write(closed, data)
     path.unlink()
     return closed
+
+
+def tombstone_record(workspace: Path, repo: str, pr: int, witness: str, host: str) -> Path:
+    """Close another host's record from THIS host's subtree: the tombstone
+    names the exact head, so a re-opened record for a new head stays open."""
+    if not isinstance(witness, str) or not witness.strip():
+        raise ValueError("witness must name where the round trip was posted")
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("host must be a non-empty string")
+    path = find_record(workspace, repo, pr)
+    if path is None:
+        raise FileNotFoundError(f"no open witness-owed record for {repo}#{pr}")
+    data = validate_record(json.loads(path.read_text()), path)
+    stone = records_dir(workspace, host) / "tombstones" / path.name
+    _atomic_write(stone, {"repo": repo, "pr": int(pr), "head": data["head"], "owed_by": data["host"],
+                          "witness": witness.strip(), "closed_by": host, "closed_at": _now()})
+    return stone
 
 
 def _split(key: str) -> tuple[str, int]:
@@ -239,8 +356,14 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("check")
     c.add_argument("--ref", required=True); c.add_argument("--current")
     c.add_argument("--repo-root", default="."); c.add_argument("--host")
+    c.add_argument("--repo", help="owner/name of the deployment target; scopes (#N) matches")
+    c.add_argument("--max-age", type=float, help="seconds; a foreign host stamped older than this blocks")
     m = sub.add_parser("canary"); m.add_argument("key"); m.add_argument("--host", required=True)
     x = sub.add_parser("close"); x.add_argument("key"); x.add_argument("--witness", required=True)
+    x.add_argument("--host", required=True)
+    t = sub.add_parser("tombstone"); t.add_argument("key"); t.add_argument("--witness", required=True)
+    t.add_argument("--host", required=True)
+    pb = sub.add_parser("publish"); pb.add_argument("--host", required=True)
     a = ap.parse_args(argv)
     if a.workspace:
         ws = Path(a.workspace)
@@ -259,11 +382,19 @@ def main(argv: list[str] | None = None) -> int:
                   f"canary={rec.get('canary')} reason={rec['reason']}")
         return 0
     if a.cmd == "check":
-        hits = blocking(ws, Path(a.repo_root), a.ref, a.current, a.host)
+        hits = blocking(ws, Path(a.repo_root), a.ref, a.current, a.host, a.repo, a.max_age)
         for rec in hits:
             print(f"witness owed: {rec['repo']}#{rec['pr']} head={rec['head'][:8]} "
                   f"host={rec['host']} — {rec['reason']}", file=sys.stderr)
         return 3 if hits else 0
+    if a.cmd == "publish":
+        print(publish(ws, a.host)); return 0
+    if a.cmd == "tombstone":
+        repo, pr = _split(a.key)
+        try:
+            print(tombstone_record(ws, repo, pr, a.witness, a.host)); return 0
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"witness-owed: {exc}", file=sys.stderr); return 5
     if a.cmd == "canary":
         repo, pr = _split(a.key)
         try:
@@ -273,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "close":
         repo, pr = _split(a.key)
         try:
-            print(close_record(ws, repo, pr, a.witness)); return 0
+            print(close_record(ws, repo, pr, a.witness, a.host)); return 0
         except (FileNotFoundError, ValueError) as exc:
             print(f"witness-owed: {exc}", file=sys.stderr); return 5
     return 2

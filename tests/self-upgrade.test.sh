@@ -53,6 +53,7 @@ case "\${1:-}" in
   workspace) printf '%s\n' "$root/workspace" ;;
   python-bin) command -v python3 ;;
   host-label) printf '%s\n' testhost ;;
+  vault-enabled) printf '%s\n' false ;;
   tmux-socket) printf '%s\n' "$TEST_TMUX_SOCKET" ;;
 esac
 EOF

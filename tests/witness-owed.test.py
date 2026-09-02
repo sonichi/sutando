@@ -91,13 +91,13 @@ class Records(Fixture):
         recs = wo.list_open(self.ws)
         self.assertEqual([(r["repo"], r["pr"], r["head"]) for r in recs], [("o/r", 12, self.owed)])
         with self.assertRaises(ValueError):
-            wo.close_record(self.ws, "o/r", 12, "")
-        closed = wo.close_record(self.ws, "o/r", 12, "https://example/pr/12#c1")
+            wo.close_record(self.ws, "o/r", 12, "", HOST_A)
+        closed = wo.close_record(self.ws, "o/r", 12, "https://example/pr/12#c1", HOST_A)
         self.assertEqual(wo.list_open(self.ws), [])
         self.assertEqual(closed.parent.name, "closed")
         self.assertIn("closed_at", json.loads(closed.read_text()))
         with self.assertRaises(FileNotFoundError):
-            wo.close_record(self.ws, "o/r", 12, "again")
+            wo.close_record(self.ws, "o/r", 12, "again", HOST_A)
 
     def test_a_malformed_record_blocks_rather_than_vanishes(self):
         d = wo.records_dir(self.ws, HOST_A)
@@ -115,7 +115,7 @@ class Gate(Fixture):
         self.assertEqual(len(wo.blocking(self.ws, self.repo, later, self.base)), 1)
         self.assertEqual(wo.blocking(self.ws, self.repo, self.base), [])
         self.assertEqual(wo.blocking(self.ws, self.repo, later, later), [])
-        wo.close_record(self.ws, "o/r", 12, "posted")
+        wo.close_record(self.ws, "o/r", 12, "posted", HOST_A)
         self.assertEqual(wo.blocking(self.ws, self.repo, later, self.base), [])
 
     def test_squash_topology_is_recognised_by_the_merge_subject(self):
@@ -171,6 +171,79 @@ class Gate(Fixture):
             wo.mark_canary(self.ws, "o/r", 99, HOST_A)
 
 
+class Round4Blockers(Fixture):
+    """keweichen's round-4 blockers, each with the control that was missing."""
+
+    def test_all_keys_present_but_invalid_head_is_malformed_and_blocks(self):
+        p = self.open12(); later = self.merge_topology()
+        d = json.loads(p.read_text()); d["head"] = ""; p.write_text(json.dumps(d))
+        recs = wo.list_open(self.ws)
+        self.assertEqual([r.get("malformed") for r in recs], [True])
+        self.assertEqual(len(wo.blocking(self.ws, self.repo, later, self.base)), 1)
+        for bad in ({"pr": True}, {"pr": 0}, {"repo": "nope"}, {"canary": "other-host"},
+                    {"opened_at": "yesterday"}, {"host": ""}):
+            d2 = dict(json.loads(p.read_text()) if p.exists() else {}); d2 = {**d2, **bad}
+            p.write_text(json.dumps({**d, "head": self.owed, **bad}))
+            self.assertTrue(wo.list_open(self.ws)[0].get("malformed"), bad)
+
+    def test_a_record_whose_path_disagrees_with_its_payload_is_malformed(self):
+        p = self.open12()
+        wrong = p.with_name("o-r#13.json"); p.rename(wrong)
+        self.assertTrue(wo.list_open(self.ws)[0].get("malformed"))
+        wrong.rename(p)
+        elsewhere = self.ws / "hosts" / HOST_B / "witness-owed" / p.name
+        elsewhere.parent.mkdir(parents=True); p.rename(elsewhere)
+        self.assertTrue(wo.list_open(self.ws)[0].get("malformed"))
+
+    def test_an_unrelated_repositorys_same_pr_number_does_not_block(self):
+        wo.open_record(self.ws, "unrelated/project", 12, "f" * 40, HOST_A, "elsewhere", "001")
+        sq, later = self.squash_topology()   # subject ends in (#12)
+        self.assertEqual(len(wo.blocking(self.ws, self.repo, later, self.base, target_repo="o/r")), 0)
+        self.assertEqual(len(wo.blocking(self.ws, self.repo, later, self.base)), 1,
+                         "without a target repo the (#N) match is unscoped — the CLI always passes --repo")
+        wo.open_record(self.ws, "o/r", 12, self.owed, HOST_A, "ours", "001")
+        hits = wo.blocking(self.ws, self.repo, later, self.base, target_repo="o/r")
+        self.assertEqual([h["repo"] for h in hits], ["o/r"])
+
+    def test_only_the_owing_host_may_close_and_a_peer_tombstones(self):
+        p = self.open12(host=HOST_A); later = self.merge_topology()
+        with self.assertRaises(ValueError):
+            wo.close_record(self.ws, "o/r", 12, "https://x/12", HOST_B)
+        self.assertTrue(p.exists(), "a foreign close must not touch the owner's file")
+        stone = wo.tombstone_record(self.ws, "o/r", 12, "https://x/12", HOST_B)
+        self.assertEqual(stone.parent.parent.parent.name, HOST_B, "the tombstone lives in the closer's subtree")
+        self.assertTrue(p.exists(), "the owner's record is untouched")
+        self.assertEqual(wo.list_open(self.ws), [], "a tombstone for the exact head closes the record")
+        self.assertEqual(wo.blocking(self.ws, self.repo, later, self.base, target_repo="o/r"), [])
+        # A re-opened record for a NEW head is not covered by the old tombstone.
+        p.unlink(); wo.open_record(self.ws, "o/r", 12, later, HOST_A, "reopened", "001")
+        self.assertEqual(len(wo.list_open(self.ws)), 1)
+
+    def test_freshness_two_workspaces_stale_copy_blocks_fresh_copy_passes(self):
+        # Host B's workspace holds a COPY of host A's subtree (what the vault carries).
+        ws_b = Path(self.tmp.name) / "ws-b"
+        self.open12(host=HOST_A); wo.publish(self.ws, HOST_A); later = self.merge_topology()
+        import shutil; shutil.copytree(self.ws / "hosts" / HOST_A, ws_b / "hosts" / HOST_A)
+        # Fresh stamp: the record itself blocks (it is open), not staleness.
+        hits = wo.blocking(ws_b, self.repo, later, self.base, host=HOST_B, target_repo="o/r", max_age_s=3600)
+        self.assertEqual([h.get("stale", False) for h in hits], [False])
+        # Host A closes at home; B's copy has not been refreshed: B must not activate on
+        # a stale view, and it must not read a stale-but-present stamp as fresh forever.
+        wo.close_record(self.ws, "o/r", 12, "https://x/12", HOST_A)
+        self.assertEqual(wo.blocking(self.ws, self.repo, later, self.base, host=HOST_A, target_repo="o/r"), [])
+        old = json.loads((ws_b / "hosts" / HOST_A / "witness-owed" / wo.STAMP_NAME).read_text())
+        old["published_at"] = "2000-01-01T00:00:00Z"; (ws_b / "hosts" / HOST_A / "witness-owed" / wo.STAMP_NAME).write_text(json.dumps(old))
+        hits = wo.blocking(ws_b, self.repo, later, self.base, host=HOST_B, target_repo="o/r", max_age_s=3600)
+        self.assertTrue(any(h.get("stale") for h in hits), "a stale foreign stamp blocks by itself")
+        # A missing stamp is the same as a stale one.
+        (ws_b / "hosts" / HOST_A / "witness-owed" / wo.STAMP_NAME).unlink()
+        self.assertEqual(wo.stale_hosts(ws_b, HOST_B, 3600), [HOST_A])
+        # After a refresh (the vault's copy step), the closed record is gone and the stamp is fresh.
+        shutil.rmtree(ws_b / "hosts" / HOST_A); wo.publish(self.ws, HOST_A)
+        shutil.copytree(self.ws / "hosts" / HOST_A, ws_b / "hosts" / HOST_A)
+        self.assertEqual(wo.blocking(ws_b, self.repo, later, self.base, host=HOST_B, target_repo="o/r", max_age_s=3600), [])
+
+
 class Cli(Fixture):
     def _run(self, *args):
         import contextlib
@@ -204,8 +277,8 @@ class Cli(Fixture):
         self.assertEqual(self._run("canary", "o/r#7", "--host", HOST_A).returncode, 0)
         self.assertEqual(self._run("check", "--ref", later, "--repo-root", rr, "--host", HOST_A).returncode, 0)
         self.assertEqual(self._run("check", "--ref", later, "--repo-root", rr, "--host", HOST_B).returncode, 3)
-        self.assertEqual(self._run("close", "o/r#7", "--witness", "thread").returncode, 0)
-        self.assertEqual(self._run("close", "o/r#7", "--witness", "thread").returncode, 5)
+        self.assertEqual(self._run("close", "o/r#7", "--witness", "thread", "--host", HOST_A).returncode, 0)
+        self.assertEqual(self._run("close", "o/r#7", "--witness", "thread", "--host", HOST_A).returncode, 5)
         self.assertEqual(self._run("check", "--ref", later, "--repo-root", rr).returncode, 0)
         self.assertNotEqual(self._run("open", "bad key", "--head", self.owed, "--host", "h",
                                       "--reason", "r", "--by", "me").returncode, 0)
@@ -224,7 +297,9 @@ class UpgradeWiring(unittest.TestCase):
 
     def test_gate_fails_closed_and_uses_the_canonical_python(self):
         for token in ('[ -n "$GATE_WS" ] ||', '[ -n "$GATE_PY" ] ||',
-                      '[ -f "$GATE_HELPER" ] ||', 'sutando-config.sh" python-bin'):
+                      '[ -f "$GATE_HELPER" ] ||', 'sutando-config.sh" python-bin',
+                      '[ -n "$GATE_REPO" ] ||', '--repo "$GATE_REPO"', '--max-age "$GATE_MAX_AGE"',
+                      'sync-workspace.sh" --pull-only ||', 'publish --host "$GATE_HOST"'):
             self.assertIn(token, self.SRC, token)
         self.assertNotIn('python3 "$REPO/src/witness_owed.py"', self.SRC, "bare python3 may hit the CLT stub")
         # A missing host label cannot release a record, so it must not stop
