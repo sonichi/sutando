@@ -117,6 +117,36 @@ def test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count() -> No
     assert done.result == "done"
 
 
+def test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes() -> None:
+    # iter_archived_tasks() yields ask-*/sc-ask-*/reco-skill-* rows by contract;
+    # a task-*-anchored canonicalizer must not drop them from history.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-legacy-ids-"))
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "ask-123.txt",
+        "ask-123", "2026-08-03T10:00:00Z", "legacy ask producer",
+    )
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "sc-ask-9.txt",
+        "sc-ask-9", "2026-08-03T10:01:00Z", "legacy screen-companion ask",
+    )
+    write_task(
+        workspace / "tasks" / "task-c1.claimed-core-3.txt",
+        "task-c1", "2026-08-03T10:02:00Z", "in-flight claimed work",
+    )
+    (workspace / "results").mkdir(parents=True, exist_ok=True)
+    (workspace / "state").mkdir(parents=True, exist_ok=True)
+    (workspace / "state" / "core-status.json").write_text('{"status":"idle"}\n')
+
+    ids = [row.id for row in workstreams.scan_task_history(workspace)]
+    assert ids == ["task-c1", "sc-ask-9", "ask-123"], ids
+    snapshot_ids = [row["id"] for row in workstreams.build_classifier_snapshot(workspace)["tasks"]]
+    assert "ask-123" in snapshot_ids and "sc-ask-9" in snapshot_ids, snapshot_ids
+    assert "task-c1.claimed-core-3" not in ids
+    # The archive gate still rejects traversal-shaped names even if one landed.
+    assert workstreams._archive_task_id("..txt") is None
+    assert workstreams._archive_task_id("a/b.txt") is None
+
+
 def test_loader_parser_and_history_fail_open_edges() -> None:
     workspace = fixture_workspace()
     store_path = workspace / "data" / "task-workstreams.json"

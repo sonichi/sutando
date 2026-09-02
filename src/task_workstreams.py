@@ -25,7 +25,7 @@ from typing import Optional
 
 import local_task_protocol
 from result_markers import parse_markers
-from task_archive import task_id_from_filename
+from task_archive import archive_id_from_filename, task_id_from_filename
 from workspace_default import status_read_path
 
 
@@ -218,6 +218,15 @@ def _parse_timestamp(raw: str, fallback: float) -> float:
         return fallback
 
 
+def _archive_task_id(name: str) -> str | None:
+    """Prefix-agnostic id for an archived file (ask-*, sc-ask-*, reco-skill-*),
+    gated by the archive lookup contract; the live pool grammar stays task-*."""
+    task_id = archive_id_from_filename(name)
+    if task_id is None or not local_task_protocol.valid_archive_lookup_id(task_id):
+        return None
+    return task_id
+
+
 def _task_paths(tasks_dir: Path):
     """Yield (canonical task id, path) for each distinct task, live copy first."""
     seen = set()
@@ -227,7 +236,7 @@ def _task_paths(tasks_dir: Path):
     # Prefer the live copy per id; keyed on the canonical id because a claimed
     # file's stem differs from its archived copy's, hiding that they are one.
     for path in candidates:
-        task_id = task_id_from_filename(path.name)
+        task_id = task_id_from_filename(path.name) or _archive_task_id(path.name)
         if task_id is None or task_id in seen:
             continue
         seen.add(task_id)
