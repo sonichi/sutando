@@ -337,28 +337,38 @@ def run() -> None:
     check("/guest-task: decoder RecursionError is the invalid-JSON 400 (negative control, forced)",
           raw_forced("/guest-task", DEEP) == BAD_JSON)
 
-    # An integer past sys.get_int_max_str_digits() makes json.loads raise plain
-    # ValueError, not JSONDecodeError. Natural case, then a forced control.
+    # Past the digit limit json.loads raises plain ValueError. The natural case
+    # needs an ACTIVE limit under the 64 KiB cap (3.9 has none; a raised one 413s).
     import sys as _sys
-    _digits = _sys.get_int_max_str_digits() or 4300
-    BIG = b'{"task":"x","padding":' + b"9" * (_digits + 1) + b"}"
-    OK_BIG = b'{"task":"x","padding":' + b"9" * max(_digits - 1, 1) + b"}"
-    check("/task: an integer past the digit limit is the invalid-JSON 400 (natural)", raw("/task", BIG) == BAD_JSON)
-    check("/guest-task: an integer past the digit limit is the invalid-JSON 400 (natural, negative control)",
-          raw("/guest-task", BIG) == BAD_JSON)
-    check("/task: an integer within the digit limit is not rejected as JSON (control)", raw("/task", OK_BIG)[0] != 400 or raw("/task", OK_BIG) != BAD_JSON)
+    _digits = getattr(_sys, "get_int_max_str_digits", lambda: 0)()
+    _natural = 0 < _digits and _digits + 64 <= 65536
+    if _natural:
+        BIG = b'{"task":"x","padding":' + b"9" * (_digits + 1) + b"}"
+        OK_BIG = b'{"task":"x","padding":' + b"9" * max(_digits - 1, 1) + b"}"
+        check("/task: an integer past the digit limit is the invalid-JSON 400 (natural)", raw("/task", BIG) == BAD_JSON)
+        check("/guest-task: an integer past the digit limit is the invalid-JSON 400 (natural, negative control)",
+              raw("/guest-task", BIG) == BAD_JSON)
+        check("/task: an integer within the digit limit is not rejected as JSON (control)",
+              raw("/task", OK_BIG)[0] != 400 or raw("/task", OK_BIG) != BAD_JSON)
+    else:
+        print(f"  (natural digit-limit case skipped: limit={_digits}, not active or over the 64 KiB cap)")
 
+    # Forced control: a FIXED small valid object, matched exactly, so the patched
+    # decoder is always reached regardless of interpreter or configuration.
+    SMALL = b'{"task":"x","n":1}'
     def raw_forced_value_error(path: str, body: bytes):
         real = agent_api.json.loads
         def boom(b, *a, **k):
-            if isinstance(b, (bytes, bytearray, str)) and len(b) == len(BIG):
+            raw_b = b.encode() if isinstance(b, str) else bytes(b)
+            if raw_b == SMALL:
                 raise ValueError("Exceeds the limit (4300 digits) for integer string conversion")
             return real(b, *a, **k)
         with patch.object(agent_api.json, "loads", boom):
             return raw(path, body)
-    check("/task: decoder ValueError is the invalid-JSON 400 (forced)", raw_forced_value_error("/task", BIG) == BAD_JSON)
+    check("/task: decoder ValueError is the invalid-JSON 400 (forced)", raw_forced_value_error("/task", SMALL) == BAD_JSON)
     check("/guest-task: decoder ValueError is the invalid-JSON 400 (negative control, forced)",
-          raw_forced_value_error("/guest-task", BIG) == BAD_JSON)
+          raw_forced_value_error("/guest-task", SMALL) == BAD_JSON)
+    check("/task: the forced control's object is accepted when the decoder is real (control)", raw("/task", SMALL) != BAD_JSON)
 
     print()
     if failures:
