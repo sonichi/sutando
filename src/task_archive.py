@@ -41,7 +41,8 @@ def task_id_from_filename(name: str) -> str | None:
     nothing ever writes. Covers the lead's `.assigned-<inst>` rename too.
     """
     stem = _stem_of(name)
-    if stem is None or not stem.startswith("task-"):
+    # An LF is a legal filename byte but not an id byte: the grammar rejects it.
+    if stem is None or "\n" in stem or not stem.startswith("task-"):
         return None
     m = _STATE_SUFFIX.match(stem)
     return m.group(1) if m else stem

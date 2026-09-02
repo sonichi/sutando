@@ -71,7 +71,7 @@ for name in ("task_id_from_filename", "find_task_file"):
 
 src_txt = (REPO / OWNERS[0]).read_text()
 vend_txt = (REPO / OWNERS[1]).read_text()
-for pat in ("_ID_STATE", "_ID_PLAIN"):
+for pat in ("_STATE_SUFFIX", "_NOT_A_RECORD"):
     a = re.search(rf"^{pat}\s*=\s*re\.compile\((.+)$", src_txt, re.M)
     b = re.search(rf"^{pat}\s*=\s*re\.compile\((.+)$", vend_txt, re.M)
     check(f"{pat} is byte-identical in both copies of the owner",
