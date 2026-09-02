@@ -6625,6 +6625,23 @@ def apply_skill_symlink_fixes(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
+def _oldest_pending(files: "list[Path]") -> "tuple[Path, float] | None":
+    """(oldest file, its mtime), skipping entries that vanish mid-scan.
+
+    A claim renames the file, so any entry can be gone between the listing and
+    the stat; one unguarded stat() aborts the whole health run.
+    """
+    pairs = []
+    for f in files:
+        try:
+            pairs.append((f, f.stat().st_mtime))
+        except OSError:
+            continue
+    if not pairs:
+        return None
+    return min(pairs, key=lambda t: t[1])
+
+
 def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> list[Path]:
     """Top-level task files that have not produced or archived a result."""
     if results_dir is None:
@@ -6842,7 +6859,8 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     if pooled and not files:
         stuck = _pool_held_stuck(pooled, now, stuck_age_sec)
         if stuck:
-            oldest_h = int(now - min(f.stat().st_mtime for f in stuck)) // 3600
+            _st = _oldest_pending(stuck)
+            oldest_h = int(now - _st[1]) // 3600 if _st else 0
             return {"name": name, "status": "warn",
                     "detail": f"{len(stuck)} of {len(pooled)} pool-held task(s) have not moved "
                               f"in over {stuck_age_sec // 60} min (oldest {oldest_h}h): "
@@ -6854,8 +6872,11 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     holdings = _worker_holdings()
     inflight = sum(1 for f in files if f.name in holdings)
     held_note = f", {inflight} in flight with a worker" if inflight else ""
-    oldest = min(files, key=lambda p: p.stat().st_mtime)
-    oldest_age = int(now - oldest.stat().st_mtime)
+    _oldest = _oldest_pending(files)
+    if _oldest is None:
+        return {"name": name, "status": "ok",
+                "detail": "queue drained while scanning"}
+    oldest_age = int(now - _oldest[1])
     # Deadline vs the WORKER's runtime, never the file's age: a task can queue
     # for hours before a worker claims it, and claiming does not touch the file.
     all_held = inflight == len(files)
@@ -10758,11 +10779,10 @@ def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple
     files = _pending_task_files(tasks_dir)
     if not files:
         return None
-    try:
-        oldest = min(files, key=lambda p: p.stat().st_mtime)
-        mtime = oldest.stat().st_mtime
-    except OSError:
+    got = _oldest_pending(files)
+    if got is None:
         return None
+    oldest, mtime = got
     return (f"{oldest.name}|{int(mtime)}", int(now - mtime))
 
 
