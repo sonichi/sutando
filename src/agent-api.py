@@ -1322,8 +1322,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
-        # /scan-text — decoded-value guard re-run for the Signal Room daemon;
-        # tier pinned server-side, errors 500 (the caller fails closed on non-200).
+        # /scan-text — decoded-value guard re-run for the Signal Room daemon, which
+        # publishes the text itself: markers exempt nothing, scanner outage is a 500.
         if path == "/scan-text":
             if not self.check_auth():
                 return
@@ -1347,11 +1347,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "texts must be 1..64 strings of <=16384 chars"})
                 return
             try:
-                from policy.egress.result import guard_result_for_tier
+                from policy.egress.result import (SCANNER_UNAVAILABLE,
+                                                  guard_result_for_tier)
                 verdict = "pass"
                 for t in texts:
-                    _safe, reason = guard_result_for_tier(t, SIGNAL_ROOM_TIER, REPO_DIR)
+                    _safe, reason = guard_result_for_tier(
+                        t, SIGNAL_ROOM_TIER, REPO_DIR, honor_suppressions=False)
                     if reason is not None:
+                        if reason.startswith(SCANNER_UNAVAILABLE):
+                            self.send_json(500, {"error": "scanner unavailable"})
+                            return
                         verdict = "withhold"
                         break
                 self.send_json(200, {"verdict": verdict})

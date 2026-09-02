@@ -5,7 +5,8 @@ Exercises the real Handler.do_POST (same harness as agent-api-guest-routes):
   * the tier is pinned server-side (SIGNAL_ROOM_TIER) — the request carries no
     tier and cannot pick one;
   * verdicts: clean text -> pass; a withheld verdict from the guard -> withhold;
-  * a scanner exception -> 500 (the daemon reads any non-200 as fail-closed);
+  * suppression markers exempt nothing (the daemon publishes the text itself);
+  * a failing underlying scanner -> 500 (the daemon reads non-200 as fail-closed);
   * input validation: auth, Content-Length caps, texts shape/limits.
 
 Run: `python3 tests/agent-api-scan-text.test.py`
@@ -72,7 +73,7 @@ def run() -> None:
     real_guard = egress.guard_result_for_tier
 
     def spy(body, tier, repo, *a, **kw):
-        calls.append((body, tier))
+        calls.append((body, tier, kw.get("honor_suppressions")))
         if "TRIGGER" in body:
             return "[withheld]", "secret-scan"
         return body, None
@@ -82,7 +83,9 @@ def run() -> None:
         h = post({"texts": ["clean one", "clean two"]})
         check("clean texts -> 200 pass", h._responses[0] == (200, {"verdict": "pass"}))
         check("tier is pinned server-side to the Signal Room lane",
-              all(t == agent_api.SIGNAL_ROOM_TIER for _b, t in calls))
+              all(t == agent_api.SIGNAL_ROOM_TIER for _b, t, _hs in calls))
+        check("published-text mode: honor_suppressions=False on every call",
+              all(hs is False for _b, _t, hs in calls))
 
         calls.clear()
         h = post({"texts": ["fine", "has TRIGGER inside", "never scanned"]})
@@ -93,18 +96,43 @@ def run() -> None:
         calls.clear()
         h = post({"texts": ["x"], "tier": "owner", "access_tier": "owner"})
         check("caller cannot elect a tier", h._responses[0][0] == 200
-              and all(t == agent_api.SIGNAL_ROOM_TIER for _b, t in calls))
+              and all(t == agent_api.SIGNAL_ROOM_TIER for _b, t, _hs in calls))
     finally:
         egress.guard_result_for_tier = real_guard
 
-    # --- scanner failure is a 500, never a silent pass ------------------------
+    # --- real guard: the daemon publishes the text itself, so a [no-send] skip
+    # marker exempts nothing and a failing underlying scanner is a 500 ---------
+    from types import SimpleNamespace
+
+    real_loader = egress.load_team_result_scanner
+    egress.load_team_result_scanner = lambda repo: (lambda body: SimpleNamespace(
+        detected="AKIA" in body, secret_types=["aws-key"]))
+    try:
+        h = post({"texts": ["[no-send]\nAKIAFAKEFAKEFAKEFAKE"]})
+        check("a skip marker does not exempt a secret from the scan",
+              h._responses[0] == (200, {"verdict": "withhold"}))
+        h = post({"texts": ["[no-send]\nnothing sensitive here"]})
+        check("a clean skip-marker body still passes",
+              h._responses[0] == (200, {"verdict": "pass"}))
+
+        def down(_repo):
+            raise RuntimeError("scanner down")
+
+        egress.load_team_result_scanner = down
+        h = post({"texts": ["anything"]})
+        check("failing underlying scanner -> 500 with the real guard in place",
+              h._responses[0] == (500, {"error": "scanner unavailable"}))
+    finally:
+        egress.load_team_result_scanner = real_loader
+
+    # --- a guard that itself throws (out-of-contract) still fails closed ------
     def boom(*a, **kw):
-        raise RuntimeError("scanner down")
+        raise RuntimeError("guard blew up")
 
     egress.guard_result_for_tier = boom
     try:
         h = post({"texts": ["anything"]})
-        check("scanner exception -> 500 (daemon fails closed on non-200)",
+        check("out-of-contract guard exception -> 500",
               h._responses[0][0] == 500)
     finally:
         egress.guard_result_for_tier = real_guard
