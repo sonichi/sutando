@@ -10,7 +10,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
-from hitl.projector import fallback_body, project  # noqa: E402
+from hitl.projector import (  # noqa: E402
+    fallback_body,
+    project,
+)
 from hitl.schema import Action, HumanRequirement, WIRE_FIELD  # noqa: E402
 
 ROOM = "!room:ag2.space"
@@ -88,9 +91,9 @@ class ProjectorTests(unittest.TestCase):
         self.assertEqual(project(self.mgr, self.send, ROOM), [])
         self.assertTrue(self.mgr.needs_projection(req.id))  # nothing recorded
         done = project(self.mgr, self.send, ROOM)
-        self.assertEqual(done, [(req.id, "$ev1")])  # fake counts successes only
-        # Both attempts carried the SAME dedupe key: the gateway absorbs a
-        # send that failed after landing.
+        self.assertEqual(done, [(req.id, "$ev1")])
+        # Same dedupe key on both attempts: the gateway absorbs a send that
+        # failed after landing. (The fake numbers successes only, hence $ev1.)
         self.assertEqual(self.send.sent[0]["dedupe_key"], self.send.sent[1]["dedupe_key"])
 
     def test_edit_target_survives_multiple_transitions(self):

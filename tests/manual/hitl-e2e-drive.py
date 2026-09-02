@@ -20,12 +20,18 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))  # lint-workspace-resolution: allow-repo-root
 
 from hitl.detector import drive  # noqa: E402
-from hitl.manager import HitlManager, HitlStore  # noqa: E402
+from hitl.manager import (  # noqa: E402
+    HitlManager,
+    HitlStore,
+)
 from hitl.projector import project  # noqa: E402
-from hitl.schema import ActionReply, StaleRequirementError  # noqa: E402
+from hitl.schema import (  # noqa: E402
+    ActionReply,
+    StaleRequirementError,
+)
 
 URL = os.environ.get("REMOTE_TASK_URL", "").rstrip("/")
 TOKEN = os.environ.get("REMOTE_TASK_TOKEN", "")
