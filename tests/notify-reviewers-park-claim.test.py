@@ -556,7 +556,11 @@ class RollbackAndIdentityControls(unittest.TestCase):
             self.skipTest("no origin/main ref here (git-less CI copy) — "
                           "cross-revision control needs a real checkout")
         src = got.stdout
-        f = pathlib.Path(self.tmp) / "nr_main.py"
+        # The module resolves its repo root as parents[3] at import time, so a
+        # flat temp path raises IndexError before any assertion can run.
+        f = (pathlib.Path(self.tmp) / "rollback" / "skills"
+             / "collaboration-intelligence" / "scripts" / "notify_reviewers.py")
+        f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(src)
         spec = importlib.util.spec_from_file_location("nr_main", f)
         mod = importlib.util.module_from_spec(spec)
