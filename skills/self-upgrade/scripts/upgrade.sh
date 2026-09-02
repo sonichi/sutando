@@ -12,7 +12,8 @@
 #
 # Usage:
 #   bash skills/self-upgrade/scripts/upgrade.sh [--remote <name>] [--branch <name>] [--no-restart] [--canary owner/repo#N]
-# Exit codes: 0 = upgraded (or already latest); 2 = aborted (dirty tree / not FF-able)
+# Exit codes: 0 = upgraded (or already latest); 2 = aborted (dirty tree / not FF-able);
+#             4 = refused by the witness-owed gate (or the gate could not run)
 
 set -uo pipefail
 
@@ -107,13 +108,26 @@ GATE_HELPER="$REPO/src/witness_owed.py"
 # `check` still runs; only a canary declaration needs the label and fails closed.
 [ -n "$GATE_PY" ] || { echo "self-upgrade: ABORT — no usable python (sutando-config.sh python-bin), so the witness-owed gate cannot run" >&2; exit 4; }
 [ -f "$GATE_HELPER" ] || { echo "self-upgrade: ABORT — $GATE_HELPER is missing, so the witness-owed gate cannot run" >&2; exit 4; }
+# The target repository scopes the gate: another project's (#N) is not ours.
+GATE_URL="$(git remote get-url "$REMOTE" 2>/dev/null || true)"
+GATE_REPO="$(printf '%s' "$GATE_URL" | sed -E 's#/+$##; s#\.git$##' | sed -nE 's#^.*[/:]([^/:]+)/([^/:]+)$#\1/\2#p')"
+[ -n "$GATE_REPO" ] || { echo "self-upgrade: ABORT — cannot derive owner/name from remote '$REMOTE' ($GATE_URL), so the witness-owed gate cannot scope its records" >&2; exit 4; }
+# Fleet view: with the vault on, refresh it first and fail closed if that fails;
+# with it off, foreign host subtrees are a fleet this host cannot refresh.
+GATE_VAULT="$(bash "$REPO/scripts/sutando-config.sh" vault-enabled 2>/dev/null || true)"
+GATE_MAX_AGE="${SUTANDO_WITNESS_MAX_AGE:-3600}"
+if [ "$GATE_VAULT" = "true" ]; then
+  bash "$REPO/scripts/sync-workspace.sh" --pull-only || { echo "self-upgrade: ABORT — vault pull failed, so the fleet's witness-owed records cannot be called fresh" >&2; exit 4; }
+elif [ -d "$GATE_WS/hosts" ] && [ -n "$GATE_HOST" ] && find "$GATE_WS/hosts" -mindepth 2 -maxdepth 2 -name witness-owed -not -path "$GATE_WS/hosts/$GATE_HOST/*" | grep -q .; then
+  echo "self-upgrade: ABORT — foreign host witness-owed subtrees exist but the vault is disabled, so they cannot be refreshed" >&2; exit 4
+fi
 if [ -n "$CANARY" ]; then
   [ -n "$GATE_HOST" ] || { echo "self-upgrade: ABORT — cannot resolve this host's label, so it cannot be declared the canary for $CANARY" >&2; exit 4; }
   "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" canary "$CANARY" --host "$GATE_HOST" >/dev/null ||
     { echo "self-upgrade: ABORT — cannot declare $GATE_HOST the canary for $CANARY (no open record, or a different host owes it)" >&2; exit 4; }
   echo "self-upgrade: canary activation of $CANARY declared for $GATE_HOST — post the round trip and close the record"
 fi
-if ! "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" check --ref "$REMOTE/$BRANCH" --current HEAD --repo-root "$REPO" ${GATE_HOST:+--host "$GATE_HOST"}; then
+if ! "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" check --ref "$REMOTE/$BRANCH" --current HEAD --repo-root "$REPO" --repo "$GATE_REPO" --max-age "$GATE_MAX_AGE" ${GATE_HOST:+--host "$GATE_HOST"}; then
   echo "self-upgrade: ABORT — the target head newly contains a live-path PR that still owes its witness (listed above)." >&2
   echo "  Post the exact-head round trip to the PR thread and close the record: witness_owed.py close owner/repo#N --witness <url>" >&2
   echo "  Or, on the host that owes it, activate as the declared canary: $0 --canary owner/repo#N" >&2
@@ -123,6 +137,8 @@ fi
 # 4. Fast-forward pull — the actual code upgrade.
 git pull --ff-only "$REMOTE" "$BRANCH" || { echo "self-upgrade: git pull --ff-only failed" >&2; exit 2; }
 NOW="$(git rev-parse --short HEAD)"
+# This host's view is now current: stamp it so peers can tell fresh from stale.
+[ -n "$GATE_HOST" ] && "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" publish --host "$GATE_HOST" >/dev/null 2>&1 || true
 echo "self-upgrade: pulled $LOCAL -> $NOW (0 behind)"
 
 if [ "$DO_RESTART" = "0" ]; then
