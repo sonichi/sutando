@@ -396,8 +396,8 @@ and loads whichever repo it reviews.
     behind it, and the review said the opposite. On #3600 the gate was red at the reviewed
     head (`89.7%`) and the author pushed a fix six minutes later, so nothing came of it —
     luck, not process. Neither review looked. The cheap form is one call before the
-    verdict: `gh pr checks <PR>`, or `scripts/ci-triage.py <PR>`, which additionally maps
-    a failing check to any issue already filed about it.
+    verdict: `gh pr checks <PR>`. Mapping a failing check to an issue already filed
+    about it is worth doing by hand until tooling for it lands.
     **Reading it is necessary and not sufficient — check that the job actually RAN.**
     Sometimes a red check is naming the infrastructure rather than the diff: a job killed
     by an Actions budget wall reports `conclusion=failure` with **`steps=0`**, which is
