@@ -13,6 +13,7 @@ Every row the caller adds or edits is stamped `(w:<writer>)` from SUTANDO_CORE_I
 
     doc_sync.py get --room R --name N [--folder F] [--workspace W]
     doc_sync.py put --room R --name N --file EDITED [--folder F] [--workspace W] [--writer ID]
+    doc_sync.py duplicates --room R --name N [--folder F]      # keys present more than once
 
 Room/name come from flags or ROOM_DOC_ROOM / ROOM_DOC_NAME / ROOM_DOC_FOLDER; a missing
 required value fails naming it (exit 2). Exit: 0 ok · 1 transport · 2 config · 3 not found
@@ -190,6 +191,32 @@ def base_path(workspace: Path, folder: str, name: str) -> Path:
     return Path(workspace) / "state" / "room-doc-sync" / f"{folder}__{name}.base"
 
 
+def duplicate_report(text: str) -> List[str]:
+    """One line per duplicated key: sections and line numbers, for whoever resolves it."""
+    where: Dict[str, List[str]] = {}
+    section = ""
+    for n, line in enumerate(text.split("\n"), 1):
+        m = SECTION_RE.match(line)
+        if m:
+            section = m.group(1)
+        k = RECORD_RE.match(line)
+        if k:
+            where.setdefault(k.group(1), []).append(f"L{n} {section or '(none)'}")
+    return [f"{k}: {', '.join(v)}" for k, v in sorted(where.items()) if len(v) > 1]
+
+
+def cmd_duplicates(room: str, folder: str, name: str) -> int:
+    rc, res = fetch(room, folder, name)
+    if rc:
+        print(f"duplicates FAILED rc={rc}: {res.get('reason')}", file=sys.stderr)
+        return rc
+    rows = duplicate_report(res["content"])
+    print(f"{len(rows)} duplicated key(s) in {folder}/{name}")
+    for r in rows:
+        print("  " + r)
+    return 0
+
+
 def cmd_get(room: str, folder: str, name: str, workspace: Path) -> int:
     rc, res = fetch(room, folder, name)
     if rc:
@@ -242,7 +269,7 @@ def _required(value: Optional[str], flag: str, env_key: str) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=["get", "put"])
+    ap.add_argument("action", choices=["get", "put", "duplicates"])
     ap.add_argument("--room", default=os.environ.get("ROOM_DOC_ROOM"))
     ap.add_argument("--folder", default=os.environ.get("ROOM_DOC_FOLDER") or "room-live-context")
     ap.add_argument("--name", default=os.environ.get("ROOM_DOC_NAME"))
@@ -258,6 +285,8 @@ def main(argv=None) -> int:
         sys.path.insert(0, str(HERE.parent.parent / "src"))
         from workspace_default import resolve_workspace  # noqa: WPS433
         ws = Path(resolve_workspace())
+    if a.action == "duplicates":
+        return cmd_duplicates(room, a.folder, name)
     if a.action == "get":
         return cmd_get(room, a.folder, name, ws)
     if not a.file:

@@ -90,6 +90,11 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(applied, []); self.assertIn("org/repo#2", conflicts[0]); self.assertIn("2 times", conflicts[0])
         self.assertEqual(merged, remote)
 
+    def test_duplicate_report_names_sections_and_lines(self):
+        remote = BASE.replace("## History\n", "## History\norg/repo#2 | shepherd: a | status: merged | two\n")
+        self.assertEqual(ds.duplicate_report(BASE), [])
+        self.assertEqual(ds.duplicate_report(remote), ["org/repo#2: L5 Active, L7 History"])
+
     def test_structure_change_refuses(self):
         mine = BASE.replace("prose line", "prose line EDITED")
         merged, applied, conflicts = ds.merge(BASE, mine, BASE, "me")
