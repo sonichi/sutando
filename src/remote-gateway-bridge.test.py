@@ -497,6 +497,21 @@ def main() -> int:
           "notify step carries the channel-env prelude BEFORE the notify.py call")
     check(sum(_env_hint in ln for ln in sk.splitlines()) == 2,
           "the env prelude rides both gateway-calling steps (context-first + notify)")
+    # CHANNEL_DIR defaults to "ag2space", so every assertion above passes even
+    # when the hint is hardcoded; varying it is what makes this prove anything.
+    _saved_dir, _saved_tier2 = rtc.CHANNEL_DIR, rtc.LOCAL_TIER
+    rtc.CHANNEL_DIR, rtc.LOCAL_TIER = "dev-ag2space", "owner"
+    try:
+        rtc._write_task({**TASK, "id": "task-SKILLDEV", "channel_id": "!r:dev.ag2.space"})
+        skd = (rtc.TASKS_DIR / "task-SKILLDEV.txt").read_text()
+    finally:
+        rtc.CHANNEL_DIR, rtc.LOCAL_TIER = _saved_dir, _saved_tier2
+    check("channel-env.sh dev-ag2space" in skd
+          and "--source dev-ag2space " in skd
+          and "channel-env.sh ag2space)" not in skd,
+          "a non-default CHANNEL_DIR reaches BOTH env preludes and the notify --source")
+    check(sum("channel-env.sh dev-ag2space" in ln for ln in skd.splitlines()) == 2,
+          "both gateway-calling steps name the task's own channel dir, not the default")
     # A string assertion passes even when the named file holds no gateway vars,
     # so drive the resolver itself across both real layouts and neither-has-it.
     import os as _os
