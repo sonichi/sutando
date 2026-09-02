@@ -224,15 +224,15 @@ check "structural: the newest source survives an identical drop" \
 
 # --- control 4f: a failed mtime promotion is write-failed, not a silent drop ---
 
-# Shadow only `touch -r`; every other touch must still work or the fixture
-# itself cannot be built.
+# The promotion materializes through the contained copy (cp -p + mv), never
+# `touch -r` on the existing inode. Shadow only `cp -p`; plain cp still works.
 _tf="$(mktemp -d)"; mkdir -p "$_tf/bin"
-cat > "$_tf/bin/touch" <<'STUB'
+cat > "$_tf/bin/cp" <<'STUB'
 #!/bin/sh
-[ "$1" = "-r" ] && exit 1
-exec /usr/bin/touch "$@"
+[ "$1" = "-p" ] && exit 1
+exec /bin/cp "$@"
 STUB
-chmod +x "$_tf/bin/touch"
+chmod +x "$_tf/bin/cp"
 mkdir -p "$_tf/A/scripts" "$_tf/dest/scripts"
 printf 'version=3\n' > "$_tf/dest/$SREL"; touch -t 202608281100 "$_tf/dest/$SREL"
 printf 'version=3\n' > "$_tf/A/$SREL";    touch -t 202608281300 "$_tf/A/$SREL"
@@ -367,6 +367,69 @@ _dm_probe() {  # $1=src hosts mode  $2=pre-existing dest mode ("" = none) -> "ho
 check "a 0700 source dir does NOT land world-readable"        "$(_dm_probe 0700 '')"     "700:700:644"
 check "non-widening: a 0755 source never opens a 0700 dest"   "$(_dm_probe 0755 0700)"   "700:700:644"
 check "control: an ordinary 0755 source stays 0755"           "$(_dm_probe 0755 '')"     "755:755:644"
+
+# --- control 8: a destination leaf that is a SYMLINK is refused before it is read ---
+
+# `touch -r` on the leaf followed the link and stamped a file outside DEST_REAL while
+# commit certified success; the leaf must be refused with no sentinel and the target untouched.
+_mt() { stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1"; }
+_nl() { stat -c '%h' "$1" 2>/dev/null || stat -f '%l' "$1"; }
+_sl="$(mktemp -d)"; mkdir -p "$_sl/A/scripts" "$_sl/dest/scripts" "$_sl/dest/state" "$_sl/outside"
+printf 'version=3\n' > "$_sl/outside/target"; chmod 0755 "$_sl/outside/target"; touch -t 202608281100 "$_sl/outside/target"
+ln -s "$_sl/outside/target" "$_sl/dest/$SREL"
+printf 'version=3\n' > "$_sl/A/$SREL"; chmod 0755 "$_sl/A/$SREL"; touch -t 202608281300 "$_sl/A/$SREL"
+_sl_before="$(_mt "$_sl/outside/target")"
+_sl_rc=0; SUTANDO_MIGRATE_SRC_A="$_sl/A" SUTANDO_MIGRATE_DEST="$_sl/dest" \
+  bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1 || _sl_rc=$?
+check "symlink leaf: commit FAILS" "$([ "$_sl_rc" -ne 0 ] && echo failed || echo certified)" "failed"
+check "symlink leaf: no sentinel is written" \
+  "$(ls "$_sl/dest/state"/.migrated-from-A-* 2>/dev/null | wc -l | tr -d ' ')" "0"
+check "symlink leaf: the external target's mtime is untouched" "$(_mt "$_sl/outside/target")" "$_sl_before"
+check "symlink leaf: the leaf is still the symlink (not replaced, not read into)" \
+  "$([ -L "$_sl/dest/$SREL" ] && echo link || echo file)" "link"
+rm -rf "$_sl"
+
+# --- control 9: a HARDLINK leaf gets its own contained inode; the alias is untouched ---
+
+_hl="$(mktemp -d)"; mkdir -p "$_hl/A/scripts" "$_hl/dest/scripts" "$_hl/dest/state" "$_hl/outside"
+printf 'version=3\n' > "$_hl/outside/target"; chmod 0755 "$_hl/outside/target"; touch -t 202608281100 "$_hl/outside/target"
+ln "$_hl/outside/target" "$_hl/dest/$SREL"
+printf 'version=3\n' > "$_hl/A/$SREL"; chmod 0755 "$_hl/A/$SREL"; touch -t 202608281300 "$_hl/A/$SREL"
+_hl_before="$(_mt "$_hl/outside/target")"
+_hl_rc=0; SUTANDO_MIGRATE_SRC_A="$_hl/A" SUTANDO_MIGRATE_DEST="$_hl/dest" \
+  bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1 || _hl_rc=$?
+check "hardlink leaf: commit succeeds" "$_hl_rc" "0"
+check "hardlink leaf: the external inode's mtime is untouched" "$(_mt "$_hl/outside/target")" "$_hl_before"
+check "hardlink leaf: a contained regular inode landed (link count 1)" "$(_nl "$_hl/dest/$SREL")" "1"
+check "hardlink leaf: the contained copy carries the newer source mtime" \
+  "$(_mt "$_hl/dest/$SREL")" "$(_mt "$_hl/A/$SREL")"
+_hl_v=0; SUTANDO_MIGRATE_SRC_A="$_hl/A" SUTANDO_MIGRATE_DEST="$_hl/dest" \
+  bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1 || _hl_v=$?
+check "hardlink leaf: verify passes on the contained copy" "$_hl_v" "0"
+rm -rf "$_hl"
+
+# --- control 10: a union write takes the shared directory-mode policy; verify sees the parent ---
+
+# 0700 source parent, 0755 destination parent, 0644 divergent union: before,
+# the union path wrote directly and the parent stayed 0755 while verify passed.
+_up="$(mktemp -d)"; mkdir -p "$_up/A/state" "$_up/dest/state"
+printf '{"allow": ["a@example.org"]}\n' > "$_up/A/$REL";    chmod 0644 "$_up/A/$REL"
+printf '{"allow": ["b@example.org"]}\n' > "$_up/dest/$REL"; chmod 0644 "$_up/dest/$REL"
+chmod 0700 "$_up/A/state"; chmod 0755 "$_up/dest/state"
+_up_rc=0; SUTANDO_MIGRATE_SRC_A="$_up/A" SUTANDO_MIGRATE_DEST="$_up/dest" \
+  bash scripts/sutando-migrate.sh commit --source A >/dev/null 2>&1 || _up_rc=$?
+check "union under a 0700 source parent: commit succeeds" "$_up_rc" "0"
+check "union parent takes the non-widening intersection (0755 -> 0700)" "$(mode_of "$_up/dest/state")" "700"
+check "the union still merged (control: the path ran)" "$(grep -c 'a@example.org' "$_up/dest/$REL" | tr -d ' ')" "1"
+_up_v=0; SUTANDO_MIGRATE_SRC_A="$_up/A" SUTANDO_MIGRATE_DEST="$_up/dest" \
+  bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1 || _up_v=$?
+check "verify passes with the narrowed parent" "$_up_v" "0"
+chmod 0755 "$_up/dest/state"
+_up_w=0; SUTANDO_MIGRATE_SRC_A="$_up/A" SUTANDO_MIGRATE_DEST="$_up/dest" \
+  bash scripts/sutando-migrate.sh verify --source A >/dev/null 2>&1 || _up_w=$?
+check "verify FAILS once the destination parent is widened past the source's" \
+  "$([ "$_up_w" -ne 0 ] && echo failed || echo certified)" "failed"
+rm -rf "$_up"
 
 if [ "$fails" -gt 0 ]; then echo "$fails FAILURE(S)"; exit 1; fi
 echo "ALL PASS"
