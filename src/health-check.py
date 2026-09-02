@@ -6049,7 +6049,7 @@ def check_gateway_bridge() -> "dict | None":
                       "ag2.space mobile messages are not being delivered",
         }
     if verdict is True:
-        return {"name": "gateway-bridge", "status": "ok", "detail": "running + connected"}
+        return _gateway_ok_unless_lane_stalled("running + connected")
     # The bridge rewrites this file on every poll outcome, so silence past the
     # freshness window means the writer stopped — evidence, not absence of it.
     stale_age = _gateway_status_stale_age_s()
@@ -6087,9 +6087,8 @@ def check_gateway_bridge() -> "dict | None":
         }
     if lanes:
         served = ", ".join(ln for ln, serving, _ in lanes if serving)
-        return {"name": "gateway-bridge", "status": "ok",
-                "detail": f"running + connected (lane {served})"}
-    return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
+        return _gateway_ok_unless_lane_stalled(f"running + connected (lane {served})")
+    return _gateway_ok_unless_lane_stalled("running")
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
@@ -6258,6 +6257,53 @@ def _gateway_lane_verdicts(state_dir: "Path | None" = None,
             continue
         out.append((lane, v.serving, v.last_ok_ts is not None))
     return out
+
+
+def _gateway_stale_lanes(state_dir: "Path | None" = None,
+                         now: "float | None" = None) -> "list[tuple[str, float]]":
+    """(lane, age_s) for every lane sidecar whose `ts` is PAST the freshness
+    window — a lane that stopped, as opposed to one that failed.
+
+    A per-channel bridge that dies leaves its last record in place, and that
+    record almost always says `connected: true` — it did not fail, it stopped.
+    `_gateway_lane_verdicts` drops such a file (no fresh verdict), so a healthy
+    primary hides a dead lane completely. Only the sidecar's silence names it.
+    """
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    out = []
+    try:
+        entries = sorted(root.glob("gateway-status.*.json"))
+    except OSError:
+        return out
+    for f in entries:
+        lane = f.name[len("gateway-status."):-len(".json")]
+        age = _gateway_status_stale_age_s(f, now=now)
+        if age is not None:
+            out.append((lane, age))
+    return out
+
+
+def _gateway_ok_unless_lane_stalled(detail: str) -> dict:
+    """The ok verdict for the bridge, demoted to warn when any lane's sidecar
+    has gone silent — the primary being healthy says nothing about a lane."""
+    stalled = _gateway_stale_lanes()
+    if not stalled:
+        return {"name": "gateway-bridge", "status": "ok", "detail": detail}
+    names = ", ".join(
+        f"{ln} (last write {age:.0f}s ago)" if age < 3600
+        else f"{ln} (last write {age / 3600:.1f}h ago)"
+        for ln, age in stalled)
+    return {
+        "name": "gateway-bridge",
+        "status": "warn",
+        "detail": (
+            f"{detail}, but lane {names} stopped writing its sidecar — its last "
+            "record still says connected, so only the silence shows it; messages "
+            "on that lane are not being delivered (retired lane? remove "
+            "state/gateway-status.<lane>.json)"
+        ),
+    }
 
 
 def _gateway_status_stale_age_s(path: "Path | None" = None,
