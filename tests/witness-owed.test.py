@@ -99,9 +99,29 @@ class Gate(Fixture):
 
 class Cli(Fixture):
     def _run(self, *args):
-        return subprocess.run([sys.executable, str(ROOT / "src" / "witness_owed.py"),
-                               "--workspace", str(self.ws), *args],
-                              capture_output=True, text=True)
+        # In-process so the CLI arms count toward coverage; one subprocess case
+        # below still proves the entry point.
+        import contextlib
+        import io
+        import types
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = wo.main(["--workspace", str(self.ws), *args])
+            except SystemExit as e:
+                rc = e.code if isinstance(e.code, int) else 2
+        return types.SimpleNamespace(returncode=rc, stdout=out.getvalue(), stderr=err.getvalue())
+
+    def test_entry_point_runs_as_a_process(self):
+        r = subprocess.run([sys.executable, str(ROOT / "src" / "witness_owed.py"),
+                            "--workspace", str(self.ws), "list"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_list_prints_open_records_and_missing_dir_is_empty(self):
+        self.assertEqual(wo.list_open(self.ws), [])
+        r = self._run("list"); self.assertEqual((r.returncode, r.stdout), (0, ""))
+        wo.open_record(self.ws, "o/r", 9, self.owed, "hostA", "why", "001")
+        r = self._run("list"); self.assertIn("o/r#9 head=" + self.owed[:8], r.stdout)
 
     def test_check_exit_codes_and_messages(self):
         self.assertEqual(self._run("check", "--ref", self.later, "--repo-root", str(self.repo)).returncode, 0)
