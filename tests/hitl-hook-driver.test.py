@@ -130,6 +130,17 @@ class HookDriverTests(unittest.TestCase):
         by_msg = {("curl" in r.message): r for r in self.mgr.store.all()}
         self.assertEqual((by_msg[True].status, by_msg[False].status), ("resolved", "expired"))
 
+    def test_long_command_is_clipped_with_an_explicit_marker(self):
+        cmd = "echo " + "x" * 300
+        _, out, _ = run_hook(self.ws, {"tool_name": "Bash", "tool_input": {"command": cmd}}, timeout="1")
+        [req] = self.mgr.store.all()
+        self.assertIn("… (truncated; 305 chars total)", req.message)
+        self.assertIn("… (truncated; 305 chars total)", req.subject["input"])
+        self.assertNotIn("x" * 250, req.message)  # clipped, and says so
+        short = "echo hi"
+        run_hook(self.ws, {"tool_name": "Bash", "tool_input": {"command": short}}, timeout="1")
+        self.assertTrue(any(r.message.endswith(short) for r in self.mgr.store.all()))  # no marker when nothing was cut
+
     def test_timeout_denies_and_expires_never_allows(self):
         _, out, _ = run_hook(self.ws, {"tool_name": "Bash", "tool_input": {"command": "true"}}, timeout="1")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")

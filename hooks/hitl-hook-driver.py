@@ -62,14 +62,24 @@ def _workspace() -> Path:
     return Path(resolve_workspace())
 
 
+SUMMARY_CAP = 200
+
+
+def _clip(text: str) -> str:
+    # A clipped command must SAY it was clipped: the owner allows what they read.
+    if len(text) <= SUMMARY_CAP:
+        return text
+    return f"{text[:SUMMARY_CAP]}… (truncated; {len(text)} chars total)"
+
+
 def _summary(tool: str, tool_input: dict) -> str:
     if tool == "Bash":
-        return str(tool_input.get("command") or "")[:200]
+        return _clip(str(tool_input.get("command") or ""))
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         return str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
     if tool == "ExitPlanMode":
         return "exit plan mode and start executing"
-    return json.dumps(tool_input, sort_keys=True)[:200]
+    return _clip(json.dumps(tool_input, sort_keys=True))
 
 
 def _guard(tool: str, tool_input: dict) -> str:

@@ -17,10 +17,11 @@ from typing import Iterable, Mapping, Optional
 from .schema import HumanRequirement
 
 ALLOW_TOOLS_ENV = "SUTANDO_HITL_ALLOW_TOOLS"
-# Read-only tools: nothing they do needs a human's eyes before it runs.
+# Tools whose own effect is local and read-only. Task/Skill only START work whose
+# tool calls are hooked individually; WebFetch is an egress channel and is NOT here.
 DEFAULT_ALLOW_TOOLS = (
     "Read", "Glob", "Grep", "LS", "TodoWrite", "TodoRead",
-    "WebSearch", "WebFetch", "Task", "Skill", "NotebookRead",
+    "WebSearch", "Task", "Skill", "NotebookRead",
 )
 AUTO_ALLOW_KIND = "allow_once"
 
