@@ -25,9 +25,9 @@ _COMPONENT = r"(?:[^%@#+~:/\\]|%[0-9A-F]{2})+"
 _DELIVERY_BASE = rf"(?:d|legacy):{_COMPONENT}@{_COMPONENT}(?:\+r[1-9][0-9]*)*"
 _DELIVERY_PARTS = re.compile(rf"(?:d|legacy):({_COMPONENT})@({_COMPONENT})(?:\+r[1-9][0-9]*)*")
 _ORDINAL = r"(?:0|[1-9][0-9]*)"
-# delivery_core's shipped key <item_id>#<epoch>, unescaped and OPAQUE: path
-# separators included. Disjoint from "e:...@...", which has no '#'.
-_LEGACY_KEY = r".+#[0-9]+"
+# delivery_core's shipped key <item_id>#<epoch>: OPAQUE, any item_id the
+# formatter accepted ("" included), one canonical epoch spelling.
+_LEGACY_KEY = rf".*#{_ORDINAL}"
 
 
 def _validate(value: str, kind: str, *, charset: bool = True,
@@ -102,11 +102,12 @@ class AttemptId(_Identity):
 
 
 class IdempotencyKey(_Identity):
-    """One external side-effect, deduplicated. Stable across re-sends. Two
-    admissible shapes: the canonical e:<task>@<boundary>, and the pre-B
-    provider key <item_id>#<epoch> that legacy_idempotency_key preserves."""
+    """One external side-effect, deduplicated. Epoch 0 is stable across
+    retries; a re-send epoch n carries the +r<n> suffix and is a new effect.
+    Two admissible shapes: the canonical e:<task>@<boundary>[+r<n>], and the
+    pre-B provider key <item_id>#<epoch> that legacy_idempotency_key preserves."""
 
-    _PATTERN = re.compile(rf"e:({_COMPONENT})@({_COMPONENT})")
+    _PATTERN = re.compile(rf"e:({_COMPONENT})@({_COMPONENT})(?:\+r[1-9][0-9]*)?")
     _OPAQUE = re.compile(_LEGACY_KEY, re.DOTALL)  # an item_id may hold newlines
 
     def _components(self):

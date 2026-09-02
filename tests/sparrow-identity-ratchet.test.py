@@ -150,7 +150,7 @@ def scan_task_mints(root: Path) -> dict:
                 # names one spelling invites the other.
                 if (isinstance(f, ast.Attribute)
                         and f.attr in ("format", "format_map")
-                        and _is_task_literal(f.value)):
+                        and _leads_task(f.value)):
                     record()
                 self.generic_visit(n)
 
@@ -262,7 +262,36 @@ def _assigned_here(node) -> set:
             if isinstance(sub, ast.Name) and isinstance(sub.ctx,
                                                         (ast.Store, ast.Del)):
                 out.add(sub.id)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                # A private import is a binding too: rebinding a canonical
+                # name makes every later call in this scope private.
+                out.update(_import_bindings(sub))
     return out
+
+
+def _import_bindings(node) -> set:
+    """Names an import binds, excluding the canonical package's own —
+    those are the bindings the gate exists to recognise, not shadows."""
+    if isinstance(node, ast.ImportFrom) and node.module in (_IDENTITY_MODULE,
+                                                            "ag2_sparrow"):
+        return set()
+    if isinstance(node, ast.Import):
+        return {a.asname or a.name.split(".")[0] for a in node.names
+                if a.name != _IDENTITY_MODULE}
+    return {a.asname or a.name.split(".")[0] for a in node.names}
+
+
+def _scope_nodes(body_node):
+    """Nodes of ONE lexical scope in source order; nested scopes are pruned,
+    so a sibling function's locals never certify this one's names."""
+    for child in ast.iter_child_nodes(body_node):
+        yield child
+        # A nested scope has its own walk; an assignment's subtree is
+        # handled at the assignment, value before targets.
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef, ast.Assign, ast.AnnAssign)):
+            continue
+        yield from _scope_nodes(child)
 
 
 
@@ -325,41 +354,74 @@ def _certified_nodes(tree, bindings: set) -> set:
         fn = node.func
         if isinstance(fn, ast.Name):
             return (fn.id in bindings and fn.id in _PURE_DERIVATIONS
-                    and fn.id not in rebound and fn.id not in module_rebound)
+                    and fn.id not in rebound)
         if isinstance(fn, ast.Attribute) and fn.attr in _PURE_DERIVATIONS:
             root = fn.value
             while isinstance(root, ast.Attribute):
                 root = root.value
             return (isinstance(root, ast.Name) and root.id in bindings
-                    and root.id not in rebound and root.id not in module_rebound)
+                    and root.id not in rebound)
         return False
 
     def mark(node):
         out.update(id(n) for n in ast.walk(node))
 
-    def walk_scope(body_node, rebound):
+    def walk_scope(body_node, outer_rebound):
         cert = set()
+        # Shadowing is positional: a call before this scope rebinds the
+        # constructor is canonical, the same call after it is private.
+        shadowed = set()
+
+        def rebound_now():
+            return shadowed | outer_rebound
 
         def certified(v):
-            return pure_call(v, rebound) or (isinstance(v, ast.Name) and v.id in cert)
+            return (pure_call(v, rebound_now())
+                    or (isinstance(v, ast.Name) and v.id in cert))
 
-        for node in ast.walk(body_node):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
-                    and node is not body_node:
-                continue
-            if isinstance(node, ast.Call) and pure_call(node, rebound):
-                mark(node.func)
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        def shadow(name):
+            shadowed.add(name)
+            cert.discard(name)
+
+        def visit_expr(expr):
+            for node in ast.walk(expr):
+                if isinstance(node, ast.Call) and pure_call(node, rebound_now()):
+                    mark(node.func)
+                elif isinstance(node, ast.keyword) and certified(node.value):
+                    out.add(id(node))
+                elif isinstance(node, ast.Dict):
+                    for k, v in zip(node.keys, node.values):
+                        if k is not None and certified(v):
+                            mark(k)
+                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) \
+                        and node.id in cert:
+                    out.add(id(node))
+
+        for node in _scope_nodes(body_node):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for name in _import_bindings(node):
+                    shadow(name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef)):
+                shadow(node.name)
+            elif isinstance(node, ast.arg):
+                shadow(node.arg)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                if node.value is not None and certified(node.value):
-                    for tg in targets:
+                ok = node.value is not None and certified(node.value)
+                if node.value is not None:
+                    visit_expr(node.value)
+                for tg in targets:
+                    if ok:
                         mark(tg)
-                        if isinstance(tg, ast.Name):
-                            cert.add(tg.id)
-                else:
-                    for tg in targets:
-                        if isinstance(tg, ast.Name):
-                            cert.discard(tg.id)
+                    for name in (n.id for n in ast.walk(tg) if isinstance(n, ast.Name)):
+                        shadow(name)
+                        if ok and isinstance(tg, ast.Name):
+                            cert.add(name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                shadow(node.id)
+            elif isinstance(node, ast.Call) and pure_call(node, rebound_now()):
+                mark(node.func)
             elif isinstance(node, ast.keyword) and certified(node.value):
                 out.add(id(node))
             elif isinstance(node, ast.Dict):
@@ -370,12 +432,11 @@ def _certified_nodes(tree, bindings: set) -> set:
                     and node.id in cert:
                 out.add(id(node))
 
-    # ast.walk is breadth-first, so a nested scope's nodes are reached after
-    # its parent's; each scope is walked once with its own rebinding set.
-    walk_scope(tree, module_rebound)
+    # Each scope is walked once, lexically, with its own rebinding set.
+    walk_scope(tree, set())
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            walk_scope(node, _assigned_here(node))
+            walk_scope(node, module_rebound)
     return out
 
 
@@ -523,6 +584,16 @@ class ScannerPositiveControls(unittest.TestCase):
             self.assertEqual(sum(self._scan_fixture(rel, src).values()), 1,
                              f"scanner missed the {name} mint shape")
 
+    def test_catches_a_mint_behind_a_module_constant_template(self):
+        # `T = "task-{stamp}"; T.format_map(d)` mints exactly what the literal
+        # form does; the constant is one level of indirection, not a disguise.
+        for src in ('T = "task-{stamp}"\nx = T.format_map(d)\n',
+                    'T = "task-{}"\nx = T.format(ts)\n'):
+            self.assertEqual(sum(self._scan_fixture("a.py", src).values()), 1,
+                             src)
+        self.assertEqual(self._scan_fixture("a.py", 'T = "task-static"\nx = T\n'),
+                         {}, "a bare constant reference is not a mint")
+
     def test_ignores_non_mint_task_strings(self):
         self.assertEqual(
             self._scan_fixture("a.py", 'x = "task-static"\ny = f"task-lit"\n'),
@@ -562,6 +633,35 @@ class DeliveryGateHostileControls(unittest.TestCase):
 
     def _canonical(self, source: str) -> bool:
         return has_canonical_binding(ast.parse(source))
+
+    def test_a_sibling_scope_cannot_certify_this_scopes_local(self):
+        # bad() records a private value under a local that good() later binds
+        # canonically; certification is per scope and per binding order.
+        src = ("from ag2_sparrow.identity import delivery_id\n"
+               "def bad(d):\n"
+               '    return {"delivery_id": d}\n'
+               "def good(t):\n"
+               '    d = delivery_id(t, "gw")\n'
+               '    return {"delivery_id": d}\n')
+        self.assertEqual(self._sites(src), {"bad": 1})
+        # Same scope, but the use precedes the canonical binding.
+        src = ("from ag2_sparrow.identity import delivery_id\n"
+               "def f(t, d):\n"
+               '    rec = {"delivery_id": d}\n'
+               '    d = delivery_id(t, "gw")\n'
+               "    return rec\n")
+        self.assertEqual(self._sites(src), {"f": 1})
+
+    def test_a_private_import_rebinding_the_constructor_is_not_canonical(self):
+        src = ("from ag2_sparrow.identity import delivery_id\n"
+               "def f(t):\n"
+               '    d = delivery_id(t, "gw")\n'
+               "    from private_mint import mint as delivery_id\n"
+               "    d = delivery_id(t)\n"
+               '    return {"delivery_id": d}\n')
+        sites = self._sites(src)
+        self.assertGreaterEqual(sites.get("f", 0), 1,
+                                f"import shadow cleared the gate: {sites}")
 
     def test_no_spoof_or_shadow_clears_the_gate(self):
         for name, source in sorted(self.SPOOFS.items()):

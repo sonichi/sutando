@@ -11,7 +11,8 @@ Namespace prefixes keep the kinds parseable and collision-free:
     legacy:<content>@<boundary>    R3 mapping of a pre-B artifact
     <delivery>+r<n>                post-reconciliation re-send successor
     <delivery>#a<n>                attempt n of a delivery
-    e:<task>@<boundary>            idempotency key (stable across re-sends)
+    e:<task>@<boundary>            idempotency key, resend_epoch 0
+    e:<task>@<boundary>+r<n>       the key of re-send epoch n (a NEW effect)
     <item_id>#<epoch>              the pre-B provider key, preserved verbatim
 """
 from __future__ import annotations
@@ -37,6 +38,14 @@ def _require_ordinal(ordinal, name: str) -> None:
                         f"got {type(ordinal).__name__}")
     if ordinal < 1:
         raise ValueError(f"{name} is 1-based")
+
+
+def _require_epoch(resend_epoch) -> None:
+    if isinstance(resend_epoch, bool) or not isinstance(resend_epoch, int):
+        raise TypeError(f"resend_epoch must be an int, "
+                        f"got {type(resend_epoch).__name__}")
+    if resend_epoch < 0:
+        raise ValueError("resend_epoch is 0-based")
 
 
 def ingress_task_id(instance: str, provider_event_id: str) -> TaskId:
@@ -100,12 +109,16 @@ def attempt_id(delivery: DeliveryId, ordinal: int) -> AttemptId:
     return AttemptId(f"{delivery.value}#a{ordinal}")
 
 
-def idempotency_key(task: TaskId, boundary: str) -> IdempotencyKey:
-    """One external side-effect. A re-send successor keeps the SAME key —
-    derive from the task and boundary, never from the delivery lineage."""
+def idempotency_key(task: TaskId, boundary: str, resend_epoch: int = 0
+                    ) -> IdempotencyKey:
+    """One external side-effect. Retries and crash recovery keep epoch 0's
+    key; a post-reconciliation re-send is a NEW effect, so its epoch advances
+    and the key changes (sparrow-delivery-identity: R2's minting row)."""
     _require(task, TaskId, "task")
-    return IdempotencyKey(f"e:{escape_component(task.value)}@"
-                          f"{escape_component(boundary)}")
+    _require_epoch(resend_epoch)
+    base = (f"e:{escape_component(task.value)}@"
+            f"{escape_component(boundary)}")
+    return IdempotencyKey(base if resend_epoch == 0 else f"{base}+r{resend_epoch}")
 
 
 def legacy_idempotency_key(item_id: str, resend_epoch: int = 0
@@ -116,13 +129,11 @@ def legacy_idempotency_key(item_id: str, resend_epoch: int = 0
     the shape is opaque rather than injective. Deliveries begun before the
     canonical key exists must keep this key, or the same side effect is
     re-offered under a name the provider cannot recognise as a duplicate."""
-    if not isinstance(item_id, str) or not item_id:
-        raise ValueError("item_id must be a non-empty string")
-    if isinstance(resend_epoch, bool) or not isinstance(resend_epoch, int):
-        raise TypeError(f"resend_epoch must be an int, "
-                        f"got {type(resend_epoch).__name__}")
-    if resend_epoch < 0:
-        raise ValueError("resend_epoch is 0-based")
+    # Every str is in the domain, the empty string included: the shipped
+    # formatter accepted it and a published item must stay drainable.
+    if not isinstance(item_id, str):
+        raise TypeError(f"item_id must be str, got {type(item_id).__name__}")
+    _require_epoch(resend_epoch)
     return IdempotencyKey(f"{item_id}#{resend_epoch}")
 
 

@@ -14,6 +14,9 @@
     {"kind": "idempotency_key", "args": ["task-1712000000001", "discord-dm"], "expected": "e:task-1712000000001@discord-dm"},
     {"kind": "legacy_idempotency_key", "args": ["task-1712000000001", 0], "expected": "task-1712000000001#0"},
     {"kind": "legacy_idempotency_key", "args": ["proactive-99.txt#171200000", 1], "expected": "proactive-99.txt#171200000#1"},
-    {"kind": "incarnation_id_from", "args": ["worker-2", 4242, 1712000000123456], "expected": "worker-2:4242:1712000000123456"}
+    {"kind": "incarnation_id_from", "args": ["worker-2", 4242, 1712000000123456], "expected": "worker-2:4242:1712000000123456"},
+    {"kind": "idempotency_key", "args": ["task-1712000000001", "discord-dm", 1], "expected": "e:task-1712000000001@discord-dm+r1"},
+    {"kind": "idempotency_key", "args": ["task-1712000000001", "discord-dm", 0], "expected": "e:task-1712000000001@discord-dm"},
+    {"kind": "legacy_idempotency_key", "args": ["", 0], "expected": "#0"}
   ]
 }

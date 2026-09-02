@@ -36,7 +36,8 @@ def from_outbox_item(item_id: str, boundary: str,
     )
 
 
-def from_delivered_sentinel(task_id: str, boundary: str) -> LegacyMapping:
+def from_delivered_sentinel(task_id: str, boundary: str,
+                            resend_epoch: int = 0) -> LegacyMapping:
     """A task-keyed delivered-sentinel: delivery and side-effect were both
     keyed by the task (delivery_id == task_id debt, legal under R3).
 
@@ -46,5 +47,5 @@ def from_delivered_sentinel(task_id: str, boundary: str) -> LegacyMapping:
     task = TaskId(task_id)
     return LegacyMapping(
         delivery_id=legacy_delivery_id(task.value, boundary),
-        idempotency_key=idempotency_key(task, boundary),
+        idempotency_key=idempotency_key(task, boundary, resend_epoch),
     )

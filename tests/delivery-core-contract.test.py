@@ -539,17 +539,16 @@ class LegacyKeyDomain(unittest.TestCase):
                 self.assertEqual(core.provider.calls, [(item, f"{item}#0")],
                                  "expected exactly one provider call with the shipped key")
 
-    def test_underivable_key_strands_nothing(self):
-        # Derivation runs before the claim, so a key that cannot be derived
-        # leaves no provider call and no item held by this worker.
+    def test_empty_item_id_keeps_the_parent_domain_through_the_real_core(self):
+        # main accepted "" at publish and drained it under key "#0"; the real
+        # core must still reach the provider exactly once with that key.
         item = ""
         with tempfile.TemporaryDirectory() as td:
             backend, core = self._core(td, item)
-            with self.assertRaises(ValueError):
-                core.deliver_one(item, b"payload")
-            self.assertEqual(core.provider.calls, [], "provider was called")
-            self.assertIsNotNone(backend.claim(item, "successor"),
-                                 "item is stranded: no successor can claim it")
+            core.deliver_one(item, b"payload")
+            core.deliver_one(item, b"payload")
+            self.assertEqual(core.provider.calls, [(item, "#0")],
+                             "expected exactly one provider call with the shipped key")
 
 
 class _KeyProbe:

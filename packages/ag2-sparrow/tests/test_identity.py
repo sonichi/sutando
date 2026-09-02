@@ -30,7 +30,7 @@ _KINDS = {
         serialization.parse_delivery_id(a[0]), a[1]),
     "attempt_id": lambda a: I.attempt_id(
         serialization.parse_delivery_id(a[0]), a[1]),
-    "idempotency_key": lambda a: I.idempotency_key(I.TaskId(a[0]), a[1]),
+    "idempotency_key": lambda a: I.idempotency_key(I.TaskId(a[0]), *a[1:]),
     "legacy_idempotency_key": lambda a: I.legacy_idempotency_key(*a),
     "incarnation_id_from": lambda a: I.incarnation_id_from(*a),
 }
@@ -106,14 +106,28 @@ class Injectivity(unittest.TestCase):
 
 
 class LineageAndOrdering(unittest.TestCase):
-    def test_resend_is_new_id_with_lineage_and_same_effect_key(self):
+    def test_resend_is_new_id_with_lineage_and_a_new_effect_key(self):
+        # A re-send is a NEW side-effect: its epoch advances and its key is
+        # new; epoch 0 stays stable across retries (R2's minting row).
         task = I.TaskId("task-abc")
         d1 = I.delivery_id(task, "gw")
         d2 = I.resend_delivery_id(d1, 1)
         self.assertNotEqual(d1, d2)
         self.assertTrue(d2.value.startswith(d1.value))
-        self.assertEqual(I.idempotency_key(task, "gw"),
-                         I.idempotency_key(task, "gw"))
+        k0 = I.idempotency_key(task, "gw")
+        self.assertEqual(k0, I.idempotency_key(task, "gw", 0))
+        k1 = I.idempotency_key(task, "gw", 1)
+        self.assertNotEqual(k0, k1)
+        self.assertEqual(k1.value, "e:task-abc@gw+r1")
+        self.assertNotEqual(k1, I.idempotency_key(task, "gw", 2))
+        with self.assertRaises(ValueError):
+            I.idempotency_key(task, "gw", -1)
+        with self.assertRaises(TypeError):
+            I.idempotency_key(task, "gw", True)
+        m0 = legacy.from_delivered_sentinel("task-abc", "gw")
+        m1 = legacy.from_delivered_sentinel("task-abc", "gw", 1)
+        self.assertEqual(m0.idempotency_key, k0)
+        self.assertEqual(m1.idempotency_key, k1)
 
     def test_ordinals_are_one_based(self):
         d = I.delivery_id(I.TaskId("task-abc"), "gw")
@@ -123,6 +137,27 @@ class LineageAndOrdering(unittest.TestCase):
             I.resend_delivery_id(d, 0)
 
 
+class LegacyKeyDomain(unittest.TestCase):
+    def test_every_string_the_shipped_formatter_accepted_is_a_key(self):
+        # main formats f"{item_id}#{epoch}" for every str, the empty one
+        # included; narrowing it strands a published item on every drain.
+        for item in ("", "a/b", "a\nb", "x" * 500):
+            k = I.legacy_idempotency_key(item, 0)
+            self.assertEqual(k.value, f"{item}#0")
+            self.assertEqual(serialization.parse_idempotency_key(k.value), k)
+        with self.assertRaises(TypeError):
+            I.legacy_idempotency_key(None, 0)
+
+    def test_the_epoch_spelling_is_canonical(self):
+        # legacy_idempotency_key emits task-X#0, never task-X#00: a spelling the
+        # constructor cannot produce must not parse as a shipped key.
+        self.assertEqual(I.IdempotencyKey("task-X#0").value, "task-X#0")
+        self.assertEqual(I.IdempotencyKey("#0").value, "#0")
+        for bad in ("task-X#00", "task-X#01", "task-X#", "task-X#-1"):
+            with self.assertRaises(ValueError, msg=bad):
+                I.IdempotencyKey(bad)
+
+
 class RoundTrip(unittest.TestCase):
     def test_parse_accepts_every_derived_shape(self):
         task = I.TaskId("task-1~x")
@@ -130,11 +165,13 @@ class RoundTrip(unittest.TestCase):
         r = I.resend_delivery_id(d, 2)
         a = I.attempt_id(r, 1)
         k = I.idempotency_key(task, "gw")
+        k3 = I.idempotency_key(task, "gw", 3)
         n = I.incarnation_id_from("w", 1, 2)
         self.assertEqual(serialization.parse_delivery_id(d.value), d)
         self.assertEqual(serialization.parse_delivery_id(r.value), r)
         self.assertEqual(serialization.parse_attempt_id(a.value), a)
         self.assertEqual(serialization.parse_idempotency_key(k.value), k)
+        self.assertEqual(serialization.parse_idempotency_key(k3.value), k3)
         self.assertEqual(serialization.parse_task_id(task.value), task)
         self.assertEqual(serialization.parse_incarnation_id(n.value), n)
 
@@ -374,8 +411,11 @@ class DeliveryCoreKeyOwnership(unittest.TestCase):
                 self.assertEqual(serialization.parse_idempotency_key(k.value), k)
 
     def test_preserved_key_rejects_only_genuinely_invalid_input(self):
-        with self.assertRaises(ValueError):
-            I.legacy_idempotency_key("")
+        # "" is in the shipped domain (main formats every str); only a
+        # non-str item or a malformed epoch is genuinely invalid.
+        self.assertEqual(I.legacy_idempotency_key("").value, "#0")
+        with self.assertRaises(TypeError):
+            I.legacy_idempotency_key(None)
         with self.assertRaises(TypeError):
             I.legacy_idempotency_key("task-X", True)
         with self.assertRaises(ValueError):
