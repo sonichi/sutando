@@ -37,9 +37,12 @@ check "the real log() is silent on stdout/stderr (control)" \
 check "...and is durable in \$LOG (so the control is not silence-by-breakage)" \
       'grep -q "control probe" "$LOG"'
 
-echo "1. reviewer's control: per-host written independently, stale root TOUCHED LATER"
+echo "1. reviewer's control: a RECORDED copy edited independently, stale root TOUCHED LATER"
+# The record is what makes a diverged copy evidence of a second writer; a copy
+# with no record is adopted instead (5c-5f).
 echo "stale relic" > "$WORKSPACE_DIR/build_log.md"
 echo "per-host live entry" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+printf '%064d\n' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"   # valid, does not match
 sleep 1
 touch "$WORKSPACE_DIR/build_log.md"   # root now strictly NEWER than the live per-host copy
 _snapshot_per_host_config
@@ -89,69 +92,77 @@ _snapshot_per_host_config
 check "root-live refresh works after the upgrade bootstrap" \
       '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root moved after upgrade" ]'
 
-echo "5c. pre-provenance DIVERGED copy stays refused (no adoption on difference)"
-rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
-_snapshot_per_host_config
-check "diverged unrecorded copy is preserved, not adopted or overwritten" \
-      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "independent content" ]'
-check "no-provenance refusal names the ACTUAL condition, not a second writer" \
-      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "provenance record"'
-check "...and does NOT tell the operator to archive a copy (the message that did)" \
-      '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+# A copy with NO USABLE record (absent, empty, malformed, NUL-damaged) is not
+# evidence of a second writer: it is adopted — stamped, then refreshed from root.
+_sha_of() { shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1; }
+adopts() {   # $1 = case label; the sig file has already been arranged by the caller
+    echo "root is the writer" > "$WORKSPACE_DIR/build_log.md"
+    echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+    : > "$LOG"
+    _out="$(_snapshot_per_host_config 2>&1 >/dev/null)"
+    check "$1: per-host copy is refreshed from root in the SAME tick" \
+          '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "root is the writer" ]'
+    check "$1: provenance now records the refreshed copy" \
+          '[ "$(tr -d "\n" < "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha")" = "$(_sha_of "$WORKSPACE_DIR/build_log.md")" ]'
+    check "$1: the adoption is logged as such" \
+          'grep -q "adopted hosts/testhost/build_log.md" "$LOG"'
+    check "$1: nothing is refused and no copy is called an independent writer" \
+          '[ -z "$_out" ] && ! grep -q "pick ONE writer" "$LOG"'
+}
 
-# [ -z "$_rec" ] is ALSO true for an EMPTY or unreadable sig file, so the
-# branch must not claim the file is merely missing.
+echo "5c. pre-provenance DIVERGED copy is ADOPTED, not refused"
+rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+adopts "absent record"
 : > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"     # exists, but empty
-check "an EMPTY provenance file takes the same no-usable-record branch" \
-      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
-check "...and an empty record is still not called an independent writer" \
-      '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+adopts "EMPTY record"
 
 echo "5d. present-but-MALFORMED signature is not usable provenance either"
 # A 63-char partial (torn write, stray copy, manual edit) satisfies a bare
-# equality test; any non-sha256 content must take the guarded branch.
+# equality test; any non-sha256 content must take the no-record branch.
 printf '%063d' 0 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-check "a 63-char partial signature takes the no-usable-record branch" \
-      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
-check "...and is NOT read as an independent writer" \
-      '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+adopts "63-char partial signature"
 printf 'not hex at all\n' > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-check "arbitrary foreign content in the sig file is equally unusable" \
-      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
+adopts "arbitrary foreign content"
+printf '%064d ' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+adopts "trailing SPACE after the sha"
 # Positive control for the validator: a VALID 64-hex stale sha must still be
-# read as a genuine independent writer — validation must not widen the guard.
+# read as a genuine independent writer — adoption must not widen past no-record.
+echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
 printf '%064d' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 check "a valid-shape stale sha is STILL an independent writer (control)" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+check "...and its copy is preserved, not adopted" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "independent content" ]'
 # Pinned leniency: the writer itself emits a trailing newline, so newlines
-# after the sha must stay usable. Trailing SPACES stay invalid.
+# after the sha must stay usable.
 printf '%064d\n\n\n' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 check "a valid sha with trailing blank lines is still USABLE provenance" \
       '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
-printf '%064d ' 1 > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-check "...but a trailing SPACE is malformed, not a writer" \
-      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
 
 echo "5e. NUL damage must be judged on the on-disk bytes, not post-\$() text"
 # Shell substitution strips NULs, so a NUL-damaged record collapses to 64
 # clean hex chars; the validator must reject the bytes before that happens.
-printf 'root stale\n' > "$WORKSPACE_DIR/build_log.md"
 printf 'per-host live entry\n' > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
-_live_sha="$(shasum -a 256 "$WORKSPACE_DIR/hosts/testhost/build_log.md" | cut -d' ' -f1)"
+_live_sha="$(_sha_of "$WORKSPACE_DIR/hosts/testhost/build_log.md")"
 printf '%s\0' "$_live_sha" > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-check "a trailing-NUL signature is NOT usable provenance" \
-      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
-check "...and the live destination survives (no overwrite authority)" \
-      'grep -q "per-host live entry" "$WORKSPACE_DIR/hosts/testhost/build_log.md"'
-check "...and NUL damage is not an independent writer" \
-      '! _snapshot_per_host_config 2>&1 >/dev/null | grep -q "pick ONE writer"'
+adopts "trailing-NUL signature"
 printf '%.32s\0%.32s' "$_live_sha" "${_live_sha:32}" \
     > "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
-check "an embedded-NUL signature is equally unusable" \
-      '_snapshot_per_host_config 2>&1 >/dev/null | grep -q "NO USABLE provenance record"'
-check "...and the live destination still survives" \
-      'grep -q "per-host live entry" "$WORKSPACE_DIR/hosts/testhost/build_log.md"'
+adopts "embedded-NUL signature"
+
+echo "5f. an adoption whose record cannot be made durable does NOT touch the copy"
+rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
+echo "root is the writer" > "$WORKSPACE_DIR/build_log.md"
+echo "independent content" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
+chmod 555 "$WORKSPACE_DIR/hosts/testhost"        # the stamp's temp cannot be staged
+_out="$(_snapshot_per_host_config 2>&1 >/dev/null)"
+chmod 755 "$WORKSPACE_DIR/hosts/testhost"
+check "no durable record -> the diverged copy is left exactly as it was" \
+      '[ "$(cat "$WORKSPACE_DIR/hosts/testhost/build_log.md")" = "independent content" ]'
+check "...and the operator hears it could not be adopted, not that it was refused as a writer" \
+      'printf "%s" "$_out" | grep -q "could not be adopted this tick" && ! printf "%s" "$_out" | grep -q "pick ONE writer"'
+check "...and no provenance record was invented" \
+      '[ ! -e "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha" ]'
 rm -f "$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 echo "keep it that way" >> "$WORKSPACE_DIR/build_log.md"
 echo "per-host went live" > "$WORKSPACE_DIR/hosts/testhost/build_log.md"
@@ -277,9 +288,8 @@ check "the composed rule does NOT ignore an unrelated notes/ file of the same na
 rm -rf "$_gi"
 
 echo "10. an interrupted publish is recoverable at EVERY boundary, and fails closed"
-# The publish is intent -> mv -> promote. Each boundary is exercised by leaving
-# the on-disk state that boundary produces, then running the production function
-# and asserting what the NEXT tick does with it.
+# The publish is intent -> mv -> promote. Each boundary is exercised by leaving the
+# state it produces, then asserting what the NEXT tick does with it.
 _SIG="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 _INT="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha.next"
 _DST="$WORKSPACE_DIR/hosts/testhost/build_log.md"
@@ -328,18 +338,14 @@ check "d) a second recovery pass changes nothing" \
 rm -f "$_INT" "$_SIG"
 
 echo "11. INJECTED write/fsync/rename failures: the chain fails closed, never half-published"
-# keweichen on #3198: a best-effort chain lets the destination be renamed with no
-# durable intent. Each injection asserts the destination and the signature are
-# left CONSISTENT — never a new destination with stale/absent provenance.
+# A best-effort chain lets the destination be renamed with no durable intent. Each
+# injection asserts destination and signature are left CONSISTENT.
 _SIG="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha"
 _INT="$WORKSPACE_DIR/hosts/testhost/.build_log.snapshot-sha.next"
 _DST="$WORKSPACE_DIR/hosts/testhost/build_log.md"
 
-# Inject a durability failure without a seam in production code: the fsync
-# helper runs `python3 - <path>`, so a shim that refuses exactly that path makes
-# the fsync fail while every other python3 call still works.
-# PATH no longer reaches the interpreter (section 12), so inject through
-# SYNC_PY — the seam the resolver itself honours.
+# Inject a durability failure with no seam in production code: the fsync helper runs
+# `python3 - <path>`, so shim SYNC_PY — the seam the resolver itself honours.
 _fsync_shim() {
     _fs="$(mktemp -d)"
     cat > "$_fs/python3" <<SHIM
@@ -388,9 +394,8 @@ _dst_now="$(shasum -a 256 "$_DST" | cut -d' ' -f1)"
 check "...so the NEXT tick completes it from the intent" \
       '[ ! -f "$_INT" ] && [ "$(cat "$_SIG")" = "$_dst_now" ]'
 
-# (c) a non-atomic in-place signature write must not exist as a fallback: with
-# the promote rename failing, the signature must stay UNCHANGED rather than be
-# rewritten in place.
+# (c) a non-atomic in-place signature write must not exist as a fallback: with the
+# promote rename failing, the signature must stay UNCHANGED.
 _arm_owned_snapshot
 _sig_before="$(cat "$_SIG")"
 _shim="$(mktemp -d)"
@@ -409,12 +414,8 @@ check "...and the intent survives for the next tick" '[ -f "$_INT" ]'
 rm -rf "$_shim"
 rm -f "$_INT"; rm -f "$_SIG"
 
-# (d) the SIGNATURE cannot be confirmed durable -> the promote rename has
-# already CONSUMED the intent, so a fresh one must be left behind. keweichen on
-# #3198: treating this last fsync as log-only spends the only recovery record
-# and still logs completion, so a crash here loses the provenance entirely.
-# The shim must match the signature and NOT the intent, so anchor on the end of
-# the path: `.snapshot-sha.next` must keep working while `.snapshot-sha` fails.
+# (d) the promote rename already CONSUMED the intent, so a non-durable signature must
+# leave a fresh one. Anchor the shim on `.snapshot-sha`, not `.snapshot-sha.next`.
 _sig_only_shim() {
     _fs="$(mktemp -d)"
     cat > "$_fs/python3" <<SHIM
@@ -460,8 +461,7 @@ check "...and does NOT log the publish as completed" \
 rm -f "$_INT"; rm -f "$_SIG"
 
 # ---- 12. the durable-publish path uses the REPO'S verified interpreter -------
-# A bare `python3` can be the Xcode-CLT stub: it "exists", fails on exec, and
-# raises an install dialog every interval while the snapshot stays stale.
+# A bare `python3` can be the Xcode-CLT stub: it exists, then fails on exec.
 echo "== 12. verified interpreter, not bare python3 =="
 
 check "no bare python3 survives in the script (comments aside)" \
@@ -490,10 +490,9 @@ check "...and it actually runs under the poisoned PATH" '[ "$?" -eq 0 ]'
 check "...without the stub ever being invoked" '[ ! -f "$_pylog" ]'
 rm -rf "$_pyd"
 
-echo "14. #3198 P1: the equal-content REPAIR obeys the durable publish contract"
-# The repair branch (dest == root, signature missing or stale) used to write the
-# signature in place with its failure swallowed. That is the partial-signature
-# risk the promote path refuses by using rename-only, reachable through repair.
+echo "14. the equal-content REPAIR obeys the durable publish contract"
+# The repair branch (dest == root, signature missing or stale) used to write in place
+# with its failure swallowed — the partial-signature risk rename-only avoids.
 
 _arm_stale_sig_equal_content() {
     printf 'same on both sides\n' > "$WORKSPACE_DIR/build_log.md"
