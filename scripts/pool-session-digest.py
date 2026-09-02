@@ -108,6 +108,9 @@ def find_transcript(session_id: str) -> "Path | None":
 # C0, DEL and C1. Whitespace is collapsed before this runs, so anything left is
 # a control the terminal would ACT on (OSC 52 writes the clipboard).
 _CTRL = {c: "\ufffd" for c in [*range(0x00, 0x20), 0x7F, *range(0x80, 0xA0)]}
+# A lone surrogate survives json.loads but not a UTF-8 stdout; one bad string
+# would end the sweep and hide every later session.
+_CTRL.update({c: "\ufffd" for c in range(0xD800, 0xE000)})
 
 
 def _safe(value) -> str:

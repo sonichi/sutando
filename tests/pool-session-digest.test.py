@@ -325,6 +325,28 @@ class MainTest(unittest.TestCase):
             rc = digest_mod.main()
         return rc, out.getvalue(), err.getvalue()
 
+    def test_lone_surrogate_in_a_session_does_not_hide_the_next_one(self):
+        """A JSON-decoded lone surrogate reaches print() through _safe; on a real
+        UTF-8 stdout that raised and ended the sweep before the clean session."""
+        self._transcript("sid-clean")
+        bad = json.loads('{"name": "core-x", "sessionId": "\\ud800", "status": "busy", "pid": 1}')
+        raw = io.BytesIO()
+        with unittest.mock.patch.object(sys, "argv", ["prog"]), \
+             unittest.mock.patch.object(digest_mod, "live_sessions",
+                                        return_value=([bad, self._session(sid="sid-clean")], None)), \
+             unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}), \
+             contextlib.redirect_stderr(io.StringIO()):
+            wrapped = io.TextIOWrapper(raw, encoding="utf-8", write_through=True)
+            with contextlib.redirect_stdout(wrapped):
+                rc = digest_mod.main()
+                wrapped.flush()
+                out = raw.getvalue().decode("utf-8")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("core-x", out)
+        self.assertIn("\ufffd", out)
+        self.assertIn("core-1", out)
+        self.assertIn("did a thing", out)
+
     def test_reports_a_session_and_its_last_event(self):
         self._transcript()
         rc, out, _ = self._main([], [self._session()])
