@@ -16,6 +16,9 @@ Namespace prefixes keep the kinds parseable and collision-free:
 """
 from __future__ import annotations
 
+import hashlib
+import re
+
 from .types import (AttemptId, DeliveryId, IdempotencyKey, IncarnationId,
                     TaskId)
 
@@ -70,12 +73,32 @@ def delivery_id(task: TaskId, boundary: str) -> DeliveryId:
                       f"{escape_component(boundary)}")
 
 
+# Mirrors the outbox's _safe_key: past this, a readable prefix plus a digest
+# of the RAW key — the prefix is lossy, the digest decides identity.
+_LEGACY_READABLE = 80
+
+
+def _bounded_legacy_component(content_key: str) -> str:
+    esc = escape_component(content_key)
+    if len(esc) <= _LEGACY_READABLE + 17:
+        return esc
+    out, n = [], 0
+    for tok in re.findall(r"%[0-9A-F]{2}|.", esc):   # never split an escape
+        if n + len(tok) > _LEGACY_READABLE:
+            break
+        out.append(tok)
+        n += len(tok)
+    digest = hashlib.sha256(content_key.encode("utf-8")).hexdigest()[:16]
+    return f"{''.join(out)}.{digest}"
+
+
 def legacy_delivery_id(content_key: str, boundary: str) -> DeliveryId:
     """R3 mapping for a pre-B artifact with no delivery_id: a pure function
     of its stable content, so the same artifact maps to the same id on every
     read, on every host. content_key is whatever stable identity the artifact
-    already carries (task_id, filename#mtime_ns, ...)."""
-    return DeliveryId(f"legacy:{escape_component(content_key)}@"
+    already carries (task_id, filename#mtime_ns, ...). Long or escape-dense
+    keys take the digest form so derived attempt/resend ids stay bounded."""
+    return DeliveryId(f"legacy:{_bounded_legacy_component(content_key)}@"
                       f"{escape_component(boundary)}")
 
 

@@ -26,10 +26,11 @@ _DELIVERY_BASE = rf"(?:d|legacy):{_COMPONENT}@{_COMPONENT}(?:\+r[1-9][0-9]*)*"
 _LEGACY_KEY = r".+#[0-9]+"
 
 
-def _validate(value: str, kind: str, *, charset: bool = True) -> None:
+def _validate(value: str, kind: str, *, charset: bool = True,
+              bounded: bool = True) -> None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{kind} must be a non-empty string")
-    if len(value) > _MAX_LEN:
+    if bounded and len(value) > _MAX_LEN:
         raise ValueError(f"{kind} exceeds {_MAX_LEN} chars")
     if not charset:
         return
@@ -43,8 +44,8 @@ class _Identity:
     value: str
 
     _PATTERN: ClassVar[Optional[re.Pattern]] = None
-    # Bytes an earlier release already shipped: length stays bounded, but the
-    # charset rule cannot apply — narrowing it strands live deliveries.
+    # Bytes an earlier release already shipped byte-for-byte: neither the
+    # charset nor the length rule may apply — narrowing strands live deliveries.
     _OPAQUE: ClassVar[Optional[re.Pattern]] = None
 
     def __post_init__(self) -> None:
@@ -52,7 +53,7 @@ class _Identity:
         opaque = type(self)._OPAQUE
         is_opaque = bool(opaque is not None and isinstance(self.value, str)
                          and opaque.fullmatch(self.value))
-        _validate(self.value, kind, charset=not is_opaque)
+        _validate(self.value, kind, charset=not is_opaque, bounded=not is_opaque)
         if is_opaque:
             return
         pattern = type(self)._PATTERN
@@ -88,7 +89,7 @@ class IdempotencyKey(_Identity):
     provider key <item_id>#<epoch> that legacy_idempotency_key preserves."""
 
     _PATTERN = re.compile(rf"e:{_COMPONENT}@{_COMPONENT}")
-    _OPAQUE = re.compile(_LEGACY_KEY)
+    _OPAQUE = re.compile(_LEGACY_KEY, re.DOTALL)  # an item_id may hold newlines
 
 
 class IncarnationId(_Identity):

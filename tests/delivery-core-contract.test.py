@@ -528,10 +528,21 @@ class LegacyKeyDomain(unittest.TestCase):
                 self.assertEqual(core.provider.calls, [(item, f"{item}#0")],
                                  "provider saw a different key than was shipped")
 
+    def test_long_and_newline_item_ids_reach_the_provider_once(self):
+        # The cap ran BEFORE the opaque bypass, so these raised pre-claim on
+        # every drain and sat READY forever; the parent's domain was every string.
+        for item in ("x" * 199, "a\nb"):
+            with self.subTest(item=repr(item[:6])), tempfile.TemporaryDirectory() as td:
+                _, core = self._core(td, item)
+                core.deliver_one(item, b"payload")
+                core.deliver_one(item, b"payload")
+                self.assertEqual(core.provider.calls, [(item, f"{item}#0")],
+                                 "expected exactly one provider call with the shipped key")
+
     def test_underivable_key_strands_nothing(self):
         # Derivation runs before the claim, so a key that cannot be derived
         # leaves no provider call and no item held by this worker.
-        item = "x" * 300
+        item = ""
         with tempfile.TemporaryDirectory() as td:
             backend, core = self._core(td, item)
             with self.assertRaises(ValueError):

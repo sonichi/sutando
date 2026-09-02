@@ -275,6 +275,35 @@ class LegacyAdapter(unittest.TestCase):
         self.assertEqual(fence.idempotency_key.value, "proactive-9.txt#123#0")
 
 
+class LegacyDeliveryIdStaysBounded(unittest.TestCase):
+    """The delivery id is ours to shape (unlike the key), so a long or
+    escape-dense item takes a digest form rather than raising — and the
+    ids derived from it (attempt, resend) must still fit."""
+
+    LONG = ("x" * 191, "/" * 65, "\u00e9" * 100, "a b" * 70)
+
+    def test_long_items_map_and_stay_derivable(self):
+        for item in self.LONG:
+            with self.subTest(item=item[:12]):
+                m = legacy.from_outbox_item(item, "gw")
+                self.assertLessEqual(len(m.delivery_id.value), 200)
+                self.assertEqual(serialization.parse_delivery_id(m.delivery_id.value), m.delivery_id)
+                I.attempt_id(m.delivery_id, 1)
+                I.resend_delivery_id(m.delivery_id, 1)
+                self.assertEqual(m.idempotency_key.value, f"{item}#0",
+                                 "the provider key must stay byte-for-byte")
+
+    def test_digest_form_is_pure_and_injective(self):
+        a = legacy.from_outbox_item("x" * 191, "gw").delivery_id
+        self.assertEqual(a, legacy.from_outbox_item("x" * 191, "gw").delivery_id)
+        b = legacy.from_outbox_item("x" * 190 + "y", "gw").delivery_id
+        self.assertNotEqual(a, b, "the readable prefix is lossy; the digest must decide")
+
+    def test_short_items_keep_the_readable_form(self):
+        self.assertEqual(legacy.from_outbox_item("task-1712000000001", "gw").delivery_id.value,
+                         "legacy:task-1712000000001@gw")
+
+
 class DeliveryCoreKeyOwnership(unittest.TestCase):
     """One owner derives provider keys. The delivery core keeps its public
     name; the bytes come from ag2_sparrow.identity."""
@@ -304,10 +333,18 @@ class DeliveryCoreKeyOwnership(unittest.TestCase):
                 self.assertEqual(I.legacy_idempotency_key(item).value,
                                  f"{item}#0")
 
+    def test_preserved_key_keeps_every_length_and_newline(self):
+        # The parent formatted every string byte-for-byte; a cap or a charset
+        # applied before the opaque bypass strands the items past it.
+        for item in ("x" * 199, "x" * 300, "a\nb", "line\n#1"):
+            with self.subTest(item=item):
+                k = I.legacy_idempotency_key(item)
+                self.assertEqual(k.value, f"{item}#0")
+                self.assertEqual(serialization.parse_idempotency_key(k.value), k)
+
     def test_preserved_key_rejects_only_genuinely_invalid_input(self):
-        for bad in ("", "x" * 300):
-            with self.assertRaises(ValueError, msg=bad):
-                I.legacy_idempotency_key(bad)
+        with self.assertRaises(ValueError):
+            I.legacy_idempotency_key("")
         with self.assertRaises(TypeError):
             I.legacy_idempotency_key("task-X", True)
         with self.assertRaises(ValueError):
