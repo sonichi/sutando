@@ -87,10 +87,12 @@ class HitlManager:
         self.store = store
 
     def create(self, req: HumanRequirement) -> HumanRequirement:
-        # One active requirement per (runtime, kind): a re-detection refreshes
-        # the guard on the existing one instead of stacking duplicate cards.
+        # One active requirement per (runtime, kind, device): a re-detection
+        # refreshes the guard instead of stacking duplicate cards, while two
+        # sessions (device ids) with the same dialog stay two cards.
         for existing in self.active():
-            if existing.runtime == req.runtime and existing.kind == req.kind:
+            if (existing.runtime == req.runtime and existing.kind == req.kind
+                    and _device_id(existing) == _device_id(req)):
                 if req.guard and req.guard != existing.guard:
                     existing.refresh_guard(req.guard)
                     self.store.save(existing)
@@ -171,6 +173,10 @@ class HitlManager:
     def projection_target(self, req_id: str) -> Optional[str]:
         """Event id of the CREATE projection — the target for status EDITs."""
         return self.store.projection(req_id).get("event_id")
+
+
+def _device_id(req: HumanRequirement) -> str:
+    return str((req.device or {}).get("id") or "")
 
 
 def _req_to_dict(req: HumanRequirement) -> Dict:

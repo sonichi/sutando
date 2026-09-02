@@ -129,6 +129,12 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.mgr.get(a.id).guard, "g2")
         self.assertEqual(self.mgr.get(a.id).revision, 2)  # old cards went stale
 
+    def test_dedup_is_per_device_so_two_sessions_stay_two_cards(self):
+        a = self.mgr.create(make_req(guard="g1", device={"id": "core-1"}))
+        b = self.mgr.create(make_req(guard="g1", device={"id": "core-2"}))
+        self.assertNotEqual(a.id, b.id)
+        self.assertEqual(len(self.mgr.active()), 2)
+
     def test_apply_action_marks_in_progress(self):
         req = self.mgr.create(make_req())
         action = self.mgr.apply_action(reply_for(req))
