@@ -76,7 +76,8 @@ emit_restart_alert() {
   NOW="$(date +%s)"
   RESULT="$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$NOW.txt"
   echo "[$CHANNEL-bridge-wrapper] previous process exited; automatically restarting" >&2
-  printf '%s\n' "⚠️ The $CHANNEL bridge exited and was automatically restarted." > "$RESULT"
+  # Publish atomically: a consumer must never observe a partial body.
+  printf '%s\n' "⚠️ The $CHANNEL bridge exited and was automatically restarted." > "$RESULT.tmp-$$" && mv -f "$RESULT.tmp-$$" "$RESULT"
   osascript -e "display notification \"The $CHANNEL bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
 }
 if [ -f "$MARKER" ]; then emit_restart_alert; fi

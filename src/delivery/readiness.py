@@ -46,18 +46,21 @@ def read_ready_result(path: str | Path) -> str | None:
 
 
 def retire_claim_if_unchanged(claim: str | Path, delivered: str) -> bool:
-    """Unlink `claim` only while it still holds exactly the body that was sent.
+    """Retire `claim` only while it still holds exactly the body that was sent.
 
     A claim is a hard link, so a producer holding the original fd keeps
-    appending to THIS inode after the consumer read it. Unlinking then destroys
-    bytes that were never guarded and never delivered. False means the body
-    grew: the caller releases the claim instead, and a later pass sends it whole.
+    appending to THIS inode after the consumer read it. A destructive retire
+    (unlink) turns any append that lands after the last check into bytes that
+    were never guarded and never delivered — and no check-then-unlink closes
+    that window, because the producer is not party to the check.
 
-    Three ways bytes were destroyed before, all "return True and unlink":
-    a partial write mid-character decoded as None; an unreadable file decoded as
-    None; and an append landing between the final read and the unlink. The size
-    re-check NARROWS that last window — it does not close it. Closing it needs
-    atomic publication by every producer, which is a separate contract.
+    So retirement never destroys: the claim is MOVED (atomic rename) into a
+    sibling `retired/` directory, out of every consumer's glob, and the moved
+    inode is re-read. If the body grew in the meantime the move is undone and
+    False is returned: the caller releases the claim and a later pass sends it
+    whole. An append that lands after that re-read is preserved in `retired/`
+    rather than lost. False also covers unreadable, partial or vanished
+    claims — never retire what cannot be verified.
     """
     p = Path(claim)
     try:
@@ -85,5 +88,26 @@ def retire_claim_if_unchanged(claim: str | Path, delivered: str) -> bool:
             return False
     except OSError:
         return False
-    p.unlink(missing_ok=True)
+    retired = _retired_path(p)
+    try:
+        retired.parent.mkdir(parents=True, exist_ok=True)
+        p.replace(retired)
+    except OSError:
+        # Vanished or unmovable: release rather than act on a path we cannot verify.
+        return False
+    try:
+        if retired.read_bytes().decode().strip() != delivered:
+            retired.replace(p)   # grew between the check and the move: undo, resend whole
+            return False
+    except (OSError, UnicodeDecodeError):
+        try:
+            retired.replace(p)
+        except OSError:
+            pass
+        return False
     return True
+
+
+def _retired_path(claim: Path) -> Path:
+    """Where a retired claim's inode is kept: a sibling dir no consumer globs."""
+    return claim.parent / "retired" / claim.name

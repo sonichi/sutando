@@ -247,6 +247,51 @@ def _retire_rows() -> None:
           kept and c4.exists(),
           "the late bytes were destroyed")
 
+    # keweichen (#3305): the size re-check only NARROWED the window. An append
+    # between the size check and the retire step must be kept AND recoverable.
+    c9 = d / "after-stat.txt"; c9.write_text("body\n")
+    real_stat = Path.stat
+    fired9 = {"done": False}
+
+    def _stat_hook(self, *a, **k):
+        out = real_stat(self, *a, **k)
+        if str(self) == str(c9) and not fired9["done"]:
+            fired9["done"] = True
+            with open(c9, "a") as f:
+                f.write("LATE\n")
+        return out
+
+    Path.stat = _stat_hook
+    try:
+        kept9 = rd.retire_claim_if_unchanged(c9, "body") is False
+    finally:
+        Path.stat = real_stat
+    check("append AFTER the size check is kept and the claim released",
+          kept9 and c9.exists() and "LATE" in c9.read_text(),
+          "the late bytes were destroyed or the claim was retired")
+
+    # Retirement never unlinks: the moved inode keeps whatever a stale fd
+    # appends after the re-verify, so the worst case is a recoverable file.
+    c10 = d / "after-verify.txt"; c10.write_text("body\n")
+    real_replace = Path.replace
+    appended = {"done": False}
+
+    def _replace_hook(self, target, *a, **k):
+        out = real_replace(self, target, *a, **k)
+        return out
+    fd10 = open(c10, "a")
+    try:
+        assert rd.retire_claim_if_unchanged(c10, "body") is True
+        fd10.write("LATE\n"); fd10.flush()
+    finally:
+        fd10.close()
+        Path.replace = real_replace
+    retired10 = rd._retired_path(c10)
+    check("retired claim path is gone (consumer semantics unchanged)", not c10.exists())
+    check("bytes appended after retirement are preserved, not destroyed",
+          retired10.exists() and "LATE" in retired10.read_text(),
+          f"retired inode missing or lost the late bytes: {retired10}")
+
     # The remaining branches. Each is a distinct decision, and each was a way
     # bytes got destroyed or kept before, so none is filler for a coverage gate.
     c5 = d / "missing.txt"
