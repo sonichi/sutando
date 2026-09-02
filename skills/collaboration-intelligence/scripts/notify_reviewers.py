@@ -478,9 +478,8 @@ def _streams(led: Path) -> dict:
             # onto every retained row, losing asks made under an older alias.
             ident = {f: d[f] for f in ("reviewer", "actor", "endpoint")
                      if isinstance(d.get(f), str) and d.get(f)}
-            # `membership` is the component a park was reserved for, and
-            # `_membership_overlap` rereads it from the RAW row. Dropping it in
-            # compaction silently retires every retry-admission check.
+            # `_membership_overlap` rereads `membership` from the RAW row, so
+            # dropping it in compaction retires every retry-admission check.
             mem = valid_tags(d.get("membership"))
             if mem:
                 st["membership"] = sorted(set(st.get("membership") or []) | set(mem))
