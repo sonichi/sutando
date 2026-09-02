@@ -96,7 +96,9 @@ _EVICT_HELPER="$REPO/src/launchd/evict-own-bridge.sh"
 if [ -f "$_EVICT_HELPER" ]; then
   # shellcheck source=evict-own-bridge.sh
   . "$_EVICT_HELPER"
-  evict_own_bridge "$CHANNEL" "$REPO"
+  # Best-effort HERE by design: a discovery failure (nonzero return) must not
+  # set -e-abort the wrapper and park the bridge; the singleton lock still holds.
+  evict_own_bridge "$CHANNEL" "$REPO" || echo "[$CHANNEL-bridge-wrapper] eviction skipped (rc=$?)" >&2
 fi
 sleep 0.3
 
