@@ -232,11 +232,12 @@ class TestKeychainAuth(unittest.TestCase):
 
 
 class TestPrefs(unittest.TestCase):
-    def test_missing_file_defaults_both_on(self):
+    def test_missing_file_reports_but_sends_no_logs(self):
+        # Absence is not consent: reporting still works, the excerpt does not.
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(
                 report_feedback.read_prefs(Path(td)),
-                {"autoReport": True, "sendLogs": True},
+                {"autoReport": True, "sendLogs": False},
             )
 
     def test_reads_written_values(self):
@@ -257,9 +258,11 @@ class TestPrefs(unittest.TestCase):
             (ws / "state").mkdir()
             p = ws / "state" / "feedback-prefs.json"
             p.write_text("{not json")
-            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": True, "sendLogs": True})
-            p.write_text(json.dumps({"autoReport": "no", "sendLogs": False}))
             self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": True, "sendLogs": False})
+            # Each key falls back to its OWN default, and an explicit True for
+            # sendLogs must still be honoured or the opt-in is unusable.
+            p.write_text(json.dumps({"autoReport": "no", "sendLogs": True}))
+            self.assertEqual(report_feedback.read_prefs(ws), {"autoReport": True, "sendLogs": True})
 
 
 class TestAutoGate(unittest.TestCase):
@@ -485,10 +488,23 @@ class TestMain(unittest.TestCase):
             self._run(argv)
         return seen["ctx"]
 
+    @staticmethod
+    def _opt_in_to_logs(ws: Path) -> None:
+        """sendLogs is opt-in, so a test ABOUT the excerpt must ask for it.
+
+        These two cover the excerpt/omission-note logic, not the default. They
+        used to rely on sendLogs defaulting ON, which made them silently depend
+        on a policy they were not testing.
+        """
+        (ws / "state").mkdir(parents=True, exist_ok=True)
+        (ws / "state" / "feedback-prefs.json").write_text(json.dumps({"sendLogs": True}))
+
     def test_absent_logs_are_explained_in_the_posted_context(self):
         """THE BUG: Odoo tickets carried exactly {source, platform, python}."""
         with tempfile.TemporaryDirectory() as td:
-            ctx = self._posted_context(["--title", "hello"], Path(td))
+            ws = Path(td)
+            self._opt_in_to_logs(ws)
+            ctx = self._posted_context(["--title", "hello"], ws)
         self.assertNotIn("last_logs_excerpt", ctx)
         self.assertIn("logs_omitted", ctx)
         self.assertIn("no logs directory", ctx["logs_omitted"])
@@ -497,11 +513,22 @@ class TestMain(unittest.TestCase):
         """Mutation guard: the note must not fire when logs actually shipped."""
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
+            self._opt_in_to_logs(ws)
             (ws / "logs").mkdir()
             (ws / "logs" / "a.log").write_text("hello\n")
             ctx = self._posted_context(["--title", "hello"], ws)
         self.assertIn("last_logs_excerpt", ctx)
         self.assertNotIn("logs_omitted", ctx)
+
+    def test_default_prefs_ship_no_logs_even_when_logs_exist(self):
+        """The point of the change: no prefs file -> no excerpt, logs present."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "logs").mkdir()
+            (ws / "logs" / "a.log").write_text("hello\n")
+            ctx = self._posted_context(["--title", "hello"], ws)
+        self.assertNotIn("last_logs_excerpt", ctx)
+        self.assertNotIn("log_files", ctx)
 
     def test_no_logs_flag_is_not_an_omission_to_explain(self):
         """--no-logs is the user's choice, not a failure to report."""

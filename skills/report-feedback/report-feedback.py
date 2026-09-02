@@ -46,7 +46,9 @@ RETIRED_CLOUD_ORIGINS = ("https://sutando.ag2.ai",)
 SIGNED_OUT_SENTINEL = "__signed_out__"
 
 # Owner prefs written by the desktop Settings UI (host is the single writer).
-PREFS_DEFAULTS = {"autoReport": True, "sendLogs": True}
+# autoReport defaults ON; sendLogs defaults OFF. The log excerpt is the part
+# that carries incidental owner data, so it is opt-in rather than opt-out.
+PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False}
 # Auto-report throttle state (this script is the single writer).
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
@@ -243,8 +245,13 @@ def read_prefs(ws: Path) -> dict:
 
     Written by the desktop Settings toggles ("File automatic bug reports",
     "Send logs with bug reports"). Missing file, missing key, or a non-bool
-    value all read as the default (both ON) — absence of the file must never
-    disable reporting on installs that predate the toggles.
+    value all read as PREFS_DEFAULTS: autoReport ON, sendLogs OFF.
+
+    The two defaults differ on purpose. Absence of the file must never disable
+    REPORTING on installs that predate the toggles. But absence is not consent
+    either, and the log excerpt is the part that carries incidental owner data
+    (paths with usernames, hostnames, workspace content), so it is opt-in: an
+    owner who has never opened Settings ships no logs.
     """
     prefs = dict(PREFS_DEFAULTS)
     try:
@@ -408,8 +415,8 @@ def main() -> None:
             ctx["last_logs_excerpt"] = excerpt
             ctx["log_files"] = names
         else:
-            # Logs are on by default, so silence here is indistinguishable from
-            # a report that never wanted them. Say why they are absent.
+            # sendLogs is opt-in, so reaching here means logs were asked for:
+            # say why they are absent rather than shipping silence.
             ctx["logs_omitted"] = why_no_logs(ws)
 
     payload = {
