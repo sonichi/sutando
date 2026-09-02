@@ -80,6 +80,30 @@ class VanishingTaskFile(unittest.TestCase):
         self.assertIsInstance(rows, list)
         self.assertIn("task-1788000000000", hist)
 
+    def test_a_file_claimed_between_the_sort_and_the_read(self):
+        """The PRODUCTION traceback's window, which the ghost case does not reach.
+
+        The ghost is dropped by the mtime sort before the loop body runs. The
+        observed crash was a file that survived the sort and was renamed away
+        before read_text().
+        """
+        real_read = Path.read_text
+
+        def vanishing_read(self_path, *a, **k):
+            if self_path == self.real:
+                raise FileNotFoundError(2, "No such file or directory", str(self_path))
+            return real_read(self_path, *a, **k)
+
+        with patch.object(self.mod, "TASK_DIR", self.tasks), \
+             patch.object(self.mod, "RESULT_DIR", self.results), \
+             patch.dict(self.mod.task_history, {}, clear=True), \
+             patch.object(Path, "read_text", vanishing_read):
+            rows = self.mod._active_task_rows()
+            hist = dict(self.mod.task_history)
+        self.assertIsInstance(rows, list)
+        self.assertNotIn("task-1788000000000", hist)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
