@@ -76,6 +76,10 @@ class ReadLimitCountsMessages(unittest.TestCase):
             else:
                 os.environ.pop(k, None)
 
+    def test_max_limit_matches_the_gateway_ceiling(self):
+        """A lowered ceiling loses history without making the existing tests fail."""
+        self.assertEqual(rd.MAX_LIMIT, 1000)
+
     def test_small_limit_does_not_report_an_empty_room(self):
         """The regression: limit=3 returned ZERO from a room holding fourteen."""
         with mock.patch.object(rd, "http_request", side_effect=raw_window_gateway()):

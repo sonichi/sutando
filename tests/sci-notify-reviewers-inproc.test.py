@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -301,6 +302,13 @@ class FailurePaths(unittest.TestCase):
         def fake_run(cmd, *a, **k):
             if "members" in cmd:
                 return type("R", (), {"stdout": ok, "stderr": "", "returncode": 0})()
+            # Identity and capability probes, like `members` above: not sends,
+            # so a proxy whose subject is send attempts must not count them.
+            if any("collaborators" in str(x) for x in cmd):
+                return type("R", (), {"stdout": "write", "stderr": "", "returncode": 0})()
+            if any(str(x).startswith("users/") for x in cmd):
+                login = next(str(x)[6:] for x in cmd if str(x).startswith("users/"))
+                return type("R", (), {"stdout": login, "stderr": "", "returncode": 0})()
             calls["n"] += 1
             if send_effect and calls["n"] == 1:
                 raise send_effect
@@ -366,6 +374,268 @@ class FailurePaths(unittest.TestCase):
             refuse, _ = self.mod._stale_repeat_ask(
                 "https://github.com/o/r/pull/7", [{"name": "rui"}], {"rui": {}})
         self.assertFalse(refuse)
+
+
+class ResolveDedupesOneActor(unittest.TestCase):
+    """Two roster keys for one person must not satisfy the two-reviewer gate."""
+
+    ROSTER = {
+        "alice": {"stand": "@a:x", "room": "!r"},
+        "bob": {"stand": "@a:x", "room": "!r"},              # same stand, no link
+        "carol": {"stand": "@c:x", "room": "!r"},
+        "dave": {"stand": "@d:x", "room": "!r", "same_actor_as": "erin"},
+        "erin": {"stand": "@e:x", "room": "!r", "same_actor_as": "dave"},
+    }
+
+    def names(self, *keys):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            targets, _ = _load().resolve(list(keys), self.ROSTER)
+        return sorted(t["name"] for t in targets), buf.getvalue()
+
+    def test_two_keys_sharing_a_stand_count_once(self):
+        got, err = self.names("alice", "bob", "carol")
+        self.assertEqual(got, ["alice", "carol"])
+        self.assertIn("DUPLICATE 'bob'", err)
+
+    def test_two_keys_linked_by_same_actor_as_count_once(self):
+        # Distinct stands, one human — the link is the only signal.
+        got, err = self.names("dave", "erin", "carol")
+        self.assertEqual(got, ["carol", "dave"])
+        self.assertIn("DUPLICATE 'erin'", err)
+
+    def test_distinct_people_are_not_deduped(self):
+        # Control: without this the assertions above pass on a resolve() that
+        # simply drops every second name.
+        got, err = self.names("alice", "carol")
+        self.assertEqual(got, ["alice", "carol"])
+        self.assertNotIn("DUPLICATE", err)
+
+    def test_an_mxid_shaped_roster_key_does_not_alias_a_stand(self):
+        # A flat keyspace lets a roster key collide with someone else's stand,
+        # and a false DUPLICATE drops a real second reviewer with no error.
+        roster = {"@shared:x": {"stand": "@a-stand:x", "room": "!r"},
+                  "bob": {"stand": "@shared:x", "room": "!r"}}
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            targets, _ = _load().resolve(["@shared:x", "bob"], roster)
+        self.assertEqual(sorted(t["name"] for t in targets), ["@shared:x", "bob"])
+        self.assertNotIn("DUPLICATE", buf.getvalue())
+
+    def test_the_refusal_names_who_already_covers_the_slot(self):
+        # "already addressed" and "unreachable" need different follow-ups.
+        _, err = self.names("alice", "bob")
+        self.assertIn("same person as 'alice'", err)
+
+
+class GateCapabilityFiltersBeforeTheCountGate(unittest.TestCase):
+    """A read-only approval looks identical in the UI and discharges nothing."""
+
+    ROSTER = {"alice": {"stand": "@a:x", "room": "!r"},
+              "bob": {"stand": "@b:x", "room": "!r"}}
+    MSG = "see https://github.com/o/r/pull/7"
+
+    def _run(self, caps, argv_extra=()):
+        m = _load()
+        m.gate_capability = lambda repo, login: caps[login]
+        # Stub the identity probe too: a test that needs the network can fail
+        # for a reason it is not about.
+        m._github_login = lambda name, roster: (name, "stubbed")
+        m.load_roster = lambda: self.ROSTER
+        m.stand_present_in_room = lambda t: (True, "2 members")
+        buf = io.StringIO()
+        argv = ["nr", "--reviewers", "alice,bob", "--kind", "ask",
+                "--message", self.MSG, *argv_extra]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(buf), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = m.main()
+        return rc, buf.getvalue()
+
+    def test_a_read_only_reviewer_is_dropped_and_the_count_gate_sees_it(self):
+        rc, err = self._run({"alice": (False, "read"), "bob": (True, "write")},
+                            ("--send",))
+        self.assertIn("CANNOT GATE 'alice'", err)
+        self.assertIn("REFUSED: 1 reviewer(s)", err)   # the gate saw the FILTERED list
+        self.assertNotEqual(rc, 0)
+
+    def test_two_write_tier_reviewers_are_not_filtered(self):
+        # Control: without this the assertions above pass on a filter that
+        # drops everyone.
+        rc, err = self._run({"alice": (True, "write"), "bob": (True, "write")})
+        self.assertNotIn("CANNOT GATE", err)
+        self.assertNotIn("REFUSED", err)
+
+    def test_an_undeterminable_capability_prints_but_does_not_refuse(self):
+        # Refusing on absent would block every reviewer whose tier we cannot read.
+        rc, err = self._run({"alice": (None, "unverified (gh rc=1)"),
+                             "bob": (True, "write")})
+        self.assertIn("gate capability unverified", err)
+        self.assertNotIn("CANNOT GATE", err)
+
+
+class GateCapabilityProbesAGitHubLogin(unittest.TestCase):
+    """A roster key is not always a login; probing one that is not is a no-op."""
+
+    ROSTER = {"stand-only": {"stand": "@s:x", "room": "!r",
+                             "same_actor_as": "real-login"},
+              "real-login": {"stand": "@r:x", "room": "!r",
+                             "same_actor_as": "stand-only"},
+              "plain": {"stand": "@p:x", "room": "!r"}}
+
+    def _resolve(self, name, users):
+        m = _load()
+        m._is_github_user = lambda login: login in users
+        return m._github_login(name, self.ROSTER)
+
+    def test_a_stand_only_key_resolves_through_same_actor_as(self):
+        login, why = self._resolve("stand-only", {"real-login"})
+        self.assertEqual(login, "real-login")
+        self.assertIn("same_actor_as", why)
+
+    def test_a_key_that_is_a_login_is_used_directly(self):
+        # Control: without this the mapping could rewrite every name.
+        login, why = self._resolve("plain", {"plain"})
+        self.assertEqual(login, "plain")
+        self.assertNotIn("same_actor_as", why)
+
+    def test_no_login_anywhere_returns_the_key_and_says_so(self):
+        login, why = self._resolve("stand-only", set())
+        self.assertEqual(login, "stand-only")
+        self.assertIn("no login found", why)
+
+
+class GateCapabilityNamesTheRightReason(unittest.TestCase):
+    """`read` is also the endpoint's answer for a non-collaborator."""
+
+    def _cap(self, perm, is_collab):
+        # The two calls differ only by URL, so the stub must too — keying both
+        # on one return code makes the permission read fail as well.
+        def run(cmd, **k):
+            membership = not any("permission" in str(x) for x in cmd)
+            rc = (0 if is_collab else 1) if membership else 0
+            return type("R", (), {"stdout": "" if membership else perm,
+                                  "stderr": "", "returncode": rc})()
+        m = _load()
+        m.subprocess = type("S", (), {"run": staticmethod(run),
+                                      "TimeoutExpired": Exception})
+        return m.gate_capability("o/r", "who")
+
+    def test_a_non_collaborator_is_not_described_as_read_only(self):
+        can, why = self._cap("read", is_collab=False)
+        self.assertIs(can, False)
+        self.assertEqual(why, "not a collaborator")
+
+    def test_a_real_read_collaborator_keeps_its_permission_word(self):
+        # Control: without this the reason collapses to one string for both.
+        can, why = self._cap("read", is_collab=True)
+        self.assertIs(can, False)
+        self.assertEqual(why, "read")
+
+    def test_write_is_unaffected_by_the_membership_probe(self):
+        can, why = self._cap("write", is_collab=False)
+        self.assertIs(can, True)
+        self.assertEqual(why, "write")
+
+
+class GateCapabilitySkipIsAnnounced(unittest.TestCase):
+    """The one case the tool cannot check must not be the one it is silent about."""
+
+    def test_a_message_without_a_pr_url_says_the_check_was_skipped(self):
+        m = _load()
+        m.load_roster = lambda: {"a": {"stand": "@a:x", "room": "!r"},
+                                 "b": {"stand": "@b:x", "room": "!r"}}
+        m.stand_present_in_room = lambda t: (True, "2 members")
+        buf = io.StringIO()
+        argv = ["nr", "--reviewers", "a,b", "--kind", "ask", "--message", "no url"]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(buf), \
+                contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+        self.assertIn("gate capability NOT CHECKED", buf.getvalue())
+
+
+class ProbeFailureDefaultsAreDeliberate(unittest.TestCase):
+    """Every probe here can fail, and the three defaults disagree on purpose.
+
+    Each probe feeds an assertion of a different polarity, and each default is
+    the one that declines to assert: never refuse a reviewer, and never claim a
+    relationship, on the strength of a probe that did not answer. Read as return
+    values alone the trio looks inconsistent, which is why the direction is
+    pinned here per probe rather than left to be re-derived.
+    """
+
+    @staticmethod
+    def _raising(exc):
+        return type("S", (), {"run": staticmethod(lambda *a, **k: (_ for _ in ()).throw(exc)),
+                              "TimeoutExpired": Exception})
+
+    def test_gate_capability_returns_unverified_when_the_probe_raises(self):
+        m = _load()
+        m.subprocess = self._raising(OSError("boom"))
+        can, why = m.gate_capability("o/r", "who")
+        # None, not False: a probe that did not run has not shown anyone unable
+        # to approve, and main() prints on None while refusing on False.
+        self.assertIsNone(can)
+        self.assertIn("OSError", why)
+
+    def test_gate_capability_returns_unverified_when_gh_exits_nonzero(self):
+        m = _load()
+        m.subprocess = type("S", (), {
+            "run": staticmethod(lambda *a, **k: type("R", (), {
+                "stdout": "", "stderr": "", "returncode": 4})()),
+            "TimeoutExpired": Exception})
+        can, why = m.gate_capability("o/r", "who")
+        self.assertIsNone(can)
+        self.assertIn("rc=4", why)
+
+    def test_is_collaborator_defaults_to_TRUE_so_the_wording_stays_milder(self):
+        m = _load()
+        m.subprocess = self._raising(OSError("boom"))
+        # True keeps the weaker word ("read"); False would assert an absent
+        # relationship on no evidence — the bug 63d18d2c fixed, reversed.
+        self.assertIs(m._is_collaborator("o/r", "who"), True)
+
+    def test_is_github_user_defaults_to_FALSE_and_that_is_not_a_contradiction(self):
+        m = _load()
+        m.subprocess = self._raising(OSError("boom"))
+        # Opposite literal, same rule: True would assert an unprobed key IS a
+        # login. False degrades to "no login found", then to unverified.
+        self.assertIs(m._is_github_user("who"), False)
+
+    def test_the_two_defaults_compose_to_send_with_a_caveat_not_to_refuse(self):
+        # The property that matters is not either literal but their composition:
+        # with every probe failing, a reviewer is still notified.
+        m = _load()
+        m.subprocess = self._raising(OSError("boom"))
+        login, _ = m._github_login("who", {"who": {"stand": "@w:x", "room": "!r"}})
+        can, _ = m.gate_capability("o/r", login)
+        self.assertIsNot(can, False)
+
+
+class AliasProbeIsAnnounced(unittest.TestCase):
+    """Probing under a different name than the one asked for must be visible."""
+
+    def test_the_substituted_login_is_named_on_stderr(self):
+        m = _load()
+        m.load_roster = lambda: {
+            "stand-only": {"stand": "@s:x", "room": "!r", "same_actor_as": "real-login"},
+            "b": {"stand": "@b:x", "room": "!r"}}
+        m.stand_present_in_room = lambda t: (True, "2 members")
+        m._is_github_user = lambda login: login == "real-login"
+        m.gate_capability = lambda repo, login: (True, "write")
+        m.send_to_stand = lambda *a, **k: type("R", (), {
+            "returncode": 0, "stdout": "ok", "stderr": ""})()
+        m.record_asks = lambda *a, **k: 1
+        buf = io.StringIO()
+        argv = ["nr", "--reviewers", "stand-only,b", "--kind", "ask",
+                "--message", "please review https://github.com/o/r/pull/1"]
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(buf), \
+                contextlib.redirect_stdout(io.StringIO()):
+            m.main()
+        err = buf.getvalue()
+        self.assertIn("stand-only: probing GitHub as real-login", err)
+        # Control: the reviewer whose key IS the login gets no such line, so the
+        # assertion above cannot be satisfied by a message printed for everyone.
+        self.assertNotIn("b: probing GitHub as", err)
 
 
 if __name__ == "__main__":
