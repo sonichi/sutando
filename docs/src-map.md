@@ -125,6 +125,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`pool_delivery.py`** — Delivery-side half of the worker pool: read one recipient's own folder.
 - **`pool_roster.py`** — Bindings the owner writes; a roster the core compiles; the router only reads.
+- **`portable_mtime.sh`** — The ONE portable mtime probe.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
