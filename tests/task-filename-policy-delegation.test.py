@@ -16,7 +16,7 @@ Exit: 0 = all pass, 1 = failure
 """
 from __future__ import annotations
 
-import importlib.util
+import ast
 import re
 import sys
 import tempfile
@@ -73,9 +73,18 @@ def delegation() -> None:
     }
     for name, path in consumers.items():
         text = path.read_text()
+        # Parse the AST, not the spelling: a parenthesized multi-line import
+        # puts the symbol on another line and a one-line regex misses it.
+        names = set()
+        for node in ast.walk(ast.parse(text)):
+            # Either path reaches the same owner: src/ directly, or the
+            # vendored ag2_sparrow copy the drift gate keeps identical.
+            if (isinstance(node, ast.ImportFrom)
+                    and node.module in ("task_archive", "ag2_sparrow.task_archive")):
+                names.update(a.name for a in node.names)
         check(f"{name}: imports the owner",
-              re.search(r"from task_archive import .*(task_id_from_filename|find_task_file)", text)
-              is not None, f"{path} does not import task_archive")
+              bool(names & {"task_id_from_filename", "find_task_file"}),
+              f"{path} imports nothing from task_archive (found {sorted(names)})")
         # The exact private forms that shipped, each blind to one state suffix.
         for bad, why in ((r'\.split\("\.claimed-"\)', "hand-rolled .claimed- split"),
                          (r'glob\(f?"\{task_id\}\.claimed-core-\*', "claimed-only glob")):

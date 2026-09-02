@@ -23,10 +23,10 @@ from typing import Any, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from task_archive import find_task_file  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
-from task_archive import find_task_file  # noqa: E402
 
 
 LABEL = "com.sutando.codex-schedules"
@@ -297,10 +297,10 @@ def _find_result(workspace: Path, task_ids: list[str]) -> Path | None:
 
 
 def _task_is_active(workspace: Path, task_ids: list[str]) -> bool:
+    # find_task_file owns the live-name grammar: the lead also renames to
+    # .assigned-<inst>, which a .claimed-only check reads as gone.
     tasks = workspace / "tasks"
     for task_id in task_ids:
-        # find_task_file covers bare AND every state suffix; a private glob here
-        # recognised .claimed- but not .assigned-, so an assigned job retried.
         if find_task_file(tasks, task_id) is not None:
             return True
         if (tasks / "processed" / f"{task_id}.txt").exists():
