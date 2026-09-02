@@ -69,6 +69,23 @@ The goal of this phase is to confirm the PR is necessary at all. In rough order 
 3. For a bug-fix: is the bug still on `upstream/main`? (`git show upstream/main:path | grep buggy-line`) — don't fix something that's already gone.
 4. Is this a single concern? **One bug or one feature per PR.** If you're tempted to bundle several features into one PR ("while I'm here I'll also add Y, Z"), split them up front — open one PR per concern, each with its own closes-link. Mixing concerns triples the review burden, increases revert blast radius, and slows merge. "Drive-by" cleanup that happens to land in the same hunk is fine; net-new scope is not.
 
+5. **Run the repo's own scanner before you push**, not after CI tells you:
+
+   ```bash
+   git commit ...                                              # it reads COMMITS, not your worktree
+   bash scripts/review-checks.sh --diff <(git diff origin/main...HEAD)
+   ```
+
+   It runs the machine-readable `checks:` block in [`REVIEW.md`](REVIEW.md) — the same one CI runs — so a red result here is a red result there.
+
+   Three things that make it report something other than what you expect, each measured:
+
+   - **Commit first.** Against an uncommitted or merely staged worktree the three-dot range is empty and you get `ERROR — empty diff; nothing was scanned, so this is NOT a pass`. It fails loudly rather than passing, but it is easy to read as "clean".
+   - **Three dots, not two.** `origin/main..HEAD` renders `main`'s own newer commits as your removals.
+   - **`PARTIAL` is not `PASS`.** With no `.py` in the diff it prints `prose-cap had no in-scope files`; from a `gh pr diff` file with no tree to read it prints `prose-cap SKIPPED`. Neither one scanned any prose.
+
+   Worth the second it costs because these findings are mechanical and invisible while writing. `prose-cap` counts **consecutive added comment lines**, so a trailing comment on a code line folds into the block beneath it — `return None  # why` above a 2-line block is a 3-line run, and the fix is a blank line between them, not a rewrite. On 2026-09-01 one file cost four separate CI round-trips across two authors for that class alone.
+
 ## The PR body should answer
 
 In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so the reviewer doesn't wonder whether you forgot it.
@@ -272,6 +289,7 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
 5. **Solicit and NOTIFY reviewers.** You need to solicit reviewers for your PR and keep making progress on their comments, change requests and blocking comments until you have enough approvals and the PR is merged. Use a GitHub review request **and** the [`collaboration-intelligence`](skills/collaboration-intelligence/SKILL.md) skill to resolve *whom* to ask and *where they read*: it maps each reviewer to the agent stand-in that acts on their behalf.
    - **On open** — request on GitHub **and** address each reviewer in a channel they are in. Requesting on GitHub alone is filing, not asking.
    - **On every update that changes the diff** — notify them again in a channel they are in. A push re-notifies no one, and this repo sets `dismiss_stale_reviews_on_push: false`, so a standing `CHANGES_REQUESTED` latch survives the fix and its author gets no signal to look again. **A mechanical base-merge is not such an update**: clearing BEHIND carries no author work, so there is nothing for the reviewer to look at again and the ping is pure noise. The test is whether the head moved because *you* answered something.
+   - **As the author, read `reviewDecision`, not the thread.** The same latch survives the *reviewer's own comment* saying it is resolved: a `COMMENTED` review is not decisive, so a reviewer who writes "your condition was met" has said so and not recorded it. If `gh pr view N --json reviewDecision` still reads `CHANGES_REQUESTED`, you are still blocked no matter what the thread says — tell them, because they cannot see the gap either.
    - **Address both the human and their AI stand-in's handle** — the stand-in acts, the human decides, and only one of them is watching any given channel.
    - Look up collaborators and their stand-in handles per platform with `python3 skills/collaboration-intelligence/scripts/lookup.py <name>`.
 
@@ -285,7 +303,7 @@ If you're reviewing someone else's PR (including a bot's), keep the comment thre
 - **Distinguish blockers from nits.** Mark each comment so the author knows what's gating merge vs what's deferrable.
 - **Review the current head and the right layer.** For a stacked PR, identify the parent and inspect the child-only change as well as the cumulative interaction. After an update/rebase, re-check the head SHA, required checks, and whether prior approvals still apply.
 - **Scan added lines for hardcoded host paths on every review.** Do not rely only on CI: look for `/Users/<name>`, `/home/<name>`, clone-specific absolute paths, and inline workspace/home fallbacks. Keep fixture exclusions token-specific so an allowed fixture on a line cannot hide a real production path on that same line.
-- **Clear stale formal blockers.** When the author pushes a fix, re-review the current head. If the request is genuinely resolved, dismiss/replace the stale REQUEST_CHANGES state; if it remains, cite the exact unresolved line or behavior. Do not leave a resolved change-request blocking merge through automation inertia.
+- **Clear stale formal blockers.** When the author pushes a fix, re-review the current head. If the request is genuinely resolved, dismiss/replace the stale REQUEST_CHANGES state; if it remains, cite the exact unresolved line or behavior. **"Replace" means an `APPROVED` review or a dismissal — a `COMMENTED` review does not clear your own `CHANGES_REQUESTED`.** GitHub takes the latest *decisive* review per login, and a comment is not one, so writing that the block is satisfied reads as closure in the thread while `reviewDecision` still shows it blocking. Do not leave a resolved change-request blocking merge through automation inertia.
 - **Apply the complete merge gate.** Merge only when the current head is mergeable, required CI and CLA checks are green, and two maintainers have recorded formal approvals. A comment, Discord acknowledgement, bot recommendation, stale approval on an old head, or admin bypass is not a substitute for any gate.
 
 For more detail (verification phases for fix PRs, sign trailers, sonichi-fix POC mechanics), see the `review-pr` skill if it's installed.

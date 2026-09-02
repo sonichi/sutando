@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -189,7 +190,7 @@ class PriorArtTest(unittest.TestCase):
     def test_a_comment_is_surfaced_even_though_it_is_not_a_review(self):
         run = self._runner(comments='[{"created_at":"2026-08-24T11:36:36Z",'
                                     '"user":{"login":"sonichi"},"body":"the finding"}]')
-        seen = pf.prior_art("3327", runner=run)
+        seen, _ = pf.prior_art("3327", runner=run)
         self.assertEqual(len(seen), 1)
         self.assertIn("sonichi", seen[0])
         self.assertIn("(comment)", seen[0])
@@ -204,16 +205,70 @@ class PriorArtTest(unittest.TestCase):
         the only review shape an agent can leave."""
         run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
                                    '"state":"COMMENTED","body":"a real finding"}]')
-        seen = pf.prior_art("1", runner=run)
+        seen, _ = pf.prior_art("1", runner=run)
         self.assertEqual(len(seen), 1)
         self.assertIn("COMMENTED", seen[0])
 
-    def test_an_empty_bodied_review_is_skipped(self):
-        """The real rule is skip-on-EMPTY: an approval with no prose says nothing
-        a reviewer needs to read before writing."""
+    def test_an_empty_bodied_approval_has_no_prose_but_keeps_its_VERDICT(self):
+        """Supersedes an earlier test that asserted this review vanished entirely.
+
+        Skip-on-EMPTY is right about PROSE — a bare approval gives a reviewer
+        nothing to read. It was wrong about STATE. On a repo where agents share
+        a login, `REVIEW.md` lesson 16 tells a reviewer to establish the login's
+        current decisive state first, and dropping the row made the mandatory
+        preflight answer "nothing here" over a live approval."""
         run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
                                    '"state":"APPROVED","body":"   "}]')
-        self.assertEqual(pf.prior_art("1", runner=run), [])
+        seen, verdicts = pf.prior_art("1", runner=run)
+        self.assertEqual(seen, [], "a bare approval carries no prose to read")
+        self.assertEqual(verdicts, ["t  a: APPROVED"], "but the verdict stands")
+
+    def test_the_reported_input_cannot_render_as_no_reviews(self):
+        """The exact input from the review that requested this change."""
+        run = self._runner(reviews='[{"submitted_at":"2026-08-28T00:00:00Z",'
+                                   '"user":{"login":"qingyun-wu"},'
+                                   '"state":"APPROVED","body":""}]')
+        got = pf.prior_art("1", runner=run)
+        rendered = "\n".join(pf.verdict_block(got[1]) + pf.prior_art_block("1", got[0]))
+        self.assertIn("qingyun-wu", rendered)
+        self.assertIn("APPROVED", rendered)
+        self.assertNotIn("DECISIVE STATE: none", rendered)
+
+    def test_a_verdict_survives_the_display_cap(self):
+        """Truncation must not lose state: the cap applies to prose only."""
+        reviews = ",".join(
+            '{"submitted_at":"t%02d","user":{"login":"u%d"},'
+            '"state":"COMMENTED","body":"prose %d"}' % (i, i, i)
+            for i in range(1, pf.PRIOR_ART_SHOWN + 6))
+        old_approval = ('{"submitted_at":"t00","user":{"login":"early"},'
+                        '"state":"APPROVED","body":""}')
+        run = self._runner(reviews=f"[{old_approval},{reviews}]")
+        seen, verdicts = pf.prior_art("1", runner=run)
+        shown = "\n".join(pf.prior_art_block("1", seen))
+        self.assertNotIn("early", shown, "precondition: prose list truncated it away")
+        self.assertIn("early", "\n".join(pf.verdict_block(verdicts)))
+
+    def test_verdict_unknown_and_verdict_none_do_not_render_alike(self):
+        """The same load-bearing distinction the prose block already makes.
+
+        None means the lookup failed; [] means it succeeded and found no
+        decisive review. Rendering them alike would let a failed check read as
+        a clean one — the exact substitution lesson 16 tells a reviewer to
+        avoid, one layer down."""
+        unknown = "\n".join(pf.verdict_block(None))
+        none = "\n".join(pf.verdict_block([]))
+        self.assertIn("COULD NOT CHECK", unknown)
+        self.assertNotIn("COULD NOT CHECK", none)
+        self.assertNotEqual(unknown, none)
+
+    def test_latest_verdict_per_login_regardless_of_row_order(self):
+        """Newest wins even when the endpoint returns rows out of order."""
+        run = self._runner(reviews='[{"submitted_at":"t9","user":{"login":"a"},'
+                                   '"state":"CHANGES_REQUESTED","body":""},'
+                                   '{"submitted_at":"t1","user":{"login":"a"},'
+                                   '"state":"APPROVED","body":""}]')
+        _, verdicts = pf.prior_art("1", runner=run)
+        self.assertEqual(verdicts, ["t9  a: CHANGES_REQUESTED"])
 
     def test_unknown_is_not_empty(self):
         """The load-bearing case: a failed check must not render as a clean one."""
@@ -222,11 +277,30 @@ class PriorArtTest(unittest.TestCase):
                            ("bad json", self._runner(reviews="not json"))):
             with self.subTest(label):
                 self.assertIsNone(pf.prior_art("1", runner=run), label)
-        unknown = "\n".join(pf.prior_art_block("1", None))
+        # Pin the repo: unpinned, this falls through to resolve_repo() and reads the
+        # real env, so the branch under test depends on the developer's shell.
+        unknown = "\n".join(pf.prior_art_block("1", None, repo="a/b"))
         empty = "\n".join(pf.prior_art_block("1", []))
         self.assertIn("COULD NOT CHECK", unknown)
         self.assertNotIn("COULD NOT CHECK", empty)
         self.assertNotEqual(unknown, empty)
+
+    def test_an_unexpanded_repo_placeholder_names_its_own_fix(self):
+        """The one COULD-NOT-CHECK the reader can act on must say so.
+
+        An app-pinned install has no .git, so gh cannot expand {owner}/{repo}
+        and this check is inert on every run — indistinguishable, before this,
+        from ordinary gh flakiness.
+        """
+        no_repo = "\n".join(pf.prior_art_block("1", None, repo="{owner}/{repo}"))
+        gh_down = "\n".join(pf.prior_art_block("1", None, repo="a/b"))
+        for body in (no_repo, gh_down):
+            self.assertIn("COULD NOT CHECK", body)
+        self.assertIn("--repo", no_repo)
+        self.assertIn("SUTANDO_REVIEW_REPO", no_repo)
+        # The generic branch must NOT claim a repo-context cause it cannot know.
+        self.assertNotIn("--repo", gh_down)
+        self.assertNotEqual(no_repo, gh_down)
 
     def test_the_block_says_why_reviews_alone_are_not_enough(self):
         body = "\n".join(pf.prior_art_block("1", ["t  sonichi (comment)"]))
@@ -247,6 +321,44 @@ class PriorArtTest(unittest.TestCase):
         head = pf.prior_art_block("1", few)[0]
         self.assertIn(f"({pf.PRIOR_ART_SHOWN})", head)
         self.assertNotIn("showing last", head)
+
+
+class RepoResolution(unittest.TestCase):
+    """`{owner}/{repo}` is gh's REMOTE inference; an app-pinned install has no
+    `.git`, so it resolved to nothing and prior-art degraded on every run."""
+
+    def test_explicit_repo_wins(self):
+        self.assertEqual(pf.resolve_repo("a/b", env={"SUTANDO_REVIEW_REPO": "c/d"}), "a/b")
+
+    def test_env_is_used_when_no_flag(self):
+        self.assertEqual(pf.resolve_repo(None, env={"SUTANDO_REVIEW_REPO": "c/d"}), "c/d")
+
+    def test_remote_inference_is_the_LAST_resort_not_the_only_one(self):
+        self.assertEqual(pf.resolve_repo(None, env={}), "{owner}/{repo}")
+
+    def test_the_resolved_repo_reaches_the_gh_call(self):
+        seen = []
+
+        def run(argv):
+            seen.append(argv)
+            return types.SimpleNamespace(returncode=0, stdout="[]")
+
+        pf.prior_art("1", runner=run, repo="a/b")
+        self.assertTrue(seen, "no gh call was made")
+        self.assertTrue(any("repos/a/b/" in x for x in seen[0]), seen[0])
+        self.assertFalse(any("{owner}/{repo}" in x for x in seen[0]), seen[0])
+
+    def test_COULD_NOT_CHECK_is_still_reachable(self):
+        """The tell that this fix works is not that the check passes — it is
+        that the caveat still fires. A resolution fix that makes it unreachable
+        has replaced one silent failure with another."""
+
+        def failing(argv):
+            return types.SimpleNamespace(returncode=1, stdout="")
+
+        self.assertIsNone(pf.prior_art("1", runner=failing, repo="a/b"))
+        self.assertIn("COULD NOT CHECK",
+                      "\n".join(pf.prior_art_block("1", None, repo="a/b")))
 
 
 if __name__ == "__main__":
