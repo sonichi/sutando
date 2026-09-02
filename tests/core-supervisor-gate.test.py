@@ -96,6 +96,18 @@ class TestSessionGone(unittest.TestCase):
             raise OSError("no tmux binary")
         self.assertIsNone(self._with_run(boom, "s.sock", "core"))
 
+    def test_refused_client_is_unknown_not_dead(self):
+        # A tmux client of another version than the server exits 1 with this
+        # stderr before any session lookup — a dead PROBE, not a dead core.
+        class _Skew(self._R):
+            stderr = b"server exited unexpectedly\n"
+        self.assertIsNone(self._with_run(lambda *a, **k: _Skew(1), "s.sock", "core"))
+
+    def test_absent_with_miss_stderr_is_dead(self):
+        class _Miss(self._R):
+            stderr = b"can't find session: core\n"
+        self.assertIs(self._with_run(lambda *a, **k: _Miss(1), "s.sock", "core"), True)
+
 
 class TestOperatorIntent(unittest.TestCase):
     def test_absent_and_present(self):
