@@ -32,8 +32,9 @@ PYTHON="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
 if [ -z "$PYTHON" ] && [ -r "$REPO/scripts/python-binary.sh" ]; then
   # shellcheck source=../../scripts/python-binary.sh
   . "$REPO/scripts/python-binary.sh"
-  _candidate="$(resolve_python "$REPO")"
-  [ -n "$_candidate" ] && "$_candidate" -c "import $MODULE" >/dev/null 2>&1 && PYTHON="$_candidate"
+  # Module-aware: the contract candidate can be a bundled runtime that simply
+  # lacks this channel's dep, while a later candidate in the same order has it.
+  PYTHON="$(resolve_python_for_module "$REPO" "$MODULE")"
 fi
 
 # The bridge resolves env -> .env -> vault, so an .env-only gate here is NARROWER
@@ -63,7 +64,7 @@ fi
 # fatal check stays HERE, after the idle branch: a deconfigured channel with no
 # usable interpreter must still park quietly rather than exit 1 into a respawn.
 if [ -z "$PYTHON" ]; then
-  echo "[$CHANNEL-bridge-wrapper] no usable Python interpreter" >&2
+  echo "[$CHANNEL-bridge-wrapper] no python3 can 'import $MODULE' (tried \$SUTANDO_PY, the bundled runtime, then PATH) — install it for one of those, or set SUTANDO_CHANNEL_BRIDGE_PYTHON" >&2
   exit 1
 fi
 
@@ -95,7 +96,9 @@ _EVICT_HELPER="$REPO/src/launchd/evict-own-bridge.sh"
 if [ -f "$_EVICT_HELPER" ]; then
   # shellcheck source=evict-own-bridge.sh
   . "$_EVICT_HELPER"
-  evict_own_bridge "$CHANNEL" "$REPO"
+  # Best-effort HERE by design: a discovery failure (nonzero return) must not
+  # set -e-abort the wrapper and park the bridge; the singleton lock still holds.
+  evict_own_bridge "$CHANNEL" "$REPO" || echo "[$CHANNEL-bridge-wrapper] eviction skipped (rc=$?)" >&2
 fi
 sleep 0.3
 

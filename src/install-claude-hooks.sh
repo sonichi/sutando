@@ -131,6 +131,9 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 mkdir -p "$REPO_DIR/.claude"
+# The PreCompact archive hook is a bare `cp`, which cannot create its own
+# destination; without this the archiver fails on every compaction, silently.
+mkdir -p "$HOME/Desktop/sutando-conversations"
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
