@@ -283,6 +283,100 @@ class LeaseOwnershipTest(unittest.TestCase):
         self._await_run("B")
         self.assertIsNone(other.poll(), "a second socket was suppressed by the first")
 
+    # --- P1: reclamation is serialized and re-judged under its own lock ---
+
+    def _plant_stale(self):
+        self.lock.mkdir()
+        (self.lock / "token").write_text("999999:Mon_Jan__1_00:00:00_2001\n")
+        (self.lock / "pid").write_text("999999\n")
+        old = time.time() - 600
+        os.utime(self.lock, (old, old))
+
+    def test_two_reclaimers_cannot_both_win(self):
+        """Reclaimer A judges the lease stale and is held there; B reclaims and
+        runs; A resumes. A must not delete B's lease: both alive was the P1."""
+        self._plant_stale()
+        entered, go = self.d / "hook-entered", self.d / "hook-go"
+        hook = _write(self.d / "hook.sh", f"""
+            #!/bin/bash
+            touch "{entered}"
+            while [ ! -f "{go}" ]; do sleep 0.05; done
+        """, executable=True)
+        a = self._bg("A", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock),
+                     SUTANDO_NOTIFIER_RECLAIM_HOOK=str(hook))
+        deadline = time.monotonic() + 20
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(entered.exists(), "reclaimer A never reached the hook")
+
+        b = self._bg("B", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("B")
+        b_token = (self.lock / "token").read_text()
+
+        go.touch()
+        _, a_err = a.communicate(timeout=20)
+        self.assertEqual(a.returncode, 0, a_err)
+        self.assertIn("already supervises", a_err)
+        self.assertIsNone(b.poll(), "reclaimer A took the lease out from under B")
+        self.assertEqual((self.lock / "token").read_text(), b_token,
+                         "A deleted B's lease; a third contender could now double-run")
+        self.assertEqual(self._ran(), ["B"])
+
+    def test_serial_reclaim_still_works(self):
+        """Control for the race case: one reclaimer, no contention, must win."""
+        self._plant_stale()
+        r = self._bg("solo", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("solo")
+        self.assertIsNone(r.poll())
+        self.assertNotIn("999999", (self.lock / "token").read_text())
+
+    # --- P1: an unmeasurable start identity is contended, never stale ---
+
+    def _blind_ps_dir(self):
+        d = self.d / "blind"
+        d.mkdir(exist_ok=True)
+        _write(d / "ps", """
+            #!/bin/bash
+            exit 1
+        """, executable=True)
+        return d
+
+    def test_unreadable_contender_identity_refuses(self):
+        holder = self._bg("holder", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self._await_run("holder")
+        env = self._env("ps_blind", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        env["PATH"] = f"{self._blind_ps_dir()}:{env['PATH']}"
+        r = subprocess.run(["bash", str(SUPERVISOR)], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("cannot verify", r.stderr)
+        self.assertIsNone(holder.poll(), "a blind contender stole the lease")
+        self.assertEqual(self._ran(), ["holder"])
+
+    def test_unreadable_holder_identity_refuses(self):
+        env = self._env("blind_holder", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        env["PATH"] = f"{self._blind_ps_dir()}:{env['PATH']}"
+        holder = subprocess.Popen(["bash", str(SUPERVISOR)], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self._reap, holder)
+        self._await_run("blind_holder")
+        self.assertIn(":unknown", (self.lock / "token").read_text())
+        r = self._run("sighted", SUTANDO_NOTIFIER_LOCK_DIR=str(self.lock))
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("cannot verify", r.stderr)
+        self.assertIsNone(holder.poll(), "a holder with an unreadable identity was treated as pid reuse")
+        self.assertEqual(self._ran(), ["blind_holder"])
+
+    # --- P2: the lease key must not alias distinct sockets ---
+
+    def test_colliding_flat_keys_do_not_alias(self):
+        """`/tmp/team/a.sock` and `/tmp/team_a.sock` flattened to one key."""
+        self._bg("nested", SUTANDO_TMUX_SOCKET="/tmp/team/a.sock", SUTANDO_TMUX_SESSION="s")
+        self._await_run("nested")
+        flat = self._bg("flat", SUTANDO_TMUX_SOCKET="/tmp/team_a.sock", SUTANDO_TMUX_SESSION="s")
+        self._await_run("flat")
+        self.assertIsNone(flat.poll(), "a distinct socket was suppressed by a colliding key")
+
     # --- cleanup must not be recursive on a configurable path ---
 
     def test_cleanup_never_removes_unrelated_contents(self):
