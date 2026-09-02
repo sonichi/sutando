@@ -96,21 +96,26 @@ fi
 
 # 3.5 Witness-owed gate: a merged live-path PR that still owes its post-restart
 #     round trip (REVIEW.md lesson 15) is not activated here, except as a declared
-#     canary on the host that owes it. Runs BEFORE the pull so a refusal leaves HEAD alone.
+#     canary on the host that owes it. Runs BEFORE the pull so a refusal leaves HEAD
+#     alone, and FAILS CLOSED: a gate it cannot run is a gate it cannot pass.
 GATE_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
-GATE_HOST="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null || hostname -s)"
-if [ -n "$GATE_WS" ] && [ -f "$REPO/src/witness_owed.py" ]; then
-  if [ -n "$CANARY" ]; then
-    python3 "$REPO/src/witness_owed.py" --workspace "$GATE_WS" canary "$CANARY" --host "$GATE_HOST" >/dev/null ||
-      { echo "self-upgrade: ABORT — no open witness-owed record for $CANARY" >&2; exit 4; }
-    echo "self-upgrade: canary activation of $CANARY declared for $GATE_HOST — post the round trip and close the record"
-  fi
-  if ! python3 "$REPO/src/witness_owed.py" --workspace "$GATE_WS" check --ref "$REMOTE/$BRANCH" --current HEAD --repo-root "$REPO" --host "$GATE_HOST"; then
-    echo "self-upgrade: ABORT — the target head newly contains a live-path PR that still owes its witness (listed above)." >&2
-    echo "  Post the exact-head round trip to the PR thread and close the record: python3 src/witness_owed.py --workspace <ws> close owner/repo#N --witness <url>" >&2
-    echo "  Or, on the host that owes it, activate as the declared canary: $0 --canary owner/repo#N" >&2
-    exit 4
-  fi
+GATE_HOST="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null || true)"
+GATE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null || true)"
+GATE_HELPER="$REPO/src/witness_owed.py"
+[ -n "$GATE_WS" ] || { echo "self-upgrade: ABORT — cannot resolve the workspace, so the witness-owed gate cannot run" >&2; exit 4; }
+[ -n "$GATE_HOST" ] || { echo "self-upgrade: ABORT — cannot resolve this host's label, so the witness-owed gate cannot run" >&2; exit 4; }
+[ -n "$GATE_PY" ] || { echo "self-upgrade: ABORT — no usable python (sutando-config.sh python-bin), so the witness-owed gate cannot run" >&2; exit 4; }
+[ -f "$GATE_HELPER" ] || { echo "self-upgrade: ABORT — $GATE_HELPER is missing, so the witness-owed gate cannot run" >&2; exit 4; }
+if [ -n "$CANARY" ]; then
+  "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" canary "$CANARY" --host "$GATE_HOST" >/dev/null ||
+    { echo "self-upgrade: ABORT — cannot declare $GATE_HOST the canary for $CANARY (no open record, or a different host owes it)" >&2; exit 4; }
+  echo "self-upgrade: canary activation of $CANARY declared for $GATE_HOST — post the round trip and close the record"
+fi
+if ! "$GATE_PY" "$GATE_HELPER" --workspace "$GATE_WS" check --ref "$REMOTE/$BRANCH" --current HEAD --repo-root "$REPO" --host "$GATE_HOST"; then
+  echo "self-upgrade: ABORT — the target head newly contains a live-path PR that still owes its witness (listed above)." >&2
+  echo "  Post the exact-head round trip to the PR thread and close the record: witness_owed.py close owner/repo#N --witness <url>" >&2
+  echo "  Or, on the host that owes it, activate as the declared canary: $0 --canary owner/repo#N" >&2
+  exit 4
 fi
 
 # 4. Fast-forward pull — the actual code upgrade.
