@@ -191,7 +191,7 @@ class PriorArtTest(unittest.TestCase):
     def test_a_comment_is_surfaced_even_though_it_is_not_a_review(self):
         run = self._runner(comments='[{"created_at":"2026-08-24T11:36:36Z",'
                                     '"user":{"login":"sonichi"},"body":"the finding"}]')
-        seen = pf.prior_art("3327", runner=run)
+        seen, _ = pf.prior_art("3327", runner=run)
         self.assertEqual(len(seen), 1)
         self.assertIn("sonichi", seen[0])
         self.assertIn("(comment)", seen[0])
@@ -206,16 +206,70 @@ class PriorArtTest(unittest.TestCase):
         the only review shape an agent can leave."""
         run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
                                    '"state":"COMMENTED","body":"a real finding"}]')
-        seen = pf.prior_art("1", runner=run)
+        seen, _ = pf.prior_art("1", runner=run)
         self.assertEqual(len(seen), 1)
         self.assertIn("COMMENTED", seen[0])
 
-    def test_an_empty_bodied_review_is_skipped(self):
-        """The real rule is skip-on-EMPTY: an approval with no prose says nothing
-        a reviewer needs to read before writing."""
+    def test_an_empty_bodied_approval_has_no_prose_but_keeps_its_VERDICT(self):
+        """Supersedes an earlier test that asserted this review vanished entirely.
+
+        Skip-on-EMPTY is right about PROSE — a bare approval gives a reviewer
+        nothing to read. It was wrong about STATE. On a repo where agents share
+        a login, `REVIEW.md` lesson 16 tells a reviewer to establish the login's
+        current decisive state first, and dropping the row made the mandatory
+        preflight answer "nothing here" over a live approval."""
         run = self._runner(reviews='[{"submitted_at":"t","user":{"login":"a"},'
                                    '"state":"APPROVED","body":"   "}]')
-        self.assertEqual(pf.prior_art("1", runner=run), [])
+        seen, verdicts = pf.prior_art("1", runner=run)
+        self.assertEqual(seen, [], "a bare approval carries no prose to read")
+        self.assertEqual(verdicts, ["t  a: APPROVED"], "but the verdict stands")
+
+    def test_the_reported_input_cannot_render_as_no_reviews(self):
+        """The exact input from the review that requested this change."""
+        run = self._runner(reviews='[{"submitted_at":"2026-08-28T00:00:00Z",'
+                                   '"user":{"login":"qingyun-wu"},'
+                                   '"state":"APPROVED","body":""}]')
+        got = pf.prior_art("1", runner=run)
+        rendered = "\n".join(pf.verdict_block(got[1]) + pf.prior_art_block("1", got[0]))
+        self.assertIn("qingyun-wu", rendered)
+        self.assertIn("APPROVED", rendered)
+        self.assertNotIn("DECISIVE STATE: none", rendered)
+
+    def test_a_verdict_survives_the_display_cap(self):
+        """Truncation must not lose state: the cap applies to prose only."""
+        reviews = ",".join(
+            '{"submitted_at":"t%02d","user":{"login":"u%d"},'
+            '"state":"COMMENTED","body":"prose %d"}' % (i, i, i)
+            for i in range(1, pf.PRIOR_ART_SHOWN + 6))
+        old_approval = ('{"submitted_at":"t00","user":{"login":"early"},'
+                        '"state":"APPROVED","body":""}')
+        run = self._runner(reviews=f"[{old_approval},{reviews}]")
+        seen, verdicts = pf.prior_art("1", runner=run)
+        shown = "\n".join(pf.prior_art_block("1", seen))
+        self.assertNotIn("early", shown, "precondition: prose list truncated it away")
+        self.assertIn("early", "\n".join(pf.verdict_block(verdicts)))
+
+    def test_verdict_unknown_and_verdict_none_do_not_render_alike(self):
+        """The same load-bearing distinction the prose block already makes.
+
+        None means the lookup failed; [] means it succeeded and found no
+        decisive review. Rendering them alike would let a failed check read as
+        a clean one — the exact substitution lesson 16 tells a reviewer to
+        avoid, one layer down."""
+        unknown = "\n".join(pf.verdict_block(None))
+        none = "\n".join(pf.verdict_block([]))
+        self.assertIn("COULD NOT CHECK", unknown)
+        self.assertNotIn("COULD NOT CHECK", none)
+        self.assertNotEqual(unknown, none)
+
+    def test_latest_verdict_per_login_regardless_of_row_order(self):
+        """Newest wins even when the endpoint returns rows out of order."""
+        run = self._runner(reviews='[{"submitted_at":"t9","user":{"login":"a"},'
+                                   '"state":"CHANGES_REQUESTED","body":""},'
+                                   '{"submitted_at":"t1","user":{"login":"a"},'
+                                   '"state":"APPROVED","body":""}]')
+        _, verdicts = pf.prior_art("1", runner=run)
+        self.assertEqual(verdicts, ["t9  a: CHANGES_REQUESTED"])
 
     def test_unknown_is_not_empty(self):
         """The load-bearing case: a failed check must not render as a clean one."""
