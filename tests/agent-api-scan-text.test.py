@@ -7,7 +7,11 @@ Exercises the real Handler.do_POST (same harness as agent-api-guest-routes):
   * verdicts: clean text -> pass; a withheld verdict from the guard -> withhold;
   * suppression markers exempt nothing (the daemon publishes the text itself);
   * a failing underlying scanner -> 500 (the daemon reads non-200 as fail-closed);
-  * input validation: auth, Content-Length caps, texts shape/limits.
+  * auth is registry-scoped exactly like /guest-task: the legacy global token
+    works until a live per-room row exists, then only a per-room ENQUEUE token
+    whose room equals the body room_id (cross-room 403, read scope 403), and
+    the global token is re-admitted once every row is revoked;
+  * input validation: bearer, Content-Length caps, texts shape/limits.
 
 Run: `python3 tests/agent-api-scan-text.test.py`
 """
@@ -25,6 +29,11 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 _spec = importlib.util.spec_from_file_location("agent_api", str(SRC / "agent-api.py"))
 agent_api = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(agent_api)
+from policy import signal_tokens as st  # noqa: E402
+
+GLOBAL = "global-token"
+agent_api.API_TOKEN = GLOBAL
+agent_api.SIGNAL_TOKEN_REGISTRY = Path(_TEST_WS) / "state" / "signal-room-tokens.json"
 
 failures = 0
 
@@ -46,21 +55,22 @@ class FakeRFile:
         return self.body
 
 
-def make_handler(path: str, headers: dict, body: bytes = b"", auth: bool = True):
+def make_handler(path: str, headers: dict, body: bytes = b"", token=GLOBAL):
     h = agent_api.Handler.__new__(agent_api.Handler)
     h.path = path
-    h.headers = headers
+    h.headers = dict(headers)
+    if token is not None:
+        h.headers["Authorization"] = f"Bearer {token}"
     h.rfile = FakeRFile(body)
     h._responses = []
-    h.check_auth = lambda: (auth if auth else h._responses.append((401, {"error": "unauthorized"})) or False)
     h.send_json = lambda status, data: h._responses.append((status, data))
     h.send_private_json = lambda status, data: h._responses.append((status, data))
     return h
 
 
-def post(payload, auth: bool = True):
+def post(payload, token=GLOBAL):
     body = json.dumps(payload).encode()
-    h = make_handler("/scan-text", {"Content-Length": str(len(body))}, body, auth=auth)
+    h = make_handler("/scan-text", {"Content-Length": str(len(body))}, body, token=token)
     h.do_POST()
     return h
 
@@ -137,9 +147,52 @@ def run() -> None:
     finally:
         egress.guard_result_for_tier = real_guard
 
+    # --- registry-scoped auth, mirroring /guest-task ---------------------------
+    egress.guard_result_for_tier = lambda body, tier, repo, *a, **kw: (body, None)
+    registry = agent_api.SIGNAL_TOKEN_REGISTRY
+    rows = [st.make_row("!a:hs", "enqueue", "tok-a-enq", created_at_ms=1),
+            st.make_row("!a:hs", "read", "tok-a-read", created_at_ms=2),
+            st.make_row("!b:hs", "enqueue", "tok-b-enq", created_at_ms=3)]
+    try:
+        h = post({"texts": ["x"], "room_id": "!a:hs"})
+        check("global token accepted before any per-room row exists",
+              h._responses[0] == (200, {"verdict": "pass"}))
+        h = post({"texts": ["x"]}, token="tok-a-enq")
+        check("an unprovisioned room token is 401 (ordinary gate, no rows yet)",
+              h._responses[0][0] == 401)
+
+        st.write_registry(registry, rows)
+        h = post({"texts": ["x"], "room_id": "!a:hs"}, token="tok-a-enq")
+        check("per-room enqueue token accepted for its own room",
+              h._responses[0] == (200, {"verdict": "pass"}))
+        h = post({"texts": ["x"]}, token="tok-a-enq")
+        check("no body room_id: the token's room stands (200)", h._responses[0][0] == 200)
+        h = post({"texts": ["x"], "room_id": "!b:hs"}, token="tok-a-enq")
+        check("body room_id != token room -> 403", h._responses[0][0] == 403)
+        h = post({"texts": ["x"], "room_id": "!a:hs"}, token="tok-a-read")
+        check("read-scope token cannot scan (403)", h._responses[0][0] == 403)
+        h = post({"texts": ["x"], "room_id": "!a:hs"}, token=GLOBAL)
+        check("global token refused once a live row exists (403)", h._responses[0][0] == 403)
+        h = post({"texts": ["x"]}, token="tok-unknown")
+        check("unknown token is 403, never the legacy path", h._responses[0][0] == 403)
+        h = post({"texts": ["x"] * 65, "room_id": "!b:hs"}, token="tok-a-enq")
+        check("payload shape is validated before the room binding (400, not 403)",
+              h._responses[0][0] == 400)
+
+        st.write_registry(registry, [dict(r, revoked_at=9) for r in rows])
+        h = post({"texts": ["x"], "room_id": "!a:hs"}, token=GLOBAL)
+        check("every row revoked: the global token is re-admitted", h._responses[0][0] == 200)
+        h = post({"texts": ["x"]}, token="tok-a-enq")
+        check("a revoked room token falls to the ordinary gate (401)", h._responses[0][0] == 401)
+    finally:
+        egress.guard_result_for_tier = real_guard
+        registry.unlink(missing_ok=True)
+
     # --- input validation -----------------------------------------------------
-    h = post({"texts": ["x"]}, auth=False)
-    check("honours check_auth", not any(r[0] == 200 for r in h._responses))
+    h = post({"texts": ["x"]}, token="wrong")
+    check("wrong bearer -> 401", h._responses[0][0] == 401)
+    h = post({"texts": ["x"]}, token=None)
+    check("missing bearer -> 401", h._responses[0][0] == 401)
 
     h = make_handler("/scan-text", {"Content-Length": "999999"})
     h.do_POST()

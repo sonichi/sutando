@@ -1648,10 +1648,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
-        # /scan-text — decoded-value guard re-run for the Signal Room daemon, which
-        # publishes the text itself: markers exempt nothing, scanner outage is a 500.
+        # /scan-text — decoded-value guard re-run for the Signal Room daemon (its
+        # per-room enqueue token): markers exempt nothing, scanner outage is a 500.
         if path == "/scan-text":
-            if not self.check_auth():
+            auth = self.check_scoped_auth(SCOPE_ENQUEUE)
+            if auth is None:
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -1676,6 +1677,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     or not all(isinstance(t, str) for t in texts)
                     or any(len(t) > 16384 for t in texts)):
                 self.send_json(400, {"error": "texts must be 1..64 strings of <=16384 chars"})
+                return
+            _room, room_error = _token_bound_room(auth, data)
+            if room_error:
+                self.send_json(403, {"error": room_error})
                 return
             try:
                 from policy.egress.result import (SCANNER_UNAVAILABLE,
