@@ -223,10 +223,15 @@ class UpgradeWiring(unittest.TestCase):
         self.assertIn("--canary", self.SRC)
 
     def test_gate_fails_closed_and_uses_the_canonical_python(self):
-        for token in ('[ -n "$GATE_WS" ] ||', '[ -n "$GATE_HOST" ] ||', '[ -n "$GATE_PY" ] ||',
+        for token in ('[ -n "$GATE_WS" ] ||', '[ -n "$GATE_PY" ] ||',
                       '[ -f "$GATE_HELPER" ] ||', 'sutando-config.sh" python-bin'):
             self.assertIn(token, self.SRC, token)
         self.assertNotIn('python3 "$REPO/src/witness_owed.py"', self.SRC, "bare python3 may hit the CLT stub")
+        # A missing host label cannot release a record, so it must not stop
+        # `check`; it must stop a canary declaration.
+        canary = self.SRC.index('if [ -n "$CANARY" ]')
+        self.assertLess(canary, self.SRC.index('[ -n "$GATE_HOST" ] ||'))
+        self.assertIn('${GATE_HOST:+--host "$GATE_HOST"}', self.SRC)
 
 
 if __name__ == "__main__":
