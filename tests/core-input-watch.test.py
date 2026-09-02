@@ -62,6 +62,12 @@ _FABLE_LIMIT = ("  You've reached your Fable limit\n"
                 "  Esc to cancel")
 # The same dialog under a select-list footer, in case the generic one is not rendered.
 _FABLE_LIMIT_SELECT_FOOTER = _FABLE_LIMIT.rsplit("\n", 1)[0] + "\n  ↑/↓ to navigate · Enter to select"
+# The caret on the PAYING option (rui, #3739): Enter here spends credits, so this
+# must be a human gate however the text around it reads.
+_FABLE_LIMIT_UNFOCUSED = _FABLE_LIMIT.replace(
+    "  ❯ Switch to Opus 5 and continue\n    Continue with Fable 5.1",
+    "    Switch to Opus 5 and continue\n  ❯ Continue with Fable 5.1")
+assert _FABLE_LIMIT_UNFOCUSED != _FABLE_LIMIT
 
 
 class TestClassify(unittest.TestCase):
@@ -138,6 +144,29 @@ class TestClassify(unittest.TestCase):
         st, _d, _p, kind = compose_state(_FABLE_LIMIT, "working", True)
         self.assertEqual((st, kind), ("blocked-known", "fable-limit"))
         self.assertEqual(auto_answer("fable-limit"), "Enter")
+
+    def test_fable_limit_with_the_caret_elsewhere_is_a_human_gate(self):
+        # Same dialog, caret on "Continue with Fable": Enter would spend credits.
+        kind, _ = classify(_FABLE_LIMIT_UNFOCUSED)
+        self.assertEqual(kind, "fable-limit-unfocused")
+        st, _d, _p, k = compose_state(_FABLE_LIMIT_UNFOCUSED, "working", True)
+        self.assertEqual((st, k), ("blocked-human", "fable-limit-unfocused"))
+        self.assertIsNone(auto_answer("fable-limit-unfocused"))
+        self.assertIsNone(_mod.answer_step("blocked-known", "fable-limit-unfocused", "p", None))
+
+    def test_switch_text_without_the_caret_is_not_the_answerable_kind(self):
+        # The switch phrase alone (scrollback, an unfocused row) must not read as focus.
+        pane = "  Switch to Opus 5 and continue\n  Esc to cancel"
+        self.assertNotEqual((classify(pane) or (None,))[0], "fable-limit")
+
+    def test_a_focused_switch_line_on_some_other_dialog_is_never_typed_at(self):
+        # sonichi (#3739): a dialog whose own text says it discards work carried the
+        # same "Switch to … and continue" row; without the Fable text it is unknown.
+        pane = ("  This will discard local changes\n"
+                "  ❯ Switch to origin/main and continue\n    Cancel\n  Esc to cancel")
+        kind, _ = classify(pane)
+        self.assertNotIn(kind, ("fable-limit", "fable-limit-unfocused"))
+        self.assertIsNone(auto_answer(kind))
 
     def test_fable_limit_and_session_limit_stay_distinct(self):
         # One is a switch the monitor may take; the other is a wait/spend decision.
@@ -257,7 +286,7 @@ class TestAnswerStep(unittest.TestCase):
         self.assertEqual(_mod.answer_step("blocked-known", "fable-limit", "p2", "p1"), "Enter")
 
     def test_human_gates_are_never_typed_at(self):
-        for kind in ("login", "session-limit", "permission", "selection", "unknown"):
+        for kind in ("login", "session-limit", "fable-limit-unfocused", "permission", "selection", "unknown"):
             self.assertIsNone(_mod.answer_step("blocked-known", kind, "p", None), kind)
         self.assertIsNone(_mod.answer_step("blocked-human", "fable-limit", "p", None))
 
@@ -272,11 +301,12 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
     """One --once tick against a Fable-limit pane: the key is typed through send_keys
     and the signal file records it; --no-auto-answer only reports."""
 
-    def _tick(self, extra_args):
+    def _tick(self, extra_args, pane=None):
         import sys
         import tempfile
         from unittest.mock import patch
         sent = []
+        pane = _FABLE_LIMIT if pane is None else pane
         out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
 
         class _RH:
@@ -286,7 +316,7 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
                 return {"health": "working"}
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
                 "--once", "--stable", "1"] + extra_args
-        with patch.object(_mod, "capture", lambda s, sess: _FABLE_LIMIT), \
+        with patch.object(_mod, "capture", lambda s, sess: pane), \
                 patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
@@ -302,6 +332,12 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
         self.assertEqual(payload["kind"], "fable-limit")
         self.assertEqual(payload["auto_answered"]["kind"], "fable-limit")
         self.assertEqual(payload["auto_answered"]["key"], "Enter")
+
+    def test_caret_on_the_paying_option_is_escalated_never_typed(self):
+        sent, payload = self._tick([], pane=_FABLE_LIMIT_UNFOCUSED)
+        self.assertEqual(sent, [])
+        self.assertEqual((payload["state"], payload["kind"]), ("blocked-human", "fable-limit-unfocused"))
+        self.assertNotIn("auto_answered", payload)
 
     def test_no_auto_answer_flag_reports_only(self):
         sent, payload = self._tick(["--no-auto-answer"])

@@ -163,11 +163,11 @@ def compose_message(signal: dict) -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt."""
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE:
-        return ("ℹ️ Fable weekly limit reached — the core answered Claude Code's limit dialog"
-                " with \"Switch to <fallback> and continue\", so it now runs on the fallback"
-                " model (Opus unless your model policy says otherwise) for this session."
-                " Nothing to do; at the core's terminal /model changes it and"
-                " /usage-credits keeps Fable running on credits.")
+        return ("ℹ️ Fable weekly limit reached — the core pressed Enter on the focused"
+                " \"Switch to <fallback> and continue\" of Claude Code's limit dialog, which"
+                " should leave it on the fallback model (Opus unless your model policy says"
+                " otherwise) for this session. Nothing to do unless the terminal shows"
+                " otherwise; /model there changes it, /usage-credits keeps Fable on credits.")
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
     kind = signal.get("kind")
     prompt = (signal.get("prompt") or "").strip()
@@ -183,6 +183,11 @@ def compose_message(signal: dict) -> str:
         msg += f": {excerpt[:110]}"
     if signal.get("kind") == "session-limit":
         msg += _limit_remedy(signal)
+    elif signal.get("kind") == "fable-limit-unfocused":
+        msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
+                " not \"Switch to <fallback> and continue\", so the core will not press Enter"
+                " (that could spend credits). Pick the switch at the core's terminal, or"
+                " /usage-credits to stay on Fable.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"

@@ -155,14 +155,25 @@ class TestShouldEscalate(unittest.TestCase):
 
 
 class TestComposeMessage(unittest.TestCase):
-    def test_fable_auto_answer_says_switched_not_needs_you(self):
+    def test_fable_auto_answer_says_what_was_pressed_not_needs_you(self):
         msg = compose_message(_FABLE_AUTO)
         self.assertIn("Fable weekly limit", msg)
+        self.assertIn("pressed Enter", msg)
         self.assertIn("fallback model", msg)
         self.assertNotIn("Agent needs you", msg)
         self.assertNotIn("/login", msg)
         # Carried onto a later idle tick, the notice reads the same.
         self.assertEqual(compose_message(_FABLE_AUTO_LATER), msg)
+
+    def test_fable_limit_with_the_caret_elsewhere_escalates_with_the_reason(self):
+        unfocused = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
+                     "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1",
+                     "kind": "fable-limit-unfocused"}
+        self.assertTrue(should_escalate(unfocused, None)[0])
+        msg = compose_message(unfocused)
+        self.assertIn("Agent needs you", msg)
+        self.assertIn("will not press Enter", msg)
+        self.assertNotIn("/login", msg)
 
     def test_includes_detail_and_prompt_excerpt(self):
         m = compose_message(_LOGIN)

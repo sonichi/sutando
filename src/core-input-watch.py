@@ -107,15 +107,19 @@ def _load_runtime_health():
     return mod
 
 
+# Claude Code's weekly Fable-consent dialog (title / body); Enter is safe there only
+# with the caret on its "Switch to <fallback> and continue" row.
+_FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this week", re.I)
+
 # ---- ESCALATE-detection: interactive-prompt signatures. First match classifies.
 # Specific so the idle "❯ " prompt (ready for a task) is NEVER flagged. This is
 # the net-new layer over runtime-health: it identifies WHICH gate the core is
 # stuck at so ESCALATE can show the prompt and AUTO-ANSWER can decide.
 _SIGNATURES = [
-    # Claude Code's weekly Fable-consent dialog: its default-focused option is
-    # "Switch to <fallback> and continue", so Enter is the model switch itself.
-    ("fable-limit", re.compile(
-        r"reached your Fable limit|included Fable usage for this week|Switch to .+ and continue", re.I)),
+    # The caret ON the Fable dialog's switch row (classify also demands the Fable text
+    # above it); the same dialog with the caret anywhere else is the human gate below.
+    ("fable-limit", re.compile(r"❯\s*Switch to .{1,80}? and continue", re.I)),
+    ("fable-limit-unfocused", _FABLE_TEXT),
     ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
     ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
@@ -132,7 +136,7 @@ _IDLE = re.compile(r"⏵⏵\s*bypass permissions on|for agents\b", re.I)
 # Gates that need a human (can't be auto-answered): login + any unrecognized
 # selection/permission. The rest (trust/bypass/press-enter) are known-safe.
 # session-limit is a spend/wait decision: never auto-answered, never a login.
-_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "unknown"}
+_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "fable-limit-unfocused", "unknown"}
 
 # --- M4 AUTO-ANSWER (Layer 2): the safe key per gate; `answer_step` in the loop sends it
 # once per prompt instance (`--no-auto-answer` disables). Unlisted → None → ESCALATE.
@@ -141,8 +145,8 @@ _AUTO_ANSWER = {
     # confirmation). Pressing Enter only proceeds; it grants nothing and is not
     # destructive.
     "press-enter": "Enter",
-    # The Fable weekly-limit dialog focuses "Switch to <fallback> and continue" by
-    # default: Enter spends nothing and keeps the core working (owner 2026-09-02).
+    # Matched only with the caret ON "Switch to <fallback> and continue" under the Fable
+    # text, so Enter is that switch and spends nothing (owner 2026-09-02).
     "fable-limit": "Enter",
 }
 
@@ -182,7 +186,12 @@ def classify(pane: str):
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
             for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
     if hits:
-        return max(hits, key=lambda h: (h[0], -h[1]))[2], tail
+        start, _, kind = max(hits, key=lambda h: (h[0], -h[1]))
+        # A focused switch row is Enter-safe only under the Fable text; on any other
+        # dialog it is an unforeseen prompt and gets the human treatment.
+        if kind == "fable-limit" and not any(m.start() < start for m in _FABLE_TEXT.finditer(tail)):
+            return "unknown", tail
+        return kind, tail
     # No specific signature — but an input affordance IS present and this is NOT
     # the idle prompt. That means an UNFORESEEN prompt. Surface it rather than
     # leave a silent dead-end (owner's no-dead-end requirement 2026-07-14): we
