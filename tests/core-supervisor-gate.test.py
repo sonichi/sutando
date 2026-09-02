@@ -81,8 +81,12 @@ class TestSessionGone(unittest.TestCase):
     def test_session_present(self):
         self.assertIs(self._with_run(lambda *a, **k: self._R(0), "s.sock", "core"), False)
 
-    def test_session_absent(self):
-        self.assertIs(self._with_run(lambda *a, **k: self._R(1), "s.sock", "core"), True)
+    def test_unrecognised_nonzero_is_unknown_not_dead(self):
+        # rc 1 with no recognised absence message observed nothing: the gate holds.
+        self.assertIsNone(self._with_run(lambda *a, **k: self._R(1), "s.sock", "core"))
+
+    def test_signalled_client_is_unknown_not_dead(self):
+        self.assertIsNone(self._with_run(lambda *a, **k: self._R(-9), "s.sock", "core"))
 
     def test_tmux_timeout_is_unknown_not_dead(self):
         import subprocess as sp

@@ -2,7 +2,8 @@
 
 The stderr strings below are verbatim from tmux 3.6a (server, homebrew) and a
 3.5a client (the desktop app's vendored engine/bin/tmux) against the same
-socket: the two genuine misses stay False, the version-skew failure is None.
+socket. Absence is matched positively: the genuine misses are False; the
+version-skew failure, a signalled client and an unrecognised message are None.
 """
 import os
 import subprocess
@@ -30,19 +31,31 @@ class TestClassify(unittest.TestCase):
         err = b"error connecting to /tmp/x.sock (No such file or directory)\n"
         self.assertIs(tmux_probe.classify(1, err), False)
 
-    def test_bare_nonzero_without_stderr_is_absent(self):
-        # A subprocess double with no stderr at all must read as an ordinary miss.
-        self.assertIs(tmux_probe.classify(1, None), False)
-        self.assertIs(tmux_probe.classify(1, ""), False)
+    def test_no_server_running_form_is_absent(self):
+        self.assertIs(tmux_probe.classify(1, b"no server running on /tmp/x.sock\n"), False)
+
+    def test_bare_nonzero_without_stderr_is_unknown(self):
+        # No recognised absence message = nothing observed, whatever the rc.
+        self.assertIsNone(tmux_probe.classify(1, None))
+        self.assertIsNone(tmux_probe.classify(1, ""))
+
+    def test_signalled_client_is_unknown(self):
+        self.assertIsNone(tmux_probe.classify(-9, b""))
+
+    def test_unrecognised_message_is_unknown(self):
+        self.assertIsNone(tmux_probe.classify(1, b"server version is too old for client\n"))
 
     def test_version_skew_client_is_unknown(self):
         self.assertIsNone(tmux_probe.classify(1, b"server exited unexpectedly\n"))
         self.assertIsNone(tmux_probe.classify(1, "protocol version mismatch (client 8, server 9)"))
         self.assertIsNone(tmux_probe.classify(1, b"lost server\n"))
 
-    def test_client_fault_never_reads_true(self):
-        # rc 0 wins outright; the signatures only demote a non-zero exit.
+    def test_rc_zero_wins_outright(self):
         self.assertIs(tmux_probe.classify(0, b"server exited unexpectedly\n"), True)
+
+    def test_absence_needs_a_recognised_message_not_just_rc(self):
+        self.assertIs(tmux_probe.classify(1, b"can't find session: x\n"), False)
+        self.assertIsNone(tmux_probe.classify(1, b"something else entirely\n"))
 
     def test_unexecuted_is_unknown(self):
         self.assertIsNone(tmux_probe.classify(None, b""))
@@ -75,10 +88,10 @@ class TestHasSession(unittest.TestCase):
     def test_miss_is_false(self):
         self.assertIs(self._with_run(lambda *a, **k: _R(1, b"can't find session: core\n")), False)
 
-    def test_double_without_stderr_is_false(self):
+    def test_double_without_stderr_is_unknown(self):
         class Bare:
             returncode = 1
-        self.assertIs(self._with_run(lambda *a, **k: Bare()), False)
+        self.assertIsNone(self._with_run(lambda *a, **k: Bare()))
 
     def test_missing_binary_is_unknown(self):
         def boom(*a, **k):
