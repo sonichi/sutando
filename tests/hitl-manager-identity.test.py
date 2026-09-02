@@ -6,6 +6,7 @@ cross-process lock around read-modify-write."""
 
 import json
 import multiprocessing
+import os
 import sys
 import tempfile
 import unittest
@@ -85,7 +86,7 @@ class IdentityTests(unittest.TestCase):
         self.assertIn("hitl_custom-1", [r.id for r in store.all()])  # saved => enumerated
 
     def test_concurrent_creates_of_one_interaction_yield_one_record(self):
-        ctx = multiprocessing.get_context("fork")
+        ctx = multiprocessing.get_context("spawn" if os.name == "nt" else "fork")
         procs = [ctx.Process(target=_spawn_create, args=(str(self.root), "hook:race")) for _ in range(6)]
         for p in procs:
             p.start()

@@ -249,7 +249,8 @@ class DefaultRunnerTest(unittest.TestCase):
     def test_default_runner_runs_a_real_command(self):
         from hitl.detector import _default_runner
 
-        rc, out = _default_runner(["echo", "hitl-runner-probe"])
+        rc, out = _default_runner(
+            [sys.executable, "-c", "print('hitl-runner-probe')"])
         self.assertEqual(rc, 0)
         self.assertIn("hitl-runner-probe", out)
 

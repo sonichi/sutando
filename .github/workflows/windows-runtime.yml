@@ -134,6 +134,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { throw 'file-lock.test.py failed' }
+          python tests/hitl-manager-identity.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'hitl-manager-identity.test.py failed' }
+          python tests/hitl-schema.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'hitl-schema.test.py failed' }
           python tests/cron-state-lock-windows.test.py
           if ($LASTEXITCODE -ne 0) { throw 'cron-state-lock-windows.test.py failed' }
           python tests/idle-surface-canonical-hash.test.py

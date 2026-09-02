@@ -11,7 +11,6 @@ and neither ever mutates requirement state.
 from __future__ import annotations
 
 import json
-import fcntl
 import os
 import re
 import tempfile
@@ -20,6 +19,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from file_lock import lock_fd, unlock_fd
 from workspace_default import resolve_workspace
 
 from .schema import (
@@ -72,14 +72,14 @@ class HitlStore:
         (a blocking hook and the bridge do). Re-entrant within one thread."""
         if self._lock_depth == 0:
             self._lock_fd = os.open(str(self.root / ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+            lock_fd(self._lock_fd)
         self._lock_depth += 1
         try:
             yield
         finally:
             self._lock_depth -= 1
             if self._lock_depth == 0 and self._lock_fd is not None:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                unlock_fd(self._lock_fd)
                 os.close(self._lock_fd)
                 self._lock_fd = None
 
