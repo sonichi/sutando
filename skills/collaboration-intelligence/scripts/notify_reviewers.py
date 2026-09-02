@@ -769,6 +769,62 @@ def _ledger_lock(led: Path):
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
 
+def reserve_ask(a, t, who, person_of, roster, require_ref=True):
+    """Reserve the retry park for one ask. TRANSPORT-INDEPENDENT by contract.
+
+    Returns (proceed, bucket, note). A park that only one transport honours is
+    not a park: an alias on the other transport walks past a landed send."""
+    if a.kind != "ask":
+        return True, None, None
+    if not _PR_URL.search(a.message):
+        if require_ref:
+            return False, "failure", (
+                f"{t['name']}: REFUSED — the message carries no full PR URL, so an "
+                "unknown outcome could not be recorded and a repeat could duplicate "
+                "it. Use the full URL, not a short #ref.")
+        # Unkeyable: no park can exist for it, so return BEFORE the ledger
+        # rather than adding a dependency this path does not need.
+        return True, None, None
+    try:
+        reserved = claim_park(a.message, t["name"], who, canonical=person_of,
+                              endpoint=t.get("endpoint"),
+                              membership=component_tags(roster, t["name"]))
+    except OSError as e:
+        return False, "failure", (
+            f"{t['name']}: REFUSED — could not reserve the park ({e}); sending now "
+            "would be unrepeatable-but-unrecorded. Nothing was sent.")
+    if reserved is None:
+        return False, "unknown", (
+            f"{t['name']}: PARKED — a previous send to {who} is UNSAFE to repeat "
+            "(it landed, or may have); check the channel")
+    if not reserved:
+        if not require_ref:
+            return True, None, None
+        return False, "failure", (
+            f"{t['name']}: REFUSED — no PR reference to key the park on; "
+            "nothing was sent")
+    return True, None, None
+
+
+def settler(a, t, who):
+    """The matching settlement for reserve_ask, on either transport."""
+    def _settle(outcome, detail):
+        # A NOTICE never claimed, so it has nothing to supersede — and a row
+        # here would be projected into ask history by `_first_ask`.
+        if a.kind != "ask":
+            return 0
+        try:
+            return record_asks(a.message, t["name"], outcome=outcome, actor=who,
+                               detail=detail, endpoint=t.get("endpoint")) or 0
+        except OSError as err:
+            # The reservation still stands, so the park holds and the next run
+            # refuses rather than repeating. Say which way it fails.
+            print(f"  WARNING: {t['name']} stayed PENDING ({err}) — the park holds, "
+                  "so a repeat is blocked until it is cleared", file=sys.stderr)
+            return None
+    return _settle
+
+
 def claim_park(message: str, reviewer: str, actor: str = None,
                canonical=None, endpoint: str = None,
                membership=None) -> "int | None":
@@ -1227,59 +1283,18 @@ def main() -> int:
             if not a.send:
                 print("PLAN:", " ".join(argv))
                 continue
-            if not _PR_URL.search(a.message):
-                # An UNKNOWN outcome here could not be parked, so a retry would
-                # duplicate a post that may have landed. Refuse before sending.
-                print(f"{t['name']}: REFUSED — the message carries no full PR URL, "
-                      "so an unknown outcome could not be recorded and a repeat "
-                      "could duplicate it. Use the full URL, not a short #ref.",
-                      file=sys.stderr)
-                failures += 1
-                continue
             who = actors.get(t["name"], t["name"])
             # Claim BEFORE the POST: a later reservation cannot cover a crash
-            # between the two. A NOTICE is not an ask, so it skips the block.
-            if a.kind == "ask":
-                try:
-                    reserved = claim_park(a.message, t["name"], who,
-                                          canonical=person_of,
-                                          endpoint=t.get("endpoint"),
-                                          membership=component_tags(
-                                              load_roster(), t["name"]))
-                except OSError as e:
-                    print(f"{t['name']}: REFUSED — could not reserve the park ({e}); "
-                          "sending now would be unrepeatable-but-unrecorded. Nothing "
-                          "was sent.", file=sys.stderr)
-                    failures += 1
-                    continue
-                if reserved is None:
-                    print(f"{t['name']}: PARKED — a previous send to {who} is UNSAFE "
-                          "to repeat (it landed, or may have); check the channel",
-                          file=sys.stderr)
+            # between the two. Shared with the Matrix path — see reserve_ask.
+            proceed, bucket, note = reserve_ask(a, t, who, person_of, load_roster())
+            if not proceed:
+                print(note, file=sys.stderr)
+                if bucket == "unknown":
                     unknowns += 1
-                    continue
-                if not reserved:
-                    print(f"{t['name']}: REFUSED — no PR reference to key the park on; "
-                          "nothing was sent", file=sys.stderr)
+                else:
                     failures += 1
-                    continue
-
-            def _settle(outcome, detail):
-                """Supersede the reservation. Append-only, so this is atomic.
-
-                A NOTICE never claimed, so it has nothing to supersede — and a
-                row here would be projected into ask history by `_first_ask`."""
-                if a.kind != "ask":
-                    return
-                try:
-                    record_asks(a.message, t["name"], outcome=outcome, actor=who,
-                                detail=detail, endpoint=t.get("endpoint"))
-                except OSError as err:
-                    # The reservation still stands, so the park holds and the
-                    # next run refuses rather than repeating. Say which way it fails.
-                    print(f"  WARNING: {t['name']} stayed PENDING ({err}) — the "
-                          "park holds, so a repeat is blocked until it is cleared",
-                          file=sys.stderr)
+                continue
+            _settle = settler(a, t, who)
 
             try:
                 p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
@@ -1402,16 +1417,34 @@ def main() -> int:
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue
+        who = actors.get(t["name"], t["name"])
+        # Same reservation as the Discord path: an alias on this transport must
+        # not walk past a park an ask on the other one is still holding.
+        proceed, bucket, note = reserve_ask(a, t, who, person_of, load_roster(),
+                                            require_ref=False)
+        if not proceed:
+            print(note, file=sys.stderr)
+            if bucket == "unknown":
+                unknowns += 1
+            else:
+                failures += 1
+            continue
+        _settle = settler(a, t, who)
         # Per-target boundary: a raise here would drop every remaining target
         # AND skip the return, so the caller sees no asks and no failure code.
         try:
             p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
-            print(f"{t['name']}: ok=False reason=room_ops exceeded the 60s timeout",
+            # May have landed. Park it rather than counting a clean failure —
+            # the Discord path has always done this; this one used to not.
+            _settle("unknown", "timeout: TimeoutExpired")
+            print(f"{t['name']}: UNKNOWN outcome (room_ops exceeded the 60s timeout)"
+                  f" — the post may have landed; {retry_clause(a.kind)}",
                   file=sys.stderr)
-            failures += 1
+            unknowns += 1
             continue
         except OSError as e:
+            _settle("failed", f"no spawn: {type(e).__name__}")
             print(f"{t['name']}: ok=False reason=could not run room_ops ({e})",
                   file=sys.stderr)
             failures += 1
@@ -1436,14 +1469,12 @@ def main() -> int:
             print(f"{t['name']}: ok=True event={event[:24]}")
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
-            try:
-                n_logged = (record_asks(a.message, t["name"],
-                                        endpoint=t.get("endpoint"))
-                            if a.kind == "ask" else 0)
-            except OSError as e:
+            # Supersede the reservation this send claimed, same as Discord.
+            n_logged = _settle("confirmed", f"event={event[:24]}")
+            if n_logged is None:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "
-                      f"({e}) — pr-unattended will under-report this PR as unasked",
+                      "— pr-unattended will under-report this PR as unasked",
                       file=sys.stderr)
             else:
                 if a.kind == "notice":
@@ -1457,8 +1488,18 @@ def main() -> int:
                     print(f"  note: nothing recorded for {t['name']} — the message "
                           f"names no github.com/<owner>/<repo>/pull/<n> URL, so any "
                           f"PR it refers to will read as unasked", file=sys.stderr)
-        else:
+        elif isinstance(payload, dict):
+            # room_ops refuses in-band at rc 0: a parsed ok=false PROVES nothing
+            # was posted, so the reservation releases and a retry stays allowed.
             detail = reason or p.stderr.strip()[:120] or fallback
+            _settle("failed", f"room_ops ok=false: {detail[:80]}")
+            print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
+            failures += 1
+        else:
+            # Unreadable output says nothing about whether the post landed: settle
+            # UNKNOWN so the park holds. The failure exit code is pinned elsewhere.
+            detail = reason or p.stderr.strip()[:120] or fallback
+            _settle("unknown", f"unparseable room_ops output: {detail[:60]}")
             print(f"{t['name']}: ok=False reason={detail}", file=sys.stderr)
             failures += 1
     if unlogged:
