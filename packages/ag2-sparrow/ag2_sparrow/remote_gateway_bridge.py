@@ -1594,7 +1594,10 @@ def _one_line(value) -> str:
     """Header-safe single-line value: CR/LF stripped so a gateway-controlled
     field can't inject extra `key: value` lines (e.g. forge a second
     access_tier). Applied to every field — task content is single-line in
-    practice and a stray newline only ever indicates an injection attempt."""
+    practice and a stray newline only ever indicates an injection attempt.
+
+    Load-bearing: this producer does no body defanging, so the flatten is the
+    only thing stopping a field from forging a registered header line."""
     return str(value).replace("\r", " ").replace("\n", " ")
 
 
