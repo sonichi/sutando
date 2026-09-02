@@ -31,7 +31,8 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+# Locates the CODE tree (this hook is registered by absolute path), never the workspace.
+REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
 
 from hitl.manager import HitlManager, HitlStore, default_store  # noqa: E402

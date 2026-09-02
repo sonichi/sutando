@@ -17,6 +17,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from workspace_default import resolve_workspace
+
 from .schema import (
     Action,
     ActionReply,
@@ -30,10 +32,11 @@ from .schema import (
 )
 
 
-def default_store(workspace: Path) -> Path:
+def default_store(workspace: Optional[Path] = None) -> Path:
     """Where every hitl component on a host keeps requirements: the hook driver
     writes here, the supervisor projects from here. One store, one card."""
-    return Path(workspace) / "state" / "hitl" / "requirements"
+    ws = Path(workspace) if workspace is not None else resolve_workspace()
+    return ws / "state" / "hitl" / "requirements"
 
 
 class HitlStore:

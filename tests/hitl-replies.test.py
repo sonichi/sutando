@@ -14,10 +14,18 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
+from hitl.schema import (  # noqa: E402
+    Action,
+    HumanRequirement,
+)
+from hitl.replies import (  # noqa: E402
+    REPLY_FIELD,
+    HitlReplyHandler,
+    actions_dir,
+    parse_reply,
+)
 from hitl.events import events_dir, ingest  # noqa: E402
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
-from hitl.replies import REPLY_FIELD, HitlReplyHandler, actions_dir, parse_reply  # noqa: E402
-from hitl.schema import Action, HumanRequirement  # noqa: E402
 
 OWNER = "@owner:ag2.space"
 

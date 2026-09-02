@@ -17,6 +17,8 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from workspace_default import resolve_workspace
+
 from .manager import HitlManager
 from .schema import (
     STATUS_IN_PROGRESS,
@@ -28,8 +30,9 @@ SCHEMA = "space.ag2.hitl.runtime_event.v1"
 JUMP_ACTION_ID = "open_terminal"
 
 
-def events_dir(workspace: Path) -> Path:
-    return Path(workspace) / "state" / "hitl" / "events"
+def events_dir(workspace: Optional[Path] = None) -> Path:
+    ws = Path(workspace) if workspace is not None else resolve_workspace()
+    return ws / "state" / "hitl" / "events"
 
 
 def _actions_for(ev: Dict) -> List[Action]:

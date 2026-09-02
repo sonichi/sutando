@@ -20,6 +20,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from workspace_default import resolve_workspace
+
 from .manager import HitlManager
 from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError
 
@@ -30,8 +32,9 @@ EVENT_TYPE = "message.created"
 TUI_ACTION_KIND = "tui_select"
 
 
-def actions_dir(workspace: Path) -> Path:
-    return Path(workspace) / "state" / "hitl" / "actions"
+def actions_dir(workspace: Optional[Path] = None) -> Path:
+    ws = Path(workspace) if workspace is not None else resolve_workspace()
+    return ws / "state" / "hitl" / "actions"
 
 
 def parse_reply(event: Dict[str, Any]) -> Optional[ActionReply]:
