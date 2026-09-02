@@ -166,5 +166,86 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(self.mgr.needs_projection(req.id))
 
 
+
+
+class EdgeBranchTests(unittest.TestCase):
+    """The guard branches the happy paths never touch — each one is what
+    stands between a missing/terminal/corrupt record and a wrong action."""
+
+    def test_transition_with_guard_swaps_it(self):
+        req = make_req()
+        req.transition("in_progress", guard="g-new")
+        self.assertEqual(req.guard, "g-new")
+
+    def test_refresh_guard_on_terminal_raises(self):
+        req = make_req()
+        req.transition("resolved")
+        with self.assertRaises(StaleRequirementError):
+            req.refresh_guard("g2")
+
+    def test_action_for_wrong_requirement_id(self):
+        req = make_req()
+        with self.assertRaises(MalformedActionError):
+            validate_action(req, reply_for(req, hitl_id="hitl_other"))
+
+
+class ManagerEdgeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        from hitl.manager import HitlStore
+
+        self.store = HitlStore(Path(self.tmp.name))
+        self.mgr = HitlManager(self.store)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_load_missing_returns_none(self):
+        self.assertIsNone(self.mgr.get("hitl_nope"))
+
+    def test_all_skips_corrupt_file(self):
+        self.mgr.create(make_req())
+        (Path(self.tmp.name) / "hitl_corrupt.json").write_text("{not json")
+        (Path(self.tmp.name) / "hitl_nokey.json").write_text("{}")
+        self.assertEqual(len(self.store.all()), 1)
+
+    def test_apply_action_on_missing_requirement(self):
+        with self.assertRaises(MalformedActionError):
+            self.mgr.apply_action(
+                ActionReply(hitl_id="hitl_ghost", expected_revision=1, action_id="x", guard="")
+            )
+
+    def test_cancel_and_expire_paths(self):
+        a = self.mgr.create(make_req())
+        self.assertEqual(self.mgr.cancel(a.id), [])
+        self.assertEqual(self.mgr.get(a.id).status, "cancelled")
+        b = self.mgr.create(make_req(kind="billing"))
+        self.mgr.link_blocked_task(b.id, "t1")
+        self.assertEqual(self.mgr.expire(b.id), ["t1"])
+        self.assertEqual(self.mgr.get(b.id).status, "expired")
+
+    def test_terminate_missing_and_already_terminal(self):
+        self.assertEqual(self.mgr.resolve("hitl_ghost"), [])
+        req = self.mgr.create(make_req())
+        self.mgr.resolve(req.id)
+        self.assertEqual(self.mgr.cancel(req.id), [])  # terminal stays terminal
+
+    def test_link_blocked_task_on_missing_requirement_is_noop(self):
+        self.mgr.link_blocked_task("hitl_ghost", "t1")  # must not raise
+
+    def test_projection_ops_on_missing_requirement(self):
+        self.assertFalse(self.mgr.needs_projection("hitl_ghost"))
+        self.mgr.record_projection("hitl_ghost", 1, "$e")  # must not raise
+
+
+class DefaultRunnerTest(unittest.TestCase):
+    def test_default_runner_runs_a_real_command(self):
+        from hitl.detector import _default_runner
+
+        rc, out = _default_runner(["echo", "hitl-runner-probe"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hitl-runner-probe", out)
+
+
 if __name__ == "__main__":
     unittest.main()
