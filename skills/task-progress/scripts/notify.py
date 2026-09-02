@@ -313,9 +313,17 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
         print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
               f"for source '{source}' (looked in {env_path})", file=sys.stderr)
         return False
+    # Progress updates carry the same worker stamp as results, so a notify
+    # renders with the sender's attribution instead of stripping it.
+    worker = os.environ.get("SUTANDO_WORKER_ID") or (
+        f"worker-{os.environ.get('SUTANDO_WORKER_SEAT') or os.environ['SUTANDO_CORE_ID']}"
+        if os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID") else None)
+    payload = {"op": "message", "room_id": channel_id, "body": message}
+    if worker:
+        payload["extra_content"] = {"space.ag2.worker": {"id": worker}}
     return _post(
         f"{url}/v1/room",
-        {"op": "message", "room_id": channel_id, "body": message},
+        payload,
         {"Authorization": f"Bearer {token}",
          # some gateway edges (CDN/WAF) reject the default Python-urllib UA
          "User-Agent": "sutando-task-progress/1.0"},
