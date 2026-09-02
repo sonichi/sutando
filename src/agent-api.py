@@ -1322,6 +1322,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_private_json(503, {"error": "task workstream classifier unavailable"})
             return
 
+        # /scan-text — decoded-value guard re-run for the Signal Room daemon, which
+        # publishes the text itself: markers exempt nothing, scanner outage is a 500.
+        if path == "/scan-text":
+            if not self.check_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self.send_json(400, {"error": "invalid Content-Length"})
+                return
+            if length < 0 or length > 262144:
+                self.send_json(413, {"error": "scan request too large"})
+                return
+            try:
+                data = json.loads(self.rfile.read(length).decode() or "{}")
+            except Exception:
+                self.send_json(400, {"error": "invalid JSON"})
+                return
+            # json.loads accepts any JSON value, so `[1]` reaches .get() outside
+            # the except above and raises instead of returning this 400.
+            if not isinstance(data, dict):
+                self.send_json(400, {"error": "body must be a JSON object"})
+                return
+            texts = data.get("texts")
+            if (not isinstance(texts, list) or not texts or len(texts) > 64
+                    or not all(isinstance(t, str) for t in texts)
+                    or any(len(t) > 16384 for t in texts)):
+                self.send_json(400, {"error": "texts must be 1..64 strings of <=16384 chars"})
+                return
+            try:
+                from policy.egress.result import (SCANNER_UNAVAILABLE,
+                                                  guard_result_for_tier)
+                verdict = "pass"
+                for t in texts:
+                    _safe, reason = guard_result_for_tier(
+                        t, SIGNAL_ROOM_TIER, REPO_DIR, honor_suppressions=False)
+                    if reason is not None:
+                        if reason.startswith(SCANNER_UNAVAILABLE):
+                            self.send_json(500, {"error": "scanner unavailable"})
+                            return
+                        verdict = "withhold"
+                        break
+                self.send_json(200, {"verdict": verdict})
+            except Exception:
+                self.send_json(500, {"error": "scanner unavailable"})
+            return
+
         # /guest-task — the Signal Room lane.
         if path == "/guest-task":
             if not self.check_auth():
