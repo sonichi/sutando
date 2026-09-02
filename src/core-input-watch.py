@@ -113,7 +113,7 @@ def _load_runtime_health():
 # stuck at so ESCALATE can show the prompt and AUTO-ANSWER can decide.
 _SIGNATURES = [
     # First: the limit screen often sits below stale /login text in the same pane.
-    ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit|/usage-credits", re.I)),
+    ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
     ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
     ("login", re.compile(r"Select login method|Paste code here|Browser didn'?t open", re.I)),
