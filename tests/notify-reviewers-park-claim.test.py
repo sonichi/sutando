@@ -527,5 +527,102 @@ class HoldingOneLedgerIsNotReentrancyOnAnother(unittest.TestCase):
         self.assertEqual(self._ops(self.a, self.a), ["EX", "UN"])
 
 
+class RollbackAndIdentityControls(unittest.TestCase):
+    """@keweichen round 5: the two durable-state blockers, pinned with both
+    revisions' production code where the claim is cross-revision."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.led = pathlib.Path(self.tmp) / "led.jsonl"
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = str(self.led)
+        self.nr = _load()
+
+    def tearDown(self):
+        os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None)
+
+    def _old_reader(self):
+        """origin/main's module, its own bytes, loaded fresh — the rollback."""
+        import subprocess
+        src = subprocess.run(
+            ["git", "-C", str(REPO), "show",
+             "origin/main:skills/collaboration-intelligence/scripts/notify_reviewers.py"],
+            capture_output=True, text=True, check=True).stdout
+        f = pathlib.Path(self.tmp) / "nr_main.py"
+        f.write_text(src)
+        spec = importlib.util.spec_from_file_location("nr_main", f)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_head_written_rows_keep_the_request_spelling(self):
+        up = "please re-review https://github.com/Sonichi/Sutando/pull/9"
+        self.nr.record_asks(up, "r1", outcome="unknown", actor="X", endpoint="@x:1")
+        rows = [json.loads(l) for l in self.led.read_text().splitlines()]
+        self.assertEqual(rows[-1]["repo"], "Sonichi/Sutando",
+                         "the persisted spelling must be the request's own")
+
+    def test_the_pre_canonicalization_reader_recognizes_head_rows(self):
+        """The round-5 P1 control: HEAD's production writer, origin/main's
+        production reader (`_stale_repeat_ask`, exact-spelling match) — the
+        rollback. Both the uppercase case and the lowercase control must
+        report the ask as already made (stale=True), aged past its window."""
+        for url_repo in ("Sonichi/Sutando", "sonichi/sutando"):
+            msg = f"re-review https://github.com/{url_repo}/pull/9"
+            self.led.write_text("")
+            self.nr.record_asks(msg, "r1", outcome="unknown",
+                                actor="X", endpoint="@x:1")
+            rows = [json.loads(l) for l in self.led.read_text().splitlines()]
+            rows[-1]["ts"] = "2026-09-02T01:00:00Z"      # aged 91+ minutes
+            self.led.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+            old = self._old_reader()
+            old.ledger_path = lambda: self.led           # main has no env override
+            stale, _why = old._stale_repeat_ask(msg, [{"name": "r1"}], {})
+            self.assertTrue(stale,
+                f"origin/main reader must still recognize {url_repo} after rollback")
+
+    def test_both_revisions_dedup_a_recased_url(self):
+        self.nr.record_asks("x https://github.com/Sonichi/Sutando/pull/9", "r1",
+                            outcome="unknown", actor="X", endpoint="@x:1")
+        self.assertTrue(self.nr.unknown_parked(
+            "x https://github.com/SONICHI/sutando/pull/9",
+            reviewer="r1", actor="X", endpoint="@x:1"),
+            "HEAD must dedup the same PR under any casing")
+
+    def test_a_list_reviewer_beside_a_valid_endpoint_is_refused(self):
+        """Round-5 P2: `who` won on endpoint, so the list reviewer was never
+        looked at — accepted, then re-emitted, then a rollback TypeError."""
+        row = {"repo": "o/r", "pr": 7, "reviewer": ["a", "b"], "actor": "X",
+               "endpoint": "@x:1", "outcome": "unknown",
+               "ts": "2026-09-02T02:00:00Z", "membership": ["actor:B"]}
+        self.assertIsNone(self.nr._row(row),
+                          "a present malformed identity field must drop the row")
+
+    def test_overlap_reemits_only_string_validated_identity(self):
+        """A legacy malformed row on disk must neither crash admission nor have
+        its raw reviewer written into a NEW row by the park."""
+        msg = "re-review https://github.com/o/r/pull/7"
+        with open(self.led, "a") as fh:
+            fh.write(json.dumps({"repo": "o/r", "pr": 7, "reviewer": ["a", "b"],
+                                 "actor": "X", "endpoint": "@x:1",
+                                 "outcome": "unknown", "membership": ["actor:C"],
+                                 "ts": "2026-09-02T02:00:00Z"}) + "\n")
+        got = self.nr.claim_park(msg, "C2", "C2", membership=["actor:C"])
+        for line in self.led.read_text().splitlines():
+            d = json.loads(line)
+            r = d.get("reviewer")
+            if line == self.led.read_text().splitlines()[0]:
+                continue                      # the planted legacy row itself
+            self.assertTrue(r is None or isinstance(r, str),
+                            f"the park re-emitted a raw identity: {d}")
+
+    def test_overlap_reads_through_streams_not_a_second_parser(self):
+        """The single-reader claim, held structurally: the function's source
+        must fold via _streams and carry no raw json.loads of its own."""
+        import inspect
+        src = inspect.getsource(self.nr._membership_overlap)
+        self.assertIn("_streams(", src)
+        self.assertNotIn("json.loads", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

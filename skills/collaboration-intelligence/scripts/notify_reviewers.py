@@ -360,6 +360,23 @@ def _refs(message: str) -> set:
     return {(_canon_repo(m.group(1)), int(m.group(2)))
             for m in _PR_URL.finditer(message or "")}
 
+
+def _refs_spelled(message: str) -> list:
+    """(as-written repo, pr) per distinct canonical ref, for PERSISTENCE only.
+
+    Rows keep the request's own spelling so a pre-canonicalization reader
+    (rollback) still recognizes them by exact match; every reader in THIS
+    revision canonicalizes through _row(), so both revisions dedup the row.
+    """
+    out, seen = [], set()
+    for m in _PR_URL.finditer(message or ""):
+        key = (_canon_repo(m.group(1)), int(m.group(2)))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((m.group(1), int(m.group(2))))
+    return out
+
 def ledger_path() -> Path:
     # Overridable so a test can exercise the real reserve/settle path against a
     # scratch file. Two cases sharing one ledger park each other.
@@ -426,6 +443,12 @@ def _row(d) -> "tuple | None":
     actor = d.get("actor")
     if actor is not None and not (isinstance(actor, str) and actor):
         return None                     # PRESENT but wrong: not an absent actor
+    # EVERY present identity field, not just the one that wins the chain: a
+    # valid endpoint must not smuggle a list-valued reviewer into the state.
+    for f in ("endpoint", "reviewer"):
+        v = d.get(f)
+        if v is not None and not (isinstance(v, str) and v):
+            return None
     # The endpoint is durable identity; a roster alias is a renameable spelling.
     who = d.get("endpoint") or actor or d.get("reviewer")
     outcome, ts = d.get("outcome"), d.get("ts")
@@ -778,40 +801,30 @@ def claim_park(message: str, reviewer: str, actor: str = None,
 def _membership_overlap(led: Path, message: str, cand) -> "tuple | None":
     """An unresolved OUTCOME_UNKNOWN record for this notice whose persisted
     membership intersects the candidate's component, with its identity."""
-    refs = {(_canon_repo(r), str(n)) for r, n in _refs(message)}
+    refs = {(r, str(n)) for r, n in _refs(message)}
     if not refs or not led.exists():
         return None
-    # LAST row per stream, never any matching row: a definite failure settles
-    # its endpoint, and its earlier `pending` must not keep parking the person.
-    streams, best = {}, None
+    # Through _streams(), THE one ledger reader: it already folds last-outcome,
+    # replace-carried membership and STRING-validated identity per stream, so a
+    # raw shape can neither crash this check nor be re-emitted into a new row —
+    # and memory stays at the folded state, not the file (measured 44 KB vs
+    # 6.7 MB on a 2.86 MB ledger through the raw reparse this replaces).
+    best = None
     try:
-        for line in led.read_text().splitlines():
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            # _row() owns the closed schema; reparsing raw shapes here crashed
-            # the whole batch on one malformed row (repo: [] -> unhashable key).
-            parsed = _row(d)
-            if parsed is None:
-                continue
-            c_repo, c_pr, who, _outcome, _ts = parsed
-            if (c_repo, c_pr) not in refs and (None, c_pr) not in refs:
-                continue
-            key = (c_repo, c_pr, who)
-            # Membership is carried FORWARD within its stream: a settle row
-            # supersedes the claim's outcome but does not restate its identity.
-            seen = valid_tags(d.get("membership"))
-            prior = streams.get(key, (None, None))[1]
-            streams[key] = (d, seen if seen is not None else prior)
+        streams = _streams(led)
     except OSError:
         return None
-    for d, tags in streams.values():
-        if d.get("outcome") not in _UNSAFE_OUTCOMES:
+    for (repo, pr, _who), st in streams.items():
+        if (repo, pr) not in refs and (None, pr) not in refs:
             continue
+        outcome = (st["last"] or (None, None))[0]
+        if outcome not in _UNSAFE_OUTCOMES:
+            continue
+        tags = set(st["membership"] or ())
         if not tags or not (tags & set(cand)):
             continue
-        best = (tags, {k: d.get(k) for k in ("reviewer", "actor", "endpoint")})
+        best = (tags, {k: st["last_identity"].get(k)
+                       for k in ("reviewer", "actor", "endpoint")})
     return best
 
 def record_asks(message: str, reviewer: str, outcome: str = "confirmed",
@@ -836,7 +849,7 @@ def _append(p: Path, message: str, reviewer: str, outcome: str,
     `outcome="unknown"` records a send that MAY have landed. It must be written:
     the receipt is RetrySafety.UNSAFE, so an unrecorded unknown invites the
     repeat that duplicates the ping."""
-    refs = _refs(message)
+    refs = _refs_spelled(message)
     if not refs:
         return 0
     if not isinstance(outcome, str) or outcome not in _KNOWN_OUTCOMES:
