@@ -219,24 +219,21 @@ export function _readTaskHeader(taskId: string): string[] | null {
 	for (const p of candidates) {
 		if (!existsSync(p)) continue;
 		try {
-			const body = readFileSync(p, 'utf-8');
-			// Stop scanning at the first `task:` delimiter. The task-file
-			// format puts `task:` last on the line preceding the user-
-			// supplied multi-line task body (see agent-api.py and the
-			// /meeting handler). Without this stop, a body of
-			// `do thing\nchannel_id: local-voice` would forge a voice-
-			// task classification — the residual half of the PR #982
-			// fix Qingyun flagged. Stop-at-`task:` makes consumers
-			// honor the delimiter PR #982 already established.
-			const headerLines: string[] = [];
-			for (const l of body.split('\n')) {
-				if (l.startsWith('task:')) break;
-				headerLines.push(l);
-			}
-			return headerLines;
+			return headerRegion(readFileSync(p, 'utf-8'));
 		} catch {}
 	}
 	return null;
+}
+
+/** Lines before the first `task:`. Body after it is user-supplied, so reading it
+ *  as a header field lets a body line forge its own classification. */
+export function headerRegion(raw: string): string[] {
+	const headerLines: string[] = [];
+	for (const l of raw.split('\n')) {
+		if (l.startsWith('task:')) break;
+		headerLines.push(l);
+	}
+	return headerLines;
 }
 
 export function _isVoiceTask(taskId: string): boolean {
@@ -628,11 +625,84 @@ export function getRecentConversation(count = 10): string {
 const CONTEXT_DROP_FILE = join(REPO_DIR, 'context-drop.txt');
 const NOTE_VIEWING_FILE = '/tmp/sutando-note-viewing.json';
 
-/**
- * Watch for context-drop.txt and inject into Gemini conversation.
- * Called once at startup. When user drops context via keyboard shortcut,
- * it gets sent to Gemini so it knows about it.
- */
+/** Mirrors `_ID_STATE` in task_archive.py. The instance label is interpolated
+ *  with re.escape, so it is opaque — never assume `core-<digits>`. */
+const TASK_STATE_SUFFIX = /^(task-.+?)\.(?:assigned|claimed)-.+?\.txt$/;
+
+/** The lead renames on assign and claim_task.py on claim, so all three spellings
+ *  are one task. Key task-identity state on this, never the raw basename. */
+export function logicalTaskName(basename: string): string {
+	const m = basename.match(TASK_STATE_SUFFIX);
+	return m ? `${m[1]}.txt` : basename;
+}
+
+/** Anchored, so `context-drop-replay` does not match. Shared by the scan and the
+ *  result loop so the two cannot disagree about what a drop is. */
+export function isContextDropHeader(raw: string): boolean {
+	// Per LINE, never /m over rejoined text: /m ends a line at \r, U+2028 and
+	// U+2029 too, so one field could forge two headers. CRLF is stripped here.
+	const lines = headerRegion(raw).map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+	if (!lines.some((l) => /^source:[ \t]*context-drop[ \t]*$/.test(l))) return false;
+	const tiers = lines.filter((l) => /^access_tier:/.test(l));
+	// Absent stays owner (the real producer emits none); otherwise the LAST
+	// candidate decides and a malformed value fails closed, per resolve_access_tier.
+	if (tiers.length === 0) return true;
+	const m = tiers[tiers.length - 1].match(/^access_tier:[ \t]*(\S+)[ \t]*$/);
+	return m !== null && m[1] === 'owner';
+}
+
+/** Locate a task file across bare and claimed spellings — TS mirror of task_archive.find_task_file. */
+export function findTaskFile(dir: string, taskId: string): string | null {
+	const bare = join(dir, `${taskId}.txt`);
+	if (existsSync(bare)) return bare;
+	try {
+		const names = readdirSync(dir).sort();
+		// Compare the captured id, not a name prefix: task-1 must not claim task-10's file.
+		const claimed = names.filter((n) => n.match(TASK_STATE_SUFFIX)?.[1] === taskId);
+		if (claimed.length) return join(dir, claimed[0]);
+		// Quarantined last, matching find_task_file in task_archive.py: it is the
+		// task's only surviving header block, and routing needs those headers.
+		const quarantined = names.filter((n) => n.startsWith(`${taskId}.txt.archive-failed`));
+		return quarantined.length ? join(dir, quarantined[0]) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Drop task files already handed to the live session, so a re-scan cannot re-inject.
+ *  Holds LOGICAL names (see logicalTaskName) — a claim rename must not read as new. */
+const _injectedDropTasks = new Set<string>();
+/** Bytes fingerprint of a drop seen but unclaimed: two consecutive scans must
+ *  agree, so a partial write cannot be claimed with its suffix unwritten. */
+const _dropStability = new Map<string, string>();
+/** First scan only records what is already queued — a restart must not replay old drops. */
+let _seedingDropTasks = true;
+
+type DropTaskScan =
+	| { kind: 'other' }
+	| { kind: 'incomplete' }
+	| { kind: 'drop'; body: string };
+
+/** A drop whose `task:` line has not landed yet is `incomplete`, never `other`. */
+export function scanDropTask(path: string): DropTaskScan {
+	const raw = readFileSync(path, 'utf-8');
+	// Header only: matching `raw` let a body line forge `source: context-drop`,
+	// injecting a Guest task into the live owner session.
+	if (!isContextDropHeader(raw)) {
+		// A header still being written has no source line yet; re-read next tick.
+		return /^task:/m.test(raw) ? { kind: 'other' } : { kind: 'incomplete' };
+	}
+	const marker = raw.indexOf('\ntask:');
+	if (marker === -1) return { kind: 'incomplete' };
+	const body = raw
+		.slice(marker + '\ntask:'.length)
+		.replace(/^[ \t]*User dropped context via hotkey\. Process this:[ \t]*/, '')
+		.trim();
+	return body ? { kind: 'drop', body } : { kind: 'incomplete' };
+}
+
+/** Watch for context drops and inject them. Only one of the two producers writes
+ *  CONTEXT_DROP_FILE, so the task dir — which both write — is the injection point. */
 export function startContextDropWatcher(onContextDrop: (content: string) => void): void {
 	console.log(`${ts()} [TaskBridge] Watching for context drops`);
 	setInterval(() => {
@@ -665,12 +735,73 @@ export function startContextDropWatcher(onContextDrop: (content: string) => void
 					);
 					emitTaskProcessed(stampedContent);
 					unlinkSync(CONTEXT_DROP_FILE);
-					// Also inject into Gemini if available
+					// Claim it before injecting so the task-dir scan below cannot
+					// send this same drop a second time.
+					_injectedDropTasks.add(`${taskId}.txt`);
 					onContextDrop(content);
 				}
 			} catch { /* file might be in transit */ }
 		}
+
+		// The desktop app writes its `source: context-drop` task file directly and
+		// never creates CONTEXT_DROP_FILE, so the poll above cannot see its drops.
+		try {
+			scanDropTasksOnce(TASK_DIR, onContextDrop);
+		} catch { /* tasks dir may not exist yet */ }
 	}, 2000);
+}
+
+/** One tick of the desktop-drop scan. Exported so regressions drive THIS state:
+ *  a copied recipe still passes when the production call is mutated. */
+export function scanDropTasksOnce(dir: string, onDrop: (body: string) => void): void {
+	const present = readdirSync(dir);
+	// Archived tasks can never be re-read, so their claims are dead weight.
+	if (_injectedDropTasks.size > 500) {
+		const live = new Set(present.map(logicalTaskName));
+		for (const seen of _injectedDropTasks) if (!live.has(seen)) _injectedDropTasks.delete(seen);
+		for (const seen of _dropStability.keys()) if (!live.has(seen)) _dropStability.delete(seen);
+	}
+	for (const name of present) {
+		if (!name.startsWith('task-') || !name.endsWith('.txt')) continue;
+		const logical = logicalTaskName(name);
+		if (_injectedDropTasks.has(logical)) continue;
+		let scan: DropTaskScan;
+		try {
+			scan = scanDropTask(join(dir, name));
+		} catch { continue; }
+		if (scan.kind === 'incomplete') continue;
+		// A progressive body reads complete at its first chunk and the claim is
+		// permanent, so require unchanged bytes across two scans. Seeding is exempt.
+		if (scan.kind === 'drop' && !_seedingDropTasks) {
+			let fp: string;
+			try {
+				const st = statSync(join(dir, name));
+				fp = `${st.size}:${st.mtimeMs}`;
+			} catch { continue; }
+			if (_dropStability.get(logical) !== fp) {
+				_dropStability.set(logical, fp);
+				continue;
+			}
+			_dropStability.delete(logical);
+		}
+		_injectedDropTasks.add(logical);
+		if (scan.kind !== 'drop' || _seedingDropTasks) continue;
+		console.log(`${ts()} [TaskBridge] Context drop detected: ${scan.body.slice(0, 100)}`);
+		onDrop(scan.body);
+	}
+	_seedingDropTasks = false;
+}
+
+/** Test seam: clear the scan's dedup set and choose whether the next pass seeds. */
+export function _resetDropScanState(seeding: boolean): void {
+	_injectedDropTasks.clear();
+	_dropStability.clear();
+	_seedingDropTasks = seeding;
+}
+
+/** Test seam: current dedup-set size, for the >500 eviction case. */
+export function _dropScanStateSize(): number {
+	return _injectedDropTasks.size;
 }
 
 /**
@@ -1037,11 +1168,13 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 					// Companion fix: Sutando.app main.swift writeTask() must include this field.
 					// Issue: https://github.com/sonichi/sutando/issues/969
 					if (taskId.startsWith('task-')) {
-						const ctxTaskFile = join(TASK_DIR, `${taskId}.txt`);
-						if (existsSync(ctxTaskFile)) {
+						const ctxTaskFile = findTaskFile(TASK_DIR, taskId);
+						if (ctxTaskFile) {
 							try {
 								const taskBody = readFileSync(ctxTaskFile, 'utf-8');
-								if (/^source:\s*context-drop/m.test(taskBody)) {
+								// Header only: a body line reading `source: context-drop`
+								// would archive this result instead of delivering it.
+								if (isContextDropHeader(taskBody)) {
 									_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
 									_deliveredResults.add(file);
 									_pendingTasks.delete(taskId);

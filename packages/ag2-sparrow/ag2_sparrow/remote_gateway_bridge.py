@@ -1605,11 +1605,11 @@ def _valid_tid(tid: str) -> bool:
 
 
 def _one_line(value) -> str:
-    """Header-safe single-line value: CR/LF stripped so a gateway-controlled
-    field can't inject extra `key: value` lines (e.g. forge a second
-    access_tier). Applied to every field — task content is single-line in
-    practice and a stray newline only ever indicates an injection attempt."""
-    return str(value).replace("\r", " ").replace("\n", " ")
+    """Header-safe single-line value: EVERY recognized line separator is
+    stripped so a gateway-controlled field can't inject extra `key: value`
+    lines (e.g. forge a second access_tier). CR/LF alone was not enough —
+    U+2028 is a boundary for a JS /m reader but not for split('\\n')."""
+    return " ".join(str(value).splitlines())
 
 
 def _redact_url(value: str) -> str:
