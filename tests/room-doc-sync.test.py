@@ -130,6 +130,23 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(ds.duplicate_report(BASE), [])
         self.assertEqual(ds.duplicate_report(remote), ["org/repo#2: L5 Active, L7 History"])
 
+    def test_history_convention_retirement_is_a_record_move_not_a_structure_change(self):
+        # The list retires a row as `key — MERGED <date> … was: <old row>`; that is the same record, moved.
+        row = "org/repo#2 | shepherd: a | status: active | two"
+        kept = [l for l in BASE.split("\n") if l != row]
+        kept.insert(kept.index("## History") + 1, "org/repo#2 — MERGED 2026-09-02 14:16Z by owner. was: " + row)
+        mine = "\n".join(kept)
+        merged, applied, conflicts = ds.merge(BASE, mine, BASE, "me")
+        self.assertEqual(conflicts, [])
+        self.assertEqual(applied, ["move org/repo#2 Active -> History"])
+        self.assertEqual(ds.parse(merged)[1]["org/repo#2"].section, "History")
+        self.assertIn("org/repo#2 — MERGED 2026-09-02 14:16Z by owner. was: " + row + " (w:me)", merged)
+
+    def test_duplicates_see_both_row_shapes(self):
+        remote = BASE + "\norg/repo#1 — MERGED 2026-09-02 by owner. was: org/repo#1 | one"
+        self.assertEqual(ds.duplicates(remote), {"org/repo#1": 2})
+        self.assertNotIn("org/repo#1", ds.duplicates(BASE))
+
     def test_structure_change_refuses(self):
         mine = BASE.replace("prose line", "prose line EDITED")
         merged, applied, conflicts = ds.merge(BASE, mine, BASE, "me")

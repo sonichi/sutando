@@ -32,7 +32,9 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-RECORD_RE = re.compile(r"^([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+#\d+)\s*\|")
+# A record is any line whose first token is a `owner/repo#N` key, whatever separator follows:
+# active rows use ` | `, the History convention retires a row as `key — MERGED <date> … was: …`.
+RECORD_RE = re.compile(r"^([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+#\d+)(?=\s|$)")
 SECTION_RE = re.compile(r"^## (.+?)\s*$")
 STAMP_RE = re.compile(r"\s*\(w:[^)]*\)\s*$")
 RETRY_AFTER_S = 3.0
