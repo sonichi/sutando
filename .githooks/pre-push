@@ -27,15 +27,24 @@ fi
 [ -f "$CHECKS" ] || { note "review-checks.sh absent — fail-open"; exit 0; }
 git rev-parse --verify -q origin/main >/dev/null || { note "no local origin/main ref — fail-open"; exit 0; }
 
-# Deletions and tag-only pushes have nothing to scan.
-any_branch=0
-while read -r _local_ref local_sha _remote_ref _remote_sha; do
-    [ "${local_sha:-}" != "0000000000000000000000000000000000000000" ] && [ -n "${local_sha:-}" ] && any_branch=1
+# Scan the refs git SAYS are being pushed, not HEAD: `git push origin other`
+# from a different branch would otherwise scan the wrong commits entirely.
+shas=""
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+    case "${local_ref:-}" in refs/tags/*) continue ;; esac
+    [ "${local_sha:-}" != "0000000000000000000000000000000000000000" ] && [ -n "${local_sha:-}" ] && shas="$shas $local_sha"
 done
-[ "$any_branch" = "1" ] || exit 0
+[ -n "$shas" ] || exit 0
 
-DIFF="$(git diff origin/main...HEAD 2>/dev/null)"
-[ -n "$DIFF" ] || { note "empty three-dot diff vs local origin/main — nothing to scan, fail-open"; exit 0; }
+DIFF=""
+head_sha="$(git rev-parse HEAD 2>/dev/null)"
+offtree=0
+for sha in $shas; do
+    [ "$sha" != "$head_sha" ] && offtree=1
+    DIFF="$DIFF$(git diff "origin/main...$sha" 2>/dev/null)
+"
+done
+[ -n "${DIFF//[[:space:]]/}" ] || { note "empty three-dot diff vs local origin/main — nothing to scan, fail-open"; exit 0; }
 
 RUN=(bash "$CHECKS" --diff /dev/stdin)
 if command -v timeout >/dev/null 2>&1; then
@@ -46,7 +55,14 @@ fi
 out="$(printf '%s' "$DIFF" | "${RUN[@]}" 2>&1)"; rc=$?
 
 case "$rc" in
-    0) exit 0 ;;
+    0) # PARTIAL also exits 0 and "not scanned" is not "clean" — say so, and
+       # say why when the pushed ref is not the checked-out tree (no post-image).
+       if printf '%s' "$out" | grep -q "review-checks: PARTIAL"; then
+           printf '%s\n' "$out" | grep "review-checks:" >&2
+           [ "$offtree" = "1" ] && note "pushed ref is not the checked-out tree, so post-image scans skipped"
+           note "PARTIAL is not PASS — pushing (fail-open), CI is the verdict on what was not scanned"
+       fi
+       exit 0 ;;
     1) echo "$out" >&2
        note "BLOCKED — review-checks found a violation CI would also find."
        note "fix it, or push once with SUTANDO_SKIP_REVIEW_CHECKS=1 (logged)."
