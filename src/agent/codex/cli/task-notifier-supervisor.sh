@@ -18,10 +18,10 @@ _lease_key() {
   local digest
   digest="$(python3 -c 'import hashlib,sys;print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:16])' "$1" "$2" 2>/dev/null)" || digest=""
   # An empty digest aliases every socket onto one key: fail closed, never lease.
-  case "$digest" in
-    ????????????????) ;;
-    *) echo "task-notifier-supervisor: cannot derive the lease key for ($1, $2); refusing to run" >&2; exit 1 ;;
-  esac
+  # Malformed successful output (sixteen non-hex bytes) also aliases sockets.
+  if ! [[ "$digest" =~ ^[0-9a-f]{16}$ ]]; then
+    echo "task-notifier-supervisor: cannot derive the lease key for ($1, $2); refusing to run" >&2; exit 1
+  fi
   printf '%s-%s' "$(printf '%s' "$2" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-40)" "$digest"
 }
 if [ -n "${SUTANDO_NOTIFIER_LOCK_DIR:-}" ]; then
@@ -119,13 +119,16 @@ _lease_rm() { _dir_rm "$LOCK_DIR"; }
 
 # Publish a token into directory $1 whole-or-not-at-all: stage OUTSIDE the
 # directory (a crash mid-publication must not leave a file that blocks rmdir),
-# then rename in. Returns nonzero if the publication did not land.
+# then link in. link(2) is atomic and refuses an existing name, so at most one
+# publication ever lands in a directory: a publisher that lost the race to a
+# post-grace claimant fails here and withdraws. Nonzero = did not land.
 _publish_token() {
   local dir="$1" stage="$1.stage.$$"
-  printf '%s\n' "$$" > "$dir/pid" || return 1
   printf '%s' "$OWNER_TOKEN" > "$stage" || { rm -f "$stage"; return 1; }
-  mv -f "$stage" "$dir/token" || { rm -f "$stage"; return 1; }
-  [ "$(_token_of "$dir")" = "$OWNER_TOKEN" ]
+  ln "$stage" "$dir/token" 2>/dev/null || { rm -f "$stage"; return 1; }
+  rm -f "$stage"
+  [ "$(_token_of "$dir")" = "$OWNER_TOKEN" ] || return 1
+  printf '%s\n' "$$" > "$dir/pid" || return 1
 }
 
 release_lease() {
@@ -146,9 +149,10 @@ _reclaim_release() {
 
 # Take the reclaim lock: mkdir is the atomic test-and-set, but an empty
 # directory is a publication in progress, not an abandoned one — it is judged
-# by the same live/publishing/stale rule as the lease, and a dead or recycled
-# holder is BROKEN by renaming its directory away (only one contender's mv
-# succeeds), never by deleting in place.
+# by the same live/publishing/stale rule as the lease. A stale EMPTY directory
+# is recovered by claiming it in place (the no-clobber link fences its late
+# publisher out); a dead or recycled holder with a token is BROKEN by renaming
+# its directory away (only one contender's mv succeeds), never deleted in place.
 _reclaim_lock() {
   local verdict broken
   if mkdir "$RECLAIM_DIR" 2>/dev/null; then
@@ -160,6 +164,11 @@ _reclaim_lock() {
   verdict="$(_judge_dir "$RECLAIM_DIR")"
   case "$verdict" in
     stale)
+      if [ -z "$(_token_of "$RECLAIM_DIR")" ]; then
+        _publish_token "$RECLAIM_DIR" && return 0
+        _reclaim_release
+        return 1
+      fi
       broken="$RECLAIM_DIR.broken.$$"
       mv "$RECLAIM_DIR" "$broken" 2>/dev/null && _dir_rm "$broken"
       ;;
