@@ -506,6 +506,10 @@ def _streams(led: Path) -> dict:
             # onto every retained row, losing asks made under an older alias.
             ident = {f: d[f] for f in ("reviewer", "actor", "endpoint")
                      if isinstance(d.get(f), str) and d.get(f)}
+            # As-written spelling rides the EVENT, so compaction can re-emit
+            # it and a pre-canonicalization reader (rollback) still matches.
+            if isinstance(d.get("repo"), str) and d.get("repo"):
+                ident["spelled_repo"] = d["repo"]
             # REPLACES on a newer claim, matching the uncompacted reader that
             # `_membership_overlap` uses: a union revives retired links.
             mem = valid_tags(d.get("membership"))
@@ -609,8 +613,8 @@ def _rewrite(led: Path, streams: dict) -> int:
             streams.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
         for outcome, ts, identity in _retained(st):
             # The reader's normalized string: int() renamed "007" to "7".
-            row = {"repo": repo, "pr": num, "ts": ts,
-                   "channel": "room", "outcome": outcome}
+            row = {"repo": identity.get("spelled_repo") or repo, "pr": num,
+                   "ts": ts, "channel": "room", "outcome": outcome}
             row["actor"] = identity.get("actor") or who
             if identity.get("endpoint"):
                 row["endpoint"] = identity["endpoint"]

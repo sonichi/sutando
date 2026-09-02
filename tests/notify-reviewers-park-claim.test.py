@@ -589,6 +589,37 @@ class RollbackAndIdentityControls(unittest.TestCase):
             self.assertTrue(stale,
                 f"origin/main reader must still recognize {url_repo} after rollback")
 
+    def test_compaction_preserves_the_request_spelling_for_the_old_reader(self):
+        """Round-6 P1: the append kept the spelling but _rewrite emitted the
+        canonical stream key, so ROUTINE COMPACTION undid the rollback fix.
+        Drive the production writer across the automatic compaction trigger,
+        then read the aged ask with origin/main's own production reader —
+        both casings must stay recognized (repeat refused)."""
+        for url_repo in ("Sonichi/Sutando", "sonichi/sutando"):
+            msg = f"re-review https://github.com/{url_repo}/pull/9"
+            self.led.write_text("")
+            self.nr.record_asks(msg, "r1", outcome="unknown",
+                                actor="X", endpoint="@x:1")
+            # Filler streams push past _COMPACT_ABOVE so compact() takes the
+            # PRODUCTION path, not a hand-invoked partial one.
+            for i in range(self.nr._COMPACT_ABOVE + 1):
+                self.nr.record_asks(
+                    f"see https://github.com/o/filler/pull/{10_000 + i}",
+                    "f", outcome="failed", actor="F", endpoint="@f:1")
+            self.nr.compact(self.led)
+            rows = [json.loads(l) for l in self.led.read_text().splitlines()]
+            kept = [r for r in rows if str(r.get("pr")) == "9"]
+            self.assertEqual([r["repo"] for r in kept], [url_repo],
+                             f"compaction must re-emit the request spelling, got {kept}")
+            for r in rows:                       # age every stamp past the window
+                r["ts"] = "2026-09-02T01:00:00Z"
+            self.led.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+            old = self._old_reader()
+            old.ledger_path = lambda: self.led
+            stale, _why = old._stale_repeat_ask(msg, [{"name": "r1"}], {})
+            self.assertTrue(stale,
+                f"origin/main reader must recognize {url_repo} AFTER compaction")
+
     def test_both_revisions_dedup_a_recased_url(self):
         self.nr.record_asks("x https://github.com/Sonichi/Sutando/pull/9", "r1",
                             outcome="unknown", actor="X", endpoint="@x:1")
