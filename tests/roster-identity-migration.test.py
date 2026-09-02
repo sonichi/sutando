@@ -1883,5 +1883,80 @@ class TwoPassShapeRepairDoesNotDischargeASeed(unittest.TestCase):
         self.assertIsNone(rec.get("human_discord_id"))
 
 
+class ACarriedSeedIsUntrustedInput(unittest.TestCase):
+    """A seed is a claim the SOURCE makes about itself, so it is only usable when
+    the document can make that claim (v2) and the claim is self-consistent (the
+    path names a referent and the verdict agrees). Each control below RESOLVED
+    the id before this gate existed."""
+
+    X = BOT
+
+    def _run(self, roster):
+        script = str(pathlib.Path(__file__).resolve().parents[1]
+                     / "skills/collaboration-intelligence/scripts/migrate_roster_identity.py")
+        d = pathlib.Path(tempfile.mkdtemp())
+        (d / "r.json").write_text(json.dumps(roster))
+        (d / "t.json").write_text(json.dumps({"people": {}}))
+        out = d / "o.json"
+        rc = subprocess.run([sys.executable, script, "--roster", str(d / "r.json"),
+                             "--triage-config", str(d / "t.json"), "--out", str(out)],
+                            capture_output=True, text=True).returncode
+        doc = json.loads(out.read_text()) if out.exists() else {}
+        return rc, (doc.get("alice") or {})
+
+    def _doc(self, schema, path, verdict, id_=None):
+        rec = {"id": id_ or self.X,
+               "seeded_by": [{"path": path, "verdict": verdict, "reason": "control"}]}
+        doc = {"alice": {"unresolved_discord_ids": [rec]}}
+        if schema is not None:
+            doc["_schema"] = schema
+        return doc
+
+    V2 = {"name": "reviewer-identity", "version": 2}
+    V1 = {"name": "reviewer-identity", "version": 1}
+
+    def _assert_unresolved(self, rc, rec, why):
+        self.assertEqual(rc, 5, why)
+        self.assertIsNone(rec.get("human_discord_id"), why)
+        self.assertIsNone(rec.get("stand_discord_id"), why)
+        self.assertEqual([u.get("id") for u in rec.get("unresolved_discord_ids") or []],
+                         [self.X], why)
+
+    def test_a_consistent_v2_seed_still_resolves(self):
+        # POSITIVE CONTROL FIRST: without it every assertion below passes on a
+        # gate that refuses everything, which certifies nothing.
+        rc, rec = self._run(self._doc(self.V2, "human_discord_id", "human"))
+        self.assertEqual(rc, 0, "a consistent v2 seed is the case the record exists for")
+        self.assertEqual(rec.get("human_discord_id"), self.X)
+        self.assertFalse(rec.get("unresolved_discord_ids"))
+
+    def test_a_v1_document_cannot_seed(self):
+        self._assert_unresolved(
+            *self._run(self._doc(self.V1, "stand_discord_id", "stand")),
+            why="v1 has no stated referent to make the claim with")
+
+    def test_an_unversioned_document_cannot_seed(self):
+        self._assert_unresolved(
+            *self._run(self._doc(None, "stand_discord_id", "stand")),
+            why="an unversioned document is v1 by another name")
+
+    def test_a_verdict_disagreeing_with_its_path_is_discarded(self):
+        # The measured defect: path says HUMAN, verdict says STAND, and the
+        # migration published STAND -- the opposite principal -- with rc=0.
+        self._assert_unresolved(
+            *self._run(self._doc(self.V2, "human_discord_id", "stand")),
+            why="a verdict that contradicts its own path is unbacked")
+
+    def test_a_referent_free_path_is_discarded(self):
+        self._assert_unresolved(
+            *self._run(self._doc(self.V2, "unresolved_discord_ids", "human")),
+            why="unresolved_discord_ids states no referent to agree with")
+
+    def test_a_partial_snowflake_is_discarded(self):
+        rc, rec = self._run(self._doc(self.V2, "human_discord_id", "human", id_="150431"))
+        self.assertEqual(rc, 5, "a truncated id resolves the wrong account")
+        self.assertIsNone(rec.get("human_discord_id"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -40,6 +40,23 @@ WRITER_OWNED = (HUMAN_FIELD, STAND_FIELD, OTHER_STANDS_FIELD, UNRESOLVED_FIELD)
 
 def writer_owned_path(path) -> bool:
     return isinstance(path, str) and path.split(".")[0] in WRITER_OWNED
+
+
+def path_referent(path):
+    """The referent a writer-owned PATH states, or None when it states none.
+
+    `unresolved_discord_ids` is writer-owned but says by design which ids have
+    NO agreed principal, so a verdict quoted against it is unbacked by the slot
+    it names and cannot be checked against anything.
+    """
+    if not writer_owned_path(path):
+        return None
+    head = path.split(".")[0]
+    if head == HUMAN_FIELD:
+        return "human"
+    if head in (STAND_FIELD, OTHER_STANDS_FIELD):
+        return "stand"
+    return None
 _REFERENTS = ("human", "stand")
 
 

@@ -329,8 +329,27 @@ rather than reading `discord_id`; use `scripts/roster_identity.py`'s accessors
 id. The migration overwrites those slots, so its own output no longer holds the
 claim that caused the disagreement; without the record a re-migration sees only
 the surviving source, agrees with itself, and publishes the referent the
-previous pass refused. It is read only while the named slot is still empty — a
-slot that reads again is a repair, and the record clears.
+previous pass refused.
+
+A seed is discharged by **repair**, not by occupancy: the slot reads again AND
+nothing in the current pass still contradicts it. A *rival* id filling the slot
+leaves the original disagreement untouched, so clearing the seed there
+republishes the contested id — the seed is carried while any source this pass
+states a different referent for the same id, and dropped once none does.
+
+A seed is untrusted input, so it is consumed only when all three hold:
+
+- the document declares `reviewer-identity/2` — below that the source has no
+  stated referent to make the claim with, and the id stays unresolved;
+- the `path` names a **referent-bearing** slot (`human_discord_id`,
+  `stand_discord_id`, `other_stand_discord_ids`). `unresolved_discord_ids` is
+  writer-owned but says which ids have no agreed principal, so a verdict quoted
+  against it is unbacked;
+- the `verdict` **agrees with** that path, and the `id` is a whole snowflake.
+
+Neither of the last two implies the other, and a mismatch is not cosmetic: a
+`human_discord_id` path carrying a `stand` verdict resolved the id to the
+opposite principal and returned success.
 
 `id_shape_failures` is RESERVED and migration-owned: findings the migration
 could not re-derive from its own output, carried so a refusal survives a

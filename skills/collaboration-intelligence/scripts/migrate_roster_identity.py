@@ -361,7 +361,7 @@ def _canonical_seeds(seeds: list) -> list:
 
 
 def _carried_seeds(entry, arbitrated: set, fresh_claims: dict,
-                   peer_ids: dict, owner_id: str):
+                   peer_ids: dict, owner_id: str, src_version: int = 0):
     """Claims from a carried disagreement whose writer-owned slot we erased.
 
     A seed is discharged by REPAIR, not by OCCUPANCY. A slot reading again is
@@ -372,19 +372,27 @@ def _carried_seeds(entry, arbitrated: set, fresh_claims: dict,
     """
     if not isinstance(entry, dict):
         return
+    # Below v2 the source has no stated referent to make this claim with, so
+    # the seed is unbacked and the id stays unresolved.
+    if src_version < ri.SCHEMA_VERSION:
+        return
     for rec in entry.get(ri.UNRESOLVED_FIELD) or []:
         if not isinstance(rec, dict):
             continue
         id_ = rec.get("id")
         if not id_ or str(id_) in arbitrated:
             continue
+        if not _is_snowflake(str(id_)):
+            continue                    # a partial id resolves the wrong account
         for seed in rec.get("seeded_by") or []:
             if not isinstance(seed, dict):
                 continue
             path, verdict = seed.get("path"), seed.get("verdict")
             if not path or verdict not in (HUMAN, STAND):
                 continue
-            if not ri.writer_owned_path(path):
+            # Referent-free path, or a verdict contradicting it: either is
+            # unbacked, and the second resolved the id to the WRONG principal.
+            if ri.path_referent(path) != verdict:
                 continue
             # Every source, not just `claims`: peers.json and owner_id are
             # stamped later, so an id contested only there would look uncontested.
@@ -459,7 +467,7 @@ _CITED_PATH = re.compile(r"`([A-Za-z0-9_.]+)`")
 
 
 def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
-             owner_id: str):
+             owner_id: str, src_version: int = 0):
     """-> (human_id|None, stand_id|None, other_stands[], unresolved[], basis{},
     collisions[]) — collisions are axis clashes, reported with or without ids."""
     claims: dict = {}   # id -> {verdict -> [reasons]}
@@ -566,7 +574,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
     # Below the triage read, not above it: the discharge test needs what THIS
     # pass states about the id, which does not exist until the config is read.
     for id_, verdict, reason, seed in _carried_seeds(
-            entry, arbitrated, claims, peer_ids, owner_id):
+            entry, arbitrated, claims, peer_ids, owner_id, src_version):
         claim(id_, verdict, reason)
         seeds.setdefault(id_, []).append(seed)
 
@@ -680,6 +688,7 @@ def _canonical_triage(triage_people: dict):
 def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             source_name: str):
     out, rows = {}, []
+    src_version = ri.schema_version(doc)
     canon, dupes = _canonical_triage(triage_people)
     if dupes:
         # Two spellings of one login carrying DIFFERENT records: nothing here
@@ -712,7 +721,7 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             continue
         (human, stand, others, unresolved, basis, collisions,
          shape_failures) = classify(
-            key, entry, canon, peer_ids, owner_id)
+            key, entry, canon, peer_ids, owner_id, src_version)
         new = dict(entry)                       # every provenance field survives
         new[ri.HUMAN_FIELD] = human
         new[ri.STAND_FIELD] = stand
