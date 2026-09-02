@@ -7,13 +7,19 @@ this hook JSON on stdin; the hook blocks until a human answers the card (or a
 policy answers for them), then prints the decision in the shape the firing
 event expects. Two events are served, told apart by `hook_event_name`:
 
-  PermissionRequest (preferred) — fires only when Claude Code would render a
-    permission dialog, so every requirement it creates is a real block. Output:
+  PermissionRequest — fires only when Claude Code would render a permission
+    dialog, so every requirement it creates is a real block, and its payload
+    carries `permission_suggestions` (the basis for an "allow always"). Output:
     `{"hookSpecificOutput": {"hookEventName": "PermissionRequest",
       "decision": {"behavior": "allow"} | {"behavior": "deny", "message": ...}}}`
-  PreToolUse (legacy registration) — fires before EVERY tool call, dialog or
-    not. Output: `{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+    Measured (2.1.258): the TUI still DRAWS the dialog while this hook waits;
+    the decision resolves it. A screen sensor must treat that dialog as owned.
+  PreToolUse — fires before EVERY tool call, dialog or not; while it waits
+    nothing is drawn (the screen shows "Waiting…"). Output:
+    `{"hookSpecificOutput": {"hookEventName": "PreToolUse",
       "permissionDecision": "allow" | "deny", "permissionDecisionReason": ...}}`
+    Neither event's allow clears the ExitPlanMode plan dialog (it asks HOW to
+    proceed, not whether); that dialog stays with the screen layer.
 
 A payload with no `hook_event_name` is treated as PreToolUse (the shape every
 existing registration produces). The card itself is posted by the supervisor's
@@ -25,8 +31,9 @@ Invariants (same as hooks/human-action-bridge.py, which owns AskUserQuestion):
     so Claude Code falls back to its own permission flow
   - policy first: an allowlisted tool never creates a requirement
 
-Registration (settings.json) — PermissionRequest, so the hook runs only for
-real dialogs; keep a PreToolUse entry only on installs that predate the event:
+Registration (settings.json) is a choice, not a default: PreToolUse keeps the
+terminal dialog-free; PermissionRequest is exact and enables "allow always" but
+leaves the dialog drawn under it. Register ONE of the two, never both:
   "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command",
       "command": "python3 <repo>/hooks/hitl-hook-driver.py", "timeout": 900}]}]
 The hook's own wait (SUTANDO_HITL_TIMEOUT, default 600s) must stay below the
