@@ -63,6 +63,15 @@ git -C "$hostB_WS" log -1 --format=%s -- notes/hostB-note.md | grep -q "Sync hos
 rm "$hostB_WS/notes/bulk-1.md"
 runsync hostB wsb --pull-only >/dev/null 2>&1 || true
 git -C "$hostB_WS" ls-files notes/bulk-1.md | grep -q . && ok "a local deletion is left for the push tripwire (still tracked after the pull)" || bad "the pre-pull commit swallowed a local deletion"
+# The safety of committing before the pull rests on generate_exclude running
+# BEFORE the add: reordering the two would let an out-of-carrier path ride into
+# the vault with every behavioural check above still green. Pin the order.
+fn="$(awk '/^_commit_local_pre_pull\(\) \{/,/^\}/' "$REPO/scripts/sync-workspace.sh")"
+ex_line="$(printf '%s\n' "$fn" | grep -n 'generate_exclude' | head -1 | cut -d: -f1)"
+add_line="$(printf '%s\n' "$fn" | grep -n 'git add ' | head -1 | cut -d: -f1)"
+[ -n "$ex_line" ] && [ -n "$add_line" ] && [ "$ex_line" -lt "$add_line" ] \
+  && ok "generate_exclude runs BEFORE git add inside _commit_local_pre_pull (order pinned)" \
+  || bad "generate_exclude must precede git add in _commit_local_pre_pull (ex=$ex_line add=$add_line)"
 printf '\n%s: %d passed, %d failed\n' "sync pre-pull commit" "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
 echo "PASS — local edits survive a refused pull"
