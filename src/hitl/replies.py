@@ -112,3 +112,63 @@ class HitlReplyHandler:
                 note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
+
+    # -- task-relay path ---------------------------------------------------------
+
+    def offer_task(self, task: Dict[str, Any]) -> bool:
+        """A click delivered as a relay TASK, not an event (an owner DM travels
+        only the task relay). True = it was a click and is consumed here,
+        whatever the Manager decided; False = an ordinary message, leave it on
+        the task path."""
+        event = self.task_to_event(task)
+        if event is None:
+            return False
+        self.offer(event)
+        return True
+
+    def task_to_event(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Exact form: `hitl_action` (the relay forwards the message's action
+        field). Fallback: a reply to a card's own event whose text is one of
+        that card's action labels — the projection ledger names the card event,
+        so no field is needed. Anything else is not a click."""
+        base = {
+            "type": EVENT_TYPE,
+            "event_id": str(task.get("source_message_id") or task.get("id") or ""),
+            "room_id": task.get("channel_id"),
+            "actor_id": str(task.get("user_id") or ""),
+        }
+        payload = task.get("hitl_action")
+        if isinstance(payload, dict):
+            return {**base, "content": {REPLY_FIELD: dict(payload)}}
+        target = str(task.get("reply_to_event") or "")
+        if not target:
+            return None
+        req = self.requirement_for_event(target)
+        if req is None:
+            return None
+        label = _reply_text(str(task.get("task") or "")).strip().lower()
+        action = next((a for a in req.actions
+                       if a.label.strip().lower() == label or a.id.lower() == label), None)
+        if action is None:
+            return None  # a reply to the card that is not a click stays a message
+        return {**base, "content": {REPLY_FIELD: {
+            "hitl_id": req.id, "expected_revision": req.revision,
+            "action_id": action.id, "guard": req.guard}}}
+
+    def requirement_for_event(self, event_id: str) -> Optional[HumanRequirement]:
+        """The active requirement whose card is `event_id` (CREATE projection;
+        status EDITs keep the same event id, so a reply to any revision maps)."""
+        for req in self._manager.active():
+            if self._manager.projection_target(req.id) == event_id:
+                return req
+        return None
+
+
+REPLY_CONTEXT_END = "[End AG2 Space reply context]"
+
+
+def _reply_text(task_text: str) -> str:
+    """The message text after the relay's quoted reply context. A wrong cut can
+    only fail to match a label (the task then stays a message), never pick one."""
+    head, sep, tail = task_text.rpartition(REPLY_CONTEXT_END)
+    return tail if sep else task_text

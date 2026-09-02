@@ -781,6 +781,27 @@ def _resolve_review_card(path: Path, record: dict) -> bool:
     return True
 
 
+def _handle_hitl_action(task: dict) -> bool:
+    """An owner card click delivered on the task relay (its `hitl_action`, or a
+    reply to the card whose text is an action label). Applied to the HITL
+    store here so a click never becomes a chat task; the caller closes the
+    task with a [no-send] control result. False = an ordinary message."""
+    task_id = str(task.get("id") or "")
+    if task_id and _control_result_path(task_id).is_file():
+        return isinstance(task.get("hitl_action"), dict)  # redelivery of a consumed click
+    if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
+        return False
+    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    handler = _hitl_reply_handler(owner, log=_log) if owner else None
+    if handler is None:
+        return False  # no owner or no store on this host: the click stays an ordinary task
+    try:
+        return bool(handler.offer_task(task))
+    except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
+        _log(f"hitl: task-relay click {task_id} not applied: {e}")
+        return False
+
+
 def _handle_review_decision(task: dict) -> bool:
     task_id = str(task.get("id") or "")
     if task_id and _control_result_path(task_id).is_file():
@@ -3642,6 +3663,11 @@ def main() -> None:
                     _queue_review_control_result(task)
                     _retry_review_control_results()
                     _log(f"consumed private review decision {task.get('id')}")
+                    continue
+                if _handle_hitl_action(task):
+                    _queue_review_control_result(task)
+                    _retry_review_control_results()
+                    _log(f"hitl: consumed card click {task.get('id')} from the task relay")
                     continue
                 tid = _write_task(task)
                 if tid:
