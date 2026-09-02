@@ -271,6 +271,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`detector.py`** — Claude readiness detector — the Requirement Detector half of the runtime supervisor, and the one-state ClaudeTuiDriver v0 (AUTH_REQUIRED only).
 - **`events.py`** — Ingest RuntimeEvents dropped by the runtime drivers (the desktop watchdog's `hitl_events.rs`) into the HumanRequirement Manager.
 - **`manager.py`** — HumanRequirement Manager: durable requirement store + projection ledger.
+- **`policy.py`** — Manager-level auto-answer policy: the tail of permission requests that never needs a human.
 - **`projector.py`** — Projects HumanRequirement state into Matrix via an injected sender.
 - **`replies.py`** — Inbound half of the client action wire.
 - **`schema.py`** — HITL v1 domain model + wire contract (space.ag2.hitl).

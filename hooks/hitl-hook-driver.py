@@ -35,12 +35,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(REPO / "src"))
 
-from hitl.manager import HitlManager, HitlStore, default_store  # noqa: E402
+from hitl.manager import (  # noqa: E402
+    POLICY_DECIDER,
+    HitlManager,
+    HitlStore,
+    default_store,
+)
+from hitl.policy import policy_from_env  # noqa: E402
 from hitl.schema import Action, HumanRequirement  # noqa: E402
 
-# AskUserQuestion has its own bridge; read-only tools never need a human.
+# AskUserQuestion has its own bridge. The allowlist lives in hitl.policy: the
+# Manager answers it, so the record exists even when no human is needed.
 OWNED_ELSEWHERE = {"AskUserQuestion"}
-DEFAULT_ALLOW = "Read,Glob,Grep,LS,TodoWrite,TodoRead,WebSearch,WebFetch,Task,Skill,NotebookRead"
 TIMEOUT_REASON = (
     "No decision arrived from the owner within the wait window (requirement {rid}). "
     "Denied by default; the owner can re-run the tool once they answer."
@@ -83,6 +89,7 @@ def _requirement(data: dict) -> HumanRequirement:
         message=f"Claude {verb} {tool}: {_summary(tool, tool_input)}",
         title=f"claude · {session}",
         guard=_guard(tool, tool_input),
+        subject={"tool": tool, "input": _summary(tool, tool_input)},
         device={"id": session, "name": session},
         actions=[
             Action(id="allow", kind="allow_once", label="Allow"),
@@ -116,12 +123,12 @@ def main() -> None:
     tool = str(data.get("tool_name") or "")
     if not tool or tool in OWNED_ELSEWHERE:
         sys.exit(0)  # not ours — no decision, Claude's own flow continues
-    allow = {t.strip() for t in os.environ.get("SUTANDO_HITL_ALLOW_TOOLS", DEFAULT_ALLOW).split(",") if t.strip()}
-    if tool in allow:
-        _emit({"permissionDecision": "allow", "permissionDecisionReason": "hitl policy: allowlisted tool"})
-        sys.exit(0)
-    manager = HitlManager(HitlStore(default_store(_workspace())))
+    manager = HitlManager(HitlStore(default_store(_workspace())), policy=policy_from_env())
     req = manager.create(_requirement(data))
+    if req.decided_by == POLICY_DECIDER and req.chosen_action == "allow":
+        manager.resolve(req.id)
+        _emit({"permissionDecision": "allow", "permissionDecisionReason": f"hitl policy: allowlisted tool ({req.id})"})
+        sys.exit(0)
     timeout_s = float(os.environ.get("SUTANDO_HITL_TIMEOUT", "600"))
     poll_s = float(os.environ.get("SUTANDO_HITL_POLL", "1"))
     chosen = _wait(manager, req.id, timeout_s, poll_s)

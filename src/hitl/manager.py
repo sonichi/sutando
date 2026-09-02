@@ -32,6 +32,9 @@ from .schema import (
 )
 
 
+POLICY_DECIDER = "policy"
+
+
 def default_store(workspace: Optional[Path] = None) -> Path:
     """Where every hitl component on a host keeps requirements: the hook driver
     writes here, the supervisor projects from here. One store, one card."""
@@ -92,19 +95,28 @@ class HitlStore:
 
 
 class HitlManager:
-    def __init__(self, store: HitlStore):
+    def __init__(self, store: HitlStore, policy=None):
         self.store = store
+        # Optional: `decide(req) -> action id | None`; see hitl.policy.
+        self.policy = policy
 
     def create(self, req: HumanRequirement) -> HumanRequirement:
         # One active per (runtime, kind, device): re-detection refreshes the
         # guard; two sessions (device ids) with one dialog stay two cards.
         for existing in self.active():
+            if existing.decided_by == POLICY_DECIDER:
+                continue  # auto-answered, in flight: never a dedup target
             if (existing.runtime == req.runtime and existing.kind == req.kind
                     and _device_id(existing) == _device_id(req)):
                 if req.guard and req.guard != existing.guard:
                     existing.refresh_guard(req.guard)
                     self.store.save(existing)
                 return existing
+        choice = self.policy.decide(req) if self.policy is not None else None
+        if choice is not None and any(a.id == choice for a in req.actions):
+            req.chosen_action = choice
+            req.decided_by = POLICY_DECIDER
+            req.transition(STATUS_IN_PROGRESS)
         self.store.save(req)
         return req
 
@@ -163,8 +175,8 @@ class HitlManager:
 
     def needs_projection(self, req_id: str) -> bool:
         req = self.store.load(req_id)
-        if req is None:
-            return False
+        if req is None or req.decided_by == POLICY_DECIDER:
+            return False  # a policy answer is a record, never a card
         return self.store.projection(req_id).get("revision", 0) < req.revision
 
     def record_projection(self, req_id: str, revision: int, event_id: Optional[str]) -> None:

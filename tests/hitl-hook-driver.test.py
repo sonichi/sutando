@@ -39,11 +39,22 @@ class HookDriverTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_allowlisted_tool_is_allowed_without_a_requirement(self):
+    def test_allowlisted_tool_is_allowed_by_policy_with_a_record_and_no_card(self):
         rc, out, _ = run_hook(self.ws, {"tool_name": "Read", "tool_input": {"file_path": "/x"}})
         self.assertEqual(rc, 0)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "allow")
-        self.assertEqual(self.mgr.store.all(), [])
+        self.assertIn("policy", out["hookSpecificOutput"]["permissionDecisionReason"])
+        [req] = self.mgr.store.all()  # the Manager answered it; the record stays for audit
+        self.assertEqual((req.status, req.chosen_action, req.decided_by, req.subject["tool"]),
+                         ("resolved", "allow", "policy", "Read"))
+        self.assertFalse(self.mgr.needs_projection(req.id))  # never a card
+
+    def test_allowlist_env_override_reaches_the_policy(self):
+        _, out, _ = run_hook(self.ws, {"tool_name": "Read", "tool_input": {"file_path": "/x"}},
+                             timeout="1", extra_env={"SUTANDO_HITL_ALLOW_TOOLS": "Glob"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")  # not allowlisted -> card -> timed out
+        [req] = self.mgr.store.all()
+        self.assertEqual((req.status, req.decided_by), ("expired", None))
 
     def test_ask_user_question_is_left_to_its_own_bridge(self):
         rc, out, _ = run_hook(self.ws, {"tool_name": "AskUserQuestion", "tool_input": {}})

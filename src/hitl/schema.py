@@ -61,6 +61,11 @@ class HumanRequirement:
     # The action id a human chose (set on apply_action) — what a blocking
     # hook driver reads to turn a card click into its permissionDecision.
     chosen_action: Optional[str] = None
+    # What is being asked, structurally (e.g. {"tool": "Bash", "input": "..."}):
+    # the policy reads this; the message stays the human rendering.
+    subject: Dict[str, Any] = field(default_factory=dict)
+    # "policy" when the Manager auto-answered it: never projected as a card.
+    decided_by: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -110,6 +115,8 @@ class HumanRequirement:
             wire["device"] = dict(self.device)
         if self.actions:
             wire["actions"] = [a.to_wire() for a in self.actions]
+        if self.subject:
+            wire["subject"] = dict(self.subject)
         return wire
 
 
