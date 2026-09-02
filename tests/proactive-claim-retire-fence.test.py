@@ -34,17 +34,19 @@ REPO = Path(__file__).resolve().parent.parent
 
 # MODULE level, before any exec_module: the bridge resolves ACCESS_FILE during
 # import and falls back to the real ~/.claude when CLAUDE_CONFIG_DIR is unset.
-os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="sutando-retire-fence-ccd-")
-_CCD = os.environ["CLAUDE_CONFIG_DIR"]
+_CCD = tempfile.mkdtemp(prefix="sutando-retire-fence-ccd-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CCD
 _cfg_slack = Path(_CCD) / "channels" / "slack"
 _cfg_slack.mkdir(parents=True, exist_ok=True)
 (_cfg_slack / "access.json").write_text('{"allowFrom": []}')
-# The wiring checks below name every bridge; each channel's allowlist is seeded
-# so no import can fall back to the developer's real config.
-for _ch in ("telegram", "discord"):
-    _cfg = Path(_CCD) / "channels" / _ch
-    _cfg.mkdir(parents=True, exist_ok=True)
-    (_cfg / "access.json").write_text('{"allowFrom": []}')
+# The wiring checks name every bridge; each channel's allowlist is seeded so
+# no import can fall back to the developer's real config.
+_cfg_telegram = Path(_CCD) / "channels" / "telegram"
+_cfg_telegram.mkdir(parents=True, exist_ok=True)
+(_cfg_telegram / "access.json").write_text('{"allowFrom": []}')
+_cfg_discord = Path(_CCD) / "channels" / "discord"
+_cfg_discord.mkdir(parents=True, exist_ok=True)
+(_cfg_discord / "access.json").write_text('{"allowFrom": []}')
 
 OWNER_DM = "DOWNER1"
 FIRST = "first half of the answer"
