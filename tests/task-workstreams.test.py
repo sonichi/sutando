@@ -17,6 +17,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import task_workstreams as workstreams  # noqa: E402
+from task_archive import task_id_from_filename  # noqa: E402
 
 
 def inherit_worker(workspace: str, child_id: str, start) -> None:
@@ -182,6 +183,38 @@ def test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment() ->
     assert workstreams._archive_task_id("ask-123.claimed-review.txt") == "ask-123.claimed-review"
     assert workstreams._archive_task_id("ask-123.assigned-core-2.txt") == "ask-123.assigned-core-2"
     assert workstreams._archive_task_id("task-c1.claimed-core-3.txt") == "task-c1"
+
+
+def test_a_stem_containing_txt_archive_failed_is_one_record_not_a_quarantine() -> None:
+    # A name ending in .txt is an ordinary record whose id is the whole stem;
+    # collapsing it onto `ask-123` hides a row and drops its assignment.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-terminal-txt-"))
+    write_task(workspace / "tasks" / "archive" / "2026-08" / "ask-123.txt",
+               "ask-123", "2026-08-03T10:00:00Z", "the short one")
+    write_task(workspace / "tasks" / "archive" / "2026-08" / "ask-123.txt.archive-failed-review.txt",
+               "ask-123.txt.archive-failed-review", "2026-08-03T10:01:00Z", "the long one")
+    write_task(workspace / "tasks" / "archive" / "2026-08" / "task-a.txt.archive-failed-review.txt",
+               "task-a.txt.archive-failed-review", "2026-08-03T10:02:00Z", "task-shaped long one")
+    (workspace / "results").mkdir(parents=True, exist_ok=True)
+    (workspace / "state").mkdir(parents=True, exist_ok=True)
+    (workspace / "state" / "core-status.json").write_text('{"status":"idle"}\n')
+    store_path = workstreams._store_path(workspace)
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {"workstream-x": {"title": "X"}},
+        "assignments": {"ask-123.txt.archive-failed-review": {"workstream_id": "workstream-x"}},
+    }))
+    ids = [row.id for row in workstreams.scan_task_history(workspace)]
+    assert ids == ["task-a.txt.archive-failed-review", "ask-123.txt.archive-failed-review", "ask-123"], ids
+    payload = {row["id"]: row for row in workstreams.task_history_payload(workspace)["tasks"]}
+    assert payload["ask-123.txt.archive-failed-review"].get("workstream_id") == "workstream-x"
+    assert "workstream_id" not in payload["ask-123"]
+    assert task_id_from_filename("task-a.txt.archive-failed-review.txt") == "task-a.txt.archive-failed-review"
+    # A real quarantine and a numbered collision still identify by their prefix.
+    assert workstreams._archive_task_id("ask-9.txt.archive-failed-2") == "ask-9"
+    assert workstreams._archive_task_id("ask-9.txt.3") == "ask-9"
+    assert task_id_from_filename("task-c1.claimed-core-3.txt") == "task-c1"
 
 
 def test_loader_parser_and_history_fail_open_edges() -> None:
@@ -1052,6 +1085,7 @@ def main() -> None:
         test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count,
         test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes,
         test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment,
+        test_a_stem_containing_txt_archive_failed_is_one_record_not_a_quarantine,
         test_loader_parser_and_history_fail_open_edges,
         test_task_text_keeps_the_whole_body_not_just_its_first_line,
         test_task_text_stops_at_headers_that_follow_the_task_line,

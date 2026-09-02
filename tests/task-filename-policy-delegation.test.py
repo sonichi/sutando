@@ -67,7 +67,7 @@ def delegation() -> None:
     consumers = {
         "runtime-api/tasks_view": REPO / "src" / "runtime-api" / "tasks_view.py",
         # The workstream-grouping CLI is absent on purpose: its delegation
-        # lands together with the live-file lookup it needs (#3658).
+        # lands together with the live-file lookup it needs.
         "codex-scheduler": (REPO / "skills" / "schedule-crons" / "scripts"
                             / "codex-scheduler.py"),
     }
