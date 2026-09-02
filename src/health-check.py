@@ -689,7 +689,56 @@ def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict
 
 # Bridges that import vault_intercept, and so need detect-secrets at RUNTIME.
 # Mirrors the three _vault_scanner_check call sites in src/startup.sh.
-_VAULT_SCANNER_BRIDGES = ["telegram-bridge", "discord-bridge", "slack-bridge"]
+_VAULT_SCANNER_BRIDGES = ["telegram-bridge", "discord-bridge", "slack-bridge",
+                          "remote-gateway-bridge"]
+_VAULT_SCANNER_SCRIPTS = {
+    "telegram-bridge": "telegram-bridge.py",
+    "discord-bridge": "discord-bridge.py",
+    "slack-bridge": "slack-bridge.py",
+    "remote-gateway-bridge": "remote-gateway-bridge.py",
+}
+
+
+def _proc_executable(pid: "str | int") -> "str | None":
+    """Executable path of `pid`, or None. `comm` is one field, so a path with
+    spaces survives it — argv cannot be split back apart reliably."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() or None
+
+
+# The script must appear as its own argv token — a `-c` payload that merely
+# prints the name is not a bridge launch.
+def _argv_runs(argv: str, script: str) -> bool:
+    return re.search(r"(?:^|[\s/])" + re.escape(script) + r"(?=\s|$)", argv) is not None
+
+
+def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
+                              exe_of=None) -> "list[str]":
+    """EVERY distinct interpreter currently running `script`, sorted.
+
+    Multi-instance is a supported launch (startup-runtime.sh spawns one gateway
+    per AG2_REMOTE_TOKEN_*), so a scalar both under-collects and makes the answer
+    depend on ps row order.
+    """
+    if ps_output is None:
+        ps_output = _ps_snapshot()
+    if ps_output is None:
+        return []
+    exe_of = exe_of or _proc_executable
+    me = str(os.getpid())
+    found = set()
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] == me or not _argv_runs(parts[2], script):
+            continue
+        exe = exe_of(parts[0])
+        if exe and os.path.basename(exe).lower().startswith("python"):
+            found.add(exe)
+    return sorted(found)
 
 
 def check_secret_scanner_mode() -> dict:
@@ -701,24 +750,29 @@ def check_secret_scanner_mode() -> dict:
     prints no failures.
     """
     degraded, checked = [], []
+    ps_output = _ps_snapshot()
     for bridge in _VAULT_SCANNER_BRIDGES:
-        interp = _bridge_interpreter(bridge)
-        if interp is None:
-            continue  # bridge cannot launch at all; its own probe owns that
-        if interp in checked:
-            continue
-        checked.append(interp)
-        try:
-            probe = subprocess.run([interp, "-c", "import detect_secrets"],
-                                   capture_output=True, timeout=10)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            return {
-                "name": "secret-scanner",
-                "status": "warn",
-                "detail": f"could not probe {interp} for detect-secrets ({exc}) — mode unknown, not proven healthy",
-            }
-        if probe.returncode != 0:
-            degraded.append(interp)
+        # Running bridges' own interpreters are the ones scanning inbound text;
+        # what *would* launch them is the wrong question while any are up.
+        live = _live_bridge_interpreters(_VAULT_SCANNER_SCRIPTS[bridge], ps_output)
+        if not live:
+            fallback = _bridge_interpreter(bridge)
+            live = [fallback] if fallback else []
+        for interp in live:
+            if interp in checked:
+                continue
+            checked.append(interp)
+            try:
+                probe = subprocess.run([interp, "-c", "import detect_secrets"],
+                                       capture_output=True, timeout=10)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                return {
+                    "name": "secret-scanner",
+                    "status": "warn",
+                    "detail": f"could not probe {interp} for detect-secrets ({exc}) — mode unknown, not proven healthy",
+                }
+            if probe.returncode != 0:
+                degraded.append(interp)
     if not checked:
         return {
             "name": "secret-scanner",
