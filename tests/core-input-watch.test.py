@@ -106,10 +106,10 @@ class TestClassify(unittest.TestCase):
         pane = _LOGIN_MENU + "\n" + _SESSION_LIMIT
         self.assertEqual(classify(pane)[0], "session-limit")
 
-    def test_stale_usage_credits_text_does_not_outrank_a_live_login_gate(self):
-        # The symmetric twin (rui, #3730 review): the limit signature sits above
-        # login, so a bare /usage-credits mention must not carry a login screen.
-        pane = "     /usage-credits to finish what you're working on.\n" + _LOGIN_MENU
+    def test_stale_limit_text_does_not_outrank_a_live_login_gate(self):
+        # The symmetric twin (rui + sonichi, #3730): a full limit screen left in
+        # scrollback above a live login menu; the live gate is the lower one.
+        pane = _SESSION_LIMIT + "\n" + _LOGIN_MENU
         self.assertEqual(classify(pane)[0], "login")
 
     def test_session_limit_is_a_human_gate_never_auto_answered(self):

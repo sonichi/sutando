@@ -112,7 +112,6 @@ def _load_runtime_health():
 # the net-new layer over runtime-health: it identifies WHICH gate the core is
 # stuck at so ESCALATE can show the prompt and AUTO-ANSWER can decide.
 _SIGNATURES = [
-    # First: the limit screen often sits below stale /login text in the same pane.
     ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
     ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
@@ -175,9 +174,11 @@ def classify(pane: str):
     # footer itself matches none of the signatures, so idle still suppresses.)
     if _IDLE.search(tail) and not any(rx.search(tail) for _, rx in _SIGNATURES):
         return None
-    for kind, rx in _SIGNATURES:
-        if rx.search(tail):
-            return kind, tail
+    # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
+    hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
+            for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
+    if hits:
+        return max(hits, key=lambda h: (h[0], -h[1]))[2], tail
     # No specific signature — but an input affordance IS present and this is NOT
     # the idle prompt. That means an UNFORESEEN prompt. Surface it rather than
     # leave a silent dead-end (owner's no-dead-end requirement 2026-07-14): we
