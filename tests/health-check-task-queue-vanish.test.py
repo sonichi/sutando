@@ -8,6 +8,7 @@ probe is called unwrapped, so one unguarded stat() takes down every later check.
 import importlib.util
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -73,6 +74,47 @@ class VanishingTaskFile(unittest.TestCase):
         self.assertIsInstance(res, dict)
         self.assertEqual(res["name"], "task-queue")
         self.assertIn(res["status"], ("ok", "warn", "error"))
+
+
+class OldestPendingTaskIdentity(unittest.TestCase):
+    """The restart-gate identity reads the same oldest-file policy, so it must
+    survive a vanished entry too rather than raising into its caller."""
+
+    def setUp(self):
+        self.mod = _load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self.tmp.name)
+        (self.ws / "tasks").mkdir()
+        (self.ws / "results").mkdir()
+        self.real = self.ws / "tasks" / "task-1788000000000.txt"
+        self.real.write_text("id: task-1788000000000\ntask: real\n")
+        self.gone = self.ws / "tasks" / "task-1788000000001.txt"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, listed):
+        with patch.object(self.mod, "WORKSPACE_DIR", self.ws), \
+             patch.object(self.mod, "_pending_task_files", return_value=listed):
+            return self.mod._oldest_pending_task(time.time(), self.ws / "tasks")
+
+    def test_identity_is_returned_for_a_present_file(self):
+        got = self._run([self.real])
+        self.assertIsNotNone(got)
+        ident, age = got
+        self.assertTrue(ident.startswith(self.real.name + "|"))
+        self.assertGreaterEqual(age, 0)
+
+    def test_a_vanished_entry_does_not_raise(self):
+        got = self._run([self.real, self.gone])
+        self.assertIsNotNone(got)
+        self.assertTrue(got[0].startswith(self.real.name + "|"))
+
+    def test_all_entries_vanished_yields_no_identity(self):
+        self.assertIsNone(self._run([self.gone]))
+
+    def test_an_empty_listing_yields_no_identity(self):
+        self.assertIsNone(self._run([]))
 
 
 if __name__ == "__main__":
