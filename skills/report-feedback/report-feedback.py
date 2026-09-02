@@ -418,6 +418,10 @@ def main() -> None:
             # sendLogs is opt-in, so reaching here means logs were asked for:
             # say why they are absent rather than shipping silence.
             ctx["logs_omitted"] = why_no_logs(ws)
+    elif not prefs["sendLogs"]:
+        # Without this the payload carries NEITHER key and triage cannot tell a
+        # standing opt-out from logs that were wanted and missing. Carries no data.
+        ctx["logs_opted_out"] = True
 
     payload = {
         "kind": a.kind,

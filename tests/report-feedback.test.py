@@ -530,6 +530,27 @@ class TestMain(unittest.TestCase):
         self.assertNotIn("last_logs_excerpt", ctx)
         self.assertNotIn("log_files", ctx)
 
+    def test_opt_out_is_stated_so_triage_can_tell_it_from_missing_logs(self):
+        # Silence is ambiguous: withheld consent and absent logs look identical.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "logs").mkdir()
+            (ws / "logs" / "a.log").write_text("hello\n")
+            ctx = self._posted_context(["--title", "hello"], ws)
+        self.assertIs(ctx.get("logs_opted_out"), True)
+        self.assertNotIn("logs_omitted", ctx)
+
+    def test_opt_in_never_claims_an_opt_out(self):
+        """Mutation guard: the marker must not fire when logs were requested."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._opt_in_to_logs(ws)
+            (ws / "logs").mkdir()
+            (ws / "logs" / "a.log").write_text("hello\n")
+            ctx = self._posted_context(["--title", "hello"], ws)
+        self.assertNotIn("logs_opted_out", ctx)
+        self.assertIn("last_logs_excerpt", ctx)
+
     def test_no_logs_flag_is_not_an_omission_to_explain(self):
         """--no-logs is the user's choice, not a failure to report."""
         with tempfile.TemporaryDirectory() as td:
