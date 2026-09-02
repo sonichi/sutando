@@ -36,9 +36,8 @@ def task_id_from_filename(name: str) -> str | None:
     match = _ID_STATE.match(name) or _ID_PLAIN.match(name)
     return match.group(1) if match else None
 
-# Same grammar, any producer prefix: archive corpora keep historic ids such as
-# ask-*, sc-ask-* and reco-skill-* (see local_task_protocol.valid_archive_lookup_id).
-_ANY_ID_STATE = re.compile(r"^(.+?)\.(?:assigned|claimed)-.+?\.txt$")
+# Any producer prefix: archive corpora keep historic ids such as ask-*,
+# sc-ask-* and reco-skill-* (see local_task_protocol.valid_archive_lookup_id).
 _ANY_ID_PLAIN = re.compile(r"^(.+?)\.txt(?:\.\d+|\.archive-failed.*)?$")
 
 
@@ -50,7 +49,12 @@ def archive_id_from_filename(name: str) -> str | None:
     live grammar drops every legacy row. Callers gate the result with
     `local_task_protocol.valid_archive_lookup_id`.
     """
-    match = _ANY_ID_STATE.match(name) or _ANY_ID_PLAIN.match(name)
+    # Pool-state suffixes are only ever appended to task-* names; a legacy id
+    # may legitimately contain `.claimed-`, so it keeps its whole stem.
+    task_id = task_id_from_filename(name)
+    if task_id is not None:
+        return task_id
+    match = _ANY_ID_PLAIN.match(name)
     return match.group(1) if match else None
 
 

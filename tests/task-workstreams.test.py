@@ -147,6 +147,43 @@ def test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes() 
     assert workstreams._archive_task_id("a/b.txt") is None
 
 
+def test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment() -> None:
+    # Pool-state canonicalization is a task-* rule: `ask-123.claimed-review` and
+    # `ask-123` are distinct archive ids, and collapsing them drops an assignment.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-legacy-claimed-"))
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "ask-123.claimed-review.txt",
+        "ask-123.claimed-review", "2026-08-03T10:00:00Z", "legacy id with a dot",
+    )
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "ask-123.txt",
+        "ask-123", "2026-08-03T10:01:00Z", "its plain sibling",
+    )
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "task-c1.claimed-core-3.txt",
+        "task-c1", "2026-08-03T10:02:00Z", "task-* grammar still canonicalizes",
+    )
+    (workspace / "results").mkdir(parents=True, exist_ok=True)
+    (workspace / "state").mkdir(parents=True, exist_ok=True)
+    (workspace / "state" / "core-status.json").write_text('{"status":"idle"}\n')
+    store_path = workstreams._store_path(workspace)
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {"workstream-x": {"title": "X"}},
+        "assignments": {"ask-123.claimed-review": {"workstream_id": "workstream-x"}},
+    }))
+
+    ids = [row.id for row in workstreams.scan_task_history(workspace)]
+    assert ids == ["task-c1", "ask-123", "ask-123.claimed-review"], ids
+    payload = {row["id"]: row for row in workstreams.task_history_payload(workspace)["tasks"]}
+    assert payload["ask-123.claimed-review"].get("workstream_id") == "workstream-x", payload
+    assert "workstream_id" not in payload["ask-123"], payload["ask-123"]
+    assert workstreams._archive_task_id("ask-123.claimed-review.txt") == "ask-123.claimed-review"
+    assert workstreams._archive_task_id("ask-123.assigned-core-2.txt") == "ask-123.assigned-core-2"
+    assert workstreams._archive_task_id("task-c1.claimed-core-3.txt") == "task-c1"
+
+
 def test_loader_parser_and_history_fail_open_edges() -> None:
     workspace = fixture_workspace()
     store_path = workspace / "data" / "task-workstreams.json"
@@ -1013,6 +1050,8 @@ def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
         test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count,
+        test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes,
+        test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment,
         test_loader_parser_and_history_fail_open_edges,
         test_task_text_keeps_the_whole_body_not_just_its_first_line,
         test_task_text_stops_at_headers_that_follow_the_task_line,
