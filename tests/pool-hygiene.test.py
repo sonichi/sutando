@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
 from pool_lead import PoolLead  # noqa: E402
+from pool_metrics import PoolMetrics  # noqa: E402
 
 
 class HygieneBase(unittest.TestCase):
@@ -35,6 +36,52 @@ class HygieneBase(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+
+class ReclaimMetricsTests(HygieneBase):
+    """Each lead reclaim path is a producer of the summary's `reclaims`;
+    drive the production paths, never the recorder directly."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics = PoolMetrics(self.state, now_fn=lambda: self.clock[0])
+        self.lead.metrics = self.metrics
+
+    def _rows(self):
+        return [__import__("json").loads(ln) for ln in
+                self.metrics._path().read_text().splitlines()]
+
+    def test_dead_followers_assignment_counts_as_a_reclaim(self):
+        (self.tasks / "task-d.assigned-worker-2.txt").write_text("task: t\n")
+        self.alive["worker-2"] = False
+        self.assertEqual(self.lead.reclaim_dead(),
+                         ["task-d.assigned-worker-2.txt"])
+        self.assertEqual(self.metrics.summarize()["reclaims"], 1)
+        self.assertEqual(self._rows()[0]["reason"], "dead")
+
+    def test_stuck_assignment_counts_as_a_reclaim(self):
+        (self.tasks / "task-s.assigned-worker-1.txt").write_text("task: t\n")
+        self.lead.reclaim_stuck_assignments()  # adopted, nothing to count
+        self.assertEqual(self.metrics.summarize()["rows"], 0)
+        self.clock[0] += 301
+        self.assertEqual(self.lead.reclaim_stuck_assignments(),
+                         ["task-s.assigned-worker-1.txt"])
+        self.assertEqual(self.metrics.summarize()["reclaims"], 1)
+        self.assertEqual(self._rows()[0]["reason"], "stuck")
+
+    def test_repooled_claim_counts_but_a_delivered_one_does_not(self):
+        (self.tasks / "task-c1.claimed-worker-2.txt").write_text("task: t\n")
+        (self.tasks / "task-c2.claimed-worker-2.txt").write_text("task: t\n")
+        results = self.tasks.parent / "results"
+        results.mkdir()
+        (results / "task-c2.txt").write_text("done\n")
+        self.alive["worker-2"] = False
+        self.assertEqual(sorted(self.lead.reclaim_claimed()),
+                         [("task-c1.claimed-worker-2.txt", "repooled"),
+                          ("task-c2.claimed-worker-2.txt", "delivered")])
+        self.assertEqual(self.metrics.summarize()["reclaims"], 1)
+        self.assertEqual([(r["task"], r["reason"]) for r in self._rows()],
+                         [("task-c1.txt", "claim-dead")])
 
 
 class StuckAssignmentTests(HygieneBase):

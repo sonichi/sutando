@@ -25,6 +25,9 @@ from task_archive import _move_without_clobbering  # noqa: E402
 
 import pool_names as pn  # noqa: E402
 
+sys.path.insert(0, str(_HERE / "runtime-api"))
+from pool_metrics import PoolMetrics  # noqa: E402
+
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
 
 _UNASSIGNED_RE = re.compile(
@@ -69,6 +72,13 @@ def _claim_assignment(tasks_dir: Path, f: Path, instance: str) -> "Path | None":
         return None  # lead reclaimed or a restart raced us — not an error
 
 
+def _record_claim(state_dir, claimed: Path, instance: str, fallback: bool) -> None:
+    # Fail-open by construction; the lead's summary counts the fallback ones.
+    m = _CLAIMED_RE.match(claimed.name)
+    task = f"task-{m.group(1)}.txt" if m else claimed.name
+    PoolMetrics(state_dir).claimed(task, instance, fallback=fallback)
+
+
 def acquire_work(tasks_dir, state_dir, instance: str,
                  lead_label: str, now_fn=time.time) -> "Path | None":
     """Claim the next unit of work for `instance`, or None when idle.
@@ -84,6 +94,7 @@ def acquire_work(tasks_dir, state_dir, instance: str,
     for f in sort_tasks_by_priority(assigned):
         got = _claim_assignment(tasks, f, instance)
         if got is not None:
+            _record_claim(state_dir, got, instance, fallback=False)
             return got
     if lead_alive(state_dir, lead_label, now_fn):
         return None  # a live lead owns the unassigned pool — never steal
@@ -104,9 +115,10 @@ def acquire_work(tasks_dir, state_dir, instance: str,
         target = f.with_name(f.name[:-4] + pn.claimed_suffix(instance))
         try:
             os.rename(f, target)
-            return target
         except OSError:
             continue
+        _record_claim(state_dir, target, instance, fallback=True)
+        return target
     return None
 
 

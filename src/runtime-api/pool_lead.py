@@ -154,6 +154,10 @@ class PoolLead:
         self.now = now_fn
         self.metrics = metrics  # PoolMetrics or None; recording is optional
 
+    def _record_reclaim(self, task: str, instance: str, reason: str) -> None:
+        if self.metrics is not None:
+            self.metrics.reclaimed(task, instance, reason=reason)
+
     # ── affinity table (single-writer: the lead) ────────────────────────────
     def _affinity_path(self) -> Path:
         return self.state_dir / "pool" / "affinity.json"
@@ -472,6 +476,7 @@ class PoolLead:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
                 continue
+            self._record_reclaim(m.group(1) + ".txt", pn.canonical(m.group(2)), "dead")
             reclaimed.append(f.name)
         return reclaimed
 
@@ -573,6 +578,7 @@ class PoolLead:
             ledger.pop(f.name, None)
             live.discard(f.name)
             self._mark_noclaim(inst)
+            self._record_reclaim(m.group(1) + ".txt", inst, "stuck")
             out.append(f.name)
             # An unresponsive home releases its rooms so the re-pick moves
             # them; a pinned row survives — pins move only by owner command.
@@ -643,5 +649,7 @@ class PoolLead:
             except OSError:
                 continue
             done = self._result_evidence(canonical)
+            if not done:
+                self._record_reclaim(canonical, pn.canonical(m.group(2)), "claim-dead")
             out.append((f.name, "delivered" if done else "repooled"))
         return out

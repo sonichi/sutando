@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -47,8 +48,9 @@ class PoolMetrics:
         self.record("claimed", task=task, instance=instance,
                     fallback=fallback)
 
-    def reclaimed(self, task: str, dead_instance: str):
-        self.record("reclaimed", task=task, dead_instance=dead_instance)
+    def reclaimed(self, task: str, instance: str, reason: str = "dead"):
+        # reason: dead (assignment), stuck (never claimed), claim-dead (repooled claim)
+        self.record("reclaimed", task=task, instance=instance, reason=reason)
 
     # ── the summary the benchmark reads ─────────────────────────────────────
     def summarize(self, day: "str | None" = None,
@@ -117,3 +119,17 @@ class PoolMetrics:
                 "continuity_breaks": sum(breaks_by_channel.values()),
                 "continuity_pairs": pairs,
                 "continuity_breaks_by_channel": dict(breaks_by_channel)}
+
+
+def summarize_cli(argv: "list[str]") -> int:
+    """`pool_metrics.py <state_dir> [YYYY-MM-DD]` — the summary as JSON."""
+    if len(argv) not in (1, 2):
+        print("usage: pool_metrics.py <state_dir> [YYYY-MM-DD]", file=sys.stderr)
+        return 2
+    print(json.dumps(PoolMetrics(argv[0]).summarize(*argv[1:]),
+                     indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(summarize_cli(sys.argv[1:]))

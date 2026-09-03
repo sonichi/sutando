@@ -1,8 +1,7 @@
 #!/bin/bash
 # pool-status.sh — one-shot live snapshot of the multi-worker agent pool (#880).
 #
-# Complements scripts/pool-metrics.py: that one is a historic latency rollup,
-# this one is a "what's the pool doing right now" five-section view. Read-only.
+# A "what's the pool doing right now" six-section view. Read-only.
 #
 # Sections:
 #   1. launchd state           — which plists are loaded + their PIDs/exit codes
@@ -10,6 +9,7 @@
 #   3. channel-affinity        — which slot owns which channel right now
 #   4. recent claims           — last N tasks that were atomically claimed
 #   5. log tails               — last K lines from each worker's stdout log
+#   6. lead metrics            — today's summary from src/runtime-api/pool_metrics.py
 #
 # Usage:
 #   bash scripts/pool-status.sh              # defaults: 5 claims, 3 log lines
@@ -22,7 +22,8 @@ set -u
 CLAIMS_LIMIT="${1:-5}"
 LOG_LINES="${2:-3}"
 
-WORKSPACE="$(bash "$(dirname "$0")/sutando-config.sh" workspace)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
 WORKSPACE="${WORKSPACE/#\~/$HOME}"
 CORES_DIR="$WORKSPACE/state/cores"
 LOG_DIR="$WORKSPACE/logs"
@@ -105,5 +106,17 @@ for log in "$LOG_DIR"/worker-[0-9]*.log "$LOG_DIR"/core-[0-9]*.log; do
   tail -n "$LOG_LINES" "$log" 2>/dev/null | sed 's/^/  /'
 done
 shopt -u nullglob
+
+# ---------------------------------------------------------------------------
+hdr "6. lead metrics (today: fallback claims, reclaims, head-of-line)"
+# The lead and every follower append to state/pool/metrics/; this reads it.
+# shellcheck source=./python-binary.sh
+. "$REPO/scripts/python-binary.sh"
+PY="$(resolve_python "$REPO")"
+if [ -n "$PY" ]; then
+  "$PY" "$REPO/src/runtime-api/pool_metrics.py" "$WORKSPACE/state" 2>/dev/null | sed 's/^/  /'
+else
+  echo "  (no runnable python3 — metrics summary skipped)"
+fi
 
 echo

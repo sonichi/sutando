@@ -18,6 +18,9 @@ sys.path.insert(0, str(REPO / "src"))
 
 import pool_follower as pf  # noqa: E402
 
+sys.path.insert(0, str(REPO / "src" / "runtime-api"))
+from pool_metrics import PoolMetrics  # noqa: E402
+
 
 class AcquireTests(unittest.TestCase):
     def setUp(self):
@@ -66,6 +69,24 @@ class AcquireTests(unittest.TestCase):
         (self.tasks / "task-free.txt").write_text("task: t\n")
         got = pf.acquire_work(self.tasks, self.state, "me", "lead")
         self.assertEqual(got.name, "task-free.claimed-me.txt")
+
+    def test_fallback_claim_lands_in_the_lead_metrics(self):
+        """The production claim path is the only producer of fallback_claims;
+        the summary the status view reads must move when it fires."""
+        (self.tasks / "task-free.txt").write_text("task: t\n")
+        got = pf.acquire_work(self.tasks, self.state, "me", "lead")
+        self.assertEqual(got.name, "task-free.claimed-me.txt")
+        s = PoolMetrics(self.state).summarize()
+        self.assertEqual(s["fallback_claims"], 1)
+        self.assertEqual(s["rows"], 1)
+
+    def test_assignment_claim_is_recorded_but_is_not_a_fallback(self):
+        (self.tasks / "task-a.assigned-me.txt").write_text("task: t\n")
+        self._beat()
+        got = pf.acquire_work(self.tasks, self.state, "me", "lead")
+        self.assertEqual(got.name, "task-a.claimed-me.txt")
+        s = PoolMetrics(self.state).summarize()
+        self.assertEqual((s["rows"], s["fallback_claims"]), (1, 0))
 
     def test_future_dated_lead_beat_degrades(self):
         # clock skew: a lead "from the future" is not a live lead
