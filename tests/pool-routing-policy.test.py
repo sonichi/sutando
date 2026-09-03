@@ -327,7 +327,46 @@ class EdgesAndFaults(Base):
         r = Router(cfg, lambda *a: "core-2")
         d = r.pick(TaskMeta("t", source="slack"), [MemberView("core-1"), MemberView("core-2")], {})
         self.assertEqual((d.worker, d.fallback), ("core-2", True))
-        self.assertIn("not a candidate", d.reason)
+        self.assertIn("not a claiming candidate", d.reason)
+
+    def test_custom_naming_a_known_but_not_claiming_member_falls_back(self):
+        # Membership is not liveness: a known id that is not claiming parks the task.
+        mod = Path(self.tmp.name) / "parked.py"
+        mod.write_text("def pick(task, workers, affinity, state): return 'core-1'\n")
+        r = Router(RoutingConfig(policy=f"custom:{mod}:pick"), lambda *a: "core-2")
+        d = r.pick(TaskMeta("t"), [MemberView("core-1", claiming=False), MemberView("core-2")], {})
+        self.assertEqual((d.worker, d.fallback), ("core-2", True))
+        self.assertIn("not live", d.reason)
+
+    def test_rule_to_naming_a_non_claiming_worker_falls_back(self):
+        mod = Path(self.tmp.name) / "echo.py"
+        mod.write_text("def pick(task, workers, affinity, state): return 'core-1'\n")
+        cfg = RoutingConfig(rules=[{"match": {"source": "slack"}, "to": ["core-1"],
+                                    "policy": f"custom:{mod}:pick"}])
+        r = Router(cfg, lambda *a: "core-2")
+        d = r.pick(TaskMeta("t", source="slack"),
+                   [MemberView("core-1", claiming=False), MemberView("core-2")], {})
+        self.assertEqual((d.worker, d.fallback), ("core-2", True))
+        self.assertIn("not a claiming candidate", d.reason)
+
+    def test_custom_module_outside_repo_and_workspace_is_refused(self):
+        # routing.json is a code-execution surface; a module in a foreign dir is not loaded.
+        import tempfile as _tf
+        foreign = Path(_tf.mkdtemp()) / "outside.py"
+        foreign.write_text("def pick(task, workers, affinity, state): return 'core-2'\n")
+        self.routing(policy=f"custom:{foreign}:pick")
+        self.write("task-1.txt", task())
+        self.lead().sweep()
+        t = self.trace("routed")[0]
+        self.assertTrue(t["fallback"])
+        self.assertIn("must live under the repo or the workspace", t["reason"])
+        inside = Path(self.tmp.name) / "inside.py"
+        inside.write_text("def pick(task, workers, affinity, state): return 'core-2'\n")
+        self.routing(policy=f"custom:{inside}:pick")
+        self.write("task-2.txt", task())
+        self.lead().sweep()
+        self.assertEqual(self.assigned()["task-2.txt"], "core-2")
+        self.assertFalse(self.trace("routed")[-1]["fallback"])
 
     def test_lead_default_pick_over_core_only_membership(self):
         lead = self.lead()

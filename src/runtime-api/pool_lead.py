@@ -335,7 +335,7 @@ class PoolLead:
         task = read_task_meta(f, lane)
         d: Decision = self.router.pick(task, members, affinity)
         inst = d.worker
-        if inst is None or inst not in {m.id for m in members}:
+        if inst is None or inst not in {m.id for m in members if m.claiming}:
             inst = self._pick(channel, followers, affinity, lane)
             d = Decision(inst, d.policy, d.rule, True,
                          d.reason or "policy declined; lead default")

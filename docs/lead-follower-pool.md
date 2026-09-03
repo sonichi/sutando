@@ -147,7 +147,10 @@ a policy behind one call: `pick(task, workers, affinity) -> worker | None`.
   `sticky-sender`, `home-first` (explicit `target_worker:` → that worker;
   otherwise the home seat; no home seat → least-loaded; `core-first` accepted for one release).
 - **Custom code:** `"policy": "custom:/path/mod.py:pick"` — same signature
-  `(task, workers, affinity, state)`. Owner-only surface.
+  `(task, workers, affinity, state)`. This is a code-execution surface: the
+  state file names a module the lead imports, so keep `state/pool/` owner-only
+  and out of the vault; the path must resolve under the repo or the workspace
+  (a config naming `/tmp/x.py` is refused and traced as a fallback).
 - **Degrade, never strand:** a policy that raises, or names a worker that is
   not live, is overridden by `affinity-first`; every assignment traces
   `{"event": "routed", policy, rule, fallback, reason}`.

@@ -71,6 +71,7 @@ class RoutingConfig:
     rules: list = field(default_factory=list)
     allow_delegation: bool = False
     source: "str | None" = None
+    roots: list = field(default_factory=list)
 
 
 def read_task_meta(path: Path, lane: str = "owner") -> TaskMeta:
@@ -97,20 +98,32 @@ def config_path(state_dir: Path) -> Path:
     return Path(env) if env else Path(state_dir) / "pool" / "routing.json"
 
 
+def _custom_roots(state_dir: Path, cfg: Path) -> list:
+    """Where owner code may live: the repo, the workspace that holds the state
+    dir, and the config's own directory. A state file naming /tmp is refused."""
+    repo = Path(__file__).resolve().parents[2]
+    out = []
+    for r in (repo, Path(state_dir).resolve().parent, cfg.resolve().parent):
+        if r not in out:
+            out.append(r)
+    return out
+
+
 def load_config(state_dir: Path) -> RoutingConfig:
     p = config_path(state_dir)
+    roots = _custom_roots(state_dir, p)
     try:
         data = json.loads(p.read_text())
     except (OSError, ValueError):
-        return RoutingConfig()
+        return RoutingConfig(roots=roots)
     if not isinstance(data, dict):
-        return RoutingConfig()
+        return RoutingConfig(roots=roots)
     rules = data.get("rules")
     return RoutingConfig(
         policy=str(data.get("policy") or DEFAULT_POLICY),
         rules=rules if isinstance(rules, list) else [],
         allow_delegation=bool(data.get("allow_delegation", False)),
-        source=str(p))
+        source=str(p), roots=roots)
 
 
 # ── built-in policies ─────────────────────────────────────────────────────
@@ -172,11 +185,14 @@ BUILTINS = {
 }
 
 
-def _load_custom(spec: str):
+def _load_custom(spec: str, roots=()):
     """`custom:<path.py>:<attr>` — owner-supplied code behind the same
     signature. Import failure is a config error: caller falls back."""
     _, path, attr = spec.split(":", 2)
-    mod_spec = importlib.util.spec_from_file_location("sutando_routing_custom", path)
+    resolved = Path(path).resolve()
+    if roots and not any(resolved == r or r in resolved.parents for r in roots):
+        raise PermissionError(f"{spec}: custom policy must live under the repo or the workspace")
+    mod_spec = importlib.util.spec_from_file_location("sutando_routing_custom", str(resolved))
     if mod_spec is None or mod_spec.loader is None:
         raise ImportError(spec)
     mod = importlib.util.module_from_spec(mod_spec)
@@ -206,7 +222,7 @@ class Router:
         if name in BUILTINS:
             fn = BUILTINS[name]
         elif name.startswith("custom:"):
-            fn = _load_custom(name)
+            fn = _load_custom(name, self.config.roots)
         else:
             raise KeyError(name)
         self._cache[name] = fn
@@ -233,7 +249,9 @@ class Router:
         return str(got) if got is not None else None
 
     def pick(self, task: TaskMeta, workers: list, affinity: dict) -> Decision:
-        live_ids = {w.id for w in workers}
+        # A member that is not claiming is not a valid answer: assigning to it
+        # parks the task until the stuck-reclaim path repools it.
+        live_ids = {w.id for w in workers if w.claiming}
         try:
             for i, rule in enumerate(self.config.rules):
                 if not isinstance(rule, dict) or not self._matches(rule, task, workers):
@@ -250,8 +268,8 @@ class Router:
                 if not cand:
                     return Decision(None, name, i, reason="rule narrowed to no live worker")
                 got = self._run(name, task, cand, affinity)
-                if got is not None and got not in {w.id for w in cand}:
-                    raise ValueError(f"{name} returned {got!r}, not a candidate")
+                if got is not None and got not in {w.id for w in cand if w.claiming}:
+                    raise ValueError(f"{name} returned {got!r}, not a claiming candidate")
                 return Decision(got, name, i)
             name = self.config.policy
             got = self._run(name, task, workers, affinity)
