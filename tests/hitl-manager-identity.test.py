@@ -101,5 +101,30 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(self.mgr.store._lock_depth, 0)
 
 
+class ForeignRecordTests(unittest.TestCase):
+    """A store shared by two engine revisions: unknown fields are dropped, and a
+    record that cannot be constructed is skipped rather than blinding all()."""
+
+    def _store(self):
+        from pathlib import Path as _P
+        return HitlStore(_P(tempfile.mkdtemp()) / "req")
+
+    def test_unknown_fields_are_ignored_on_load(self):
+        store = self._store()
+        store.save(HumanRequirement(id="hitl_future01", kind="permission", runtime="claude", message="m",
+                                    actions=[Action(id="allow", kind="allow_once", label="Allow")]))
+        f = store.root / "hitl_future01.json"
+        raw = json.loads(f.read_text()); raw["requirement"]["some_future_field"] = {"x": 1}
+        f.write_text(json.dumps(raw))
+        self.assertEqual(store.load("hitl_future01").id, "hitl_future01")
+        self.assertEqual([r.id for r in store.all()], ["hitl_future01"])
+
+    def test_unconstructible_record_is_skipped_not_fatal(self):
+        store = self._store()
+        store.save(HumanRequirement(id="hitl_good00001", kind="permission", runtime="claude", message="m"))
+        (store.root / "hitl_bad000001.json").write_text(json.dumps({"requirement": {"id": "hitl_bad000001"}}))
+        self.assertEqual([r.id for r in store.all()], ["hitl_good00001"])
+
+
 if __name__ == "__main__":
     unittest.main()

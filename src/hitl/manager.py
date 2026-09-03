@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
+import dataclasses
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -123,8 +124,8 @@ class HitlStore:
         for p in sorted(self.root.glob("hitl_*.json")):
             try:
                 out.append(_req_from_dict(json.loads(p.read_text())["requirement"]))
-            except (json.JSONDecodeError, KeyError):
-                continue
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue  # one unreadable record must not hide the store
         return out
 
 
@@ -255,7 +256,12 @@ def _req_to_dict(req: HumanRequirement) -> Dict:
     return d
 
 
+_REQ_FIELDS = {f.name for f in dataclasses.fields(HumanRequirement)}
+
+
 def _req_from_dict(d: Dict) -> HumanRequirement:
-    d = dict(d)
+    """Unknown keys are dropped: a store shared by two engine revisions must stay
+    readable by the older one, and one foreign record must not blind the rest."""
+    d = {k: v for k, v in dict(d).items() if k in _REQ_FIELDS}
     d["actions"] = [Action(**a) for a in d.get("actions", [])]
     return HumanRequirement(**d)
