@@ -68,9 +68,8 @@ check("request-changes denied when gh is path-qualified",
 check("a binary merely ending in gh is NOT gh",
       run("/usr/bin/notgh pr review 1 --approve", "hold")[0], False)
 
-# macOS filesystems are case-INSENSITIVE, so `GH` runs the very same binary
-# (same inode). The early `"gh" not in command` prefilter was case-sensitive and
-# returned before the token scan lowercased anything.
+# macOS filesystems are case-insensitive, so `GH` is the same binary, and the
+# early `"gh" not in command` prefilter ran before the token scan lowercased.
 check("approve denied when the path is mixed-case",
       run("/opt/homebrew/bin/" + APPROVE.replace("gh ", "GH ", 1), "hold")[0], True)
 check("approve denied when a bare gh is uppercase",
