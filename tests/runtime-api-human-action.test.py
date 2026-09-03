@@ -54,17 +54,16 @@ class HumanActionTests(unittest.TestCase):
 
     def test_request_mirrors_card_with_act_and_outcome_options(self):
         rid = self._request()
-        card = self.ha.store.get(self.d._ha_of[rid])
-        q = card["questions"][0]
-        self.assertIn("Sign the agreement", q["question"])
-        self.assertIn("Review section 4", q["question"])
-        self.assertEqual([o["label"] for o in q["options"]], ["Done", "Decline"])
+        req = self.ha.manager.get(self.d._ha_of[rid])
+        self.assertIn("Sign the agreement", req.message)
+        self.assertIn("Review section 4", req.message)
+        self.assertEqual([a.label for a in req.actions], ["Done", "Decline"])
 
     def test_card_done_completes_and_decline_declines(self):
         for answer, expected in ((1, "completed"), (2, "declined")):
             rid = self._request()
             aid = self.d._ha_of[rid]
-            self.ha.store.resolve(aid, {"1": [answer]}, "@owner:x")
+            self.ha.resolve(aid, {"1": [answer]}, "@owner:x")
             self.d._settle(rid)
             rec = self.store.get(rid)
             self.assertEqual(rec["status"], expected)
@@ -76,8 +75,7 @@ class HumanActionTests(unittest.TestCase):
                                               {"requestId": rid, "note": "signed"}))
         self.assertEqual(out["status"], "completed")
         self.assertEqual(self.store.get(rid)["result"], {"note": "signed"})
-        card = self.ha.store.get(self.d._ha_of[rid])
-        self.assertEqual(card["status"], "resolved")  # no dangling card
+        self.assertEqual(self.ha.manager.get(self.d._ha_of[rid]).status, "resolved")  # no dangling card
 
     def test_api_decline_and_terminal_is_idempotent_safe(self):
         rid = self._request()
@@ -106,7 +104,7 @@ class HumanActionTests(unittest.TestCase):
                                       {"requestId": rid}))
         self.assertEqual(cm.exception.code, -32601)
         self.assertEqual(self.store.get(rid)["status"], "pending")
-        self.assertEqual(self.ha.store.get(self.d._ha_of[rid])["status"],
+        self.assertEqual(self.ha.manager.get(self.d._ha_of[rid]).status,
                          "pending")
         with self.assertRaises(ProtocolError):
             asyncio.run(self.d.handle("human_action.decline", {"requestId": rid}))
@@ -149,7 +147,7 @@ class ProductionComposedSettleTests(unittest.TestCase):
         rec = self.srv.store.get(rid)
         self.assertEqual(rec["status"], "pending")
         self.assertIsNone(rec.get("resolvedBy"))
-        self.assertEqual(self.srv.ha.store.get(self.d._ha_of[rid])["status"],
+        self.assertEqual(self.srv.ha.manager.get(self.d._ha_of[rid]).status,
                          "pending")
 
 

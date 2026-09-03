@@ -184,6 +184,8 @@ class HitlManager:
                 raise MalformedActionError(f"no requirement {reply.hitl_id}")
             action = validate_action(req, reply)
             req.chosen_action = action.id
+            if reply.answer is not None:
+                req.answer = reply.answer
             req.transition(STATUS_IN_PROGRESS)
             self.store.save(req)
             return action
