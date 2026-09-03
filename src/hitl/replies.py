@@ -95,6 +95,7 @@ class HitlReplyHandler:
         if not self.claims(event):
             return claimed
         actor = str(event.get("actor_id") or "")
+        self.last_outcome = "ignored"
         # AUTHORIZATION — the whole point: only the owner resolves.
         if not self._owner or actor != self._owner:
             self._log(f"hitl: action reply from non-owner {actor or '?'} ignored")
@@ -102,12 +103,17 @@ class HitlReplyHandler:
         reply = parse_reply(event)
         if reply is None:
             self._log("hitl: malformed action reply ignored")
+            self.last_outcome = "rejected"
+            self.last_reason = "malformed action payload"
             return claimed
         try:
             action = self._manager.apply_action(reply)
         except (StaleRequirementError, MalformedActionError) as e:
             self._log(f"hitl: reply for {reply.hitl_id} rejected — {e}")
+            self.last_outcome = "rejected"
+            self.last_reason = str(e)
             return claimed
+        self.last_outcome = "applied"
         note = ""
         if action.kind == TUI_ACTION_KIND and self._workspace is not None:
             req = self._manager.get(reply.hitl_id)
