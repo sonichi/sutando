@@ -88,6 +88,24 @@ class VerifyCeremonyGate(unittest.TestCase):
             )
             self.assertEqual(_run(ws).returncode, 0)
 
+    def test_missing_probe_is_rc2_not_rc1(self):
+        """Copy-deployed tree: the script exists, src/health-check.py does not. Must be rc 2
+        ("cannot answer"), never rc 1 — rc 1 tells the agent to run /schedule-crons and retry,
+        which can never fix an unimportable probe and re-creates the re-send loop."""
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td) / "copy"
+            dst = tree / "skills" / "startup" / "scripts" / "verify-ceremony.py"
+            dst.parent.mkdir(parents=True)
+            dst.write_text(GATE.read_text())
+            (tree / "src").mkdir()  # src/ present, health-check.py absent — the reviewer's second case
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=1_000_300.0)
+            env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
+            r = subprocess.run([sys.executable, str(dst), "--workspace", str(ws), "--host-label", HOST],
+                               capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(r.returncode, 2, f"rc={r.returncode}\n{r.stderr}")
+            self.assertIn("probe unavailable", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

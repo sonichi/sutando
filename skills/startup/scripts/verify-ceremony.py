@@ -20,7 +20,12 @@ REPO = Path(__file__).resolve().parents[3]
 
 
 def load_probe():
-    spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
+    probe_file = REPO / "src" / "health-check.py"
+    # spec_from_file_location returns a VALID spec for a missing file (None only for an
+    # unknown suffix), so the existence check has to be explicit or the guard guards nothing.
+    if not probe_file.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("health_check", probe_file)
     if spec is None or spec.loader is None:
         return None
     mod = importlib.util.module_from_spec(spec)
@@ -28,6 +33,8 @@ def load_probe():
         spec.loader.exec_module(mod)
     except SystemExit:
         pass
+    except Exception:  # unimportable probe is "cannot answer" (rc 2), never "not ok" (rc 1)
+        return None
     return getattr(mod, "check_session_cron_registration", None)
 
 
