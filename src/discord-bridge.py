@@ -519,9 +519,12 @@ def _chunk_for_discord(
     if len(preview) > 1:
         # Compose-side feedback: a multi-chunk delivery means the body failed
         # the one-message cap. The composer never sees the split otherwise.
+        # Not an inequality: the split point depends on line structure, so a
+        # body AT the cap can still need two chunks. Report both, claim neither.
         print(
             f"  [delivery-gate] body needed {len(preview)} chunk(s) "
-            f"({len(text)} chars > {max_len}) — compose-side cap missed",
+            f"(body {len(text)} chars, one-message cap {max_len}) "
+            "— compose-side cap missed",
             flush=True,
         )
     if len(preview) <= max_chunks:

@@ -293,6 +293,7 @@ def parse_markers(text: str) -> ParseResult:
 
 
 _TASK_CHANNEL_RE = re.compile(r"^channel_id:\s*(\S+)\s*$", re.MULTILINE)
+_TASK_USER_RE = re.compile(r"^user_id:\s*(\S+)\s*$", re.MULTILINE)
 
 
 def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None) -> str | None:
@@ -321,6 +322,44 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None)
     holder_channel = m.group(1).strip()
     if holder_channel and str(holder_channel) != str(deduped_channel_id):
         return holder_channel
+    return None
+
+
+def task_user_id(task_text: str | None) -> str | None:
+    """The `user_id:` a task carries, or None. Owned here so callers never
+    re-derive the header grammar (CLAUDE.md: marker parsing is centralised)."""
+    if not task_text:
+        return None
+    m = _TASK_USER_RE.search(task_text)
+    return m.group(1).strip() if m else None
+
+
+def dedup_cross_sender_target(deduped_user_id, holder_task_text: str | None) -> str | None:
+    """Sender-aware dedup support — the silence the channel check cannot see.
+
+    `dedup_cross_channel_target` asks whether the reply went to another ROOM.
+    In a shared multi-member room every sender carries the SAME channel_id, so
+    folding one member's task into another member's returns None there and the
+    dedup is honoured: the holder is answered and the asker hears nothing.
+
+    Returns the holder's `user_id` when known AND different from the deduped
+    task's own. `user_id` rather than `sender_name` because a display name is
+    not unique — one human on two homeservers has two ids but one name, so
+    keying on the name merges them and misses a real cross-sender silence.
+
+    Conversely a strict id compare SPLITS that same human, so a dev/prod pair
+    can report as cross-sender when nobody was silenced. That is bounded: the
+    requeue path re-asks at most once (`dedup_requeue_count >= 1` -> report),
+    and a spurious re-ask costs a message where a missed one costs the answer.
+    """
+    if not holder_task_text:
+        return None
+    m = _TASK_USER_RE.search(holder_task_text)
+    if not m:
+        return None
+    holder_user = m.group(1).strip()
+    if holder_user and str(holder_user) != str(deduped_user_id):
+        return holder_user
     return None
 
 
@@ -381,6 +420,12 @@ _REQUEUE_REASONS = {
         f"DIFFERENT channel. Dedup is per-channel only — a cross-channel dedup leaves this "
         f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
         "Do NOT [deduped:] across channels.\n"
+    ),
+    "cross-sender": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder task was asked by a "
+        f"DIFFERENT sender. Dedup folds one reply into another task's result, which is delivered "
+        f"to whoever asked THAT task — so across senders the person who asked this one hears "
+        f"nothing. Answer THIS task directly. Only use [deduped:] within one sender's thread.\n"
     ),
     "holder-empty": lambda holder_id, asking_channel: (
         f"Your previous result used [deduped: {holder_id}], but that holder delivered nothing, "

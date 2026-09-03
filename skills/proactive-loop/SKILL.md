@@ -370,10 +370,16 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    Hash it with:
 
    ```bash
+   # 1. COMPUTE — no --commit, so nothing is stamped and you are free to decline.
+   echo '[["3166","owner"],["3274","owner"]]' |
+     python3 skills/proactive-loop/scripts/idle-surface-hash.py \
+       --state "$WORKSPACE/state/idle-streak.json"
+   # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
+
+   # 2. Post the message. THEN, and only then, stamp the set as surfaced:
    echo '[["3166","owner"],["3274","owner"]]' |
      python3 skills/proactive-loop/scripts/idle-surface-hash.py \
        --state "$WORKSPACE/state/idle-streak.json" --commit
-   # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
    ```
 
    ⚠⚠ **AND DO NOT BUILD THE LIST EITHER — pipe it from the record.** The hash script takes the
@@ -386,11 +392,23 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    is why prose cannot fix it.
 
    ```bash
+   # 1. COMPUTE — no --write and no --commit, so nothing is persisted and nothing is
+   #    stamped. `idle-held.py` prints the resulting list before it consults --write.
+   python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" \
+       --remove <id> --reason "<why>" --add <id>:<gate> \
+     | python3 skills/proactive-loop/scripts/idle-surface-hash.py \
+         --state "$WORKSPACE/state/idle-streak.json"
+   # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
+
+   # 2. Post the message. THEN persist the ops and stamp the set as surfaced:
    python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" \
        --remove <id> --reason "<why>" --add <id>:<gate> --write \
      | python3 skills/proactive-loop/scripts/idle-surface-hash.py \
          --state "$WORKSPACE/state/idle-streak.json" --commit
    ```
+
+   Both runs read the same unmutated state, so they print the same list and hash identically;
+   deferring `--write` too means a declined send leaves neither the stamp nor the ops behind.
 
    It reads `held_item_ids` from the state file and applies explicit ops; **there is no interface
    that accepts a whole list**, so a recall-built set cannot be expressed. A `--remove` of an id the
@@ -414,6 +432,13 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    still listed as "waiting only on the owner merge" **17 hours after it merged** — an FYI surface
    would have reported a blocker that no longer existed. A PR-backed held item is one `gh pr view`
    away from being checkable; retire it through `--remove <id> --reason "<why>"`.
+
+   ⚠ **Two steps, because `--commit` stamps at HASH time, not at SEND time.** The single-call form
+   is correct only when the send is unconditional — and it is not: the guardrails below tell you to
+   stay quiet when the owner is away, and step 1 tells you to keep generating instead. Committing
+   before deciding records a delivery that never happened, and the next genuinely-new change to the
+   same set is then deduped into silence — the failure this guard exists to prevent, pointing the
+   wrong way. The state keeps no history, so the stamp cannot be undone.
 
    ⚠ **Do not compute this hash yourself.** The rule used to live here as "sha1 the held-list", and an
    agent handed that instruction hashes the sentence it was about to send — so re-wording the same
