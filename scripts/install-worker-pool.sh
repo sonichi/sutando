@@ -416,10 +416,11 @@ for existing in "$LAUNCH_AGENTS"/com.sutando.worker-[0-9]*.plist; do
   # `--only-worker=2 3` would silently tear down worker 4.
   [ -z "$ONLY_WORKER" ] || continue
   base="$(basename "$existing")"
-  idx="$(pool_name seat_of "${base%.plist}" || true)"
+  label="${base%.plist}"
+  # seat_of reads a worker name; the launchd prefix must be gone by then.
+  idx="$(pool_name seat_of "${label#com.sutando.}" || true)"
   [ -n "$idx" ] || continue
   if [ "$idx" -gt "$N" ]; then
-    label="${base%.plist}"
     echo "removing stale pool member: $base"
     launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
     rm -f "$existing"

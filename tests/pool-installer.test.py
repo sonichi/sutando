@@ -78,13 +78,16 @@ class PoolInstallerHarness(unittest.TestCase):
         (home / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
         binstub = td / "bin"
         binstub.mkdir(exist_ok=True)
-        for name in ("tmux", "claude", "codex"):
+        for name in ("claude", "codex"):
             _write_exec(binstub / name, "#!/bin/bash\nexit 0\n")
-        # Recording stub: which jobs a run actually touched is the contract for
-        # --only-worker, and "exit 0" cannot answer it.
+        # Recording stubs: which jobs and sessions a run actually touched is
+        # the contract for --only-worker and shrink; "exit 0" cannot answer it.
         _write_exec(binstub / "launchctl",
                     '#!/bin/bash\n[ -n "${LAUNCHCTL_LOG:-}" ] && '
                     'printf "%s\\n" "$*" >> "$LAUNCHCTL_LOG"\nexit 0\n')
+        _write_exec(binstub / "tmux",
+                    '#!/bin/bash\n[ -n "${TMUX_LOG:-}" ] && '
+                    'printf "%s\\n" "$*" >> "$TMUX_LOG"\nexit 0\n')
         ws = td / "ws"
         ws.mkdir(exist_ok=True)
         env = dict(
@@ -588,6 +591,38 @@ class SingleCoreLifecycleTest(PoolInstallerHarness):
             r = self.run_installer(repo, env, "2", "--only-worker=5")
             self.assertEqual(r.returncode, 2, r.stdout)
             self.assertIn("outside the pool", r.stderr)
+
+    def test_shrink_ends_the_removed_workers_session_and_beat(self):
+        """`install 3` then `install 2` must end worker-3 entirely. Booting
+        out the job and deleting the plist leaves its tmux session running
+        and its beat fresh, so the lead keeps assigning to a seat nothing
+        supervises. The kept workers' sessions must survive the resize."""
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            repo, env, home, ws = self.install_pool(td, "3")
+            cores = ws / "state" / "cores"
+            cores.mkdir(parents=True, exist_ok=True)
+            for i in (1, 2, 3):
+                (cores / f"worker-{i}.alive").write_text("{}")
+            tmux_log, lctl_log = td / "tmux.log", td / "launchctl.log"
+            env2 = dict(env, TMUX_LOG=str(tmux_log), LAUNCHCTL_LOG=str(lctl_log))
+            r = self.run_installer(repo, env2, "2")
+            self.assertEqual(r.returncode, 0, f"{r.stdout}\n{r.stderr}")
+            agents = home / "Library" / "LaunchAgents"
+            self.assertFalse((agents / "com.sutando.worker-3.plist").exists())
+            self.assertTrue((agents / "com.sutando.worker-2.plist").exists())
+            self.assertIn("bootout gui/", lctl_log.read_text())
+            self.assertIn("com.sutando.worker-3", lctl_log.read_text())
+            sessions = tmux_log.read_text().splitlines()
+            self.assertIn("kill-session -t worker-3", sessions,
+                          "shrink removed the plist but left the session alive")
+            for kept in ("worker-1", "worker-2"):
+                self.assertNotIn(f"kill-session -t {kept}", sessions,
+                                 f"resize ended {kept}, which stays in the pool")
+            self.assertFalse((cores / "worker-3.alive").exists(),
+                             "a stale beat keeps the lead assigning to a ghost")
+            self.assertTrue((cores / "worker-1.alive").exists())
+            self.assertTrue((cores / "worker-2.alive").exists())
 
     def test_uninstall_only_core_removes_plist_session_and_beat(self):
         with tempfile.TemporaryDirectory() as t:
