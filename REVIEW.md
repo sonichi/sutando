@@ -471,8 +471,14 @@ and loads whichever repo it reviews.
     m5 decisive drops blockers   CAUGHT       CAUGHT          8252
     ```
 
-    Exactly the colliding pair flips; the three distinctly-sized mutants are unchanged, which
-    is what rules out "the suite is flaky" and names the size collision as the mechanism. m3's
+    The only mutant that flips is **inside** the colliding pair — m3 — while its partner m2
+    (same 8270 bytes) and the three distinctly-sized mutants are unchanged. That asymmetry is
+    what rules out "the suite is flaky": a flaky suite would move mutants at random sizes, and
+    a collision can only corrupt a mutant that *shares* a size with the one written before it.
+    **m2 and m4 survive a CLEARED cache, so they are not artifacts** — the suite genuinely does
+    not catch `staleness > -> >=` or the dropped-bar mutation. Only m3's SURVIVED was false.
+    Stating that because a reader who takes "cache collision" as the explanation for every
+    SURVIVED here would discard two real uncaught mutations along with the artifact. m3's
     mutation is caught by a test *named for it* — `test_a_commit_AT_the_approval_timestamp_
     does_not_count_as_after`, docstring "Pins the boundary so widening `>` to `>=` cannot pass
     silently" — so the harness reported SURVIVED about a mutant the suite catches by design.
