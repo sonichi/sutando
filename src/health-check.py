@@ -5257,39 +5257,53 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         )
         return check
 
-    # The proxy records the LAST response through it, whoever sent it: a
-    # rejection while both windows are far from full is another client's gate.
-    util = _quota_utilizations(headers)
-    if util is not None and max(util) < 0.9:
+    # Every unified window is read, not just 5h/7d: a per-model window such as
+    # 7d_oi can be the one rejected while the headline windows sit low.
+    windows = _quota_windows(headers)
+    full = [w for w, (u, st) in windows.items() if st == "rejected" or (u is not None and u >= 0.9)]
+    if windows and not full:
+        summary = ", ".join(f"{w} {u:.0%}" for w, (u, st) in windows.items() if u is not None)
         check["status"] = "warn"
         check["detail"] = (
             f"last response through the shared credential proxy was rejected "
-            f"(status={status}) but this core's windows are at {util[0]:.0%} (5h) / "
-            f"{util[1]:.0%} (7d) — another client's per-model or usage-credit limit "
-            "is the likely source (a seat out of credits); not paging. If THIS core "
-            "were stuck, its own passes would stop and quota-telemetry would go stale."
+            f"(status={status}) but none of this core's windows is near full ({summary}) "
+            "— another client's limit is the likely source (a seat out of credits); "
+            "not paging. If THIS core were stuck, its own passes would stop and "
+            "quota-telemetry would go stale."
         )
         return check
 
     reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
     reset_note = f" 5h window resets {reset}." if reset else ""
+    window_note = ""
+    if full:
+        window_note = " Exhausted window(s): " + ", ".join(
+            f"{w} ({windows[w][0]:.0%}, {windows[w][1] or 'no status'})" for w in full) + "."
     check["status"] = "fail"
     check["detail"] = (
-        f"CORE IS OVER QUOTA (rate-limit status={status}).{reset_note} The core "
+        f"CORE IS OVER QUOTA (rate-limit status={status}).{window_note}{reset_note} The core "
         "cannot process tasks until quota resets or you switch models (/model) — "
         "this is the 'stuck silently' condition; tasks will queue undelivered."
     )
     return check
 
 
-def _quota_utilizations(headers: dict):
-    """(5h, 7d) utilization fractions from the unified headers, or None when
-    either is absent or unparseable — an unknown reading corroborates nothing."""
-    try:
-        return (float(headers["anthropic-ratelimit-unified-5h-utilization"]),
-                float(headers["anthropic-ratelimit-unified-7d-utilization"]))
-    except (KeyError, TypeError, ValueError):
-        return None
+def _quota_windows(headers: dict) -> dict:
+    """Every `anthropic-ratelimit-unified-<window>-utilization` header, keyed by
+    window, as (utilization or None, that window's own status or None)."""
+    out = {}
+    prefix, suffix = "anthropic-ratelimit-unified-", "-utilization"
+    for k, v in headers.items():
+        if not (k.startswith(prefix) and k.endswith(suffix)):
+            continue
+        w = k[len(prefix):-len(suffix)]
+        try:
+            u = float(v)
+        except (TypeError, ValueError):
+            u = None
+        st = headers.get(f"{prefix}{w}-status")
+        out[w] = (u, str(st) if st is not None else None)
+    return out
 
 
 def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:

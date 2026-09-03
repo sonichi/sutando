@@ -51,7 +51,7 @@ class TestCoreQuotaExhausted(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _write(self, *, available, status, age_sec=0, reset=None, util=None):
+    def _write(self, *, available, status, age_sec=0, reset=None, util=None, extra=None):
         payload = {"available": available, "headers": {
             "anthropic-ratelimit-unified-status": status,
         }}
@@ -60,6 +60,8 @@ class TestCoreQuotaExhausted(unittest.TestCase):
         if util is not None:
             payload["headers"]["anthropic-ratelimit-unified-5h-utilization"] = str(util[0])
             payload["headers"]["anthropic-ratelimit-unified-7d-utilization"] = str(util[1])
+        for k, v in (extra or {}).items():
+            payload["headers"][k] = v
         self.qpath.write_text(json.dumps(payload))
         if age_sec:
             old = time.time() - age_sec
@@ -146,8 +148,25 @@ class TestCoreQuotaExhausted(unittest.TestCase):
         c = self.hc.check_core_quota_exhausted()
         self.assertEqual(c["status"], "warn")
         self.assertIn("shared credential proxy", c["detail"])
-        self.assertIn("13% (5h)", c["detail"])
-        self.assertIn("52% (7d)", c["detail"])
+        self.assertIn("5h 13%", c["detail"])
+        self.assertIn("7d 52%", c["detail"])
+
+    def test_rejected_per_model_window_at_full_still_fails_and_names_it(self):
+        # Live shape 2026-09-03: 5h 13% / 7d 52%, but 7d_oi rejected at 100%.
+        self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
+            "anthropic-ratelimit-unified-7d_oi-utilization": "1.0",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("7d_oi (100%, rejected)", c["detail"])
+
+    def test_per_window_rejected_status_counts_even_below_the_utilization_bar(self):
+        self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
+            "anthropic-ratelimit-unified-overage-utilization": "0.5",
+            "anthropic-ratelimit-unified-overage-status": "rejected"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("overage (50%, rejected)", c["detail"])
 
     def test_rejected_with_a_window_near_full_still_fails(self):
         self._write(available=False, status="rejected", util=(0.97, 0.52))
