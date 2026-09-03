@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Callable
 
 
 # A dot is legal inside an id: pool_lead allows [A-Za-z0-9._~-] and excludes the
@@ -64,10 +65,10 @@ def archive_id_from_filename(name: str) -> str | None:
     return _stem_of(name)
 
 
-def _declared_id(path: Path) -> str | None:
+def declared_task_id(path: Path) -> str | None:
     """The `id:` a task file persists in its header block, or None."""
     try:
-        text = path.read_text(errors="replace")
+        text = Path(path).read_text(errors="replace")
     except OSError:
         return None
     head = text.split("\ntask:", 1)[0]
@@ -75,36 +76,42 @@ def _declared_id(path: Path) -> str | None:
     return m.group(1) if m else None
 
 
+def task_id_for(path: Path, *, accept: Callable[[str], bool] | None = None) -> str | None:
+    """The canonical id of a task file, live or quarantined, or None.
+
+    The persisted `id:` is the positive authority: a gateway id may itself end
+    in `.claimed-<x>`, and only the header tells it from a pool rename. The
+    filename answers only for a file that declares nothing (or nothing
+    `accept` admits). `accept` is the caller's id grammar; this module has none.
+    """
+    declared = declared_task_id(path)
+    if declared is not None and (accept is None or accept(declared)):
+        return declared
+    parsed = archive_id_from_filename(Path(path).name)
+    if parsed is None or (accept is not None and not accept(parsed)):
+        return None
+    return parsed
+
+
 def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     """Return the actual task file path for task_id, or None if absent.
 
-    Checks the bare name first (unclaimed), then any state variant. State
-    matching goes through `task_id_from_filename` itself — a second, narrower
-    pattern here is exactly how one state gets handled and its sibling missed.
-    If multiple variants exist (shouldn't happen but defensive), returns the
-    first lexicographic match; the caller only needs one path to archive.
+    Checks the bare name first (unclaimed), then every variant — pool state or
+    quarantine — through the one predicate `task_id_for`, so the persisted id
+    is the same authority for a quarantined file as for a live one. A live
+    variant outranks a quarantine; ties fall to the first lexicographic name.
     """
     bare = tasks_dir / f"{task_id}.txt"
     if bare.exists():
         return bare
-    # An ordinary id may end in `.claimed-<x>`; only the persisted header can
-    # tell it from a pool rename, so a variant that declares another id is not ours.
     matches = sorted(
-        p for p in tasks_dir.glob(f"{task_id}.*")
-        if p.name != bare.name and task_id_from_filename(p.name) == task_id
-        and _declared_id(p) in (None, task_id)
+        (p for p in tasks_dir.glob(f"{task_id}.*")
+         if p.name != bare.name and task_id_for(p) == task_id),
+        # A quarantine has left the .txt glob; it answers only when no live
+        # variant does, since routing still needs its surviving header block.
+        key=lambda p: (not p.name.endswith(".txt"), p.name),
     )
-    if matches:
-        return matches[0]
-    # Quarantined last: it is the task's only surviving header block, and
-    # routing needs those headers or a failed archive also strands the reply.
-    quarantined = sorted(
-        p for p in tasks_dir.glob(f"{task_id}.txt.archive-failed*")
-        # The glob is a prefix match: an ordinary record can start with this
-        # string, so only a name whose PARSED id equals task_id may answer.
-        if archive_id_from_filename(p.name) == task_id
-    )
-    return quarantined[0] if quarantined else None
+    return matches[0] if matches else None
 
 
 # Collision NAMING lives here (_move_without_clobbering mints `.N`); collision

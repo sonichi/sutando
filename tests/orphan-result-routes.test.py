@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -87,20 +88,58 @@ class OrphanResultRoutesTest(unittest.TestCase):
         has to see it or the result is undeliverable forever.
         """
         tid = self._result()
-        (self.tasks / f"{tid}.txt.archive-failed").write_text(task_text())
+        (self.tasks / f"{tid}.txt.archive-failed").write_text(task_text(task_id=tid))
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
 
     def test_a_suffixed_quarantine_still_yields_its_route(self):
         tid = self._result()
-        (self.tasks / f"{tid}.txt.archive-failed.1").write_text(task_text())
+        (self.tasks / f"{tid}.txt.archive-failed.1").write_text(task_text(task_id=tid))
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_a_quarantine_declaring_another_id_is_not_this_tasks_header(self):
+        """The persisted id is the authority for a quarantine as for a live
+        file: a leftover that declares a different task must not lend its
+        channel to this result. A headerless quarantine still answers by name."""
+        tid = self._result()
+        (self.tasks / f"{tid}.txt.archive-failed").write_text(task_text(task_id="task-other"))
+        self.assertEqual(self.routes(), {})
+        (self.tasks / f"{tid}.txt.archive-failed").write_text(
+            task_text(task_id=tid).replace(f"id: {tid}\n", ""))
+        self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+
+    def test_a_quarantined_state_looking_id_keeps_its_route_by_declared_id(self):
+        """`task-a.claimed-review` is a gateway id. Once a failed archive
+        quarantines it, the filename alone reads as a claim of `task-a`; the
+        persisted id keeps the long result routable and the short one denied."""
+        long_id = "task-a.claimed-review"
+        src = self.tasks / f"{long_id}.txt"
+        src.write_text(task_text(task_id=long_id))
+        real = _task_archive._move_without_clobbering
+        calls = []
+
+        def first_fails(s, d):
+            calls.append(d.name)
+            if len(calls) == 1:
+                raise OSError(5, "simulated archive failure")
+            return real(s, d)
+
+        with mock.patch.object(_task_archive, "_move_without_clobbering", side_effect=first_fails):
+            ok = _task_archive.archive_file(
+                src, "tasks", long_id, tasks_dir=self.archive,
+                results_dir=self.results / "archive", log=lambda *a: None)
+        self.assertTrue(ok)
+        self.assertTrue((self.tasks / f"{long_id}.txt.archive-failed").exists())
+        self._result("task-a")
+        self.assertEqual(self.routes(), {})
+        self._result(long_id)
+        self.assertEqual(self.routes(), {long_id: SNOWFLAKE})
 
     def test_a_quarantined_long_id_does_not_route_the_short_ids_result(self):
         """`task-a.txt.archive-failed-review.txt` that itself failed to archive
         is `…txt.archive-failed`; its id is read from the rightmost .txt, so a
         result for plain `task-a` is not routed with the long task's channel."""
         long_id = "task-a.txt.archive-failed-review"
-        (self.tasks / f"{long_id}.txt.archive-failed").write_text(task_text())
+        (self.tasks / f"{long_id}.txt.archive-failed").write_text(task_text(task_id=long_id))
         self._result("task-a")
         self.assertEqual(self.routes(), {})
         self._result(long_id)

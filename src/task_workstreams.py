@@ -25,7 +25,7 @@ from typing import Optional
 
 import local_task_protocol
 from result_markers import parse_markers
-from task_archive import archive_id_from_filename, task_id_from_filename
+from task_archive import task_id_for
 from workspace_default import status_read_path
 
 
@@ -218,22 +218,10 @@ def _parse_timestamp(raw: str, fallback: float) -> float:
         return fallback
 
 
-def _declared_id(path: Path) -> str | None:
-    try:
-        content = path.read_text(errors="replace")
-    except OSError:
-        return None
-    declared = local_task_protocol.parse_task_headers_lenient(content).headers.get("id")
-    return str(declared) if declared else None
-
-
-def _archive_task_id(name: str) -> str | None:
-    """Prefix-agnostic id for an archived file (ask-*, sc-ask-*, reco-skill-*),
-    gated by the archive lookup contract; the live pool grammar stays task-*."""
-    task_id = archive_id_from_filename(name)
-    if task_id is None or not local_task_protocol.valid_archive_lookup_id(task_id):
-        return None
-    return task_id
+def _task_id_of(path: Path) -> str | None:
+    """Canonical id of a task file under the archive-lookup grammar; the
+    persisted `id:` outranks the filename, and pool suffixes canonicalize."""
+    return task_id_for(path, accept=local_task_protocol.valid_archive_lookup_id)
 
 
 def _task_paths(tasks_dir: Path):
@@ -242,16 +230,9 @@ def _task_paths(tasks_dir: Path):
     candidates = list(tasks_dir.glob("task-*.txt"))
     candidates.extend((tasks_dir / "processed").glob("task-*.txt"))
     candidates.extend(local_task_protocol.iter_archived_tasks(tasks_dir))
-    # Keyed on the canonical id, and the persisted `id:` outranks the filename:
-    # a gateway id may itself end in `.claimed-<x>`; only the header can tell.
     for path in candidates:
-        task_id = task_id_from_filename(path.name) or _archive_task_id(path.name)
-        if task_id is None:
-            continue
-        declared = _declared_id(path)
-        if declared is not None and local_task_protocol.valid_archive_lookup_id(declared):
-            task_id = declared
-        if task_id in seen:
+        task_id = _task_id_of(path)
+        if task_id is None or task_id in seen:
             continue
         seen.add(task_id)
         yield task_id, path
