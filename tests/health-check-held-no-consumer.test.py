@@ -93,9 +93,31 @@ check("live-shape", _probe(_live_shape), "warn",
 # Something parked seconds ago is in flight, not stranded.
 check("under-threshold", _probe(_fresh), "ok", ("no undisposed",))
 
+# A file the probe cannot stat is partial coverage, never a clean pass. This is
+# the branch a later simplification is most likely to fold into `ok`.
+def _unreadable(results):
+    held = results / "held-no-consumer"
+    held.mkdir()
+    _touch(held / "parked.no-push-transport.txt")
+    # Readable but not executable: iterdir lists the name, stat on the child
+    # raises EACCES. Root ignores mode bits, so skip rather than assert there.
+    held.chmod(0o400)
+
+
+if os.geteuid() != 0:
+    _root = Path(tempfile.mkdtemp())
+    (_root / "results").mkdir()
+    _unreadable(_root / "results")
+    hc.WORKSPACE_DIR = _root
+    _res = hc.check_held_no_consumer()
+    (_root / "results" / "held-no-consumer").chmod(0o700)
+    check("unreadable", _res, "warn", ("coverage is partial, not clean",))
+else:
+    print("note: running as root — unreadable arm skipped, mode bits do not apply")
+
 if FAILURES:
     print("FAIL")
     for line in FAILURES:
         print(" ", line)
     sys.exit(1)
-print("PASS: 6 controls, both directions")
+print("PASS: 7 controls, both directions")

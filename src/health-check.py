@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import statistics
 import shutil
 import tempfile
@@ -7475,12 +7476,15 @@ def check_held_no_consumer(threshold_age_sec: int = 3600) -> dict:
         # Per-file isolation, same reason as check_orphaned_results: one
         # unreadable entry must not decide the answer for the directory.
         try:
-            if not path.is_file():
-                continue
-            age = int(now - path.stat().st_mtime)
+            # stat FIRST: is_file() swallows EACCES and returns False, so an
+            # unreadable entry would `continue` instead of counting as partial.
+            st = path.stat()
         except OSError:
             unreadable += 1
             continue
+        if not stat.S_ISREG(st.st_mode):
+            continue
+        age = int(now - st.st_mtime)
         if any(tok in path.name for tok in disposed_tokens):
             disposed += 1
             continue
