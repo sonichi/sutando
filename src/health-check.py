@@ -1545,13 +1545,13 @@ def check_env_split(repo_env: "Path | None" = None,
         PUNCT = set("();<>|&")
 
         def _segment(words):
-            """One command's words -> (names it persists, was-pure-assignment)."""
+            """One command's words -> the names bash provably persists."""
             if not words:
-                return set(), True
+                return set()
             if words[0] == "export":
                 # export's bare-name args only mark existing vars; every
                 # assignment among them persists, so no word ends the scan.
-                return {n for n in map(_assign, words[1:]) if n}, True
+                return {n for n in map(_assign, words[1:]) if n}
             names, i = [], 0
             while i < len(words):
                 w = words[i]
@@ -1561,7 +1561,7 @@ def check_env_split(repo_env: "Path | None" = None,
                     i += 1
                     continue
                 if w == "export":
-                    return {n for n in map(_assign, words[i + 1:]) if n}, True
+                    return {n for n in map(_assign, words[i + 1:]) if n}
                 # `[fd]> target` on a pure assignment leaves it an assignment.
                 fd = w.isdigit() and i + 1 < len(words) and words[i + 1] in REDIR_OPS
                 if w in REDIR_OPS or fd:
@@ -1569,8 +1569,10 @@ def check_env_split(repo_env: "Path | None" = None,
                     continue
                 if w and set(w) <= PUNCT:
                     raise _Unmodelled("unparseable")
-                return set(), False                    # `A=1 cmd` is a PREFIX
-            return set(names), True                    # pure assignment persists
+                # Any command (`readonly X=1`, `false`, `A=1 cmd`) has an effect
+                # and an exit status this probe cannot prove: UNKNOWN, not empty.
+                raise _Unmodelled("unmodelled-command")
+            return set(names)                          # pure assignment persists
 
         for line in text.splitlines():
             lex = shlex.shlex(line, posix=True, punctuation_chars=True)
@@ -1593,12 +1595,7 @@ def check_env_split(repo_env: "Path | None" = None,
                             break          # comment: the rest of the line is text
                         words.append(tok)
                         continue
-                    names, pure = _segment(words)
-                    out.update(names)
-                    # `cmd && X=1` loads X only on exit 0 (and `set -e` aborts
-                    # otherwise) — an exit status this probe cannot prove.
-                    if tok == "&&" and not pure:
-                        return None, "status-dependent"
+                    out.update(_segment(words))
                     words = []
             except _Unmodelled as exc:
                 return None, str(exc)
@@ -1647,10 +1644,11 @@ def check_env_split(repo_env: "Path | None" = None,
                 "classified (unbalanced quote, or a list operator this probe "
                 "does not model) — fix the syntax or simplify the line"
             ),
-            frozenset({"status-dependent"}): (
-                "a `&&` follows a command, so whether its right-hand assignments "
-                "load depends on that command's exit status (and `set -e` aborts "
-                "the load on failure) — put the assignments on their own line"
+            frozenset({"unmodelled-command"}): (
+                "a line runs a command rather than a plain assignment or export "
+                "(e.g. `readonly X=1`, `false; X=1`, `cmd && X=1`); what it sets, "
+                "and whether `set -e` lets the rest of the file load, are not "
+                "proven — put each credential on its own assignment line"
             ),
             frozenset({"invalid-identifier"}): (
                 "a line assigns to a name bash does not accept as a variable "

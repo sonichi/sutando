@@ -313,7 +313,7 @@ for _label, _line, _persists in [
 # and forms whose effect is NOT proven must be UNKNOWN — never "absent".
 for _label, _line, _want in [
     ("successful command then &&: exit status unmodelled -> UNKNOWN",
-     "true && DISCORD_BOT_TOKEN=old", "status-dependent"),
+     "true && DISCORD_BOT_TOKEN=old", "unmodelled-command"),
     ("pure assignment then && (control): named", "GEMINI_API_KEY=o && DISCORD_BOT_TOKEN=old", "named"),
     ("append-assignment persists", "DISCORD_BOT_TOKEN+=old", "named"),
     ("assignment with a redirection persists", "DISCORD_BOT_TOKEN=old >/dev/null", "named"),
@@ -340,8 +340,8 @@ for _label, _line, _want in [
         check(f"loader grammar: {_label} (not absence)", "is missing" in _d, False)
         check(f"loader grammar: {_label} (no merge advice for the bad name)", "1BAD" in _d and "merged" in _d, False)
 
-# The SELECTED side obeys the same grammar: a command-prefix assignment there
-# does not persist, so the other file's copy is genuinely stranded.
+# The SELECTED side obeys the same grammar: a command there makes the selected
+# key set unproven, so the probe WARNs UNKNOWN rather than claiming a diff.
 with tempfile.TemporaryDirectory() as td:
     td = Path(td)
     (td / "repo").mkdir(); (td / "ws").mkdir()
@@ -350,8 +350,54 @@ with tempfile.TemporaryDirectory() as td:
     _we_.write_text("GEMINI_API_KEY=sel\nDISCORD_BOT_TOKEN=persistent\n")
     with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
         _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
-    check("command prefix in the SELECTED file leaves the other key stranded",
-          _r is not None and "DISCORD_BOT_TOKEN" in _r["detail"], True)
+    check("command prefix in the SELECTED file is UNKNOWN, never silent",
+          _r is not None and "could not be completed" in _r["detail"]
+          and "selected repo" in _r["detail"]
+          and "unmodelled-command" in _r["detail"], True)
+
+# 10. A command segment is UNKNOWN at `;` and end-of-line, not an empty parse.
+# Expectations come from bash itself (`set -e; set -a; .` inside a function).
+import shutil as _shutil
+import subprocess as _sp
+
+
+def _bash_load(path):
+    """(rc, DISCORD_BOT_TOKEN set?) after the loader-shaped source of path."""
+    _p = _sp.run(
+        ["bash", "-c",
+         'trap \'echo "rc=$? set=${DISCORD_BOT_TOKEN+yes}"\' EXIT; '
+         'f(){ set -e; set -a; . "$1"; }; f "$1"', "_", str(path)],
+        capture_output=True, text=True)
+    _rc, _set = _p.stdout.split()
+    return int(_rc[3:]), _set == "set=yes"
+
+
+for _label, _line, _bash, _want in [
+    ("plain assignment (control)", "DISCORD_BOT_TOKEN=old", (0, True), "named"),
+    ("persistent builtin at end-of-line", "readonly DISCORD_BOT_TOKEN=old",
+     (0, True), "unmodelled-command"),
+    ("failed command then semicolon", "false; DISCORD_BOT_TOKEN=old",
+     (1, False), "unmodelled-command"),
+]:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "repo").mkdir(); (td / "ws").mkdir()
+        _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+        _re_.write_text("GEMINI_API_KEY=selected\n")
+        _we_.write_text("GEMINI_API_KEY=other\n" + _line + "\n")
+        if _shutil.which("bash"):
+            check(f"bash oracle: {_label}", _bash_load(_we_), _bash)
+        with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+            _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    _d = "" if _r is None else _r["detail"]
+    if _want == "named":
+        check(f"command segment: {_label}",
+              "DISCORD_BOT_TOKEN" in _d and "is missing" in _d, True)
+    else:
+        check(f"command segment: {_label} (UNKNOWN, not silent)",
+              _r is not None and _want in _d, True)
+        check(f"command segment: {_label} (no invented key)",
+              "DISCORD_BOT_TOKEN" in _d or "is missing" in _d, False)
 
 # 9. `||` short-circuits after a SUCCESSFUL assignment, so bash never reaches
 # the right side. Rather than model exit status, the probe answers UNKNOWN.
