@@ -5163,7 +5163,7 @@ def _fmt_quota_reset(epoch_str: Optional[str]) -> str:
 
 
 
-def _rejection_epoch(entry: object) -> float | None:
+def _rejection_epoch(entry: object) -> "float | None":
     if not isinstance(entry, dict):
         return None
     ts = entry.get("ts")
