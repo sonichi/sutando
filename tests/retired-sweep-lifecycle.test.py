@@ -74,6 +74,8 @@ with tempfile.TemporaryDirectory() as td:
               routing.proactive_destination(pub[0].name) == "slack", pub[0].name)
         check("the name is a bridge-claimable proactive-*.txt",
               pub[0].name.startswith("proactive-") and pub[0].name.endswith(".txt"), pub[0].name)
+        check("the source's own proactive- prefix is not repeated in the name",
+              pub[0].name.startswith("proactive-late-42-"), pub[0].name)
     check("a second sweep republishes nothing (no duplicate)",
           rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [])
     for f in late_files(d):

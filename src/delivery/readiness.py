@@ -169,6 +169,8 @@ def _late_name(inode: Path, now: float) -> str:
             break
     m = _TYPED_STEM_RE.match(stem)
     base, dest = (m.group("base"), m.group("dest") or "") if m else (stem, "")
+    if base.startswith("proactive-"):
+        base = base[len("proactive-"):]
     return f"proactive-late-{base}-{int(now)}{dest}.txt"
 
 
