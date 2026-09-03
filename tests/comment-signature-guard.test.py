@@ -6,12 +6,18 @@ commit email (hooks/comment-signature-guard.py).
 Run:  python3 tests/comment-signature-guard.test.py
 """
 import importlib.util
+import json
 import os
+import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks" / "comment-signature-guard.py"
+# The hook has NO default identity, so the direct-call tests must state which
+# one they exercise — the same thing a deploying node has to do.
+os.environ["SUTANDO_AGENT_MXID"] = "qingyun-air.agent"
 _spec = importlib.util.spec_from_file_location("csg", HOOK)
 G = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(G)
@@ -22,6 +28,29 @@ OLD = f"Signed: @{MX}:ag2.space (air, Qingyun's agent)"
 
 
 class SignatureGuard(unittest.TestCase):
+    def test_an_unset_MXID_does_not_enforce_a_stranger_identity(self):
+        """A node deploying this without SUTANDO_AGENT_MXID would otherwise
+        enforce whoever wrote the default and deny every comment (sonichi)."""
+        env = dict(os.environ)
+        env.pop("SUTANDO_AGENT_MXID", None)
+        env.pop("SUTANDO_ALLOW_UNSIGNED_COMMENT", None)
+        r = subprocess.run([sys.executable, str(HOOK)],
+                           input=json.dumps({"tool_name": "Bash", "tool_input": {
+                               "command": 'gh pr comment 1 --body "unsigned"'}}),
+                           capture_output=True, text=True, env=env)
+        self.assertNotIn('"permissionDecision": "deny"', r.stdout)
+        self.assertIn("SUTANDO_AGENT_MXID unset", r.stderr)
+
+    def test_an_explicit_MXID_still_enforces(self):
+        env = dict(os.environ)
+        env["SUTANDO_AGENT_MXID"] = "some-other.agent"
+        env.pop("SUTANDO_ALLOW_UNSIGNED_COMMENT", None)
+        r = subprocess.run([sys.executable, str(HOOK)],
+                           input=json.dumps({"tool_name": "Bash", "tool_input": {
+                               "command": 'gh pr comment 1 --body "unsigned"'}}),
+                           capture_output=True, text=True, env=env)
+        self.assertIn('"permissionDecision": "deny"', r.stdout)
+
     def test_an_unsigned_inline_comment_is_flagged(self):
         self.assertIsNotNone(G.unsigned_body('gh pr comment 1 --body "findings below"'))
 

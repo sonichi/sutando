@@ -17,7 +17,9 @@ import re
 import shlex
 import sys
 
-MXID = os.environ.get("SUTANDO_AGENT_MXID", "qingyun-air.agent")
+# No default: a node that deploys this without SUTANDO_AGENT_MXID would
+# otherwise enforce another agent's identity and deny every comment.
+MXID = os.environ.get("SUTANDO_AGENT_MXID", "")
 BODY_FLAGS = {"--body", "-b"}
 FILE_FLAGS = {"--body-file", "-F"}
 # Only subcommands that PUBLISH prose under this login. `gh pr view`, `gh api`
@@ -77,6 +79,10 @@ def unsigned_body(command):
 
 def main(argv):
     if os.environ.get("SUTANDO_ALLOW_UNSIGNED_COMMENT") == "1":
+        return 0
+    if not MXID:
+        print("comment-signature-guard: SUTANDO_AGENT_MXID unset — not enforcing",
+              file=sys.stderr)
         return 0
     try:
         payload = json.load(sys.stdin)
