@@ -1518,3 +1518,31 @@ class ChannelEnvTierTests(EnvCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class DegradeReasonFromTests(unittest.TestCase):
+    """The server's own error text reaches the caller; auth statuses keep the local diagnosis in front."""
+
+    @staticmethod
+    def _err(code, body):
+        import io
+        from urllib.error import HTTPError
+        return HTTPError("http://gw/v1/room", code, "x", {}, io.BytesIO(body.encode()))
+
+    def test_403_appends_the_servers_reason(self):
+        r = _gateway.degrade_reason_from(self._err(403, '{"error": "permission denied: platform grant events.subscribe missing"}'))
+        self.assertIn("not a joined member", r)
+        self.assertIn("events.subscribe missing", r)
+
+    def test_401_appends_too_and_keeps_the_token_diagnosis(self):
+        r = _gateway.degrade_reason_from(self._err(401, '{"error": "denied - agent not a joined member"}'))
+        self.assertTrue(r.startswith("auth failed"))
+        self.assertIn("server said", r)
+
+    def test_non_auth_status_uses_the_servers_text(self):
+        self.assertEqual(_gateway.degrade_reason_from(self._err(404, '{"error": "roadmap/plan.md not found"}')),
+                         "roadmap/plan.md not found")
+
+    def test_no_body_falls_back_to_the_status_text(self):
+        self.assertEqual(_gateway.degrade_reason_from(self._err(403, "")), _gateway.degrade_reason(403))
+

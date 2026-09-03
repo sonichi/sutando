@@ -263,6 +263,28 @@ def degrade_reason(code):
     return f"HTTP {code}"
 
 
+# Statuses whose local diagnosis must not be overwritten by the server's prose:
+# 401 points at the bearer, 403 at authorization. The server's text is appended.
+AUTH_STATUSES = frozenset({401, 403})
+
+
+def degrade_reason_from(err):
+    """degrade_reason() plus what the server actually said (`{"error": ...}`).
+    Measured 2026-09-02: a 403 that read "not a joined member" was really
+    "platform grant events.subscribe missing" — a different subsystem entirely."""
+    reason = degrade_reason(err.code)
+    try:
+        parsed = json.loads(err.read().decode("utf-8") or "{}")
+    except Exception:
+        parsed = None
+    server_msg = str(parsed.get("error")) if isinstance(parsed, dict) and parsed.get("error") else ""
+    if not server_msg:
+        return reason
+    if err.code in AUTH_STATUSES:
+        return f"{reason} (server said: {server_msg})"
+    return server_msg
+
+
 def quote(s):
     return urllib.parse.quote(s, safe="")
 
