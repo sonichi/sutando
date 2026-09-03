@@ -157,6 +157,16 @@ def _heredoc_owner(prefix):
     return None
 
 
+def _is_gh(word: str) -> bool:
+    """A path-qualified `gh` is still gh. `_heredoc_owner` already basenames;
+    the main scan compared the whole word, so an absolute path slipped past."""
+    return word.rsplit("/", 1)[-1] == "gh"
+
+
+def _has_gh(words) -> bool:
+    return any(_is_gh(w) for w in words)
+
+
 def classify(command: str) -> Optional[str]:
     """Return 'APPROVE' / 'REQUEST_CHANGES' / 'COMMENT', or None if not a formal review."""
     if not isinstance(command, str) or "gh" not in command:
@@ -204,8 +214,8 @@ def classify(command: str) -> Optional[str]:
             nested = classify(inner)
             if nested is not None:
                 return nested
-        if "gh" in low and "pr" in low and "review" in low:
-            starts = [i for i, w in enumerate(low) if w == "gh"]
+        if _has_gh(low) and "pr" in low and "review" in low:
+            starts = [i for i, w in enumerate(low) if _is_gh(w)]
             if any(low[i + 1:i + 3] == ["pr", "review"] for i in starts):
                 for w in low:
                     flag = w.lstrip("-")
@@ -219,7 +229,7 @@ def classify(command: str) -> Optional[str]:
                     return "COMMENT"
                 # `gh pr review` with no event flag opens an interactive prompt.
                 return "COMMENT"
-        if "gh" in low and "api" in low and _API_REVIEWS.search(seg):
+        if _has_gh(low) and "api" in low and _API_REVIEWS.search(seg):
             m = _API_EVENT.search(seg)
             if m:
                 return m.group(1)
