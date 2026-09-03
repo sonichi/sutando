@@ -193,16 +193,18 @@ def case_aa_gateway_plan_requires_a_token() -> list[str]:
     fails = []
     # Shut the vault off at channel_token, NOT hc.token_from_vault: the plan
     # calls gateway_token() with no vault_get, so the real Keychain answers.
-    with mock.patch("channel_token.token_from_vault", return_value=""), \
+    with tempfile.TemporaryDirectory() as td, \
+         mock.patch("channel_token.token_from_vault", return_value=""), \
          mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
          mock.patch.object(hc, "_load_channel_env", return_value={}), \
-         mock.patch.dict(os.environ, {}, clear=True):
+         mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": td}, clear=True):
         if hc._bridge_launch_plan("gateway-bridge") is not None:
             fails.append("aa) tokenless gateway must yield no launch plan")
-    with mock.patch("channel_token.token_from_vault", return_value=""), \
+    with tempfile.TemporaryDirectory() as td, \
+         mock.patch("channel_token.token_from_vault", return_value=""), \
          mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
          mock.patch.object(hc, "_load_channel_env", side_effect=_channel_env), \
-         mock.patch.dict(os.environ, {}, clear=True):
+         mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": td}, clear=True):
         plan = hc._bridge_launch_plan("gateway-bridge")
         if plan is None:
             fails.append("aa) gateway with a channel-env token must yield a plan")
@@ -221,15 +223,54 @@ def case_ab_ag2_remote_token_alias_is_accepted() -> list[str]:
     so a host with only that alias must be launchable — otherwise the check warns
     forever about a bridge --fix structurally refuses to start."""
     fails = []
-    with mock.patch("channel_token.token_from_vault", return_value=""), \
+    with tempfile.TemporaryDirectory() as td, \
+         mock.patch("channel_token.token_from_vault", return_value=""), \
          mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
          mock.patch.object(hc, "_load_channel_env", return_value={"AG2_REMOTE_TOKEN": "alias-tok"}), \
-         mock.patch.dict(os.environ, {}, clear=True):
+         mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": td}, clear=True):
         plan = hc._bridge_launch_plan("gateway-bridge")
         if plan is None:
             fails.append("ab) AG2_REMOTE_TOKEN alone must yield a plan")
         elif plan[1].get("REMOTE_TASK_TOKEN") != "alias-tok":
             fails.append("ab) alias must be normalised into REMOTE_TASK_TOKEN")
+    return fails
+
+
+def case_ad_gateway_plan_follows_the_lane() -> list[str]:
+    """The launch plan sources the LANE's .env, not prod's: the bridge child
+    runs on channels/<REMOTE_TASK_CHANNEL_DIR>/, so a plan built from
+    channels/ag2space/ recovers a dev host with prod's credential (or none)."""
+    fails = []
+    asked: list[str] = []
+
+    def _lane_env(channel: str) -> dict:
+        asked.append(channel)
+        return {"dev": {"REMOTE_TASK_TOKEN": "dev-lane-token"}}.get(channel, {})
+
+    with tempfile.TemporaryDirectory() as td, \
+         mock.patch("channel_token.token_from_vault", return_value=""), \
+         mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+         mock.patch.object(hc, "_load_channel_env", side_effect=_lane_env), \
+         mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": td,
+                                      "REMOTE_TASK_CHANNEL_DIR": "dev"}, clear=True):
+        plan = hc._bridge_launch_plan("gateway-bridge")
+        if asked != ["dev"]:
+            fails.append(f"ad) plan must source the dev lane's .env, asked for {asked}")
+        if plan is None:
+            fails.append("ad) a dev-lane host with a dev token must yield a plan")
+        elif plan[1].get("REMOTE_TASK_TOKEN") != "dev-lane-token":
+            fails.append("ad) plan must carry the dev lane's token")
+    # Control: with the lane unset the plan still sources prod, and prod is empty.
+    asked.clear()
+    with tempfile.TemporaryDirectory() as td, \
+         mock.patch("channel_token.token_from_vault", return_value=""), \
+         mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+         mock.patch.object(hc, "_load_channel_env", side_effect=_lane_env), \
+         mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": td}, clear=True):
+        if hc._bridge_launch_plan("gateway-bridge") is not None:
+            fails.append("ad) control: an unset lane must not find the dev token")
+        if asked != ["ag2space"]:
+            fails.append(f"ad) control: an unset lane must source ag2space, asked for {asked}")
     return fails
 
 
@@ -1185,7 +1226,8 @@ def main() -> int:
                  case_z_gateway_other_warns_never_respawn,
                  case_aa_gateway_plan_requires_a_token,
                  case_ab_ag2_remote_token_alias_is_accepted,
-                 case_ac_unknown_name_without_detail_is_untouched):
+                 case_ac_unknown_name_without_detail_is_untouched,
+                 case_ad_gateway_plan_follows_the_lane):
         fails = case()
         status = "PASS" if not fails else "FAIL"
         print(f"  {status} {case.__name__}")

@@ -53,7 +53,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
-from channel_token import gateway_token as _gateway_token  # noqa: E402
+from channel_token import gateway_channel_dir as _gateway_channel_dir, gateway_token as _gateway_token  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
 import slack_access  # noqa: E402
@@ -3652,12 +3652,11 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
     child_env = os.environ.copy()
     if name == "gateway-bridge":
         # The bridge exits without a token, and startup.sh sources the same
-        # channels/ag2space/.env before launching it.
-        gw_env = _load_channel_env("ag2space")
+        # lane .env before launching it; the resolver names the lane, not us.
+        gw_env = _load_channel_env(_gateway_channel_dir())
         # Same resolver as the gate that decided this host HAS a gateway; a
         # narrower lookup here would refuse to recover the bridge it watches.
-        token = _gateway_token(environ={**os.environ, **gw_env},
-                               env_file=claude_home_path("channels", "ag2space", ".env"))
+        token = _gateway_token(environ={**os.environ, **gw_env})
         if not token:
             return None
         child_env.update(gw_env)
@@ -5947,10 +5946,9 @@ def _gateway_configured() -> bool:
     the bug this helper exists to close.
     """
     try:
-        # env -> .env -> VAULT, via the one resolver the bridge itself uses. A
-        # local env+file copy made a vault-only host read as unconfigured here.
-        gw_env = claude_home_path("channels", "ag2space", ".env")
-        if _gateway_token(env_file=gw_env):
+        # env -> lane .env -> VAULT, via the one resolver the bridge itself
+        # uses; it also picks the lane file, so prod's cannot answer for dev.
+        if _gateway_token():
             return True
     except OSError:
         # EXPECTED failures only: the env file is unreadable / the path is bad.

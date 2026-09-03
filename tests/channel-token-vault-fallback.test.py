@@ -393,6 +393,38 @@ def main() -> int:
                            vault_get=lambda v: "vault-tok"
                            if v == CANON else "") == "vault-tok")
 
+    # The lane lives INSIDE the resolver: AG2_DEVICE_ENV, then channels/<REMOTE_
+    # TASK_CHANNEL_DIR or ag2space>/.env, so no gate judges dev from prod's file.
+    cfg = Path(os.environ["CLAUDE_CONFIG_DIR"])
+    prod = cfg / "channels" / "ag2space" / ".env"
+    dev = cfg / "channels" / "dev" / ".env"
+    check("default lane is channels/ag2space/.env under the Claude home",
+          ct.gateway_env_file(environ={}) == prod, str(ct.gateway_env_file(environ={})))
+    check("REMOTE_TASK_CHANNEL_DIR=dev resolves channels/dev/.env",
+          ct.gateway_env_file(environ={"REMOTE_TASK_CHANNEL_DIR": "dev"}) == dev)
+    device = _envfile(**{CANON: "device-tok"})
+    check("AG2_DEVICE_ENV wins over the lane when it names an existing file",
+          ct.gateway_env_file(environ={"AG2_DEVICE_ENV": str(device),
+                                       "REMOTE_TASK_CHANNEL_DIR": "dev"}) == device)
+    check("a missing AG2_DEVICE_ENV falls through to the lane file, as the bridge does",
+          ct.gateway_env_file(environ={"AG2_DEVICE_ENV": str(cfg / "nope.env"),
+                                       "REMOTE_TASK_CHANNEL_DIR": "dev"}) == dev)
+    # The detector-shaped call: no env_file argument, so the resolver picks it.
+    dev.parent.mkdir(parents=True, exist_ok=True)
+    dev.write_text(f"{CANON}=dev-lane-tok\n")
+    try:
+        check("a dev-lane host with prod's file absent resolves the dev token",
+              not prod.exists()
+              and ct.gateway_token(environ={"REMOTE_TASK_CHANNEL_DIR": "dev"},
+                                   vault_get=lambda v: "") == "dev-lane-tok")
+        check("...and the same host with the lane unset still reads prod (absent -> '')",
+              ct.gateway_token(environ={}, vault_get=lambda v: "") == "")
+        check("AG2_DEVICE_ENV alone configures the gateway with no lane file at all",
+              ct.gateway_token(environ={"AG2_DEVICE_ENV": str(device)},
+                               vault_get=lambda v: "") == "device-tok")
+    finally:
+        dev.unlink()
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")

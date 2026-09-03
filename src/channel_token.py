@@ -53,6 +53,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from util_paths import claude_home_path  # noqa: E402
+
 # Both spellings the gateway contract accepts (docs/remote-gateway-protocol.md);
 # AG2_REMOTE_TOKEN is the legacy alias still present on older installs.
 RELAY_TOKEN_VARS: tuple[str, ...] = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
@@ -167,6 +169,32 @@ def resolve_channel_token(var: str, env_file: Path | None = None,
 GATEWAY_TOKEN_VARS = RELAY_TOKEN_VARS
 
 
+def gateway_channel_dir(environ=None) -> str:
+    """The `channels/<dir>` lane this host's gateway bridge reads.
+
+    Env-only, as in the bridge: a lane's `.env` cannot name its own directory.
+    """
+    environ = os.environ if environ is None else environ
+    return environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+
+
+def gateway_env_file(environ=None) -> Path:
+    """The channel `.env` the gateway bridge itself reads, in its own order.
+
+    `AG2_DEVICE_ENV` wins when it names an existing file; otherwise the lane's
+    `channels/<dir>/.env` under the Claude home. Every gate resolves the file
+    HERE so a non-default lane cannot be judged from prod's file: a detector
+    that read `channels/ag2space/.env` on a `dev` host answered "not
+    configured" for a bridge that was running fine, and that verdict silences
+    the gateway-down warn.
+    """
+    environ = os.environ if environ is None else environ
+    override = environ.get("AG2_DEVICE_ENV") or ""
+    if override and Path(override).is_file():
+        return Path(override)
+    return Path(claude_home_path("channels", gateway_channel_dir(environ), ".env"))
+
+
 def gateway_token(env_file: Path | None = None, environ=None,
                   vault_get=None) -> str:
     """The ag2.space gateway token from env -> `.env` -> vault, or ''.
@@ -180,17 +208,22 @@ def gateway_token(env_file: Path | None = None, environ=None,
     Looping aliases outermost instead made a canonical value in a LATER source
     beat a legacy value in an EARLIER one, so this gate could hand recovery a
     different bearer than the bridge would have chosen for itself.
+
+    `env_file=None` means the file the bridge would read (`gateway_env_file`),
+    not "no file tier": callers stop naming the lane, so they cannot name the
+    wrong one.
     """
     environ = os.environ if environ is None else environ
     for var in GATEWAY_TOKEN_VARS:
         found = _clean_for(var, environ.get(var, ""))
         if found:
             return found
-    if env_file is not None:
-        for var in GATEWAY_TOKEN_VARS:
-            found = token_from_env_file(var, env_file)
-            if found:
-                return found
+    if env_file is None:
+        env_file = gateway_env_file(environ)
+    for var in GATEWAY_TOKEN_VARS:
+        found = token_from_env_file(var, env_file)
+        if found:
+            return found
     for var in GATEWAY_TOKEN_VARS:
         found = token_from_vault(var, vault_get=vault_get)
         if found:
