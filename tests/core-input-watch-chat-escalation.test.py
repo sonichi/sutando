@@ -137,5 +137,64 @@ class TestScope(unittest.TestCase):
             self.assertNotIn(s, M._CHAT_ESCALATE_STATES, s)
 
 
+class TestDegradesWithoutDyingV(unittest.TestCase):
+    """The monitor's contract is that it keeps writing its state file whatever
+    the card layer does. Every branch below is a failure the card layer can
+    have; none of them may reach the caller as an exception."""
+
+    def test_it_puts_src_on_the_path_when_it_is_missing(self):
+        """The monitor is executed as a script, so `src` is not importable
+        unless it puts itself there."""
+        removed = [p for p in sys.path if p == str(SRC)]
+        for p in removed:
+            sys.path.remove(p)
+        try:
+            self.assertNotIn(str(SRC), sys.path, "control: src really was removed")
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "state", "core-input.json")
+                self.assertIsNotNone(M._hitl_manager(out))
+            self.assertIn(str(SRC), sys.path, "it must re-insert src to import hitl")
+        finally:
+            for p in removed:
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+
+    def test_no_hitl_package_yields_no_manager_and_no_exception(self):
+        """`src/hitl` is an optional tier: a standalone checkout without it
+        must still run the monitor, minus the card."""
+        saved = sys.modules.get("hitl.manager", "absent")
+        sys.modules["hitl.manager"] = None  # makes `from hitl.manager import ...` raise
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.assertIsNone(M._hitl_manager(os.path.join(d, "state", "s.json")))
+        finally:
+            if saved == "absent":
+                del sys.modules["hitl.manager"]
+            else:
+                sys.modules["hitl.manager"] = saved
+
+    def test_a_raising_store_does_not_take_down_the_escalation(self):
+        class Boom:
+            def create(self, req):
+                raise RuntimeError("store on fire")
+
+        self.assertIsNone(
+            M.escalate(Boom(), "blocked-human", "d", "selection", "Pick one:", "s1"))
+
+    def test_resolution_without_a_manager_is_empty_not_an_error(self):
+        self.assertEqual(M.resolve_escalations(None, "s1"), [])
+
+    def test_a_raising_store_does_not_take_down_resolution(self):
+        class Boom:
+            def active(self):
+                raise RuntimeError("store on fire")
+
+        self.assertEqual(M.resolve_escalations(Boom(), "s1"), [])
+
+    def test_escalate_without_a_manager_is_none_not_an_error(self):
+        self.assertIsNone(
+            M.escalate(None, "blocked-human", "d", None, None, "s1"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
