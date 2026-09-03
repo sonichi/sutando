@@ -293,6 +293,7 @@ def parse_markers(text: str) -> ParseResult:
 
 
 _TASK_CHANNEL_RE = re.compile(r"^channel_id:\s*(\S+)\s*$", re.MULTILINE)
+_TASK_USER_RE = re.compile(r"^user_id:\s*(\S+)\s*$", re.MULTILINE)
 
 
 def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None) -> str | None:
@@ -321,6 +322,44 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None)
     holder_channel = m.group(1).strip()
     if holder_channel and str(holder_channel) != str(deduped_channel_id):
         return holder_channel
+    return None
+
+
+def task_user_id(task_text: str | None) -> str | None:
+    """The `user_id:` a task carries, or None. Owned here so callers never
+    re-derive the header grammar (CLAUDE.md: marker parsing is centralised)."""
+    if not task_text:
+        return None
+    m = _TASK_USER_RE.search(task_text)
+    return m.group(1).strip() if m else None
+
+
+def dedup_cross_sender_target(deduped_user_id, holder_task_text: str | None) -> str | None:
+    """Sender-aware dedup support — the silence the channel check cannot see.
+
+    `dedup_cross_channel_target` asks whether the reply went to another ROOM.
+    In a shared multi-member room every sender carries the SAME channel_id, so
+    folding one member's task into another member's returns None there and the
+    dedup is honoured: the holder is answered and the asker hears nothing.
+
+    Returns the holder's `user_id` when known AND different from the deduped
+    task's own. `user_id` rather than `sender_name` because a display name is
+    not unique — one human on two homeservers has two ids but one name, so
+    keying on the name merges them and misses a real cross-sender silence.
+
+    Conversely a strict id compare SPLITS that same human, so a dev/prod pair
+    can report as cross-sender when nobody was silenced. That is bounded: the
+    requeue path re-asks at most once (`dedup_requeue_count >= 1` -> report),
+    and a spurious re-ask costs a message where a missed one costs the answer.
+    """
+    if not holder_task_text:
+        return None
+    m = _TASK_USER_RE.search(holder_task_text)
+    if not m:
+        return None
+    holder_user = m.group(1).strip()
+    if holder_user and str(holder_user) != str(deduped_user_id):
+        return holder_user
     return None
 
 
@@ -382,6 +421,12 @@ _REQUEUE_REASONS = {
         f"channel silent. Re-answer THIS task directly in its own channel (<#{asking_channel}>). "
         "Do NOT [deduped:] across channels.\n"
     ),
+    "cross-sender": lambda holder_id, asking_channel: (
+        f"Your previous result used [deduped: {holder_id}], but that holder task was asked by a "
+        f"DIFFERENT sender. Dedup folds one reply into another task's result, which is delivered "
+        f"to whoever asked THAT task — so across senders the person who asked this one hears "
+        f"nothing. Answer THIS task directly. Only use [deduped:] within one sender's thread.\n"
+    ),
     "holder-empty": lambda holder_id, asking_channel: (
         f"Your previous result used [deduped: {holder_id}], but that holder delivered nothing, "
         "so this question was never answered. Answer THIS task directly and in full. Only use "
@@ -390,15 +435,66 @@ _REQUEUE_REASONS = {
 }
 
 
+def render_skill_prelude(
+    channel_id: str, channel_dir: str, tid: str, addressed_to: str = "",
+) -> "list[str]":
+    """The ===SKILL INSTRUCTIONS=== prelude for an owner-tier task, rendered
+    from the task's OWN routing fields. Single owner of the template: the
+    gateway writes with its live lane values; a dedup requeue re-renders from
+    the requeuing adapter (channel_dir = that host's own lane dir, per-lane since the
+    lane-authoritative stamping change) so a requeue can never resurrect a
+    superseded prelude."""
+    import shlex as _shlex
+    _chan = channel_id or ""
+    _chan_q = _shlex.quote(_chan)
+    _cdir_q = _shlex.quote(channel_dir)
+    _step = 1
+    _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
+    if addressed_to:
+        _skill.append(
+            f"{_step}. ADDRESSING: this message replies to {addressed_to}'s message and "
+            f"does not mention you — it is {addressed_to}'s to claim. Do not process it "
+            "unless a later message hands it to you explicitly; close your copy "
+            "with [no-send].")
+        _step += 1
+    if _chan:
+        _skill.append(
+            f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
+            f"message, reconstruct the room thread — `python3 "
+            f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
+            f"reports no gateway configured, load the channel env first: `set -a; . "
+            f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a`) — and read it "
+            "back (everyone's messages including your own prior replies) until this "
+            "message stands on its own, then answer from the reconstructed thread, "
+            "NOT from memory. Do this every time; do NOT skip it because the message "
+            "looks self-contained or you feel you already understand it — felt "
+            "confidence is exactly the signal that fails. The only exception is a "
+            'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
+        _step += 1
+        _skill.append(
+            f"{_step}. NOTIFY FIRST (if task takes >60s): `set -a; . "
+            f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a` then python3 "
+            f"skills/task-progress/scripts/notify.py --source {_cdir_q} "
+            f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
+        _step += 1
+    _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
+    return _skill
+
+
 def build_requeued_task(
     orig_text: str, new_task_id: str, count: int, asking_channel, holder_id: str,
-    reason: str = "cross-channel",
+    reason: str = "cross-channel", channel_dir: str = "",
 ) -> str:
     """Rewrite an original task for re-processing after a REJECTED cross-channel
     dedup. Keeps the original fields (channel_id, access_tier, source, body, …)
     so it routes + tiers identically, but:
       * sets `id:` to new_task_id (so the watcher re-fires),
       * sets `dedup_requeue_count: count` (loop guard),
+      * when the caller injects its lane via `channel_dir`, strips the stored
+        `===SKILL INSTRUCTIONS===` block and re-renders it fresh (gateway
+        template). Without an injected lane the stored prelude is carried
+        byte-verbatim: Slack/Discord write their own bridge-specific
+        templates, which the gateway renderer cannot represent,
       * appends a trusted `===SUTANDO SYSTEM INSTRUCTIONS===` block telling the
         core the prior dedup was cross-channel (invalid) and to answer THIS
         task directly in its own channel, not dedup across channels.
@@ -410,16 +506,33 @@ def build_requeued_task(
     """
     lines = []
     seen_count = False
+    had_prelude = False
+    hdr = {}
     for ln in (orig_text or "").rstrip("\n").split("\n"):
+        # A stale gateway prelude re-instructs handlers with superseded text;
+        # only the injecting caller's template is ours to rewrite, though.
+        if ln.startswith("===SKILL INSTRUCTIONS") and channel_dir:
+            had_prelude = True
+            break
         if ln.startswith("id:"):
             lines.append(f"id: {new_task_id}")
         elif ln.startswith("dedup_requeue_count:"):
             lines.append(f"dedup_requeue_count: {count}")
             seen_count = True
         else:
+            for k in ("channel_id", "source", "addressed_to"):
+                if ln.startswith(k + ":") and k not in hdr:
+                    hdr[k] = ln[len(k) + 1:].strip()
             lines.append(ln)
+    while lines and lines[-1] == "":
+        lines.pop()
     if not seen_count:
         lines.append(f"dedup_requeue_count: {count}")
+    if had_prelude:
+        # Re-render, never copy; the injected lane dir is the only lane source.
+        lines.extend(render_skill_prelude(
+            hdr.get("channel_id", ""), channel_dir,
+            new_task_id, hdr.get("addressed_to", "")))
     note = (
         "\n===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===\n"
         + _REQUEUE_REASONS.get(reason, _REQUEUE_REASONS["cross-channel"])(

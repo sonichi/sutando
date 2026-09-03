@@ -47,6 +47,14 @@ _IDLE = {"state": "idle-ready", "detail": "ready for a task", "prompt": None, "k
 _RUNNING = {"state": "running", "detail": "actively processing", "prompt": None, "kind": None}
 _CRASHED = {"state": "crashed", "detail": "core process/session not found", "prompt": None}
 _HUNG = {"state": "hung", "detail": "core alive but stalled", "prompt": "…", "kind": "unknown"}
+# The monitor answered the Fable weekly-limit dialog itself (Enter = switch model);
+# the record rides along in the signal for AUTO_ANSWER_CARRY_S whatever the state.
+_FABLE_AUTO = {"state": "blocked-known", "detail": "at known gate: fable-limit",
+               "prompt": "You've reached your Fable limit\n❯ Switch to Opus 5 and continue",
+               "kind": "fable-limit",
+               "auto_answered": {"kind": "fable-limit", "key": "Enter", "at": 1788380000.0}}
+_FABLE_AUTO_LATER = dict(_IDLE, auto_answered=_FABLE_AUTO["auto_answered"])
+_PRESS_ENTER_AUTO = dict(_RUNNING, auto_answered={"kind": "press-enter", "key": "Enter", "at": 1.0})
 
 
 @contextlib.contextmanager
@@ -125,7 +133,48 @@ class TestShouldEscalate(unittest.TestCase):
         self.assertFalse(should_escalate(_LOGIN, h_mid)[0])
 
 
+    def test_fable_auto_answer_notifies_once_across_states(self):
+        esc, h = should_escalate(_FABLE_AUTO, None)
+        self.assertTrue(esc)
+        # The same record carried on a later idle tick must not fire again.
+        esc2, h2 = should_escalate(_FABLE_AUTO_LATER, h)
+        self.assertFalse(esc2)
+        self.assertEqual(h, h2)
+
+    def test_a_new_fable_answer_notifies_again(self):
+        _, h = should_escalate(_FABLE_AUTO, None)
+        again = dict(_FABLE_AUTO, auto_answered=dict(_FABLE_AUTO["auto_answered"], at=1788390000.0))
+        self.assertTrue(should_escalate(again, h)[0])
+
+    def test_a_plain_known_gate_still_never_escalates(self):
+        plain = {k: v for k, v in _FABLE_AUTO.items() if k != "auto_answered"}
+        self.assertFalse(should_escalate(plain, None)[0])
+
+    def test_press_enter_auto_answer_is_silent(self):
+        self.assertFalse(should_escalate(_PRESS_ENTER_AUTO, None)[0])
+
+
 class TestComposeMessage(unittest.TestCase):
+    def test_fable_auto_answer_says_what_was_pressed_not_needs_you(self):
+        msg = compose_message(_FABLE_AUTO)
+        self.assertIn("Fable weekly limit", msg)
+        self.assertIn("pressed Enter", msg)
+        self.assertIn("fallback model", msg)
+        self.assertNotIn("Agent needs you", msg)
+        self.assertNotIn("/login", msg)
+        # Carried onto a later idle tick, the notice reads the same.
+        self.assertEqual(compose_message(_FABLE_AUTO_LATER), msg)
+
+    def test_fable_limit_with_the_caret_elsewhere_escalates_with_the_reason(self):
+        unfocused = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
+                     "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1",
+                     "kind": "fable-limit-unfocused"}
+        self.assertTrue(should_escalate(unfocused, None)[0])
+        msg = compose_message(unfocused)
+        self.assertIn("Agent needs you", msg)
+        self.assertIn("will not press Enter", msg)
+        self.assertNotIn("/login", msg)
+
     def test_includes_detail_and_prompt_excerpt(self):
         m = compose_message(_LOGIN)
         self.assertIn("awaiting user: login", m)
@@ -156,6 +205,9 @@ class TestComposeMessage(unittest.TestCase):
         m = compose_message(_LIMIT)
         self.assertIn("resumes on its own at 12:10pm", m)
         self.assertIn("/usage-credits", m)
+        # The owner named this third route (2026-09-02): the limit is per
+        # subscription, so signing in under another one is often the fastest.
+        self.assertIn("different subscription", m)
         self.assertNotIn("/login", m)
         self.assertNotIn("restart.sh", m)
 

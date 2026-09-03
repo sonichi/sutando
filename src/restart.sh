@@ -52,6 +52,10 @@ if _VOICE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)";
 else
     echo "  WARN no usable python3 for the guarded voice lock helper — skipping voice-agent stop (fail closed)"
 fi
+# Deliberate restart: the launchd bridge wrappers treat an exit inside this
+# window as ours, not a crash, so the owner is not alerted for every restart.
+_WS="$(bash "$(dirname "$0")/../scripts/sutando-config.sh" workspace 2>/dev/null)"
+if [ -n "$_WS" ]; then mkdir -p "$_WS/state/channel-bridge-supervisor"; date +%s > "$_WS/state/channel-bridge-supervisor/deliberate-restart"; fi
 pkill -f "web-client.ts" 2>/dev/null
 pkill -f "dashboard.py" 2>/dev/null
 pkill -f "agent-api.py" 2>/dev/null
@@ -131,7 +135,9 @@ APP_BIN="$REPO/src/Sutando/Sutando"
 if pgrep -x Sutando > /dev/null 2>&1; then
     echo "  ✓ Sutando.app (already running)"
 elif [ -x "$APP_BIN" ]; then
-    nohup "$APP_BIN" > /tmp/sutando-app.log 2>&1 &
+    # The app is the OUT-of-session restart path: a core-session marker inherited
+    # here makes restart-guard refuse every restart the app later requests.
+    env -u SUTANDO_CORE_SESSION nohup "$APP_BIN" > /tmp/sutando-app.log 2>&1 &
     sleep 1
     # `pgrep -x`, never `-f`: -f matches this script's own argv and would report
     # a launch that did not happen. The ✓ stays inside the verified branch.
