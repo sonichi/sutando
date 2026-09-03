@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """remote-gateway-bridge: a card click on the TASK relay is applied to the HITL
 store and consumed; ordinary messages and unconfigured hosts stay on the task path."""
+import json
 import os
 import sys
 import tempfile
@@ -69,6 +70,26 @@ class TaskRelayClickTests(unittest.TestCase):
         rev = self.mgr.get(self.req.id).revision
         self.assertTrue(rgb._handle_hitl_action(t))
         self.assertEqual(self.mgr.get(self.req.id).revision, rev)
+
+
+    def test_stale_click_is_consumed_and_the_owner_is_told(self):
+        stale = {"hitl_id": self.req.id, "expected_revision": self.req.revision + 5,
+                 "action_id": "allow", "guard": self.req.guard}
+        t = self._task(hitl_action=stale)
+        out = rgb._handle_hitl_action(t)
+        self.assertTrue(str(out).startswith("rejected:"), out)
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+        body = "That click did not apply" if str(out).startswith("rejected:") else "[no-send]"
+        rgb._queue_review_control_result(t, body=body)
+        rec = json.loads(rgb._control_result_path(t["id"]).read_text())
+        self.assertIn("did not apply", rec["body"])
+
+    def test_applied_click_closes_silently(self):
+        t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                    "action_id": "allow", "guard": self.req.guard})
+        self.assertEqual(rgb._handle_hitl_action(t), "applied")
+        rgb._queue_review_control_result(t)
+        self.assertEqual(json.loads(rgb._control_result_path(t["id"]).read_text())["body"], "[no-send]")
 
 
 if __name__ == "__main__":

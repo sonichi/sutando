@@ -781,14 +781,14 @@ def _resolve_review_card(path: Path, record: dict) -> bool:
     return True
 
 
-def _handle_hitl_action(task: dict) -> bool:
+def _handle_hitl_action(task: dict):
     """An owner card click delivered on the task relay (its `hitl_action`, or a
     reply to the card whose text is an action label). Applied to the HITL
     store here so a click never becomes a chat task; the caller closes the
     task with a [no-send] control result. False = an ordinary message."""
     task_id = str(task.get("id") or "")
     if task_id and _control_result_path(task_id).is_file():
-        return isinstance(task.get("hitl_action"), dict)  # redelivery of a consumed click
+        return "applied" if isinstance(task.get("hitl_action"), dict) else False  # redelivery
     if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
         return False
     owner = os.environ.get("SPARROW_HA_OWNER") or ""
@@ -796,10 +796,13 @@ def _handle_hitl_action(task: dict) -> bool:
     if handler is None:
         return False  # no owner or no store on this host: the click stays an ordinary task
     try:
-        return bool(handler.offer_task(task))
+        out = handler.offer_task(task)
     except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
         _log(f"hitl: task-relay click {task_id} not applied: {e}")
         return False
+    if out == "rejected":
+        return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    return out or False
 
 
 def _handle_review_decision(task: dict) -> bool:
@@ -868,13 +871,13 @@ def _control_result_path(task_id: str) -> Path:
     return _WITHHELD_CONTROL_DIR / f"{safe}.json"
 
 
-def _queue_review_control_result(task: dict) -> None:
+def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
     task_id = str(task.get("id") or "")
     if not task_id:
         return
     path = _control_result_path(task_id)
     if not path.is_file():
-        _atomic_private_json(path, {"id": task_id, "body": "[no-send]"})
+        _atomic_private_json(path, {"id": task_id, "body": body})
 
 
 def _retry_review_control_results() -> None:
@@ -3659,15 +3662,20 @@ def main() -> None:
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
+                hitl_out = _handle_hitl_action(task)
+                if hitl_out:
+                    body = "[no-send]"
+                    if str(hitl_out).startswith("rejected:"):
+                        body = ("That click did not apply: the card had already moved "
+                                f"({str(hitl_out)[9:]}). Please use the current card.")
+                    _queue_review_control_result(task, body=body)
+                    _retry_review_control_results()
+                    _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
+                    continue
                 if _handle_review_decision(task):
                     _queue_review_control_result(task)
                     _retry_review_control_results()
                     _log(f"consumed private review decision {task.get('id')}")
-                    continue
-                if _handle_hitl_action(task):
-                    _queue_review_control_result(task)
-                    _retry_review_control_results()
-                    _log(f"hitl: consumed card click {task.get('id')} from the task relay")
                     continue
                 tid = _write_task(task)
                 if tid:

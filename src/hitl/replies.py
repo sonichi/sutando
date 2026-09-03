@@ -81,6 +81,9 @@ class HitlReplyHandler:
         self._workspace = Path(workspace) if workspace is not None else None
         self._log = log
         self.last_path = None  # handler-contract compat (never promotes tasks)
+        # What the most recent offer() did: applied | rejected | ignored (+ reason).
+        self.last_outcome = None
+        self.last_reason = ""
 
     def claims(self, event: Dict[str, Any]) -> bool:
         content = event.get("content") or {}
@@ -115,16 +118,16 @@ class HitlReplyHandler:
 
     # -- task-relay path ---------------------------------------------------------
 
-    def offer_task(self, task: Dict[str, Any]) -> bool:
+    def offer_task(self, task: Dict[str, Any]) -> Optional[str]:
         """A click delivered as a relay TASK, not an event (an owner DM travels
-        only the task relay). True = it was a click and is consumed here,
-        whatever the Manager decided; False = an ordinary message, leave it on
-        the task path."""
+        only the task relay). Returns "applied" / "rejected" / "ignored" for a
+        click (consumed either way), or None for an ordinary message that stays
+        on the task path. A rejection is the owner's to hear about."""
         event = self.task_to_event(task)
         if event is None:
-            return False
+            return None
         self.offer(event)
-        return True
+        return self.last_outcome or "ignored"
 
     def task_to_event(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Exact form: `hitl_action` (the relay forwards the message's action
