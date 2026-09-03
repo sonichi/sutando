@@ -142,6 +142,23 @@ class TestCoreQuotaExhausted(unittest.TestCase):
         self._write(available=True, status="rejected", reset=int(time.time()) + 60)
         self.assertEqual(self.hc.check_core_quota_exhausted()["status"], "fail")
 
+    def test_warn_summary_renders_overage_as_a_flag_not_a_budget(self):
+        """A live header set carries a third window, `overage`; `0%` there reads
+        as headroom, so the summary says on/off instead."""
+        self._write(available=False, status="rejected", util=(0.04, 0.24), extra={
+            "anthropic-ratelimit-unified-overage-utilization": "0.0",
+            "anthropic-ratelimit-unified-overage-status": "allowed"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("overage: off", c["detail"])
+        self.assertNotIn("overage 0%", c["detail"])
+        self._write(available=False, status="rejected", util=(0.04, 0.24), extra={
+            "anthropic-ratelimit-unified-overage-utilization": "0.3",
+            "anthropic-ratelimit-unified-overage-status": "allowed"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("overage: on", c["detail"])
+
     def test_rejected_with_both_windows_low_is_a_warn_naming_the_shared_proxy(self):
         # Another client's credit gate through the shared proxy, not this core's window.
         self._write(available=False, status="rejected", util=(0.13, 0.52))

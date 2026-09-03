@@ -5262,7 +5262,7 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     windows = _quota_windows(headers)
     full = [w for w, (u, st) in windows.items() if st == "rejected" or (u is not None and u >= 0.9)]
     if windows and not full:
-        summary = ", ".join(f"{w} {u:.0%}" for w, (u, st) in windows.items() if u is not None)
+        summary = _window_summary(windows)
         check["status"] = "warn"
         check["detail"] = (
             f"last response through the shared credential proxy was rejected "
@@ -5287,6 +5287,19 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         "this is the 'stuck silently' condition; tasks will queue undelivered."
     )
     return check
+
+
+def _window_summary(windows: dict) -> str:
+    """Owner-facing per-window line. overage is a flag, not a budget: rendering
+    it as `0%` reads as a third window with headroom."""
+    parts = []
+    for w, (u, st) in windows.items():
+        if w == "overage":
+            on = bool(u) or (st is not None and st != "allowed")
+            parts.append(f"overage: {'on' if on else 'off'}")
+        elif u is not None:
+            parts.append(f"{w} {u:.0%}")
+    return ", ".join(parts)
 
 
 def _quota_windows(headers: dict) -> dict:
