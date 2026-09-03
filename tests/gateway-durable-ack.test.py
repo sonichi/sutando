@@ -9,7 +9,8 @@ otherwise. Acks that never confirm are persisted and retried.
 Covers:
   1. the four state writes go temp → fsync file → rename → fsync directory;
   2. a task queued by a pre-durability client and redelivered after the upgrade
-     is verified, fsync'd and given its sidecar before a durable ack is allowed;
+     is verified, fsync'd and given its sidecar before a durable ack is allowed,
+     as is the pending reply of a redelivery this node already handled;
   3. every failure boundary (task write, sidecar, in-flight set, ack ledger)
      withholds the ack rather than claiming a task that could be lost;
   4. pending acks are retried by the outbound worker, retired on a per-task
@@ -28,6 +29,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -183,6 +185,99 @@ class DurableAck(unittest.TestCase):
                          "id: task-old\naccess_tier: owner\ntask: earlier\n",
                          "repair must not rewrite the queued file")
 
+    def _fsync_watch(self, want: "set[int]") -> "tuple[list, object]":
+        """(what the ack saw, a context manager) — records whether every inode in
+        `want` had been fsync'd by the time the ack was posted."""
+        mod = self.mod
+        synced: "set[int]" = set()
+        at_ack: list = []
+        real_fsync, real_ack = mod.os.fsync, mod._post_task_ack
+
+        def spy(fd):
+            synced.add(os.fstat(fd).st_ino)
+            return real_fsync(fd)
+
+        def ack(tid, durable=False):
+            at_ack.append(want <= synced)
+            return real_ack(tid, durable)
+
+        class _Watch:
+            def __enter__(_self):
+                _self._p = [patch.object(mod.os, "fsync", spy),
+                            patch.object(mod, "_post_task_ack", side_effect=ack)]
+                for one in _self._p:
+                    one.start()
+                return _self
+
+            def __exit__(_self, *exc):
+                for one in reversed(_self._p):
+                    one.stop()
+                return False
+
+        return at_ack, _Watch()
+
+    def _refuse_fsync_of(self, *paths):
+        """os.open refuses exactly these paths, so the fsync loop over them raises."""
+        real_open = self.mod.os.open
+        blocked = {str(p) for p in paths}
+
+        def refuse(path, *a, **k):
+            if str(path) in blocked:
+                raise OSError("cannot open for fsync")
+            return real_open(path, *a, **k)
+
+        return patch.object(self.mod.os, "open", refuse)
+
+    def test_the_repair_fsyncs_the_queued_task_and_its_directory(self):
+        mod = self.mod
+        tfile = mod.TASKS_DIR / "task-old4.txt"
+        tfile.write_text("id: task-old4\n")
+        at_ack, watch = self._fsync_watch({tfile.stat().st_ino,
+                                           mod.TASKS_DIR.stat().st_ino})
+        with watch:
+            self._ack_round([self._task("task-old4")])
+        self.assertEqual(at_ack, [True],
+                         "the queued file and tasks/ must be fsync'd before the ack")
+        self.assertEqual(self._acks()[0][2], {"id": "task-old4", "durable": True})
+
+    def test_a_repair_whose_fsync_fails_is_acked_without_durability(self):
+        mod = self.mod
+        tfile = mod.TASKS_DIR / "task-old5.txt"
+        tfile.write_text("id: task-old5\n")
+        with self._refuse_fsync_of(tfile, mod.TASKS_DIR):
+            self._ack_round([self._task("task-old5")])
+        self.assertEqual(self._acks()[0][2], {"id": "task-old5"},
+                         "an uncommitted queue file must not be claimed as durable")
+
+    def test_a_redelivery_commits_the_pending_reply_before_a_durable_ack(self):
+        mod = self.mod
+        (mod.TASKS_DIR / "archive").mkdir(parents=True, exist_ok=True)
+        (mod.TASKS_DIR / "archive" / "task-red.txt").write_text("id: task-red\n")
+        # What the local core left behind: a reply written with a plain
+        # write_text, so this process has committed nothing of its own.
+        rfile = mod.RESULTS_DIR / "task-red.txt"
+        rfile.write_text("the answer the core already produced")
+        at_ack, watch = self._fsync_watch({rfile.stat().st_ino,
+                                           mod.RESULTS_DIR.stat().st_ino})
+        with watch:
+            self._ack_round([self._task("task-red")])
+        self.assertEqual(at_ack, [True],
+                         "the pending reply and results/ must commit before the ack")
+        self.assertEqual(self._acks()[0][2], {"id": "task-red", "durable": True})
+        self.assertEqual(rfile.read_text(), "the answer the core already produced",
+                         "the repair must not rewrite the pending reply")
+
+    def test_a_redelivery_whose_reply_will_not_commit_is_acked_plain(self):
+        mod = self.mod
+        (mod.TASKS_DIR / "archive").mkdir(parents=True, exist_ok=True)
+        (mod.TASKS_DIR / "archive" / "task-red2.txt").write_text("id: task-red2\n")
+        rfile = mod.RESULTS_DIR / "task-red2.txt"
+        rfile.write_text("an earlier answer")
+        with self._refuse_fsync_of(rfile, mod.RESULTS_DIR):
+            self._ack_round([self._task("task-red2")])
+        self.assertEqual(self._acks()[0][2], {"id": "task-red2"},
+                         "an uncommitted reply must not be claimed as durable")
+
     def test_a_redelivery_recommits_the_in_flight_set(self):
         mod = self.mod
         # A pre-durability client's ledger: readable, but never fsync'd.
@@ -288,6 +383,30 @@ class DurableAck(unittest.TestCase):
         before = len(self._acks())
         mod._retry_pending_acks(set())     # the result POST already closed it
         self.assertEqual(len(self._acks()), before)
+        self.assertEqual(mod._load_pending_acks(), {})
+
+    def test_the_outbound_worker_is_what_retries_a_pending_ack(self):
+        """The retry reaches production only through `_outbound_worker`, so the
+        seam — not the inner function — is what has to be driven."""
+        mod = self.mod
+        with patch.object(mod, "_req", side_effect=urllib.error.URLError("down")):
+            self._ack_round([self._task("task-worker")])
+        self.assertEqual(mod._load_pending_acks(), {"task-worker": True})
+        mod.OUTBOUND_SCAN_S = 0.2
+        worker = mod._start_outbound_worker({"task-worker"})
+        try:
+            mod.wake_outbound()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not self._acks():
+                time.sleep(0.02)
+        finally:
+            mod._OUTBOUND_STOP.set()
+            mod.wake_outbound()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([c[2] for c in self._acks()],
+                         [{"id": "task-worker", "durable": True}],
+                         "the worker never re-posted the persisted ack")
         self.assertEqual(mod._load_pending_acks(), {})
 
     def test_the_ledger_survives_a_restart(self):
