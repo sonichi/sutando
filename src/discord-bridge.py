@@ -5579,6 +5579,7 @@ async def poll_proactive():
                         continue
                     f = claim  # subsequent reads + unlink operate on the claim path
                     text = read_ready_result(f)
+                    _ready_body = text  # the exact bytes the retire must still find
                     if text is None:
                         _proactive_fence().release(f)
                         continue
@@ -5753,7 +5754,7 @@ async def poll_proactive():
                                         f"to channel {_target_id}",
                                         flush=True,
                                     )
-                                    _proactive_fence().confirm(f)
+                                    _proactive_fence().confirm(f, _ready_body)
                                     continue
                                 except Exception as _exc:
                                     print(
@@ -5795,7 +5796,7 @@ async def poll_proactive():
                                 _sent_any = True  # pragma: no cover
                                 print(f"  [proactive] REJECTED file: {fpath}", flush=True)
                         print(f"  [proactive] sent to {owner_id}: {clean_text[:80]}")
-                        _proactive_fence().confirm(f)
+                        _proactive_fence().confirm(f, _ready_body)
                     except Exception as e:  # pragma: no cover — live send path
                         # Quarantine rather than retry, and ONLY for a failure a retry cannot fix: a
                         # 413 never becomes a 200, a 503 does on the very next poll.

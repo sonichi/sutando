@@ -242,7 +242,9 @@ def _task_body(
     prompt = confine_user_content(job.get("prompt") or f"/{job['prompt_skill']}")
     if job.get("delivery") == "proactive":
         prompt += (
-            f" Write the concise owner-facing result to {proactive_path}, then write "
+            f" Publish the concise owner-facing result as {proactive_path}: write "
+            f"{proactive_path.parent}/.{proactive_path.name}.tmp, then `mv` it to the final "
+            f"name (never write the final name in place; a bridge claims it on sight). Then write "
             f"[no-send] to {result_path} so this scheduled task is archived without a duplicate reply."
         )
     elif job.get("_silent_result"):

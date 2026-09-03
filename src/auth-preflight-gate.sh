@@ -160,8 +160,9 @@ if [ -n "$_ws" ] && [ -n "$_host" ]; then
     rmdir "$_lock" 2>/dev/null || true
   fi
   # --- end pending-question write (unique sentinel; tests extract to here) ---
+  _out="$_ws/results/proactive-$(date +%s).txt"
   printf '[dm-only]\nSutando boot on %s ABORTED: CLI login required.\n%s\n' \
-    "$_host" "$_remedy" > "$_ws/results/proactive-$(date +%s).txt"
+    "$_host" "$_remedy" > "$_out.tmp-$$" && mv -f "$_out.tmp-$$" "$_out"
 fi
 
 exit 2

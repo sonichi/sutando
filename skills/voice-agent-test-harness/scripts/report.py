@@ -80,8 +80,9 @@ def deliver(text: str, workspace: str | None = None) -> str:
     # Telegram-destined by contract (module docstring); the filename tag makes
     # the intended bridge — not the polling race — the claimant.
     from proactive_routing import proactive_filename
+    from delivery.publication import publish_result
     path = results / proactive_filename(ts, channel="telegram")
-    path.write_text(text)
+    publish_result(path, text)
     return str(path)
 
 

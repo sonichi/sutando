@@ -48,4 +48,4 @@ If you can't tell whether something is a real subscription (e.g. unclear if it's
 
 ## Notify on changes
 
-If the scan finds anything `added` or `removed` since the previous run, write a `proactive-{ts}.txt` to `results/` with a brief summary (not the full table — just "+1 added: X. -1 removed: Y") so the change is surfaced via Telegram.
+If the scan finds anything `added` or `removed` since the previous run, publish `results/proactive-{ts}.txt` (write `results/.proactive-{ts}.txt.tmp`, then `mv` it to the final name) with a brief summary (not the full table — just "+1 added: X. -1 removed: Y") so the change is surfaced via Telegram.

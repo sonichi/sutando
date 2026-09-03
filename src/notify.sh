@@ -15,7 +15,8 @@ TS=$(date +%s%3N)
 
 # 1. Voice — write proactive message if voice agent is up
 if curl -s -o /dev/null -w "%{http_code}" http://localhost:9900 2>/dev/null | grep -q "426"; then
-  echo "$MSG" > "$REPO_DIR/results/proactive-$TS.txt"
+  _out="$REPO_DIR/results/proactive-$TS.txt"
+  echo "$MSG" > "$_out.tmp-$$" && mv -f "$_out.tmp-$$" "$_out"
 fi
 
 # 2. Discord DM — via dm-result.py's send_dm, which owns token/owner

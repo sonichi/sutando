@@ -19,6 +19,11 @@ except ImportError:  # pragma: no cover - flat src/ import path
     from proactive_recovery import recover_orphan_sending_files, release_claim
     from send_failure_policy import decide_failed_send
 
+try:
+    from .delivery.readiness import retire_claim_if_unchanged
+except ImportError:
+    from delivery.readiness import retire_claim_if_unchanged  # noqa: E402
+
 from ag2_sparrow.delivery_core import DeliveryOutcome
 
 
@@ -74,10 +79,23 @@ class ProactiveClaimFence:
         self._tokens[claim] = (item, token)
         return claim
 
-    def confirm(self, claim: Path) -> None:
-        """Delivery confirmed: consume the file, archive the record."""
-        claim.unlink(missing_ok=True)
-        self._finish(claim, DeliveryOutcome.CONFIRMED)
+    def confirm(self, claim: Path, delivered: "str | None" = None) -> bool:
+        """Delivery confirmed. Given the delivered body, the claim is retired
+        only while it still holds exactly that body; a claim that grew is
+        released so a later pass sends it whole (bytes are never destroyed).
+        Without a body (a terminal drop) the file is consumed outright."""
+        if delivered is None:
+            claim.unlink(missing_ok=True)
+            self._finish(claim, DeliveryOutcome.CONFIRMED)
+            return True
+        if retire_claim_if_unchanged(claim, delivered):
+            self._finish(claim, DeliveryOutcome.CONFIRMED)
+            return True
+        print(f"  [fence] {claim.name} grew after the send; released for a whole resend",
+              flush=True)
+        release_claim(claim)
+        self._finish(claim, DeliveryOutcome.NOT_DELIVERED)
+        return False
 
     def drop(self, claim: Path, reason: str) -> None:
         """Terminal non-delivery discard (e.g. no resolvable recipient)."""
