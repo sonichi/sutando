@@ -99,6 +99,30 @@ class TestIncompletePredicate(unittest.TestCase):
         self.assertFalse(self.ct._is_bad(RUNNING_CHECKRUN))
 
 
+class TestIncompleteChecksApi(unittest.TestCase):
+    """The `rollup=None` fetch path — `main` passes one, so only callers hit it."""
+
+    def setUp(self):
+        self.ct = _load()
+
+    def test_it_fetches_when_no_rollup_is_supplied(self):
+        seen = []
+
+        def fake_gh(run, args):
+            seen.append(args)
+            return {"statusCheckRollup": [GREEN_CHECKRUN, PENDING_CONTEXT]}
+        self.ct._gh = fake_gh
+        got = self.ct.incomplete_checks("1", None, "o/r")
+        self.assertEqual(got, ["license/cla"])
+        self.assertEqual(len(seen), 1)
+
+    def test_an_unreadable_fetch_returns_none_not_empty(self):
+        # None means "could not tell"; [] would mean "nothing is gating" and
+        # is the confident all-clear this whole PR exists to prevent.
+        self.ct._gh = lambda run, args: None
+        self.assertIsNone(self.ct.incomplete_checks("1", None, "o/r"))
+
+
 class TestMainOutput(unittest.TestCase):
     def setUp(self):
         self.ct = _load()
