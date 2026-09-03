@@ -122,6 +122,36 @@ class TestOffenders(unittest.TestCase):
         self.assertEqual(
             G.offenders('/opt/homebrew/bin/gh pr comment 1 --body "a `b` c"'), ["--body"])
 
+    def test_a_hash_opens_a_comment_after_a_separator_too_not_only_whitespace(self):
+        """The word-start test was `prev.isspace()`, but `;` `&` `|` `(` `)`
+        end a word in bash too — so `;#` commented the line and the guard then
+        never saw the NEXT line, which the shell does run."""
+        self.assertEqual(
+            G.offenders('echo hi;# note\ngh pr comment 1 --body "a `b` c"'), ["--body"])
+        self.assertEqual(
+            G.offenders('echo hi&&# note\ngh pr comment 1 --body "a `b` c"'), ["--body"])
+        self.assertEqual(
+            G.offenders('echo hi|# note\ngh pr comment 1 --body "a `b` c"'), ["--body"])
+
+    def test_a_mid_word_hash_is_literal_and_must_not_blank_the_rest(self):
+        """`shlex`'s own `commenters` fires anywhere, including inside a word,
+        where bash keeps a literal `#`. A URL fragment or an issue ref before
+        the `gh` silently disabled the guard for the rest of the command."""
+        self.assertEqual(
+            G.offenders('echo a#b; gh pr comment 1 --body "a `b` c"'), ["--body"])
+        self.assertEqual(
+            G.offenders('echo https://x/y#frag && gh pr comment 1 --body "a `b` c"'),
+            ["--body"])
+
+    def test_a_gh_INSIDE_a_comment_is_still_not_flagged(self):
+        """False-positive control. Green before and after the fix by
+        construction — it pins that stripping comments did not buy the
+        catches above by flagging text bash never runs."""
+        self.assertEqual(
+            G.offenders('echo hi\n# gh pr comment 1 --body "a `b` c"'), [])
+        self.assertEqual(
+            G.offenders('echo hi;# gh pr comment 1 --body "a `b` c"'), [])
+
     def test_unbalanced_quotes_do_not_raise(self):
         self.assertEqual(G.offenders('gh pr comment 1 --body "unclosed `'), [])
 

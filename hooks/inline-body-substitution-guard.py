@@ -57,17 +57,20 @@ def _newline_separators(command: str) -> str:
             quote = ch
         elif ch == quote:
             quote = None
-        # A `#` starts a comment only at the start of a word — `a#b` is literal.
-        if ch == "#" and quote is None and (prev.isspace() or prev == ""):
+        # bash opens a comment only at a word start, and `;&|()` end a word too.
+        # `a#b` and `x/y#frag` stay literal.
+        if ch == "#" and quote is None and (
+                prev.isspace() or prev == "" or prev in ";&|()"):
             comment = True; prev = ch; continue
         if ch in "\r\n" and quote is None:
+            # CRLF is ONE separator: two `;` lex as the single token `;;`,
+            # which is not in SEPARATORS, so `armed` would never reset.
             if not (ch == "\r" and command[i + 1:i + 2] == "\n"):
                 out.append(";")
             prev = ch
             continue
         out.append(ch); prev = ch
     return "".join(out)
-
 
 def offenders(command: str):
     """Flags whose inline double-quoted value the shell would rewrite.
@@ -81,6 +84,7 @@ def offenders(command: str):
     command = _newline_separators(command)
     try:
         lex = shlex.shlex(command, posix=False, punctuation_chars=True)
+        lex.commenters = ""  # _newline_separators owns comments; shlex's fire mid-word
         lex.whitespace_split = True
         words = list(lex)
     except ValueError:
