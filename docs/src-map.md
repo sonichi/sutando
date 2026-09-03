@@ -149,6 +149,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
+- **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.

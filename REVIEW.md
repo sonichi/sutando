@@ -211,6 +211,31 @@ and loads whichever repo it reviews.
     The tell: the same expression supplies both the default and the measurement, usually as
     `x or 0`, `.get(k, 0)`, or an `except` that returns the empty case.
 
+    **The same rule binds the REVIEW's own prose, not just the patch's code.** Every instance
+    above is a formatter substituting a default for a measurement. A reviewer does it in
+    sentences: a version number, a platform threshold, a library behaviour written from
+    recall and set beside figures that were actually measured against the repo. On the page
+    they are indistinguishable, and the recalled one is often the actionable one — it is
+    what the author will go and act on. So **cite or label every external fact**: link the
+    source, or write "unverified" next to it. A review that mixes six measured claims with
+    one recalled claim does not read as five-sixths reliable; the measured majority launders
+    the recalled sentence.
+    *Grounded by:* 2026-08-30 — a review of [`ag2-space/cinny-webclient#703`][cinny-703]
+    correctly measured that `color-mix()` had zero precedent in that codebase (with a positive control
+    proving the search worked), then asserted it "needs WebKitGTK 2.42+" from recall. The 2.42
+    figure was never checked. Checking produces the sharper finding the review should have
+    carried: [Tauri's webview-versions table][tauri-webviews] pairs Ubuntu 22.04 with WebKitGTK
+    2.36, and lists that row as Safari "TP 140 (16.0)" — a technology preview, not a shipped
+    16.0 — against a Safari 16.2 threshold for the settled `color-mix()` syntax (**unverified**:
+    that threshold comes from secondary sources, not a primary WebKit release note). Note what the citation
+    itself says: the same table warns its Linux data is "a very incomplete list", so it is
+    evidence, not proof — which is why `@supports (color: color-mix(in srgb, red 50%, blue))`
+    is the right instrument here and a version comparison is not. The unmeasured sentence sat
+    in the paragraph the review named as the blocker.
+
+    [tauri-webviews]: https://v2.tauri.app/reference/webview-versions/
+    [cinny-703]: https://github.com/ag2-space/cinny-webclient/pull/703
+
 14. **Never assert on source text as a stand-in for a behavioral claim.** When a module
     cannot be imported by tests (import-time side effects, heavy SDK deps), extract the
     decision into an importable unit and test THAT — do not regex the file. A source-text
@@ -377,6 +402,37 @@ and loads whichever repo it reviews.
     opposing reviews. Force-pushes were ruled out by the issue timeline on #3471 (zero
     `head_ref_force_pushed` events) but not on every PR in that set, so treat 32 as the
     measured figure for the PRs checked rather than a proven fleet-wide total.
+
+20. **Read the PR's own failing checks before you approve — a red gate is OFTEN a finding
+    the CI already made for you, and you cannot know which without reading it.** Lesson 8
+    says the verdict is a recommendation and never the merge gate, which is true and is
+    *not* a licence to skip looking: the reason to read a failing check is not that your
+    approval could merge something broken, it is that the check is frequently reporting a
+    defect in the diff you are reviewing.
+    A coverage gate naming uncovered lines is pointing at untested behavior; a failing
+    suite is naming the case the change breaks. Approving without reading it means
+    shipping a review that missed a finding the repository had already surfaced, and it
+    tells the author "ready" while the PR is not.
+    *Grounded by:* two approvals cast over red gates on 2026-08-31 by the same reviewer
+    within eight minutes. On #3567 the coverage gate read
+    `scripts/review-preflight.py (90.3%): Missing lines 147-148,153-154,173,192` — those
+    lines are the failure branches of `_gh_json`, the fail-closed design the review had
+    just singled out for praise. The gate had found that the praised behavior has no test
+    behind it, and the review said the opposite. On #3600 the gate was red at the reviewed
+    head (`89.7%`) and the author pushed a fix six minutes later, so nothing came of it —
+    luck, not process. Neither review looked. The cheap form is one call before the
+    verdict: `gh pr checks <PR>`. Mapping a failing check to an issue already filed
+    about it is worth doing by hand until tooling for it lands.
+    **Reading it is necessary and not sufficient — check that the job actually RAN.**
+    Sometimes a red check is naming the infrastructure rather than the diff: a job killed
+    by an Actions budget wall reports `conclusion=failure` with **`steps=0`**, which is
+    indistinguishable from a real failure by conclusion alone (reported by @qingyun-air.agent
+    from a SIBLING org — not this one — on two "Engine pin staleness" failures that were the
+    wall, not findings).
+    A check that never executed has no finding in it, and telling an author to fix one is
+    worse than not looking. Same reason `conclusion` alone is never the whole answer: an
+    IN_PROGRESS run carries `conclusion == ""`, so a filter keyed only on it calls a running
+    check failing.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
