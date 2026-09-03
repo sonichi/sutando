@@ -873,8 +873,9 @@ _snapshot_per_host_config() {
     local _host_dir="$WORKSPACE_DIR/hosts/$(_host)"
     mkdir -p "$_host_dir" 2>/dev/null || return 0
 
-    # An interrupted stage cannot clean up after itself. Scoped to this host's own
-    # pattern and past the grace window, so a concurrent sync's temp is never hit.
+    # An interrupted stage cannot clean up after itself: host-scoped, past the grace window,
+    # and never while a live intent names it (the scheduler tick outlives the grace; recovery decides).
+    [ -f "$_host_dir/.build_log.snapshot-sha.next" ] ||
     find "$_host_dir" -maxdepth 1 -type f -name 'build_log.md.snap.??????' \
         -mmin +"${SYNC_SNAP_TMP_GRACE_MIN:-10}" -delete 2>/dev/null || true
     find "$_host_dir" -maxdepth 1 -type f -name '.build_log.snapshot-sha.repair.??????' \
@@ -1065,12 +1066,29 @@ PY
                 return 0
             fi
             log "snapshot: completed an interrupted publish from its intent record"
+        elif _dest_is_partial_of_root "$_d" "$_s"; then
+            # Partial and no source to roll forward from: pushing it would vault a truncated
+            # log, so the intent stays and this tick keeps withholding.
+            warn_operator "snapshot: hosts/$(_host)/build_log.md is PARTIAL and its staged copy is gone; intent kept, this sync will not push it (root build_log.md still holds the whole content)"
+            return 3
         else
             # The move never landed (or landed as something else): the intent
             # describes content that is not there, so it grants nothing.
             rm -f "$_i" 2>/dev/null || true
             log "snapshot: discarded a stale publish intent (destination does not match it)"
         fi
+    }
+    # Partial = a strict prefix of root that the signature does not vouch for (an old
+    # complete copy is also a prefix, but its sha is the recorded one).
+    _dest_is_partial_of_root() {
+        local _d="$1" _s="$2" _r="$WORKSPACE_DIR/build_log.md" _dn _rn _dsha _rec
+        [ -f "$_d" ] && [ -f "$_r" ] || return 1
+        _dn="$(wc -c < "$_d" 2>/dev/null | tr -d ' ')"; _rn="$(wc -c < "$_r" 2>/dev/null | tr -d ' ')"
+        [ -n "$_dn" ] && [ -n "$_rn" ] && [ "$_dn" -gt 0 ] && [ "$_dn" -lt "$_rn" ] || return 1
+        head -c "$_dn" "$_r" 2>/dev/null | cmp -s - "$_d" || return 1
+        _dsha="$(shasum -a 256 "$_d" 2>/dev/null | cut -d' ' -f1)"
+        _rec=""; [ -f "$_s" ] && _rec="$(_usable_sig_record "$_s")"
+        [ "$_dsha" != "$_rec" ]
     }
 
     # Record a sha as the destination's provenance through the SAME durable contract as a

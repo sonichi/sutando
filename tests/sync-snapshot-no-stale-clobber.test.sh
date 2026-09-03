@@ -649,6 +649,34 @@ check "...cleans up and reports success" \
 check "...and the recovery is recorded in \$LOG" \
       'grep -q "rolled hosts/testhost/build_log.md forward from its staged copy" "$LOG"'
 
+# (c) same as (b), but the next tick arrives past the stage grace window (scheduler = 900s):
+# the sweep must not take the intent's source before recovery runs.
+_arm_big_root
+_fz="$(_fsize_shim "--replace|--rollforward")"
+SYNC_PY="$_fz/python3" _snapshot_per_host_config > "$SB/16c.out" 2>&1; _rc16c=$?
+rm -rf "$_fz"
+check "c) aged: the staged copy and the intent are kept after the short writes" \
+      '[ "$_rc16c" -eq 3 ] && [ -f "$_INT" ] && [ -n "$(ls "$_DST".snap.* 2>/dev/null)" ]'
+touch -t 202601010000 "$_DST".snap.* "$_INT"
+_snapshot_per_host_config > "$SB/16c2.out" 2>&1; _rc16c2=$?
+check "...an aged next tick still rolls forward to the WHOLE root" 'cmp -s "$WORKSPACE_DIR/build_log.md" "$_DST"'
+check "...promotes provenance and cleans up" \
+      '[ "$(cat "$_SIG")" = "$(_root_sha)" ] && [ ! -f "$_INT" ] && [ -z "$(ls "$_DST".snap.* 2>/dev/null)" ] && [ "$_rc16c2" -eq 0 ]'
+
+# (d) partial destination whose staged copy is GONE: nothing to roll forward from, so the tick
+# keeps withholding (rc 3) with the intent intact instead of discarding it and pushing a prefix.
+_arm_big_root
+_fz="$(_fsize_shim "--replace|--rollforward")"
+SYNC_PY="$_fz/python3" _snapshot_per_host_config > "$SB/16d.out" 2>&1; _rc16d=$?
+rm -rf "$_fz"
+rm -f "$_DST".snap.*
+_snapshot_per_host_config > "$SB/16d2.out" 2>&1; _rc16d2=$?
+check "d) no source: a still-partial destination keeps returning 3" '[ "$_rc16d" -eq 3 ] && [ "$_rc16d2" -eq 3 ]'
+check "...the intent is kept and the destination is still the partial prefix" \
+      '[ -f "$_INT" ] && _dst_is_strict_prefix_of_root'
+check "...and the operator is told the source is gone" 'grep -q "staged copy is gone" "$SB/16d2.out"'
+rm -f "$_INT"
+
 # (c) KILL mid-write: only the on-disk state survives — a prefix, a durable intent, a staged copy.
 _arm_big_root
 _ino="$(ls -i "$_DST" | awk "{print \$1}")"
@@ -675,14 +703,17 @@ check "...the intent and staged copy are discarded, loudly" \
 check "...and the signature is not promoted to bytes that are not there" \
       '[ "$(cat "$_SIG")" != "$(_root_sha)" ]'
 
-# (e) control: a staged copy whose sha is NOT the intent's grants nothing.
+# (e) control: a staged copy whose sha is NOT the intent's grants nothing — and with the
+# destination still a partial prefix, the tick withholds (rc 3) rather than discarding the intent.
 _arm_big_root
 _stg="$(mktemp "$_DST.snap.XXXXXX")"; printf 'unrelated staged bytes\n' > "$_stg"; _root_sha > "$_INT"
 head -c 700 "$WORKSPACE_DIR/build_log.md" > "$_DST"
-_snapshot_per_host_config > /dev/null 2>&1
-check "e) control: an unmatched staged copy is ignored (intent discarded, destination untouched)" \
-      '[ ! -f "$_INT" ] && [ "$(wc -c < "$_DST" | tr -d " ")" = "700" ]'
-rm -f "$_stg"
+_snapshot_per_host_config > /dev/null 2>&1; _rc16e=$?
+check "e) control: an unmatched staged copy is ignored (destination untouched, not rolled forward from it)" \
+      '[ "$(wc -c < "$_DST" | tr -d " ")" = "700" ] && [ "$(cat "$_SIG")" != "$(_root_sha)" ]'
+check "...and a partial destination with no usable source keeps its intent and withholds" \
+      '[ -f "$_INT" ] && [ "$_rc16e" -eq 3 ]'
+rm -f "$_stg" "$_INT"
 
 [ "$fails" -eq 0 ] && { echo "ALL PASS"; exit 0; }
 echo "$fails FAILURE(S)"; exit 1

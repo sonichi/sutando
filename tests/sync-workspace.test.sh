@@ -342,9 +342,8 @@ if cmp -s "$FIXTURE_WS/build_log.md" "$PARTIAL_DST"; then
 else
   echo "  FAIL: precondition — per-host copy not published from root"; fail=$((fail+1))
 fi
-# Grow root past one block, then make every in-place write stop short AFTER the truncate:
-# a one-block RLIMIT_FSIZE on the --replace/--rollforward interpreters only, injected
-# through the resolver the script itself honours (`sutando-config.sh python-bin`).
+# Grow root past one block, then a one-block RLIMIT_FSIZE on the --replace/--rollforward
+# interpreters only (via the `sutando-config.sh python-bin` resolver) makes every in-place write stop short.
 awk 'BEGIN{for(i=0;i<200;i++)printf "vault-visible line %04d ........................................\n", i}' \
   >> "$FIXTURE_WS/build_log.md"
 SHIM_DIR="$TEST_ROOT/fsize-shim"; mkdir -p "$SHIM_DIR"
@@ -377,7 +376,9 @@ if [ "$dst_n" -gt 0 ] && [ "$dst_n" -lt "$root_n" ] && head -c "$dst_n" "$FIXTUR
 else
   echo "  FAIL: the per-host copy is not a partial prefix of root (dst=$dst_n root=$root_n)"; fail=$((fail+1))
 fi
-# The next tick, with a working interpreter, rolls forward and pushes the whole file.
+# The next tick, with a working interpreter, arrives a scheduler interval later (900s, past
+# the 10-minute stage grace) and must still roll forward and push the whole file.
+touch -t 202601010000 "$PARTIAL_DST".snap.* "$(dirname "$PARTIAL_DST")/.build_log.snapshot-sha.next"
 rollfwd_out=$(run_sync --push-only 2>&1 || true)
 if cmp -s "$FIXTURE_WS/build_log.md" "$PARTIAL_DST"; then
   echo "  OK: the next tick rolled the per-host copy forward to the whole root"; pass=$((pass+1))
