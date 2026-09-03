@@ -457,9 +457,24 @@ and loads whichever repo it reviews.
     depends on and check the continuation re-reads it rather than closing over it.
 22. **A mutation-test `SURVIVED` is untrusted until the bytecode cache is invalidated.**
     Two mutants of the *same byte length*, written within the same mtime second, share a
-    `__pycache__` entry: CPython validates a cached `.pyc` on source **mtime + size**, so the
-    second mutant silently executes the first one's compiled code. It reports SURVIVED, and
-    SURVIVED is the direction that sends someone to "fix" a gap that is not there.
+    `__pycache__` entry **when the cache is CPython's default timestamp mode** (`flags == 0`):
+    that mode validates on source `int(st_mtime)` + byte size, so the second mutant silently
+    executes the first one's compiled code. It reports SURVIVED, and SURVIVED is the direction
+    that sends someone to "fix" a gap that is not there.
+
+    The mode matters, so check it before reaching for this explanation. Driving all three
+    invalidation modes through `spec_from_file_location`, same path, same size, same
+    `int(mtime)` (CPython 3.13.5 and 3.14.6 agree):
+
+    ```
+    timestamp       flags=0  serves STALE bytecode   <-- the collision above
+    checked-hash    flags=3  detects the rewrite
+    unchecked-hash  flags=1  serves STALE bytecode, and needs neither condition
+    ```
+
+    A `checked-hash` cache does not collide at all, so a SURVIVED under one is not explained
+    by this lesson; an `unchecked-hash` cache is worse than described, because it never
+    revalidates and so stays stale even when size and mtime both change.
     *Measured on `scripts/my-stale-approvals.py` + its suite, five mutants, two arms:*
 
     ```
@@ -472,15 +487,16 @@ and loads whichever repo it reviews.
     ```
 
     The only mutant that flips is **inside** the colliding pair — m3 — while its partner m2
-    (same 8270 bytes) and the three distinctly-sized mutants are unchanged. That asymmetry is
-    what rules out "the suite is flaky": a flaky suite would move mutants at random sizes, and
-    a collision can only corrupt a mutant that *shares* a size with the one written before it.
+    (same 8270 bytes) and the three distinctly-sized mutants are unchanged. That asymmetry
+    *localizes* the cause to the colliding pair, which is what makes the cache hypothesis worth
+    testing; it does not by itself rule out flakiness, because a stochastic or input-correlated
+    failure need not move mutants at random sizes. What establishes the cause is the direct
+    pair of controls — stale bytecode kept vs. cache cleared — not the shape of the table.
     **m2 and m4 survive a CLEARED cache, so they are not artifacts** — the suite genuinely does
     not catch `staleness > -> >=` or the dropped-bar mutation. Only m3's SURVIVED was false.
-    Stating that because a reader who takes "cache collision" as the explanation for every
+    That is stated explicitly because a reader who takes "cache collision" as the explanation for every
     SURVIVED here would discard two real uncaught mutations along with the artifact. m3's
-    mutation is caught by a test *named for it* — `test_a_commit_AT_the_approval_timestamp_
-    does_not_count_as_after`, docstring "Pins the boundary so widening `>` to `>=` cannot pass
+    mutation is caught by a test *named for it* — `test_a_commit_AT_the_approval_timestamp_does_not_count_as_after`, docstring "Pins the boundary so widening `>` to `>=` cannot pass
     silently" — so the harness reported SURVIVED about a mutant the suite catches by design.
     Acting on that report meant nearly replacing a deliberate documented semantic with its
     opposite, in the name of rigour.
