@@ -35,17 +35,9 @@ except ImportError:
     publish_result = _mod.publish_result
 
 try:
-    from .result_markers import parse_markers
+    from .result_markers import parse_markers  # the Sparrow package layout
 except ImportError:
-    try:
-        from result_markers import parse_markers
-    except ImportError:
-        # Loaded by file path from src/delivery/: the marker owner is one level up.
-        _mspec = importlib.util.spec_from_file_location(
-            "result_markers", Path(__file__).resolve().parent.parent / "result_markers.py")
-        _mmod = importlib.util.module_from_spec(_mspec)
-        _mspec.loader.exec_module(_mmod)
-        parse_markers = _mmod.parse_markers
+    from result_markers import parse_markers  # src/ on sys.path, as every bridge has it
 
 __all__ = ["read_ready_result", "is_ready_body", "retire_claim_if_unchanged",
            "sweep_retired"]
