@@ -48,8 +48,9 @@ STATE_REL = os.path.join("state", "authority.json")
 KEY = "github_formal_review"
 BLOCKING = {"approve": "APPROVE", "request-changes": "REQUEST_CHANGES"}
 
-# `gh api .../reviews` carrying an event, e.g. -f event=APPROVE or JSON input.
-_API_EVENT = re.compile(r"\b(APPROVE|REQUEST_CHANGES)\b")
+# `gh api .../reviews`: the event ASSIGNMENT (-f event=APPROVE, "event": "APPROVE"),
+# never a bare word — a COMMENT whose body discusses approval is not an approval.
+_API_EVENT = re.compile(r"""\bevent\b["']?\s*[:=]\s*["']?(APPROVE|REQUEST_CHANGES|COMMENT)\b""")
 _API_REVIEWS = re.compile(r"/pulls/\d+/reviews\b")
 # Dismissal is a REDUCTION of standing — never gated.
 _DISMISSAL = re.compile(r"/reviews/\d+/dismissals\b")
@@ -108,11 +109,15 @@ def _segments(command: str):
 
 
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+_INTERPRETERS = {"python", "python3", "node", "ruby", "perl"}
+# A list-literal argv (`['gh','pr','review']`) is one program string to shlex; dropping
+# quotes, commas and brackets restores adjacency so the token check sees it.
+_LITERAL_NOISE = re.compile(r"""[\[\]\(\),'"]""")
 
 
 def _wrapped_command(words):
-    """The command string a shell wrapper would run: `bash -c "..."`, `eval "..."`.
-    shlex keeps the whole -c argument as one token, so it is re-classified."""
+    """The string a wrapper would run (`bash -c`, `eval`, `python3 -c`, `node -e`):
+    one shlex token, so it is re-classified; interpreter strings de-literalised first."""
     if not words:
         return None
     head = words[0].rsplit("/", 1)[-1].lower()
@@ -122,6 +127,10 @@ def _wrapped_command(words):
         for i, w in enumerate(words[1:-1], 1):
             if w == "-c" or (w.startswith("-") and not w.startswith("--") and "c" in w):
                 return words[i + 1]
+    if head in _INTERPRETERS or head.startswith("python"):
+        for i, w in enumerate(words[1:-1], 1):
+            if w in ("-c", "-e"):
+                return _LITERAL_NOISE.sub(" ", words[i + 1])
     return None
 
 
@@ -174,6 +183,8 @@ def classify(command: str) -> Optional[str]:
             m = _API_EVENT.search(seg)
             if m:
                 return m.group(1)
+            # A reviews POST whose event rides in --input/stdin is unreadable here;
+            # fail open rather than guess from prose.
     return None
 
 

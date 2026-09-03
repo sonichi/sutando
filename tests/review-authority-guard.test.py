@@ -155,6 +155,30 @@ for _cmd, _want in (
 ):
     check(f"wrapper: {_cmd}", classify(_cmd), _want)
 
+print("11. interpreter indirection: -c/-e strings and list-literal argv are de-literalised")
+_R = "gh pr review"
+for _cmd, _want in (
+    ("""python3 -c "import subprocess; subprocess.run(['gh','pr','review','123','--approve'])" """, "APPROVE"),
+    ("""python3 -c 'import subprocess; subprocess.run(["gh", "pr", "review", "123", "--request-changes", "-b", "x"])' """, "REQUEST_CHANGES"),
+    ("""python3.12 -c "subprocess.run(['gh','pr','review','7','--comment','-b','ok'])" """, "COMMENT"),
+    (f"""node -e "require('child_process').execSync('{_R} 5 --approve')" """, "APPROVE"),
+    ("""python3 -c "subprocess.run(['gh','api','repos/o/r/pulls/3/reviews','-f','event=APPROVE'])" """, "APPROVE"),
+    ('python3 -c "print(\'hello\')"', None),
+    ("python3 -c \"subprocess.run(['gh','pr','view','123'])\"", None),
+):
+    check(f"interp: {_cmd.strip()}", classify(_cmd), _want)
+
+print("12. gh api reviews: the event ASSIGNMENT decides, body prose never does")
+for _cmd, _want in (
+    ("gh api repos/o/r/pulls/3/reviews -f event=COMMENT -f body='I do not APPROVE of this'", "COMMENT"),
+    ("gh api repos/o/r/pulls/3/reviews -f event=COMMENT -f body='needs REQUEST_CHANGES later'", "COMMENT"),
+    ("gh api repos/o/r/pulls/3/reviews -f event=APPROVE -f body='ok'", "APPROVE"),
+    ("gh api repos/o/r/pulls/3/reviews --raw-field event=REQUEST_CHANGES", "REQUEST_CHANGES"),
+    ("""gh api repos/o/r/pulls/3/reviews --input - <<< '{"event": "APPROVE", "body": "x"}'""", "APPROVE"),
+    ("gh api repos/o/r/pulls/3/reviews -f body='APPROVE this please'", None),
+):
+    check(f"api: {_cmd}", classify(_cmd), _want)
+
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")
     for f in FAILURES:
