@@ -216,7 +216,7 @@ class CallersHonourTheReturn(unittest.TestCase):
         cleared = []
         tasks = self.d / "tasks"; tasks.mkdir()
         pair = _load_pair(self.d / "at", self.d / "ar", tasks, cleared)
-        claimed = tasks / "task-3.claimed-core-1.txt"; claimed.write_text("t")
+        claimed = tasks / "task-3.claimed-worker-1.txt"; claimed.write_text("t")
         res = self.d / "task-3.txt"; res.write_text("r")
         pair(res, "task-3")
         self.assertFalse(claimed.exists(),

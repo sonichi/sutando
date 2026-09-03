@@ -527,7 +527,7 @@ def test_stale_classifier_is_archived_under_its_pool_assigned_name() -> None:
     # The lead renames queued work to `.assigned-<inst>`. A bare-name lookup
     # misses it, so every TTL expiry left a file behind and the queue grew.
     workspace = fixture_workspace()
-    first, path, replacement = _stale_and_replace(workspace, ".assigned-core-1")
+    first, path, replacement = _stale_and_replace(workspace, ".assigned-worker-1")
 
     assert replacement.enqueued and replacement.task_id != first.task_id
     assert not path.exists()
@@ -542,7 +542,7 @@ def test_a_worker_held_classifier_claim_is_left_alone() -> None:
     # Archiving out from under a running worker is worse than one duplicate
     # proposal, so a `.claimed-` file must survive its own replacement.
     workspace = fixture_workspace()
-    first, path, replacement = _stale_and_replace(workspace, ".claimed-core-1")
+    first, path, replacement = _stale_and_replace(workspace, ".claimed-worker-1")
 
     assert replacement.enqueued
     assert path.exists(), "claimed file was archived while a worker held it"
@@ -555,9 +555,9 @@ def test_an_assigned_and_claimed_pair_still_leaves_the_claim_alone() -> None:
     workspace = fixture_workspace()
     first = workstreams.maybe_enqueue_classifier_task(workspace)
     base = workspace / "tasks" / f"{first.task_id}.txt"
-    claimed = base.with_name(f"{first.task_id}.claimed-core-1.txt")
+    claimed = base.with_name(f"{first.task_id}.claimed-worker-1.txt")
     base.rename(claimed)
-    assigned = base.with_name(f"{first.task_id}.assigned-core-2.txt")
+    assigned = base.with_name(f"{first.task_id}.assigned-worker-2.txt")
     assigned.write_text("id: " + first.task_id + "\n")
     state_path = workspace / "state" / "task-workstream-classifier.json"
     state = json.loads(state_path.read_text())
@@ -591,7 +591,7 @@ def test_a_vanished_predecessor_is_not_an_error() -> None:
 def test_a_directory_wearing_a_task_name_is_never_archived() -> None:
     # find_task_file resolves by NAME, not type, so dropping the parent's
     # is_file() would relocate a whole directory into the archive.
-    for suffix in ("", ".assigned-core-1"):
+    for suffix in ("", ".assigned-worker-1"):
         workspace = fixture_workspace()
         first = workstreams.maybe_enqueue_classifier_task(workspace)
         real = workspace / "tasks" / f"{first.task_id}.txt"

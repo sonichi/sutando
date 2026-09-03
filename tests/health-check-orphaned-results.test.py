@@ -127,7 +127,7 @@ class OrphanedResultsTest(unittest.TestCase):
     def test_aged_CLAIMED_task_is_still_not_an_orphan(self):
         """A claimed task is owned by a running consumer, however long it runs."""
         self._write("results/task-slow.txt", TWO_HOURS_AGO)
-        self._write("tasks/task-slow.claimed-core-2.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-slow.claimed-worker-2.txt", TWO_HOURS_AGO)
         self.assertEqual(hc.check_orphaned_results()["status"], "ok")
 
     def test_claimed_task_is_still_a_live_task(self):
@@ -141,13 +141,13 @@ class OrphanedResultsTest(unittest.TestCase):
         there a file with this exact name".
         """
         self._write("results/task-abc.txt", TWO_HOURS_AGO)
-        self._write("tasks/task-abc.claimed-core-1.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-abc.claimed-worker-1.txt", TWO_HOURS_AGO)
         self.assertEqual(hc.check_orphaned_results()["status"], "ok")
 
     def test_claimed_by_a_different_core_is_also_live(self):
-        """The claim suffix carries a core number — do not match only core-1."""
+        """The claim suffix carries a core number — do not match only worker-1."""
         self._write("results/task-xyz.txt", TWO_HOURS_AGO)
-        self._write("tasks/task-xyz.claimed-core-7.txt", TWO_HOURS_AGO)
+        self._write("tasks/task-xyz.claimed-worker-7.txt", TWO_HOURS_AGO)
         self.assertEqual(hc.check_orphaned_results()["status"], "ok")
 
     def test_fresh_result_is_not_an_orphan(self):

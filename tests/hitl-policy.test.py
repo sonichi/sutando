@@ -26,7 +26,7 @@ ACTIONS = [Action(id="allow", kind="allow_once", label="Allow"),
            Action(id="open_terminal", kind="open_terminal", label="Open terminal")]
 
 
-def perm(tool, session="core-1", guard="g"):
+def perm(tool, session="worker-1", guard="g"):
     return HumanRequirement(kind="permission", runtime="claude", message=f"Claude wants to run {tool}",
                             guard=guard, subject={"tool": tool, "input": "x"},
                             device={"id": session, "name": session}, actions=list(ACTIONS))

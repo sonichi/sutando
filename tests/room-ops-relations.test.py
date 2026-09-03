@@ -149,9 +149,9 @@ class CitationCliTests(unittest.TestCase):
                                return_value={"ok": True, "room_id": ROOM,
                                              "event_id": "$e", "reason": None}) as m:
             with mock.patch("sys.stdout"):
-                rc = room_ops._main(["say", ROOM, "hi", "--worker", "core-9"])
+                rc = room_ops._main(["say", ROOM, "hi", "--worker", "worker-9"])
         self.assertEqual(rc, 0)
-        m.assert_called_once_with("hi", ROOM, None, reply_to=None, worker="core-9")
+        m.assert_called_once_with("hi", ROOM, None, reply_to=None, worker="worker-9")
 
     def test_mention_flag_reaches_mention(self):
         with mock.patch.object(room_ops._mention, "mention",

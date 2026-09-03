@@ -19,7 +19,7 @@ from hitl.schema import Action, ActionReply, HumanRequirement  # noqa: E402
 ACTS = [Action(id="allow", kind="allow_once", label="Allow"), Action(id="deny", kind="reject_once", label="Deny")]
 
 
-def perm(cmd, guard, session="core-1"):
+def perm(cmd, guard, session="worker-1"):
     return HumanRequirement(kind="permission", runtime="claude", message=f"Claude wants to run Bash: {cmd}",
                             guard=guard, device={"id": session, "name": session}, actions=list(ACTS))
 
@@ -60,15 +60,15 @@ class IdentityTests(unittest.TestCase):
 
     def test_auth_still_collapses_onto_one_refreshed_card(self):
         auth = lambda g: HumanRequirement(kind="auth", runtime="claude", message="Claude Code needs to sign in again",
-                                          guard=g, device={"id": "core-1"}, actions=[Action(id="reauth", kind="authenticate", label="Re-authenticate")])
+                                          guard=g, device={"id": "worker-1"}, actions=[Action(id="reauth", kind="authenticate", label="Re-authenticate")])
         a = self.mgr.create(auth("probe:1"))
         b = self.mgr.create(auth("probe:2"))
         self.assertEqual(a.id, b.id)
         self.assertEqual((self.mgr.get(a.id).guard, self.mgr.get(a.id).revision), ("probe:2", 2))
 
     def test_two_sessions_same_guard_stay_two_cards(self):
-        a = self.mgr.create(perm("ls", "g", session="core-1"))
-        b = self.mgr.create(perm("ls", "g", session="core-2"))
+        a = self.mgr.create(perm("ls", "g", session="worker-1"))
+        b = self.mgr.create(perm("ls", "g", session="worker-2"))
         self.assertNotEqual(a.id, b.id)
 
     def test_store_id_contract_is_one_rule(self):

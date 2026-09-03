@@ -139,7 +139,7 @@ class TasksViewTests(unittest.TestCase):
         self.assertEqual(self.view.status(tid)["state"], "pending")
         # claim rename, as claim_task.py does
         f = self._task_file(tid)
-        f.rename(self.tasks / f"{tid}.claimed-core-1.txt")
+        f.rename(self.tasks / f"{tid}.claimed-worker-1.txt")
         self.assertEqual(self.view.status(tid)["state"], "in_progress")
         # result lands → done (result presence wins)
         self.results.mkdir(parents=True, exist_ok=True)
@@ -254,7 +254,7 @@ class TasksViewTests(unittest.TestCase):
         a = self.view.submit("first")["taskId"]
         b = self.view.submit("second")["taskId"]
         # claimed task still listed (as in_progress); done task drops off
-        (self.tasks / f"{a}.txt").rename(self.tasks / f"{a}.claimed-core-1.txt")
+        (self.tasks / f"{a}.txt").rename(self.tasks / f"{a}.claimed-worker-1.txt")
         c = self.view.submit("third")["taskId"]
         self.results.mkdir(parents=True, exist_ok=True)
         (self.results / f"{c}.txt").write_text("done")
@@ -538,8 +538,8 @@ class TasksViewAssignedIdTests(unittest.TestCase):
     def test_assigned_and_claimed_files_list_their_canonical_id(self):
         # The lead renames to .assigned-<inst>; a .claimed- split is blind to it.
         self._write("task-rtapi-P1.txt", "task-rtapi-P1")
-        self._write("task-rtapi-C1.claimed-core-2.txt", "task-rtapi-C1")
-        self._write("task-rtapi-A1.assigned-core-2.txt", "task-rtapi-A1")
+        self._write("task-rtapi-C1.claimed-worker-2.txt", "task-rtapi-C1")
+        self._write("task-rtapi-A1.assigned-worker-2.txt", "task-rtapi-A1")
 
         listed = sorted(e["taskId"] for e in self.view.list_tasks()["tasks"])
         self.assertEqual(listed, ["task-rtapi-A1", "task-rtapi-C1", "task-rtapi-P1"])
@@ -558,7 +558,7 @@ class TasksViewAssignedIdTests(unittest.TestCase):
     def test_a_listed_id_can_fetch_its_result(self):
         # The defect: the compound id is listed, no result is ever written under
         # it, and status() reads pending forever because the file does exist.
-        self._write("task-rtapi-A1.assigned-core-2.txt", "task-rtapi-A1")
+        self._write("task-rtapi-A1.assigned-worker-2.txt", "task-rtapi-A1")
         (self.results / "task-rtapi-A1.txt").write_text("the answer")
 
         listed = [e["taskId"] for e in self.view.list_tasks()["tasks"]]

@@ -30,7 +30,7 @@ class TaskRelayClickTests(unittest.TestCase):
         self.mgr = HitlManager(HitlStore(default_store(TMP)))
         self.req = self.mgr.create(HumanRequirement(
             kind="permission", runtime="claude", message="Claude wants to run Bash: ls",
-            guard=f"hook:{os.urandom(4).hex()}", device={"id": "core-1", "name": "core-1"},
+            guard=f"hook:{os.urandom(4).hex()}", device={"id": "worker-1", "name": "worker-1"},
             actions=[Action(id="allow", kind="allow_once", label="Allow"),
                      Action(id="deny", kind="reject_once", label="Deny")]))
 
