@@ -47,7 +47,15 @@ Locally a re-delivered id is never queued twice while the first copy is live
 delivered → `[no-send]` lease close), and the result sink dedupes on the task
 id. What this client cannot prevent: a lease shorter than the seat's honest
 task time hands the SAME id to another seat, which then answers it too — set
-the broker's visibility timeout above the longest honest task.
+RELAY_VISIBILITY_TIMEOUT (seconds, on the BROKER) above the longest honest
+task. The consequence is at-least-once: a task on a seat that dies mid-run is
+re-served to another seat, and the result sink dedupes by task id.
+
+Result attribution: every result POST carries `metadata.worker_id` and
+`metadata.location`. The worker id is the pool done-flag owner
+(`state/cores/<worker>/done/<task>.flag`) when exactly one exists — a pool
+worker answering a task its lead routed — else this seat's own WORKER_ID: a
+cloud seat has no done-flag, and its result is still its own.
 
 Config (env / .env):
   REMOTE_TASK_TOKEN      the onboarding string — the ONLY required setting
@@ -3376,9 +3384,9 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["no_send"] = True
     # Structured attribution, not the "— core-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
-    worker = _worker_of(tid)
-    if worker:
-        doc["metadata"] = {"worker_id": worker}
+    # Pool done-flag owner first; else this seat answered it (cloud, home).
+    doc["metadata"] = {"worker_id": _worker_of(tid) or WORKER_ID,
+                       "location": WORKER_LOCATION}
     payload = json.dumps(doc).encode("utf-8")
     core.backend.publish(broker_tid, payload)   # False = already live: retry pass
     res = core.deliver_one(broker_tid, payload)

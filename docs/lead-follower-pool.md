@@ -235,8 +235,16 @@ while the first copy is live (pending, `.assigned-*` or `.claimed-*` file) and
 re-acks it so the broker learns the seat still has it; an id already archived
 or delivered closes the lease with a `[no-send]` marker. What the client cannot
 prevent is a lease shorter than an honest task: the broker then hands the same
-id to another seat, which answers it too. Set the visibility timeout above the
-longest honest task.
+id to another seat, which answers it too. Set `RELAY_VISIBILITY_TIMEOUT`
+(seconds) on the broker above the longest honest task. The at-least-once
+consequence in one sentence: a task on a worker that dies mid-run is re-served
+to another seat, and results dedupe by task id.
+
+Every result POST names the seat that produced it — `metadata.worker_id` +
+`metadata.location`. On a pool host the worker id is the done-flag owner
+(`state/cores/<worker>/done/<task>.flag`, the pool worker that answered a task
+the lead routed); a cloud seat has no done-flag, so its own `SUTANDO_WORKER_ID`
+is the attribution of last resort (`cloud-1` / `cloud`, never an empty payload).
 
 ### Turning on a Codex follower
 

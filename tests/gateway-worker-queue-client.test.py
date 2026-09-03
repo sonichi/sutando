@@ -257,8 +257,10 @@ def main() -> int:
     check(len(STATE["results"]) == 1
           and STATE["results"][0].get("id") == "task-CLOUD1"
           and STATE["results"][0].get("body") == "answer from the cloud seat"
-          and "metadata" not in STATE["results"][0],
-          "result POSTed once with the broker id; no pool attribution without state/cores")
+          and STATE["results"][0].get("metadata")
+          == {"worker_id": "cloud-1", "location": "cloud"},
+          "result POSTed once with the broker id; attributed to the cloud seat itself "
+          "(no done-flag on this host → the seat's own WORKER_ID + location)")
     print(f"     result payload: {json.dumps(STATE['results'][0], sort_keys=True)}")
     check(not (cloud.RESULTS_DIR / "task-CLOUD1.txt").exists()
           and (cloud.TASKS_DIR / "archive" / "task-CLOUD1.txt").exists(),
