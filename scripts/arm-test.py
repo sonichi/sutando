@@ -48,7 +48,9 @@ def run_arm(test: str, label: str) -> "tuple[int, str]":
                            text=True, env=env)
     tail = [ln for ln in (r.stdout + r.stderr).splitlines()
             if ln.startswith(("OK", "FAILED", "Ran "))]
-    return r.returncode, " | ".join(tail[-2:]) or f"rc={r.returncode}"
+    # A silent test has no summary line; "" beats repeating rc, which the
+    # caller already prints.
+    return r.returncode, " | ".join(tail[-2:])
 
 
 def main(argv=None) -> int:
@@ -84,18 +86,23 @@ def main(argv=None) -> int:
             rc, summary = run_arm(a.test, rev)
             rows.append((rev, _git("rev-parse", rev) or "?", blob, rc, summary))
             seen.setdefault(blob, []).append(rev)
-        if not a.no_worktree_arm:
+        # On a clean tree this arm's blob IS HEAD's, so adding it would trip
+        # the dupe refusal on a comparison nobody asked for.
+        if not a.no_worktree_arm and (worktree_blob or "?") not in seen:
             target.write_bytes(saved)
             rc, summary = run_arm(a.test, "worktree")
             rows.append(("worktree", "-", worktree_blob or "?", rc, summary))
             seen.setdefault(worktree_blob or "?", []).append("worktree")
+        elif not a.no_worktree_arm:
+            print(f"arm-test: tree arm skipped — its blob "
+                  f"{(worktree_blob or '?')[:9]} is already an arm", file=sys.stderr)
     finally:
         target.write_bytes(saved)
 
     width = max((len(r[0]) for r in rows), default=4)
     for rev, commit, blob, rc, summary in rows:
         print(f"ARM {rev:<{width}}  commit={commit[:9]:<9} blob={(blob or '?')[:9]}  "
-              f"rc={rc}  {summary}")
+              f"rc={rc}{('  ' + summary) if summary else ''}")
 
     dupes = {b: revs for b, revs in seen.items() if len(revs) > 1}
     if dupes:

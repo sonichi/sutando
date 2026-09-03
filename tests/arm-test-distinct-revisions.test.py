@@ -71,6 +71,28 @@ class TestArming(unittest.TestCase):
         self.assertIn("rc=1", r.stdout)
         self.assertIn("rc=0", r.stdout)
 
+    def test_a_clean_tree_does_not_turn_a_real_comparison_into_a_refusal(self):
+        # THE BLOCKER (@yixuan-ag2, #3817): on a clean tree the implicit arm's
+        # blob equals HEAD's, so the dupe check fired on arms nobody compared.
+        r = self._run("--rev", self.base, "--rev", self.head)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("tree arm skipped", r.stderr)
+        self.assertNotIn("NOT A COMPARISON", r.stderr)
+        self.assertNotIn("ARM worktree", r.stdout)
+
+    def test_a_dirty_tree_still_gets_its_own_arm(self):
+        (Path(self.tmp) / "src" / "m.py").write_text("VALUE = 3\n")
+        r = self._run("--rev", self.head)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ARM worktree", r.stdout)
+        self.assertNotIn("tree arm skipped", r.stderr)
+
+    def test_a_silent_test_does_not_print_rc_twice(self):
+        (Path(self.tmp) / "tests" / "t.py").write_text("import sys\nsys.exit(0)\n")
+        r = self._run("--rev", self.head, "--no-worktree-arm")
+        self.assertNotIn("rc=0  rc=0", r.stdout)
+        self.assertRegex(r.stdout, r"rc=0\s*$")
+
     def test_two_arms_on_the_same_revision_are_refused(self):
         # THE POINT: this is what a stashed "parent" really was.
         r = self._run("--rev", self.head, "--rev", "HEAD", "--no-worktree-arm")
