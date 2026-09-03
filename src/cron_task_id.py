@@ -23,6 +23,10 @@ DISCOVERY_GLOB = TASK_PREFIX + "*"
 # `.no-task.<stamp>.txt`. An unknown suffix fails closed (record not counted).
 RECORD_SUFFIX = r"(?:-late-duplicate)?(?:\.no-task\.\d+)?\.txt"
 
+# An archived record carries two stamps: emit (ms) then archive (s). Both halves
+# demand >=10 digits so a job named `<name>-2` cannot pass its `2` off as one.
+STAMP = r"(?:\d{10,}-\d{10,}|\d+)"
+
 
 def sanitize_name(name: str) -> str:
     """Slugify a cron name for use in a task id and filename.
@@ -48,8 +52,11 @@ def record_matcher(name: str) -> "re.Pattern[str]":
 
     The post-stamp grammar is the three suffixes records actually carry, so a
     neighbour like `<slug>-2-late` cannot pass its `2` off as this job's stamp.
+
+    An ARCHIVED record carries a second stamp (`<emit-ms>-<archive-s>`); both
+    halves must then be >=10 digits, which is what keeps `<slug>-2` out.
     """
     slug = re.escape(sanitize_name(name))
     return re.compile(
-        rf"^{re.escape(TASK_PREFIX)}{slug}-\d+{RECORD_SUFFIX}$"
+        rf"^{re.escape(TASK_PREFIX)}{slug}-{STAMP}{RECORD_SUFFIX}$"
     )

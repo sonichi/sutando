@@ -518,9 +518,12 @@ def _chunk_for_discord(
     if len(preview) > 1:
         # Compose-side feedback: a multi-chunk delivery means the body failed
         # the one-message cap. The composer never sees the split otherwise.
+        # Not an inequality: the split point depends on line structure, so a
+        # body AT the cap can still need two chunks. Report both, claim neither.
         print(
             f"  [delivery-gate] body needed {len(preview)} chunk(s) "
-            f"({len(text)} chars > {max_len}) — compose-side cap missed",
+            f"(body {len(text)} chars, one-message cap {max_len}) "
+            "— compose-side cap missed",
             flush=True,
         )
     if len(preview) <= max_chunks:
@@ -4106,10 +4109,10 @@ async def _handle_discord_message(message, force=False):
             "2. PR-REVIEW REQUEST (the task asks you to review / look at a specific GitHub PR #N) — AUTO-REVIEW, read-only:\n"
             "   - Run: bash skills/claude-codex/scripts/review-pr.sh <N>   (fetches the diff via `gh pr diff` — READ-ONLY: no checkout, never mutates git state or fails on a dirty tree — inlines it into `codex exec --sandbox read-only` `< /dev/null`, bounded by codex-bounded.sh --stall/--max so it can't grind. The verdict is comment-only; it never merges/approves. Diff is fetched OUTSIDE the sandbox so the sandboxed agent needs no network. Note: codex is agentic — a review can take 100s+; --max defaults to 240, don't shorten it.)\n"
             "   - On SUCCESS (exit 0): stdout line 1 is `VERDICT-MARKER: <token>`; the verdict is ONLY the text after the LAST occurrence of that exact <token>. The token is a per-run nonce, so a diff or verdict that quotes a marker literal cannot truncate the extract. Everything before it is codex's exec trace (kept there deliberately so codex-bounded.sh --stall can watch it) and contains repository source the agent inlined while working — copying the whole stream, or its tail, quotes that source as the PR's own content. Extract after the last marker and write ONLY that to results/task-{id}.txt. This is information-only (the team-tier bound) — safe because the review ran sandboxed read-only and the output is just analysis.\n"
-            "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — write results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed), and do NOT write results/task-{id}.txt. Owner-ping is the FALLBACK here, not the default.\n"
+            "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — write results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed), then write exactly `[no-send]` to results/task-{id}.txt so the task archives — the bridge delivers nothing for that marker, so this is still no sender reply. Owner-ping is the FALLBACK here, not the default.\n"
             "2b. MESSAGE OWNER — when the task needs owner decision for any OTHER reason (authorization, scope question, merge direction, repeated echo):\n"
             "   - Write a single proactive message to results/proactive-{ts}.txt summarizing what the sender asked and why it needs owner attention.\n"
-            "   - Do NOT write to results/task-{id}.txt (no sender reply).\n\n"
+            "   - Then write exactly `[no-send]` to results/task-{id}.txt: the bridge delivers nothing for that marker (no sender reply) and archives the task. A task left with no result stays in tasks/ forever, where health-check's task-queue probe and the end-of-pass queue check report it as unanswered.\n\n"
             "3. NO-REPLY — when the task is echo/noise:\n"
             "   - Content is EXACTLY a Stage-2 fallback sentinel: the legacy 'Sandbox unavailable; refusing non-owner task.', or 'Sandbox unavailable (codex exit <N>) — no reply generated.', or 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. Exact match only — a message that merely BEGINS with those words (e.g. 'Sandbox unavailable after upgrading — can you diagnose it?') is ordinary prose and goes to RUN CODEX\n"
             "   - Content is empty / punctuation-only / meta-chatter about the relay itself\n"

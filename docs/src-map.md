@@ -179,6 +179,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmux-status.ts`** — Tmux-pane status scraper.
+- **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
 - **`url-scheme.ts`** — Scheme normalization for URLs handed to Chrome via AppleScript.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
@@ -353,13 +354,14 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`__init__.py`** — _(no header comment)_
 - **`attachment.py`** — Shared file-attachment allowlist for `[file:|send:|attach:]` markers.
 - **`result.py`** — Final scan applied to a Team-tier result before any router reads its markers.
+- **`unfurl.py`** — Whether an outgoing chat post should render link preview cards.
 
 ## `src/runtime-api/`
 
 - **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
 - **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
-- **`ha_adapter.py`** — runtime-api ↔ human-action adapter — the v0 approve/answer transport.
+- **`ha_adapter.py`** — runtime-api ↔ human-action adapter, over the HITL Requirement store.
 - **`identity_view.py`** — Read-only identity surface for THIS agent (the Sutando Server "smallest slice"): sutando.info / sutando.status / sutando.owner / sutando.allowlist.
 - **`instance_key.py`** — Composite (agent_id, instance_id) identity encoding — the ONE owner shared by the durable registry (flat manifest filenames) and the live run dir (the directory holding this instance's socket and lock).
 - **`instance_registry.py`** — Sutando Instance Manifest registry — persistent "this agent exists here" records, M1 of the manifest spec (taxonomy part 4/5): Agent existence ≠ agent process existence.
