@@ -455,14 +455,18 @@ def escalate(manager, state, detail, kind, prompt, session):
         return None
     try:
         from hitl.schema import Action, HumanRequirement
+        # Session in BOTH the guard and the identity: a pool shares one login, so
+        # a weekly limit blocks every worker on byte-identical prompt text at once.
         req = HumanRequirement(
             kind=HITL_KIND,
             runtime="claude",
             message=escalation_message(state, detail, kind, prompt),
-            guard=hashlib.sha256((prompt or state).encode()).hexdigest()[:16],
+            guard=hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16],
+            device={"id": session},
             title=f"{session} · {state}",
             actions=[Action(id="ack", kind="acknowledge", label="I have answered it")],
-            subject={"state": state, "gate": kind or "", "detail": detail},
+            subject={"state": state, "gate": kind or "", "detail": detail,
+                     "session": session},
         )
         return manager.create(req)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
@@ -470,13 +474,18 @@ def escalate(manager, state, detail, kind, prompt, session):
         return None
 
 
-def resolve_escalations(manager):
-    """Clear this driver's requirements once the core is no longer blocked —
-    the card says answered because the core moved, not because anyone clicked."""
+def resolve_escalations(manager, session):
+    """Clear THIS session's requirements once its core is no longer blocked —
+    the card says answered because the core moved, not because anyone clicked.
+
+    Scoped by session: one worker recovering must not clear a sibling's card.
+    """
     if manager is None:
         return []
     try:
-        mine = [r.id for r in manager.active() if r.kind == HITL_KIND]
+        mine = [r.id for r in manager.active()
+                if r.kind == HITL_KIND
+                and (r.subject or {}).get("session") == session]
         for req_id in mine:
             manager.resolve(req_id)   # returns blocked task ids, not a verdict
         return mine
@@ -570,7 +579,7 @@ def main():
             if state in _CHAT_ESCALATE_STATES:
                 escalate(hitl, state, detail, kind, prompt, a.session)
             else:
-                resolve_escalations(hitl)
+                resolve_escalations(hitl, a.session)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)

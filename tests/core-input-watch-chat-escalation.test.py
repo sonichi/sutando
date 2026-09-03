@@ -92,7 +92,7 @@ class TestResolve(unittest.TestCase):
     def test_leaving_the_blocked_set_resolves_the_card(self):
         m = _mgr()
         req = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
-        self.assertEqual(M.resolve_escalations(m), [req.id])
+        self.assertEqual(M.resolve_escalations(m, "s"), [req.id])
         self.assertEqual(m.get(req.id).status, STATUS_RESOLVED)
 
     def test_it_resolves_only_its_own_kind(self):
@@ -104,13 +104,27 @@ class TestResolve(unittest.TestCase):
                                           message="may I", guard="g1",
                                           actions=[Action("allow", "allow", "Allow")]))
         M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
-        self.assertNotIn(other.id, M.resolve_escalations(m))
+        self.assertNotIn(other.id, M.resolve_escalations(m, "s"))
         self.assertNotEqual(m.get(other.id).status, STATUS_RESOLVED)
+
+    def test_it_resolves_only_its_own_session(self):
+        """A pool shares one login, so a weekly limit blocks every worker on
+        byte-identical prompt text. One worker recovering must not clear a
+        sibling's card, and two blocked workers are two cards, not one."""
+        m = _mgr()
+        P = "You've reached your Fable limit"
+        a = M.escalate(m, "blocked-human", "d", "fable-limit-unfocused", P, "worker-1")
+        b = M.escalate(m, "blocked-human", "d", "fable-limit-unfocused", P, "worker-2")
+        self.assertNotEqual(a.id, b.id, "two blocked workers collapsed to one card")
+        self.assertEqual(len(m.active()), 2)
+        self.assertEqual(M.resolve_escalations(m, "worker-1"), [a.id])
+        self.assertEqual([r.id for r in m.active()], [b.id],
+                         "worker-1 recovering cleared worker-2's card")
 
     def test_a_second_block_after_recovery_raises_again(self):
         m = _mgr()
         first = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
-        M.resolve_escalations(m)
+        M.resolve_escalations(m, "s")
         again = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
         self.assertNotEqual(first.id, again.id)
 
