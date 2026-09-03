@@ -105,6 +105,50 @@ with tempfile.TemporaryDirectory() as td:
     )
 
 with tempfile.TemporaryDirectory() as td:
+    # 3b. MEMORY.md is the index every corpus ships with, so counting it makes a
+    #     bare project dir read as populated forever.
+    home = Path(td) / "claude"
+    projects = home / "projects"
+    live = seed(projects / "-repo-slug" / "memory", 42)
+    idx_only = projects / "-repo.slug" / "memory"
+    idx_only.mkdir(parents=True)
+    (idx_only / "MEMORY.md").write_text(
+        "# Sutando memory index\n\nDurable facts about the user, project, and references.\n"
+    )
+    hc_idx = load_hc(home, live)
+    r_idx = hc_idx.check_memory_dir_siblings()
+    check(
+        "index-only sibling is NOT reported as populated",
+        r_idx is None,
+        f"got: {(r_idx or {}).get('detail', '')[:140]}",
+    )
+
+    # 3c. CONTROL: index ENTRIES must still warn, or 3b would also pass for a
+    #     check that stopped reporting index-bearing corpora entirely.
+    (idx_only / "MEMORY.md").write_text(
+        "# Sutando memory index\n\n- [Some fact](some_fact.md) - a hook\n"
+    )
+    hc_entries = load_hc(home, live)
+    r_entries = hc_entries.check_memory_dir_siblings()
+    check(
+        "index WITH entries still warns (control)",
+        r_entries is not None and "-repo.slug" in r_entries["detail"],
+        f"got: {(r_entries or {}).get('detail', '')[:140]}",
+    )
+
+    # 3d. CONTROL: a real memory beside the empty index warns, so 3b cannot pass
+    #     merely because this corpus is unreachable.
+    (idx_only / "MEMORY.md").write_text("# Sutando memory index\n")
+    (idx_only / "user_profile.md").write_text("x")
+    hc_real = load_hc(home, live)
+    r_real = hc_real.check_memory_dir_siblings()
+    check(
+        "one real memory beside an empty index warns (control)",
+        r_real is not None and "2 .md" in r_real["detail"],
+        f"got: {(r_real or {}).get('detail', '')[:140]}",
+    )
+
+with tempfile.TemporaryDirectory() as td:
     # 4. THE ONE THAT MATTERS: a symlinked twin is one corpus, not two.
     home = Path(td) / "claude"
     projects = home / "projects"

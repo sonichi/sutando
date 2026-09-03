@@ -1591,6 +1591,27 @@ def check_workspace_root_tidy() -> "dict | None":
         ),
     }
 
+def _corpus_holds_memories(mem: "Path", mds: "list[Path]") -> bool:
+    """True when a corpus holds memories rather than just an untouched index.
+
+    MEMORY.md is the index every corpus ships with, so counting it makes a bare
+    project dir read as populated forever. Nothing can be invisible there — the
+    corpus has no memories — and a warning that can never clear is the exact
+    failure this probe's scope filter already guards against elsewhere. An index
+    carrying entries still counts: that says something wrote here.
+    """
+    if any(p.name != "MEMORY.md" for p in mds):
+        return True
+    index = mem / "MEMORY.md"
+    if not index.is_file():
+        return False
+    try:
+        text = index.read_text(errors="replace")
+    except OSError:
+        return True  # unreadable: report rather than silently drop a real corpus
+    return any(ln.lstrip().startswith(("- [", "* [")) for ln in text.splitlines())
+
+
 def check_memory_dir_siblings() -> "dict | None":
     """Flag a populated memory corpus sitting under a DIFFERENT project slug.
 
@@ -1634,8 +1655,9 @@ def check_memory_dir_siblings() -> "dict | None":
             continue
         if _slug_derivation_key(entry.name) != live_key:
             continue  # unrelated project, not a slug split
-        count = len(list(mem.glob("*.md")))
-        if count == 0:
+        mds = list(mem.glob("*.md"))
+        count = len(mds)
+        if not _corpus_holds_memories(mem, mds):
             continue
         key = str(mem.resolve())  # collapse symlinked twins onto one entry
         if key not in seen or count > seen[key][1]:
