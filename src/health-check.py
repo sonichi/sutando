@@ -5278,7 +5278,8 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     window_note = ""
     if full:
         window_note = " Exhausted window(s): " + ", ".join(
-            f"{w} ({windows[w][0]:.0%}, {windows[w][1] or 'no status'})" for w in full) + "."
+            f"{w} ({'n/a' if windows[w][0] is None else format(windows[w][0], '.0%')}, "
+            f"{windows[w][1] or 'no status'})" for w in full) + "."
     check["status"] = "fail"
     check["detail"] = (
         f"CORE IS OVER QUOTA (rate-limit status={status}).{window_note}{reset_note} The core "

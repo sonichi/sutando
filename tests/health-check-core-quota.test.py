@@ -160,6 +160,15 @@ class TestCoreQuotaExhausted(unittest.TestCase):
         self.assertEqual(c["status"], "fail")
         self.assertIn("7d_oi (100%, rejected)", c["detail"])
 
+    def test_unparseable_window_utilization_with_rejected_status_still_fails(self):
+        # A rejected window whose utilization does not parse is named as n/a, not crashed on.
+        self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
+            "anthropic-ratelimit-unified-7d_oi-utilization": "n/a",
+            "anthropic-ratelimit-unified-7d_oi-status": "rejected"})
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("7d_oi (n/a, rejected)", c["detail"])
+
     def test_per_window_rejected_status_counts_even_below_the_utilization_bar(self):
         self._write(available=False, status="rejected", util=(0.13, 0.52), extra={
             "anthropic-ratelimit-unified-overage-utilization": "0.5",
