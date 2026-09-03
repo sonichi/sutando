@@ -5162,6 +5162,76 @@ def _fmt_quota_reset(epoch_str: Optional[str]) -> str:
         return ""
 
 
+
+def _rejection_epoch(entry: object) -> float | None:
+    if not isinstance(entry, dict):
+        return None
+    ts = entry.get("ts")
+    if not isinstance(ts, str):
+        return None
+    from datetime import datetime as _dt
+    try:
+        return _dt.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
+                                  hour_sec: int = 3600) -> dict:
+    """WARN on a recent upstream rejection (4xx/5xx other than 401) recorded by the
+    credential proxy, FAIL on a sustained run — the class `check_core_quota_exhausted`
+    cannot see.
+
+    Owner-reported 2026-09-03 (#3790): two scheduled fires were dropped with
+    "You're out of usage credits" while every unified-status header read
+    "allowed", so no probe fired. The proxy now records each such response into
+    `recent_rejections` in quota-state.json; this probe reads only that ledger.
+    A rejection younger than `window_sec` warns (the owner hears once per
+    episode via the transition-hash dedup); `sustained` or more inside
+    `hour_sec` fails. Missing, foreign or unparsable ledgers never page.
+    """
+    check = {"name": "core-request-rejections", "status": "ok"}
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        check["detail"] = "no quota-state.json (absence handled by quota-telemetry)"
+        return check
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        check["status"] = "warn"
+        check["detail"] = "quota-state.json present but unreadable"
+        return check
+    ledger = data.get("recent_rejections") if isinstance(data, dict) else None
+    if not isinstance(ledger, list) or not ledger:
+        check["detail"] = "no upstream rejections recorded by the proxy"
+        return check
+
+    now = time.time()
+    dated = [(e, t) for e in ledger for t in [_rejection_epoch(e)] if t is not None]
+    if not dated:
+        check["detail"] = f"{len(ledger)} ledger entr(y/ies) but none carry a parsable ts"
+        return check
+    last_entry, last_t = max(dated, key=lambda p: p[1])
+    in_hour = [p for p in dated if now - p[1] <= hour_sec]
+    in_window = [p for p in dated if now - p[1] <= window_sec]
+    age_min = int(max(now - last_t, 0) / 60)
+    what = (f"last: HTTP {last_entry.get('status')} {age_min}m ago — "
+            f"{str(last_entry.get('snippet') or '')[:160]!r}")
+    remedy = ("; the CLI drops the fire and prints the error in the core pane, so run "
+              "/usage-credits (or /model to switch) there")
+    if len(in_hour) >= sustained:
+        check["status"] = "fail"
+        check["detail"] = (f"{len(in_hour)} upstream rejections in the last "
+                           f"{hour_sec // 60}m ({what}){remedy}")
+    elif in_window:
+        check["status"] = "warn"
+        check["detail"] = (f"{len(in_window)} upstream rejection(s) in the last "
+                           f"{window_sec // 60}m ({what}){remedy}")
+    else:
+        check["detail"] = f"{len(ledger)} recorded, none in the last {window_sec // 60}m ({what})"
+    return check
+
+
 def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     """FAIL (loudly, to the remote owner surface) when the core's model quota is
     exhausted — the 'stuck silently' condition.
@@ -10249,6 +10319,9 @@ def run_all_checks() -> list[dict]:
     # Core over-quota — fail loudly to the remote owner surface so an exhausted
     # model no longer stalls every task silently (owner-reported 2026-08-01).
     checks.append(check_core_quota_exhausted())
+    # A credits/overage rejection leaves every unified-status header "allowed",
+    # so the check above cannot see it; the proxy's ledger is the only record.
+    checks.append(check_core_request_rejections())
 
     # G1.5: which Node would JS services resolve to (bundled/app-bundle/
     # system), red when none — the silent-dead-services failure class.

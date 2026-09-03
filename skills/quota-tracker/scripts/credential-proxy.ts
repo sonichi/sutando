@@ -15,7 +15,7 @@
 import { createServer, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { statusPath } from '../../../src/workspace_default.js';
@@ -34,6 +34,10 @@ const UPSTREAM_IDLE_TIMEOUT_MS = Number(process.env.SUTANDO_PROXY_TIMEOUT_MS) ||
 // Historically written into the skill dir; readers (dashboard.py, read-quota.py)
 // keep the skill-dir path as a last-resort fallback for one release.
 const QUOTA_FILE = statusPath('quota-state.json');
+// Bounded ledger of upstream rejections (4xx/5xx other than the handled 401),
+// persisted in quota-state.json so health-check can page on a transient one.
+export const MAX_RECENT_REJECTIONS = 20;
+const REJECTION_SNIPPET_BYTES = 2048;
 
 // OAuth self-refresh. A namespaced CLAUDE_CONFIG_DIR uses a namespaced keychain
 // item (`Claude Code-credentials-<sha256(config-dir)[0..8]>`), while vanilla
@@ -302,6 +306,26 @@ export function authUnavailableBody(verdict: 'expired' | 'rejected'): string {
 
 // Injectable seams (keychain, refresh, upstream, clock) so the proxy's failure
 // semantics are testable hermetically; defaults are the production bindings.
+export interface RejectionRecord {
+	ts: string;
+	status: number;
+	path: string;
+	snippet: string;
+}
+
+function isRejectionRecord(x: unknown): x is RejectionRecord {
+	return !!x && typeof x === 'object'
+		&& typeof (x as RejectionRecord).ts === 'string'
+		&& typeof (x as RejectionRecord).status === 'number';
+}
+
+/** Append one rejection to a (possibly foreign/corrupt) prior ledger, keeping the newest `max`. */
+export function appendRejection(prev: unknown, rej: RejectionRecord, max: number = MAX_RECENT_REJECTIONS): RejectionRecord[] {
+	const list = Array.isArray(prev) ? prev.filter(isRejectionRecord) : [];
+	list.push(rej);
+	return list.slice(-max);
+}
+
 export interface ProxyDeps {
 	readCredCandidates: () => StoredClaudeOAuth[];
 	writeCred: (service: string, oauth: ClaudeOAuth) => boolean;
@@ -309,6 +333,7 @@ export interface ProxyDeps {
 	request: typeof httpsRequest;
 	upstreamUrl: URL;
 	updateQuotaState: (headers: Record<string, string>) => void;
+	recordRejection: (rej: RejectionRecord) => void;
 	now: () => number;
 	idleTimeoutMs: number;
 }
@@ -321,6 +346,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		request: httpsRequest,
 		upstreamUrl: new URL(UPSTREAM),
 		updateQuotaState,
+		recordRejection,
 		now: Date.now,
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		...overrides,
@@ -515,7 +541,24 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 							rejectedToken = injectedToken;
 						}
 
-						res.writeHead(upRes.statusCode!, upRes.headers);
+						const code = upRes.statusCode ?? 0;
+						if (code >= 400 && code !== 401) {
+							// The only component that sees a credits/overage rejection is this
+							// proxy; without a record the dropped request is invisible upstream.
+							const chunks: Buffer[] = [];
+							let seen = 0;
+							upRes.on('data', (c: Buffer) => {
+								if (seen < REJECTION_SNIPPET_BYTES) { chunks.push(c); seen += c.length; }
+							});
+							upRes.on('end', () => {
+								const snippet = redactForLog(Buffer.concat(chunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
+								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url}: ${snippet}`);
+								try {
+									deps.recordRejection({ ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet });
+								} catch { /* best effort */ }
+							});
+						}
+						res.writeHead(code, upRes.headers);
 						upRes.pipe(res);
 					},
 				);
@@ -561,12 +604,36 @@ function getOAuthToken(): string | null {
 	return readCred()?.oauth.accessToken ?? null;
 }
 
+function readQuotaFile(): Record<string, unknown> {
+	try {
+		const parsed = JSON.parse(readFileSync(QUOTA_FILE, 'utf8'));
+		return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+function writeQuotaFile(state: Record<string, unknown>): void {
+	mkdirSync(dirname(QUOTA_FILE), { recursive: true });
+	writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2));
+}
+
+function recordRejection(rej: RejectionRecord): void {
+	try {
+		const prev = readQuotaFile();
+		writeQuotaFile({ ...prev, recent_rejections: appendRejection(prev.recent_rejections, rej) });
+	} catch { /* best effort */ }
+}
+
 function updateQuotaState(headers: Record<string, string>): void {
 	try {
+		// The header write replaces the file, so carry the rejection ledger across it.
+		const prevLedger = readQuotaFile().recent_rejections;
 		const state: Record<string, unknown> = {
 			available: true,
 			last_checked: new Date().toISOString(),
 			headers,
+			recent_rejections: Array.isArray(prevLedger) ? prevLedger.filter(isRejectionRecord) : [],
 		};
 
 		// Parse specific headers
@@ -587,8 +654,7 @@ function updateQuotaState(headers: Record<string, string>): void {
 			state.exhausted_since = new Date().toISOString();
 		}
 
-		mkdirSync(dirname(QUOTA_FILE), { recursive: true });
-		writeFileSync(QUOTA_FILE, JSON.stringify(state, null, 2));
+		writeQuotaFile(state);
 	} catch { /* best effort */ }
 }
 
