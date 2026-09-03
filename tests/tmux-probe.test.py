@@ -34,6 +34,12 @@ class TestClassify(unittest.TestCase):
     def test_no_server_running_form_is_absent(self):
         self.assertIs(tmux_probe.classify(1, b"no server running on /tmp/x.sock\n"), False)
 
+    def test_connect_denied_is_unknown_not_absent(self):
+        # The client could not observe the server; only "No such file" is a miss.
+        for reason in (b"Permission denied", b"Operation not permitted", b"Connection refused"):
+            err = b"error connecting to /tmp/x.sock (" + reason + b")\n"
+            self.assertIsNone(tmux_probe.classify(1, err), reason)
+
     def test_bare_nonzero_without_stderr_is_unknown(self):
         # No recognised absence message = nothing observed, whatever the rc.
         self.assertIsNone(tmux_probe.classify(1, None))

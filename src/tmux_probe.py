@@ -17,11 +17,11 @@ import subprocess
 from typing import Optional
 
 # The server's own "no such session" answer, and the two forms a dead socket
-# takes ("no server running on …", "error connecting to … (No such file …)").
+# takes; a connect failure counts only with the definitive "No such file" reason.
 ABSENT_SIGNATURES = (
     "can't find session",
     "no server running",
-    "error connecting to",
+    "(No such file or directory)",
 )
 
 
