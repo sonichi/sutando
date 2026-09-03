@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import signal
 import sys
 import tempfile
@@ -130,6 +131,55 @@ class MainLoopTests(unittest.TestCase):
                              "beat must be unlinked on clean shutdown")
             self.assertTrue(
                 (tasks / "task-d1.assigned-worker-1.txt").exists())
+
+    def test_runtime_of_reads_the_workers_plist_under_home(self):
+        """A codex plist under $HOME/Library/LaunchAgents must steer owner
+        work to the claude seat; unread, both seats look claude and the
+        lane rule sends it to worker-1."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td) / "ws"
+            home = Path(td) / "home"
+            tasks, cores = ws / "tasks", ws / "state" / "cores"
+            tasks.mkdir(parents=True)
+            cores.mkdir(parents=True)
+            agents = home / "Library" / "LaunchAgents"
+            agents.mkdir(parents=True)
+            (agents / "com.sutando.worker-1.plist").write_text(
+                "<plist><dict><key>POOL_RUNTIME</key><string>codex</string>"
+                "</dict></plist>")
+            for w in ("worker-1", "worker-2"):
+                (cores / f"{w}.alive").write_text("beat")
+            (tasks / "task-r1.txt").write_text(
+                "id: task-r1\nsource: chat\ntask: t\n")
+
+            real_ws, real_rec, real_send = (
+                daemon._workspace, daemon._run_recovery, daemon._send_notice)
+            real_time, real_argv = daemon.time, sys.argv
+            real_home = os.environ.get("HOME")
+
+            def fake_sleep(_s):
+                signal.raise_signal(signal.SIGTERM)
+
+            daemon._workspace = lambda: ws
+            daemon._run_recovery = lambda: ""
+            daemon._send_notice = lambda *a: True
+            daemon.time = types.SimpleNamespace(
+                time=real_time.time, sleep=fake_sleep)
+            sys.argv = ["pool-lead-daemon.py", "--interval", "0.01"]
+            os.environ["HOME"] = str(home)
+            out = io.StringIO()
+            try:
+                with redirect_stdout(out):
+                    rc = daemon.main()
+            finally:
+                daemon._workspace, daemon._run_recovery = real_ws, real_rec
+                daemon._send_notice, daemon.time = real_send, real_time
+                sys.argv = real_argv
+                os.environ["HOME"] = real_home
+            self.assertEqual(rc, 0)
+            self.assertIn("assigned task-r1.txt -> worker-2", out.getvalue())
+            self.assertTrue(
+                (tasks / "task-r1.assigned-worker-2.txt").exists())
 
     def test_scale_up_failure_is_reported_not_fatal(self):
         with tempfile.TemporaryDirectory() as td:

@@ -7,10 +7,14 @@ seat/name resolution, every suffix/label builder, env precedence
 
 Run: python3 tests/pool-names.test.py
 """
+import io
+import os
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -90,6 +94,42 @@ class NamesTest(unittest.TestCase):
         self.assertEqual(pn.pool_size_from_env(
             {"SUTANDO_WORKER_POOL_SIZE": "4", "SUTANDO_CORE_POOL_SIZE": "3"}), 4)
         self.assertIsNone(pn.pool_size_from_env({}))
+
+
+class MainTest(unittest.TestCase):
+    """_main in-process: every exit code the shell callers branch on."""
+
+    def run_main(self, *argv, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env or {}, clear=env is not None):
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = pn._main(list(argv))
+        return rc, out.getvalue().strip(), err.getvalue()
+
+    def test_builder_prints_and_exits_0(self):
+        self.assertEqual(self.run_main("launchd_label", "core-2"),
+                         (0, "com.sutando.worker-2", ""))
+
+    def test_none_result_exits_1_silently(self):
+        self.assertEqual(self.run_main("seat_of", "pool-lead"), (1, "", ""))
+
+    def test_bad_seat_exits_2_with_the_reason(self):
+        rc, out, err = self.run_main("worker_name", "0")
+        self.assertEqual((rc, out), (2, ""))
+        self.assertIn("seat must be >= 1", err)
+
+    def test_unknown_verb_and_arity_print_usage(self):
+        for argv in (("bogus", "1"), ("worker_name",), ()):
+            rc, out, err = self.run_main(*argv)
+            self.assertEqual((rc, out), (2, ""), argv)
+            self.assertIn("usage: pool_names.py", err)
+
+    def test_from_env_prints_the_canonical_name(self):
+        self.assertEqual(self.run_main("from_env", env={"SUTANDO_CORE_ID": "3"}),
+                         (0, "worker-3", ""))
+
+    def test_from_env_outside_a_pool_exits_2(self):
+        self.assertEqual(self.run_main("from_env", env={}), (2, "", ""))
 
 
 class CliTest(unittest.TestCase):
