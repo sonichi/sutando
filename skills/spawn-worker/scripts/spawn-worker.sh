@@ -32,6 +32,11 @@ _self="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BA
 REPO="${SUTANDO_ROOT:-$(cd "$(dirname "$_self")/../../.." && pwd)}"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 
+# stat's mtime flag differs between BSD and GNU; python is already a dependency.
+_mtime() {
+  python3 -c 'import os, sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$1" 2>/dev/null || echo 0
+}
+
 installed_workers() {
   local n=0 p
   shopt -s nullglob
@@ -53,7 +58,7 @@ live_workers() {
   now="$(date +%s)"
   shopt -s nullglob
   for f in "$ws"/state/cores/core-[0-9]*.alive; do
-    age=$(( now - $(stat -f %m "$f" 2>/dev/null || echo 0) ))
+    age=$(( now - $(_mtime "$f") ))
     [ "$age" -lt 90 ] && n=$((n + 1))
   done
   shopt -u nullglob
