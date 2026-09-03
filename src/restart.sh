@@ -6,7 +6,28 @@
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
+# The sentinel IS the clean-exit signal, so a failed write must be visible: a
+# stub interpreter here would let a stop look successful while nothing changed.
+PY_BIN=""
+if [ -r "$REPO/scripts/python-binary.sh" ]; then
+  . "$REPO/scripts/python-binary.sh"
+  PY_BIN="$(resolve_python "$REPO")"
+fi
+_shutdown_state() {
+  if [ -z "$PY_BIN" ]; then
+    echo "restart.sh: no runnable python3 — shutdown sentinel NOT $1" >&2
+    return 1
+  fi
+  "$PY_BIN" "$REPO/src/shutdown.py" "$@" >/dev/null || {
+    echo "restart.sh: shutdown.py $1 failed — sentinel state is NOT $1" >&2
+    return 1
+  }
+}
+
 echo "Stopping Sutando services..."
+# Marked before killing so the intake gate holds new tasks while services stop.
+# --stop-only leaves it set: that IS the core's clean-exit signal.
+_shutdown_state mark "restart.sh${1:+ $1}" || true
 # Voice-agent stop goes through the GUARDED lock takeover, never a broad
 # `pkill -f voice-agent` (voice-reliability plan amendment U2): the old blind
 # pkill could kill an unvalidated process and leave a live lock behind (or
@@ -100,6 +121,10 @@ for _ in $(seq 1 30); do
     sleep 0.1
 done
 
+# Restart, not a stop: the core is NOT in STOP_PATTERNS and survives this, so a
+# A restart is not a shutdown: a sentinel left set would make the surviving
+# core read it as one. --stop-only exits above and deliberately keeps it.
+_shutdown_state clear || true
 # Relaunch what line 73 killed. This belongs here, not in startup.sh: that file
 # is guarded headless (tests/startup-headless.test.sh) and owns no desktop UI.
 APP_BIN="$REPO/src/Sutando/Sutando"
