@@ -21,6 +21,7 @@ import pathlib
 import subprocess
 import sys as _sys
 import tempfile
+import time
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts"
 spec = importlib.util.spec_from_file_location("ish", SCRIPTS / "idle-surface-hash.py")
@@ -117,22 +118,30 @@ check("streak matches the same count under concurrency",
 
 # CONTROL: this harness must be ABLE to observe a lost count, or the assertion
 # above is satisfied by a race that never happens. Same shape, no lock.
+
+# A shared wall-clock barrier FORCES the overlap: interpreter startup on a
+# loaded runner can otherwise exceed the window and serialise every process.
 UNLOCKED = r"""
 import json, pathlib, sys, time
-q = pathlib.Path(sys.argv[1])
+q, start_at = pathlib.Path(sys.argv[1]), float(sys.argv[2])
+while time.time() < start_at:
+    time.sleep(0.002)
 doc = json.loads(q.read_text())
 doc["noop_total"] = int(doc.get("noop_total") or 0) + 1
-time.sleep(0.05)
+time.sleep(0.20)
 q.write_text(json.dumps(doc))
 """
 p3 = fresh()
-rcs = run_concurrent([[_sys.executable, "-c", UNLOCKED, str(p3)] for _ in range(N)])
+start_at = time.time() + 3.0
+rcs = run_concurrent([[_sys.executable, "-c", UNLOCKED, str(p3), repr(start_at)]
+                      for _ in range(N)])
 lost = json.loads(p3.read_text())["noop_total"]
 check("CONTROL: the unlocked variant also ran (rc=0 everywhere)", rcs == [0] * N, f"rcs={rcs}")
 check("CONTROL: it incremented at least once — the harness is live, not inert",
       lost >= 1, f"unlocked total={lost}; 0 means no process ran and the check above is vacuous")
 check("CONTROL: and it LOSES counts, so the locked assertion is discriminating",
-      lost < N, f"unlocked total={lost}; equal to {N} means this harness cannot see the bug")
+      lost < N, f"unlocked total={lost}; equal to {N} means the barrier did not "
+                f"overlap the windows and this harness cannot see the bug")
 
 print(f"\nidle-surface-hash: {ran - len(fails)}/{ran} passed")
 if fails:
