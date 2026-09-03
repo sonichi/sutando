@@ -365,10 +365,21 @@ _host_ws_segment() {
 LOCK_DIR="${SUTANDO_SYNC_LOCK_DIR:-/tmp/sync-workspace.lock.d}"
 
 acquire_lock() {
-    # Stale lock cleanup: lock dir older than 10 min = assume crash, remove.
+    # Stale means the HOLDER IS GONE, not "older than N minutes": a run whose
+    # report step outlasts the cadence must not be overtaken by the next starter.
     if [ -d "$LOCK_DIR" ]; then
-        if find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
-            log "Stale lock removed (older than 10 min)"
+        local holder=""
+        [ -f "$LOCK_DIR/pid" ] && holder="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+        if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+            log "Another sync (pid $holder) already in progress, exiting."
+            echo "sync-workspace: another instance is running (pid $holder), skipping."
+            exit 0
+        elif [ -n "$holder" ]; then
+            log "Stale lock removed (holder pid $holder is gone)"
+            rm -rf "$LOCK_DIR"
+        elif find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
+            # A lock with no pid file predates this rule; age is all it can say.
+            log "Stale lock removed (no holder recorded, older than 10 min)"
             rm -rf "$LOCK_DIR"
         fi
     fi
@@ -377,6 +388,7 @@ acquire_lock() {
         echo "sync-workspace: another instance is running, skipping."
         exit 0
     fi
+    echo "$$" > "$LOCK_DIR/pid"
     trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 }
 
