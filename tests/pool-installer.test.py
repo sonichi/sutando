@@ -19,6 +19,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,6 +54,8 @@ class PoolInstallerHarness(unittest.TestCase):
         shutil.copy(REPO / "src" / "claude_config_dir.sh",
                     repo / "src" / "claude_config_dir.sh")
         shutil.copy(REPO / "src" / "pool_names.py", repo / "src" / "pool_names.py")
+        shutil.copy(REPO / "scripts" / "python-binary.sh",
+                    repo / "scripts" / "python-binary.sh")
         (repo / "src" / "launchd").mkdir()
         shutil.copy(REPO / "src" / "launchd" / "com.sutando.pool-lead.plist",
                     repo / "src" / "launchd" / "com.sutando.pool-lead.plist")
@@ -198,6 +201,25 @@ class LeadPlistTest(PoolInstallerHarness):
             # The message must name the directory the logs are actually in.
             self.assertIn(str(logs), r.stdout)
             self.assertNotIn(f"{ws}/logs/core-", r.stdout)
+
+    def test_lead_job_bakes_the_shared_helpers_interpreter(self):
+        """POOL_PY must come from scripts/python-binary.sh, not a bare
+        `command -v python3`: the launcher's SUTANDO_PY override outranks
+        PATH there, and on a Mac without the CLT the PATH python3 is the
+        stub that raises the install dialog."""
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            override = td / "override" / "python3"
+            override.parent.mkdir()
+            _write_exec(override, f'#!/bin/bash\nexec "{sys.executable}" "$@"\n')
+            resolved = td / "resolved-ccd"
+            repo = self.make_repo(td, config_dir_body=f"printf '%s' '{resolved}'")
+            env, home, _ = self.make_env(td, SUTANDO_PY=str(override))
+            r = self.run_installer(repo, env, "1")
+            self.assertEqual(r.returncode, 0, f"{r.stdout}\n{r.stderr}")
+            envv = self.lead_plist(home)["EnvironmentVariables"]
+            self.assertEqual(envv["POOL_PY"], str(override),
+                             "the plist baked a PATH python3, not the resolved one")
 
     def test_follower_path_carries_the_npm_global_bin(self):
         # A non-login installer run snapshotted a PATH without npm's global

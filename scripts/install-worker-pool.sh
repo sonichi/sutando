@@ -50,8 +50,13 @@ ONLY_WORKER=""
 # This script lives at `<repo>/scripts/install-worker-pool.sh`; the staging block
 # and the preflight below both address repo files by absolute path.
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolved through the shared helper: a bare python3 can be the Xcode-CLT
+# stub, which passes `command -v` and raises the install dialog when run.
+# shellcheck source=./python-binary.sh
+. "$REPO_DIR/scripts/python-binary.sh"
+PY_BIN="$(require_python "$REPO_DIR" "install the worker pool (the lead daemon is python)")" || exit 1
 # Worker naming has one owner; bash never spells `worker-N` itself.
-pool_name() { python3 "$REPO_DIR/src/pool_names.py" "$@"; }
+pool_name() { "$PY_BIN" "$REPO_DIR/src/pool_names.py" "$@"; }
 # The runtime allowlist has one owner, shared with the wrapper and the watchdog.
 # shellcheck source=./pool-runtime-drive.sh
 source "$REPO_DIR/scripts/pool-runtime-drive.sh"
@@ -223,15 +228,10 @@ for w in pool-worker-wrapper.sh pool-follower-beat.sh pool-lead-wrapper.sh kick-
   chmod +x "$STAGE_DIR/$w"
 done
 
-# Resolve claude + python3 binaries. Caller's $PATH may not include the
+# Resolve claude + tmux binaries. Caller's $PATH may not include the
 # install dirs on launchd-spawned processes, so capture absolute paths now.
 CLAUDE_BIN="$(command -v claude || true)"
 TMUX_BIN="$(command -v tmux || true)"
-PY_BIN="$(command -v python3 || true)"
-if [ -z "$PY_BIN" ]; then
-  echo "error: 'python3' not found on \$PATH (the lead daemon is python)" >&2
-  exit 1
-fi
 if [ -z "$TMUX_BIN" ]; then
   echo "error: 'tmux' not found on \$PATH (persistent-form followers run in tmux)" >&2
   exit 1
