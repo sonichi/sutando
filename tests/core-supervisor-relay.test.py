@@ -205,6 +205,9 @@ class TestComposeMessage(unittest.TestCase):
         m = compose_message(_LIMIT)
         self.assertIn("resumes on its own at 12:10pm", m)
         self.assertIn("/usage-credits", m)
+        # The owner named this third route (2026-09-02): the limit is per
+        # subscription, so signing in under another one is often the fastest.
+        self.assertIn("different subscription", m)
         self.assertNotIn("/login", m)
         self.assertNotIn("restart.sh", m)
 

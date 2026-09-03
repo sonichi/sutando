@@ -206,6 +206,69 @@ class HookDriverTests(unittest.TestCase):
         self.assertEqual((rc, out), (0, None))
         self.assertEqual(self.mgr.store.all(), [])
 
+    # ── PermissionRequest: same requirement, the event's own decision shape ──
+
+    def _answer_first_active(self, action_id):
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            active = self.mgr.active()
+            if active:
+                req = active[0]
+                self.mgr.apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision, action_id=action_id, guard=req.guard))
+                return
+            time.sleep(0.1)
+
+    def test_permission_request_allow_uses_the_decision_behavior_shape(self):
+        t = threading.Thread(target=self._answer_first_active, args=("allow",)); t.start()
+        _, out, err = run_hook(self.ws, {"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                                         "tool_input": {"command": "rm -rf build"}, "permission_suggestions": []}, timeout="10")
+        t.join()
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "PermissionRequest", err)
+        self.assertEqual(hso["decision"], {"behavior": "allow"})
+        self.assertNotIn("permissionDecision", hso)  # the PreToolUse field must not leak into this event
+        [req] = self.mgr.store.all()
+        self.assertEqual((req.kind, req.status, req.chosen_action), ("permission", "resolved", "allow"))
+
+    def test_permission_request_deny_carries_the_reason_as_message(self):
+        t = threading.Thread(target=self._answer_first_active, args=("deny",)); t.start()
+        _, out, _ = run_hook(self.ws, {"hook_event_name": "PermissionRequest", "tool_name": "Write",
+                                       "tool_input": {"file_path": "/etc/hosts"}}, timeout="10")
+        t.join()
+        d = out["hookSpecificOutput"]["decision"]
+        self.assertEqual(d["behavior"], "deny")
+        self.assertIn("owner denied via card", d["message"])
+
+    def test_permission_request_timeout_denies_with_the_timeout_message(self):
+        _, out, _ = run_hook(self.ws, {"hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                                       "tool_input": {"command": "true"}}, timeout="1")
+        d = out["hookSpecificOutput"]["decision"]
+        self.assertEqual(d["behavior"], "deny")
+        self.assertIn("No decision", d["message"])
+        [req] = self.mgr.store.all()
+        self.assertEqual(req.status, "expired")
+
+    def test_permission_request_policy_allow_needs_no_card(self):
+        _, out, _ = run_hook(self.ws, {"hook_event_name": "PermissionRequest", "tool_name": "Read",
+                                       "tool_input": {"file_path": "/x"}})
+        self.assertEqual(out["hookSpecificOutput"], {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}})
+        [req] = self.mgr.store.all()
+        self.assertEqual(req.decided_by, "policy")
+
+    def test_pre_tool_use_named_explicitly_keeps_the_legacy_shape(self):
+        _, out, _ = run_hook(self.ws, {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                                       "tool_input": {"command": "true"}}, timeout="1")
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "PreToolUse")
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertNotIn("decision", hso)
+
+    def test_unknown_event_name_falls_back_to_the_legacy_shape(self):
+        # A future event we do not know must not produce a PermissionRequest decision by accident.
+        _, out, _ = run_hook(self.ws, {"hook_event_name": "SomethingNew", "tool_name": "Bash",
+                                       "tool_input": {"command": "true"}}, timeout="1")
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "PreToolUse")
+
 
 if __name__ == "__main__":
     unittest.main()
