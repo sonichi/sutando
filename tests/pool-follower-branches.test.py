@@ -23,16 +23,16 @@ class ClaimRaceTests(unittest.TestCase):
     def test_raced_assignment_returns_none(self):
         with tempfile.TemporaryDirectory() as td:
             tasks = Path(td)
-            ghost = tasks / "task-x.assigned-core-1.txt"  # never created
+            ghost = tasks / "task-x.assigned-worker-1.txt"  # never created
             self.assertIsNone(
-                pool_follower._claim_assignment(tasks, ghost, "core-1"))
+                pool_follower._claim_assignment(tasks, ghost, "worker-1"))
 
     def test_missing_tasks_dir_is_idle(self):
         with tempfile.TemporaryDirectory() as td:
             state = Path(td) / "state"
             state.mkdir()
             got = pool_follower.acquire_work(
-                Path(td) / "no-such-tasks", state, "core-1", "pool-lead")
+                Path(td) / "no-such-tasks", state, "worker-1", "pool-lead")
             self.assertIsNone(got)
 
     def test_live_lead_blocks_unassigned_pool(self):
@@ -46,7 +46,7 @@ class ClaimRaceTests(unittest.TestCase):
             (ws / "state" / "cores" / "pool-lead.alive").write_text(
                 json.dumps({"ts": time.time()}))
             got = pool_follower.acquire_work(
-                ws / "tasks", ws / "state", "core-1", "pool-lead")
+                ws / "tasks", ws / "state", "worker-1", "pool-lead")
             self.assertIsNone(got)
             self.assertTrue((ws / "tasks" / "task-q1.txt").exists())
 
@@ -57,21 +57,21 @@ class ClaimRaceTests(unittest.TestCase):
             (ws / "state" / "cores").mkdir(parents=True)
             (ws / "tasks" / "task-q2.txt").write_text("x")
             got = pool_follower.acquire_work(
-                ws / "tasks", ws / "state", "core-1", "pool-lead")
+                ws / "tasks", ws / "state", "worker-1", "pool-lead")
             self.assertIsNotNone(got)
-            self.assertTrue(got.name.endswith(".claimed-core-1.txt"))
+            self.assertTrue(got.name.endswith(".claimed-worker-1.txt"))
 
 
 class SourceSniffTests(unittest.TestCase):
     def test_source_header_is_read(self):
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "task-s.claimed-core-1.txt"
+            f = Path(td) / "task-s.claimed-worker-1.txt"
             f.write_text("id: s\nsource: discord\ntask: hi\n")
             self.assertEqual(pool_follower._source_of(f), "discord")
 
     def test_blank_line_ends_the_header_scan(self):
         with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "task-s2.claimed-core-1.txt"
+            f = Path(td) / "task-s2.claimed-worker-1.txt"
             f.write_text("id: s2\n\nsource: too-late\n")
             self.assertEqual(pool_follower._source_of(f), "")
 
@@ -97,14 +97,14 @@ class FinishCliTests(unittest.TestCase):
     def test_finish_via_cli_writes_result_and_archives(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            claimed = ws / "tasks" / "task-f1.claimed-core-1.txt"
+            claimed = ws / "tasks" / "task-f1.claimed-worker-1.txt"
             claimed.write_text("id: task-f1\nsource: chat\ntask: t\n")
             out = io.StringIO()
             old_stdin = sys.stdin
             sys.stdin = io.StringIO("task: f1\nall done\n")
             try:
                 with redirect_stdout(out):
-                    rc = pool_follower._finish_cli([str(claimed), "core-1"])
+                    rc = pool_follower._finish_cli([str(claimed), "worker-1"])
             finally:
                 sys.stdin = old_stdin
             self.assertEqual(rc, 0)
@@ -115,14 +115,14 @@ class FinishCliTests(unittest.TestCase):
     def test_mismatched_pairing_line_is_refused(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            claimed = ws / "tasks" / "task-f2.claimed-core-1.txt"
+            claimed = ws / "tasks" / "task-f2.claimed-worker-1.txt"
             claimed.write_text("id: task-f2\ntask: t\n")
             err = io.StringIO()
             old_stdin = sys.stdin
             sys.stdin = io.StringIO("task: OTHER\nbody\n")
             try:
                 with redirect_stderr(err):
-                    rc = pool_follower._finish_cli([str(claimed), "core-1"])
+                    rc = pool_follower._finish_cli([str(claimed), "worker-1"])
             finally:
                 sys.stdin = old_stdin
             self.assertEqual(rc, 2)

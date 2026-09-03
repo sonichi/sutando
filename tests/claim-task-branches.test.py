@@ -81,13 +81,14 @@ class HandlerIOTests(unittest.TestCase):
             got = claim_task.claim_with_affinity("m1", "2", "chan",
                                                  workspace=ws)
             self.assertIsNotNone(got)
-            self.assertEqual(json.loads(hp.read_text())["core_id"], "2")
+            self.assertEqual(json.loads(hp.read_text())["worker"], "worker-2")
 
     def test_fresh_alive_handler_claims_and_refreshes(self):
+        # The handler file predates the rename (`core_id: "1"`): read as worker-1.
         with tempfile.TemporaryDirectory() as td:
             ws = _ws(td)
             (ws / "tasks" / "task-m2.txt").write_text("x")
-            (ws / "state" / "cores" / "core-1.alive").write_text("beat")
+            (ws / "state" / "cores" / "worker-1.alive").write_text("beat")
             hp = claim_task._handler_path(ws, "chan")
             hp.parent.mkdir(parents=True, exist_ok=True)
             hp.write_text(json.dumps(
@@ -97,7 +98,7 @@ class HandlerIOTests(unittest.TestCase):
             got = claim_task.claim_with_affinity("m2", "1", "chan",
                                                  workspace=ws)
             self.assertIsNotNone(got)
-            self.assertTrue(got.name.endswith(".claimed-core-1.txt"))
+            self.assertTrue(got.name.endswith(".claimed-worker-1.txt"))
 
 
 class UnexpectedErrnoTests(unittest.TestCase):
@@ -141,7 +142,7 @@ class CliTests(unittest.TestCase):
             (ws / "tasks" / "task-c1.txt").write_text("x")
             rc, out, _ = self._run(["c1", "1"], ws)
             self.assertEqual(rc, 0)
-            self.assertIn("task-c1.claimed-core-1.txt", out)
+            self.assertIn("task-c1.claimed-worker-1.txt", out)
 
     def test_missing_task_is_lost_race(self):
         with tempfile.TemporaryDirectory() as td:
@@ -160,7 +161,7 @@ class CliTests(unittest.TestCase):
             (ws / "tasks" / "task-c2.txt").write_text("x")
             rc, out, _ = self._run(["c2", "1", "chan"], ws)
             self.assertEqual(rc, 0)
-            self.assertIn(".claimed-core-1.txt", out)
+            self.assertIn(".claimed-worker-1.txt", out)
 
 
 if __name__ == "__main__":

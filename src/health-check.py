@@ -7451,7 +7451,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         #
         # Must ask "does a task with this id exist", NOT "is there a file with
         # this exact name". `claim_task.py` renames a claimed task to
-        # `task-<id>.claimed-core-N.txt`, so a bare-name test reports a LIVE,
+        # `task-<id>.claimed-<worker>.txt`, so a bare-name test reports a LIVE,
         # in-flight task as archived — a valid retrying delivery raising the
         # same signal as a genuinely stranded reply, which is how a detector
         # trains its readers to ignore it. `find_task_file()` is the canonical
@@ -7466,7 +7466,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         if task_path is not None:
             # A CLAIMED task is owned by a running consumer; its lifetime is
             # not ours to judge, however long it takes.
-            if ".claimed-core-" in task_path.name:
+            if ".claimed-" in task_path.name:
                 continue
             try:
                 task_age = now - task_path.stat().st_mtime

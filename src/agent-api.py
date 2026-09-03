@@ -378,7 +378,7 @@ def _active_task_rows() -> list[dict]:
             )
         )
     )[:10]:
-        # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
+        # A CLAIMED task is task-{id}.claimed-<worker>.txt, but every writer puts
         # the reply at results/{id}.txt — so key AND look up by the canonical id.
         task_id = task_id_from_filename(task_file.name)
         if task_id is None:

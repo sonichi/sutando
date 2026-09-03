@@ -51,58 +51,58 @@ class NotifyBase(unittest.TestCase):
 
 class HandoffTests(NotifyBase):
     def test_first_assignment_is_silent_and_records_handler(self):
-        self._assigned("task-1", "core-2")
-        self.assertFalse(self.n.on_assigned("task-1.txt", "core-2"))
+        self._assigned("task-1", "worker-2")
+        self.assertFalse(self.n.on_assigned("task-1.txt", "worker-2"))
         self.assertEqual(self.sent, [])
 
     def test_handler_change_notifies_the_channel(self):
-        self._assigned("task-1", "core-2")
-        self.n.on_assigned("task-1.txt", "core-2")
-        self._assigned("task-2", "core-1")
-        self.assertTrue(self.n.on_assigned("task-2.txt", "core-1"))
+        self._assigned("task-1", "worker-2")
+        self.n.on_assigned("task-1.txt", "worker-2")
+        self._assigned("task-2", "worker-1")
+        self.assertTrue(self.n.on_assigned("task-2.txt", "worker-1"))
         (source, channel, msg), = self.sent
         self.assertEqual((source, channel), ("discord", "C1"))
-        self.assertIn("core-1", msg)
-        self.assertIn("core-2", msg)
+        self.assertIn("worker-1", msg)
+        self.assertIn("worker-2", msg)
         self.assertNotIn("[", msg)  # ag2space team_result_guard withholds brackets
 
     def test_same_handler_stays_silent(self):
-        self._assigned("task-1", "core-2")
-        self.n.on_assigned("task-1.txt", "core-2")
-        self._assigned("task-2", "core-2")
-        self.assertFalse(self.n.on_assigned("task-2.txt", "core-2"))
+        self._assigned("task-1", "worker-2")
+        self.n.on_assigned("task-1.txt", "worker-2")
+        self._assigned("task-2", "worker-2")
+        self.assertFalse(self.n.on_assigned("task-2.txt", "worker-2"))
         self.assertEqual(self.sent, [])
 
     def test_unroutable_task_is_silent(self):
-        p = self.tasks / "task-9.assigned-core-1.txt"
+        p = self.tasks / "task-9.assigned-worker-1.txt"
         p.write_text("id: task-9\ntask: voice thing, no channel\n")
-        self.assertFalse(self.n.on_assigned("task-9.txt", "core-1"))
+        self.assertFalse(self.n.on_assigned("task-9.txt", "worker-1"))
         self.assertEqual(self.sent, [])
 
 
 class StallTests(NotifyBase):
     def test_stall_fires_once_after_threshold(self):
-        self._claimed("task-1", "core-2")
+        self._claimed("task-1", "worker-2")
         self.assertEqual(self.n.check_stalls(), [])  # first sight: records t0
         self.clock[0] += 601
         self.assertEqual(self.n.check_stalls(), ["task-1"])
         (source, channel, msg), = self.sent
         self.assertEqual((source, channel), ("discord", "C1"))
-        self.assertIn("core-2", msg)
+        self.assertIn("worker-2", msg)
         self.assertIn("10", msg)
         self.assertEqual(self.n.check_stalls(), [])  # at most once
 
     def test_no_stall_before_threshold(self):
-        self._claimed("task-1", "core-2")
+        self._claimed("task-1", "worker-2")
         self.n.check_stalls()
         self.clock[0] += 599
         self.assertEqual(self.n.check_stalls(), [])
         self.assertEqual(self.sent, [])
 
     def test_done_flag_suppresses_stall(self):
-        self._claimed("task-1", "core-2")
+        self._claimed("task-1", "worker-2")
         self.n.check_stalls()
-        done = self.state / "cores" / "core-2" / "done"
+        done = self.state / "cores" / "worker-2" / "done"
         done.mkdir(parents=True)
         (done / "task-1.flag").touch()
         self.clock[0] += 601
@@ -110,7 +110,7 @@ class StallTests(NotifyBase):
         self.assertEqual(self.sent, [])
 
     def test_slack_is_excluded_its_bridge_owns_the_notice(self):
-        self._claimed("task-1", "core-2", source="slack", channel="D1")
+        self._claimed("task-1", "worker-2", source="slack", channel="D1")
         self.n.check_stalls()
         self.clock[0] += 601
         self.assertEqual(self.n.check_stalls(), [])
@@ -125,7 +125,7 @@ class StallTests(NotifyBase):
 
         n = PoolNotifier(self.tasks, self.state, send_fn=flaky,
                          now_fn=lambda: self.clock[0], stall_after_s=600)
-        self._claimed("task-1", "core-2")
+        self._claimed("task-1", "worker-2")
         n.check_stalls()
         self.clock[0] += 601
         self.assertEqual(n.check_stalls(), [])       # send failed → not marked
@@ -170,7 +170,7 @@ class StallTests(NotifyBase):
         self.assertEqual(sorted(ledger["tasks"]), ["task-12"])
 
     def test_ledger_drops_archived_claims(self):
-        p = self._claimed("task-1", "core-2")
+        p = self._claimed("task-1", "worker-2")
         self.n.check_stalls()
         p.unlink()  # follower archived it
         self.n.check_stalls()

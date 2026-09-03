@@ -56,6 +56,9 @@ class PoolStatusWriter:
         snap = {
             "ts": int(self.now()),
             "writer": "pool-lead",
+            "live_workers": live,
+            "dead_workers": dead,
+            # The snapshot rides verbatim to the broker; old keys stay one release.
             "live_cores": live,
             "dead_cores": dead,
             "in_flight": self._in_flight(),

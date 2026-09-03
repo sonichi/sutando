@@ -16,7 +16,7 @@ looks like — so a writer landing between the pre-put read and the put is still
 undetectably. That window is one round trip instead of "since your last get"; closing
 it needs a conditional write at the doc layer, not anything in this module.
 
-Every row the caller adds or edits is stamped `(w:<writer>)` from SUTANDO_CORE_ID
+Every row the caller adds or edits is stamped `(w:<writer>)` from SUTANDO_WORKER_SEAT
 (or --writer); an unset id stamps `unknown`, never a shape-valid empty slot.
 
     doc_sync.py get --room R --name N [--folder F] [--workspace W]
@@ -70,7 +70,8 @@ def parse(text: str) -> Tuple[List[str], Dict[str, Record]]:
 
 def writer_id(explicit: Optional[str] = None, env=None) -> str:
     env = os.environ if env is None else env
-    w = (explicit or env.get("SUTANDO_CORE_ID") or "").strip()
+    w = (explicit or env.get("SUTANDO_WORKER_SEAT")
+         or env.get("SUTANDO_CORE_ID") or "").strip()  # CORE_ID: one-release alias
     return w or "unknown"
 
 
@@ -309,7 +310,7 @@ def main(argv=None) -> int:
     ap.add_argument("--name", default=os.environ.get("ROOM_DOC_NAME"))
     ap.add_argument("--file", help="put: the edited document")
     ap.add_argument("--workspace", help="workspace root (default: the repo's resolver)")
-    ap.add_argument("--writer", help="row stamp (default: SUTANDO_CORE_ID, else 'unknown')")
+    ap.add_argument("--writer", help="row stamp (default: SUTANDO_WORKER_SEAT, else 'unknown')")
     a = ap.parse_args(argv)
     room = _required(a.room, "--room", "ROOM_DOC_ROOM")
     name = _required(a.name, "--name", "ROOM_DOC_NAME")

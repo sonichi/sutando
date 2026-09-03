@@ -3317,7 +3317,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     doc = {"id": broker_tid, "body": body}
     if no_send:
         doc["no_send"] = True
-    # Structured attribution, not the "— core-N" prose in the body: the
+    # Structured attribution, not the "— worker-N" prose in the body: the
     # signature is for humans and reformatting it must not change routing.
     worker = _worker_of(tid)
     if worker:

@@ -26,7 +26,7 @@ class HygieneBase(unittest.TestCase):
         self.state = root / "state"
         self.tasks.mkdir()
         self.state.mkdir()
-        self.alive = {"core-1": True, "core-2": True}
+        self.alive = {"worker-1": True, "worker-2": True}
         self.clock = [10_000.0]
         self.lead = PoolLead(self.tasks, self.state,
                              followers_fn=lambda: list(self.alive),
@@ -39,45 +39,45 @@ class HygieneBase(unittest.TestCase):
 
 class StuckAssignmentTests(HygieneBase):
     def test_first_sight_adopts_then_old_age_repools(self):
-        f = self.tasks / "task-s1.assigned-core-1.txt"
+        f = self.tasks / "task-s1.assigned-worker-1.txt"
         f.write_text("task: t\n")
         self.assertEqual(self.lead.reclaim_stuck_assignments(), [])  # adopted
         self.clock[0] += 301
         self.assertEqual(self.lead.reclaim_stuck_assignments(),
-                         ["task-s1.assigned-core-1.txt"])
+                         ["task-s1.assigned-worker-1.txt"])
         self.assertTrue((self.tasks / "task-s1.txt").exists())
 
     def test_young_assignment_untouched(self):
-        (self.tasks / "task-s2.assigned-core-1.txt").write_text("task: t\n")
+        (self.tasks / "task-s2.assigned-worker-1.txt").write_text("task: t\n")
         self.lead.reclaim_stuck_assignments()
         self.clock[0] += 299
         self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
 
     def test_dead_follower_left_to_reclaim_dead(self):
-        (self.tasks / "task-s3.assigned-core-1.txt").write_text("task: t\n")
+        (self.tasks / "task-s3.assigned-worker-1.txt").write_text("task: t\n")
         self.lead.reclaim_stuck_assignments()
-        self.alive["core-1"] = False
+        self.alive["worker-1"] = False
         self.clock[0] += 301
         self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
 
     def test_claimed_files_never_touched(self):
-        (self.tasks / "task-s4.claimed-core-1.txt").write_text("task: t\n")
+        (self.tasks / "task-s4.claimed-worker-1.txt").write_text("task: t\n")
         self.lead.reclaim_stuck_assignments()
         self.clock[0] += 10_000
         self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
-        self.assertTrue((self.tasks / "task-s4.claimed-core-1.txt").exists())
+        self.assertTrue((self.tasks / "task-s4.claimed-worker-1.txt").exists())
 
     def test_ledger_forgets_departed_files(self):
-        f = self.tasks / "task-s5.assigned-core-1.txt"
+        f = self.tasks / "task-s5.assigned-worker-1.txt"
         f.write_text("task: t\n")
         self.lead.reclaim_stuck_assignments()
-        f.rename(self.tasks / "task-s5.claimed-core-1.txt")  # follower claimed
+        f.rename(self.tasks / "task-s5.claimed-worker-1.txt")  # follower claimed
         self.clock[0] += 400
         self.assertEqual(self.lead.reclaim_stuck_assignments(), [])
         import json
         ledger = json.loads(
             (self.state / "pool" / "assignments.json").read_text())
-        self.assertNotIn("task-s5.assigned-core-1.txt", ledger)
+        self.assertNotIn("task-s5.assigned-worker-1.txt", ledger)
 
 
 class PruneTests(HygieneBase):
@@ -92,18 +92,18 @@ class PruneTests(HygieneBase):
         return p
 
     def test_old_flag_of_archived_task_removed(self):
-        p = self._flag("core-1", "task-p1", 8 * 86400)
+        p = self._flag("worker-1", "task-p1", 8 * 86400)
         self.assertEqual(self.lead.prune_done_flags(), 1)
         self.assertFalse(p.exists())
 
     def test_old_flag_of_live_task_kept(self):
-        p = self._flag("core-1", "task-p2", 8 * 86400)
-        (self.tasks / "task-p2.claimed-core-1.txt").write_text("x")
+        p = self._flag("worker-1", "task-p2", 8 * 86400)
+        (self.tasks / "task-p2.claimed-worker-1.txt").write_text("x")
         self.assertEqual(self.lead.prune_done_flags(), 0)
         self.assertTrue(p.exists())
 
     def test_young_flag_kept(self):
-        p = self._flag("core-1", "task-p3", 3600)
+        p = self._flag("worker-1", "task-p3", 3600)
         self.assertEqual(self.lead.prune_done_flags(), 0)
         self.assertTrue(p.exists())
 
@@ -116,19 +116,19 @@ class PruneTests(HygieneBase):
 
     def test_old_ms_stamp_pruned_despite_refreshed_mtime(self):
         self.clock[0] = self.EPOCH
-        p = self._flag("core-1", self._stamped(8 * 86400, "ms"), 0)
+        p = self._flag("worker-1", self._stamped(8 * 86400, "ms"), 0)
         self.assertEqual(self.lead.prune_done_flags(), 1)
         self.assertFalse(p.exists())
 
     def test_old_s_stamp_pruned_despite_refreshed_mtime(self):
         self.clock[0] = self.EPOCH
-        p = self._flag("core-1", self._stamped(8 * 86400, "s"), 0)
+        p = self._flag("worker-1", self._stamped(8 * 86400, "s"), 0)
         self.assertEqual(self.lead.prune_done_flags(), 1)
         self.assertFalse(p.exists())
 
     def test_young_stamp_kept_despite_old_mtime(self):
         self.clock[0] = self.EPOCH
-        p = self._flag("core-1", self._stamped(3600, "ms"), 8 * 86400)
+        p = self._flag("worker-1", self._stamped(3600, "ms"), 8 * 86400)
         self.assertEqual(self.lead.prune_done_flags(), 0)
         self.assertTrue(p.exists())
 
@@ -137,11 +137,11 @@ class PruneTests(HygieneBase):
         old_s = int(self.EPOCH - 8 * 86400)
         # Leading component is a word or hex, so the trailing number is not
         # a stamp: mtime decides, in both directions.
-        kept = [self._flag("core-1", f"task-chat-{old_s}", 0),
-                self._flag("core-1", "task-local~task-0f3a9c1d2b4e5f60", 0),
-                self._flag("core-1", f"task-{old_s}abc", 0)]
-        gone = [self._flag("core-2", "task-local~task-9e8d7c6b5a4f3e2d", 8 * 86400),
-                self._flag("core-2", f"task-chat-{old_s}", 8 * 86400)]
+        kept = [self._flag("worker-1", f"task-chat-{old_s}", 0),
+                self._flag("worker-1", "task-local~task-0f3a9c1d2b4e5f60", 0),
+                self._flag("worker-1", f"task-{old_s}abc", 0)]
+        gone = [self._flag("worker-2", "task-local~task-9e8d7c6b5a4f3e2d", 8 * 86400),
+                self._flag("worker-2", f"task-chat-{old_s}", 8 * 86400)]
         self.assertEqual(self.lead.prune_done_flags(), len(gone))
         self.assertTrue(all(p.exists() for p in kept))
         self.assertFalse(any(p.exists() for p in gone))

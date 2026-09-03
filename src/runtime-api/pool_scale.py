@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Lead-side follower autoscaling policy (lead-follower pool, slice L6).
 
-Owner rule (2026-08-23): when every live core is saturated and unassigned
+Owner rule (2026-08-23): when every live worker is saturated and unassigned
 work is still queuing, add a follower. Scaling down is the risky direction —
-a booted-out core may hold claims — so it is conservative: only past a quiet
-window, and the caller must verify the victim core holds no claimed tasks.
+a booted-out worker may hold claims — so it is conservative: only past a quiet
+window, and the caller must verify the victim worker holds no claimed tasks.
 
 Pure decision function + a cooldown ledger; executing a decision (running
 the idempotent installer) belongs to the daemon. Each follower is a real
@@ -18,7 +18,7 @@ import os
 import time
 from pathlib import Path
 
-BUSY_THRESHOLD = 3   # per-core in-flight depth that reads as saturated
+BUSY_THRESHOLD = 3   # per-worker in-flight depth that reads as saturated
 UP_COOLDOWN_S = 300  # flap guard; DOWN_IDLE_S = full-pool quiet before shrink
 DOWN_IDLE_S = 1800
 
@@ -31,7 +31,7 @@ def decide(pending_unassigned: int, in_flight: "dict[str, int]",
            down_idle_s: int = DOWN_IDLE_S) -> "int | None":
     """Return the new follower count, or None to hold.
 
-    Scale up: backlog exists, every live core is at/over threshold, cap and
+    Scale up: backlog exists, every live worker is at/over threshold, cap and
     cooldown allow. Scale down: the pool has been fully idle for the whole
     quiet window. The caller still owns the no-claims safety check.
     """

@@ -110,7 +110,7 @@ class DedicatedWorkerTests(unittest.TestCase):
         spec.loader.exec_module(cli)
         ws = Path(self.tmp.name)
         self.assertEqual(
-            cli.main(["pin", "chan-D", "core-2", "--dedicated"],
+            cli.main(["pin", "chan-D", "worker-2", "--dedicated"],
                      workspace=ws), 0)
         table = json.loads(
             (ws / "state" / "pool" / "affinity.json").read_text())

@@ -7,7 +7,7 @@ see only their own slice, and the owner sees interleaved replies with no
 explanation. This module turns those two lead-visible events into one-time,
 channel-addressed notices:
 
-- handoff: a channel's task was assigned to a different core than the one
+- handoff: a channel's task was assigned to a different worker than the one
   that last handled that channel;
 - stall: a claimed task passed `stall_after_s` with no done-flag from its
   claimer.
@@ -22,8 +22,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
+import pool_names as pn  # noqa: E402
 
 STALL_AFTER_S = 600  # matches slack-bridge's user-visible timeout notice
 
@@ -73,6 +78,8 @@ class PoolNotifier:
             if isinstance(data, dict):
                 data.setdefault("channels", {})
                 data.setdefault("tasks", {})
+                data["channels"] = {ch: pn.canonical(w) if isinstance(w, str) else w
+                                    for ch, w in data["channels"].items()}
                 return data
         except (OSError, ValueError):
             pass
@@ -91,9 +98,10 @@ class PoolNotifier:
     # ── handoff notices ─────────────────────────────────────────────────────
     def on_assigned(self, task_name: str, instance: str) -> bool:
         """Called per sweep assignment. Notifies the channel when its
-        conversation moved to a different core. Returns True if sent."""
+        conversation moved to a different worker. Returns True if sent."""
         stem = task_name[:-len(".txt")]
-        assigned = self.tasks_dir / f"{stem}.assigned-{instance}.txt"
+        instance = pn.canonical(instance)
+        assigned = self.tasks_dir / f"{stem}{pn.assigned_suffix(instance)}"
         routing = read_routing(assigned)
         ledger = self._load()
         sent = False
@@ -155,8 +163,8 @@ class PoolNotifier:
         return notified
 
     def _done_flag(self, stem: str, instance: str) -> bool:
-        return (self.state_dir / "cores" / instance / "done"
-                / f"{stem}.flag").exists()
+        return any((self.state_dir / "cores" / d / "done" / f"{stem}.flag").exists()
+                   for d in pn.done_dir_names(instance))
 
     def _try_send(self, source: str, channel: str, message: str) -> bool:
         try:

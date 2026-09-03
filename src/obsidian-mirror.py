@@ -55,7 +55,7 @@ def _ensure_vault(vault: Path) -> None:
 
 def _task_id_from_path(path: Path) -> Optional[str]:
     # Delegates so a CLAIMED file yields its real id: the old greedy
-    # `^task-(.+)\.txt$` returned `task-x.claimed-core-2` for one.
+    # `^task-(.+)\.txt$` returned `task-x.claimed-worker-2` for one.
     return task_id_from_filename(path.name)
 
 

@@ -40,7 +40,7 @@ class LaneBase(unittest.TestCase):
         self.state = root / "state"
         self.tasks.mkdir()
         self.state.mkdir()
-        self.pool = ["core-1", "core-2"]
+        self.pool = ["worker-1", "worker-2"]
         self.lead = PoolLead(self.tasks, self.state,
                              followers_fn=lambda: list(self.pool),
                              alive_fn=lambda i: True,
@@ -65,61 +65,61 @@ class LaneRoutingTests(LaneBase):
     def test_routine_goes_to_highest_core(self):
         self._write("task-r1.txt", routine_task())
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-r1"), "core-2")
+        self.assertEqual(self._assigned_to("task-r1"), "worker-2")
 
     def test_non_owner_tier_is_routine(self):
         self._write("task-r2.txt", routine_task(access_tier="team", priority="normal"))
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-r2"), "core-2")
+        self.assertEqual(self._assigned_to("task-r2"), "worker-2")
 
     def test_self_reflective_is_routine(self):
         self._write("task-r3.txt",
                     routine_task(priority="normal", interaction_type="self_reflective"))
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-r3"), "core-2")
+        self.assertEqual(self._assigned_to("task-r3"), "worker-2")
 
     def test_owner_stays_off_lane_core_even_when_it_is_idler(self):
-        self._occupy("core-1", 1)  # lane core idle, core-1 has load
+        self._occupy("worker-1", 1)  # lane core idle, worker-1 has load
         self._write("task-o1.txt", owner_task())
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-o1"), "core-1")
+        self.assertEqual(self._assigned_to("task-o1"), "worker-1")
 
     def test_owner_overflows_to_idle_lane_core_when_saturated(self):
-        self._occupy("core-1", 3)  # AFFINITY_BUSY_MAX
+        self._occupy("worker-1", 3)  # AFFINITY_BUSY_MAX
         self._write("task-o2.txt", owner_task(channel="C9"))
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-o2"), "core-2")
+        self.assertEqual(self._assigned_to("task-o2"), "worker-2")
 
     def test_no_overflow_when_lane_core_is_busy_too(self):
-        self._occupy("core-1", 3)
-        self._occupy("core-2", 1)
+        self._occupy("worker-1", 3)
+        self._occupy("worker-2", 1)
         self._write("task-o3.txt", owner_task(channel="C9"))
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-o3"), "core-1")
+        self.assertEqual(self._assigned_to("task-o3"), "worker-1")
 
     def test_single_core_pool_has_no_lanes(self):
-        self.pool = ["core-1"]
+        self.pool = ["worker-1"]
         self._write("task-r4.txt", routine_task())
         self._write("task-o4.txt", owner_task())
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-r4"), "core-1")
-        self.assertEqual(self._assigned_to("task-o4"), "core-1")
+        self.assertEqual(self._assigned_to("task-r4"), "worker-1")
+        self.assertEqual(self._assigned_to("task-o4"), "worker-1")
 
     def test_explicit_binding_beats_lane_defaults(self):
         # binding rows are always deliberate now (sweep cannot stamp the
         # lane core) — honor them on ANY alive seat, incl. lane core/codex
         (self.state / "pool").mkdir(parents=True)
         (self.state / "pool" / "affinity.json").write_text(
-            '{"C1": {"instance": "core-2", "ts": 999.0}}')
+            '{"C1": {"instance": "worker-2", "ts": 999.0}}')
         self._write("task-o5.txt", owner_task(channel="C1"))
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-o5"), "core-2")
+        self.assertEqual(self._assigned_to("task-o5"), "worker-2")
 
     def test_numeric_core_ordering(self):
-        self.pool = ["core-2", "core-10"]
+        self.pool = ["worker-2", "worker-10"]
         self._write("task-r5.txt", routine_task())
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-r5"), "core-10")
+        self.assertEqual(self._assigned_to("task-r5"), "worker-10")
 
 
 class LaneDetectionTests(LaneBase):
@@ -144,55 +144,55 @@ class RuntimeAwareLaneTests(LaneBase):
                         runtime_fn=lambda i: runtimes[i])
 
     def test_routine_skips_codex_for_the_highest_claude_core(self):
-        lead = self._lead({"core-1": "claude", "core-2": "claude",
-                           "core-3": "codex"})
+        lead = self._lead({"worker-1": "claude", "worker-2": "claude",
+                           "worker-3": "codex"})
         self._write("task-r1.txt", routine_task())
         lead.sweep()
-        self.assertEqual(self._assigned_to("task-r1"), "core-2")
+        self.assertEqual(self._assigned_to("task-r1"), "worker-2")
 
     def test_owner_work_queues_on_claude_over_idle_codex(self):
         # owner 2026-08-26: a codex seat is turnaround-slow, so owner work
         # waits behind a lightly-loaded claude seat rather than landing there.
-        lead = self._lead({"core-1": "claude", "core-2": "claude",
-                           "core-3": "codex"})
-        self._occupy("core-1", 1)
+        lead = self._lead({"worker-1": "claude", "worker-2": "claude",
+                           "worker-3": "codex"})
+        self._occupy("worker-1", 1)
         self._write("task-o1.txt", owner_task())
         lead.sweep()
-        self.assertEqual(self._assigned_to("task-o1"), "core-1")
+        self.assertEqual(self._assigned_to("task-o1"), "worker-1")
 
     def test_all_codex_pool_still_has_a_lane(self):
-        lead = self._lead({"core-1": "codex", "core-2": "codex"})
+        lead = self._lead({"worker-1": "codex", "worker-2": "codex"})
         self._write("task-r2.txt", routine_task())
         lead.sweep()
-        self.assertEqual(self._assigned_to("task-r2"), "core-2")
+        self.assertEqual(self._assigned_to("task-r2"), "worker-2")
 
     def test_explicit_binding_to_codex_is_honored(self):
-        lead = self._lead({"core-1": "claude", "core-2": "claude",
-                           "core-3": "codex"})
+        lead = self._lead({"worker-1": "claude", "worker-2": "claude",
+                           "worker-3": "codex"})
         (self.state / "pool").mkdir(parents=True, exist_ok=True)
         (self.state / "pool" / "affinity.json").write_text(
-            '{"C2": {"instance": "core-3", "ts": 999.0}}')
+            '{"C2": {"instance": "worker-3", "ts": 999.0}}')
         self._write("task-o6.txt", owner_task(channel="C2"))
         lead.sweep()
-        self.assertEqual(self._assigned_to("task-o6"), "core-3")
+        self.assertEqual(self._assigned_to("task-o6"), "worker-3")
 
     def test_single_claude_with_codex_gets_owner_work(self):
         # the sole claude doubles as lane core but must stay owner-eligible
-        lead = self._lead({"core-1": "claude", "core-4": "codex"})
+        lead = self._lead({"worker-1": "claude", "worker-4": "codex"})
         self._write("task-o7.txt", owner_task())
         lead.sweep()
-        self.assertEqual(self._assigned_to("task-o7"), "core-1")
+        self.assertEqual(self._assigned_to("task-o7"), "worker-1")
 
     def test_single_claude_with_codex_gets_routine_work(self):
-        lead = self._lead({"core-1": "claude", "core-4": "codex"})
+        lead = self._lead({"worker-1": "claude", "worker-4": "codex"})
         self._write("task-r6.txt", routine_task())
         lead.sweep()
-        self.assertEqual(self._assigned_to("task-r6"), "core-1")
+        self.assertEqual(self._assigned_to("task-r6"), "worker-1")
 
     def test_no_runtime_fn_keeps_the_pre_runtime_behaviour(self):
         self._write("task-r3.txt", routine_task())
         self.lead.sweep()
-        self.assertEqual(self._assigned_to("task-r3"), "core-2")
+        self.assertEqual(self._assigned_to("task-r3"), "worker-2")
 
 
 class HeaderPastTheOldCap(LaneBase):

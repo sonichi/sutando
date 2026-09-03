@@ -169,7 +169,7 @@ class MetricsTests(FinishTests):
         self._finish_m(claimed, "task: a1\nbody\n")
         rec = json.loads(self._metrics().read_text().strip())
         self.assertEqual(rec["task_id"], "a1")
-        self.assertEqual(rec["core"], "me")
+        self.assertEqual(rec["worker"], "me")
         self.assertEqual(rec["source"], "ag2space")
         # arrival survives the assign/claim renames, so duration is real
         self.assertGreaterEqual(rec["duration_s"], 30)

@@ -594,7 +594,7 @@ def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
     """
     gone = archive_file(result_file, "results", task_id)
     # find_task_file, not a reconstructed bare name: a claimed task is
-    # `<id>.claimed-core-N.txt` and would strand forever.
+    # `<id>.claimed-<worker>.txt` and would strand forever.
     task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
     archive_file(task_file, "tasks", task_id)
     if gone:
@@ -609,7 +609,7 @@ def _anchor_from_task_file(task_id: str):
         live = find_task_file(TASKS_DIR, task_id)
         if live is not None:
             candidates.append(live)
-        for pattern in (f"*/{task_id}.txt", f"*/{task_id}.claimed-core-*.txt"):
+        for pattern in (f"*/{task_id}.txt", f"*/{task_id}.claimed-*.txt"):
             candidates.extend(sorted(ARCHIVE_TASKS_DIR.glob(pattern)))
     except Exception:
         pass

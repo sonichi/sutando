@@ -33,7 +33,7 @@ GONE = Path("/nonexistent-pool-io-fail-open")
 class LeadScanGuards(unittest.TestCase):
     def _lead(self):
         return PoolLead(GONE / "tasks", GONE / "state",
-                        followers_fn=lambda: ["core-1"],
+                        followers_fn=lambda: ["worker-1"],
                         alive_fn=lambda _i: True)
 
     def test_every_scan_is_empty_not_fatal_on_missing_dirs(self):
@@ -43,7 +43,7 @@ class LeadScanGuards(unittest.TestCase):
         self.assertEqual(lead.reclaim_claimed(), [])
         self.assertEqual(lead.reclaim_stuck_assignments(), [])
         self.assertEqual(lead.prune_done_flags(), 0)
-        self.assertEqual(lead._load("core-1"), 0)
+        self.assertEqual(lead._load("worker-1"), 0)
 
     def test_read_channel_unreadable_task_is_none(self):
         self.assertIsNone(_read_channel(GONE / "task-x.txt"))
@@ -108,7 +108,7 @@ class FollowerFallbackGuards(unittest.TestCase):
             pool_follower.os.rename = flaky
             try:
                 got = pool_follower.acquire_work(
-                    ws / "tasks", ws / "state", "core-1", "pool-lead")
+                    ws / "tasks", ws / "state", "worker-1", "pool-lead")
             finally:
                 pool_follower.os.rename = real_rename
             self.assertIsNotNone(got, "second candidate must still claim")

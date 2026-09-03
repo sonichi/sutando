@@ -4,7 +4,7 @@
 The bar demanded a CONTINUOUS benchmark, not one-off bursts: claim
 distribution, head-of-line incidents, duplicate-reply risk, per-channel
 latency, tracked over time. The lead's global queue view makes this one
-append-only JSONL per day plus a summarizer — no cross-core aggregation.
+append-only JSONL per day plus a summarizer — no cross-worker aggregation.
 
 Recording is fail-open (a metrics error must never break scheduling) and
 append-only (multi-writer-safe under O_APPEND, same contract as build_log).
@@ -100,7 +100,7 @@ class PoolMetrics:
         pairs = 0
         for c, seq in chan_seq.items():
             # by TIME only, stable: sorting the (ts, instance) tuple would
-            # reorder equal-timestamp rows by core name and invent switches
+            # reorder equal-timestamp rows by worker name and invent switches
             seq.sort(key=lambda r: r[0])
             for (t0, i0), (t1, i1) in zip(seq, seq[1:]):
                 if t1 - t0 > continuity_window_s:
