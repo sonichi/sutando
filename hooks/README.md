@@ -248,6 +248,11 @@ Register it under the `Bash` PreToolUse matcher exactly as the guards above do
 Escape hatch: `SUTANDO_SKIP_RELEASE_TARGET_GUARD=1`. Fail-open on any internal
 error, like every guard here.
 
+Scope: it sees only literal text. `--target "$(git rev-parse --short HEAD)"`
+is allowed, because the value is unknowable before execution — and that is a
+very plausible way to produce this bug. The guard bounds pasted values, not
+computed ones.
+
 Tests: `python3 tests/release-target-guard.test.py`
 
 ## `result-file-marker-guard.py`

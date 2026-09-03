@@ -73,6 +73,31 @@ class TestOffenders(unittest.TestCase):
             G.offenders(f"gh release create v1 --target {SHORT} ; gh release edit v2 --target 544a68f"),
             [SHORT, "544a68f"])
 
+    def test_a_separator_ends_the_gh_command(self):
+        """`shlex.split` glues `;` to the word before it, so the incident command
+        with a trailing `; echo` read as target `<sha>;` and was ALLOWED — the
+        guard missing the exact command it was built for (vidhuUC, #3829)."""
+        self.assertEqual(G.offenders(f"gh release edit v1 --target {SHORT}; echo done"), [SHORT])
+        self.assertEqual(G.offenders(f"gh release edit v1 --target {SHORT} && echo ok"), [SHORT])
+
+    def test_a_path_qualified_gh_still_arms(self):
+        self.assertEqual(
+            G.offenders(f"/opt/homebrew/bin/gh release edit v1 --target {SHORT}"), [SHORT])
+
+    def test_another_tool_after_a_gh_command_is_not_attributed_to_it(self):
+        """`armed` used to survive every non-`gh` word, so a later tool's own
+        --target was denied. A false denial is how a guard gets switched off."""
+        self.assertEqual(
+            G.offenders("gh release create v1 --target main && docker build --target abcdef1234 ."), [])
+        self.assertEqual(
+            G.offenders("gh release create v1 --target main; cargo build --target deadbeef1"), [])
+
+    def test_a_quoted_separator_stays_one_word(self):
+        """The tokenizer change must not split quoted text — that is the obvious
+        way this fix breaks something."""
+        self.assertEqual(
+            G.offenders(f'gh release create v1 --notes "a && b" --target {SHORT}'), [SHORT])
+
     def test_unbalanced_quotes_do_not_raise(self):
         self.assertEqual(G.offenders("gh release create v1 --target 'unclosed"), [])
 

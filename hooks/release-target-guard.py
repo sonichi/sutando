@@ -26,6 +26,8 @@ import sys
 
 FULL_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 HEX_RUN = re.compile(r"\A[0-9a-f]{7,}\Z")
+# A separator ends the gh command; anything after it belongs to another tool.
+SEPARATORS = (";", "&&", "||", "|", "&", "(", ")")
 
 
 def _deny(reason):
@@ -40,18 +42,22 @@ def _deny(reason):
 def targets(command: str):
     """Every --target value belonging to a `gh release create|edit` in `command`.
 
-    Splitting into shell words rather than regexing the string keeps
-    `--target=X` and `--target X` one case, and stops a `--target` in unrelated
-    text (a different tool, a quoted sentence) from being read as one.
+    `punctuation_chars` tokenizes `;` `&&` `|` as their own words while leaving
+    quoted text intact, so a separator ends the gh command instead of gluing to
+    the sha before it — and another tool's `--target` after one is not read.
     """
     try:
-        words = shlex.split(command)
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
     except ValueError:
         return []
     out, i, armed = [], 0, False
     while i < len(words):
         w = words[i]
-        if w == "gh":
+        if w in SEPARATORS:
+            armed = False
+        if os.path.basename(w) == "gh":
             armed = words[i + 1:i + 3] in (["release", "create"], ["release", "edit"])
         if armed and w == "--target" and i + 1 < len(words):
             out.append(words[i + 1])
