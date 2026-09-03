@@ -63,6 +63,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 - [Architecture boundaries](architecture-boundaries.md)
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
+- [Interaction semantics — the AG2 contract (V1)](interaction-semantics.md) — the closed semantic-request vocabulary agents call, and how it compiles to A2UI.
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
 - [Lead-follower agent pool design](lead-follower-pool.md)
