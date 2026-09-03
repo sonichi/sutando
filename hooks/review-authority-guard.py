@@ -24,7 +24,8 @@ restrictive reading is what applies until the owner rules, and this surface is
 narrow enough (formal reviews only) that defaulting closed cannot wedge the core.
 Genuine hook exceptions still fail OPEN, per the repo's hook contract.
 
-NOT blocked, deliberately: ``--comment`` under findings-only, review DISMISSAL
+NOT blocked, deliberately: ``--comment`` under findings-only, review DISMISSAL,
+variable indirection (``GH=gh; $GH ...`` needs real shell expansion — a non-goal here)
 (reducing one's own standing review is never the risky direction), plain PR
 comments, and every non-review ``gh`` call.
 
@@ -93,6 +94,24 @@ def _segments(command: str):
     return [s for s in re.split(r"&&|\|\||[;|\n]", command) if s.strip()]
 
 
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+
+
+def _wrapped_command(words):
+    """The command string a shell wrapper would run: `bash -c "..."`, `eval "..."`.
+    shlex keeps the whole -c argument as one token, so it is re-classified."""
+    if not words:
+        return None
+    head = words[0].rsplit("/", 1)[-1].lower()
+    if head == "eval":
+        return " ".join(words[1:]) or None
+    if head in _SHELLS:
+        for i, w in enumerate(words[1:-1], 1):
+            if w == "-c" or (w.startswith("-") and not w.startswith("--") and "c" in w):
+                return words[i + 1]
+    return None
+
+
 def classify(command: str) -> Optional[str]:
     """Return 'APPROVE' / 'REQUEST_CHANGES' / 'COMMENT', or None if not a formal review."""
     if not isinstance(command, str) or "gh" not in command:
@@ -107,6 +126,11 @@ def classify(command: str) -> Optional[str]:
         if not words:
             continue
         low = [w.lower() for w in words]
+        inner = _wrapped_command(words)
+        if inner is not None:
+            nested = classify(inner)
+            if nested is not None:
+                return nested
         if "gh" in low and "pr" in low and "review" in low:
             starts = [i for i, w in enumerate(low) if w == "gh"]
             if any(low[i + 1:i + 3] == ["pr", "review"] for i in starts):

@@ -6,6 +6,7 @@ dismissals, plain comments and every non-review command pass through
 
 Run:  python3 tests/review-authority-guard.test.py
 """
+import importlib.util
 import json
 import os
 import subprocess
@@ -128,6 +129,24 @@ print("9. the hook never wedges the core")
 check("exit code is 0 even when denying", run(APPROVE, "hold")[2], 0)
 check("malformed stdin fails OPEN", subprocess.run(
     [sys.executable, HOOK], input="not json", capture_output=True, text=True).returncode, 0)
+
+_spec = importlib.util.spec_from_file_location("review_authority_guard", HOOK)
+_guard = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_guard)
+classify = _guard.classify
+print("10. shell-wrapper indirection: the inner command is one shlex token and is re-classified")
+_R = "gh pr review"
+for _cmd, _want in (
+    (f'bash -c "{_R} 123 --approve"', "APPROVE"),
+    (f"bash -c '{_R} 123 --approve'", "APPROVE"),
+    (f'sh -c "{_R} 123 --request-changes -b x"', "REQUEST_CHANGES"),
+    (f'/bin/zsh -lc "cd repo && {_R} 123 -a"', "APPROVE"),
+    (f'eval "{_R} 123 --approve"', "APPROVE"),
+    (f'bash -c "{_R} 123 --comment -b ok"', "COMMENT"),
+    ('bash -c "gh pr view 123"', None),
+    ('bash -c "echo hello"', None),
+):
+    check(f"wrapper: {_cmd}", classify(_cmd), _want)
 
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")
