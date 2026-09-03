@@ -2580,15 +2580,12 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         _log(f"owner-activity write failed: {e}")
 
 
-def _repair_pending_task(tid: str, task: dict) -> bool:
-    """A task the gateway redelivered while it is still queued here: fsync the
-    queued file and its directory and (re)commit the media sidecar, so a task
-    written by a pre-durability client can still earn a `durable` ack."""
-    tfile = find_task_file(TASKS_DIR, tid)
-    if tfile is None:
-        return False
+def _fsync_in_place(tid: str, *targets: Path) -> bool:
+    """fsync files (and directories) already on disk. A pre-durability writer
+    left these bytes uncommitted, so nothing may be claimed durable until this
+    lands; False when it did not."""
     try:
-        for target in (tfile, TASKS_DIR):
+        for target in targets:
             fd = os.open(target, os.O_RDONLY)
             try:
                 os.fsync(fd)
@@ -2596,6 +2593,18 @@ def _repair_pending_task(tid: str, task: dict) -> bool:
                 os.close(fd)
     except OSError as exc:
         _log(f"durability repair failed for {tid} ({exc})")
+        return False
+    return True
+
+
+def _repair_pending_task(tid: str, task: dict) -> bool:
+    """A task the gateway redelivered while it is still queued here: fsync the
+    queued file and its directory and (re)commit the media sidecar, so a task
+    written by a pre-durability client can still earn a `durable` ack."""
+    tfile = find_task_file(TASKS_DIR, tid)
+    if tfile is None:
+        return False
+    if not _fsync_in_place(tid, tfile, TASKS_DIR):
         return False
     return _record_task_media(tid, task)
 
@@ -2632,8 +2641,11 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     )
     if task_archived or _delivered_copy_exists(tid):
         rfile = RESULTS_DIR / f"{tid}.txt"
-        durable = True
-        if not rfile.exists():
+        if rfile.exists():
+            # A reply the local core wrote with a plain write_text: this process
+            # has committed nothing yet, so fsync before claiming durable.
+            durable = _fsync_in_place(tid, rfile, RESULTS_DIR)
+        else:
             durable = _durable_write(rfile, GATEWAY_REDELIVERY_RESULT)
             # Provenance the result BODY cannot carry: a Team runtime controls
             # the body and can emit these exact bytes, but not this process's set.
