@@ -31,7 +31,8 @@ idle / wedged":
     needs_login             →   logged-out        (unless an ACTIVE gate shows, below)
     working                 →   running
     idle                    →   idle-ready
-    unknown (status stale)  →   hung
+    unknown (status stale)  →   hung              (only when the process probe SAW a session)
+    unknown (unobserved)    →   unobserved        (probe could not run: hold, never RECOVER)
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
     (any, + active gate)    →   blocked-known / blocked-human   (net-new: pane classify)
 
@@ -226,13 +227,16 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive):
+def compose_state(pane, base_health, gateway_alive, process=True):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
     runtime_health.derive() — the SHARED derivation. This function adds only the
     escalation-specific refinements: an active gate in the pane (finest signal),
     and the bundled-gateway-down state. Returns (state, detail, prompt, kind).
+
+    `process` is runtime-health's `signals.process` tri-state: True (session
+    seen), False (server answered "no session"), None (the probe could not run).
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -263,6 +267,9 @@ def compose_state(pane, base_health, gateway_alive):
         if pane and _is_idle_ready(pane):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
+        if process is None:  # no session observed = no wedge evidence; never RECOVER
+            return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
+                    tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None
 
@@ -440,7 +447,8 @@ def main():
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
-            gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))))
+            gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
+            process=(base.get("signals") or {}).get("process", True))
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).

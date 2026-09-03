@@ -11,6 +11,7 @@ So the margin rule lives here instead of in a habit.
 
 from __future__ import annotations
 
+import re
 from typing import Iterable, Optional, Sequence
 
 
@@ -35,6 +36,24 @@ def candidates_from_snapshot(snapshot: dict) -> list[tuple[str, str]]:
         label = str(row.get("name") or row.get("title") or "")
         out.append((cid, f'{label} {row.get("summary") or ""}'.strip()))
     return out
+
+
+def keywords_from_text(text: str, *, min_length: int = 4) -> list[str]:
+    """Build ``best_match`` keywords from one task's own text.
+
+    Splits on every non-letter. Keeping ``-`` inside the token class merges a
+    compound such as ``morning-briefing.py`` into one token that appears in no
+    workstream's label, so a workstream named "Daily morning briefing" scores on
+    neither word; an unrelated candidate then wins by a sub-margin count and
+    ``best_match`` refuses -- indistinguishable from a correct low-confidence
+    refusal. Deriving the list here is what stops that regex from being
+    re-invented at each call site, as ``candidates_from_snapshot`` does for the
+    other argument.
+    """
+    if not text:
+        return []
+    floor = max(1, int(min_length))
+    return sorted({w for w in re.findall(r"[a-z]+", str(text).lower()) if len(w) >= floor})
 
 
 def score(text: str, keywords: Sequence[str]) -> int:
