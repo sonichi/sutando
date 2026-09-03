@@ -88,30 +88,43 @@ labels.
        done = subprocess.run(["python3", S, "apply", "-"],
                              input=json.dumps(proposal), text=True,
                              capture_output=True)
-       out = json.loads(done.stdout) if done.stdout.strip().startswith("{") else {}
-       # rc=0 is NOT the success condition. `apply` returns 0 with "assigned": 0
-       # when the snapshot moved under you, so a NON-EMPTY proposal that assigned
-       # nothing is a silent no-op wearing a success code.
-       if done.returncode == 0 and (not proposal["workstreams"]
-                                    or out.get("assigned", 0) > 0):
-           break
+       if done.returncode == 2:
+           continue  # stale snapshot_hash: apply changed nothing; try again from a fresh snapshot
+       if done.returncode != 0:
+           raise RuntimeError(f"apply failed rc={done.returncode}: {done.stderr.strip()}")
+       out = json.loads(done.stdout)
+       # rc=0 means the hash matched and the classifier is now COMPLETE for this
+       # snapshot: every candidate not assigned is recorded `classifier-omitted`.
+       if proposal["workstreams"] and out.get("assigned", 0) == 0:
+           raise RuntimeError(f"apply accepted the snapshot but assigned nothing "
+                              f"(skipped={out.get('skipped')}): the groups were "
+                              f"rejected in validation and the candidates are now "
+                              f"recorded omitted — do NOT retry, report it")
+       break
    else:
-       raise RuntimeError(f"apply rejected or assigned nothing after 3 "
-                          f"snapshot/infer/apply cycles: {done.stderr.strip()} "
-                          f"{done.stdout.strip()[:200]}")
+       raise RuntimeError(f"apply rejected after 3 snapshot/infer/apply cycles: "
+                          f"{done.stderr.strip()}")
    ```
 
-   **Gate on `assigned`, not on the return code — and know that retrying is not
-   sufficient on its own.** Measured 2026-08-31 on snapshot `036e888f`: `apply`
-   returned rc=0 with `"assigned": 0` and a snapshot_hash different from the one
-   submitted, because an owner task landed between `snapshot` and `apply`. The
-   loop above (gating on rc) treated that as success. By the time the next fire
-   re-ran, both candidate tasks had left the candidate set — their results were
-   already written — so they were never grouped and never recorded as omitted.
-   **The grouping was lost, not deferred.** The `assigned` gate catches the
-   no-op; nothing catches a task that ages out between a failed apply and its
-   retry, so a fire that ends with candidates still ungrouped should say so
-   rather than report success.
+   **Two outcomes look alike from the return code and mean opposite things.**
+   `apply` has exactly three results, and only one of them is retryable:
+   - **rc=2, no stdout** — the `snapshot_hash` no longer matches (a task arrived
+     between `snapshot` and `apply`), or the proposal was malformed. Nothing was
+     written. Take a fresh snapshot and infer again; that is the whole retry.
+   - **rc=0 with `assigned > 0`**, or **rc=0 for an empty proposal** — success.
+     An empty proposal is a decision, not a no-op: every candidate is recorded
+     `classifier-omitted` and the snapshot is marked complete.
+   - **rc=0 with a non-empty proposal and `assigned == 0`** — the hash matched,
+     so `apply` ran to completion, but every group was skipped in validation
+     (unknown `workstream_id`, missing name, confidence below the threshold, or
+     task ids that are no longer candidates). The remaining candidates are now
+     `classifier-omitted`, so the next `snapshot` returns an EMPTY candidate set
+     and a retry "succeeds" on it. **That is a loss, not a deferral** — a loop
+     that retries here adds one iteration and then reports success. Raise
+     instead, so the fire reports which groups were skipped and why.
+
+   A stale hash can never produce rc=0, and rc=0 can never leave a candidate
+   unrecorded; the loop above is shaped by those two facts.
 
    Bounded on purpose: an unbounded loop on a queue that never quiesces is a
    spin, and the failure has to reach the operator rather than be swallowed.
