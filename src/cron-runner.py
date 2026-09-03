@@ -61,6 +61,7 @@ sys.path.insert(0, str(SRC_DIR))
 from task_body_guard import confine_user_content  # noqa: E402
 import cron_task_id  # noqa: E402
 import cron_eval  # noqa: E402
+from dashboard_schedules import LAUNCHD_FIRE_RECORD_KEY  # noqa: E402
 
 try:
     from workspace_default import resolve_workspace  # type: ignore
@@ -459,6 +460,9 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
     try:
         # start_new_session gives the shell its own process group, which is what
         # makes killing the whole tree possible on timeout.
+        # The child's PATH is launchd's minimal one, so a bare `python3` can
+        # resolve to the CLT stub; hand it this runner's validated interpreter.
+        env = {**os.environ, "SUTANDO_PY": sys.executable} if sys.executable else None
         process = subprocess.Popen(
             command,
             shell=True,
@@ -467,6 +471,7 @@ def _run_shell_command(name: str, command: str, timeout_s: int = SHELL_COMMAND_T
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
+            env=env,
         )
         try:
             stdout, stderr = process.communicate(timeout=timeout_s)
@@ -588,6 +593,15 @@ def _emit_cron_telemetry() -> None:
         pass
 
 
+def _record_fire(state: dict, name: str, slot_epoch: int) -> None:
+    """The fire record is separate from the per-name scan boundary, which
+    advances on every tick whether or not anything ran."""
+    fired = state.get(LAUNCHD_FIRE_RECORD_KEY)
+    if not isinstance(fired, dict):
+        fired = state[LAUNCHD_FIRE_RECORD_KEY] = {}
+    fired[name] = int(slot_epoch)
+
+
 def run(now_epoch: Optional[int] = None) -> list:
     """One tick. Returns the list of cron names emitted this tick."""
     now_epoch = int(now_epoch if now_epoch is not None else time.time())
@@ -606,7 +620,7 @@ def run(now_epoch: Optional[int] = None) -> list:
                 continue  # session-owned or not reliability-critical — skip
             name = entry.get("name")
             expr = entry.get("cron")
-            if not name or not expr:
+            if not name or not expr or name == LAUNCHD_FIRE_RECORD_KEY:
                 continue
             has_shell_command = "shell_command" in entry
             shell_command = entry.get("shell_command")
@@ -635,6 +649,7 @@ def run(now_epoch: Optional[int] = None) -> list:
                     _run_shell_command(
                         name, shell_command, _shell_timeout_for(entry))
                     emitted.append(name)
+                    _record_fire(state, name, due_epoch)
                 elif not core_alive:
                     # Preserve the previous boundary so a short outage can
                     # recover this slot after the heartbeat returns.
@@ -645,6 +660,7 @@ def run(now_epoch: Optional[int] = None) -> list:
                     if lateness <= budget:
                         emit_task(name, entry)
                         emitted.append(name)
+                        _record_fire(state, name, due_epoch)
                     else:
                         # The drop is the only record a slot was skipped; undated,
                         # it cannot be tied to a sleep window or counted per day.

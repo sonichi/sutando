@@ -51,10 +51,68 @@ class FmtTests(unittest.TestCase):
         self.assertEqual(ps._fmt(None), "—")
         self.assertEqual(ps._fmt("2026-09-03 00:40:11"), "—")
 
+    def test_naive_is_taken_as_host_local(self):
+        naive = datetime.datetime(2026, 9, 3, 12, 0)
+        self.assertEqual(ps._fmt(naive), naive.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ"))
+
 
 class CfgTests(unittest.TestCase):
     def test_reads_the_repo_config_helper(self):
         self.assertTrue(ps._cfg("workspace"))
+
+    def test_a_failing_config_helper_is_unavailable_not_empty(self):
+        fake = types.SimpleNamespace(returncode=3, stdout="", stderr="sutando config: malformed")
+        with mock.patch.object(ps.subprocess, "run", return_value=fake):
+            with self.assertRaises(ps.SourceUnavailable):
+                ps._cfg("workspace")
+        fake = types.SimpleNamespace(returncode=0, stdout="\n", stderr="")
+        with mock.patch.object(ps.subprocess, "run", return_value=fake):
+            with self.assertRaises(ps.SourceUnavailable):
+                ps._cfg("workspace")
+
+
+class StrictSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory(); self.addCleanup(self.td.cleanup)
+        self.p = pathlib.Path(self.td.name) / "crons.json"
+
+    def test_missing_invalid_and_wrong_shape_are_unavailable(self):
+        with self.assertRaises(ps.SourceUnavailable):
+            ps.read_crons_strict(self.p)
+        self.p.write_text("{not json")
+        with self.assertRaises(ps.SourceUnavailable):
+            ps.read_crons_strict(self.p)
+        self.p.write_text(json.dumps({"jobs": []}))
+        with self.assertRaises(ps.SourceUnavailable):
+            ps.read_crons_strict(self.p)
+
+    def test_a_valid_empty_list_is_an_empty_schedule(self):
+        self.p.write_text("[]")
+        self.assertEqual(ps.read_crons_strict(self.p), [])
+
+    def test_main_refuses_to_publish_on_an_unavailable_source(self):
+        calls = []
+        with mock.patch.object(ps, "build_rows", side_effect=ps.SourceUnavailable("cfg rc=3")), \
+             mock.patch.object(ps, "publish", side_effect=lambda *a, **k: calls.append(a) or {"ok": True}):
+            rc = ps.main(["--publish", "--room", "!r:x"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(calls, [], "doc_put ran on an unavailable source")
+
+    def test_main_other_paths(self):
+        with mock.patch.object(ps, "build_rows", return_value=[]):
+            self.assertEqual(ps.main(["--json"]), 0)
+            self.assertEqual(ps.main([]), 0)
+            with mock.patch.object(ps, "publish", return_value={"ok": False, "reason": "boom"}):
+                self.assertEqual(ps.main(["--publish", "--room", "!r:x"]), 1)
+
+    def test_main_publishes_a_valid_empty_schedule(self):
+        calls = []
+        with mock.patch.object(ps, "build_rows", return_value=[]), \
+             mock.patch.object(ps, "publish", side_effect=lambda room, md: calls.append((room, md)) or {"ok": True}):
+            rc = ps.main(["--publish", "--room", "!r:x"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("# Scheduled jobs", calls[0][1])
 
 
 class _Workspace(unittest.TestCase):
@@ -94,11 +152,13 @@ class BuildRowsTests(_Workspace):
         self.assertEqual(rows[1]["does"], "x" * 48)
         self.assertEqual(rows[2]["does"], "—")
 
-    def test_dict_shape_is_not_a_schedule(self):
-        # The schedulers reject a non-array crons.json; the panel must not
-        # publish jobs no scheduler owns.
-        self.assertEqual(self._rows({"jobs": [{"name": "a", "cron": "0 0 * * *"}]}), [])
-        self.assertEqual(self._rows({"crons": [{"name": "b", "cron": "0 0 * * *"}]}), [])
+    def test_dict_shape_is_unavailable_not_an_empty_schedule(self):
+        # The schedulers reject a non-array crons.json; the panel must neither
+        # publish jobs no scheduler owns nor overwrite the doc with an empty table.
+        with self.assertRaises(ps.SourceUnavailable):
+            self._rows({"jobs": [{"name": "a", "cron": "0 0 * * *"}]})
+        with self.assertRaises(ps.SourceUnavailable):
+            self._rows({"crons": [{"name": "b", "cron": "0 0 * * *"}]})
 
     def test_codex_job_next_fire_is_in_its_own_zone(self):
         rows = self._rows([{"name": "d", "cron": "0 6 * * *", "execution": "codex-task", "prompt": "x"},
@@ -120,7 +180,9 @@ class BuildRowsTests(_Workspace):
         self._write("state/core-status.json", {"ts": "2026-09-03 12:34:00"})
         self._write("state/schedules/codex-scheduler.json",
                     {"jobs": {"nightly": {"last_scheduled_slot": "2026-09-02T13:00:00Z"}}})
-        self._write("state/cron-runner-state.json", {"digest": 1788390000})
+        # boundary (moves every tick) vs the fire record: only the record renders
+        self._write("state/cron-runner-state.json",
+                    {"digest": 1788393600, "__fired__": {"digest": 1788390000}})
         self._write("state/ghost.json", {"last_pass": 1})
         self._write("outside.json", {"last_pass": 1})
         rows = self._rows([

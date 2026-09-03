@@ -10,7 +10,7 @@ restricted, AND-ed otherwise (Vixie cron). Malformed fields raise ValueError.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # (lo, hi) per field: minute, hour, day-of-month, month, day-of-week (7 = Sunday).
 FIELD_BOUNDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
@@ -108,17 +108,40 @@ def matches(expr: str, dt: datetime) -> bool:
 
 
 def next_match(expr: str, after: datetime, horizon_days: int = 8):
-    """First wall-clock minute strictly after ``after`` that fires, or None
-    inside the horizon. Whole days that cannot match are skipped, so a
-    multi-year horizon (a leap-day job) costs days, not minutes."""
+    """First minute strictly after ``after`` that fires, or None inside the
+    horizon. Whole days that cannot match are skipped, so a multi-year horizon
+    (a leap-day job) costs days, not minutes.
+
+    A naive ``after`` is walked as wall-clock minutes. An aware one is walked
+    as real instants, each judged by its wall clock in ``after``'s zone — the
+    predicate both schedulers apply to their minute slots — so a spring-forward
+    minute that never exists is never returned and a fall-back minute that
+    exists twice is visited twice.
+    """
     spec = parse(expr)
-    t = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    end = after + timedelta(days=horizon_days)
+    tz = after.tzinfo
+    if tz is None:
+        t = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        end = after + timedelta(days=horizon_days)
+        while t <= end:
+            if not spec.date_matches(t.year, t.month, t.day):
+                t = (t + timedelta(days=1)).replace(hour=0, minute=0)
+                continue
+            if t.minute in spec.minutes and t.hour in spec.hours:
+                return t
+            t += timedelta(minutes=1)
+        return None
+    utc = timezone.utc
+    t = after.astimezone(utc).replace(second=0, microsecond=0) + timedelta(minutes=1)
+    end = after.astimezone(utc) + timedelta(days=horizon_days)
     while t <= end:
-        if not spec.date_matches(t.year, t.month, t.day):
-            t = (t + timedelta(days=1)).replace(hour=0, minute=0)
+        local = t.astimezone(tz)
+        if not spec.date_matches(local.year, local.month, local.day):
+            midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            jump = midnight.astimezone(utc)
+            t = jump if jump > t else t + timedelta(minutes=1)
             continue
-        if t.minute in spec.minutes and t.hour in spec.hours:
-            return t
+        if local.minute in spec.minutes and local.hour in spec.hours:
+            return local
         t += timedelta(minutes=1)
     return None

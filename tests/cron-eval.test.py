@@ -133,17 +133,53 @@ class LastFiredTests(unittest.TestCase):
         got = ds.last_fired({"name": "nightly", "cron": "0 6 * * *", "execution": "codex-task"}, self.state)
         self.assertEqual(got, datetime(2026, 9, 2, 13, 0, tzinfo=timezone.utc))
 
-    def test_launchd_record(self):
+    def test_launchd_scan_boundary_is_not_a_fire(self):
+        # The per-name value advances every tick; without a fire record the
+        # panel must say unknown, never render the boundary as a fire.
         (self.state / "cron-runner-state.json").write_text(json.dumps({"digest": 1788390000}))
+        self.assertIsNone(ds.last_fired({"name": "digest", "cron": "0 6 * * *", "launchd": True}, self.state))
+        (self.state / "cron-runner-state.json").write_text(json.dumps(
+            {"digest": 1788390000, ds.LAUNCHD_FIRE_RECORD_KEY: {"digest": 1788386400}}))
         got = ds.last_fired({"name": "digest", "cron": "0 6 * * *", "launchd": True}, self.state)
-        self.assertEqual(got, datetime.fromtimestamp(1788390000, timezone.utc))
+        self.assertEqual(got, datetime.fromtimestamp(1788386400, timezone.utc))
 
-    def test_dynamic_alive_mtime(self):
+    def _runner_at(self, root):
+        cr.WORKSPACE = root
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CORE_ALIVE_FILE = root / "state" / "cores" / "h.alive"
+
+    def test_launchd_record_comes_from_the_production_writer(self):
+        # Drive cron-runner.run() itself: a fired shell job leaves a fire record,
+        # an impossible cron advances the boundary and leaves none.
+        root = Path(self.td.name) / "runner"
+        self._runner_at(root)
+        now = 1788464040  # 2026-09-03T19:34:00Z
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "fires", "cron": "* * * * *", "launchd": True, "shell_command": "true"},
+            {"name": "parked", "cron": "0 0 31 2 *", "launchd": True, "shell_command": "true"}]))
+        cr.STATE_FILE.write_text(json.dumps({"fires": now - 120, "parked": now - 120}))
+        emitted = cr.run(now_epoch=now)
+        self.assertEqual(emitted, ["fires"])
+        state = json.loads(cr.STATE_FILE.read_text())
+        self.assertEqual(state["parked"], now, "boundary advanced although nothing fired")
+        self.assertIsNone(ds.last_fired({"name": "parked", "cron": "0 0 31 2 *", "launchd": True}, root / "state"))
+        fired = ds.last_fired({"name": "fires", "cron": "* * * * *", "launchd": True}, root / "state")
+        self.assertEqual(fired, datetime.fromtimestamp(now - now % 60, timezone.utc))
+
+    def test_dynamic_alive_uses_the_payload_ts_not_mtime(self):
         p = self.state / "dynamic-loop-loopy.alive"
-        p.write_text("")
-        os.utime(p, (0, 0))
+        p.write_text(json.dumps({"ts": 1000, "next_delay_s": 60}))
+        os.utime(p, (2000, 2000))
         got = ds.last_fired({"name": "loopy", "loop": "dynamic"}, self.state)
-        self.assertEqual(got, datetime.fromtimestamp(0, timezone.utc))
+        self.assertEqual(got, datetime.fromtimestamp(1000, timezone.utc))
+        p.write_text("")   # unparseable: unknown, not the synced mtime
+        os.utime(p, (2000, 2000))
+        self.assertIsNone(ds.last_fired({"name": "loopy", "loop": "dynamic"}, self.state))
+        p.write_text(json.dumps({"ts": True}))
+        self.assertIsNone(ds.last_fired({"name": "loopy", "loop": "dynamic"}, self.state))
 
     def test_job_name_cannot_escape_state(self):
         (self.ws / "outside.json").write_text(json.dumps({"last_pass": 1}))
@@ -199,6 +235,79 @@ class WiringTests(unittest.TestCase):
             self.assertTrue(cx.cron_matches(expr, at.replace(tzinfo=la)), expr)
             self.assertTrue(cr.cron_matches(expr, at.timetuple()), expr)
             self.assertEqual(ds.next_run(expr, at - timedelta(minutes=1), 1), at, expr)
+
+
+def _codex_style_next(expr, after_utc, tz, minutes=60 * 24 * 40):
+    """The exact tick() predicate: real minute slots, each judged in the zone."""
+    t = after_utc.replace(second=0, microsecond=0)
+    for i in range(1, minutes):
+        slot = t + timedelta(minutes=i)
+        if cx.cron_matches(expr, slot.astimezone(tz)):
+            return slot
+    return None
+
+
+class TimezoneTransitionTests(unittest.TestCase):
+    """The panel's next fire walks real instants, so it agrees with the codex
+    tick() scan across a spring gap and a fall fold, not only in ordinary time."""
+    LA = ZoneInfo("America/Los_Angeles")
+
+    def _agree(self, expr, after_utc):
+        panel = ce.next_match(expr, after_utc.astimezone(self.LA), 40)
+        tick = _codex_style_next(expr, after_utc, self.LA)
+        self.assertIsNotNone(panel, expr)
+        self.assertEqual(panel.astimezone(timezone.utc), tick, expr)
+        return panel
+
+    def test_ordinary(self):
+        got = self._agree("0 6 * * *", datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(got.astimezone(timezone.utc), datetime(2026, 9, 3, 13, 0, tzinfo=timezone.utc))
+
+    def test_spring_gap_skips_the_nonexistent_minute(self):
+        # 2026-03-08 02:30 PST does not exist; the next real 02:30 is March 9 (PDT).
+        got = self._agree("30 2 * * *", datetime(2026, 3, 8, 8, 0, tzinfo=timezone.utc))
+        self.assertEqual(got.astimezone(timezone.utc), datetime(2026, 3, 9, 9, 30, tzinfo=timezone.utc))
+
+    def test_fall_fold_visits_the_repeated_minute(self):
+        # 01:30 happens twice on 2026-11-01 (PDT then PST); after the first, the
+        # next fire is the second, the same slot tick() enqueues.
+        got = self._agree("30 1 * * *", datetime(2026, 11, 1, 8, 31, tzinfo=timezone.utc))
+        self.assertEqual(got.astimezone(timezone.utc), datetime(2026, 11, 1, 9, 30, tzinfo=timezone.utc))
+
+    def test_naive_after_keeps_wall_clock_semantics(self):
+        self.assertEqual(ce.next_match("30 2 * * *", datetime(2026, 3, 8, 1, 0)), datetime(2026, 3, 8, 2, 30))
+
+    def test_host_zone_is_a_named_zone_not_todays_offset(self):
+        # A launchd row on a future date must use that date's offset, which a
+        # fixed PDT/PST offset cannot do; TZ names the zone explicitly here.
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+            self.assertEqual(str(ds.host_zone()), "America/New_York")
+            nxt = ds.next_run_for_job({"name": "x", "cron": "0 6 1 12 *", "launchd": True},
+                                      datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc), 120)
+            self.assertEqual(nxt.astimezone(timezone.utc), datetime(2026, 12, 1, 11, 0, tzinfo=timezone.utc))
+        with mock.patch.dict(os.environ, {"TZ": "Not/AZone"}):
+            self.assertIsNotNone(ds.host_zone())   # falls back rather than raising
+        with mock.patch.dict(os.environ, {"TZ": ""}), \
+             mock.patch.object(ds.os.path, "realpath", side_effect=OSError("no localtime")):
+            self.assertIsNotNone(ds.host_zone())   # unreadable /etc/localtime: still a zone
+
+    def test_positive_seconds_rejects_non_finite_and_non_positive(self):
+        for bad in (float("nan"), float("inf"), float("-inf"), 0, -1, True, "5", None):
+            self.assertIsNone(ds._positive_seconds(bad), repr(bad))
+        self.assertEqual(ds._positive_seconds(5), 5.0)
+
+
+class ShellJobInterpreterTests(unittest.TestCase):
+    """A shell job gets the runner's own interpreter as $SUTANDO_PY, so the
+    documented invocation never resolves a bare python3 on launchd's PATH."""
+    def test_child_sees_the_runners_interpreter_outside_its_path(self):
+        td = tempfile.TemporaryDirectory(); self.addCleanup(td.cleanup)
+        root = Path(td.name); cr.WORKSPACE = root
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            rc = cr._run_shell_command("probe", '"$SUTANDO_PY" -c "import sys; print(sys.executable)"', 30)
+        self.assertEqual(rc, 0)
+        log = next((root / "logs").rglob("*")).read_text() if (root / "logs").exists() else ""
+        self.assertIn(sys.executable, log or cr._shell_log_path().read_text())
 
 
 if __name__ == "__main__":

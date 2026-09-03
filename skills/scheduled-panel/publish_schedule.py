@@ -21,9 +21,32 @@ import dashboard_schedules as ds  # noqa: E402
 PANEL_HORIZON_DAYS = 366 * 4 + 1
 
 
+class SourceUnavailable(RuntimeError):
+    """The schedule source could not be resolved or read. Distinct from an
+    empty schedule: nothing may be published on it."""
+
+
 def _cfg(arg: str) -> str:
-    return subprocess.run(["bash", os.path.join(REPO, "scripts/sutando-config.sh"), arg],
-                          capture_output=True, text=True).stdout.strip()
+    proc = subprocess.run(["bash", os.path.join(REPO, "scripts/sutando-config.sh"), arg],
+                          capture_output=True, text=True)
+    value = proc.stdout.strip()
+    if proc.returncode != 0 or not value:
+        raise SourceUnavailable(
+            f"sutando-config.sh {arg}: rc={proc.returncode} {proc.stderr.strip()[:200]}")
+    return value
+
+
+def read_crons_strict(path: Path) -> list:
+    """The job list, or SourceUnavailable when the file is missing, unreadable
+    or not a JSON list. A valid empty list is an empty schedule and is returned."""
+    p = Path(path)
+    try:
+        jobs = json.loads(p.read_text())
+    except (OSError, ValueError) as exc:
+        raise SourceUnavailable(f"{p}: {exc}") from exc
+    if not isinstance(jobs, list):
+        raise SourceUnavailable(f"{p}: expected a JSON list, got {type(jobs).__name__}")
+    return jobs
 
 
 def _human_cron(expr: str) -> str:
@@ -54,7 +77,7 @@ def _fmt(dt) -> str:
 
 def build_rows(now: datetime.datetime | None = None) -> list[dict]:
     ws, host = _cfg("workspace"), _cfg("host-label")
-    jobs = ds.read_crons(Path(ws) / "hosts" / host / "crons.json")  # canonical shape only
+    jobs = read_crons_strict(Path(ws) / "hosts" / host / "crons.json")  # canonical shape only
     now = now or datetime.datetime.now(datetime.timezone.utc)
     state = Path(ws) / "state"
     rows = []
@@ -104,14 +127,28 @@ def _arg(flag: str):
     return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else None
 
 
-if __name__ == "__main__":
-    rows = build_rows()
-    if "--json" in sys.argv:
-        print(json.dumps(rows, indent=2)); sys.exit(0)
+def main(argv: list[str]) -> int:
+    try:
+        rows = build_rows()
+    except SourceUnavailable as exc:
+        # Unknown is not empty: the room doc keeps its last good content.
+        print(f"refusing to publish: schedule source unavailable ({exc})", file=sys.stderr)
+        return 2
+    if "--json" in argv:
+        print(json.dumps(rows, indent=2))
+        return 0
     md = render_md(rows)
-    room = _arg("--room")
-    if "--publish" in sys.argv and room:
+    room = argv[argv.index("--room") + 1] if "--room" in argv else None
+    if "--publish" in argv and room:
         r = publish(room, md)
-        print("published" if r.get("ok") else f"FAILED: {r.get('reason')}")
-    else:
-        print(md)
+        if r.get("ok"):
+            print("published")
+            return 0
+        print(f"FAILED: {r.get('reason')}")
+        return 1
+    print(md)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

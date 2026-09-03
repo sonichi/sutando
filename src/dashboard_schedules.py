@@ -90,6 +90,29 @@ def next_run(expr: str, now: datetime, horizon_days: int = 8):
 
 DEFAULT_CODEX_TIMEZONE = "America/Los_Angeles"
 
+# cron-runner-state.json: {name: scan boundary, ...}. The boundary advances on
+# every tick, so the last FIRE lives under this key: {name: fired slot epoch}.
+LAUNCHD_FIRE_RECORD_KEY = "__fired__"
+
+
+def host_zone():
+    """The host's IANA zone, so evaluation follows DST the way the launchd
+    runner's time.localtime does; a fixed offset only when no name resolves."""
+    name = os.environ.get("TZ") or ""
+    if not name:
+        try:
+            target = os.path.realpath("/etc/localtime")
+        except OSError:
+            target = ""
+        if "/zoneinfo/" in target:
+            name = target.split("/zoneinfo/", 1)[1]
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return datetime.now().astimezone().tzinfo
+
 
 def job_timezone(job: dict):
     """The zone a job's cron fields are evaluated in by the scheduler that owns
@@ -97,7 +120,17 @@ def job_timezone(job: dict):
     every other owner fires on host-local wall-clock time."""
     if schedule_owner(job) == "codex":
         return ZoneInfo(str(job.get("timezone") or DEFAULT_CODEX_TIMEZONE))
-    return datetime.now().astimezone().tzinfo
+    return host_zone()
+
+
+def _positive_seconds(value):
+    """A finite positive number, or None. bool is an int and is excluded."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    seconds = float(value)
+    if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds <= 0:
+        return None
+    return seconds
 
 
 def next_run_for_job(job: dict, now: datetime, horizon_days: int = 8):
@@ -136,13 +169,20 @@ def last_fired(job: dict, state_dir: Path):
             if isinstance(slot, str) and slot:
                 return datetime.fromisoformat(slot.replace("Z", "+00:00")).astimezone(timezone.utc)
         elif owner == "launchd":
+            # The per-name value is the runner's scan boundary and moves every
+            # tick; only the fire record says a slot was actually run.
             raw = json.loads((state_dir / "cron-runner-state.json").read_text())
-            epoch = raw.get(name)
-            if isinstance(epoch, (int, float)) and not isinstance(epoch, bool):
+            fired = raw.get(LAUNCHD_FIRE_RECORD_KEY)
+            epoch = _positive_seconds(fired.get(name)) if isinstance(fired, dict) else None
+            if epoch is not None:
                 return datetime.fromtimestamp(epoch, timezone.utc)
         elif owner == "dynamic-loop":
+            # The payload's own `ts` is the clock; a sync can rewrite the mtime.
             alive = state_dir / f"dynamic-loop-{name}.alive"
-            return datetime.fromtimestamp(alive.stat().st_mtime, timezone.utc)
+            payload = json.loads(alive.read_text())
+            stamped = _positive_seconds(payload.get("ts")) if isinstance(payload, dict) else None
+            if stamped is not None:
+                return datetime.fromtimestamp(stamped, timezone.utc)
     except (OSError, ValueError, TypeError, AttributeError):
         return None
     return None
