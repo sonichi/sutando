@@ -12,9 +12,8 @@ from datetime import datetime
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from task_archive import (archive_file, declared_task_id, find_task_file,
-                          lookup_id_from_filename, task_id_for,
-                          task_id_from_filename)
+from task_archive import (archive_file, archive_id_from_filename, declared_task_id,
+                          find_task_file, task_id_for, task_id_from_filename)
 import task_archive as _task_archive  # noqa: E402
 
 
@@ -121,22 +120,25 @@ class TestArchiveNeverOverwrites(unittest.TestCase):
         self.assertFalse(src.exists())
 
 
-class TestLookupIdFromFilename(unittest.TestCase):
+class TestArchiveIdFromFilename(unittest.TestCase):
     def test_task_names_use_the_anchored_grammar(self) -> None:
-        self.assertEqual(lookup_id_from_filename("task-a.txt"), "task-a")
+        self.assertEqual(archive_id_from_filename("task-a.txt"), "task-a")
         self.assertEqual(
-            lookup_id_from_filename("task-a.claimed-core-3.txt"), "task-a")
+            archive_id_from_filename("task-a.claimed-core-3.txt"), "task-a")
 
     def test_historic_prefixes_strip_the_plain_suffix(self) -> None:
-        self.assertEqual(lookup_id_from_filename("ask-9.txt"), "ask-9")
-        self.assertEqual(lookup_id_from_filename("sc-ask-9.txt.2"), "sc-ask-9")
+        self.assertEqual(archive_id_from_filename("ask-9.txt"), "ask-9")
+        self.assertEqual(archive_id_from_filename("sc-ask-9.txt.2"), "sc-ask-9")
         self.assertEqual(
-            lookup_id_from_filename("reco-skill-x.txt.archive-failed"),
+            archive_id_from_filename("reco-skill-x.txt.archive-failed"),
             "reco-skill-x")
 
-    def test_a_bare_id_with_dots_passes_through_unmangled(self) -> None:
-        # Path.stem would return "ask-1" here; dots are legal inside ids.
-        self.assertEqual(lookup_id_from_filename("ask-1.2"), "ask-1.2")
+    def test_a_name_carrying_no_structural_txt_is_not_a_filename(self) -> None:
+        # One derivation, one null contract: a bare id is not a filename, so it
+        # is None here rather than passing through a second, laxer parser.
+        self.assertIsNone(archive_id_from_filename("ask-1.2"))
+        self.assertIsNone(archive_id_from_filename("task-1788443871192.txt.sending"))
+        self.assertIsNone(archive_id_from_filename(""))
 
 
 class TestFindTaskFile(unittest.TestCase):
@@ -511,14 +513,14 @@ class TrailingTxtIsTerminal(unittest.TestCase):
     def test_dotted_id_containing_archive_failed_survives(self):
         self.assertEqual(task_id_from_filename("task-current.txt.archive-failed-review.txt"),
                          "task-current.txt.archive-failed-review")
-        self.assertEqual(lookup_id_from_filename("reco-skill-x.txt.archive-failed-r.txt"),
+        self.assertEqual(archive_id_from_filename("reco-skill-x.txt.archive-failed-r.txt"),
                          "reco-skill-x.txt.archive-failed-r")
 
     def test_real_quarantine_names_still_reduce(self):
         for name in ("task-current.txt.archive-failed", "task-current.txt.archive-failed.1",
                      "task-current.txt.archive-failed-review"):
             self.assertEqual(task_id_from_filename(name), "task-current", name)
-        self.assertEqual(lookup_id_from_filename("reco-skill-x.txt.archive-failed"), "reco-skill-x")
+        self.assertEqual(archive_id_from_filename("reco-skill-x.txt.archive-failed"), "reco-skill-x")
 
     def test_dotted_terminal_record_round_trips_through_find_task_file(self):
         d = Path(tempfile.mkdtemp())

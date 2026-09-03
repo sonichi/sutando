@@ -93,17 +93,6 @@ def task_id_for(path: Path, *, accept: Callable[[str], bool] | None = None) -> s
     return parsed
 
 
-def lookup_id_from_filename(name: str) -> str:
-    """The archive-lookup id for a filename, with a bare id passing through.
-
-    `archive_id_from_filename` answers only for a name carrying a structural
-    `.txt`; a bare id has none, and dots are legal inside ids, so it is
-    returned unchanged rather than run through a stem.
-    """
-    task_id = archive_id_from_filename(name)
-    return task_id if task_id is not None else name
-
-
 def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     """Return the actual task file path for task_id, or None if absent.
 
