@@ -38,6 +38,23 @@ class MarkerOwnership(unittest.TestCase):
         self.assertGreater(pub, gate,
                            "the detached path must publish only after the liveness check")
 
+    def test_every_codex_publish_sits_inside_a_liveness_gate(self):
+        """qingyun-wu's standing P1 on this PR: the codex launcher published the
+        marker BEFORE new-session could succeed. An offset comparison cannot check
+        this — branch A's publish legitimately precedes branch B's launch in an
+        if/elif — so assert the GATE each call sits under, not its position."""
+        src = CODEX.read_text(encoding="utf-8").splitlines()
+        calls = [i for i, l in enumerate(src)
+                 if l.strip() == "publish_active_runtime"]
+        self.assertTrue(calls, "the codex launcher never publishes")
+        for i in calls:
+            gate = next((src[j] for j in range(i - 1, max(0, i - 12), -1)
+                         if src[j].lstrip().startswith("if ")), "")
+            self.assertIn("session_exists", gate,
+                          f"codex publish at line {i+1} is not under a session_exists gate "
+                          f"(nearest if: {gate.strip()!r}) — a launch that never came up "
+                          f"would overwrite a truthful marker")
+
     def test_no_publish_call_precedes_the_launch(self):
         """The sibling test above indexes FORWARD from `new-session -d`, so an
         ungated publish placed BEFORE the launch is invisible to it — exactly the
