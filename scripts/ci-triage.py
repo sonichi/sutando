@@ -84,6 +84,17 @@ def _is_bad(c: dict) -> bool:
     return c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") in ("FAILURE", "ERROR")
 
 
+def _is_incomplete(c: dict) -> bool:
+    """Neither green nor failing — still blocks the merge, and reads as absent.
+
+    Two shapes share this list: a CheckRun carries `status`/`conclusion` and no
+    `state`; a StatusContext carries `state` and neither of the others.
+    """
+    if "status" in c:
+        return c.get("status") != "COMPLETED"
+    return c.get("state") == "PENDING"
+
+
 def latest_by_name(rollup) -> "list[dict]":
     """One head can carry several runs, so a check name can appear more than once.
 
@@ -110,6 +121,18 @@ def failing_checks(pr: str, run, repo: str) -> "list[str] | None":
         c.get("name") or c.get("context") or "?"
         for c in latest_by_name(j.get("statusCheckRollup"))
         if _is_bad(c)
+    ]
+
+
+def incomplete_checks(pr: str, run, repo: str) -> "list[str] | None":
+    """Checks that are neither green nor failing, by display name."""
+    j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "statusCheckRollup"])
+    if j is None:
+        return None
+    return [
+        c.get("name") or c.get("context") or "?"
+        for c in latest_by_name(j.get("statusCheckRollup"))
+        if _is_incomplete(c)
     ]
 
 
@@ -207,7 +230,17 @@ def main(argv=None) -> int:
         print("ci-triage: could not read checks (gh failed) — UNKNOWN, not 'none failing'")
         return 0
     if not red:
-        print(f"ci-triage: no failing checks on #{a.pr}")
+        waiting = incomplete_checks(a.pr, run, a.repo)
+        if waiting is None:
+            print(f"ci-triage: no failing checks on #{a.pr}; could not re-read "
+                  "the rollup for incomplete ones — UNKNOWN, not 'ready'")
+        elif waiting:
+            print(f"ci-triage: no failing checks on #{a.pr}, but "
+                  f"{len(waiting)} not yet green — the merge is still gated:")
+            for n in waiting:
+                print(f"  … {n}")
+        else:
+            print(f"ci-triage: no failing checks on #{a.pr}")
         return 0
     print(f"ci-triage: {len(red)} failing check(s) on #{a.pr}:")
     for n in red:
