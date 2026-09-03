@@ -222,6 +222,34 @@ a deployed copy searches upward for `state/authority.json`. Set
 
 Test: `python3 tests/review-authority-guard.test.py`.
 
+## `release-target-guard.py`
+
+DENIES `gh release create|edit` whose `--target` is an abbreviated commit SHA
+(7-39 hex characters). GitHub answers `Release.target_commitish is invalid` and
+creates nothing, so the release reads as cut at the moment it did not happen.
+A full 40-character SHA and a branch/tag name both pass.
+
+It exists because the rule is easy to know and useless to know: the value is not
+chosen, it is pasted from whatever printed last, and every tool prints the
+abbreviated form. Measured twice in fourteen hours on one host, with the
+correction written into the build log between the two occurrences.
+
+### Deploy (per node)
+
+```bash
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/hooks"
+cp hooks/release-target-guard.py "$CFG/hooks/"
+```
+
+Register it under the `Bash` PreToolUse matcher exactly as the guards above do
+(same `shlex.quote` recipe — these paths routinely contain a space).
+
+Escape hatch: `SUTANDO_SKIP_RELEASE_TARGET_GUARD=1`. Fail-open on any internal
+error, like every guard here.
+
+Tests: `python3 tests/release-target-guard.test.py`
+
 ## `result-file-marker-guard.py`
 
 Denies a **Write/Edit into `<workspace>/results/`** whose body carries a
