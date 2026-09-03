@@ -42,7 +42,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 MIGRATE = REPO / "scripts" / "sutando-migrate.sh"
 
-REL = "state/process-pins.json"          # classified newest-mtime
+REL = "state/probe-snapshot.json"        # classified newest-mtime (state/*.json)
 SRC_BODY = '{"pins": [{"service": "discord-bridge", "pid": 222}]}\n'
 DEST_BODY = '{"pins": []}\n'
 
@@ -52,7 +52,7 @@ FORBIDDEN = ("copied", "src-newer", "COMMIT complete")
 SHIM = """#!/bin/bash
 for a in "$@"; do
     case "$a" in
-        *process-pins.json*)
+        *probe-snapshot.json*)
             echo "refused: $*" >> "$CP_SHIM_LOG"
             exit 42
             ;;

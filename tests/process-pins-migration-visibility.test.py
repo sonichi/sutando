@@ -526,7 +526,9 @@ finish(a, *dispatch(a))
         self.assertEqual(strays, [], f"pin written to a path no reader opens: {strays}")
 
     def test_migration_does_not_resurrect_a_RELEASED_pin(self) -> None:
-        """Absence from the NEWER array is the release. A union would re-arm it."""
+        """A released pin on a process that is no longer running stays released:
+        the union keeps an older-only pin only while its pid is live with a
+        matching lstart, and this pid is not."""
         self._write("src/a", [pin(LIVE_PID, LIVE_LSTART, "#2604 witness armed")], OLDER)
         self._write("src/c", [], NEWER)          # newer: released
         self._migrate()
@@ -987,6 +989,90 @@ finish(a, *dispatch(a))
                 status, detail = self._verdict(
                     self.tmp / "dest" / "state" / "process-pins.json")
                 self.assertEqual(status, "stale" if release_is_newer else "warn", detail)
+
+
+class PinMigrationUnionTest(PinMigrationVisibilityTest):
+    """Independent sources are not one history (keweichen, #3356): a newer
+    snapshot missing a pin proves nothing about a LIVE pin an older one carries.
+    Positive control uses a real child process so liveness is measured, not
+    injected; negative controls keep the release semantics for dead pids."""
+
+    # Reuse the fixture only: the parent's cases must not run a second time here.
+    for _name in [n for n in dir(PinMigrationVisibilityTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+    def _live_child(self):
+        import subprocess
+        child = subprocess.Popen(["sleep", "300"])
+        self.addCleanup(child.kill)
+        ls = subprocess.run(["ps", "-o", "lstart=", "-p", str(child.pid)],
+                            capture_output=True, text=True).stdout.strip()
+        self.assertTrue(ls, "ps returned no lstart for the live child")
+        return str(child.pid), ls
+
+    def _pins_at(self, path):
+        return {(p["service"], str(p["pid"]), p["lstart"]) for p in pp.load_pins(path)}
+
+    def test_a_LIVE_older_only_pin_survives_a_newer_unrelated_snapshot(self) -> None:
+        """The blocker as reported: an unrelated newer Telegram pin must not
+        drop a still-live Discord veto."""
+        cpid, cls = self._live_child()
+        self._write("src/a", [pin(cpid, cls, "#2604 witness armed")], OLDER)
+        self._write("src/c", [{"service": "telegram-bridge", "pid": 333,
+                               "lstart": "Sat Aug 23 01:00:00 2026",
+                               "reason": "unrelated", "expires_at": FUTURE}], NEWER)
+        self._migrate()
+        got = self._pins_at(self.tmp / "dest" / "state" / "process-pins.json")
+        self.assertIn((SERVICE, cpid, cls), got, f"live veto dropped: {got}")
+        self.assertIn(("telegram-bridge", "333", "Sat Aug 23 01:00:00 2026"), got)
+        # the production reader still vetoes the live one
+        res = pp.evaluate(pp.load_pins(self.tmp / "dest" / "state" / "process-pins.json"),
+                          SERVICE, {cpid: cls}, time.time())
+        self.assertEqual([v for v, _p, _d in res], [pp.ARMED], res)
+
+    def test_a_DEAD_older_only_pin_is_still_dropped(self) -> None:
+        """Dead pid + unrelated newer snapshot: nothing live to keep."""
+        self._write("src/a", [pin(DEAD_PID, "Sat Aug 23 01:00:00 2026", "stale witness")], OLDER)
+        self._write("src/c", [{"service": "telegram-bridge", "pid": 333,
+                               "lstart": "Sat Aug 23 01:00:00 2026",
+                               "reason": "unrelated", "expires_at": FUTURE}], NEWER)
+        self._migrate()
+        got = self._pins_at(self.tmp / "dest" / "state" / "process-pins.json")
+        self.assertNotIn((SERVICE, DEAD_PID, "Sat Aug 23 01:00:00 2026"), got, got)
+        self.assertEqual(len(got), 1, got)
+
+    def test_an_EXPIRED_live_older_only_pin_is_dropped(self) -> None:
+        cpid, cls = self._live_child()
+        expired = {"service": SERVICE, "pid": int(cpid), "lstart": cls,
+                   "reason": "old", "expires_at": "2000-01-01T00:00:00Z"}
+        self._write("src/a", [expired], OLDER)
+        self._write("src/c", [], NEWER)
+        self._migrate()
+        self.assertEqual(self._pins_at(self.tmp / "dest" / "state" / "process-pins.json"), set())
+
+    def test_the_same_pin_in_both_snapshots_is_kept_ONCE(self) -> None:
+        cpid, cls = self._live_child()
+        self._write("src/a", [pin(cpid, cls, "armed (a)")], OLDER)
+        self._write("src/c", [pin(cpid, cls, "armed (c)")], NEWER)
+        self._migrate()
+        pins = pp.load_pins(self.tmp / "dest" / "state" / "process-pins.json")
+        self.assertEqual(len(pins), 1, pins)
+        self.assertEqual(pins[0]["reason"], "armed (c)", "the newer snapshot's copy wins")
+
+    def test_direction_does_not_matter_for_a_live_pin(self) -> None:
+        """Scan order and which side is newer both leave the live pin present."""
+        cpid, cls = self._live_child()
+        unrelated = {"service": "telegram-bridge", "pid": 333,
+                     "lstart": "Sat Aug 23 01:00:00 2026", "reason": "x", "expires_at": FUTURE}
+        for live_is_newer in (True, False):
+            with self.subTest(live_is_newer=live_is_newer):
+                self.setUp()
+                self._write("src/a", [pin(cpid, cls, "armed")], NEWER if live_is_newer else OLDER)
+                self._write("src/c", [unrelated], OLDER if live_is_newer else NEWER)
+                self._migrate()
+                got = self._pins_at(self.tmp / "dest" / "state" / "process-pins.json")
+                self.assertIn((SERVICE, cpid, cls), got, got)
 
 
 if __name__ == "__main__":

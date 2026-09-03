@@ -233,9 +233,9 @@ CLASS_RULES=(
     "state/dynamic-content.json|structural"
     "state/voice-state.json|structural"
     "state/contextual-chips.json|structural"
-    # A pin is a LOCAL pid + lstart, meaningless on another host; absence from a
-    # newer `pins` array IS the release, so newest-mtime wins, never union.
-    "state/process-pins.json|newest-mtime"
+    # Legacy sources are independent paths, not one history: a newer snapshot
+    # missing a pin proves nothing about a LIVE pin the older one carries.
+    "state/process-pins.json|pins-union"
     # Accumulated grants, not a snapshot: newest-mtime drops the whole
     # allow-set when a fresh install writes an empty one first.
     "state/slack-allowed-recipients.json|union-json-array"
@@ -615,6 +615,9 @@ scan_source() {
                 # in would make the dry-run describe the wrong action.
                 n_union=$((n_union+1))
                 ;;
+            pins-union)
+                n_union=$((n_union+1))
+                ;;
             rehome-state)
                 # Target is <dest>/state/<basename>
                 n_rehome=$((n_rehome+1))
@@ -830,7 +833,7 @@ index_dest_for_collisions() {
         local cls
         cls="$(classify "$rel")"
         case "$cls" in
-            structural|append|newest-mtime|collision-keep-both|rehome-state)
+            structural|append|newest-mtime|pins-union|collision-keep-both|rehome-state)
                 record_xsrc "DEST" "$rel" "existing" "$file"
                 ;;
         esac
@@ -1316,6 +1319,50 @@ commit_one() {
                 echo "copied"
                 return 0
             fi
+            ;;
+        pins-union)
+            # Newer snapshot whole, plus every older-only pin that is still live;
+            # the merge is process_pins.py's, so the reader and the migrator agree.
+            dst_path="$DEST_REAL/$rel"
+            if [ -e "$dst_path" ]; then
+                if sha_match "$src_file" "$dst_path"; then
+                    echo "dest-newer"
+                    return 0
+                fi
+                local src_mt dst_mt newer older
+                if ! src_mt="$(mtime_ns "$src_file")"; then
+                    echo "AMBIGUOUS: $rel — mtime unavailable for source $src_file — resolve by hand" >&2
+                    return 1
+                fi
+                if ! dst_mt="$(mtime_ns "$dst_path")"; then
+                    echo "AMBIGUOUS: $rel — mtime unavailable for destination $dst_path — resolve by hand" >&2
+                    return 1
+                fi
+                # A tie keeps the destination whole; the union still admits every
+                # live source pin, so no live veto is lost either way.
+                if [ "$src_mt" -gt "$dst_mt" ]; then newer="$src_file"; older="$dst_path"; else newer="$dst_path"; older="$src_file"; fi
+                local merge_out
+                if ! merge_out="$(python3 "$SCRIPT_DIR/../src/process_pins.py" merge --into "$dst_path" --newer "$newer" --older "$older")"; then
+                    echo "AMBIGUOUS: $rel — pin snapshots could not be merged — resolve by hand" >&2
+                    return 1
+                fi
+                case "$merge_out" in
+                    *"kept=0 "*)
+                        # No live pin to carry over: the newer snapshot wins whole.
+                        if [ "$newer" = "$src_file" ]; then
+                            commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                            echo "src-newer"
+                        else
+                            echo "dest-newer"
+                        fi
+                        ;;
+                    *) echo "unioned" ;;
+                esac
+            else
+                commit_copy "$src_file" "$dst_path" "$rel" || return 1
+                echo "copied"
+            fi
+            return 0
             ;;
         newest-mtime)
             dst_path="$DEST_REAL/$rel"
