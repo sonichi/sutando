@@ -22,6 +22,7 @@ import os
 import re
 import tempfile
 import time
+
 from pathlib import Path
 
 try:
@@ -32,6 +33,19 @@ except ImportError:
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     publish_result = _mod.publish_result
+
+try:
+    from .result_markers import parse_markers
+except ImportError:
+    try:
+        from result_markers import parse_markers
+    except ImportError:
+        # Loaded by file path from src/delivery/: the marker owner is one level up.
+        _mspec = importlib.util.spec_from_file_location(
+            "result_markers", Path(__file__).resolve().parent.parent / "result_markers.py")
+        _mmod = importlib.util.module_from_spec(_mspec)
+        _mspec.loader.exec_module(_mmod)
+        parse_markers = _mmod.parse_markers
 
 __all__ = ["read_ready_result", "is_ready_body", "retire_claim_if_unchanged",
            "sweep_retired"]
@@ -156,7 +170,7 @@ def _write_atomic(path: Path, text: str) -> None:
 _SWEEP_SUFFIX = ".sweeping"
 _CLAIM_SUFFIXES = (".txt", ".sending")
 _TYPED_STEM_RE = re.compile(r"^(?P<base>.+?)(?P<dest>\.to-[a-z0-9_-]+)?\Z")
-_REDIRECT_LINE_RE = re.compile(r"^\[(?:channel: [^\]]+|dm-only)\]\s*$")
+_SCRATCH_RE = re.compile(r"^\.(?P<inode>.+)\.late-(?P<offset>\d+)\.tmp$")
 
 
 def _late_name(inode: Path, now: float) -> str:
@@ -175,35 +189,86 @@ def _late_name(inode: Path, now: float) -> str:
 
 
 def _carried_redirect(delivered_prefix: bytes) -> str:
-    """The body-leg routing lines the delivered head carried, so a remainder
-    on its own is claimed by the same bridge the original was."""
-    lines = []
-    for line in delivered_prefix.decode(errors="replace").splitlines():
-        if not line.strip():
-            continue
-        if _REDIRECT_LINE_RE.match(line.strip()):
-            lines.append(line.strip())
-            continue
-        break
-    return "".join(f"{l}\n" for l in lines)
+    """The routing the delivered head carried, read by the marker owner so a
+    remainder can never widen it: dm-only stays dm-only, a redirect stays."""
+    parsed = parse_markers(delivered_prefix.decode(errors="replace"))
+    kinds = {a.kind: a.value for a in parsed.actions}
+    if "dm-only" in kinds:
+        return "[dm-only]\n"
+    if kinds.get("redirect"):
+        return f"[channel: {kinds['redirect']}]\n"
+    return ""
+
+
+def _scratch_path(inode: Path, results: Path, delivered: int) -> Path:
+    """The staged remainder is the journal: dotted (no consumer globs it) and
+    keyed by the cursor it starts at, so a replay finds the same entry."""
+    return results / f".{inode.name}.late-{delivered}.tmp"
+
+
+def _lease_age(claim: Path, now: float) -> float | None:
+    try:
+        return now - float(claim.read_text())
+    except (OSError, ValueError):
+        try:
+            return now - claim.stat().st_mtime
+        except OSError:
+            return None
 
 
 def _claim_for_sweep(inode: Path, now: float, quiesce_s: float) -> Path | None:
-    """One sweeper per inode: link a claim name, EEXIST means another holds it.
-    A claim older than quiesce_s is a crashed sweeper's and is broken."""
+    """One sweeper per inode: an exclusive stamped lease, so its age is the
+    claim's own and not the inode's. A stale lease is renamed away before it
+    is replaced — only one breaker wins the rename, so two cannot both sweep."""
     claim = inode.with_name(inode.name + _SWEEP_SUFFIX)
+    age = _lease_age(claim, now)
+    if age is not None and age >= quiesce_s:
+        broken = claim.with_name(f"{claim.name}.broken-{os.getpid()}-{int(now)}")
+        try:
+            os.rename(claim, broken)
+            broken.unlink(missing_ok=True)
+        except OSError:
+            pass
     try:
-        if now - claim.stat().st_mtime >= quiesce_s:
-            claim.unlink(missing_ok=True)
+        fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except OSError:
-        pass
-    try:
-        os.link(inode, claim)
-    except (FileExistsError, FileNotFoundError):
         return None
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(repr(now))
     except OSError:
+        claim.unlink(missing_ok=True)
+        return None
+    if not inode.exists():
+        claim.unlink(missing_ok=True)
         return None
     return claim
+
+
+def _recover_staged(inode: Path, results: Path, marker: Path, now: float) -> list[Path]:
+    """Finish or discard a staged remainder a crashed sweeper left behind.
+    Marker past the stage's cursor means the bytes are accounted for and only
+    publication is owed; otherwise the stage predates its cursor and is redone."""
+    published: list[Path] = []
+    try:
+        delivered = int(marker.read_text()) if marker.exists() else None
+    except (OSError, ValueError):
+        return published
+    for stage in sorted(results.glob(f".{inode.name}.late-*.tmp")):
+        m = _SCRATCH_RE.match(stage.name)
+        if not m or m.group("inode") != inode.name:
+            continue
+        offset = int(m.group("offset"))
+        if delivered is not None and delivered > offset:
+            target = results / _late_name(inode, now)
+            try:
+                os.replace(stage, target)
+            except OSError:
+                continue
+            published.append(target)
+        else:
+            stage.unlink(missing_ok=True)
+    return published
 
 
 def sweep_retired(results_dir: str | Path, quiesce_s: float = 600.0,
@@ -219,8 +284,9 @@ def sweep_retired(results_dir: str | Path, quiesce_s: float = 600.0,
     this lifecycle: its delivered length is unknown, so it is never
     republished (a duplicate is worse than the loss) and only aged out.
 
-    One sweeper per inode, and the marker advances before the remainder is
-    visible: an unadvanceable marker publishes nothing (retried, never twice).
+    One sweeper per inode. A remainder is staged under a dotted name keyed by
+    its cursor, the marker advances, then the stage is published: a crash at
+    any point is replayed by `_recover_staged` — never lost, never twice.
     """
     results = Path(results_dir)
     retired_dir = results / "retired"
@@ -237,6 +303,7 @@ def sweep_retired(results_dir: str | Path, quiesce_s: float = 600.0,
             continue
         try:
             marker = _delivered_marker(inode)
+            published.extend(_recover_staged(inode, results, marker, now))
             try:
                 raw = inode.read_bytes()
                 delivered = int(marker.read_text()) if marker.exists() else None
@@ -244,28 +311,26 @@ def sweep_retired(results_dir: str | Path, quiesce_s: float = 600.0,
             except (OSError, ValueError):
                 continue
             if delivered is not None and len(raw) > delivered:
-                remainder = raw[delivered:].decode(errors="replace").strip()
+                # A split multibyte character is a still-growing write: leave
+                # the cursor where it is and read the whole character later.
+                try:
+                    remainder = raw[delivered:].decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    continue
                 if remainder:
                     body = _carried_redirect(raw[:delivered]) + remainder + "\n"
+                    stage = _scratch_path(inode, results, delivered)
                     target = results / _late_name(inode, now)
                     try:
-                        fd, tmp_name = tempfile.mkstemp(
-                            dir=results, prefix=f".{target.name}.", suffix=".tmp")
-                    except OSError:
-                        continue
-                    tmp = Path(tmp_name)
-                    try:
-                        with os.fdopen(fd, "w") as fh:
-                            fh.write(body)
+                        _write_atomic(stage, body)
                         _write_atomic(marker, str(len(raw)))
-                        try:
-                            os.replace(tmp, target)
-                        except OSError:
-                            _write_atomic(marker, str(delivered))
-                            raise
                     except OSError:
-                        tmp.unlink(missing_ok=True)
+                        stage.unlink(missing_ok=True)
                         continue
+                    try:
+                        os.replace(stage, target)
+                    except OSError:
+                        continue  # the stage + advanced marker replay next sweep
                     published.append(target)
                     continue
                 try:

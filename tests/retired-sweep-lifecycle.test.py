@@ -173,6 +173,96 @@ with tempfile.TemporaryDirectory() as td:
     for f in late_files(d):
         f.unlink()
 
+    # --- routing is read by the marker owner: dm-only wins, redirects survive D7 + IPv6
+    cases = [
+        ("[dm-only]\nprivate\n", "[dm-only]\n"),
+        ("private [dm-only] inline\n[channel: 1535008729106485288]\n", "[dm-only]\n"),
+        ("[channel: 1535008729106485288]\nhead\n", "[channel: 1535008729106485288]\n"),
+        ("**[core: 2]**\n[channel: C0AB12]\nhead\n", "[channel: C0AB12]\n"),
+        ("[channel: !r:[2001:db8::1]:8448]\nhead\n", "[channel: !r:[2001:db8::1]:8448]\n"),
+        ("plain head\n", ""),
+    ]
+    for prefix, want in cases:
+        got = rd._carried_redirect(prefix.encode())
+        check(f"carried routing for {prefix.splitlines()[0]!r} -> {want!r}", got == want, f"got={got!r}")
+    retired = retire_with_late(d, "proactive-60.txt", "private [dm-only] inline\n[channel: 1535008729106485288]\n", "late secret\n")
+    pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+    check("an inline dm-only prefix republishes its remainder dm-only, never as a redirect",
+          len(pub) == 1 and pub[0].read_text() == "[dm-only]\nlate secret\n", f"{[x.read_text() for x in pub]}")
+    for f in late_files(d):
+        f.unlink()
+
+    # --- a split multibyte append is retried whole, never delivered as replacement characters
+    retired = retire_with_late(d, "proactive-61.txt", "FIRST\n", "")
+    with open(retired, "ab") as fh:
+        fh.write("日".encode()[:1])
+    check("a torn character publishes nothing and leaves the cursor",
+          rd.sweep_retired(d, quiesce_s=600, now=time.time()) == []
+          and rd._delivered_marker(retired).read_text() == "6")
+    with open(retired, "ab") as fh:
+        fh.write("日".encode()[1:] + b"\n")
+    pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+    check("the whole character is delivered once it is complete",
+          len(pub) == 1 and pub[0].read_text() == "日\n", f"{[x.read_bytes() for x in pub]}")
+    for f in late_files(d):
+        f.unlink()
+
+    # --- an old inode: a fresh lease over it is not stale, so racing sweepers publish once
+    retired = retire_with_late(d, "proactive-62.txt", "FIRST\n", "LATE9\n")
+    old = time.time() - 7200
+    os.utime(retired, (old, old))
+    held = retired.with_name(retired.name + rd._SWEEP_SUFFIX)
+    first = rd._claim_for_sweep(retired, time.time(), 600)
+    second = rd._claim_for_sweep(retired, time.time(), 600)
+    check("old inode: a fresh lease is exclusive (second claim refused)",
+          first is not None and second is None, f"first={first} second={second}")
+    held.unlink(missing_ok=True)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def run_old():
+        barrier.wait()
+        results.append(rd.sweep_retired(d, quiesce_s=600, now=time.time()))
+
+    ts = [threading.Thread(target=run_old) for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    check("old inode: racing sweepers publish exactly one remainder",
+          sum(len(r) for r in results) == 1 and len(late_files(d)) == 1, f"{results} {late_files(d)}")
+    for f in late_files(d):
+        f.unlink()
+
+    # --- crash between the marker advance and publication: replayed after restart, once
+    retired = retire_with_late(d, "proactive-63.txt", "FIRST\n", "LATE10\n")
+    marker = rd._delivered_marker(retired)
+    real_replace = os.replace
+
+    def _crash(src, dst, *a, **k):
+        if Path(dst).name.startswith("proactive-late-"):
+            raise KeyboardInterrupt  # the process dies here
+        return real_replace(src, dst, *a, **k)
+
+    rd.os.replace = _crash
+    try:
+        try:
+            rd.sweep_retired(d, quiesce_s=600, now=time.time())
+        except KeyboardInterrupt:
+            pass
+    finally:
+        rd.os.replace = real_replace
+    held = retired.with_name(retired.name + rd._SWEEP_SUFFIX)
+    check("crash state: marker advanced, stage on disk, nothing visible",
+          marker.read_text() == "13" and not late_files(d)
+          and [p for p in d.iterdir() if p.name.startswith(".proactive-63.txt.late-")],
+          f"marker={marker.read_text()!r} files={sorted(x.name for x in d.iterdir())}")
+    pub = rd.sweep_retired(d, quiesce_s=600, now=time.time() + 601)
+    check("restarted sweep after quiescence publishes the staged remainder exactly once",
+          len(pub) == 1 and pub[0].read_text().strip() == "LATE10", f"{pub}")
+    check("and the inode is not aged out from under it, nor published twice",
+          rd.sweep_retired(d, quiesce_s=600, now=time.time() + 602) == [] and len(late_files(d)) == 1)
+    for f in late_files(d):
+        f.unlink()
+
     # --- a legacy retired inode (no marker) is never republished, only aged out
     legacy = d / "retired" / "proactive-50.to-telegram.sending"
     legacy.write_text("old\nbytes\n")
@@ -223,39 +313,53 @@ with tempfile.TemporaryDirectory() as td:
           rd._carried_redirect(b"\n[channel: 123456789012345678]\nFIRST\n") == "[channel: 123456789012345678]\n")
     check("a plain head carries nothing", rd._carried_redirect(b"FIRST\n") == "")
 
-    # --- sweep claim: a vanished inode or a refused link is a skip, never a raise
+    # --- sweep claim: a vanished inode or a refused lease is a skip, never a raise
     check("claim on a vanished inode -> None", rd._claim_for_sweep(d / "retired" / "gone.txt", time.time(), 600) is None)
-    real_link = rd.os.link
-    rd.os.link = lambda *a, **k: (_ for _ in ()).throw(PermissionError("no link"))
-    try:
-        retired = retire_with_late(d, "proactive-54.txt", "FIRST\n", "LATE8\n")
-        check("claim with a refused link -> None", rd._claim_for_sweep(retired, time.time(), 600) is None)
-        check("sweep skips the inode it cannot claim", rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [])
-    finally:
-        rd.os.link = real_link
-    pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
-    check("...and sweeps it once the link works", len(pub) == 1)
-    for f in late_files(d): f.unlink()
+    retired = retire_with_late(d, "proactive-46b.txt", "FIRST\n", "LATE5\n")
+    real_open = os.open
 
-    # --- sweep: the final rename failing rolls the marker back and publishes nothing
-    retired = retire_with_late(d, "proactive-55.txt", "FIRST\n", "LATE9\n")
-    marker = rd._delivered_marker(retired); before = marker.read_text()
-    def _final_rename_fails(src, dst, *a, **k):
-        if "proactive-late-" in str(dst) and not str(dst).endswith(".delivered"):
-            raise OSError("rename refused")
-        return real_os_replace(src, dst, *a, **k)
-    rd.os.replace = _final_rename_fails
+    def _refuse(path, *a, **k):
+        if str(path).endswith(rd._SWEEP_SUFFIX):
+            raise PermissionError("claim refused")
+        return real_open(path, *a, **k)
+
+    rd.os.open = _refuse
+    try:
+        check("claim with a refused lease -> None",
+              rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [] and not late_files(d))
+    finally:
+        rd.os.open = real_open
+    pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+    check("...and sweeps it once the lease can be taken", len(pub) == 1, f"{pub}")
+    for f in late_files(d):
+        f.unlink()
+
+    # --- publication failure after the marker advanced: staged, replayed, never lost
+    retired = retire_with_late(d, "proactive-49b.txt", "FIRST\n", "LATE8\n")
+    marker = rd._delivered_marker(retired)
+    real_replace = os.replace
+
+    def _refuse_publish(src, dst, *a, **k):
+        if Path(dst).name.startswith("proactive-late-"):
+            raise OSError("publish refused")
+        return real_replace(src, dst, *a, **k)
+
+    rd.os.replace = _refuse_publish
     try:
         pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
     finally:
-        rd.os.replace = real_os_replace
-    check("rename failure -> nothing published, marker rolled back, no scratch",
-          pub == [] and marker.read_text() == before and not late_files(d)
-          and not [p for p in d.iterdir() if p.name.startswith(".proactive-late-")],
-          f"pub={pub} marker={marker.read_text()!r} before={before!r}")
+        rd.os.replace = real_replace
+    stages = [p for p in d.iterdir() if p.name.startswith(".proactive-49b.txt.late-")]
+    check("publish failure -> nothing visible, marker advanced, the stage is kept as the journal",
+          pub == [] and not late_files(d) and marker.read_text() == "12" and len(stages) == 1,
+          f"pub={pub} marker={marker.read_text()!r} stages={stages}")
     pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
-    check("...then published exactly once when the rename works", len(pub) == 1 and pub[0].read_text().strip() == "LATE9")
-    for f in late_files(d): f.unlink()
+    check("the next sweep replays the stage: published once, from the journal",
+          len(pub) == 1 and pub[0].read_text().strip() == "LATE8"
+          and not [p for p in d.iterdir() if p.name.startswith(".proactive-49b")], f"{pub}")
+    check("and not again", rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [])
+    for f in late_files(d):
+        f.unlink()
 
     # --- a whitespace-only remainder advances the marker and publishes nothing
     retired = retire_with_late(d, "proactive-56.txt", "FIRST\n", "   \n")
