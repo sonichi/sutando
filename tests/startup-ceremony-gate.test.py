@@ -106,6 +106,24 @@ class VerifyCeremonyGate(unittest.TestCase):
             self.assertIn("probe unavailable", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def test_probe_that_raises_at_import_is_rc2(self):
+        """The other half of the fix: the probe file EXISTS but fails to import. Must be rc 2,
+        no traceback — the same "cannot answer" verdict as a missing file."""
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td) / "copy"
+            dst = tree / "skills" / "startup" / "scripts" / "verify-ceremony.py"
+            dst.parent.mkdir(parents=True)
+            dst.write_text(GATE.read_text())
+            (tree / "src").mkdir()
+            (tree / "src" / "health-check.py").write_text('raise RuntimeError("boom at import")\n')
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=1_000_300.0)
+            env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
+            r = subprocess.run([sys.executable, str(dst), "--workspace", str(ws), "--host-label", HOST],
+                               capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(r.returncode, 2, f"rc={r.returncode}\n{r.stderr}")
+            self.assertIn("probe unavailable", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
