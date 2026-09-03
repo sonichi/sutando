@@ -455,6 +455,33 @@ and loads whichever repo it reviews.
     mode *at settle time* — which is also what made it testable under node.
     Cheap form: for each side effect in a newly-async continuation, name the state it
     depends on and check the continuation re-reads it rather than closing over it.
+22. **A mutation-test `SURVIVED` is untrusted until the bytecode cache is invalidated.**
+    Two mutants of the *same byte length*, written within the same mtime second, share a
+    `__pycache__` entry: CPython validates a cached `.pyc` on source **mtime + size**, so the
+    second mutant silently executes the first one's compiled code. It reports SURVIVED, and
+    SURVIVED is the direction that sends someone to "fix" a gap that is not there.
+    *Measured on `scripts/my-stale-approvals.py` + its suite, five mutants, two arms:*
+
+    ```
+    mutant                       cache KEPT   cache CLEARED   mutant size
+    m1 parent-count -> True      CAUGHT       CAUGHT          8217
+    m2 staleness   > -> >=       SURVIVED     SURVIVED        8270
+    m3 commits_after > -> >=     SURVIVED     CAUGHT          8270   <-- flips
+    m4 decisive drops bar        SURVIVED     SURVIVED        8243
+    m5 decisive drops blockers   CAUGHT       CAUGHT          8252
+    ```
+
+    Exactly the colliding pair flips; the three distinctly-sized mutants are unchanged, which
+    is what rules out "the suite is flaky" and names the size collision as the mechanism. m3's
+    mutation is caught by a test *named for it* — `test_a_commit_AT_the_approval_timestamp_
+    does_not_count_as_after`, docstring "Pins the boundary so widening `>` to `>=` cannot pass
+    silently" — so the harness reported SURVIVED about a mutant the suite catches by design.
+    Acting on that report meant nearly replacing a deliberate documented semantic with its
+    opposite, in the name of rigour.
+    **Cure:** unlink `importlib.util.cache_from_source(...)` between mutants, or run the suite
+    with `PYTHONDONTWRITEBYTECODE=1`. **And run one mutant per invocation**, printing the
+    failing test's name for a CAUGHT and ending with a restore-control — a batch loop that
+    restores between iterations is itself stateful, and this collision is invisible inside it.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
