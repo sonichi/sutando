@@ -27,32 +27,20 @@ import os
 import re
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import cron_eval
 
 
-def cron_field_match(spec: str, value: int) -> bool:
-    """Match one cron field value against a spec supporting *, */N, A-B, A,B, N."""
-    for token in spec.split(","):
-        if token == "*":
-            return True
-        if token.startswith("*/"):
-            try:
-                step = int(token[2:])
-            except ValueError:
-                continue
-            if step and value % step == 0:
-                return True
-        elif "-" in token:
-            try:
-                a, b = (int(x) for x in token.split("-", 1))
-            except ValueError:
-                continue
-            if a <= value <= b:
-                return True
-        elif token.isdigit() and int(token) == value:
-            return True
-    return False
+def cron_field_match(spec: str, value: int, lo: int = 0, hi: int = 59) -> bool:
+    """Match one cron field value against a spec (*, */N, A-B, A,B, N, A-B/N).
+    Delegates to cron_eval; a malformed spec matches nothing."""
+    try:
+        return value in cron_eval.field_values(spec, lo, hi, sunday_7=(hi == 7))
+    except ValueError:
+        return False
 
 
 # Per-field value bounds (minute, hour, day-of-month, month, day-of-week).
@@ -91,25 +79,72 @@ def cron_field_valid(spec: str, lo: int, hi: int) -> bool:
 
 
 def next_run(expr: str, now: datetime, horizon_days: int = 8):
-    """Next datetime matching a 5-field cron expr (minute hour dom month dow),
-    scanning minute-by-minute up to horizon_days. Returns datetime or None.
-
-    dom/dow are AND-combined (sufficient for our crons, which restrict only one
-    of them); the rare cron OR-semantics edge case is not modeled.
-    """
-    parts = expr.split()
-    if len(parts) != 5:
+    """Next datetime matching a 5-field cron expr, or None inside the horizon.
+    Semantics (Vixie dom/dow OR, Sunday=7) come from cron_eval, the same
+    evaluator the launchd and codex schedulers fire on."""
+    try:
+        return cron_eval.next_match(expr, now, horizon_days)
+    except ValueError:
         return None
-    mnt, hr, dom, mon, dow = parts
-    t = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    end = now + timedelta(days=horizon_days)
-    while t <= end:
-        cron_dow = (t.weekday() + 1) % 7  # python Mon=0..Sun=6 -> cron Sun=0..Sat=6
-        if (cron_field_match(mnt, t.minute) and cron_field_match(hr, t.hour)
-                and cron_field_match(dom, t.day) and cron_field_match(mon, t.month)
-                and cron_field_match(dow, cron_dow)):
-            return t
-        t += timedelta(minutes=1)
+
+
+DEFAULT_CODEX_TIMEZONE = "America/Los_Angeles"
+
+
+def job_timezone(job: dict):
+    """The zone a job's cron fields are evaluated in by the scheduler that owns
+    it: codex-task entries declare an IANA zone (default America/Los_Angeles);
+    every other owner fires on host-local wall-clock time."""
+    if schedule_owner(job) == "codex":
+        return ZoneInfo(str(job.get("timezone") or DEFAULT_CODEX_TIMEZONE))
+    return datetime.now().astimezone().tzinfo
+
+
+def next_run_for_job(job: dict, now: datetime, horizon_days: int = 8):
+    """Next fire as an aware datetime, evaluated in the job's own zone. None for
+    a dynamic loop, an invalid cron, an unknown zone, or nothing in horizon."""
+    expr = job.get("cron") or ""
+    if job.get("loop") == "dynamic" or not expr:
+        return None
+    try:
+        tz = job_timezone(job)
+    except ZoneInfoNotFoundError:
+        return None
+    if now.tzinfo is None:
+        now = now.astimezone()
+    return next_run(expr, now.astimezone(tz), horizon_days)
+
+
+# A job name may only address state files through this shape; anything else is
+# refused rather than joined into a path.
+SAFE_JOB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def last_fired(job: dict, state_dir: Path):
+    """The owning scheduler's own record of the last fire, as an aware UTC
+    datetime, or None when no scheduler records one. Generic activity stamps
+    (core-status.json) are never a fire."""
+    name = str(job.get("name") or "")
+    if not SAFE_JOB_NAME_RE.match(name):
+        return None
+    owner = schedule_owner(job)
+    state_dir = Path(state_dir)
+    try:
+        if owner == "codex":
+            raw = json.loads((state_dir / "schedules" / "codex-scheduler.json").read_text())
+            slot = ((raw.get("jobs") or {}).get(name) or {}).get("last_scheduled_slot")
+            if isinstance(slot, str) and slot:
+                return datetime.fromisoformat(slot.replace("Z", "+00:00")).astimezone(timezone.utc)
+        elif owner == "launchd":
+            raw = json.loads((state_dir / "cron-runner-state.json").read_text())
+            epoch = raw.get(name)
+            if isinstance(epoch, (int, float)) and not isinstance(epoch, bool):
+                return datetime.fromtimestamp(epoch, timezone.utc)
+        elif owner == "dynamic-loop":
+            alive = state_dir / f"dynamic-loop-{name}.alive"
+            return datetime.fromtimestamp(alive.stat().st_mtime, timezone.utc)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
     return None
 
 

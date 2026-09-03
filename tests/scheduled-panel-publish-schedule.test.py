@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""scheduled-panel/publish_schedule.py — the next-fire column must honour every
-cron field. Measured on a live crons.json: `4 6 */3 * *` and `23 9 7 8 *`
-(annual) both rendered as "fires today" because day-of-month and month were
-never consulted, beside a human column that fell back honestly to the raw
-expression for exactly those fields.
+"""scheduled-panel/publish_schedule.py renders and publishes; every schedule
+judgement (cron semantics, per-job zone, file shape, last-fire record) is
+delegated to src/dashboard_schedules, so the panel cannot drift from the
+schedulers. Cron semantics themselves are pinned in tests/cron-eval.test.py.
 
 Hermetic: `_cfg` is patched to a temp workspace; publish() gets a stub doc
 module. Run: python3 tests/scheduled-panel-publish-schedule.test.py
@@ -27,16 +26,6 @@ UTC = datetime.timezone.utc
 NOW = datetime.datetime(2026, 9, 3, 0, 40, tzinfo=UTC)  # a Thursday
 
 
-class FieldSetTests(unittest.TestCase):
-    def test_shapes(self):
-        self.assertEqual(ps._field_set("*", 0, 3), {0, 1, 2, 3})
-        self.assertEqual(ps._field_set("*/20", 0, 59), {0, 20, 40})
-        self.assertEqual(ps._field_set("1,5", 0, 6), {1, 5})
-        self.assertEqual(ps._field_set("2-4", 0, 6), {2, 3, 4})
-        self.assertEqual(ps._field_set("1-10/3", 1, 31), {1, 4, 7, 10})
-        self.assertEqual(ps._field_set("*/3", 1, 31), set(range(1, 32, 3)))
-
-
 class HumanCronTests(unittest.TestCase):
     def test_forms(self):
         self.assertEqual(ps._human_cron("*/5 * * * *"), "every 5 min")
@@ -46,56 +35,25 @@ class HumanCronTests(unittest.TestCase):
         self.assertEqual(ps._human_cron("4 6 */3 * *"), "4 6 */3 * *")  # honest fallback
         self.assertEqual(ps._human_cron("bad"), "bad")
 
-
-class NextFireTests(unittest.TestCase):
-    """Reviewer's four live expressions at now=2026-09-03T00:40Z, two of them controls."""
-
-    def test_day_of_month_step_is_consulted(self):
-        # */3 -> days 1,4,7,...; the 3rd is not one, so NOT 2026-09-03T06:04Z.
-        self.assertEqual(ps._next_fire("4 6 */3 * *", NOW), "2026-09-04T06:04Z")
-
-    def test_annual_job_is_eleven_months_out_not_nine_hours(self):
-        self.assertEqual(ps._next_fire("23 9 7 8 *", NOW), "2027-08-07T09:23Z")
-
-    def test_controls_unchanged(self):
-        self.assertEqual(ps._next_fire("*/5 * * * *", NOW), "2026-09-03T00:45Z")
-        self.assertEqual(ps._next_fire("7 16 * * 5", NOW), "2026-09-04T16:07Z")  # Friday
-
-    def test_month_field(self):
-        self.assertEqual(ps._next_fire("0 12 * 10 *", NOW), "2026-10-01T12:00Z")
-
-    def test_dom_and_dow_both_restricted_are_or_ed(self):
-        # Vixie cron: the 15th OR a Monday. Mon 2026-09-07 comes before the 15th.
-        self.assertEqual(ps._next_fire("0 12 15 * 1", NOW), "2026-09-07T12:00Z")
-        # Only dow restricted: still AND with the wildcard dom -> the same Monday.
-        self.assertEqual(ps._next_fire("0 12 * * 1", NOW), "2026-09-07T12:00Z")
-
-    def test_never_fires_and_malformed(self):
-        self.assertEqual(ps._next_fire("0 0 31 2 *", NOW), "—")  # Feb 31 never comes
-        self.assertEqual(ps._next_fire("not a cron", NOW), "—")
-        self.assertEqual(ps._next_fire("x * * * *", NOW), "—")
-
-    def test_next_minute_boundary(self):
-        # Fires at :40 exactly when now is :40 -> the scan starts at :41, so next hour.
-        self.assertEqual(ps._next_fire("40 * * * *", NOW), "2026-09-03T01:40Z")
+    def test_a_calendar_restriction_is_never_hidden(self):
+        # "every 5 min" would be false 30 days of 31: the restriction stays visible.
+        self.assertEqual(ps._human_cron("*/5 * 1 * *"), "*/5 * 1 * *")
+        self.assertEqual(ps._human_cron("1,31 * * 9 *"), "1,31 * * 9 *")
+        self.assertEqual(ps._human_cron("*/5 * * * 1"), "*/5 * * * 1")
 
 
-class IsoTests(unittest.TestCase):
-    def test_forms(self):
-        self.assertEqual(ps._iso(0), "1970-01-01T00:00Z")
-        self.assertEqual(ps._iso("2026-09-03 00:40:11"), "2026-09-03T00:40")
-        self.assertEqual(ps._iso(None), "None")
+class FmtTests(unittest.TestCase):
+    def test_aware_to_utc_minute(self):
+        tokyo = datetime.timezone(datetime.timedelta(hours=9))
+        self.assertEqual(ps._fmt(datetime.datetime(2026, 9, 3, 21, 0, tzinfo=tokyo)), "2026-09-03T12:00Z")
 
-    def test_unrenderable_is_a_dash(self):
-        class Boom:
-            def __str__(self):
-                raise RuntimeError("no")
-        self.assertEqual(ps._iso(Boom()), "—")
+    def test_none_and_junk_are_a_dash(self):
+        self.assertEqual(ps._fmt(None), "—")
+        self.assertEqual(ps._fmt("2026-09-03 00:40:11"), "—")
 
 
 class CfgTests(unittest.TestCase):
     def test_reads_the_repo_config_helper(self):
-        # The real helper, in-repo: the path it prints is a directory name, never empty.
         self.assertTrue(ps._cfg("workspace"))
 
 
@@ -105,72 +63,89 @@ class _Workspace(unittest.TestCase):
         self.addCleanup(self.td.cleanup)
         self.ws = self.td.name
         self.state = os.path.join(self.ws, "state")
-        os.makedirs(self.state)
+        os.makedirs(os.path.join(self.state, "schedules"))
         os.makedirs(os.path.join(self.ws, "hosts", "h1"))
 
     def _write(self, rel, obj):
         with open(os.path.join(self.ws, rel), "w") as fh:
             json.dump(obj, fh)
 
-
-class LastFiredTests(_Workspace):
-    def test_main_loop_reads_core_status(self):
-        self._write("state/core-status.json", {"ts": "2026-09-03 00:30:00"})
-        self.assertEqual(ps._last_fired({"name": "main-loop"}, self.ws, "h1"), "2026-09-03T00:30")
-
-    def test_per_cron_state_last_pass(self):
-        self._write("state/shepherd.json", {"last_pass": 1})
-        self.assertEqual(ps._last_fired({"name": "shepherd"}, self.ws, "h1"), "1970-01-01T00:00Z")
-
-    def test_main_loop_without_a_stamp_falls_through(self):
-        self._write("state/core-status.json", {"status": "idle"})
-        self.assertEqual(ps._last_fired({"name": "main-loop"}, self.ws, "h1"), "—")
-
-    def test_alive_file_mtime(self):
-        p = os.path.join(self.state, "dynamic-loop-loopy.alive")
-        open(p, "w").close()
-        os.utime(p, (0, 0))
-        self.assertEqual(ps._last_fired({"name": "loopy"}, self.ws, "h1"), "1970-01-01T00:00Z")
-
-    def test_nothing_known(self):
-        self.assertEqual(ps._last_fired({"name": "ghost"}, self.ws, "h1"), "—")
+    def _rows(self, jobs, now=NOW):
+        self._write("hosts/h1/crons.json", jobs)
+        with mock.patch.object(ps, "_cfg", side_effect=lambda a: {"workspace": self.ws, "host-label": "h1"}[a]):
+            return ps.build_rows(now)
 
 
 class BuildRowsTests(_Workspace):
-    def _rows(self, jobs):
-        self._write("hosts/h1/crons.json", jobs)
-        with mock.patch.object(ps, "_cfg", side_effect=lambda a: {"workspace": self.ws, "host-label": "h1"}[a]):
-            return ps.build_rows()
-
-    def test_rows_from_list_shape(self):
+    def test_rows_from_the_canonical_list_shape(self):
         rows = self._rows([
             {"name": "main-loop", "cron": "*/5 * * * *", "prompt_skill": "proactive-loop"},
             {"name": "dyn", "loop": "dynamic", "cron": "", "prompt": "x" * 60},
             {"cron": "7 16 * * 5"},
+            "not a job",
         ])
         self.assertEqual([r["name"] for r in rows], ["main-loop", "dyn", "?"])
         self.assertEqual(rows[0]["schedule"], "every 5 min")
+        self.assertEqual(rows[0]["owner"], "session")
         self.assertEqual(rows[0]["does"], "proactive-loop")
-        self.assertRegex(rows[0]["next_fire"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z$")
+        self.assertEqual(rows[0]["next_fire"], "2026-09-03T00:45Z")
         self.assertEqual(rows[1]["schedule"], "adaptive (self-paced)")
         self.assertEqual(rows[1]["next_fire"], "—")
         self.assertEqual(rows[1]["does"], "x" * 48)
         self.assertEqual(rows[2]["does"], "—")
 
-    def test_rows_from_dict_shape(self):
-        rows = self._rows({"jobs": [{"name": "a", "cron": "0 0 * * *"}]})
-        self.assertEqual(rows[0]["schedule"], "daily 00:00")
-        rows = self._rows({"crons": [{"name": "b", "cron": "0 0 * * *"}]})
-        self.assertEqual(rows[0]["name"], "b")
+    def test_dict_shape_is_not_a_schedule(self):
+        # The schedulers reject a non-array crons.json; the panel must not
+        # publish jobs no scheduler owns.
+        self.assertEqual(self._rows({"jobs": [{"name": "a", "cron": "0 0 * * *"}]}), [])
+        self.assertEqual(self._rows({"crons": [{"name": "b", "cron": "0 0 * * *"}]}), [])
+
+    def test_codex_job_next_fire_is_in_its_own_zone(self):
+        rows = self._rows([{"name": "d", "cron": "0 6 * * *", "execution": "codex-task", "prompt": "x"},
+                           {"name": "t", "cron": "0 6 * * *", "execution": "codex-task", "prompt": "x",
+                            "timezone": "Asia/Tokyo"}])
+        self.assertEqual(rows[0]["next_fire"], "2026-09-03T13:00Z")  # 06:00 Los Angeles
+        self.assertEqual(rows[1]["next_fire"], "2026-09-03T21:00Z")  # 06:00 Tokyo
+        self.assertEqual(rows[0]["owner"], "codex")
+
+    def test_sunday_seven_and_leap_day_have_a_next_fire(self):
+        rows = self._rows([{"name": "sun", "cron": "0 6 * * 7", "execution": "codex-task", "prompt": "x"},
+                           {"name": "leap", "cron": "0 0 29 2 *", "execution": "codex-task", "prompt": "x"},
+                           {"name": "never", "cron": "0 0 31 2 *", "execution": "codex-task", "prompt": "x"}])
+        self.assertEqual(rows[0]["next_fire"], "2026-09-06T13:00Z")
+        self.assertEqual(rows[1]["next_fire"], "2028-02-29T08:00Z")
+        self.assertEqual(rows[2]["next_fire"], "—")
+
+    def test_last_fired_comes_from_the_owning_scheduler_only(self):
+        self._write("state/core-status.json", {"ts": "2026-09-03 12:34:00"})
+        self._write("state/schedules/codex-scheduler.json",
+                    {"jobs": {"nightly": {"last_scheduled_slot": "2026-09-02T13:00:00Z"}}})
+        self._write("state/cron-runner-state.json", {"digest": 1788390000})
+        self._write("state/ghost.json", {"last_pass": 1})
+        self._write("outside.json", {"last_pass": 1})
+        rows = self._rows([
+            {"name": "main-loop", "cron": "*/5 * * * *", "prompt_skill": "proactive-loop"},
+            {"name": "nightly", "cron": "0 6 * * *", "execution": "codex-task", "prompt": "x"},
+            {"name": "digest", "cron": "0 6 * * *", "launchd": True},
+            {"name": "ghost", "cron": "0 6 * * *"},
+            {"name": "../outside", "cron": "0 6 * * *", "launchd": True},
+        ])
+        by = {r["name"]: r["last_fired"] for r in rows}
+        self.assertEqual(by["main-loop"], "—")           # core-status.ts is activity, not a fire
+        self.assertEqual(by["nightly"], "2026-09-02T13:00Z")
+        self.assertEqual(by["digest"], "2026-09-02T23:00Z")
+        self.assertEqual(by["ghost"], "—")               # no <name>.json convention
+        self.assertEqual(by["../outside"], "—")          # no path escape
 
 
 class RenderTests(unittest.TestCase):
     def test_markdown_table(self):
-        md = ps.render_md([{"name": "a", "schedule": "s", "last_fired": "l", "next_fire": "n", "does": "d"}])
+        md = ps.render_md([{"name": "a", "schedule": "s", "owner": "o", "last_fired": "l",
+                            "next_fire": "n", "does": "d"}])
         self.assertTrue(md.startswith("# Scheduled jobs\n*updated "))
         self.assertIn("source: durable crons.json", md)
-        self.assertIn("| Job | Schedule | Last fired | Next fire | Does |", md)
-        self.assertTrue(md.endswith("| a | s | l | n | d |\n"))
+        self.assertIn("| Job | Schedule | Fires via | Last fired | Next fire | Does |", md)
+        self.assertTrue(md.endswith("| a | s | o | l | n | d |\n"))
 
 
 class PublishTests(unittest.TestCase):
@@ -200,4 +175,4 @@ class ArgTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=1)

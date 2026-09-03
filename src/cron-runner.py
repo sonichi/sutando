@@ -60,6 +60,7 @@ sys.path.insert(0, str(SRC_DIR))
 # last: confine_user_content() neutralizes forged fields even in a multi-line body.
 from task_body_guard import confine_user_content  # noqa: E402
 import cron_task_id  # noqa: E402
+import cron_eval  # noqa: E402
 
 try:
     from workspace_default import resolve_workspace  # type: ignore
@@ -113,33 +114,13 @@ DATE_LOOKAHEAD_DAYS = 2
 CORE_ALIVE_MAX_AGE_SECONDS = 90
 
 
-# --- minimal 5-field cron matcher (no external deps) ------------------------
+# --- 5-field cron matcher: thin bindings over the shared contract -----------
 @functools.lru_cache(maxsize=512)
 def _parse_field(field: str, lo: int, hi: int) -> frozenset[int]:
-    """Expand one cron field into the set of matching integers.
-
-    Supports ``*``, ``*/N``, ``A``, ``A,B``, ``A-B``, and ``A-B/N`` — the full
-    grammar used by Sutando's crons.json (e.g. ``*/5``, ``*/3`` day-of-month,
-    ``1-5`` weekdays).
-    """
-    result: set[int] = set()
-    for part in field.split(","):
-        step = 1
-        if "/" in part:
-            part, step_s = part.split("/", 1)
-            step = int(step_s)
-        if part == "*":
-            start, end = lo, hi
-        elif "-" in part:
-            start_s, end_s = part.split("-", 1)
-            start, end = int(start_s), int(end_s)
-        else:
-            start = end = int(part)
-        for v in range(start, end + 1, step):
-            if lo <= v <= hi:
-                result.add(v)
+    """Expand one cron field via cron_eval; out-of-range values are dropped
+    (this runner's historical contract), syntax errors raise ValueError."""
     # Frozen: the lru_cache hands every caller the SAME object.
-    return frozenset(result)
+    return cron_eval.field_values(field, lo, hi, clamp=True)
 
 
 def cron_matches(expr: str, t: time.struct_time) -> bool:
@@ -156,30 +137,14 @@ def cron_matches(expr: str, t: time.struct_time) -> bool:
 
 
 def _day_matches(dom: str, month: str, dow: str, t: time.struct_time) -> bool:
-    """True if the date part of ``t`` satisfies the dom/month/dow fields.
-
-    Split out so the period scan can reject a whole day with one test instead
-    of re-deriving DOM/DOW semantics — two copies of this would drift.
-    """
-    if t.tm_mon not in _parse_field(month, 1, 12):
-        return False
-    # Standard cron DOM/DOW semantics: when both are restricted (not '*'), a
-    # match on EITHER fires. tm_wday is Mon=0..Sun=6; cron uses Sun=0..Sat=6.
-    cron_dow = (t.tm_wday + 1) % 7
-    dom_restricted = dom != "*"
-    dow_restricted = dow != "*"
-    dom_ok = t.tm_mday in _parse_field(dom, 1, 31)
-    # DOW accepts 7 as an alias for Sunday (0). Expand with 7 permitted, then
-    # fold 7→0 at the SET level. Substituting 7→0 on the raw field string would
-    # corrupt ranges: "5-7" → "5-0" (empty set — never fires) and "0-7" → "0-0"
-    # (Sundays only) — the exact silent-miss class this runner exists to kill.
-    dow_set = _parse_field(dow, 0, 7)
-    if 7 in dow_set:
-        dow_set = (dow_set - {7}) | {0}
-    dow_ok = cron_dow in dow_set
-    if dom_restricted and dow_restricted:
-        return dom_ok or dow_ok
-    return dom_ok and dow_ok
+    """Date part of ``t`` against dom/month/dow — Vixie OR/AND and the Sunday=7
+    fold both live in cron_eval so no second copy can drift."""
+    spec = cron_eval.CronSpec(
+        minutes=frozenset(), hours=frozenset(),
+        doms=_parse_field(dom, 1, 31), months=_parse_field(month, 1, 12),
+        dows=cron_eval.fold_sunday(_parse_field(dow, 0, 7)),
+        dom_restricted=dom != "*", dow_restricted=dow != "*")
+    return spec.date_matches(t.tm_year, t.tm_mon, t.tm_mday)
 
 
 def _day_offsets(y: int, mo: int, d: int) -> "tuple[int, ...]":
