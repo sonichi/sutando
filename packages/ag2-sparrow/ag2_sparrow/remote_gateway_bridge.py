@@ -1281,6 +1281,9 @@ OUTBOUND_SCAN_S = float(os.environ.get("REMOTE_OUTBOUND_SCAN_S") or "1.0")
 _OUTBOUND_WAKE = threading.Event()
 _OUTBOUND_STOP = threading.Event()
 _INFLIGHT_MUTEX = threading.RLock()
+# True when the in-flight restore FAILED rather than finding no file. Both cases
+# yield an empty set, but only the second one means "nothing is in flight".
+_INFLIGHT_DEGRADED = False
 # Same hazard as the in-flight set: both ledgers are read-modify-written by the
 # poll loop and the outbound worker, so each load->mutate->write runs under a lock.
 _TASK_MEDIA_MUTEX = threading.RLock()
@@ -2127,9 +2130,12 @@ def _forget_pending_ack(tid: str) -> None:
 
 def _retry_pending_acks(inflight: "set[str]") -> None:
     """Re-post acks the gateway never confirmed. An id no longer in flight had
-    its lease closed by the result POST, so its record is retired unposted."""
+    its lease closed by the result POST, so its record is retired unposted.
+    That inference needs a TRUSTWORTHY in-flight set. When the restore degraded
+    the set is empty-because-unknown, so post instead and let the gateway's
+    'not leased' 404 retire the lease it actually closed."""
     for tid, durable in sorted(_load_pending_acks().items()):
-        if tid not in inflight:
+        if tid not in inflight and not _INFLIGHT_DEGRADED:
             _forget_pending_ack(tid)
             continue
         _post_task_ack(tid, durable)
@@ -3258,13 +3264,21 @@ def _post_proactive() -> None:
 
 
 def _load_inflight() -> set[str]:
-    """Restore the in-flight set from disk (fail-open to empty)."""
+    """Restore the in-flight set from disk (fail-open to empty).
+    A failed restore also sets _INFLIGHT_DEGRADED: the empty set it returns then
+    means "unknown", which is not what FileNotFoundError's empty set means."""
+    global _INFLIGHT_DEGRADED
     try:
         data = json.loads(INFLIGHT_FILE.read_text())
-        return {str(t) for t in data} if isinstance(data, list) else set()
+        if isinstance(data, list):
+            return {str(t) for t in data}
+        _INFLIGHT_DEGRADED = True
+        _log(f"inflight file is {type(data).__name__}, not a list — starting empty")
+        return set()
     except FileNotFoundError:
         return set()
     except Exception as e:  # noqa: BLE001
+        _INFLIGHT_DEGRADED = True
         _log(f"inflight file unreadable ({e}) — starting empty")
         return set()
 

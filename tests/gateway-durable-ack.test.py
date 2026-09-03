@@ -369,6 +369,66 @@ class DurableAck(unittest.TestCase):
             self._drive_main([self._task("task-main-old")])
         self.assertEqual(self._acks()[0][2], {"id": "task-main-old"})
 
+    # Two fail-opens compose: `_load_inflight` returns empty on a corrupt file, and
+    # `_retry_pending_acks` retires every id absent from it — unposted.
+
+    def _seed_acks(self, ids):
+        self.mod._durable_write(self.mod.PENDING_ACK_FILE,
+                                json.dumps({t: True for t in ids}, sort_keys=True))
+
+    def test_intact_inflight_posts_and_keeps_the_ledger(self):
+        """CONTROL: a readable in-flight set holding the same ids posts all three."""
+        mod = self.mod
+        ids = ["task-A", "task-B", "task-C"]
+        self._seed_acks(ids)
+        mod.INFLIGHT_FILE.write_text(json.dumps(ids))
+        mod._INFLIGHT_DEGRADED = False
+        mod._retry_pending_acks(mod._load_inflight())
+        self.assertEqual(sorted(c[1].split("/")[-2] for c in self._acks()), ids,
+                         "an intact in-flight set must post every pending ack")
+
+    def test_corrupt_inflight_does_not_retire_acks_unposted(self):
+        """TREATMENT: identical, except the in-flight file is truncated mid-write."""
+        mod = self.mod
+        ids = ["task-A", "task-B", "task-C"]
+        self._seed_acks(ids)
+        mod.INFLIGHT_FILE.write_text('["task-A", "task-B", "tas')   # truncated
+        mod._INFLIGHT_DEGRADED = False
+        inflight = mod._load_inflight()
+        self.assertEqual(inflight, set(), "precondition: the restore fails open to empty")
+        self.assertTrue(mod._INFLIGHT_DEGRADED, "a failed restore must mark itself degraded")
+        mod._retry_pending_acks(inflight)
+        self.assertEqual(sorted(c[1].split("/")[-2] for c in self._acks()), ids,
+                         "acks must be POSTED, not retired, when in-flight is unknown")
+        self.assertEqual(sorted(mod._load_pending_acks()), [],
+                         "a posted ack is retired normally by _post_task_ack")
+
+    def test_non_list_inflight_is_also_unknown(self):
+        """Valid JSON of the wrong type is corruption too, not an empty set."""
+        mod = self.mod
+        self._seed_acks(["task-A"])
+        mod.INFLIGHT_FILE.write_text('{"task-A": true}')            # object, not list
+        mod._INFLIGHT_DEGRADED = False
+        inflight = mod._load_inflight()
+        self.assertEqual(inflight, set())
+        self.assertTrue(mod._INFLIGHT_DEGRADED, "a non-list payload must mark degraded")
+        mod._retry_pending_acks(inflight)
+        self.assertEqual([c[1].split("/")[-2] for c in self._acks()], ["task-A"])
+
+    def test_missing_inflight_file_still_retires(self):
+        """The fix must NOT disable retirement generally: a genuinely absent file
+        means nothing is in flight, and that inference is still sound."""
+        mod = self.mod
+        self._seed_acks(["task-gone"])
+        if mod.INFLIGHT_FILE.exists():
+            mod.INFLIGHT_FILE.unlink()
+        mod._INFLIGHT_DEGRADED = False
+        inflight = mod._load_inflight()
+        self.assertFalse(mod._INFLIGHT_DEGRADED, "FileNotFoundError is not degradation")
+        mod._retry_pending_acks(inflight)
+        self.assertEqual(self._acks(), [], "a closed lease is retired without posting")
+        self.assertEqual(sorted(mod._load_pending_acks()), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
