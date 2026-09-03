@@ -3,6 +3,7 @@
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -61,6 +62,49 @@ class PoolStatusWriterTest(unittest.TestCase):
         self.state.rmdir()
         self.state.write_text("not a dir")  # mkdir/replace will fail
         self.assertFalse(w.maybe_write())
+
+    def test_two_concurrent_writers_lose_nothing_and_tear_nothing(self):
+        # Two briefly-overlapping leads must not contend for one temp path:
+        # every attempted write lands and no reader sees a partial file.
+        writes_each = 400
+        writers = [
+            PoolStatusWriter(self.tasks, self.state, lambda: ["core-1"],
+                             lambda i: True, refresh_s=0.0)
+            for _ in range(2)]
+        self.assertTrue(writers[0].maybe_write())  # file exists before readers
+        swallowed = [0, 0]
+        torn = [0]
+        stop = threading.Event()
+        start = threading.Barrier(3)
+
+        def write(idx):
+            start.wait()
+            for _ in range(writes_each):
+                if not writers[idx].maybe_write():
+                    swallowed[idx] += 1
+
+        def read():
+            start.wait()
+            while not stop.is_set():
+                try:
+                    self.read()
+                except (OSError, ValueError):
+                    torn[0] += 1
+
+        threads = [threading.Thread(target=write, args=(0,)),
+                   threading.Thread(target=write, args=(1,)),
+                   threading.Thread(target=read)]
+        for t in threads:
+            t.start()
+        for t in threads[:2]:
+            t.join()
+        stop.set()
+        threads[2].join()
+        self.assertEqual(sum(swallowed), 0, f"swallowed per writer: {swallowed}")
+        self.assertEqual(torn[0], 0)
+        self.assertEqual(self.read()["writer"], "pool-lead")
+        self.assertEqual([f.name for f in self.state.iterdir()],
+                         ["pool-status.json"])  # no temp files left behind
 
 
 if __name__ == "__main__":

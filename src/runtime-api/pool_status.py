@@ -13,6 +13,7 @@ import os
 import re
 import time
 from pathlib import Path
+from uuid import uuid4
 
 REFRESH_S = 30.0
 
@@ -78,13 +79,19 @@ class PoolStatusWriter:
         if (key == self._last_key
                 and self.now() - self._last_write < self.refresh_s):
             return False
+        p = self._path()
+        # Per-writer temp name: a shared one lets a second lead consume it
+        # between write and rename, and the loser's replace fails silently.
+        tmp = p.with_name(f".{p.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
         try:
-            p = self._path()
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".tmp")
             tmp.write_text(json.dumps(snap, indent=2))
             os.replace(tmp, p)
         except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
             return False
         self._last_write = self.now()
         self._last_key = key
