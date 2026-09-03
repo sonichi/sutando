@@ -161,6 +161,29 @@ with tempfile.TemporaryDirectory() as td:
         f"got: {(r_real or {}).get('detail', '')[:140]}",
     )
 
+    # 3f. An UNREADABLE index must report, not vanish. A check that goes quiet
+    #     cannot be told from one that passed (yixuan-ag2 mutation, #3778).
+    (idx_only / "user_profile.md").unlink()
+    (idx_only / "MEMORY.md").chmod(0o000)
+    try:
+        try:
+            (idx_only / "MEMORY.md").read_text()
+            blocked = False
+        except OSError:
+            blocked = True
+        if not blocked:
+            check("unreadable index still warns (SKIPPED: fs ignores mode bits)", True)
+        else:
+            hc_unread = load_hc(home, live)
+            r_unread = hc_unread.check_memory_dir_siblings()
+            check(
+                "unreadable index still warns rather than vanishing",
+                r_unread is not None and "-repo.slug" in r_unread["detail"],
+                f"got: {(r_unread or {}).get('detail', '')[:140]}",
+            )
+    finally:
+        (idx_only / "MEMORY.md").chmod(0o600)
+
 with tempfile.TemporaryDirectory() as td:
     # 4. THE ONE THAT MATTERS: a symlinked twin is one corpus, not two.
     home = Path(td) / "claude"
