@@ -90,6 +90,23 @@ WORKSPACE_DIR = resolve_workspace()
 _LAST_HASH_KEY = "_last_hash"
 
 
+def _prune_alert_history(history: dict, cutoff: int) -> dict:
+    """Drop alert-history entries older than `cutoff`, tolerating bad values.
+
+    A non-numeric value raises inside a dict comprehension and kills the whole
+    run — measured 2026-09-01: a malformed entry crashed `main()` through
+    `notify_for_failures`, so every later step, `--recover-core` included,
+    never ran. An unreadable entry is dropped, never fatal.
+    """
+    kept = {}
+    for k, v in history.items():
+        if k == _LAST_HASH_KEY:
+            kept[k] = v
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and v >= cutoff:
+            kept[k] = v
+    return kept
+
+
 def _load_alert_history(state_file: Path) -> dict:
     """Read a failure-alert dedup file, dropping entries this build cannot use.
 
@@ -1471,6 +1488,7 @@ WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 #: so the probe's "state belongs under state/" remedy would break the reader.
 WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "PERSONAL_CLAUDE.md",
+    "current-track.md",      # per-host under hosts/<host>/; personal_path() falls back to the root
     "stand-identity.json",
     "stand-avatar.png",
     "voice-context-active",
@@ -8264,6 +8282,61 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
+# The one owned hook whose effect leaves the workspace; excluded from unattended repair.
+_TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
+
+
+def apply_claude_hooks_fix(checks: list, stream=None) -> None:
+    """--fix dispatch for claude-hooks: warn-level, so it never reaches the issues
+    loop and needs its own pass (same shape as the task-watcher one).
+
+    An app update replaces the engine tree and strips settings.json back to
+    SessionStart alone, which silently disables `PreCompact -> session-handoff.sh`
+    until a human reads the warn and re-runs the installer. Detecting that has
+    never been the gap; repairing it was.
+
+    Keys on `_unregistered_hooks`, not the detail text. The check is RE-RUN rather
+    than assumed repaired — a fixer's self-report is not evidence of the result.
+
+    Scoped: the ~/Desktop transcript archiver is the one owned hook whose effect
+    leaves the workspace, and the dominant caller of `--fix` is an unattended
+    30-minute Timer in Sutando.app (`src/Sutando/main.swift`), not a terminal. A
+    routine timer must not make that egress decision, so it is left to explicit
+    opt-in and its absence keeps warning.
+    """
+    out = stream if stream is not None else sys.stdout
+    for c in checks:
+        if c["name"] != "claude-hooks" or not c.get("_unregistered_hooks"):
+            continue
+        installer = REPO_DIR / "src" / "install-claude-hooks.sh"
+        # Sutando.app runs `--fix` on a 30-minute Timer, so this repair is normally
+        # unattended: it may restore only hooks whose effects stay in the workspace.
+        scoped = [h for h in c["_unregistered_hooks"] if h != _TRANSCRIPT_ARCHIVE_HOOK]
+        if not scoped:
+            print(f"  {c['name']}: not repairing — the only unregistered hook copies full "
+                  f"transcripts to ~/Desktop. Opt in with `bash src/{installer.name}`",
+                  file=out)
+            continue
+        print(f"  {c['name']}: repairing {', '.join(scoped)} via {installer.name}"
+              + (f" (leaving {_TRANSCRIPT_ARCHIVE_HOOK} to explicit opt-in)"
+                 if len(scoped) != len(c["_unregistered_hooks"]) else ""), file=out)
+        try:
+            proc = subprocess.run(
+                ["bash", str(installer)],
+                capture_output=True, text=True, timeout=60,
+                env={**os.environ, "SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE": "1"},
+            )
+            emitted = (proc.stdout or "") + (proc.stderr or "")
+            lines = [ln for ln in emitted.splitlines() if ln.strip()]
+            msg = lines[-1].strip() if lines else f"installer exited {proc.returncode}"
+        except Exception as exc:  # noqa: BLE001 — a failed repair must warn, not raise
+            msg = f"could not run install-claude-hooks.sh ({exc})"
+        print(f"  {c['name']}: {msg}", file=out)
+        fresh = check_claude_hook_registration()
+        c.clear()
+        c.update(fresh)
+
+
 def _fresh_local_core_record(
     workspace: "Optional[Path]" = None,
     max_age_s: float = 90.0,
@@ -9491,8 +9564,11 @@ def check_vault_manifest_integrity(
                            f"'{account}' — treating as an unverifiable keychain, not as divergence")}
     src = " (read via the LEGACY fallback — canonical manifest absent)" if via_legacy else ""
     if not phantom:
+        # Where an agent about to say "I can't, it needs X" learns X is held. 12,
+        # not the warn branch's 6: that answers only if the roster is near-whole.
+        held = ", ".join(sorted(backed)[:12]) + (f", +{len(backed) - 12} more" if len(backed) > 12 else "")
         return {"name": name, "status": "ok",
-                "detail": f"all {len(backed)} advertised key(s) resolve in Keychain{src}"}
+                "detail": f"all {len(backed)} advertised key(s) resolve in Keychain{src} — {held}"}
 
     shown = ", ".join(phantom[:6]) + (f", +{len(phantom) - 6} more" if len(phantom) > 6 else "")
     truncated = f" (checked first {max_keys} of {len(names)})" if len(names) > max_keys else ""
@@ -9642,8 +9718,13 @@ def check_claude_hook_registration(
             bits.append(f"{len(foreign)} registered but NOT running the installer's command "
                         f"— a different program, another checkout, or the path is "
                         f"only an argument ({', '.join(foreign)})")
-        return {"name": name, "status": "warn",
-                "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+        result = {"name": name, "status": "warn",
+                  "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+        if missing:
+            # Keyed structurally so --fix cannot fire on the warn branches the
+            # installer can't repair; `foreign` excluded (displacement unverified).
+            result["_unregistered_hooks"] = list(missing)
+        return result
     return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
 
 
@@ -10770,7 +10851,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10839,7 +10920,7 @@ def notify_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10954,7 +11035,11 @@ def _default_slack_sender(text: str) -> bool:
         if not opened.get("ok"):
             return False
         channel = opened["channel"]["id"]
-        posted = _slack_api(token, "chat.postMessage", {"channel": channel, "text": text})
+        # Health output carries URLs, and this DM is the owner's alert channel:
+        # a wall of preview cards buries the failure it is reporting.
+        posted = _slack_api(token, "chat.postMessage", {
+            "channel": channel, "text": text,
+            "unfurl_links": False, "unfurl_media": False})
         return bool(posted.get("ok"))
     except Exception:
         return False
@@ -11088,7 +11173,7 @@ def notify_slack_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -11141,7 +11226,7 @@ def notify_gateway_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -11982,6 +12067,7 @@ def main():
     if do_fix:
         apply_skill_symlink_fixes(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_task_watcher_sentinel_fix(checks, stream=sys.stderr if as_json else sys.stdout)
+        apply_claude_hooks_fix(checks, stream=sys.stderr if as_json else sys.stdout)
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set

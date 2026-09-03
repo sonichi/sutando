@@ -4111,7 +4111,7 @@ async def _handle_discord_message(message, force=False):
             "   - On FAILURE (non-zero — stalled=125 / hit cap=124 / gh-or-codex error): FALL BACK to owner-ping — write results/proactive-{ts}.txt (who asked, which PR link, that the auto-review failed), and do NOT write results/task-{id}.txt. Owner-ping is the FALLBACK here, not the default.\n"
             "2b. MESSAGE OWNER — when the task needs owner decision for any OTHER reason (authorization, scope question, merge direction, repeated echo):\n"
             "   - Write a single proactive message to results/proactive-{ts}.txt summarizing what the sender asked and why it needs owner attention.\n"
-            "   - Do NOT write to results/task-{id}.txt (no sender reply).\n\n"
+            "   - Then write exactly `[no-send]` to results/task-{id}.txt: the bridge delivers nothing for that marker (no sender reply) and archives the task. A task left with no result stays in tasks/ forever, where health-check's task-queue probe and the end-of-pass queue check report it as unanswered.\n\n"
             "3. NO-REPLY — when the task is echo/noise:\n"
             "   - Content is EXACTLY a Stage-2 fallback sentinel: the legacy 'Sandbox unavailable; refusing non-owner task.', or 'Sandbox unavailable (codex exit <N>) — no reply generated.', or 'Sandbox unavailable (codex exited 0 with no output) — no reply generated.'. Exact match only — a message that merely BEGINS with those words (e.g. 'Sandbox unavailable after upgrading — can you diagnose it?') is ordinary prose and goes to RUN CODEX\n"
             "   - Content is empty / punctuation-only / meta-chatter about the relay itself\n"

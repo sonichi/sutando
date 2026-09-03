@@ -913,6 +913,38 @@ def _resolve_review_card(path: Path, record: dict) -> bool:
     return True
 
 
+def _handle_hitl_action(task: dict):
+    """An owner card click delivered on the task relay (its `hitl_action`, or a
+    reply to the card whose text is an action label). Applied to the HITL
+    store here so a click never becomes a chat task; the caller closes the
+    task with a [no-send] control result. False = an ordinary message."""
+    task_id = str(task.get("id") or "")
+    # The control record exists only for a task already consumed here (either
+    # click form, or a review decision); its form must not be re-derived.
+    if task_id and _control_result_path(task_id).is_file():
+        return "redelivered"
+    if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
+        return False
+    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    handler = _hitl_reply_handler(owner, log=_log) if owner else None
+    if handler is None:
+        return False  # no owner or no store on this host: the click stays an ordinary task
+    try:
+        out = handler.offer_task(task)
+    except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
+        _log(f"hitl: task-relay click {task_id} not applied: {e}")
+        return False
+    if out == "rejected":
+        return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
+        # A non-owner typed a label as a reply: that is a message, not a click
+        # to decline; it must reach _write_task like any other text.
+        return False
+    # A non-owner's real click stays consumed on purpose: a card press is not
+    # prose, so it closes [no-send] and is only logged, never a chat task.
+    return out or False
+
+
 def _handle_review_decision(task: dict) -> bool:
     task_id = str(task.get("id") or "")
     if task_id and _control_result_path(task_id).is_file():
@@ -979,13 +1011,13 @@ def _control_result_path(task_id: str) -> Path:
     return _WITHHELD_CONTROL_DIR / f"{safe}.json"
 
 
-def _queue_review_control_result(task: dict) -> None:
+def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
     task_id = str(task.get("id") or "")
     if not task_id:
         return
     path = _control_result_path(task_id)
     if not path.is_file():
-        _atomic_private_json(path, {"id": task_id, "body": "[no-send]"})
+        _atomic_private_json(path, {"id": task_id, "body": body})
 
 
 def _retry_review_control_results() -> None:
@@ -1740,7 +1772,10 @@ def _one_line(value) -> str:
     """Header-safe single-line value: CR/LF stripped so a gateway-controlled
     field can't inject extra `key: value` lines (e.g. forge a second
     access_tier). Applied to every field — task content is single-line in
-    practice and a stray newline only ever indicates an injection attempt."""
+    practice and a stray newline only ever indicates an injection attempt.
+
+    Load-bearing: this producer does no body defanging, so the flatten is the
+    only thing stopping a field from forging a registered header line."""
     return str(value).replace("\r", " ").replace("\n", " ")
 
 
@@ -3733,6 +3768,16 @@ def main() -> None:
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
+                hitl_out = _handle_hitl_action(task)
+                if hitl_out:
+                    body = "[no-send]"
+                    if str(hitl_out).startswith("rejected:"):
+                        body = ("That click did not apply: the card had already moved "
+                                f"({str(hitl_out)[9:]}). Please use the current card.")
+                    _queue_review_control_result(task, body=body)
+                    _retry_review_control_results()
+                    _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
+                    continue
                 if _handle_review_decision(task):
                     _queue_review_control_result(task)
                     _retry_review_control_results()

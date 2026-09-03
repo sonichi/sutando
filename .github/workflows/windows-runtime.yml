@@ -154,6 +154,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'workspace-lock.test.py failed' }
           python tests/runtime-api-dispatcher.test.py
           if ($LASTEXITCODE -ne 0) { throw 'runtime-api-dispatcher.test.py failed' }
+          python tests/runtime-api-human-action.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'runtime-api-human-action.test.py failed' }
           python tests/runtime-api-tasks-view.test.py
           if ($LASTEXITCODE -ne 0) { throw 'runtime-api-tasks-view.test.py failed' }
           python tests/runtime-api-identity-view.test.py TestAuthorityBoundaries

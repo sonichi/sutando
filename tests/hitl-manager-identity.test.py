@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -100,6 +101,53 @@ class IdentityTests(unittest.TestCase):
                 self.mgr.create(perm("ls", "g"))
         self.assertEqual(len(self.mgr.active()), 1)
         self.assertEqual(self.mgr.store._lock_depth, 0)
+
+
+class ForeignRecordTests(unittest.TestCase):
+    """A store shared by two engine revisions: unknown fields are dropped, and a
+    record that cannot be constructed is skipped rather than blinding all()."""
+
+    def _store(self):
+        from pathlib import Path as _P
+        return HitlStore(_P(tempfile.mkdtemp()) / "req")
+
+    def test_unknown_fields_are_ignored_on_load(self):
+        store = self._store()
+        store.save(HumanRequirement(id="hitl_future01", kind="permission", runtime="claude", message="m",
+                                    actions=[Action(id="allow", kind="allow_once", label="Allow")]))
+        f = store.root / "hitl_future01.json"
+        raw = json.loads(f.read_text()); raw["requirement"]["some_future_field"] = {"x": 1}
+        f.write_text(json.dumps(raw))
+        self.assertEqual(store.load("hitl_future01").id, "hitl_future01")
+        self.assertEqual([r.id for r in store.all()], ["hitl_future01"])
+
+    def test_unconstructible_record_is_skipped_not_fatal(self):
+        store = self._store()
+        store.save(HumanRequirement(id="hitl_good00001", kind="permission", runtime="claude", message="m"))
+        (store.root / "hitl_bad000001.json").write_text(json.dumps({"requirement": {"id": "hitl_bad000001"}}))
+        with self.assertLogs("hitl.store", level="WARNING") as logs:
+            self.assertEqual([r.id for r in store.all()], ["hitl_good00001"])
+        # A dropped record must leave a trace: an empty store reads as "nothing
+        # needs the human", so silence here is the dangerous polarity.
+        self.assertEqual(store.last_skipped, ("hitl_bad000001.json",))
+        self.assertIn("1 unreadable record(s) skipped", logs.output[0])
+        self.assertIn("hitl_bad000001.json", logs.output[0])
+
+    def test_transiently_unreadable_record_is_skipped_not_fatal(self):
+        store = self._store()
+        blocked = store.root / "hitl_busy000001.json"
+        blocked.write_text(json.dumps({"requirement": {"id": "hitl_busy000001"}}))
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("busy")), \
+                self.assertLogs("hitl.store", level="WARNING"):
+            self.assertEqual(store.all(), [])
+        self.assertEqual(store.last_skipped, ("hitl_busy000001.json",))
+
+    def test_a_clean_store_leaves_no_trace(self):
+        store = self._store()
+        store.save(HumanRequirement(id="hitl_good00002", kind="permission", runtime="claude", message="m"))
+        with self.assertNoLogs("hitl.store", level="WARNING"):
+            self.assertEqual([r.id for r in store.all()], ["hitl_good00002"])
+        self.assertEqual(store.last_skipped, ())
 
 
 if __name__ == "__main__":
