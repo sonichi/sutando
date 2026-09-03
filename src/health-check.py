@@ -1621,9 +1621,75 @@ def check_env_split(repo_env: "Path | None" = None,
         class _Unmodelled(Exception):
             """Raised with the reason token when a line's effect is not proven."""
         _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-        def _assign(word):
-            name, sep, _ = word.partition("=")
-            if not sep:
+        # Only `;` and `&&` are split. `||` short-circuits after a successful
+        # assignment, and `|`/`&` run their side in a subshell — unmodelled.
+        SPLIT_OPS = {";", "&&"}
+        REDIR_OPS = {">", ">>", "<", "<<", "<<<"}
+        PUNCT = set("();<>|&")
+
+        def _lex(line):
+            """bash word split that keeps quote evidence. Yields ("op", text) or
+            ("word", text, index of the first quoted char or None, has-subst)."""
+            toks, i, n = [], 0, len(line)
+            while i < n:
+                c = line[i]
+                if c in " \t":
+                    i += 1
+                    continue
+                if c in PUNCT:
+                    j = i
+                    while j < n and line[j] in PUNCT:
+                        j += 1
+                    toks.append(("op", line[i:j]))
+                    i = j
+                    continue
+                buf, qat, subst = [], None, False
+                while i < n and line[i] not in " \t" and line[i] not in PUNCT:
+                    c = line[i]
+                    if c == "'":
+                        j = line.find("'", i + 1)
+                        if j < 0:
+                            raise ValueError("unbalanced quote")
+                        qat = len(buf) if qat is None else qat
+                        buf.append(line[i + 1:j])
+                        i = j + 1
+                        continue
+                    if c == '"':
+                        qat = len(buf) if qat is None else qat
+                        i += 1
+                        while True:
+                            if i >= n:
+                                raise ValueError("unbalanced quote")
+                            c = line[i]
+                            if c == '"':
+                                i += 1
+                                break
+                            if c == "\\" and i + 1 < n and line[i + 1] in '"\\$`':
+                                buf.append(line[i + 1])
+                                i += 2
+                                continue
+                            subst = subst or c == "`" or line.startswith("$(", i)
+                            buf.append(c)
+                            i += 1
+                        continue
+                    if c == "\\":
+                        if i + 1 >= n:
+                            raise ValueError("line continuation")
+                        qat = len(buf) if qat is None else qat
+                        buf.append(line[i + 1])
+                        i += 2
+                        continue
+                    subst = subst or c == "`"
+                    buf.append(c)
+                    i += 1
+                toks.append(("word", "".join(buf), qat, subst))
+            return toks
+
+        def _assign(w):
+            text, qat = w[1], w[2]
+            name, sep, _ = text.partition("=")
+            # A quoted name or `=` makes bash run the word as a command.
+            if not sep or (qat is not None and qat <= len(name)):
                 return None
             if name.endswith("+"):
                 name = name[:-1]                   # `B+=old` appends to B
@@ -1633,71 +1699,69 @@ def check_env_split(repo_env: "Path | None" = None,
             # aborts there, so it is never a key to advise merging.
             raise _Unmodelled("invalid-identifier")
 
-        # Only `;` and `&&` are split. `||` short-circuits after a successful
-        # assignment, and `|`/`&` run their side in a subshell — unmodelled.
-        SPLIT_OPS = {";", "&&", "\n"}
-        UNKNOWN_OPS = {"||", "|", "&", "(", ")", ";;", "|&"}
-        REDIR_OPS = {">", ">>", "<", "<<", "<<<"}
-        PUNCT = set("();<>|&")
-
         def _segment(words):
-            """One command's words -> the names bash provably persists."""
-            if not words:
-                return set()
-            if words[0] == "export":
-                # export's bare-name args only mark existing vars; every
-                # assignment among them persists, so no word ends the scan.
-                return {n for n in map(_assign, words[1:]) if n}
-            names, i = [], 0
+            """One command's words -> (names bash provably persists, whether
+            its exit status is unproven: a `$(cmd)`/backtick value or a redirection)."""
+            names, i, unproven, in_export = [], 0, False, False
             while i < len(words):
                 w = words[i]
+                if w[0] == "op":
+                    if w[1] not in REDIR_OPS:
+                        raise _Unmodelled("unparseable")
+                    unproven, i = True, i + 2      # `> target` may fail: status unproven
+                    continue
                 n = _assign(w)
                 if n is not None:
                     names.append(n)
+                    unproven = unproven or w[3]
                     i += 1
                     continue
-                if w == "export":
-                    return {n for n in map(_assign, words[i + 1:]) if n}
-                # `[fd]> target` on a pure assignment leaves it an assignment.
-                fd = w.isdigit() and i + 1 < len(words) and words[i + 1] in REDIR_OPS
-                if w in REDIR_OPS or fd:
-                    i += 3 if fd else 2
+                if w[1] == "export":
+                    # export's bare-name args only mark existing vars; assignments
+                    # among them persist; prefixes before it were temporary.
+                    names, in_export = [], True
+                    i += 1
                     continue
-                if w and set(w) <= PUNCT:
-                    raise _Unmodelled("unparseable")
+                nxt = words[i + 1] if i + 1 < len(words) else None
+                fd = (w[1].isdigit() and w[2] is None and nxt is not None
+                      and nxt[0] == "op" and nxt[1] in REDIR_OPS)
+                if in_export or fd:
+                    i += 1           # bare export arg, or the `[fd]` of `[fd]> target`
+                    continue
                 # Any command (`readonly X=1`, `false`, `A=1 cmd`) has an effect
                 # and an exit status this probe cannot prove: UNKNOWN, not empty.
                 raise _Unmodelled("unmodelled-command")
-            return set(names)                          # pure assignment persists
+            return set(names), unproven
 
+        segs = []                                  # file order, comments removed
         for line in text.splitlines():
-            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
-            lex.whitespace_split = True
-            # bash opens a comment only where `#` STARTS a word, so `a#b` is
-            # literal; shlex's own commenter would cut the word instead.
-            lex.commenters = ""
             try:
-                tokens = list(lex)
+                toks = _lex(line)
             except ValueError:
                 return None, "unparseable"  # unbalanced quote: never "absent"
-
             words = []
-            try:
-                for tok in tokens + [";"]:
-                    if tok in UNKNOWN_OPS:
-                        return None, "unparseable"
-                    if tok not in SPLIT_OPS:
-                        if tok.startswith("#") and lex.punctuation_chars:
-                            # comment: commit the segment before it, drop the rest
-                            out.update(_segment(words))
-                            words = []
-                            break
-                        words.append(tok)
-                        continue
-                    out.update(_segment(words))
+            for t in toks:
+                if t[0] == "word" and t[1].startswith("#") and t[2] != 0:
+                    break                          # only an UNQUOTED `#` opens a comment
+                if t[0] == "op" and t[1] in SPLIT_OPS:
+                    if words:
+                        segs.append(words)
                     words = []
-            except _Unmodelled as exc:
-                return None, str(exc)
+                    continue
+                words.append(t)
+            if words:
+                segs.append(words)
+        try:
+            unproven = False
+            for words in segs:
+                if unproven:
+                    # A failed status skips the `&&` right side and, under
+                    # `set -e`, every later line — nothing after it is proven.
+                    raise _Unmodelled("status-bearing")
+                names, unproven = _segment(words)
+                out.update(names)
+        except _Unmodelled as exc:
+            return None, str(exc)
         return out, None
 
     # The canonical resolver owns selection; a re-derivation drifts.
@@ -1748,6 +1812,13 @@ def check_env_split(repo_env: "Path | None" = None,
                 "(e.g. `readonly X=1`, `false; X=1`, `cmd && X=1`); what it sets, "
                 "and whether `set -e` lets the rest of the file load, are not "
                 "proven — put each credential on its own assignment line"
+            ),
+            frozenset({"status-bearing"}): (
+                "a line's assignment expands a command substitution or carries "
+                "a redirection, so its exit status — and whether bash reaches "
+                "the assignments after it (`&&` right side, later lines under "
+                "`set -e`) — is not proven; put each credential on its own "
+                "plain assignment line"
             ),
             frozenset({"invalid-identifier"}): (
                 "a line assigns to a name bash does not accept as a variable "

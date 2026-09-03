@@ -445,6 +445,110 @@ with tempfile.TemporaryDirectory() as td:
     check("unbalanced quote does NOT advise fixing permissions",
           _r is not None and "file permissions" in _r["detail"], False)
 
+# 11. Quote/exit-status evidence: /bin/bash sources each SELECTED file the
+# loader's way (`set -e; set -a; .`); the probe may never be MORE confident.
+import os as _os
+
+_CLEAN_ENV = {k: v for k, v in _os.environ.items()
+              if k not in ("GEMINI_API_KEY", "GEMINI_VOICE_API_KEY", "SKIP_VOICE")}
+_ROWS = [
+    ("pure assignment then && (control)",
+     "PLACEHOLDER=ok && GEMINI_API_KEY=selected", None),
+    ("failed substitution short-circuits &&",
+     "PLACEHOLDER=`false` && GEMINI_API_KEY=selected", "status-bearing"),
+    ("unquoted trailing comment (control)",
+     "GEMINI_API_KEY=selected # actual comment", None),
+    ("quoted word is a command, not a comment",
+     'GEMINI_API_KEY=selected "#not-a-comment" && X=never', "unmodelled-command"),
+]
+
+
+def _bash_selected(path):
+    """(rc, GEMINI_API_KEY set?) after /bin/bash sources path the loader's way."""
+    _p = _sp.run(
+        ["/bin/bash", "-c",
+         'trap \'echo "rc=$? set=${GEMINI_API_KEY+yes}"\' EXIT; '
+         'f(){ set -e; set -a; . "$1"; }; f "$1"', "_", str(path)],
+        capture_output=True, text=True, env=_CLEAN_ENV)
+    _rc, _set = _p.stdout.split()
+    return int(_rc[3:]), _set == "set=yes"
+
+
+for _label, _first, _reason in _ROWS:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "repo").mkdir(); (td / "ws").mkdir()
+        _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+        _re_.write_text(_first + "\nBASE_KEY=selected\n")
+        _we_.write_text("GEMINI_API_KEY=old\nBASE_KEY=other\n")
+        _rc, _bash_set = _bash_selected(_re_)
+        with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+            _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    _d = "" if _r is None else _r["detail"]
+    check(f"bash oracle: {_label}: source returns 0", _rc, 0)
+    check(f"bash oracle: {_label}: GEMINI_API_KEY persists", _bash_set, _reason is None)
+    if _bash_set:
+        check(f"control stays silent: {_label}", _r, None)
+    else:
+        check(f"never more confident than bash: {_label}",
+              _r is not None and "could not be completed" in _d, True)
+        check(f"...names the cause: {_label}", _reason in _d, True)
+        check(f"...and claims no diff: {_label}", "is missing" in _d, False)
+
+# Escape forms, same oracle. (want_rc, bash persists?, probe reason or None).
+for _label, _first, _want_rc, _want_set, _reason in [
+    ("escaped quote inside double quotes is one value (control)",
+     'GEMINI_API_KEY="sel\\"ected"', 0, True, None),
+    ("backslash-escaped # is a command word, not a comment",
+     "GEMINI_API_KEY=selected \\#not-a-comment", 127, False, "unmodelled-command"),
+    ("trailing backslash continues the line: UNKNOWN, never a guess",
+     "GEMINI_API_KEY=selected \\", 0, True, "unparseable"),
+    ("double-quoted substitution then &&: later segments unproven",
+     'GEMINI_API_KEY="$(false)" && X=never', 0, True, "status-bearing"),
+]:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        (td / "repo").mkdir(); (td / "ws").mkdir()
+        _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+        _re_.write_text(_first + "\nBASE_KEY=selected\n")
+        _we_.write_text("GEMINI_API_KEY=old\nBASE_KEY=other\n")
+        _rc, _bash_set = _bash_selected(_re_)
+        with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+            _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    _d = "" if _r is None else _r["detail"]
+    check(f"bash oracle: {_label}", (_rc, _bash_set), (_want_rc, _want_set))
+    check(f"never more confident than bash: {_label}", not _bash_set and _r is None, False)
+    if _reason is None:
+        check(f"control stays silent: {_label}", _r, None)
+    else:
+        check(f"UNKNOWN names the cause: {_label}", _reason in _d and "is missing" not in _d, True)
+
+# The failed-substitution row through the REAL loader function: rc 0, key
+# unset, voice disabled — the silent partial load the probe must surface.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "src").mkdir(); (td / "ws").mkdir()
+    for _f in ("startup-runtime.sh", "repo_root.sh"):
+        _shutil.copy(_SRC / _f, td / "src" / _f)
+    _re_, _we_ = td / ".env", td / "ws" / ".env"
+    _re_.write_text(_ROWS[1][1] + "\nBASE_KEY=selected\n")
+    _we_.write_text("GEMINI_API_KEY=old\nBASE_KEY=other\n")
+    _p = _sp.run(
+        ["/bin/bash", "-c",
+         'cd "$1" && source src/startup-runtime.sh 2>/dev/null; '
+         'configure_startup_runtime >/dev/null 2>&1; '
+         'echo "rc=$? set=${GEMINI_API_KEY+yes} skip=${SKIP_VOICE:-}"',
+         "_", str(td)],
+        capture_output=True, text=True, env=_CLEAN_ENV)
+    _got = _p.stdout.split()
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+        _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    check("configure_startup_runtime: failed substitution still returns 0",
+          _got, ["rc=0", "set=", "skip=1"])
+    check("configure_startup_runtime: probe warns on the same file",
+          _r is not None and "status-bearing" in _r["detail"], True)
+
 if fails:
     print(f"FAIL ({len(fails)})")
     sys.exit(1)
