@@ -136,6 +136,19 @@ with tempfile.TemporaryDirectory() as td:
         f"got: {(r_entries or {}).get('detail', '')[:140]}",
     )
 
+    # 3e. An index row may lead with a bold label before the link. A corpus whose
+    #     rows are all that shape must not read as empty (qingyun-air, #3778).
+    (idx_only / "MEMORY.md").write_text(
+        "# Sutando memory index\n\n- **Controls:** a control is [a claim](claim.md) - hook\n"
+    )
+    hc_bold = load_hc(home, live)
+    r_bold = hc_bold.check_memory_dir_siblings()
+    check(
+        "index row with a bold label before the link still warns",
+        r_bold is not None and "-repo.slug" in r_bold["detail"],
+        f"got: {(r_bold or {}).get('detail', '')[:140]}",
+    )
+
     # 3d. CONTROL: a real memory beside the empty index warns, so 3b cannot pass
     #     merely because this corpus is unreachable.
     (idx_only / "MEMORY.md").write_text("# Sutando memory index\n")

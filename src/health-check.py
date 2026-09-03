@@ -1609,7 +1609,8 @@ def _corpus_holds_memories(mem: "Path", mds: "list[Path]") -> bool:
         text = index.read_text(errors="replace")
     except OSError:
         return True  # unreadable: report rather than silently drop a real corpus
-    return any(ln.lstrip().startswith(("- [", "* [")) for ln in text.splitlines())
+    # A row may lead with a bold label, so anchor on the bullet and the link.
+    return any(re.search(r"^\s*[-*] .*\]\(", ln) for ln in text.splitlines())
 
 
 def check_memory_dir_siblings() -> "dict | None":
