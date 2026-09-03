@@ -78,18 +78,39 @@ def _gh(run, args) -> "object | None":
         return None
 
 
+def _is_bad(c: dict) -> bool:
+    # CANCELLED is capacity (job cap or a superseded run), not a defect — and
+    # triaging it sends the reader after a cause that does not exist.
+    return c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") in ("FAILURE", "ERROR")
+
+
+def latest_by_name(rollup) -> "list[dict]":
+    """One head can carry several runs, so a check name can appear more than once.
+
+    A concurrency cancellation leaves the loser's jobs in the rollup beside the
+    winner's, and a job that starts during cancellation records FAILURE.
+    """
+    latest: "dict[str, tuple[str, dict]]" = {}
+    for c in rollup or []:
+        name = c.get("name") or c.get("context") or "?"
+        stamp = c.get("completedAt") or c.get("startedAt") or ""
+        prev = latest.get(name)
+        # Equal stamps leave no order to read, so keep the failing entry rather
+        # than forgiving it on a coin flip.
+        if prev is None or stamp > prev[0] or (stamp == prev[0] and _is_bad(c)):
+            latest[name] = (stamp, c)
+    return [c for _, c in latest.values()]
+
+
 def failing_checks(pr: str, run, repo: str) -> "list[str] | None":
     j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "statusCheckRollup"])
     if j is None:
         return None
-    out = []
-    for c in (j.get("statusCheckRollup") or []):
-        # CANCELLED is capacity (job cap or a superseded run), not a defect — and
-        # triaging it sends the reader after a cause that does not exist.
-        bad = c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") in ("FAILURE", "ERROR")
-        if bad:
-            out.append(c.get("name") or c.get("context") or "?")
-    return out
+    return [
+        c.get("name") or c.get("context") or "?"
+        for c in latest_by_name(j.get("statusCheckRollup"))
+        if _is_bad(c)
+    ]
 
 
 def failure_text(pr: str, run, repo: str) -> str:
@@ -113,10 +134,9 @@ def failure_text(pr: str, run, repo: str) -> str:
 def _run_ids(pr: str, run, repo: str) -> "list[str]":
     j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "statusCheckRollup"])
     ids, seen = [], set()
-    for c in ((j or {}).get("statusCheckRollup") or []):
-        bad = c.get("conclusion") in ("FAILURE", "TIMED_OUT") or c.get("state") in ("FAILURE", "ERROR")
+    for c in latest_by_name((j or {}).get("statusCheckRollup")):
         m = re.search(r"/runs/(\d+)", c.get("detailsUrl") or "")
-        if bad and m and m.group(1) not in seen:
+        if _is_bad(c) and m and m.group(1) not in seen:
             seen.add(m.group(1))
             ids.append(m.group(1))
     return ids
