@@ -69,8 +69,18 @@ client can render:
 
 ```json
 {"mode": "space.ag2.design_compare",
- "fallback": {"mode": "single_select", "options": []}}
+ "prompt": "Which design should ship?",
+ "fallback": {"mode": "single_select",
+              "prompt": "Which design should ship?",
+              "options": [{"id": "a", "label": "Design A"},
+                          {"id": "b", "label": "Design B"}]}}
 ```
+
+A fallback is a complete request in its own right and must validate on its
+own: `single_select` requires at least one option (the runtime dispatcher
+rejects an empty list, `tests/runtime-api-dispatcher.test.py` "single_select
+requires options"), so an extension whose fallback is `options: []` is
+rejected before it reaches any surface.
 
 ## Semantic vs presentation (two layers, never merged)
 
@@ -108,7 +118,8 @@ current client.
 
 ## When the agent asks (usage policy)
 
-Call `request_user_input` only when ALL hold: a finite, real user choice
+Call an interaction — one of the five convenience aliases in the table
+above, or the runtime method it resolves to — only when ALL hold: a finite, real user choice
 exists; the choice changes subsequent execution; it cannot be reliably
 inferred from expressed preferences; the options suit structured display.
 
@@ -116,6 +127,10 @@ Do NOT call for: rhetorical questions; decisions the agent can safely make;
 questions the user already answered; work that can proceed now with review
 later; micro implementation details. A choice card is easy to abuse into
 stopping at every step — the policy is part of the contract.
+
+There is no umbrella verb. `request_user_input` is not in the vocabulary;
+an agent picks the alias whose response contract it needs, and the
+compiler resolves that alias to exactly one wire `mode`.
 
 ## Rendering pipeline (owner-settled): compile, don't compose
 
@@ -142,12 +157,66 @@ Consequence for today's seams: the raw card pass-through
 `interactions` verbs exist it becomes the compiler's internal output and the
 agent-facing surface is the verbs alone.
 
-## Current implementation status (this instance)
+## Relationship to the shipped V1 wires (a boundary, not a competing path)
 
-Rendering today: the client's A2UI kit (`A2UIButtonsCard` = confirm /
-single-choice / approval; `choice-group` and `form` components exist but
-lack settled submit semantics). Sending today: `skills/agent-room-ops/say.py`
-attaches a validated buttons card (`SUTANDO_WORKER_A2UI`). A tap sends the
+Two interaction wires already ship. This contract sits between them; it does
+not replace either and it adds no second lifecycle.
+
+**Input: the runtime API is where an agent's request enters the pipeline.**
+`src/runtime-api/protocol.py` accepts `approval.request` and
+`elicitation.request` with `type` in `("free_text", "single_select",
+"multi_select", "confirmation")`; `src/runtime-api/dispatcher.py` validates
+the request and issues a durable request record. Those are runtime spellings
+of the same closed set, and the mapping to the wire `mode` is fixed:
+
+| Runtime API request | Wire `mode` | Status today |
+|---|---|---|
+| `approval.request` | `approval` | shipped |
+| `elicitation.request`, `type: single_select` | `single_select` | shipped |
+| `elicitation.request`, `type: multi_select` | `multi_select` | shipped |
+| `elicitation.request`, `type: confirmation` | `confirm` | shipped |
+| `elicitation.request`, `type: free_text` | `form` (one text field) | rejected by the dispatcher in v0 (`dispatcher.py` "free_text elicitation is not supported"); `form` has no runtime producer yet |
+
+The compiler described above consumes the validated runtime request. It is
+downstream of the dispatcher, never a parallel entry point.
+
+**Lifecycle and delivery: `space.ag2.hitl` is the durable envelope, and it stays.**
+`src/hitl/schema.py` (`RuntimeEvent -> HumanRequirement -> space.ag2.hitl ->
+RequirementCard`) owns interaction state: `revision` and `guard` advance on
+every transition, a card projected from an older revision is stale, and a
+response carrying a stale guard is refused (`StaleRequirementError`).
+`src/hitl/projector.py` posts each revision as one Matrix event with the
+wire under `space.ag2.hitl` and a text `fallback_body`. In this contract the
+compiler's A2UI payload is a *projection inside that envelope* — the
+presentation of one revision — so the stale-response gate applies to every
+semantic mode unchanged, and "pending state survives restarts" is inherited
+from the HITL store rather than re-implemented.
+
+**Migration boundary.** Until the compiler exists, the shipped wires *are* the
+transport: runtime approvals and elicitations render through
+`packages/ag2-sparrow/ag2_sparrow/human_action.py` (a markdown card with the
+decision grammar in the text), and runtime requirements (`auth`, `permission`,
+`billing`, ...) through the HITL requirement card. The compiler replaces how a
+revision is *rendered*; it never replaces how a request is *issued* (runtime
+API) or how its state is *kept* (HITL). A change to either of those is a
+change to this document.
+
+## Current implementation status (this instance, 2026-09-03)
+
+Two columns, because they differ:
+
+| | Exists as code | Deployed and renderable today |
+|---|---|---|
+| Client A2UI kit (`A2UIButtonsCard` = confirm / single-choice / approval; `choice-group`, `form`) | yes | **no** — the deployed web client does not render `space.ag2.a2ui`: it shows an unclickable "Room App" chip and hides the text fallback (observed live 2026-07-24) |
+| `human_action.py` `CardPoster` A2UI block | yes, opt-in (`SPARROW_HA_A2UI`) | **off by default**; `packages/ag2-sparrow/tests/test_human_action.py` pins "plain text card, NO a2ui block" |
+| `say.py` raw card seam (`SUTANDO_WORKER_A2UI`) | yes, opt-in | off; `skills/agent-room-ops/SKILL.md` forbids attaching an `a2ui` block until the client renderer ships; `tests/room-ops-say.test.py` pins that an empty option list attaches nothing |
+| `space.ag2.hitl` requirement card | yes | **yes** — the lifecycle envelope above |
+| Markdown text (decision grammar in the body) | yes | **yes** — the path that reaches a human today |
+
+So the renderable paths today are markdown text and the HITL requirement
+card. A tap on a rendered button, where a client renders one, sends the
 option's action text as an ordinary message — buttons are pre-typed replies.
 Next slice: the `interactions` module exposing the V1 verbs with schema
-validation, then capability discovery on the workers/surface snapshot.
+validation behind the runtime API, then capability discovery on the
+workers/surface snapshot; the A2UI column flips only when the client renderer
+ships, and this table's date moves with it.
