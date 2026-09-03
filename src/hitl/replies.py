@@ -84,6 +84,9 @@ class HitlReplyHandler:
         # What the most recent offer() did: applied | rejected | ignored (+ reason).
         self.last_outcome = None
         self.last_reason = ""
+        # Form task_to_event() last recognised: "click" (hitl_action) or
+        # "fallback" (typed label) — a non-owner's fallback is a MESSAGE.
+        self.last_branch = None
 
     def claims(self, event: Dict[str, Any]) -> bool:
         content = event.get("content") or {}
@@ -96,6 +99,7 @@ class HitlReplyHandler:
             return claimed
         actor = str(event.get("actor_id") or "")
         self.last_outcome = "ignored"
+        self.last_reason = ""
         # AUTHORIZATION — the whole point: only the owner resolves.
         if not self._owner or actor != self._owner:
             self._log(f"hitl: action reply from non-owner {actor or '?'} ignored")
@@ -146,8 +150,10 @@ class HitlReplyHandler:
             "room_id": task.get("channel_id"),
             "actor_id": str(task.get("user_id") or ""),
         }
+        self.last_branch = None
         payload = task.get("hitl_action")
         if isinstance(payload, dict):
+            self.last_branch = "click"
             return {**base, "content": {REPLY_FIELD: dict(payload)}}
         target = str(task.get("reply_to_event") or "")
         if not target:
@@ -160,6 +166,7 @@ class HitlReplyHandler:
                        if a.label.strip().lower() == label or a.id.lower() == label), None)
         if action is None:
             return None  # a reply to the card that is not a click stays a message
+        self.last_branch = "fallback"
         return {**base, "content": {REPLY_FIELD: {
             "hitl_id": req.id, "expected_revision": req.revision,
             "action_id": action.id, "guard": req.guard}}}

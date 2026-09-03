@@ -141,6 +141,28 @@ class ReplyHandlerTests(unittest.TestCase):
         t.update(kw)
         return t
 
+    def test_non_owner_fallback_reply_is_ignored_but_named_a_message(self):
+        # john-the-dev on #3750: "ignored" is truthy, so the bridge consumed a
+        # non-owner's typed reply; the handler now says which form it saw.
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card")
+        t = self._task(user_id="@someone-else:ag2.space", reply_to_event="$card", task="Allow")
+        self.assertEqual(self.h.offer_task(t), "ignored")
+        self.assertEqual(self.h.last_branch, "fallback")
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+
+    def test_non_owner_click_is_ignored_on_the_click_branch(self):
+        t = self._task(user_id="@someone-else:ag2.space", hitl_action=reply_for(self.req, "allow"))
+        self.assertEqual(self.h.offer_task(t), "ignored")
+        self.assertEqual(self.h.last_branch, "click")
+
+    def test_last_reason_does_not_survive_a_later_non_rejection(self):
+        self.h.offer(event({"hitl_id": "nope", "expected_revision": 1, "action_id": "allow"}))
+        self.assertEqual(self.h.last_outcome, "rejected")
+        self.assertTrue(self.h.last_reason)
+        self.h.offer(event(reply_for(self.req, "allow"), actor="@someone-else:ag2.space", eid="$e9"))
+        self.assertEqual(self.h.last_outcome, "ignored")
+        self.assertEqual(self.h.last_reason, "")
+
     def test_task_with_hitl_action_is_the_exact_form(self):
         t = self._task(hitl_action=reply_for(self.req, "allow"))
         self.assertTrue(self.h.offer_task(t))

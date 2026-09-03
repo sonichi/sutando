@@ -934,6 +934,10 @@ def _handle_hitl_action(task: dict):
         return False
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
+        # A non-owner typed a label as a reply: that is a message, not a click
+        # to decline; it must reach _write_task like any other text.
+        return False
     return out or False
 
 

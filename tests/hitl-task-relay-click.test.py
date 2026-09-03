@@ -40,6 +40,20 @@ class TaskRelayClickTests(unittest.TestCase):
         t.update(kw)
         return t
 
+    def test_non_owner_typed_label_reply_stays_a_message(self):
+        """A non-owner's typed "Deny" is a message and must reach the task path;
+        a non-owner's real click is still consumed. Own card id: the store
+        outlives one test and requirement_for_event returns the first match."""
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card-nonowner")
+        t = self._task(user_id="@someone-else:ag2.space", reply_to_event="$card-nonowner", task="Deny")
+        self.assertIs(rgb._handle_hitl_action(t), False)
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+        click = self._task(user_id="@someone-else:ag2.space",
+                           hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "deny", "guard": self.req.guard})
+        self.assertEqual(rgb._handle_hitl_action(click), "ignored")
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+
     def test_hitl_action_on_the_task_is_applied_and_consumed(self):
         t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
                                     "action_id": "allow", "guard": self.req.guard})
