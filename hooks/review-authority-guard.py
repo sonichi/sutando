@@ -139,16 +139,40 @@ def _wrapped_command(words):
 _HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n\s*\1\s*(?:\n|$)", re.S)
 
 
+def _heredoc_owner(prefix):
+    """Head of the command that owns a heredoc: 'gh', an interpreter name, or None."""
+    line = prefix.rsplit("\n", 1)[-1]
+    seg = re.split(r"&&|\|\||[;|]", line)[-1]
+    try:
+        words = shlex.split(seg)
+    except ValueError:
+        words = seg.split()
+    if not words:
+        return None
+    head = words[0].rsplit("/", 1)[-1].lower()
+    if head == "gh":
+        return "gh"
+    if head in _INTERPRETERS or head.startswith("python"):
+        return head
+    return None
+
+
 def classify(command: str) -> Optional[str]:
     """Return 'APPROVE' / 'REQUEST_CHANGES' / 'COMMENT', or None if not a formal review."""
     if not isinstance(command, str) or "gh" not in command:
         return None
     for m in _HEREDOC.finditer(command):
+        # Only program text or API input is scanned; a `cat`/`tee` heredoc that
+        # merely mentions the command is documentation, not a review.
+        head = _heredoc_owner(command[:m.start()])
+        if head is None:
+            continue
         body = m.group(2)
-        if _API_REVIEWS.search(command):
-            e = _API_EVENT.search(body)
+        if head == "gh":
+            e = _API_EVENT.search(body) if _API_REVIEWS.search(command) else None
             if e:
                 return e.group(1)
+            continue
         nested = classify(_LITERAL_NOISE.sub(" ", body))
         if nested is not None:
             return nested

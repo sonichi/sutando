@@ -187,6 +187,10 @@ for _cmd, _want in (
     ("gh api repos/o/r/pulls/3/reviews --input - <<'JSON'\n{\"event\": \"APPROVE\", \"body\": \"x\"}\nJSON", "APPROVE"),
     ("python3 - <<'PY'\nprint('hello gh')\nPY", None),
     ("cat <<'EOF' > note.md\ngh is installed; review the pr later\nEOF", None),
+    # A heredoc owned by cat/tee is documentation, whatever it quotes (john-the-dev, #3756).
+    (f"cat > /tmp/d.md <<'DOC'\nTo approve, run {_R} 123 --approve and you are done.\nDOC", None),
+    (f"tee notes.md <<EOF\nI usually {_R} 5 --request-changes when the tests are red.\nEOF", None),
+    (f"cat > review.md <<'MD'\nVerified at abc: {_R} 7 --approve returns APPROVE, dismissal returns None.\nMD\ngh pr comment 7 --body-file review.md", None),
 ):
     check(f"heredoc: {_cmd.splitlines()[0]} …", classify(_cmd), _want)
 
