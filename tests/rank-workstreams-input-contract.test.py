@@ -26,6 +26,15 @@ class BestMatchContract(unittest.TestCase):
         with self.assertRaises(TypeError):
             best_match([{"id": "a", "text": "agent settings design"}], ["agent"])
 
+    def test_a_dict_after_a_tuple_is_refused_too(self):
+        # keweichen on #3758: a candidate-zero check let a later dict score its
+        # keys silently (-> None) or return a phantom key id (-> "id").
+        mixed = [("real", "zzz"), {"id": "b", "text": "agent settings"}]
+        with self.assertRaises(TypeError):
+            best_match(mixed, ["agent"])
+        with self.assertRaises(TypeError):
+            best_match(mixed, ["text", "ext"])
+
     def test_accepts_a_generator(self):
         # `candidates = list(candidates)` is load-bearing: the guard indexes
         # candidates[0], and a generator would raise the guard's own TypeError.
