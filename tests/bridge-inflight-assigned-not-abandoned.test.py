@@ -38,12 +38,12 @@ class AssignedIsNotAbandoned(unittest.TestCase):
         return inflight
 
     def test_assigned_state_keeps_the_inflight_entry(self):
-        (rgb.TASKS_DIR / "task-a1.assigned-core-1.txt").write_text("x")
+        (rgb.TASKS_DIR / "task-a1.assigned-worker-1.txt").write_text("x")
         inflight = {"task-a1"}
         self.assertEqual(self._two_passes(inflight), {"task-a1"})
 
     def test_claimed_state_keeps_the_inflight_entry(self):
-        (rgb.TASKS_DIR / "task-a2.claimed-core-2.txt").write_text("x")
+        (rgb.TASKS_DIR / "task-a2.claimed-worker-2.txt").write_text("x")
         self.assertEqual(self._two_passes({"task-a2"}), {"task-a2"})
 
     def test_truly_gone_id_is_dropped_after_two_sightings(self):

@@ -58,7 +58,7 @@ class ClaimTaskTests(unittest.TestCase):
         original = self._write_task("abc123", "hello\n")
         result = claim("abc123", "1", workspace=self.ws)
         self.assertIsNotNone(result)
-        self.assertEqual(result.name, "task-abc123.claimed-core-1.txt")
+        self.assertEqual(result.name, "task-abc123.claimed-worker-1.txt")
         self.assertTrue(result.exists())
         self.assertFalse(original.exists())
         # Content preserved through rename.
@@ -75,8 +75,8 @@ class ClaimTaskTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIsNone(second)
         # First claim file still present, no second claim file.
-        self.assertTrue((self.ws / "tasks" / "task-dup.claimed-core-1.txt").exists())
-        self.assertFalse((self.ws / "tasks" / "task-dup.claimed-core-2.txt").exists())
+        self.assertTrue((self.ws / "tasks" / "task-dup.claimed-worker-1.txt").exists())
+        self.assertFalse((self.ws / "tasks" / "task-dup.claimed-worker-2.txt").exists())
 
     def test_race_exactly_one_wins(self):
         """Two subprocesses race to claim the same task — exactly one wins.
@@ -107,10 +107,10 @@ class ClaimTaskTests(unittest.TestCase):
         won_core = won[0].split(":")[0]
         lost_core = lost[0].split(":")[0]
         self.assertTrue(
-            (self.ws / "tasks" / f"task-race.claimed-core-{won_core}.txt").exists()
+            (self.ws / "tasks" / f"task-race.claimed-worker-{won_core}.txt").exists()
         )
         self.assertFalse(
-            (self.ws / "tasks" / f"task-race.claimed-core-{lost_core}.txt").exists()
+            (self.ws / "tasks" / f"task-race.claimed-worker-{lost_core}.txt").exists()
         )
 
     def test_different_core_ids_distinguish_claim_files(self):
@@ -118,8 +118,8 @@ class ClaimTaskTests(unittest.TestCase):
         self._write_task("b")
         a = claim("a", "1", workspace=self.ws)
         b = claim("b", "2", workspace=self.ws)
-        self.assertEqual(a.name, "task-a.claimed-core-1.txt")
-        self.assertEqual(b.name, "task-b.claimed-core-2.txt")
+        self.assertEqual(a.name, "task-a.claimed-worker-1.txt")
+        self.assertEqual(b.name, "task-b.claimed-worker-2.txt")
 
     def test_validation_rejects_path_traversal(self):
         # hostile task_id with / or .. must not escape tasks/
@@ -164,7 +164,7 @@ class ChannelAffinityTests(unittest.TestCase):
     def _touch_alive(self, core_id: str, age_sec: float = 0) -> None:
         """Write a fresh heartbeat for core <core_id>. age_sec lets the test
         backdate the mtime to simulate a dead heartbeat."""
-        p = self.ws / "state" / "cores" / f"core-{core_id}.alive"
+        p = self.ws / "state" / "cores" / f"worker-{core_id}.alive"
         p.write_text(f'{{"core_id": "{core_id}"}}')
         if age_sec > 0:
             past = os.path.getmtime(p) - age_sec
@@ -175,30 +175,30 @@ class ChannelAffinityTests(unittest.TestCase):
         self._touch_alive("1")
         result = claim_with_affinity("a", "1", "ch-X", workspace=self.ws)
         self.assertIsNotNone(result)
-        # Handler should now point to core-1
+        # Handler should now point to worker-1
         handler_p = self.ws / "state" / "cores" / "channel-ch-X.handler"
         self.assertTrue(handler_p.exists())
         import json as _json
         data = _json.loads(handler_p.read_text())
-        self.assertEqual(data["core_id"], "1")
+        self.assertEqual(data["worker"], "worker-1")
         self.assertIn("last_handled_at", data)
 
     def test_subsequent_task_same_channel_sticks_to_handler(self):
-        # core-1 handles first task in channel ch-X.
+        # worker-1 handles first task in channel ch-X.
         self._write_task("a")
         self._touch_alive("1")
         self._touch_alive("2")
         claim_with_affinity("a", "1", "ch-X", workspace=self.ws)
-        # Now task-b arrives in same channel. core-2 attempts → should be
-        # refused (handler-respect); core-1 should win.
+        # Now task-b arrives in same channel. worker-2 attempts → should be
+        # refused (handler-respect); worker-1 should win.
         self._write_task("b")
         c2_attempt = claim_with_affinity("b", "2", "ch-X", workspace=self.ws)
-        self.assertIsNone(c2_attempt, "core-2 should not claim while core-1 is fresh handler")
+        self.assertIsNone(c2_attempt, "worker-2 should not claim while worker-1 is fresh handler")
         c1_attempt = claim_with_affinity("b", "1", "ch-X", workspace=self.ws)
-        self.assertIsNotNone(c1_attempt, "core-1 should win as fresh handler")
+        self.assertIsNotNone(c1_attempt, "worker-1 should win as fresh handler")
 
     def test_different_channel_does_not_steal_handler(self):
-        # core-1 handles ch-X. New task in ch-Y → core-2 should be free
+        # worker-1 handles ch-X. New task in ch-Y → worker-2 should be free
         # to claim it (different channel).
         self._write_task("a")
         self._touch_alive("1")
@@ -206,32 +206,32 @@ class ChannelAffinityTests(unittest.TestCase):
         claim_with_affinity("a", "1", "ch-X", workspace=self.ws)
         self._write_task("b")
         result = claim_with_affinity("b", "2", "ch-Y", workspace=self.ws)
-        self.assertIsNotNone(result, "core-2 should claim ch-Y (different channel)")
-        # ch-Y handler now points to core-2
+        self.assertIsNotNone(result, "worker-2 should claim ch-Y (different channel)")
+        # ch-Y handler now points to worker-2
         handler_p = self.ws / "state" / "cores" / "channel-ch-Y.handler"
         import json as _json
-        self.assertEqual(_json.loads(handler_p.read_text())["core_id"], "2")
+        self.assertEqual(_json.loads(handler_p.read_text())["worker"], "worker-2")
 
     def test_dead_handler_releases_to_other_core(self):
-        # core-1 handles ch-X, then dies. core-2 should be able to claim
-        # the next ch-X task once core-1's heartbeat goes stale.
+        # worker-1 handles ch-X, then dies. worker-2 should be able to claim
+        # the next ch-X task once worker-1's heartbeat goes stale.
         self._write_task("a")
         self._touch_alive("1")
         self._touch_alive("2")
         claim_with_affinity("a", "1", "ch-X", workspace=self.ws)
-        # Backdate core-1's heartbeat — simulate crash.
+        # Backdate worker-1's heartbeat — simulate crash.
         self._touch_alive("1", age_sec=ALIVE_THRESHOLD_SEC + 30)
-        self._touch_alive("2")  # core-2 still fresh
+        self._touch_alive("2")  # worker-2 still fresh
         self._write_task("b")
         result = claim_with_affinity("b", "2", "ch-X", workspace=self.ws)
-        self.assertIsNotNone(result, "core-2 should claim ch-X after handler dies")
-        # Handler now points to core-2
+        self.assertIsNotNone(result, "worker-2 should claim ch-X after handler dies")
+        # Handler now points to worker-2
         handler_p = self.ws / "state" / "cores" / "channel-ch-X.handler"
         import json as _json
-        self.assertEqual(_json.loads(handler_p.read_text())["core_id"], "2")
+        self.assertEqual(_json.loads(handler_p.read_text())["worker"], "worker-2")
 
     def test_idle_channel_releases_for_race(self):
-        # core-1 handles ch-X, then the channel goes idle past IDLE_THRESHOLD.
+        # worker-1 handles ch-X, then the channel goes idle past IDLE_THRESHOLD.
         # Next task → race-claim, any core can win.
         import json as _json
         self._write_task("a")
@@ -243,10 +243,10 @@ class ChannelAffinityTests(unittest.TestCase):
         data = _json.loads(handler_p.read_text())
         data["last_handled_at"] = time.time() - (31 * 60)  # 31 min ago
         handler_p.write_text(_json.dumps(data))
-        # Now core-2 should be able to claim (race-claim path).
+        # Now worker-2 should be able to claim (race-claim path).
         self._write_task("b")
         result = claim_with_affinity("b", "2", "ch-X", workspace=self.ws)
-        self.assertIsNotNone(result, "core-2 should claim after channel idle expires")
+        self.assertIsNotNone(result, "worker-2 should claim after channel idle expires")
 
     def test_no_channel_id_falls_back_to_plain_claim(self):
         # channel_id=None: voice tasks etc. Plain race-claim, no handler tracking.
@@ -272,7 +272,7 @@ class ChannelAffinityTests(unittest.TestCase):
         handler_p = self.ws / "state" / "cores" / "channel-ch-X.handler"
         handler_p.parent.mkdir(parents=True, exist_ok=True)
         handler_p.write_text("not valid json {{{")
-        # core-2 should be able to claim despite the malformed handler
+        # worker-2 should be able to claim despite the malformed handler
         result = claim_with_affinity("a", "2", "ch-X", workspace=self.ws)
         self.assertIsNotNone(result)
 

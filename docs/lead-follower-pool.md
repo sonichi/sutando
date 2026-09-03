@@ -68,28 +68,29 @@ The lead will subsume this policy, but the shipped mechanism is race-side and
 worth stating exactly, because two of its properties are commonly misread.
 
 **State.** One file per channel, `state/cores/channel-<id>.handler`, written
-atomically (temp + rename) as `{"core_id": ..., "last_handled_at": <epoch>}`.
+atomically (temp + rename) as `{"worker": "worker-N", "last_handled_at": <epoch>}`
+(a pre-rename `{"core_id": "<seat>"}` file is read as the same worker for one release).
 
 **Two independent gates.** A follower defers to the recorded handler only when
 BOTH hold; they fail for different reasons and protect different things:
 
 | gate | test | protects against |
 |---|---|---|
-| freshness | `now - last_handled_at < IDLE_THRESHOLD` (30 min) | a live core hoarding a channel it has stopped serving |
-| liveness | `.alive` mtime `< ALIVE_THRESHOLD` (90 s) | a **dead** core stranding the channel |
+| freshness | `now - last_handled_at < IDLE_THRESHOLD` (30 min) | a live worker hoarding a channel it has stopped serving |
+| liveness | `.alive` mtime `< ALIVE_THRESHOLD` (90 s) | a **dead** worker stranding the channel |
 
 Crash recovery therefore does **not** depend on the idle threshold: a dead
 handler releases its channel in 90 seconds no matter how long that window is.
-The idle threshold governs only rebalancing among cores that are still alive —
+The idle threshold governs only rebalancing among workers that are still alive —
 so raising it is far cheaper than it first appears.
 
 **`last_handled_at` is claim-stamped, not activity-stamped.** It is written in
 exactly one place — on a successful claim — and never refreshed while the task
-runs or when it completes. The value means "when this core last *started* work
-on this channel," which has a consequence worth designing around: a core that
+runs or when it completes. The value means "when this worker last *started* work
+on this channel," which has a consequence worth designing around: a worker that
 spends longer than `IDLE_THRESHOLD` on a single task goes stale *while actively
-working on that channel's task*, and the next message races freely to a core
-with none of the conversation. The busy core stays perfectly **alive**
+working on that channel's task*, and the next message races freely to a worker
+with none of the conversation. The busy worker stays perfectly **alive**
 throughout — the heartbeat is a sidecar and keeps beating — so the failure is
 not "busy mistaken for idle"; activity is never measured at all.
 
@@ -112,7 +113,7 @@ non-positive values fall back to the default rather than disabling affinity.
 - **Pool metrics:** the owner's 2026-05-19 quality bar (continuous benchmark:
   claim distribution, head-of-line incidents, duplicate-reply rate,
   per-channel latency) becomes a lead-side counter file — global view, one
-  collection point, no cross-core aggregation.
+  collection point, no cross-worker aggregation.
 
 ## Instance registry touchpoints
 
@@ -139,12 +140,12 @@ non-positive values fall back to the default rather than disabling affinity.
 
 ## Install troubleshooting (each observed on the first real N=2 install)
 
-| Symptom | Cause | Fix (now automated in `install-core-pool.sh`) |
+| Symptom | Cause | Fix (now automated in `install-worker-pool.sh`) |
 |---|---|---|
 | launchd job exits instantly, `last exit code = 78`, or never spawns | macOS TCC: launchd cannot exec scripts under `~/Documents`, open log files there, or use it as `WorkingDirectory` | Wrapper is staged to `~/.sutando/bin/`, logs go to `~/Library/Application Support/Sutando/logs/`, `WorkingDirectory=$HOME` |
 | `Failed to authenticate: OAuth session expired` | Follower defaulted to `~/.claude` while the live session's credentials live in `CLAUDE_CONFIG_DIR` | Installer captures its own `CLAUDE_CONFIG_DIR` into the plist env; preflight warns if no `.credentials.json` there |
 | `Unknown command: /proactive-loop-pool` | Pool skill not discoverable in the shared config dir | Installer symlinks `skills/proactive-loop-pool` into `$CLAUDE_CONFIG_DIR/skills/` |
-| Old error text after a fix | `core-N.err` accumulates across runs | Append a `=== MARK ===` line, kickstart, read only post-mark lines |
+| Old error text after a fix | `worker-N.err` accumulates across runs | Append a `=== MARK ===` line, kickstart, read only post-mark lines |
 
 Debug recipe: reproduce outside launchd first (`cd $POOL_REPO_DIR && $POOL_CLAUDE_BIN --dangerously-skip-permissions --add-dir $POOL_WORKSPACE --print "Reply with exactly: BOOT-OK"`) — userland success + launchd failure isolates the plist env; userland failure isolates auth/skill/config.
 
@@ -158,11 +159,11 @@ spawn = inefficient`, exit 0), and the watchdog's own `StartInterval: 180`
 never fired unaided over 7 minutes (`pended nondemand spawn = interval`).
 launchd defers *non-demand* spawns here; only `launchctl kickstart` — a demand
 spawn — reliably starts a job. Anything that relies on KeepAlive or a plist
-timer to bring a core back is decorative.
+timer to bring a worker back is decorative.
 
 So recovery is driven by the **lead**, the one process provably running (2s
-sweep). Every 60s it reconciles the installed `com.sutando.core-*` plists
-against live tmux sessions and kickstarts whichever core has no session.
+sweep). Every 60s it reconciles the installed `com.sutando.worker-N` plists
+against live tmux sessions and kickstarts whichever worker has no session.
 `scripts/kick-pool.sh` holds that logic and additionally un-wedges a session
 that is alive but idle at the REPL.
 
@@ -170,7 +171,7 @@ Verify it is alive by its own output, never by log presence:
 
     grep 'recovery:' <workspace>/logs/pool-lead.log | tail -3
     # recovery: ok (3 session(s) healthy)      <- idle heartbeat, emitted every pass
-    # recovery: core-3: NO SESSION (dead) -> launchctl kickstart
+    # recovery: worker-3: NO SESSION (dead) -> launchctl kickstart
 
 The idle heartbeat exists because a sweep that logs only when it acts is
 indistinguishable from a sweep that stopped running — the failure mode that
@@ -183,10 +184,10 @@ process succeed?*
 
 | Symptom | Class | Action |
 |---|---|---|
-| `401`, credentials expired, auth errors | auth-state — per-process, not shared | Recycle that session (`launchctl kickstart -k gui/$(id -u)/com.sutando.core-N`). Retrying re-hits the same dead auth; a re-login elsewhere only affects *newly started* processes |
+| `401`, credentials expired, auth errors | auth-state — per-process, not shared | Recycle that session (`launchctl kickstart -k gui/$(id -u)/com.sutando.worker-N`). Retrying re-hits the same dead auth; a re-login elsewhere only affects *newly started* processes |
 | Timeouts, 5xx, network errors | transport | Back off and retry; do not touch the session |
 | Heartbeat fresh but assignments sit unclaimed | hung session | The lead's stuck-assignment reclaim repools it; `kick-pool.sh` un-wedges an idle REPL |
-| No tmux session | dead core | The lead's 60s reconcile kickstarts it (~55s observed end to end) |
+| No tmux session | dead worker | The lead's 60s reconcile kickstarts it (~55s observed end to end) |
 
 A follower's heartbeat is pid-bound, so it keeps beating while auth is dead —
 use assigned-but-unclaimed age as the signal, not the `.alive` file.
@@ -196,7 +197,7 @@ use assigned-but-unclaimed age as the signal, not the `.alive` file.
 `bash src/startup.sh --pool N` (or `--pool auto`, which starts at 2 and lets
 the lead grow the pool) installs/resizes and ensures the lead is running.
 Scale-up is automatic under saturation up to `SUTANDO_POOL_MAX` (default 3);
-**scale-down stays manual** because booting out a core can strand its live
+**scale-down stays manual** because booting out a worker can strand its live
 claims. `SUTANDO_AFFINITY_BUSY_MAX` (default 3) sets how backlogged a channel's
 handler must be before affinity yields — lower favors latency, higher favors
 conversational continuity; `continuity_breaks` in the pool metrics measures
@@ -204,18 +205,18 @@ what that choice costs.
 
 ### Turning on a Codex follower
 
-The runtime dimension (`--runtime` / `--core-runtime`) declares which CLI a core
-runs. Two things make it usable on a running pool:
+The runtime dimension (`--runtime` / `--worker-runtime`) declares which CLI a
+worker runs. Two things make it usable on a running pool:
 
-    # convert core 2 to codex, in place — the lead and cores 1,3 keep working
-    bash scripts/install-core-pool.sh --only-core=2 --core-runtime=2:codex
+    # convert worker 2 to codex, in place — the lead and workers 1,3 keep working
+    bash scripts/install-worker-pool.sh --only-worker=2 --worker-runtime=2:codex
 
     # remove it again — plist, tmux session AND the stale beat, in one step
-    bash scripts/uninstall-core-pool.sh --only-core=2
+    bash scripts/uninstall-worker-pool.sh --only-worker=2
 
-`--only-core` converts a core in place but **cannot resize the pool** — it
-refuses when the N given differs from the installed size. Adding a fourth core
-is therefore a full install, which boots out and re-bootstraps every core and
+`--only-worker` converts a worker in place but **cannot resize the pool** — it
+refuses when the N given differs from the installed size. Adding a fourth worker
+is therefore a full install, which boots out and re-bootstraps every worker and
 the lead. That is less disruptive than it sounds: the tmux sessions outlive the
 launchd jobs, so running sessions keep their context and the job is only a
 supervisor. Plan for the churn anyway; nothing guarantees that ordering.
@@ -223,7 +224,7 @@ supervisor. Plan for the churn anyway; nothing guarantees that ordering.
 ### Measuring the pool
 
 `finish_task` appends one line per completed task to `data/pool-metrics.jsonl`:
-`task_id`, `core`, `source`, `arrived_at`, `finished_at`, `duration_s`. Arrival
+`task_id`, `worker`, `source`, `arrived_at`, `finished_at`, `duration_s`. Arrival
 comes from the claimed file's mtime, which survives the assign/claim renames, so
 the duration is measured rather than inferred.
 
@@ -234,18 +235,47 @@ honestly is worse than no field.
 
 This is the only durable record of pool timing. Result files are deleted once a
 bridge delivers them, and archive mtimes are arrival times, not completion
-times — so without this file, questions like "did anything wait on a busy core"
+times — so without this file, questions like "did anything wait on a busy worker"
 and "what does N=3 buy over N=1" are unanswerable after the fact.
 
-Without `--only-core` the installer boots out the lead and every core, so
+Without `--only-worker` the installer boots out the lead and every worker, so
 changing one follower restarts the whole pool. Without the teardown path,
 `launchctl bootout` alone leaves the plist behind — the recovery sweep revives
 any installed plist whose session is gone — and a left-behind
-`state/cores/core-N.alive` keeps the lead assigning to a core that no longer
+`state/cores/worker-N.alive` keeps the lead assigning to a worker that no longer
 exists.
 
+### Naming and the compat window
+
+The pool is ONE core plus N workers, and every worker surface says `worker-N`:
+the launchd label `com.sutando.worker-N`, the tmux session, the log stem, the
+beat `state/cores/worker-N.alive`, the done-flag dir `state/cores/worker-N/done`,
+the task-file suffixes `.assigned-worker-N` / `.claimed-worker-N`, the rows in
+`state/pool/affinity.json` / `no-claim.json` / `notify-ledger.json`, the
+`worker` field in `data/pool-metrics.jsonl`, and the env vars
+`SUTANDO_WORKER_ID` (`worker-N`) / `SUTANDO_WORKER_SEAT` (`N`) /
+`SUTANDO_WORKER_POOL_SIZE`. `src/pool_names.py` is the single owner of that
+spelling (Python imports it; shell calls `python3 src/pool_names.py <fn> <arg>`),
+guarded by `tests/pool-names-owner-guard.test.py`.
+
+The pre-rename spelling `core-N` is a **read-side alias for one release**, the
+same window as the `SUTANDO_CORE_ID` / `SUTANDO_CORE_POOL_SIZE` env aliases:
+the lead reads `core-N.alive` as `worker-N`, followers and the lead recognise
+`.assigned-core-N` / `.claimed-core-N` files, the tables canonicalise `core-N`
+rows on load and write them back as `worker-N`, a `{"core_id": "<seat>"}`
+channel handler is read as the same worker, `pool-bind.py pin ... core-2` stores
+`worker-2`, and `--only-core=` / `--core-runtime=` still parse. Nothing writes
+the old spelling. The old script names — `install-core-pool.sh`,
+`uninstall-core-pool.sh`, `pool-core-wrapper.sh` — are shims that print one
+deprecation line and `exec` the new script.
+
+**Migration is `bash src/restart.sh --pool N`** (or the installer directly): a
+full run first retires every legacy `com.sutando.core-N` job, its `core-N` tmux
+session and beat, then installs `com.sutando.worker-N`. Running sessions are
+ended by that step — plan the churn as for any full install.
+
 How the session is driven is owned by `scripts/pool-runtime-drive.sh`, sourced
-by both `pool-core-wrapper.sh` (the in-session sweep) and `kick-pool.sh` (the
+by both `pool-worker-wrapper.sh` (the in-session sweep) and `kick-pool.sh` (the
 watchdog). Recognition is positive and fails closed: a session is typed into
 only when the pane shows *that* runtime's idle prompt. A pane nobody recognizes,
 a plist whose runtime is unreadable or unknown, and a codex startup dialog are
@@ -258,5 +288,5 @@ the model is reading anything. It has no in-session task watcher and
 something types the pool entry at it: the wrapper's own sweep (300s) or the
 watchdog (180s on this host). Worst-case assignment latency is therefore the
 sweep interval, not the sub-second watcher latency a Claude follower gets, and
-a Codex core wedged *inside* a turn is invisible to both — `esc to interrupt`
+a Codex worker wedged *inside* a turn is invisible to both — `esc to interrupt`
 reads as healthy work. Use assigned-but-unclaimed age, not `.alive`, to judge it.

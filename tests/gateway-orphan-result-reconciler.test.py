@@ -428,8 +428,8 @@ class AbandonedHardening(_Base):
         # The pool renames a task through three names. A state the reconciler
         # cannot see reads as abandoned, and the reply is dropped mid-flight.
         for name in (f"{TID}.txt",
-                     f"{TID}.assigned-core-2.txt",
-                     f"{TID}.claimed-core-2.txt"):
+                     f"{TID}.assigned-worker-2.txt",
+                     f"{TID}.claimed-worker-2.txt"):
             with self.subTest(pending=name):
                 self.assertTrue(
                     self._pending_probe(name),

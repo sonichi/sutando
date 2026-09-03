@@ -108,7 +108,8 @@ def _guard(tool: str, tool_input: dict) -> str:
 def _requirement(data: dict) -> HumanRequirement:
     tool = str(data.get("tool_name") or "")
     tool_input = data.get("tool_input") or {}
-    session = os.environ.get("SUTANDO_TMUX_SESSION") or os.environ.get("SUTANDO_CORE_ID") or "sutando-core"
+    session = (os.environ.get("SUTANDO_TMUX_SESSION") or os.environ.get("SUTANDO_WORKER_ID")
+               or os.environ.get("SUTANDO_CORE_ID") or "sutando-core")
     return HumanRequirement(
         kind="permission",
         runtime="claude",

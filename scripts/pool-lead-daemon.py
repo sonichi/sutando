@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Production lead driver (L3): binds PoolLead to the live workspace.
 
-Followers = state/cores/<inst>.alive files matching the pool prefix; alive =
-mtime within LEAD_STALE_S bounds (future-dated = dead, same rule everywhere).
+Followers = state/cores/<inst>.alive files matching the pool prefix (a legacy
+`core-N` beat is read as `worker-N` for one release); alive = mtime within
+LEAD_STALE_S bounds (future-dated = dead, same rule everywhere).
 The lead stamps its own `pool-lead.alive` each sweep so followers can detect
 lead loss and degrade (pool_follower.lead_alive reads it).
 
-Usage: python3 scripts/pool-lead-daemon.py [--interval 2.0] [--prefix core-]
+Usage: python3 scripts/pool-lead-daemon.py [--interval 2.0] [--prefix worker-]
 Stop with SIGTERM/SIGINT; the beat file is unlinked on exit so followers
 degrade immediately instead of waiting out the stale window.
 """
@@ -28,6 +29,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "src"))
 sys.path.insert(0, str(_HERE.parent / "src" / "runtime-api"))
 
+import pool_names as pn
 from pool_follower import LEAD_STALE_S
 from pool_lead import PoolLead
 from pool_metrics import PoolMetrics
@@ -77,38 +79,56 @@ def _workspace() -> Path:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=2.0)
-    ap.add_argument("--prefix", default="core-",
+    ap.add_argument("--prefix", default=pn.WORKER_PREFIX,
                     help="instance-id prefix that marks pool followers")
     ap.add_argument("--pool-max", type=int,
                     default=int(os.environ.get("SUTANDO_POOL_MAX", "3")),
                     help="autoscale cap; 0 disables scale-up (owner rule: "
-                         "grow when every core is saturated and work queues)")
+                         "grow when every worker is saturated and work queues)")
     a = ap.parse_args()
     ws = _workspace()
     tasks, state = ws / "tasks", ws / "state"
     cores = state / "cores"
 
     def followers():
+        # Both spellings of a seat's beat resolve to one canonical follower.
+        globs = [f"{a.prefix}*.alive"]
+        if a.prefix == pn.WORKER_PREFIX:
+            globs.append(f"{pn.LEGACY_PREFIX}*.alive")
+        out: "list[str]" = []
         try:
-            return [f.stem for f in cores.glob(f"{a.prefix}*.alive")]
+            for g in globs:
+                for f in cores.glob(g):
+                    c = pn.canonical(f.stem)
+                    if c not in out:
+                        out.append(c)
         except OSError:
             return []
+        return out
 
     def alive(inst: str) -> bool:
-        try:
-            age = time.time() - (cores / f"{inst}.alive").stat().st_mtime
-        except OSError:
-            return False
-        return 0 <= age < LEAD_STALE_S
+        for fn in pn.alive_filenames(inst):
+            try:
+                age = time.time() - (cores / fn).stat().st_mtime
+            except OSError:
+                continue
+            if 0 <= age < LEAD_STALE_S:
+                return True
+        return False
 
     def runtime_of(inst: str) -> str:
-        # The core's own plist is the only authority; unreadable or unstated
+        # The worker's own plist is the only authority; unreadable or unstated
         # means claude, matching every plist written before the runtime flag.
-        plist = (Path.home() / "Library/LaunchAgents"
-                 / f"com.sutando.{inst}.plist")
-        try:
-            body = plist.read_text(errors="replace")
-        except OSError:
+        body = ""
+        for name in pn.aliases(inst):
+            plist = (Path.home() / "Library/LaunchAgents"
+                     / f"com.sutando.{name}.plist")
+            try:
+                body = plist.read_text(errors="replace")
+                break
+            except OSError:
+                continue
+        if not body:
             return "claude"
         m = re.search(r"<key>POOL_RUNTIME</key>\s*<string>([^<]*)</string>",
                       body)
@@ -163,10 +183,11 @@ def main() -> int:
             # Always emit, even when idle: a sweep that is silent while healthy
             # is indistinguishable from a sweep that stopped running.
             if not acted:
-                live = sum(1 for ln in out.splitlines() if ln.startswith("core-"))
+                live = sum(1 for ln in out.splitlines()
+                           if pn.seat_of(re.split(r"[:\s]", ln, 1)[0]) is not None)
                 print(f"recovery: ok ({live} session(s) healthy)", flush=True)
             last_recovery = time.time()
-        # Autoscale, scale-UP only: shrinking can strand a core's live claims,
+        # Autoscale, scale-UP only: shrinking can strand a worker's live claims,
         # so it stays a manual operation (--pool N) for now.
         if a.pool_max > 0:
             live = followers()
@@ -181,7 +202,7 @@ def main() -> int:
                                  now=time.time())
             if new_n is not None and new_n > len(live):
                 r = subprocess.run(
-                    ["bash", str(_HERE / "install-core-pool.sh"), str(new_n)],
+                    ["bash", str(_HERE / "install-worker-pool.sh"), str(new_n)],
                     capture_output=True, text=True, timeout=120)
                 if r.returncode == 0:
                     ledger.record(changed=True)

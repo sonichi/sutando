@@ -37,7 +37,7 @@ class VanishingTaskFile(unittest.TestCase):
         (self.ws / "results").mkdir()
         self.real = self.ws / "tasks" / "task-1788000000000.txt"
         self.real.write_text("id: task-1788000000000\ntask: real\n")
-        # Plain name on purpose: a `.claimed-core-N` name is split to the
+        # Plain name on purpose: a `.claimed-worker-N` name is split to the
         # pool-held branch before the stat, so it never reaches this defect.
         self.gone = self.ws / "tasks" / "task-1788000000001.txt"
 

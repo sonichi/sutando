@@ -20,7 +20,7 @@ from hitl.manager import HitlManager, HitlStore  # noqa: E402
 from hitl.schema import ActionReply  # noqa: E402
 
 
-def event(session="core-2", guard="g1", kind="permission", cleared=False, **extra):
+def event(session="worker-2", guard="g1", kind="permission", cleared=False, **extra):
     d = {"schema": SCHEMA, "session": session, "socket": "/tmp/s.sock", "runtime": "claude",
          "kind": kind, "prompt": "Do you want to proceed?", "guard": guard, "observed_ms": 1,
          "options": [{"id": "1", "label": "Yes"}, {"id": "4", "label": "No"}]}
@@ -44,31 +44,31 @@ class IngestTests(unittest.TestCase):
         (events_dir(self.ws) / f"{name}.json").write_text(json.dumps(ev))
 
     def test_creates_requirement_with_tui_options_and_jump(self):
-        self.drop("core-2-g1", event())
+        self.drop("worker-2-g1", event())
         c = ingest(self.mgr, self.ws)
         self.assertEqual(c["created"], 1)
         [req] = self.mgr.active()
         self.assertEqual((req.kind, req.runtime, req.guard), ("permission", "claude", "g1"))
-        self.assertIn("core-2", req.message)
+        self.assertIn("worker-2", req.message)
         kinds = [(a.id, a.kind) for a in req.actions]
         self.assertIn(("1", "tui_select"), kinds)
         self.assertEqual(req.actions[-1].id, JUMP_ACTION_ID)
 
     def test_reingest_is_idempotent(self):
-        self.drop("core-2-g1", event())
+        self.drop("worker-2-g1", event())
         ingest(self.mgr, self.ws)
         c = ingest(self.mgr, self.ws)
         self.assertEqual((c["created"], c["skipped"]), (0, 1))
         self.assertEqual(len(self.mgr.active()), 1)
 
     def test_tombstone_expires_untouched_and_resolves_acted_on(self):
-        self.drop("core-2-g1", event(session="core-2", guard="g1"))
-        self.drop("core-3-g2", event(session="core-3", guard="g2"))
+        self.drop("worker-2-g1", event(session="worker-2", guard="g1"))
+        self.drop("worker-3-g2", event(session="worker-3", guard="g2"))
         ingest(self.mgr, self.ws)
         acted = next(r for r in self.mgr.active() if r.guard == "g2")
         self.mgr.apply_action(ActionReply(hitl_id=acted.id, expected_revision=acted.revision, action_id="1", guard="g2"))
-        self.drop("core-2-g1", event(guard="g1", cleared=True))
-        self.drop("core-3-g2", event(session="core-3", guard="g2", cleared=True))
+        self.drop("worker-2-g1", event(guard="g1", cleared=True))
+        self.drop("worker-3-g2", event(session="worker-3", guard="g2", cleared=True))
         c = ingest(self.mgr, self.ws)
         self.assertEqual((c["expired"], c["resolved"]), (1, 1))
         self.assertEqual(self.mgr.active(), [])
@@ -88,7 +88,7 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(req.actions[-1].kind, "open_terminal")  # the jump floor stays
 
     def test_option_without_kind_is_still_a_tui_keystroke(self):
-        self.drop("core-2-g1", event())
+        self.drop("worker-2-g1", event())
         ingest(self.mgr, self.ws)
         [req] = self.mgr.active()
         self.assertEqual({a.kind for a in req.actions[:-1]}, {"tui_select"})
@@ -97,11 +97,11 @@ class IngestTests(unittest.TestCase):
     def test_repaint_expires_the_old_dialog_and_mints_a_new_card_with_new_options(self):
         # TustinOC's second repro: the guard moved to screen BBB; the old card's
         # options must never be typed into the new screen.
-        self.drop("core-2-AAA", event(session="core-2", guard="tui:AAA",
+        self.drop("worker-2-AAA", event(session="worker-2", guard="tui:AAA",
                                        options=[{"id": "1", "label": "Keep the file"}, {"id": "2", "label": "Delete the file"}]))
         ingest(self.mgr, self.ws)
         [old] = self.mgr.active()
-        self.drop("core-2-BBB", event(session="core-2", guard="tui:BBB",
+        self.drop("worker-2-BBB", event(session="worker-2", guard="tui:BBB",
                                        options=[{"id": "1", "label": "Deploy to production"}, {"id": "2", "label": "Cancel"}]))
         c = ingest(self.mgr, self.ws)
         self.assertEqual((c["created"], c.get("superseded")), (1, 1))

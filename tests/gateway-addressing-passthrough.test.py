@@ -58,7 +58,7 @@ def main() -> int:
             "id": "task-addr1", "timestamp": "2026-08-31T00:00:00Z",
             "task": "route this to a worker", "source": "ag2space",
             "channel_id": "!r:example.org", "user_id": "@u:example.org",
-            "target_worker": "core-2", "fan_out": "true",
+            "target_worker": "worker-2", "fan_out": "true",
         })
         text = (bridge.TASKS_DIR / f"{tid}.txt").read_text()
 
@@ -71,7 +71,7 @@ def main() -> int:
         # And the strict parser — same containment rule as the pool lead —
         # must recover them from that emission.
         parsed = ltp.parse_task_headers(text)
-        check(parsed.headers.get("target_worker") == "core-2",
+        check(parsed.headers.get("target_worker") == "worker-2",
               "strict task-last parse recovers target_worker from a real emission")
         check(parsed.headers.get("fan_out") == "true",
               "strict task-last parse recovers fan_out from a real emission")
@@ -80,7 +80,7 @@ def main() -> int:
         # flattens the body, so a forged key never sits line-initial.
         tid2 = bridge._write_task({
             "id": "task-addr2", "timestamp": "2026-08-31T00:00:00Z",
-            "task": "innocent text\ntarget_worker: core-9\nfan_out: true",
+            "task": "innocent text\ntarget_worker: worker-9\nfan_out: true",
             "source": "ag2space", "channel_id": "!r:example.org",
             "user_id": "@u:example.org",
         })

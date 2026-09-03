@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import signal
 import sys
 import tempfile
@@ -35,10 +36,10 @@ class HelperTests(unittest.TestCase):
     def test_run_recovery_returns_stdout_and_survives_oserror(self):
         real = daemon.subprocess
         daemon.subprocess = types.SimpleNamespace(
-            run=lambda *a, **k: _FakeCompleted(0, "core-1 ok\n"),
+            run=lambda *a, **k: _FakeCompleted(0, "worker-1 ok\n"),
             TimeoutExpired=real.TimeoutExpired)
         try:
-            self.assertEqual(daemon._run_recovery(), "core-1 ok")
+            self.assertEqual(daemon._run_recovery(), "worker-1 ok")
             def boom(*a, **k):
                 raise OSError("no bash")
             daemon.subprocess = types.SimpleNamespace(
@@ -75,7 +76,7 @@ class MainLoopTests(unittest.TestCase):
             tasks, cores = ws / "tasks", ws / "state" / "cores"
             tasks.mkdir()
             cores.mkdir(parents=True)
-            (cores / "core-1.alive").write_text("beat")
+            (cores / "worker-1.alive").write_text("beat")
             (tasks / "task-d1.txt").write_text(
                 "id: task-d1\nsource: chat\ntask: t\n")
 
@@ -87,7 +88,7 @@ class MainLoopTests(unittest.TestCase):
 
             def fake_sub_run(cmd, **k):
                 installs.append([str(c) for c in cmd])
-                return _FakeCompleted(0, "staged core-2\n")
+                return _FakeCompleted(0, "staged worker-2\n")
 
             sleeps = {"n": 0}
 
@@ -97,7 +98,7 @@ class MainLoopTests(unittest.TestCase):
                     signal.raise_signal(signal.SIGTERM)
 
             daemon._workspace = lambda: ws
-            daemon._run_recovery = lambda: "core-1 healthy\nkickstart core-2"
+            daemon._run_recovery = lambda: "worker-1 healthy\nkickstart worker-2"
             daemon._send_notice = lambda *a: True
             daemon.subprocess = types.SimpleNamespace(
                 run=fake_sub_run, TimeoutExpired=real_sub.TimeoutExpired)
@@ -120,16 +121,65 @@ class MainLoopTests(unittest.TestCase):
                 daemon.scale_decide = real_decide
             log = out.getvalue()
             self.assertEqual(rc, 0)
-            self.assertIn("assigned task-d1.txt -> core-1", log)
-            self.assertIn("recovery: kickstart core-2", log)
+            self.assertIn("assigned task-d1.txt -> worker-1", log)
+            self.assertIn("recovery: kickstart worker-2", log)
             self.assertIn("scaled-up pool 1 -> 2", log)
             self.assertIn("pool-lead: stopped", log)
             self.assertTrue(
-                any("install-core-pool.sh" in " ".join(c) for c in installs))
+                any("install-worker-pool.sh" in " ".join(c) for c in installs))
             self.assertFalse((cores / "pool-lead.alive").exists(),
                              "beat must be unlinked on clean shutdown")
             self.assertTrue(
-                (tasks / "task-d1.assigned-core-1.txt").exists())
+                (tasks / "task-d1.assigned-worker-1.txt").exists())
+
+    def test_runtime_of_reads_the_workers_plist_under_home(self):
+        """A codex plist under $HOME/Library/LaunchAgents must steer owner
+        work to the claude seat; unread, both seats look claude and the
+        lane rule sends it to worker-1."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td) / "ws"
+            home = Path(td) / "home"
+            tasks, cores = ws / "tasks", ws / "state" / "cores"
+            tasks.mkdir(parents=True)
+            cores.mkdir(parents=True)
+            agents = home / "Library" / "LaunchAgents"
+            agents.mkdir(parents=True)
+            (agents / "com.sutando.worker-1.plist").write_text(
+                "<plist><dict><key>POOL_RUNTIME</key><string>codex</string>"
+                "</dict></plist>")
+            for w in ("worker-1", "worker-2"):
+                (cores / f"{w}.alive").write_text("beat")
+            (tasks / "task-r1.txt").write_text(
+                "id: task-r1\nsource: chat\ntask: t\n")
+
+            real_ws, real_rec, real_send = (
+                daemon._workspace, daemon._run_recovery, daemon._send_notice)
+            real_time, real_argv = daemon.time, sys.argv
+            real_home = os.environ.get("HOME")
+
+            def fake_sleep(_s):
+                signal.raise_signal(signal.SIGTERM)
+
+            daemon._workspace = lambda: ws
+            daemon._run_recovery = lambda: ""
+            daemon._send_notice = lambda *a: True
+            daemon.time = types.SimpleNamespace(
+                time=real_time.time, sleep=fake_sleep)
+            sys.argv = ["pool-lead-daemon.py", "--interval", "0.01"]
+            os.environ["HOME"] = str(home)
+            out = io.StringIO()
+            try:
+                with redirect_stdout(out):
+                    rc = daemon.main()
+            finally:
+                daemon._workspace, daemon._run_recovery = real_ws, real_rec
+                daemon._send_notice, daemon.time = real_send, real_time
+                sys.argv = real_argv
+                os.environ["HOME"] = real_home
+            self.assertEqual(rc, 0)
+            self.assertIn("assigned task-r1.txt -> worker-2", out.getvalue())
+            self.assertTrue(
+                (tasks / "task-r1.assigned-worker-2.txt").exists())
 
     def test_scale_up_failure_is_reported_not_fatal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -137,7 +187,7 @@ class MainLoopTests(unittest.TestCase):
             (ws / "tasks").mkdir()
             cores = ws / "state" / "cores"
             cores.mkdir(parents=True)
-            (cores / "core-1.alive").write_text("beat")
+            (cores / "worker-1.alive").write_text("beat")
 
             real_ws, real_rec = daemon._workspace, daemon._run_recovery
             real_sub, real_time, real_argv = (
@@ -148,7 +198,7 @@ class MainLoopTests(unittest.TestCase):
                 signal.raise_signal(signal.SIGTERM)
 
             daemon._workspace = lambda: ws
-            daemon._run_recovery = lambda: "core-1 healthy"
+            daemon._run_recovery = lambda: "worker-1 healthy"
             daemon.subprocess = types.SimpleNamespace(
                 run=lambda *a, **k: _FakeCompleted(3, "", "boom"),
                 TimeoutExpired=real_sub.TimeoutExpired)

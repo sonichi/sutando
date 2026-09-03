@@ -271,7 +271,7 @@ class TestD7HeaderTolerance(unittest.TestCase):
     def test_d7_header_with_italic_subline(self):
         text = (
             "**[core: 2]**\n"
-            "_(channel→core handler switch from core-1)_\n"
+            "_(channel→core handler switch from worker-1)_\n"
             "\n"
             "[channel: C09XYZ]\n"
             "Body."
@@ -280,7 +280,7 @@ class TestD7HeaderTolerance(unittest.TestCase):
         self.assertEqual(first_action(r, "redirect").value, "C09XYZ")
         # Both header lines preserved.
         self.assertIn("**[core: 2]**", r.body)
-        self.assertIn("_(channel→core handler switch from core-1)_", r.body)
+        self.assertIn("_(channel→core handler switch from worker-1)_", r.body)
 
     def test_d7_header_without_marker_passes_through(self):
         text = "**[core: 2]**\n\nJust a normal reply, no markers."

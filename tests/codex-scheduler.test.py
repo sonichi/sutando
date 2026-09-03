@@ -158,7 +158,7 @@ def test_enqueue_retry_complete_and_no_duplicate():
 
         # A queued or claimed original attempt must never be rewritten/re-fired.
         assert scheduler.tick(ws, "test-host", at(6, 5))["events"] == []
-        claimed = tasks[0].with_name(f"{tasks[0].stem}.claimed-core-1.txt")
+        claimed = tasks[0].with_name(f"{tasks[0].stem}.claimed-worker-1.txt")
         tasks[0].rename(claimed)
         assert scheduler.tick(ws, "test-host", at(6, 6))["events"] == []
 
@@ -194,7 +194,7 @@ def test_an_assigned_task_is_active_so_no_duplicate_retry_fires():
         scheduler.tick(ws, "test-host", at(6, 0))
         task = next((ws / "tasks").glob("*.txt"))
 
-        assigned = task.with_name(f"{task.stem}.assigned-core-2.txt")
+        assigned = task.with_name(f"{task.stem}.assigned-worker-2.txt")
         task.rename(assigned)
         assert scheduler._task_is_active(ws, [task.stem]) is True
         assert scheduler.tick(ws, "test-host", at(6, 7))["events"] == []
@@ -227,8 +227,8 @@ def test_an_assigned_task_counts_as_active_so_no_duplicate_retry() -> None:
     irreversible side effects."""
     import tempfile
     for name, label in (("task-x.txt", "bare"),
-                        ("task-x.claimed-core-2.txt", "claimed"),
-                        ("task-x.assigned-core-2.txt", "assigned")):
+                        ("task-x.claimed-worker-2.txt", "claimed"),
+                        ("task-x.assigned-worker-2.txt", "assigned")):
         ws = Path(tempfile.mkdtemp())
         (ws / "tasks" / "processed").mkdir(parents=True)
         (ws / "tasks" / name).write_text("id: task-x\ntask: y\n")
@@ -247,7 +247,7 @@ def test_stale_active_task_fails_instead_of_stalling_or_duplicating():
         config(ws, active_stale_minutes=10)
         scheduler.tick(ws, "test-host", at(6, 0))
         task = next((ws / "tasks").glob("*.txt"))
-        claimed = task.with_name(f"{task.stem}.claimed-core-1.txt")
+        claimed = task.with_name(f"{task.stem}.claimed-worker-1.txt")
         task.rename(claimed)
 
         assert scheduler.tick(ws, "test-host", at(6, 9))["events"] == []

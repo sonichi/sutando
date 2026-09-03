@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-shot cleanup: move stranded .claimed-core-*.txt files from tasks/ to
+# One-shot cleanup: move stranded .claimed-<worker>.txt files from tasks/ to
 # tasks/archive/YYYY-MM/ (#933). Run once after deploying the bridge fix.
 set -e
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,6 +14,6 @@ while IFS= read -r -d '' f; do
   mv "$f" "$DEST/"
   echo "  swept: $(basename "$f")"
   count=$((count + 1))
-done < <(find "$TASKS_DIR" -maxdepth 1 -name "*.claimed-core-*.txt" -print0 2>/dev/null)
+done < <(find "$TASKS_DIR" -maxdepth 1 -name "*.claimed-*.txt" -print0 2>/dev/null)
 
 echo "Swept $count stranded claim file(s) → $DEST/"

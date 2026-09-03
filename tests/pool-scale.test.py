@@ -20,7 +20,7 @@ T = 10_000.0
 
 
 def call(**kw):
-    base = dict(pending_unassigned=2, in_flight={"core-1": 3, "core-2": 3},
+    base = dict(pending_unassigned=2, in_flight={"worker-1": 3, "worker-2": 3},
                 current_n=2, min_n=1, max_n=4,
                 last_change_ts=0.0, last_busy_ts=T, now=T)
     base.update(kw)
@@ -32,7 +32,7 @@ class ScaleUpTests(unittest.TestCase):
         self.assertEqual(call(), 3)
 
     def test_one_idle_core_blocks_scale_up(self):
-        self.assertIsNone(call(in_flight={"core-1": 3, "core-2": 1}))
+        self.assertIsNone(call(in_flight={"worker-1": 3, "worker-2": 1}))
 
     def test_no_backlog_blocks_scale_up(self):
         self.assertIsNone(call(pending_unassigned=0))
@@ -45,24 +45,24 @@ class ScaleUpTests(unittest.TestCase):
 
     def test_owner_example_every_core_over_three(self):
         self.assertEqual(
-            call(in_flight={"core-1": 4, "core-2": 5}, pending_unassigned=1),
+            call(in_flight={"worker-1": 4, "worker-2": 5}, pending_unassigned=1),
             3)
 
 
 class ScaleDownTests(unittest.TestCase):
     def test_long_idle_scales_down(self):
         self.assertEqual(
-            call(pending_unassigned=0, in_flight={"core-1": 0, "core-2": 0},
+            call(pending_unassigned=0, in_flight={"worker-1": 0, "worker-2": 0},
                  last_busy_ts=T - 2000, last_change_ts=T - 2000), 1)
 
     def test_recent_busy_blocks_scale_down(self):
         self.assertIsNone(
-            call(pending_unassigned=0, in_flight={"core-1": 0, "core-2": 0},
+            call(pending_unassigned=0, in_flight={"worker-1": 0, "worker-2": 0},
                  last_busy_ts=T - 100, last_change_ts=T - 2000))
 
     def test_min_floor_blocks_scale_down(self):
         self.assertIsNone(
-            call(pending_unassigned=0, in_flight={"core-1": 0},
+            call(pending_unassigned=0, in_flight={"worker-1": 0},
                  current_n=1, last_busy_ts=T - 2000, last_change_ts=T - 2000))
 
     def test_total_follower_loss_does_not_shrink_the_pool(self):
@@ -83,7 +83,7 @@ class ScaleDownTests(unittest.TestCase):
         """Control: the guard must reject only the EMPTY case, not idleness —
         otherwise scale-down is dead and the test above passes vacuously."""
         self.assertEqual(
-            call(pending_unassigned=0, in_flight={"core-1": 0},
+            call(pending_unassigned=0, in_flight={"worker-1": 0},
                  last_busy_ts=T - 2000, last_change_ts=T - 2000), 1)
 
 

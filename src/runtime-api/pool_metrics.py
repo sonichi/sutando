@@ -4,7 +4,7 @@
 The bar demanded a CONTINUOUS benchmark, not one-off bursts: claim
 distribution, head-of-line incidents, duplicate-reply risk, per-channel
 latency, tracked over time. The lead's global queue view makes this one
-append-only JSONL per day plus a summarizer — no cross-core aggregation.
+append-only JSONL per day plus a summarizer — no cross-worker aggregation.
 
 Recording is fail-open (a metrics error must never break scheduling) and
 append-only (multi-writer-safe under O_APPEND, same contract as build_log).
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -47,8 +48,9 @@ class PoolMetrics:
         self.record("claimed", task=task, instance=instance,
                     fallback=fallback)
 
-    def reclaimed(self, task: str, dead_instance: str):
-        self.record("reclaimed", task=task, dead_instance=dead_instance)
+    def reclaimed(self, task: str, instance: str, reason: str = "dead"):
+        # reason: dead (assignment), stuck (never claimed), claim-dead (repooled claim)
+        self.record("reclaimed", task=task, instance=instance, reason=reason)
 
     # ── the summary the benchmark reads ─────────────────────────────────────
     def summarize(self, day: "str | None" = None,
@@ -100,7 +102,7 @@ class PoolMetrics:
         pairs = 0
         for c, seq in chan_seq.items():
             # by TIME only, stable: sorting the (ts, instance) tuple would
-            # reorder equal-timestamp rows by core name and invent switches
+            # reorder equal-timestamp rows by worker name and invent switches
             seq.sort(key=lambda r: r[0])
             for (t0, i0), (t1, i1) in zip(seq, seq[1:]):
                 if t1 - t0 > continuity_window_s:
@@ -117,3 +119,17 @@ class PoolMetrics:
                 "continuity_breaks": sum(breaks_by_channel.values()),
                 "continuity_pairs": pairs,
                 "continuity_breaks_by_channel": dict(breaks_by_channel)}
+
+
+def summarize_cli(argv: "list[str]") -> int:
+    """`pool_metrics.py <state_dir> [YYYY-MM-DD]` — the summary as JSON."""
+    if len(argv) not in (1, 2):
+        print("usage: pool_metrics.py <state_dir> [YYYY-MM-DD]", file=sys.stderr)
+        return 2
+    print(json.dumps(PoolMetrics(argv[0]).summarize(*argv[1:]),
+                     indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(summarize_cli(sys.argv[1:]))

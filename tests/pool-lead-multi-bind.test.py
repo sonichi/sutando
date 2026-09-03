@@ -33,61 +33,61 @@ def _lead(ws: Path, followers, claiming=None):
 class MultiBindTests(unittest.TestCase):
     def test_pin_set_persists_and_lists(self):
         with tempfile.TemporaryDirectory() as td:
-            lead = _lead(Path(td), ["core-1", "core-2", "core-3"])
-            row = lead.pin_room("!r:x", ["core-2", "core-3"])
-            self.assertEqual(row["instances"], ["core-2", "core-3"])
+            lead = _lead(Path(td), ["worker-1", "worker-2", "worker-3"])
+            row = lead.pin_room("!r:x", ["worker-2", "worker-3"])
+            self.assertEqual(row["instances"], ["worker-2", "worker-3"])
             self.assertTrue(row["pinned"])
             self.assertEqual(
-                lead.bindings()["!r:x"]["instances"], ["core-2", "core-3"])
+                lead.bindings()["!r:x"]["instances"], ["worker-2", "worker-3"])
 
     def test_single_pin_stays_compact_legacy_form(self):
         with tempfile.TemporaryDirectory() as td:
-            lead = _lead(Path(td), ["core-1"])
-            row = lead.pin_room("!r:x", "core-1")
+            lead = _lead(Path(td), ["worker-1"])
+            row = lead.pin_room("!r:x", "worker-1")
             self.assertNotIn("instances", row)
-            self.assertEqual(row["instance"], "core-1")
+            self.assertEqual(row["instance"], "worker-1")
 
     def test_sweep_routes_within_the_set_only(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
-            lead = _lead(ws, ["core-1", "core-2", "core-3"])
-            lead.pin_room("!r:x", ["core-2", "core-3"])
+            lead = _lead(ws, ["worker-1", "worker-2", "worker-3"])
+            lead.pin_room("!r:x", ["worker-2", "worker-3"])
             for i in range(4):
                 (ws / "tasks" / f"task-m{i}.txt").write_text(
                     f"id: task-m{i}\nchannel_id: !r:x\ntask: t\n")
             picks = {inst for _n, inst in lead.sweep()}
-            self.assertTrue(picks and picks <= {"core-2", "core-3"}, picks)
+            self.assertTrue(picks and picks <= {"worker-2", "worker-3"}, picks)
 
     def test_busy_member_yields_to_the_other(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
-            lead = _lead(ws, ["core-1", "core-2", "core-3"])
-            lead.pin_room("!r:x", ["core-2", "core-3"])
-            # load core-2 with an in-flight claim; core-3 idle
-            (ws / "tasks" / "task-b.claimed-core-2.txt").write_text("x")
+            lead = _lead(ws, ["worker-1", "worker-2", "worker-3"])
+            lead.pin_room("!r:x", ["worker-2", "worker-3"])
+            # load worker-2 with an in-flight claim; worker-3 idle
+            (ws / "tasks" / "task-b.claimed-worker-2.txt").write_text("x")
             (ws / "tasks" / "task-y.txt").write_text(
                 "id: task-y\nchannel_id: !r:x\ntask: t\n")
-            self.assertEqual(lead.sweep(), [("task-y.txt", "core-3")])
+            self.assertEqual(lead.sweep(), [("task-y.txt", "worker-3")])
 
     def test_whole_set_not_claiming_falls_through_to_loan(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
-            lead = _lead(ws, ["core-1", "core-2", "core-3"],
-                         claiming={"core-1"})
-            lead.pin_room("!r:x", ["core-2", "core-3"])
+            lead = _lead(ws, ["worker-1", "worker-2", "worker-3"],
+                         claiming={"worker-1"})
+            lead.pin_room("!r:x", ["worker-2", "worker-3"])
             (ws / "tasks" / "task-z.txt").write_text(
                 "id: task-z\nchannel_id: !r:x\ntask: t\n")
-            self.assertEqual(lead.sweep(), [("task-z.txt", "core-1")],
+            self.assertEqual(lead.sweep(), [("task-z.txt", "worker-1")],
                              "availability beats the binding when the whole "
                              "set is unclaiming")
             self.assertEqual(
-                lead.bindings()["!r:x"]["instances"], ["core-2", "core-3"],
+                lead.bindings()["!r:x"]["instances"], ["worker-2", "worker-3"],
                 "the loan must not consume the pin")
 
     def test_unpin_clears_the_set(self):
         with tempfile.TemporaryDirectory() as td:
-            lead = _lead(Path(td), ["core-1", "core-2"])
-            lead.pin_room("!r:x", ["core-1", "core-2"])
+            lead = _lead(Path(td), ["worker-1", "worker-2"])
+            lead.pin_room("!r:x", ["worker-1", "worker-2"])
             self.assertTrue(lead.unpin_room("!r:x"))
             row = lead.bindings()["!r:x"]
             self.assertNotIn("instances", row)
@@ -95,7 +95,7 @@ class MultiBindTests(unittest.TestCase):
 
     def test_empty_set_is_refused(self):
         with tempfile.TemporaryDirectory() as td:
-            lead = _lead(Path(td), ["core-1"])
+            lead = _lead(Path(td), ["worker-1"])
             with self.assertRaises(ValueError):
                 lead.pin_room("!r:x", [])
 

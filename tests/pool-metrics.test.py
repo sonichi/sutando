@@ -6,14 +6,21 @@ Run: python3 tests/pool-metrics.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+import io
+import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
+import pool_metrics  # noqa: E402
 from pool_metrics import PoolMetrics  # noqa: E402
 
 
@@ -75,6 +82,50 @@ class MetricsTests(unittest.TestCase):
         s = self.m.summarize()
         self.assertEqual(s["continuity_breaks"], 0)
         self.assertEqual(s["continuity_pairs"], 0)
+
+    def test_cli_prints_the_days_summary_as_json(self):
+        self.m.claimed("task-4", "b", fallback=True)
+        self.m.reclaimed("task-5", "a", reason="stuck")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = pool_metrics.summarize_cli([self.tmp.name, "2023-11-14"])
+        self.assertEqual(rc, 0)
+        s = json.loads(out.getvalue())
+        self.assertEqual((s["fallback_claims"], s["reclaims"]), (1, 1))
+
+    def test_cli_usage_exits_2(self):
+        err = io.StringIO()
+        with __import__("contextlib").redirect_stderr(err):
+            self.assertEqual(pool_metrics.summarize_cli([]), 2)
+        self.assertIn("usage", err.getvalue())
+
+
+class PoolStatusScriptTest(unittest.TestCase):
+    """scripts/pool-status.sh is the summary's consumer: a fake repo with the
+    real script, the real resolver and the real module, a stub config."""
+
+    def test_status_view_prints_the_summary(self):
+        with tempfile.TemporaryDirectory() as t:
+            td = Path(t)
+            repo = td / "repo"
+            (repo / "scripts").mkdir(parents=True)
+            (repo / "src" / "runtime-api").mkdir(parents=True)
+            for rel in ("scripts/pool-status.sh", "scripts/python-binary.sh",
+                        "src/runtime-api/pool_metrics.py"):
+                shutil.copy(REPO / rel, repo / rel)
+            cfg = repo / "scripts" / "sutando-config.sh"
+            cfg.write_text('#!/bin/bash\n[ "$1" = workspace ] && printf %s "$STUB_WS"\n')
+            cfg.chmod(0o755)
+            ws = td / "ws"
+            (ws / "state").mkdir(parents=True)
+            PoolMetrics(ws / "state").claimed("task-1", "worker-2", fallback=True)
+            r = subprocess.run(["bash", str(repo / "scripts" / "pool-status.sh")],
+                               env=dict(os.environ, STUB_WS=str(ws)),
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("6. lead metrics", r.stdout)
+            self.assertIn('"fallback_claims": 1', r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -31,7 +31,7 @@ class PoolStatusBindingsTest(unittest.TestCase):
 
     def writer(self):
         return PoolStatusWriter(
-            self.tasks, self.state, lambda: ["core-1"],
+            self.tasks, self.state, lambda: ["worker-1"],
             lambda i: True, now_fn=lambda: self.clock[0],
             bindings_fn=lambda: dict(self.bindings))
 
@@ -40,16 +40,16 @@ class PoolStatusBindingsTest(unittest.TestCase):
 
     def test_snapshot_carries_bindings_with_pinned_flags(self):
         self.bindings = {
-            "!room:x": {"instance": "core-1", "ts": 9.0, "pinned": True},
-            "chan-d": {"instance": "core-2", "ts": 8.0},
+            "!room:x": {"instance": "worker-1", "ts": 9.0, "pinned": True},
+            "chan-d": {"instance": "worker-2", "ts": 8.0},
             "junk": "not-a-row"}
         w = self.writer()
         self.assertTrue(w.maybe_write())
         got = self.read()["bindings"]
-        self.assertEqual(got["!room:x"], {"instance": "core-1",
+        self.assertEqual(got["!room:x"], {"instance": "worker-1",
                                           "pinned": True,
                                           "dedicated": False})
-        self.assertEqual(got["chan-d"], {"instance": "core-2",
+        self.assertEqual(got["chan-d"], {"instance": "worker-2",
                                          "pinned": False,
                                          "dedicated": False})
         self.assertNotIn("junk", got)
@@ -58,7 +58,7 @@ class PoolStatusBindingsTest(unittest.TestCase):
         w = self.writer()
         self.assertTrue(w.maybe_write())
         self.clock[0] += 5  # deep inside the 30s window
-        self.bindings = {"!room:x": {"instance": "core-1", "pinned": True}}
+        self.bindings = {"!room:x": {"instance": "worker-1", "pinned": True}}
         self.assertTrue(w.maybe_write(), "a pin must land immediately")
         self.assertEqual(self.read()["ts"], 1005)
 

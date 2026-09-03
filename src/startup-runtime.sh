@@ -551,7 +551,7 @@ pool_lead_supervised() {
   local label="com.sutando.pool-lead"
   local service="gui/$(id -u)/$label"
   local daemon="$REPO/scripts/pool-lead-daemon.py"
-  local installer="$REPO/scripts/install-core-pool.sh"
+  local installer="$REPO/scripts/install-worker-pool.sh"
   local template="$REPO/src/launchd/$label.plist"
 
   [ -f "$installer" ] && [ -f "$template" ] && [ -f "$daemon" ] || return 1

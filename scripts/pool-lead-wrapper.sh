@@ -1,5 +1,5 @@
 #!/bin/bash
-# Staged into the install bin dir (see scripts/install-core-pool.sh, which owns
+# Staged into the install bin dir (see scripts/install-worker-pool.sh, which owns
 # that path): launchd's TCC blocks exec of scripts
 # under the Documents tree, so the plist's ProgramArguments must point outside it.
 set -u

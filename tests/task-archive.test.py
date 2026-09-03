@@ -136,14 +136,14 @@ class TestFindTaskFile(unittest.TestCase):
         self.assertEqual(result.name, "task-123.txt")
 
     def test_claimed_file_returned_when_bare_missing(self) -> None:
-        self._write("task-456.claimed-core-2.txt")
+        self._write("task-456.claimed-worker-2.txt")
         result = find_task_file(self.tasks_dir, "task-456")
         self.assertIsNotNone(result)
-        self.assertEqual(result.name, "task-456.claimed-core-2.txt")
+        self.assertEqual(result.name, "task-456.claimed-worker-2.txt")
 
     def test_bare_preferred_over_claimed(self) -> None:
         self._write("task-789.txt")
-        self._write("task-789.claimed-core-1.txt")
+        self._write("task-789.claimed-worker-1.txt")
         result = find_task_file(self.tasks_dir, "task-789")
         self.assertEqual(result.name, "task-789.txt")
 
@@ -152,11 +152,11 @@ class TestFindTaskFile(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_multiple_claimed_returns_first_lexicographic(self) -> None:
-        self._write("task-000.claimed-core-2.txt")
-        self._write("task-000.claimed-core-3.txt")
+        self._write("task-000.claimed-worker-2.txt")
+        self._write("task-000.claimed-worker-3.txt")
         result = find_task_file(self.tasks_dir, "task-000")
         self.assertIsNotNone(result)
-        self.assertIn("claimed-core-", result.name)
+        self.assertIn("claimed-worker-", result.name)
 
 
 
@@ -277,9 +277,9 @@ class TaskIdFromFilename(unittest.TestCase):
 
     def test_every_real_filename_form_yields_one_canonical_id(self):
         for name in ("task-abc123.txt",
-                     "task-abc123.claimed-core-2.txt",
-                     "task-abc123.claimed-core-11.txt",
-                     "task-abc123.assigned-core-3.txt",
+                     "task-abc123.claimed-worker-2.txt",
+                     "task-abc123.claimed-worker-11.txt",
+                     "task-abc123.assigned-worker-3.txt",
                      "task-abc123.assigned-follower-7.txt",
                      "task-abc123.txt.1",
                      "task-abc123.txt.archive-failed-9"):
@@ -287,16 +287,16 @@ class TaskIdFromFilename(unittest.TestCase):
                 self.assertEqual(task_id_from_filename(name), "task-abc123")
 
     def test_claimed_is_the_regression_stem_gets_wrong(self):
-        name = "task-abc123.claimed-core-2.txt"
-        self.assertEqual(Path(name).stem, "task-abc123.claimed-core-2")   # the old behaviour
+        name = "task-abc123.claimed-worker-2.txt"
+        self.assertEqual(Path(name).stem, "task-abc123.claimed-worker-2")   # the old behaviour
         self.assertEqual(task_id_from_filename(name), "task-abc123")      # the fixed one
 
     def test_instance_label_is_opaque(self):
         """pool_lead interpolates the instance with re.escape, so the label is
         arbitrary — a reader must not assume `core-<digits>`."""
-        for name in ("task-abc123.claimed-core-x.txt",
+        for name in ("task-abc123.claimed-worker-x.txt",
                      "task-abc123.assigned-follower-7.txt",
-                     "task-abc123.claimed-core-2.local.txt"):
+                     "task-abc123.claimed-worker-2.local.txt"):
             with self.subTest(name=name):
                 self.assertEqual(task_id_from_filename(name), "task-abc123")
 
@@ -305,7 +305,7 @@ class TaskIdFromFilename(unittest.TestCase):
         suffixes by lookahead, so banning dots would reject a valid name."""
         self.assertEqual(task_id_from_filename("task-a.b.txt"), "task-a.b")
         self.assertEqual(
-            task_id_from_filename("task-a.b.claimed-core-2.txt"), "task-a.b")
+            task_id_from_filename("task-a.b.claimed-worker-2.txt"), "task-a.b")
 
     def test_hyphenated_ids_survive(self):
         self.assertEqual(
@@ -322,11 +322,11 @@ class TaskIdFromFilename(unittest.TestCase):
         one state, misses its sibling, and the archive silently strands the file."""
         cases = {
             "task-A.txt": "task-A",
-            "task-B.claimed-core-1.txt": "task-B",
-            "task-C.assigned-core-2.txt": "task-C",
+            "task-B.claimed-worker-1.txt": "task-B",
+            "task-C.assigned-worker-2.txt": "task-C",
             "task-D.claimed-worker-7.txt": "task-D",
             "task-E.claimed-core1.txt": "task-E",
-            "task-F.a.claimed-core-3.txt": "task-F.a",
+            "task-F.a.claimed-worker-3.txt": "task-F.a",
         }
         with tempfile.TemporaryDirectory() as tmp:
             tasks = Path(tmp)
@@ -343,14 +343,14 @@ class TaskIdFromFilename(unittest.TestCase):
         """The glob is a prefix match, so the grammar must confirm the id itself."""
         with tempfile.TemporaryDirectory() as tmp:
             tasks = Path(tmp)
-            (tasks / "task-F.a.claimed-core-3.txt").write_text("x")
+            (tasks / "task-F.a.claimed-worker-3.txt").write_text("x")
             self.assertIsNone(find_task_file(tasks, "task-F"))
 
     def test_round_trips_with_find_task_file(self):
         """The two directions must agree, or a locator and a reader disagree."""
         with tempfile.TemporaryDirectory() as tmp:
             tasks = Path(tmp)
-            claimed = tasks / "task-abc123.claimed-core-2.txt"
+            claimed = tasks / "task-abc123.claimed-worker-2.txt"
             claimed.write_text("id: task-abc123\n")
             task_id = task_id_from_filename(claimed.name)
             self.assertEqual(task_id, "task-abc123")

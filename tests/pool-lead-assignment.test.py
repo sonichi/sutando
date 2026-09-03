@@ -26,7 +26,7 @@ class PoolLeadTests(unittest.TestCase):
         self.state = root / "state"
         self.tasks.mkdir()
         self.state.mkdir()
-        self.alive = {"core-a": True, "core-b": True}
+        self.alive = {"worker-a": True, "worker-b": True}
         self.clock = [1000.0]
         self.lead = PoolLead(
             self.tasks, self.state,
@@ -70,14 +70,14 @@ class PoolLeadTests(unittest.TestCase):
     def test_both_halves_present_is_not_reassigned(self):
         self._task("task-T2.txt")
         self._result("task-T2")
-        self._flag("task-T2", "core-a")
+        self._flag("task-T2", "worker-a")
         self.assertEqual(self.lead.sweep(), [])
 
     def test_flag_without_result_IS_assigned(self):
         """The unreachable-by-finish_task case, kept as the negative control:
         no result means no user-visible effect, so the task must still run."""
         self._task("task-T3.txt")
-        self._flag("task-T3", "core-a")
+        self._flag("task-T3", "worker-a")
         self.assertEqual([n for n, _ in self.lead.sweep()], ["task-T3.txt"])
 
     def test_consumed_result_dispositions_also_count(self):
@@ -119,20 +119,20 @@ class PoolLeadTests(unittest.TestCase):
         self.assertEqual(row["ts"], self.clock[0])
 
     def test_least_loaded_gets_channelless_work(self):
-        self.alive["core-c"] = True  # a/b stay in the owner lane (c = routine)
-        (self.tasks / "task-old.assigned-core-a.txt").write_text("x")
+        self.alive["worker-c"] = True  # a/b stay in the owner lane (c = routine)
+        (self.tasks / "task-old.assigned-worker-a.txt").write_text("x")
         self._task("task-new.txt")
         inst = dict(self.lead.sweep())["task-new.txt"]
-        self.assertEqual(inst, "core-b")
+        self.assertEqual(inst, "worker-b")
 
     def test_dead_follower_assignments_reclaimed_claims_kept(self):
-        (self.tasks / "task-r1.assigned-core-a.txt").write_text("x")
-        (self.tasks / "task-r2.claimed-core-a.txt").write_text("x")
-        self.alive["core-a"] = False
+        (self.tasks / "task-r1.assigned-worker-a.txt").write_text("x")
+        (self.tasks / "task-r2.claimed-worker-a.txt").write_text("x")
+        self.alive["worker-a"] = False
         reclaimed = self.lead.reclaim_dead()
-        self.assertEqual(reclaimed, ["task-r1.assigned-core-a.txt"])
+        self.assertEqual(reclaimed, ["task-r1.assigned-worker-a.txt"])
         self.assertIn("task-r1.txt", self._names())
-        self.assertIn("task-r2.claimed-core-a.txt", self._names())
+        self.assertIn("task-r2.claimed-worker-a.txt", self._names())
 
     def test_no_live_followers_leaves_tasks_untouched(self):
         self._task("task-x.txt")
@@ -151,9 +151,9 @@ class PoolLeadTests(unittest.TestCase):
     def test_assigned_file_never_reassigned(self):
         # an assigned name must not re-enter the pending set — the id
         # charset contains dots, so this once double-assigned (L1 bug)
-        (self.tasks / "task-old.assigned-core-a.txt").write_text("x")
+        (self.tasks / "task-old.assigned-worker-a.txt").write_text("x")
         self.assertEqual(self.lead.sweep(), [])
-        self.assertEqual(self._names(), ["task-old.assigned-core-a.txt"])
+        self.assertEqual(self._names(), ["task-old.assigned-worker-a.txt"])
 
 
 
@@ -172,8 +172,8 @@ class ReclaimClaimedTest(unittest.TestCase):
         (self.state / "cores").mkdir(parents=True)
         self.lead = PoolLead(
             self.tasks, self.state,
-            followers_fn=lambda: ["core-1"],
-            alive_fn=lambda inst: inst == "core-1",
+            followers_fn=lambda: ["worker-1"],
+            alive_fn=lambda inst: inst == "worker-1",
             results_dir=self.results,
         )
 
@@ -191,47 +191,47 @@ class ReclaimClaimedTest(unittest.TestCase):
         (done / f"task-{tid}.flag").write_text("")
 
     def test_dead_claimer_without_done_flag_repools(self):
-        self._claimed("x1", "core-9")
+        self._claimed("x1", "worker-9")
         out = self.lead.reclaim_claimed()
-        self.assertEqual(out, [("task-x1.claimed-core-9.txt", "repooled")])
+        self.assertEqual(out, [("task-x1.claimed-worker-9.txt", "repooled")])
         self.assertTrue((self.tasks / "task-x1.txt").exists())
 
     def test_dead_claimer_with_flag_and_result_restores_for_delivery_only(self):
-        self._claimed("x2", "core-9")
-        self._flag("x2", "core-9")
+        self._claimed("x2", "worker-9")
+        self._flag("x2", "worker-9")
         (self.results / "task-x2.txt").write_text("the reply")
         out = self.lead.reclaim_claimed()
-        self.assertEqual(out, [("task-x2.claimed-core-9.txt", "delivered")])
+        self.assertEqual(out, [("task-x2.claimed-worker-9.txt", "delivered")])
         self.assertTrue((self.tasks / "task-x2.txt").exists())
         self.assertEqual(self.lead.sweep(), [])  # never reassigned
 
     def test_flag_without_result_repools_and_reassigns(self):
         # the silent-loss edge: crash after flag, before result write
-        self._claimed("x5", "core-9")
-        self._flag("x5", "core-9")
+        self._claimed("x5", "worker-9")
+        self._flag("x5", "worker-9")
         out = self.lead.reclaim_claimed()
-        self.assertEqual(out, [("task-x5.claimed-core-9.txt", "repooled")])
-        self.assertEqual(self.lead.sweep(), [("task-x5.txt", "core-1")])
+        self.assertEqual(out, [("task-x5.claimed-worker-9.txt", "repooled")])
+        self.assertEqual(self.lead.sweep(), [("task-x5.txt", "worker-1")])
 
     def test_bridge_archived_result_still_counts_as_delivered(self):
-        self._claimed("x6", "core-9")
-        self._flag("x6", "core-9")
+        self._claimed("x6", "worker-9")
+        self._flag("x6", "worker-9")
         (self.results / "archive").mkdir()
         (self.results / "archive" / "task-x6.txt").write_text("consumed")
         out = self.lead.reclaim_claimed()
-        self.assertEqual(out, [("task-x6.claimed-core-9.txt", "delivered")])
+        self.assertEqual(out, [("task-x6.claimed-worker-9.txt", "delivered")])
         self.assertEqual(self.lead.sweep(), [])
 
     def test_live_claimer_untouched(self):
-        f = self._claimed("x3", "core-1")
+        f = self._claimed("x3", "worker-1")
         self.assertEqual(self.lead.reclaim_claimed(), [])
         self.assertTrue(f.exists())
 
     def test_repooled_task_is_reassignable(self):
-        self._claimed("x4", "core-9")
+        self._claimed("x4", "worker-9")
         self.lead.reclaim_claimed()
         assigned = self.lead.sweep()
-        self.assertEqual(assigned, [("task-x4.txt", "core-1")])
+        self.assertEqual(assigned, [("task-x4.txt", "worker-1")])
 
 
 
@@ -248,12 +248,12 @@ class AffinityBusyYieldTest(unittest.TestCase):
         self.tasks.mkdir(); (self.state / "pool").mkdir(parents=True)
         self.lead = PoolLead(
             self.tasks, self.state,
-            followers_fn=lambda: ["core-1", "core-2", "core-3"],
+            followers_fn=lambda: ["worker-1", "worker-2", "worker-3"],
             alive_fn=lambda inst: True,
         )
         import json
         (self.state / "pool" / "affinity.json").write_text(
-            json.dumps({"chan-A": {"instance": "core-2", "ts": self.lead.now()}}))
+            json.dumps({"chan-A": {"instance": "worker-2", "ts": self.lead.now()}}))
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
@@ -268,16 +268,16 @@ class AffinityBusyYieldTest(unittest.TestCase):
         return f
 
     def test_busy_home_core_keeps_the_room(self):
-        self._backlog("core-2", 5)  # far past any depth threshold
+        self._backlog("worker-2", 5)  # far past any depth threshold
         self._new_task()
         out = dict(self.lead.sweep())
-        self.assertEqual(out.get("task-fresh.txt"), "core-2")
+        self.assertEqual(out.get("task-fresh.txt"), "worker-2")
 
     def test_handler_below_threshold_keeps_channel(self):
-        self._backlog("core-2", 2)
+        self._backlog("worker-2", 2)
         self._new_task()
         out = dict(self.lead.sweep())
-        self.assertEqual(out.get("task-fresh.txt"), "core-2")
+        self.assertEqual(out.get("task-fresh.txt"), "worker-2")
 
     def test_routine_assignment_never_rebinds_a_room(self):
         # owner report 2026-08-26: a routine task tagged with a room stamped
@@ -286,13 +286,13 @@ class AffinityBusyYieldTest(unittest.TestCase):
             "id: task-r9\nchannel_id: chan-A\npriority: low\ntask: t\n")
         self.lead.sweep()
         row = self.lead._load_affinity()["chan-A"]
-        self.assertEqual(row["instance"], "core-2", "binding must survive")
+        self.assertEqual(row["instance"], "worker-2", "binding must survive")
 
     def test_busy_core_keeps_unclaimed_assignments_and_its_rooms(self):
         # busy != wedged: a mid-task core claims later; repooling moved
         # bound rooms off their context core
-        (self.tasks / "task-w1.claimed-core-2.txt").write_text("x")
-        stuck = self.tasks / "task-w2.assigned-core-2.txt"
+        (self.tasks / "task-w1.claimed-worker-2.txt").write_text("x")
+        stuck = self.tasks / "task-w2.assigned-worker-2.txt"
         stuck.write_text("id: task-w2\nchannel_id: chan-A\n")
         self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
         out = self.lead.reclaim_stuck_assignments(max_age_s=300)
@@ -303,8 +303,8 @@ class AffinityBusyYieldTest(unittest.TestCase):
     def test_wedged_busy_core_yields_at_the_deferral_cap(self):
         # a claimed file is not proof of progress: past BUSY_DEFER_MAX_S the
         # assignment repools even though the core still holds a claim
-        (self.tasks / "task-w3.claimed-core-2.txt").write_text("x")
-        stuck = self.tasks / "task-w4.assigned-core-2.txt"
+        (self.tasks / "task-w3.claimed-worker-2.txt").write_text("x")
+        stuck = self.tasks / "task-w4.assigned-worker-2.txt"
         stuck.write_text("id: task-w4\nchannel_id: chan-A\n")
         import os as _os
         _os.utime(stuck, (self.lead.now() - 1801.0,) * 2)
@@ -316,9 +316,9 @@ class AffinityBusyYieldTest(unittest.TestCase):
     def test_post_busy_grace_lets_the_core_claim_before_repool(self):
         # a core that was busy through the whole window gets a fresh short
         # claim grace when the busy spell ends, instead of an instant repool
-        busy = self.tasks / "task-g1.claimed-core-2.txt"
+        busy = self.tasks / "task-g1.claimed-worker-2.txt"
         busy.write_text("x")
-        stuck = self.tasks / "task-g2.assigned-core-2.txt"
+        stuck = self.tasks / "task-g2.assigned-worker-2.txt"
         stuck.write_text("id: task-g2\nchannel_id: chan-A\n")
         self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
         self.assertEqual(self.lead.reclaim_stuck_assignments(max_age_s=300), [])
@@ -336,13 +336,13 @@ class AffinityBusyYieldTest(unittest.TestCase):
         # rename preserves arrival mtime; assignment must stamp its own time
         # or a task queued > cap is repooled the moment the claim window ends
         import os as _os
-        (self.tasks / "task-s1.claimed-core-2.txt").write_text("x")
+        (self.tasks / "task-s1.claimed-worker-2.txt").write_text("x")
         old = self.tasks / "task-s2.txt"
         old.write_text("id: task-s2\nsource: slack\nchannel_id: chan-A\n"
                        "access_tier: owner\npriority: normal\ntask: hi\n")
         _os.utime(old, (self.lead.now() - 7200.0,) * 2)  # queued two hours
         self.lead.sweep()
-        stuck = self.tasks / "task-s2.assigned-core-2.txt"
+        stuck = self.tasks / "task-s2.assigned-worker-2.txt"
         self.assertTrue(stuck.exists())
         self.lead._save_assign_ledger({stuck.name: self.lead.now() - 301.0})
         out = self.lead.reclaim_stuck_assignments(max_age_s=300)
@@ -351,13 +351,13 @@ class AffinityBusyYieldTest(unittest.TestCase):
     def test_unclaimed_reclaim_releases_the_room_binding(self):
         # home core heartbeats but never claims: reclaim must drop the row
         # so the re-pick moves the room to a core that answers.
-        stuck = self.tasks / "task-stuck.assigned-core-2.txt"
+        stuck = self.tasks / "task-stuck.assigned-worker-2.txt"
         stuck.write_text("id: task-stuck\nchannel_id: chan-A\n")
         self.lead._save_assign_ledger({stuck.name: 0.0})
         self.lead.reclaim_stuck_assignments(max_age_s=1)
         self.assertNotIn("chan-A", self.lead._load_affinity())
         out = dict(self.lead.sweep())
-        self.assertNotEqual(out.get("task-stuck.txt"), "core-2")
+        self.assertNotEqual(out.get("task-stuck.txt"), "worker-2")
         self.assertEqual(
             self.lead._load_affinity()["chan-A"]["instance"],
             out["task-stuck.txt"])  # new home re-stamped
@@ -372,7 +372,7 @@ class RoutineLaneEscape(unittest.TestCase):
         root = Path(self.tmp.name)
         self.tasks = root / "tasks"; self.tasks.mkdir()
         self.state = root / "state"; self.state.mkdir()
-        self.alive = {"core-1": True, "core-2": True, "core-3": True}
+        self.alive = {"worker-1": True, "worker-2": True, "worker-3": True}
         self.clock = [1000.0]
         self.lead = PoolLead(
             self.tasks, self.state,

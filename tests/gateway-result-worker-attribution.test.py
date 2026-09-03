@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A result POST carries which pool worker produced it, as structured
-metadata: {"metadata": {"worker_id": "core-2"}} -> broker -> the Matrix
+metadata: {"metadata": {"worker_id": "worker-2"}} -> broker -> the Matrix
 event's content["space.ag2.worker"].id (ag2space-backend#882).
 
 The worker is read from the per-core done-flag the pool already writes
@@ -64,18 +64,18 @@ class WorkerAttribution(unittest.TestCase):
         return self.seen["payload"]
 
     def test_worker_rides_the_payload(self):
-        self._flag("core-2", "task-0023dacce4b1f0a9c7")
+        self._flag("worker-2", "task-0023dacce4b1f0a9c7")
         doc = self._doc("task-0023dacce4b1f0a9c7")
-        self.assertEqual(doc["metadata"], {"worker_id": "core-2"})
+        self.assertEqual(doc["metadata"], {"worker_id": "worker-2"})
         # Attribution must not leak into the text the user reads.
         self.assertEqual(doc["body"], "done!")
 
     def test_varying_the_worker_varies_the_payload(self):
-        self._flag("core-1", "task-dev~task-07c59a1b2d3e4f5061")
-        self._flag("core-3", "task-9f81c02de5a6b7c8d9")
+        self._flag("worker-1", "task-dev~task-07c59a1b2d3e4f5061")
+        self._flag("worker-3", "task-9f81c02de5a6b7c8d9")
         a, b = self._doc("task-dev~task-07c59a1b2d3e4f5061"), self._doc("task-9f81c02de5a6b7c8d9")
-        self.assertEqual(a["metadata"]["worker_id"], "core-1")
-        self.assertEqual(b["metadata"]["worker_id"], "core-3")
+        self.assertEqual(a["metadata"]["worker_id"], "worker-1")
+        self.assertEqual(b["metadata"]["worker_id"], "worker-3")
         self.assertNotEqual(a["metadata"], b["metadata"])
 
     def test_control_no_flag_sends_no_metadata(self):
@@ -84,14 +84,14 @@ class WorkerAttribution(unittest.TestCase):
         self.assertNotIn("metadata", self._doc("task-unflagged00000000"))
 
     def test_control_ambiguous_flags_send_no_metadata(self):
-        self._flag("core-1", "task-4ambiguous000000a")
-        self._flag("core-2", "task-4ambiguous000000a")
+        self._flag("worker-1", "task-4ambiguous000000a")
+        self._flag("worker-2", "task-4ambiguous000000a")
         self.assertNotIn("metadata", self._doc("task-4ambiguous000000a"))
 
     def test_control_a_bare_id_does_not_attribute(self):
         # Production never passes a bare id; if one ever reaches here it must
         # not resolve, or the prefix contract has silently changed shape.
-        self._flag("core-2", "task-6bareid00000000000")
+        self._flag("worker-2", "task-6bareid00000000000")
         self.assertEqual(self.mod._worker_of("6bareid00000000000"), "")
 
     def test_worker_of_survives_a_missing_state_tree(self):

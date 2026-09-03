@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A task file claimed mid-scan must not 500 the /tasks/active endpoint.
 
-A claim RENAMES `task-{id}.txt` to `task-{id}.claimed-core-N.txt`. Between
+A claim RENAMES `task-{id}.txt` to `task-{id}.claimed-worker-N.txt`. Between
 `TASK_DIR.glob` listing the old name and `_active_task_rows` reading it, the
 path is gone; the exception escapes `do_GET` and the client sees the connection
 closed with no response.
@@ -55,7 +55,7 @@ class VanishingTaskFile(unittest.TestCase):
         def fake_glob(self_path, pattern):
             yield from real_glob(self_path, pattern)
             if ghost and self_path == self.tasks:
-                yield self.tasks / "task-1788000000001.claimed-core-1.txt"
+                yield self.tasks / "task-1788000000001.claimed-worker-1.txt"
 
         with patch.object(self.mod, "TASK_DIR", self.tasks), \
              patch.object(self.mod, "RESULT_DIR", self.results), \

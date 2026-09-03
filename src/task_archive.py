@@ -1,9 +1,9 @@
 """Task-file locator for archive calls (#933).
 
-claim_task.py (#884) renames task-{id}.txt → task-{id}.claimed-core-N.txt
-when a core claims work. Bridge archive calls that hard-code the bare
+claim_task.py (#884) renames task-{id}.txt → task-{id}.claimed-worker-N.txt
+when a worker claims work. Bridge archive calls that hard-code the bare
 task-{id}.txt path silently no-op after claiming, leaving stranded
-.claimed-core-N.txt files in tasks/ forever.
+.claimed-worker-N.txt files in tasks/ forever.
 
 Usage:
     from task_archive import find_task_file

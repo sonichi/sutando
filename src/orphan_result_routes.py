@@ -72,7 +72,7 @@ def orphan_result_routes(
         if task_id in known:
             continue
         # Two helpers, not one: find_task_file is the only one that matches a
-        # CLAIMED `<id>.claimed-core-N`; find_archived_task is the measured walk.
+        # CLAIMED `<id>.claimed-<worker>`; find_archived_task is the measured walk.
         # Both stat the tree, so an unreadable dir raises here on some Python
         # versions and returns None on others; the caller polls every second, so
         # one bad directory must skip its item rather than kill the loop.

@@ -15,7 +15,7 @@ Fix: chat_id is durable — it's in the task file's own headers from creation
 time (`f"chat_id: {chat_id}\n"` at task-write time) — even though
 pending_replies isn't. _recover_orphaned_task_routing() rebuilds routing for
 any orphaned result by re-reading the original task file — checking BOTH
-live tasks/ (via find_task_file, bare or claimed-core-N) AND the archive
+live tasks/ (via find_task_file, bare or claimed-worker-N) AND the archive
 (via local_task_protocol.find_archived_task: flat tasks/archive/,
 tasks/processed/, and month-partitioned tasks/archive/YYYY-MM/).
 
@@ -160,8 +160,8 @@ class TestRecoverOrphanedTaskRouting(unittest.TestCase):
         self.assertEqual(recovered, {})
 
     def test_claimed_task_file_variant_is_found(self):
-        """find_task_file() also matches the claimed-core-N rename shape."""
-        _write_task(self.tasks / "task-888.claimed-core-1.txt", id="task-888",
+        """find_task_file() also matches the claimed-worker-N rename shape."""
+        _write_task(self.tasks / "task-888.claimed-worker-1.txt", id="task-888",
                     source="telegram", chat_id="42")
         (self.results / "task-888.txt").write_text("claimed then restarted")
         recovered = self.mod._recover_orphaned_task_routing(self.results, self.tasks, set())

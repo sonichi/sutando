@@ -527,7 +527,7 @@ def _clear_progress(task_id: str) -> None:
 
 
 def _find_task_file_anywhere(tasks_dir: Path, task_id: str) -> Path | None:
-    """Locate task_id's file across live tasks/ (bare or claimed-core-N) AND
+    """Locate task_id's file across live tasks/ (bare or claimed-<worker>) AND
     the archive (flat tasks/archive/, tasks/processed/, and month-partitioned
     tasks/archive/YYYY-MM/).
 

@@ -51,8 +51,8 @@ def main() -> int:
 
     snap_path = Path(tmp) / "state" / "pool-status.json"
     snap_path.parent.mkdir(parents=True, exist_ok=True)
-    blob = {"ts": 1, "writer": "pool-lead", "live_cores": ["core-1"],
-            "bindings": {"!r:x": {"instance": "core-1", "pinned": True,
+    blob = {"ts": 1, "writer": "pool-lead", "live_cores": ["worker-1"],
+            "bindings": {"!r:x": {"instance": "worker-1", "pinned": True,
                                   "dedicated": False}}}
     snap_path.write_text(json.dumps(blob))
     check(rtc._maybe_push_workers_snapshot() is True,

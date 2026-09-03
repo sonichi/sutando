@@ -24,8 +24,9 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 from task_priority import sort_tasks_by_priority  # noqa: E402
+import pool_names as pn  # noqa: E402
 
-# Depth at which channelless work overflows to the idle lane core; room
+# Depth at which channelless work overflows to the idle lane worker; room
 # affinity itself is binding and never yields on load (owner 2026-08-26).
 AFFINITY_BUSY_MAX = max(1, int(os.environ.get("SUTANDO_AFFINITY_BUSY_MAX", "3")))
 ASSIGN_STUCK_S = 300         # assigned but unclaimed this long → repool
@@ -54,6 +55,20 @@ _CHANNEL_RE = re.compile(r"^(?:channel_id|chat_id):\s*(\S+)", re.M)
 _TARGET_RE = re.compile(r"^target_worker:\s*(\S+)", re.M)
 _FANOUT_RE = re.compile(r"^fan_out:\s*true\s*$", re.M | re.I)
 _INST_RE = re.compile(r"^[A-Za-z0-9@:._-]{1,128}$")
+
+
+def _canonical_rows(table: dict) -> dict:
+    """Affinity rows name workers; a pre-rename `core-N` row is `worker-N`."""
+    out = {}
+    for ch, row in table.items():
+        if isinstance(row, dict):
+            row = dict(row)
+            if isinstance(row.get("instance"), str):
+                row["instance"] = pn.canonical(row["instance"])
+            if isinstance(row.get("instances"), list):
+                row["instances"] = [pn.canonical(i) for i in row["instances"]]
+        out[ch] = row
+    return out
 _LANE_RE = re.compile(
     r"^(?P<key>access_tier|priority|interaction_type):\s*(?P<val>\S+)", re.M)
 
@@ -139,6 +154,10 @@ class PoolLead:
         self.now = now_fn
         self.metrics = metrics  # PoolMetrics or None; recording is optional
 
+    def _record_reclaim(self, task: str, instance: str, reason: str) -> None:
+        if self.metrics is not None:
+            self.metrics.reclaimed(task, instance, reason=reason)
+
     # ── affinity table (single-writer: the lead) ────────────────────────────
     def _affinity_path(self) -> Path:
         return self.state_dir / "pool" / "affinity.json"
@@ -146,9 +165,9 @@ class PoolLead:
     def _load_affinity(self) -> dict:
         try:
             data = json.loads(self._affinity_path().read_text())
-            return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
+        return _canonical_rows(data) if isinstance(data, dict) else {}
 
     def _save_affinity(self, table: dict) -> None:
         p = self._affinity_path()
@@ -169,8 +188,8 @@ class PoolLead:
                  dedicated: bool = False) -> dict:
         """Pin a room to one worker, or to a bound SET (pool-restriction
         semantics: the lead routes each task to one member of the set)."""
-        instances = [instance] if isinstance(instance, str) else [
-            str(i) for i in instance if str(i).strip()]
+        instances = [pn.canonical(instance)] if isinstance(instance, str) else [
+            pn.canonical(i) for i in instance if str(i).strip()]
         if not instances:
             raise ValueError("pin_room: empty worker set")
         with self._affinity_lock():
@@ -219,30 +238,34 @@ class PoolLead:
 
     # ── pool state ──────────────────────────────────────────────────────────
     def _live_followers(self) -> "list[str]":
-        return [f for f in self.followers_fn()
-                if _INST_RE.match(str(f)) and self.alive_fn(f)]
+        # A legacy `core-N` beat is the same seat as `worker-N`: one entry.
+        out: "list[str]" = []
+        for f in self.followers_fn():
+            c = pn.canonical(f)
+            if _INST_RE.match(c) and c not in out and self.alive_fn(c):
+                out.append(c)
+        return out
 
     def _claimed_load(self, instance: str) -> int:
-        """Claims only — assigned-but-unclaimed files do not count. A core
+        """Claims only — assigned-but-unclaimed files do not count. A worker
         with claims in flight is BUSY, which is not the same as wedged."""
-        pat = re.compile(rf"\.claimed-{re.escape(instance)}\.txt$")
+        suffixes = pn.claimed_suffixes(instance)
         try:
             return sum(1 for f in self.tasks_dir.iterdir()
-                       if pat.search(f.name))
+                       if f.name.endswith(suffixes))
         except OSError:
             return 0
 
     def _load(self, instance: str) -> int:
-        pat = re.compile(
-            rf"\.(?:assigned|claimed)-{re.escape(instance)}\.txt$")
+        suffixes = pn.assigned_suffixes(instance) + pn.claimed_suffixes(instance)
         try:
             return sum(1 for f in self.tasks_dir.iterdir()
-                       if pat.search(f.name))
+                       if f.name.endswith(suffixes))
         except OSError:
             return 0
 
-    def _lane_core_of(self, followers: "list[str]") -> "str | None":
-        """Highest CLAUDE core is the routine lane (owner 2026-08-25); a codex
+    def _lane_worker_of(self, followers: "list[str]") -> "str | None":
+        """Highest CLAUDE worker is the routine lane (owner 2026-08-25); a codex
         follower sweeps on a timer, so maintenance there waits for a poll."""
         eligible = [f for f in followers
                     if self.runtime_fn(f) == "claude"] or followers
@@ -252,32 +275,32 @@ class PoolLead:
     def _pick(self, channel: "str | None", followers: "list[str]",
               affinity: dict, lane: str = "owner") -> str:
         # Soft lanes (owner 2026-08-23): owner traffic stays off the lane
-        # core except as saturated-pool overflow.
+        # worker except as saturated-pool overflow.
         eligible = [f for f in followers
                     if self.runtime_fn(f) == "claude"] or followers
-        lane_core = self._lane_core_of(followers)
+        lane_worker = self._lane_worker_of(followers)
         # A dedicated worker serves only its own room (owner 2026-08-30);
         # reserved-elsewhere workers leave the general rotation entirely.
         reserved = {r.get("instance") for ch, r in affinity.items()
                     if isinstance(r, dict) and r.get("exclusive")
                     and ch != channel}
-        # Wedge escape: the routine pin holds only while the lane core is
+        # Wedge escape: the routine pin holds only while the lane worker is
         # below the busy cap and demonstrably claiming; else fall through.
-        if (lane == "routine" and lane_core is not None
-                and lane_core not in reserved
-                and self._load(lane_core) < AFFINITY_BUSY_MAX
-                and self._claiming(lane_core)):
-            return lane_core
-        # owner prefers claude seats; a sole claude doubles as lane core yet stays
+        if (lane == "routine" and lane_worker is not None
+                and lane_worker not in reserved
+                and self._load(lane_worker) < AFFINITY_BUSY_MAX
+                and self._claiming(lane_worker)):
+            return lane_worker
+        # owner prefers claude seats; a sole claude doubles as lane worker yet stays
         # owner-eligible. All-reserved pool falls back — never starve a task.
         free = [f for f in eligible if f not in reserved] or eligible
-        primary = [f for f in free if f != lane_core] or free
+        primary = [f for f in free if f != lane_worker] or free
         # A repool drops the follower's load, so least-loaded actively PREFERS
-        # the core that just failed to claim. Never narrow to empty.
+        # the worker that just failed to claim. Never narrow to empty.
         primary = [f for f in primary if self._claiming(f)] or primary
         if channel:
             row = affinity.get(channel)
-            # Binding: a live home core keeps its room; only death or an
+            # Binding: a live home worker keeps its room; only death or an
             # unclaimed-reclaim moves it. Explicit pins beat lane defaults.
             bound = row.get("instances") if isinstance(row, dict) else None
             if isinstance(bound, list) and row.get("pinned"):
@@ -300,10 +323,10 @@ class PoolLead:
         # equal load -> least-recently-picked, so an idle pool round-robins
         pick = min(primary, key=lambda f: (
             self._load(f), self._last_pick.get(str(f), 0.0), str(f)))
-        if (lane_core is not None and lane_core not in reserved
+        if (lane_worker is not None and lane_worker not in reserved
                 and self._load(pick) >= AFFINITY_BUSY_MAX
-                and self._load(lane_core) == 0 and self._claiming(lane_core)):
-            pick = lane_core  # overflow: owner lane saturated, lane idle
+                and self._load(lane_worker) == 0 and self._claiming(lane_worker)):
+            pick = lane_worker  # overflow: owner lane saturated, lane idle
         self._last_pick[str(pick)] = self.now()
         return pick
 
@@ -326,7 +349,7 @@ class PoolLead:
             return []
         out = []
         for inst in sorted(live):
-            copy = f.with_name(f"{stem}~{inst}.assigned-{inst}.txt")
+            copy = f.with_name(f"{stem}~{inst}{pn.assigned_suffix(inst)}")
             try:
                 copy.write_text(body)
                 out.append((copy.name, inst))
@@ -395,13 +418,13 @@ class PoolLead:
             else:
                 inst = self._pick(channel, followers, affinity, lane)
             if lane == "owner" and (
-                    (inst == self._lane_core_of(followers) and inst != bound)
+                    (inst == self._lane_worker_of(followers) and inst != bound)
                     or (bound is not None and bound not in followers)):
                 self._trace({"ts": self.now(), "event": "anomalous_owner_pick",
                              "task": f.name, "inst": str(inst), "bound": bound,
                              "channel": channel, "alive": live})
             target = f.with_name(
-                f.name[:-len(".txt")] + f".assigned-{inst}.txt")
+                f.name[:-len(".txt")] + pn.assigned_suffix(inst))
             try:
                 arrived = f.stat().st_mtime  # before rename — f is gone after
             except OSError:
@@ -411,11 +434,11 @@ class PoolLead:
                 os.utime(target)  # stamp assignment time; rename keeps arrival mtime
             except OSError:
                 continue
-            # Only an owner-lane pick off the lane core may (re)bind a room:
+            # Only an owner-lane pick off the lane worker may (re)bind a room:
             # a routine/overflow landing there must not become a sticky steal
             prev = affinity.get(channel) if channel else None
             if (channel and lane == "owner"
-                    and inst != self._lane_core_of(followers)
+                    and inst != self._lane_worker_of(followers)
                     and not (isinstance(prev, dict) and prev.get("pinned"))):
                 affinity[channel] = {"instance": inst, "ts": self.now()}
             if self.metrics is not None:
@@ -447,12 +470,13 @@ class PoolLead:
             return reclaimed
         for f in entries:
             m = pat.match(f.name)
-            if not m or self.alive_fn(m.group(2)):
+            if not m or self.alive_fn(pn.canonical(m.group(2))):
                 continue
             try:
                 os.rename(f, f.with_name(m.group(1) + ".txt"))
             except OSError:
                 continue
+            self._record_reclaim(m.group(1) + ".txt", pn.canonical(m.group(2)), "dead")
             reclaimed.append(f.name)
         return reclaimed
 
@@ -484,9 +508,10 @@ class PoolLead:
     def _load_noclaim(self) -> dict:
         try:
             d = json.loads(self._noclaim_path().read_text())
-            return d if isinstance(d, dict) else {}
         except (OSError, ValueError):
             return {}
+        return ({pn.canonical(k): v for k, v in d.items()}
+                if isinstance(d, dict) else {})
 
     def _mark_noclaim(self, instance: str) -> None:
         """Record that this follower held an assignment past the stuck window.
@@ -533,16 +558,17 @@ class PoolLead:
             if ts is None:
                 ledger[f.name] = self.now()  # adopt pre-ledger assignments
                 continue
-            if self.now() - float(ts) < max_age_s or not self.alive_fn(m.group(2)):
+            inst = pn.canonical(m.group(2))
+            if self.now() - float(ts) < max_age_s or not self.alive_fn(inst):
                 continue  # young, or dead (reclaim_dead owns that path)
             try:
                 assigned_age = self.now() - f.stat().st_mtime
             except OSError:
                 assigned_age = self.now() - float(ts)
-            if (self._claimed_load(m.group(2)) > 0
+            if (self._claimed_load(inst) > 0
                     and assigned_age < BUSY_DEFER_MAX_S):
                 # busy pauses the clock and leaves a post-busy claim grace;
-                # the cap anchors to file age, so a wedged core still yields
+                # the cap anchors to file age, so a wedged worker still yields
                 ledger[f.name] = self.now() - max_age_s + BUSY_EXIT_GRACE_S
                 continue
             try:
@@ -551,7 +577,8 @@ class PoolLead:
                 continue
             ledger.pop(f.name, None)
             live.discard(f.name)
-            self._mark_noclaim(m.group(2))
+            self._mark_noclaim(inst)
+            self._record_reclaim(m.group(1) + ".txt", inst, "stuck")
             out.append(f.name)
             # An unresponsive home releases its rooms so the re-pick moves
             # them; a pinned row survives — pins move only by owner command.
@@ -561,7 +588,7 @@ class PoolLead:
                     aff = self._load_affinity()
                     row = aff.get(ch)
                     if (isinstance(row, dict)
-                            and row.get("instance") == m.group(2)
+                            and row.get("instance") == inst
                             and not row.get("pinned")):
                         del aff[ch]
                         self._save_affinity(aff)
@@ -614,7 +641,7 @@ class PoolLead:
             return out
         for f in entries:
             m = pat.match(f.name)
-            if not m or self.alive_fn(m.group(2)):
+            if not m or self.alive_fn(pn.canonical(m.group(2))):
                 continue
             canonical = m.group(1) + ".txt"
             try:
@@ -622,5 +649,7 @@ class PoolLead:
             except OSError:
                 continue
             done = self._result_evidence(canonical)
+            if not done:
+                self._record_reclaim(canonical, pn.canonical(m.group(2)), "claim-dead")
             out.append((f.name, "delivered" if done else "repooled"))
         return out

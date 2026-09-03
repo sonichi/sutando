@@ -34,21 +34,24 @@ class PoolStatusWriterTest(unittest.TestCase):
         return json.loads((self.state / "pool-status.json").read_text())
 
     def test_snapshot_splits_live_dead_and_counts_in_flight(self):
-        (self.tasks / "task-a.assigned-core-1.txt").write_text("x")
-        (self.tasks / "task-b.claimed-core-1.txt").write_text("x")
-        (self.tasks / "task-c.claimed-core-2.txt").write_text("x")
+        (self.tasks / "task-a.assigned-worker-1.txt").write_text("x")
+        (self.tasks / "task-b.claimed-worker-1.txt").write_text("x")
+        (self.tasks / "task-c.claimed-worker-2.txt").write_text("x")
         (self.tasks / "task-d.txt").write_text("x")  # unassigned: not in flight
-        w = self.writer(["core-1", "core-2", "core-3"], {"core-1", "core-2"})
+        w = self.writer(["worker-1", "worker-2", "worker-3"], {"worker-1", "worker-2"})
         self.assertTrue(w.maybe_write())
         got = self.read()
-        self.assertEqual(got["live_cores"], ["core-1", "core-2"])
-        self.assertEqual(got["dead_cores"], ["core-3"])
-        self.assertEqual(got["in_flight"], {"core-1": 2, "core-2": 1})
+        self.assertEqual(got["live_workers"], ["worker-1", "worker-2"])
+        self.assertEqual(got["dead_workers"], ["worker-3"])
+        # legacy keys ride to the broker for one release
+        self.assertEqual(got["live_cores"], ["worker-1", "worker-2"])
+        self.assertEqual(got["dead_cores"], ["worker-3"])
+        self.assertEqual(got["in_flight"], {"worker-1": 2, "worker-2": 1})
         self.assertEqual(got["ts"], 1000)
         self.assertEqual(got["writer"], "pool-lead")
 
     def test_throttle_skips_within_window_and_refreshes_after(self):
-        w = self.writer(["core-1"], {"core-1"})
+        w = self.writer(["worker-1"], {"worker-1"})
         self.assertTrue(w.maybe_write())
         self.clock[0] += 10
         self.assertFalse(w.maybe_write())  # inside 30s window
@@ -58,7 +61,7 @@ class PoolStatusWriterTest(unittest.TestCase):
         self.assertEqual(self.read()["ts"], 1035)
 
     def test_write_error_fails_open(self):
-        w = self.writer(["core-1"], {"core-1"})
+        w = self.writer(["worker-1"], {"worker-1"})
         self.state.rmdir()
         self.state.write_text("not a dir")  # mkdir/replace will fail
         self.assertFalse(w.maybe_write())
@@ -68,7 +71,7 @@ class PoolStatusWriterTest(unittest.TestCase):
         # every attempted write lands and no reader sees a partial file.
         writes_each = 400
         writers = [
-            PoolStatusWriter(self.tasks, self.state, lambda: ["core-1"],
+            PoolStatusWriter(self.tasks, self.state, lambda: ["worker-1"],
                              lambda i: True, refresh_s=0.0)
             for _ in range(2)]
         self.assertTrue(writers[0].maybe_write())  # file exists before readers

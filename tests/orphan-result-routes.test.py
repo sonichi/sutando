@@ -121,9 +121,9 @@ class OrphanResultRoutesTest(unittest.TestCase):
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
 
     def test_a_claimed_task_file_is_found(self):
-        # find_task_file's shape: a claimed task is `<id>.claimed-core-N.txt`.
+        # find_task_file's shape: a claimed task is `<id>.claimed-worker-N.txt`.
         tid = self._result()
-        (self.tasks / f"{tid}.claimed-core-1.txt").write_text(task_text())
+        (self.tasks / f"{tid}.claimed-worker-1.txt").write_text(task_text())
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
 
     # --- must not fire --------------------------------------------------
@@ -305,7 +305,7 @@ class WiringTest(unittest.TestCase):
         self.assertIsNotNone(expr, "the helper must resolve a task path")
         with tempfile.TemporaryDirectory() as td:
             tasks = Path(td)
-            claimed = tasks / "task-99.claimed-core-1.txt"
+            claimed = tasks / "task-99.claimed-worker-1.txt"
             claimed.write_text("body")
             ns = {"find_task_file": _task_archive.find_task_file,
                   "TASKS_DIR": tasks, "task_id": "task-99"}

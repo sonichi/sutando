@@ -917,12 +917,12 @@ def main() -> int:
           and (rtc.TASKS_DIR / "task-COLL.txt").exists(),
           "archive rename failure is swallowed (result still delivered, task file left in place)")
     # claimed-task shape (review repro): the core renames a queued task to
-    # task-<id>.claimed-core-N.txt while processing — delivery must archive
+    # task-<id>.claimed-<worker>.txt while processing — delivery must archive
     # THAT file, not just the bare name, or health-check keeps counting it
     (rtc.RESULTS_DIR / "task-CLAIMED.txt").write_text("reply\n")
-    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-1.txt").write_text("task body\n")
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-worker-1.txt").write_text("task body\n")
     rtc._post_ready_results({"task-CLAIMED"})
-    check(not (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-1.txt").exists()
+    check(not (rtc.TASKS_DIR / "task-CLAIMED.claimed-worker-1.txt").exists()
           and (rtc.TASKS_DIR / "archive" / "task-CLAIMED.txt").exists(),
           "claimed-shape task file archived under the bare name after delivery")
 
@@ -1721,12 +1721,12 @@ def main() -> int:
           "reconcile: pending task file / waiting result exempt from suspicion")
     # a task claimed by a core (multi-core rename, claim_task.py #884) is
     # ACTIVE, not abandoned — must never be suspected while the claim exists
-    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-2.txt").write_text("being worked")
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-worker-2.txt").write_text("being worked")
     inflight.add("task-CLAIMED")
     s_c = rtc._reconcile_abandoned(inflight, {"task-CLAIMED"})
     check("task-CLAIMED" in inflight and "task-CLAIMED" not in s_c,
           "reconcile: claimed task exempt (long-running work not dropped)")
-    (rtc.TASKS_DIR / "task-CLAIMED.claimed-core-2.txt").unlink()
+    (rtc.TASKS_DIR / "task-CLAIMED.claimed-worker-2.txt").unlink()
     inflight.discard("task-CLAIMED")
     s2 = rtc._reconcile_abandoned(inflight, s1)
     check("task-GONE" not in inflight and s2 == set(),

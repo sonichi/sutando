@@ -58,7 +58,7 @@ class AnchorRecovery(unittest.TestCase):
     def test_recovers_from_a_CLAIMED_task_file(self):
         """Production renames claimed work, so a bare-name lookup misses exactly
         the tasks that are in flight."""
-        (self.tasks / "task-2.claimed-core-3.txt").write_text(BODY.format(i="task-2"))
+        (self.tasks / "task-2.claimed-worker-3.txt").write_text(BODY.format(i="task-2"))
         self.assertEqual(self.fn("task-2"), ANCHOR)
 
     def test_recovers_from_the_monthly_ARCHIVE(self):
@@ -67,7 +67,7 @@ class AnchorRecovery(unittest.TestCase):
         self.assertEqual(self.fn("task-3"), ANCHOR)
 
     def test_recovers_from_a_CLAIMED_file_in_the_archive(self):
-        self._archived("2026-07", "task-4.claimed-core-1.txt", "task-4")
+        self._archived("2026-07", "task-4.claimed-worker-1.txt", "task-4")
         self.assertEqual(self.fn("task-4"), ANCHOR)
 
     def test_live_file_wins_over_a_stale_archived_one(self):

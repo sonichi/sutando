@@ -51,7 +51,7 @@ class ReplyHandlerTests(unittest.TestCase):
         self.h = HitlReplyHandler(self.mgr, OWNER, workspace=self.ws, log=self.logs.append)
         self.req = self.mgr.create(HumanRequirement(
             kind="permission", runtime="claude", message="Claude wants to run Bash: rm -rf build",
-            guard="hook:abc", device={"id": "core-1", "name": "core-1"},
+            guard="hook:abc", device={"id": "worker-1", "name": "worker-1"},
             actions=[Action(id="allow", kind="allow_once", label="Allow"),
                      Action(id="deny", kind="reject_once", label="Deny"),
                      Action(id="open_terminal", kind="open_terminal", label="Open terminal")]))
@@ -111,8 +111,8 @@ class ReplyHandlerTests(unittest.TestCase):
 
     def test_tui_reply_writes_the_driver_action_file(self):
         events_dir(self.ws).mkdir(parents=True)
-        (events_dir(self.ws) / "core-2-g7.json").write_text(json.dumps({
-            "schema": "space.ag2.hitl.runtime_event.v1", "session": "core-2", "socket": "/tmp/s.sock",
+        (events_dir(self.ws) / "worker-2-g7.json").write_text(json.dumps({
+            "schema": "space.ag2.hitl.runtime_event.v1", "session": "worker-2", "socket": "/tmp/s.sock",
             "runtime": "claude", "kind": "permission", "prompt": "Do you want to proceed?", "guard": "g7",
             "observed_ms": 1, "options": [{"id": "1", "label": "Yes"}, {"id": "3", "label": "No"}]}))
         ingest(self.mgr, self.ws)
@@ -123,7 +123,7 @@ class ReplyHandlerTests(unittest.TestCase):
         self.assertEqual(path.name, f"{tui.id}.json")
         body = json.loads(path.read_text())
         self.assertEqual({k: body[k] for k in ("session", "socket", "guard", "action_id")},
-                         {"session": "core-2", "socket": "/tmp/s.sock", "guard": "g7", "action_id": "1"})
+                         {"session": "worker-2", "socket": "/tmp/s.sock", "guard": "g7", "action_id": "1"})
         # The jump action is the client's, never the driver's.
         self.h.offer(event(reply_for(self.mgr.get(tui.id), "open_terminal"), eid="$e3"))
         self.assertEqual(len(list(actions_dir(self.ws).glob("*.json"))), 1)

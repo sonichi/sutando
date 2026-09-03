@@ -33,19 +33,19 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
             with redirect_stdout(io.StringIO()):
-                pool_bind.main(["pin", "!r:x", "core-2"], workspace=ws)
+                pool_bind.main(["pin", "!r:x", "worker-2"], workspace=ws)
             out = io.StringIO()
             with redirect_stdout(out):
                 rc = pool_bind.main(["list"], workspace=ws)
             self.assertEqual(rc, 0)
             table = json.loads(out.getvalue())
-            self.assertEqual(table["!r:x"]["instance"], "core-2")
+            self.assertEqual(table["!r:x"]["instance"], "worker-2")
 
     def test_unpin_reports_the_dropped_row(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
             with redirect_stdout(io.StringIO()):
-                pool_bind.main(["pin", "!r:y", "core-3", "--dedicated"],
+                pool_bind.main(["pin", "!r:y", "worker-3", "--dedicated"],
                                workspace=ws)
             out = io.StringIO()
             with redirect_stdout(out):

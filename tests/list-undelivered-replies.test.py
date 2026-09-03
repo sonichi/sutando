@@ -84,7 +84,7 @@ class Lister(unittest.TestCase):
         is about to deliver itself."""
         self._orphan("task-ddd", where="tasks")
         (self.ws / "tasks" / "task-ddd.txt").rename(
-            self.ws / "tasks" / "task-ddd.claimed-core-2.txt")
+            self.ws / "tasks" / "task-ddd.claimed-worker-2.txt")
         self.assertEqual(lur.undelivered(self.ws), [])
 
     def test_an_assigned_task_is_not_listed(self):
@@ -92,7 +92,7 @@ class Lister(unittest.TestCase):
         has not claimed it yet."""
         self._orphan("task-eee", where="tasks")
         (self.ws / "tasks" / "task-eee.txt").rename(
-            self.ws / "tasks" / "task-eee.assigned-core-3.txt")
+            self.ws / "tasks" / "task-eee.assigned-worker-3.txt")
         self.assertEqual(lur.undelivered(self.ws), [])
 
     def test_a_longer_task_id_does_not_suppress_a_real_orphan(self):

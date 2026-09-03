@@ -140,7 +140,7 @@ check("no call site globs .claimed- without .assigned- or a `# claimed-only:` ma
 print("── the scans are able to fire ──")
 check("the file->id scan flags a synthetic hand-rolled split",
       bool(HANDROLLED.search('tid = f.name.split(".claimed-")[0]')))
-_synth = ['def g(t):', '    return next(d.glob(f"{t}.claimed-core-*.txt"), None)']
+_synth = ['def g(t):', '    return next(d.glob(f"{t}.claimed-worker-*.txt"), None)']
 check("the id->file scan flags a synthetic unpaired glob",
       any(CLAIMED_GLOB.search(l) and not ASSIGNED.search("\n".join(_synth))
           for l in _synth))
@@ -165,7 +165,7 @@ _tmp = Path(tempfile.mkdtemp(prefix="deleg-walk-"))
 (_tmp / "src" / "planted_split.py").write_text(
     'def f(n):\n    return n.split(".claimed-")[0]\n')
 (_tmp / "src" / "planted_glob.py").write_text(
-    'def g(d, t):\n    return next(d.glob(f"{t}.claimed-core-*.txt"), None)\n')
+    'def g(d, t):\n    return next(d.glob(f"{t}.claimed-worker-*.txt"), None)\n')
 (_tmp / "src" / "clean.py").write_text('def h():\n    return 1\n')
 _a, _b = [], []
 scan_handrolled(_tmp, ["src"], _a)
@@ -183,7 +183,7 @@ shutil.rmtree(_tmp, ignore_errors=True)
 
 # ── 5. shell sites: enumerated, not gated ────────────────────────────────────
 print("── shell sites (reported, not gated — see the docstring) ──")
-SH = re.compile(r"claimed-core-")
+SH = re.compile(r"claimed-worker-")
 sh_sites = []
 for root in ROOTS:
     for p in sorted((REPO / root).rglob("*.sh")):

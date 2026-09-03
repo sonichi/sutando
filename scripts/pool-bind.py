@@ -7,7 +7,10 @@ to a concurrent assignment sweep.
 
 Usage:
   python3 scripts/pool-bind.py list
-  python3 scripts/pool-bind.py pin '<channel-or-room-id>' core-2 [--dedicated]
+  python3 scripts/pool-bind.py pin '<channel-or-room-id>' worker-2 [--dedicated]
+
+A worker may be given by seat (`2`) or name; legacy `core-2` is accepted and
+stored as `worker-2`.
   python3 scripts/pool-bind.py unpin '<channel-or-room-id>'
 """
 import json
@@ -20,6 +23,8 @@ sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
 from workspace_default import resolve_workspace  # noqa: E402
 from pool_lead import PoolLead  # noqa: E402
+
+import pool_names as pn  # noqa: E402
 
 
 def _lead(workspace=None) -> PoolLead:
@@ -43,10 +48,10 @@ def main(argv, workspace=None) -> int:
             print("usage: pool-bind.py pin <channel> <instance>... "
                   "[--dedicated]", file=sys.stderr)
             return 2
-        channel, workers = argv[1], argv[2:]
+        channel, workers = argv[1], [pn.resolve(w) for w in argv[2:]]
         for inst in workers:
-            beat = lead.state_dir / "cores" / f"{inst}.alive"
-            if not beat.exists():
+            if not any((lead.state_dir / "cores" / fn).exists()
+                       for fn in pn.alive_filenames(inst)):
                 print(f"warning: no liveness beat for {inst}; pinning anyway",
                       file=sys.stderr)
         target = workers[0] if len(workers) == 1 else workers

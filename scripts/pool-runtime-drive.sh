@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # pool-runtime-drive.sh — sourceable library: the ONE owner of per-runtime
-# session-driving policy for the core pool (#880). Sourcing has no side effects.
+# session-driving policy for the worker pool (#880). Sourcing has no side effects.
 #
 # Two adapters bind it and neither may keep a private copy:
-#   scripts/pool-core-wrapper.sh — the in-session sweep nudge
+#   scripts/pool-worker-wrapper.sh — the in-session sweep nudge
 #   scripts/kick-pool.sh         — the watchdog that recovers a stalled session
 # It owns: the runtime allowlist, runtime resolution from an installed plist,
 # prompt/idle/menu/busy markers, the nudge text, the submit key, and the
@@ -18,10 +18,10 @@
 # Contract:
 #   pool_runtime_supported <runtime>                  -> rc 0 known, 1 unknown
 #   pool_runtime_from_plist <plist>                   -> prints runtime; rc 1 unresolvable
-#   pool_drive_nudge_text <runtime> <core-id>         -> prints the pool-entry text
-#   pool_drive_nudge <runtime> <session> <tmux-fn> <core-id>
+#   pool_drive_nudge_text <runtime> <worker>          -> prints the pool-entry text
+#   pool_drive_nudge <runtime> <session> <tmux-fn> <worker>
 #         -> rc 0 sent, 1 deferred (session busy), 2 unsupported runtime
-#   pool_drive_kick <runtime> <session> <tmux-fn> <core-id>
+#   pool_drive_kick <runtime> <session> <tmux-fn> <worker>
 #         -> rc 0 kicked, 1 skipped (busy/menu/staged/unrecognized), 2 unsupported
 # <tmux-fn> is the NAME of a caller-provided function that runs tmux with that
 # caller's binary and socket; this library never resolves tmux itself.
@@ -56,7 +56,7 @@ pool_drive_nudge_text() {
     codex)
       # Codex has no slash-command surface, so the pool-mode entry is a prompt.
       # Keep it pointing at CODEX.md rather than restating the claim protocol.
-      printf '%s' "Sutando pool mode. You are core-${2:-}. Do not read task files or write results/ directly — follow skills/proactive-loop-pool/CODEX.md: acquire work first, and complete only through the finish helper." ;;
+      printf '%s' "Sutando pool mode. You are ${2:-}. Do not read task files or write results/ directly — follow skills/proactive-loop-pool/CODEX.md: acquire work first, and complete only through the finish helper." ;;
     *) return 2 ;;
   esac
 }
@@ -151,9 +151,9 @@ pool_drive_send() {
 }
 
 pool_drive_nudge() {
-  local rt="$1" sess="$2" tmux_fn="$3" core_id="$4" text state
+  local rt="$1" sess="$2" tmux_fn="$3" worker="$4" text state
   pool_runtime_supported "$rt" || return 2
-  text=$(pool_drive_nudge_text "$rt" "$core_id") || return 2
+  text=$(pool_drive_nudge_text "$rt" "$worker") || return 2
   # Claude's input IS a durable queue, so typing into it is always safe.
   if [ "$rt" != "codex" ]; then
     pool_drive_send "$rt" "$sess" "$tmux_fn" "$text"
@@ -171,7 +171,7 @@ pool_drive_nudge() {
 }
 
 pool_drive_kick() {
-  local rt="$1" sess="$2" tmux_fn="$3" core_id="$4"
+  local rt="$1" sess="$2" tmux_fn="$3" worker="$4"
   local pane state menu_key
   if ! pool_runtime_supported "$rt"; then
     echo "$sess: UNRESOLVED RUNTIME ('$rt') — skip (won't type another runtime's text)"
@@ -204,7 +204,7 @@ pool_drive_kick() {
       return 0 ;;
     idle)
       echo "$sess: idle REPL → type + send $rt pool entry"
-      pool_drive_send "$rt" "$sess" "$tmux_fn" "$(pool_drive_nudge_text "$rt" "$core_id")" ;;
+      pool_drive_send "$rt" "$sess" "$tmux_fn" "$(pool_drive_nudge_text "$rt" "$worker")" ;;
     *) echo "$sess: unclassified pane state '$state' — skip (fail closed)"; return 1 ;;
   esac
 }

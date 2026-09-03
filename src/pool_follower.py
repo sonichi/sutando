@@ -23,6 +23,11 @@ sys.path.insert(0, str(_HERE))
 from task_priority import sort_tasks_by_priority  # noqa: E402
 from task_archive import _move_without_clobbering  # noqa: E402
 
+import pool_names as pn  # noqa: E402
+
+sys.path.insert(0, str(_HERE / "runtime-api"))
+from pool_metrics import PoolMetrics  # noqa: E402
+
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
 
 _UNASSIGNED_RE = re.compile(
@@ -56,14 +61,22 @@ def lead_alive(state_dir, lead_label: str, now_fn=time.time) -> bool:
 
 
 def _claim_assignment(tasks_dir: Path, f: Path, instance: str) -> "Path | None":
-    suffix = f".assigned-{instance}.txt"
+    # Either spelling of the assigned suffix is honoured; the claim is canonical.
+    suffix = next(s for s in pn.assigned_suffixes(instance) if f.name.endswith(s))
     target = f.with_name(
-        f.name[:-len(suffix)] + f".claimed-{instance}.txt")
+        f.name[:-len(suffix)] + pn.claimed_suffix(instance))
     try:
         os.rename(f, target)
         return target
     except OSError:
         return None  # lead reclaimed or a restart raced us — not an error
+
+
+def _record_claim(state_dir, claimed: Path, instance: str, fallback: bool) -> None:
+    # Fail-open by construction; the lead's summary counts the fallback ones.
+    m = _CLAIMED_RE.match(claimed.name)
+    task = f"task-{m.group(1)}.txt" if m else claimed.name
+    PoolMetrics(state_dir).claimed(task, instance, fallback=fallback)
 
 
 def acquire_work(tasks_dir, state_dir, instance: str,
@@ -72,15 +85,16 @@ def acquire_work(tasks_dir, state_dir, instance: str,
     Own assignments are honored in priority order in BOTH modes — the
     fallback additionally opens the unassigned pool."""
     tasks = Path(tasks_dir)
-    suffix = f".assigned-{instance}.txt"
+    suffixes = pn.assigned_suffixes(instance)
     try:
-        assigned = [f for f in tasks.iterdir() if f.name.endswith(suffix)
+        assigned = [f for f in tasks.iterdir() if f.name.endswith(suffixes)
                     and f.name.startswith("task-")]
     except OSError:
         assigned = []
     for f in sort_tasks_by_priority(assigned):
         got = _claim_assignment(tasks, f, instance)
         if got is not None:
+            _record_claim(state_dir, got, instance, fallback=False)
             return got
     if lead_alive(state_dir, lead_label, now_fn):
         return None  # a live lead owns the unassigned pool — never steal
@@ -97,13 +111,14 @@ def acquire_work(tasks_dir, state_dir, instance: str,
         if result_evidence(results_dir, f.name):
             continue
         # assignment-suffix convention so lead-side load counting and
-        # reclaim see fallback claims (legacy .claimed-core-N stays put)
-        target = f.with_name(f.name[:-4] + f".claimed-{instance}.txt")
+        # reclaim see fallback claims (a pre-rename claim stays put)
+        target = f.with_name(f.name[:-4] + pn.claimed_suffix(instance))
         try:
             os.rename(f, target)
-            return target
         except OSError:
             continue
+        _record_claim(state_dir, target, instance, fallback=True)
+        return target
     return None
 
 
@@ -137,8 +152,9 @@ def finish_task(tasks_dir, results_dir, state_dir, instance: str,
     writing); a mismatch means the body was composed for another task, so
     refuse with ValueError and write nothing."""
     claimed = Path(claimed_path)
+    instance = pn.canonical(instance)
     m = _CLAIMED_RE.match(claimed.name)
-    if m is None or m.group(2) != instance:
+    if m is None or pn.canonical(m.group(2)) != instance:
         raise ValueError(
             f"not a claim held by {instance!r}: {claimed.name}")
     if not claimed.is_file():
@@ -186,7 +202,7 @@ def finish_task(tasks_dir, results_dir, state_dir, instance: str,
         finished_at = time.time()
         _append_metric(metrics_path, {
             "task_id": task_id,
-            "core": instance,
+            "worker": instance,
             "source": source,
             "arrived_at": arrived_at,
             "finished_at": finished_at,
@@ -198,7 +214,7 @@ def finish_task(tasks_dir, results_dir, state_dir, instance: str,
 
 def _finish_cli(argv: "list[str]") -> int:
     if len(argv) != 2:
-        print("usage: pool_follower.py finish <claimed_path> <instance>",
+        print("usage: pool_follower.py finish <claimed_path> <worker>",
               file=sys.stderr)
         return 2
     claimed = Path(argv[0]).resolve()

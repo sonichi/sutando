@@ -240,7 +240,7 @@ def _live_followers(self):
 ```
 
 A follower appearing or vanishing is already an ordinary input. The fixedness
-lives entirely in `scripts/install-core-pool.sh N`, which writes N plists at
+lives entirely in `scripts/install-worker-pool.sh N`, which writes N plists at
 install time. So this is an **authority gap, not an architecture one**: the lead
 can observe the fleet but cannot change it.
 
