@@ -404,6 +404,51 @@ def answer_step(state, kind, prompt, answered_prompt, enabled=True):
 AUTO_ANSWER_CARRY_S = 120.0
 
 
+# ESCALATE (Layer 3) — the banner is a window the owner has to be looking at.
+# When nothing automatic can clear the gate, say so where they already are.
+_CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+
+
+def escalation_body(state, detail, kind, prompt):
+    """The owner-facing text. The core is blocked, so this is the only thing
+    that will reach them until they act."""
+    head = ("I am blocked and cannot continue without you."
+            if state == "blocked-human" else
+            "I am signed out and cannot continue without you.")
+    lines = [head, "", f"State: {state} — {detail}"]
+    if kind and kind != "unknown":
+        lines.append(f"Gate: {kind}")
+    if prompt:
+        excerpt = "\n".join(prompt.strip().splitlines()[-6:])
+        lines += ["", "What the terminal is showing:", "```", excerpt, "```"]
+    lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
+                  "Nothing else I do can clear this one."]
+    return "\n".join(lines)
+
+
+def escalate_to_chat(out_path, state, detail, kind, prompt):
+    """Write ONE proactive message per episode. The bridge claims it independently
+    of the core, which is the point: the core is the thing that is stuck.
+
+    Returns the path written, or None when this episode was already announced —
+    a stuck core must not become a stuck core plus a message every tick.
+    """
+    ws = os.path.dirname(os.path.dirname(os.path.abspath(out_path)))
+    results = os.path.join(ws, "results")
+    try:
+        os.makedirs(results, exist_ok=True)
+        path = os.path.join(results, f"proactive-core-blocked-{int(time.time())}.txt")
+        with open(path, "w") as f:
+            f.write(escalation_body(state, detail, kind, prompt) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        return path
+    except OSError as exc:
+        # Never let the escalation take down the monitor that produces it.
+        print(f"chat escalation failed: {exc}", file=_sys.stderr)
+        return None
+
+
 def _atomic_write(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -424,6 +469,8 @@ def main():
     ap.add_argument("--once", action="store_true", help="one tick then exit (for tests/probes)")
     ap.add_argument("--no-auto-answer", dest="auto_answer", action="store_false",
                     help="report allowlisted gates without typing their safe answer")
+    ap.add_argument("--no-chat-escalation", dest="chat_escalation", action="store_false",
+                    help="write the supervisor state but never announce a block in chat")
     a = ap.parse_args()
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
@@ -438,6 +485,7 @@ def main():
     rh.SESSION = a.session
 
     last_sig = None
+    escalated_episode = None
     stable_prompt = 0
     last_prompt = None
     answered_prompt = None
@@ -479,6 +527,17 @@ def main():
                 payload["auto_answered"] = last_answered
             _atomic_write(a.out, payload)
             last_sig = sig
+
+        # One announcement per EPISODE, keyed on what the owner would act on.
+        # Re-keying on `prompt` alone would re-fire as a menu redraws; leaving
+        # the blocked set clears it so a genuine second block is not swallowed.
+        if a.chat_escalation and state in _CHAT_ESCALATE_STATES:
+            ep = (state, kind, prompt)
+            if ep != escalated_episode:
+                if escalate_to_chat(a.out, state, detail, kind, prompt):
+                    escalated_episode = ep
+        elif state not in _CHAT_ESCALATE_STATES:
+            escalated_episode = None
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)
