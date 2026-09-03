@@ -160,5 +160,211 @@ for nm, body in (("z", f"{aware:%Y-%m-%dT%H:%M:%S}Z"),
 check("missing state dir returns empty",
       hc._daily_completion_minutes(Path(tempfile.mkdtemp()) / "nope", "x") == [])
 
+# ── a launchd job that publishes a dated ARTIFACT but stamps no sentinel ─────
+
+# `launchd` says how a job is SCHEDULED, not what dated evidence it leaves; without
+# the fallback such a job reports "no dated artifact" while writing one every day.
+def _launchd_artifact_ws(days=5, include_today=True, name="digest-job", stem="digest-job"):
+    ws = Path(tempfile.mkdtemp(prefix="punct-la-"))
+    (ws / "hosts" / "H").mkdir(parents=True)
+    (ws / "state").mkdir()
+    (ws / "results").mkdir()
+    (ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+        [{"name": name, "cron": "0 6 * * *", "launchd": True, "artifact": stem}]))
+    today = datetime.date.today()
+    for i in range(days):
+        if i == 0 and not include_today:
+            continue
+        d = today - datetime.timedelta(days=i)
+        f = ws / "results" / f"{stem}-{d:%Y%m%d}.txt"
+        f.write_text("x")
+        os.utime(f, (time.time(),
+                     datetime.datetime.combine(d, datetime.time(6, 4)).timestamp()))
+    return ws
+
+
+r = run(_launchd_artifact_ws())
+check("launchd + dated artifact is OBSERVABLE, not UNCHECKED",
+      "digest-job" not in (r.get("detail") or ""), f"got {r.get('detail')!r}")
+check("...and a punctual artifact history is not reported late",
+      r.get("status") == "ok", f"got {r.get('status')}: {r.get('detail')}")
+
+r = run(_launchd_artifact_ws(include_today=False))
+check("a launchd artifact history that stops TODAY surfaces as a named miss",
+      "digest-job" in (r.get("detail") or "") and "no output today" in (r.get("detail") or ""),
+      f"got {r.get('detail')!r}")
+
+# The control that can fail: with NO evidence in either lane the job must stay
+# UNCHECKED, so the fallback cannot manufacture observability out of nothing.
+r = run(_launchd_artifact_ws(days=0))
+check("no sentinel and no artifact stays UNCHECKED",
+      "digest-job" in (r.get("detail") or "")
+      and ("UNCHECKED" in (r.get("detail") or "") or "unverifiable" in (r.get("detail") or "")),
+      f"got {r.get('detail')!r}")
+
+
+# ── declared artifact, zero evidence in EITHER lane (yixuan-ag2 on #3440) ────
+
+# `used_artifact_lane` flips here vs the old `not launchd`, but the interpret
+# layer `continue`s on empty artifacts before the stem_declared gate is read.
+ws = Path(tempfile.mkdtemp(prefix="punct-none-"))
+(ws / "hosts" / "H").mkdir(parents=True)
+(ws / "state").mkdir()
+(ws / "results").mkdir()
+(ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+    [{"name": "never-ran", "cron": "0 6 * * *", "artifact": "never-ran"}]))
+r = run(ws)
+_d = r.get("detail") or ""
+check("a job with no evidence in either lane is UNCHECKED, not a miss",
+      "never-ran" in _d and "past due" not in _d and "no output today" not in _d,
+      f"got {_d!r}")
+
+# The same property at the interpret layer, holding everything but the flag
+# fixed — it must not matter which value stem_declared carries.
+_base = dict(name="j", hour=6, minute=0, artifacts=[], today_seen=False,
+             minutes_since_due=999, conditional=False)
+_outs = [hc._interpret_daily_punctuality([dict(_base, stem_declared=sd)]).get("detail") or ""
+         for sd in (True, False)]
+check("stem_declared cannot change the verdict when artifacts is empty",
+      _outs[0] == _outs[1], f"got {_outs}")
+
+# ── the task-cron lane: the only completion record needing no per-job config ──
+
+# Every cron job leaves results/task-cron-<name>-<epoch>.txt when its result is
+# written, whatever else it publishes; mtime is the finish, as with sentinels.
+def _task_record_ws(days=5, include_today=True, name="ghost-job", finish=(6, 3),
+                    file_name=None):
+    ws = Path(tempfile.mkdtemp(prefix="punct-tc-"))
+    (ws / "hosts" / "H").mkdir(parents=True)
+    (ws / "state").mkdir()
+    (ws / "results").mkdir()
+    (ws / "hosts" / "H" / "crons.json").write_text(json.dumps(
+        [{"name": name, "cron": "0 6 * * *"}]))
+    today = datetime.date.today()
+    for i in range(days):
+        if i == 0 and not include_today:
+            continue
+        d = today - datetime.timedelta(days=i)
+        f = ws / "results" / f"task-cron-{file_name or name}-{1787000000000 + i}.txt"
+        f.write_text("x")
+        os.utime(f, (time.time(),
+                     datetime.datetime.combine(d, datetime.time(*finish)).timestamp()))
+    return ws
+
+
+r = run(_task_record_ws())
+check("a job with only task-cron records is OBSERVABLE",
+      "ghost-job" not in (r.get("detail") or ""), f"got {r.get('detail')!r}")
+check("...and a punctual record history is not reported late",
+      r.get("status") == "ok", f"got {r.get('status')}: {r.get('detail')}")
+
+r = run(_task_record_ws(include_today=False))
+check("a task-cron history that stops TODAY surfaces as a named miss",
+      "ghost-job" in (r.get("detail") or "") and "no output today" in (r.get("detail") or ""),
+      f"got {r.get('detail')!r}")
+
+# The control that can fail: no records in ANY lane must stay UNCHECKED, so the
+# fallback cannot manufacture observability out of nothing.
+r = run(_task_record_ws(days=0))
+_d = r.get("detail") or ""
+check("no evidence in any of the three lanes stays UNCHECKED",
+      "ghost-job" in _d and ("UNCHECKED" in _d or "unverifiable" in _d), f"got {_d!r}")
+
+# Records for a DIFFERENT job must not vouch for this one — the glob is anchored
+# on the full job name, so a prefix-sharing neighbour cannot bleed across.
+ws = _task_record_ws(days=0)
+for i in range(5):
+    d = datetime.date.today() - datetime.timedelta(days=i)
+    f = ws / "results" / f"task-cron-ghost-job-extra-{1787000000000 + i}.txt"
+    f.write_text("x")
+    os.utime(f, (time.time(),
+                 datetime.datetime.combine(d, datetime.time(6, 3)).timestamp()))
+r = run(ws)
+_d = r.get("detail") or ""
+check("another job's records do NOT make this one observable",
+      "ghost-job" in _d and ("UNCHECKED" in _d or "unverifiable" in _d), f"got {_d!r}")
+
+
+# `cron-runner` writes task-cron-<SLUG>-<stamp>; globbing the RAW name finds nothing.
+import cron_task_id  # noqa: E402
+
+for _raw, _slug in [("Money scan", "Money-scan"), ("a/b", "a-b"), ("...", "unnamed"),
+                    ("daily.report.job", "daily-report-job"), ("mo*ney", "mo-ney")]:
+    check(f"slug contract: {_raw!r} -> {_slug}", cron_task_id.sanitize_name(_raw) == _slug,
+          f"got {cron_task_id.sanitize_name(_raw)!r}")
+
+    # Configured under the RAW name, recorded under the SLUG: the regression.
+    _r = run(_task_record_ws(name=_raw, file_name=_slug))
+    _det = _r.get("detail") or ""
+    check(f"a job named {_raw!r} is found under its written slug",
+          _raw not in _det and _slug not in _det, f"got {_det!r}")
+
+# The decoys must still be refused after the contract change.
+_ws = _task_record_ws(name="Money scan", file_name="Money-scan")
+for _i in range(5):
+    _d0 = datetime.date.today() - datetime.timedelta(days=_i)
+    for _decoy in (f"task-cron-Money-scan-extra-{1787000000000 + _i}.txt",
+                   f"task-cron-Money-scanner-{1787000000000 + _i}.txt"):
+        _f = _ws / "results" / _decoy
+        _f.write_text("x")
+        os.utime(_f, (time.time(),
+                      datetime.datetime.combine(_d0, datetime.time(6, 3)).timestamp()))
+_matcher = cron_task_id.record_matcher("Money scan")
+check("neighbour suffix is refused", not _matcher.match("task-cron-Money-scan-extra-123.txt"))
+check("bare-prefix neighbour is refused", not _matcher.match("task-cron-Money-scanner-123.txt"))
+check("the job's own record is accepted", bool(_matcher.match("task-cron-Money-scan-123.txt")))
+# Numeric-prefix neighbour: `ghost-job-2` is its own configured job, so its
+# record must not vouch for `ghost-job`. The stamp has to END the slug.
+_gj = cron_task_id.record_matcher("ghost-job")
+check("numeric-suffix neighbour is refused",
+      not _gj.match("task-cron-ghost-job-2-1787000000000.txt"))
+check("numeric-suffix neighbour is refused with a trailing marker too",
+      not _gj.match("task-cron-ghost-job-2-1787000000000-late-duplicate.txt"))
+check("control: the neighbour still claims its own record",
+      bool(cron_task_id.record_matcher("ghost-job-2")
+           .match("task-cron-ghost-job-2-1787000000000.txt")))
+# Real filename shapes that MUST keep matching — measured against 2050 live
+# task-cron-* files: 2041 `.txt`, 8 `-late-duplicate.txt`, 1 `.no-task.<n>.txt`.
+check("own record, plain", bool(_gj.match("task-cron-ghost-job-1787000000000.txt")))
+check("own record, -late-duplicate marker",
+      bool(_gj.match("task-cron-ghost-job-1787000000000-late-duplicate.txt")))
+check("own record, .no-task.<stamp> marker",
+      bool(_gj.match("task-cron-ghost-job-1787801434542.no-task.1787803712.txt")))
+# Numeric-plus-text neighbour, built with BOTH production helpers so the writer
+# and the matcher are exercised against each other rather than a hand-typed name.
+for _nb in ("ghost-job-2", "ghost-job-2-late", "ghost-job-2-text",
+            "ghost-job-42-backfill"):
+    _fn = cron_task_id.task_id(_nb, 1787000000000) + ".txt"
+    check(f"neighbour {_nb!r} does not vouch for ghost-job",
+          not cron_task_id.record_matcher("ghost-job").match(_fn))
+    check(f"control: {_nb!r} still claims its own record",
+          bool(cron_task_id.record_matcher(_nb).match(_fn)))
+# The three suffixes records actually carry must keep matching.
+for _sfx in ("", "-late-duplicate", ".no-task.1787803712"):
+    _own = cron_task_id.task_id("ghost-job", 1787000000000) + _sfx + ".txt"
+    check(f"own record with suffix {_sfx!r} is accepted",
+          bool(cron_task_id.record_matcher("ghost-job").match(_own)))
+# An archived record is `task-cron-<job>-<emit-ms>-<archive-s>.txt`; 54 of one
+# host's 1331 records carried that shape and matched no job at all.
+check("archived record (emit stamp + archive stamp) is accepted",
+      bool(_gj.match("task-cron-ghost-job-1788172659933-1788173709.txt")))
+check("archived record plus -late-duplicate is accepted",
+      bool(_gj.match(
+          "task-cron-ghost-job-1788172659933-1788173709-late-duplicate.txt")))
+# The neighbour guard must survive the widening: `2` is not a stamp, so a
+# 13-digit number after it cannot be read as an archive stamp.
+check("numeric-suffix neighbour still refused against the archived shape",
+      not _gj.match("task-cron-ghost-job-2-1788172659933.txt"))
+check("control: a two-stamp neighbour still claims its own record",
+      bool(cron_task_id.record_matcher("ghost-job-2")
+           .match("task-cron-ghost-job-2-1788172659933-1788173709.txt")))
+check("a short second field is not an archive stamp",
+      not _gj.match("task-cron-ghost-job-1788172659933-7.txt"))
+
+check("task_id spells the writer's filename",
+      cron_task_id.task_id("Money scan", 123) == "task-cron-Money-scan-123")
+check("discovery glob carries no job name", "*" == cron_task_id.DISCOVERY_GLOB[-1]
+      and "task-cron-" == cron_task_id.DISCOVERY_GLOB[:-1])
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

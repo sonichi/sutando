@@ -13,12 +13,16 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
+import sys
 import tempfile
 import contextlib
 import unittest
+from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_HERE, "..", "src", "core-supervisor-relay.py")
+sys.path.insert(0, os.path.join(_HERE, "..", "src"))
 _spec = importlib.util.spec_from_file_location("core_supervisor_relay", _SRC)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
@@ -28,14 +32,29 @@ run_cycle = _mod.run_cycle
 main = _mod.main
 resolve_active_target = _mod.resolve_active_target
 
+import channel_env_containment  # noqa: E402 — the shared module the probe delegates to
+
 _LOGIN = {"state": "blocked-human", "detail": "awaiting user: login",
           "prompt": "Login\nSelect login method:\n  1. Claude account", "kind": "login"}
+_LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit",
+          "prompt": "You've hit your session limit · resets 12:10pm\n"
+                    "/usage-credits to finish what you're working on.\n"
+                    "Continuing automatically at 12:10pm · esc to cancel",
+          "kind": "session-limit"}
 _LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs /login)",
                "prompt": None, "kind": None}
 _IDLE = {"state": "idle-ready", "detail": "ready for a task", "prompt": None, "kind": None}
 _RUNNING = {"state": "running", "detail": "actively processing", "prompt": None, "kind": None}
 _CRASHED = {"state": "crashed", "detail": "core process/session not found", "prompt": None}
 _HUNG = {"state": "hung", "detail": "core alive but stalled", "prompt": "…", "kind": "unknown"}
+# The monitor answered the Fable weekly-limit dialog itself (Enter = switch model);
+# the record rides along in the signal for AUTO_ANSWER_CARRY_S whatever the state.
+_FABLE_AUTO = {"state": "blocked-known", "detail": "at known gate: fable-limit",
+               "prompt": "You've reached your Fable limit\n❯ Switch to Opus 5 and continue",
+               "kind": "fable-limit",
+               "auto_answered": {"kind": "fable-limit", "key": "Enter", "at": 1788380000.0}}
+_FABLE_AUTO_LATER = dict(_IDLE, auto_answered=_FABLE_AUTO["auto_answered"])
+_PRESS_ENTER_AUTO = dict(_RUNNING, auto_answered={"kind": "press-enter", "key": "Enter", "at": 1.0})
 
 
 @contextlib.contextmanager
@@ -114,7 +133,48 @@ class TestShouldEscalate(unittest.TestCase):
         self.assertFalse(should_escalate(_LOGIN, h_mid)[0])
 
 
+    def test_fable_auto_answer_notifies_once_across_states(self):
+        esc, h = should_escalate(_FABLE_AUTO, None)
+        self.assertTrue(esc)
+        # The same record carried on a later idle tick must not fire again.
+        esc2, h2 = should_escalate(_FABLE_AUTO_LATER, h)
+        self.assertFalse(esc2)
+        self.assertEqual(h, h2)
+
+    def test_a_new_fable_answer_notifies_again(self):
+        _, h = should_escalate(_FABLE_AUTO, None)
+        again = dict(_FABLE_AUTO, auto_answered=dict(_FABLE_AUTO["auto_answered"], at=1788390000.0))
+        self.assertTrue(should_escalate(again, h)[0])
+
+    def test_a_plain_known_gate_still_never_escalates(self):
+        plain = {k: v for k, v in _FABLE_AUTO.items() if k != "auto_answered"}
+        self.assertFalse(should_escalate(plain, None)[0])
+
+    def test_press_enter_auto_answer_is_silent(self):
+        self.assertFalse(should_escalate(_PRESS_ENTER_AUTO, None)[0])
+
+
 class TestComposeMessage(unittest.TestCase):
+    def test_fable_auto_answer_says_what_was_pressed_not_needs_you(self):
+        msg = compose_message(_FABLE_AUTO)
+        self.assertIn("Fable weekly limit", msg)
+        self.assertIn("pressed Enter", msg)
+        self.assertIn("fallback model", msg)
+        self.assertNotIn("Agent needs you", msg)
+        self.assertNotIn("/login", msg)
+        # Carried onto a later idle tick, the notice reads the same.
+        self.assertEqual(compose_message(_FABLE_AUTO_LATER), msg)
+
+    def test_fable_limit_with_the_caret_elsewhere_escalates_with_the_reason(self):
+        unfocused = {"state": "blocked-human", "detail": "awaiting user: fable-limit-unfocused",
+                     "prompt": "You've reached your Fable limit\n❯ Continue with Fable 5.1",
+                     "kind": "fable-limit-unfocused"}
+        self.assertTrue(should_escalate(unfocused, None)[0])
+        msg = compose_message(unfocused)
+        self.assertIn("Agent needs you", msg)
+        self.assertIn("will not press Enter", msg)
+        self.assertNotIn("/login", msg)
+
     def test_includes_detail_and_prompt_excerpt(self):
         m = compose_message(_LOGIN)
         self.assertIn("awaiting user: login", m)
@@ -137,6 +197,25 @@ class TestComposeMessage(unittest.TestCase):
         m = compose_message(_LOGIN)
         self.assertIn("GUI /login", m)
         self.assertNotIn("reply here or open the app", m)
+
+    def test_session_limit_escalates(self):
+        self.assertTrue(should_escalate(_LIMIT, None)[0])
+
+    def test_session_limit_names_the_reset_time_not_login(self):
+        m = compose_message(_LIMIT)
+        self.assertIn("resumes on its own at 12:10pm", m)
+        self.assertIn("/usage-credits", m)
+        # The owner named this third route (2026-09-02): the limit is per
+        # subscription, so signing in under another one is often the fastest.
+        self.assertIn("different subscription", m)
+        self.assertNotIn("/login", m)
+        self.assertNotIn("restart.sh", m)
+
+    def test_session_limit_without_a_reset_time_still_avoids_login(self):
+        sig = dict(_LIMIT, prompt="You've hit your session limit")
+        m = compose_message(sig)
+        self.assertIn("when the limit window resets", m)
+        self.assertNotIn("/login", m)
 
     def test_non_login_blocker_names_the_cli_terminal(self):
         """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply
@@ -462,6 +541,59 @@ class TestResolveActiveTarget(unittest.TestCase):
                 else:
                     os.environ["CLAUDE_CONFIG_DIR"] = old
 
+    def _with_env(self, **values):
+        """Set/unset env vars for one test; None means unset."""
+        saved = {k: os.environ.get(k) for k in values}
+        for k, v in values.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
+
+    def _relocated_layout(self, source="ag2space"):
+        """$CLAUDE_CONFIG_DIR/channels/<source>/.env -> $APP/channels/<source>/.env,
+        the AG2 Space desktop-app layout (#3150/#3201). Returns (cfg, app)."""
+        cfg = tempfile.mkdtemp()
+        app = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, app, ignore_errors=True)
+        real_dir = os.path.join(app, "channels", source)
+        os.makedirs(real_dir)
+        with open(os.path.join(real_dir, ".env"), "w") as f:
+            f.write("REMOTE_TASK_TOKEN=x\n")
+        link_dir = os.path.join(cfg, "channels", source)
+        os.makedirs(link_dir)
+        os.symlink(os.path.join(real_dir, ".env"), os.path.join(link_dir, ".env"))
+        return cfg, app
+
+    def test_app_support_relocated_env_is_deliverable(self):
+        # notify.py accepts $SUTANDO_APP_SUPPORT/channels/<source>/.env as a
+        # second root (#3150/#3201); the probe must agree or the lane never routes.
+        with tempfile.TemporaryDirectory() as td:
+            cfg, app = self._relocated_layout("dev-ag2space")
+            self._with_env(CLAUDE_CONFIG_DIR=cfg, SUTANDO_APP_SUPPORT=app)
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            self.assertEqual(resolve_active_target(p), ("dev-ag2space", "!r:d"))
+
+    def test_same_shape_outside_app_support_is_not_deliverable(self):
+        # Containment, not a leaf-shape match: same layout with the var unset or
+        # pointed at another root is a symlink the sender refuses — so must the probe.
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as other:
+            cfg, _app = self._relocated_layout("dev-ag2space")
+            p = self._write(td, {"channel": "dev-ag2space", "channel_id": "!r:d"})
+            self._with_env(CLAUDE_CONFIG_DIR=cfg, SUTANDO_APP_SUPPORT=None)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+            self._with_env(SUTANDO_APP_SUPPORT=other)
+            self.assertEqual(resolve_active_target(p), ("", ""))
+
     def test_claude_home_tier_is_honored(self):
         # notify.py resolves CLAUDE_CONFIG_DIR -> CLAUDE_HOME -> ~/.claude; the
         # probe must walk the SAME tiers (a CLAUDE_HOME-only env previously
@@ -498,6 +630,89 @@ class TestResolveActiveTarget(unittest.TestCase):
             self.assertEqual(resolve_active_target(self._write(td, "{bad json")), ("", ""))
             self.assertEqual(resolve_active_target(self._write(td, [1, 2, 3])), ("", ""))
 
+
+
+class TestChannelEnvContainmentDelegation(unittest.TestCase):
+    """The probe (_is_deliverable) must call the shared
+    src/channel_env_containment.py function, not carry its own copy of the
+    containment rule — the exact duplication CLAUDE.md's architecture rules
+    call out as the defect."""
+
+    def _reload(self):
+        """A fresh module instance, separate from the shared `_mod` every
+        other test class depends on, so patching the shared function's
+        binding here can't affect them."""
+        spec = importlib.util.spec_from_file_location("core_supervisor_relay_fresh", _SRC)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_binds_the_shared_function_by_identity(self):
+        self.assertIs(_mod._channel_env_is_contained,
+                      channel_env_containment.channel_env_is_contained)
+
+    def test_containment_delegates_to_shared_module_not_a_copy(self):
+        """Stub the shared function to always refuse, reload the probe, and
+        confirm even an otherwise-deliverable app-support relocation is now
+        refused. If _is_deliverable carried its own copy of the rule, this
+        module-level stub would have no effect."""
+        with tempfile.TemporaryDirectory() as td:
+            cfg = tempfile.mkdtemp()
+            app = tempfile.mkdtemp()
+            self.addCleanup(shutil.rmtree, cfg, ignore_errors=True)
+            self.addCleanup(shutil.rmtree, app, ignore_errors=True)
+            real_dir = os.path.join(app, "channels", "dev-ag2space")
+            os.makedirs(real_dir)
+            with open(os.path.join(real_dir, ".env"), "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            link_dir = os.path.join(cfg, "channels", "dev-ag2space")
+            os.makedirs(link_dir)
+            os.symlink(os.path.join(real_dir, ".env"), os.path.join(link_dir, ".env"))
+
+            p = os.path.join(td, "last-owner-activity.json")
+            with open(p, "w") as f:
+                json.dump({"channel": "dev-ag2space", "channel_id": "!r:d"}, f)
+
+            saved = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "SUTANDO_APP_SUPPORT")}
+            os.environ["CLAUDE_CONFIG_DIR"] = cfg
+            os.environ["SUTANDO_APP_SUPPORT"] = app
+            try:
+                with patch.object(channel_env_containment, "channel_env_is_contained",
+                                  return_value=False):
+                    fresh = self._reload()
+                    self.assertEqual(fresh.resolve_active_target(p), ("", ""))
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+    def test_load_channel_env_containment_fails_closed_when_import_fails(self):
+        """The fallback lambda itself, not just the already-bound result:
+        force the shared module's import to fail and confirm the returned
+        callable refuses even an otherwise-valid-looking containment case —
+        never silently widen the guard just because the import failed."""
+        import builtins
+        real_import = builtins.__import__
+
+        def boom(name, *a, **kw):
+            if name == "channel_env_containment":
+                raise ImportError("simulated: src/ not importable")
+            return real_import(name, *a, **kw)
+
+        fresh = self._reload()
+        with patch.object(builtins, "__import__", boom):
+            fallback = fresh._load_channel_env_containment()
+
+        with tempfile.TemporaryDirectory() as td:
+            channels_dir = os.path.join(td, "channels")
+            env_dir = os.path.join(channels_dir, "dev-ag2space")
+            os.makedirs(env_dir)
+            env_path = os.path.join(env_dir, ".env")
+            with open(env_path, "w") as f:
+                f.write("REMOTE_TASK_TOKEN=x\n")
+            self.assertFalse(fallback(env_path, channels_dir, "dev-ag2space"))
 
 
 class TestBackendRecordContract(unittest.TestCase):

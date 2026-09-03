@@ -30,10 +30,14 @@ from workspace_default import status_read_path
 
 SCHEMA_VERSION = 1
 CLASSIFIER_VERSION = "task-workstream-grouping-v1"
+# Fleet churn shifts the candidate window on every completed task; a cooldown
+# bounds how often that churn can re-queue the classifier.
+CLASSIFIER_COOLDOWN_SECONDS = 1800
 CLASSIFIER_TASK_PREFIX = "task-workstream-grouping-"
 LEGACY_CLASSIFIER_TASK_PREFIX = "task-project-grouping-"
 MIN_CONFIDENCE = 0.65
 MAX_RESULT_CHARS = 4_000
+MAX_TASK_TEXT_CHARS = 4_000
 CONTEXT_MAX_TASKS = 5
 CONTEXT_TASK_CHARS = 500
 CONTEXT_RESULT_CHARS = 2_000
@@ -177,10 +181,30 @@ def load_workstream_store(workspace: Path) -> dict:
     }
 
 
+def _header_stop_pattern(keys) -> "re.Pattern[str]":
+    # Keys are interpolated into a regex, so a future key holding a metacharacter
+    # would silently widen the stop set. Escaping makes that impossible.
+    return re.compile(
+        r"^(?:={3,}.*={3,}$|("
+        + "|".join(re.escape(k) for k in keys)
+        + r"):)")
+
+
+_TASK_BODY_STOP = _header_stop_pattern(local_task_protocol.KNOWN_HEADER_KEYS)
+
+
 def _task_text(content: str) -> str:
-    for line in content.splitlines():
+    # `task:` is mid-file for several producers, so the body ends at the next
+    # known header key as well as at the bridge's `===` block.
+    lines = content.splitlines()
+    for i, line in enumerate(lines):
         if line.startswith("task:"):
-            return line[5:].strip()
+            body = [line[5:]]
+            for rest in lines[i + 1:]:
+                if _TASK_BODY_STOP.match(rest):
+                    break
+                body.append(rest)
+            return "\n".join(body).strip()[:MAX_TASK_TEXT_CHARS]
     return ""
 
 
@@ -671,7 +695,13 @@ def _apply_inference_locked(
         if not isinstance(group, dict):
             skipped += 1
             continue
-        title = _safe_title(group.get("name"))
+        requested_id = str(group.get("workstream_id") or "")
+        reused = workstreams.get(requested_id) if requested_id else None
+        # A reused workstream already stores its title; demanding `name` again would
+        # drop an otherwise valid proposal into the skip branch below.
+        title = _safe_title(group.get("name")) or (
+            _safe_title(reused.get("title")) if isinstance(reused, dict) else ""
+        )
         task_ids = group.get("task_ids")
         try:
             confidence = float(group.get("confidence", 0))
@@ -687,7 +717,6 @@ def _apply_inference_locked(
         skipped += len(task_ids) - len(valid_task_ids)
         if not valid_task_ids:
             continue
-        requested_id = str(group.get("workstream_id") or "")
         if requested_id and requested_id in workstreams:
             workstream_id = requested_id
         else:
@@ -893,6 +922,7 @@ def classifier_status(
     workspace: Path,
     ttl_seconds: int = 900,
     limit: int = 100,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
     """Report whether the current snapshot needs classification without writing."""
     workspace = Path(workspace)
@@ -919,6 +949,23 @@ def classifier_status(
             return _queue_result(
                 True, False, "already-queued", snapshot_hash,
                 str(state.get("task_id") or ""), source_state,
+            )
+
+    # Sources change on every completed owner task; a completed run younger
+    # than the cooldown absorbs that churn before the expensive discover+scan.
+    if state.get("status") == "complete" and cooldown_seconds > 0:
+        try:
+            # completed_at is absent on pre-cooldown state files and on the
+            # refresh-source-token path; fall back to enqueued_at there.
+            age = time.time() - float(
+                state.get("completed_at") or state.get("enqueued_at", 0))
+        except (TypeError, ValueError):
+            age = -1.0
+        # A negative age means a clock step or bad state; never cool on it.
+        if 0 <= age < cooldown_seconds:
+            return ClassifierQueueResult(
+                False, False, "cooling-down",
+                str(state.get("snapshot_hash") or ""),
             )
 
     # Discover archive directories immediately before the expensive scan, then
@@ -958,26 +1005,48 @@ def classifier_status(
     return _queue_result(True, False, "ready", snapshot_hash, "", source_state)
 
 
+#: Dashboard-driven enqueue is OFF by default (owner request 2026-09-02, pending
+#: a redesign). Set SUTANDO_WORKSTREAM_CLASSIFIER truthy to re-enable.
+_CLASSIFIER_ENABLE_VALUES = frozenset({"1", "on", "true", "yes", "enabled"})
+
+
+def classifier_enqueue_enabled() -> bool:
+    """Whether the classifier may enqueue a maintenance task. Default: no."""
+    return (os.environ.get("SUTANDO_WORKSTREAM_CLASSIFIER", "")
+            .strip().lower() in _CLASSIFIER_ENABLE_VALUES)
+
+
 def maybe_enqueue_classifier_task(
     workspace: Path,
     ttl_seconds: int = 900,
     limit: int = 100,
     skill_file: Optional[Path] = None,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
+    # Off by default gates EVERY caller — the dashboard POST and the manual
+    # endpoint alike; read-only classifier_status is unaffected.
+    if not classifier_enqueue_enabled():
+        return ClassifierQueueResult(False, False, "disabled")
     if skill_file is not None and not Path(skill_file).is_file():
         return ClassifierQueueResult(False, False, "skill-unavailable")
     with _workstream_store_lock(Path(workspace)):
-        return _maybe_enqueue_classifier_task_locked(workspace, ttl_seconds, limit)
+        return _maybe_enqueue_classifier_task_locked(
+            workspace, ttl_seconds, limit, cooldown_seconds,
+        )
 
 
 def _maybe_enqueue_classifier_task_locked(
     workspace: Path,
     ttl_seconds: int,
     limit: int,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
     """Queue one deduped classifier task only while the selected core is idle."""
     workspace = Path(workspace)
-    readiness = classifier_status(workspace, ttl_seconds=ttl_seconds, limit=limit)
+    readiness = classifier_status(
+        workspace, ttl_seconds=ttl_seconds, limit=limit,
+        cooldown_seconds=cooldown_seconds,
+    )
     if readiness.reason != "ready":
         if readiness.reason in {"complete", "already-queued"} and readiness.source_token:
             state_path = _classifier_state_path(workspace)
@@ -1067,8 +1136,21 @@ def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
         return False
     if not re.fullmatch(r"task-[a-zA-Z0-9_.-]+", task_id):
         return False
-    task_path = Path(workspace) / "tasks" / f"{task_id}.txt"
-    if not task_path.is_file():
+    # Function-local: task_archive is also loaded BY PATH with src/ off
+    # sys.path, where a module-scope import here would take its caller down.
+    from task_archive import find_task_file
+
+    # The lead renames queued work to `.assigned-<inst>`, so a bare-name
+    # lookup here misses and the supersede silently no-ops.
+    tasks_dir = Path(workspace) / "tasks"
+    task_path = find_task_file(tasks_dir, task_id)
+    # find_task_file resolves by name, not by type, so keep the parent's
+    # file-type guard: a same-named DIRECTORY must not be os.replace'd away.
+    if task_path is None or not task_path.is_file():
+        return False
+    # claimed-only: asks whether ANY claimed variant exists, not whether the
+    # returned one is claimed — find_task_file sorts `.assigned-` first.
+    if any(tasks_dir.glob(f"{task_id}.claimed-*")):
         return False
     archive_dir = task_path.parent / "archive" / datetime.now(timezone.utc).strftime("%Y-%m")
     archive_dir.mkdir(parents=True, exist_ok=True)

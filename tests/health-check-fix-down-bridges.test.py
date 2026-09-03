@@ -87,8 +87,11 @@ def run_with_popen_stub(checks: list, *, action="restart",
         return mock.MagicMock()
 
     with tempfile.TemporaryDirectory() as td:
+        # No supervisor here (keeps these hermetic — no live launchctl probe);
+        # the supervised leg: tests/health-check-supervised-bridge-restart.test.py.
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              mock.patch.object(hc, "_load_channel_env", side_effect=_channel_env), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
@@ -356,6 +359,7 @@ def case_g_launch_parity_interpreter_and_env() -> list[str]:
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", return_value="/opt/homebrew/bin/python3"), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              mock.patch.object(hc, "_load_channel_env", return_value={"SLACK_BOT_TOKEN": "xoxb-abc", "SLACK_APP_TOKEN": "xapp-xyz"}), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen):
             restarted = hc.fix_down_bridges(
@@ -395,6 +399,7 @@ def case_h_launch_parity_failsafe_skips() -> list[str]:
     with tempfile.TemporaryDirectory() as td:
         with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
              mock.patch.object(hc, "_bridge_interpreter", side_effect=lambda n: None if n == "discord-bridge" else "python3"), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              mock.patch.object(hc, "_load_channel_env", return_value={}), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
              mock.patch.dict(hc.os.environ, clean_env, clear=True), \
@@ -571,6 +576,7 @@ def case_u_defaults_from_config_and_module() -> list[str]:
              mock.patch.object(hc, "_checkout_is_canonical", return_value=(True, "clean")), \
              mock.patch.object(hc, "_default_slack_sender", return_value=True), \
              mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=lambda a, **k: mock.MagicMock()):
             restarted = hc.fix_down_bridges(checks)  # no kwargs → module defaults
     if restarted != ["discord-bridge"]:
@@ -869,6 +875,17 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
         if isinstance(argv, list) and argv and argv[0] == "/bin/kill":
             killed.append(argv[1])
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        # Stale pre-kill delegates to evict-own-bridge.sh (recorded in `killed`
+        # for plan-before-kill); --list is the verifier, empty = confirmed.
+        if (isinstance(argv, list) and len(argv) >= 4 and argv[0] == "/bin/bash"
+                and str(argv[1]).endswith("evict-own-bridge.sh")):
+            if argv[2] == "--list":
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            killed.append(f"evict:{argv[2]}:{argv[3]}")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        # Post-eviction survivor scan: an empty table proves the pgrep hit gone.
+        if isinstance(argv, list) and argv and argv[0] in ("ps", "/bin/ps"):
+            return subprocess.CompletedProcess(argv, 0, stdout="  PID  PPID ARGS\n", stderr="")
         return real_run(argv, *args, **kwargs)
 
     if plan == "REAL":
@@ -889,6 +906,7 @@ def _run_main_fix_with_stale(checks: list, plan="REAL", channel_env=None, ambien
              mock.patch.object(hc, "run_all_checks", return_value=checks), \
              mock.patch.object(hc, "fix_down_bridges", return_value=[]), \
              mock.patch.object(hc, "token_from_vault", return_value=""), \
+             mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
              plan_patch, env_patch, os_patch, \
              mock.patch.object(hc.subprocess, "run", side_effect=fake_run), \
              mock.patch.object(hc.subprocess, "Popen", side_effect=fake_popen), \
@@ -910,8 +928,8 @@ def case_o_stale_restart_uses_launch_plan() -> list[str]:
     out, spawned, killed = _run_main_fix_with_stale(checks, plan)
     if "slack-bridge: restarted (stale code)" not in out:
         fails.append(f"o) missing 'restarted (stale code)' line; got: {out!r}")
-    if killed != ["4242"]:
-        fails.append(f"o) expected old pid 4242 killed, got {killed}")
+    if killed != [f"evict:slack:{hc.REPO_DIR}"]:
+        fails.append(f"o) expected the checkout-scoped evict-own-bridge.sh pre-kill, got {killed}")
     if len(spawned) != 1 or spawned[0][0] != "/usr/local/bin/python3-probed":
         fails.append(f"o) spawn must use the plan's interpreter, got {spawned}")
     if any(argv[0] == sys.executable for argv in spawned):
@@ -946,6 +964,7 @@ def case_q_down_path_requires_both_slack_tokens() -> list[str]:
         with tempfile.TemporaryDirectory() as td:
             with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
                  mock.patch.object(hc, "_bridge_interpreter", return_value="python3"), \
+                 mock.patch.object(hc, "_bridge_supervision", return_value=("absent", None)), \
                  mock.patch.object(hc, "_load_channel_env", return_value=env), \
                  mock.patch.object(hc, "token_from_vault", return_value=""), \
                  mock.patch.dict(hc.os.environ, clean_env, clear=True), \

@@ -161,7 +161,8 @@ class SayCliDispatchTests(unittest.TestCase):
                 rc = room_ops._main(["say", ROOM, "hi there"])
         self.assertEqual(rc, 0)
         # say() takes (message, room_id); the CLI takes (room_id, message).
-        m.assert_called_once_with("hi there", ROOM, None)
+        # reply_to rides as a keyword and is None when --reply-to is not given.
+        m.assert_called_once_with("hi there", ROOM, None, reply_to=None)
 
 
 class SayNetworkFailureTests(unittest.TestCase):
@@ -200,6 +201,43 @@ class SayNetworkFailureTests(unittest.TestCase):
                 # ok stays true: flipping it would make callers re-send a
                 # delivered message, which cron-notify deliberately avoids.
                 self.assertTrue(res["ok"])
+
+
+
+
+class A2uiCardEnvTests(unittest.TestCase):
+    """SUTANDO_WORKER_A2UI attaches a VALIDATED buttons card; anything that
+    fails validation attaches nothing rather than riding the wire malformed."""
+
+    _GOOD = ('{"type": "buttons", "prompt": "Pick one",'
+             ' "options": [{"label": "A", "action": "choose A"}]}')
+
+    def _card_sent(self, env_value):
+        ctx, calls = _capture()
+        env = {"SUTANDO_WORKER_A2UI": env_value, "SUTANDO_CORE_ID": "1"}
+        with ctx, mock.patch.dict(os.environ, env, clear=False):
+            sy.say("hi", ROOM, "@a:hs")
+        self.assertEqual(len(calls), 1)
+        return calls[0]["payload"].get("extra_content", {}).get("space.ag2.a2ui")
+
+    def test_valid_card_rides_extra_content_normalized(self):
+        card = self._card_sent(self._GOOD)
+        self.assertEqual(card, {"version": "0.9", "type": "buttons",
+                                "prompt": "Pick one",
+                                "options": [{"label": "A", "action": "choose A"}]})
+
+    def test_unparseable_json_attaches_nothing(self):
+        self.assertIsNone(self._card_sent("{not json"))
+
+    def test_wrong_type_attaches_nothing(self):
+        self.assertIsNone(self._card_sent('{"type": "modal", "options": []}'))
+
+    def test_option_missing_action_attaches_nothing(self):
+        self.assertIsNone(self._card_sent(
+            '{"type": "buttons", "options": [{"label": "A"}]}'))
+
+    def test_empty_options_attaches_nothing(self):
+        self.assertIsNone(self._card_sent('{"type": "buttons", "options": []}'))
 
 
 if __name__ == "__main__":

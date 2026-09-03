@@ -479,12 +479,11 @@ bash "$REPO/scripts/install-git-hooks.sh" >/dev/null 2>&1 || true
 # dark whenever a session restarts without an explicit /schedule-crons invocation.
 bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
 
-# Re-inject PERSONAL_CLAUDE.md after context compaction (SessionStart
-# "compact" matcher). CLAUDE.md + the memory index survive compaction via the
-# system prompt; PERSONAL_CLAUDE.md only enters context via an explicit Read,
-# which compaction summarizes away — so long sessions silently lose per-user
-# rules. Idempotent — safe to run on every start.
-bash "$REPO/scripts/install-personal-claude-hook.sh" 2>&1 || true
+# PERSONAL_CLAUDE.md compaction-reinject hook is Claude-only policy — wired
+# at src/agent/claude/cli/start-cli.sh, the Claude launch chokepoint, not here.
+
+# The sentinel is NOT cleared here. This runs ~850 lines before the
+# `exec start-cli.sh` below, which clears it once a core is verified live.
 
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
@@ -1245,7 +1244,29 @@ elif grep -qE '^[[:space:]]*TWILIO_ACCOUNT_SID=[^[:space:]]' .env 2>/dev/null; t
         echo "  ✓ ngrok ($NGROK_URL — reserved domain, no Twilio update needed)"
       else
         echo "  ✓ ngrok ($NGROK_URL)"
-        echo "  ⚠ Update Twilio webhook to: $NGROK_URL"
+        # Trailing slash is stripped because conversation-server.ts strips it
+        # before binding WEBHOOK_BASE_URL; comparing unnormalised reads as drift.
+        TWILIO_CFG_URL=$(grep -E '^TWILIO_WEBHOOK_URL=' .env 2>/dev/null | head -1 \
+          | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs | sed 's:/*$::')
+        NGROK_CMP="${NGROK_URL%/}"
+        if [ -z "$TWILIO_CFG_URL" ]; then
+          echo "  ⚠ Point the Twilio webhook at: $NGROK_URL (no TWILIO_WEBHOOK_URL recorded)"
+        elif [ "$TWILIO_CFG_URL" = "$NGROK_CMP" ]; then
+          :
+        elif ! printf '%s' "$TWILIO_CFG_URL" | grep -qE '\.ngrok(-free)?\.(app|io)$'; then
+          # A non-ngrok tunnel (e.g. Funnel) is authoritative: the phone server
+          # binds it and never starts ngrok, so this ngrok is not its tunnel.
+          :
+        else
+          # The server binds WEBHOOK_BASE_URL from this var, so a stale value
+          # leaves TwiML and <Stream> pointing at a tunnel that no longer exists.
+          echo "  ⚠ ngrok URL moved — BOTH sides are stale:"
+          echo "      was: $TWILIO_CFG_URL"
+          echo "      now: $NGROK_URL"
+          echo "      1. update the Twilio console webhook to the new URL"
+          echo "      2. set TWILIO_WEBHOOK_URL=$NGROK_URL in .env and restart the"
+          echo "         phone conversation server — it binds this at startup"
+        fi
       fi
     else
       echo "  ✗ ngrok (failed to start)"
@@ -1262,7 +1283,12 @@ echo ""
 # Verify services actually started (wait a moment, then check ports)
 sleep 3
 echo "Verifying services..."
-VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api 7845:screen-capture"
+VERIFY_PORTS="$WEB_CLIENT_PORT:web-client 7844:dashboard 7843:agent-api"
+# Only verify 7845 when we actually tried to start it. Same condition as the start
+# branch: a deliberate skip must not render as a crash pointing at an empty log.
+if [ "${PERM_OK:-0}" = "1" ]; then
+  VERIFY_PORTS="$VERIFY_PORTS 7845:screen-capture"
+fi
 if [ "${SKIP_VOICE:-}" != "1" ]; then
   VERIFY_PORTS="9900:voice-agent $VERIFY_PORTS"
 fi
@@ -1272,11 +1298,26 @@ fi
 if [ "${OBS_COLLECTOR_READY:-0}" = "1" ]; then
   VERIFY_PORTS="$VERIFY_PORTS ${SUTANDO_OBS_PORT:-4000}:collector"
 fi
+# A single probe races a service still binding, so retry briefly. The deadline is
+# GLOBAL: per-port it would serialise to ports x settle seconds before core launch.
+VERIFY_SETTLE_S="${VERIFY_SETTLE_S:-10}"
+verify_deadline=$(( $(date +%s) + VERIFY_SETTLE_S ))
 for port_name in $VERIFY_PORTS; do
   port="${port_name%%:*}"
   name="${port_name##*:}"
+  # COUNT SLEEPS, never two `date` samples: at 1s granularity the two can
+  # straddle a boundary and report 1s for a port that never waited at all.
+  waited=0
+  while ! lsof -i :"$port" > /dev/null 2>&1 && [ "$(date +%s)" -lt "$verify_deadline" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
   if lsof -i :"$port" > /dev/null 2>&1; then
-    echo "  ✓ $name (port $port)"
+    if [ "$waited" -gt 0 ]; then
+      echo "  ✓ $name (port $port, after ${waited}s)"
+    else
+      echo "  ✓ $name (port $port)"
+    fi
   else
     echo "  ✗ $name (port $port) — check $LOGS_DIR/${name}.log"
   fi

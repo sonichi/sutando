@@ -12,7 +12,10 @@ Any --source other than slack/discord/telegram is treated as a remote-gateway
 channel: the sender reads channels/<source>/.env (under $CLAUDE_CONFIG_DIR) for
 REMOTE_TASK_URL + REMOTE_TASK_TOKEN and posts the message through the gateway's
 POST /v1/room {op: "message"} endpoint — the same transport the task bridge for
-that provider uses, so progress updates land in the originating room.
+that provider uses, so progress updates land in the originating room. That file
+must resolve inside channels/ itself, or be the AG2 Space desktop app's own
+$SUTANDO_APP_SUPPORT/channels/<source>/.env (containment policy owned by
+src/channel_env_containment.py; see _channel_env_is_contained below).
 
 Exits 0 on success, 1 on failure. Fail-open by design — a failed send must never
 block the task itself. The caller should always continue working regardless of exit code.
@@ -239,6 +242,23 @@ def send_telegram(chat_id: str, message: str) -> bool:
 _SOURCE_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]|\.(?=[a-z0-9]))*$")
 
 
+def _load_channel_env_containment():
+    """The shared containment policy (src/channel_env_containment.py), or a
+    fail-closed stub when src/ isn't importable this way — never silently
+    widen the guard just because the import failed."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+        from channel_env_containment import channel_env_is_contained  # type: ignore
+        return channel_env_is_contained
+    except Exception:
+        return lambda env_path, channels_dir, source: False
+
+
+# Single shared owner: src/channel_env_containment.py (see its docstring for
+# the accept/refuse rule; also delegated to by core-supervisor-relay.py).
+_channel_env_is_contained = _load_channel_env_containment()
+
+
 def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN)."""
@@ -252,10 +272,8 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
     _claude_config = Path(_base) if _base else Path.home() / ".claude"
     channels_dir = _claude_config / "channels"
     env_path = channels_dir / source / ".env"
-    # Belt and suspenders: even a slug-valid name must RESOLVE inside the
-    # channels directory. The containment root is the realpath of channels/
-    # itself (so a symlinked channels dir works), but a channel entry that
-    # symlinks OUT of the directory is refused by design.
+    # Belt and suspenders: even a slug-valid name must RESOLVE inside an
+    # approved root (_channel_env_is_contained) — anything else is refused.
     # Derive the EFFECTIVE gateway config from os.environ ALONE first — including
     # the alias and the combined "url|secret" one-token form. Only if that is still
     # missing a value do we resolve/guard/read the channel file. Checking just the
@@ -281,23 +299,29 @@ def send_remote_gateway(source: str, channel_id: str, message: str) -> bool:
 
     url, token = _derive(lambda k: os.environ.get(k, ""))
     if not (url and token):
-        # The file IS needed, so the containment check applies — unchanged. A
-        # channel entry that symlinks OUT of channels/ is refused by design.
-        real_env = os.path.realpath(env_path)
-        real_root = os.path.realpath(channels_dir)
-        if not real_env.startswith(real_root + os.sep):
+        # The file IS needed, so the containment check applies — two approved
+        # roots, fail-closed outside both (see _channel_env_is_contained).
+        if not _channel_env_is_contained(env_path, channels_dir, source):
             print(f"[task-progress] refusing env path outside channels dir: {env_path}",
                   file=sys.stderr)
             return False
-        env = _env_file(real_env)
+        env = _env_file(os.path.realpath(env_path))
         url, token = _derive(lambda k: os.environ.get(k, "") or env.get(k, ""))
     if not url or not token:
         print(f"[task-progress] no REMOTE_TASK_URL/REMOTE_TASK_TOKEN (or AG2_REMOTE_TOKEN) "
               f"for source '{source}' (looked in {env_path})", file=sys.stderr)
         return False
+    # Progress updates carry the same worker stamp as results, so a notify
+    # renders with the sender's attribution instead of stripping it.
+    worker = os.environ.get("SUTANDO_WORKER_ID") or (
+        f"worker-{os.environ.get('SUTANDO_WORKER_SEAT') or os.environ['SUTANDO_CORE_ID']}"
+        if os.environ.get("SUTANDO_WORKER_SEAT") or os.environ.get("SUTANDO_CORE_ID") else None)
+    payload = {"op": "message", "room_id": channel_id, "body": message}
+    if worker:
+        payload["extra_content"] = {"space.ag2.worker": {"id": worker}}
     return _post(
         f"{url}/v1/room",
-        {"op": "message", "room_id": channel_id, "body": message},
+        payload,
         {"Authorization": f"Bearer {token}",
          # some gateway edges (CDN/WAF) reject the default Python-urllib UA
          "User-Agent": "sutando-task-progress/1.0"},

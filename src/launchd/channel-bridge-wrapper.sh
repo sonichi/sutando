@@ -13,12 +13,42 @@ ENV_FILE="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path "channels/$C
 [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
 
 case "$CHANNEL" in
-  slack) TOKEN="${SLACK_BOT_TOKEN:-}"; MODULE=slack_bolt ;;
-  discord) TOKEN="${DISCORD_BOT_TOKEN:-}"; MODULE=discord ;;
+  slack) TOKEN_VAR=SLACK_BOT_TOKEN; TOKEN="${SLACK_BOT_TOKEN:-}"; MODULE=slack_bolt ;;
+  discord) TOKEN_VAR=DISCORD_BOT_TOKEN; TOKEN="${DISCORD_BOT_TOKEN:-}"; MODULE=discord ;;
   # telegram has no third-party dep; urllib.request is stdlib, so this stays an
   # interpreter probe rather than a network one.
-  telegram) TOKEN="${TELEGRAM_BOT_TOKEN:-}"; MODULE=urllib.request ;;
+  telegram) TOKEN_VAR=TELEGRAM_BOT_TOKEN; TOKEN="${TELEGRAM_BOT_TOKEN:-}"; MODULE=urllib.request ;;
 esac
+
+# Interpreter: resolved ONCE, before anything invokes it. Honor an explicit
+# override, else the safe-interpreter-contract candidate -- but only after the
+# module probe accepts it. A bare `command -v python3` can be the Xcode Command
+# Line Tools stub, which prompts an install dialog when executed, so the token
+# gate below must never be the thing that discovers that. scripts/python-binary.sh
+# (already used by src/startup.sh and start-cli.sh) resolves the same way this
+# wrapper needs to: it rejects the /usr/bin stub via `xcode-select -p` unless the
+# developer tools are actually installed, so its candidate is safe to run here.
+PYTHON="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
+if [ -z "$PYTHON" ] && [ -r "$REPO/scripts/python-binary.sh" ]; then
+  # shellcheck source=../../scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  # Module-aware: the contract candidate can be a bundled runtime that simply
+  # lacks this channel's dep, while a later candidate in the same order has it.
+  PYTHON="$(resolve_python_for_module "$REPO" "$MODULE")"
+fi
+
+# The bridge resolves env -> .env -> vault, so an .env-only gate here is NARROWER
+# than the thing it gates and parks a bridge whose token is merely in the vault.
+# Uses the SAME validated $PYTHON the child gets: a host relying on the explicit
+# override otherwise gets a runnable bridge and an unrunnable gate, and a host
+# whose PATH python3 is a stub must not have it invoked here at all.
+if [ -z "$TOKEN" ] && [ -n "$PYTHON" ]; then
+  _tok_rc=0
+  "$PYTHON" "$REPO/src/channel_token.py" --has "$TOKEN_VAR" --env-file "$ENV_FILE" 2>/dev/null || _tok_rc=$?
+  # 0 = usable, 3 = definitively absent, anything else = resolver unrunnable, so
+  # fall through to the .env answer rather than taking the bridge down on a bug.
+  [ "$_tok_rc" -eq 0 ] && TOKEN="vault"
+fi
 if [ -z "$TOKEN" ]; then
   # KeepAlive=true is intentionally unconditional: the conditional
   # Crashed/SuccessfulExit dictionary can remain pended instead of respawning
@@ -30,17 +60,11 @@ if [ -z "$TOKEN" ]; then
   while :; do sleep 300; done
 fi
 
-# Interpreter: honor an explicit override, else the PATH-resolved python3. The
-# launchd plist sets PATH to "__BREW_BIN__:/usr/bin:...", where __BREW_BIN__ is
-# the dir the installer resolved via its own `command -v python3` — so a bare
-# `python3` here is the interpreter the installer validated, with no clone-,
-# arch-, or user-specific candidate list baked into this committed file.
-PYTHON="${SUTANDO_CHANNEL_BRIDGE_PYTHON:-}"
-if [ -z "$PYTHON" ] && command -v python3 >/dev/null 2>&1; then
-  python3 -c "import $MODULE" >/dev/null 2>&1 && PYTHON=python3
-fi
+# $PYTHON was resolved above, before the token gate could invoke anything. The
+# fatal check stays HERE, after the idle branch: a deconfigured channel with no
+# usable interpreter must still park quietly rather than exit 1 into a respawn.
 if [ -z "$PYTHON" ]; then
-  echo "[$CHANNEL-bridge-wrapper] no usable Python interpreter" >&2
+  echo "[$CHANNEL-bridge-wrapper] no python3 can 'import $MODULE' (tried \$SUTANDO_PY, the bundled runtime, then PATH) — install it for one of those, or set SUTANDO_CHANNEL_BRIDGE_PYTHON" >&2
   exit 1
 fi
 
@@ -48,10 +72,26 @@ WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
 mkdir -p "$STATE_DIR" "$WORKSPACE/results"
 MARKER="$STATE_DIR/$CHANNEL.started"
+# A deliberate restart (src/restart.sh) stamps this; an exit inside the window is
+# not a crash and gets no owner alert. Same channel alerted within the cooldown: one line, not a stream.
+DELIBERATE="$STATE_DIR/deliberate-restart"
+DELIBERATE_WINDOW_S="${SUTANDO_BRIDGE_DELIBERATE_WINDOW_S:-180}"
+ALERT_STAMP="$STATE_DIR/$CHANNEL.last-alert"
+ALERT_COOLDOWN_S="${SUTANDO_BRIDGE_ALERT_COOLDOWN_S:-600}"
+_age() { local t; t="$(cat "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
 emit_restart_alert() {
   NOW="$(date +%s)"
-  RESULT="$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$NOW.txt"
   echo "[$CHANNEL-bridge-wrapper] previous process exited; automatically restarting" >&2
+  if [ -f "$DELIBERATE" ] && [ "$(_age "$DELIBERATE")" -lt "$DELIBERATE_WINDOW_S" ]; then
+    echo "[$CHANNEL-bridge-wrapper] exit within a deliberate restart window; no alert" >&2
+    return 0
+  fi
+  if [ -f "$ALERT_STAMP" ] && [ "$(_age "$ALERT_STAMP")" -lt "$ALERT_COOLDOWN_S" ]; then
+    echo "[$CHANNEL-bridge-wrapper] alert cooldown active; not repeating" >&2
+    return 0
+  fi
+  echo "$NOW" > "$ALERT_STAMP"
+  RESULT="$WORKSPACE/results/proactive-$CHANNEL-bridge-restarted-$NOW.txt"
   printf '%s\n' "⚠️ The $CHANNEL bridge exited and was automatically restarted." > "$RESULT"
   osascript -e "display notification \"The $CHANNEL bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
 }
@@ -72,7 +112,9 @@ _EVICT_HELPER="$REPO/src/launchd/evict-own-bridge.sh"
 if [ -f "$_EVICT_HELPER" ]; then
   # shellcheck source=evict-own-bridge.sh
   . "$_EVICT_HELPER"
-  evict_own_bridge "$CHANNEL" "$REPO"
+  # Best-effort HERE by design: a discovery failure (nonzero return) must not
+  # set -e-abort the wrapper and park the bridge; the singleton lock still holds.
+  evict_own_bridge "$CHANNEL" "$REPO" || echo "[$CHANNEL-bridge-wrapper] eviction skipped (rc=$?)" >&2
 fi
 sleep 0.3
 
@@ -93,9 +135,17 @@ while [ "$STOPPING" = 0 ]; do
   CHILD_PID=$!
   set +e
   wait "$CHILD_PID"
+  CHILD_RC=$?
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
+  # 75 == single_instance.EXIT_STANDDOWN: a peer holds the lock. Gate on THAT,
+  # never on 0 -- a bridge whose main loop returns also exits 0, and treating
+  # that as deliberate would leave it down silently, with the alert suppressed.
+  # Clear the marker too: launchd KeepAlive is unconditional, so exiting hands
+  # the respawn back to launchd, which re-enters above and alerts off a marker
+  # this run left behind.
+  [ "$CHILD_RC" -eq 75 ] && { rm -f "$MARKER"; exit 0; }
   emit_restart_alert
   sleep "$RESTART_DELAY" &
   CHILD_PID=$!
