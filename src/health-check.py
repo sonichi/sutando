@@ -5176,6 +5176,20 @@ def _rejection_epoch(entry: object) -> "float | None":
         return None
 
 
+def _own_core_model() -> "str | None":
+    """This core's model, or None when no writer has recorded it (Claude cores today)."""
+    env = os.environ.get("SUTANDO_CORE_MODEL")
+    if env:
+        return env
+    path = status_read_path("core-runtime.json", WORKSPACE_DIR)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    m = data.get("model") if isinstance(data, dict) else None
+    return m if isinstance(m, str) and m else None
+
+
 def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
                                   hour_sec: int = 3600) -> dict:
     """WARN on a recent upstream rejection (4xx/5xx other than 401) recorded by the
@@ -5186,6 +5200,15 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
     "You're out of usage credits" while every unified-status header read
     "allowed", so no probe fired. The proxy now records each such response into
     `recent_rejections` in quota-state.json; this probe reads only that ledger.
+
+    The proxy serves every seat on the host, so the ledger mixes clients. Each
+    entry carries the request's `model`; when this core's own model is known
+    (`SUTANDO_CORE_MODEL` or core-runtime.json), only entries for that model
+    count toward the thresholds and the rest are reported as other clients'.
+    When it is unknown, every entry counts and the detail says so, because a
+    shared-proxy rejection that cannot be attributed must not be silently
+    discarded either.
+
     A rejection younger than `window_sec` warns (the owner hears once per
     episode via the transition-hash dedup); `sustained` or more inside
     `hour_sec` fails. Missing, foreign or unparsable ledgers never page.
@@ -5211,26 +5234,42 @@ def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,
     if not dated:
         check["detail"] = f"{len(ledger)} ledger entr(y/ies) but none carry a parsable ts"
         return check
-    last_entry, last_t = max(dated, key=lambda p: p[1])
-    in_hour = [p for p in dated if now - p[1] <= hour_sec]
-    in_window = [p for p in dated if now - p[1] <= window_sec]
+
+    own = _own_core_model()
+    if own:
+        mine = [p for p in dated if p[0].get("model") == own]
+        others = [p for p in dated if p[0].get("model") != own]
+        attribution = f"counting model={own}"
+    else:
+        mine, others = dated, []
+        attribution = "unattributed (this core's model is unknown, so every client counts)"
+    other_models = sorted({str(p[0].get("model") or "?") for p in others})
+    other_note = (f"; {len(others)} from other client(s) [{', '.join(other_models)}] not counted"
+                  if others else "")
+
+    if not mine:
+        check["detail"] = (f"{len(ledger)} recorded, none for this core's model ({attribution}){other_note}")
+        return check
+    last_entry, last_t = max(mine, key=lambda p: p[1])
+    in_hour = [p for p in mine if now - p[1] <= hour_sec]
+    in_window = [p for p in mine if now - p[1] <= window_sec]
     age_min = int(max(now - last_t, 0) / 60)
-    what = (f"last: HTTP {last_entry.get('status')} {age_min}m ago — "
+    what = (f"last: HTTP {last_entry.get('status')} {age_min}m ago, model={last_entry.get('model') or '?'} — "
             f"{str(last_entry.get('snippet') or '')[:160]!r}")
-    remedy = ("; the CLI drops the fire and prints the error in the core pane, so run "
-              "/usage-credits (or /model to switch) there")
+    remedy = ("; the CLI drops the fire and prints the error in the pane of the seat that was "
+              "rejected, so run /usage-credits (or /model to switch) there")
     if len(in_hour) >= sustained:
         check["status"] = "fail"
-        check["detail"] = (f"{len(in_hour)} upstream rejections in the last "
-                           f"{hour_sec // 60}m ({what}){remedy}")
+        check["detail"] = (f"{len(in_hour)} upstream rejections in the last {hour_sec // 60}m "
+                           f"({attribution}; {what}){remedy}{other_note}")
     elif in_window:
         check["status"] = "warn"
-        check["detail"] = (f"{len(in_window)} upstream rejection(s) in the last "
-                           f"{window_sec // 60}m ({what}){remedy}")
+        check["detail"] = (f"{len(in_window)} upstream rejection(s) in the last {window_sec // 60}m "
+                           f"({attribution}; {what}){remedy}{other_note}")
     else:
-        check["detail"] = f"{len(ledger)} recorded, none in the last {window_sec // 60}m ({what})"
+        check["detail"] = (f"{len(mine)} recorded, none in the last {window_sec // 60}m "
+                           f"({attribution}; {what}){other_note}")
     return check
-
 
 def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
     """FAIL (loudly, to the remote owner surface) when the core's model quota is

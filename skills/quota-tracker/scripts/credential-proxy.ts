@@ -311,6 +311,21 @@ export interface RejectionRecord {
 	status: number;
 	path: string;
 	snippet: string;
+	// The proxy serves every seat on a host, so a rejection is attributable only
+	// by what the request carried: the model, the CLI's user-agent, the peer port.
+	model?: string;
+	user_agent?: string;
+	peer_port?: number;
+}
+
+/** The `model` field of a JSON request body, or "" when absent or unparsable. */
+export function requestModel(body: Buffer): string {
+	try {
+		const m = JSON.parse(body.toString('utf8'))?.model;
+		return typeof m === 'string' ? m : '';
+	} catch {
+		return '';
+	}
 }
 
 function isRejectionRecord(x: unknown): x is RejectionRecord {
@@ -545,16 +560,20 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						if (code >= 400 && code !== 401) {
 							// The only component that sees a credits/overage rejection is this
 							// proxy; without a record the dropped request is invisible upstream.
-							const chunks: Buffer[] = [];
+							const rejChunks: Buffer[] = [];
 							let seen = 0;
 							upRes.on('data', (c: Buffer) => {
-								if (seen < REJECTION_SNIPPET_BYTES) { chunks.push(c); seen += c.length; }
+								if (seen < REJECTION_SNIPPET_BYTES) { rejChunks.push(c); seen += c.length; }
 							});
 							upRes.on('end', () => {
-								const snippet = redactForLog(Buffer.concat(chunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
-								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url}: ${snippet}`);
+								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
+								const model = requestModel(body);
+								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
 								try {
-									deps.recordRejection({ ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet });
+									deps.recordRejection({
+										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
+										model, user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
+									});
 								} catch { /* best effort */ }
 							});
 						}

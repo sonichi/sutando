@@ -8,7 +8,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { request as httpsRequest } from 'node:https';
-import { createProxyServer, appendRejection, MAX_RECENT_REJECTIONS, type ProxyDeps, type RejectionRecord } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { createProxyServer, appendRejection, requestModel, MAX_RECENT_REJECTIONS, type ProxyDeps, type RejectionRecord } from '../skills/quota-tracker/scripts/credential-proxy.ts';
 
 const NOW = 1_700_000_000_000;
 let upstreamHandler: (req: IncomingMessage, res: ServerResponse) => void = () => {};
@@ -42,15 +42,15 @@ async function startProxy(): Promise<number> {
 	return listen(createProxyServer(deps));
 }
 
-function call(port: number): Promise<{ status: number; body: string }> {
+function call(port: number, reqBody = '{}', headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
 	return new Promise((resolve, reject) => {
-		const req = httpRequest({ hostname: '127.0.0.1', port, path: '/v1/messages?beta=true', method: 'POST' }, (res) => {
+		const req = httpRequest({ hostname: '127.0.0.1', port, path: '/v1/messages?beta=true', method: 'POST', headers }, (res) => {
 			const chunks: Buffer[] = [];
 			res.on('data', (c) => chunks.push(c));
 			res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
 		});
 		req.on('error', reject);
-		req.end('{}');
+		req.end(reqBody);
 	});
 }
 
@@ -69,6 +69,21 @@ test('a 429 credits rejection is forwarded unchanged AND recorded with status, p
 	assert.equal(recorded[0].path, '/v1/messages?beta=true');
 	assert.equal(recorded[0].ts, new Date(NOW).toISOString(), 'stamped from the injected clock');
 	assert.match(recorded[0].snippet, /out of usage credits/);
+});
+
+test('the record attributes the rejection to the requesting client: model from the body, user-agent, peer port', async () => {
+	upstreamHandler = (_req, res) => { res.writeHead(429); res.end('{"error":"credits"}'); };
+	const port = await startProxy();
+	await call(port, '{"model":"claude-fable-5-1","messages":[]}', { 'user-agent': 'claude-cli/9.9.9 (seat-3)' });
+	await call(port, 'not json', { 'user-agent': 'other-client/1' });
+	await settle();
+	assert.equal(recorded.length, 2);
+	assert.equal(recorded[0].model, 'claude-fable-5-1');
+	assert.equal(recorded[0].user_agent, 'claude-cli/9.9.9 (seat-3)');
+	assert.equal(typeof recorded[0].peer_port, 'number');
+	assert.equal(recorded[1].model, '', 'an unparsable body records an empty model, never throws');
+	assert.equal(recorded[1].user_agent, 'other-client/1');
+	assert.equal(requestModel(Buffer.from('{"model":5}')), '', 'a non-string model is empty');
 });
 
 test('a 5xx is recorded too; a 2xx and a 401 are NOT (401 has its own auth path)', async () => {

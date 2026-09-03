@@ -21,6 +21,7 @@ import json
 import tempfile
 import time
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,8 +55,11 @@ class TestCoreRequestRejections(unittest.TestCase):
         self.q.write_text(json.dumps({"available": True, "headers": {
             "anthropic-ratelimit-unified-status": "allowed"}, "recent_rejections": ledger}))
 
-    def _rej(self, age, status=429, snippet="You're out of usage credits. Run /usage-credits"):
-        return {"ts": _iso(age), "status": status, "path": "/v1/messages", "snippet": snippet}
+    def _rej(self, age, status=429, snippet="You're out of usage credits. Run /usage-credits", model="claude-fable-5-1"):
+        return {"ts": _iso(age), "status": status, "path": "/v1/messages", "snippet": snippet, "model": model}
+
+    def _own(self, model):
+        return unittest.mock.patch.dict("os.environ", {"SUTANDO_CORE_MODEL": model} if model else {}, clear=False)
 
     def test_fresh_rejection_warns_with_remedy_and_reaches_owner_filter(self):
         self._write([self._rej(120)])
@@ -109,6 +113,37 @@ class TestCoreRequestRejections(unittest.TestCase):
         c = self.hc.check_core_request_rejections()
         self.assertEqual(c["status"], "warn")
         self.assertIn("unreadable", c["detail"])
+
+    def test_shared_proxy_other_seats_rejections_do_not_count_when_own_model_known(self):
+        # Five rejections from another seat's model inside the hour; one fresh from mine.
+        self._write([self._rej(60 * k, model="claude-opus-5") for k in range(1, 6)] + [self._rej(30, model="claude-fable-5-1")])
+        with self._own("claude-fable-5-1"):
+            c = self.hc.check_core_request_rejections()
+        self.assertEqual(c["status"], "warn", c)
+        self.assertIn("counting model=claude-fable-5-1", c["detail"])
+        self.assertIn("5 from other client(s) [claude-opus-5] not counted", c["detail"])
+
+    def test_only_other_seats_rejected_is_ok_for_this_core(self):
+        self._write([self._rej(60 * k, model="claude-opus-5") for k in range(1, 6)])
+        with self._own("claude-fable-5-1"):
+            c = self.hc.check_core_request_rejections()
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("none for this core's model", c["detail"])
+
+    def test_unknown_own_model_counts_every_client_and_says_so(self):
+        self._write([self._rej(60 * k, model="claude-opus-5") for k in range(1, 6)])
+        with self._own(None):
+            c = self.hc.check_core_request_rejections()
+        self.assertEqual(c["status"], "fail", c)
+        self.assertIn("unattributed", c["detail"])
+
+    def test_control_attribution_is_what_flips_the_verdict(self):
+        ledger = [self._rej(60 * k, model="claude-opus-5") for k in range(1, 6)]
+        self._write(ledger)
+        with self._own("claude-fable-5-1"):
+            self.assertEqual(self.hc.check_core_request_rejections()["status"], "ok")
+        with self._own("claude-opus-5"):
+            self.assertEqual(self.hc.check_core_request_rejections()["status"], "fail")
 
     def test_probe_is_registered_next_to_core_quota(self):
         src = (REPO / "src" / "health-check.py").read_text()
