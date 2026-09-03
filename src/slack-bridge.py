@@ -85,6 +85,7 @@ from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
+from policy.egress.unfurl import should_unfurl  # noqa: E402
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -1479,8 +1480,12 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
     # at each boundary so every chunk renders as a well-formed block.
     if clean_text:
         all_chunks_sent = True
+        # Decided on the whole body, not per chunk: a digest split at 4000
+        # chars must not unfurl piecewise just because a chunk holds one link.
+        unfurl = should_unfurl(clean_text)
         for chunk in chunk_message(clean_text, 4000):
-            kwargs = {"channel": channel, "text": chunk}
+            kwargs = {"channel": channel, "text": chunk,
+                      "unfurl_links": unfurl, "unfurl_media": unfurl}
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
             try:

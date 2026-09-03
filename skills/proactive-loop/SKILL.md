@@ -160,6 +160,21 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
      If every message in the group is a notice needing no reply, use `[no-send]` on **all** of them — never `[deduped:]` pointing at one. Guarded by `tests/proactive-loop-check-dedup-targets.test.py` (11 tests; mutations verified red). The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
 
+   **⚠ CLOSE THE PASS BY ASKING THE QUEUE, NOT YOUR MEMORY.** Before writing the idle
+   status, run:
+
+   ```bash
+   python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"   # rc=1 => a task got no result
+   ```
+
+   A task file stays in `tasks/` until a result is written and the bridge archives it, so
+   the queue already *is* the record of what is unanswered — nothing reads it at the end of
+   a pass. The miss is invisible from the inside: the work gets done, the reply is composed
+   in the transcript, the terminal shows it, and only the queue disagrees. Measured five
+   times in one session, caught every time by re-listing by hand and never once by recall —
+   which is why this is a command and not a reminder. It fires only on tasks older than
+   `--min-age-sec` (default 120), so a task still in flight is never flagged.
+
 2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
