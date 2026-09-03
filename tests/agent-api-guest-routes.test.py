@@ -27,6 +27,9 @@ from pathlib import Path
 # tempdir instead of the live workspace.
 _TEST_WS = tempfile.mkdtemp()
 os.environ["SUTANDO_TEST_MODE"] = "1"
+# A standalone run must never reach product telemetry: opt out before the
+# import, in addition to the emitter stub the accepted-object controls need.
+os.environ.setdefault("SUTANDO_TELEMETRY", "0")
 os.environ["SUTANDO_WORKSPACE"] = _TEST_WS
 SRC = Path(__file__).resolve().parent.parent / "src"
 _spec = importlib.util.spec_from_file_location("agent_api", str(SRC / "agent-api.py"))
@@ -292,8 +295,8 @@ def run() -> None:
         check(f"every Signal Room task is team tier, never owner (saw {tiers})", tiers == {"team"})
     finally:
         agent_api.submit_signal_room_task = orig_submit
-        if orig_emit is not None:
-            agent_api._emit_task_processed = orig_emit
+        # The emitter stays stubbed: the accepted-object controls below reach
+        # the normal accept path and would call the production emitter.
 
     # ── JSON bodies that parse but are not objects, and bodies the decoder
     #    cannot finish at all, must be 400s on BOTH lanes ──
@@ -369,6 +372,8 @@ def run() -> None:
     check("/guest-task: decoder ValueError is the invalid-JSON 400 (negative control, forced)",
           raw_forced_value_error("/guest-task", SMALL) == BAD_JSON)
     check("/task: the forced control's object is accepted when the decoder is real (control)", raw("/task", SMALL) != BAD_JSON)
+    if orig_emit is not None:
+        agent_api._emit_task_processed = orig_emit
 
     print()
     if failures:
