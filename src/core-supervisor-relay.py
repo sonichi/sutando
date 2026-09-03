@@ -49,11 +49,27 @@ import sys
 # Hard blockers only the USER can clear → escalate to the owner's channel.
 # crashed/hung belong to RECOVER (restart), not to user-escalation.
 HARD_ESCALATE = {"blocked-human", "logged-out"}
+# Gates the monitor answered by itself but the owner should still hear about:
+# the core changed something (its model) without anyone asking.
+SOFT_NOTICE_KINDS = {"fable-limit"}
+
+
+def _soft_notice(signal: dict):
+    """The auto-answer record worth a notice, or None."""
+    aa = signal.get("auto_answered")
+    if isinstance(aa, dict) and aa.get("kind") in SOFT_NOTICE_KINDS:
+        return aa
+    return None
 
 
 def _sig_hash(signal: dict) -> str:
-    """Stable hash of the escalation-relevant fields (state + prompt)."""
-    key = f"{signal.get('state')}\x00{signal.get('prompt') or ''}"
+    """Stable hash of the escalation-relevant fields (state + prompt); a soft
+    notice hashes its own record, so it fires once however the state moves on."""
+    aa = _soft_notice(signal)
+    if aa and signal.get("state") not in HARD_ESCALATE:
+        key = f"auto\x00{aa.get('kind')}\x00{aa.get('at')}"
+    else:
+        key = f"{signal.get('state')}\x00{signal.get('prompt') or ''}"
     return hashlib.sha1(key.encode()).hexdigest()
 
 
@@ -65,9 +81,11 @@ def should_escalate(signal: dict, last_hash):
       considered already-seen and does not double-notify.
     - A hard blocker escalates only when its (state,prompt) hash differs from the
       last escalated one (debounce) — a persistent prompt fires exactly once.
+    - A soft notice (an allowlisted gate the monitor answered) fires once per
+      answer record, on whichever state carries it first.
     """
     state = signal.get("state")
-    if state not in HARD_ESCALATE:
+    if state not in HARD_ESCALATE and not _soft_notice(signal):
         return False, last_hash
     h = _sig_hash(signal)
     if h == last_hash:
@@ -143,6 +161,13 @@ def _derive_backend() -> "dict | None":
 
 def compose_message(signal: dict) -> str:
     """The owner-facing 'action needed' line: what's stuck + a prompt excerpt."""
+    aa = _soft_notice(signal)
+    if aa and signal.get("state") not in HARD_ESCALATE:
+        return ("ℹ️ Fable weekly limit reached — the core pressed Enter on the focused"
+                " \"Switch to <fallback> and continue\" of Claude Code's limit dialog, which"
+                " should leave it on the fallback model (Opus unless your model policy says"
+                " otherwise) for this session. Nothing to do unless the terminal shows"
+                " otherwise; /model there changes it, /usage-credits keeps Fable on credits.")
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
     kind = signal.get("kind")
     prompt = (signal.get("prompt") or "").strip()
@@ -158,6 +183,11 @@ def compose_message(signal: dict) -> str:
         msg += f": {excerpt[:110]}"
     if signal.get("kind") == "session-limit":
         msg += _limit_remedy(signal)
+    elif signal.get("kind") == "fable-limit-unfocused":
+        msg += (" — Claude Code's Fable weekly-limit dialog is up but the focused option is"
+                " not \"Switch to <fallback> and continue\", so the core will not press Enter"
+                " (that could spend credits). Pick the switch at the core's terminal, or"
+                " /usage-credits to stay on Fable.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"
