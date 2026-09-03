@@ -528,9 +528,8 @@ def main():
             _atomic_write(a.out, payload)
             last_sig = sig
 
-        # One announcement per EPISODE, keyed on what the owner would act on.
-        # Re-keying on `prompt` alone would re-fire as a menu redraws; leaving
-        # the blocked set clears it so a genuine second block is not swallowed.
+        # One announcement per EPISODE: leaving the blocked set clears the key,
+        # so a genuine second block is not swallowed by the first.
         if a.chat_escalation and state in _CHAT_ESCALATE_STATES:
             ep = (state, kind, prompt)
             if ep != escalated_episode:
