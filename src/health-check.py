@@ -5177,17 +5177,19 @@ def _rejection_epoch(entry: object) -> "float | None":
 
 
 def _own_core_model() -> "str | None":
-    """This core's model, or None when no writer has recorded it (Claude cores today)."""
+    """This core's model, or None when nothing on this host declares one.
+
+    NOT read from core-runtime.json: that marker records launch-time facts
+    (runtime, session), and the supervisor can switch model mid-session, so a
+    stamped model would go stale and attribute a rejection confidently and
+    wrongly — worse than reporting unattributed.
+    """
     env = os.environ.get("SUTANDO_CORE_MODEL")
     if env:
         return env
-    path = status_read_path("core-runtime.json", WORKSPACE_DIR)
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    m = data.get("model") if isinstance(data, dict) else None
-    return m if isinstance(m, str) and m else None
+    pins = {model for _label, model in _settings_model_pins()}
+    # Two settings files disagreeing is not a model this core can claim.
+    return pins.pop() if len(pins) == 1 else None
 
 
 def check_core_request_rejections(window_sec: int = 900, sustained: int = 5,

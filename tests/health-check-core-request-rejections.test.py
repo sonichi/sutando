@@ -20,6 +20,8 @@ import importlib.util
 import json
 import tempfile
 import time
+import os
+import contextlib
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
@@ -47,6 +49,12 @@ class TestCoreRequestRejections(unittest.TestCase):
         self.hc.WORKSPACE_DIR = self.root
         self.q = self.hc.status_read_path("quota-state.json", self.root)
         self.q.parent.mkdir(parents=True, exist_ok=True)
+        # The probe reads this core's model from the HOST, so an uncontrolled
+        # default makes every arm pass or fail by which machine runs it.
+        os.environ.pop("SUTANDO_CORE_MODEL", None)
+        pins = unittest.mock.patch.object(self.hc, "_settings_model_pins", lambda *a, **k: [])
+        pins.start()
+        self.addCleanup(pins.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -58,8 +66,23 @@ class TestCoreRequestRejections(unittest.TestCase):
     def _rej(self, age, status=429, snippet="You're out of usage credits. Run /usage-credits", model="claude-fable-5-1"):
         return {"ts": _iso(age), "status": status, "path": "/v1/messages", "snippet": snippet, "model": model}
 
+    @contextlib.contextmanager
     def _own(self, model):
-        return unittest.mock.patch.dict("os.environ", {"SUTANDO_CORE_MODEL": model} if model else {}, clear=False)
+        """Declare (or un-declare) this core's model for the duration.
+
+        Both sources must be controlled: leaving the settings fallback live
+        would read the HOST's own pin, so the "unknown model" arm would pass
+        on a machine with no pin and fail on the developer's.
+        """
+        env = {"SUTANDO_CORE_MODEL": model} if model else {}
+        with unittest.mock.patch.dict("os.environ", env, clear=False):
+            if not model:
+                os.environ.pop("SUTANDO_CORE_MODEL", None)
+            with unittest.mock.patch.object(
+                self.hc, "_settings_model_pins",
+                lambda *a, **k: [("test", model)] if model else []
+            ):
+                yield
 
     def test_fresh_rejection_warns_with_remedy_and_reaches_owner_filter(self):
         self._write([self._rej(120)])
@@ -151,6 +174,42 @@ class TestCoreRequestRejections(unittest.TestCase):
         j = src.index("checks.append(check_core_request_rejections())")
         self.assertLess(i, j)
         self.assertLess(j - i, 400, "registered right after the core-quota probe")
+
+
+    def test_a_model_stamped_in_core_runtime_json_is_ignored(self):
+        """The launch marker records runtime/session, not model. A model there
+        would be a launch-time copy of a value the supervisor can change
+        mid-session (#3739), so reading it would attribute confidently and
+        wrongly. This is the control for that: the file says fable, the probe
+        must still report unattributed."""
+        marker = self.hc.status_read_path("core-runtime.json", self.root)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(
+            {"runtime": "claude", "session": "sutando-core", "model": "claude-fable-5-1"}))
+        self._write([self._rej(120, model="claude-fable-5-1")])
+        c = self.hc.check_core_request_rejections()
+        self.assertIn("unattributed", c["detail"], c)
+        self.assertNotIn("counting model=", c["detail"], c)
+
+    def test_a_single_settings_pin_declares_the_model(self):
+        with unittest.mock.patch.object(
+            self.hc, "_settings_model_pins", lambda *a, **k: [("user", "claude-opus-5")]
+        ):
+            self._write([self._rej(120, model="claude-opus-5")])
+            c = self.hc.check_core_request_rejections()
+        self.assertEqual(c["status"], "warn", c)
+        self.assertIn("counting model=claude-opus-5", c["detail"], c)
+
+    def test_two_settings_pins_that_disagree_are_not_a_claim(self):
+        """Two files naming different models is not a model this core can claim;
+        guessing one would attribute every rejection to a coin flip."""
+        with unittest.mock.patch.object(
+            self.hc, "_settings_model_pins",
+            lambda *a, **k: [("user", "claude-opus-5"), ("project", "claude-fable-5-1")]
+        ):
+            self._write([self._rej(120, model="claude-opus-5")])
+            c = self.hc.check_core_request_rejections()
+        self.assertIn("unattributed", c["detail"], c)
 
 
 if __name__ == "__main__":
