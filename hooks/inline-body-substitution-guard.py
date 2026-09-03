@@ -21,7 +21,11 @@ import sys
 BODY_FLAGS = ("--body", "--notes", "--title")
 # What the shell eats inside double quotes. `$VAR` is deliberately absent: it is
 # a normal, usually-intended interpolation, unlike a code span or a subshell.
-SUBSTITUTES = re.compile(r"`|\$\(")
+# An ESCAPED backtick publishes literally, so it is not a rewrite.
+SUBSTITUTES = re.compile(r"(?<!\\)`|(?<!\\)\$\(")
+# `"$(cat f)"` as the WHOLE value is the intended content, not prose the shell
+# mangled — the standard file-passing idiom, and denying it cries wolf.
+WHOLE_SUBSTITUTION = re.compile(r'\A"\$\((?:[^()]|\([^()]*\))*\)"\Z')
 EQUALS_FORM = re.compile(r"(--body|--notes|--title)=")
 
 
@@ -35,19 +39,34 @@ def _deny(reason):
 
 
 def _newline_separators(command: str) -> str:
-    """A newline ends the command unless it sits inside a quoted argument,
-    where it is ordinary body text — so quote state decides, not str.split."""
-    out, quote, esc = [], None, False
-    for ch in command:
+    """Unquoted `#` comments out to end of line; an unquoted line break ends the
+    command. Comments go FIRST: once a newline is a `;`, nothing terminates one."""
+    out, quote, esc, comment = [], None, False, False
+    prev = " "
+    for i, ch in enumerate(command):
+        if comment:
+            if ch in "\r\n":
+                comment = False
+            else:
+                prev = ch
+                continue
         if esc:
-            out.append(ch); esc = False; continue
+            out.append(ch); esc = False; prev = ch; continue
         if ch == "\\" and quote != "'":
-            out.append(ch); esc = True; continue
+            out.append(ch); esc = True; prev = ch; continue
         if quote is None and ch in ("'", '"'):
             quote = ch
         elif ch == quote:
             quote = None
-        out.append(";" if (ch == "\n" and quote is None) else ch)
+        # A `#` starts a comment only at the start of a word — `a#b` is literal.
+        if ch == "#" and quote is None and (prev.isspace() or prev == ""):
+            comment = True; prev = ch; continue
+        if ch in "\r\n" and quote is None:
+            if not (ch == "\r" and command[i + 1:i + 2] == "\n"):
+                out.append(";")
+            prev = ch
+            continue
+        out.append(ch); prev = ch
     return "".join(out)
 
 
@@ -76,7 +95,8 @@ def offenders(command: str):
             armed = True
         if armed and w in BODY_FLAGS and i + 1 < len(words):
             val = words[i + 1]
-            if val.startswith('"') and SUBSTITUTES.search(val):
+            if (val.startswith('"') and SUBSTITUTES.search(val)
+                    and not WHOLE_SUBSTITUTION.match(val)):
                 out.append(w)
         i += 1
     return out

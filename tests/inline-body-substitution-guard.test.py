@@ -22,6 +22,36 @@ spec.loader.exec_module(G)
 
 
 class TestOffenders(unittest.TestCase):
+    def test_an_unquoted_hash_comments_out_the_rest_of_ITS_line_only(self):
+        """`shlex` keeps commenters='#', and once newlines became ';' nothing
+        terminated a comment — so a '#' on line 1 hid a violation on line 2
+        (vidhuUC, reproduced by sonichi, on both guards)."""
+        self.assertEqual(
+            G.offenders('echo hi # deploying now\n'
+                        'gh pr comment 1 --body "cost is $(wc -l)"'), ["--body"])
+        self.assertEqual(
+            G.offenders('echo hi # deploying now\r\n'
+                        'gh pr comment 1 --body "cost is $(wc -l)"'), ["--body"])
+
+    def test_a_fully_commented_command_is_not_a_violation(self):
+        """Why commenters='' would be the WRONG fix: it would flag this."""
+        self.assertEqual(G.offenders('# gh pr comment 1 --body "x $(date)"'), [])
+
+    def test_a_hash_inside_a_quoted_body_is_text(self):
+        self.assertEqual(G.offenders('gh pr comment 1 --body "a # b"'), [])
+
+    def test_an_escaped_backtick_publishes_literally(self):
+        """It is not a rewrite, so denying it cries wolf (sonichi)."""
+        self.assertEqual(G.offenders(r'gh pr comment 1 --body "use \`code\` here"'), [])
+        self.assertEqual(G.offenders('gh pr comment 1 --body "use `code` here"'), ["--body"])
+
+    def test_a_whole_value_substitution_is_the_intended_content(self):
+        """`--body "$(cat f)"` is the standard file-passing idiom: the value IS
+        the substitution, so nothing of the author's prose is lost."""
+        self.assertEqual(G.offenders('gh pr comment 1 --body "$(cat /tmp/body.md)"'), [])
+        self.assertEqual(
+            G.offenders('gh pr comment 1 --body "built at $(date) ok"'), ["--body"])
+
     def test_a_newline_ends_the_command_like_a_semicolon(self):
         """`whitespace_split` eats a newline, so `armed` survived a line break
         and a non-gh tool on line 2 was denied (yixuan-ag2, #3830)."""
