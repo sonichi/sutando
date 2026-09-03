@@ -118,6 +118,17 @@ class TestMentionFallback(unittest.TestCase):
         self.assertIn("no agent matches", got["reason"])
         self.assertEqual(self.posted, [])
 
+    def test_an_unimportable_members_module_keeps_the_directory_reason(self):
+        """`members` reaches the network, so it is imported lazily inside the
+        fallback — and a lazy import can fail. That must read as "cannot answer",
+        never as "the handle is not in the room"."""
+        with mock.patch.dict(sys.modules, {"members": None}):
+            got = self.M.mention("sutando-sonichi", "ping", "!r:ag2.space", "@me:ag2.space",
+                                 agents=[])
+        self.assertFalse(got["ok"])
+        self.assertIn("no agent matches", got["reason"])
+        self.assertEqual(self.posted, [])
+
     def test_a_room_miss_reports_and_posts_nothing(self):
         with self._members(["@chi:ag2.space"]):
             got = self.M.mention("sutando-rui", "ping", "!r:ag2.space", "@me:ag2.space",
