@@ -123,7 +123,20 @@ class ForeignRecordTests(unittest.TestCase):
         store = self._store()
         store.save(HumanRequirement(id="hitl_good00001", kind="permission", runtime="claude", message="m"))
         (store.root / "hitl_bad000001.json").write_text(json.dumps({"requirement": {"id": "hitl_bad000001"}}))
-        self.assertEqual([r.id for r in store.all()], ["hitl_good00001"])
+        with self.assertLogs("hitl.store", level="WARNING") as logs:
+            self.assertEqual([r.id for r in store.all()], ["hitl_good00001"])
+        # A dropped record must leave a trace: an empty store reads as "nothing
+        # needs the human", so silence here is the dangerous polarity.
+        self.assertEqual(store.last_skipped, ("hitl_bad000001.json",))
+        self.assertIn("1 unreadable record(s) skipped", logs.output[0])
+        self.assertIn("hitl_bad000001.json", logs.output[0])
+
+    def test_a_clean_store_leaves_no_trace(self):
+        store = self._store()
+        store.save(HumanRequirement(id="hitl_good00002", kind="permission", runtime="claude", message="m"))
+        with self.assertNoLogs("hitl.store", level="WARNING"):
+            self.assertEqual([r.id for r in store.all()], ["hitl_good00002"])
+        self.assertEqual(store.last_skipped, ())
 
 
 if __name__ == "__main__":

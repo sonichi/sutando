@@ -124,6 +124,8 @@ class HumanRequirement:
             wire["subject"] = dict(self.subject)
         if self.expires_at is not None:
             wire["expires_at"] = self.expires_at
+        # `answer` is inbound-only (what the human typed back); a card never
+        # renders it, so it is persisted but deliberately not on the wire.
         return wire
 
 
