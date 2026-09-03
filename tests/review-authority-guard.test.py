@@ -68,6 +68,30 @@ check("request-changes denied when gh is path-qualified",
 check("a binary merely ending in gh is NOT gh",
       run("/usr/bin/notgh pr review 1 --approve", "hold")[0], False)
 
+# macOS filesystems are case-INSENSITIVE, so `GH` runs the very same binary
+# (same inode). The early `"gh" not in command` prefilter was case-sensitive and
+# returned before the token scan lowercased anything.
+check("approve denied when the path is mixed-case",
+      run("/opt/homebrew/bin/" + APPROVE.replace("gh ", "GH ", 1), "hold")[0], True)
+check("approve denied when a bare gh is uppercase",
+      run(APPROVE.replace("gh ", "GH ", 1), "hold")[0], True)
+check("request-changes denied when the path is mixed-case",
+      run("/usr/local/bin/" + REQCH.replace("gh ", "Gh ", 1), "hold")[0], True)
+# Same boundary as the lowercase control: case-folding must not widen the match.
+check("a mixed-case binary merely ending in gh is NOT gh",
+      run("/usr/bin/notGH pr review 1 --approve", "hold")[0], False)
+check("an uppercase NON-review gh subcommand is still allowed",
+      run("GH pr view 1", "hold")[0], False)
+
+# keweichen's coverage note: the `gh api .../reviews` branch was only ever
+# exercised UNQUALIFIED, so reverting the basename fix left every path arm green.
+check("the api review form is denied when gh is path-qualified",
+      run("/opt/homebrew/bin/gh api repos/o/r/pulls/1/reviews -f event=APPROVE",
+          "hold")[0], True)
+check("the api review form is denied when gh is mixed-case",
+      run("/opt/homebrew/bin/GH api repos/o/r/pulls/1/reviews -f event=APPROVE",
+          "hold")[0], True)
+
 check("approve denied with no state file", run(APPROVE)[0], True)
 check("request-changes denied with no state file", run(REQCH)[0], True)
 check("comment ALLOWED with no state file", run(COMMENT)[0], False)

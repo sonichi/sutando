@@ -169,7 +169,9 @@ def _has_gh(words) -> bool:
 
 def classify(command: str) -> Optional[str]:
     """Return 'APPROVE' / 'REQUEST_CHANGES' / 'COMMENT', or None if not a formal review."""
-    if not isinstance(command, str) or "gh" not in command:
+    # Case-fold here too: the token scan lowercases, but this prefilter runs
+    # first, and a case-insensitive filesystem runs `GH` as the same binary.
+    if not isinstance(command, str) or "gh" not in command.lower():
         return None
     for m in _HEREDOC.finditer(command):
         # Only program text or API input is scanned; a `cat`/`tee` heredoc that
