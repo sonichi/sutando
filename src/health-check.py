@@ -7447,6 +7447,19 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
             "detail": f"{len(files)} task(s){held_note}{pool_note}, oldest {oldest_age}s"}
 
 
+def _held_age(seconds: int) -> str:
+    """Render an age at the granularity it actually has.
+
+    The threshold is in seconds, so storing days would print `(0d)` for
+    everything under a day and tie the sort at zero.
+    """
+    if seconds >= 86400:
+        return f"{seconds // 86400}d"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 60}m"
+
+
 def check_held_no_consumer(threshold_age_sec: int = 3600) -> dict:
     """Results parked in results/held-no-consumer/ because no transport claimed them.
 
@@ -7490,7 +7503,7 @@ def check_held_no_consumer(threshold_age_sec: int = 3600) -> dict:
             continue
         if age < threshold_age_sec:
             continue
-        held.append((path.name, age // 86400))
+        held.append((path.name, age))
 
     if unreadable and not held:
         return {"name": name, "status": "warn",
@@ -7502,13 +7515,13 @@ def check_held_no_consumer(threshold_age_sec: int = 3600) -> dict:
         return {"name": name, "status": "ok", "detail": detail}
 
     held.sort(key=lambda t: -t[1])
-    shown = ", ".join(f"{n} ({d}d)" for n, d in held[:5])
+    shown = ", ".join(f"{n} ({_held_age(a)})" for n, a in held[:5])
     more = f" +{len(held) - 5} more" if len(held) > 5 else ""
     extra = f"; {disposed} excluded by disposition suffix" if disposed else ""
     if unreadable:
         extra += f"; {unreadable} unreadable, so this count is a floor"
     return {"name": name, "status": "warn",
-            "detail": (f"{len(held)} result(s) parked with no consumer, oldest {held[0][1]}d: "
+            "detail": (f"{len(held)} result(s) parked with no consumer, oldest {_held_age(held[0][1])}: "
                        f"{shown}{more}{extra} — these were addressed and never delivered")}
 
 

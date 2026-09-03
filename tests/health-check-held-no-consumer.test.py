@@ -115,9 +115,27 @@ if os.geteuid() != 0:
 else:
     print("note: running as root — unreadable arm skipped, mode bits do not apply")
 
+# With days in the tuple these three all score 0, so each prints "(0d)" and the
+# "oldest" is whatever iterdir yielded first.
+def _sub_day(results):
+    held = results / "held-no-consumer"
+    held.mkdir()
+    now = time.time()
+    _touch(held / "just-over.no-push-transport.txt", now - 3601)
+    _touch(held / "middle.no-push-transport.txt", now - 40000)
+    _touch(held / "nearly-a-day.no-push-transport.txt", now - 86399)
+
+
+_sub = _probe(_sub_day)
+check("sub-day-render", _sub, "warn", ("oldest 23h", "just-over.no-push-transport.txt (1h)"))
+if "(0d)" in _sub["detail"]:
+    FAILURES.append(f"sub-day-render: days-granularity leaked into {_sub['detail']!r}")
+if _sub["detail"].index("nearly-a-day") > _sub["detail"].index("just-over"):
+    FAILURES.append("sub-day-render: ordered by filesystem, not by age")
+
 if FAILURES:
     print("FAIL")
     for line in FAILURES:
         print(" ", line)
     sys.exit(1)
-print("PASS: 7 controls, both directions")
+print("PASS: 8 controls, both directions")
