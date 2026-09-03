@@ -222,6 +222,33 @@ a deployed copy searches upward for `state/authority.json`. Set
 
 Test: `python3 tests/review-authority-guard.test.py`.
 
+## `inline-body-substitution-guard.py`
+
+DENIES a `gh` command whose `--body` / `--notes` / `--title` is passed inline in
+**double quotes** and contains a backtick or `$(`. The shell substitutes both
+before gh runs, so a published comment arrives with holes where its code spans
+were — while the command succeeds and still returns a URL. Single quotes are
+safe and allowed; `--body-file` is the fix and is what the denial names.
+
+Measured 2026-09-03 on sonichi/sutando#3829: a review reply lost three sentences
+that way, and it was caught only by reading the comment back afterwards.
+
+### Deploy (per node)
+
+```bash
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/hooks"
+cp hooks/inline-body-substitution-guard.py "$CFG/hooks/"
+```
+
+Register under the `Bash` PreToolUse matcher exactly as the guards above do
+(same `shlex.quote` recipe — these paths routinely contain a space).
+
+Escape hatch: `SUTANDO_SKIP_INLINE_BODY_GUARD=1`. Fail-open on any internal
+error, like every guard here.
+
+Tests: `python3 tests/inline-body-substitution-guard.test.py`
+
 ## `result-file-marker-guard.py`
 
 Denies a **Write/Edit into `<workspace>/results/`** whose body carries a
