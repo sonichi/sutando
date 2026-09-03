@@ -406,9 +406,8 @@ def answer_step(state, kind, prompt, answered_prompt, enabled=True):
 AUTO_ANSWER_CARRY_S = 120.0
 
 
-# ESCALATE (Layer 3) — the banner is a window the owner has to be looking at.
-# A blocked core is exactly a HumanRequirement, so it goes through `src/hitl`
-# like every other one: the Manager dedups, the projector renders the card.
+# ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
+# `src/hitl` — the Manager dedups, the projector renders the card.
 _CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
 HITL_KIND = "core-blocked"
 
