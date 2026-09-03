@@ -307,10 +307,7 @@ def test_context_bare_id_with_no_tasks_dir_fails_open() -> None:
     # No tasks/ at all: the bare-id resolver must answer None, not raise.
     workspace = fixture_workspace()
     tasks = workspace / "tasks"
-    if tasks.exists():
-        for child in tasks.iterdir():
-            child.unlink()
-        tasks.rmdir()
+    shutil.rmtree(tasks, ignore_errors=True)
     assert workstreams._unique_task_file(tasks, "task-a1", lambda n: "task-a1") is None
     assert workstreams.build_workstream_context(workspace, "task-a1") is None
 
@@ -327,7 +324,8 @@ def test_context_refuses_a_task_path_that_is_missing_or_carries_another_id() -> 
     store.write_text(json.dumps({
         "schema_version": 1,
         "workstreams": {"w": {"title": "Grouping", "summary": "s"}},
-        "assignments": {"task-a1": {"workstream_id": "w"}},
+        "assignments": {"task-a1": {"workstream_id": "w"},
+                        "task-a2": {"workstream_id": "w"}},
         "reviews": {},
     }))
     assert workstreams.build_workstream_context(
