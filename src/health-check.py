@@ -5257,6 +5257,20 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         )
         return check
 
+    # The proxy records the LAST response through it, whoever sent it: a
+    # rejection while both windows are far from full is another client's gate.
+    util = _quota_utilizations(headers)
+    if util is not None and max(util) < 0.9:
+        check["status"] = "warn"
+        check["detail"] = (
+            f"last response through the shared credential proxy was rejected "
+            f"(status={status}) but this core's windows are at {util[0]:.0%} (5h) / "
+            f"{util[1]:.0%} (7d) — another client's per-model or usage-credit limit "
+            "is the likely source (a seat out of credits); not paging. If THIS core "
+            "were stuck, its own passes would stop and quota-telemetry would go stale."
+        )
+        return check
+
     reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
     reset_note = f" 5h window resets {reset}." if reset else ""
     check["status"] = "fail"
@@ -5266,6 +5280,16 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
         "this is the 'stuck silently' condition; tasks will queue undelivered."
     )
     return check
+
+
+def _quota_utilizations(headers: dict):
+    """(5h, 7d) utilization fractions from the unified headers, or None when
+    either is absent or unparseable — an unknown reading corroborates nothing."""
+    try:
+        return (float(headers["anthropic-ratelimit-unified-5h-utilization"]),
+                float(headers["anthropic-ratelimit-unified-7d-utilization"]))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _scoped_keychain_service(config_dir: Optional[str]) -> Optional[str]:
