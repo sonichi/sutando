@@ -270,5 +270,109 @@ class Delegation(Base):
             pool_follower.delegate(self.tasks, self.state, other, CORE_ID, "core-2")
 
 
+class EdgesAndFaults(Base):
+    """Every declined/faulted branch the router can take, driven directly."""
+
+    def test_task_meta_unreadable_file_is_owner_default(self):
+        from pool_routing import read_task_meta
+        m = read_task_meta(self.tasks / "nope.txt", lane="routine")
+        self.assertEqual((m.name, m.lane, m.access_tier), ("nope.txt", "routine", "owner"))
+
+    def test_config_non_object_is_default(self):
+        (self.state / "pool").mkdir()
+        (self.state / "pool" / "routing.json").write_text("[]")
+        self.assertEqual(load_config(self.state).policy, "affinity-first")
+
+    def test_builtins_with_no_workers_return_none(self):
+        for name in ("least-loaded", "round-robin", "sticky-sender", "core-first"):
+            r = Router(RoutingConfig(policy=name), lambda *a: None)
+            self.assertIsNone(r.pick(TaskMeta("t", sender="U1"), [], {}).worker, name)
+
+    def test_core_first_addressed_target_via_router(self):
+        r = Router(RoutingConfig(policy="core-first"), lambda *a: None)
+        ws = [WorkerView("core-2"), WorkerView(CORE_ID, is_core=True)]
+        self.assertEqual(r.pick(TaskMeta("t", target="core-2"), ws, {}).worker, "core-2")
+        self.assertEqual(r.pick(TaskMeta("t", target="ghost"), ws, {}).worker, CORE_ID)
+
+    def test_custom_unloadable_and_uncallable_fall_back(self):
+        txt = Path(self.tmp.name) / "policy.txt"
+        txt.write_text("def pick(*a): return 'core-1'\n")
+        nc = Path(self.tmp.name) / "nc.py"
+        nc.write_text("pick = 5\n")
+        for spec, err in ((f"custom:{txt}:pick", "ImportError"), (f"custom:{nc}:pick", "TypeError")):
+            r = Router(RoutingConfig(policy=spec), lambda *a: "core-1")
+            d = r.pick(TaskMeta("t"), [WorkerView("core-1")], {})
+            self.assertTrue(d.fallback, spec)
+            self.assertIn(err, d.reason)
+
+    def test_rule_match_shapes(self):
+        cfg = RoutingConfig(policy="least-loaded", rules=[
+            {"match": "not-a-dict", "to": ["core-1"]},
+            {"match": {"runtime": "codex"}, "to": ["core-1"]},
+            {"match": {"source": ["slack", "discord"]}, "to": ["core-2"]},
+        ])
+        r = Router(cfg, lambda *a: None)
+        ws = [WorkerView("core-1"), WorkerView("core-2")]
+        d = r.pick(TaskMeta("t", source="discord"), ws, {})
+        self.assertEqual((d.worker, d.rule), ("core-2", 2))
+        ws_codex = [WorkerView("core-1", runtime="codex"), WorkerView("core-2")]
+        d = r.pick(TaskMeta("t", source="voice"), ws_codex, {})
+        self.assertEqual((d.worker, d.rule), ("core-1", 1))
+
+    def test_rule_policy_returning_non_candidate_falls_back(self):
+        bad = Path(self.tmp.name) / "leak.py"
+        bad.write_text("def pick(task, workers, affinity, state): return 'core-1'\n")
+        cfg = RoutingConfig(rules=[{"match": {"source": "slack"}, "policy": f"custom:{bad}:pick",
+                                    "exclude": ["core-1"]}])
+        r = Router(cfg, lambda *a: "core-2")
+        d = r.pick(TaskMeta("t", source="slack"), [WorkerView("core-1"), WorkerView("core-2")], {})
+        self.assertEqual((d.worker, d.fallback), ("core-2", True))
+        self.assertIn("not a candidate", d.reason)
+
+    def test_lead_default_pick_over_core_only_membership(self):
+        lead = self.lead()
+        only_core = [WorkerView(CORE_ID, is_core=True)]
+        self.assertEqual(lead._default_pick(TaskMeta("t"), only_core, {}, {}), CORE_ID)
+        self.assertIsNone(lead._default_pick(TaskMeta("t"), [], {}, {}))
+
+
+class DelegateCli(Base):
+    def held(self):
+        p = self.tasks / f"task-1.claimed-{CORE_ID}.txt"
+        p.write_text(task())
+        return p
+
+    def test_usage_and_refusal_exit_2(self):
+        self.assertEqual(pool_follower._delegate_cli(["only-one"]), 2)
+        self.assertEqual(pool_follower._delegate_cli([str(self.held()), CORE_ID, "core-2"]), 2)
+
+    def test_success_prints_assignment_path(self):
+        self.routing(allow_delegation=True)
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = pool_follower._delegate_cli([str(self.held()), CORE_ID, "core-2"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(buf.getvalue().strip().endswith("task-1.assigned-core-2.txt"))
+
+
+class DaemonHostLabel(unittest.TestCase):
+    def test_subprocess_fault_is_empty_label(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "pld", REPO / "scripts" / "pool-lead-daemon.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        real = mod.subprocess.run
+        try:
+            def boom(*a, **k):
+                raise OSError("no bash")
+            mod.subprocess.run = boom
+            self.assertEqual(mod._host_label(), "")
+        finally:
+            mod.subprocess.run = real
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

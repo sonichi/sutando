@@ -75,6 +75,15 @@ def _workspace() -> Path:
     return Path(out.stdout.strip())
 
 
+def _host_label() -> str:
+    try:
+        r = subprocess.run(["bash", str(_HERE / "sutando-config.sh"), "host-label"],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--interval", type=float, default=2.0)
@@ -116,14 +125,7 @@ def main() -> int:
         rt = (m.group(1).strip() if m else "") or "claude"
         return rt if rt in ("claude", "codex") else "claude"
 
-    def host_label() -> str:
-        try:
-            r = subprocess.run(["bash", str(_HERE / "sutando-config.sh"), "host-label"],
-                               capture_output=True, text=True, timeout=15)
-            return r.stdout.strip() if r.returncode == 0 else ""
-        except (OSError, subprocess.SubprocessError):
-            return ""
-    _host = {"label": host_label()}
+    _host = {"label": _host_label()}
     def core_alive() -> bool:
         return bool(_host["label"]) and alive(_host["label"])
     # The core's beat file is host-labelled; it is routed under CORE_ID.
