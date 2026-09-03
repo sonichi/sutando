@@ -357,6 +357,8 @@ def test_classifier_enqueue_is_off_by_default() -> None:
     assert on.pending and on.enqueued and on.reason == "enqueued"
     assert list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
 
+    # The cooldown is measured from a COMPLETION; an inflight run does not cool.
+    workstreams.mark_classifier_complete(workspace, on.snapshot_hash)
     write_task(
         workspace / "tasks" / "archive" / "2026-08" / "task-new.txt",
         "task-new",
