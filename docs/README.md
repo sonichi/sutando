@@ -10,6 +10,10 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Start here
 
+- [Lead-follower agent pool](lead-follower-pool.md) — multi-worker pool design:
+  lanes, binding room affinity, reclaim semantics.
+- [Sutando Server & the Agent ID card](server-and-identity.md) — server v0
+  composition and the identity-card contract.
 - [Configure a workspace](workspace-config.md) — defaults, overrides, and
   resolver APIs.
 - [Run Codex as the core](codex-core.md) — core selection, setup, and rollback.
@@ -61,6 +65,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
+- [Lead-follower agent pool design](lead-follower-pool.md)
 - [Sparrow delivery identity — frozen definitions](sparrow-delivery-identity.md)
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)

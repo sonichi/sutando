@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.sutando.pool-lead</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__STAGE_DIR__/pool-lead-wrapper.sh</string>
+  </array>
+  <!-- Staged wrapper, home cwd and Library logs: launchd cannot exec, chdir to,
+       or open files under the Documents tree (TCC — exit code 78). -->
+  <key>WorkingDirectory</key><string>__HOME__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>POOL_REPO_DIR</key><string>__REPO__</string>
+    <key>POOL_PY</key><string>__PY__</string>
+    <key>PATH</key><string>__PATH__</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__LOG_DIR__/pool-lead.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/pool-lead.err</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>

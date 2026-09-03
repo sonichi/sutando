@@ -167,6 +167,9 @@ KNOWN_HEADER_KEYS = (
     # Which instance a task belongs to; header status defangs forged
     # body-line claims, consumers may verify before executing.
     "instance_id",
+    # Per-message worker addressing: intake-stamped, lead-honored; header
+    # status defangs a forged body line — a message can never route itself.
+    "target_worker", "fan_out",
     # Broker attestation that a Team sender is a collaborator. The bridge
     # appends this line directly, bypassing serialize_task_last's key check.
     "collaborator",

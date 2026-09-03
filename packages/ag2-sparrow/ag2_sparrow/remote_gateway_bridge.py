@@ -345,6 +345,25 @@ if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
 _INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+# Optional fence for instanced lanes: claim only rooms on this suffix
+GATEWAY_ROOM_SUFFIX = (os.environ.get("GATEWAY_ROOM_SUFFIX") or "").strip()
+# Rooms on these suffixes belong to a foreign lane; the default lane's gateway
+# 403s them, and the failure policy then parks deliverable work as undeliverable.
+GATEWAY_FOREIGN_SUFFIXES = tuple(
+    s.strip() for s in (os.environ.get("GATEWAY_FOREIGN_SUFFIXES") or "").split(",")
+    if s.strip())
+
+
+def _instance_may_claim(peek_room: "str | None") -> bool:
+    """Unaddressed proactives default to the owner's primary surface, which
+    only the DEFAULT lane serves — an instanced lane must never claim them."""
+    if not GATEWAY_INSTANCE:
+        if peek_room is None:
+            return True
+        return not any(peek_room.endswith(s) for s in GATEWAY_FOREIGN_SUFFIXES)
+    if peek_room is None:
+        return False
+    return not GATEWAY_ROOM_SUFFIX or peek_room.endswith(GATEWAY_ROOM_SUFFIX)
 
 
 def _local_tid(broker_tid: str) -> str:
@@ -394,11 +413,30 @@ def _valid_local_tid(tid: str) -> bool:
     return bool(m) and m.group(1) not in (".", "..")
 
 
+def _owns_local_tid(tid: str) -> bool:
+    """Is this LOCAL task id inside THIS bridge's namespace?
+
+    `_local_tid` mints `task-<inst>~<broker_id>` for a named instance and leaves
+    the primary's ids unscoped, so ownership is decidable from the id alone. A
+    shared `RESULTS_DIR` therefore needs no coordination — each lane can tell its
+    own files from a sibling's.
+
+    Both directions matter. A named instance must not touch unscoped ids, and the
+    primary must not touch `~`-scoped ones: `task-*` matches `task-dev~1` too, so
+    filtering only the instance side would leave the primary cannibalising every
+    named lane — the same defect mirrored.
+    """
+    if GATEWAY_INSTANCE:
+        return tid.startswith(f"task-{GATEWAY_INSTANCE}~")
+    # `~` is outside the broker-id alphabet, so any scoped id — including an
+    # instance this build does not know — is someone else's. Unowned > misrouted.
+    return "~" not in tid
+
+
 def _task_pending(tid: str) -> bool:
     """Is this task still live in tasks/, under ANY of its names?
 
-    A pooled task is renamed twice -- unassigned -> `.assigned-<core>` (lead
-    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
+    A pooled task is renamed twice — unassigned -> `.assigned-<core>` (lead    picked a core) -> `.claimed-<core>` (core took it). Every caller asking
     "is this still being worked?" must accept all three, so the question has
     one owner: a state missed here reads as finished, which drops a reply
     mid-flight or re-queues work another core already holds."""
@@ -1459,7 +1497,11 @@ def _auth_probe() -> bool:
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
-_TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_id",
+_TASK_FIELDS = ("id", "timestamp", "session_scope",
+                # Routing keys the pool lead reads with a strict task-last
+                # parse: they must serialize BEFORE task: or the lead sees None.
+                "target_worker", "fan_out",
+                "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
@@ -2108,6 +2150,97 @@ def _read_core_status() -> tuple[str | None, str | None]:
         return (None, None)
 
 
+_WORKERS_SNAPSHOT_FILE = _STATE / "pool-status.json"
+_workers_push_mtime = 0.0
+_workers_push_retry_at = 0.0
+
+
+def _maybe_push_workers_snapshot() -> bool:
+    """Push-on-change relay of the pool's workers snapshot (the worker
+    picker's read path). No file = no pool = no-op; a broker without the
+    endpoint (404) backs the push off an hour; nothing here may ever
+    break the task loop."""
+    global _workers_push_mtime, _workers_push_retry_at
+    now = time.time()
+    if now < _workers_push_retry_at:
+        return False
+    try:
+        mtime = _WORKERS_SNAPSHOT_FILE.stat().st_mtime
+    except OSError:
+        return False
+    if mtime <= _workers_push_mtime:
+        return False
+    try:
+        snap = json.loads(_WORKERS_SNAPSHOT_FILE.read_text())
+    except (OSError, ValueError):
+        return False  # mid-write or malformed: the next change retries
+    if not isinstance(snap, dict):
+        return False
+    try:
+        _req("POST", "/v1/workers", snap, timeout=15)
+    except urllib.error.HTTPError as e:
+        _workers_push_retry_at = now + 3600
+        _log(f"workers-snapshot push deferred 1h (HTTP {e.code}"
+             f"{': broker has no /v1/workers yet' if e.code == 404 else ''})")
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _workers_push_retry_at = now + 300
+        _log(f"workers-snapshot push failed, retrying in 5m: {e}")
+        return False
+    _workers_push_mtime = mtime
+    _log("workers-snapshot pushed")
+    return True
+
+
+_profile_push_key = ""
+_profile_push_retry_at = 0.0
+
+
+def _build_agent_profile() -> "dict | None":
+    """The instance's identity card for PUT /v1/agents/{mxid}/profile.
+    Only instance-authoritative fields — appearance is user/platform-owned
+    and the broker drops it from instance PUTs anyway."""
+    name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
+    try:
+        host_id = socket.gethostname().split(".")[0]
+    except OSError:
+        host_id = "unknown-host"
+    return {"display": {"name": name},
+            "host": {"host_id": host_id, "kind": "local"}}
+
+
+def _maybe_push_agent_profile() -> bool:
+    """Push-on-change relay of the agent's profile card. Same failure
+    contract as the workers-snapshot push: 404 defers an hour (broker not
+    deployed yet), other errors 5m; nothing here may break the task loop."""
+    global _profile_push_key, _profile_push_retry_at
+    now = time.time()
+    if now < _profile_push_retry_at:
+        return False
+    mxid = _reenroll_identity()
+    if not mxid:
+        return False  # identity may appear mid-episode; recheck next loop
+    card = _build_agent_profile()
+    key = mxid + json.dumps(card, sort_keys=True)
+    if key == _profile_push_key:
+        return False
+    try:
+        _req("PUT", f"/v1/agents/{urllib.parse.quote(mxid)}/profile",
+             card, timeout=15)
+    except urllib.error.HTTPError as e:
+        _profile_push_retry_at = now + 3600
+        _log(f"agent-profile push deferred 1h (HTTP {e.code}"
+             f"{': broker has no profile API yet' if e.code == 404 else ''})")
+        return False
+    except Exception as e:  # noqa: BLE001 — relay must never kill the loop
+        _profile_push_retry_at = now + 300
+        _log(f"agent-profile push failed, retrying in 5m: {e}")
+        return False
+    _profile_push_key = key
+    _log(f"agent-profile pushed for {mxid}")
+    return True
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
@@ -2493,7 +2626,12 @@ def _write_task(task: dict) -> str | None:
             if task.get(f) == "room":
                 lines.append("session_scope: room")
         elif f == "source":
-            lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+            # The RECEIVING lane is the origin authority — the wire label names
+            # the contract family, identical from BOTH homeservers (#3612 class).
+            lines.append(f"source: {_one_line(CHANNEL_DIR)}")
+            _wire_src = _one_line(str(task.get("source") or ""))
+            if _wire_src and _wire_src != CHANNEL_DIR:
+                lines.append(f"wire_source: {_wire_src}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
             # all current gateway traffic is Matrix room messages. Whitelisted:
@@ -2917,6 +3055,8 @@ def _post_proactive() -> None:
             continue  # racing consumer already claimed it
         if route == "foreign":
             continue
+        if not _instance_may_claim(peek_room):
+            continue  # the default lane's file (or another lane's suffix)
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
         if route == "send" and peek_room is None and not PROACTIVE_ROOM:
@@ -2950,6 +3090,7 @@ def _post_proactive() -> None:
                      f"owner nudge stranded under live pid until restart")
             continue
         if route == "foreign" or (
+                route == "send" and not _instance_may_claim(room_override)) or (
                 route == "send" and room_override is None and not PROACTIVE_ROOM):
             # Hand back rather than eat: a foreign target seen only post-claim,
             # or one that vanished with no default (room_id=None loses the body).
@@ -3092,9 +3233,11 @@ def _dedup_plan(tid: str, holder_id: str | None):
         _save_task_rooms(rooms)
         return True
 
+    # The re-ask id must live in THIS lane's namespace (`_owns_local_tid`):
+    # an unscoped mint on a named instance is orphaned to the primary's sweep.
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit,
+        _local_tid(f"task-{uuid.uuid4().hex[:18]}"), commit_identity=_commit,
         channel_dir=CHANNEL_DIR)
     return action, payload, room
 
@@ -3463,7 +3606,9 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         return
     _last_orphan_sweep = now
     try:
-        candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
+        # RESULTS_DIR is shared across lanes; the glob is not namespace-aware.
+        candidates = sorted(p for p in RESULTS_DIR.glob("task-*.txt")
+                            if _owns_local_tid(p.stem))
     except OSError:
         return
     for rfile in candidates:
@@ -3753,6 +3898,8 @@ def main() -> None:
                     _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
+            _maybe_push_workers_snapshot()
+            _maybe_push_agent_profile()
             _retry_pending_publications()
             _retry_review_card_resolutions()
             _retry_review_control_results()

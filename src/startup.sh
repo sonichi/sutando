@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sutando startup — starts available services + the selected core CLI.
-# Usage: bash src/startup.sh [--with-app]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job).
+# Usage: bash src/startup.sh [--with-app] [--pool N|auto]   ./start.sh is the front door; --with-app builds + launches the menu-bar app (no launchd job); --pool installs the core pool + lead (auto = start 2, lead autoscales).
 
 set -e
 
@@ -8,10 +8,28 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --with-app is opt-in and parsed here so an unknown flag cannot silently do
 # nothing: every other argument is still ignored exactly as before.
+# --pool N installs/updates the multi-worker follower pool AND ensures the lead
+# daemon is running — the installer alone starts only followers, which would
+# run leaderless. --pool 1 shrinks back to a single follower.
 WITH_APP=0
+POOL_N=""
+_prev=""
 for _arg in "$@"; do
-    case "$_arg" in --with-app) WITH_APP=1 ;; esac
+    case "$_prev" in --pool) POOL_N="$_arg" ;; esac
+    case "$_arg" in
+        --with-app) WITH_APP=1 ;;
+        --pool=*) POOL_N="${_arg#--pool=}" ;;
+    esac
+    _prev="$_arg"
 done
+if [ -n "$POOL_N" ]; then
+    case "$POOL_N" in
+        # auto = start at the 2-core baseline; the lead's autoscale grows the
+        # pool when every core saturates (cap SUTANDO_POOL_MAX, default 3).
+        auto) POOL_N=2 ;;
+        ''|*[!0-9]*) echo "✗ --pool needs a positive integer or 'auto'; got '$POOL_N'" >&2; exit 2 ;;
+    esac
+fi
 
 # Resolve python3 ONCE, refusing Apple's Xcode-CLT stub. On a Mac without the
 # developer tools `/usr/bin/python3` exists but raises a modal install dialog
@@ -1351,6 +1369,36 @@ if [ "$WITH_APP" -eq 1 ]; then
         echo "    auto-start at login is opt-in: bash scripts/install-menu-bar-app.sh --supervise" >&2
     else
         echo "  ✗ menu-bar app setup failed (exit $?) — the core is unaffected and still starting." >&2
+    fi
+fi
+
+# --pool N|auto installs/resizes the follower set first; the lead is ensured
+# below for any host that has followers, with or without the flag.
+if [ -n "$POOL_N" ]; then
+    echo "Setting up multi-worker pool (N=$POOL_N)..." >&2
+    bash "$REPO/scripts/install-core-pool.sh" "$POOL_N" \
+        || echo "  ✗ pool install failed (exit $?) — continuing with whatever is installed" >&2
+fi
+
+# Pool lead — runs whenever pool followers are installed: without it they
+# degrade to leaderless claiming. Never starts one alongside launchd; the
+# helper returns 0 once a lead from this checkout is running.
+shopt -s nullglob
+_pool_members=("$HOME/Library/LaunchAgents"/com.sutando.core-[0-9]*.plist)
+shopt -u nullglob
+if [ "${#_pool_members[@]}" -gt 0 ]; then
+    if pool_lead_supervised; then
+        echo "  ✓ pool lead (launchd-supervised)" >&2
+    else
+        _POOL_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace)"
+        nohup "$PY" "$REPO/scripts/pool-lead-daemon.py" \
+            > "$_POOL_WS/logs/pool-lead.log" 2>&1 &
+        sleep 1
+        if pgrep -f "$REPO/scripts/pool-lead-daemon.py" > /dev/null 2>&1; then
+            echo "  ⚠ pool lead started unsupervised (log: $_POOL_WS/logs/pool-lead.log)" >&2
+        else
+            echo "  ✗ pool lead failed to start — followers will run leaderless; see $_POOL_WS/logs/pool-lead.log" >&2
+        fi
     fi
 fi
 

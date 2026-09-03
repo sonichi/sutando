@@ -3,6 +3,7 @@
 # Does NOT touch the Claude Code CLI (core agent) — that's managed separately.
 # Usage: bash src/restart.sh
 #   --stop-only    Stop without restarting
+#   --pool N       Forwarded to startup.sh: install/resize the core pool + lead
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -151,4 +152,13 @@ else
 fi
 
 echo "Starting..."
-exec bash "$REPO/src/startup.sh"
+# Forward --pool N / --pool=N so a restart can (re)configure the multi-worker
+# pool in one step; startup.sh owns the option's behavior.
+_POOL_ARGS=()
+_prev=""
+for _arg in "$@"; do
+    case "$_prev" in --pool) _POOL_ARGS=(--pool "$_arg") ;; esac
+    case "$_arg" in --pool=*) _POOL_ARGS=("$_arg") ;; esac
+    _prev="$_arg"
+done
+exec bash "$REPO/src/startup.sh" ${_POOL_ARGS[@]+"${_POOL_ARGS[@]}"}

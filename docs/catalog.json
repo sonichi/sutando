@@ -443,6 +443,25 @@
    "status": "draft",
    "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
    "last_verified": "2026-08-25"
+  },
+  "docs/lead-follower-pool.md": {
+   "title": "Lead-follower agent pool — design",
+   "audience": [
+    "contributors",
+    "operators"
+   ],
+   "status": "active",
+   "canonical_for": "multi-worker pool design: lead assignment sweep, follower claim protocol, room pins, dedicated workers, crash recovery",
+   "last_verified": "2026-08-30"
+  },
+  "docs/server-and-identity.md": {
+   "title": "Sutando Server & the Agent ID card — design",
+   "audience": [
+    "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "server v0 runtime-api surface and the read-only agent identity card mapping",
+   "last_verified": "2026-08-30"
   }
  }
 }
