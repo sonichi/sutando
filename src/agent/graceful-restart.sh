@@ -44,6 +44,14 @@ log() {
 PREP_TASK="$WS/tasks/task-restart-prep-$RID.txt"
 # The task has done its job once a decision is made; never leave it for the next boot's orphan-check.
 retire_prep_task() {
+  # The core answers the drain task in results/; no bridge collects a task the
+  # orchestrator wrote, so the orchestrator is its consumer: log it, archive it.
+  local res="$WS/results/task-restart-prep-$RID.txt"
+  if [ -f "$res" ]; then
+    log "drain result: $(head -c 300 "$res" | tr '\n' ' ')"
+    mkdir -p "$WS/results/archive"
+    mv "$res" "$WS/results/archive/" 2>/dev/null || true
+  fi
   [ -f "$PREP_TASK" ] || return 0
   mkdir -p "$WS/tasks/archive"
   mv "$PREP_TASK" "$WS/tasks/archive/" 2>/dev/null || true
