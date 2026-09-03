@@ -6,8 +6,10 @@ value refused at import); heartbeat and workers-snapshot carry worker_id +
 location; the poll URL carries `worker=`; a legacy broker that ignores the
 param or 404s heartbeat is served exactly as before; a cloud seat with NO
 state/pool* and NO state/cores runs pull → tasks/ → results/ → POST end to end
-against a stub broker; and a task id re-delivered while its first copy is still
-in flight (pending, assigned or claimed) is never queued or answered twice.
+against a stub broker; a task id re-delivered while its first copy is still
+in flight (pending, assigned or claimed) is never queued or answered twice; and
+the broker's `worker-pin-*` compat task is consumed as a control message (no
+task file, one ack, one [no-send] lease close, nothing else on the wire).
 
 Run: python3 tests/gateway-worker-queue-client.test.py   (stdlib only)
 """
@@ -38,7 +40,7 @@ def check(cond: bool, msg: str) -> None:
 # ── stub broker: records every call; serves TASK on the first `serve_n` polls,
 # ignores the worker= query entirely (a broker that predates seats) ──────────
 STATE = {"gets": [], "acks": [], "results": [], "heartbeats": [], "workers": [],
-         "serve_n": 0, "heartbeat_404": False}
+         "other": [], "serve_n": 0, "heartbeat_404": False, "task": None}
 TASK = {"id": "task-CLOUD1", "timestamp": "2026-09-03T00:00:00Z",
         "task": "hello cloud seat", "source": "remote-gateway",
         "channel_id": "!room:example.org", "user_id": "@qingyun:example.org",
@@ -66,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
             served = STATE["serve_n"] > 0
             if served:
                 STATE["serve_n"] -= 1
-            self._json(200, {"tasks": [TASK] if served else []})
+            self._json(200, {"tasks": [STATE["task"] or TASK] if served else []})
             return
         self.send_response(404); self.end_headers()
 
@@ -81,6 +83,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE["heartbeats"].append(self._body()); self._json(200, {}); return
         if self.path == "/v1/workers":
             STATE["workers"].append(self._body()); self._json(200, {}); return
+        STATE["other"].append((self.path, self._body()))
         self.send_response(404); self.end_headers()
 
 
@@ -267,6 +270,52 @@ def main() -> int:
           "result + task archived after delivery")
     check(cloud._load_inflight() == set(), "inflight empty after delivery")
     check(_pool_state_absent(ws4), "post-delivery: still no pool state on this host")
+
+    # ── 5. worker-pin compat task: a control message, never a user task ─────
+    print("5. worker-pin compat task is consumed in-client")
+    ws5 = root / "ws5"; ws5.mkdir()
+    seat = _load("wqc_pin", ws5, port, SUTANDO_WORKER_ID="cloud-1",
+                 SUTANDO_WORKER_LOCATION="cloud")
+    for k in ("gets", "acks", "results", "heartbeats", "other"):
+        STATE[k].clear()
+    STATE["task"] = {"id": "worker-pin-123-abc", "timestamp": "2026-09-03T00:00:01Z",
+                     "task": "pin cloud-1", "source": "remote-gateway",
+                     "channel_id": "!room:example.org", "user_id": "@broker:example.org",
+                     "access_tier": "owner", "priority": "normal"}
+    STATE["serve_n"] = 1
+    logs: list[str] = []
+    seat._log = lambda m: logs.append(str(m))
+    real_hb = seat._post_heartbeat
+    calls = {"n": 0}
+
+    def _one_iteration(inflight_arg):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise KeyboardInterrupt
+        return real_hb(inflight_arg, force=True)
+
+    seat._post_heartbeat = _one_iteration
+    try:
+        seat.main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        seat._post_heartbeat = real_hb
+        seat._OUTBOUND_STOP.set(); seat._OUTBOUND_WAKE.set()
+        STATE["task"] = None
+    files = sorted(p.name for p in seat.TASKS_DIR.glob("*")) if seat.TASKS_DIR.exists() else []
+    check(files == [], f"no tasks/*.txt written for the pin: {files}")
+    check(STATE["acks"] == [("/v1/tasks/worker-pin-123-abc/ack", {"id": "worker-pin-123-abc"})],
+          f"exactly one ack, on the pin id: {STATE['acks']}")
+    check(STATE["results"] == [{"id": "worker-pin-123-abc", "body": "[no-send]"}],
+          f"exactly one [no-send] lease close: {STATE['results']}")
+    check(STATE["other"] == [], f"nothing else reached the broker (no room post): {STATE['other']}")
+    check(seat._load_inflight() == set(), "the pin never entered inflight")
+    check(not list((seat._STATE / "withheld-review-control-results").glob("*.json")),
+          "no deferred control result left behind")
+    target = "archived worker-pin-123-abc (marker no-send, lease closed, not sent)"
+    check(target in logs, f"log line matches the live-run target: {[l for l in logs if 'pin' in l]}")
+    print(f"     result payload: {json.dumps(STATE['results'][0], sort_keys=True)}")
 
     srv.shutdown()
     if FAILS:

@@ -240,6 +240,13 @@ id to another seat, which answers it too. Set `RELAY_VISIBILITY_TIMEOUT`
 consequence in one sentence: a task on a worker that dies mid-run is re-served
 to another seat, and results dedupe by task id.
 
+The broker's pin route also enqueues a `worker-pin-<ms>-<hex>` compat task.
+The client consumes it as a control message — ack, then a `[no-send]` lease
+close, no task file — because `src/watch-tasks-stream.sh` only globs
+`task-*.txt` and a file under any other name would sit in flight until the
+lease expired. Log line: `archived worker-pin-… (marker no-send, lease closed,
+not sent)`.
+
 Every result POST names the seat that produced it — `metadata.worker_id` +
 `metadata.location`. On a pool host the worker id is the done-flag owner
 (`state/cores/<worker>/done/<task>.flag`, the pool worker that answered a task

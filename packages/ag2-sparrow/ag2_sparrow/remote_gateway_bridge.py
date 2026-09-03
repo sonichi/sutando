@@ -51,6 +51,11 @@ RELAY_VISIBILITY_TIMEOUT (seconds, on the BROKER) above the longest honest
 task. The consequence is at-least-once: a task on a seat that dies mid-run is
 re-served to another seat, and the result sink dedupes by task id.
 
+Control messages: the broker's pin route also enqueues a `worker-pin-<ms>-<hex>`
+compat task. It is consumed in-client (ack, `[no-send]` lease close) and never
+written to `tasks/` — the watcher globs `task-*.txt`, so a file under any other
+name would sit in flight until the lease expired.
+
 Result attribution: every result POST carries `metadata.worker_id` and
 `metadata.location`. The worker id is the pool done-flag owner
 (`state/cores/<worker>/done/<task>.flag`) when exactly one exists — a pool
@@ -1106,6 +1111,27 @@ def _retry_review_control_results() -> None:
             path.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001 — next poll retries
             _log(f"review control result {record.get('id')} retry deferred: {exc}")
+
+
+_WORKER_PIN_PREFIX = "worker-pin-"
+
+
+def _consume_worker_pin(task: dict) -> bool:
+    """The broker's pin route enqueues a `worker-pin-<ms>-<hex>` compat task: a
+    control message for this seat, never user work. It writes no task file
+    (the watcher only sees task-*.txt, so one would sit in flight until the
+    lease expired); it is acked and its lease closed [no-send]. False = not a pin."""
+    tid = str(task.get("id") or "").strip()
+    if not tid.startswith(_WORKER_PIN_PREFIX) or not _valid_tid(tid):
+        return False
+    _post_task_ack(_local_tid(tid))
+    _queue_review_control_result(task)
+    _retry_review_control_results()
+    if _control_result_path(tid).is_file():
+        _log(f"worker-pin {tid}: lease close deferred — next poll retries")
+    else:
+        _log(f"archived {tid} (marker no-send, lease closed, not sent)")
+    return True
 
 
 def _is_redelivery_control(body: str) -> bool:
@@ -3980,6 +4006,8 @@ def main() -> None:
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
+                if _consume_worker_pin(task):
+                    continue
                 hitl_out = _handle_hitl_action(task)
                 if hitl_out:
                     body = "[no-send]"
