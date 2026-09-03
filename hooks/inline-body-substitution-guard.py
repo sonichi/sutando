@@ -34,6 +34,23 @@ def _deny(reason):
     sys.exit(0)
 
 
+def _newline_separators(command: str) -> str:
+    """A newline ends the command unless it sits inside a quoted argument,
+    where it is ordinary body text — so quote state decides, not str.split."""
+    out, quote, esc = [], None, False
+    for ch in command:
+        if esc:
+            out.append(ch); esc = False; continue
+        if ch == "\\" and quote != "'":
+            out.append(ch); esc = True; continue
+        if quote is None and ch in ("'", '"'):
+            quote = ch
+        elif ch == quote:
+            quote = None
+        out.append(";" if (ch == "\n" and quote is None) else ch)
+    return "".join(out)
+
+
 def offenders(command: str):
     """Flags whose inline double-quoted value the shell would rewrite.
 
@@ -43,6 +60,7 @@ def offenders(command: str):
     # `--body="x"` never lexes as one token: a quote only opens a string at a
     # token boundary, so normalise it to the space form before splitting.
     command = EQUALS_FORM.sub(r"\1 ", command)
+    command = _newline_separators(command)
     try:
         lex = shlex.shlex(command, posix=False, punctuation_chars=True)
         lex.whitespace_split = True

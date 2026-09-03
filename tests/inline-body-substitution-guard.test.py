@@ -22,6 +22,25 @@ spec.loader.exec_module(G)
 
 
 class TestOffenders(unittest.TestCase):
+    def test_a_newline_ends_the_command_like_a_semicolon(self):
+        """`whitespace_split` eats a newline, so `armed` survived a line break
+        and a non-gh tool on line 2 was denied (yixuan-ag2, #3830)."""
+        self.assertEqual(
+            G.offenders('gh pr view 1 --repo o/r --json title\n'
+                        'my-notes-tool --title "x $(date)"'), [])
+
+    def test_a_newline_INSIDE_a_quoted_body_is_body_text(self):
+        """The obvious fix — split the raw string on newlines — loses this:
+        the token breaks, the lexer hits an unterminated quote, and a real
+        violation returns []. A multi-line body is how the incident was written."""
+        self.assertEqual(
+            G.offenders('gh pr comment 1 --body "built at $(date)\n'
+                        'second line of the body"'), ["--body"])
+
+    def test_a_violation_on_a_later_line_is_still_caught(self):
+        self.assertEqual(
+            G.offenders('echo hi\ngh pr comment 1 --body "x $(date)"'), ["--body"])
+
     def test_the_case_that_actually_published_with_holes(self):
         self.assertEqual(
             G.offenders('gh pr comment 3829 --repo o/r --body "Applied `shlex.shlex` as written"'),
