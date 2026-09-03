@@ -1516,10 +1516,6 @@ class ChannelEnvTierTests(EnvCase):
             base, _ = _gateway.gateway()
         self.assertEqual(base, "")
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class DegradeReasonFromTests(unittest.TestCase):
     """The server's own error text reaches the caller; auth statuses keep the local diagnosis in front."""
 
@@ -1546,3 +1542,6 @@ class DegradeReasonFromTests(unittest.TestCase):
     def test_no_body_falls_back_to_the_status_text(self):
         self.assertEqual(_gateway.degrade_reason_from(self._err(403, "")), _gateway.degrade_reason(403))
 
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

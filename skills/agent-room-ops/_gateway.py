@@ -263,13 +263,16 @@ def degrade_reason(code):
     return f"HTTP {code}"
 
 
-# Statuses whose local diagnosis must not be overwritten by the server's prose:
-# 401 points at the bearer, 403 at authorization. The server's text is appended.
+# Not "auth-ish codes": codes where a wrong reason sends someone to the wrong
+# subsystem (401 = the bearer, 403 = authorization), so the server's text is appended.
 AUTH_STATUSES = frozenset({401, 403})
 
 
 def degrade_reason_from(err):
     """degrade_reason() plus what the server actually said (`{"error": ...}`).
+
+    CONSUMES the response body: `err.read()` is single-shot, so a caller that
+    also wants the parsed body must read it first and cannot call this after.
     Measured 2026-09-02: a 403 that read "not a joined member" was really
     "platform grant events.subscribe missing" — a different subsystem entirely."""
     reason = degrade_reason(err.code)

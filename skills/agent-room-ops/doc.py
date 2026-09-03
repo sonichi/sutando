@@ -16,21 +16,12 @@ gateway — the client passes them through verbatim.
 from __future__ import annotations
 
 import base64
-import json
 import os
 
-from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason,
-                      degrade_reason_from, AUTH_STATUSES,
-                    HTTPError, URLError)
+from _gateway import (gate_allows, load_gate, gateway, http_json, degrade_reason_from,
+                      HTTPError, URLError)
 
 DEFAULT_FOLDER = "room-live-context"
-
-# Statuses whose degrade_reason() text is a DIAGNOSIS the server's own message
-# must not overwrite — 401 points at the bearer token, 403 at room membership.
-# Kept as a named set rather than an inline `in (401, 403)` so the reason it
-# exists is attached to it: this is not "auth-ish codes", it is "codes where a
-# wrong reason sends someone to the wrong subsystem".
-_AUTH_STATUSES = AUTH_STATUSES
 
 
 def _result(ok, *, room_id=None, folder=None, name=None, content=None,
