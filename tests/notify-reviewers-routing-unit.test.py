@@ -792,11 +792,21 @@ class UnknownBranchesActuallyRun(unittest.TestCase):
                          "a send that never started must not be parked")
 
     def test_an_unrecordable_message_is_refused_before_any_send(self):
-        # Unreachable by construction: a message with no full PR URL cannot
-        # record an unknown, so it never sends.
+        # Shorthand is claimed by the earlier unrecordable_pr_refs gate (exit 7);
+        # pinned so removing that gate fails here instead of passing on the park.
         called = []
         nr.subprocess.run = lambda *a, **k: called.append(1)
         rc, _, err = self._run_main(message="re-review #3303")
+        self.assertIn("REFUSED", err)
+        self.assertEqual(called, [], "must not send what it could not park")
+        self.assertEqual(rc, 7)
+
+    def test_a_message_naming_no_pr_at_all_is_refused_by_the_park(self):
+        # The shorthand gate reports absence deliberately never, so this case
+        # reaches reserve_ask and the park is its only guard.
+        called = []
+        nr.subprocess.run = lambda *a, **k: called.append(1)
+        rc, _, err = self._run_main(message="please take a look when you can")
         self.assertIn("REFUSED", err)
         self.assertIn("no full PR URL", err)
         self.assertEqual(called, [], "must not send what it could not park")
