@@ -29,6 +29,10 @@ DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 SERVICE="$DOMAIN/$LABEL"
 
+# The same resolved interpreter every launchd installer uses; never a bare python3.
+. "$REPO/scripts/python-binary.sh"
+PYBIN="$(require_python "$REPO" "install the gateway bridge launchd job")" || exit 1
+
 # Resolve runtime workspace via the shared post-M0 helper (single source at
 # src/workspace_resolve.sh). Prefer $REPO/src/, fall back to script-sibling.
 __HELPER="$REPO/src/workspace_resolve.sh"
@@ -50,13 +54,7 @@ resolve_brew_bin() {
     # clone-, arch-, or user-specific literal. The resolved dir is substituted
     # into the plist PATH (__BREW_BIN__) at install time, so the launchd wrapper
     # gets a working `python3` on PATH without re-probing at runtime.
-    local py
-    py="$(command -v python3 2>/dev/null)" || py=""
-    if [ -n "$py" ]; then
-        dirname "$py"
-    else
-        echo /usr/bin
-    fi
+    dirname "$PYBIN"
 }
 
 bootout_if_loaded() {
@@ -114,7 +112,7 @@ case "$cmd" in
         # break bootstrap. Mirrors install-channel-bridge-launchd.sh (CR #2068,
         # qingyun-wu).
         export REPO WORKSPACE BREW_BIN CLAUDE_CFG
-        python3 - "$TEMPLATE" "$DEST" <<'PY'
+        "$PYBIN" - "$TEMPLATE" "$DEST" <<'PY'
 import os, plistlib, sys
 src, dst = sys.argv[1:]
 with open(src, "rb") as fh:

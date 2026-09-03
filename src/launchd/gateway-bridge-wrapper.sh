@@ -28,7 +28,7 @@ PYBIN="$(require_python "$REPO" "run the ag2.space gateway bridge")" || exit 1
 # Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
 # $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
 # config helper falls back to ~/.claude otherwise.
-if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
+if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path "channels/${REMOTE_TASK_CHANNEL_DIR:-ag2space}/.env" 2>/dev/null)"; then
     [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
 fi
 
@@ -60,15 +60,15 @@ export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
 # the bridge down on a resolver bug.
 _TOKEN_PRESENT="$REMOTE_TASK_TOKEN"
 if [ -z "$_TOKEN_PRESENT" ]; then
-    for _tok_var in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
-        _tok_rc=0
-        "$PYBIN" "$REPO/src/channel_token.py" --has "$_tok_var" \
-            ${_RELAY_ENV:+--env-file "$_RELAY_ENV"} >/dev/null 2>&1 || _tok_rc=$?
-        if [ "$_tok_rc" -eq 0 ]; then
-            _TOKEN_PRESENT="vault"
-            break
-        fi
-    done
+    _tok_rc=0
+    "$PYBIN" "$REPO/src/channel_token.py" --gateway >/dev/null 2>&1 || _tok_rc=$?
+    if [ "$_tok_rc" -eq 0 ]; then
+        _TOKEN_PRESENT="resolver"
+    elif [ "$_tok_rc" -ne 3 ]; then
+        echo "[gateway-bridge-wrapper] token resolver failed (rc=$_tok_rc) — using the lane file check" >&2
+        [ -f "$_RELAY_ENV" ] && grep -qE '^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=.+' "$_RELAY_ENV" \
+            && _TOKEN_PRESENT="lane-file"
+    fi
 fi
 
 # If there's still no token, the bridge would FATAL-exit and KeepAlive would

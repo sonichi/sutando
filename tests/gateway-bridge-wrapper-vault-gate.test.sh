@@ -34,11 +34,7 @@ cat > "$TMP/bin/python3" <<PY
 printf '%s\n' "\$*" >> "$TMP/argv.log"
 case "\${MODE:-absent}" in
   vault)  exit 0 ;;
-  alias)  case "\$*" in
-            *channel_token.py*REMOTE_TASK_TOKEN*) exit 3 ;;
-            *channel_token.py*AG2_REMOTE_TOKEN*)  exit 0 ;;
-            *) exit 0 ;;
-          esac ;;
+  broken) case "\$*" in *channel_token.py*) exit 1 ;; *) exit 0 ;; esac ;;
   absent) case "\$*" in *channel_token.py*) exit 3 ;; *) exit 0 ;; esac ;;
 esac
 PY
@@ -98,20 +94,37 @@ else
   say ok ".env token still works and short-circuits the resolver"
 fi
 
-echo "4. ONLY the legacy AG2_REMOTE_TOKEN is in the vault: must still start"
-# Discriminating by construction: the resolver answers 3 (absent) for
-# REMOTE_TASK_TOKEN and 0 only for AG2_REMOTE_TOKEN, so a gate that dropped the
-# legacy alias from its loop parks here. The previous form asserted only that
-# SOME var was queried, which the always-first REMOTE_TASK_TOKEN satisfied.
-run alias ""
-if [ "$RC" -ne 0 ]; then
-  say FAIL "a legacy-alias-only vault token must start the bridge (rc=$RC)"
-elif grep -q 'no REMOTE_TASK_TOKEN configured' "$TMP/err"; then
-  say FAIL "parked despite a vault AG2_REMOTE_TOKEN — legacy alias not consulted"
-elif ! grep -q 'AG2_REMOTE_TOKEN' "$TMP/argv.log"; then
-  say FAIL "the legacy alias was never queried"
+echo "4. the gate asks ONE predicate (--gateway), both aliases inside the resolver"
+run vault ""
+if ! grep -q -- 'channel_token.py --gateway' "$TMP/argv.log"; then
+  say FAIL "the shared --gateway predicate was not what the wrapper asked"
+elif grep -q -- '--has' "$TMP/argv.log"; then
+  say FAIL "a per-alias --has loop is still in the wrapper (alias order lives in the resolver)"
 else
-  say ok "legacy AG2_REMOTE_TOKEN alone starts the bridge"
+  say ok "the wrapper asks the resolver's one gateway predicate"
+fi
+
+echo "5. a BROKEN resolver (rc=1) must degrade to the lane file, never park a working host"
+run broken 'REMOTE_TASK_TOKEN=tok-from-envfile'
+if [ "$RC" -ne 0 ] || grep -q 'no REMOTE_TASK_TOKEN configured' "$TMP/err"; then
+  say FAIL "broken resolver + .env token parked the bridge (rc=$RC)"
+else
+  say ok "broken resolver + lane-file token still starts (0/3/other contract)"
+fi
+: > "$TMP/argv.log"; : > "$ENVF"
+env -i HOME="$TMP" MODE=broken PATH="$TMP/bin:/usr/bin:/bin" SUTANDO_PY="$TMP/bin/python3" \
+  REMOTE_TASK_CHANNEL_DIR=nolane bash "$REPO/src/launchd/gateway-bridge-wrapper.sh" > "$TMP/out" 2> "$TMP/err"; RC=$?
+if [ "$RC" -ne 0 ] || ! grep -q 'resolver failed' "$TMP/err" || ! grep -q 'no REMOTE_TASK_TOKEN configured' "$TMP/err"; then
+  say FAIL "broken resolver + no lane token must park cleanly AND say the resolver failed (rc=$RC)"
+else
+  say ok "broken resolver + nothing usable parks cleanly and names the resolver failure"
+fi
+
+echo "6. the lane file is REMOTE_TASK_CHANNEL_DIR's, not a hardcoded ag2space"
+if grep -q 'claude-home-path channels/ag2space/.env' "$REPO/src/launchd/gateway-bridge-wrapper.sh"; then
+  say FAIL "wrapper still hardcodes channels/ag2space/.env"
+else
+  say ok "wrapper names the lane through REMOTE_TASK_CHANNEL_DIR"
 fi
 
 [ "$fails" -eq 0 ] && echo "ALL PASS" || { echo "$fails FAILURE(S)"; exit 1; }

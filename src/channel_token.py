@@ -277,8 +277,13 @@ def main(argv: list[str] | None = None) -> int:
     leak into a log.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--gateway":
+        # The whole gateway predicate: env -> candidate files -> vault, both
+        # aliases; 0 = usable, 3 = definitively absent, anything else = broken.
+        return 0 if gateway_token() else 3
     if not argv or argv[0] != "--has" or len(argv) < 2:
-        print("usage: channel_token.py --has VAR [--env-file PATH]", file=sys.stderr)
+        print("usage: channel_token.py --has VAR [--env-file PATH] | --gateway",
+              file=sys.stderr)
         return 2
     var = argv[1]
     env_file = None
