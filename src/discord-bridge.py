@@ -427,10 +427,6 @@ _GEMINI_STAGE1_OTHER = (
     "bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- "
     "bash skills/claude-gemini/scripts/gemini-sandbox.sh --cd /tmp -o {results}/.codex-staging-{{id}}.txt -- "
 )
-# The PR auto-review branch of the team rulebook is codex-specific (review-pr.sh
-# inlines the diff into codex) and is left alone whatever the sandbox runtime.
-_PR_REVIEW_START = "2. PR-REVIEW REQUEST"
-_PR_REVIEW_END = "2b. MESSAGE OWNER"
 
 
 def _render_sandbox_rulebook(text: str, runtime: str, repo=None, results=None,
@@ -604,6 +600,11 @@ def _tier_rulebooks(quoted_task: str) -> dict:
         ),
     }
 
+
+# The PR auto-review branch is codex-specific and is left alone whatever the runtime.
+# Defined after the rulebook text: a test slices this file from the first "2. PR-REVIEW".
+_PR_REVIEW_START = "2. PR-REVIEW REQUEST"
+_PR_REVIEW_END = "2b. MESSAGE OWNER"
 
 # Checked once at import against the text the bridge really writes, so a runtime the
 # rulebooks cannot render stops the bridge here, loudly (docs/gemini-sandbox.md).
