@@ -12,6 +12,9 @@ as local, which is what lets the session boundary resolve from `state/session-st
 """
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -123,6 +126,41 @@ class VerifyCeremonyGate(unittest.TestCase):
             self.assertEqual(r.returncode, 2, f"rc={r.returncode}\n{r.stderr}")
             self.assertIn("probe unavailable", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+
+def _load_gate_module():
+    """Import the gate from its REPO path so coverage attributes the run to the real file —
+    the subprocess arms above copy it to a temp tree, which measures nothing in-repo."""
+    spec = importlib.util.spec_from_file_location("verify_ceremony", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class VerifyCeremonyGateInProcess(unittest.TestCase):
+    def _main_with_repo(self, repo: Path) -> tuple[int, str]:
+        mod = _load_gate_module()
+        mod.REPO = repo
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = mod.main(["--workspace", str(repo / "ws"), "--host-label", HOST])
+        return rc, err.getvalue()
+
+    def test_missing_probe_rc2_in_process(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td); (repo / "src").mkdir()
+            rc, err = self._main_with_repo(repo)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("probe unavailable", err)
+
+    def test_raising_probe_rc2_in_process(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td); (repo / "src").mkdir()
+            (repo / "src" / "health-check.py").write_text('raise RuntimeError("boom at import")\n')
+            rc, err = self._main_with_repo(repo)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("probe unavailable", err)
+            self.assertNotIn("Traceback", err)
 
 
 if __name__ == "__main__":
