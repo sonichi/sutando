@@ -62,6 +62,21 @@ Each pass, in order:
    cadence. If create or confirmation fails, retain the old job and stop loudly; a brief duplicate
    is recoverable, while deleting the only loop driver is not. Do not edit
    `crons.json`: its cron is the normal cadence restored automatically after the 7-day reset.
+
+   **⚠ DO NOT HAND-SELECT THE TIER. Pipe it through the helper (added 2026-09-01 after I inverted
+   the comparison and printed FULL on a MEDIUM budget):**
+
+   ```bash
+   python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py \
+     | python3 skills/proactive-loop/scripts/quota-tier.py
+   # -> 5h ... -> FULL / 7d ... -> MEDIUM / TIER MEDIUM (bound by 7d)  sustainable Nx CURRENT pace
+   ```
+
+   It tiers each window by its OWN rule, selects with `max` over an ordered scale (`min` returns the
+   LEAST restrictive — that was the bug), infers reset years with a bounds check, and refuses rather
+   than guessing. 15 tests; the discriminating ones are the MIXED pairs, since same-tier pairs pass
+   under both `min` and `max`. The prose below stays as the rationale — read it to understand the
+   two rules, but do not execute it by hand.
    **Tier EACH window by its OWN rule, then take the MOST RESTRICTIVE TIER.** `read-quota.py`
    reports two windows and they are scored differently — do not apply one window's thresholds to the
    other, and do not pick a window by largest `burn`. Those select differently: a short window can show a huge `burn`
@@ -130,7 +145,35 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 1. **Check for tasks.** Look in `tasks/` for voice / Discord / Telegram / phone tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`.
    - **Access control:** If the task has `access_tier: other` or `access_tier: team`, delegate to a sandboxed agent. Do NOT process non-owner tasks with your full capabilities. Write the sandboxed output to results.
    - Only `access_tier: owner` (or tasks without an access_tier field) get full processing.
-   - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result. The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
+   - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result.
+
+     **⚠ THE TARGET MUST ACTUALLY DELIVER. `[deduped: X]` onto a `[no-send]` X is a contradiction** — it says "the reply is in X" where X says "send nothing" — and the failure is invisible until the bridge announces it INTO THE ROOM, naming an internal task id the peer cannot resolve. Measured 2026-09-01: three collaborator notices closed that way produced a DELIVERED outbox item reading *"This was folded into `task-<internal id>`, which delivered nothing"*, and the peer spent a 519-task sweep hunting an id that never existed on their side. All-time on this host: **68 such pairs on disk**. ⚠ I first published "12 of which reached a room" — WRONG, and the error is instructive: I grepped my outbox for the phrase, which matched my own replies QUOTING it, so my write-up inflated its own count. Corrected: 5 genuine bridge notices, of which 3 had targets that DID deliver (the notice was a false alarm), so **2 genuinely delivered nothing — and neither owed a reply**. The harm was five confusing room notices, not lost messages. **A grep for a defect's own wording counts the documentation of the defect.**
+
+     `[deduped: A]` where A is itself `[deduped: B]` resolves to no reply just as completely (found by @yixuan-ag2 against their tree).
+
+     **⚠ AND THE WHOLE JUDGEMENT BELONGS TO `src/result_markers.py`, WHICH ALREADY HAD IT.** `dedup_holder_delivered()` and `dedup_decision()` ship in the repo: the bridge already detects this, REQUEUES the asking task with a "holder delivered nothing, answer directly" reason, and only reports to the room after a requeue ALSO failed. So the room notice is the third step, not the first. I built a checker that re-implemented that policy and it drifted TWICE in one night — a hand-rolled `[no-send]` test called a `[REPLIED]` holder delivered, and hand-rolled chain-WALKING (`a -> b -> real reply` => clean) was **more permissive than production**, because `[deduped:]` is itself a skip action so the bridge requeues a chained holder and never walks it. A guard that clears what the bridge rejects is worse than no guard. The checker now delegates and refuses (exit 2) if the module cannot be imported, rather than falling back to a weaker local rule. Corpus went 68 -> 88 findings on the fix.
+
+     ```bash
+     python3 skills/proactive-loop/scripts/check-dedup-targets.py "$WORKSPACE/results/<file>.txt"
+     # 0 clean · 1 the dedup resolves to nothing · 2 could not answer (NOT a green light)
+     ```
+
+     If every message in the group is a notice needing no reply, use `[no-send]` on **all** of them — never `[deduped:]` pointing at one. Guarded by `tests/proactive-loop-check-dedup-targets.test.py` (11 tests; mutations verified red). The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
+
+   **⚠ CLOSE THE PASS BY ASKING THE QUEUE, NOT YOUR MEMORY.** Before writing the idle
+   status, run:
+
+   ```bash
+   python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"   # rc=1 => a task got no result
+   ```
+
+   A task file stays in `tasks/` until a result is written and the bridge archives it, so
+   the queue already *is* the record of what is unanswered — nothing reads it at the end of
+   a pass. The miss is invisible from the inside: the work gets done, the reply is composed
+   in the transcript, the terminal shows it, and only the queue disagrees. Measured five
+   times in one session, caught every time by re-listing by hand and never once by recall —
+   which is why this is a command and not a reminder. It fires only on tasks older than
+   `--min-age-sec` (default 120), so a task still in flight is never flagged.
 
 2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
@@ -165,6 +208,79 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    This lives in the loop file rather than only in a memory because a memory loads when RECALLED while this file loads EVERY PASS. The rule already existed, stated sharply, and still failed repeatedly — placement was the defect, not precision.
 
+3.4. **⚠ THE ZERO-RESULT RULE — generalised from step 3, because it is not about warns (added
+   2026-08-28 after NINE instances in ONE session, each confirmed in that night's build_log by a
+   distinctive token, not by a regex over the log).**
+
+   Step 3 says a zero PQ-grep means "try another token". **The same holds for EVERY probe**, and the
+   nine were: a dict filtered by `startswith('http')` when keys were `repo#N` (-> "0 tracked PRs",
+   there were 26); `git ls-tree | head -5` (-> a file "absent" from a 75-entry dir); `git diff` on a
+   STAGED file (-> 0, vacuously, forever); a zsh `"$H:path"` eaten as a parameter modifier; grepping
+   `def read_gateway_verdict` when it is an ALIAS of `read_verdict`; a regex `return [2-5]` against
+   code that says `refusal_rc or 5`; a 90-line WINDOW read of a function whose wiring was further
+   down; `ps | grep` matching its own argv (-> "5 processes", 3 were the check itself); and a
+   block-split of `git log --name-only` that printed `.gitignore` as a commit header.
+
+   **Every one returned a clean, quotable, WRONG answer.** None errored. Several were published.
+
+   **So, before reporting any empty/zero result as a fact about the world:**
+   - **Name what would have to be true for a NON-zero.** If you cannot, the probe is not a measurement.
+   - **Run the positive control** — the same probe against a case you KNOW is present. A probe that
+     cannot produce a hit scores 0 by construction and certifies nothing.
+   - **Suspect SCOPE first**: a `head`/`tail`/`--limit`, a directory searched non-recursively, a window
+     instead of a file, a single package instead of the tree. Absence inside a bound is a fact about
+     the bound.
+   - **Suspect the SHAPE second**: print one record before filtering a collection (`print(rows[0])`),
+     and check an alias is not the definition.
+   - **Never verify in zsh.** A blank where a number belongs is a SYNTAX result; re-run in python3.
+
+   **⚠ AND IT FIRES BEFORE TELLING THE OWNER SOMETHING IS TRUE OF THE SYSTEM — not only before
+   reporting a zero (added 2026-09-01 after FIVE instances in one night).** Step 3 scopes the grep to
+   health warns and 3.4 scopes it to probes; neither covers *"I noticed X about how this system is
+   wired, worth you knowing"*. That sentence is the highest-cost one to get wrong — it reaches the
+   owner — and it is the one with no gate in front of it.
+
+   Measured the same night: I told the owner `workspace/build_log.md` is outside the vault carrier
+   set and that its backup "depends on a mirror running, worth knowing rather than my quietly
+   assuming." **My own `current-track.md` already carried that claim AND its retraction** — filed
+   2026-08-29, retracted the same day with byte-identical remote proof, plus the reason the root path
+   is excluded ON PURPOSE (it collided across hosts; `sync-workspace.sh:846-853` snapshots it per-host
+   instead). The step-3 grep found all of it in ONE call, the next pass, after I had already said it.
+
+   The other four that night: re-deriving a footer discriminator I authored 5 days earlier; hunting a
+   doc the instrument I was about to run already prints; hunting a `--folder` the memory that failure
+   routes to already documented; and appending a memory section that was already there — caught only
+   because the assertion was `== 1` and returned 2.
+
+   ⇒ **Before any sentence to the owner of the form "X is how this system behaves", run the step-3
+   grep on X's own nouns first.** One call. The record is usually ahead of you, and it often contains
+   your own retraction of exactly what you are about to say.
+
+   **⚠ THAT RULE HAD NO MECHANISM AND FAILED AGAIN 2026-09-01.** I told the owner `hosts/` holds two
+   subtrees and called it host-label drift worth settling — measured, diagnosed and filed since
+   **2026-08-28** under `[host-subtrees-false-red-20260828]`, complete with a prepared patch. She
+   read it twice. The 3.4 clause above was loaded on that pass, as it is on every pass; prose in a
+   file I read is not a gate.
+
+   ⇒ **RUN IT. It is one command and it takes a second:**
+
+   ```bash
+   python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence you are about to say>"
+   # exit 1 = already parked, with file:line -> READ IT, then extend or say nothing is new
+   # exit 0 = genuinely untriaged -> proceed
+   # exit 2 = could not answer (no parking files / empty claim) -> NOT a green light
+   ```
+
+   Same `tokens()` + search the warn path uses, so the two cannot drift. Verified against the
+   failure that produced it: the exact sentence I sent her returns exit 1 pointing at the parked
+   entry. Guarded by `tests/proactive-loop-warn-already-triaged.test.py` (10 tests; the discriminating one asserts
+   the verdict flips when the subject is redacted from **both** parking files — a one-file redaction
+   leaves it firing and reads as insensitivity that is not there).
+
+   This is step 3's rule with the noun changed. It sits here rather than in a memory for the reason
+   step 3 already gives: a memory loads when RECALLED, this file loads EVERY PASS — and all nine
+   happened on a night when the memory existed and was loaded.
+
 3.5. **Apply the self-development policy gate.** Run:
 
    ```bash
@@ -183,6 +299,36 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    remain active. Disabling self-development does not turn Sutando off and
    does not prevent the owner from explicitly asking it to change code.
    Manual `/proactive-loop` invocation does not override the policy.
+
+3.6. **Re-run my own tool suites when a tool changed — the instruments this loop quotes are
+   not otherwise tested.** `merge-gate.py`, `check-dedup-targets.py`, `warn-already-triaged.py`,
+   `memory-index-budget.py`, `idle-held.py` all have suites; **nothing re-ran them.** Measured
+   2026-09-01: two were broken. `notify_reviewers.py` did not PARSE — I broke it that morning
+   marking it superseded, and never re-ran its suite. `merge-gate-gate.test.py` had been dying at
+   check 3 of 124 on a fixture that drifted behind the code, so **121 assertions on the instrument
+   every shepherd sweep quotes had gone unexecuted**.
+
+   ```bash
+   python3 skills/proactive-loop/scripts/tool-suites-check.py --workspace "$WORKSPACE" --repo "$PWD"
+   # fresh -> two stat() calls, prints one line · 0 all pass · 1 a suite FAILED · 2 cannot answer
+   ```
+
+   **The trigger, not the cadence, is what closes the gap.** A daily run would still have let that
+   morning's edit sit green until the next day. This fires when any tool or suite is NEWER than the
+   last green run, and otherwise only after 24h, so an edited tool cannot keep a stale pass.
+   Controls verified: unchanged -> skip; `touch` one tool -> runs; break one tool -> exit 1 naming
+   the suite; restore -> exit 0.
+
+   The six suites ship as `tests/proactive-loop-*.test.py` (CI discovers only `tests/*.test.py`;
+   `tests/ci-covers-every-python-test.test.py` refuses a suite anywhere else). They sit outside
+   `$WORKSPACE/scripts`, so declare them (repo-relative) in `$WORKSPACE/state/tool-suites-extra.json`
+   — `{"suites": ["tests/proactive-loop-idle-held.test.py", ...]}` — to put them under the same
+   changed-since-last-green trigger; a declared path that does not exist is exit 2, never a skip.
+
+   ⚠ It invokes each suite with **no extra argv**. A `unittest`-based suite reads `argv[1]` as a
+   test-NAME selector, so passing a repo path makes it error with `AttributeError: module
+   '__main__' has no attribute '/Users/...'` — indistinguishable from a real failure until you vary
+   the harness. Running this sweep by hand that way produced **four false failures** out of six.
 
 4. **Read the build log** (`$WORKSPACE/build_log.md`) — understand what exists. Do not rebuild what works.
 
@@ -227,6 +373,45 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
        --state "$WORKSPACE/state/idle-streak.json" --commit
    # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
    ```
+
+   ⚠⚠ **AND DO NOT BUILD THE LIST EITHER — pipe it from the record.** The hash script takes the
+   whole set from its caller, and an agent handed that interface builds the set from RECALL. A
+   recall-built list is a different set wearing the same name, so the hash says "post" and
+   `--commit` then overwrites the legitimate baseline with it. That happened **three times** on this
+   host; the third replaced an 18-item record with 4 ids remembered under the wrong names
+   (`3198` for `sutando-3198`, `cinny-690` for `cinny-700`). Every one of those passes had the
+   warning in the very file it was writing to — the list gets BUILT before the file gets READ, which
+   is why prose cannot fix it.
+
+   ```bash
+   python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" \
+       --remove <id> --reason "<why>" --add <id>:<gate> --write \
+     | python3 skills/proactive-loop/scripts/idle-surface-hash.py \
+         --state "$WORKSPACE/state/idle-streak.json" --commit
+   ```
+
+   It reads `held_item_ids` from the state file and applies explicit ops; **there is no interface
+   that accepts a whole list**, so a recall-built set cannot be expressed. A `--remove` of an id the
+   record does not hold is refused and the near-miss named; a removal without `--reason` is refused,
+   because a silent shrink is the failure that corrupted the baseline. 48 assertions, 5 mutations red.
+   ⚠ Nothing else writes `held_item_ids` — verified across 10,024 files in both trees, where the key
+   appears only in the state file, in prose records and in one patch. It was hand-maintained, which
+   is exactly why it drifted.
+
+   **⚠ AND THE NOTES DRIFT TOO — `held_item_notes` has no guard, unlike the ids.** A note that
+   carries `<branch> @ <sha>` is a COPY of a fact git owns, so it goes stale silently. Measured
+   2026-09-01: two notes held shas that `current-track.md` had ALREADY corrected — a third record
+   of one fact, disagreeing with both. Audit them against git, not against another note:
+
+   ```bash
+   python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" \
+       --audit-notes "$PWD"        # 0 all match git · 1 a note disagrees, named
+   ```
+
+   **And re-check the held items themselves, not just their shas.** The same pass found `ds-pr-12`
+   still listed as "waiting only on the owner merge" **17 hours after it merged** — an FYI surface
+   would have reported a blocker that no longer existed. A PR-backed held item is one `gh pr view`
+   away from being checkable; retire it through `--remove <id> --reason "<why>"`.
 
    ⚠ **Do not compute this hash yourself.** The rule used to live here as "sha1 the held-list", and an
    agent handed that instruction hashes the sentence it was about to send — so re-wording the same
@@ -325,6 +510,36 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    **If no:** no write. Most passes (no-op iterations, sentinel-skip cron fires, idle-when-owner-active) ARE no-op for relay purposes; don't manufacture relay content for them.
 
    This bakes the auto-trigger into the existing build_log update step rather than a separate auto-refresh subsystem. Event-triggered, not time-triggered — fires only on natural beat points where something worth relaying actually happened.
+
+7.5. **⚠ BEFORE ADDING A ROW TO `MEMORY.md`, ASK WHAT IT COSTS — the index is a BYTE
+   PREFIX and it is 181 B from the cut (2026-09-01).** The session reads `MEMORY.md` up to
+   25,000 B / 200 lines; rows past that are dropped **silently**, while every memory file still
+   looks perfect on disk. `health-check.py` reports this AFTER the fact, so the first signal that
+   a lesson stopped loading is a warn on a later pass, and it never names the casualty.
+
+   ```bash
+   python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<the exact row you are about to add>"
+   # 0 safe · 1 REFUSE — it names the row that would drop, or says the addition itself won't load
+   #                     · 2 cannot answer (health-check not importable) — NOT a green light
+   ```
+
+   **Headroom is the wrong question and that is why this is a script.** "181 B remaining" reads
+   like a budget you may spend and cannot name what spending it costs; the tool asks which rows
+   load now, which load after, and what is in the difference. Measured on the live index with a
+   median 239 B row: appending refuses because **the new row never loads**, and inserting at the
+   top refuses because it evicts a *different* row (named). Same addition, two distinct casualties
+   — a headroom number shows neither.
+
+   It DELEGATES to `health-check.py` (`_index_effective_text` + `_index_loaded_prefix` +
+   `MEMORY_INDEX_LOAD_BYTES`) and refuses rather than falling back to a private copy of the limit,
+   because a guard that measures differently from the probe it guards clears writes that probe
+   will later condemn — the drift that made the dedup checker worse than no checker. 13 tests,
+   4 mutations verified red, including one that installs exactly that silent fallback.
+
+   **On a refusal, free room FIRST — and run `scripts/memory-hub-containment.py` before trimming**,
+   so a row you remove is still carried by its hub. Which rows may go is the owner's call
+   (`pending-questions.md` -> "MEMORY.md byte budget"); the guard's job is only to stop the write
+   that would decide it by accident.
 
 8. **If blocked, ask.** Write the question to the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; create the `hosts/<hostname>/` dir if absent) — send a macOS notification, and write to `results/question-{ts}.txt` if voice is connected. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 

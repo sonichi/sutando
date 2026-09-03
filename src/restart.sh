@@ -135,7 +135,9 @@ APP_BIN="$REPO/src/Sutando/Sutando"
 if pgrep -x Sutando > /dev/null 2>&1; then
     echo "  ✓ Sutando.app (already running)"
 elif [ -x "$APP_BIN" ]; then
-    nohup "$APP_BIN" > /tmp/sutando-app.log 2>&1 &
+    # The app is the OUT-of-session restart path: a core-session marker inherited
+    # here makes restart-guard refuse every restart the app later requests.
+    env -u SUTANDO_CORE_SESSION nohup "$APP_BIN" > /tmp/sutando-app.log 2>&1 &
     sleep 1
     # `pgrep -x`, never `-f`: -f matches this script's own argv and would report
     # a launch that did not happen. The ✓ stays inside the verified branch.

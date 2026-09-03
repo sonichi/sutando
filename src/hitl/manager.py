@@ -11,11 +11,13 @@ and neither ever mutates requirement state.
 from __future__ import annotations
 
 import json
+import logging
 import fcntl
 import os
 import re
 import tempfile
 from contextlib import contextmanager
+import dataclasses
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -55,6 +57,7 @@ class HitlStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock_fd: Optional[int] = None
         self._lock_depth = 0
+        self.last_skipped: tuple = ()
 
     @staticmethod
     def valid_id(req_id: str) -> bool:
@@ -119,12 +122,19 @@ class HitlStore:
         return raw.get("projection") or {"revision": 0, "event_id": None}
 
     def all(self) -> List[HumanRequirement]:
-        out = []
+        out, skipped = [], []
         for p in sorted(self.root.glob("hitl_*.json")):
             try:
                 out.append(_req_from_dict(json.loads(p.read_text())["requirement"]))
-            except (json.JSONDecodeError, KeyError):
-                continue
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                skipped.append(p.name)
+        # An empty store reads as "nothing needs the human", so a dropped
+        # record must leave a trace that a quiet day would not.
+        self.last_skipped = tuple(skipped)
+        if skipped:
+            logging.getLogger("hitl.store").warning(
+                "hitl: %d unreadable record(s) skipped in %s: %s",
+                len(skipped), self.root, ", ".join(skipped))
         return out
 
 
@@ -184,6 +194,8 @@ class HitlManager:
                 raise MalformedActionError(f"no requirement {reply.hitl_id}")
             action = validate_action(req, reply)
             req.chosen_action = action.id
+            if reply.answer is not None:
+                req.answer = reply.answer
             req.transition(STATUS_IN_PROGRESS)
             self.store.save(req)
             return action
@@ -253,7 +265,12 @@ def _req_to_dict(req: HumanRequirement) -> Dict:
     return d
 
 
+_REQ_FIELDS = {f.name for f in dataclasses.fields(HumanRequirement)}
+
+
 def _req_from_dict(d: Dict) -> HumanRequirement:
-    d = dict(d)
+    """Unknown keys are dropped: a store shared by two engine revisions must stay
+    readable by the older one, and one foreign record must not blind the rest."""
+    d = {k: v for k, v in dict(d).items() if k in _REQ_FIELDS}
     d["actions"] = [Action(**a) for a in d.get("actions", [])]
     return HumanRequirement(**d)

@@ -60,7 +60,7 @@ def _srv(tmp: Path) -> "rt.RuntimeServer":
 
 def _resolve_ha(srv, request_id, answers):
     aid = ha_action_id(request_id)
-    srv.ha.store.resolve(aid, answers, "@owner:hs")
+    srv.ha.resolve(aid, answers, "@owner:hs")
 
 
 def main() -> int:  # noqa: PLR0915 — one linear conformance script
@@ -96,9 +96,9 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
                          "resource": {"roomId": "!r:hs"}, "reason": "why"}))
     check(ra["status"] == "pending", "approval.request issues pending")
     ha_file = tmp / "ha" / (ha_action_id(ra["requestId"]) + ".json")
-    rec = json.loads(ha_file.read_text())
-    check("Approve: message.send" in rec["questions"][0]["question"]
-          and "Reason: why" in rec["questions"][0]["question"],
+    rec = json.loads(ha_file.read_text())["requirement"]
+    check("Approve: message.send" in rec["message"]
+          and "Reason: why" in rec["message"],
           "ha mirror carries action + reason in the card question")
     for bad_params, frag in (
             ({"question": "q", "type": "bogus"}, "type must be"),
@@ -114,7 +114,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
                          {"question": "Which?", "type": "multi_select",
                           "options": ["a", "b", "c"]}))
     rec1 = json.loads((tmp / "ha" / (ha_action_id(re1["requestId"]) + ".json")).read_text())
-    check(rec1["questions"][0].get("multiSelect") is True,
+    check(rec1["requirement"]["subject"].get("multi_select") is True,
           "multi_select sets the multiSelect card flag")
     try:
         run(srv.dispatcher.handle("no.such", {}))
@@ -258,7 +258,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     rx = run(srv.dispatcher.handle("approval.request", {"action": "x.y"}))
     xf = tmp / "ha" / (ha_action_id(rx["requestId"]) + ".json")
     xr = json.loads(xf.read_text())
-    xr["expires_at"] = time.time() - 5
+    xr["requirement"]["expires_at"] = time.time() - 5
     xf.write_text(json.dumps(xr))
     srv.dispatcher._settle(rx["requestId"])
     check(srv.store.get(rx["requestId"])["status"] == "expired",
@@ -371,15 +371,15 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
     ad = HumanActionAdapter(str(tmp / "ha4"))
     aid = ad.open_elicitation({"requestId": "elicitation-cafe01234567",
                                "params": {"type": "confirmation", "question": "Go?"}})
-    got = ad.store.get(aid)
-    check([o["label"] for o in got["questions"][0]["options"]] == ["Yes", "No"],
+    got = ad.manager.get(aid)
+    check([a.label for a in got.actions] == ["Yes", "No"],
           "confirmation without options defaults Yes/No")
     check(ad.poll_resolution("ha_missing000000") is None,
           "poll: unknown action → None")
     check(ad.poll_resolution(aid) is None, "poll: pending → None")
-    rec = ad.store.get(aid)
-    rec["expires_at"] = time.time() - 1
-    ad.store.update(rec)
+    rec = ad.manager.get(aid)
+    rec.expires_at = time.time() - 1
+    ad.manager.store.save(rec)
     check(ad.poll_resolution(aid)[0] == "expired", "poll: past deadline → expired")
     opts = [{"label": "A"}, {"label": "B"}]
     check(HumanActionAdapter.first_answer({"1": [2, 99]}, opts) == ["B"],
@@ -595,7 +595,7 @@ def main() -> int:  # noqa: PLR0915 — one linear conformance script
                               "input": {"body": "benign"}}))
         card = json.loads((tmp / "ha" / (ha_action_id(rbi["requestId"]) + ".json"))
                           .read_text())
-        check("benign" in card["questions"][0]["question"],
+        check("benign" in card["requirement"]["message"],
               "approval card shows the governed input")
         _resolve_ha(srv, rbi["requestId"], {"1": [1]})
         run(srv.dispatcher.handle("request.wait", {"requestId": rbi["requestId"], "timeoutS": 5}))

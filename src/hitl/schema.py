@@ -66,6 +66,11 @@ class HumanRequirement:
     subject: Dict[str, Any] = field(default_factory=dict)
     # "policy" when the Manager auto-answered it: never projected as a card.
     decided_by: Optional[str] = None
+    # A payload beyond the chosen action (free text, multi-select labels): set by
+    # apply_action from ActionReply.answer; None for pure button clicks.
+    answer: Optional[Any] = None
+    # Absolute epoch after which the producer treats the requirement as expired.
+    expires_at: Optional[float] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -117,6 +122,10 @@ class HumanRequirement:
             wire["actions"] = [a.to_wire() for a in self.actions]
         if self.subject:
             wire["subject"] = dict(self.subject)
+        if self.expires_at is not None:
+            wire["expires_at"] = self.expires_at
+        # `answer` is inbound-only (what the human typed back); a card never
+        # renders it, so it is persisted but deliberately not on the wire.
         return wire
 
 
@@ -133,6 +142,9 @@ class ActionReply:
     expected_revision: int
     action_id: str
     guard: str
+    # Optional payload for actions that carry more than a click: free text, a
+    # list of selected labels. Stored on the requirement as `answer`.
+    answer: Optional[Any] = None
 
     @classmethod
     def from_wire(cls, payload: Dict[str, Any]) -> "ActionReply":
@@ -142,6 +154,7 @@ class ActionReply:
                 expected_revision=int(payload["expected_revision"]),
                 action_id=str(payload["action_id"]),
                 guard=str(payload.get("guard", "")),
+                answer=payload.get("answer"),
             )
         except (KeyError, TypeError, ValueError) as e:
             raise MalformedActionError(f"bad action payload: {e}") from e

@@ -270,6 +270,16 @@
    "canonical_for": "Slack bridge setup and behavior",
    "last_verified": null
   },
+  "docs/sparrow-delivery-identity.md": {
+   "title": "Sparrow delivery identity — frozen definitions (B, slice 1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "the five delivery/agent-boundary identities (delivery_id, task_id, attempt_id, idempotency_key, incarnation_id) and the three identity ratchets that gate B's format changes",
+   "last_verified": "2026-08-22"
+  },
   "docs/sparrow-v1-contract.md": {
    "title": "ag2-sparrow v1 — the frozen delivery contract",
    "audience": [
