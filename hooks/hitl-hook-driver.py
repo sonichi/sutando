@@ -46,7 +46,9 @@ from hitl.schema import Action, HumanRequirement  # noqa: E402
 
 # AskUserQuestion has its own bridge. The allowlist lives in hitl.policy: the
 # Manager answers it, so the record exists even when no human is needed.
-OWNED_ELSEWHERE = {"AskUserQuestion"}
+# ExitPlanMode: a PreToolUse allow does not clear Claude Code's own plan-approval
+# dialog (measured 2026-09-02), so the screen layer owns it, not this hook.
+OWNED_ELSEWHERE = {"AskUserQuestion", "ExitPlanMode"}
 TIMEOUT_REASON = (
     "No decision arrived from the owner within the wait window (requirement {rid}). "
     "Denied by default; the owner can re-run the tool once they answer."
@@ -77,8 +79,6 @@ def _summary(tool: str, tool_input: dict) -> str:
         return _clip(str(tool_input.get("command") or ""))
     if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
         return str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
-    if tool == "ExitPlanMode":
-        return "exit plan mode and start executing"
     return _clip(json.dumps(tool_input, sort_keys=True))
 
 
@@ -91,12 +91,10 @@ def _requirement(data: dict) -> HumanRequirement:
     tool = str(data.get("tool_name") or "")
     tool_input = data.get("tool_input") or {}
     session = os.environ.get("SUTANDO_TMUX_SESSION") or os.environ.get("SUTANDO_CORE_ID") or "sutando-core"
-    kind = "confirmation" if tool == "ExitPlanMode" else "permission"
-    verb = "wants to" if tool == "ExitPlanMode" else "wants to run"
     return HumanRequirement(
-        kind=kind,
+        kind="permission",
         runtime="claude",
-        message=f"Claude {verb} {tool}: {_summary(tool, tool_input)}",
+        message=f"Claude wants to run {tool}: {_summary(tool, tool_input)}",
         title=f"claude · {session}",
         guard=_guard(tool, tool_input),
         subject={"tool": tool, "input": _summary(tool, tool_input)},
