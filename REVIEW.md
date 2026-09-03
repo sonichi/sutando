@@ -478,8 +478,14 @@ and loads whichever repo it reviews.
     silently" — so the harness reported SURVIVED about a mutant the suite catches by design.
     Acting on that report meant nearly replacing a deliberate documented semantic with its
     opposite, in the name of rigour.
-    **Cure:** unlink `importlib.util.cache_from_source(...)` between mutants, or run the suite
-    with `PYTHONDONTWRITEBYTECODE=1`. **And run one mutant per invocation**, printing the
+    **Cure — and one obvious candidate is not one.** `PYTHONDONTWRITEBYTECODE=1` (and `-B`) stops
+    *writing* a `.pyc`, never *reading* one, so it does nothing once a cache exists — which is the
+    normal state, because the ordinary suite run before you start mutating leaves one. Measured on
+    3.14.6 with a populated cache: source `BBB`, `-B` plus the env var still returned the cached
+    `AAA`; unlinking first returned the new value. Reported on 3.12.14 by @qingyun-air, reproduced
+    here. What works: **unlink `importlib.util.cache_from_source(...)` between mutants**, or point
+    `PYTHONPYCACHEPREFIX` at a fresh temp dir per run (verified: stale `DDD` plain, correct `EEE`
+    and `FFF` under a per-run prefix). **And run one mutant per invocation**, printing the
     failing test's name for a CAUGHT and ending with a restore-control — a batch loop that
     restores between iterations is itself stateful, and this collision is invisible inside it.
 
