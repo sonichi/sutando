@@ -627,6 +627,27 @@ else
   say FAIL "exit $rc20d and live task(s): $(ls "$WS20d"/tasks/ 2>/dev/null | tr '\n' ' ')"
 fi
 
+echo "20e. everything cleanup_lock calls is DEFINED before the traps that call it are armed"
+# yixuan-ag2 on #3823: retire_prep_task was defined 60 lines after `trap cleanup_lock EXIT`,
+# so a TERM in that window exited 127 (command not found) instead of 143.
+def_line="$(grep -n '^retire_prep_task()' "$GR" | head -1 | cut -d: -f1)"
+trap_line="$(grep -n '^trap cleanup_lock EXIT' "$GR" | head -1 | cut -d: -f1)"
+pt_line="$(grep -n '^PREP_TASK=' "$GR" | head -1 | cut -d: -f1)"
+if [ -n "$def_line" ] && [ -n "$trap_line" ] && [ "$def_line" -lt "$trap_line" ] && [ "$pt_line" -lt "$trap_line" ]; then
+  say ok "retire_prep_task (line $def_line) and PREP_TASK (line $pt_line) precede the EXIT trap (line $trap_line)"
+else
+  say FAIL "ordering: retire_prep_task=$def_line PREP_TASK=$pt_line trap=$trap_line — a TERM before the definition exits 127"
+fi
+# behavioural control: a TERM delivered as early as bash allows still exits 143 and leaves no task behind
+WS20e="$TMP/ws20e"; mkws "$WS20e"
+printf '{"status":"running","step":"x","ts":%s}\n' "$(date +%s)" > "$WS20e/state/core-status.json"
+GR_WS="$WS20e" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" > "$TMP/ws20e.out" 2>&1 &
+gr20e=$!
+sleep 0.3; kill -TERM "$gr20e" 2>/dev/null; wait "$gr20e" 2>/dev/null; rc20e=$?
+[ "$rc20e" = 143 ] && ! grep -q "command not found" "$TMP/ws20e.out" \
+  && say ok "TERM 0.3s in -> exit 143, no 'command not found'" \
+  || say FAIL "early TERM -> exit $rc20e: $(grep -i 'not found' "$TMP/ws20e.out" | head -1)"
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else

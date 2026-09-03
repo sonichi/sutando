@@ -31,6 +31,16 @@ POLL_S="${GR_POLL_S:-2}"                       # test override
 
 log() { echo "graceful-restart[$RID]: $*"; }
 
+# Defined BEFORE the EXIT/INT/TERM traps below are armed: bash resolves a
+# function at call time, so cleanup_lock must never name one that is not yet there.
+PREP_TASK="$WS/tasks/task-restart-prep-$RID.txt"
+# The task has done its job once a decision is made; never leave it for the next boot's orphan-check.
+retire_prep_task() {
+  [ -f "$PREP_TASK" ] || return 0
+  mkdir -p "$WS/tasks/archive"
+  mv "$PREP_TASK" "$WS/tasks/archive/" 2>/dev/null || true
+}
+
 # ---- Phase 0: serialize -------------------------------------------------
 
 # Sentinels are per-WORKSPACE and every run clears them, so without a lock two
@@ -141,7 +151,6 @@ busy() {
 
 # Phase 1a: hand the core a drain task. A busy core reads it at its next tool
 # boundary; only a wedged or dead core never does, and .alive covers that case.
-PREP_TASK="$WS/tasks/task-restart-prep-$RID.txt"
 write_prep_task() {
   if [ "$DRY_RUN" = 1 ]; then
     log "DRY-RUN — would write the drain task $PREP_TASK (not written: it would drain a live core)"
@@ -160,13 +169,6 @@ write_prep_task() {
   mv "$tmp" "$PREP_TASK"
   log "drain task written: tasks/$(basename "$PREP_TASK") — waiting for the core to go idle"
 }
-# The task has done its job once a decision is made; never leave it for the next boot's orphan-check.
-retire_prep_task() {
-  [ -f "$PREP_TASK" ] || return 0
-  mkdir -p "$WS/tasks/archive"
-  mv "$PREP_TASK" "$WS/tasks/archive/" 2>/dev/null || true
-}
-
 do_restart() {
   local reason="$1"
   if [ "$DRY_RUN" = 1 ]; then
