@@ -90,9 +90,13 @@ def _is_incomplete(c: dict) -> bool:
     Two shapes share this list: a CheckRun carries `status`/`conclusion` and no
     `state`; a StatusContext carries `state` and neither of the others.
     """
+    if _is_bad(c):
+        return False
     if "status" in c:
         return c.get("status") != "COMPLETED"
-    return c.get("state") == "PENDING"
+    # Not-SUCCESS, never an enum whitelist: StatusState also has EXPECTED, and
+    # listing only PENDING lets a required context that never reported read green.
+    return c.get("state") != "SUCCESS"
 
 
 def latest_by_name(rollup) -> "list[dict]":
@@ -113,25 +117,29 @@ def latest_by_name(rollup) -> "list[dict]":
     return [c for _, c in latest.values()]
 
 
-def failing_checks(pr: str, run, repo: str) -> "list[str] | None":
-    j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "statusCheckRollup"])
-    if j is None:
-        return None
+def failing_checks(pr: str, run, repo: str, rollup=None) -> "list[str] | None":
+    if rollup is None:
+        j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "statusCheckRollup"])
+        if j is None:
+            return None
+        rollup = j.get("statusCheckRollup")
     return [
         c.get("name") or c.get("context") or "?"
-        for c in latest_by_name(j.get("statusCheckRollup"))
+        for c in latest_by_name(rollup)
         if _is_bad(c)
     ]
 
 
-def incomplete_checks(pr: str, run, repo: str) -> "list[str] | None":
+def incomplete_checks(pr: str, run, repo: str, rollup=None) -> "list[str] | None":
     """Checks that are neither green nor failing, by display name."""
-    j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "statusCheckRollup"])
-    if j is None:
-        return None
+    if rollup is None:
+        j = _gh(run, ["pr", "view", pr, "--repo", repo, "--json", "statusCheckRollup"])
+        if j is None:
+            return None
+        rollup = j.get("statusCheckRollup")
     return [
         c.get("name") or c.get("context") or "?"
-        for c in latest_by_name(j.get("statusCheckRollup"))
+        for c in latest_by_name(rollup)
         if _is_incomplete(c)
     ]
 
@@ -225,16 +233,17 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     run = lambda args: subprocess.run(args, capture_output=True, text=True, timeout=30)
 
-    red = failing_checks(a.pr, run, a.repo)
+    # ONE read: `red` and `waiting` must describe the same instant, and two
+    # fetches would also cost a second API call for the same answer.
+    j = _gh(run, ["pr", "view", a.pr, "--repo", a.repo, "--json", "statusCheckRollup"])
+    rollup = None if j is None else j.get("statusCheckRollup")
+    red = None if j is None else failing_checks(a.pr, run, a.repo, rollup)
     if red is None:
         print("ci-triage: could not read checks (gh failed) — UNKNOWN, not 'none failing'")
         return 0
     if not red:
-        waiting = incomplete_checks(a.pr, run, a.repo)
-        if waiting is None:
-            print(f"ci-triage: no failing checks on #{a.pr}; could not re-read "
-                  "the rollup for incomplete ones — UNKNOWN, not 'ready'")
-        elif waiting:
+        waiting = incomplete_checks(a.pr, run, a.repo, rollup)
+        if waiting:
             print(f"ci-triage: no failing checks on #{a.pr}, but "
                   f"{len(waiting)} not yet green — the merge is still gated:")
             for n in waiting:

@@ -53,6 +53,10 @@ PENDING_CONTEXT = {"__typename": "StatusContext", "context": "license/cla",
                    "state": "PENDING", "startedAt": "2026-09-03T15:47:39Z"}
 GREEN_CONTEXT = {"__typename": "StatusContext", "context": "license/cla",
                  "state": "SUCCESS", "startedAt": "2026-09-03T15:47:39Z"}
+EXPECTED_CONTEXT = {"__typename": "StatusContext", "context": "required/never-reported",
+                    "state": "EXPECTED", "startedAt": "2026-09-03T15:47:39Z"}
+FAILED_CONTEXT = {"__typename": "StatusContext", "context": "license/cla",
+                  "state": "FAILURE", "startedAt": "2026-09-03T15:47:39Z"}
 
 
 class TestIncompletePredicate(unittest.TestCase):
@@ -66,6 +70,17 @@ class TestIncompletePredicate(unittest.TestCase):
 
     def test_a_green_statuscontext_is_not(self):
         self.assertFalse(self.ct._is_incomplete(GREEN_CONTEXT))
+
+    def test_expected_is_incomplete_too(self):
+        # StatusState is EXPECTED/ERROR/FAILURE/PENDING/SUCCESS; enumerating
+        # PENDING alone lets a never-reported required context read green.
+        self.assertTrue(self.ct._is_incomplete(EXPECTED_CONTEXT))
+
+    def test_failing_is_not_also_incomplete(self):
+        # The two sets stay disjoint: `_is_bad` owns failure, and a red item
+        # must not be double-reported as merely-not-green.
+        self.assertTrue(self.ct._is_bad(FAILED_CONTEXT))
+        self.assertFalse(self.ct._is_incomplete(FAILED_CONTEXT))
 
     def test_a_running_checkrun_is_incomplete(self):
         self.assertTrue(self.ct._is_incomplete(RUNNING_CHECKRUN))
@@ -112,18 +127,33 @@ class TestMainOutput(unittest.TestCase):
         self.assertIn("python standalone tests", out)
         self.assertIn("still gated", out)
 
+    def test_an_expected_context_is_named(self):
+        out = self._main_with([GREEN_CHECKRUN, EXPECTED_CONTEXT])
+        self.assertIn("required/never-reported", out)
+        self.assertIn("still gated", out)
+
     def test_an_unreadable_rollup_is_unknown_not_ready(self):
-        def fake_gh(run, args):
-            if "statusCheckRollup" not in args:
-                return {}
-            fake_gh.n += 1
-            return {"statusCheckRollup": [GREEN_CHECKRUN]} if fake_gh.n == 1 else None
-        fake_gh.n = 0
-        self.ct._gh = fake_gh
+        self.ct._gh = lambda run, args: None
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             self.ct.main(["3698", "--repo", "o/r"])
         self.assertIn("UNKNOWN", buf.getvalue())
+        self.assertNotIn("no failing checks", buf.getvalue())
+
+    def test_the_rollup_is_read_exactly_once(self):
+        # `red` and `waiting` must describe the same instant, so main fetches
+        # once and passes it down rather than re-reading.
+        calls = []
+
+        def fake_gh(run, args):
+            if "statusCheckRollup" in args:
+                calls.append(args)
+                return {"statusCheckRollup": [GREEN_CHECKRUN, PENDING_CONTEXT]}
+            return {}
+        self.ct._gh = fake_gh
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.ct.main(["3698", "--repo", "o/r"])
+        self.assertEqual(len(calls), 1, f"rollup fetched {len(calls)}x")
 
 
 if __name__ == "__main__":
