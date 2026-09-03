@@ -150,10 +150,8 @@ def test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes() 
 
 
 def test_a_gateway_id_that_looks_claimed_is_its_own_task_beside_the_short_one() -> None:
-    # `task-a.claimed-review` passes the gateway's id charset and is written
-    # verbatim; the persisted `id:` header, not the filename, says it is not a
-    # pool rename of `task-a`. Both rows and the long id's assignment survive,
-    # while a genuine `task-a.claimed-core-3` still canonicalizes to task-a.
+    # `task-a.claimed-review` is a legal gateway id, not a pool rename of task-a:
+    # the persisted `id:` decides, and a genuine claimed-core-3 still canonicalizes.
     workspace = Path(tempfile.mkdtemp(prefix="sutando-gateway-id-"))
     try:
         tasks = workspace / "tasks"

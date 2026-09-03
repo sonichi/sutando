@@ -242,10 +242,8 @@ def _task_paths(tasks_dir: Path):
     candidates = list(tasks_dir.glob("task-*.txt"))
     candidates.extend((tasks_dir / "processed").glob("task-*.txt"))
     candidates.extend(local_task_protocol.iter_archived_tasks(tasks_dir))
-    # Prefer the live copy per id; keyed on the canonical id because a claimed
-    # file's stem differs from its archived copy's, hiding that they are one.
-    # The persisted `id:` outranks the filename: a gateway id may itself end
-    # in `.claimed-<x>`, which only the header can tell from a pool rename.
+    # Keyed on the canonical id, and the persisted `id:` outranks the filename:
+    # a gateway id may itself end in `.claimed-<x>`; only the header can tell.
     for path in candidates:
         task_id = task_id_from_filename(path.name) or _archive_task_id(path.name)
         if task_id is None:

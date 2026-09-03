@@ -20,11 +20,10 @@ from pathlib import Path
 
 # A dot is legal inside an id: pool_lead allows [A-Za-z0-9._~-] and excludes the
 # state suffixes by lookahead rather than banning dots.
-# A name ending in .txt is one record: its id is the whole stem (task-* may
-# carry a pool-state suffix); .txt.N and .txt.archive-failed* identify by prefix.
 _STATE_SUFFIX = re.compile(r"^(task-.+?)\.(?:assigned|claimed)-.+$")
-# Greedy: the collision/quarantine tail is appended to the WHOLE name, so the
-# structural .txt is the rightmost one — a lazy match re-aliases a long id.
+
+# The collision/quarantine tail is appended to the WHOLE name, so the structural
+# .txt is the rightmost one: greedy, or a long id's quarantine re-aliases.
 _NOT_A_RECORD = re.compile(r"^(.+)\.txt(?:\.\d+|\.archive-failed.*)$")
 _DECLARED_ID = re.compile(r"^id:[ \t]*(\S+)[ \t]*$", re.M)
 
