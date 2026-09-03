@@ -28,6 +28,12 @@ GATE = REPO / "skills" / "startup" / "scripts" / "verify-ceremony.py"
 HOST = "gate-test-host"
 ENTRIES = [{"name": "main-loop", "cron": "*/15 * * * *", "prompt_skill": "proactive-loop"}]
 
+# Subprocess coverage is opt-in in this repo (see runtime-cli-surface.test.py): under the
+# gate, run the child through `coverage run` so the repo-path arms measure the real file.
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
+
 
 def _workspace(root: Path, *, started_at: float, stamp_ts: float | None) -> Path:
     ws = root / "workspace"
@@ -49,8 +55,8 @@ def _workspace(root: Path, *, started_at: float, stamp_ts: float | None) -> Path
 def _run(ws: Path) -> subprocess.CompletedProcess:
     env = dict(os.environ, SUTANDO_HOST_LABEL=HOST)
     return subprocess.run(
-        [sys.executable, str(GATE), "--workspace", str(ws), "--host-label", HOST],
-        capture_output=True, text=True, env=env, timeout=60,
+        PYBASE + [str(GATE), "--workspace", str(ws), "--host-label", HOST],
+        capture_output=True, text=True, env=env, timeout=60, cwd=REPO,
     )
 
 
@@ -161,6 +167,27 @@ class VerifyCeremonyGateInProcess(unittest.TestCase):
             self.assertEqual(rc, 2, err)
             self.assertIn("probe unavailable", err)
             self.assertNotIn("Traceback", err)
+
+    def test_probe_exiting_at_import_is_rc2_in_process(self):
+        """`except SystemExit: pass` then no probe attribute → None → rc 2."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td); (repo / "src").mkdir()
+            (repo / "src" / "health-check.py").write_text("raise SystemExit(0)\n")
+            rc, err = self._main_with_repo(repo)
+            self.assertEqual(rc, 2, err)
+
+    def test_unloadable_spec_is_rc2_in_process(self):
+        """spec_from_file_location → None (unknown suffix) is guarded too; force it."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td); (repo / "src").mkdir()
+            (repo / "src" / "health-check.py").write_text("x = 1\n")
+            mod = _load_gate_module(); mod.REPO = repo
+            with mock.patch.object(mod.importlib.util, "spec_from_file_location", return_value=None):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = mod.main(["--workspace", str(repo / "ws"), "--host-label", HOST])
+            self.assertEqual(rc, 2, err.getvalue())
 
 
 if __name__ == "__main__":
