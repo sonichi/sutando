@@ -26,7 +26,7 @@ def run(command, mode="__absent__", tool="Bash", env_extra=None):
             with open(os.path.join(td, "state", "authority.json"), "w") as fh:
                 fh.write(mode if mode.startswith("{") else json.dumps({"github_formal_review": mode}))
         env = dict(os.environ)
-        env["SUTANDO_WORKSPACE_FOR_HOOK"] = td
+        env["SUTANDO_HOOK_WORKSPACE"] = td
         env.pop("SUTANDO_ALLOW_FORMAL_GH_REVIEWS", None)
         env.update(env_extra or {})
         p = subprocess.run([sys.executable, HOOK], input=json.dumps(
@@ -54,10 +54,16 @@ check("approve denied", run(APPROVE, "hold")[0], True)
 check("request-changes denied", run(REQCH, "hold")[0], True)
 check("comment denied under hold", run(COMMENT, "hold")[0], True)
 
-print("2. MISSING state file behaves as hold — the restrictive reading is the default")
+print("2. MISSING state file behaves as findings-only — votes gated, --comment stays possible")
 check("approve denied with no state file", run(APPROVE)[0], True)
-check("unparseable state denied", run(APPROVE, "{not json")[0], True)
-check("unknown mode value denied", run(APPROVE, "yolo")[0], True)
+check("request-changes denied with no state file", run(REQCH)[0], True)
+check("comment ALLOWED with no state file", run(COMMENT)[0], False)
+
+print("2b. a PRESENT but unreadable/unknown state file is hold — a ruling exists and cannot be read")
+check("unparseable state denies approve", run(APPROVE, "{not json")[0], True)
+check("unparseable state denies comment", run(COMMENT, "{not json")[0], True)
+check("unknown mode value denies approve", run(APPROVE, "yolo")[0], True)
+check("unknown mode value denies comment", run(COMMENT, "yolo")[0], True)
 
 print("3. findings-only allows --comment but still gates the votes")
 check("approve denied", run(APPROVE, "findings-only")[0], True)
@@ -101,7 +107,8 @@ check("env override allows", run(APPROVE, "hold",
 
 print("8. the denial must be actionable, not a bare refusal")
 _, out, _ = run(APPROVE, "hold")
-for token in ("authority.json", "in-room", "findings-only", "SUTANDO_ALLOW_FORMAL_GH_REVIEWS"):
+for token in ("authority.json", "in-room", "SUTANDO_ALLOW_FORMAL_GH_REVIEWS", "--comment",
+              '{\\"github_formal_review\\": \\"findings-only\\"}'):
     check(f"reason names {token}", token in out, True)
 
 print("9b. a DEPLOYED copy (outside the repo) still finds the state file")
@@ -115,7 +122,7 @@ with tempfile.TemporaryDirectory() as td:
     os.makedirs(depdir)
     dep = os.path.join(depdir, "review-authority-guard.py")
     shutil.copy(HOOK, dep)
-    env = dict(os.environ); env.pop("SUTANDO_WORKSPACE_FOR_HOOK", None)
+    env = dict(os.environ); env.pop("SUTANDO_HOOK_WORKSPACE", None)
     env.pop("SUTANDO_ALLOW_FORMAL_GH_REVIEWS", None)
     r = subprocess.run([sys.executable, dep], input=json.dumps(
         {"tool_name": "Bash", "tool_input": {"command": APPROVE}}),

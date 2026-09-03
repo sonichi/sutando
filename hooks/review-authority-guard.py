@@ -19,10 +19,12 @@ Authority state lives in ``<workspace>/state/authority.json``:
   findings-only  deny APPROVE and REQUEST_CHANGES; allow --comment
   allow          allow all formal reviews
 
-MISSING or UNREADABLE state means ``hold``. That is policy, not a bug: the
-restrictive reading is what applies until the owner rules, and this surface is
-narrow enough (formal reviews only) that defaulting closed cannot wedge the core.
-Genuine hook exceptions still fail OPEN, per the repo's hook contract.
+A MISSING file means ``findings-only``: the two events that move a merge gate
+stay denied until the owner rules, while a COMMENTED review — which moves nothing
+and is the only durable place a finding lives — stays possible. A file that is
+PRESENT but unreadable or carries an unknown mode means ``hold``: someone wrote
+a ruling and it cannot be read, so the restrictive reading applies. Genuine hook
+exceptions still fail OPEN, per the repo's hook contract.
 
 NOT blocked, deliberately: ``--comment`` under findings-only, review DISMISSAL,
 variable indirection (``GH=gh; $GH ...`` needs real shell expansion — a non-goal here)
@@ -32,6 +34,8 @@ comments, and every non-review ``gh`` call.
 Escape hatch: ``SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1``.
 
 Registration: per-node deploy into $CLAUDE_CONFIG_DIR — see hooks/README.md.
+Workspace: SUTANDO_HOOK_WORKSPACE > workspace_default.resolve_workspace (in-repo)
+> an upward search for the state file (deployed copy).
 """
 import json
 import os
@@ -59,11 +63,16 @@ def _workspace() -> str:
     and a missing state file reads as 'hold', which looks correct while being
     permanently deaf to the file. Search for the state file itself instead.
     """
-    env = os.environ.get("SUTANDO_WORKSPACE_FOR_HOOK", "").strip()
+    env = os.environ.get("SUTANDO_HOOK_WORKSPACE", "").strip()
     if env:
         return env
     here = os.path.dirname(os.path.abspath(__file__))
-    cand = [os.path.join(os.path.dirname(here), "workspace")]  # in-repo layout
+    src = os.path.join(os.path.dirname(here), "src")
+    if os.path.isfile(os.path.join(src, "workspace_default.py")):  # in-repo layout
+        sys.path.insert(0, src)
+        from workspace_default import resolve_workspace
+        return str(resolve_workspace())
+    cand = [os.path.join(os.path.dirname(here), "workspace")]
     d = here
     for _ in range(6):                                        # deployed layout
         d = os.path.dirname(d)
@@ -78,9 +87,13 @@ def _workspace() -> str:
 
 
 def read_state(workspace: str) -> str:
-    """Return the authority mode. Missing/unreadable/unknown -> 'hold'."""
+    """Return the authority mode. Missing -> 'findings-only'; present but
+    unreadable or unknown -> 'hold' (a ruling was written and cannot be read)."""
+    path = os.path.join(workspace, STATE_REL)
+    if not os.path.exists(path):
+        return "findings-only"
     try:
-        with open(os.path.join(workspace, STATE_REL)) as fh:
+        with open(path) as fh:
             val = json.load(fh).get(KEY)
     except Exception:
         return "hold"
@@ -168,14 +181,17 @@ def reason(event: str, mode: str, workspace: str) -> str:
     return (
         f"BLOCKED: filing a formal GitHub review ({event}) is gated on this install. "
         f"Authority state is '{mode}' in {os.path.join(workspace, STATE_REL)} "
-        f"({KEY}); a missing or unreadable file also means 'hold'. "
+        f"({KEY}); a missing file means 'findings-only', an unreadable one 'hold'. "
         "An APPROVE/REQUEST_CHANGES is not just publishing — it moves a merge gate, "
         "and merges are the owner's. This guard exists because on 2026-09-01 a careful, "
         "correct review was filed as a formal APPROVE without that ruling, and it was the "
         "only gating approval on the PR. Verifying a change well is not authorization to "
-        "vote on it. Do this instead: post the findings in-room and let a human or an "
-        "authorised agent file the review, or use `--comment` if the state is "
-        "'findings-only'. When the owner rules, set the state file and this lifts. "
+        "vote on it. Do this instead: file the findings as a COMMENTED review "
+        "(`gh pr review --comment`) — that moves no gate and keeps the record on the PR; "
+        f"if the state is 'hold' or an unreadable file, {{\"{KEY}\": \"findings-only\"}} "
+        "in that file is the setting that restores --comment while the votes stay gated. "
+        "Otherwise post in-room and let a human or an authorised agent file the review. "
+        "When the owner rules, set the state file and this lifts. "
         "Override for one session with SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1. "
         "[review-authority-guard]"
     )

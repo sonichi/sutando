@@ -198,11 +198,15 @@ The mode lives in `<workspace>/state/authority.json`:
 {"github_formal_review": "hold" | "findings-only" | "allow"}
 ```
 
-A missing or unreadable file means `hold` (policy: the restrictive reading
-applies until the owner rules). Never gated: review dismissals (a reduction of
-standing), `gh pr comment`, `--comment` under `findings-only`, and every
-non-review command. Compound commands are split per segment so an earlier
-benign `gh` cannot shadow a later review.
+A missing file means `findings-only`: the votes stay denied until the owner
+rules, while a COMMENTED review — which moves no gate and is the durable place
+a finding lives — stays possible. A file that is present but unreadable, or
+carries an unknown mode, means `hold` (a ruling was written and cannot be read,
+so the restrictive reading applies). Never gated: review dismissals (a
+reduction of standing), `gh pr comment`, `--comment` under `findings-only`, and
+every non-review command. Compound commands are split per segment so an earlier
+benign `gh` cannot shadow a later review; `bash -c "..."` / `sh -c` / `eval`
+wrappers are re-classified on their quoted command.
 
 Escape hatch: `SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1`. Fail-OPEN on hook errors.
 
@@ -211,8 +215,9 @@ Escape hatch: `SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1`. Fail-OPEN on hook errors.
 Not auto-registered. Deploy per node into `$CLAUDE_CONFIG_DIR` and add a
 `PreToolUse` entry with matcher `Bash`, the same way as the manual block under
 `gmail-write-guard.py` above (command: `python3 <deployed path>/review-authority-guard.py`).
-The deployed copy locates the workspace by searching upward for
-`state/authority.json`; set `SUTANDO_WORKSPACE_FOR_HOOK=<workspace>` to pin it.
+In-repo the hook resolves the workspace through `workspace_default.resolve_workspace`;
+a deployed copy searches upward for `state/authority.json`. Set
+`SUTANDO_HOOK_WORKSPACE=<workspace>` to pin it.
 
 Test: `python3 tests/review-authority-guard.test.py`.
 
