@@ -32,6 +32,8 @@ Output includes:
 - `anthropic-ratelimit-unified-7d-reset` — when the 7d window resets (epoch)
 - `anthropic-ratelimit-unified-status` — "allowed" or "rejected"
 
+`recent_rejections` is a bounded ledger (newest 20) of upstream responses the proxy forwarded with a 4xx/5xx other than 401 — `{ts, status, path, snippet, model, user_agent, peer_port}` — the proxy serves every seat on the host, so the client fields are what make a rejection attributable; the probe counts only entries for this core's own model (`SUTANDO_CORE_MODEL` or `core-runtime.json`) and counts every client when that is unknown. It survives the per-response header rewrite, and `health-check.py`'s `core-request-rejections` probe warns on one inside 15 minutes and fails on five inside an hour, so a credits/overage rejection that leaves every unified-status header `allowed` still reaches the owner.
+
 ## Setup
 
 ### 1. Start the credential proxy

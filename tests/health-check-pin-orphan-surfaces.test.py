@@ -220,8 +220,8 @@ class OrphanSurfacesOnServicePaths(unittest.TestCase):
         down_row = {"name": "slack-bridge", "status": "warn",
                     "detail": "configured but not running"}
         launched = []
-        with mock.patch.object(hc, "_bridge_launch_plan",
-                               side_effect=lambda n: (launched.append(n), None)[1]):
+        with mock.patch.object(hc, "_restart_bridge",
+                               side_effect=lambda n, **kw: (launched.append(n), (True, "t"))[1]):
             hc.fix_down_bridges([unknown_row], action="restart",
                                 guard=lambda repo: (True, "t"),
                                 sender=lambda m: True, notifier=lambda m: True)
@@ -261,8 +261,8 @@ class OrphanSurfacesOnServicePaths(unittest.TestCase):
         hc._apply_pin_findings(row, hc._pin_verdicts("slack-bridge", {}))
         self.assertIn("no longer running", row["detail"], row)
         launched = []
-        with mock.patch.object(hc, "_bridge_launch_plan",
-                               side_effect=lambda n: (launched.append(n), None)[1]):
+        with mock.patch.object(hc, "_restart_bridge",
+                               side_effect=lambda n, **kw: (launched.append(n), (True, "t"))[1]):
             hc.fix_down_bridges([row], action="restart",
                                 guard=lambda repo: (True, "t"),
                                 sender=lambda m: True, notifier=lambda m: True)
@@ -275,8 +275,8 @@ class OrphanSurfacesOnServicePaths(unittest.TestCase):
                "detail": "configured but not running",
                "restart_veto": "DO NOT RESTART slack-bridge pid 1 — witness"}
         launched = []
-        with mock.patch.object(hc, "_bridge_launch_plan",
-                               side_effect=lambda n: (launched.append(n), None)[1]):
+        with mock.patch.object(hc, "_restart_bridge",
+                               side_effect=lambda n, **kw: (launched.append(n), (True, "t"))[1]):
             hc.fix_down_bridges([row], action="restart",
                                 guard=lambda repo: (True, "t"),
                                 sender=lambda m: True, notifier=lambda m: True)

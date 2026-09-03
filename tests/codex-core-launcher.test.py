@@ -70,6 +70,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/local_task_protocol.py",
             "src/result_markers.py",
             "src/task_priority.py",
+            "src/task_archive.py",
             "src/task_workstreams.py",
             "src/util_paths.py",
             "src/watch-tasks-stream.sh",

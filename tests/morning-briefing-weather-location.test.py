@@ -65,7 +65,7 @@ class TestWeatherLocation(unittest.TestCase):
 
     def _weather(self, env):
         clean = {k: v for k, v in os.environ.items()
-                 if k not in ("WEATHER_LAT", "WEATHER_LON")}
+                 if k not in ("WEATHER_LAT", "WEATHER_LON", "WEATHER_UNIT")}
         clean.update(env)
         with patch.dict(os.environ, clean, clear=True):
             return self.mod.get_weather()
@@ -109,6 +109,54 @@ class TestWeatherLocation(unittest.TestCase):
             self._weather({}),
             self._weather({"WEATHER_LAT": "33.45", "WEATHER_LON": "-112.07"}),
         )
+
+
+class TestWeatherUnit(unittest.TestCase):
+    """WEATHER_UNIT was previously not configurable: temperature_unit was a
+    fahrenheit literal in the Open-Meteo query, so any owner outside a
+    Fahrenheit-reporting country saw the wrong scale even after WEATHER_LAT/
+    WEATHER_LON were set correctly for their own location."""
+
+    def setUp(self):
+        self.mod = _load()
+        self.captured = {}
+
+        def _fake_urlopen(url, *a, **k):
+            self.captured["url"] = url
+            return _Resp()
+
+        patcher = patch.object(self.mod, "urlopen", _fake_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _weather(self, env):
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("WEATHER_LAT", "WEATHER_LON", "WEATHER_UNIT")}
+        clean.update(env)
+        with patch.dict(os.environ, clean, clear=True):
+            return self.mod.get_weather()
+
+    def test_default_stays_fahrenheit(self):
+        """Unset WEATHER_UNIT must not change behavior for existing installs."""
+        w = self._weather({})
+        self.assertIn("temperature_unit=fahrenheit", self.captured["url"])
+        self.assertIn("°F", w)
+
+    def test_celsius_changes_query_and_symbol(self):
+        w = self._weather({"WEATHER_UNIT": "celsius"})
+        self.assertIn("temperature_unit=celsius", self.captured["url"])
+        self.assertIn("°C", w)
+        self.assertNotIn("°F", w)
+
+    def test_unit_is_case_insensitive(self):
+        w = self._weather({"WEATHER_UNIT": "Celsius"})
+        self.assertIn("temperature_unit=celsius", self.captured["url"])
+        self.assertIn("°C", w)
+
+    def test_unrecognized_unit_falls_back_to_fahrenheit(self):
+        w = self._weather({"WEATHER_UNIT": "kelvin"})
+        self.assertIn("temperature_unit=fahrenheit", self.captured["url"])
+        self.assertIn("°F", w)
 
 
 if __name__ == "__main__":

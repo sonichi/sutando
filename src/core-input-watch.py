@@ -31,7 +31,8 @@ idle / wedged":
     needs_login             →   logged-out        (unless an ACTIVE gate shows, below)
     working                 →   running
     idle                    →   idle-ready
-    unknown (status stale)  →   hung
+    unknown (status stale)  →   hung              (only when the process probe SAW a session)
+    unknown (unobserved)    →   unobserved        (probe could not run: hold, never RECOVER)
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
     (any, + active gate)    →   blocked-known / blocked-human   (net-new: pane classify)
 
@@ -107,11 +108,22 @@ def _load_runtime_health():
     return mod
 
 
+# Claude Code's weekly Fable-consent dialog (title / body); Enter is safe there only
+# with the caret on its "Switch to <fallback> and continue" row.
+_FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this week", re.I)
+#: Lines allowed between the nearest Fable text and the focused switch row (body may wrap).
+_FABLE_CARET_GAP = 3
+
 # ---- ESCALATE-detection: interactive-prompt signatures. First match classifies.
 # Specific so the idle "❯ " prompt (ready for a task) is NEVER flagged. This is
 # the net-new layer over runtime-health: it identifies WHICH gate the core is
 # stuck at so ESCALATE can show the prompt and AUTO-ANSWER can decide.
 _SIGNATURES = [
+    # The caret ON the Fable dialog's switch row (classify also demands the Fable text
+    # above it); the same dialog with the caret anywhere else is the human gate below.
+    ("fable-limit", re.compile(r"❯\s*Switch to .{1,80}? and continue", re.I)),
+    ("fable-limit-unfocused", _FABLE_TEXT),
+    ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
     ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
     ("login", re.compile(r"Select login method|Paste code here|Browser didn'?t open", re.I)),
@@ -120,24 +132,25 @@ _SIGNATURES = [
     ("permission", re.compile(r"Do you want to (proceed|allow)|Allow this action|permission to", re.I)),
 ]
 _AWAIT_HINT = re.compile(
-    r"Esc to cancel|Enter to confirm|Press Enter|Paste code|to accept|❯\s*\d+\.", re.I)
+    r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
+    r"|Continuing automatically|❯\s*\d+\.", re.I)
 _IDLE = re.compile(r"⏵⏵\s*bypass permissions on|for agents\b", re.I)
 
 # Gates that need a human (can't be auto-answered): login + any unrecognized
 # selection/permission. The rest (trust/bypass/press-enter) are known-safe.
-_HUMAN_GATES = {"login", "selection", "permission", "unknown"}
+# session-limit is a spend/wait decision: never auto-answered, never a login.
+_HUMAN_GATES = {"login", "selection", "permission", "session-limit", "fable-limit-unfocused", "unknown"}
 
-# --- M4 AUTO-ANSWER decision (Layer 2), PURE + report-only. -----------------
-# This returns WHICH keystroke would safely dismiss a gate; it does NOT send it —
-# a separate, opt-in supervisor actor does that (kept OUT of the report-only
-# monitor loop). The allowlist is deliberately TINY and strictly non-destructive:
-# EVERYTHING not explicitly listed (every _HUMAN_GATE, every unknown/ambiguous
-# state) returns None → ESCALATE. Expanding it is an owner-reviewed change.
+# --- M4 AUTO-ANSWER (Layer 2): the safe key per gate; `answer_step` in the loop sends it
+# once per prompt instance (`--no-auto-answer` disables). Unlisted → None → ESCALATE.
 _AUTO_ANSWER = {
     # "Press Enter to continue…" — purely informational (e.g. the post-login
     # confirmation). Pressing Enter only proceeds; it grants nothing and is not
-    # destructive. The one gate safe to auto-dismiss.
+    # destructive.
     "press-enter": "Enter",
+    # Matched only with the caret ON "Switch to <fallback> and continue" under the Fable
+    # text, so Enter is that switch and spends nothing (owner 2026-09-02).
+    "fable-limit": "Enter",
 }
 
 
@@ -172,9 +185,18 @@ def classify(pane: str):
     # footer itself matches none of the signatures, so idle still suppresses.)
     if _IDLE.search(tail) and not any(rx.search(tail) for _, rx in _SIGNATURES):
         return None
-    for kind, rx in _SIGNATURES:
-        if rx.search(tail):
-            return kind, tail
+    # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
+    hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)
+            for m in [max(rx.finditer(tail), key=lambda m: m.start(), default=None)] if m]
+    if hits:
+        start, _, kind = max(hits, key=lambda h: (h[0], -h[1]))
+        # A focused switch row is Enter-safe only right under the Fable text (title, body,
+        # caret); a resolved Fable dialog higher up must not vouch for some other dialog's row.
+        if kind == "fable-limit" and not any(
+                m.start() < start and tail.count("\n", m.start(), start) <= _FABLE_CARET_GAP
+                for m in _FABLE_TEXT.finditer(tail)):
+            return "unknown", tail
+        return kind, tail
     # No specific signature — but an input affordance IS present and this is NOT
     # the idle prompt. That means an UNFORESEEN prompt. Surface it rather than
     # leave a silent dead-end (owner's no-dead-end requirement 2026-07-14): we
@@ -205,13 +227,16 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive):
+def compose_state(pane, base_health, gateway_alive, process=True):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
     runtime_health.derive() — the SHARED derivation. This function adds only the
     escalation-specific refinements: an active gate in the pane (finest signal),
     and the bundled-gateway-down state. Returns (state, detail, prompt, kind).
+
+    `process` is runtime-health's `signals.process` tri-state: True (session
+    seen), False (server answered "no session"), None (the probe could not run).
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -242,6 +267,9 @@ def compose_state(pane, base_health, gateway_alive):
         if pane and _is_idle_ready(pane):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
+        if process is None:  # no session observed = no wedge evidence; never RECOVER
+            return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
+                    tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None
 
@@ -350,6 +378,32 @@ def capture(socket, session):
         return None
 
 
+def send_keys(socket, session, key):
+    """Type one key into the core pane. True only when tmux accepted it."""
+    try:
+        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", f"{session}:0", key],
+                           capture_output=True, timeout=8)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def answer_step(state, kind, prompt, answered_prompt, enabled=True):
+    """The AUTO-ANSWER actor's pure half: the key to send now, or None.
+
+    One send per prompt instance: the same prompt still on screen after a send is
+    the gate not clearing, and typing again would answer whatever replaced it.
+    """
+    if not enabled or state != "blocked-known" or prompt == answered_prompt:
+        return None
+    return auto_answer(kind)
+
+
+#: How long a completed auto-answer stays in the signal file, so a relay that
+#: polls slower than the monitor still sees it exactly once.
+AUTO_ANSWER_CARRY_S = 120.0
+
+
 def _atomic_write(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -368,6 +422,8 @@ def main():
     ap.add_argument("--stable", type=int, default=2,
                     help="consecutive identical prompt polls before escalating (debounce)")
     ap.add_argument("--once", action="store_true", help="one tick then exit (for tests/probes)")
+    ap.add_argument("--no-auto-answer", dest="auto_answer", action="store_false",
+                    help="report allowlisted gates without typing their safe answer")
     a = ap.parse_args()
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
@@ -384,12 +440,15 @@ def main():
     last_sig = None
     stable_prompt = 0
     last_prompt = None
+    answered_prompt = None
+    last_answered = None
     while True:
         pane = capture(a.socket, a.session)
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
-            gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))))
+            gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
+            process=(base.get("signals") or {}).get("process", True))
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -401,11 +460,24 @@ def main():
         else:
             stable_prompt = 0
             last_prompt = None
+        if state != "blocked-known":
+            answered_prompt = None
 
-        sig = (state, prompt)
+        # The actor: only a settled, allowlisted gate is typed at, once per instance.
+        key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
+        if key and send_keys(a.socket, a.session, key):
+            answered_prompt = prompt
+            last_answered = {"kind": kind, "key": key, "at": time.time()}
+        if last_answered and time.time() - last_answered["at"] > AUTO_ANSWER_CARRY_S:
+            last_answered = None
+
+        sig = (state, prompt, last_answered and last_answered["at"])
         if sig != last_sig:
-            _atomic_write(a.out, {"state": state, "detail": detail,
-                                  "prompt": prompt, "kind": kind, "session": a.session})
+            payload = {"state": state, "detail": detail,
+                       "prompt": prompt, "kind": kind, "session": a.session}
+            if last_answered:
+                payload["auto_answered"] = last_answered
+            _atomic_write(a.out, payload)
             last_sig = sig
         if a.once:
             return

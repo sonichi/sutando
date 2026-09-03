@@ -143,8 +143,140 @@ def _resolve_bounded(host, *args, **kwargs):
     return call.result
 
 
+# Resolver fallback: the OS cache can hold a stuck negative answer for the relay
+# host while the configured nameserver still resolves it — ask that one directly.
+_FALLBACK_TTL_S = float(os.environ.get("REMOTE_GATEWAY_DNS_FALLBACK_TTL") or "300")
+_FALLBACK_QUERY_TIMEOUT_S = 2.0
+_RESOLV_CONF = "/etc/resolv.conf"
+_fallback_cache: dict = {}  # host -> (expires_at_monotonic, [ip, ...])
+_fallback_lock = threading.Lock()
+
+
+def _system_nameservers(path=None):
+    """IPv4 nameservers from resolv.conf in file order; [] when unreadable.
+    IPv6 entries are skipped: the query socket is AF_INET only."""
+    out = []
+    try:
+        with open(path or _RESOLV_CONF) as fh:
+            for ln in fh:
+                parts = ln.split()
+                if len(parts) >= 2 and parts[0] == "nameserver" and ":" not in parts[1]:
+                    out.append(parts[1])
+    except OSError:
+        pass
+    return out
+
+
+def _skip_name(data, i):
+    while True:
+        n = data[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += 1 + n
+
+
+def _encode_qname(host):
+    out = b""
+    for label in host.rstrip(".").split("."):
+        b = label.encode("idna")
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _parse_a_records(data, qid, qname=None):
+    """A-record IPs from one DNS response; [] unless id, QR bit, RCODE and
+    the echoed question all match what was asked."""
+    import struct
+    try:
+        rid, flags, qd, an, _ns, _ar = struct.unpack("!HHHHHH", data[:12])
+        if rid != qid or not flags & 0x8000 or flags & 0x000F:
+            return []
+        i = 12
+        for _ in range(qd):
+            end = _skip_name(data, i)
+            if qname is not None and data[i:end].lower() != qname.lower():
+                return []
+            i = end + 4
+        ips = []
+        for _ in range(an):
+            i = _skip_name(data, i)
+            rtype, _cls, _ttl, rdlen = struct.unpack("!HHIH", data[i:i + 10])
+            i += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append(socket.inet_ntoa(data[i:i + 4]))
+            i += rdlen
+        return ips
+    except (IndexError, struct.error, OSError):
+        return []
+
+
+def _dns_a_query(host, nameserver, timeout=None, port=53):
+    """One UDP A query (RFC 1035), stdlib only; [] on any failure."""
+    import secrets
+    import struct
+    qid = secrets.randbelow(0xFFFF) + 1
+    qname = _encode_qname(host)
+    q = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(_FALLBACK_QUERY_TIMEOUT_S if timeout is None else timeout)
+        # connect(): the kernel then drops datagrams from any other peer.
+        s.connect((nameserver, port))
+        s.send(q)
+        data = s.recv(4096)
+    except OSError:
+        return []
+    finally:
+        s.close()
+    return _parse_a_records(data, qid, qname)
+
+
+def _fallback_resolve(host):
+    """IPs for host via the system nameservers, cached; [] when none answers."""
+    now = time.monotonic()
+    with _fallback_lock:
+        hit = _fallback_cache.get(host)
+        if hit and hit[0] > now:
+            return list(hit[1])
+    for ns in _system_nameservers():
+        ips = _dns_a_query(host, ns)
+        if ips:
+            with _fallback_lock:
+                _fallback_cache[host] = (now + _FALLBACK_TTL_S, ips)
+            _log(f"system resolver failed for {host}; nameserver {ns} answered "
+                 f"{ips[0]} — using it for {_FALLBACK_TTL_S:.0f}s")
+            return ips
+    return []
+
+
+def _is_ip_literal(host):
+    for fam in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(fam, host)
+            return True
+        except (OSError, TypeError, ValueError):
+            pass
+    return False
+
+
 def _getaddrinfo_prefer_v4(host, *args, **kwargs):
-    infos = _resolve_bounded(host, *args, **kwargs)
+    try:
+        infos = _resolve_bounded(host, *args, **kwargs)
+    except socket.gaierror as err:
+        ips = []
+        if isinstance(host, str) and host and not _is_ip_literal(host):
+            try:
+                ips = _fallback_resolve(host)
+            except Exception:  # noqa: BLE001 — fallback must never mask the gaierror
+                ips = []
+        if not ips:
+            raise err
+        infos = []
+        for ip in ips:
+            # A literal IP never touches DNS: this only shapes the tuples.
+            infos.extend(_orig_getaddrinfo(ip, *args, **kwargs))
     if _PREFER_V4 and host and "ag2.space" in str(host):
         v4 = [i for i in infos if i[0] == socket.AF_INET]
         return v4 or infos
@@ -161,7 +293,7 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
-from .result_markers import parse_markers
+from .result_markers import parse_markers, render_skill_prelude
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
@@ -280,6 +412,12 @@ INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
 # Sidecar map {task id → origin room id}, recorded at queue time. Outbound
 # file-attach needs the room because media uploads go to the room-scoped
 TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
+# Sidecar map {WIRE task id → {"mode": "task-media", "thread_root": …}}, committed
+# BEFORE the task is published: nothing else survives a restart to route the upload.
+TASK_MEDIA_FILE = _STATE / f"remote-task-media{_INST_SUFFIX}.json"
+# Acks the gateway has not confirmed yet, with the durability each one may claim.
+# The outbound worker retries them; a closed lease retires the record.
+PENDING_ACK_FILE = _STATE / f"remote-task-acks{_INST_SUFFIX}.json"
 # Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
 # fresh local id, but the delivery it answers is still the original one.
 DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
@@ -468,16 +606,7 @@ def _token_from_vault_ag2space(vault_get=None):
     without touching a real Keychain.
     """
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        src = _monorepo_src("channel_token.py")
         if not src:
             return ""
         if src not in sys.path:
@@ -530,6 +659,53 @@ def _atomic_private_json(path: Path, payload: dict) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def _stage_durable(path: Path, text: str) -> "Path | None":
+    """Write `text` to a sibling temp file and fsync it; None when nothing
+    reached the disk. Staging is separate from publishing because a sidecar the
+    published file refers to has to commit in between."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Per-INVOCATION, not per-PID: the poll loop and the outbound worker both
+        # publish through here, and a shared temp name lets one rename the other's bytes.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return tmp
+    except Exception as exc:  # noqa: BLE001
+        _log(f"durable stage failed for {path.name} ({exc})")
+        return None
+
+
+def _publish_staged(tmp: Path, path: Path) -> bool:
+    """Rename a staged file into place and fsync the directory entry, so the
+    publication is durable the moment it becomes visible."""
+    try:
+        os.replace(tmp, path)
+        dfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"durable publish failed for {path.name} ({exc})")
+        return False
+
+
+def _durable_write(path: Path, text: str) -> bool:
+    """write temp → fsync file → rename → fsync parent directory. False when the
+    bytes did not commit, so the caller can withhold whatever they gate."""
+    tmp = _stage_durable(path, text)
+    if tmp is None:
+        return False
+    if _publish_staged(tmp, path):
+        return True
+    tmp.unlink(missing_ok=True)
+    return False
 
 
 def _read_private_json(path: Path) -> "dict | None":
@@ -790,6 +966,38 @@ def _resolve_review_card(path: Path, record: dict) -> bool:
     return True
 
 
+def _handle_hitl_action(task: dict):
+    """An owner card click delivered on the task relay (its `hitl_action`, or a
+    reply to the card whose text is an action label). Applied to the HITL
+    store here so a click never becomes a chat task; the caller closes the
+    task with a [no-send] control result. False = an ordinary message."""
+    task_id = str(task.get("id") or "")
+    # The control record exists only for a task already consumed here (either
+    # click form, or a review decision); its form must not be re-derived.
+    if task_id and _control_result_path(task_id).is_file():
+        return "redelivered"
+    if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
+        return False
+    owner = os.environ.get("SPARROW_HA_OWNER") or ""
+    handler = _hitl_reply_handler(owner, log=_log) if owner else None
+    if handler is None:
+        return False  # no owner or no store on this host: the click stays an ordinary task
+    try:
+        out = handler.offer_task(task)
+    except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
+        _log(f"hitl: task-relay click {task_id} not applied: {e}")
+        return False
+    if out == "rejected":
+        return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "ignored" and getattr(handler, "last_branch", None) == "fallback":
+        # A non-owner typed a label as a reply: that is a message, not a click
+        # to decline; it must reach _write_task like any other text.
+        return False
+    # A non-owner's real click stays consumed on purpose: a card press is not
+    # prose, so it closes [no-send] and is only logged, never a chat task.
+    return out or False
+
+
 def _handle_review_decision(task: dict) -> bool:
     task_id = str(task.get("id") or "")
     if task_id and _control_result_path(task_id).is_file():
@@ -856,13 +1064,13 @@ def _control_result_path(task_id: str) -> Path:
     return _WITHHELD_CONTROL_DIR / f"{safe}.json"
 
 
-def _queue_review_control_result(task: dict) -> None:
+def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
     task_id = str(task.get("id") or "")
     if not task_id:
         return
     path = _control_result_path(task_id)
     if not path.is_file():
-        _atomic_private_json(path, {"id": task_id, "body": "[no-send]"})
+        _atomic_private_json(path, {"id": task_id, "body": body})
 
 
 def _retry_review_control_results() -> None:
@@ -956,6 +1164,38 @@ def _guarded_result_body(tid: str, body: str):
 _VAULT_INTERCEPT_FNS: "tuple | None" = None
 
 
+def _monorepo_src(marker: str) -> str:
+    """The monorepo `src/` that holds `marker`, walking up from this file;
+    '' when sparrow runs standalone (pyproject install, no monorepo around it)."""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.isfile(os.path.join(cur, "src", marker)):
+            return os.path.join(cur, "src")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+
+
+def _hitl_reply_handler(owner_mxid: str, log=print):
+    """Owner card-click handler for HITL cards, or None when `src/hitl` is not
+    around (standalone sparrow) — the chain then simply lacks it, like the vault tier."""
+    try:
+        src = _monorepo_src(os.path.join("hitl", "replies.py"))
+        if not src:
+            return None
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl.manager import HitlManager, HitlStore, default_store
+        from hitl.replies import HitlReplyHandler
+        workspace = _STATE.parent
+        return HitlReplyHandler(HitlManager(HitlStore(default_store(workspace))), owner_mxid,
+                                workspace=workspace, log=log)
+    except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
+        log(f"hitl: reply handler unavailable ({e}); card clicks will not be applied")
+        return None
+
+
 def _vault_intercept_fns():
     """Lazily locate the monorepo `src/vault_intercept.py` helpers; memoized.
     Returns (None, None) on failure so a caller can fall back to `_local_redact_vault_set`."""
@@ -963,16 +1203,7 @@ def _vault_intercept_fns():
     if _VAULT_INTERCEPT_FNS is not None:
         return _VAULT_INTERCEPT_FNS
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "vault_intercept.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        src = _monorepo_src("vault_intercept.py")
         if not src:
             _VAULT_INTERCEPT_FNS = (None, None)
             return _VAULT_INTERCEPT_FNS
@@ -1050,6 +1281,13 @@ OUTBOUND_SCAN_S = float(os.environ.get("REMOTE_OUTBOUND_SCAN_S") or "1.0")
 _OUTBOUND_WAKE = threading.Event()
 _OUTBOUND_STOP = threading.Event()
 _INFLIGHT_MUTEX = threading.RLock()
+# True when the in-flight restore FAILED rather than finding no file. Both cases
+# yield an empty set, but only the second one means "nothing is in flight".
+_INFLIGHT_DEGRADED = False
+# Same hazard as the in-flight set: both ledgers are read-modify-written by the
+# poll loop and the outbound worker, so each load->mutate->write runs under a lock.
+_TASK_MEDIA_MUTEX = threading.RLock()
+_PENDING_ACK_MUTEX = threading.RLock()
 
 
 def wake_outbound() -> None:
@@ -1078,6 +1316,10 @@ def _outbound_worker(inflight: "set[str]") -> None:
             _post_proactive()
         except Exception as e:  # noqa: BLE001
             _log(f"outbound worker: proactive drain error (isolated): {e}")
+        try:
+            _retry_pending_acks(inflight)
+        except Exception as e:  # noqa: BLE001
+            _log(f"outbound worker: pending-ack retry error (isolated): {e}")
         for tid in [t for t in first_seen if t not in inflight]:
             ms = (time.monotonic() - first_seen.pop(tid)) * 1000.0
             _log(f"outbound worker: {tid} seen->retired {ms:.0f}ms (monotonic)")
@@ -1594,7 +1836,10 @@ def _one_line(value) -> str:
     """Header-safe single-line value: CR/LF stripped so a gateway-controlled
     field can't inject extra `key: value` lines (e.g. forge a second
     access_tier). Applied to every field — task content is single-line in
-    practice and a stray newline only ever indicates an injection attempt."""
+    practice and a stray newline only ever indicates an injection attempt.
+
+    Load-bearing: this producer does no body defanging, so the flatten is the
+    only thing stopping a field from forging a registered header line."""
     return str(value).replace("\r", " ").replace("\n", " ")
 
 
@@ -1854,8 +2099,52 @@ def _recover_auth(code: int) -> bool:
             return True
 
 
-def _post_task_ack(tid: str) -> bool:
-    """Tell the gateway a task made it safely into the local queue."""
+def _load_pending_acks() -> "dict[str, bool]":
+    """Acks the gateway never confirmed, mapped to the durability each may
+    claim (fail-open to empty: a lost ledger only costs a redelivery)."""
+    try:
+        data = json.loads(PENDING_ACK_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        _log(f"pending-ack file unreadable ({e}) — starting empty")
+        return {}
+    return {str(k): bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _record_pending_acks(pending: "list[tuple[str, bool]]") -> bool:
+    """Commit this round's acks before any of them is posted, so a crash between
+    ack and confirmation still leaves a ledger to retry from."""
+    with _PENDING_ACK_MUTEX:
+        acks = _load_pending_acks()
+        acks.update(dict(pending))
+        return _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
+
+
+def _forget_pending_ack(tid: str) -> None:
+    with _PENDING_ACK_MUTEX:
+        acks = _load_pending_acks()
+        if acks.pop(tid, None) is not None:
+            _durable_write(PENDING_ACK_FILE, json.dumps(acks, sort_keys=True))
+
+
+def _retry_pending_acks(inflight: "set[str]") -> None:
+    """Re-post acks the gateway never confirmed. An id no longer in flight had
+    its lease closed by the result POST, so its record is retired unposted.
+    That inference needs a TRUSTWORTHY in-flight set. When the restore degraded
+    the set is empty-because-unknown, so post instead and let the gateway's
+    'not leased' 404 retire the lease it actually closed."""
+    for tid, durable in sorted(_load_pending_acks().items()):
+        if tid not in inflight and not _INFLIGHT_DEGRADED:
+            _forget_pending_ack(tid)
+            continue
+        _post_task_ack(tid, durable)
+
+
+def _post_task_ack(tid: str, durable: bool = False) -> bool:
+    """Tell the gateway a task made it safely into the local queue. `durable`
+    says the task file, its media sidecar and the in-flight set are all fsync'd,
+    which is the only thing that lets the relay call the task accepted."""
     global _ack_disabled_until
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
@@ -1866,14 +2155,19 @@ def _post_task_ack(tid: str) -> bool:
     try:
         wire_tid = _broker_tid(tid)
         safe_tid = urllib.parse.quote(wire_tid, safe="")
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", {"id": wire_tid}, timeout=10)
+        body = {"id": wire_tid}
+        if durable:
+            body["durable"] = True
+        _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
+        _forget_pending_ack(tid)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
             # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
             # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
             if e.code == 404 and "not leased" in _http_error_body(e).lower():
+                _forget_pending_ack(tid)  # terminal: the lease is gone for good
                 return False   # per-task lease gone — keep acking the rest
             _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
             _log(f"gateway does not support task ack — retrying in "
@@ -2251,9 +2545,39 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         _log(f"owner-activity write failed: {e}")
 
 
-def _write_task(task: dict) -> str | None:
+def _fsync_in_place(tid: str, *targets: Path) -> bool:
+    """fsync files (and directories) already on disk. A pre-durability writer
+    left these bytes uncommitted, so nothing may be claimed durable until this
+    lands; False when it did not."""
+    try:
+        for target in targets:
+            fd = os.open(target, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except OSError as exc:
+        _log(f"durability repair failed for {tid} ({exc})")
+        return False
+    return True
+
+
+def _repair_pending_task(tid: str, task: dict) -> bool:
+    """A task the gateway redelivered while it is still queued here: fsync the
+    queued file and its directory and (re)commit the media sidecar, so a task
+    written by a pre-durability client can still earn a `durable` ack."""
+    tfile = find_task_file(TASKS_DIR, tid)
+    if tfile is None:
+        return False
+    if not _fsync_in_place(tid, tfile, TASKS_DIR):
+        return False
+    return _record_task_media(tid, task)
+
+
+def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
-    Returns the task id, or None if it has no id / already present."""
+    Returns (task id, durable) — `durable` says the queue write and its sidecar
+    committed, which is what an ack may claim — or None when nothing was queued."""
     broker_tid = str(task.get("id") or "").strip()
     if not broker_tid:
         _log("dropping task with no id")
@@ -2266,9 +2590,10 @@ def _write_task(task: dict) -> str | None:
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
     dest = TASKS_DIR / f"{tid}.txt"
-    # Idempotent: don't re-write a task already queued, claimed, or archived.
+    # Idempotent: don't re-write a task already queued, claimed, or archived —
+    # but a pre-S1 queue file still has to earn its durability before the ack.
     if _task_pending(tid):
-        return tid
+        return tid, _repair_pending_task(tid, task)
     # Relay redelivery of already-handled work: on reconnect the gateway replays
     # its unacked pool, including tasks this node long since processed (the
     _task_archive = TASKS_DIR / "archive"
@@ -2281,14 +2606,18 @@ def _write_task(task: dict) -> str | None:
     )
     if task_archived or _delivered_copy_exists(tid):
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if not rfile.exists():
-            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-            rfile.write_text(GATEWAY_REDELIVERY_RESULT)
+        if rfile.exists():
+            # A reply the local core wrote with a plain write_text: this process
+            # has committed nothing yet, so fsync before claiming durable.
+            durable = _fsync_in_place(tid, rfile, RESULTS_DIR)
+        else:
+            durable = _durable_write(rfile, GATEWAY_REDELIVERY_RESULT)
             # Provenance the result BODY cannot carry: a Team runtime controls
             # the body and can emit these exact bytes, but not this process's set.
-            _REDELIVERED.add(tid)
+            if durable:
+                _REDELIVERED.add(tid)
         _log(f"dedup: {tid} already handled — not re-queued")
-        return tid
+        return tid, durable
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     # Promote only the exact broker boolean plus Team request; the legacy Guest
     # wire tier keeps old nodes restricted and body text cannot opt itself in.
@@ -2407,53 +2736,25 @@ def _write_task(task: dict) -> str | None:
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
-        _chan = _one_line(task.get("channel_id") or "")
-        # shlex.quote: an unescaped quote in _chan must not close the shell
-        # string early and turn the remainder into executable shell syntax.
-        _chan_q = shlex.quote(_chan)
-        # The credential and the notify lane are per-instance: a dev-homeserver
-        # task needs ITS channel dir, not the default one this file was written for.
-        _cdir_q = shlex.quote(CHANNEL_DIR)
-        _step = 1
-        _skill = ["", "===SKILL INSTRUCTIONS (follow before any other action)==="]
-        _addr = _one_line(task.get("addressed_to") or "")
-        if _addr:
-            # Addressing gate (#649): the broker resolved this reply's target to a
-            # peer agent. State it in-band so the check cannot fail to retrieve.
-            _skill.append(
-                f"{_step}. ADDRESSING: this message replies to {_addr}'s message and "
-                f"does not mention you — it is {_addr}'s to claim. Do not process it "
-                "unless a later message hands it to you explicitly; close your copy "
-                "with [no-send].")
-            _step += 1
-        if _chan:
-            _skill.append(
-                f"{_step}. CONTEXT-FIRST (unconditional): before interpreting this "
-                f"message, reconstruct the room thread — `python3 "
-                f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
-                f"reports no gateway configured, load the channel env first: `set -a; . "
-                f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a`) — and read it "
-                "back (everyone's messages including your own prior replies) until this "
-                "message stands on its own, then answer from the reconstructed thread, "
-                "NOT from memory. Do this every time; do NOT skip it because the message "
-                "looks self-contained or you feel you already understand it — felt "
-                "confidence is exactly the signal that fails. The only exception is a "
-                'pure greeting or acknowledgement with no referent (e.g. "hi", "thanks").')
-            _step += 1
-            # Which channel file holds REMOTE_TASK_* differs per onboarding, so the
-            # prelude resolves it by content; notify.py's own guard can refuse a symlink.
-            _skill.append(
-                f"{_step}. NOTIFY FIRST (if task takes >60s): `set -a; . "
-                f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a` then python3 "
-                f"skills/task-progress/scripts/notify.py --source {_cdir_q} "
-                f"--channel-id {_chan_q} --message \"On it — back in a moment.\"")
-            _step += 1
-        _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
-        lines.extend(_skill)
-    tmp = dest.with_suffix(".txt.tmp")
+        # Template lives in result_markers.render_skill_prelude (single owner):
+        # a dedup requeue re-renders it there from the stored header (#3613).
+        lines.extend(render_skill_prelude(
+            _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
+            _one_line(task.get("addressed_to") or "")))
     from .local_task_protocol import apply_task_stamper
-    tmp.write_text(apply_task_stamper("\n".join(lines) + "\n"))
-    tmp.rename(dest)  # atomic publish so the watcher never sees a partial file
+    tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
+    if tmp is None:
+        _log(f"task write FAILED for {tid} — not queued, not acked")
+        return None
+    # The sidecar has to be visible BEFORE the task is: the results watcher is
+    # already running, so a sidecar written after the publish can lose the race.
+    if not _record_task_media(tid, task):
+        tmp.unlink(missing_ok=True)
+        _log(f"media sidecar FAILED for {tid} — not queued, not acked")
+        return None
+    if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
+        tmp.unlink(missing_ok=True)
+        return None
     _log(f"queued {tid}")
     # #2274 parity: one task_processed per NEWLY queued task (idempotent early
     # returns never reach here), bucketed to this gateway's own "remote" surface
@@ -2466,7 +2767,7 @@ def _write_task(task: dict) -> str | None:
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
-    return tid
+    return tid, True
 
 
 def _load_dedup_aliases() -> "dict[str, str] | None":
@@ -2558,33 +2859,114 @@ def _forget_task_room(tid: str) -> None:
         _save_task_rooms(rooms)
 
 
-def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
-    """Upload one allowlisted local file to the task's room via the gateway
-    media endpoint. Returns (ok, reason)."""
+def _load_task_media() -> "dict | None":
+    """The per-task media-mode map, or None when it exists but cannot be read.
+
+    None is not the same as empty: guessing "no entry" sends a Signal task's
+    attachment down the room-scoped route, outside the task's own lease.
+    """
+    if not TASK_MEDIA_FILE.exists():
+        return {}
+    try:
+        loaded = json.loads(TASK_MEDIA_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        _log(f"task-media sidecar unreadable ({exc}) — deferring")
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _record_task_media(tid: str, task: dict) -> bool:
+    """Commit this task's media mode, keyed by the WIRE id the media route posts
+    under. True when there is nothing to record (an ordinary relay task)."""
+    if not isinstance(task.get("signal"), dict):
+        return True
+    # A matching entry is re-committed rather than skipped: on the repair path an
+    # entry can be visible from a rename whose directory fsync never landed.
+    with _TASK_MEDIA_MUTEX:
+        media = _load_task_media()
+        if media is None:
+            return False
+        media[_broker_tid(tid)] = {"mode": "task-media",
+                                   "thread_root": str(task.get("thread_root") or "")}
+        return _durable_write(TASK_MEDIA_FILE, json.dumps(media, sort_keys=True))
+
+
+def _forget_task_media(tid: str) -> None:
+    """Retire a finished delivery's media mode (best-effort, like the room map)."""
+    delivery = _delivery_tid(tid)
+    if delivery is None:
+        return
+    with _TASK_MEDIA_MUTEX:
+        media = _load_task_media()
+        if media is None:
+            return
+        if media.pop(_broker_tid(delivery), None) is not None:
+            _durable_write(TASK_MEDIA_FILE, json.dumps(media, sort_keys=True))
+
+
+def _read_attachment(path_str: str) -> "tuple[str, str, str]":
+    """(basename, base64 bytes, "") for an allowlisted readable file, or
+    ("", "", reason) — the refusals both upload routes report in-band."""
     fpath = os.path.realpath(os.path.expanduser(path_str.strip()))
     if not is_path_sendable(fpath):
-        return False, "path not allowlisted"
+        return "", "", "path not allowlisted"
     try:
         size = os.path.getsize(fpath)
     except OSError as e:
-        return False, f"stat failed: {e}"
+        return "", "", f"stat failed: {e}"
     if size > MAX_MEDIA_BYTES:
-        return False, f"file exceeds {MAX_MEDIA_BYTES} bytes"
+        return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
     try:
         with open(fpath, "rb") as f:
-            content_b64 = base64.b64encode(f.read()).decode("ascii")
+            return os.path.basename(fpath), base64.b64encode(f.read()).decode("ascii"), ""
     except OSError as e:
-        return False, f"read failed: {e}"
+        return "", "", f"read failed: {e}"
+
+
+def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
+    """Upload one allowlisted local file to the task's room via the gateway
+    media endpoint. Returns (ok, reason)."""
+    name, content_b64, reason = _read_attachment(path_str)
+    if reason:
+        return False, reason
     safe_room = urllib.parse.quote(room, safe="")
     try:
         _req("POST", f"/v1/rooms/{safe_room}/media",
-             {"filename": os.path.basename(fpath), "content_b64": content_b64},
-             timeout=60)
+             {"filename": name, "content_b64": content_b64}, timeout=60)
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError) as e:
         return False, f"network error: {e}"
     return True, ""
+
+
+def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str) -> "tuple[str, str]":
+    """Upload one attachment against a Signal task's own lease. Returns
+    ("ok"|"note"|"defer", reason).
+
+    "defer" holds the WHOLE result for the next scan rather than collapsing to
+    an in-band note: the retry has to re-offer the same wire id, ordinal and
+    bytes for the relay to resume the upload it may already have recorded.
+    """
+    name, content_b64, reason = _read_attachment(path_str)
+    if reason:
+        return "note", reason
+    safe_tid = urllib.parse.quote(wire_id, safe="")
+    try:
+        _req("POST", f"/v1/tasks/{safe_tid}/media",
+             {"ordinal": ordinal, "filename": name, "content_b64": content_b64},
+             timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            return "note", "content conflicts with the recorded upload"
+        if e.code == 423:
+            return "note", "room is encrypted"
+        if e.code >= 500:
+            return "defer", f"HTTP {e.code}"
+        return "note", f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return "defer", f"network error: {e}"
+    return "ok", ""
 
 
 def _archive_result(path: Path, tid: str) -> None:
@@ -2894,32 +3276,33 @@ def _post_proactive() -> None:
 
 
 def _load_inflight() -> set[str]:
-    """Restore the in-flight set from disk (fail-open to empty)."""
+    """Restore the in-flight set from disk (fail-open to empty).
+    A failed restore also sets _INFLIGHT_DEGRADED: the empty set it returns then
+    means "unknown", which is not what FileNotFoundError's empty set means."""
+    global _INFLIGHT_DEGRADED
     try:
         data = json.loads(INFLIGHT_FILE.read_text())
-        return {str(t) for t in data} if isinstance(data, list) else set()
+        if isinstance(data, list):
+            return {str(t) for t in data}
+        _INFLIGHT_DEGRADED = True
+        _log(f"inflight file is {type(data).__name__}, not a list — starting empty")
+        return set()
     except FileNotFoundError:
         return set()
     except Exception as e:  # noqa: BLE001
+        _INFLIGHT_DEGRADED = True
         _log(f"inflight file unreadable ({e}) — starting empty")
         return set()
 
 
-def _save_inflight(inflight: set[str]) -> None:
-    """Atomically persist the in-flight set. Best-effort (never blocks the loop).
+def _save_inflight(inflight: set[str]) -> bool:
+    """Durably persist the in-flight set; False when it did not commit, which
+    withholds the ack that would have claimed it.
     The mutex covers snapshot+write: the poll loop and the outbound worker both
     save, and an unguarded interleave could persist a state missing the other
     thread's mutation (resurrecting a delivered id or dropping a fresh one)."""
     with _INFLIGHT_MUTEX:
-        try:
-            INFLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
-            # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if
-            # a second sparrow instance ever runs. os.replace is atomic overwrite.
-            tmp = INFLIGHT_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(sorted(inflight)))
-            os.replace(tmp, INFLIGHT_FILE)
-        except Exception as e:  # noqa: BLE001
-            _log(f"inflight persist failed ({e}) — continuing")
+        return _durable_write(INFLIGHT_FILE, json.dumps(sorted(inflight)))
 
 
 # (tid, path) pairs already uploaded this process — result-POST retry guard.
@@ -2951,7 +3334,8 @@ def _dedup_plan(tid: str, holder_id: str | None):
 
     action, payload = plan_dedup_recovery(
         RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit)
+        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit,
+        channel_dir=CHANNEL_DIR)
     return action, payload, room
 
 
@@ -3130,6 +3514,10 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _archive_result(rfile, tid)
                 inflight.discard(tid)
                 _forget_task_room(tid)
+                # A requeue carries the SAME delivery forward under a fresh local
+                # id, so only a retired delivery gives up its media mode.
+                if action != "requeue":
+                    _forget_task_media(tid)
                 _forget_dedup_alias(tid)
                 if action == "requeue":
                     inflight.add(payload)
@@ -3152,6 +3540,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             _REDELIVERED.discard(tid)
             inflight.discard(tid)
             _forget_task_room(tid)
+            _forget_task_media(tid)
             changed = True
             _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
             continue
@@ -3162,38 +3551,59 @@ def _post_ready_results(inflight: set[str]) -> None:
             # re-stitch the marker the parser stripped so the server still
             out_body = f"[channel: {redirect.value}]\n{out_body}"
         attaches = [a.value for a in parsed.actions if a.kind == "attach"]
+        # Resolved before the uploads: a Signal task posts its media under the
+        # DELIVERY id, and an unreadable ledger must defer rather than guess.
+        _delivery = _delivery_tid(tid)
+        if _delivery is None:
+            _log(f"delivery deferred for {tid} — alias ledger unreadable")
+            continue
+        _wire = _broker_tid(_delivery)
         if attaches:
+            _media = _load_task_media()
+            if _media is None:
+                _log(f"delivery deferred for {tid} — media sidecar unreadable")
+                continue
+            task_media = (_media.get(_wire) or {}).get("mode") == "task-media"
             room = _load_task_rooms().get(tid, "")
             sent = 0
-            for fp in attaches:
+            deferred = False
+            for ordinal, fp in enumerate(attaches):
                 # Uploads happen before the result POST (so failures can be
                 # annotated in-band); if that POST then fails and this loop
                 if (tid, fp) in _uploaded_attachments:
                     sent += 1
                     continue
-                ok, reason = (_upload_attachment(room, fp) if room
-                              else (False, "origin room unknown"))
-                if ok:
+                if task_media:
+                    status, reason = _upload_task_attachment(_wire, ordinal, fp)
+                else:
+                    ok, reason = (_upload_attachment(room, fp) if room
+                                  else (False, "origin room unknown"))
+                    status = "ok" if ok else "note"
+                if status == "defer":
+                    # A retryable upload failure holds the whole result: the next
+                    # scan re-offers the same wire id, ordinal and bytes.
+                    _log(f"attachment deferred for {tid}: {fp} ({reason})")
+                    deferred = True
+                    break
+                if status == "ok":
                     sent += 1
                     _uploaded_attachments.add((tid, fp))
-                    _log(f"attached {fp} to {room} for {tid}")
+                    _log(f"attached {fp} for {tid}")
                 else:
                     # Keep the information in-band rather than dropping the
                     # file silently — mirrors the other bridges' rejection UX.
                     out_body += f"\n[attachment not sent: {fp} ({reason})]"
                     _log(f"attachment skipped for {tid}: {fp} ({reason})")
+            if deferred:
+                continue
             if not out_body.strip() and sent:
                 out_body = "(file attached)"
-        _delivery = _delivery_tid(tid)
-        if _delivery is None:
-            _log(f"delivery deferred for {tid} — alias ledger unreadable")
-            continue
-        if not _deliver_result_payload(tid, _broker_tid(_delivery), out_body,
-                                       result_file=rfile):
+        if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile):
             continue
         _archive_result(rfile, tid)
         inflight.discard(tid)
         _forget_task_room(tid)
+        _forget_task_media(tid)
         _forget_dedup_alias(tid)
         changed = True
         _log(f"delivered result for {tid}")
@@ -3517,7 +3927,12 @@ def _maybe_start_event_channel() -> None:
         if ha_owner:
             from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
             store = ActionStore(str(_STATE / "human-actions"))
-            handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
+            # HITL card clicks ride the same owner-only chain, ahead of taskify.
+            claimants = [DecisionHandler(store, ha_owner, log=_log)]
+            hitl = _hitl_reply_handler(ha_owner, log=_log)
+            if hitl is not None:
+                claimants.append(hitl)
+            handler = HandlerChain(claimants + [handler])
             if ha_room:
                 poster = CardPoster(store, URL, _AUTH_HEADERS,
                                     ha_room, log=_log,
@@ -3619,23 +4034,35 @@ def main() -> None:
             added = False
             pending_ack = []
             for task in resp.get("tasks", []):
+                hitl_out = _handle_hitl_action(task)
+                if hitl_out:
+                    body = "[no-send]"
+                    if str(hitl_out).startswith("rejected:"):
+                        body = ("That click did not apply: the card had already moved "
+                                f"({str(hitl_out)[9:]}). Please use the current card.")
+                    _queue_review_control_result(task, body=body)
+                    _retry_review_control_results()
+                    _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
+                    continue
                 if _handle_review_decision(task):
                     _queue_review_control_result(task)
                     _retry_review_control_results()
                     _log(f"consumed private review decision {task.get('id')}")
                     continue
-                tid = _write_task(task)
-                if tid:
+                written = _write_task(task)
+                if written:
+                    tid, durable = written
                     if tid not in inflight:
                         inflight.add(tid)
                         added = True
-                    pending_ack.append(tid)
-            if added:
-                _save_inflight(inflight)
-            # Ack only after both the task file and local in-flight state are
-            # durable, so a crash after ack does not strand the eventual result.
-            for tid in pending_ack:
-                _post_task_ack(tid)
+                    pending_ack.append((tid, durable))
+            # Ack only after task file, in-flight set and ack ledger are durable;
+            # any failure withholds every ack this round, redeliveries included.
+            committed = _save_inflight(inflight) if pending_ack else True
+            if pending_ack and committed:
+                committed = _record_pending_acks(pending_ack)
+            for tid, durable in pending_ack if committed else ():
+                _post_task_ack(tid, durable)
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
