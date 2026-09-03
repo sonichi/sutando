@@ -77,6 +77,7 @@ def plan_dedup_recovery(
     asking_channel,
     new_task_id: str,
     commit_identity=None,
+    channel_dir: str = "",
 ) -> tuple[str, str | None]:
     """Decide and perform the filesystem half of dedup recovery.
 
@@ -122,6 +123,7 @@ def plan_dedup_recovery(
             orig_text, new_task_id, dedup_requeue_count(orig_text) + 1,
             asking_channel, holder,
             reason="cross-sender" if cross_sender else "holder-empty",
+            channel_dir=channel_dir,
         )
         try:
             (Path(tasks_dir) / f"{new_task_id}.txt").write_text(body)
