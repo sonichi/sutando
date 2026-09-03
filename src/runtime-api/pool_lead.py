@@ -25,7 +25,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 from task_priority import sort_tasks_by_priority  # noqa: E402
 from pool_routing import (  # noqa: E402
-    Decision, WorkerView, build_router, read_task_meta)
+    Decision, MemberView, build_router, read_task_meta)
 
 # Depth at which channelless work overflows to the idle lane core; room
 # affinity itself is binding and never yields on load (owner 2026-08-26).
@@ -122,7 +122,7 @@ def _read_lane(path: Path) -> str:
 class PoolLead:
     def __init__(self, tasks_dir, state_dir, followers_fn, alive_fn,
                  now_fn=time.time, metrics=None, results_dir=None,
-                 runtime_fn=None, core_fn=None, router=None):
+                 runtime_fn=None, home_fn=None, router=None):
         """followers_fn() -> list of instance ids eligible for assignment.
         alive_fn(instance) -> bool (fresh heartbeat). Both injected — the
         production binder wires instance_registry + the .alive files.
@@ -140,8 +140,8 @@ class PoolLead:
         self.alive_fn = alive_fn
         self.now = now_fn
         self.metrics = metrics  # PoolMetrics or None; recording is optional
-        # core_fn(): core id while its beat is fresh, else None; never a follower.
-        self.core_fn = core_fn or (lambda: None)
+        # home_fn(): home seat id while its beat is fresh, else None; never a follower.
+        self.home_fn = home_fn or (lambda: None)
         self.router = router or build_router(self.state_dir, self._default_pick)
 
     # ── affinity table (single-writer: the lead) ────────────────────────────
@@ -315,19 +315,18 @@ class PoolLead:
     # ── routing policy seam ───────────────────────────────────────────────
     def _default_pick(self, task, workers, affinity, state):
         """`affinity-first`: the lead's historical choice over the follower
-        subset — the core joins only when a configured policy names it."""
-        followers = [w.id for w in workers if not w.is_core]
+        subset — the home seat joins only when a configured policy names it."""
+        followers = [w.id for w in workers if not w.is_home]
         if not followers:
-            core = next((w.id for w in workers if w.is_core), None)
-            return core
+            return next((w.id for w in workers if w.is_home), None)
         return self._pick(task.channel, followers, affinity, task.lane)
 
-    def _members(self, followers: "list[str]") -> "list[WorkerView]":
-        views = [WorkerView(str(i), self._load(i), self._claiming(i),
+    def _members(self, followers: "list[str]") -> "list[MemberView]":
+        views = [MemberView(str(i), self._load(i), self._claiming(i),
                             self.runtime_fn(i)) for i in followers]
-        core = self.core_fn()
+        core = self.home_fn()
         if core:
-            views.append(WorkerView(str(core), self._load(core),
+            views.append(MemberView(str(core), self._load(core),
                                     self._claiming(core), "claude", True))
         return views
 

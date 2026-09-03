@@ -120,16 +120,19 @@ non-positive values fall back to the default rather than disabling affinity.
 assigned. The lead keeps the atomic rename, reclaim and trace; the choice is
 a policy behind one call: `pick(task, workers, affinity) -> worker | None`.
 
-- **Members = one core + N workers.** The core is a routable member
-  (`WorkerView.is_core`), discovered by the daemon from the host heartbeat.
-  Single-core mode is the same policy evaluated over a membership of one
-  (`solo_pick`) — N=0 workers is not a separate code path.
+- **Members.** Every seat the policy may pick is a `MemberView`; the seat that
+  owns the loop, memory and owner relationship is the HOME member
+  (`is_home`, discovered by the daemon from the host heartbeat). A single-seat
+  install is the same policy evaluated over a membership of one (`solo_pick`),
+  not a separate code path. Whether that seat is counted as a worker (N=1) or
+  sits outside the worker count (N=0) is a vocabulary ruling this module does
+  not take — `HOME_ID` and `pool_names` are the two places it lands.
 - **Config** `state/pool/routing.json` (or `$SUTANDO_POOL_ROUTING`), absent →
   `affinity-first` (the lead's historical `_pick`; existing behaviour and tests
   unchanged):
 
   ```json
-  {"policy": "core-first", "allow_delegation": true,
+  {"policy": "home-first", "allow_delegation": true,
    "rules": [
      {"match": {"room_name": "Pro-Main"},  "to": ["core-1"]},
      {"match": {"access_tier": "team"},     "policy": "least-loaded", "exclude": ["core-1"]},
@@ -141,18 +144,18 @@ a policy behind one call: `pick(task, workers, affinity) -> worker | None`.
   `runtime` matches the pool); `to`/`only`/`exclude` narrow candidates
   before the named policy runs. No rule → top-level `policy`.
 - **Built-ins:** `affinity-first`, `least-loaded`, `round-robin`,
-  `sticky-sender`, `core-first` (explicit `target_worker:` → that worker;
-  otherwise the core; no core in the pool → least-loaded).
+  `sticky-sender`, `home-first` (explicit `target_worker:` → that worker;
+  otherwise the home seat; no home seat → least-loaded; `core-first` accepted for one release).
 - **Custom code:** `"policy": "custom:/path/mod.py:pick"` — same signature
   `(task, workers, affinity, state)`. Owner-only surface.
 - **Degrade, never strand:** a policy that raises, or names a worker that is
   not live, is overridden by `affinity-first`; every assignment traces
   `{"event": "routed", policy, rule, fallback, reason}`.
-- **Delegation (work stealing).** With `allow_delegation: true` the core may
+- **Delegation (work stealing).** With `allow_delegation: true` the home seat may
   hand a task it holds to a specific worker (`pool_follower.delegate`, CLI
   `python3 src/pool_follower.py delegate <claimed-path> <me> <worker>`): the
   claimed file becomes that worker's assignment, which the lead's ledger and
-  reclaim already understand. With it false the core must process itself.
+  reclaim already understand. With it false the home seat must process itself.
 
 ## Instance registry touchpoints
 

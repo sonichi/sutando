@@ -24,7 +24,7 @@ from task_priority import sort_tasks_by_priority  # noqa: E402
 from task_archive import _move_without_clobbering  # noqa: E402
 sys.path.insert(0, str(_HERE / "runtime-api"))
 from pool_routing import (  # noqa: E402
-    CORE_ID, build_router, load_config, read_task_meta, solo_pick)
+    HOME_ID, build_router, load_config, read_task_meta, solo_pick)
 
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
 
@@ -103,7 +103,7 @@ def acquire_work(tasks_dir, state_dir, instance: str,
         if result_evidence(results_dir, f.name):
             continue
         if not solo_pick(router, read_task_meta(f), instance,
-                         is_core=(instance == CORE_ID)):
+                         is_home=(instance == HOME_ID)):
             continue
         # assignment-suffix convention so lead-side load counting and
         # reclaim see fallback claims (legacy .claimed-core-N stays put)

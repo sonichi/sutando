@@ -7,9 +7,10 @@ built-in, an ordered rules file, or owner-supplied code — all behind one
 `pick(task, workers, affinity) -> worker | None` call. A policy that raises
 or names a worker that is not live is overridden by the default and traced.
 
-The pool is one core plus zero or more workers. The core is a routable
-member like any other, so single-core mode is the same policy evaluated
-over a membership of one (`solo_pick`), not a second code path.
+Every seat in the pool is a member the policy may pick; the seat that owns
+the loop, memory and owner relationship is the HOME member. A single-seat
+install is the same policy evaluated over a membership of one (`solo_pick`),
+not a second code path — the counting convention is decided elsewhere.
 
 Config: `<state>/pool/routing.json` (or $SUTANDO_POOL_ROUTING). Absent or
 malformed means `affinity-first`, the lead's historical behaviour.
@@ -25,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_POLICY = "affinity-first"
-CORE_ID = "core"
+HOME_ID = "home"
 
 _HDR_RE = re.compile(
     r"^(?P<key>channel_id|source|access_tier|priority|user_id|room_name"
@@ -47,12 +48,12 @@ class TaskMeta:
 
 
 @dataclass
-class WorkerView:
+class MemberView:
     id: str
     load: int = 0
     claiming: bool = True
     runtime: str = "claude"
-    is_core: bool = False
+    is_home: bool = False
 
 
 @dataclass
@@ -150,13 +151,13 @@ def _sticky_sender(task, workers, affinity, state):
     return pick
 
 
-def _core_first(task, workers, affinity, state):
-    """Explicit address wins; everything else goes to the core, which claims
-    and processes like any member. No core in the pool → least-loaded."""
+def _home_first(task, workers, affinity, state):
+    """Explicit address wins; everything else goes to the home seat, which
+    claims and processes like any member. No home seat → least-loaded."""
     ids = {w.id: w for w in workers}
     if task.target and task.target in ids and ids[task.target].claiming:
         return task.target
-    core = next((w for w in workers if w.is_core), None)
+    core = next((w for w in workers if w.is_home), None)
     if core is not None and core.claiming:
         return core.id
     return _least_loaded(task, workers, affinity, state)
@@ -166,7 +167,8 @@ BUILTINS = {
     "least-loaded": _least_loaded,
     "round-robin": _round_robin,
     "sticky-sender": _sticky_sender,
-    "core-first": _core_first,
+    "home-first": _home_first,
+    "core-first": _home_first,  # pre-ruling spelling, kept for one release
 }
 
 
@@ -263,10 +265,10 @@ class Router:
 
 
 def solo_pick(router: Router, task: TaskMeta, self_id: str,
-              is_core: bool = True) -> bool:
+              is_home: bool = True) -> bool:
     """Single-member evaluation: True when the configured policy lets
-    `self_id` take `task`. N=0 workers is just a pool of one."""
-    me = WorkerView(id=self_id, is_core=is_core)
+    `self_id` take `task`. A lone seat is a membership of one."""
+    me = MemberView(id=self_id, is_home=is_home)
     return router.pick(task, [me], {}).worker == self_id
 
 

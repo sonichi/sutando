@@ -20,7 +20,7 @@ sys.path.insert(0, str(REPO / "src" / "runtime-api"))
 
 from pool_lead import PoolLead  # noqa: E402
 from pool_routing import (  # noqa: E402
-    CORE_ID, Router, RoutingConfig, TaskMeta, WorkerView, build_router,
+    HOME_ID, Router, RoutingConfig, TaskMeta, MemberView, build_router,
     load_config, solo_pick)
 import pool_follower  # noqa: E402
 
@@ -51,7 +51,7 @@ class Base(unittest.TestCase):
         return PoolLead(self.tasks, self.state,
                         followers_fn=lambda: list(self.pool),
                         alive_fn=lambda i: True, now_fn=lambda: 1_000.0,
-                        core_fn=lambda: self.core)
+                        home_fn=lambda: self.core)
 
     def routing(self, **cfg):
         (self.state / "pool").mkdir(exist_ok=True)
@@ -85,7 +85,7 @@ class NoConfigIsHistoricalBehaviour(Base):
         self.assertFalse(r[0]["fallback"])
 
     def test_core_not_picked_unless_policy_names_it(self):
-        self.core = CORE_ID
+        self.core = HOME_ID
         self.write("task-1.txt", task())
         self.lead().sweep()
         self.assertIn(self.assigned()["task-1.txt"], self.pool)
@@ -93,25 +93,25 @@ class NoConfigIsHistoricalBehaviour(Base):
 
 class CoreFirst(Base):
     def test_unaddressed_goes_to_core(self):
-        self.core = CORE_ID
-        self.routing(policy="core-first")
+        self.core = HOME_ID
+        self.routing(policy="home-first")
         self.write("task-1.txt", task())
         self.lead().sweep()
-        self.assertEqual(self.assigned()["task-1.txt"], CORE_ID)
+        self.assertEqual(self.assigned()["task-1.txt"], HOME_ID)
 
     def test_addressed_goes_to_that_worker(self):
-        self.core = CORE_ID
-        self.routing(policy="core-first")
+        self.core = HOME_ID
+        self.routing(policy="home-first")
         self.write("task-1.txt", task(target_worker="core-2"))
         self.lead().sweep()
         self.assertEqual(self.assigned()["task-1.txt"], "core-2")
 
     def test_no_core_falls_to_least_loaded(self):
-        self.routing(policy="core-first")
+        self.routing(policy="home-first")
         self.write("task-1.txt", task())
         self.lead().sweep()
         self.assertIn(self.assigned()["task-1.txt"], self.pool)
-        self.assertEqual(self.trace("routed")[0]["policy"], "core-first")
+        self.assertEqual(self.trace("routed")[0]["policy"], "home-first")
 
 
 class Rules(Base):
@@ -186,8 +186,8 @@ class BrokenPolicyDegrades(Base):
 
 class BuiltinsUnit(unittest.TestCase):
     def w(self, *ids, core=None):
-        return [WorkerView(i, load=0, claiming=True) for i in ids] + (
-            [WorkerView(core, is_core=True)] if core else [])
+        return [MemberView(i, load=0, claiming=True) for i in ids] + (
+            [MemberView(core, is_home=True)] if core else [])
 
     def test_round_robin_cycles(self):
         r = Router(RoutingConfig(policy="round-robin"), lambda *a: None)
@@ -204,7 +204,7 @@ class BuiltinsUnit(unittest.TestCase):
 
     def test_least_loaded_prefers_lowest_load(self):
         r = Router(RoutingConfig(policy="least-loaded"), lambda *a: None)
-        ws = [WorkerView("a", load=3), WorkerView("b", load=1)]
+        ws = [MemberView("a", load=3), MemberView("b", load=1)]
         self.assertEqual(r.pick(TaskMeta("t"), ws, {}).worker, "b")
 
 
@@ -217,57 +217,57 @@ class SingleCoreIsNEqualsOne(Base):
     def test_default_policy_lets_the_lone_member_claim(self):
         self.stale_lead()
         self.write("task-1.txt", task())
-        got = pool_follower.acquire_work(self.tasks, self.state, CORE_ID,
+        got = pool_follower.acquire_work(self.tasks, self.state, HOME_ID,
                                          "pool-lead", now_fn=lambda: 1e9)
         self.assertIsNotNone(got)
-        self.assertTrue(got.name.endswith(f".claimed-{CORE_ID}.txt"))
+        self.assertTrue(got.name.endswith(f".claimed-{HOME_ID}.txt"))
 
     def test_rule_excluding_me_leaves_the_file(self):
         self.stale_lead()
-        self.routing(policy="core-first", rules=[
-            {"match": {"access_tier": "team"}, "exclude": [CORE_ID]}])
+        self.routing(policy="home-first", rules=[
+            {"match": {"access_tier": "team"}, "exclude": [HOME_ID]}])
         self.write("task-team.txt", task(access_tier="team"))
         self.write("task-own.txt", task())
-        got = pool_follower.acquire_work(self.tasks, self.state, CORE_ID,
+        got = pool_follower.acquire_work(self.tasks, self.state, HOME_ID,
                                          "pool-lead", now_fn=lambda: 1e9)
-        self.assertEqual(got.name, f"task-own.claimed-{CORE_ID}.txt")
+        self.assertEqual(got.name, f"task-own.claimed-{HOME_ID}.txt")
         self.assertTrue((self.tasks / "task-team.txt").exists())
 
     def test_solo_pick_is_the_same_router(self):
         router = build_router(self.state)
-        self.assertTrue(solo_pick(router, TaskMeta("t"), CORE_ID))
-        self.assertTrue(solo_pick(router, TaskMeta("t"), "core-1", is_core=False))
+        self.assertTrue(solo_pick(router, TaskMeta("t"), HOME_ID))
+        self.assertTrue(solo_pick(router, TaskMeta("t"), "core-1", is_home=False))
 
 
 class Delegation(Base):
     def held(self):
-        p = self.tasks / f"task-1.claimed-{CORE_ID}.txt"
+        p = self.tasks / f"task-1.claimed-{HOME_ID}.txt"
         p.write_text(task())
         return p
 
     def test_disabled_by_default(self):
         with self.assertRaises(ValueError):
-            pool_follower.delegate(self.tasks, self.state, self.held(), CORE_ID, "core-2")
-        self.assertTrue((self.tasks / f"task-1.claimed-{CORE_ID}.txt").exists())
+            pool_follower.delegate(self.tasks, self.state, self.held(), HOME_ID, "core-2")
+        self.assertTrue((self.tasks / f"task-1.claimed-{HOME_ID}.txt").exists())
 
     def test_enabled_hands_off_as_assignment(self):
-        self.routing(policy="core-first", allow_delegation=True)
-        out = pool_follower.delegate(self.tasks, self.state, self.held(), CORE_ID, "core-2")
+        self.routing(policy="home-first", allow_delegation=True)
+        out = pool_follower.delegate(self.tasks, self.state, self.held(), HOME_ID, "core-2")
         self.assertEqual(out.name, "task-1.assigned-core-2.txt")
         self.assertEqual(self.assigned()["task-1.txt"], "core-2")
 
     def test_refuses_foreign_or_self_target(self):
         self.routing(allow_delegation=True)
-        for bad in (CORE_ID, "", "../x"):
+        for bad in (HOME_ID, "", "../x"):
             with self.assertRaises(ValueError):
-                pool_follower.delegate(self.tasks, self.state, self.held(), CORE_ID, bad)
+                pool_follower.delegate(self.tasks, self.state, self.held(), HOME_ID, bad)
 
     def test_only_a_file_i_hold(self):
         self.routing(allow_delegation=True)
         other = self.tasks / "task-2.claimed-core-1.txt"
         other.write_text(task())
         with self.assertRaises(ValueError):
-            pool_follower.delegate(self.tasks, self.state, other, CORE_ID, "core-2")
+            pool_follower.delegate(self.tasks, self.state, other, HOME_ID, "core-2")
 
 
 class EdgesAndFaults(Base):
@@ -284,15 +284,15 @@ class EdgesAndFaults(Base):
         self.assertEqual(load_config(self.state).policy, "affinity-first")
 
     def test_builtins_with_no_workers_return_none(self):
-        for name in ("least-loaded", "round-robin", "sticky-sender", "core-first"):
+        for name in ("least-loaded", "round-robin", "sticky-sender", "home-first"):
             r = Router(RoutingConfig(policy=name), lambda *a: None)
             self.assertIsNone(r.pick(TaskMeta("t", sender="U1"), [], {}).worker, name)
 
     def test_core_first_addressed_target_via_router(self):
-        r = Router(RoutingConfig(policy="core-first"), lambda *a: None)
-        ws = [WorkerView("core-2"), WorkerView(CORE_ID, is_core=True)]
+        r = Router(RoutingConfig(policy="home-first"), lambda *a: None)
+        ws = [MemberView("core-2"), MemberView(HOME_ID, is_home=True)]
         self.assertEqual(r.pick(TaskMeta("t", target="core-2"), ws, {}).worker, "core-2")
-        self.assertEqual(r.pick(TaskMeta("t", target="ghost"), ws, {}).worker, CORE_ID)
+        self.assertEqual(r.pick(TaskMeta("t", target="ghost"), ws, {}).worker, HOME_ID)
 
     def test_custom_unloadable_and_uncallable_fall_back(self):
         txt = Path(self.tmp.name) / "policy.txt"
@@ -301,7 +301,7 @@ class EdgesAndFaults(Base):
         nc.write_text("pick = 5\n")
         for spec, err in ((f"custom:{txt}:pick", "ImportError"), (f"custom:{nc}:pick", "TypeError")):
             r = Router(RoutingConfig(policy=spec), lambda *a: "core-1")
-            d = r.pick(TaskMeta("t"), [WorkerView("core-1")], {})
+            d = r.pick(TaskMeta("t"), [MemberView("core-1")], {})
             self.assertTrue(d.fallback, spec)
             self.assertIn(err, d.reason)
 
@@ -312,10 +312,10 @@ class EdgesAndFaults(Base):
             {"match": {"source": ["slack", "discord"]}, "to": ["core-2"]},
         ])
         r = Router(cfg, lambda *a: None)
-        ws = [WorkerView("core-1"), WorkerView("core-2")]
+        ws = [MemberView("core-1"), MemberView("core-2")]
         d = r.pick(TaskMeta("t", source="discord"), ws, {})
         self.assertEqual((d.worker, d.rule), ("core-2", 2))
-        ws_codex = [WorkerView("core-1", runtime="codex"), WorkerView("core-2")]
+        ws_codex = [MemberView("core-1", runtime="codex"), MemberView("core-2")]
         d = r.pick(TaskMeta("t", source="voice"), ws_codex, {})
         self.assertEqual((d.worker, d.rule), ("core-1", 1))
 
@@ -325,26 +325,26 @@ class EdgesAndFaults(Base):
         cfg = RoutingConfig(rules=[{"match": {"source": "slack"}, "policy": f"custom:{bad}:pick",
                                     "exclude": ["core-1"]}])
         r = Router(cfg, lambda *a: "core-2")
-        d = r.pick(TaskMeta("t", source="slack"), [WorkerView("core-1"), WorkerView("core-2")], {})
+        d = r.pick(TaskMeta("t", source="slack"), [MemberView("core-1"), MemberView("core-2")], {})
         self.assertEqual((d.worker, d.fallback), ("core-2", True))
         self.assertIn("not a candidate", d.reason)
 
     def test_lead_default_pick_over_core_only_membership(self):
         lead = self.lead()
-        only_core = [WorkerView(CORE_ID, is_core=True)]
-        self.assertEqual(lead._default_pick(TaskMeta("t"), only_core, {}, {}), CORE_ID)
+        only_core = [MemberView(HOME_ID, is_home=True)]
+        self.assertEqual(lead._default_pick(TaskMeta("t"), only_core, {}, {}), HOME_ID)
         self.assertIsNone(lead._default_pick(TaskMeta("t"), [], {}, {}))
 
 
 class DelegateCli(Base):
     def held(self):
-        p = self.tasks / f"task-1.claimed-{CORE_ID}.txt"
+        p = self.tasks / f"task-1.claimed-{HOME_ID}.txt"
         p.write_text(task())
         return p
 
     def test_usage_and_refusal_exit_2(self):
         self.assertEqual(pool_follower._delegate_cli(["only-one"]), 2)
-        self.assertEqual(pool_follower._delegate_cli([str(self.held()), CORE_ID, "core-2"]), 2)
+        self.assertEqual(pool_follower._delegate_cli([str(self.held()), HOME_ID, "core-2"]), 2)
 
     def test_success_prints_assignment_path(self):
         self.routing(allow_delegation=True)
@@ -352,7 +352,7 @@ class DelegateCli(Base):
         import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = pool_follower._delegate_cli([str(self.held()), CORE_ID, "core-2"])
+            rc = pool_follower._delegate_cli([str(self.held()), HOME_ID, "core-2"])
         self.assertEqual(rc, 0)
         self.assertTrue(buf.getvalue().strip().endswith("task-1.assigned-core-2.txt"))
 
