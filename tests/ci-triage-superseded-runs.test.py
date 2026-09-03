@@ -93,12 +93,34 @@ got = ct.failing_checks("1", run_for([
 ]), "o/r")
 check("e2) ...regardless of rollup order", got == ["shellcheck"], f"got {got}")
 
-# --- StatusContext entries carry `context`, not `name` -----------------------
+# --- StatusContext -----------------------------------------------------------
+# Keyed `context` not `name`, and carries startedAt with NO completedAt.
+def sc(context, state, started):
+    return {"__typename": "StatusContext", "context": context, "state": state,
+            "startedAt": started, "targetUrl": ""}
+
+
 got = ct.failing_checks("1", run_for([
-    {"context": "license/cla", "state": "FAILURE", "completedAt": "2026-09-03T09:00:00Z"},
-    {"context": "license/cla", "state": "SUCCESS", "completedAt": "2026-09-03T09:10:00Z"},
+    sc("license/cla", "FAILURE", "2026-09-03T09:00:00Z"),
+    sc("license/cla", "SUCCESS", "2026-09-03T09:10:00Z"),
 ]), "o/r")
-check("f) a StatusContext dedupes on `context` too", got == [], f"got {got}")
+check("f) a StatusContext dedupes on `context`, ordered by `startedAt` alone",
+      got == [], f"got {got}")
+
+got = ct.failing_checks("1", run_for([
+    sc("license/cla", "SUCCESS", "2026-09-03T09:00:00Z"),
+    sc("license/cla", "FAILURE", "2026-09-03T09:10:00Z"),
+]), "o/r")
+check("f2) ...and a later StatusContext FAILURE is still reported",
+      got == ["license/cla"], f"got {got}")
+
+got = ct.failing_checks("1", run_for([
+    sc("license/cla", "FAILURE", "2026-09-03T09:00:00Z"),
+    sc("license/cla", "SUCCESS", "2026-09-03T09:10:00Z"),
+    sc("continuous-integration", "FAILURE", "2026-09-03T09:10:00Z"),
+]), "o/r")
+check("f3) two distinct contexts: only the genuinely bad one reports",
+      got == ["continuous-integration"], f"got {got}")
 
 # --- _run_ids must not send the reader to a superseded run's log ------------
 ids = ct._run_ids("1", run_for([
