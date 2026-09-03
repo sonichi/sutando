@@ -149,6 +149,30 @@ with tempfile.TemporaryDirectory() as td:
         f"got: {(r_bold or {}).get('detail', '')[:140]}",
     )
 
+    # 3f. A compacted index abbreviates entries and carries no link, so a rule
+    #     keyed on `](` calls a live corpus untouched and hides the split.
+    for abbrev in ("f:pronoun_she_her", "r:memory_index_budget", "p:some_project"):
+        (idx_only / "MEMORY.md").write_text(f"# Sutando memory index\n\n- {abbrev}\n")
+        hc_c = load_hc(home, live)
+        r_c = hc_c.check_memory_dir_siblings()
+        check(
+            f"compact index entry `{abbrev}` counts as an entry",
+            r_c is not None and "-repo.slug" in r_c["detail"],
+            f"got: {(r_c or {}).get('detail', '')[:140]}",
+        )
+
+    # 3g. CONTROL: an abbreviation matching inside a word would re-create 3b's
+    #     never-clearing warning by another route.
+    for noise in ("see conf:iguration notes", "f: ", "just prose, nothing referenced"):
+        (idx_only / "MEMORY.md").write_text(f"# Sutando memory index\n\n- {noise}\n")
+        hc_n = load_hc(home, live)
+        r_n = hc_n.check_memory_dir_siblings()
+        check(
+            f"a non-entry row `{noise.strip()}` is still NOT an entry",
+            r_n is None,
+            f"got: {(r_n or {}).get('detail', '')[:140]}",
+        )
+
     # 3d. CONTROL: a real memory beside the empty index warns, so 3b cannot pass
     #     merely because this corpus is unreachable.
     (idx_only / "MEMORY.md").write_text("# Sutando memory index\n")

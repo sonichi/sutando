@@ -1591,6 +1591,17 @@ def check_workspace_root_tidy() -> "dict | None":
         ),
     }
 
+# The compact forms a compacted index uses for entries, shared by the two
+# readers below so a row cannot be an entry for one and invisible to the other.
+INDEX_ENTRY_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
+
+_INDEX_ROW_ENTRY = re.compile(
+    r"^\s*[-*] .*(?:\]\(|(?<![\w-])(?:"
+    + "|".join(re.escape(s) for s in INDEX_ENTRY_ABBREV.values())
+    + r")[\w-])"
+)
+
+
 def _corpus_holds_memories(mem: "Path", mds: "list[Path]") -> bool:
     """True when a corpus holds memories rather than just an untouched index.
 
@@ -1609,8 +1620,9 @@ def _corpus_holds_memories(mem: "Path", mds: "list[Path]") -> bool:
         text = index.read_text(errors="replace")
     except OSError:
         return True  # unreadable: report rather than silently drop a real corpus
-    # A row may lead with a bold label, so anchor on the bullet and the link.
-    return any(re.search(r"^\s*[-*] .*\]\(", ln) for ln in text.splitlines())
+
+    # Anchor on the bullet, not the link: a compacted index writes `- f:slug`.
+    return any(_INDEX_ROW_ENTRY.search(ln) for ln in text.splitlines())
 
 
 def check_memory_dir_siblings() -> "dict | None":
@@ -2383,9 +2395,6 @@ def check_memory_index_integrity() -> "dict | None":
     loaded_text, loaded_bytes, loaded_lines = _index_loaded_prefix(effective_text)
     truncated = len(loaded_text) < len(effective_text)
 
-    # An index that outgrows the load budget compacts its entries to prefix
-    # abbreviations (`f:` for feedback_, `r:` for reference_, `p:` for project_).
-    _INDEX_ABBREV = {"feedback_": "f:", "reference_": "r:", "project_": "p:"}
 
     def _referenced_in(hay: str, name: str) -> bool:
         stem = name[:-3] if name.endswith(".md") else name
@@ -2393,7 +2402,7 @@ def check_memory_index_integrity() -> "dict | None":
             return True
         # Without this the probe calls an indexed file unindexed, and the
         # "fix" it invites — expanding the index — is what blows the read limit.
-        for full, short in _INDEX_ABBREV.items():
+        for full, short in INDEX_ENTRY_ABBREV.items():
             if not stem.startswith(full):
                 continue
             token = short + stem[len(full):]
