@@ -271,6 +271,45 @@ def test_a_bare_exit_zero_is_NOT_a_standdown():
               "a bare exit 0 still alerts the owner - it is not a declared stand-down")
 
 
+def test_a_deliberate_restart_window_suppresses_the_alert():
+    """restart.sh stamps state/channel-bridge-supervisor/deliberate-restart; a crash
+    inside that window is ours and must not reach the owner (four alerts per two
+    restarts, owner 2026-09-02)."""
+    with tempfile.TemporaryDirectory() as raw:
+        wrapper, workspace, exec_log, env = _stage_clean_exit(Path(raw), rc=1)
+        sup = workspace / "state" / "channel-bridge-supervisor"
+        sup.mkdir(parents=True)
+        (sup / "deliberate-restart").write_text(str(int(time.time())))
+        proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            _wait_for(lambda: _launches(exec_log) >= 3, SETTLE)
+            seen = _wait_for(lambda: bool(_alerts(workspace)), 1.0)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+        check(_launches(exec_log) >= 3, "the wrapper still respawns inside the window")
+        check(not seen, f"no alert inside the deliberate window (found {_alerts(workspace)})")
+
+
+def test_repeated_crashes_alert_once_per_cooldown():
+    """A crash loop is one line, not a stream: the second alert within the cooldown is dropped."""
+    with tempfile.TemporaryDirectory() as raw:
+        wrapper, workspace, exec_log, env = _stage_clean_exit(Path(raw), rc=1)
+        proc = subprocess.Popen(["bash", str(wrapper), "slack"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            _wait_for(lambda: _launches(exec_log) >= 4, SETTLE)
+            _wait_for(lambda: bool(_alerts(workspace)), SETTLE)
+            time.sleep(0.3)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+        check(_launches(exec_log) >= 4, "at least four launches happened")
+        check(len(_alerts(workspace)) == 1,
+              f"exactly one alert across the crash loop (found {_alerts(workspace)})")
+
+
 if __name__ == "__main__":
     test_contract()
     test_wrapper_restart_signal()
@@ -278,4 +317,6 @@ if __name__ == "__main__":
     test_a_launchd_relaunch_after_a_standdown_does_not_alert()
     test_the_alert_detector_actually_fires()
     test_a_bare_exit_zero_is_NOT_a_standdown()
+    test_a_deliberate_restart_window_suppresses_the_alert()
+    test_repeated_crashes_alert_once_per_cooldown()
     print("all passed")

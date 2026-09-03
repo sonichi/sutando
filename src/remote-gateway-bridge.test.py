@@ -255,11 +255,12 @@ def main() -> int:
     # _post_ready_results dropped it from inflight with the result stranded.
     _maxid = "task-" + "M" * 59
     check(_lrtc._valid_tid(_maxid), "max-length broker id is wire-valid (precondition)")
-    _mt = _grtc._write_task({"id": _maxid, "timestamp": "2026-08-02T00:00:00Z",
-                             "task": "MAXLEN", "source": "remote-gateway",
-                             "channel_id": "!p:example.org", "user_id": "@q:example.org"})
-    check(_mt == f"task-dev~{_maxid}" and (_grtc.TASKS_DIR / f"{_mt}.txt").exists(),
-          "max-length broker id queues under the instance encoding")
+    _mt, _mt_durable = _grtc._write_task({"id": _maxid, "timestamp": "2026-08-02T00:00:00Z",
+                                          "task": "MAXLEN", "source": "remote-gateway",
+                                          "channel_id": "!p:example.org", "user_id": "@q:example.org"})
+    check(_mt == f"task-dev~{_maxid}" and _mt_durable
+          and (_grtc.TASKS_DIR / f"{_mt}.txt").exists(),
+          "max-length broker id queues durably under the instance encoding")
     check(_grtc._valid_local_tid(_mt) and not _lrtc._valid_tid(_mt),
           "local validator accepts the over-64 encoding the wire validator refuses")
     _ab = len(STATE["acks"])
@@ -284,8 +285,8 @@ def main() -> int:
     _collide = {"id": "task-COLLIDE", "timestamp": "2026-08-02T00:00:00Z",
                 "task": "PROD TASK", "source": "remote-gateway",
                 "channel_id": "!p:example.org", "user_id": "@qingyun:example.org"}
-    _pt = _lrtc._write_task(dict(_collide))
-    _dt = _grtc._write_task({**_collide, "task": "DEV TASK"})
+    _pt, _ = _lrtc._write_task(dict(_collide))
+    _dt, _ = _grtc._write_task({**_collide, "task": "DEV TASK"})
     check(_pt == "task-COLLIDE" and _dt == "task-dev~task-COLLIDE",
           "same broker id yields DISTINCT local ids per instance")
     check((_lrtc.TASKS_DIR / "task-COLLIDE.txt").exists()
@@ -329,8 +330,8 @@ def main() -> int:
 
     # 1. pull a task and write it locally
     resp = rtc._req("GET", "/v1/tasks?wait=0")
-    tid = rtc._write_task(resp["tasks"][0])
-    check(tid == "task-MOCK1", "pull → task id parsed")
+    tid, _durable = rtc._write_task(resp["tasks"][0])
+    check(tid == "task-MOCK1" and _durable, "pull → task id parsed, durably queued")
     tfile = rtc.TASKS_DIR / "task-MOCK1.txt"
     check(tfile.exists(), "task file written")
     content = tfile.read_text() if tfile.exists() else ""
@@ -861,7 +862,7 @@ def main() -> int:
     # re-acks it upstream. (Regression for the reconnect redelivery floods.)
     (rtc.TASKS_DIR / "archive").mkdir(parents=True, exist_ok=True)
     (rtc.TASKS_DIR / "archive" / "task-DONE1.txt").write_text("handled")
-    check(rtc._write_task({**TASK, "id": "task-DONE1"}) == "task-DONE1"
+    check(rtc._write_task({**TASK, "id": "task-DONE1"}) == ("task-DONE1", True)
           and not (rtc.TASKS_DIR / "task-DONE1.txt").exists(),
           "redelivery of core-archived task not re-queued (id returned for ack)")
     check((rtc.RESULTS_DIR / "task-DONE1.txt").read_text().startswith("[no-send]"),
@@ -872,14 +873,14 @@ def main() -> int:
     # flat-only archive probe (PR #1896 review).
     (rtc.TASKS_DIR / "archive" / "2026-07").mkdir(parents=True, exist_ok=True)
     (rtc.TASKS_DIR / "archive" / "2026-07" / "task-MONTH.txt").write_text("handled")
-    check(rtc._write_task({**TASK, "id": "task-MONTH"}) == "task-MONTH"
+    check(rtc._write_task({**TASK, "id": "task-MONTH"}) == ("task-MONTH", True)
           and not (rtc.TASKS_DIR / "task-MONTH.txt").exists(),
           "redelivery of month-partitioned-archived task not re-queued")
     check((rtc.RESULTS_DIR / "task-MONTH.txt").read_text().startswith("[no-send]"),
           "month-archive dedup drops a [no-send] result")
     rtc.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (rtc.ARCHIVE_RESULTS_DIR / "task-DONE2-1750000000.txt").write_text("sent")
-    check(rtc._write_task({**TASK, "id": "task-DONE2"}) == "task-DONE2"
+    check(rtc._write_task({**TASK, "id": "task-DONE2"}) == ("task-DONE2", True)
           and not (rtc.TASKS_DIR / "task-DONE2.txt").exists(),
           "redelivery of archived-result task not re-queued")
     (rtc.RESULTS_DIR / "task-DONE3.txt").write_text("real result pending\n")
@@ -887,7 +888,7 @@ def main() -> int:
     rtc._write_task({**TASK, "id": "task-DONE3"})
     check((rtc.RESULTS_DIR / "task-DONE3.txt").read_text() == "real result pending\n",
           "dedup never clobbers an existing pending result")
-    check(rtc._write_task({**TASK, "id": "task-DONE"}) == "task-DONE"
+    check(rtc._write_task({**TASK, "id": "task-DONE"}) == ("task-DONE", True)
           and (rtc.TASKS_DIR / "task-DONE.txt").exists(),
           "prefix id does not false-match an archived sibling (task-DONE vs task-DONE2)")
 

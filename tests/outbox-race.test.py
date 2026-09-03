@@ -1,5 +1,21 @@
 import json
 import multiprocessing as mp
+import contextlib
+# forkserver, not fork: a forked worker inherits a lock the parent's tracer
+# thread holds under coverage, and the pool then hangs in terminate() on CI.
+_CTX = mp.get_context("forkserver")
+
+
+@contextlib.contextmanager
+def _pool(n):
+    # close()+join(), never Pool.__exit__: that terminate()s, which kills
+    # workers mid-flush (empty coverage fragments) and is the CI hang site.
+    p = _CTX.Pool(n)
+    try:
+        yield p
+    finally:
+        p.close()
+        p.join()
 import os
 import sys
 import tempfile
@@ -52,15 +68,21 @@ def run_rounds(per_phase_s, min_rounds, max_rounds, one_round):
 if __name__ == "__main__":
     # Contention is workers-per-core, not an absolute: a fixed 24 is 12x
     # oversubscribed on a 2-core runner, and the thrash is what timed out.
-    N = max(8, (os.cpu_count() or 2) * 3)
-    MIN_ROUNDS, MAX_ROUNDS = 3, 12
-    # Bounds round STARTS only: worst case is floor + budget + in-flight
-    # round durations — far below 36 unconditional rounds, not a ceiling.
+    # Under the coverage gate every pool child pays instrumented startup, and
+    # the 240s file cap fired mid-spawn on a thrashed lane (2026-09-02, x3 PRs).
+    INSTRUMENTED = os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1"
+    N = max(4, (os.cpu_count() or 2)) if INSTRUMENTED else max(8, (os.cpu_count() or 2) * 3)
+    # Instrumented floor is halved to 2 (phase 2 runs MIN_ROUNDS*2 -> 6 guaranteed
+    # rounds, not 9) with MAX == floor, so the 240s coverage cap holds. Why: PR body.
+    MIN_ROUNDS = 2 if INSTRUMENTED else 3
+    MAX_ROUNDS = MIN_ROUNDS if INSTRUMENTED else 12
+    # Bounds round STARTS only (moot when MAX == floor, i.e. instrumented): worst
+    # case off-instrumentation is floor + budget + in-flight round durations.
     PHASE_BUDGET_S = float(os.environ.get("OUTBOX_RACE_PHASE_BUDGET_S", "35"))
     totals = []
     # ONE warm pool here too, for the reason phase 2 already states: a fresh pool
     # per round pays process startup inside the window under test.
-    with mp.Pool(N) as pool:
+    with _pool(N) as pool:
         def acquire_round(r):
             with tempfile.TemporaryDirectory() as tmp:
                 os.makedirs(os.path.join(tmp, ".claims"), exist_ok=True)  # pre-make so mkdir isn't the serializer
@@ -81,7 +103,7 @@ if __name__ == "__main__":
     orphan_flags = []
     # ONE warm pool for every round. A fresh pool per round pays process startup
     # inside the window under test, which staggers the workers and hides the race.
-    with mp.Pool(N) as pool:
+    with _pool(N) as pool:
         def reclaim_round(r):
             with tempfile.TemporaryDirectory() as tmp:
                 item = f"item-reclaim-{r}"
@@ -94,7 +116,7 @@ if __name__ == "__main__":
                 orphan_flags.append(
                     len(winners) == 1 and (held is None or held.drainer_id != winners[0]))
                 return len(winners)
-        rc_totals = run_rounds(PHASE_BUDGET_S, MIN_ROUNDS * 2, MAX_ROUNDS * 2, reclaim_round)
+        rc_totals = run_rounds(PHASE_BUDGET_S, MIN_ROUNDS * 2, MAX_ROUNDS * 2, reclaim_round)  # floor 6 either way
     orphaned = sum(orphan_flags)
     print(f"\n  {len(rc_totals)} of {MAX_ROUNDS * 2} rounds x {N} concurrent PROCESSES reclaiming one dead owner's claim"
           + (" (stopped at phase budget)" if len(rc_totals) < MAX_ROUNDS * 2 else ""))

@@ -69,6 +69,44 @@ SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 # in-session restart guard must not read the marker this script sets itself.
 CALLER_CORE_SESSION="${SUTANDO_CORE_SESSION:-}"
 export SUTANDO_CORE_SESSION=1
+
+# Called ONLY from paths that create or heal a core. Attaching to a live one
+# must not clear: that would cancel a `--stop-only` still waiting to be observed.
+clear_shutdown_sentinel() {
+  if [ -n "$PY" ]; then
+    "$PY" "$REPO/src/shutdown.py" clear >/dev/null \
+      || echo "start-cli.sh: shutdown.py clear failed — the intake gate may hold tasks" >&2
+  else
+    echo "start-cli.sh: no runnable interpreter — shutdown sentinel NOT cleared" >&2
+  fi
+}
+
+# Clearing the sentinel before a launch that never yields a live core opens
+# intake with nothing serving, so exec paths stash it and restore on failure.
+_SENTINEL_STASH=""
+# Without execfail bash exits 127 on a failed exec, which would make every
+# restore-after-exec below unreachable dead code.
+shopt -s execfail
+stash_shutdown_sentinel() {
+  _SENTINEL_STASH=""
+  [ -n "$PY" ] || return 0
+  _sp="$("$PY" "$REPO/src/shutdown.py" path 2>/dev/null)" || return 0
+  [ -n "$_sp" ] && [ -f "$_sp" ] || return 0
+  _SENTINEL_STASH="$(mktemp "${TMPDIR:-/tmp}/sutando-sentinel.XXXXXX" 2>/dev/null)" || return 0
+  cp "$_sp" "$_SENTINEL_STASH" 2>/dev/null || _SENTINEL_STASH=""
+}
+# Only reachable when exec FAILED: exec never returns on success.
+restore_shutdown_sentinel() {
+  [ -n "$_SENTINEL_STASH" ] && [ -f "$_SENTINEL_STASH" ] || return 0
+  _sp="$("$PY" "$REPO/src/shutdown.py" path 2>/dev/null)" || return 0
+  if [ -n "$_sp" ]; then
+    mkdir -p "$(dirname "$_sp")" 2>/dev/null || true
+    cp "$_SENTINEL_STASH" "$_sp" 2>/dev/null \
+      || echo "start-cli.sh: could not restore the shutdown sentinel after a failed launch" >&2
+  fi
+  rm -f "$_SENTINEL_STASH" 2>/dev/null || true
+  _SENTINEL_STASH=""
+}
 export SUTANDO_CORE_RUNTIME=claude
 CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=claude)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && CORE_ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
@@ -490,6 +528,15 @@ case "${1:-}" in
   --restart)       RESTART_REQUESTED=1 ;;
   --force-restart) RESTART_REQUESTED=1; FORCE_RESTART=1 ;;
 esac
+# graceful-restart.sh exec's this script holding its lock; an abort here would
+# otherwise leave that lock to age out (15 min) and defer the owner's next click.
+release_orchestrator_lock() {
+  [ -n "${GR_RID:-}" ] || return 0
+  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  local lock="$ws/state/locks/graceful-restart.lock"
+  [ "$(cat "$lock/rid" 2>/dev/null)" = "$GR_RID" ] && rm -rf "$lock"
+  return 0
+}
 log_restart_attempt() {
   local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
   [ -n "$ws" ] || return 0
@@ -513,17 +560,17 @@ if [ -n "$RESTART_REQUESTED" ]; then
     core_claude_pids | while read -r pid; do
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
-    # Graceful window: Claude Code flushes telemetry/state on shutdown and can
-    # take several seconds — longer than the old ~1s (5×0.2s) ceiling that let a
-    # still-dying core slip into the "orphan reuse → exit 0" guard below. Poll ~3s.
-    for _ in $(seq 1 15); do
-      tmux_session_exists || core_claude_running || break
-      sleep 0.2
+    # The kill is already issued, so this wait can only be bounded, never
+    # abandoned: a SessionEnd handoff takes longer than a few seconds.
+    GRACE_S="${SUTANDO_RESTART_GRACE_S:-90}"
+    _ticks=$(( GRACE_S * 5 ))
+    while [ "$_ticks" -gt 0 ] && { tmux_session_exists || core_claude_running; }; do
+      sleep 0.2; _ticks=$(( _ticks - 1 ))
     done
     if tmux_session_exists || core_claude_running; then
       if [ -n "$FORCE_RESTART" ]; then
         # force-restart: the core is wedged; escalate to SIGKILL, then poll ~3s.
-        echo "  core still alive ~3s after SIGTERM — force-restart escalating to SIGKILL" >&2
+        echo "  core still alive ${GRACE_S}s after SIGTERM — force-restart escalating to SIGKILL" >&2
         tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
         core_claude_pids | while read -r pid; do
           [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
@@ -535,10 +582,10 @@ if [ -n "$RESTART_REQUESTED" ]; then
       else
         # plain restart must NOT hammer: the core may be legitimately mid-task.
         # Abort loud and point at force-restart rather than risk killing work.
-        echo "  ⚠ $SESSION core did not stop within ~3s of SIGTERM." >&2
-        echo "    'restart' won't SIGKILL a busy/wedged core — it may be mid-task." >&2
-        echo "    Re-run as: bash $0 --force-restart   (or wait and retry)." >&2
-        log_restart_attempt "abort: core would not stop gracefully (needs --force-restart)"
+        echo "  ⚠ $SESSION core did not stop within ${GRACE_S}s of SIGTERM." >&2
+        echo "    'restart' won't SIGKILL a wedged core — re-run as: bash $0 --force-restart" >&2
+        log_restart_attempt "abort: core would not stop within ${GRACE_S}s (needs --force-restart)"
+        release_orchestrator_lock
         exit 1
       fi
     fi
@@ -548,6 +595,7 @@ if [ -n "$RESTART_REQUESTED" ]; then
       echo "  ⚠ $SESSION core did not die after SIGKILL — aborting force-restart." >&2
       echo "    Investigate the stuck pid; rerun once it's gone." >&2
       log_restart_attempt "abort: core survived SIGKILL"
+      release_orchestrator_lock
       exit 1
     fi
   fi
@@ -694,6 +742,17 @@ if tmux_session_exists; then
   # quiet gateway (same reason launch-sutando.sh creates siblings with -d).
   tmux -S "$TMUX_SOCKET" select-window -t "$SESSION:${healed_idx:-0}" 2>/dev/null || true
   ensure_core_monitor
+  # new-window returning an index proves tmux ACCEPTED the command, not that the
+  # child lives; poll before opening intake, same bound as the fresh-start path.
+  for _ in $(seq 1 25); do
+    tmux_core_session_running && break
+    sleep 0.2
+  done
+  if tmux_core_session_running; then
+    clear_shutdown_sentinel
+  else
+    echo "  ⚠ healed window did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
+  fi
   if [ -t 1 ]; then
     echo "Attaching to healed $SESSION (Ctrl-b d to detach)..."
     exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -701,6 +760,9 @@ if tmux_session_exists; then
   echo "Healed core window in $SESSION (session + sibling windows preserved)."
   exit 0
 fi
+
+# Past every attach/adopt/heal exit above, so this is a genuine fresh boot. The
+# sentinel is cleared at each launch site below, never before one can fail.
 
 # Auto-install tmux via Homebrew if missing. Sutando.app's
 # watcher-auto-restart depends on a tmux-wrapped CLI pane.
@@ -725,9 +787,23 @@ if ! command -v tmux > /dev/null 2>&1; then
   echo "  ⚠ tmux not found — running without tmux wrapper"
   echo "    (Sutando.app's watcher-auto-restart won't work; brew install tmux to enable)"
   [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] && cd "$SUTANDO_CLAUDE_WORKING_DIR"
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "  ⚠ claude not found — not clearing the shutdown sentinel, no core can start." >&2
+    exit 127
+  fi
+  stash_shutdown_sentinel
+  clear_shutdown_sentinel
+  # errexit would exit on the failed exec before the restore below is reached;
+  # drop it just around the exec and re-raise the exec's own status.
+  set +e
   exec claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${EFFORT_ARGS[@]+"${EFFORT_ARGS[@]}"} \
     -- "/startup"
+  _exec_rc=$?
+  set -e
+  restore_shutdown_sentinel
+  echo "  ⚠ claude failed to exec — shutdown sentinel restored, no core is live." >&2
+  exit "$_exec_rc"
 fi
 
 # Explicit -S socket path so Sutando.app (which runs under a different
@@ -749,16 +825,30 @@ apply_tmux_defaults
 #   - No TTY (Sutando.app's Restart Core or any background invocation):
 #     start detached so we don't hang, server keeps running.
 #
-# NOTE: the working dir (`-c` in CWD_ARGS) applies only when `new-session -A`
-# CREATES the session. If the session already exists, `-A` attaches and the
-# start-directory is silently dropped — so re-anchoring a running core to a new
-# working dir must go through `--restart` (kill-then-create), not a bare rerun.
+# NOTE: the working dir (`-c` in CWD_ARGS) applies only when new-session CREATES
+# the session. An existing session keeps its own start-directory, so re-anchoring
+# a running core to a new working dir must go through `--restart`
+# (kill-then-create), not a bare rerun.
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
-  exec tmux -S "$TMUX_SOCKET" new-session -A -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${EFFORT_ARGS[@]+"${EFFORT_ARGS[@]}"} \
-    -- "/startup"
+    -- "/startup" || true
+  # Create-then-attach rather than `new-session -A`, so the sentinel clears only
+  # once a session demonstrably exists; the poll below is the single verdict.
+  for _ in $(seq 1 25); do
+    tmux_core_session_running && break
+    sleep 0.2
+  done
+  if ! tmux_core_session_running; then
+    echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
+    [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
+    exit 1
+  fi
+  clear_shutdown_sentinel
+  [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
+  exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${CORE_ENV_ARGS[@]+"${CORE_ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     claude --name "$SESSION" --remote-control "Sutando" --chrome --dangerously-skip-permissions --add-dir "$HOME" \
@@ -779,6 +869,9 @@ else
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
   fi
+  # Verified live above, so this is the first point at which clearing the
+  # intentional-stop gate cannot open intake with nothing serving.
+  clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   if [ "$VISIBLE" = 1 ]; then

@@ -56,6 +56,43 @@ class RestartRelaunchesTheApp(unittest.TestCase):
         self.assertRegex(self.text, r'elif \[ -x "\$APP_BIN" \]')
         self.assertIn("Sutando.app skipped", self.text)
 
+    LAUNCH_RE = re.compile(r'^[ \t]*(?:env -u SUTANDO_CORE_SESSION[ \t]+)?nohup "\$APP_BIN" > /tmp/sutando-app\.log 2>&1 &[ \t]*$', re.M)
+
+    def test_launch_line_scrubs_the_core_session_marker(self):
+        """restart.sh runs inside the core session, so a bare nohup hands the app
+        SUTANDO_CORE_SESSION=1; restart-guard then refuses every restart the app
+        later requests (intent file and menu bar both, measured 2026-09-02)."""
+        self.assertRegex(self.text, r'env -u SUTANDO_CORE_SESSION\s+nohup\s+"\$APP_BIN"')
+
+    def test_the_launched_app_does_not_inherit_the_marker(self):
+        """Behavioural: run the real launch line with a fake app that dumps its
+        environment, from a shell that carries the marker. FAILS on the parent
+        (the fake sees SUTANDO_CORE_SESSION=1) and passes once the line scrubs it."""
+        import os
+        import tempfile
+        import textwrap
+        m = self.LAUNCH_RE.search(self.text)
+        self.assertIsNotNone(m, "could not find the app launch line to exercise")
+        with tempfile.TemporaryDirectory() as d:
+            dump = os.path.join(d, "env.txt")
+            fake = os.path.join(d, "Sutando")
+            Path(fake).write_text("#!/bin/bash\nenv > \"$SUTANDO_TEST_ENV_DUMP\"\n")
+            os.chmod(fake, 0o755)
+            line = m.group(0).strip().replace("/tmp/sutando-app.log", os.path.join(d, "app.log"))
+            script = textwrap.dedent(f"""
+                export SUTANDO_CORE_SESSION=1
+                export SUTANDO_TEST_ENV_DUMP={dump!r}
+                APP_BIN={fake!r}
+                {line}
+                wait
+            """)
+            r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=20)
+            self.assertEqual(0, r.returncode, r.stderr)
+            env = Path(dump).read_text()
+            self.assertIn("SUTANDO_TEST_ENV_DUMP=", env, "fake app never ran")
+            self.assertNotIn("SUTANDO_CORE_SESSION=", env,
+                             "the relaunched app inherited the core-session marker")
+
     def test_the_premise_still_holds_restart_kills_it(self):
         """CONTROL: if restart.sh stops killing the app, this fix is moot and the
         test should say so rather than passing for a stale reason."""
