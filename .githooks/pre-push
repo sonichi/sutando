@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Run the repo's own review-checks on what CI will see, BEFORE the push.
+#
+# Fail-open on infrastructure trouble (absent script, no local origin/main,
+# empty diff, no timeout binary): only an actual violation blocks. Escape
+# hatch: SUTANDO_SKIP_REVIEW_CHECKS=1 pushes anyway but logs the bypass.
+# No network here — the LOCAL origin/main ref bounds runtime; CI is the
+# authority when it is stale. Born of 4 prose-cap CI round-trips, 2026-09-01.
+set -uo pipefail
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+CHECKS="$REPO/scripts/review-checks.sh"
+# --git-dir, not $REPO/.git: in a worktree .git is a FILE and the append
+# fails silently, which turns the logged escape hatch into a silent one.
+LOG="$(git rev-parse --git-dir)/pre-push-bypass.log"
+
+note() { echo "pre-push: $*" >&2; }
+
+if [ "${SUTANDO_SKIP_REVIEW_CHECKS:-0}" = "1" ]; then
+    if echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) bypass by $(git config user.email 2>/dev/null || echo '?') on $(git rev-parse --abbrev-ref HEAD 2>/dev/null)" >> "$LOG" 2>/dev/null; then
+        note "SUTANDO_SKIP_REVIEW_CHECKS=1 — bypass LOGGED to $LOG, pushing unchecked"
+    else
+        note "SUTANDO_SKIP_REVIEW_CHECKS=1 — bypass log UNWRITABLE ($LOG); pushing, but this bypass is only on your terminal"
+    fi
+    exit 0
+fi
+[ -f "$CHECKS" ] || { note "review-checks.sh absent — fail-open"; exit 0; }
+git rev-parse --verify -q origin/main >/dev/null || { note "no local origin/main ref — fail-open"; exit 0; }
+
+# Scan the refs git SAYS are being pushed, not HEAD: `git push origin other`
+# from a different branch would otherwise scan the wrong commits entirely.
+shas=""
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+    case "${local_ref:-}" in refs/tags/*) continue ;; esac
+    [ "${local_sha:-}" != "0000000000000000000000000000000000000000" ] && [ -n "${local_sha:-}" ] && shas="$shas $local_sha"
+done
+[ -n "$shas" ] || exit 0
+
+DIFF=""
+head_sha="$(git rev-parse HEAD 2>/dev/null)"
+offtree=0
+for sha in $shas; do
+    [ "$sha" != "$head_sha" ] && offtree=1
+    DIFF="$DIFF$(git diff "origin/main...$sha" 2>/dev/null)
+"
+done
+# Streamed, not `${DIFF//[[:space:]]/}`: that substitution is quadratic in
+# bash and spins for minutes on a diff of a few tens of KB.
+grep -q '[^[:space:]]' <<< "$DIFF" || { note "empty three-dot diff vs local origin/main — nothing to scan, fail-open"; exit 0; }
+
+RUN=(bash "$CHECKS" --diff /dev/stdin)
+if command -v timeout >/dev/null 2>&1; then
+    RUN=(timeout -k 5 60 "${RUN[@]}")
+else
+    note "no timeout binary — running unbounded this once (still fail-open on its errors)"
+fi
+out="$(printf '%s' "$DIFF" | "${RUN[@]}" 2>&1)"; rc=$?
+
+case "$rc" in
+    0) # PARTIAL also exits 0 and "not scanned" is not "clean" — say so, and
+       # name the cause: prose-cap scans only files matching the working tree.
+       if printf '%s' "$out" | grep -q "review-checks: PARTIAL"; then
+           printf '%s\n' "$out" | grep "review-checks:" >&2
+           [ "$offtree" = "1" ] && note "pushed ref is not the checked-out tree, so post-image scans skipped"
+           git diff --quiet HEAD 2>/dev/null || note "working tree is dirty — post-image scans skip any file in the range that does not match it"
+           note "PARTIAL is not PASS — pushing (fail-open), CI is the verdict on what was not scanned"
+       fi
+       exit 0 ;;
+    1) echo "$out" >&2
+       note "BLOCKED — review-checks found a violation CI would also find."
+       note "fix it, or push once with SUTANDO_SKIP_REVIEW_CHECKS=1 (logged)."
+       exit 1 ;;
+    *) echo "$out" >&2
+       note "review-checks infra trouble (rc=$rc, incl. timeout) — fail-open"
+       exit 0 ;;
+esac

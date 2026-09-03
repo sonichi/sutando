@@ -85,6 +85,23 @@ WORKSPACE_DIR = resolve_workspace()
 _LAST_HASH_KEY = "_last_hash"
 
 
+def _prune_alert_history(history: dict, cutoff: int) -> dict:
+    """Drop alert-history entries older than `cutoff`, tolerating bad values.
+
+    A non-numeric value raises inside a dict comprehension and kills the whole
+    run — measured 2026-09-01: a malformed entry crashed `main()` through
+    `notify_for_failures`, so every later step, `--recover-core` included,
+    never ran. An unreadable entry is dropped, never fatal.
+    """
+    kept = {}
+    for k, v in history.items():
+        if k == _LAST_HASH_KEY:
+            kept[k] = v
+        elif isinstance(v, (int, float)) and not isinstance(v, bool) and v >= cutoff:
+            kept[k] = v
+    return kept
+
+
 def _load_alert_history(state_file: Path) -> dict:
     """Read a failure-alert dedup file, dropping entries this build cannot use.
 
@@ -672,7 +689,56 @@ def resolve_node_runtime(env: Optional[dict] = None, which=shutil.which) -> dict
 
 # Bridges that import vault_intercept, and so need detect-secrets at RUNTIME.
 # Mirrors the three _vault_scanner_check call sites in src/startup.sh.
-_VAULT_SCANNER_BRIDGES = ["telegram-bridge", "discord-bridge", "slack-bridge"]
+_VAULT_SCANNER_BRIDGES = ["telegram-bridge", "discord-bridge", "slack-bridge",
+                          "remote-gateway-bridge"]
+_VAULT_SCANNER_SCRIPTS = {
+    "telegram-bridge": "telegram-bridge.py",
+    "discord-bridge": "discord-bridge.py",
+    "slack-bridge": "slack-bridge.py",
+    "remote-gateway-bridge": "remote-gateway-bridge.py",
+}
+
+
+def _proc_executable(pid: "str | int") -> "str | None":
+    """Executable path of `pid`, or None. `comm` is one field, so a path with
+    spaces survives it — argv cannot be split back apart reliably."""
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() or None
+
+
+# The script must appear as its own argv token — a `-c` payload that merely
+# prints the name is not a bridge launch.
+def _argv_runs(argv: str, script: str) -> bool:
+    return re.search(r"(?:^|[\s/])" + re.escape(script) + r"(?=\s|$)", argv) is not None
+
+
+def _live_bridge_interpreters(script: str, ps_output: "str | None" = None,
+                              exe_of=None) -> "list[str]":
+    """EVERY distinct interpreter currently running `script`, sorted.
+
+    Multi-instance is a supported launch (startup-runtime.sh spawns one gateway
+    per AG2_REMOTE_TOKEN_*), so a scalar both under-collects and makes the answer
+    depend on ps row order.
+    """
+    if ps_output is None:
+        ps_output = _ps_snapshot()
+    if ps_output is None:
+        return []
+    exe_of = exe_of or _proc_executable
+    me = str(os.getpid())
+    found = set()
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] == me or not _argv_runs(parts[2], script):
+            continue
+        exe = exe_of(parts[0])
+        if exe and os.path.basename(exe).lower().startswith("python"):
+            found.add(exe)
+    return sorted(found)
 
 
 def check_secret_scanner_mode() -> dict:
@@ -684,24 +750,29 @@ def check_secret_scanner_mode() -> dict:
     prints no failures.
     """
     degraded, checked = [], []
+    ps_output = _ps_snapshot()
     for bridge in _VAULT_SCANNER_BRIDGES:
-        interp = _bridge_interpreter(bridge)
-        if interp is None:
-            continue  # bridge cannot launch at all; its own probe owns that
-        if interp in checked:
-            continue
-        checked.append(interp)
-        try:
-            probe = subprocess.run([interp, "-c", "import detect_secrets"],
-                                   capture_output=True, timeout=10)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            return {
-                "name": "secret-scanner",
-                "status": "warn",
-                "detail": f"could not probe {interp} for detect-secrets ({exc}) — mode unknown, not proven healthy",
-            }
-        if probe.returncode != 0:
-            degraded.append(interp)
+        # Running bridges' own interpreters are the ones scanning inbound text;
+        # what *would* launch them is the wrong question while any are up.
+        live = _live_bridge_interpreters(_VAULT_SCANNER_SCRIPTS[bridge], ps_output)
+        if not live:
+            fallback = _bridge_interpreter(bridge)
+            live = [fallback] if fallback else []
+        for interp in live:
+            if interp in checked:
+                continue
+            checked.append(interp)
+            try:
+                probe = subprocess.run([interp, "-c", "import detect_secrets"],
+                                       capture_output=True, timeout=10)
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                return {
+                    "name": "secret-scanner",
+                    "status": "warn",
+                    "detail": f"could not probe {interp} for detect-secrets ({exc}) — mode unknown, not proven healthy",
+                }
+            if probe.returncode != 0:
+                degraded.append(interp)
     if not checked:
         return {
             "name": "secret-scanner",
@@ -1417,6 +1488,7 @@ WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 #: so the probe's "state belongs under state/" remedy would break the reader.
 WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "PERSONAL_CLAUDE.md",
+    "current-track.md",      # per-host under hosts/<host>/; personal_path() falls back to the root
     "stand-identity.json",
     "stand-avatar.png",
     "voice-context-active",
@@ -3170,7 +3242,8 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
         return {"name": name, "status": "ok",
                 "detail": "no ENGINE_MANIFEST.json — not a bundled engine, skipping"}
     try:
-        built = (json.loads(manifest.read_text()) or {}).get("sha")
+        meta = json.loads(manifest.read_text()) or {}
+        built = meta.get("sha")
     except (OSError, ValueError) as e:
         return {"name": name, "status": "ok",
                 "detail": f"unreadable ENGINE_MANIFEST.json ({str(e)[:40]}) — skipping"}
@@ -3186,8 +3259,28 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
         git_bin = resolve_git()
     except Exception:
         git_bin = None
+
+    def _bundle_only(why: str) -> dict:
+        """No clone to diff against — report the revision the manifest knows."""
+        # Local import: datetime is deliberately not at module scope here.
+        from datetime import datetime, timezone  # noqa: PLC0415
+        built_at = ""
+        stamp = str(meta.get("built_at") or "")
+        branch = str(meta.get("branch") or "")
+        if stamp:
+            try:
+                when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                hours = (datetime.now(timezone.utc) - when).total_seconds() / 3600
+                built_at = f", built {hours:.0f}h ago" if hours < 48 else f", built {hours/24:.0f}d ago"
+            except ValueError:
+                built_at = f", built {stamp}"
+        on = f" ({branch})" if branch else ""
+        return {"name": name, "status": "ok",
+                "detail": f"{why} — running bundled {built[:9]}{on}{built_at}; "
+                          f"drift from source is UNDETERMINED here, not absent"}
+
     if git_bin is None:
-        return {"name": name, "status": "ok", "detail": "no runnable git — skipping"}
+        return _bundle_only("no runnable git")
 
     def _git(*args):
         return subprocess.run([git_bin, "-C", str(repo), *args],
@@ -3196,9 +3289,9 @@ def check_engine_revision_drift(repo_dir: "Path | None" = None,
     try:
         head = _git("rev-parse", "HEAD")
     except (OSError, subprocess.TimeoutExpired):
-        return {"name": name, "status": "ok", "detail": "git not runnable — skipping"}
+        return _bundle_only("git not runnable")
     if head.returncode != 0:
-        return {"name": name, "status": "ok", "detail": "not a git checkout — skipping"}
+        return _bundle_only("not a git checkout")
     head_sha = head.stdout.strip()
     # Normalise first: an abbreviated sha (or a tag) of the checked-out commit
     # would otherwise compare unequal and print "X != X (0 commits ahead)".
@@ -3552,15 +3645,16 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
             continue
 
 
-        # #2905 moved the spawn behind the shared launch policy; this PR's
-        # contribution is the decision ABOVE it, so defer rather than keep a copy.
-        if _launch_bridge(name):
+        # Restart policy (supervision decision + spawn) lives in _restart_bridge;
+        # this loop owns only down-detection and alerting.
+        ok, how = _restart_bridge(name)
+        if ok:
             restarted.append(name)
-            _alert(f"♻️ health-check auto-restarted **{name}** (was down). "
+            _alert(f"♻️ health-check auto-restarted **{name}** (was down; {how}). "
                    f"If this repeats, it's crash-looping — check logs/{name}.log.")
         else:
             _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted "
-                   f"(no launch plan — see _bridge_launch_plan). Start it via startup.sh.")
+                   f"({how}). Start it via startup.sh.")
     return restarted
 
 
@@ -3618,6 +3712,361 @@ def _launch_bridge(name: str, plan: "tuple[str, dict] | None" = None) -> bool:
                          env=child_env, start_new_session=True)
     return True
 
+
+# Wrapper channel per channel bridge; the gateway wrapper execs into the
+# bridge, so launchd itself is its only supervision witness.
+_BRIDGE_WRAPPER_CHANNEL = {
+    "telegram-bridge": "telegram",
+    "discord-bridge": "discord",
+    "slack-bridge": "slack",
+}
+
+# `launchctl print` exit codes: 113 is "no such service" — the ONLY conclusive
+# absence. 0 = registered; anything else (e.g. 64 malformed) is a probe error.
+_LAUNCHCTL_NOT_FOUND_RC = 113
+
+
+def _bridge_ps_rows() -> "list[tuple[str, str, str]] | None":
+    """(pid, ppid, command) rows parsed from the shared _ps_snapshot(); None
+    when ps cannot answer — an unreadable table must never read as empty."""
+    out = _ps_snapshot()
+    if out is None:
+        return None
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            rows.append((parts[0], parts[1], parts[2].rstrip()))
+    return rows
+
+
+def _wrapper_pids(name: str) -> "tuple[list, list] | None":
+    """(ours, foreign) wrapper pids for `name`'s channel; None on probe failure.
+
+    "Ours" is bound to THIS checkout by the wrapper's argv path — a
+    channel-bridge-wrapper.sh running from any other checkout is FOREIGN, and a
+    pid that cannot be classified makes the whole probe fail closed (None).
+    """
+    channel = _BRIDGE_WRAPPER_CHANNEL.get(name)
+    if channel is None:
+        return ([], [])
+    try:
+        pg = subprocess.run(
+            ["/usr/bin/pgrep", "-f", rf"channel-bridge-wrapper\.sh {channel}$"],
+            capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if pg.returncode == 1:
+        return ([], [])
+    if pg.returncode != 0:
+        return None
+    pids = pg.stdout.split()
+    rows = _bridge_ps_rows()
+    if rows is None:
+        return None
+    cmd_by_pid = {p: cmd for p, _pp, cmd in rows}
+    # ps flattens argv without quoting (a path with spaces cannot be tokenized
+    # back), so ownership = the WHOLE command equals our known launch shape.
+    launch_shapes = set()
+    for root in {str(REPO_DIR), os.path.realpath(str(REPO_DIR))}:
+        wpath = f"{root}/src/launchd/channel-bridge-wrapper.sh"
+        launch_shapes.add(f"/bin/bash {wpath} {channel}")
+        launch_shapes.add(f"bash {wpath} {channel}")
+    ours, foreign = [], []
+    for pid in pids:
+        cmd = cmd_by_pid.get(pid)
+        if cmd is None:
+            return None
+        (ours if cmd.strip() in launch_shapes else foreign).append(pid)
+    return (ours, foreign)
+
+
+def _launchctl_job_arguments(stdout: str) -> "list[str] | None":
+    """Argument lines of launchctl print's `arguments = { ... }` block, or None
+    when the block is absent/unterminated. Parsing, not substring: ownership
+    must come from the exact program argument — never from the repo path
+    appearing anywhere in the dump (log paths, working directory, or a sibling
+    checkout sharing this repo's path as a prefix)."""
+    lines = stdout.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip() == "arguments = {":
+            args = []
+            for raw in lines[i + 1:]:
+                stripped = raw.strip()
+                if stripped == "}":
+                    return args
+                args.append(stripped)
+            return None
+    return None
+
+
+# Shell interpreters the bridge plists may prefix the wrapper with. An argv
+# whose executed slot is one of these runs its NEXT argument as the script.
+_JOB_INTERPRETERS = frozenset({"/bin/bash", "bash", "/bin/sh", "sh", "/bin/zsh", "zsh"})
+
+
+def _job_executed_script(args: "list[str]") -> "tuple[str, str | None] | None":
+    """(script, next_arg) at the position launchd actually EXECUTES, or None
+    when that position cannot be determined (interpreter flags, empty argv).
+    Ownership must bind here — membership anywhere later in the block is data
+    passed TO the executed program, not the program."""
+    if not args:
+        return None
+    i = 0
+    if args[0] in _JOB_INTERPRETERS:
+        if len(args) < 2 or args[1].startswith("-"):
+            return None
+        i = 1
+    return (args[i], args[i + 1] if i + 1 < len(args) else None)
+
+
+def _job_is_ours(name: str, stdout: str) -> "bool | None":
+    """Is the wrapper launchd EXECUTES this checkout's (and, for channel
+    bridges, followed by this channel)? None when the arguments block or the
+    executed position cannot be determined — callers fail closed on None. A
+    foreign executed wrapper carrying our path as a LATER argument is foreign:
+    only the executed position proves who owns the job."""
+    args = _launchctl_job_arguments(stdout)
+    if args is None:
+        return None
+    executed = _job_executed_script(args)
+    if executed is None:
+        return None
+    script, nxt = executed
+    channel = _BRIDGE_WRAPPER_CHANNEL.get(name)
+    wrapper = "channel-bridge-wrapper.sh" if channel is not None else "gateway-bridge-wrapper.sh"
+    expected = {f"{REPO_DIR}/src/launchd/{wrapper}",
+                f"{os.path.realpath(str(REPO_DIR))}/src/launchd/{wrapper}"}
+    if script not in expected:
+        return False
+    if channel is None:
+        return True
+    return nxt == channel
+
+
+def _bridge_supervision(name: str) -> "tuple[str, str | None]":
+    """Supervision verdict for `name`, identity-bound to THIS checkout:
+
+    ("supervised", label_or_None) — this checkout's launchd job (label given:
+        kickstartable) or this checkout's resident wrapper (None: drive via
+        the wrapper's child only) — with NO foreign presence anywhere.
+    ("mixed", None)    — own AND foreign supervision both present (any
+        job×wrapper combination); acting would race another install, so
+        callers must refuse everything.
+    ("foreign", None)  — only another checkout's job/wrapper exists; it is
+        never ours to kickstart, kill under, or race.
+    ("absent", None)   — launchctl conclusively knows no job (rc 113) AND the
+        wrapper scan ran clean.
+    ("unknown", None)  — a probe failed or answered ambiguously. Fails closed
+        in callers: not a license to spawn beside a possible supervisor.
+    """
+    label = f"com.sutando.{name}"
+    job_state = "unknown"
+    try:
+        probe = subprocess.run(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=10)
+        if probe.returncode == 0:
+            owned = _job_is_ours(name, probe.stdout)
+            job_state = ("ours" if owned is True
+                         else "foreign" if owned is False else "unknown")
+        elif probe.returncode == _LAUNCHCTL_NOT_FOUND_RC:
+            job_state = "absent"
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    if name not in _BRIDGE_WRAPPER_CHANNEL:
+        # No resident wrapper exists for this bridge (the gateway wrapper execs).
+        return {"ours": ("supervised", label),
+                "foreign": ("foreign", None),
+                "absent": ("absent", None)}.get(job_state, ("unknown", None))
+    # The COMPLETE state is scanned before any verdict — an owned job must not
+    # short-circuit past a foreign wrapper it is about to race.
+    wrappers = _wrapper_pids(name)
+    if wrappers is None or job_state == "unknown":
+        return ("unknown", None)
+    ours, foreign = wrappers
+    if (job_state == "foreign" and ours) or (foreign and (job_state == "ours" or ours)):
+        # ANY own/foreign mix refuses: acting would race the other install
+        # (singleton contention or duplicate delivery).
+        return ("mixed", None)
+    if job_state == "ours":
+        return ("supervised", label)
+    if ours:
+        return ("supervised", None)
+    if job_state == "foreign" or foreign:
+        return ("foreign", None)
+    return ("absent", None)
+
+
+def _pid_confirmed_gone(pid: "str | int") -> bool:
+    """True only when the pid provably does not exist (ESRCH). EPERM means the
+    pid may still exist but is unprobeable, and any other error proves
+    nothing — neither may ever read as a confirmed exit."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    except Exception:  # noqa: BLE001 — includes PermissionError: not proof of exit
+        return False
+    return False
+
+
+def _kill_supervised_child(name: str) -> bool:
+    """TERM this checkout's wrapper's OWN bridge child and confirm it exited.
+
+    Identity is by observed lineage under a checkout-bound wrapper — the ppid
+    must be one of THIS repo's wrapper pids — so a bare pid, or a child of a
+    foreign checkout's wrapper, can never be signalled. True only after every
+    signalled child is confirmed gone (kill -0 fails); anything less is a
+    failure the caller must report, not paper over.
+    """
+    wrappers = _wrapper_pids(name)
+    if wrappers is None or not wrappers[0]:
+        return False
+    ours = set(wrappers[0])
+    rows = _bridge_ps_rows()
+    if rows is None:
+        return False
+    children = [pid for pid, ppid, cmd in rows
+                if ppid in ours and cmd.endswith(f"{name}.py")]
+    if not children:
+        return False
+    try:
+        signalled = [pid for pid in children if subprocess.run(
+            ["/bin/kill", pid], capture_output=True).returncode == 0]
+        if len(signalled) != len(children):
+            return False
+        for _ in range(10):
+            time.sleep(0.5)
+            if all(_pid_confirmed_gone(pid) for pid in signalled):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — an unconfirmable kill is a reported failure, not a crash
+        return False
+
+
+def _surviving_own_bridge_pids(name: str) -> "list | None":
+    """Live pids of THIS checkout's bridge, per the ONE production identity
+    owner — `evict-own-bridge.sh --list` (absolute argv under repo, else cwd ==
+    repo; indeterminate never classifies). "OWN <pid>" lines are survivors; any
+    "INDETERMINATE" line, a nonzero exit, or an unrunnable helper returns None —
+    an unprovable scan must fail closed, never read as "gone". Bridges without
+    a wrapper channel (gateway) have no owner entry here and return None.
+    """
+    channel = _BRIDGE_WRAPPER_CHANNEL.get(name)
+    if channel is None:
+        return None
+    helper = REPO_DIR / "src" / "launchd" / "evict-own-bridge.sh"
+    try:
+        r = subprocess.run(["/bin/bash", str(helper), "--list", channel, str(REPO_DIR)],
+                           capture_output=True, text=True, timeout=30)
+    except Exception:  # noqa: BLE001 — an unrunnable verifier is an unprovable scan
+        return None
+    if r.returncode != 0:
+        return None
+    survivors = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "OWN":
+            survivors.append(parts[1])
+        elif parts and parts[0] == "INDETERMINATE":
+            return None
+    return survivors
+
+
+def _evict_own_stale_bridge(name: str) -> "tuple[bool, str]":
+    """Verified pre-spawn eviction of THIS checkout's old bridge process.
+
+    Delegates the kill to the production identity contract in
+    src/launchd/evict-own-bridge.sh (absolute argv under this repo, or cwd ==
+    repo; indeterminate never kills), then VERIFIES no survivor of this
+    checkout remains. (False, why) whenever the helper fails or the exit
+    cannot be confirmed — an unverified eviction must refuse the spawn, or a
+    still-live singleton holder makes the newcomer stand down and "restarted"
+    is a false report. Bridges with no wrapper channel (gateway) have no
+    eviction path and always return False.
+    """
+    channel = _BRIDGE_WRAPPER_CHANNEL.get(name)
+    if channel is None:
+        return (False, "no eviction path for this bridge")
+    helper = REPO_DIR / "src" / "launchd" / "evict-own-bridge.sh"
+    try:
+        r = subprocess.run(["/bin/bash", str(helper), channel, str(REPO_DIR)],
+                           capture_output=True, timeout=30)
+    except Exception:  # noqa: BLE001 — an unrunnable helper is a verified-failure, not a crash
+        return (False, "evict-own-bridge.sh could not be run")
+    if r.returncode != 0:
+        return (False, f"evict-own-bridge.sh exited {r.returncode}")
+    time.sleep(1)
+    survivors = _surviving_own_bridge_pids(name)
+    if survivors is None:
+        return (False, "post-eviction survivor scan could not prove the old process exited")
+    if survivors:
+        return (False, f"old process(es) still alive after eviction: {','.join(survivors)}")
+    return (True, "evicted + confirmed exited")
+
+
+def _restart_bridge(name: str, *, stale: bool = False) -> "tuple[bool, str]":
+    """Single supervision-aware owner of every bridge restart (down and stale).
+
+    A supervised bridge restarts THROUGH its supervisor — `kickstart -k` of
+    this checkout's job, else kill this checkout's wrapper's own child so the
+    keepalive respawns it onto the code now on disk — and is NEVER spawned
+    directly: a hand-spawned bridge (ppid 1) takes the singleton lock, and
+    every keepalive respawn then loses it seconds later, forever, one owner
+    alert per cycle. A direct spawn is allowed only when supervision is
+    conclusively ABSENT, and a stale spawn only after a VERIFIED eviction;
+    unknown and foreign verdicts fail closed. Returns (restarted, how).
+    """
+    verdict, kick_label = _bridge_supervision(name)
+    if verdict == "unknown":
+        return False, (f"supervision state UNKNOWN (probe failed or ambiguous) — "
+                       f"refusing to spawn or kill next to a possible supervisor; "
+                       f"check `launchctl print gui/$(id -u)/com.sutando.{name}` and re-run")
+    if verdict == "foreign":
+        return False, (f"a com.sutando.{name} supervisor exists on this host but is NOT this "
+                       f"checkout's ({REPO_DIR}) — refusing to drive another install's "
+                       f"supervisor or spawn beside it; reconcile the installs manually")
+    if verdict == "mixed":
+        return False, (f"BOTH this checkout's and another install's supervision are present "
+                       f"for {name} (job/wrapper mix) — refusing to kickstart, kill, or spawn "
+                       f"into a contested singleton; reconcile the installs manually")
+    if verdict == "supervised":
+        if kick_label is not None:
+            try:
+                r = subprocess.run(
+                    ["/bin/launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{kick_label}"],
+                    capture_output=True, text=True, timeout=15)
+                if r.returncode == 0:
+                    return True, f"restarted through launchd supervisor ({kick_label}, kickstart -k)"
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        if _kill_supervised_child(name):
+            return True, ("killed this checkout's supervised child (confirmed exited); "
+                          "the wrapper's keepalive respawns it on current code")
+        return False, (f"supervised, but the supervisor could not be driven and its child "
+                       f"could not be identified and confirmed dead — not hand-spawning "
+                       f"alongside a supervisor; run "
+                       f"`launchctl kickstart -k gui/$(id -u)/com.sutando.{name}` manually")
+    # Plan BEFORE any kill: killing a working stale bridge with no viable
+    # relaunch turns a warning into an outage.
+    plan = _bridge_launch_plan(name)
+    if plan is None:
+        return False, "no capable interpreter/env — restart skipped (see startup.sh launch requirements)"
+    if stale:
+        evicted, why = _evict_own_stale_bridge(name)
+        if not evicted:
+            return False, (f"stale pre-eviction not verified ({why}) — refusing to spawn a "
+                           f"duplicate next to a possibly-live stale process")
+    # _launch_bridge does real I/O (mkdir/open/Popen); a raising spawn must
+    # degrade to a reported failure, never abort the whole health-check pass.
+    try:
+        spawned = _launch_bridge(name, plan)
+    except Exception as e:  # noqa: BLE001 — normalize EMFILE/EACCES/etc. into the failure path
+        return False, f"spawn failed ({type(e).__name__}: {e})"
+    if spawned:
+        return True, "spawned directly (supervision conclusively absent)"
+    return False, "spawn failed"
 
 # Interpreter candidates, in the same priority order startup.sh probes. First
 # candidate that can import the bridge's required module wins. Keep this list in
@@ -5655,7 +6104,7 @@ def check_gateway_bridge() -> "dict | None":
                       "ag2.space mobile messages are not being delivered",
         }
     if verdict is True:
-        return {"name": "gateway-bridge", "status": "ok", "detail": "running + connected"}
+        return _gateway_ok_unless_lane_stalled("running + connected")
     # The bridge rewrites this file on every poll outcome, so silence past the
     # freshness window means the writer stopped — evidence, not absence of it.
     stale_age = _gateway_status_stale_age_s()
@@ -5693,9 +6142,8 @@ def check_gateway_bridge() -> "dict | None":
         }
     if lanes:
         served = ", ".join(ln for ln, serving, _ in lanes if serving)
-        return {"name": "gateway-bridge", "status": "ok",
-                "detail": f"running + connected (lane {served})"}
-    return {"name": "gateway-bridge", "status": "ok", "detail": "running"}
+        return _gateway_ok_unless_lane_stalled(f"running + connected (lane {served})")
+    return _gateway_ok_unless_lane_stalled("running")
 
 
 GATEWAY_STATUS_MAX_AGE_S = 180.0
@@ -5866,6 +6314,53 @@ def _gateway_lane_verdicts(state_dir: "Path | None" = None,
     return out
 
 
+def _gateway_stale_lanes(state_dir: "Path | None" = None,
+                         now: "float | None" = None) -> "list[tuple[str, float]]":
+    """(lane, age_s) for every lane sidecar whose `ts` is PAST the freshness
+    window — a lane that stopped, as opposed to one that failed.
+
+    A per-channel bridge that dies leaves its last record in place, and that
+    record almost always says `connected: true` — it did not fail, it stopped.
+    `_gateway_lane_verdicts` drops such a file (no fresh verdict), so a healthy
+    primary hides a dead lane completely. Only the sidecar's silence names it.
+    """
+    root = (Path(state_dir) if state_dir is not None
+            else Path(status_read_path("gateway-status.json", WORKSPACE_DIR)).parent)
+    out = []
+    try:
+        entries = sorted(root.glob("gateway-status.*.json"))
+    except OSError:
+        return out
+    for f in entries:
+        lane = f.name[len("gateway-status."):-len(".json")]
+        age = _gateway_status_stale_age_s(f, now=now)
+        if age is not None:
+            out.append((lane, age))
+    return out
+
+
+def _gateway_ok_unless_lane_stalled(detail: str) -> dict:
+    """The ok verdict for the bridge, demoted to warn when any lane's sidecar
+    has gone silent — the primary being healthy says nothing about a lane."""
+    stalled = _gateway_stale_lanes()
+    if not stalled:
+        return {"name": "gateway-bridge", "status": "ok", "detail": detail}
+    names = ", ".join(
+        f"{ln} (last write {age:.0f}s ago)" if age < 3600
+        else f"{ln} (last write {age / 3600:.1f}h ago)"
+        for ln, age in stalled)
+    return {
+        "name": "gateway-bridge",
+        "status": "warn",
+        "detail": (
+            f"{detail}, but lane {names} stopped writing its sidecar — its last "
+            "record still says connected, so only the silence shows it; messages "
+            "on that lane are not being delivered (retired lane? remove "
+            "state/gateway-status.<lane>.json)"
+        ),
+    }
+
+
 def _gateway_status_stale_age_s(path: "Path | None" = None,
                                 now: "float | None" = None) -> "float | None":
     """Age of the sidecar's `ts` when it is present, usable, and PAST the
@@ -5938,6 +6433,7 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
     identical to one produced by a working schedule."""
     name = "daily-cron-punctuality"
     late, missed, unknown, drifted, quiet = [], [], [], [], []
+    unconsumed, trailing = [], []
     for j in jobs:
         due = j["hour"] * 60 + j["minute"]
         if not j["artifacts"]:
@@ -5955,16 +6451,33 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
         # -1417 early. The filename date is logical, often a day off the mtime.
         deltas = sorted(((w - due + 720) % 1440) - 720 for _, w in j["artifacts"])
         median = statistics.median(deltas)
-        if median > DAILY_LATE_TOLERANCE_MIN:
-            late.append((j["name"], median, len(deltas)))
+        # Artifact mtimes date COMPLETION. Where the schedule's own dispatch
+        # record exists, it answers punctuality and the output time does not.
+        disp = [((w - due + 720) % 1440) - 720 for _, w in (j.get("dispatch_history") or [])]
+        if disp:
+            d_median = statistics.median(sorted(disp))
+            if d_median > DAILY_LATE_TOLERANCE_MIN:
+                late.append((j["name"], d_median, len(disp), "dispatch"))
+            elif median > DAILY_LATE_TOLERANCE_MIN:
+                trailing.append((j["name"], median, d_median, len(deltas)))
+        elif median > DAILY_LATE_TOLERANCE_MIN:
+            late.append((j["name"], median, len(deltas), "output"))
         if (not j["today_seen"] and j["minutes_since_due"] > DAILY_MISS_GRACE_MIN
                 and not j.get("conditional")
                 and (j.get("stem_declared") or j["artifacts"])):
-            missed.append((j["name"], j["minutes_since_due"]))
-    if not late and not missed and not drifted:
+            fired = j.get("dispatched_today")
+            if fired is None:
+                missed.append((j["name"], j["minutes_since_due"]))
+            else:
+                unconsumed.append((j["name"], fired, j["minutes_since_due"]))
+    if not late and not missed and not drifted and not unconsumed:
         seen = len(jobs) - len(unknown) - len(quiet)
         detail = f"{seen} of {len(jobs)} daily job(s) observable"
         detail += ", all on schedule" if seen else ""
+        for n, m, dm, c in sorted(trailing):
+            detail += (f"; {n} dispatches on time (median {dm:+g} min) and its output "
+                       f"trails by median {m:+g} min over {c} run(s) — pickup and "
+                       f"execution latency, not the schedule")
         if quiet:
             detail += (f"; conditional, nothing produced to score: "
                        f"{', '.join(sorted(quiet))}")
@@ -5978,17 +6491,30 @@ def _interpret_daily_punctuality(jobs: list) -> dict:
             return {"name": name, "status": "warn", "detail": f"{detail} — {scope}"}
         return {"name": name, "status": "ok", "detail": detail}
     bits = []
-    for n, m, c in late:
-        bits.append(f"{n}: {c} run(s), median +{m} min late — the schedule is not what "
-                    f"produced these; something else is covering for it")
+    for n, m, c, src in late:
+        if src == "dispatch":
+            bits.append(f"{n}: {c} run(s), median +{m} min late at DISPATCH — the "
+                        f"schedule itself is running late")
+        else:
+            bits.append(f"{n}: {c} run(s), median +{m} min late, measured from output "
+                        f"— no dispatch record retained for this job, so a late "
+                        f"schedule and a slow pickup cannot be told apart here")
     for n, m in missed:
-        bits.append(f"{n}: no output today, {m} min past due")
+        bits.append(f"{n}: no output today, {m} min past due, and no task was "
+                    f"dispatched — the schedule itself did not fire")
+    for n, fired, m in unconsumed:
+        bits.append(f"{n}: DISPATCHED {fired // 60:02d}:{fired % 60:02d} but produced "
+                    f"no output {m} min past due — the schedule fired and the task was "
+                    f"never consumed, so this is the consumer, not the cron")
     for n, newest, age in sorted(drifted):
         age_txt = f", {age}d ago" if age is not None else ""
         bits.append(f"{n}: UNCHECKED — artifacts stop at {newest}{age_txt}, so the "
                     f"probe's filename match has drifted off this job's output; "
                     f"punctuality cannot be scored and a missed-today verdict would "
                     f"blame the job for the probe's own blind spot")
+    for n, m, dm, c in sorted(trailing):
+        bits.append(f"{n}: dispatches on time (median {dm:+g} min); output trails by "
+                    f"median {m:+g} min over {c} run(s) — latency, not the schedule")
     if quiet:
         bits.append(f"conditional, nothing produced to score: {', '.join(sorted(quiet))}")
     if unknown:
@@ -6036,6 +6562,34 @@ def _daily_task_record_minutes(results: Path, job: str, limit: int = 7) -> list:
         if not f.is_file() or not anchored.match(f.name):
             continue
         lt = datetime.fromtimestamp(f.stat().st_mtime)
+        out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
+    out.sort()
+    return out[-limit:]
+
+
+def _daily_dispatch_minutes(tasks: Path, job: str, limit: int = 7) -> list:
+    """(date, minute-of-day-dispatched) from `tasks/**/task-cron-<job>-<epoch>.txt`.
+
+    The epoch in the NAME is emit time, so this reads when the SCHEDULE FIRED.
+    Every other lane here dates OUTPUT, which is why none of them can tell a
+    schedule that never ran from one that ran and was never picked up.
+    """
+    from datetime import datetime
+    out = []
+    if not tasks.is_dir():
+        return out
+    prefix = f"{cron_task_id.TASK_PREFIX}{cron_task_id.sanitize_name(job)}-"
+    anchored = cron_task_id.record_matcher(job)
+    for f in tasks.rglob(cron_task_id.DISCOVERY_GLOB):
+        if not f.is_file() or not anchored.match(f.name):
+            continue
+        stamp = f.name[len(prefix):].split(".")[0].split("-")[0]
+        try:
+            # int() carries the non-digit case: the matcher already anchors a
+            # digit run, so a separate isdigit guard is unreachable by construction.
+            lt = datetime.fromtimestamp(int(stamp) / 1000)
+        except (OverflowError, OSError, ValueError):
+            continue
         out.append((lt.strftime("%Y-%m-%d"), lt.hour * 60 + lt.minute))
     out.sort()
     return out[-limit:]
@@ -6139,6 +6693,7 @@ def check_daily_cron_punctuality() -> dict:
             used_artifact_lane = False
         # Staleness is computed HERE because `now` lives here; the interpret layer
         # reads it as an optional field so its fixtures stay clock-independent.
+        dispatched = _daily_dispatch_minutes(ws / "tasks", jname)
         newest = max((d for d, _ in arts), default=None)
         age_days = None
         if newest:
@@ -6152,6 +6707,11 @@ def check_daily_cron_punctuality() -> dict:
             "naming_stale": age_days is not None and age_days > DAILY_ARTIFACT_STALE_DAYS,
             "today_seen": any(d == now.strftime("%Y-%m-%d") for d, _ in arts),
             "minutes_since_due": max(0, int((now - due).total_seconds() // 60)),
+            # Dispatch is the schedule's own evidence: it is what "on time"
+            # means, and it is what an output mtime cannot report.
+            "dispatch_history": dispatched,
+            "dispatched_today": next(
+                (m for d, m in dispatched if d == now.strftime("%Y-%m-%d")), None),
             # `artifact` names a results file, so it cannot vouch for a sentinel:
             # only an observed history makes a missing sentinel today actionable.
             "stem": stem, "stem_declared": bool(declared) and used_artifact_lane,
@@ -6539,6 +7099,23 @@ def apply_skill_symlink_fixes(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
+def _oldest_pending(files: "list[Path]") -> "tuple[Path, float] | None":
+    """(oldest file, its mtime), skipping entries that vanish mid-scan.
+
+    A claim renames the file, so any entry can be gone between the listing and
+    the stat; one unguarded stat() aborts the whole health run.
+    """
+    pairs = []
+    for f in files:
+        try:
+            pairs.append((f, f.stat().st_mtime))
+        except OSError:
+            continue
+    if not pairs:
+        return None
+    return min(pairs, key=lambda t: t[1])
+
+
 def _pending_task_files(tasks_dir: Path, results_dir: Optional[Path] = None) -> list[Path]:
     """Top-level task files that have not produced or archived a result."""
     if results_dir is None:
@@ -6756,7 +7333,8 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     if pooled and not files:
         stuck = _pool_held_stuck(pooled, now, stuck_age_sec)
         if stuck:
-            oldest_h = int(now - min(f.stat().st_mtime for f in stuck)) // 3600
+            _st = _oldest_pending(stuck)
+            oldest_h = int(now - _st[1]) // 3600 if _st else 0
             return {"name": name, "status": "warn",
                     "detail": f"{len(stuck)} of {len(pooled)} pool-held task(s) have not moved "
                               f"in over {stuck_age_sec // 60} min (oldest {oldest_h}h): "
@@ -6768,8 +7346,11 @@ def check_task_queue(threshold_count: int = 3, threshold_age_sec: int = 300,
     holdings = _worker_holdings()
     inflight = sum(1 for f in files if f.name in holdings)
     held_note = f", {inflight} in flight with a worker" if inflight else ""
-    oldest = min(files, key=lambda p: p.stat().st_mtime)
-    oldest_age = int(now - oldest.stat().st_mtime)
+    _oldest = _oldest_pending(files)
+    if _oldest is None:
+        return {"name": name, "status": "ok",
+                "detail": "queue drained while scanning"}
+    oldest_age = int(now - _oldest[1])
     # Deadline vs the WORKER's runtime, never the file's age: a task can queue
     # for hours before a worker claims it, and claiming does not touch the file.
     all_held = inflight == len(files)
@@ -7705,6 +8286,61 @@ def apply_task_watcher_sentinel_fix(checks: list, stream=None) -> None:
             c.update(fresh)
 
 
+# The one owned hook whose effect leaves the workspace; excluded from unattended repair.
+_TRANSCRIPT_ARCHIVE_HOOK = "PreCompact:sutando-conversations/"
+
+
+def apply_claude_hooks_fix(checks: list, stream=None) -> None:
+    """--fix dispatch for claude-hooks: warn-level, so it never reaches the issues
+    loop and needs its own pass (same shape as the task-watcher one).
+
+    An app update replaces the engine tree and strips settings.json back to
+    SessionStart alone, which silently disables `PreCompact -> session-handoff.sh`
+    until a human reads the warn and re-runs the installer. Detecting that has
+    never been the gap; repairing it was.
+
+    Keys on `_unregistered_hooks`, not the detail text. The check is RE-RUN rather
+    than assumed repaired — a fixer's self-report is not evidence of the result.
+
+    Scoped: the ~/Desktop transcript archiver is the one owned hook whose effect
+    leaves the workspace, and the dominant caller of `--fix` is an unattended
+    30-minute Timer in Sutando.app (`src/Sutando/main.swift`), not a terminal. A
+    routine timer must not make that egress decision, so it is left to explicit
+    opt-in and its absence keeps warning.
+    """
+    out = stream if stream is not None else sys.stdout
+    for c in checks:
+        if c["name"] != "claude-hooks" or not c.get("_unregistered_hooks"):
+            continue
+        installer = REPO_DIR / "src" / "install-claude-hooks.sh"
+        # Sutando.app runs `--fix` on a 30-minute Timer, so this repair is normally
+        # unattended: it may restore only hooks whose effects stay in the workspace.
+        scoped = [h for h in c["_unregistered_hooks"] if h != _TRANSCRIPT_ARCHIVE_HOOK]
+        if not scoped:
+            print(f"  {c['name']}: not repairing — the only unregistered hook copies full "
+                  f"transcripts to ~/Desktop. Opt in with `bash src/{installer.name}`",
+                  file=out)
+            continue
+        print(f"  {c['name']}: repairing {', '.join(scoped)} via {installer.name}"
+              + (f" (leaving {_TRANSCRIPT_ARCHIVE_HOOK} to explicit opt-in)"
+                 if len(scoped) != len(c["_unregistered_hooks"]) else ""), file=out)
+        try:
+            proc = subprocess.run(
+                ["bash", str(installer)],
+                capture_output=True, text=True, timeout=60,
+                env={**os.environ, "SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE": "1"},
+            )
+            emitted = (proc.stdout or "") + (proc.stderr or "")
+            lines = [ln for ln in emitted.splitlines() if ln.strip()]
+            msg = lines[-1].strip() if lines else f"installer exited {proc.returncode}"
+        except Exception as exc:  # noqa: BLE001 — a failed repair must warn, not raise
+            msg = f"could not run install-claude-hooks.sh ({exc})"
+        print(f"  {c['name']}: {msg}", file=out)
+        fresh = check_claude_hook_registration()
+        c.clear()
+        c.update(fresh)
+
+
 def _fresh_local_core_record(
     workspace: "Optional[Path]" = None,
     max_age_s: float = 90.0,
@@ -8442,6 +9078,15 @@ def _resolve_menu_bar_pgrep(pgrep_status: Optional[str], pids: list[str]) -> tup
     return pgrep_status, pids
 
 
+# Two causes fit "no event since start" equally: subscriptions off, or a restart
+# during a quiet window. Rank them; asserting the config one misdirects.
+_SLACK_NO_EVENTS_SINCE_START = (
+    "no inbound event since this bridge started — benign if it restarted during a "
+    "quiet period; if it has never received one, check Event Subscriptions at "
+    "api.slack.com/apps"
+)
+
+
 def bridge_log_content_status(name: str, status: str, tail: list[str],
                               detail: str = "",
                               slack_state: "str | None" = None,
@@ -8487,6 +9132,8 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
             if not events_after:
                 # Event Subscriptions alone is the whole fix ONLY when an owner
                 # is already enrolled; in TOFU state the code gate also blocks.
+                # Remedy is ranked, not asserted — a quiet-window restart gives
+                # this same observation.
                 if slack_state is None:
                     try:
                         slack_state = slack_access.access_state(
@@ -8494,8 +9141,7 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
                     except Exception:  # noqa: BLE001 — a probe must not fail the check
                         slack_state = slack_access.UNKNOWN
                 if slack_state == slack_access.ENROLLED:
-                    return "warn", ("connected but events not arriving — enable Event "
-                                    "Subscriptions at api.slack.com/apps")
+                    return "warn", _SLACK_NO_EVENTS_SINCE_START
                 if slack_state == slack_access.UNKNOWN:
                     # A resolver we could not run leaves us knowing nothing, so it
                     # keeps the quieter enrolled remedy; a malformed record does not.
@@ -8512,8 +9158,7 @@ def bridge_log_content_status(name: str, status: str, tail: list[str],
                                         "(allowFrom must be a list of user-id strings), "
                                         "then enable Event Subscriptions at "
                                         "api.slack.com/apps")
-                    return "warn", ("connected but events not arriving — enable Event "
-                                    "Subscriptions at api.slack.com/apps")
+                    return "warn", _SLACK_NO_EVENTS_SINCE_START
                 # Name the log this check actually read — the workspace is
                 # configurable, so a literal path can point at no such file.
                 resolved = Path(log_path) if log_path else (
@@ -8923,8 +9568,11 @@ def check_vault_manifest_integrity(
                            f"'{account}' — treating as an unverifiable keychain, not as divergence")}
     src = " (read via the LEGACY fallback — canonical manifest absent)" if via_legacy else ""
     if not phantom:
+        # Where an agent about to say "I can't, it needs X" learns X is held. 12,
+        # not the warn branch's 6: that answers only if the roster is near-whole.
+        held = ", ".join(sorted(backed)[:12]) + (f", +{len(backed) - 12} more" if len(backed) > 12 else "")
         return {"name": name, "status": "ok",
-                "detail": f"all {len(backed)} advertised key(s) resolve in Keychain{src}"}
+                "detail": f"all {len(backed)} advertised key(s) resolve in Keychain{src} — {held}"}
 
     shown = ", ".join(phantom[:6]) + (f", +{len(phantom) - 6} more" if len(phantom) > 6 else "")
     truncated = f" (checked first {max_keys} of {len(names)})" if len(names) > max_keys else ""
@@ -9074,8 +9722,13 @@ def check_claude_hook_registration(
             bits.append(f"{len(foreign)} registered but NOT running the installer's command "
                         f"— a different program, another checkout, or the path is "
                         f"only an argument ({', '.join(foreign)})")
-        return {"name": name, "status": "warn",
-                "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+        result = {"name": name, "status": "warn",
+                  "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+        if missing:
+            # Keyed structurally so --fix cannot fire on the warn branches the
+            # installer can't repair; `foreign` excluded (displacement unverified).
+            result["_unregistered_hooks"] = list(missing)
+        return result
     return {"name": name, "status": "ok", "detail": f"all {len(owned)} owned hooks registered"}
 
 
@@ -10081,6 +10734,9 @@ def _local_core_stopped(workspace: Optional[Path] = None) -> bool:
     return (workspace / "state" / "cores" / f"{label}.stopped").exists()
 
 
+_WARN_SUPPRESS_CACHE = None
+
+
 def _alerts_suppressed(check: dict) -> bool:
     """True when a check must NOT wake anyone, whatever its status says.
 
@@ -10101,7 +10757,18 @@ def _alerts_suppressed(check: dict) -> bool:
     alerts, so no existing check changes behavior by omission, and a typo cannot
     silence a real failure.
     """
-    return check.get("alerting") is False
+    if check.get("alerting") is False:
+        return True
+    # A host may quiet a chronic WARN it judged inapplicable (a retired service,
+    # an optional dep). Never another status: a list must not hide an outage.
+    if check.get("status") != "warn":
+        return False
+    global _WARN_SUPPRESS_CACHE
+    if _WARN_SUPPRESS_CACHE is None:
+        from sutando_config import resolve_suppressed_alerts  # noqa: PLC0415
+
+        _WARN_SUPPRESS_CACHE = resolve_suppressed_alerts(REPO_DIR)
+    return check.get("name") in _WARN_SUPPRESS_CACHE
 
 
 def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None, tasks_dir: Optional[Path] = None) -> None:
@@ -10195,7 +10862,7 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10264,7 +10931,7 @@ def notify_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10379,7 +11046,11 @@ def _default_slack_sender(text: str) -> bool:
         if not opened.get("ok"):
             return False
         channel = opened["channel"]["id"]
-        posted = _slack_api(token, "chat.postMessage", {"channel": channel, "text": text})
+        # Health output carries URLs, and this DM is the owner's alert channel:
+        # a wall of preview cards buries the failure it is reporting.
+        posted = _slack_api(token, "chat.postMessage", {
+            "channel": channel, "text": text,
+            "unfurl_links": False, "unfurl_media": False})
         return bool(posted.get("ok"))
     except Exception:
         return False
@@ -10513,7 +11184,7 @@ def notify_slack_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10566,7 +11237,7 @@ def notify_gateway_for_failures(
     history[hash_key] = now_ms
     history[_LAST_HASH_KEY] = hash_key
     cutoff = now_ms - (24 * 3600 * 1000)
-    history = {k: v for k, v in history.items() if k == _LAST_HASH_KEY or v >= cutoff}
+    history = _prune_alert_history(history, cutoff)
     try:
         state_file.write_text(json.dumps(history))
     except Exception:
@@ -10649,11 +11320,10 @@ def _oldest_pending_task(now: float, tasks_dir: Optional[Path] = None) -> "tuple
     files = _pending_task_files(tasks_dir)
     if not files:
         return None
-    try:
-        oldest = min(files, key=lambda p: p.stat().st_mtime)
-        mtime = oldest.stat().st_mtime
-    except OSError:
+    got = _oldest_pending(files)
+    if got is None:
         return None
+    oldest, mtime = got
     return (f"{oldest.name}|{int(mtime)}", int(now - mtime))
 
 
@@ -11408,6 +12078,7 @@ def main():
     if do_fix:
         apply_skill_symlink_fixes(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_task_watcher_sentinel_fix(checks, stream=sys.stderr if as_json else sys.stdout)
+        apply_claude_hooks_fix(checks, stream=sys.stderr if as_json else sys.stdout)
 
     # Optional: macOS notification surface for the launchd-supervised path
     # (com.sutando.health-check-fallback). Notifies on the INITIAL check set
@@ -11531,37 +12202,13 @@ def main():
                     if "LoginFailure" in c.get("detail", "") or "token invalid" in c.get("detail", ""):
                         print(f"  {c['name']}: token invalid — regenerate at discord.com/developers/applications (no restart)")
                     else:
-                        # Plan BEFORE any kill: killing a working stale bridge
-                        # with no viable relaunch turns a warning into an outage.
-                        plan = _bridge_launch_plan(c["name"])
-                        if plan is None:
-                            print(f"  {c['name']}: no capable interpreter/env — restart skipped (see startup.sh launch requirements)")
-                            continue
-                        # If stale (process older than source code), kill old PID first
-                        # so the new process doesn't conflict with a still-running zombie.
-                        if c["status"] == "stale":
-                            try:
-                                # Anchor to `\.py$` to match the detect path at
-                                # line ~277. Without this, a bare `pgrep -f
-                                # discord-bridge` also catches grep pipelines
-                                # and shell invocations whose command line
-                                # contains the bridge name, and we'd kill them
-                                # instead of (or in addition to) the real
-                                # bridge process. PR #243 fixed the detect
-                                # side; this keeps the kill side consistent.
-                                old_pids = subprocess.run(
-                                    ["/usr/bin/pgrep", "-f", f"{c['name']}\\.py$"], capture_output=True, text=True
-                                ).stdout.strip().split("\n")
-                                for pid in old_pids:
-                                    if pid:
-                                        subprocess.run(["/bin/kill", pid], check=False)
-                                import time as _t; _t.sleep(1)
-                            except Exception:
-                                pass
-                        # Shared launch policy — a bare sys.executable spawn
-                        # crash-loops on missing imports.
-                        _launch_bridge(c["name"], plan)
-                        print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                        # Supervision decision, plan-before-kill, and the spawn
+                        # all live in _restart_bridge — the shared restart owner.
+                        ok, how = _restart_bridge(
+                            c["name"], stale=(c["status"] == "stale"))
+                        verdict = ("restarted (stale code)" if ok and c["status"] == "stale"
+                                   else "restarted" if ok else "NOT restarted")
+                        print(f"  {c['name']}: {verdict} — {how}")
                 elif c["name"] == "sutando-app":
                     # Two distinct failure modes:
                     #   1. status="warn" + detail="not running …" → binary may

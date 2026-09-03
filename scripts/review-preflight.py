@@ -102,16 +102,24 @@ def resolve_repo(explicit: "str | None" = None, env: "dict | None" = None) -> st
     return environ.get("SUTANDO_REVIEW_REPO") or "{owner}/{repo}"
 
 
-def prior_art(pr: str, runner=None, repo: "str | None" = None) -> "list[str] | None":
-    """Reviews and non-COMMENTED activity already on the PR, oldest first.
+DECISIVE = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def prior_art(pr: str, runner=None,
+              repo: "str | None" = None) -> "tuple[list[str], list[str]] | None":
+    """(prose to read, decisive verdicts) already on the PR, oldest first.
 
     None means COULD NOT CHECK, which is not the same as "nothing there" — a
     reviewer told nothing and a reviewer told the check failed behave
     differently, so the two must never render alike.
+
+    The second list is latest-state-per-login and is NOT subject to the
+    display cap, so a verdict cannot be lost to prose or to truncation.
     """
     run = runner or (lambda a: subprocess.run(a, capture_output=True,
                                               text=True, timeout=20))
     out: "list[str]" = []
+    latest: "dict[str, tuple[str, str]]" = {}
     for kind, path, when, verdict in (
             ("review", f"pulls/{pr}/reviews", "submitted_at", "state"),
             ("comment", f"issues/{pr}/comments", "created_at", None)):
@@ -127,27 +135,149 @@ def prior_art(pr: str, runner=None, repo: "str | None" = None) -> "list[str] | N
             return None
         for row in rows:
             state = row.get(verdict) if verdict else None
-            # Skip on EMPTY, never on state: a COMMENTED review's body is in
-            # pulls/reviews and absent from issues/comments, so a state filter deletes it.
+            who = (row.get("user") or {}).get("login", "?")
+            ts = row.get(when, "?")
+            # An empty body is not an empty verdict, and the newest verdict
+            # wins by timestamp — arrival order is the endpoint's, not ours.
+            if (state or "").upper() in DECISIVE and ts >= latest.get(who, ("",))[0]:
+                latest[who] = (ts, state.upper())
             if not (row.get("body") or "").strip():
                 continue
-            who = (row.get("user") or {}).get("login", "?")
             label = kind if not state else f"{kind}, {state}"
-            out.append(f"{row.get(when, '?')}  {who} ({label})")
-    return sorted(out)
+            out.append(f"{ts}  {who} ({label})")
+    return sorted(out), sorted(
+        f"{ts}  {who}: {state}" for who, (ts, state) in latest.items())
 
 
 PRIOR_ART_SHOWN = 8
 
 
-def prior_art_block(pr: str, seen: "list[str] | None") -> "list[str]":
+def _gh_json(run, args):
+    """None on any failure: a call that did not answer must not read as an empty answer."""
+    try:
+        r = run(["gh", "api"] + args)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout) if r.stdout.strip() else None
+    except ValueError:
+        return None
+
+
+def stale_approvals(pr: str, runner=None, repo: "str | None" = None) -> "list[dict] | None":
+    """Approvals counted toward the gate whose reviewer has not seen the current head.
+
+    A ruleset leaving dismiss_stale_reviews_on_push off keeps them green, so
+    nothing on the PR page separates such an approval from a live one.
+    """
+    run = runner or (lambda a: subprocess.run(a, capture_output=True,
+                                              text=True, timeout=20))
+    base = f"repos/{resolve_repo(repo)}/"
+    pull = _gh_json(run, [base + f"pulls/{pr}"])
+    reviews = _gh_json(run, [base + f"pulls/{pr}/reviews", "--paginate"])
+    commits = _gh_json(run, [base + f"pulls/{pr}/commits", "--paginate"])
+    if pull is None or reviews is None or commits is None:
+        return None
+    head = (pull.get("head") or {}).get("sha") or ""
+    if not head:
+        return None
+    # The PR's own commits, not a base compare: a base merge drags in main's
+    # history, which was never part of what this reviewer read.
+    shas = [c.get("sha", "") for c in commits]
+    # COMMENTED never supersedes a verdict, so it must not overwrite the latest state.
+    latest: "dict[str, dict]" = {}
+    for row in reviews:
+        if (row.get("state") or "").upper() not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            continue
+        who = (row.get("user") or {}).get("login", "?")
+        prev = latest.get(who)
+        if prev is None or (row.get("submitted_at") or "") >= (prev.get("submitted_at") or ""):
+            latest[who] = row
+    out: "list[dict]" = []
+    for who, row in sorted(latest.items()):
+        if (row.get("state") or "").upper() != "APPROVED":
+            continue
+        when = row.get("submitted_at") or ""
+        if not when:
+            continue
+        # Anchor on the review's own timestamp, never on commit_id: GitHub
+        # re-points commit_id forward, so position cannot represent the review.
+        after = [c for c in commits
+                 if ((c.get("commit") or {}).get("committer") or {}).get("date", "") > when]
+        if not after:
+            continue
+        content = [c for c in after if len(c.get("parents") or []) == 1]
+        at = row.get("commit_id") or ""
+        out.append({"user": who, "submitted_at": when, "commit_id": at, "head": head,
+                    "since": len(after), "content": len(content),
+                    "merges": len(after) - len(content),
+                    "first_unseen": after[0].get("sha", ""),
+                    "locatable": bool(at) and at in shas})
+    return sorted(out, key=lambda r: r["submitted_at"])
+
+
+def stale_approval_block(pr: str, rows: "list[dict] | None") -> "list[str]":
+    """Render so "none stale" and "could not tell" can never read alike."""
+    if rows is None:
+        return ["STALE APPROVALS: *** COULD NOT CHECK *** — gh is unavailable or the call",
+                "failed. Do not read this as none: compare each approval's timestamp with",
+                "the commit dates yourself before treating the approvals gate as satisfied."]
+    if not rows:
+        return ["STALE APPROVALS: none — no commit on this PR postdates any counted approval."]
+    out = ["STALE APPROVALS — these still COUNT toward the required-approvals gate, but a",
+           "commit landed after each one, so the approver has not read the current head.",
+           "CONTRIBUTING.md requires re-checking whether approvals still apply after any",
+           "update or rebase — a merge commit carries a tree nobody reviewed either:"]
+    for r in rows:
+        kinds = []
+        if r["content"]:
+            kinds.append(f"{r['content']} content")
+        if r["merges"]:
+            kinds.append(f"{r['merges']} merge")
+        detail = ", ".join(kinds) or f"{r['since']}"
+        note = "" if r["locatable"] else "; its commit_id is not in the PR's commits (force-push)"
+        base_only = r["merges"] and not r["content"] and r["locatable"]
+        verdict = ("    -> base-only, approval still fits (merges carry no reviewed-tree"
+                   " change; spot-check conflicts)" if base_only
+                   else "    -> RE-READ before counting this approval")
+        out += [f"  {r['user']}  APPROVED {r['submitted_at']}",
+                f"    {r['since']} commit(s) since ({detail}), first unseen"
+                f" {r['first_unseen'][:10]}, head {r['head'][:10]}{note}",
+                verdict]
+    return out
+
+def verdict_block(verdicts: "list[str] | None") -> "list[str]":
+    """Every login's current decisive state, uncapped and prose-independent.
+
+    Separate from the prose list because the two answer different questions:
+    what must I read, versus where does this PR actually stand.
+    """
+    if verdicts is None:
+        return ["DECISIVE STATE: *** COULD NOT CHECK *** — treat as unknown, not clean."]
+    if not verdicts:
+        return ["DECISIVE STATE: none — no APPROVED or CHANGES_REQUESTED on record."]
+    return (["DECISIVE STATE (latest per login; a bare verdict carries no prose to read):"]
+            + [f"  {v}" for v in verdicts])
+
+
+def prior_art_block(pr: str, seen: "list[str] | None",
+                    repo: "str | None" = None) -> "list[str]":
     """Render prior art so "nothing there" can never read as "unchecked"."""
     if seen is None:
+        # An unexpanded placeholder is the one COULD-NOT-CHECK with a fix the
+        # reader can apply, so it must not read as generic gh flakiness.
+        if (repo or resolve_repo()) == "{owner}/{repo}":
+            return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — no repo context.",
+                    "This install has no .git, so gh cannot expand {owner}/{repo}. Re-run",
+                    "with --repo owner/name or set $SUTANDO_REVIEW_REPO; until then this",
+                    "check is inert and every duplicate review passes it."]
         return ["ALREADY ON THIS THREAD: *** COULD NOT CHECK *** — gh is unavailable or",
                 "the call failed. Read the thread yourself: an unchecked thread is not an",
                 "empty one."]
     if not seen:
-        return ["ALREADY ON THIS THREAD: nothing — no reviews or comments yet."]
+        return ["ALREADY ON THIS THREAD: nothing to read — no prose on the thread yet."]
     # Name the truncation: a bare count above a short list reads as the count
     # being wrong, not the list being cut.
     head = (f"ALREADY ON THIS THREAD — showing last {PRIOR_ART_SHOWN} of {len(seen)};"
@@ -166,7 +296,10 @@ def render(guide: Path, pr: str | None, repo: "str | None" = None) -> str:
     out = [f"review-preflight: criteria from {guide}", ""]
     if pr:
         out += [f"Reviewing PR #{pr}. Every lesson below is a criterion, not a suggestion.", ""]
-        out += prior_art_block(pr, prior_art(pr, repo=repo)) + [""]
+        got = prior_art(pr, repo=repo)
+        seen, verdicts = (None, None) if got is None else got
+        out += verdict_block(verdicts) + prior_art_block(pr, seen, repo=repo) + [""]
+        out += stale_approval_block(pr, stale_approvals(pr, repo=repo)) + [""]
     out.append(lessons if lessons else
                "WARNING: no '## Lessons' section found — the guide's criteria could not be read.")
     n_flag, n_allow = count_check_patterns(checks)
