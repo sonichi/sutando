@@ -19,9 +19,8 @@ import shlex
 import sys
 
 BODY_FLAGS = ("--body", "--notes", "--title")
-# What the shell eats inside double quotes. `$VAR` is deliberately absent: it is
-# a normal, usually-intended interpolation, unlike a code span or a subshell.
-# An ESCAPED backtick publishes literally, so it is not a rewrite.
+# What the shell eats inside double quotes, escaped forms excluded. `$VAR` is
+# absent on purpose: an ordinary interpolation, not a code span or subshell.
 SUBSTITUTES = re.compile(r"(?<!\\)`|(?<!\\)\$\(")
 # `"$(cat f)"` as the WHOLE value is the intended content, not prose the shell
 # mangled — the standard file-passing idiom, and denying it cries wolf.
