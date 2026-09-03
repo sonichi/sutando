@@ -44,6 +44,7 @@ class ProjectHitl(unittest.TestCase):
         B._req = lambda method, path, payload=None, timeout=None: (
             self.calls.append((method, path, payload)) or self.answer)
         self.manager = hm.HitlManager(hm.HitlStore(hm.default_store(self.ws)))
+        B._hitl_backoff_reset()  # module-level state: one test's backoff must not leak
 
     def tearDown(self):
         B._STATE, B.PROACTIVE_ROOM, B._req = self._saved
@@ -71,15 +72,53 @@ class ProjectHitl(unittest.TestCase):
         self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
         self.assertEqual(len(self.calls), 1, "the second pulse must post nothing")
 
-    def test_a_rejected_send_is_retried_on_the_next_pulse(self):
+    def test_a_rejected_send_is_retried_once_the_backoff_elapses(self):
         """A refusal must record nothing — otherwise the card is lost silently
         and the requirement waits forever on a projection that never happened."""
         self._requirement()
         self.answer = {"ok": False}
         self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
+        B._hitl_backoff_reset()  # stand in for the deadline elapsing
         self.answer = {"ok": True, "event_id": "$card"}
         self.assertEqual(B._project_hitl(log=lambda *a: None), 1)
         self.assertEqual(len(self.calls), 2)
+
+    def test_a_refusing_relay_does_not_get_one_post_per_pulse(self):
+        """The worker drives this every ~1s and `project()` assigns cadence to
+        its caller, so without a backoff a refusing relay is hammered forever."""
+        self._requirement()
+        self.answer = {"ok": False}
+        for _ in range(20):
+            B._project_hitl(log=lambda *a: None)
+        self.assertEqual(len(self.calls), 1,
+                         f"20 pulses against a refusing relay sent {len(self.calls)} requests")
+        self.assertGreater(B._HITL_BACKOFF["until"], 0.0)
+
+    def test_the_backoff_grows_and_is_capped(self):
+        self._requirement()
+        self.answer = {"ok": False}
+        seen = []
+        for _ in range(12):
+            B._HITL_BACKOFF["until"] = 0.0   # let each pulse through, keep the delay
+            B._project_hitl(log=lambda *a: None)
+            seen.append(B._HITL_BACKOFF["delay"])
+        self.assertEqual(seen[:4], [1.0, 2.0, 4.0, 8.0])
+        self.assertLessEqual(max(seen), B._HITL_BACKOFF_MAX_S)
+        self.assertEqual(seen[-1], B._HITL_BACKOFF_MAX_S, "it must reach the cap and stay")
+
+    def test_an_idle_pulse_clears_a_backoff_so_a_new_card_is_not_delayed(self):
+        """Backing off on idle would make the next genuine card wait out a
+        delay earned by an unrelated failure."""
+        self._requirement()
+        self.answer = {"ok": False}
+        B._project_hitl(log=lambda *a: None)
+        self.assertGreater(B._HITL_BACKOFF["until"], 0.0)
+        for r in self.manager.store.all():      # resolve everything: nothing left to project
+            self.manager.resolve(r.id)
+            self.manager.record_projection(r.id, 99, "$x")
+        B._HITL_BACKOFF["until"] = 0.0
+        self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
+        self.assertEqual(B._HITL_BACKOFF["delay"], 0.0, "an idle pulse must reset the backoff")
 
     def test_no_proactive_room_posts_nothing(self):
         self._requirement()
