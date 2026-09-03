@@ -28,6 +28,35 @@ Agent-facing convenience names may stay finer-grained:
 `request_single_choice`, `request_multiple_choices`, `request_input`,
 `request_confirmation`, `request_approval`.
 
+### One vocabulary, three spellings — the mapping is normative
+
+The **wire `mode`** is the only spelling the semantic validator accepts and
+the only key a surface advertises under `interaction_capabilities.modes`.
+The closed-set name is what an agent *means*; the convenience name is what an
+agent *calls*. Direction is fixed: agent-facing name → wire `mode` (the
+compiler resolves it; nothing resolves the other way).
+
+| Closed-set semantic (agent-facing) | Wire `mode` (validator + capability key) | Convenience alias |
+|---|---|---|
+| `ask.choice`, `selection: "single"` | `single_select` | `request_single_choice` |
+| `ask.choice`, `selection: "multi"` | `multi_select` | `request_multiple_choices` |
+| `ask.input` | `form` | `request_input` |
+| `ask.confirm` | `confirm` | `request_confirmation` |
+| `request.approval` | `approval` | `request_approval` |
+
+Two clarifications this table settles:
+
+- `form` is not a fifth semantic. It is `ask.input`'s wire name; the
+  capability entry's `field_types` are the surface's limits for that one
+  semantic.
+- `ask.choice` keeps ONE request schema (the closed-set point stands), but
+  compiles to two wire modes because a surface's limits differ per selection
+  kind (`max_options` 7 vs 12 above). The duplication is in the capability
+  advertisement, not in the schema an agent fills in.
+
+Every JSON example in this document uses wire `mode` names, and any example
+that does not is a defect in the example.
+
 The closed set guarantees: every client knows how to display each mode,
 responses validate, accessibility is consistent, agents cannot forge system
 UI, interactions deliver cross-platform, pending state survives restarts,
@@ -67,6 +96,7 @@ A surface declares what it supports; the agent/runtime adapts and degrades:
 ```json
 {"interaction_capabilities": {"version": "1", "modes": {
   "confirm": {},
+  "approval": {},
   "single_select": {"max_options": 7, "supports_description": true,
                     "supports_images": true, "supports_other": true},
   "multi_select": {"max_options": 12, "supports_min_max": true},
