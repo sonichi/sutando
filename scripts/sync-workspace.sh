@@ -1172,6 +1172,14 @@ _resolve_conflicts_keep_ours() {
         # best-effort: a backup failure must never block the merge.
         if git checkout --ours -- "$f" 2>/dev/null; then
             git add -- "$f"
+        elif [ -e "$f" ] || [ -L "$f" ]; then
+            # Carrier enforcement untracks while KEEPING bytes on disk, so a
+            # DD path can still hold live local state git no longer owns.
+            # `--cached` resolves the index; `-f` would delete that data.
+            # `-L` because `-e` FOLLOWS the link: a dangling symlink reads as
+            # absent and would take the deleting branch (the `workspace` link
+            # is exactly this shape while its target is unavailable).
+            git rm -q --cached -- "$f" 2>/dev/null || true
         else
             git rm -f -- "$f" 2>/dev/null || true
         fi
