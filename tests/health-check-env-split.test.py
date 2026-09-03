@@ -286,6 +286,10 @@ for _label, _line, _persists in [
     ("plain two assignments", "GEMINI_API_KEY=real DISCORD_BOT_TOKEN=old", True),
     ("literal hash inside a word", "GEMINI_API_KEY=a#b DISCORD_BOT_TOKEN=old", True),
     ("real trailing comment", "GEMINI_API_KEY=real # DISCORD_BOT_TOKEN=old", False),
+    # The assignment BEFORE a comment is real; only the remainder is text.
+    ("assignment before an inline comment persists",
+     "DISCORD_BOT_TOKEN=old # retained credential", True),
+    ("commented-out key is text, not an assignment", "# DISCORD_BOT_TOKEN=old", False),
     ("bare export argument", "export GEMINI_API_KEY DISCORD_BOT_TOKEN=old", True),
     ("command prefix does not persist", "GEMINI_API_KEY=r DISCORD_BOT_TOKEN=e true", False),
     ("assignment to the export command", "GEMINI_API_KEY=r export DISCORD_BOT_TOKEN=o", True),
@@ -354,6 +358,18 @@ with tempfile.TemporaryDirectory() as td:
           _r is not None and "could not be completed" in _r["detail"]
           and "selected repo" in _r["detail"]
           and "unmodelled-command" in _r["detail"], True)
+
+# Inverse orientation: an annotated credential in the SELECTED file is loaded
+# by bash, so the probe must not report it missing nor advise a stale merge.
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+    (td / "repo").mkdir(); (td / "ws").mkdir()
+    _re_, _we_ = td / "repo" / ".env", td / "ws" / ".env"
+    _re_.write_text("GEMINI_API_KEY=sel\nDISCORD_BOT_TOKEN=selected # active credential\n")
+    _we_.write_text("GEMINI_API_KEY=sel\nDISCORD_BOT_TOKEN=old\n")
+    with _patch.object(sutando_config, "resolve_dotenv", return_value=_re_):
+        _r = hc.check_env_split(repo_env=_re_, ws_env=_we_)
+    check("annotated credential in the SELECTED file is not reported missing", _r, None)
 
 # 10. A command segment is UNKNOWN at `;` and end-of-line, not an empty parse.
 # Expectations come from bash itself (`set -e; set -a; .` inside a function).

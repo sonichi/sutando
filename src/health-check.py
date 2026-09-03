@@ -1688,7 +1688,10 @@ def check_env_split(repo_env: "Path | None" = None,
                         return None, "unparseable"
                     if tok not in SPLIT_OPS:
                         if tok.startswith("#") and lex.punctuation_chars:
-                            break          # comment: the rest of the line is text
+                            # comment: commit the segment before it, drop the rest
+                            out.update(_segment(words))
+                            words = []
+                            break
                         words.append(tok)
                         continue
                     out.update(_segment(words))
