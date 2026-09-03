@@ -133,9 +133,68 @@ if "(0d)" in _sub["detail"]:
 if _sub["detail"].index("nearly-a-day") > _sub["detail"].index("just-over"):
     FAILURES.append("sub-day-render: ordered by filesystem, not by age")
 
+
+# qingyun-wu's four uncovered branches (diff coverage 90.2% at e06b34d2), each a fixture that
+# reaches exactly one line; the mixed unreadable+held case is the one no earlier arm could produce.
+def _unlistable(results):
+    held = results / "held-no-consumer"
+    held.mkdir()
+    _touch(held / "parked.no-push-transport.txt")
+    held.chmod(0o000)          # exists, not listable: iterdir() itself raises
+
+
+if os.geteuid() != 0:
+    _r2 = Path(tempfile.mkdtemp())
+    (_r2 / "results").mkdir()
+    _unlistable(_r2 / "results")
+    hc.WORKSPACE_DIR = _r2
+    _res2 = hc.check_held_no_consumer()
+    (_r2 / "results" / "held-no-consumer").chmod(0o700)
+    check("unlistable-dir", _res2, "warn", ("could not scan results/held-no-consumer/",))
+else:
+    print("note: running as root — unlistable arm skipped, mode bits do not apply")
+
+
+def _nested_dir(results):
+    held = results / "held-no-consumer"
+    held.mkdir()
+    (held / "nested").mkdir()                       # not S_ISREG -> skipped, never counted
+    _touch(held / "parked.no-push-transport.txt")
+
+
+_nested = _probe(_nested_dir)
+check("nested-dir-skipped", _nested, "warn", ("parked.no-push-transport.txt",))
+if "nested" in _nested["detail"]:
+    FAILURES.append(f"nested-dir-skipped: a directory was counted as a held result: {_nested['detail']!r}")
+
+
+def _mixed(results):
+    held = results / "held-no-consumer"
+    held.mkdir()
+    _touch(held / "parked.no-push-transport.txt")
+    (held / "gone.no-push-transport.txt").symlink_to(held / "missing")   # stat() raises on the link only
+
+
+check("unreadable-beside-held", _probe(_mixed), "warn",
+      ("parked.no-push-transport.txt", "1 unreadable, so this count is a floor"))
+
+
+def _minutes(results):
+    held = results / "held-no-consumer"
+    held.mkdir()
+    _touch(held / "young.no-push-transport.txt", time.time() - 300)
+
+
+_r3 = Path(tempfile.mkdtemp())
+(_r3 / "results").mkdir()
+_minutes(_r3 / "results")
+hc.WORKSPACE_DIR = _r3
+check("minutes-render-at-lowered-threshold", hc.check_held_no_consumer(threshold_age_sec=60),
+      "warn", ("young.no-push-transport.txt (5m)",))
+
 if FAILURES:
     print("FAIL")
     for line in FAILURES:
         print(" ", line)
     sys.exit(1)
-print("PASS: 8 controls, both directions")
+print("PASS: 12 controls, both directions")
