@@ -36,6 +36,11 @@ import channel_env_containment  # noqa: E402 — the shared module the probe del
 
 _LOGIN = {"state": "blocked-human", "detail": "awaiting user: login",
           "prompt": "Login\nSelect login method:\n  1. Claude account", "kind": "login"}
+_LIMIT = {"state": "blocked-human", "detail": "awaiting user: session-limit",
+          "prompt": "You've hit your session limit · resets 12:10pm\n"
+                    "/usage-credits to finish what you're working on.\n"
+                    "Continuing automatically at 12:10pm · esc to cancel",
+          "kind": "session-limit"}
 _LOGGED_OUT = {"state": "logged-out", "detail": "core not authenticated (needs /login)",
                "prompt": None, "kind": None}
 _IDLE = {"state": "idle-ready", "detail": "ready for a task", "prompt": None, "kind": None}
@@ -143,6 +148,22 @@ class TestComposeMessage(unittest.TestCase):
         m = compose_message(_LOGIN)
         self.assertIn("GUI /login", m)
         self.assertNotIn("reply here or open the app", m)
+
+    def test_session_limit_escalates(self):
+        self.assertTrue(should_escalate(_LIMIT, None)[0])
+
+    def test_session_limit_names_the_reset_time_not_login(self):
+        m = compose_message(_LIMIT)
+        self.assertIn("resumes on its own at 12:10pm", m)
+        self.assertIn("/usage-credits", m)
+        self.assertNotIn("/login", m)
+        self.assertNotIn("restart.sh", m)
+
+    def test_session_limit_without_a_reset_time_still_avoids_login(self):
+        sig = dict(_LIMIT, prompt="You've hit your session limit")
+        m = compose_message(sig)
+        self.assertIn("when the limit window resets", m)
+        self.assertNotIn("/login", m)
 
     def test_non_login_blocker_names_the_cli_terminal(self):
         """A `blocked-human` prompt waits on the core's stdin. Neither a chat reply

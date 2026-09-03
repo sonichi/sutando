@@ -10,7 +10,7 @@ loaded into every session (see CLAUDE.md's note on context budget).
 If an entry reads wrong, the file's header comment is wrong: fix the header
 and re-run `python3 scripts/gen-src-map.py`.
 
-One entry per agent-facing module. 4 without a usable header comment.
+One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/`
 
@@ -147,6 +147,7 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`services_status.py`** — Per-host services-status emitter for the bundled Sutando runtime.
 - **`session-handoff.sh`** — Session handoff — writes a summary for the next session to pick up.
 - **`shepherd_contract.py`** — Shepherd contract: the responsibility scope a task accepts for an external objective, and the admission rule deciding which observed events belong to it.
+- **`shutdown.py`** — Graceful-shutdown sentinel — a durable, cross-process "we are shutting down on purpose (not crashing)" signal.
 - **`signal_room_tasks.py`** — Signal Room → Sutando task submission.
 - **`single_instance.py`** — Single-instance guard for long-running bridge daemons.
 - **`skill-setup-runner.ts`** — Shared runner for optional skills' setup() hooks.
@@ -264,6 +265,18 @@ One entry per agent-facing module. 4 without a usable header comment.
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
 - **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
 - **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
+
+## `src/hitl/`
+
+- **`__init__.py`** — _(no header comment)_
+- **`detector.py`** — Claude readiness detector — the Requirement Detector half of the runtime supervisor, and the one-state ClaudeTuiDriver v0 (AUTH_REQUIRED only).
+- **`events.py`** — Ingest RuntimeEvents dropped by the runtime drivers (the desktop watchdog's `hitl_events.rs`) into the HumanRequirement Manager.
+- **`manager.py`** — HumanRequirement Manager: durable requirement store + projection ledger.
+- **`policy.py`** — Manager-level auto-answer policy: the tail of permission requests that never needs a human.
+- **`projector.py`** — Projects HumanRequirement state into Matrix via an injected sender.
+- **`replies.py`** — Inbound half of the client action wire.
+- **`schema.py`** — HITL v1 domain model + wire contract (space.ag2.hitl).
+- **`supervisor.py`** — Runtime supervisor pass: detector -> manager -> projector, one turn.
 
 ## `src/launchd/`
 

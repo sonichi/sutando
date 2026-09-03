@@ -143,8 +143,140 @@ def _resolve_bounded(host, *args, **kwargs):
     return call.result
 
 
+# Resolver fallback: the OS cache can hold a stuck negative answer for the relay
+# host while the configured nameserver still resolves it — ask that one directly.
+_FALLBACK_TTL_S = float(os.environ.get("REMOTE_GATEWAY_DNS_FALLBACK_TTL") or "300")
+_FALLBACK_QUERY_TIMEOUT_S = 2.0
+_RESOLV_CONF = "/etc/resolv.conf"
+_fallback_cache: dict = {}  # host -> (expires_at_monotonic, [ip, ...])
+_fallback_lock = threading.Lock()
+
+
+def _system_nameservers(path=None):
+    """IPv4 nameservers from resolv.conf in file order; [] when unreadable.
+    IPv6 entries are skipped: the query socket is AF_INET only."""
+    out = []
+    try:
+        with open(path or _RESOLV_CONF) as fh:
+            for ln in fh:
+                parts = ln.split()
+                if len(parts) >= 2 and parts[0] == "nameserver" and ":" not in parts[1]:
+                    out.append(parts[1])
+    except OSError:
+        pass
+    return out
+
+
+def _skip_name(data, i):
+    while True:
+        n = data[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += 1 + n
+
+
+def _encode_qname(host):
+    out = b""
+    for label in host.rstrip(".").split("."):
+        b = label.encode("idna")
+        out += bytes([len(b)]) + b
+    return out + b"\x00"
+
+
+def _parse_a_records(data, qid, qname=None):
+    """A-record IPs from one DNS response; [] unless id, QR bit, RCODE and
+    the echoed question all match what was asked."""
+    import struct
+    try:
+        rid, flags, qd, an, _ns, _ar = struct.unpack("!HHHHHH", data[:12])
+        if rid != qid or not flags & 0x8000 or flags & 0x000F:
+            return []
+        i = 12
+        for _ in range(qd):
+            end = _skip_name(data, i)
+            if qname is not None and data[i:end].lower() != qname.lower():
+                return []
+            i = end + 4
+        ips = []
+        for _ in range(an):
+            i = _skip_name(data, i)
+            rtype, _cls, _ttl, rdlen = struct.unpack("!HHIH", data[i:i + 10])
+            i += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append(socket.inet_ntoa(data[i:i + 4]))
+            i += rdlen
+        return ips
+    except (IndexError, struct.error, OSError):
+        return []
+
+
+def _dns_a_query(host, nameserver, timeout=None, port=53):
+    """One UDP A query (RFC 1035), stdlib only; [] on any failure."""
+    import secrets
+    import struct
+    qid = secrets.randbelow(0xFFFF) + 1
+    qname = _encode_qname(host)
+    q = struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(_FALLBACK_QUERY_TIMEOUT_S if timeout is None else timeout)
+        # connect(): the kernel then drops datagrams from any other peer.
+        s.connect((nameserver, port))
+        s.send(q)
+        data = s.recv(4096)
+    except OSError:
+        return []
+    finally:
+        s.close()
+    return _parse_a_records(data, qid, qname)
+
+
+def _fallback_resolve(host):
+    """IPs for host via the system nameservers, cached; [] when none answers."""
+    now = time.monotonic()
+    with _fallback_lock:
+        hit = _fallback_cache.get(host)
+        if hit and hit[0] > now:
+            return list(hit[1])
+    for ns in _system_nameservers():
+        ips = _dns_a_query(host, ns)
+        if ips:
+            with _fallback_lock:
+                _fallback_cache[host] = (now + _FALLBACK_TTL_S, ips)
+            _log(f"system resolver failed for {host}; nameserver {ns} answered "
+                 f"{ips[0]} — using it for {_FALLBACK_TTL_S:.0f}s")
+            return ips
+    return []
+
+
+def _is_ip_literal(host):
+    for fam in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(fam, host)
+            return True
+        except (OSError, TypeError, ValueError):
+            pass
+    return False
+
+
 def _getaddrinfo_prefer_v4(host, *args, **kwargs):
-    infos = _resolve_bounded(host, *args, **kwargs)
+    try:
+        infos = _resolve_bounded(host, *args, **kwargs)
+    except socket.gaierror as err:
+        ips = []
+        if isinstance(host, str) and host and not _is_ip_literal(host):
+            try:
+                ips = _fallback_resolve(host)
+            except Exception:  # noqa: BLE001 — fallback must never mask the gaierror
+                ips = []
+        if not ips:
+            raise err
+        infos = []
+        for ip in ips:
+            # A literal IP never touches DNS: this only shapes the tuples.
+            infos.extend(_orig_getaddrinfo(ip, *args, **kwargs))
     if _PREFER_V4 and host and "ag2.space" in str(host):
         v4 = [i for i in infos if i[0] == socket.AF_INET]
         return v4 or infos
@@ -468,16 +600,7 @@ def _token_from_vault_ag2space(vault_get=None):
     without touching a real Keychain.
     """
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "channel_token.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        src = _monorepo_src("channel_token.py")
         if not src:
             return ""
         if src not in sys.path:
@@ -956,6 +1079,38 @@ def _guarded_result_body(tid: str, body: str):
 _VAULT_INTERCEPT_FNS: "tuple | None" = None
 
 
+def _monorepo_src(marker: str) -> str:
+    """The monorepo `src/` that holds `marker`, walking up from this file;
+    '' when sparrow runs standalone (pyproject install, no monorepo around it)."""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        if os.path.isfile(os.path.join(cur, "src", marker)):
+            return os.path.join(cur, "src")
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+
+
+def _hitl_reply_handler(owner_mxid: str, log=print):
+    """Owner card-click handler for HITL cards, or None when `src/hitl` is not
+    around (standalone sparrow) — the chain then simply lacks it, like the vault tier."""
+    try:
+        src = _monorepo_src(os.path.join("hitl", "replies.py"))
+        if not src:
+            return None
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl.manager import HitlManager, HitlStore, default_store
+        from hitl.replies import HitlReplyHandler
+        workspace = _STATE.parent
+        return HitlReplyHandler(HitlManager(HitlStore(default_store(workspace))), owner_mxid,
+                                workspace=workspace, log=log)
+    except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
+        log(f"hitl: reply handler unavailable ({e}); card clicks will not be applied")
+        return None
+
+
 def _vault_intercept_fns():
     """Lazily locate the monorepo `src/vault_intercept.py` helpers; memoized.
     Returns (None, None) on failure so a caller can fall back to `_local_redact_vault_set`."""
@@ -963,16 +1118,7 @@ def _vault_intercept_fns():
     if _VAULT_INTERCEPT_FNS is not None:
         return _VAULT_INTERCEPT_FNS
     try:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        src = ""
-        while True:
-            if os.path.isfile(os.path.join(cur, "src", "vault_intercept.py")):
-                src = os.path.join(cur, "src")
-                break
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
+        src = _monorepo_src("vault_intercept.py")
         if not src:
             _VAULT_INTERCEPT_FNS = (None, None)
             return _VAULT_INTERCEPT_FNS
@@ -3517,7 +3663,12 @@ def _maybe_start_event_channel() -> None:
         if ha_owner:
             from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
             store = ActionStore(str(_STATE / "human-actions"))
-            handler = HandlerChain([DecisionHandler(store, ha_owner, log=_log), handler])
+            # HITL card clicks ride the same owner-only chain, ahead of taskify.
+            claimants = [DecisionHandler(store, ha_owner, log=_log)]
+            hitl = _hitl_reply_handler(ha_owner, log=_log)
+            if hitl is not None:
+                claimants.append(hitl)
+            handler = HandlerChain(claimants + [handler])
             if ha_room:
                 poster = CardPoster(store, URL, _AUTH_HEADERS,
                                     ha_room, log=_log,
