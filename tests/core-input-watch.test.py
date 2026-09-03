@@ -52,6 +52,22 @@ _SESSION_LIMIT = ("● Monitor event: \"Streaming task watcher\"\n"
 _PERMISSION_WITH_FOOTER = (
     "  Do you want to proceed?\n  Allow this action\n  Esc to cancel\n"
     "  ────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
+# Claude Code's Fable weekly-limit dialog, reconstructed from the CLI bundle (v2.1.258),
+# not captured live: "Switch to <fallback> and continue" is focused by default.
+_FABLE_LIMIT = ("  You've reached your Fable limit\n"
+                "  You've used your included Fable usage for this week. Continuing on Fable 5.1 uses\n"
+                "  usage credits — you have $0.00 in credits.\n"
+                "  ❯ Switch to Opus 5 and continue\n"
+                "    Continue with Fable 5.1\n"
+                "  Esc to cancel")
+# The same dialog under a select-list footer, in case the generic one is not rendered.
+_FABLE_LIMIT_SELECT_FOOTER = _FABLE_LIMIT.rsplit("\n", 1)[0] + "\n  ↑/↓ to navigate · Enter to select"
+# The caret on the PAYING option (rui, #3739): Enter here spends credits, so this
+# must be a human gate however the text around it reads.
+_FABLE_LIMIT_UNFOCUSED = _FABLE_LIMIT.replace(
+    "  ❯ Switch to Opus 5 and continue\n    Continue with Fable 5.1",
+    "    Switch to Opus 5 and continue\n  ❯ Continue with Fable 5.1")
+assert _FABLE_LIMIT_UNFOCUSED != _FABLE_LIMIT
 
 
 class TestClassify(unittest.TestCase):
@@ -116,6 +132,60 @@ class TestClassify(unittest.TestCase):
         st, detail, _p, kind = compose_state(_SESSION_LIMIT, "working", True)
         self.assertEqual((st, kind), ("blocked-human", "session-limit"))
         self.assertIn("session-limit", detail)
+        self.assertIsNone(auto_answer("session-limit"))
+
+    def test_fable_limit_flags_as_its_own_kind(self):
+        self.assertEqual(classify(_FABLE_LIMIT)[0], "fable-limit")
+        self.assertEqual(classify(_FABLE_LIMIT_SELECT_FOOTER)[0], "fable-limit")
+
+    def test_fable_limit_is_a_known_gate_answered_with_enter(self):
+        # Enter takes the default-focused "Switch to <fallback> and continue": it
+        # spends nothing and keeps the core working (owner 2026-09-02).
+        st, _d, _p, kind = compose_state(_FABLE_LIMIT, "working", True)
+        self.assertEqual((st, kind), ("blocked-known", "fable-limit"))
+        self.assertEqual(auto_answer("fable-limit"), "Enter")
+
+    def test_fable_limit_with_the_caret_elsewhere_is_a_human_gate(self):
+        # Same dialog, caret on "Continue with Fable": Enter would spend credits.
+        kind, _ = classify(_FABLE_LIMIT_UNFOCUSED)
+        self.assertEqual(kind, "fable-limit-unfocused")
+        st, _d, _p, k = compose_state(_FABLE_LIMIT_UNFOCUSED, "working", True)
+        self.assertEqual((st, k), ("blocked-human", "fable-limit-unfocused"))
+        self.assertIsNone(auto_answer("fable-limit-unfocused"))
+        self.assertIsNone(_mod.answer_step("blocked-known", "fable-limit-unfocused", "p", None))
+
+    def test_switch_text_without_the_caret_is_not_the_answerable_kind(self):
+        # The switch phrase alone (scrollback, an unfocused row) must not read as focus.
+        pane = "  Switch to Opus 5 and continue\n  Esc to cancel"
+        self.assertNotEqual((classify(pane) or (None,))[0], "fable-limit")
+
+    def test_a_focused_switch_line_on_some_other_dialog_is_never_typed_at(self):
+        # sonichi (#3739): a dialog whose own text says it discards work carried the
+        # same "Switch to … and continue" row; without the Fable text it is unknown.
+        pane = ("  This will discard local changes\n"
+                "  ❯ Switch to origin/main and continue\n    Cancel\n  Esc to cancel")
+        kind, _ = classify(pane)
+        self.assertNotIn(kind, ("fable-limit", "fable-limit-unfocused"))
+        self.assertIsNone(auto_answer(kind))
+
+    def test_a_resolved_fable_dialog_above_another_dialog_does_not_vouch_for_it(self):
+        # sonichi's residual: the Fable text still inside the tail, then a NEW dialog
+        # with its own focused switch row. Co-presence is not adjacency.
+        pane = (_FABLE_LIMIT.replace("  ❯ Switch to Opus 5 and continue", "    Switch to Opus 5 and continue")
+                .rsplit("\n", 1)[0]
+                + "\n  [resolved]\n  This will discard local changes\n"
+                  "  ❯ Switch to origin/main and continue\n    Cancel\n  Esc to cancel")
+        kind, _ = classify(pane)
+        self.assertEqual(kind, "unknown")
+        self.assertIsNone(auto_answer(kind))
+        # ...while the real dialog, whose body wraps onto a second line, still qualifies.
+        wrapped = _FABLE_LIMIT.replace("uses\n  usage credits", "uses\n  usage\n  credits")
+        self.assertEqual(classify(wrapped)[0], "fable-limit")
+
+    def test_fable_limit_and_session_limit_stay_distinct(self):
+        # One is a switch the monitor may take; the other is a wait/spend decision.
+        self.assertEqual(classify(_FABLE_LIMIT)[0], "fable-limit")
+        self.assertEqual(classify(_SESSION_LIMIT)[0], "session-limit")
         self.assertIsNone(auto_answer("session-limit"))
 
     def test_unforeseen_prompt_surfaces_as_unknown(self):
@@ -196,8 +266,10 @@ class TestComposeState(unittest.TestCase):
 class TestAutoAnswer(unittest.TestCase):
     """M4 decision safety: only strictly-safe gates auto-answer; all else escalates."""
 
-    def test_press_enter_is_the_only_auto_answer(self):
+    def test_allowlist_is_exactly_press_enter_and_fable_limit(self):
         self.assertEqual(auto_answer("press-enter"), "Enter")
+        self.assertEqual(auto_answer("fable-limit"), "Enter")
+        self.assertEqual(set(_mod._AUTO_ANSWER), {"press-enter", "fable-limit"})
 
     def test_login_never_auto_answered(self):
         self.assertIsNone(auto_answer("login"))
@@ -215,6 +287,121 @@ class TestAutoAnswer(unittest.TestCase):
         # auto-accept a trust / dangerous-mode prompt without explicit opt-in.
         self.assertIsNone(auto_answer("folder-trust"))
         self.assertIsNone(auto_answer("bypass-permissions"))
+
+
+class TestAnswerStep(unittest.TestCase):
+    """The actor's pure half: a settled, allowlisted gate gets one key per instance."""
+
+    def test_sends_enter_for_a_settled_fable_limit(self):
+        self.assertEqual(_mod.answer_step("blocked-known", "fable-limit", "p1", None), "Enter")
+
+    def test_same_prompt_instance_is_answered_once(self):
+        self.assertIsNone(_mod.answer_step("blocked-known", "fable-limit", "p1", "p1"))
+        self.assertEqual(_mod.answer_step("blocked-known", "fable-limit", "p2", "p1"), "Enter")
+
+    def test_human_gates_are_never_typed_at(self):
+        for kind in ("login", "session-limit", "fable-limit-unfocused", "permission", "selection", "unknown"):
+            self.assertIsNone(_mod.answer_step("blocked-known", kind, "p", None), kind)
+        self.assertIsNone(_mod.answer_step("blocked-human", "fable-limit", "p", None))
+
+    def test_a_settling_prompt_is_not_answered(self):
+        self.assertIsNone(_mod.answer_step("running", "fable-limit", None, None))
+
+    def test_disabled_flag_reports_only(self):
+        self.assertIsNone(_mod.answer_step("blocked-known", "fable-limit", "p1", None, enabled=False))
+
+
+class TestMainAutoAnswerWiring(unittest.TestCase):
+    """One --once tick against a Fable-limit pane: the key is typed through send_keys
+    and the signal file records it; --no-auto-answer only reports."""
+
+    def _tick(self, extra_args, pane=None):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        sent = []
+        pane = _FABLE_LIMIT if pane is None else pane
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "working"}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--once", "--stable", "1"] + extra_args
+        with patch.object(_mod, "capture", lambda s, sess: pane), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod, "send_keys", lambda s, sess, k: sent.append((s, sess, k)) or True), \
+                patch.object(sys, "argv", argv):
+            main()
+        with open(out) as f:
+            return sent, json.load(f)
+
+    def test_fable_limit_is_typed_at_and_recorded(self):
+        sent, payload = self._tick([])
+        self.assertEqual(sent, [("/tmp/x.sock", "sutando-core", "Enter")])
+        self.assertEqual(payload["kind"], "fable-limit")
+        self.assertEqual(payload["auto_answered"]["kind"], "fable-limit")
+        self.assertEqual(payload["auto_answered"]["key"], "Enter")
+
+    def test_caret_on_the_paying_option_is_escalated_never_typed(self):
+        sent, payload = self._tick([], pane=_FABLE_LIMIT_UNFOCUSED)
+        self.assertEqual(sent, [])
+        self.assertEqual((payload["state"], payload["kind"]), ("blocked-human", "fable-limit-unfocused"))
+        self.assertNotIn("auto_answered", payload)
+
+    def test_an_expired_answer_record_is_dropped_from_the_signal(self):
+        # The record rides along for AUTO_ANSWER_CARRY_S; past that it is gone.
+        from unittest.mock import patch
+        with patch.object(_mod, "AUTO_ANSWER_CARRY_S", -1.0):
+            sent, payload = self._tick([])
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("auto_answered", payload)
+
+    def test_no_auto_answer_flag_reports_only(self):
+        sent, payload = self._tick(["--no-auto-answer"])
+        self.assertEqual(sent, [])
+        self.assertEqual(payload["kind"], "fable-limit")
+        self.assertNotIn("auto_answered", payload)
+
+
+class TestSendKeys(unittest.TestCase):
+    """send_keys reports what tmux did: True only on a zero exit, False on a
+    non-zero exit or when tmux cannot be run at all — never an exception."""
+
+    def _with_fake_tmux(self, script):
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        log = os.path.join(d, "argv.log")
+        p = os.path.join(d, "tmux")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n" + script + "\n")
+        os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+        return d, log
+
+    def test_zero_exit_is_true_and_the_key_reaches_the_session_pane(self):
+        from unittest.mock import patch
+        d, log = self._with_fake_tmux("exit 0")
+        with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
+            self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+        with open(log) as f:
+            self.assertEqual(f.read().split("\n")[:6],
+                             ["-S", "/tmp/x.sock", "send-keys", "-t", "sutando-core:0", "Enter"])
+
+    def test_non_zero_exit_is_false(self):
+        from unittest.mock import patch
+        d, _ = self._with_fake_tmux("exit 1")
+        with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
+            self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+
+    def test_an_unrunnable_tmux_is_false_not_an_exception(self):
+        from unittest.mock import patch
+        with patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
+            self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
 
 
 class TestEnsureTmuxOnPath(unittest.TestCase):

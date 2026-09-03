@@ -340,30 +340,56 @@ def get_status() -> dict:
     }
 
 
+def _read_or_none(path) -> "str | None":
+    """Stripped file text, or None when it is absent — one call, no exists()
+    race between the check and the read."""
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+def _newest_first(paths) -> list:
+    """Paths sorted newest-first, skipping any that vanish during the scan.
+
+    A claim renames a task file, so any glob entry can be gone before its stat.
+    """
+    pairs = []
+    for p in paths:
+        try:
+            pairs.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    pairs.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in pairs]
+
+
 def _active_task_rows() -> list[dict]:
     """Reconcile task/result files into the ten most recent history rows."""
     # Classifier tasks are machinery, not user work, so they stay out of the
     # history the UI shows.
-    for task_file in sorted(
-        (
-            path
-            for path in TASK_DIR.glob("*.txt")
-            if not path.stem.startswith(
-                (
-                    task_workstreams.CLASSIFIER_TASK_PREFIX,
-                    task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
-                )
+    for task_file in _newest_first(
+        path
+        for path in TASK_DIR.glob("*.txt")
+        if not path.stem.startswith(
+            (
+                task_workstreams.CLASSIFIER_TASK_PREFIX,
+                task_workstreams.LEGACY_CLASSIFIER_TASK_PREFIX,
             )
-        ),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+        )
     )[:10]:
         # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
         # the reply at results/{id}.txt — so key AND look up by the canonical id.
         task_id = task_id_from_filename(task_file.name)
         if task_id is None:
             continue
-        content = task_file.read_text()
+        try:
+            content = task_file.read_text()
+            task_mtime = task_file.stat().st_mtime
+        except FileNotFoundError:
+            # Claimed and renamed between the glob and here; the row reappears
+            # under the claimed name on the next poll.
+            continue
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
@@ -377,32 +403,28 @@ def _active_task_rows() -> list[dict]:
             if candidate.exists():
                 archived_file = candidate
                 break
-        if result_file.exists():
+        result_text = _read_or_none(result_file)
+        if result_text is not None:
             status = "done"
-            result_text = result_file.read_text().strip()
         elif existing.get("status") == "done" or existing.get("result"):
             status = "done"
             result_text = existing.get("result", "")
-        elif archived_file is not None:
+        elif archived_file is not None and (_archived := _read_or_none(archived_file)) is not None:
             status = "done"
-            result_text = archived_file.read_text().strip()
+            result_text = _archived
         else:
             status = "working"
             result_text = ""
         task_history[task_id] = {
             "status": status,
             "text": task_line or existing.get("text", task_id),
-            "time": task_file.stat().st_mtime,
+            "time": task_mtime,
             "result": result_text,
             "source": source_line or existing.get("source", ""),
         }
 
     # Results may outlive their task files after bridge cleanup.
-    for result_file in sorted(
-        RESULT_DIR.glob("task-*.txt"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:10]:
+    for result_file in _newest_first(RESULT_DIR.glob("task-*.txt"))[:10]:
         _remember_done_result_file(result_file)
 
     # Reconcile stale rows after the disk scans above.
