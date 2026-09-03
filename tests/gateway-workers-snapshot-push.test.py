@@ -32,6 +32,9 @@ def main() -> int:
     os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:9"  # never contacted
     os.environ["REMOTE_TASK_TOKEN"] = "testtoken"
     os.environ["REMOTE_TASK_PROVIDER"] = "remote-gateway"
+    for k in ("SUTANDO_WORKER_ID", "SUTANDO_WORKER_SEAT", "SUTANDO_CORE_ID",
+              "SUTANDO_WORKER_LOCATION"):
+        os.environ.pop(k, None)  # hermetic: the host's seat must not leak in
 
     spec = importlib.util.spec_from_file_location(
         "rtc_push", Path(__file__).resolve().parent.parent / "src" / "remote-gateway-bridge.py")
@@ -57,8 +60,11 @@ def main() -> int:
     snap_path.write_text(json.dumps(blob))
     check(rtc._maybe_push_workers_snapshot() is True,
           "new snapshot pushes")
-    check(calls == [("POST", "/v1/workers", blob)],
-          "pushed the exact blob to POST /v1/workers")
+    # The pushing seat stamps itself onto the lead's file (worker-aware brokers
+    # key workers by seat); an unconfigured process is the home seat.
+    check(calls == [("POST", "/v1/workers",
+                     {**blob, "worker_id": "home", "location": "local"})],
+          "pushed the blob + this seat's worker_id/location to POST /v1/workers")
     check(rtc._maybe_push_workers_snapshot() is False and len(calls) == 1,
           "unchanged snapshot never re-posts")
 

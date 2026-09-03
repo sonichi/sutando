@@ -202,6 +202,42 @@ handler must be before affinity yields — lower favors latency, higher favors
 conversational continuity; `continuity_breaks` in the pool metrics measures
 what that choice costs.
 
+### Cloud worker (#3794, slice 1 — client half)
+
+A cloud worker is the same gateway client (`packages/ag2-sparrow/ag2_sparrow/
+remote_gateway_bridge.py`) on another host, sharing the agent identity and
+speaking to the broker as one seat of it. Two env knobs, read at import like
+`REMOTE_TASK_URL`:
+
+- `SUTANDO_WORKER_ID` — the seat name on the wire (`home` by default;
+  `worker-<n>` is derived when only `SUTANDO_CORE_ID` is set, matching the
+  pool's own convention). Charset `[A-Za-z0-9_-]`, at most 32 characters.
+- `SUTANDO_WORKER_LOCATION` — `cloud` marks a cloud seat; anything else is
+  `local`.
+
+The seat rides every wire call: `worker=` on `GET /v1/tasks`, `worker_id` +
+`location` on `POST /v1/heartbeat` and on the `POST /v1/workers` snapshot push.
+A broker that predates seats ignores all three and serves the agent's queue
+exactly as before; a worker-aware broker (the ag2space-backend half of #3794)
+keys its queues and leases per seat and fails a lease over from a seat that
+stops beating.
+
+A cloud seat depends on nothing from this host: it pulls straight into its own
+`tasks/`, its seat answers into its own `results/`, and the client POSTs the
+result. `state/pool-status.json` and `state/cores/` are read only when they
+exist — no lead, no pool files, no affinity table are required on that host.
+`tests/gateway-worker-queue-client.test.py` runs that cycle against a stub
+broker with none of them present.
+
+Redelivery is at-least-once. The broker re-fronts a task whose lease expired,
+so a seat can receive an id it already holds. The client never queues it twice
+while the first copy is live (pending, `.assigned-*` or `.claimed-*` file) and
+re-acks it so the broker learns the seat still has it; an id already archived
+or delivered closes the lease with a `[no-send]` marker. What the client cannot
+prevent is a lease shorter than an honest task: the broker then hands the same
+id to another seat, which answers it too. Set the visibility timeout above the
+longest honest task.
+
 ### Turning on a Codex follower
 
 The runtime dimension (`--runtime` / `--core-runtime`) declares which CLI a core

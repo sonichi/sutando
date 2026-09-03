@@ -12,14 +12,17 @@ exposes a tiny HTTP protocol; this client pulls *your* tasks down into the local
 Full spec: docs/remote-gateway-protocol.md
 
   Protocol (versioned, Bearer-auth):
-  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>
+  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>&worker=<worker-id>
        → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
+       `worker` names the pulling seat; a broker that ignores it serves the
+       agent's queue exactly as before (one queue per agent identity).
   POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
        → body {"id": "<task-id>"}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/results
        → body {"id": "<task-id>", "body": "<result text>"}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/heartbeat
-       → body {"client": "...", "inflight": N, ...}  → 200 on accepted
+       → body {"client": "...", "inflight": N, "worker_id": "...",
+               "location": "local|cloud", ...}  → 200 on accepted
 
 Each task object uses the same schema Sutando's other bridges write, so this
 client just serializes it to `tasks/task-<id>.txt` and the core handles it like
@@ -27,6 +30,24 @@ any Discord/Telegram/Slack task. When `results/task-<id>.txt` appears, its body
 is POSTed back and the result file is archived. Ack/heartbeat are best-effort:
 if an older gateway returns 404/405, the client keeps working against the
 original pull/result protocol.
+
+Worker seats (issue: cloud workers sharing the agent identity). Every client is
+a queue client for ONE seat of the agent: the home seat (`home`), a pool seat
+(`worker-N`) or a cloud seat. The seat rides every wire call (`worker=` on the
+pull, `worker_id`/`location` on heartbeat and the workers-snapshot push) so a
+worker-aware broker can dispatch per seat and fail a lease over from a seat
+that stops beating. A cloud seat runs this same client with its own workspace:
+the pull → `tasks/` → `results/` → POST cycle needs nothing from another host —
+`state/pool-status.json` and `state/cores/` are read only when present.
+
+Lease safety (at-least-once). The broker's lease re-fronts a task on expiry, so
+a slow seat can see its own task delivered again, or a peer seat can receive it.
+Locally a re-delivered id is never queued twice while the first copy is live
+(`_write_task`: pending, assigned or claimed file → no rewrite; archived or
+delivered → `[no-send]` lease close), and the result sink dedupes on the task
+id. What this client cannot prevent: a lease shorter than the seat's honest
+task time hands the SAME id to another seat, which then answers it too — set
+the broker's visibility timeout above the longest honest task.
 
 Config (env / .env):
   REMOTE_TASK_TOKEN      the onboarding string — the ONLY required setting
@@ -42,6 +63,10 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+  SUTANDO_WORKER_ID     this seat's worker id on the wire (default "home";
+                        `worker-<SUTANDO_CORE_ID>` when only the pool seat
+                        number is set). Charset [A-Za-z0-9_-], max 32.
+  SUTANDO_WORKER_LOCATION  "cloud" marks a cloud seat; anything else is "local"
   REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
@@ -1536,6 +1561,34 @@ if LOCAL_TIER == "other":
 if LOCAL_TIER not in ("owner", "team", "guest"):
     LOCAL_TIER = "guest"
 
+# Same id charset as GATEWAY_INSTANCE: it lands in a query string and in
+# broker-side queue keys, so a stray value fails at import, never on the wire.
+_WORKER_ID_RE = _INSTANCE_RE
+
+
+def _worker_identity() -> "tuple[str, str]":
+    """(worker_id, location) for this seat, from env only.
+
+    SUTANDO_WORKER_ID wins; a bare pool seat number (SUTANDO_WORKER_SEAT or
+    SUTANDO_CORE_ID) derives `worker-<n>` the way the room-ops scripts do; an
+    unconfigured process is the home seat. Location is "cloud" only when
+    SUTANDO_WORKER_LOCATION says so — a typo degrades to today's local path."""
+    wid = (os.environ.get("SUTANDO_WORKER_ID") or "").strip()
+    if not wid:
+        seat = (os.environ.get("SUTANDO_WORKER_SEAT")
+                or os.environ.get("SUTANDO_CORE_ID") or "").strip()
+        wid = f"worker-{seat}" if seat else "home"
+    if not _WORKER_ID_RE.fullmatch(wid):
+        sys.exit("FATAL: SUTANDO_WORKER_ID must match "
+                 f"{_WORKER_ID_RE.pattern} (ASCII only; got {wid!r})")
+    loc = (os.environ.get("SUTANDO_WORKER_LOCATION") or "").strip().lower()
+    return wid, ("cloud" if loc == "cloud" else "local")
+
+
+WORKER_ID, WORKER_LOCATION = _worker_identity()
+# The poll's query suffix, built once: `&worker=<seat>` after `wait=<sec>`.
+_SEAT_QS = f"&worker={urllib.parse.quote(WORKER_ID, safe='')}"
+
 
 # A local per-sender map can only cap the broker tier; unlisted senders use LOCAL_TIER.
 # Cache identity includes mtime, size, and inode so revocations take effect promptly.
@@ -2176,6 +2229,8 @@ def _maybe_push_workers_snapshot() -> bool:
         return False  # mid-write or malformed: the next change retries
     if not isinstance(snap, dict):
         return False
+    # The pushing seat is authoritative about itself; the lead's file is not.
+    snap = {**snap, "worker_id": WORKER_ID, "location": WORKER_LOCATION}
     try:
         _req("POST", "/v1/workers", snap, timeout=15)
     except urllib.error.HTTPError as e:
@@ -2259,6 +2314,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
+            "worker_id": WORKER_ID,
+            "location": WORKER_LOCATION,
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
                              "core-status", "team-collaborator"],
         }
@@ -3904,7 +3961,7 @@ def main() -> None:
             _retry_review_card_resolutions()
             _retry_review_control_results()
             try:
-                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_SEAT_QS}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
