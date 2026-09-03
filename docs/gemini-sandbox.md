@@ -59,6 +59,35 @@ The PR auto-review branch of the team rulebook still uses Codex (it inlines the
 diff into `codex exec`). On a gemini-only install it takes its documented failure
 path, an owner ping, rather than a review.
 
+## What the sandbox can and cannot see
+
+Checked on macOS with the real CLI, both directions, so a null result means something:
+
+- From `/tmp`, a sandboxed run asked to list `~/.gemini` and print
+  `~/.gemini/projects.json` was refused by the CLI's workspace boundary
+  (`Path not in workspace ... allowed workspace directories: /private/tmp`).
+- The same run asked to create a file in `/tmp` was refused (`plan` mode) and the
+  file did not exist afterwards. So the confinement engages.
+
+The CLI itself still reads user-level state from `~/.gemini` at startup (a
+`GEMINI.md` there, history, extensions), whatever the working directory. With
+`GEMINI_API_KEY` set the wrapper therefore runs the CLI with a fresh, empty `HOME`
+that is deleted when the run ends. Without the key the user's own `~/.gemini` is
+where OAuth credentials live, so `HOME` is kept and the wrapper says so on stderr.
+
+`GEMINI_CLI_TRUST_WORKSPACE=true` is set because a headless run has nobody to
+answer the trust prompt. Trust means the CLI may load context files from the
+working directory: `/tmp` for other-tier tasks, the owner's workspace for
+team-tier ones. It does not widen what the sandbox may read.
+
+Off macOS, `--sandbox` needs Docker or Podman. The wrapper refuses to run when
+neither is on PATH rather than letting a non-owner task run unconfined.
+
+One thing to know when reading answers: the bridge's sandbox prompt tells the
+model it is answering as Sutando and to refer to Sutando's skills, so an answer
+may name skills from the model's own knowledge of this public repository even
+when it could read nothing. That is the prompt, not a leak.
+
 ## Verify
 
 ```

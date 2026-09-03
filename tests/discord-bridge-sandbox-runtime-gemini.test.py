@@ -66,8 +66,8 @@ codex_other = (
 check(mod._render_sandbox_rulebook(codex_team, "codex") == codex_team, "codex rendering is the identity (team)")
 check(mod._render_sandbox_rulebook(codex_other, "codex") == codex_other, "codex rendering is the identity (other)")
 
-team = mod._render_sandbox_rulebook(codex_team, "gemini", repo="/ws", results=results)
-other = mod._render_sandbox_rulebook(codex_other, "gemini", repo="/ws", results=results)
+team = mod._render_sandbox_rulebook(codex_team, "gemini", repo="/ws", results=results, pr_review=True)
+other = mod._render_sandbox_rulebook(codex_other, "gemini", repo="/ws", results=results, pr_review=False)
 
 check(f"bash skills/claude-gemini/scripts/gemini-sandbox.sh --cd /ws -o {results}/.codex-staging-{{id}}.txt -- \"$(cat /p)\" < /dev/null" in team,
       "team Stage 1 becomes the gemini wrapper in the workspace, same -o and prompt")
@@ -97,6 +97,22 @@ check(mod.sandbox_fallback_nonzero(7, "codex") == mod.SANDBOX_FALLBACK_NONZERO.f
       "the helper reproduces the codex constant exactly")
 check(not mod.is_sandbox_fallback_sentinel("Sandbox unavailable (gemini exit 1) — no reply generated. Also this."),
       "still an exact match, never a prefix match")
+
+# The guard is loud, not silent: a reworded heading raises instead of renaming the
+# codex-specific paragraph into instructions for a command that does not exist.
+reworded = codex_team.replace("2b. MESSAGE OWNER", "2b. NOTIFY THE OWNER")
+try:
+    mod._render_sandbox_rulebook(reworded, "gemini", repo="/ws", results=results, pr_review=True)
+    check(False, "a reworded PR-review heading raises")
+except ValueError as exc:
+    check("PR-review paragraph markers" in str(exc), "a reworded PR-review heading raises, naming the markers")
+try:
+    mod._render_sandbox_rulebook(codex_other + "2. PR-REVIEW REQUEST stray\n", "gemini", repo="/ws", results=results, pr_review=False)
+    check(False, "a PR-review marker in the other rulebook raises")
+except ValueError:
+    check(True, "a PR-review marker in the other rulebook raises")
+check(mod._render_sandbox_rulebook(reworded, "codex", pr_review=True) == reworded,
+      "codex stays the identity even when the markers are missing")
 
 # The builder hands the whole dict through _apply_sandbox_runtime.
 books = {"owner": "", "team-collaborator": "engage", "team": codex_team, "other": codex_other}

@@ -36,6 +36,7 @@ fake.write_text(r'''#!/usr/bin/env bash
 printf '%s\n' "$@" > "$FAKE_GEMINI_ARGS"
 cat > "$FAKE_GEMINI_STDIN"
 pwd > "$FAKE_GEMINI_PWD"
+printf '%s\n' "$HOME" > "$FAKE_GEMINI_HOME"
 case "${FAKE_GEMINI_MODE:-ok}" in
   ok)      printf '{"response": "The answer is 42.\\nSecond line.", "stats": {"x": 1}}' ;;
   empty)   printf '{"response": "   ", "stats": {}}' ;;
@@ -45,10 +46,18 @@ case "${FAKE_GEMINI_MODE:-ok}" in
 esac
 ''')
 fake.chmod(0o755)
+# A fake container runtime, so the platform check passes on Linux CI as it does on macOS.
+(fake_bin / "docker").write_text("#!/usr/bin/env bash\nexit 0\n")
+(fake_bin / "docker").chmod(0o755)
+only_gemini = tmp / "only-gemini"
+only_gemini.mkdir()
+(only_gemini / "gemini").write_text(fake.read_text())
+(only_gemini / "gemini").chmod(0o755)
 
 env = {**os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
        "FAKE_GEMINI_ARGS": str(tmp / "args"), "FAKE_GEMINI_STDIN": str(tmp / "stdin"),
-       "FAKE_GEMINI_PWD": str(tmp / "pwd")}
+       "FAKE_GEMINI_PWD": str(tmp / "pwd"), "FAKE_GEMINI_HOME": str(tmp / "home"),
+       "GEMINI_API_KEY": "test-key-not-real"}
 work = tmp / "work"
 work.mkdir()
 
@@ -71,6 +80,38 @@ check("--sandbox" in args, "sandboxed")
 check("--output-format" in args and args[args.index("--output-format") + 1] == "json", "json output")
 check((tmp / "stdin").read_text() == "", "stdin is closed, so gemini cannot wait on it")
 check(os.path.realpath((tmp / "pwd").read_text().strip()) == os.path.realpath(str(work)), "runs in --cd")
+
+seen_home = (tmp / "home").read_text().strip()
+check(seen_home != os.environ.get("HOME") and "gemini-sandbox-home." in seen_home,
+      "with GEMINI_API_KEY set the run gets a fresh empty HOME, not the user's")
+check(not pathlib.Path(seen_home).exists(), "and that HOME is removed when the run ends")
+
+r_nokey = subprocess.run(["bash", str(SCRIPT), "--cd", str(work), "-o", str(tmp / "nokey.txt"), "--", "hi"],
+                         env={k: v for k, v in {**env, "FAKE_GEMINI_MODE": "ok"}.items() if k != "GEMINI_API_KEY"},
+                         capture_output=True, text=True)
+check(r_nokey.returncode == 0 and (tmp / "home").read_text().strip() == os.environ.get("HOME")
+      and "keeping HOME" in r_nokey.stderr,
+      "without the key HOME is kept for the CLI's own auth, and stderr says so")
+
+# A PATH with everything the script needs and no container runtime at all. /usr/bin
+# cannot be on it: GitHub's Linux runners ship /usr/bin/docker.
+import shutil
+tools = tmp / "tools"
+tools.mkdir()
+for name in ("bash", "uname", "mktemp", "rm", "sed", "cat", "printf", "env"):
+    found = shutil.which(name)
+    if found:
+        os.symlink(found, tools / name)
+os.symlink(sys.executable, tools / "python3")
+no_runtime = {**env, "FAKE_GEMINI_MODE": "ok", "PATH": f"{only_gemini}{os.pathsep}{tools}"}
+r_nort = subprocess.run(["bash", str(SCRIPT), "--cd", str(work), "-o", str(tmp / "nort.txt"), "--", "hi"],
+                        env=no_runtime, capture_output=True, text=True)
+if os.uname().sysname == "Darwin":
+    check(r_nort.returncode == 0 and (tmp / "nort.txt").exists(),
+          "on macOS the curated PATH is enough and seatbelt needs no runtime (control for the case below)")
+else:
+    check(r_nort.returncode == 2 and "docker or podman" in r_nort.stderr and not (tmp / "nort.txt").exists(),
+          "off macOS, no container runtime means refuse, not run unconfined")
 
 r, out = run("fail")
 check(r.returncode == 3 and not out.exists(), "a nonzero gemini exit is forwarded and nothing is written")

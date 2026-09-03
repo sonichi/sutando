@@ -14,15 +14,18 @@
 # Usage: gemini-sandbox.sh --cd DIR -o FILE [--model M] -- PROMPT...
 #
 # Env: GEMINI_API_KEY (or whatever auth the gemini CLI is configured with).
+#      With the key set, the run gets a fresh empty HOME so no user-level
+#      ~/.gemini state reaches a non-owner task.
 #      SEATBELT_PROFILE defaults to restrictive-open on macOS: strict file
-#      restrictions, network allowed (the model call needs it).
+#      restrictions, network allowed (the model call needs it). Off macOS the
+#      sandbox needs docker or podman, and the script refuses without one.
 set -euo pipefail
 
 WORKDIR=""
 OUT=""
 MODEL=""
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,10 +47,34 @@ if ! command -v gemini >/dev/null 2>&1; then
   exit 127
 fi
 
-# Headless runs have nobody to answer the workspace-trust prompt.
+# The Gemini CLI reads user-level state from ~/.gemini (GEMINI.md context, history,
+# projects, extensions) whatever the working directory is. A non-owner task must not
+# see any of that, so when the API key is in the environment the child gets a fresh,
+# empty HOME. With no key the user's own ~/.gemini is the only place OAuth
+# credentials can come from, so HOME is kept and that is said on stderr.
+if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+  SCRUB_HOME="$(mktemp -d "${TMPDIR:-/tmp}/gemini-sandbox-home.XXXXXX")"
+  trap 'rm -rf "$SCRUB_HOME"' EXIT
+  export HOME="$SCRUB_HOME"
+else
+  echo "gemini-sandbox: GEMINI_API_KEY is not set, keeping HOME so the CLI's own auth can be used; user-level ~/.gemini state is visible to this run" >&2
+fi
+
+# Headless runs have nobody to answer the folder-trust prompt. Trust here means the
+# CLI may load context files from the working directory: /tmp for other-tier tasks
+# (nothing there) and the owner's own workspace for team-tier tasks. It does not
+# widen what the sandbox may read, which the workspace boundary and the sandbox
+# profile decide.
 export GEMINI_CLI_TRUST_WORKSPACE=true
+
+# The sandbox must actually engage. On macOS --sandbox is seatbelt, always present.
+# Elsewhere it needs Docker or Podman, and without either this refuses rather than
+# letting a non-owner task run unconfined.
 if [[ "$(uname -s)" == "Darwin" ]]; then
   export SEATBELT_PROFILE="${SEATBELT_PROFILE:-restrictive-open}"
+elif ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
+  echo "gemini-sandbox: --sandbox needs docker or podman on this platform and neither is on PATH; refusing to run unconfined" >&2
+  exit 2
 fi
 
 cmd=(gemini --prompt "$PROMPT" --approval-mode plan --sandbox --output-format json)

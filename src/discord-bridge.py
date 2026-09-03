@@ -433,18 +433,38 @@ _PR_REVIEW_START = "2. PR-REVIEW REQUEST"
 _PR_REVIEW_END = "2b. MESSAGE OWNER"
 
 
-def _render_sandbox_rulebook(text: str, runtime: str, repo=None, results=None) -> str:
+def _render_sandbox_rulebook(text: str, runtime: str, repo=None, results=None,
+                             *, pr_review: bool = False) -> str:
     """Rewrite a codex-worded tier rulebook for another sandbox runtime.
 
     Identity for codex, so the default install's rulebooks are byte-identical to
     before this option existed. For gemini: the two Stage-1 commands become the
     gemini-sandbox.sh wrapper, which keeps the `-o FILE -- PROMPT` contract, and
     the word codex becomes gemini everywhere except the PR-review paragraph.
+
+    `pr_review` says whether the text is expected to carry that paragraph (the team
+    rulebook does, the other one does not). Either way a mismatch raises, so a
+    reworded heading breaks at import rather than silently renaming a paragraph
+    into instructions for a command that does not exist.
     """
     if runtime == "codex":
         return text
     if runtime != "gemini":
         raise ValueError(f"no rulebook rendering for sandbox runtime {runtime!r}")
+    start = text.find(_PR_REVIEW_START)
+    end = text.find(_PR_REVIEW_END)
+    found = start != -1 and end != -1 and start < end
+    if pr_review and not found:
+        raise ValueError(
+            "sandbox rulebook: the PR-review paragraph markers "
+            f"{_PR_REVIEW_START!r} .. {_PR_REVIEW_END!r} were not found in order; "
+            "the paragraph is codex-specific and cannot be rendered for another runtime"
+        )
+    if not pr_review and (start != -1 or end != -1):
+        raise ValueError(
+            "sandbox rulebook: a PR-review marker appeared in a rulebook that is not "
+            "expected to carry that paragraph"
+        )
     repo = str(repo if repo is not None else REPO)
     results = str(results if results is not None else RESULTS_DIR)
     text = text.replace(_CODEX_STAGE1_OTHER.format(results=results),
@@ -464,9 +484,7 @@ def _render_sandbox_rulebook(text: str, runtime: str, repo=None, results=None) -
             seg = seg.replace(f"\x00{i}\x00", k)
         return seg
 
-    start = text.find(_PR_REVIEW_START)
-    end = text.find(_PR_REVIEW_END)
-    if start != -1 and end != -1 and start < end:
+    if found:
         return rename(text[:start]) + text[start:end] + rename(text[end:])
     return rename(text)
 
@@ -478,7 +496,7 @@ def _apply_sandbox_runtime(tier_instructions: dict, runtime: str | None = None) 
         return tier_instructions
     out = dict(tier_instructions)
     for tier in ("team", "other"):
-        out[tier] = _render_sandbox_rulebook(out[tier], runtime)
+        out[tier] = _render_sandbox_rulebook(out[tier], runtime, pr_review=(tier == "team"))
     return out
 
 
