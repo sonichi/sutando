@@ -560,6 +560,36 @@ grep -q "would exec" "$TMP/ws18.out" \
   && say ok "absent status = nothing running = proceed" \
   || say FAIL "absent status now blocks the restart — the empty-read fix over-reached"
 
+echo "19. the phase stream is PERSISTED to logs/graceful-restart.log (the app pipes stdout only into itself)"
+WS19="$TMP/ws19"; mkws "$WS19"
+out="$(GR_WS="$WS19" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run 2>&1)"
+rid="$(printf '%s\n' "$out" | sed -n 's/^graceful-restart\[\(grp-[0-9]*-[0-9]*\)\].*/\1/p' | head -1)"
+LOG19="$WS19/logs/graceful-restart.log"
+[ -f "$LOG19" ] \
+  && say ok "log file created under the workspace" \
+  || say FAIL "no $LOG19 — the stream still lives only in the caller's pipe"
+[ -n "$rid" ] && grep -q "graceful-restart\[$rid\]: DRY-RUN — would exec" "$LOG19" 2>/dev/null \
+  && say ok "the decision line landed on disk, scoped to this run's RID ($rid)" \
+  || say FAIL "decision line for rid='$rid' missing from the log"
+grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z graceful-restart\[' "$LOG19" 2>/dev/null \
+  && say ok "persisted lines are UTC-timestamped" \
+  || say FAIL "persisted lines carry no timestamp"
+# stdout is a contract with main.swift's phase matcher: no timestamp may leak into it.
+if printf '%s\n' "$out" | grep -q '^graceful-restart\[' && ! printf '%s\n' "$out" | grep -q '^[0-9]\{4\}-[0-9]\{2\}-'; then
+  say ok "stdout shape unchanged (no timestamp prefix in the app's phase stream)"
+else
+  say FAIL "stdout shape changed — main.swift's restartPhaseMessage matcher may break"
+fi
+n_out="$(printf '%s\n' "$out" | grep -c '^graceful-restart\[')"
+n_log="$(grep -c "graceful-restart\[$rid\]" "$LOG19" 2>/dev/null || echo 0)"
+[ "$n_out" -gt 0 ] && [ "$n_out" = "$n_log" ] \
+  && say ok "every stdout phase line ($n_out) has a disk twin" \
+  || say FAIL "stdout has $n_out phase lines, disk has $n_log — one side is missing a line"
+GR_WS="$WS19" GR_SYNC_CMD="true" GR_POLL_S=1 bash "$GR" --dry-run >/dev/null 2>&1
+grep -q "graceful-restart\[$rid\]" "$LOG19" \
+  && say ok "a later run APPENDS — the earlier run's trace survives" \
+  || say FAIL "the second run truncated the first run's trace"
+
 if [ "$fails" = 0 ]; then
   echo "ALL PASS"
 else
