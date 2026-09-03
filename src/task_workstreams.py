@@ -25,6 +25,7 @@ from typing import Optional
 
 import local_task_protocol
 from result_markers import parse_markers
+from task_archive import task_id_for
 from workspace_default import status_read_path
 
 
@@ -220,17 +221,24 @@ def _parse_timestamp(raw: str, fallback: float) -> float:
         return fallback
 
 
+def _task_id_of(path: Path) -> str | None:
+    """Canonical id of a task file under the archive-lookup grammar; the
+    persisted `id:` outranks the filename, and pool suffixes canonicalize."""
+    return task_id_for(path, accept=local_task_protocol.valid_archive_lookup_id)
+
+
 def _task_paths(tasks_dir: Path):
+    """Yield (canonical task id, path) for each distinct task, live copy first."""
     seen = set()
     candidates = list(tasks_dir.glob("task-*.txt"))
     candidates.extend((tasks_dir / "processed").glob("task-*.txt"))
     candidates.extend(local_task_protocol.iter_archived_tasks(tasks_dir))
-    # Prefer the live copy when duplicate ids exist; archive copies follow.
     for path in candidates:
-        if path.stem in seen:
+        task_id = _task_id_of(path)
+        if task_id is None or task_id in seen:
             continue
-        seen.add(path.stem)
-        yield path
+        seen.add(task_id)
+        yield task_id, path
 
 
 def _result_index(results_dir: Path) -> dict[str, Path]:
@@ -261,8 +269,7 @@ def scan_task_history(workspace: Path) -> list[TaskRecord]:
     tasks_dir = workspace / "tasks"
     results = _result_index(workspace / "results")
     rows: list[TaskRecord] = []
-    for path in _task_paths(tasks_dir):
-        task_id = path.stem
+    for task_id, path in _task_paths(tasks_dir):
         if task_id.startswith((CLASSIFIER_TASK_PREFIX, LEGACY_CLASSIFIER_TASK_PREFIX)):
             continue
         try:

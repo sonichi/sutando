@@ -8,6 +8,7 @@ import time
 import multiprocessing
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -19,6 +20,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import task_workstreams as workstreams  # noqa: E402
+from task_archive import task_id_from_filename  # noqa: E402
 
 # The enqueue is off by default; its gate is exercised directly in
 # test_classifier_enqueue_is_off_by_default. Every other test assumes it on.
@@ -89,6 +91,205 @@ def test_history_uses_invocation_time_and_owner_candidates() -> None:
     assert "task-team" not in json.dumps(snapshot)
 
 
+def test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count() -> None:
+    # The pool renames task-<id>.txt -> task-<id>.claimed-core-N.txt while a
+    # worker holds it; path.stem then yields an id nothing else ever writes.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-claimed-id-"))
+    write_task(
+        workspace / "tasks" / "task-c1.claimed-core-3.txt",
+        "task-c1", "2026-08-03T10:00:00Z", "in-flight claimed work",
+    )
+    write_task(
+        workspace / "tasks" / "task-c2.assigned-core-2.txt",
+        "task-c2", "2026-08-03T10:01:00Z", "assigned but unclaimed",
+    )
+    (workspace / "results").mkdir(parents=True, exist_ok=True)
+
+    ids = [row.id for row in workstreams.scan_task_history(workspace)]
+    assert ids == ["task-c2", "task-c1"], ids
+
+    # Same task, live claim plus its archived copy: one row, and the live one,
+    # which is what the "prefer the live copy" dedupe was always meant to do.
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "task-c1.txt",
+        "task-c1", "2026-08-03T10:00:00Z", "in-flight claimed work",
+    )
+    rows = workstreams.scan_task_history(workspace)
+    assert [row.id for row in rows].count("task-c1") == 1
+    assert next(row for row in rows if row.id == "task-c1").status == "working"
+
+    # A claimed task's result is written under the canonical id, so resolving
+    # the id is what lets history see the task as done at all.
+    write_result(workspace, "task-c1")
+    done = next(row for row in workstreams.scan_task_history(workspace) if row.id == "task-c1")
+    assert done.result == "done"
+
+
+def test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes() -> None:
+    # iter_archived_tasks() yields ask-*/sc-ask-*/reco-skill-* rows by contract;
+    # a task-*-anchored canonicalizer must not drop them from history.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-legacy-ids-"))
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "ask-123.txt",
+        "ask-123", "2026-08-03T10:00:00Z", "legacy ask producer",
+    )
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "sc-ask-9.txt",
+        "sc-ask-9", "2026-08-03T10:01:00Z", "legacy screen-companion ask",
+    )
+    write_task(
+        workspace / "tasks" / "task-c1.claimed-core-3.txt",
+        "task-c1", "2026-08-03T10:02:00Z", "in-flight claimed work",
+    )
+    (workspace / "results").mkdir(parents=True, exist_ok=True)
+    (workspace / "state").mkdir(parents=True, exist_ok=True)
+    (workspace / "state" / "core-status.json").write_text('{"status":"idle"}\n')
+
+    ids = [row.id for row in workstreams.scan_task_history(workspace)]
+    assert ids == ["task-c1", "sc-ask-9", "ask-123"], ids
+    snapshot_ids = [row["id"] for row in workstreams.build_classifier_snapshot(workspace)["tasks"]]
+    assert "ask-123" in snapshot_ids and "sc-ask-9" in snapshot_ids, snapshot_ids
+    assert "task-c1.claimed-core-3" not in ids
+    # The archive gate still rejects traversal-shaped names even if one landed.
+    assert workstreams._task_id_of(Path("..txt")) is None
+    assert workstreams._task_id_of(Path("...txt")) is None
+
+
+def test_a_gateway_id_that_looks_claimed_is_its_own_task_beside_the_short_one() -> None:
+    # `task-a.claimed-review` is a legal gateway id, not a pool rename of task-a:
+    # the persisted `id:` decides, and a genuine claimed-core-3 still canonicalizes.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-gateway-id-"))
+    try:
+        tasks = workspace / "tasks"
+        write_task(tasks / "task-a.txt", "task-a", "2026-08-03T11:00:00Z", "short")
+        write_task(tasks / "task-a.claimed-review.txt", "task-a.claimed-review",
+                   "2026-08-03T11:05:00Z", "long")
+        write_task(tasks / "task-c.claimed-core-3.txt", "task-c", "2026-08-03T11:06:00Z", "pool")
+        write_result(workspace, "task-a.claimed-review", "the answer")
+        store = workspace / "data" / "task-workstreams.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({
+            "schema_version": 1,
+            "workstreams": {"workstream-x": {"title": "X", "summary": "s"}},
+            "assignments": {"task-a.claimed-review": {"workstream_id": "workstream-x"}},
+            "reviews": {},
+        }))
+        payload = workstreams.task_history_payload(workspace)
+        rows = {row["id"]: row for row in payload["tasks"]}
+        assert set(rows) == {"task-a", "task-a.claimed-review", "task-c"}, sorted(rows)
+        assert rows["task-a.claimed-review"]["status"] == "done"
+        assert rows["task-a.claimed-review"]["result"] == "the answer"
+        assert rows["task-a"]["status"] == "working"
+        assert rows["task-a.claimed-review"].get("workstream_id") == "workstream-x", rows["task-a.claimed-review"]
+        assert any(w.get("id") == "workstream-x" for w in payload["workstreams"])
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment() -> None:
+    # Pool-state canonicalization is a task-* rule: `ask-123.claimed-review` and
+    # `ask-123` are distinct archive ids, and collapsing them drops an assignment.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-legacy-claimed-"))
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "ask-123.claimed-review.txt",
+        "ask-123.claimed-review", "2026-08-03T10:00:00Z", "legacy id with a dot",
+    )
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "ask-123.txt",
+        "ask-123", "2026-08-03T10:01:00Z", "its plain sibling",
+    )
+    write_task(
+        workspace / "tasks" / "archive" / "2026-08" / "task-c1.claimed-core-3.txt",
+        "task-c1", "2026-08-03T10:02:00Z", "task-* grammar still canonicalizes",
+    )
+    (workspace / "results").mkdir(parents=True, exist_ok=True)
+    (workspace / "state").mkdir(parents=True, exist_ok=True)
+    (workspace / "state" / "core-status.json").write_text('{"status":"idle"}\n')
+    store_path = workstreams._store_path(workspace)
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {"workstream-x": {"title": "X"}},
+        "assignments": {"ask-123.claimed-review": {"workstream_id": "workstream-x"}},
+    }))
+
+    ids = [row.id for row in workstreams.scan_task_history(workspace)]
+    assert ids == ["task-c1", "ask-123", "ask-123.claimed-review"], ids
+    payload = {row["id"]: row for row in workstreams.task_history_payload(workspace)["tasks"]}
+    assert payload["ask-123.claimed-review"].get("workstream_id") == "workstream-x", payload
+    assert "workstream_id" not in payload["ask-123"], payload["ask-123"]
+    assert workstreams._task_id_of(Path("ask-123.claimed-review.txt")) == "ask-123.claimed-review"
+    assert workstreams._task_id_of(Path("ask-123.assigned-core-2.txt")) == "ask-123.assigned-core-2"
+    assert workstreams._task_id_of(Path("task-c1.claimed-core-3.txt")) == "task-c1"
+
+
+def test_a_stem_containing_txt_archive_failed_is_one_record_not_a_quarantine() -> None:
+    # A name ending in .txt is an ordinary record whose id is the whole stem;
+    # collapsing it onto `ask-123` hides a row and drops its assignment.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-terminal-txt-"))
+    write_task(workspace / "tasks" / "archive" / "2026-08" / "ask-123.txt",
+               "ask-123", "2026-08-03T10:00:00Z", "the short one")
+    write_task(workspace / "tasks" / "archive" / "2026-08" / "ask-123.txt.archive-failed-review.txt",
+               "ask-123.txt.archive-failed-review", "2026-08-03T10:01:00Z", "the long one")
+    write_task(workspace / "tasks" / "archive" / "2026-08" / "task-a.txt.archive-failed-review.txt",
+               "task-a.txt.archive-failed-review", "2026-08-03T10:02:00Z", "task-shaped long one")
+    (workspace / "results").mkdir(parents=True, exist_ok=True)
+    (workspace / "state").mkdir(parents=True, exist_ok=True)
+    (workspace / "state" / "core-status.json").write_text('{"status":"idle"}\n')
+    store_path = workstreams._store_path(workspace)
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    store_path.write_text(json.dumps({
+        "schema_version": workstreams.SCHEMA_VERSION,
+        "workstreams": {"workstream-x": {"title": "X"}},
+        "assignments": {"ask-123.txt.archive-failed-review": {"workstream_id": "workstream-x"}},
+    }))
+    ids = [row.id for row in workstreams.scan_task_history(workspace)]
+    assert ids == ["task-a.txt.archive-failed-review", "ask-123.txt.archive-failed-review", "ask-123"], ids
+    payload = {row["id"]: row for row in workstreams.task_history_payload(workspace)["tasks"]}
+    assert payload["ask-123.txt.archive-failed-review"].get("workstream_id") == "workstream-x"
+    assert "workstream_id" not in payload["ask-123"]
+    assert task_id_from_filename("task-a.txt.archive-failed-review.txt") == "task-a.txt.archive-failed-review"
+    # A real quarantine and a numbered collision still identify by their prefix.
+    assert workstreams._task_id_of(Path("ask-9.txt.archive-failed-2")) == "ask-9"
+    assert workstreams._task_id_of(Path("ask-9.txt.3")) == "ask-9"
+    assert task_id_from_filename("task-c1.claimed-core-3.txt") == "task-c1"
+
+
+def test_history_derives_every_id_through_the_shared_path_to_id_owner() -> None:
+    # One path -> id owner: the scan calls task_archive.task_id_for with the
+    # archive grammar, and a private copy of the rule cannot pass this.
+    import task_archive
+    assert workstreams.task_id_for is task_archive.task_id_for
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-owner-pin-"))
+    try:
+        write_task(workspace / "tasks" / "task-a.claimed-core-3.txt",
+                   "task-a", "2026-08-03T10:00:00Z", "x")
+        (workspace / "results").mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(workstreams, "task_id_for", return_value="task-from-owner") as owner:
+            ids = [row.id for row in workstreams.scan_task_history(workspace)]
+        assert ids == ["task-from-owner"], ids
+        assert owner.call_args.kwargs["accept"] is workstreams.local_task_protocol.valid_archive_lookup_id
+        assert not hasattr(workstreams, "_declared_id") and not hasattr(workstreams, "_archive_task_id")
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_result_index_survives_unreadable_roots() -> None:
+    # A missing results dir, or an archive root whose walk raises, yields an
+    # empty index rather than taking the history scan down.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-result-index-"))
+    try:
+        assert workstreams._result_index(workspace / "results") == {}
+        results = workspace / "results"
+        (results / "archive-2026").mkdir(parents=True)
+        (results / "task-r1.txt").write_text("done")
+        with mock.patch.object(Path, "rglob", side_effect=OSError(13, "denied")):
+            index = workstreams._result_index(results)
+        assert list(index) == ["task-r1"], index
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def test_loader_parser_and_history_fail_open_edges() -> None:
     workspace = fixture_workspace()
     store_path = workspace / "data" / "task-workstreams.json"
@@ -114,7 +315,8 @@ def test_loader_parser_and_history_fail_open_edges() -> None:
 
     duplicate = workspace / "tasks" / "task-a1.txt"
     write_task(duplicate, "task-a1", "2026-08-03T11:00:00Z", "live duplicate")
-    assert [path.stem for path in workstreams._task_paths(workspace / "tasks")].count("task-a1") == 1
+    ids = [task_id for task_id, _ in workstreams._task_paths(workspace / "tasks")]
+    assert ids.count("task-a1") == 1
 
     no_text = workspace / "tasks" / "task-no-text.txt"
     no_text.write_text("id: task-no-text\nsource: discord\n")
@@ -994,6 +1196,13 @@ def test_reused_workstream_id_does_not_require_a_redundant_name() -> None:
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
+        test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count,
+        test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes,
+        test_a_gateway_id_that_looks_claimed_is_its_own_task_beside_the_short_one,
+        test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment,
+        test_a_stem_containing_txt_archive_failed_is_one_record_not_a_quarantine,
+        test_history_derives_every_id_through_the_shared_path_to_id_owner,
+        test_result_index_survives_unreadable_roots,
         test_loader_parser_and_history_fail_open_edges,
         test_task_text_keeps_the_whole_body_not_just_its_first_line,
         test_task_text_stops_at_headers_that_follow_the_task_line,
