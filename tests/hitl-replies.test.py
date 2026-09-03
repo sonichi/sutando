@@ -22,12 +22,21 @@ from hitl.replies import (  # noqa: E402
     REPLY_FIELD,
     HitlReplyHandler,
     actions_dir,
+    match_action,
     parse_reply,
 )
 from hitl.events import events_dir, ingest  # noqa: E402
 from hitl.manager import HitlManager, HitlStore  # noqa: E402
 
 OWNER = "@owner:ag2.space"
+
+
+def _mgr_with(req):
+    """A manager whose store already holds `req` — for the fallback path, which
+    looks a requirement up by the card event it was projected as."""
+    m = HitlManager(HitlStore(Path(tempfile.mkdtemp())))
+    m.create(req)
+    return m
 
 
 def event(payload, actor=OWNER, etype="message.created", eid="$e1", **content):
@@ -211,6 +220,69 @@ class ReplyHandlerTests(unittest.TestCase):
         self.assertEqual(chain.offer(event(None, eid="$chat")), ["$chat"])
         self.assertEqual(seen, ["$chat"])
         self.assertEqual(self.mgr.get(self.req.id).chosen_action, "allow")
+
+
+class TestFallbackCarriesTheNote(unittest.TestCase):
+    """The client appends the human's note to the click body so the timeline
+    shows what they actually said; the fallback must still recognise the click
+    AND carry the note on as the answer."""
+
+    def _req(self):
+        return HumanRequirement(
+            kind="choice", runtime="claude", message="m", guard="g",
+            actions=[Action(id="not_now", kind="answer", label="Not now"),
+                     Action(id="approve", kind="answer", label="Approve it")])
+
+    def test_a_bare_label_is_still_a_click_with_no_note(self):
+        a, note = match_action(self._req(), "Not now")
+        self.assertEqual(a.id, "not_now")
+        self.assertIsNone(note)
+
+    def test_label_plus_note_is_the_same_click_carrying_the_note(self):
+        a, note = match_action(
+            self._req(), "Not now — I will talk to him. Ignore his request for now.")
+        self.assertEqual(a.id, "not_now")
+        self.assertEqual(note, "I will talk to him. Ignore his request for now.")
+
+    def test_a_sentence_merely_starting_with_a_label_is_not_a_click(self):
+        """Without the separator requirement, 'Not nowadays...' would answer
+        the card — a prose reply silently becoming a decision."""
+        a, note = match_action(self._req(), "Not nowadays, this needs thought")
+        self.assertIsNone(a)
+        self.assertIsNone(note)
+
+    def test_an_unrelated_reply_stays_a_message(self):
+        a, _ = match_action(self._req(), "what does this even mean?")
+        self.assertIsNone(a)
+
+    def test_a_label_with_an_empty_note_is_a_bare_click(self):
+        a, note = match_action(self._req(), "Not now —   ")
+        self.assertEqual(a.id, "not_now")
+        self.assertIsNone(note)
+
+    def test_the_action_id_also_matches(self):
+        a, note = match_action(self._req(), "approve: rui has waited long enough")
+        self.assertEqual(a.id, "approve")
+        self.assertEqual(note, "rui has waited long enough")
+
+    def test_the_note_reaches_the_wire_as_answer(self):
+        h = HitlReplyHandler(_mgr_with(self._req()), "@owner:x")
+        req = h._manager.active()[0]
+        h._manager.store.save(req, projection={"revision": 1, "event_id": "$card"})
+        ev = h.task_to_event({"id": "t", "source_message_id": "$m", "channel_id": "!r",
+                              "user_id": "@owner:x", "reply_to_event": "$card",
+                              "task": "Not now — talking to him first"})
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["content"][REPLY_FIELD]["answer"], "talking to him first")
+
+    def test_a_bare_click_puts_no_answer_on_the_wire(self):
+        h = HitlReplyHandler(_mgr_with(self._req()), "@owner:x")
+        req = h._manager.active()[0]
+        h._manager.store.save(req, projection={"revision": 1, "event_id": "$card"})
+        ev = h.task_to_event({"id": "t", "source_message_id": "$m", "channel_id": "!r",
+                              "user_id": "@owner:x", "reply_to_event": "$card",
+                              "task": "Not now"})
+        self.assertNotIn("answer", ev["content"][REPLY_FIELD])
 
 
 if __name__ == "__main__":
