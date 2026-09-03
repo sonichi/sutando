@@ -13,6 +13,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Configure a workspace](workspace-config.md) — defaults, overrides, and
   resolver APIs.
 - [Run Codex as the core](codex-core.md) — core selection, setup, and rollback.
+- [Gemini as the non-owner sandbox](gemini-sandbox.md) — `sandbox.runtime`, for installs without Codex CLI.
 - [Use built-in tools](built-in-tools.md) — authoritative capability catalog.
 - [External runtime dependencies](runtime-dependencies.md) — what must be
   installed, what only a feature needs, and what to vendor when embedding.

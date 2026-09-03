@@ -115,6 +115,7 @@ _PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparr
 if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 from workspace_default import resolve_workspace  # noqa: E402
+from sutando_config import resolve_sandbox_runtime  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
 from util_paths import claude_home_path, personal_path, shared_personal_path, write_private_text  # noqa: E402
@@ -393,9 +394,92 @@ SANDBOX_FALLBACK_NONZERO = "Sandbox unavailable (codex exit {rc}) — no reply g
 SANDBOX_FALLBACK_NO_OUTPUT = "Sandbox unavailable (codex exited 0 with no output) — no reply generated."
 _LEGACY_SANDBOX_SENTINEL = "Sandbox unavailable; refusing non-owner task."
 _SANDBOX_SENTINEL_RE = re.compile(
-    r"\A(?:Sandbox unavailable \(codex exit \d+\) — no reply generated\."
-    r"|Sandbox unavailable \(codex exited 0 with no output\) — no reply generated\.)\Z"
+    r"\A(?:Sandbox unavailable \((?:codex|gemini) exit \d+\) — no reply generated\."
+    r"|Sandbox unavailable \((?:codex|gemini) exited 0 with no output\) — no reply generated\.)\Z"
 )
+
+# The read-only sandbox that answers non-owner tasks: codex (the rulebooks' native
+# wording) or gemini, which swaps Stage 1 only. See docs/gemini-sandbox.md.
+SANDBOX_RUNTIME = resolve_sandbox_runtime()
+
+
+def sandbox_fallback_nonzero(rc, runtime: str | None = None) -> str:
+    return f"Sandbox unavailable ({runtime or SANDBOX_RUNTIME} exit {rc}) — no reply generated."
+
+
+def sandbox_fallback_no_output(runtime: str | None = None) -> str:
+    return f"Sandbox unavailable ({runtime or SANDBOX_RUNTIME} exited 0 with no output) — no reply generated."
+
+
+_CODEX_STAGE1_TEAM = (
+    "bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- "
+    "codex exec --sandbox read-only --skip-git-repo-check -o {results}/.codex-staging-{{id}}.txt -- "
+)
+_CODEX_STAGE1_OTHER = (
+    "bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- "
+    "codex exec --sandbox read-only --skip-git-repo-check -C /tmp -o {results}/.codex-staging-{{id}}.txt -- "
+)
+_GEMINI_STAGE1_TEAM = (
+    "bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- "
+    "bash skills/claude-gemini/scripts/gemini-sandbox.sh --cd {repo} -o {results}/.codex-staging-{{id}}.txt -- "
+)
+_GEMINI_STAGE1_OTHER = (
+    "bash skills/claude-codex/scripts/codex-bounded.sh --stall 45 --max 240 -- "
+    "bash skills/claude-gemini/scripts/gemini-sandbox.sh --cd /tmp -o {results}/.codex-staging-{{id}}.txt -- "
+)
+# The PR auto-review branch of the team rulebook is codex-specific (review-pr.sh
+# inlines the diff into codex) and is left alone whatever the sandbox runtime.
+_PR_REVIEW_START = "2. PR-REVIEW REQUEST"
+_PR_REVIEW_END = "2b. MESSAGE OWNER"
+
+
+def _render_sandbox_rulebook(text: str, runtime: str, repo=None, results=None) -> str:
+    """Rewrite a codex-worded tier rulebook for another sandbox runtime.
+
+    Identity for codex, so the default install's rulebooks are byte-identical to
+    before this option existed. For gemini: the two Stage-1 commands become the
+    gemini-sandbox.sh wrapper, which keeps the `-o FILE -- PROMPT` contract, and
+    the word codex becomes gemini everywhere except the PR-review paragraph.
+    """
+    if runtime == "codex":
+        return text
+    if runtime != "gemini":
+        raise ValueError(f"no rulebook rendering for sandbox runtime {runtime!r}")
+    repo = str(repo if repo is not None else REPO)
+    results = str(results if results is not None else RESULTS_DIR)
+    text = text.replace(_CODEX_STAGE1_OTHER.format(results=results),
+                        _GEMINI_STAGE1_OTHER.format(results=results))
+    text = text.replace(_CODEX_STAGE1_TEAM.format(results=results),
+                        _GEMINI_STAGE1_TEAM.format(results=results, repo=repo))
+
+    # Paths keep their names: the bounded runner lives in the claude-codex skill and
+    # the staging file is still .codex-staging so Stage 2 needs no change.
+    _keep = ("skills/claude-codex/", "codex-bounded.sh", ".codex-staging-")
+
+    def rename(seg: str) -> str:
+        for i, k in enumerate(_keep):
+            seg = seg.replace(k, f"\x00{i}\x00")
+        seg = seg.replace("CODEX", "GEMINI").replace("Codex", "Gemini").replace("codex", "gemini")
+        for i, k in enumerate(_keep):
+            seg = seg.replace(f"\x00{i}\x00", k)
+        return seg
+
+    start = text.find(_PR_REVIEW_START)
+    end = text.find(_PR_REVIEW_END)
+    if start != -1 and end != -1 and start < end:
+        return rename(text[:start]) + text[start:end] + rename(text[end:])
+    return rename(text)
+
+
+def _apply_sandbox_runtime(tier_instructions: dict, runtime: str | None = None) -> dict:
+    """The tier rulebooks for the configured sandbox runtime. Untouched for codex."""
+    runtime = runtime or SANDBOX_RUNTIME
+    if runtime == "codex":
+        return tier_instructions
+    out = dict(tier_instructions)
+    for tier in ("team", "other"):
+        out[tier] = _render_sandbox_rulebook(out[tier], runtime)
+    return out
 
 
 def is_sandbox_fallback_sentinel(body: str) -> bool:
@@ -4137,6 +4221,7 @@ async def _handle_discord_message(message, force=False):
             "===END SUTANDO SYSTEM INSTRUCTIONS===\n"
         ),
     }
+    tier_instructions = _apply_sandbox_runtime(tier_instructions)
 
     # Auto-react BEFORE writing the task — gives the user an instant visual ack
     # at gateway-event speed, while the rest of task processing (file write,

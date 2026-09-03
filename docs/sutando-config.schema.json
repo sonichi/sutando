@@ -29,7 +29,22 @@
           "type": "integer",
           "minimum": 1,
           "default": 10,
-          "description": "Commits behind origin/<expected_branch> before health-check's live-checkout-branch probe warns that the checkout is stale. Being ON the right branch is only half of being current \u2014 a checkout can sit on main and still run weeks-old code. Deliberately not 1: main moves several times a day, so warning on any delta trains the reader to ignore the probe. Invalid values (non-integer, zero, negative) fall back to 10 rather than crashing the health check or warning on a current checkout. No env-var override."
+          "description": "Commits behind origin/<expected_branch> before health-check's live-checkout-branch probe warns that the checkout is stale. Being ON the right branch is only half of being current — a checkout can sit on main and still run weeks-old code. Deliberately not 1: main moves several times a day, so warning on any delta trains the reader to ignore the probe. Invalid values (non-integer, zero, negative) fall back to 10 rather than crashing the health check or warning on a current checkout. No env-var override."
+        }
+      }
+    },
+    "sandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Read-only sandbox that answers non-owner (team/other) Discord tasks. Codex by default. Set gemini on an install without Codex CLI, which needs the gemini CLI on PATH and GEMINI_API_KEY (or other gemini auth) in .env. SUTANDO_SANDBOX_RUNTIME env var overrides per-invocation.",
+      "properties": {
+        "runtime": {
+          "type": "string",
+          "enum": [
+            "codex",
+            "gemini"
+          ],
+          "default": "codex"
         }
       }
     },
@@ -48,14 +63,14 @@
     "claude_sutando_config_dir": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Where the Sutando-scoped Claude Code config lives \u2014 set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
+      "description": "Where the Sutando-scoped Claude Code config lives — set via the `claude-sutando` shell function as CLAUDE_CONFIG_DIR. Constrained to a workspace sub-folder so the M2 vault sync engine can include it via a single workspace-relative glob; if the path escapes the workspace, sync coherence breaks.",
       "properties": {
         "subdir": {
           "type": "string",
           "minLength": 1,
           "default": ".claude-sutando",
           "pattern": "^(?!.*\\.\\.)(?!/)[^/].*$",
-          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace \u2014 absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
+          "description": "Sub-folder of <workspace> for CLAUDE_CONFIG_DIR. MUST be a relative sub-path of the workspace — absolute paths (leading `/`) and `..` parent-directory escapes are rejected. The loader additionally asserts the resolved final path stays under workspace (defense in depth)."
         }
       }
     },
@@ -116,7 +131,7 @@
         "sync": {
           "type": "object",
           "additionalProperties": false,
-          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. include/exclude arrays REPLACE on merge (not unioned) \u2014 overriding either in .local.json wipes the defaults for that array. Use exclude_extra to ADD a carve-out while keeping the shipped ones.",
+          "description": "What to sync. Include is an allowlist of paths relative to the workspace root; exclude carves out machine-local noise from within included paths. include/exclude arrays REPLACE on merge (not unioned) — overriding either in .local.json wipes the defaults for that array. Use exclude_extra to ADD a carve-out while keeping the shipped ones.",
           "properties": {
             "include": {
               "type": "array",
@@ -159,7 +174,11 @@
       "properties": {
         "down_bridge_action": {
           "type": "string",
-          "enum": ["restart", "alert", "off"],
+          "enum": [
+            "restart",
+            "alert",
+            "off"
+          ],
           "default": "alert",
           "description": "What --fix does with a configured-but-not-running channel bridge. `restart`: restart it (only from a canonical checkout — clean + on main) and alert; if the checkout guard fails, downgrade to alert-only. `alert` (the default): never restart, only alert. `off`: do nothing. Overridable via $SUTANDO_DOWN_BRIDGE_ACTION. See resolve_down_bridge_action() in src/sutando_config.py."
         }
@@ -172,7 +191,7 @@
       "properties": {
         "progress_stream": {
           "type": "boolean",
-          "description": "Emit in-channel '\u23f3 working\u2026 (Ns)' progress placeholders while a task runs."
+          "description": "Emit in-channel '⏳ working… (Ns)' progress placeholders while a task runs."
         },
         "discord_post_gate": {
           "description": "Discord post-gate policy resolved by src/channels/discord/post_gate.py for every Discord sender. Either one path applied to every channel, or a {channel_id: path} map. Unset: ungated. A configured path that fails to load refuses sends (fail-closed). Env override: $SUTANDO_DISCORD_POST_GATE.",
@@ -184,7 +203,9 @@
             {
               "type": "object",
               "description": "Per-channel policy files. `*` is REQUIRED and is the fallback for any channel not listed: without it an unlisted channel would send unvalidated, so the resolver refuses the whole mapping. An entry with a null/blank path refuses that one channel.",
-              "required": ["*"],
+              "required": [
+                "*"
+              ],
               "propertyNames": {
                 "pattern": "^\\S+$",
                 "description": "Channel ids carry no surrounding whitespace. The resolver strips keys; an untrimmed one would route that channel to `*` instead of its own policy."
@@ -197,7 +218,10 @@
                 }
               },
               "additionalProperties": {
-                "type": ["string", "null"],
+                "type": [
+                  "string",
+                  "null"
+                ],
                 "description": "Policy file for this channel id."
               }
             }

@@ -52,9 +52,11 @@ _LOCAL_FILENAME = "sutando.config.local.json"
 # break. Per Mini's review #8 on PR #1395.
 _KNOWN_TOP_LEVEL_KEYS = {
     "core",
+    "sandbox",
     "workspace",
     "claude_sutando_config_dir",
     "core_config_dirs",
+    "sandbox",        # non-owner sandbox runtime: codex (default) or gemini
     "vault",
     "migrate",
     "env",
@@ -67,6 +69,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
 # `"type": "object"` already forbids; _load_json enforces it at read time.
 _OBJECT_TOP_LEVEL_KEYS = {
     "core",
+    "sandbox",
     "workspace",
     "claude_sutando_config_dir",
     "vault",
@@ -77,6 +80,9 @@ _OBJECT_TOP_LEVEL_KEYS = {
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
+# The read-only sandbox that answers non-owner (team/other) tasks. Codex is the
+# default; gemini is for installs without Codex CLI (docs/gemini-sandbox.md).
+_SUPPORTED_SANDBOX_RUNTIMES = {"codex", "gemini"}
 
 _DOWN_BRIDGE_ACTIONS = {"restart", "alert", "off"}
 
@@ -591,6 +597,24 @@ _DEFAULT_CLAUDE_SUTANDO_SUBDIR = ".claude-sutando"
 
 
 _LEGACY_CLAUDE_SUBDIR_WARN_PRINTED = False
+
+
+def resolve_sandbox_runtime(repo_root: Optional[Path] = None) -> str:
+    """Return the sandbox runtime that answers non-owner (team/other) tasks.
+
+    ``SUTANDO_SANDBOX_RUNTIME`` is an invocation-scoped override. Otherwise
+    ``sandbox.runtime`` is read from merged config. Codex remains the default so
+    upgrading does not change what existing installations delegate to.
+    """
+    sandbox = load_config(repo_root).get("sandbox") or {}
+    configured = str(sandbox.get("runtime") or "codex").strip()
+    runtime = os.environ.get("SUTANDO_SANDBOX_RUNTIME", "").strip() or configured
+    if runtime not in _SUPPORTED_SANDBOX_RUNTIMES:
+        supported = ", ".join(sorted(_SUPPORTED_SANDBOX_RUNTIMES))
+        raise ValueError(
+            f"sutando config: unsupported sandbox.runtime={runtime!r}; expected one of: {supported}"
+        )
+    return runtime
 
 
 def resolve_claude_sutando_config_dir(repo_root: Optional[Path] = None) -> Path:

@@ -39,10 +39,12 @@ const LOCAL_FILENAME = 'sutando.config.local.json';
  */
 const KNOWN_TOP_LEVEL_KEYS = new Set([
 	'core',
+	'sandbox',
 	'workspace',
 	'claude_sutando_config_dir',
 	'env',
 	'core_config_dirs',
+	'sandbox',
 	'vault',
 	'migrate',
 	'health_check',
@@ -57,6 +59,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
  */
 const OBJECT_TOP_LEVEL_KEYS = new Set([
 	'core',
+	'sandbox',
 	'workspace',
 	'claude_sutando_config_dir',
 	'vault',
