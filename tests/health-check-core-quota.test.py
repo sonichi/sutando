@@ -51,12 +51,15 @@ class TestCoreQuotaExhausted(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _write(self, *, available, status, age_sec=0, reset=None):
+    def _write(self, *, available, status, age_sec=0, reset=None, util=None):
         payload = {"available": available, "headers": {
             "anthropic-ratelimit-unified-status": status,
         }}
         if reset is not None:
             payload["headers"]["anthropic-ratelimit-unified-5h-reset"] = str(reset)
+        if util is not None:
+            payload["headers"]["anthropic-ratelimit-unified-5h-utilization"] = str(util[0])
+            payload["headers"]["anthropic-ratelimit-unified-7d-utilization"] = str(util[1])
         self.qpath.write_text(json.dumps(payload))
         if age_sec:
             old = time.time() - age_sec
@@ -135,6 +138,26 @@ class TestCoreQuotaExhausted(unittest.TestCase):
     def test_status_not_allowed_even_if_available_flag_true(self):
         # Defensive: trust the unified status header, not just the bool.
         self._write(available=True, status="rejected", reset=int(time.time()) + 60)
+        self.assertEqual(self.hc.check_core_quota_exhausted()["status"], "fail")
+
+    def test_rejected_with_both_windows_low_is_a_warn_naming_the_shared_proxy(self):
+        # Another client's credit gate through the shared proxy, not this core's window.
+        self._write(available=False, status="rejected", util=(0.13, 0.52))
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("shared credential proxy", c["detail"])
+        self.assertIn("13% (5h)", c["detail"])
+        self.assertIn("52% (7d)", c["detail"])
+
+    def test_rejected_with_a_window_near_full_still_fails(self):
+        self._write(available=False, status="rejected", util=(0.97, 0.52))
+        c = self.hc.check_core_quota_exhausted()
+        self.assertEqual(c["status"], "fail")
+        self.assertIn("OVER QUOTA", c["detail"])
+
+    def test_rejected_without_utilization_headers_still_fails(self):
+        # An unknown reading corroborates nothing: the original page stays loud.
+        self._write(available=False, status="rejected")
         self.assertEqual(self.hc.check_core_quota_exhausted()["status"], "fail")
 
     def test_stale_exhausted_does_not_alert(self):
