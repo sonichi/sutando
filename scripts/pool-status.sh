@@ -1,5 +1,5 @@
 #!/bin/bash
-# pool-status.sh — one-shot live snapshot of the multi-core agent pool (#880).
+# pool-status.sh — one-shot live snapshot of the multi-worker agent pool (#880).
 #
 # Complements scripts/pool-metrics.py: that one is a historic latency rollup,
 # this one is a "what's the pool doing right now" five-section view. Read-only.

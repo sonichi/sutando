@@ -22,7 +22,7 @@ edge"), applied to the dispatch layer.
 (docs/census/d1-identity-census.md) found Discord and Slack minting
 `task-<epoch-ms>` from the wall clock, against the ratified invariant "task_id
 由 Sutando 拥有" (task_id is owned by Sutando). A lead as the single task
-admission point is the structural fix for that census gap AND the multi-core
+admission point is the structural fix for that census gap AND the multi-worker
 coordinator — the two tracks meet here.
 
 ## Roles

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atomic-rename claim primitive for the multi-core agent pool (#880, #884).
+"""Atomic-rename claim primitive for the multi-worker agent pool (#880, #884).
 
 A new task lands as `<workspace>/tasks/task-<id>.txt`. A core session claims
 it by atomic-rename:

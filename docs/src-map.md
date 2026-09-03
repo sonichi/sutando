@@ -36,7 +36,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Check pending questions and notify if unanswered.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
-- **`claim_task.py`** — Atomic-rename claim primitive for the multi-core agent pool (#880, #884).
+- **`claim_task.py`** — Atomic-rename claim primitive for the multi-worker agent pool (#880, #884).
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`context-drop.sh`** — Sutando context drop — triggered by macOS hotkey via Automator Quick Action.
 - **`context_resume.py`** — Extract recent conversation turns from a Claude Code transcript (.jsonl).

@@ -8,7 +8,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # --with-app is opt-in and parsed here so an unknown flag cannot silently do
 # nothing: every other argument is still ignored exactly as before.
-# --pool N installs/updates the multi-core follower pool AND ensures the lead
+# --pool N installs/updates the multi-worker follower pool AND ensures the lead
 # daemon is running — the installer alone starts only followers, which would
 # run leaderless. --pool 1 shrinks back to a single follower.
 WITH_APP=0
@@ -1375,7 +1375,7 @@ fi
 # --pool N|auto installs/resizes the follower set first; the lead is ensured
 # below for any host that has followers, with or without the flag.
 if [ -n "$POOL_N" ]; then
-    echo "Setting up multi-core pool (N=$POOL_N)..." >&2
+    echo "Setting up multi-worker pool (N=$POOL_N)..." >&2
     bash "$REPO/scripts/install-core-pool.sh" "$POOL_N" \
         || echo "  ✗ pool install failed (exit $?) — continuing with whatever is installed" >&2
 fi

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Uninstall the multi-core agent pool — stops every pool plist and removes
+# Uninstall the multi-worker agent pool — stops every pool plist and removes
 # the files. Two flavors are installed per slot and both are torn down here:
 #   com.sutando.core-<N>.plist            — the claude session
 #   com.sutando.core-<N>-heartbeat.plist  — the .alive heartbeat sidecar

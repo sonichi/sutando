@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install the multi-core agent pool — N launchd-managed claude sessions
+# Install the multi-worker agent pool — N launchd-managed claude sessions
 # that share one workspace and coordinate via the claim primitive (#880).
 #
 # Usage:

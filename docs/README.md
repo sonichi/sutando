@@ -10,7 +10,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Start here
 
-- [Lead-follower agent pool](lead-follower-pool.md) — multi-core pool design:
+- [Lead-follower agent pool](lead-follower-pool.md) — multi-worker pool design:
   lanes, binding room affinity, reclaim semantics.
 - [Sutando Server & the Agent ID card](server-and-identity.md) — server v0
   composition and the identity-card contract.

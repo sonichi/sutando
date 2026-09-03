@@ -152,7 +152,7 @@ else
 fi
 
 echo "Starting..."
-# Forward --pool N / --pool=N so a restart can (re)configure the multi-core
+# Forward --pool N / --pool=N so a restart can (re)configure the multi-worker
 # pool in one step; startup.sh owns the option's behavior.
 _POOL_ARGS=()
 _prev=""

@@ -1,6 +1,6 @@
 ---
 name: proactive-loop-pool
-description: "Pool-aware variant of /proactive-loop for the multi-core agent pool (#880). Each session in the pool runs this skill; the only behavioral diff vs /proactive-loop is a claim step before processing each task."
+description: "Pool-aware variant of /proactive-loop for the multi-worker agent pool (#880). Each session in the pool runs this skill; the only behavioral diff vs /proactive-loop is a claim step before processing each task."
 user-invocable: true
 ---
 
@@ -8,7 +8,7 @@ user-invocable: true
 
 Variant of `/proactive-loop` that's safe to run in N parallel sessions sharing one workspace. Each core declares its own runtime — `claude` or `codex` — so a pool can mix both; this file is the Claude entry, [`CODEX.md`](CODEX.md) is the Codex one. The **only behavioral difference** from `/proactive-loop` is step 1 — task pickup goes through the atomic-rename claim before reading the task file. Losing the claim race means another session is processing the task; this session walks away. The rest of the loop body is unchanged.
 
-This skill exists for the multi-core pool installed by `bash scripts/install-core-pool.sh N`. Each launchd-managed core session in the pool invokes `/proactive-loop-pool` instead of `/proactive-loop`.
+This skill exists for the multi-worker pool installed by `bash scripts/install-core-pool.sh N`. Each launchd-managed core session in the pool invokes `/proactive-loop-pool` instead of `/proactive-loop`.
 
 **This file is the Claude entry.** The claim → finish protocol below is runtime-neutral; the entry is not. The Codex counterpart is [`CODEX.md`](CODEX.md) — one entry per runtime, sharing this protocol.
 

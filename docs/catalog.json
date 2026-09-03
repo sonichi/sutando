@@ -451,7 +451,7 @@
     "operators"
    ],
    "status": "active",
-   "canonical_for": "multi-core pool design: lead assignment sweep, follower claim protocol, room pins, dedicated workers, crash recovery",
+   "canonical_for": "multi-worker pool design: lead assignment sweep, follower claim protocol, room pins, dedicated workers, crash recovery",
    "last_verified": "2026-08-30"
   },
   "docs/server-and-identity.md": {
