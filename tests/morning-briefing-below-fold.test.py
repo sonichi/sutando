@@ -22,6 +22,13 @@ REPO = Path(__file__).resolve().parent.parent
 MB_PATH = REPO / "src" / "morning-briefing.py"
 
 
+# A missing target must FAIL, not skip: a skip gives rc=0 and
+# `OK (skipped=8)` — green with nothing executed.
+if not MB_PATH.exists():
+    raise SystemExit(f"morning-briefing.py not found at {MB_PATH} — refusing "
+                     "to report a green run in which no test executed")
+
+
 def _load_mb():
     spec = importlib.util.spec_from_file_location("morning_briefing", MB_PATH)
     mod = importlib.util.module_from_spec(spec)
@@ -31,8 +38,6 @@ def _load_mb():
 
 class TestBelowFoldCount(unittest.TestCase):
     def setUp(self):
-        if not MB_PATH.exists():
-            self.skipTest("morning-briefing.py not found")
         self.mb = _load_mb()
         self.orig = getattr(self.mb._CPQ, "VISIBLE_PREFIX", None)
 
@@ -79,8 +84,6 @@ class TestBelowFoldCount(unittest.TestCase):
 
 class TestNarrativeSaysIt(unittest.TestCase):
     def setUp(self):
-        if not MB_PATH.exists():
-            self.skipTest("morning-briefing.py not found")
         self.mb = _load_mb()
         self.orig = getattr(self.mb._CPQ, "VISIBLE_PREFIX", None)
         self.mb._CPQ.VISIBLE_PREFIX = 5

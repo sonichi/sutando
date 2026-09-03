@@ -644,6 +644,10 @@ def below_fold_count(total: int) -> int:
     """
     prefix = getattr(_CPQ, "VISIBLE_PREFIX", None)
     if not isinstance(prefix, int) or isinstance(prefix, bool) or prefix < 0:
+        # Say so: without this, an unreadable prefix and a genuinely unhidden
+        # list both render as no line, which is the silent no-op this fixes.
+        print(f"  below-fold: VISIBLE_PREFIX unreadable ({prefix!r}) — line omitted",
+              file=sys.stderr)
         return 0
     return max(0, total - prefix)
 
