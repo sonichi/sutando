@@ -292,6 +292,11 @@ with tempfile.TemporaryDirectory() as _td:
           _configured_at(_td) is None)
     check("_gateway_configured: AG2_DEVICE_ENV alone -> True",
           _configured_at(_td, AG2_DEVICE_ENV=_device) is True)
+    _urlonly = os.path.join(_td, "device-url-only.env")
+    with open(_urlonly, "w") as fh:
+        fh.write("REMOTE_TASK_URL=https://gw.invalid\n")
+    check("_gateway_configured: url-only AG2_DEVICE_ENV + dev lane with token -> True",
+          _configured_at(_td, AG2_DEVICE_ENV=_urlonly, REMOTE_TASK_CHANNEL_DIR="dev") is True)
     os.makedirs(os.path.dirname(_prod))
     with open(_prod, "w") as fh:
         fh.write("OTHER=1\n")

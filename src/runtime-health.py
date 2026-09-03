@@ -218,7 +218,7 @@ def _gateway_configured():
     # even with no CLAUDE_CONFIG_DIR: the vault does not need one.
     if _gateway_token(env_file=env_file):
         return True
-    if not cfg:
+    if not cfg or env_file is None:
         return None
     try:
         # Contract preserved: an absent/unreadable .env is "can't tell", NOT

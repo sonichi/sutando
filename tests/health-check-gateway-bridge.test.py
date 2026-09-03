@@ -79,11 +79,13 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
     # Clear the resolver's vars, then apply the requested env.
     base = {k: v for k, v in hc.os.environ.items() if k not in _RESOLVER_VARS}
     base.update(env)
+    # The resolver walks the bridge's own candidates; pin the file as the first one.
+    if gw_env_path:
+        base["AG2_DEVICE_ENV"] = str(gw_env_path)
     run_mock = (unittest.mock.Mock(side_effect=OSError("pgrep exploded"))
                 if pgrep_raises else unittest.mock.Mock(side_effect=_pgrep(pgrep_rc, pgrep_out)))
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
          unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path), \
-         unittest.mock.patch.object(ct, "claude_home_path", return_value=gw_env_path), \
          unittest.mock.patch.object(hc.subprocess, "run", run_mock):
         with unittest.mock.patch.object(hc, "_gateway_serving", lambda *a, **k: serving), \
              unittest.mock.patch.object(hc, "_gateway_status_stale_age_s",
@@ -103,10 +105,11 @@ def _configured(*, env=None, gw_env_path=None):
     env = env or {}
     base = {k: v for k, v in hc.os.environ.items() if k not in _RESOLVER_VARS}
     base.update(env)
+    if gw_env_path:
+        base["AG2_DEVICE_ENV"] = str(gw_env_path)
     # The vault is stubbed empty: "no token, no file" must not read as True on
     # a host whose Keychain holds a real bearer.
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
-         unittest.mock.patch.object(ct, "claude_home_path", return_value=gw_env_path), \
          unittest.mock.patch.object(ct, "token_from_vault", return_value=""):
         return hc._gateway_configured()
 
@@ -365,7 +368,7 @@ def main() -> int:
     #    reviewer's exact repro: a resolver contract bug.
     raised = None
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
-         unittest.mock.patch.object(ct, "claude_home_path",
+         unittest.mock.patch.object(ct, "gateway_env_candidates",
                                     side_effect=ValueError("resolver contract bug")):
         try:
             got = hc._gateway_configured()
@@ -380,7 +383,7 @@ def main() -> int:
     # 2) EXPECTED I/O failure still means unconfigured (the narrowing must not
     #    break the case the catch legitimately exists for).
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
-         unittest.mock.patch.object(ct, "claude_home_path",
+         unittest.mock.patch.object(ct, "gateway_env_candidates",
                                     side_effect=OSError("unreadable")):
         check("_gateway_configured: OSError → False (expected I/O failure)",
               hc._gateway_configured() is False)
@@ -396,6 +399,11 @@ def main() -> int:
         _device = _cfg / "device.env"
         _device.write_text("REMOTE_TASK_TOKEN=device-tok\n")
 
+        _urlonly = _cfg / "device-url-only.env"
+        _urlonly.write_text("REMOTE_TASK_URL=https://gw.invalid\n")
+        check("lane: url-only AG2_DEVICE_ENV must not shadow the dev lane's token → True",
+              _configured_on_host(_cfg, {"AG2_DEVICE_ENV": str(_urlonly),
+                                          "REMOTE_TASK_CHANNEL_DIR": "dev"}) is True)
         check("lane: dev host, prod file absent, REMOTE_TASK_CHANNEL_DIR=dev → True",
               not _prod.exists()
               and _configured_on_host(_cfg, {"REMOTE_TASK_CHANNEL_DIR": "dev"}) is True)

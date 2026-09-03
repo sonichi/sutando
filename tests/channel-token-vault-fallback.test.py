@@ -409,6 +409,30 @@ def main() -> int:
     check("a missing AG2_DEVICE_ENV falls through to the lane file, as the bridge does",
           ct.gateway_env_file(environ={"AG2_DEVICE_ENV": str(cfg / "nope.env"),
                                        "REMOTE_TASK_CHANNEL_DIR": "dev"}) == dev)
+    # A readable candidate WITHOUT a token must not shadow a later one that has
+    # it — the bridge walks every candidate (remote_gateway_bridge, #3338 B1).
+    urlonly = _envfile(REMOTE_TASK_URL="https://gw.invalid")
+    lane_ok = cfg / "channels" / "lane1" / ".env"
+    lane_ok.parent.mkdir(parents=True, exist_ok=True)
+    lane_ok.write_text(f"{CANON}=lane-secret\n")
+    _env = {"AG2_DEVICE_ENV": str(urlonly), "REMOTE_TASK_CHANNEL_DIR": "lane1"}
+    check("url-only AG2_DEVICE_ENV does not shadow a lane file with the token",
+          ct.gateway_token(environ=_env, vault_get=lambda v: "") == "lane-secret")
+    check("gateway_env_file names the candidate that supplied the token",
+          ct.gateway_env_file(environ=_env) == lane_ok, str(ct.gateway_env_file(environ=_env)))
+    check("candidate sequence is device file then lane file, in that order",
+          ct.gateway_env_candidates(environ=_env) == [urlonly, lane_ok])
+    # Never a bare ~/.claude: with no AG2_DEVICE_ENV and no CLAUDE_CONFIG_DIR the
+    # bridge refuses to guess, so the gate must resolve nothing, not an old install.
+    _saved_ccd = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    try:
+        check("no pointers at all -> no candidates (no bare-home guess)",
+              ct.gateway_env_candidates(environ={}) == [] and ct.gateway_env_file(environ={}) is None)
+        check("no pointers at all -> no token even if a home install exists",
+              ct.gateway_token(environ={}, vault_get=lambda v: "") == "")
+    finally:
+        if _saved_ccd is not None:
+            os.environ["CLAUDE_CONFIG_DIR"] = _saved_ccd
     # The detector-shaped call: no env_file argument, so the resolver picks it.
     dev.parent.mkdir(parents=True, exist_ok=True)
     dev.write_text(f"{CANON}=dev-lane-tok\n")
