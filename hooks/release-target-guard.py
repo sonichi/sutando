@@ -39,6 +39,20 @@ def _deny(reason):
     sys.exit(0)
 
 
+def _is_release_cut(rest) -> bool:
+    """`release create|edit` anywhere in this gh command, not at a fixed offset.
+
+    A global flag between them (`-R`, `--repo`, `--hostname`) is ordinary, and
+    keying on the two words right after `gh` let it disarm the guard entirely.
+    """
+    for j, w in enumerate(rest):
+        if w in SEPARATORS:
+            return False
+        if w == "release" and rest[j + 1:j + 2] in (["create"], ["edit"]):
+            return True
+    return False
+
+
 def targets(command: str):
     """Every --target value belonging to a `gh release create|edit` in `command`.
 
@@ -58,7 +72,7 @@ def targets(command: str):
         if w in SEPARATORS:
             armed = False
         if os.path.basename(w) == "gh":
-            armed = words[i + 1:i + 3] in (["release", "create"], ["release", "edit"])
+            armed = _is_release_cut(words[i + 1:])
         if armed and w == "--target" and i + 1 < len(words):
             out.append(words[i + 1])
         elif armed and w.startswith("--target="):

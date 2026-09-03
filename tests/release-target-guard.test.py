@@ -80,6 +80,29 @@ class TestOffenders(unittest.TestCase):
         self.assertEqual(G.offenders(f"gh release edit v1 --target {SHORT}; echo done"), [SHORT])
         self.assertEqual(G.offenders(f"gh release edit v1 --target {SHORT} && echo ok"), [SHORT])
 
+    def test_a_global_flag_between_gh_and_release_does_not_disarm(self):
+        """`targets` armed only on the two words immediately after `gh`, so a
+        global flag disarmed it entirely — and `-R` is exactly how a release is
+        cut from another repo's checkout (Sutando-Mini via sonichi, #3829)."""
+        self.assertEqual(
+            G.offenders("gh -R sonichi/sutando release create v1 --target abcdef1"), ["abcdef1"])
+        self.assertEqual(
+            G.offenders(f"gh --repo o/r release edit v1 --target {SHORT}"), [SHORT])
+        self.assertEqual(
+            G.offenders(f"/opt/homebrew/bin/gh -R o/r release edit v1 --target {SHORT}"), [SHORT])
+
+    def test_a_global_flag_does_not_make_every_gh_a_release_cut(self):
+        """Arming on `release create|edit` anywhere in the segment must not
+        arm on a different subcommand that merely follows a flag."""
+        self.assertEqual(G.offenders(f"gh -R o/r pr view 1 --target {SHORT}"), [])
+        self.assertEqual(G.offenders(f"gh -R o/r release list --target {SHORT}"), [])
+
+    def test_the_arm_scan_stops_at_a_separator(self):
+        """Scanning past a separator would let a LATER `gh release create` arm
+        an EARLIER, unrelated gh command — so its --target gets flagged."""
+        self.assertEqual(
+            G.offenders(f"gh pr view 1 --target {SHORT} && gh release create v2 --target main"), [])
+
     def test_a_path_qualified_gh_still_arms(self):
         self.assertEqual(
             G.offenders(f"/opt/homebrew/bin/gh release edit v1 --target {SHORT}"), [SHORT])
