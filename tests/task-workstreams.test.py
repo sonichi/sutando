@@ -303,6 +303,39 @@ def test_result_index_survives_unreadable_roots() -> None:
         assert list(index) == ["task-r1"], index
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
+def test_context_bare_id_with_no_tasks_dir_fails_open() -> None:
+    # No tasks/ at all: the bare-id resolver must answer None, not raise.
+    workspace = fixture_workspace()
+    tasks = workspace / "tasks"
+    if tasks.exists():
+        for child in tasks.iterdir():
+            child.unlink()
+        tasks.rmdir()
+    assert workstreams._unique_task_file(tasks, "task-a1", lambda n: "task-a1") is None
+    assert workstreams.build_workstream_context(workspace, "task-a1") is None
+
+
+def test_context_refuses_a_task_path_that_is_missing_or_carries_another_id() -> None:
+    # task_path is the authorization read: a path that does not exist, or one
+    # whose filename resolves to a different id, yields no context at all.
+    workspace = fixture_workspace()
+    live = workspace / "tasks" / "task-a1.claimed-core-1.txt"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    write_task(live, "task-a1", "2026-08-03T11:00:00Z", "continue the grouping work")
+    store = workspace / "data" / "task-workstreams.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    store.write_text(json.dumps({
+        "schema_version": 1,
+        "workstreams": {"w": {"title": "Grouping", "summary": "s"}},
+        "assignments": {"task-a1": {"workstream_id": "w"}},
+        "reviews": {},
+    }))
+    assert workstreams.build_workstream_context(
+        workspace, "task-a1", task_path=live) is not None
+    assert workstreams.build_workstream_context(
+        workspace, "task-a1", task_path=workspace / "tasks" / "task-a1.txt") is None
+    assert workstreams.build_workstream_context(
+        workspace, "task-zz", task_path=live) is None
 
 
 def test_loader_parser_and_history_fail_open_edges() -> None:
@@ -1304,6 +1337,8 @@ def main() -> None:
         test_a_stem_containing_txt_archive_failed_is_one_record_not_a_quarantine,
         test_history_derives_every_id_through_the_shared_path_to_id_owner,
         test_result_index_survives_unreadable_roots,
+        test_context_bare_id_with_no_tasks_dir_fails_open,
+        test_context_refuses_a_task_path_that_is_missing_or_carries_another_id,
         test_loader_parser_and_history_fail_open_edges,
         test_task_text_keeps_the_whole_body_not_just_its_first_line,
         test_task_text_stops_at_headers_that_follow_the_task_line,
