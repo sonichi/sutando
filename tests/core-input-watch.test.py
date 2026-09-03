@@ -198,6 +198,62 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(hit[0], "unknown")
 
 
+class TestUnobservedProbeIsNotHung(unittest.TestCase):
+    """An unobserved process probe (tmux refused the client, binary missing) must
+    hold, never become the RECOVER-facing `hung`; only a SEEN session with stale
+    status is `hung`, and a server that answered "no session" is `crashed`."""
+
+    def test_unobserved_probe_holds(self):
+        st, detail, _p, kind = compose_state("", "unknown", True, process=None)
+        self.assertEqual(st, "unobserved")
+        self.assertIn("unobserved", detail)
+        self.assertNotEqual(st, "hung")
+
+    def test_present_and_stale_is_still_hung(self):
+        st, *_ = compose_state("Running step 3...\n(no prompt, no footer)", "unknown", True, process=True)
+        self.assertEqual(st, "hung")
+
+    def test_definitive_absence_is_crashed(self):
+        st, *_ = compose_state("", "offline", True, process=False)
+        self.assertEqual(st, "crashed")
+
+    def test_refused_client_through_derive_and_compose(self):
+        """Full path: refused tmux client → runtime_health.derive() → compose_state()."""
+        import subprocess as _sp
+        import sys as _sys
+        import tempfile
+        from unittest import mock
+        _sys.path.insert(0, os.path.join(_HERE, "..", "src"))
+        import tmux_probe  # noqa: E402
+        rh_spec = importlib.util.spec_from_file_location(
+            "runtime_health_pin", os.path.join(_HERE, "..", "src", "runtime-health.py"))
+        rh = importlib.util.module_from_spec(rh_spec); rh_spec.loader.exec_module(rh)
+        tmp = tempfile.mkdtemp()
+        # Every unrelated probe held healthy so only the process signal varies.
+        with mock.patch.object(rh, "_resolve_workspace", lambda repo: tmp), \
+             mock.patch.object(rh, "_gateway_running", lambda: True), \
+             mock.patch.object(rh, "_ag2space_app_running", lambda: True), \
+             mock.patch.object(rh, "_station_cached", lambda ws: True), \
+             mock.patch.object(rh, "_heartbeat_fresh", lambda ws: True):
+            def refused(*a, **k):
+                return _sp.CompletedProcess(["tmux"], 1, "", "server exited unexpectedly\n")
+            with mock.patch.object(tmux_probe.subprocess, "run", refused):
+                base = rh.derive()
+            self.assertEqual(base["health"], "unknown")
+            self.assertIsNone(base["signals"]["process"])
+            st, *_ = compose_state("", base["health"], True, process=base["signals"]["process"])
+            self.assertEqual(st, "unobserved")
+
+            def gone(*a, **k):
+                return _sp.CompletedProcess(["tmux"], 1, "", "can't find session: sutando-core\n")
+            with mock.patch.object(tmux_probe.subprocess, "run", gone):
+                base = rh.derive()
+            self.assertEqual(base["health"], "offline")
+            self.assertIs(base["signals"]["process"], False)
+            st, *_ = compose_state("", base["health"], True, process=base["signals"]["process"])
+            self.assertEqual(st, "crashed")
+
+
 class TestComposeState(unittest.TestCase):
     """compose_state REFINES runtime-health's coarse `base_health` (one shared
     derivation, #2092) into the 8 supervisor states — signature is
