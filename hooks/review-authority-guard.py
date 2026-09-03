@@ -117,7 +117,8 @@ _LITERAL_NOISE = re.compile(r"""[\[\]\(\),'"]""")
 
 def _wrapped_command(words):
     """The string a wrapper would run (`bash -c`, `eval`, `python3 -c`, `node -e`):
-    one shlex token, so it is re-classified; interpreter strings de-literalised first."""
+    one shlex token, so it is re-classified; interpreter strings de-literalised first.
+    Not covered: variable indirection (`$GH pr review`) and program text via a pipe."""
     if not words:
         return None
     head = words[0].rsplit("/", 1)[-1].lower()
@@ -134,10 +135,23 @@ def _wrapped_command(words):
     return None
 
 
+# A heredoc body: program text on stdin (`python3 - <<'PY'`) or JSON for `--input -`.
+_HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n\s*\1\s*(?:\n|$)", re.S)
+
+
 def classify(command: str) -> Optional[str]:
     """Return 'APPROVE' / 'REQUEST_CHANGES' / 'COMMENT', or None if not a formal review."""
     if not isinstance(command, str) or "gh" not in command:
         return None
+    for m in _HEREDOC.finditer(command):
+        body = m.group(2)
+        if _API_REVIEWS.search(command):
+            e = _API_EVENT.search(body)
+            if e:
+                return e.group(1)
+        nested = classify(_LITERAL_NOISE.sub(" ", body))
+        if nested is not None:
+            return nested
     # A wrapper's quoted -c string may itself contain && or ; — classify it
     # whole before the separator split can cut through the quotes.
     try:

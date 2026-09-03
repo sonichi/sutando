@@ -179,6 +179,17 @@ for _cmd, _want in (
 ):
     check(f"api: {_cmd}", classify(_cmd), _want)
 
+print("13. heredoc indirection: program text on stdin is de-literalised and classified")
+for _cmd, _want in (
+    ("python3 - <<'PY'\nimport subprocess\nsubprocess.run(['gh','pr','review','3756','--approve','--body','ok'])\nPY", "APPROVE"),
+    ("python3 - <<PY\nimport subprocess\nsubprocess.run([\"gh\", \"pr\", \"review\", \"1\", \"--request-changes\", \"-b\", \"x\"])\nPY\necho done", "REQUEST_CHANGES"),
+    ("python3 - <<'PY'\nsubprocess.run(['gh','pr','review','1','--comment','-b','ok'])\nPY", "COMMENT"),
+    ("gh api repos/o/r/pulls/3/reviews --input - <<'JSON'\n{\"event\": \"APPROVE\", \"body\": \"x\"}\nJSON", "APPROVE"),
+    ("python3 - <<'PY'\nprint('hello gh')\nPY", None),
+    ("cat <<'EOF' > note.md\ngh is installed; review the pr later\nEOF", None),
+):
+    check(f"heredoc: {_cmd.splitlines()[0]} …", classify(_cmd), _want)
+
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")
     for f in FAILURES:
