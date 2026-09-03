@@ -41,6 +41,32 @@ def _deny(reason):
     sys.exit(0)
 
 
+def _newline_separators(command: str) -> str:
+    """A newline ends the command unless it sits inside a quoted argument.
+
+    Same policy as hooks/inline-body-substitution-guard.py, deliberately
+    duplicated: hooks are standalone by convention. Extraction tracked separately.
+    """
+    out, quote, esc = [], None, False
+    for i, ch in enumerate(command):
+        if esc:
+            out.append(ch); esc = False; continue
+        if ch == "\\" and quote != "'":
+            out.append(ch); esc = True; continue
+        if quote is None and ch in ("'", '"'):
+            quote = ch
+        elif ch == quote:
+            quote = None
+        if ch in "\r\n" and quote is None:
+            # CRLF is ONE separator: two `;` lex as the single token `;;`,
+            # which is not in SEPARATORS, so `armed` would never reset.
+            if not (ch == "\r" and command[i + 1:i + 2] == "\n"):
+                out.append(";")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _is_release_cut(rest) -> bool:
     """`release create|edit` anywhere in this gh command, not at a fixed offset.
 
@@ -62,6 +88,7 @@ def targets(command: str):
     quoted text intact, so a separator ends the gh command instead of gluing to
     the sha before it — and another tool's `--target` after one is not read.
     """
+    command = _newline_separators(command)
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
         lex.whitespace_split = True

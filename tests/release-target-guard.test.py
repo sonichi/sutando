@@ -115,6 +115,27 @@ class TestOffenders(unittest.TestCase):
         self.assertEqual(G.offenders("gh release create v1 --target " + "F" * 40), [])
         self.assertEqual(G.offenders("gh release create v1 --target " + "aF" * 20), [])
 
+    def test_a_newline_ends_the_command(self):
+        """`armed` survived a line break, so a --target on a LATER, unrelated
+        line was flagged. Raised three times by vidhuUC on #3829."""
+        self.assertEqual(
+            G.offenders("gh release create v1 --target main\ncargo build --target deadbeef1"), [])
+        self.assertEqual(
+            G.offenders("gh release create v1 --target main\ndocker build --target abcdef1234 ."), [])
+
+    def test_CRLF_is_ONE_separator_not_two(self):
+        """Mapping both \r and \n to ';' yields ';;', which lexes as a single
+        token that is not in SEPARATORS — so `armed` would never reset and the
+        CRLF case would keep failing while the LF case passed."""
+        self.assertEqual(
+            G.offenders("gh release create v1 --target main\r\ncargo build --target deadbeef1"), [])
+
+    def test_a_violation_on_a_later_line_is_still_caught(self):
+        self.assertEqual(
+            G.offenders("echo hi\ngh release edit v1 --target f653b4d9f8a4"), ["f653b4d9f8a4"])
+        self.assertEqual(
+            G.offenders("echo hi\r\ngh release edit v1 --target f653b4d9f8a4"), ["f653b4d9f8a4"])
+
     def test_a_path_qualified_gh_still_arms(self):
         self.assertEqual(
             G.offenders(f"/opt/homebrew/bin/gh release edit v1 --target {SHORT}"), [SHORT])
