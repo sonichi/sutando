@@ -1,0 +1,61 @@
+# One cloud worker per user. Each service is one container = one broker token
+# + one worker id + one /workspace volume. Build the image with
+# `bash deploy/cloud-worker/provision.sh --build-only` (the build context is the
+# Dockerfile's COPY allowlist, never the working tree), then `docker compose up -d`.
+#
+# To add a user, copy the `worker-example` block (and, for the ag2-assistant
+# backup seat, its `assistant-example` sidecar) and change: service names,
+# container_name, env_file (that user's env file), volume names, and
+# SUTANDO_WORKER_ID (a seat name, [A-Za-z0-9_-]{1,32}, e.g. cloud-alice).
+# `provision.sh <worker-id> <env-file>` does the same without editing this file.
+services:
+  worker-example:
+    image: ${SUTANDO_CLOUD_WORKER_IMAGE:-sutando-cloud-worker:local}
+    container_name: sutando-worker-example
+    env_file:
+      - .env.example
+    environment:
+      SUTANDO_WORKER_ID: cloud-example
+      SUTANDO_WORKER_LOCATION: cloud
+      # Only read when SUTANDO_WORKER_RUNTIME=ag2-assistant: the sidecar below.
+      AG2ASSISTANT_ACP_URL: ws://assistant-example:8802
+    volumes:
+      - worker-example:/workspace
+    depends_on:
+      - assistant-example
+    restart: unless-stopped
+
+  # The ag2-assistant backup seat: the official image as a sidecar, one per
+  # user, serving ONE headless profile over ACP WebSocket on port 8802.
+  # Not needed for the stub / claude / adapter runtimes — delete both blocks.
+  assistant-example:
+    image: ${SUTANDO_ASSISTANT_IMAGE:-ghcr.io/ag2ai/ag2-assistant:latest}
+    container_name: sutando-assistant-example
+    environment:
+      # Values come from the shell / compose .env at `up` time, not from the
+      # worker's env file: the sidecar must not see the broker token.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AG2ASSISTANT_ACP_TOKEN: ${AG2ASSISTANT_ACP_TOKEN:-}
+      TZ: ${TZ:-UTC}
+    # assistant-bootstrap.sh: first-boot profile, key seed into the secret
+    # store (acp-serve does not read the process env for it), then acp-serve.
+    entrypoint: ["sh", "/bootstrap.sh"]
+    volumes:
+      - ./assistant-bootstrap.sh:/bootstrap.sh:ro
+      - assistant-example-data:/data
+      - assistant-example-workspace:/workspace
+    restart: unless-stopped
+
+  # worker-alice:
+  #   image: ${SUTANDO_CLOUD_WORKER_IMAGE:-sutando-cloud-worker:local}
+  #   container_name: sutando-worker-alice
+  #   env_file: [users/alice.env]
+  #   environment: { SUTANDO_WORKER_ID: cloud-alice, SUTANDO_WORKER_LOCATION: cloud, AG2ASSISTANT_ACP_URL: ws://assistant-alice:8802 }
+  #   volumes: [worker-alice:/workspace]
+  #   restart: unless-stopped
+
+volumes:
+  worker-example:
+  assistant-example-data:
+  assistant-example-workspace:
+  # worker-alice:

@@ -452,7 +452,7 @@
    ],
    "status": "active",
    "canonical_for": "multi-worker pool design: lead assignment sweep, follower claim protocol, room pins, dedicated workers, crash recovery",
-   "last_verified": "2026-08-30"
+   "last_verified": "2026-09-03"
   },
   "docs/server-and-identity.md": {
    "title": "Sutando Server & the Agent ID card — design",
