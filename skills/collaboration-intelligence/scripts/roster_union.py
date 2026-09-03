@@ -24,7 +24,9 @@ def host_rosters(workspace) -> "list[tuple[str, Path]]":
            for p in sorted(ws.glob(f"hosts/*/{ROSTER_LEAF}"))]
     legacy = ws / ROSTER_LEAF
     if legacy.is_file():
-        out.append(("", legacy))
+        # A real label: an empty one made the collision branch below write the
+        # BARE key, overwriting local instead of keeping the row under a suffix.
+        out.append(("legacy", legacy))
     return out
 
 
@@ -46,5 +48,5 @@ def roster_union(paths) -> dict:
             if key.startswith("_") or key not in merged:
                 merged[key] = row
             elif merged[key] != row:
-                merged[f"{key}@{host}" if host else key] = row
+                merged[f"{key}@{host or 'legacy'}"] = row
     return merged

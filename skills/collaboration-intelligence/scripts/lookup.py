@@ -57,7 +57,12 @@ def load_roster(d):
     # this store delegate to roster_union so they cannot drift apart.
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from roster_union import host_rosters, roster_union
-    merged = roster_union(host_rosters(d.parent.parent))
+    # The file this reader was pointed at is its LOCAL and goes first: on a
+    # legacy host it is the shared file, which host_rosters lists LAST.
+    local = d / "reviewer-stands.json"
+    paths = [("local", local)] if local.is_file() else []
+    paths += [(h, p) for h, p in host_rosters(d.parent.parent) if p != local]
+    merged = roster_union(paths)
     if not merged:
         return []
     rows = []

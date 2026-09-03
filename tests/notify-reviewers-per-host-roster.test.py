@@ -126,7 +126,7 @@ class PerHostRoster(unittest.TestCase):
         legacy = self.tmp / LEAF
         legacy.parent.mkdir(parents=True, exist_ok=True)
         legacy.write_text(json.dumps({"carol": {"stand": "@c:x"}}))
-        self.assertIn("", [h for h, _ in self.nr.roster_paths()],
+        self.assertIn("legacy", [h for h, _ in self.nr.roster_paths()],
                       "the shared roster was dropped from the union")
         self.assertEqual(self.nr.load_roster()["carol"]["stand"], "@c:x")
 
@@ -161,6 +161,54 @@ class PerHostRoster(unittest.TestCase):
                          "the two readers of reviewer-stands.json disagree on a collision")
         self.assertIn("alice@peerbox", via_notify,
                       "the losing peer row was dropped instead of surfaced")
+
+    def test_a_differing_LEGACY_row_is_kept_under_a_suffix_never_a_bare_overwrite(self):
+        """john-the-dev's repro: host="" used to collapse the suffix to the bare
+        key, so the LEGACY row overwrote local and nothing preserved the loser."""
+        sys.path.insert(0, str(SCRIPT.parent))
+        from roster_union import roster_union
+        local = self._write("myhost", {"alice": {"stand": "@alice-LOCAL:x"}})
+        legacy = self.tmp / LEAF
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"alice": {"stand": "@alice-LEGACY:x"}}))
+        r = roster_union([("myhost", local), ("", legacy)])
+        self.assertEqual(r["alice"]["stand"], "@alice-LOCAL:x")
+        self.assertEqual(r["alice@legacy"]["stand"], "@alice-LEGACY:x")
+
+    def test_host_rosters_labels_the_shared_file_so_its_rows_can_be_suffixed(self):
+        from roster_union import host_rosters
+        self._write("PEER", {"bob": {"stand": "@b:x"}})
+        legacy = self.tmp / LEAF
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"alice": {"stand": "@a:x"}}))
+        labels = [h for h, _ in host_rosters(self.tmp)]
+        self.assertEqual(labels, ["PEER", "legacy"])
+        self.assertNotIn("", labels, "an empty label is what made the union overwrite")
+
+    def test_on_a_LEGACY_host_local_still_WINS_and_the_peer_row_is_kept(self):
+        """yixuan-ag2's table row that failed: local roster = the shared file."""
+        legacy = self.tmp / LEAF
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"alice": {"stand": "@local:x"}}))
+        self._write("peerbox", {"alice": {"stand": "@peer:x"}})
+        self.nr.roster_path = lambda: legacy
+        r = self.nr.load_roster()
+        self.assertEqual(r["alice"]["stand"], "@local:x")
+        self.assertEqual(r["alice@peerbox"]["stand"], "@peer:x")
+        self.assertEqual(sorted(r), ["alice", "alice@peerbox"])
+
+    def test_lookup_on_a_LEGACY_host_puts_its_own_file_first_even_when_a_peer_sorts_before_it(self):
+        # "AAA" sorts before "legacy": without local-first, sort order decided the winner.
+        legacy = self.tmp / LEAF
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"alice": {"stand": "@local:x"}}))
+        self._write("AAA", {"alice": {"stand": "@peer:x"}})
+        spec = importlib.util.spec_from_file_location(
+            "lk2", REPO / "skills" / "collaboration-intelligence" / "scripts" / "lookup.py")
+        lk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lk)
+        rows = {r["entity_id"]: r["agent_mxid"] for r in lk.load_roster(legacy.parent)}
+        self.assertEqual(rows, {"alice": "@local:x", "alice@AAA": "@peer:x"})
 
 
 if __name__ == "__main__":
