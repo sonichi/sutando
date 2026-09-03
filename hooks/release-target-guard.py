@@ -24,8 +24,10 @@ import re
 import shlex
 import sys
 
-FULL_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
-HEX_RUN = re.compile(r"\A[0-9a-f]{7,}\Z")
+FULL_SHA = re.compile(r"\A[0-9a-fA-F]{40}\Z")
+# Both take the same case set: widening only HEX_RUN would deny a valid
+# 40-char uppercase sha.
+HEX_RUN = re.compile(r"\A[0-9a-fA-F]{7,}\Z")
 # A separator ends the gh command; anything after it belongs to another tool.
 SEPARATORS = (";", "&&", "||", "|", "&", "(", ")")
 

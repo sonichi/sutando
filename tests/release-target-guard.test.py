@@ -103,6 +103,18 @@ class TestOffenders(unittest.TestCase):
         self.assertEqual(
             G.offenders(f"gh pr view 1 --target {SHORT} && gh release create v2 --target main"), [])
 
+    def test_an_abbreviated_sha_is_caught_in_any_case(self):
+        """git resolves an uppercase abbreviated sha and GitHub rejects it the
+        same way, so a case-sensitive HEX_RUN let it through (sonichi, #3829)."""
+        self.assertEqual(G.offenders("gh release create v1 --target ABCDEF1"), ["ABCDEF1"])
+        self.assertEqual(G.offenders("gh release create v1 --target AbCdEf1"), ["AbCdEf1"])
+
+    def test_a_full_uppercase_sha_is_still_allowed(self):
+        """The pair must move together: widening HEX_RUN alone would deny a
+        40-char uppercase sha, which is valid and is what --target wants."""
+        self.assertEqual(G.offenders("gh release create v1 --target " + "F" * 40), [])
+        self.assertEqual(G.offenders("gh release create v1 --target " + "aF" * 20), [])
+
     def test_a_path_qualified_gh_still_arms(self):
         self.assertEqual(
             G.offenders(f"/opt/homebrew/bin/gh release edit v1 --target {SHORT}"), [SHORT])
