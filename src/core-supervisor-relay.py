@@ -83,6 +83,18 @@ def _is_login_class(signal: dict) -> bool:
     return signal.get("state") == "logged-out" or signal.get("kind") == "login"
 
 
+_RESET_AT = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m)", re.I)
+
+
+def _limit_remedy(signal: dict) -> str:
+    """A usage-limit screen resumes by itself; /login cannot clear it."""
+    m = _RESET_AT.search(signal.get("prompt") or "")
+    when = f"at {m.group(1)}" if m else "when the limit window resets"
+    return (f" — the core hit its Claude usage limit, not a login problem; it resumes"
+            f" on its own {when}. Nothing to do unless you want it sooner: at the"
+            " core's terminal, /usage-credits spends credits now and Esc stops the wait.")
+
+
 #: A record older than this is a core that stopped beating; the socket it names
 #: may no longer exist, so pointing the owner at it is worse than generic phrasing.
 _ALIVE_STALE_SEC = 90
@@ -144,7 +156,9 @@ def compose_message(signal: dict) -> str:
         # The remedy is the actionable half, so it keeps its length; the prompt
         # echo is what gives way to stay inside the message-length bound.
         msg += f": {excerpt[:110]}"
-    if _is_login_class(signal):
+    if signal.get("kind") == "session-limit":
+        msg += _limit_remedy(signal)
+    elif _is_login_class(signal):
         host = _core_host_label() or "the host"
         msg += (f" — needs GUI /login on {host}: open Terminal there, run"
                 " `bash src/restart.sh` from the repo, then complete /login."
