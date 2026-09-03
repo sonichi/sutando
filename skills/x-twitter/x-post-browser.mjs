@@ -22,17 +22,23 @@
  * Chrome DROPS every cookie it can't decrypt on load — wiping the sign-in.
  * (Verified 2026-07-14: a GUI login wrote 9 v10 cookies; a default Playwright
  * `check` opened the profile and left 0 rows.)
- * So:
+ * So, by default:
  *   - login  → `open` (LaunchServices GUI) → REAL keychain, findable window.
  *   - check/post → Playwright with ignoreDefaultArgs:['--use-mock-keychain']
  *                  → REAL keychain → can decrypt what login wrote.
- * Never launch this profile with the mock keychain, ever.
+ * What must never happen is a MIX. $X_BROWSER_MOCK_KEYCHAIN=1 moves BOTH sides
+ * to the mock key, for a host whose login-keychain password is unknown or out of
+ * sync with the account password — there the real-keychain prompt cannot be
+ * answered and sign-in is otherwise impossible. The cookie store is then
+ * encrypted with a well-known key, so the profile dir alone grants the session;
+ * it is per-host and excluded from sync.
  *
  * Usage:
  *   node x-post-browser.mjs login          # headed — owner signs in once
  *   node x-post-browser.mjs check          # probe: is the profile signed in?
  *   node x-post-browser.mjs post "<text>"  # compose + publish a tweet
  *   node x-post-browser.mjs post "<text>" --dry-run   # stop before publish
+ *   node x-post-browser.mjs timeline <handle> [--limit N]   # read an author's posts
  *
  * Exit codes: 0 ok, 2 not-signed-in, 1 error.
  */
@@ -79,6 +85,17 @@ function resolveChromium() {
   }
   return {};
 }
+
+/** Chrome encrypts its cookie store with a key from the macOS login keychain
+ *  ("Chrome Safe Storage"). On a host whose login keychain password is unknown
+ *  or out of sync with the account password, that prompt cannot be answered and
+ *  sign-in is impossible. With the mock key nothing touches the keychain — but
+ *  login and playback MUST agree, or the saved cookies cannot be decrypted and
+ *  the profile reads as signed out. So it is one switch for both paths.
+ *  Trade-off: the cookie store is then encrypted with a well-known key, so the
+ *  profile directory alone is enough to use the session. It is per-host and
+ *  excluded from sync. */
+const MOCK_KEYCHAIN = /^(1|true|yes)$/i.test(process.env.X_BROWSER_MOCK_KEYCHAIN || '');
 
 const cmd = process.argv[2];
 const arg = process.argv[3];
@@ -132,8 +149,8 @@ const SHOT_DIR = '/tmp/sutando-screenshots';
 mkdirSync(PROFILE_DIR, { recursive: true });
 mkdirSync(SHOT_DIR, { recursive: true });
 
-if (!cmd || !['login', 'check', 'post'].includes(cmd)) {
-  console.error('Usage: node x-post-browser.mjs <login|check|post> [text] [--dry-run]');
+if (!cmd || !['login', 'check', 'post', 'timeline'].includes(cmd)) {
+  console.error('Usage: node x-post-browser.mjs <login|check|post|timeline> [text|handle] [--dry-run] [--limit N]');
   process.exit(1);
 }
 if (cmd === 'post' && !arg) {
@@ -263,6 +280,7 @@ if (cmd === 'login') {
     '-n', '-a', CHROME_APP, '--args',
     `--user-data-dir=${PROFILE_DIR}`,
     '--no-first-run', '--no-default-browser-check',
+    ...(MOCK_KEYCHAIN ? ['--use-mock-keychain'] : []),
     'https://x.com/login',
   ]);
   console.error(
@@ -300,7 +318,9 @@ const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
   // CRITICAL: strip --use-mock-keychain so cookie values are decrypted with the
   // SAME real login-keychain key the GUI login used. With the mock key, Chrome
   // can't decrypt the saved session and drops every cookie → silent sign-out.
-  ignoreDefaultArgs: ['--use-mock-keychain'],
+  // Strip it only when the GUI login also used the real keychain; keeping the
+  // two consistent is the whole requirement.
+  ...(MOCK_KEYCHAIN ? {} : { ignoreDefaultArgs: ['--use-mock-keychain'] }),
 });
 
 /** Signed-in iff the home compose box exists (not redirected to /login). */
@@ -321,6 +341,50 @@ try {
     await page.screenshot({ path: shot });
     console.log(JSON.stringify({ signedIn: ok, profile: PROFILE_DIR, screenshot: shot }));
     process.exit(ok ? 0 : 2);
+  }
+
+  // Reading an author's own posts. The v2 API can do this too, but it is
+  // credit-metered and the account's credits run out; this path costs nothing
+  // and reaches further back than recent-search's 7 days.
+  if (cmd === 'timeline') {
+    if (!arg) { console.error('usage: x-post-browser.mjs timeline <handle> [--limit N]'); process.exit(2); }
+    if (!(await isSignedIn(page))) {
+      console.error('not signed in — run: node x-post-browser.mjs login');
+      process.exit(2);
+    }
+    const li = process.argv.indexOf('--limit');
+    const want = li > -1 ? parseInt(process.argv[li + 1], 10) || 50 : 50;
+    await page.goto(`https://x.com/${arg.replace(/^@/, '')}`,
+                    { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2500);
+    const seen = new Map();
+    // Scroll until the page stops yielding new posts: a virtualised timeline
+    // drops what scrolls past, so collect on every pass, not at the end.
+    for (let pass = 0; pass < 40 && seen.size < want; pass++) {
+      const batch = await page.$$eval('article[data-testid="tweet"]', (arts) => arts.map((a) => {
+        const link = a.querySelector('a[href*="/status/"]');
+        const time = a.querySelector('time');
+        const body = a.querySelector('[data-testid="tweetText"]');
+        const href = link ? link.getAttribute('href') : '';
+        const m = href.match(/\/status\/(\d+)/);
+        return m ? { id: m[1], url: `https://x.com${href.split('/photo/')[0]}`,
+                     at: time ? time.getAttribute('datetime') : '',
+                     text: body ? body.innerText : '' } : null;
+      }).filter(Boolean));
+      const before = seen.size;
+      for (const t of batch) if (!seen.has(t.id)) seen.set(t.id, t);
+      if (seen.size === before && pass > 2) break;   // exhausted, not merely slow
+      await page.mouse.wheel(0, 3000);
+      await page.waitForTimeout(1200);
+    }
+    // A pinned post sits first in the DOM regardless of age, so DOM order is not
+    // chronological. Sort before slicing or `--limit` keeps the wrong ones.
+    const out = [...seen.values()]
+      .sort((a, b) => (b.at || '').localeCompare(a.at || ''))
+      .slice(0, want);
+    if (!out.length) { console.error('timeline: no posts extracted — UNKNOWN, not an empty account'); process.exit(3); }
+    console.log(JSON.stringify(out, null, 2));
+    process.exit(0);
   }
 
   if (cmd === 'post') {
