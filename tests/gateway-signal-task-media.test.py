@@ -189,6 +189,35 @@ class TaskMediaRoute(unittest.TestCase):
         self.assertEqual([c[1] for c in self._media_posts()],
                          ["/v1/tasks/task-restart/media"])
 
+    def test_a_dedup_requeue_keeps_the_task_media_route(self):
+        """A requeue carries the SAME delivery forward, so its route must survive.
+
+        The sidecar is keyed by the delivery wire id; retiring it here would
+        silently downgrade the re-ask's attachment to the room-scoped route,
+        outside the task's own lease.
+        """
+        mod = self.mod
+        holder = "task-22d83e59601f3a1fef"
+        mod._write_task(self._signal_task("task-requeue"))
+        # The holder delivered nothing, so the plan re-asks rather than honouring.
+        mod.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (mod.ARCHIVE_RESULTS_DIR / f"{holder}-1785976425.txt").write_text("")
+        self._result(mod, "task-requeue", f"[deduped: {holder}]")
+        inflight = {"task-requeue"}
+        mod._post_ready_results(inflight)
+        reask = [p.stem for p in mod.TASKS_DIR.glob("task-*.txt")
+                 if p.stem != "task-requeue"]
+        self.assertEqual(len(reask), 1, "the dedup was not re-asked")
+        self.assertEqual(mod._load_task_media().get("task-requeue"),
+                         {"mode": "task-media", "thread_root": "$root:server"},
+                         "the re-ask lost the delivery's media route")
+        # The re-ask answers the ORIGINAL delivery, so its attachment still
+        # uploads against that task's lease.
+        self._result(mod, reask[0], f"here [file: {self._attachment()}]")
+        mod._post_ready_results(inflight)
+        self.assertEqual([c[1] for c in self._media_posts()],
+                         ["/v1/tasks/task-requeue/media"])
+
     def test_delivered_result_retires_the_media_mode(self):
         mod = self.mod
         mod._write_task(self._signal_task("task-retire"))

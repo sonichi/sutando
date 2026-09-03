@@ -364,11 +364,41 @@ _host_ws_segment() {
 
 LOCK_DIR="${SUTANDO_SYNC_LOCK_DIR:-/tmp/sync-workspace.lock.d}"
 
+# Holder identity = pid + process start time, so a pid recycled after a reboot
+# (/tmp survives reboots on macOS) fails the check instead of passing kill -0.
+_proc_start() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//'; }
+
 acquire_lock() {
-    # Stale lock cleanup: lock dir older than 10 min = assume crash, remove.
+    # Stale means the HOLDER IS GONE (or its identity does not match), not
+    # "older than N minutes": a run whose report step outlasts the cadence must
+    # not be overtaken by the next starter. The age bound below is a loud
+    # backstop for a holder that is alive but wedged, not the liveness test.
+    local max_min="${SUTANDO_SYNC_LOCK_MAX_MIN:-180}"
     if [ -d "$LOCK_DIR" ]; then
-        if find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
-            log "Stale lock removed (older than 10 min)"
+        local holder="" hstart="" now_start=""
+        [ -f "$LOCK_DIR/pid" ] && holder="$(head -1 "$LOCK_DIR/pid" 2>/dev/null)"
+        [ -f "$LOCK_DIR/start" ] && hstart="$(head -1 "$LOCK_DIR/start" 2>/dev/null)"
+        [ -n "$holder" ] && now_start="$(_proc_start "$holder")"
+        if [ -n "$holder" ] && [ -n "$now_start" ] && { [ -z "$hstart" ] || [ "$hstart" = "$now_start" ]; }; then
+            if find "$LOCK_DIR" -maxdepth 0 -mmin +"$max_min" 2>/dev/null | grep -q .; then
+                log "WARNING: lock holder pid $holder is alive but the lock is older than ${max_min} min — reclaiming (hung sync?)"
+                echo "sync-workspace: WARNING reclaiming a ${max_min}+ min lock from live pid $holder (hung sync?)" >&2
+                rm -rf "$LOCK_DIR"
+            else
+                log "Another sync (pid $holder) already in progress, exiting."
+                echo "sync-workspace: another instance is running (pid $holder), skipping."
+                exit 0
+            fi
+        elif [ -n "$holder" ]; then
+            if [ -n "$now_start" ]; then
+                log "Stale lock removed (pid $holder is alive but started at '$now_start', lock says '$hstart' — recycled pid)"
+            else
+                log "Stale lock removed (holder pid $holder is gone)"
+            fi
+            rm -rf "$LOCK_DIR"
+        elif find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null | grep -q .; then
+            # A lock with no pid file predates this rule; age is all it can say.
+            log "Stale lock removed (no holder recorded, older than 10 min)"
             rm -rf "$LOCK_DIR"
         fi
     fi
@@ -377,6 +407,8 @@ acquire_lock() {
         echo "sync-workspace: another instance is running, skipping."
         exit 0
     fi
+    echo "$$" > "$LOCK_DIR/pid"
+    _proc_start "$$" > "$LOCK_DIR/start"
     trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 }
 
