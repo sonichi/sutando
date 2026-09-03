@@ -116,6 +116,17 @@ def classify(command: str) -> Optional[str]:
     """Return 'APPROVE' / 'REQUEST_CHANGES' / 'COMMENT', or None if not a formal review."""
     if not isinstance(command, str) or "gh" not in command:
         return None
+    # A wrapper's quoted -c string may itself contain && or ; — classify it
+    # whole before the separator split can cut through the quotes.
+    try:
+        whole = shlex.split(command)
+    except ValueError:
+        whole = []
+    inner = _wrapped_command(whole)
+    if inner is not None:
+        nested = classify(inner)
+        if nested is not None:
+            return nested
     for seg in _segments(command):
         if _DISMISSAL.search(seg):
             continue
