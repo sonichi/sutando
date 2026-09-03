@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Sutando lint: forbid inline `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` in shell.
+# Sutando lint: forbid an inline `${CLAUDE_CONFIG_DIR:-…}` default in shell.
 #
 # Bash callers MUST resolve Claude Code's per-user home via the M0 helper:
 #
 #   $(bash scripts/sutando-config.sh claude-home-path [subpath...])
 #
-# instead of the inline `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` shorthand.
+# instead of an inline `${CLAUDE_CONFIG_DIR:-…}` default that resolves the home
+# itself. `$HOME/.claude`, its tilde spelling and `$HOME/.claude-sutando` are
+# all the same defect: whatever the fallback, the banner never fires.
 # Two reasons:
 #
 #   1. The helper centralizes the resolution order ($CLAUDE_CONFIG_DIR →
@@ -41,9 +43,12 @@ cd "$REPO_ROOT"
 
 mode="${1:-all}"
 
-# Pattern: matches both `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and the rare
-# inverted ordering. Excludes SOURCE_CLAUDE_CONFIG_DIR (different concept).
-PATTERN_INLINE='\$\{CLAUDE_CONFIG_DIR:-\$HOME/\.claude\}'
+# Pattern: any CLAUDE_CONFIG_DIR default chain that ends in a `.claude`
+# literal, so a nested `${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}`
+# is caught as well as the flat form. `[^}]*` stops before the first `}`, so
+# the bare emptiness idiom `${CLAUDE_CONFIG_DIR:-}` is NOT matched, and the
+# leading `${` anchor excludes SOURCE_CLAUDE_CONFIG_DIR (different concept).
+PATTERN_INLINE='\$\{CLAUDE_CONFIG_DIR:-[^}]*\.claude'
 
 # Allowed files — may reference the anti-pattern in comments / docstrings.
 ALLOWED='^(scripts/sutando-config\.sh|src/startup\.sh|scripts/lint-claude-home-path\.sh|tests/[^/]+\.(test\.)?sh)$'
@@ -86,8 +91,10 @@ done <<< "$files"
 if [[ "$found" -eq 1 ]]; then
   cat >&2 <<'EOF'
 
-ERROR: One or more files use the inline `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`
-pattern. This bypasses the M0 helper + #1534 deprecation banner.
+ERROR: One or more files resolve the Claude home with an inline
+`${CLAUDE_CONFIG_DIR:-…}` default. Any fallback counts — `$HOME/.claude`, its
+tilde spelling, a nested `${CLAUDE_HOME:-…}`, or `.claude-sutando`: each one
+bypasses the M0 helper and the #1534 deprecation banner.
 
 Fix: replace each occurrence with the helper. Examples:
 
@@ -96,6 +103,12 @@ Fix: replace each occurrence with the helper. Examples:
 
   After:
     _CHAN_BASE="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-home-path channels)"
+
+  Before:
+    SETTINGS="${CLAUDE_CONFIG_DIR:-${CLAUDE_HOME:-$HOME/.claude}}/settings.json"
+
+  After:
+    SETTINGS="$(bash "$REPO_DIR/scripts/sutando-config.sh" claude-home-path settings.json)"
 
   Before:
     PROXY="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/quota-tracker/scripts/credential-proxy.ts"

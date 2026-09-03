@@ -45,7 +45,10 @@
 // Load .env from the project root (3 levels up from this script), not cwd —
 // override: true ensures .env values win over stale shell env vars
 import { config as _dotenvConfig } from 'dotenv';
-_dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
+// fileURLToPath (as used below at _phoneSkillDir) instead of .pathname: URL.pathname
+// stays percent-encoded, so a spaced install path (".../Application Support/...")
+// yields a literal "%20" that points at no file and the .env silently never loads. (#2228)
+_dotenvConfig({ path: fileURLToPath(new URL('../../../.env', import.meta.url)), override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -210,7 +213,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'thread_root|source_room_id|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card)\\s*:',
+	'attachments|platform_card|instance_id|collaborator)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
