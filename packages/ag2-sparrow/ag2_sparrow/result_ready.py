@@ -18,6 +18,9 @@ A deliberately empty reply is expressed with the `[no-send]` marker, parsed by
 from __future__ import annotations
 
 import importlib.util
+import os
+import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -121,14 +124,84 @@ def retire_claim_if_unchanged(claim: str | Path, delivered: str) -> bool:
     # Record how much of the inode was delivered: bytes a stale descriptor
     # appends after this point are republished by sweep_retired, not marooned.
     try:
-        _delivered_marker(retired).write_text(str(len(final)))
+        _write_atomic(_delivered_marker(retired), str(len(final)))
     except OSError:
-        pass
+        # Without the marker late bytes are indistinguishable: undo instead.
+        try:
+            retired.replace(p)
+        except OSError:
+            pass
+        return False
     return True
 
 
 def _delivered_marker(retired: Path) -> Path:
     return retired.with_name(retired.name + ".delivered")
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Whole-or-nothing text write: a torn marker reads as a bad int and the
+    inode is then aged out with its late bytes unpublished."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+_SWEEP_SUFFIX = ".sweeping"
+_CLAIM_SUFFIXES = (".txt", ".sending")
+_TYPED_STEM_RE = re.compile(r"^(?P<base>.+?)(?P<dest>\.to-[a-z0-9_-]+)?\Z")
+_REDIRECT_LINE_RE = re.compile(r"^\[(?:channel: [^\]]+|dm-only)\]\s*$")
+
+
+def _late_name(inode: Path, now: float) -> str:
+    """The republished remainder keeps the typed destination where the
+    filename grammar reads it: at the end, before .txt."""
+    stem = inode.name
+    for suffix in _CLAIM_SUFFIXES:
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    m = _TYPED_STEM_RE.match(stem)
+    base, dest = (m.group("base"), m.group("dest") or "") if m else (stem, "")
+    return f"proactive-late-{base}-{int(now)}{dest}.txt"
+
+
+def _carried_redirect(delivered_prefix: bytes) -> str:
+    """The body-leg routing lines the delivered head carried, so a remainder
+    on its own is claimed by the same bridge the original was."""
+    lines = []
+    for line in delivered_prefix.decode(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        if _REDIRECT_LINE_RE.match(line.strip()):
+            lines.append(line.strip())
+            continue
+        break
+    return "".join(f"{l}\n" for l in lines)
+
+
+def _claim_for_sweep(inode: Path, now: float, quiesce_s: float) -> Path | None:
+    """One sweeper per inode: link a claim name, EEXIST means another holds it.
+    A claim older than quiesce_s is a crashed sweeper's and is broken."""
+    claim = inode.with_name(inode.name + _SWEEP_SUFFIX)
+    try:
+        if now - claim.stat().st_mtime >= quiesce_s:
+            claim.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        os.link(inode, claim)
+    except (FileExistsError, FileNotFoundError):
+        return None
+    except OSError:
+        return None
+    return claim
 
 
 def sweep_retired(results_dir: str | Path, quiesce_s: float = 600.0,
@@ -143,6 +216,9 @@ def sweep_retired(results_dir: str | Path, quiesce_s: float = 600.0,
     a directory no consumer reads. A retired file with no marker predates
     this lifecycle: its delivered length is unknown, so it is never
     republished (a duplicate is worse than the loss) and only aged out.
+
+    One sweeper per inode, and the marker advances before the remainder is
+    visible: an unadvanceable marker publishes nothing (retried, never twice).
     """
     results = Path(results_dir)
     retired_dir = results / "retired"
@@ -150,31 +226,56 @@ def sweep_retired(results_dir: str | Path, quiesce_s: float = 600.0,
         return []
     now = time.time() if now is None else now
     published: list[Path] = []
-    for inode in sorted(retired_dir.glob("*.txt")):
-        marker = _delivered_marker(inode)
+    for inode in sorted(retired_dir.iterdir()):
+        name = inode.name
+        if name.startswith(".") or not name.endswith(_CLAIM_SUFFIXES):
+            continue
+        claim = _claim_for_sweep(inode, now, quiesce_s)
+        if claim is None:
+            continue
         try:
-            raw = inode.read_bytes()
-            delivered = int(marker.read_text()) if marker.exists() else None
-            mtime = inode.stat().st_mtime
-        except (OSError, ValueError):
-            continue
-        if delivered is not None and len(raw) > delivered:
-            remainder = raw[delivered:].decode(errors="replace").strip()
-            if remainder:
-                target = results / f"proactive-late-{inode.stem}-{int(now)}.txt"
-                try:
-                    publish_result(target, remainder + "\n")
-                except OSError:
-                    continue
-                published.append(target)
+            marker = _delivered_marker(inode)
             try:
-                marker.write_text(str(len(raw)))
-            except OSError:
-                pass
-            continue
-        if now - mtime >= quiesce_s:
-            inode.unlink(missing_ok=True)
-            marker.unlink(missing_ok=True)
+                raw = inode.read_bytes()
+                delivered = int(marker.read_text()) if marker.exists() else None
+                mtime = inode.stat().st_mtime
+            except (OSError, ValueError):
+                continue
+            if delivered is not None and len(raw) > delivered:
+                remainder = raw[delivered:].decode(errors="replace").strip()
+                if remainder:
+                    body = _carried_redirect(raw[:delivered]) + remainder + "\n"
+                    target = results / _late_name(inode, now)
+                    try:
+                        fd, tmp_name = tempfile.mkstemp(
+                            dir=results, prefix=f".{target.name}.", suffix=".tmp")
+                    except OSError:
+                        continue
+                    tmp = Path(tmp_name)
+                    try:
+                        with os.fdopen(fd, "w") as fh:
+                            fh.write(body)
+                        _write_atomic(marker, str(len(raw)))
+                        try:
+                            os.replace(tmp, target)
+                        except OSError:
+                            _write_atomic(marker, str(delivered))
+                            raise
+                    except OSError:
+                        tmp.unlink(missing_ok=True)
+                        continue
+                    published.append(target)
+                    continue
+                try:
+                    _write_atomic(marker, str(len(raw)))
+                except OSError:
+                    pass
+                continue
+            if now - mtime >= quiesce_s:
+                inode.unlink(missing_ok=True)
+                marker.unlink(missing_ok=True)
+        finally:
+            claim.unlink(missing_ok=True)
     return published
 
 

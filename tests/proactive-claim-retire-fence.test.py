@@ -334,14 +334,17 @@ def _retire_rows() -> None:
             raise OSError(_errno.EACCES, "marker unwritable")
         return real_write_text(self, *a, **k)
     Path.write_text = _wt_hook
+    real_atomic = rd._write_atomic
+    rd._write_atomic = lambda *a, **k: (_ for _ in ()).throw(OSError(_errno.EACCES, "marker unwritable"))
     try:
-        check("an unwritable delivered-marker does not fail the retirement",
-              rd.retire_claim_if_unchanged(c11, "body") is True and rd._retired_path(c11).exists())
+        # No marker -> late bytes indistinguishable -> retirement undone.
+        check("an unwritable delivered-marker undoes the retirement and keeps the claim",
+              rd.retire_claim_if_unchanged(c11, "body") is False
+              and c11.exists() and not rd._retired_path(c11).exists())
     finally:
         Path.write_text = real_write_text
-    check("an inode without a marker only ages out (unwritable marker case)",
-          rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [])
-    rd._retired_path(c11).unlink()
+        rd._write_atomic = real_atomic
+    c11.unlink()
 
     c12 = d / "unreadable.txt"; c12.write_text("body\n")
     assert rd.retire_claim_if_unchanged(c12, "body") is True
@@ -358,26 +361,31 @@ def _retire_rows() -> None:
               rd.sweep_retired(d, quiesce_s=0, now=time.time() + 1) == [] and r12.exists())
     finally:
         Path.read_bytes = real_read_bytes
-    real_publish = rd.publish_result
-    rd.publish_result = lambda *a, **k: (_ for _ in ()).throw(OSError(_errno.ENOSPC, "no space"))
+    real_mkstemp = rd.tempfile.mkstemp
+    rd.tempfile.mkstemp = lambda *a, **k: (_ for _ in ()).throw(OSError(_errno.ENOSPC, "no space"))
     try:
         check("a failed republish keeps the inode and marker for the next pass",
               rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [] and r12.exists()
               and rd._delivered_marker(r12).read_text() == str(len(b"body\n")))
     finally:
-        rd.publish_result = real_publish
-    real_marker_write = Path.write_text
-    def _mw_hook(self, *a, **k):
-        if self.name.endswith(".delivered"):
-            raise OSError(_errno.EACCES, "marker unwritable")
-        return real_marker_write(self, *a, **k)
-    Path.write_text = _mw_hook
+        rd.tempfile.mkstemp = real_mkstemp
+    # An unmarkable remainder is not published (it would republish every pass);
+    # it is published exactly once when the marker is writable again.
+    real_marker_write = rd._write_atomic
+    late_before = set(d.glob("proactive-late-*"))
+    rd._write_atomic = lambda *a, **k: (_ for _ in ()).throw(OSError(_errno.EACCES, "marker unwritable"))
     try:
         pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
-        check("a republish still lands when the marker cannot advance",
-              len(pub) == 1 and pub[0].read_text().strip() == "LATE")
+        check("no republish lands while the marker cannot advance",
+              pub == [] and r12.exists()
+              and rd._delivered_marker(r12).read_text() == str(len(b"body\n"))
+              and set(d.glob("proactive-late-*")) == late_before)
     finally:
-        Path.write_text = real_marker_write
+        rd._write_atomic = real_marker_write
+    pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+    check("the remainder is published once the marker is writable, exactly once",
+          len(pub) == 1 and pub[0].read_text().strip() == "LATE"
+          and rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [])
 
     # Wiring: every proactive poller runs the sweep each pass, so "eventual"
     # is bounded by one poll interval, not by a tool nobody runs.
