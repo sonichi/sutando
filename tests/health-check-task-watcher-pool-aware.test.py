@@ -50,10 +50,13 @@ def _ps(rows: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+LABELS = ("session-owned", "unverified", "ownerless", "same-core duplicates")
+
+
 def _groups(detail: str) -> dict:
-    """Parse the three labelled groups back out of a verdict."""
+    """Parse the four labelled groups back out of a verdict."""
     found = {}
-    for label in ("session-owned", "unverified", "ownerless"):
+    for label in LABELS:
         m = re.search(rf"{label} \((\d+)\): ([^;]*)", detail)
         if m is None:
             continue
@@ -209,8 +212,8 @@ class OwnershipRequiresAVerifiedCoreSession(unittest.TestCase):
         """A watcher is spawned via a wrapper, so the core is rarely the DIRECT
         parent — a one-hop check would call this unverified."""
         v = _probe({"100": "300", "300": "400", "400": "500", "500": "1",
-                    "200": "310", "310": "500"},
-                   roots=["100", "200"], core_pids={"500"})
+                    "200": "310", "310": "600", "600": "1"},
+                   roots=["100", "200"], core_pids={"500", "600"})
         self.assertEqual(_groups(v["detail"])["session-owned"], {"100", "200"})
 
     def test_tmux_unavailable_makes_everything_unverified(self):
@@ -245,30 +248,32 @@ class EveryMultiRootVerdictNamesEveryGroup(unittest.TestCase):
         "live sentinel": dict(sentinel=999, sentinel_alive=True),
     }
 
-    def test_all_three_labels_present_when_every_root_is_ownerless(self):
+    def test_all_labels_present_when_every_root_is_ownerless(self):
         for nm, kw in self.CASES.items():
             with self.subTest(nm):
                 v = _probe({"100": "1", "200": "1"}, roots=["100", "200"],
                            core_pids={"9"}, **kw)
                 g = _groups(v["detail"])
-                self.assertEqual(set(g), {"session-owned", "unverified", "ownerless"}, nm)
+                self.assertEqual(set(g), set(LABELS), nm)
                 self.assertEqual(g["ownerless"], {"100", "200"}, nm)
 
-    def test_all_three_labels_present_when_every_root_is_owned(self):
+    def test_all_labels_present_when_every_root_is_owned_by_a_distinct_core(self):
+        """Two roots under ONE core are not the all-owned case (see
+        OneWatcherPerCore); the all-owned fixture needs one core per root."""
         for nm, kw in self.CASES.items():
             with self.subTest(nm):
-                v = _probe({"100": "500", "200": "500", "500": "1"},
-                           roots=["100", "200"], core_pids={"500"}, **kw)
+                v = _probe({"100": "500", "200": "600", "500": "1", "600": "1"},
+                           roots=["100", "200"], core_pids={"500", "600"}, **kw)
                 g = _groups(v["detail"])
-                self.assertEqual(set(g), {"session-owned", "unverified", "ownerless"}, nm)
+                self.assertEqual(set(g), set(LABELS), nm)
                 self.assertEqual(g["session-owned"], {"100", "200"}, nm)
 
     def test_a_stop_instruction_never_names_an_owned_root(self):
         """The invariant the consumer keys on, across all three branches."""
         for nm, kw in self.CASES.items():
             with self.subTest(nm):
-                v = _probe({"100": "500", "200": "1", "300": "500", "500": "1"},
-                           roots=["100", "200", "300"], core_pids={"500"}, **kw)
+                v = _probe({"100": "500", "200": "1", "300": "600", "500": "1", "600": "1"},
+                           roots=["100", "200", "300"], core_pids={"500", "600"}, **kw)
                 g = _groups(v["detail"])
                 self.assertEqual(g["ownerless"], {"200"}, nm)
                 self.assertEqual(g["session-owned"], {"100", "300"}, nm)
@@ -305,8 +310,8 @@ class TheSentinelsOwnTreeIsClassifiedToo(unittest.TestCase):
         self.assertIn("keep the sentinel's (100)", d)
 
     def test_owned_sentinel_is_named_in_its_own_group(self):
-        v = _probe({"100": "500", "200": "500", "500": "1"},
-                   roots=["100", "200"], core_pids={"500"},
+        v = _probe({"100": "500", "200": "600", "500": "1", "600": "1"},
+                   roots=["100", "200"], core_pids={"500", "600"},
                    sentinel=100, sentinel_alive=True)
         self.assertEqual(_groups(v["detail"])["session-owned"], {"100", "200"})
 
@@ -364,20 +369,79 @@ class TheSentinelsOwnTreeIsClassifiedToo(unittest.TestCase):
                 d = _probe(rows, roots=["100", "200"], core_pids=cores,
                            sentinel=100, sentinel_alive=True)["detail"]
                 g = _groups(d)
-                union = g["session-owned"] | g["unverified"] | g["ownerless"]
+                union = set().union(*(g[k] for k in LABELS))
                 self.assertEqual(union, {"100", "200"}, d)
-                self.assertEqual(
-                    sum(len(g[k]) for k in ("session-owned", "unverified", "ownerless")),
-                    2, f"a root landed in two groups: {d!r}")
+                self.assertEqual(sum(len(g[k]) for k in LABELS), 2,
+                                 f"a root landed in two groups: {d!r}")
 
 
 class RepairDataAccompaniesTheRepairOffer(unittest.TestCase):
     def test_all_owned_no_sentinel_branch_supplies_the_restamp_pid(self):
         """It advertises `--fix`; without a pid the fix dispatcher is a no-op."""
-        v = _probe({"100": "500", "200": "500", "500": "1"},
-                   roots=["100", "200"], core_pids={"500"}, sentinel=None)
+        v = _probe({"100": "500", "200": "600", "500": "1", "600": "1"},
+                   roots=["100", "200"], core_pids={"500", "600"}, sentinel=None)
         self.assertIn("Re-stamp the sentinel with --fix", v["detail"])
         self.assertIn(v.get("_sentinel_restamp_pid"), {"100", "200"})
+
+    def test_same_core_duplicates_get_no_restamp_offer(self):
+        """Mirror control: only the owner mapping differs, and the repair goes away."""
+        v = _probe({"100": "500", "200": "500", "500": "1"},
+                   roots=["100", "200"], core_pids={"500"}, sentinel=None)
+        self.assertNotIn("Re-stamp", v["detail"])
+        self.assertNotIn("_sentinel_restamp_pid", v)
+
+
+class OneWatcherPerCore(unittest.TestCase):
+    """Two roots tracing to the SAME core are a duplicate, not a pool; recording only
+    "reaches some core" made that pair look like two roots under two distinct cores."""
+
+    SAME = {"100": "300", "300": "500", "200": "310", "310": "500", "500": "1"}
+    DISTINCT = {"100": "300", "300": "500", "200": "310", "310": "600",
+                "500": "1", "600": "1"}
+
+    def test_same_core_roots_are_duplicates_in_every_sentinel_state(self):
+        for nm, kw in EveryMultiRootVerdictNamesEveryGroup.CASES.items():
+            with self.subTest(nm):
+                v = _probe(self.SAME, roots=["100", "200"], core_pids={"500"}, **kw)
+                d = v["detail"]
+                g = _groups(d)
+                self.assertNotIn("legitimate", d, d)
+                self.assertNotIn("Do NOT stop them", d, d)
+                self.assertNotIn("_sentinel_restamp_pid", v, d)
+                # One survivor per core; the other is named for stopping.
+                self.assertEqual(g["session-owned"], {"100"}, d)
+                self.assertEqual(g["same-core duplicates"], {"200"}, d)
+                self.assertEqual(g["ownerless"] | g["unverified"], set(), d)
+                self.assertIn("Stop ONLY the ownerless roots and the same-core duplicates", d)
+
+    def test_distinct_owners_are_legitimate_in_every_sentinel_state(self):
+        """The control: only the owner mapping changes, and the verdict flips."""
+        for nm, kw in EveryMultiRootVerdictNamesEveryGroup.CASES.items():
+            with self.subTest(nm):
+                v = _probe(self.DISTINCT, roots=["100", "200"],
+                           core_pids={"500", "600"}, **kw)
+                d = v["detail"]
+                g = _groups(d)
+                self.assertIn("Do NOT stop them", d, d)
+                self.assertEqual(g["session-owned"], {"100", "200"}, d)
+                self.assertEqual(g["same-core duplicates"], set(), d)
+
+    def test_the_sentinels_root_is_the_survivor(self):
+        """Which duplicate to keep is not arbitrary when one holds the sentinel."""
+        v = _probe(self.SAME, roots=["100", "200"], core_pids={"500"},
+                   sentinel=200, sentinel_alive=True)
+        d = v["detail"]
+        g = _groups(d)
+        self.assertEqual(g["session-owned"], {"200"}, d)
+        self.assertEqual(g["same-core duplicates"], {"100"}, d)
+        self.assertIn("keep the sentinel's (200)", d)
+
+    def test_three_roots_two_cores_stops_exactly_one(self):
+        v = _probe({"100": "500", "200": "500", "300": "600", "500": "1", "600": "1"},
+                   roots=["100", "200", "300"], core_pids={"500", "600"})
+        g = _groups(v["detail"])
+        self.assertEqual(g["session-owned"], {"100", "300"}, v["detail"])
+        self.assertEqual(g["same-core duplicates"], {"200"}, v["detail"])
 
 
 class APaneIsACoreOnlyIfItRunsACoreRuntime(unittest.TestCase):

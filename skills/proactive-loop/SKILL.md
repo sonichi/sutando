@@ -370,15 +370,19 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    always read as "untracked duplicates" and which pid holds the sentinel is arbitrary.
 
    The probe does this classification for you, same-host, and now does it in **every** multi-root
-   branch. **Act only on the three labelled groups it emits.** Key on that structure, never on
+   branch. **Act only on the four labelled groups it emits.** Key on that structure, never on
    wording:
 
    ```
-   ; session-owned (N): <pids>; unverified (N): <pids>; ownerless (N): <pids>
+   ; session-owned (N): <pids>; unverified (N): <pids>; ownerless (N): <pids>; same-core duplicates (N): <pids>
    ```
 
-   - **`ownerless`** — reparented to init, or parentage unreadable. The only roots you may stop.
-   - **`session-owned`** — ancestry traced to a verified local core session. Leave alone.
+   - **`ownerless`** — reparented to init, or parentage unreadable. Stop these.
+   - **`same-core duplicates`** — a second (third, ...) root traced to the SAME core as a
+     session-owned one. A pool runs one watcher per core, so these are duplicates, not pool
+     members: stop these too. The survivor (the sentinel's root when it is one of them, else the
+     lowest pid) is listed under `session-owned`.
+   - **`session-owned`** — ancestry traced to a verified local core session, one per core. Leave alone.
    - **`unverified`** — a live parent that could not be attributed to a core. **Neither stop nor
      bless.** Ambiguous ownership is not a licence to stop a watcher; it is a reason not to.
 
@@ -407,14 +411,14 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    records carry no `host` field at all, so they cannot be filtered back to this machine even in
    principle.
 
-   | probe says | action (apply the three-group split above first: session-owned / unverified / ownerless) |
+   | probe says | action (apply the four-group split above first: session-owned / unverified / ownerless / same-core duplicates) |
    |---|---|
    | `ok` | nothing to do. |
-   | watcher(s) running with **no PID sentinel**, and at least one is session-owned or unverified | **Do NOT start another** — that is what creates the duplicate. Apply the group rules: stop only `ownerless`. |
+   | watcher(s) running with **no PID sentinel**, and at least one is session-owned or unverified | **Do NOT start another** — that is what creates the duplicate. Apply the group rules: stop only `ownerless` and `same-core duplicates`. |
    | watcher(s) running with **no PID sentinel** and **every root ownerless** | Stop them ALL, then start exactly ONE via `Monitor`. Stopping alone leaves `tasks/` undrained — the probe says this explicitly in its detail. |
-   | sentinel pid dead but **other watcher(s) still run** | same — apply the group rules, then the post-cleanup contract: stop only the ownerless roots, rerun this probe, and start exactly ONE via `Monitor` only if no tree remains (every root ownerless leaves none). |
-   | multiple trees, some **not tracked by the sentinel** | same — group rules, then the same post-cleanup contract (stop ownerless → rerun probe → start exactly ONE only if none remains). The sentinel's own tree is classified too, so an orphaned sentinel beside a live replacement is named for cleanup rather than protected. |
-   | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
+   | sentinel pid dead or recycled, but **other watcher(s) still run** | same — apply the group rules, then the post-cleanup contract: stop only the ownerless roots and same-core duplicates, rerun this probe, and start exactly ONE via `Monitor` only if no tree remains (every root ownerless leaves none). |
+   | multiple trees, some **not tracked by the sentinel** | same — group rules, then the same post-cleanup contract (stop ownerless + same-core duplicates → rerun probe → start exactly ONE only if none remains). The sentinel's own tree is classified too, so an orphaned sentinel beside a live replacement is named for cleanup rather than protected. |
+   | not running (no sentinel, no trees) / pid dead or recycled with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
 
    **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
    express on its own, and the one that makes the difference between a cleanup and an outage.

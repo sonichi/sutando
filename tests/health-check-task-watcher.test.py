@@ -16,6 +16,8 @@ Covers:
   c) core alive, sentinel holds a dead PID → warn (crashed, sentinel left behind)
   d) core alive, PID alive but argv is not the watcher → warn (PID reuse)
   e) core alive, PID alive and argv names the watcher → ok
+  e2) sentinel names an observer that merely MENTIONS the script → never ok,
+     before or after the cleanup it prescribes (anchored predicate, not substring)
   f) core alive, sentinel unparseable → warn (not a crash)
   g) the check is registered in run_checks' output
   h) _proc_argv against real PIDs (live + nonexistent) — the OS-facing half
@@ -525,6 +527,23 @@ def case_e_live_watcher_is_ok() -> list[str]:
     return []
 
 
+def case_e2_an_observer_sentinel_is_never_blessed_across_cleanup() -> list[str]:
+    """Cleanup driven twice with the sentinel naming a process that merely MENTIONS the
+    script: pass 1 still names the live root; pass 2 (root gone, sentinel kept) is never ok."""
+    fails = []
+    for argv in ("python3 observer.py watch-tasks-stream.sh",
+                 "bash -c ps aux | grep watch-tasks-stream"):
+        before = run_check(core_alive=True, pid_text="4242", argv=argv,
+                           trees={"100": {"100"}})
+        after = run_check(core_alive=True, pid_text="4242", argv=argv, trees={})
+        if "ownerless (1): 100" not in before["detail"] or "start exactly ONE" not in before["detail"]:
+            fails.append(f"e2) pass 1 must name root 100 for cleanup ({argv!r}): {before['detail']!r}")
+        for label, r in (("pass 1", before), ("pass 2", after)):
+            if r["status"] == "ok" or "alive (pid 4242)" in r["detail"]:
+                fails.append(f"e2) {label} blessed the observer ({argv!r}): {r!r}")
+    return fails
+
+
 def case_f_unparseable_sentinel_warns() -> list[str]:
     r = run_check(core_alive=True, pid_text="not-a-pid", argv="")
     if r["status"] != "warn":
@@ -750,6 +769,7 @@ def main() -> int:
         ("c", case_c_dead_pid_warns),
         ("d", case_d_pid_reuse_warns),
         ("e", case_e_live_watcher_is_ok),
+        ("e2", case_e2_an_observer_sentinel_is_never_blessed_across_cleanup),
         ("f", case_f_unparseable_sentinel_warns),
         ("g", case_g_registered_in_run_checks),
         ("h", case_h_proc_argv_reads_a_real_process),
