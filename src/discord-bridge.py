@@ -5105,17 +5105,15 @@ async def poll_results():
                     continue
 
                 try:
-                    # Extract optional [reply: <message_id>] directive — the
-                    # agent signals "this result is a reply to that message"
-                    # so the bridge POSTs with `message_reference` (Discord's
-                    # reply-style) rather than as a fresh message. Used for
-                    # welcome posts that reply to a new-user message + any
-                    # context-replying response. msze 2026-05-06 ask.
-                    reply_pattern = re.compile(r'\[reply:\s*(\d{17,20})\]')
-                    reply_match = reply_pattern.search(reply_text)
-                    reply_to_id = int(reply_match.group(1)) if reply_match else None
-                    if reply_match:
-                        reply_text = reply_pattern.sub('', reply_text).strip()
+                    # [reply: <message_id>] — the agent signals "this result
+                    # is a reply to that message", so the bridge POSTs with
+                    # `message_reference` rather than as a fresh message. Taken
+                    # from parse_markers() above, which already stripped it from
+                    # the body: a second regex here searched a body the shared
+                    # parser had emptied and always found None.
+                    _reply = next((a.value for a in _parsed.actions
+                                   if a.kind == "reply"), None)
+                    reply_to_id = int(_reply) if _reply else None
                     # Default to quoting the triggering message. Threads too:
                     # interleaved exchanges make position stop identifying it.
                     if reply_to_id is None:
