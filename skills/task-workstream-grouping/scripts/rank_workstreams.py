@@ -14,6 +14,29 @@ from __future__ import annotations
 from typing import Iterable, Optional, Sequence
 
 
+def candidates_from_snapshot(snapshot: dict) -> list[tuple[str, str]]:
+    """Build ``best_match`` candidates from a classifier snapshot.
+
+    The store keys a workstream's label as ``title``, but every snapshot layer
+    re-exports it as ``name``. A caller that assembles these pairs by hand and
+    reaches for the wrong key gets empty text rather than an error, every score
+    collapses to zero, and ``best_match`` then refuses everything -- which is
+    indistinguishable from a correct low-confidence refusal. Reading both keys
+    here is what stops that guess from being made at each call site.
+    """
+    rows = (snapshot or {}).get("existing_workstreams") or []
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cid = str(row.get("id") or "")
+        if not cid:
+            continue
+        label = str(row.get("name") or row.get("title") or "")
+        out.append((cid, f'{label} {row.get("summary") or ""}'.strip()))
+    return out
+
+
 def score(text: str, keywords: Sequence[str]) -> int:
     """Occurrences of any keyword in text. Case-insensitive, substring-based."""
     low = text.lower()

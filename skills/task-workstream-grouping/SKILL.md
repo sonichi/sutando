@@ -34,6 +34,13 @@ labels.
      only if it beats the runner-up by a margin, and `None` otherwise — on a tie
      you must OMIT the task, not take the first candidate.
 
+     **Build `candidates` with `candidates_from_snapshot(snap)` — do not assemble
+     the pairs by hand.** The store labels a workstream `title`, but the snapshot
+     re-exports it as `name`, so hand-assembling with the wrong key yields empty
+     text rather than an error: every score becomes 0 and `best_match` refuses
+     everything, which is indistinguishable from a correct low-confidence
+     refusal. The helper reads both keys so the choice cannot be made wrongly.
+
      A ranking re-derived each pass cannot degrade gracefully: on a tie it falls
      back to whatever order the candidates arrived in, which is the arbitrary
      pick scoring was supposed to remove, and the printed shortlist makes it look

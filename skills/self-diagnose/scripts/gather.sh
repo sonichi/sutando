@@ -121,13 +121,15 @@ for _gh_cand in $(/usr/bin/which -a gh 2>/dev/null); do
 done
 [ -z "$GH" ] && [ -x /opt/homebrew/bin/gh ] && GH=/opt/homebrew/bin/gh
 if [ -n "$GH" ]; then
-	"$GH" pr list --state open --limit 20 --json number,title,mergeable,headRefName,author,updatedAt \
-		--jq '.[] | "#\(.number) \(.headRefName) [@\(.author.login)] \(.title) — \(.mergeable)"' \
-		> "$OUT/prs-open.txt" 2>/dev/null || true
-	"$GH" pr list --state merged --search "merged:>$(date -v -14d +%Y-%m-%d 2>/dev/null || date -d '14 days ago' +%Y-%m-%d)" \
-		--limit 30 --json number,title,mergedAt,author \
-		--jq '.[] | "#\(.number) \(.mergedAt[:10]) [@\(.author.login)] \(.title)"' \
-		> "$OUT/prs-recent-merged.txt" 2>/dev/null || true
+	# Capped, but never silently: 20 of 117 open PRs read as the whole set.
+	_cap="$(dirname "${BASH_SOURCE[0]}")/capped-capture.sh"
+	bash "$_cap" "$GH" "$OUT/prs-open.txt" 20 \
+		'.[] | "#\(.number) \(.headRefName) [@\(.author.login)] \(.title) — \(.mergeable)"' \
+		--state open --json number,title,mergeable,headRefName,author,updatedAt
+	bash "$_cap" "$GH" "$OUT/prs-recent-merged.txt" 30 \
+		'.[] | "#\(.number) \(.mergedAt[:10]) [@\(.author.login)] \(.title)"' \
+		--state merged --json number,title,mergedAt,author \
+		--search "merged:>$(date -v -14d +%Y-%m-%d 2>/dev/null || date -d '14 days ago' +%Y-%m-%d)"
 fi
 
 # 3) Build log tail + pending questions + cold-review log (small files, copy whole)
