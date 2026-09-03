@@ -85,6 +85,21 @@ class TaskRelayClickTests(unittest.TestCase):
         self.assertTrue(rgb._handle_hitl_action(t))
         self.assertEqual(self.mgr.get(self.req.id).revision, rev)
 
+    def test_redelivered_label_reply_is_consumed_while_its_control_result_waits(self):
+        """The fallback form carries no hitl_action. While the [no-send] control
+        result is still queued (results plane down), a redelivery must be held
+        as consumed, not fall through to _write_task as the owner's chat."""
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card-redeliver")
+        t = self._task(reply_to_event="$card-redeliver", task="Deny")
+        self.assertTrue(rgb._handle_hitl_action(t))
+        rgb._queue_review_control_result(t)  # POST /v1/results has not succeeded yet
+        rev = self.mgr.get(self.req.id).revision
+        out = rgb._handle_hitl_action(t)
+        self.assertTrue(out, out)
+        self.assertFalse(str(out).startswith("rejected:"), out)
+        self.assertEqual(self.mgr.get(self.req.id).revision, rev)
+        self.assertEqual(self.mgr.get(self.req.id).chosen_action, "deny")
+
 
     def test_stale_click_is_consumed_and_the_owner_is_told(self):
         stale = {"hitl_id": self.req.id, "expected_revision": self.req.revision + 5,

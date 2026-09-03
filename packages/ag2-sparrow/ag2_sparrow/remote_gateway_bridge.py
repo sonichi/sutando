@@ -919,8 +919,10 @@ def _handle_hitl_action(task: dict):
     store here so a click never becomes a chat task; the caller closes the
     task with a [no-send] control result. False = an ordinary message."""
     task_id = str(task.get("id") or "")
+    # The control record exists only for a task already consumed here (either
+    # click form, or a review decision); its form must not be re-derived.
     if task_id and _control_result_path(task_id).is_file():
-        return "applied" if isinstance(task.get("hitl_action"), dict) else False  # redelivery
+        return "redelivered"
     if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
         return False
     owner = os.environ.get("SPARROW_HA_OWNER") or ""
@@ -938,6 +940,8 @@ def _handle_hitl_action(task: dict):
         # A non-owner typed a label as a reply: that is a message, not a click
         # to decline; it must reach _write_task like any other text.
         return False
+    # A non-owner's real click stays consumed on purpose: a card press is not
+    # prose, so it closes [no-send] and is only logged, never a chat task.
     return out or False
 
 
