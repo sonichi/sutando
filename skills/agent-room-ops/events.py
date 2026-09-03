@@ -32,7 +32,7 @@ import time
 import urllib.request
 
 from _gateway import (HTTP_TIMEOUT, gate_allows, load_gate, gateway, http_json,
-                      degrade_reason, urlencode, HTTPError, URLError)
+                      degrade_reason_from, urlencode, HTTPError, URLError)
 import receipt as _receipt
 
 DEFAULT_WAIT = 30
@@ -81,7 +81,7 @@ def _op_call(op, room_id, agent_mxid, gate, extra=None, *, gated=True):
     try:
         _status, res = http_json("POST", f"{base}/v1/room", headers, payload)
     except HTTPError as e:
-        return _result(False, room_id=room_id, reason=degrade_reason(e.code))
+        return _result(False, room_id=room_id, reason=degrade_reason_from(e))
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, reason=f"network error: {e}")
     if not isinstance(res, dict):
@@ -179,7 +179,7 @@ def pull(cursor=0, wait=DEFAULT_WAIT):
         # empty-events response.
         res = _http_get_json(url, headers, wait + HTTP_TIMEOUT)
     except HTTPError as e:
-        return {"ok": False, "events": [], "cursor": cursor, "reason": degrade_reason(e.code)}
+        return {"ok": False, "events": [], "cursor": cursor, "reason": degrade_reason_from(e)}
     except (URLError, TimeoutError, OSError) as e:
         return {"ok": False, "events": [], "cursor": cursor, "reason": f"network error: {e}"}
     except ValueError as e:
@@ -272,7 +272,7 @@ def stream(cursor=None, on_event=None, keepalive_cb=None, *, stop=None, max_even
         resp = _open_stream(f"{base}/v1/events/stream", h)
     except HTTPError as e:
         if e.code in (401, 403, 404):
-            raise RuntimeError(degrade_reason(e.code)) from e
+            raise RuntimeError(degrade_reason_from(e)) from e
         raise StreamDisconnected(f"HTTP {e.code} opening stream") from e
     except (URLError, TimeoutError, OSError) as e:
         raise StreamDisconnected(f"connect failed: {e}") from e
