@@ -161,15 +161,15 @@ class HitlReplyHandler:
         req = self.requirement_for_event(target)
         if req is None:
             return None
-        label = _reply_text(str(task.get("task") or "")).strip().lower()
-        action = next((a for a in req.actions
-                       if a.label.strip().lower() == label or a.id.lower() == label), None)
+        action, note = match_action(req, _reply_text(str(task.get("task") or "")))
         if action is None:
             return None  # a reply to the card that is not a click stays a message
         self.last_branch = "fallback"
-        return {**base, "content": {REPLY_FIELD: {
-            "hitl_id": req.id, "expected_revision": req.revision,
-            "action_id": action.id, "guard": req.guard}}}
+        payload = {"hitl_id": req.id, "expected_revision": req.revision,
+                   "action_id": action.id, "guard": req.guard}
+        if note:
+            payload["answer"] = note
+        return {**base, "content": {REPLY_FIELD: payload}}
 
     def requirement_for_event(self, event_id: str) -> Optional[HumanRequirement]:
         """The active requirement whose card is `event_id` (CREATE projection;
@@ -178,6 +178,35 @@ class HitlReplyHandler:
             if self._manager.projection_target(req.id) == event_id:
                 return req
         return None
+
+
+# The separator is required: without it a label prefix-matches an unrelated
+# sentence that merely starts with it, silently turning prose into a decision.
+NOTE_SEPARATORS = ("\u2014", "\u2013", "-", ":")
+
+
+def match_action(req: HumanRequirement, text: str):
+    """(Action, note) for a reply that is a click, else (None, None).
+
+    Exact label or id is a bare click. `<label> <sep> <note>` is the same click
+    carrying a free-text qualification, which travels on as ActionReply.answer.
+    """
+    t = (text or "").strip()
+    low = t.lower()
+    for action in req.actions:
+        for cand in (action.label or "", action.id or ""):
+            c = cand.strip()
+            if not c:
+                continue
+            if low == c.lower():
+                return action, None
+            if low.startswith(c.lower()):
+                rest = t[len(c):].lstrip()
+                if rest[:1] in NOTE_SEPARATORS:
+                    # A separator with nothing after it is still the click; the
+                    # human just left the note empty.
+                    return action, (rest[1:].strip() or None)
+    return None, None
 
 
 REPLY_CONTEXT_END = "[End AG2 Space reply context]"
