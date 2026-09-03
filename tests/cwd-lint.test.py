@@ -11,12 +11,14 @@ set but the write lands in the repo root.  Issue #863.
 
 ## What is checked
 
-TypeScript (src/ + scripts/):
+TypeScript (src/ + scripts/ + skills/):
   - Fail on any non-comment line containing `process.cwd()`
   - Allowlist: none needed (workspace_default.ts / util_paths.ts mention it
     only in docblocks; the canonical resolver uses $env + homedir(), not cwd)
 
-Python (src/ + scripts/):
+Python (src/ + scripts/) — skills/ NOT yet covered: 7 hits there need
+  per-site triage (comments explaining why getcwd is wrong, argparse
+  defaults for an explicit --cwd flag), not a blanket ban.
   - Fail on any non-comment line containing `Path.cwd()` or `os.getcwd()`
   - Allowlist: src/workspace_default.py (uses Path.cwd() for relative-path
     anchor in _expand_tilde, which is correct and intentional)
@@ -31,6 +33,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SRC  = REPO / "src"
 SCRIPTS = REPO / "scripts"
+SKILLS = REPO / "skills"
+
+# One definition per language. The summary line used to re-derive these, so a
+# scope change silently left it reporting a count for a set nobody scanned.
+TS_ROOTS = [SRC, SCRIPTS, SKILLS]
+TS_EXTS = (".ts", ".tsx", ".js", ".mjs")
+PY_ROOTS = [SRC, SCRIPTS]
+PY_EXTS = (".py",)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -73,7 +83,9 @@ TS_ALLOWLIST: set[str] = set()  # no files need allowlisting today
 
 def check_ts_cwd() -> list[str]:
     failures = []
-    ts_files = _scan_files([SRC, SCRIPTS], (".ts", ".tsx", ".js", ".mjs"))
+    # skills/ included since #3546: a manifest skill's tools.ts is dynamic-
+    # imported at runtime and resolves paths exactly like src/ does.
+    ts_files = _scan_files(TS_ROOTS, TS_EXTS)
     for path in ts_files:
         rel = path.relative_to(REPO)
         if str(rel) in TS_ALLOWLIST:
@@ -96,7 +108,7 @@ PY_ALLOWLIST = {
 
 def check_py_cwd() -> list[str]:
     failures = []
-    py_files = _scan_files([SRC, SCRIPTS], (".py",))
+    py_files = _scan_files(PY_ROOTS, PY_EXTS)
     for path in py_files:
         rel = path.relative_to(REPO)
         if str(rel) in PY_ALLOWLIST:
@@ -154,6 +166,6 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    ts_count = len(_scan_files([SRC, SCRIPTS], (".ts", ".tsx", ".js", ".mjs")))
-    py_count = len(_scan_files([SRC, SCRIPTS], (".py",)))
+    ts_count = len(_scan_files(TS_ROOTS, TS_EXTS))
+    py_count = len(_scan_files(PY_ROOTS, PY_EXTS))
     print(f"cwd-lint: OK — {ts_count} TS files, {py_count} Python files, 0 violations")

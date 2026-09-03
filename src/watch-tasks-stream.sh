@@ -698,6 +698,11 @@ while IFS= read -r path; do
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
+        # Graceful-shutdown gate (#2165): hold new tasks while the sentinel is present;
+        # emitting one mid-shutdown would orphan it.
+        if [ -f "$STATE_DIR/shutdown.sentinel" ]; then
+          continue
+        fi
         dispatch_task "$path"
       fi
       ;;

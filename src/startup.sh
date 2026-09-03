@@ -482,6 +482,9 @@ bash "$REPO/scripts/install-session-start-hook.sh" 2>&1 || true
 # PERSONAL_CLAUDE.md compaction-reinject hook is Claude-only policy — wired
 # at src/agent/claude/cli/start-cli.sh, the Claude launch chokepoint, not here.
 
+# The sentinel is NOT cleared here. This runs ~850 lines before the
+# `exec start-cli.sh` below, which clears it once a core is verified live.
+
 # Auto-bootstrap: create-if-missing files and dirs that the agent + skills
 # expect to exist (logs, state, tasks, results, notes, contextual-chips.json,
 # pending-questions.md, build_log.md, crons.json, …). Idempotent — safe to

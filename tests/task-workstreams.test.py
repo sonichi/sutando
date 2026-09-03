@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+import time
 import multiprocessing
+import os
+import re
 import sys
 import tempfile
 import threading
@@ -16,6 +19,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import task_workstreams as workstreams  # noqa: E402
+
+# The enqueue is off by default; its gate is exercised directly in
+# test_classifier_enqueue_is_off_by_default. Every other test assumes it on.
+os.environ["SUTANDO_WORKSTREAM_CLASSIFIER"] = "on"
 
 
 def inherit_worker(workspace: str, child_id: str, start) -> None:
@@ -122,6 +129,70 @@ def test_loader_parser_and_history_fail_open_edges() -> None:
     assert "task-no-text" not in ids
     assert "task-old-classifier" not in ids
 
+
+def test_task_text_keeps_the_whole_body_not_just_its_first_line() -> None:
+    # A one-line read left the ranker scoring a `cd` command's path segments.
+    content = (
+        "id: task-1\n"
+        "source: slack\n"
+        "task: [Slack DM] cd \"/Users/x/Library/Application Support/engine\"\n"
+        "PATH=\"$HOME/.local/bin:$PATH\" bash src/startup.sh\n"
+        "zsh: no such file or directory\n"
+        "\n"
+        "===SKILL INSTRUCTIONS (follow before any other action)===\n"
+        "1. NOTIFY FIRST: run notify.py --source slack\n"
+    )
+    text = workstreams._task_text(content)
+    assert "startup.sh" in text, text
+    assert "no such file or directory" in text, text
+    # The bridge block is instructions to the agent, not the user's ask.
+    assert "NOTIFY FIRST" not in text, text
+    assert "===" not in text, text
+
+    # Unchanged shapes: single-line bodies, and a file with no task: line.
+    assert workstreams._task_text("id: t\ntask: just one line\n") == "just one line"
+    assert workstreams._task_text("id: task-empty\n") == ""
+
+
+def test_task_text_stops_at_headers_that_follow_the_task_line() -> None:
+    # Real ag2space shape: `task:` is line 4 and headers follow it, so a scan
+    # that runs to `===` would score a room roster as the user's ask.
+    content = (
+        "id: task-335d10bf\n"
+        "envelope_hmac: v1:abc\n"
+        "receiving_instance: @max-sutando-max.agent:ag2.space\n"
+        "task: get me started by reading this file\n"
+        "source: ag2space\n"
+        "channel_id: !oQZbDJrYPnVKxMLECt:ag2.space\n"
+        "sender_name: Max DeNike\n"
+        "room_members: @max-sutando-max.agent:ag2.space, @max:ag2.space\n"
+        "user_id: @max:ag2.space\n"
+        "access_tier: owner\n"
+    )
+    text = workstreams._task_text(content)
+    assert text == "get me started by reading this file", text
+    for leaked in ("source:", "channel_id:", "room_members:", "ag2.space"):
+        assert leaked not in text, (leaked, text)
+
+
+
+def test_header_stop_pattern_escapes_key_metacharacters() -> None:
+    """A key holding a regex metacharacter must stop the body literally.
+
+    No shipped key contains one today, so this pins a construction property
+    rather than repairing a reachable defect.
+    """
+    hazard = re.compile(r"^(?:={3,}.*={3,}$|(" + "|".join(["a.c"]) + r"):)")
+    assert hazard.match("abc: x"), "unescaped '.' matches any char - the hazard"
+
+    safe = workstreams._header_stop_pattern(["a.c"])
+    assert safe.match("a.c: x"), "the literal key must still stop the body"
+    assert not safe.match("abc: x"), "'.' must not match an arbitrary character"
+
+    ordinary = workstreams._header_stop_pattern(["source", "user_id"])
+    assert ordinary.match("source: slack")
+    assert not ordinary.match("  user_id: x")
+    assert not ordinary.match("see user_id: x")
 
 def test_apply_is_validated_stable_sticky_and_fail_open() -> None:
     workspace = fixture_workspace()
@@ -272,12 +343,44 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         settled = workstreams.maybe_enqueue_classifier_task(workspace)
     assert not settled.pending and not settled.enqueued and settled.reason == "complete"
 
+
+def test_classifier_enqueue_is_off_by_default() -> None:
+    workspace = fixture_workspace()
+    # Unset: the gate refuses before any work; nothing is queued.
+    with mock.patch.dict(os.environ, {"SUTANDO_WORKSTREAM_CLASSIFIER": ""}):
+        off = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert not off.pending and not off.enqueued and off.reason == "disabled"
+    assert not list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
+    # A truthy value re-enables it; the same ready workspace now queues one.
+    with mock.patch.dict(os.environ, {"SUTANDO_WORKSTREAM_CLASSIFIER": "on"}):
+        on = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert on.pending and on.enqueued and on.reason == "enqueued"
+    assert list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
+
+    # The cooldown is measured from a COMPLETION; an inflight run does not cool.
+    workstreams.mark_classifier_complete(workspace, on.snapshot_hash)
     write_task(
         workspace / "tasks" / "archive" / "2026-08" / "task-new.txt",
         "task-new",
         "2026-08-03T13:00:00Z",
         "a newly archived task",
     )
+    # A fresh completion absorbs source churn without rescanning; only once the
+    # cooldown has lapsed does the new task re-open the gate.
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        side_effect=AssertionError("cooling-down must not scan history"),
+    ):
+        cooled = workstreams.classifier_status(workspace)
+    assert not cooled.pending and not cooled.enqueued
+    assert cooled.reason == "cooling-down"
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    # completed_at governs the cooldown; enqueued_at is its legacy fallback.
+    state["enqueued_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
+    state["completed_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
+    state_path.write_text(json.dumps(state))
     with mock.patch.object(
         workstreams,
         "scan_task_history",
@@ -322,6 +425,15 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         "snapshot_hash": manual_snapshot["snapshot_hash"],
         "workstreams": [],
     })
+    reviewed = workstreams.classifier_status(manual)
+    # A just-applied inference is a fresh completion: the gate cools instead
+    # of rescanning — the churn-absorption that breaks the #3621 spin.
+    assert not reviewed.pending and reviewed.reason == "cooling-down"
+    manual_state_path = manual / "state" / "task-workstream-classifier.json"
+    manual_state = json.loads(manual_state_path.read_text())
+    manual_state["completed_at"] = (
+        time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1)
+    manual_state_path.write_text(json.dumps(manual_state))
     reviewed = workstreams.classifier_status(manual)
     assert not reviewed.pending and reviewed.reason == "complete"
 
@@ -883,9 +995,13 @@ def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
         test_loader_parser_and_history_fail_open_edges,
+        test_task_text_keeps_the_whole_body_not_just_its_first_line,
+        test_task_text_stops_at_headers_that_follow_the_task_line,
+        test_header_stop_pattern_escapes_key_metacharacters,
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
+        test_classifier_enqueue_is_off_by_default,
         test_classifier_task_is_envelope_stamped,
         test_classifier_task_survives_a_raising_stamper,
         test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,

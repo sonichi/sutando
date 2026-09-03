@@ -71,12 +71,28 @@ def load_roster(d):
         })
     return rows
 
+def _name_of(r):
+    """quick-lookup.yaml keys people as `id`/`who`, the roster as `entity_id`/
+    `one_line`; match() reads both, so every render site must too."""
+    return r.get("entity_id") or r.get("id") or ""
+
+
+def _role_of(r):
+    return str(r.get("one_line") or r.get("who") or "")
+
+
+def _identity_id(i):
+    # schema.md names this field `user_id`; this reader only ever read
+    # `provider_id`, so a schema-faithful store matched nothing.
+    return str(i.get("provider_id") or i.get("user_id") or "")
+
+
 def match(rows, needle, ents=()):
     n = needle.lower().lstrip("@")
     # an entity whose GitHub/slack/discord id matches, even if the name does not
     by_ident = {e.get("entity_id") for e in ents
                 for i in (e.get("identities") or [])
-                if n in str(i.get("provider_id", "")).lower()}
+                if n in _identity_id(i).lower()}
     # Identity matches OUTRANK role text and never mix with it: role text names
     # other people and repos, so a hit there is about the subject, not the person.
     strong = [r for r in rows
@@ -128,7 +144,7 @@ def main():
         print(f"KNOWN ENTITIES ({len(rows)})\n{stale}")
         for r in rows:
             st = r.get("agent_mxid") or "-- no Stand recorded --"
-            print(f"  {r.get('entity_id',''):<28} {r.get('kind',''):<6} {st}")
+            print(f"  {_name_of(r):<28} {r.get('kind',''):<6} {st}")
         return 0
 
     hits = match(rows, a.query, ents)
@@ -139,14 +155,14 @@ def main():
         return 0
 
     for r in hits:
-        eid = r.get("entity_id", "")
+        eid = _name_of(r)
         stand = r.get("agent_mxid")
         print(f"\n  {eid}  [{r.get('kind','?')}]")
-        print(f"    role: {str(r.get('one_line',''))[:150]}")
+        print(f"    role: {_role_of(r)[:150]}")
         if stand:
             print(f"    ADDRESS THIS -> {stand}")
         else:
-            loose = re.findall(r"@[\w.\-]+", str(r.get("one_line", "")))
+            loose = re.findall(r"@[\w.\-]+", _role_of(r))
             if loose:
                 print(f"    ⚠ NO STRUCTURED Stand, but the role text names: {', '.join(loose)}")
                 print("      UNVERIFIED -- prose is not a resolved id. Use it, and say it is unconfirmed.")
@@ -160,7 +176,7 @@ def main():
             print("    ⚠ NO cross-platform ids in the store for this entity (discord/slack/github unknown).")
             print("      The SCRIPT cannot invent them -- the map was never given them.")
         for i in idents:
-            print(f"    id: {i.get('provider')}={i.get('provider_id')} verified={i.get('verified')}")
+            print(f"    id: {i.get('provider')}={_identity_id(i)} verified={i.get('verified')}")
         ev = str(r.get("evidence", ""))
         for kw in ("⚠", "Do NOT", "do NOT", "CORRECTED", "WRONG"):
             if kw in ev:

@@ -2,7 +2,11 @@
 
 Version-controlled source of truth for the LLM-driven inbox-importance scorer used by `skills/gws-gmail-voice/`. The cron prompt (`score-inbox-llm`, gitignored per-machine) is a thin wrapper that says: *"Run the procedure in `skills/gws-gmail-voice/SCORING_RUNBOOK.md`"*.
 
-When a scoring pass fires, it executes the steps below. The result is `state/external-cache/inbox-important.json` consumed by the `triage_email` voice tool (cache-first 3-tier path).
+**`<workspace>` is `bash scripts/sutando-config.sh workspace` — resolve it, never a bare
+relative path.** The reader resolves the cache from the workspace; a writer that resolves
+it against its own cwd lands the file where nothing reads it, which is #3546 in reverse.
+
+When a scoring pass fires, it executes the steps below. The result is `<workspace>/state/external-cache/inbox-important.json` consumed by the `triage_email` voice tool (cache-first 3-tier path).
 
 > **Note on owner-specific tuning.** Per-fleet additions (voice-friendly rationale rules, state-aware demotion logic for PR/issue notifications, active-thread boost, top-3 time-sensitive ordering) live in the operator's private skill repo because they encode specific people, PR numbers, and event names. The algorithm shape below is the version every clone gets; operators can layer their own tuning rules on top.
 
@@ -18,7 +22,7 @@ The LLM judges importance with full grounding. Rules retired in PR #705.
 
 ## Per-pass procedure (incremental)
 
-1. **Read existing cache** at `state/external-cache/inbox-important.json`. If absent, treat `scored_emails` as `{}`.
+1. **Read existing cache** at `<workspace>/state/external-cache/inbox-important.json`. If absent, treat `scored_emails` as `{}`.
 
 2. **Fetch current unread** via `gws gmail +triage --format json --max 200`. The full unread queue is ~200 messages; the runbook's incremental algorithm (see step 5) means each one gets scored ONCE then reused via `scored_at` TTL, so a wider net costs the same in steady state. The prior `--max 30` was caught missing buried-important items like calendar invitations and academic follow-ups several days into the queue.
 
@@ -46,7 +50,7 @@ The LLM judges importance with full grounding. Rules retired in PR #705.
 
 6. **Pick `top_3_ids`** by importance ordering: high > medium > low; tie-break by recency (newer first; gws returns newest-first so iterate the current scan in order).
 
-7. **Atomic-write** to `state/external-cache/inbox-important.json` via tmp+rename. Schema below.
+7. **Atomic-write** to `<workspace>/state/external-cache/inbox-important.json` via tmp+rename. Schema below.
 
 ## Cache schema (v2)
 
