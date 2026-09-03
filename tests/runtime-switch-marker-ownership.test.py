@@ -38,12 +38,19 @@ class MarkerOwnership(unittest.TestCase):
         self.assertGreater(pub, gate,
                            "the detached path must publish only after the liveness check")
 
-    def test_the_exec_path_publishes_immediately_before_exec(self):
-        """exec leaves no post-launch point; the call must at least be adjacent."""
+    def test_no_publish_call_precedes_the_launch(self):
+        """The sibling test above indexes FORWARD from `new-session -d`, so an
+        ungated publish placed BEFORE the launch is invisible to it — exactly the
+        defect a merge introduced here on 2026-09-03."""
         src = CLAUDE.read_text(encoding="utf-8")
-        i = src.index('exec tmux -S "$TMUX_SOCKET" new-session')
-        window = src[max(0, i - 220):i]
-        self.assertIn("publish_active_runtime", window)
+        launch = src.index("new-session -d")
+        calls = [i for i in range(len(src))
+                 if src.startswith("publish_active_runtime", i)
+                 and not src.startswith("publish_active_runtime() {", i)]
+        self.assertTrue(calls, "the launcher never publishes at all")
+        early = [i for i in calls if i < launch]
+        self.assertFalse(early, "a publish call precedes the launch, so a runtime that "
+                                "never comes up can overwrite a truthful marker")
 
     def test_a_refused_switch_leaves_the_previous_marker_truthful(self):
         """Codex->Claude: the switch runs, the restart never does."""
@@ -89,16 +96,23 @@ class MarkerOwnership(unittest.TestCase):
         src = CODEX.read_text(encoding="utf-8")
         i = src.index("publish_active_runtime() {")
         fn = src[i:src.index("\n}\n", i) + 3]
-        gated = [l.strip() for l in src.splitlines()
-                 if "has-session" in l and "publish_active_runtime" in l]
-        self.assertTrue(gated, "no gated publish call in the codex launcher — the "
-                               "publish is ungated, which is the defect this pins")
-        call = gated[0]
+        m = re.search(r'(?m)^  if session_exists "\$SESSION"; then\n(?:.*\n)*?  fi\n', src)
+        self.assertTrue(m, "no gated publish call in the codex launcher — the "
+                           "publish is ungated, which is the defect this pins")
+        self.assertIn("publish_active_runtime", m.group(0),
+                      "the liveness gate exists but does not publish inside it")
+        call = m.group(0)
         harness = (
             "set -uo pipefail\n"
             f'REPO="{REPO}"\nSESSION="sutando-core"\nTMUX_SOCKET="/tmp/none"\n'
             f'sutando_config() {{ printf "%s" "{Path(tmp) / "workspace"}"; }}\n'
             f"tmux() {{ return {tmux_rc}; }}\n"
+            # the gate now routes through session_exists; without BOTH helpers it
+            # is always false and the rc=0 positive control could never fire.
+            "tmux_available() { return 0; }\n"
+            'session_exists() { tmux_available && tmux -S "$TMUX_SOCKET" has-session -t "=$1" 2>/dev/null; }\n'
+            "sleep() { :; }\n"
+            "clear_shutdown_sentinel() { :; }\n"
             + fn.replace('bash "$REPO/scripts/sutando-config.sh" workspace', "sutando_config")
             + "\n" + call + "\n"
         )
