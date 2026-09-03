@@ -201,9 +201,16 @@ def main() -> int:
     # send, so a `*.txt` glob cannot tell "deleted" from "claimed and left" —
     # it reported success against a mutation that removed the unlink entirely.
     # (@john-the-dev's over-broad mutation on #2628 is what sent me looking.)
-    _left = [q.name for q in box2.rglob("proactive-*") if q.is_file()]
-    check("a SUCCESSFUL send still removes the file", not _left,
+    # A confirmed send RETIRES the claim (moved under retired/ with a delivered
+    # marker), so nothing claimable remains in the box and nothing was unlinked.
+    _left = [q.name for q in box2.rglob("proactive-*") if q.is_file()
+             and q.parent.name != "retired"]
+    check("a SUCCESSFUL send leaves nothing claimable in the box", not _left,
           f"success path stopped cleaning up — left {_left}; every message would re-send forever")
+    _retired = sorted(q.name for q in (box2 / "retired").glob("proactive-*")) if (box2 / "retired").is_dir() else []
+    check("  ...and the claim was retired with its delivered marker, not destroyed",
+          any(n.endswith(".sending") for n in _retired) and any(n.endswith(".delivered") for n in _retired),
+          f"retired/ holds {_retired}")
     check("  ...and it really was sent", bool(sent), "no send recorded")
 
     # --- LAST RESORT: even the quarantine fails ----------------------------

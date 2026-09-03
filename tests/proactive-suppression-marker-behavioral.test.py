@@ -135,9 +135,9 @@ class _FenceProxy:
     def claim(self, path):
         return self._real.claim(path)
 
-    def confirm(self, claim):
+    def confirm(self, claim, delivered=None):
         self._calls.append("confirm")
-        return self._real.confirm(claim)
+        return self._real.confirm(claim, delivered)
 
     def drop(self, claim, reason):
         self._calls.append("drop")
