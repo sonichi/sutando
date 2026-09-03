@@ -53,6 +53,14 @@ labels.
      those five all had wide margins, so the streak was evidence about the
      inputs, not about the method.
 
+     **Build `keywords` with `keywords_from_text(t["text"])` — do not hand-roll
+     the regex.** It splits on every non-letter, because keeping `-` in the token
+     class merges a compound like `morning-briefing.py` into one token that
+     matches no workstream label: the workstream named "Daily morning briefing"
+     then scores on neither word and `best_match` refuses, which again looks
+     exactly like a correct low-confidence refusal. Same reason
+     `candidates_from_snapshot` exists for the other argument.
+
      **Derive `keywords` from the task being classified, inside the per-task
      loop.** Hoisting one keyword list out of the loop is the mistake this
      parameter invites, and it is silent: `best_match` then scores the same fixed

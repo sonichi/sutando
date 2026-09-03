@@ -29,7 +29,15 @@ STATUS_TTL_S="${GR_STATUS_TTL_S:-900}"         # "running" older than this = wed
 STATUS_REREADS="${GR_STATUS_REREADS:-5}"       # empty-read retries before treating the status as absent
 POLL_S="${GR_POLL_S:-2}"                       # test override
 
-log() { echo "graceful-restart[$RID]: $*"; }
+# The app pipes stdout only into itself, so a kill-without-relaunch left no
+# trace on disk. Same text both ways: main.swift matches phases on its wording.
+GR_LOG="$WS/logs/graceful-restart.log"
+mkdir -p "$WS/logs" 2>/dev/null || true
+log() {
+  local line="graceful-restart[$RID]: $*"
+  echo "$line"
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line" >> "$GR_LOG" 2>/dev/null || true
+}
 
 # Defined BEFORE the EXIT/INT/TERM traps below are armed: bash resolves a
 # function at call time, so cleanup_lock must never name one that is not yet there.
@@ -179,7 +187,7 @@ do_restart() {
     exit 5
   fi
   retire_prep_task
-  log "restarting core ($reason)…"
+  log "restarting core ($reason)… — start-cli.sh's own trace continues in logs/restart-attempts.log"
   # The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
   # GR_START_CLI is a test seam: dry-run never reaches this line.
   exec bash "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" --restart ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}

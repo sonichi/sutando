@@ -53,12 +53,20 @@ def load_roster(d):
     reviewer as absent (measured twice: 2026-08-27, 2026-08-28 — both times
     `get("john-the-dev")` missed the entry keyed `rui`).
     """
-    import json
-    p = d / "reviewer-stands.json"
-    if not p.exists():
+    # Same union, same collision semantics as notify_reviewers: both readers of
+    # this store delegate to roster_union so they cannot drift apart.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from roster_union import host_rosters, roster_union
+    # The file this reader was pointed at is its LOCAL and goes first: on a
+    # legacy host it is the shared file, which host_rosters lists LAST.
+    local = d / "reviewer-stands.json"
+    paths = [("local", local)] if local.is_file() else []
+    paths += [(h, p) for h, p in host_rosters(d.parent.parent) if p != local]
+    merged = roster_union(paths)
+    if not merged:
         return []
     rows = []
-    for key, r in json.loads(p.read_text()).items():
+    for key, r in merged.items():
         if not isinstance(r, dict):
             continue
         rows.append({
