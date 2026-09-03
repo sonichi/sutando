@@ -84,24 +84,31 @@ def live_sessions() -> "tuple[list[dict], str | None]":
 _SESSION_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
+class TranscriptLookupError(OSError):
+    """The search root could not be read, so nothing is known about the transcript."""
+
+
 def find_transcript(session_id: str) -> "Path | None":
     """Locate a transcript by LITERAL filename.
 
     The id comes from session metadata, so interpolating it into a glob let
     `*` match an unrelated session's transcript. Validate, then match exactly.
+
+    None means the root was searched and holds no match. An unreadable or
+    missing root raises TranscriptLookupError: it is an unknown, not an absence.
     """
     if not _SESSION_ID.match(session_id or ""):
         return None
     name = f"{session_id}.jsonl"
     projects = config_dir() / "projects"
     try:
-        dirs = sorted(d for d in projects.iterdir() if d.is_dir())
-    except OSError:
-        return None
-    for d in dirs:
-        cand = d / name
-        if cand.is_file():
-            return cand
+        for d in sorted(d for d in projects.iterdir() if d.is_dir()):
+            cand = d / name
+            if cand.is_file():
+                return cand
+    except OSError as exc:
+        raise TranscriptLookupError(
+            f"cannot search {projects}: {exc.strerror or exc}") from exc
     return None
 
 
@@ -252,7 +259,13 @@ def main() -> int:
     for sess in sessions:
         name, sid = sess.get("name", "?"), sess.get("sessionId", "")
         head = _safe(f"{name}  [{sess.get('status','?')}]  pid={sess.get('pid','?')}")
-        path = find_transcript(sid)
+        try:
+            path = find_transcript(sid)
+        except TranscriptLookupError as e:
+            # Rendered apart from no-match: "could not look" is not "looked, none".
+            print(f"\n{head}\n  transcript lookup failed: {_one_line(str(e), 120)}")
+            failed += 1
+            continue
         if path is None:
             print(f"\n{head}\n  no transcript for {_safe(sid)}")
             continue

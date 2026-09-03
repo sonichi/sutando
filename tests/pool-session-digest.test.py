@@ -297,6 +297,16 @@ class DiscoveryTest(unittest.TestCase):
             self.assertEqual(digest_mod.find_transcript("sid-1").name, "sid-1.jsonl")
             self.assertIsNone(digest_mod.find_transcript("absent"))
 
+    def test_a_missing_search_root_raises_rather_than_reporting_absence(self):
+        """No projects/ at all is an unknown; only a searched root can say "none"."""
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}):
+            with self.assertRaises(digest_mod.TranscriptLookupError) as cm:
+                digest_mod.find_transcript("sid-1")
+            self.assertIn("cannot search", str(cm.exception))
+            (self.cfg / "projects").mkdir()
+            self.assertIsNone(digest_mod.find_transcript("sid-1"),
+                              "control: an empty readable root is a genuine no-match")
+
 
 class MainTest(unittest.TestCase):
     def setUp(self):
@@ -380,6 +390,46 @@ class MainTest(unittest.TestCase):
         rc, out, _ = self._main([], [self._session(sid="absent")])
         self.assertEqual(rc, 0, "one session without a transcript must not abort the rest")
         self.assertIn("no transcript", out)
+
+    def _deny_projects_iterdir(self, times=None):
+        """Patch the REAL Path.iterdir boundary: PermissionError on projects/,
+        for the first `times` calls (all of them when None), pass-through otherwise."""
+        real = Path.iterdir
+        seen = {"n": 0}
+
+        def deny(path):
+            if path.name == "projects" and (times is None or seen["n"] < times):
+                seen["n"] += 1
+                raise PermissionError(13, "Permission denied")
+            return real(path)
+
+        return unittest.mock.patch.object(Path, "iterdir", deny)
+
+    def test_unreadable_search_root_is_a_failure_not_an_absence(self):
+        """Both arms used to print `no transcript for sid-1` and exit 0."""
+        self.proj.rmdir()                     # projects/ exists, readable, empty
+        rc_empty, out_empty, _ = self._main([], [self._session()])
+        self.assertEqual(rc_empty, 0)
+        self.assertIn("no transcript for sid-1", out_empty)
+
+        with self._deny_projects_iterdir():
+            rc_denied, out_denied, _ = self._main([], [self._session()])
+        self.assertEqual(rc_denied, 2, "every lookup failing is not a successful run")
+        self.assertIn("transcript lookup failed", out_denied)
+        self.assertIn("Permission denied", out_denied)
+        self.assertNotIn("no transcript for", out_denied,
+                         "an unreadable root must not be rendered as a confirmed absence")
+        self.assertNotEqual(out_empty, out_denied)
+
+    def test_a_failed_lookup_does_not_poison_the_next_session(self):
+        self._transcript("sid-ok")
+        with self._deny_projects_iterdir(times=1):
+            rc, out, _ = self._main([], [self._session("core-bad", "sid-bad"),
+                                         self._session("core-ok", "sid-ok")])
+        self.assertEqual(rc, 0, "one failed lookup must not fail a sweep that digested a session")
+        self.assertIn("transcript lookup failed", out)
+        self.assertIn("core-ok", out)
+        self.assertIn("did a thing", out, "the session after the failed lookup was not digested")
 
 
 class TerminalSafety(unittest.TestCase):
