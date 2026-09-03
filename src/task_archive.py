@@ -82,7 +82,12 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
         return matches[0]
     # Quarantined last: it is the task's only surviving header block, and
     # routing needs those headers or a failed archive also strands the reply.
-    quarantined = sorted(tasks_dir.glob(f"{task_id}.txt.archive-failed*"))
+    quarantined = sorted(
+        p for p in tasks_dir.glob(f"{task_id}.txt.archive-failed*")
+        # The glob is a prefix match: an ordinary record can start with this
+        # string, so only a name whose PARSED id equals task_id may answer.
+        if archive_id_from_filename(p.name) == task_id
+    )
     return quarantined[0] if quarantined else None
 
 

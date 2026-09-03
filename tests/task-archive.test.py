@@ -151,6 +151,23 @@ class TestFindTaskFile(unittest.TestCase):
         result = find_task_file(self.tasks_dir, "task-nonexistent")
         self.assertIsNone(result)
 
+    def test_quarantine_lookup_is_by_id_not_by_prefix(self) -> None:
+        """`task-a.txt.archive-failed-review.txt` is an ordinary record whose id
+        is the whole stem; a lookup for the shorter `task-a` must not return it,
+        or an orphan result for task-a is routed with the longer task's headers."""
+        self._write("task-a.txt.archive-failed-review.txt")
+        self.assertIsNone(find_task_file(self.tasks_dir, "task-a"))
+        longer = find_task_file(self.tasks_dir, "task-a.txt.archive-failed-review")
+        self.assertEqual(longer.name, "task-a.txt.archive-failed-review.txt")
+
+    def test_real_quarantine_forms_still_resolve(self) -> None:
+        self._write("task-q.txt.archive-failed")
+        self.assertEqual(find_task_file(self.tasks_dir, "task-q").name,
+                         "task-q.txt.archive-failed")
+        self._write("task-r.txt.archive-failed.1")
+        self.assertEqual(find_task_file(self.tasks_dir, "task-r").name,
+                         "task-r.txt.archive-failed.1")
+
     def test_multiple_claimed_returns_first_lexicographic(self) -> None:
         self._write("task-000.claimed-core-2.txt")
         self._write("task-000.claimed-core-3.txt")

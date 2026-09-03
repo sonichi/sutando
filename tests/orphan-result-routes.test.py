@@ -111,6 +111,20 @@ class OrphanResultRoutesTest(unittest.TestCase):
         (self.tasks / f"{tid}-extra.txt.archive-failed").write_text(task_text())
         self.assertEqual(self.routes(), {})
 
+    def test_a_longer_terminal_txt_id_is_not_a_quarantine_of_the_shorter(self):
+        """`task-a.txt.archive-failed-review.txt` is its own task (the id is the
+        whole stem, and the gateway writes ids carrying dots and hyphens). A result
+        for `task-a` must not be routed with that task's channel, and the longer
+        task must still route under its own id."""
+        short = self._result("task-a")
+        long_id = "task-a.txt.archive-failed-review"
+        (self.tasks / f"{long_id}.txt").write_text(
+            task_text().replace(SNOWFLAKE, "2" * 19))
+        self.assertEqual(self.routes(), {})
+        self._result(long_id)
+        self.assertEqual(self.routes(), {long_id: "2" * 19})
+        self.assertNotIn(short, self.routes())
+
     def test_archived_task_still_yields_its_route(self):
         # By the time a result exists the core has usually archived the task,
         # so an archive miss would make the fix work only in a race.
