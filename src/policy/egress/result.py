@@ -202,6 +202,9 @@ def is_suppression_only(body: str) -> bool:
 VERDICT_DELIVER = "deliver"
 VERDICT_LEAK = "leak"
 VERDICT_SUPPRESS = "suppress"
+# Machine-detectable prefix of the fail-closed scanner-outage reason, so a
+# consumer that owns its own transport can map outage (not content) to an error.
+SCANNER_UNAVAILABLE = "scanner unavailable"
 WITHHELD_RESULT_DIR = "withheld-team-results"
 SUPPRESSED_RESULT_DIR = "suppressed-team-results"
 
@@ -382,15 +385,16 @@ def journal_suppressed_result(verdict: TeamResultVerdict, body: str,
 def classify_result_for_tier(body: str, tier, repo: Path,
                              secret_filter=None,
                              scan_sensitive_data: bool = True,
-                             allow_attach: bool = False) -> TeamResultVerdict:
+                             allow_attach: bool = False,
+                             honor_suppressions: bool = True) -> TeamResultVerdict:
     """The guard-owned policy verdict. Adapters apply transport mechanics only;
     re-deciding (or bypassing) this classification in a bridge is a boundary
     violation, not an implementation choice."""
     if not is_guarded_tier(tier):
         return TeamResultVerdict(VERDICT_DELIVER, body, None)
-    if is_suppression_only(body):
-        # Above the scan on purpose: an undelivered body has nothing to leak,
-        # and a LEAK here would put a notice back in the channel.
+    if honor_suppressions and is_suppression_only(body):
+        # Above the scan on purpose: an undelivered body has nothing to leak —
+        # marker-honouring adapters only (publishers pass honor_suppressions=False).
         return TeamResultVerdict(VERDICT_DELIVER, body, None)
     try:
         return TeamResultVerdict(
@@ -406,12 +410,13 @@ def classify_result_for_tier(body: str, tier, repo: Path,
         # Scanner unavailable is fail-CLOSED: an unscannable guarded result is
         # withheld, never delivered on the assumption that it was probably fine.
         return TeamResultVerdict(VERDICT_LEAK, TEAM_LEAK_RESULT,
-                                 f"scanner unavailable: {exc}")
+                                 f"{SCANNER_UNAVAILABLE}: {exc}")
 
 
 def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
                           scan_sensitive_data: bool = True, *,
-                          suppress_journal=None, allow_attach: bool = False):
+                          suppress_journal=None, allow_attach: bool = False,
+                          honor_suppressions: bool = True):
     """Consumer-facing gate: returns (safe_body, withheld_reason).
 
     Returns a body rather than raising, so a caller cannot deliver the raw text
@@ -424,7 +429,7 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     """
     verdict = classify_result_for_tier(
         body, tier, repo, secret_filter, scan_sensitive_data,
-        allow_attach=allow_attach)
+        allow_attach=allow_attach, honor_suppressions=honor_suppressions)
     if (suppress_journal is not None and is_guarded_tier(tier)
             and is_suppression_only(body)):
         state_dir, task_id = suppress_journal

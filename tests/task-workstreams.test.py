@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import time
 import multiprocessing
+import os
 import re
 import sys
 import tempfile
@@ -17,6 +19,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import task_workstreams as workstreams  # noqa: E402
+
+# The enqueue is off by default; its gate is exercised directly in
+# test_classifier_enqueue_is_off_by_default. Every other test assumes it on.
+os.environ["SUTANDO_WORKSTREAM_CLASSIFIER"] = "on"
 
 
 def inherit_worker(workspace: str, child_id: str, start) -> None:
@@ -337,12 +343,44 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         settled = workstreams.maybe_enqueue_classifier_task(workspace)
     assert not settled.pending and not settled.enqueued and settled.reason == "complete"
 
+
+def test_classifier_enqueue_is_off_by_default() -> None:
+    workspace = fixture_workspace()
+    # Unset: the gate refuses before any work; nothing is queued.
+    with mock.patch.dict(os.environ, {"SUTANDO_WORKSTREAM_CLASSIFIER": ""}):
+        off = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert not off.pending and not off.enqueued and off.reason == "disabled"
+    assert not list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
+    # A truthy value re-enables it; the same ready workspace now queues one.
+    with mock.patch.dict(os.environ, {"SUTANDO_WORKSTREAM_CLASSIFIER": "on"}):
+        on = workstreams.maybe_enqueue_classifier_task(workspace)
+    assert on.pending and on.enqueued and on.reason == "enqueued"
+    assert list((workspace / "tasks").glob("task-workstream-grouping-*.txt"))
+
+    # The cooldown is measured from a COMPLETION; an inflight run does not cool.
+    workstreams.mark_classifier_complete(workspace, on.snapshot_hash)
     write_task(
         workspace / "tasks" / "archive" / "2026-08" / "task-new.txt",
         "task-new",
         "2026-08-03T13:00:00Z",
         "a newly archived task",
     )
+    # A fresh completion absorbs source churn without rescanning; only once the
+    # cooldown has lapsed does the new task re-open the gate.
+    with mock.patch.object(
+        workstreams,
+        "scan_task_history",
+        side_effect=AssertionError("cooling-down must not scan history"),
+    ):
+        cooled = workstreams.classifier_status(workspace)
+    assert not cooled.pending and not cooled.enqueued
+    assert cooled.reason == "cooling-down"
+    state_path = workspace / "state" / "task-workstream-classifier.json"
+    state = json.loads(state_path.read_text())
+    # completed_at governs the cooldown; enqueued_at is its legacy fallback.
+    state["enqueued_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
+    state["completed_at"] = time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1
+    state_path.write_text(json.dumps(state))
     with mock.patch.object(
         workstreams,
         "scan_task_history",
@@ -387,6 +425,15 @@ def test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating() -> None:
         "snapshot_hash": manual_snapshot["snapshot_hash"],
         "workstreams": [],
     })
+    reviewed = workstreams.classifier_status(manual)
+    # A just-applied inference is a fresh completion: the gate cools instead
+    # of rescanning — the churn-absorption that breaks the #3621 spin.
+    assert not reviewed.pending and reviewed.reason == "cooling-down"
+    manual_state_path = manual / "state" / "task-workstream-classifier.json"
+    manual_state = json.loads(manual_state_path.read_text())
+    manual_state["completed_at"] = (
+        time.time() - workstreams.CLASSIFIER_COOLDOWN_SECONDS - 1)
+    manual_state_path.write_text(json.dumps(manual_state))
     reviewed = workstreams.classifier_status(manual)
     assert not reviewed.pending and reviewed.reason == "complete"
 
@@ -954,6 +1001,7 @@ def main() -> None:
         test_apply_is_validated_stable_sticky_and_fail_open,
         test_legacy_project_sidecar_migrates_on_the_next_write,
         test_classifier_enqueue_is_idle_gated_deduped_and_non_mutating,
+        test_classifier_enqueue_is_off_by_default,
         test_classifier_task_is_envelope_stamped,
         test_classifier_task_survives_a_raising_stamper,
         test_classifier_source_directory_cache_rejects_unsafe_entries_fail_open,
