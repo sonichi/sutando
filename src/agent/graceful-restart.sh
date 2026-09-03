@@ -50,7 +50,7 @@ retire_prep_task() {
   if [ -f "$res" ]; then
     log "drain result: $(head -c 300 "$res" | tr '\n' ' ')"
     mkdir -p "$WS/results/archive"
-    mv "$res" "$WS/results/archive/" 2>/dev/null || true
+    mv "$res" "$WS/results/archive/" 2>/dev/null || log "drain result NOT archived (mv failed): $res"
   fi
   [ -f "$PREP_TASK" ] || return 0
   mkdir -p "$WS/tasks/archive"
