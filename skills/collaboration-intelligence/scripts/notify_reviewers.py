@@ -88,7 +88,10 @@ def roster_paths() -> "list[tuple[str, Path]]":
     from workspace_default import resolve_workspace
     ws = Path(resolve_workspace())
     local = roster_path()
-    out = [(_host_label(), local)] if local.is_file() else []
+    # Label from the PATH, as host_rosters does: a second `host-label` subprocess here
+    # made a refused ask spawn a process before refusing (sci-notify-reviewers-shorthand-refusal).
+    label = local.parents[2].name if local.parent.parent.parent.parent.name == "hosts" else "legacy"
+    out = [(label, local)] if local.is_file() else []
     out += [(h, p) for h, p in host_rosters(ws) if p != local]
     return out
 
