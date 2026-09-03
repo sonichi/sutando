@@ -25,7 +25,7 @@ from typing import Optional
 
 import local_task_protocol
 from result_markers import parse_markers
-from task_archive import task_id_for
+from task_archive import archive_id_from_filename, task_id_for
 from workspace_default import status_read_path
 
 
@@ -365,7 +365,7 @@ def enrich_task_rows(workspace: Path, rows: list[dict]) -> list[dict]:
     return enriched
 
 
-def _unique_task_file(tasks_dir: Path, task_id: str, lookup) -> Optional[Path]:
+def _unique_task_file(tasks_dir: Path, task_id: str) -> Optional[Path]:
     """The one live file carrying task_id, or None when zero or several do.
 
     Access tier is read from this file, so a same-id sibling (a stale bare
@@ -375,9 +375,25 @@ def _unique_task_file(tasks_dir: Path, task_id: str, lookup) -> Optional[Path]:
         return None
     candidates = sorted(
         p for p in tasks_dir.glob(f"{task_id}.*")
-        if p.is_file() and lookup(p.name) == task_id
+        if p.is_file() and _task_id_of(p) == task_id
     )
     return candidates[0] if len(candidates) == 1 else None
+
+
+def resolve_context_request(workspace: Path, argument: str) -> tuple[Optional[str], Optional[Path]]:
+    """(task id, exact file) for a `context` argument, or (None, None).
+
+    A name carrying a structural `.txt` is an exact authorization request: its
+    id is read from that file, and a missing one fails closed rather than
+    resolving to another record that happens to share the id.
+    """
+    name = Path(argument).name
+    if archive_id_from_filename(name) is None:
+        return name, None
+    exact = Path(workspace) / "tasks" / name
+    if not exact.is_file():
+        return None, None
+    return _task_id_of(exact), exact
 
 
 def build_workstream_context(
@@ -399,17 +415,14 @@ def build_workstream_context(
     task_id = str(task_id)
     if not local_task_protocol.valid_archive_lookup_id(task_id):
         return None
-    # Same function-local import rationale as valid_archive_lookup_id below.
-    from task_archive import lookup_id_from_filename
-
     # The caller's exact file is the authorization read; a bare id only
     # resolves when exactly one live file (bare, claimed, assigned) carries it.
     if task_path is not None:
         current_path = Path(task_path)
-        if not current_path.is_file() or lookup_id_from_filename(current_path.name) != task_id:
+        if not current_path.is_file() or _task_id_of(current_path) != task_id:
             return None
     else:
-        current_path = _unique_task_file(workspace / "tasks", task_id, lookup_id_from_filename)
+        current_path = _unique_task_file(workspace / "tasks", task_id)
     current = _task_record_from_path(current_path) if current_path else None
     # Never attach owner history to a sandboxed/non-owner task.  Missing or
     # malformed records also fail open with no injected context.

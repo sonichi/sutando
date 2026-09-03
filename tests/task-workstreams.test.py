@@ -308,7 +308,7 @@ def test_context_bare_id_with_no_tasks_dir_fails_open() -> None:
     workspace = fixture_workspace()
     tasks = workspace / "tasks"
     shutil.rmtree(tasks, ignore_errors=True)
-    assert workstreams._unique_task_file(tasks, "task-a1", lambda n: "task-a1") is None
+    assert workstreams._unique_task_file(tasks, "task-a1") is None
     assert workstreams.build_workstream_context(workspace, "task-a1") is None
 
 
@@ -1324,6 +1324,77 @@ def test_context_cli_authorizes_the_exact_file_not_a_same_id_sibling() -> None:
     assert run("task-sensitive") != "", "control: a single claimed owner file resolves"
 
 
+def test_context_cli_reads_the_named_file_and_fails_closed_when_it_is_absent() -> None:
+    """The id comes from the FILE, not from parsing its name: `task-a.claimed-review`
+    is a gateway id, and a quarantine keeps its dotted or claimed name. A named
+    file that is absent is still an exact request and must never fall back."""
+    import contextlib
+    import importlib.util
+    import io
+
+    workspace = fixture_workspace()
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [{
+            "name": "Sutando task management",
+            "summary": "group related task history",
+            "confidence": 0.95,
+            "task_ids": ["task-a1", "task-a2"],
+        }],
+    })
+    script = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
+    spec = importlib.util.spec_from_file_location("workstreams_cli_named", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    tasks = workspace / "tasks"
+
+    def run(argument: str) -> str:
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "resolve_workspace", return_value=workspace):
+            with contextlib.redirect_stdout(buffer):
+                assert cli.main(["context", argument]) == 0
+        return buffer.getvalue()
+
+    def built(argument: str, filename: str, task_id: str) -> None:
+        for stale in tasks.glob("task-*"):
+            if stale.is_file():
+                stale.unlink()
+        write_task(tasks / filename, task_id, "2026-08-03T10:05:00Z", "continue")
+        assert workstreams.inherit_assignment(workspace, task_id, "task-a1")
+        payload = run(argument)
+        assert payload, f"no context for {argument}"
+        assert json.loads(payload)["current_task_id"] == task_id, argument
+
+    # An ordinary pool claim canonicalizes; a gateway id that LOOKS claimed is
+    # its own task, and only the persisted `id:` tells the two apart.
+    built("task-c1.claimed-core-3.txt", "task-c1.claimed-core-3.txt", "task-c1")
+    built("task-a.claimed-review.txt", "task-a.claimed-review.txt", "task-a.claimed-review")
+    # Quarantines: the structural .txt is the rightmost one, so a dotted id and
+    # a claimed name both survive `archive_file`'s .archive-failed rename.
+    built("task-q.txt.archive-failed", "task-q.txt.archive-failed", "task-q")
+    built("task-a.txt.archive-failed-review.txt.archive-failed",
+          "task-a.txt.archive-failed-review.txt.archive-failed",
+          "task-a.txt.archive-failed-review")
+    built("task-c1.claimed-core-3.txt.archive-failed",
+          "task-c1.claimed-core-3.txt.archive-failed", "task-c1")
+
+    # A named claim that does not exist, beside the owner's bare file: the
+    # request is for that file, so it fails closed instead of reading the sibling.
+    for stale in tasks.glob("task-*"):
+        if stale.is_file():
+            stale.unlink()
+    write_task(tasks / "task-sensitive.txt", "task-sensitive",
+               "2026-08-03T10:05:00Z", "private owner work")
+    assert workstreams.inherit_assignment(workspace, "task-sensitive", "task-a1")
+    assert run("task-sensitive.claimed-core-3.txt") == "", (
+        "a named-but-absent claim must not resolve to the owner's bare file")
+    assert run("task-sensitive.txt") != "", "control: naming the file that exists builds context"
+    assert run("task-sensitive") != "", "control: a bare id still uses the unique-file resolver"
+    assert workstreams.resolve_context_request(
+        workspace, "task-sensitive.claimed-core-3.txt") == (None, None)
+
+
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
@@ -1360,6 +1431,7 @@ def main() -> None:
         test_workstream_context_index_fail_open_edges,
         test_context_cli_accepts_a_live_pool_filename,
         test_context_cli_authorizes_the_exact_file_not_a_same_id_sibling,
+        test_context_cli_reads_the_named_file_and_fails_closed_when_it_is_absent,
         test_concurrent_inheritance_keeps_every_assignment,
         test_reused_workstream_id_does_not_require_a_redundant_name,
     ]
