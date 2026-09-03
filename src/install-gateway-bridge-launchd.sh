@@ -54,7 +54,11 @@ resolve_brew_bin() {
     # clone-, arch-, or user-specific literal. The resolved dir is substituted
     # into the plist PATH (__BREW_BIN__) at install time, so the launchd wrapper
     # gets a working `python3` on PATH without re-probing at runtime.
-    dirname "$PYBIN"
+    # Prefer the shared resolver's pick; the function must also stand alone.
+    local py="${PYBIN:-}"
+    [ -n "$py" ] || py="$(command -v python3 2>/dev/null)" || py=""
+    [ -n "$py" ] || return 1
+    dirname "$py"
 }
 
 bootout_if_loaded() {
