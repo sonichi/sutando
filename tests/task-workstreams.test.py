@@ -1230,6 +1230,69 @@ def test_reused_workstream_id_does_not_require_a_redundant_name() -> None:
     assert store["workstreams"][reused_id]["title"] == "Sutando task management"
 
 
+
+def test_context_cli_authorizes_the_exact_file_not_a_same_id_sibling() -> None:
+    """A stale bare OWNER copy beside a claimed TEAM file must never lend the
+    team task the owner's history: the named file is the authorization read,
+    and a bare id with two live candidates yields no context at all."""
+    import contextlib
+    import importlib.util
+    import io
+
+    workspace = fixture_workspace()
+    snapshot = workstreams.build_classifier_snapshot(workspace)
+    workstreams.apply_inference(workspace, {
+        "snapshot_hash": snapshot["snapshot_hash"],
+        "workstreams": [{
+            "name": "Sutando task management",
+            "summary": "group related task history",
+            "confidence": 0.95,
+            "task_ids": ["task-a1", "task-a2"],
+        }],
+    })
+    script = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
+    spec = importlib.util.spec_from_file_location("workstreams_cli_exact", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    tasks = workspace / "tasks"
+    assert workstreams.inherit_assignment(workspace, "task-sensitive", "task-a1")
+
+    def run(argument: str) -> str:
+        buffer = io.StringIO()
+        with mock.patch.object(cli, "resolve_workspace", return_value=workspace):
+            with contextlib.redirect_stdout(buffer):
+                assert cli.main(["context", argument]) == 0
+        return buffer.getvalue()
+
+    def write(name: str, tier: str) -> None:
+        write_task(tasks / name, "task-sensitive", "2026-08-03T10:05:00Z",
+                   "continue the sensitive work", tier=tier)
+
+    for stale in tasks.glob("task-sensitive*"):
+        stale.unlink()
+    write("task-sensitive.claimed-core-3.txt", "team")
+    assert run("task-sensitive.claimed-core-3.txt") == "", "team task alone must get no context"
+    assert run("task-sensitive") == ""
+
+    write("task-sensitive.txt", "owner")  # the stale sibling keweichen's probe added
+    assert run("task-sensitive.claimed-core-3.txt") == "", (
+        "the claimed team file was named; the owner sibling must not be read instead")
+    assert run("task-sensitive") == "", "two live candidates: ambiguous, no context"
+    assert run("task-sensitive.txt") != "", "control: naming the owner file builds context"
+
+    # Owner variant that SORTS FIRST: a first-candidate-wins resolver would
+    # read the owner file for the bare id; uniqueness is what refuses it.
+    (tasks / "task-sensitive.txt").rename(tasks / "task-sensitive.assigned-core-2.txt")
+    assert run("task-sensitive") == "", "two live candidates, owner first: still no context"
+    assert run("task-sensitive.claimed-core-3.txt") == ""
+    (tasks / "task-sensitive.assigned-core-2.txt").rename(tasks / "task-sensitive.txt")
+
+    (tasks / "task-sensitive.claimed-core-3.txt").unlink()
+    assert run("task-sensitive") != "", "control: a single owner candidate still resolves"
+    (tasks / "task-sensitive.txt").rename(tasks / "task-sensitive.claimed-core-3.txt")
+    assert run("task-sensitive") != "", "control: a single claimed owner file resolves"
+
+
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
@@ -1263,6 +1326,7 @@ def main() -> None:
         test_remembered_context_history_keeps_only_the_newest_entries,
         test_workstream_context_index_fail_open_edges,
         test_context_cli_accepts_a_live_pool_filename,
+        test_context_cli_authorizes_the_exact_file_not_a_same_id_sibling,
         test_concurrent_inheritance_keeps_every_assignment,
         test_reused_workstream_id_does_not_require_a_redundant_name,
     ]

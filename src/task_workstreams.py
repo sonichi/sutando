@@ -365,10 +365,27 @@ def enrich_task_rows(workspace: Path, rows: list[dict]) -> list[dict]:
     return enriched
 
 
+def _unique_task_file(tasks_dir: Path, task_id: str, lookup) -> Optional[Path]:
+    """The one live file carrying task_id, or None when zero or several do.
+
+    Access tier is read from this file, so a same-id sibling (a stale bare
+    owner copy beside a claimed team file) must not be silently preferred.
+    """
+    if not tasks_dir.is_dir():
+        return None
+    candidates = sorted(
+        p for p in tasks_dir.glob(f"{task_id}.*")
+        if p.is_file() and lookup(p.name) == task_id
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def build_workstream_context(
     workspace: Path,
     task_id: str,
     limit: int = CONTEXT_MAX_TASKS,
+    *,
+    task_path: Optional[Path] = None,
 ) -> Optional[dict]:
     """Return bounded prior context for an owner task's assigned workstream.
 
@@ -383,11 +400,16 @@ def build_workstream_context(
     if not local_task_protocol.valid_archive_lookup_id(task_id):
         return None
     # Same function-local import rationale as valid_archive_lookup_id below.
-    from task_archive import find_task_file
+    from task_archive import lookup_id_from_filename
 
-    # Not a bare name: an in-flight task is renamed .claimed-/.assigned-<inst>,
-    # which is exactly when prior context is wanted.
-    current_path = find_task_file(workspace / "tasks", task_id)
+    # The caller's exact file is the authorization read; a bare id only
+    # resolves when exactly one live file (bare, claimed, assigned) carries it.
+    if task_path is not None:
+        current_path = Path(task_path)
+        if not current_path.is_file() or lookup_id_from_filename(current_path.name) != task_id:
+            return None
+    else:
+        current_path = _unique_task_file(workspace / "tasks", task_id, lookup_id_from_filename)
     current = _task_record_from_path(current_path) if current_path else None
     # Never attach owner history to a sandboxed/non-owner task.  Missing or
     # malformed records also fail open with no injected context.

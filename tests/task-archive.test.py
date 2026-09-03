@@ -502,5 +502,31 @@ class TaskIdFromFilename(unittest.TestCase):
             self.assertEqual(find_task_file(tasks, task_id), claimed)
 
 
+
+class TrailingTxtIsTerminal(unittest.TestCase):
+    """A name ending in .txt is an ordinary record whose id may contain dots,
+    even `.txt.archive-failed`; only a name ending in .archive-failed* is a
+    quarantine file (that suffix is appended to the whole filename)."""
+
+    def test_dotted_id_containing_archive_failed_survives(self):
+        self.assertEqual(task_id_from_filename("task-current.txt.archive-failed-review.txt"),
+                         "task-current.txt.archive-failed-review")
+        self.assertEqual(lookup_id_from_filename("reco-skill-x.txt.archive-failed-r.txt"),
+                         "reco-skill-x.txt.archive-failed-r")
+
+    def test_real_quarantine_names_still_reduce(self):
+        for name in ("task-current.txt.archive-failed", "task-current.txt.archive-failed.1",
+                     "task-current.txt.archive-failed-review"):
+            self.assertEqual(task_id_from_filename(name), "task-current", name)
+        self.assertEqual(lookup_id_from_filename("reco-skill-x.txt.archive-failed"), "reco-skill-x")
+
+    def test_dotted_terminal_record_round_trips_through_find_task_file(self):
+        d = Path(tempfile.mkdtemp())
+        tid = "task-current.txt.archive-failed-review"
+        (d / f"{tid}.txt").write_text("id: x\n")
+        found = find_task_file(d, tid)
+        self.assertEqual(found, d / f"{tid}.txt")
+        self.assertEqual(task_id_from_filename(found.name), tid)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

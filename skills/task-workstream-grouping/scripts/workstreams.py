@@ -42,8 +42,12 @@ def main(argv=None) -> int:
     if args.command == "context":
         # Reduce to a basename (a raw path is rejected for its separator), then
         # normalize through the archive grammar -- it covers non-task-* forms too.
-        task_id = lookup_id_from_filename(Path(args.task).name)
-        context = build_workstream_context(workspace, task_id, limit=args.limit)
+        name = Path(args.task).name
+        task_id = lookup_id_from_filename(name)
+        exact = workspace / "tasks" / name
+        context = build_workstream_context(
+            workspace, task_id, limit=args.limit,
+            task_path=exact if exact.is_file() else None)
         if context is not None:
             sys.stdout.write(json.dumps(context, ensure_ascii=False, separators=(",", ":")))
         return 0
