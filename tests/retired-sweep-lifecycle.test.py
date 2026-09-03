@@ -187,5 +187,87 @@ with tempfile.TemporaryDirectory() as td:
     check("marker/scratch names are not swept as inodes",
           rd.sweep_retired(d, quiesce_s=0, now=time.time()) == [])
 
+
+    # --- retire: the undo itself failing leaves the inode in retired/ (aged out later), still False
+    claim = d / "proactive-53.txt"; claim.write_text("FIRST\n")
+    real_replace = Path.replace
+    def _undo_fails(self, target, *a, **k):
+        if self.parent.name == "retired":
+            raise OSError("undo refused")
+        return real_replace(self, target, *a, **k)
+    rd._write_atomic = lambda *a, **k: (_ for _ in ()).throw(OSError("marker disk full"))
+    Path.replace = _undo_fails
+    try:
+        ok = rd.retire_claim_if_unchanged(claim, "FIRST")
+    finally:
+        Path.replace = real_replace; rd._write_atomic = real_write
+    check("marker failure + undo failure -> False, inode kept under retired/ (never destroyed)",
+          ok is False and rd._retired_path(claim).exists() and not claim.exists())
+    rd._retired_path(claim).unlink()
+
+    # --- _write_atomic: a failing rename leaves no scratch behind and re-raises
+    real_os_replace = rd.os.replace
+    rd.os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("rename refused"))
+    try:
+        try:
+            rd._write_atomic(d / "retired" / "x.delivered", "1"); raised = False
+        except OSError:
+            raised = True
+    finally:
+        rd.os.replace = real_os_replace
+    check("_write_atomic re-raises and leaves no scratch",
+          raised and not list((d / "retired").glob(".x.delivered.*")) and not (d / "retired" / "x.delivered").exists())
+
+    # --- redirect carry skips blank lines before the marker
+    check("a blank line before [channel:] does not hide it",
+          rd._carried_redirect(b"\n[channel: 123456789012345678]\nFIRST\n") == "[channel: 123456789012345678]\n")
+    check("a plain head carries nothing", rd._carried_redirect(b"FIRST\n") == "")
+
+    # --- sweep claim: a vanished inode or a refused link is a skip, never a raise
+    check("claim on a vanished inode -> None", rd._claim_for_sweep(d / "retired" / "gone.txt", time.time(), 600) is None)
+    real_link = rd.os.link
+    rd.os.link = lambda *a, **k: (_ for _ in ()).throw(PermissionError("no link"))
+    try:
+        retired = retire_with_late(d, "proactive-54.txt", "FIRST\n", "LATE8\n")
+        check("claim with a refused link -> None", rd._claim_for_sweep(retired, time.time(), 600) is None)
+        check("sweep skips the inode it cannot claim", rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [])
+    finally:
+        rd.os.link = real_link
+    pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+    check("...and sweeps it once the link works", len(pub) == 1)
+    for f in late_files(d): f.unlink()
+
+    # --- sweep: the final rename failing rolls the marker back and publishes nothing
+    retired = retire_with_late(d, "proactive-55.txt", "FIRST\n", "LATE9\n")
+    marker = rd._delivered_marker(retired); before = marker.read_text()
+    def _final_rename_fails(src, dst, *a, **k):
+        if "proactive-late-" in str(dst) and not str(dst).endswith(".delivered"):
+            raise OSError("rename refused")
+        return real_os_replace(src, dst, *a, **k)
+    rd.os.replace = _final_rename_fails
+    try:
+        pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+    finally:
+        rd.os.replace = real_os_replace
+    check("rename failure -> nothing published, marker rolled back, no scratch",
+          pub == [] and marker.read_text() == before and not late_files(d)
+          and not [p for p in d.iterdir() if p.name.startswith(".proactive-late-")],
+          f"pub={pub} marker={marker.read_text()!r} before={before!r}")
+    pub = rd.sweep_retired(d, quiesce_s=600, now=time.time())
+    check("...then published exactly once when the rename works", len(pub) == 1 and pub[0].read_text().strip() == "LATE9")
+    for f in late_files(d): f.unlink()
+
+    # --- a whitespace-only remainder advances the marker and publishes nothing
+    retired = retire_with_late(d, "proactive-56.txt", "FIRST\n", "   \n")
+    marker = rd._delivered_marker(retired)
+    check("whitespace remainder -> no publish, marker advanced to the full length",
+          rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [] and marker.read_text() == str(retired.stat().st_size))
+    with open(retired, "a") as fh: fh.write("  \n")
+    rd._write_atomic = lambda *a, **k: (_ for _ in ()).throw(OSError("marker disk full"))
+    try:
+        check("...and a marker failure there is swallowed", rd.sweep_retired(d, quiesce_s=600, now=time.time()) == [])
+    finally:
+        rd._write_atomic = real_write
+
 print(f"\n{'FAILED' if FAILS else 'OK'} — {FAILS} failure(s)")
 sys.exit(1 if FAILS else 0)

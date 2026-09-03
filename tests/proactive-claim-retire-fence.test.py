@@ -396,6 +396,40 @@ def _retire_rows() -> None:
               "the sweep helper is not called from the poll loop")
     # The helper is the same shape in each bridge; drive the loaded Slack
     # module's copy with a raising sweep — the poll loop must not die.
+    def _load_other(tag: str, filename: str):
+        # Hermetic: both bridges exit without a token and read channel access
+        # files under CLAUDE_CONFIG_DIR (falling back to the real home dir).
+        os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
+        os.environ.setdefault("DISCORD_BOT_TOKEN", "test-token")
+        cfg = Path(tempfile.mkdtemp(prefix=f"sweep-cfg-{tag}-"))
+        for ch in ("discord", "telegram"):
+            (cfg / "channels" / ch).mkdir(parents=True)
+            (cfg / "channels" / ch / "access.json").write_text('{"allowFrom": [], "groups": {}}')
+        os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
+        spec = importlib.util.spec_from_file_location(f"{tag}_sweep_wiring", REPO / "src" / filename)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    for _tag, _file in (("tgbridge", "telegram-bridge.py"), ("dbridge", "discord-bridge.py")):
+        try:
+            _m = _load_other(_tag, _file)
+        except (Exception, SystemExit) as _exc:  # noqa: BLE001 — a bridge that cannot load here is a failed check, not a skip
+            check(f"{_file}: module loads for the sweep wiring check", False, repr(_exc)[:160])
+            continue
+        _m_saved = _m.sweep_retired
+        _m.sweep_retired = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("sweep blew up"))
+        try:
+            _m._sweep_retired_pass(); check(f"{_file}: a raising sweep does not escape _sweep_retired_pass", True)
+        except Exception as _exc:  # noqa: BLE001
+            check(f"{_file}: a raising sweep does not escape _sweep_retired_pass", False, repr(_exc))
+        finally:
+            _m.sweep_retired = _m_saved
+        _m.sweep_retired = lambda *_a, **_k: [Path("/x/proactive-late-y.txt")]
+        try:
+            _m._sweep_retired_pass(); check(f"{_file}: the helper reports a republished remainder", True)
+        finally:
+            _m.sweep_retired = _m_saved
     _b = _load_bridge("sweepref")
     _saved = _b.sweep_retired
     _b.sweep_retired = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("sweep blew up"))

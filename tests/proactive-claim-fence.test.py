@@ -63,6 +63,25 @@ def main() -> int:
         fence.confirm(claim)
         check("confirm consumes the claim file", not claim.exists())
 
+    # confirm WITH the delivered body: an unchanged claim retires; a claim that
+    # grew after the read is released for a whole resend, never destroyed.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        body = root / "proactive-g.txt"
+        body.write_text("hello\n")
+        fence = _fence(root)
+        claim = fence.claim(body)
+        fd = open(claim, "a")
+        fd.write("MORE\n"); fd.flush(); fd.close()
+        check("confirm(claim, delivered) on a grown claim returns False",
+              fence.confirm(claim, "hello") is False)
+        check("...and the claim is released back to the polling stream, bytes intact",
+              body.exists() and "MORE" in body.read_text() and not claim.exists())
+        claim = fence.claim(body)
+        check("confirm(claim, delivered) on an unchanged claim retires it",
+              fence.confirm(claim, "hello\nMORE") is True and not claim.exists()
+              and (root / "retired" / claim.name).exists())
+
     # release: unready body returns to the polling stream.
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
