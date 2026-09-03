@@ -158,6 +158,7 @@ do_restart() {
   log "restarting core ($reason)… — start-cli.sh's own trace continues in logs/restart-attempts.log"
   # The `+` guard keeps an empty array valid under `set -u` on bash 3.2.
   # GR_START_CLI is a test seam: dry-run never reaches this line.
+  export GR_RID="$RID"   # lets the launcher release THIS run's lock if it aborts
   exec bash "${GR_START_CLI:-$REPO/src/agent/start-cli.sh}" --restart ${RESTART_ARGS[@]+"${RESTART_ARGS[@]}"}
 }
 
