@@ -1,6 +1,6 @@
 #!/bin/bash
 # Follower liveness writer: beats <workspace>/state/cores/<instance>.alive
-# while <watch-pid> is alive, then exits. Spawned by pool-core-wrapper.sh with
+# while <watch-pid> is alive, then exits. Spawned by pool-worker-wrapper.sh with
 # the claude child's pid so the beat can never outlive the session it vouches
 # for (the failure class core_heartbeat.py documents for its own 2026-08-01
 # fix). No unlink on exit: KeepAlive restarts the follower within ~30s and the

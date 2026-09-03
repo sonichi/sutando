@@ -7,7 +7,7 @@ live and graceful-restart gates busy() on "running + fresh ts" (#3156). The rule
 was prose in a SKILL.md an LLM session must remember across compactions.
 
 The predicate is the VALUE, not the key's presence. The pool plist assigns 1..N
-(scripts/install-core-pool.sh); a main core carries something else ('legacy' on
+(scripts/install-worker-pool.sh); a main core carries something else ('legacy' on
 this host) or nothing. Gating on "is set" would silence a main core, and a core
 that never writes reads as idle — which authorises a kill. So unrecognised
 values WRITE: silence is the dangerous direction, and it must be unreachable by
@@ -35,10 +35,10 @@ CASES = [
     (None,     True,  "unset — a main core outside the pool"),
     ("legacy", True,  "the value this repo's own main core carries"),
     ("",       True,  "empty — indistinguishable from unset, must not silence"),
-    ("1",      False, "install-core-pool.sh assigns 1..N"),
-    ("3",      False, "install-core-pool.sh assigns 1..N"),
+    ("1",      False, "install-worker-pool.sh assigns 1..N"),
+    ("3",      False, "install-worker-pool.sh assigns 1..N"),
     ("12",     False, "multi-digit ids stay followers"),
-    ("core-2", True,  "session NAME, not the id — unrecognised, fail open"),
+    ("worker-2", True,  "session NAME, not the id — unrecognised, fail open"),
     ("weird",  True,  "unrecognised, fail open"),
     ("2x",     True,  "not purely numeric — fail open"),
 ]

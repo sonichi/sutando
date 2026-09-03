@@ -4,7 +4,7 @@
 The library is the single owner of per-runtime session driving: which pane text
 counts as busy, as a menu, as a staged input and as an idle prompt; what the
 pool entry says; and which key submits it. Both adapters bind it —
-pool-core-wrapper.sh for the in-session sweep and kick-pool.sh for the watchdog.
+pool-worker-wrapper.sh for the in-session sweep and kick-pool.sh for the watchdog.
 
 The defect being pinned is a guard that failed OPEN. kick-pool's staged-input
 test was "if the pane shows a prompt WITH content, skip" — so any pane it could
@@ -26,7 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 LIB = REPO / "scripts" / "pool-runtime-drive.sh"
 KICK = REPO / "scripts" / "kick-pool.sh"
-WRAPPER = REPO / "scripts" / "pool-core-wrapper.sh"
+WRAPPER = REPO / "scripts" / "pool-worker-wrapper.sh"
 
 NBSP = " "
 ESC = "\x1b"
@@ -41,7 +41,7 @@ CLAUDE_MENU = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel\n"
 CODEX_IDLE = (f"{ESC}[1m›{ESC}[0m {ESC}[2mImprove documentation in @filename{ESC}[0m\n"
               "  gpt-5.6-sol xhigh · /repo\n")
 CODEX_STAGED = f"{ESC}[1m›{ESC}[0m review the open PRs\n  gpt-5.6-sol xhigh · /repo\n"
-CODEX_STAGED_NUDGE = (f"{ESC}[1m›{ESC}[0m Sutando pool mode. You are core-4. Do not read\n"
+CODEX_STAGED_NUDGE = (f"{ESC}[1m›{ESC}[0m Sutando pool mode. You are worker-4. Do not read\n"
                       "  gpt-5.6-sol xhigh · /repo\n")
 CODEX_BUSY = (f"{ESC}[1m{ESC}[38;2;128;128;128m•{ESC}[0m Working "
               f"{ESC}[2m(5s • esc to interrupt) · /stop to close{ESC}[0m\n") + CODEX_IDLE
@@ -68,7 +68,7 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.sutando.core-4</string>
+  <string>com.sutando.worker-4</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>POOL_CLAUDE_BIN</key><string>/nonexistent/claude</string>
@@ -172,10 +172,10 @@ class RuntimeResolutionTest(DriveHarness):
 
 
 class NudgeTextTest(unittest.TestCase):
-    def text(self, runtime, core="4"):
+    def text(self, runtime, worker="worker-4"):
         return subprocess.run(
             ["bash", "-c",
-             f'set -u\n. "{LIB}"\npool_drive_nudge_text {runtime} {core}'],
+             f'set -u\n. "{LIB}"\npool_drive_nudge_text {runtime} {worker}'],
             capture_output=True, text=True, timeout=30)
 
     def test_claude_entry_is_the_slash_command(self):
@@ -185,7 +185,7 @@ class NudgeTextTest(unittest.TestCase):
     def test_codex_entry_points_at_codex_md_and_names_the_core(self):
         r = self.text("codex")
         self.assertIn("skills/proactive-loop-pool/CODEX.md", r.stdout)
-        self.assertIn("core-4", r.stdout)
+        self.assertIn("worker-4", r.stdout)
         self.assertNotIn("/proactive-loop-pool pass", r.stdout,
                          "codex has no slash-command surface")
 
@@ -197,7 +197,7 @@ class NudgeTextTest(unittest.TestCase):
 
 class ClaudeKickTest(DriveHarness):
     def kick(self, td, pane, pane2=None):
-        return self.drive('pool_drive_kick claude core-1 tmux_fn 1', td,
+        return self.drive('pool_drive_kick claude worker-1 tmux_fn worker-1', td,
                           pane=pane, pane2=pane2)
 
     def test_idle_pane_types_the_slash_command_and_enter(self):
@@ -207,7 +207,7 @@ class ClaudeKickTest(DriveHarness):
             self.assertIn("RC=0", r.stdout, r.stderr)
             self.assertEqual(
                 self.sends(calls),
-                [["send-keys", "-t", "core-1", "/proactive-loop-pool pass", "Enter"]])
+                [["send-keys", "-t", "worker-1", "/proactive-loop-pool pass", "Enter"]])
             self.assertNotIn("-e", calls[0],
                              "claude capture must stay byte-identical (no SGR)")
 
@@ -226,8 +226,8 @@ class ClaudeKickTest(DriveHarness):
             self.assertIn("RC=0", r.stdout)
             self.assertEqual(
                 self.sends(calls),
-                [["send-keys", "-t", "core-1", "Escape"],
-                 ["send-keys", "-t", "core-1", "/proactive-loop-pool pass", "Enter"]])
+                [["send-keys", "-t", "worker-1", "Escape"],
+                 ["send-keys", "-t", "worker-1", "/proactive-loop-pool pass", "Enter"]])
 
     def test_staged_pool_entry_is_submitted_not_retyped(self):
         with tempfile.TemporaryDirectory() as t:
@@ -235,7 +235,7 @@ class ClaudeKickTest(DriveHarness):
             r, calls = self.kick(td, CLAUDE_STAGED_NUDGE)
             self.assertIn("RC=0", r.stdout)
             self.assertEqual(self.sends(calls),
-                             [["send-keys", "-t", "core-1", "Enter"]])
+                             [["send-keys", "-t", "worker-1", "Enter"]])
 
     def test_other_staged_input_is_never_appended_to(self):
         with tempfile.TemporaryDirectory() as t:
@@ -265,7 +265,7 @@ class ClaudeKickTest(DriveHarness):
 
 class CodexKickTest(DriveHarness):
     def kick(self, td, pane, pane2=None):
-        return self.drive('pool_drive_kick codex core-4 tmux_fn 4', td,
+        return self.drive('pool_drive_kick codex worker-4 tmux_fn worker-4', td,
                           pane=pane, pane2=pane2)
 
     def test_idle_pane_types_the_codex_entry_literally_then_ctrl_m(self):
@@ -276,11 +276,11 @@ class CodexKickTest(DriveHarness):
             sends = self.sends(calls)
             self.assertEqual(len(sends), 2, sends)
             self.assertEqual(sends[0][:5],
-                             ["send-keys", "-t", "core-4", "-l", "--"])
+                             ["send-keys", "-t", "worker-4", "-l", "--"])
             self.assertIn("skills/proactive-loop-pool/CODEX.md", sends[0][5])
             self.assertNotIn("/proactive-loop-pool pass", sends[0][5],
                              "claude's slash command must never reach codex")
-            self.assertEqual(sends[1], ["send-keys", "-t", "core-4", "C-m"])
+            self.assertEqual(sends[1], ["send-keys", "-t", "worker-4", "C-m"])
             self.assertIn("-e", calls[0],
                           "codex needs SGR codes to tell placeholder from input")
 
@@ -310,7 +310,7 @@ class CodexKickTest(DriveHarness):
             r, calls = self.kick(td, CODEX_STAGED)
             self.assertIn("RC=1", r.stdout)
             self.assertEqual(self.sends(calls), [],
-                             "this is exactly the accumulation that wedged core-4")
+                             "this is exactly the accumulation that wedged worker-4")
 
     def test_staged_pool_entry_is_submitted(self):
         with tempfile.TemporaryDirectory() as t:
@@ -318,7 +318,7 @@ class CodexKickTest(DriveHarness):
             r, calls = self.kick(td, CODEX_STAGED_NUDGE)
             self.assertIn("RC=0", r.stdout)
             self.assertEqual(self.sends(calls),
-                             [["send-keys", "-t", "core-4", "C-m"]])
+                             [["send-keys", "-t", "worker-4", "C-m"]])
 
     def test_startup_menu_is_skipped_without_pressing_enter(self):
         with tempfile.TemporaryDirectory() as t:
@@ -333,7 +333,7 @@ class UnresolvableRuntimeTest(DriveHarness):
     def test_empty_runtime_types_nothing(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
-            r, calls = self.drive('pool_drive_kick "" core-9 tmux_fn 9', td,
+            r, calls = self.drive('pool_drive_kick "" worker-9 tmux_fn worker-9', td,
                                   pane=CLAUDE_IDLE)
             self.assertIn("RC=2", r.stdout)
             self.assertEqual(self.sends(calls), [],
@@ -343,7 +343,7 @@ class UnresolvableRuntimeTest(DriveHarness):
     def test_unknown_runtime_types_nothing(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
-            r, calls = self.drive('pool_drive_kick gemini core-9 tmux_fn 9', td,
+            r, calls = self.drive('pool_drive_kick gemini worker-9 tmux_fn worker-9', td,
                                   pane=CLAUDE_IDLE)
             self.assertIn("RC=2", r.stdout)
             self.assertEqual(self.sends(calls), [])
@@ -355,17 +355,17 @@ class WrapperNudgeTest(DriveHarness):
     def test_claude_nudge_is_unconditional_because_its_input_is_a_queue(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
-            r, calls = self.drive('pool_drive_nudge claude core-1 tmux_fn 1', td,
+            r, calls = self.drive('pool_drive_nudge claude worker-1 tmux_fn worker-1', td,
                                   pane=CLAUDE_BUSY)
             self.assertIn("RC=0", r.stdout)
             self.assertEqual(
                 self.sends(calls),
-                [["send-keys", "-t", "core-1", "/proactive-loop-pool pass", "Enter"]])
+                [["send-keys", "-t", "worker-1", "/proactive-loop-pool pass", "Enter"]])
 
     def test_codex_nudge_defers_while_a_turn_is_running(self):
         with tempfile.TemporaryDirectory() as t:
             td = Path(t)
-            r, calls = self.drive('pool_drive_nudge codex core-4 tmux_fn 4', td,
+            r, calls = self.drive('pool_drive_nudge codex worker-4 tmux_fn worker-4', td,
                                   pane=CODEX_BUSY)
             self.assertIn("RC=1", r.stdout)
             self.assertEqual(self.sends(calls), [],
@@ -397,13 +397,13 @@ class KickPoolWiringTest(DriveHarness):
         stub = td / "stub-tmux"
         write_exec(stub, KICK_STUB_TMUX)
         (td / "sessions").write_text(
-            "".join(f"core-{i}\n" for i in cores))
+            "".join(f"worker-{i}\n" for i in cores))
         for i, (runtime, pane) in cores.items():
             keys = ("" if runtime is None
                     else f"    <key>POOL_RUNTIME</key><string>{runtime}</string>\n")
-            (agents / f"com.sutando.core-{i}.plist").write_text(
+            (agents / f"com.sutando.worker-{i}.plist").write_text(
                 PLIST.format(runtime_keys=keys))
-            (td / f"pane-core-{i}").write_text(pane)
+            (td / f"pane-worker-{i}").write_text(pane)
         env = dict(os.environ, HOME=str(home), STUB_DIR=str(td),
                    TMUX_BIN=str(stub))
         env.pop("SUTANDO_POOL_SOCKET", None)
@@ -427,10 +427,10 @@ class KickPoolWiringTest(DriveHarness):
             })
             sends = self.sends(calls)
             self.assertEqual(
-                [c for c in sends if c[2] == "core-1"],
-                [["send-keys", "-t", "core-1", "/proactive-loop-pool pass", "Enter"]],
+                [c for c in sends if c[2] == "worker-1"],
+                [["send-keys", "-t", "worker-1", "/proactive-loop-pool pass", "Enter"]],
                 r.stdout + r.stderr)
-            four = [c for c in sends if c[2] == "core-4"]
+            four = [c for c in sends if c[2] == "worker-4"]
             self.assertEqual(len(four), 2, four)
             self.assertIn("skills/proactive-loop-pool/CODEX.md", four[0][5])
             self.assertEqual(four[1][3], "C-m")
@@ -485,7 +485,7 @@ class AdapterDelegationTest(unittest.TestCase):
 
     def test_the_runtime_allowlist_has_one_definition(self):
         # The installer used to carry its own copy of the supported-runtime case.
-        installer = (REPO / "scripts" / "install-core-pool.sh").read_text()
+        installer = (REPO / "scripts" / "install-worker-pool.sh").read_text()
         self.assertIn("pool-runtime-drive.sh", installer)
         self.assertNotIn("pool_runtime_supported() {", installer)
 

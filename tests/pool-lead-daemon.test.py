@@ -35,10 +35,10 @@ class HelperTests(unittest.TestCase):
     def test_run_recovery_returns_stdout_and_survives_oserror(self):
         real = daemon.subprocess
         daemon.subprocess = types.SimpleNamespace(
-            run=lambda *a, **k: _FakeCompleted(0, "core-1 ok\n"),
+            run=lambda *a, **k: _FakeCompleted(0, "worker-1 ok\n"),
             TimeoutExpired=real.TimeoutExpired)
         try:
-            self.assertEqual(daemon._run_recovery(), "core-1 ok")
+            self.assertEqual(daemon._run_recovery(), "worker-1 ok")
             def boom(*a, **k):
                 raise OSError("no bash")
             daemon.subprocess = types.SimpleNamespace(
@@ -75,7 +75,7 @@ class MainLoopTests(unittest.TestCase):
             tasks, cores = ws / "tasks", ws / "state" / "cores"
             tasks.mkdir()
             cores.mkdir(parents=True)
-            (cores / "core-1.alive").write_text("beat")
+            (cores / "worker-1.alive").write_text("beat")
             (tasks / "task-d1.txt").write_text(
                 "id: task-d1\nsource: chat\ntask: t\n")
 
@@ -87,7 +87,7 @@ class MainLoopTests(unittest.TestCase):
 
             def fake_sub_run(cmd, **k):
                 installs.append([str(c) for c in cmd])
-                return _FakeCompleted(0, "staged core-2\n")
+                return _FakeCompleted(0, "staged worker-2\n")
 
             sleeps = {"n": 0}
 
@@ -97,7 +97,7 @@ class MainLoopTests(unittest.TestCase):
                     signal.raise_signal(signal.SIGTERM)
 
             daemon._workspace = lambda: ws
-            daemon._run_recovery = lambda: "core-1 healthy\nkickstart core-2"
+            daemon._run_recovery = lambda: "worker-1 healthy\nkickstart worker-2"
             daemon._send_notice = lambda *a: True
             daemon.subprocess = types.SimpleNamespace(
                 run=fake_sub_run, TimeoutExpired=real_sub.TimeoutExpired)
@@ -120,16 +120,16 @@ class MainLoopTests(unittest.TestCase):
                 daemon.scale_decide = real_decide
             log = out.getvalue()
             self.assertEqual(rc, 0)
-            self.assertIn("assigned task-d1.txt -> core-1", log)
-            self.assertIn("recovery: kickstart core-2", log)
+            self.assertIn("assigned task-d1.txt -> worker-1", log)
+            self.assertIn("recovery: kickstart worker-2", log)
             self.assertIn("scaled-up pool 1 -> 2", log)
             self.assertIn("pool-lead: stopped", log)
             self.assertTrue(
-                any("install-core-pool.sh" in " ".join(c) for c in installs))
+                any("install-worker-pool.sh" in " ".join(c) for c in installs))
             self.assertFalse((cores / "pool-lead.alive").exists(),
                              "beat must be unlinked on clean shutdown")
             self.assertTrue(
-                (tasks / "task-d1.assigned-core-1.txt").exists())
+                (tasks / "task-d1.assigned-worker-1.txt").exists())
 
     def test_scale_up_failure_is_reported_not_fatal(self):
         with tempfile.TemporaryDirectory() as td:
@@ -137,7 +137,7 @@ class MainLoopTests(unittest.TestCase):
             (ws / "tasks").mkdir()
             cores = ws / "state" / "cores"
             cores.mkdir(parents=True)
-            (cores / "core-1.alive").write_text("beat")
+            (cores / "worker-1.alive").write_text("beat")
 
             real_ws, real_rec = daemon._workspace, daemon._run_recovery
             real_sub, real_time, real_argv = (
@@ -148,7 +148,7 @@ class MainLoopTests(unittest.TestCase):
                 signal.raise_signal(signal.SIGTERM)
 
             daemon._workspace = lambda: ws
-            daemon._run_recovery = lambda: "core-1 healthy"
+            daemon._run_recovery = lambda: "worker-1 healthy"
             daemon.subprocess = types.SimpleNamespace(
                 run=lambda *a, **k: _FakeCompleted(3, "", "boom"),
                 TimeoutExpired=real_sub.TimeoutExpired)

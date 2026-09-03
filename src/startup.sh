@@ -1376,7 +1376,7 @@ fi
 # below for any host that has followers, with or without the flag.
 if [ -n "$POOL_N" ]; then
     echo "Setting up multi-worker pool (N=$POOL_N)..." >&2
-    bash "$REPO/scripts/install-core-pool.sh" "$POOL_N" \
+    bash "$REPO/scripts/install-worker-pool.sh" "$POOL_N" \
         || echo "  ✗ pool install failed (exit $?) — continuing with whatever is installed" >&2
 fi
 
@@ -1384,7 +1384,9 @@ fi
 # degrade to leaderless claiming. Never starts one alongside launchd; the
 # helper returns 0 once a lead from this checkout is running.
 shopt -s nullglob
-_pool_members=("$HOME/Library/LaunchAgents"/com.sutando.core-[0-9]*.plist)
+# Legacy `core-N` plists count until `--pool N` migrates them to `worker-N`.
+_pool_members=("$HOME/Library/LaunchAgents"/com.sutando.worker-[0-9]*.plist
+               "$HOME/Library/LaunchAgents"/com.sutando.core-[0-9]*.plist)
 shopt -u nullglob
 if [ "${#_pool_members[@]}" -gt 0 ]; then
     if pool_lead_supervised; then

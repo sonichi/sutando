@@ -9,7 +9,7 @@
 #   2. liveness                — per-slot .alive heartbeats with age in seconds
 #   3. channel-affinity        — which slot owns which channel right now
 #   4. recent claims           — last N tasks that were atomically claimed
-#   5. log tails               — last K lines from each core's stdout log
+#   5. log tails               — last K lines from each worker's stdout log
 #
 # Usage:
 #   bash scripts/pool-status.sh              # defaults: 5 claims, 3 log lines
@@ -33,10 +33,10 @@ hdr() { printf "\n=== %s ===\n" "$1"; }
 
 # ---------------------------------------------------------------------------
 hdr "1. launchd state"
-# Filter to com.sutando.core-* labels. The trailing column is PID; "-" means
+# Filter to com.sutando.worker-N labels (legacy core-N too). The trailing column is PID; "-" means
 # not currently running (KeepAlive will respawn). Numeric column is exit code
 # of the last instance — 127 = wrapper script missing (see issue #886).
-if launchctl list 2>/dev/null | awk 'NR==1 || /com\.sutando\.core-/' \
+if launchctl list 2>/dev/null | awk 'NR==1 || /com\.sutando\.(worker|core)-[0-9]/' \
      | awk '{ printf "%-10s %-8s %s\n", $1, $2, $3 }'; then :; fi
 
 # ---------------------------------------------------------------------------
@@ -45,7 +45,7 @@ now="$(date +%s)"
 if [ -d "$CORES_DIR" ]; then
   shopt -s nullglob
   found=0
-  for f in "$CORES_DIR"/core-*.alive; do
+  for f in "$CORES_DIR"/worker-*.alive "$CORES_DIR"/core-*.alive; do
     found=1
     base="$(basename "$f")"
     mtime="$(stat -f %m "$f" 2>/dev/null || echo 0)"
@@ -77,13 +77,13 @@ fi
 
 # ---------------------------------------------------------------------------
 hdr "4. recent claims (last $CLAIMS_LIMIT)"
-# Claim filenames look like task-<ts>.claimed-core-<N>.txt and land first in
+# Claim filenames look like task-<ts>.claimed-worker-<N>.txt and land first in
 # tasks/, then get archived to tasks/processed/ once the result lands. Scan
 # both directories for full history.
 {
   shopt -s nullglob
   for d in "$TASKS_DIR" "$TASKS_DIR/processed"; do
-    for f in "$d"/task-*.claimed-core-*.txt; do
+    for f in "$d"/task-*.claimed-*.txt; do
       mtime="$(stat -f %m "$f" 2>/dev/null || echo 0)"
       echo "$mtime $(basename "$f")"
     done
@@ -93,13 +93,13 @@ hdr "4. recent claims (last $CLAIMS_LIMIT)"
   { ts=$1; $1=""; sub(/^ /, ""); printf "  %s  %s\n", strftime("%H:%M:%S", ts), $0 }
 '
 # If the loop produced nothing the head pipe is silent — emit a hint.
-have_claims="$(find "$TASKS_DIR" "$TASKS_DIR/processed" -maxdepth 1 -name 'task-*.claimed-core-*.txt' 2>/dev/null | head -1)"
+have_claims="$(find "$TASKS_DIR" "$TASKS_DIR/processed" -maxdepth 1 -name 'task-*.claimed-*.txt' 2>/dev/null | head -1)"
 [ -z "$have_claims" ] && echo "  (no claimed-by-pool tasks yet)"
 
 # ---------------------------------------------------------------------------
 hdr "5. log tails (last $LOG_LINES lines, per slot)"
 shopt -s nullglob
-for log in "$LOG_DIR"/core-[0-9]*.log; do
+for log in "$LOG_DIR"/worker-[0-9]*.log "$LOG_DIR"/core-[0-9]*.log; do
   base="$(basename "$log")"
   printf -- "--- %s ---\n" "$base"
   tail -n "$LOG_LINES" "$log" 2>/dev/null | sed 's/^/  /'

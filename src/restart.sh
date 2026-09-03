@@ -3,7 +3,7 @@
 # Does NOT touch the Claude Code CLI (core agent) — that's managed separately.
 # Usage: bash src/restart.sh
 #   --stop-only    Stop without restarting
-#   --pool N       Forwarded to startup.sh: install/resize the core pool + lead
+#   --pool N       Forwarded to startup.sh: install/resize the worker pool + lead
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 

@@ -6,7 +6,7 @@ watched pid is alive, stop when it dies, and never unlink the file — the 90s
 stale window is what absorbs KeepAlive restart gaps, so an unlink would make
 the lead reclaim in-flight assignments on every clean follower restart.
 
-pool-core-wrapper.sh (persistent form) must create the tmux session when
+pool-worker-wrapper.sh (persistent form) must create the tmux session when
 absent, beat `core-$SUTANDO_CORE_ID` pid-bound to the pane while the session
 lives, and exit 0 promptly once the session ends (launchd KeepAlive owns the
 restart). Exercised against a stub tmux + stub claude — the live tmux server
@@ -22,7 +22,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 BEAT = REPO / "scripts" / "pool-follower-beat.sh"
-WRAPPER = REPO / "scripts" / "pool-core-wrapper.sh"
+WRAPPER = REPO / "scripts" / "pool-worker-wrapper.sh"
 
 
 def _wait_for(cond, timeout=10.0, step=0.1):
@@ -41,15 +41,15 @@ class PoolFollowerBeatTest(unittest.TestCase):
             watched = subprocess.Popen(["sleep", "300"])
             env = dict(os.environ, SUTANDO_POOL_BEAT_INTERVAL="1")
             beater = subprocess.Popen(
-                ["bash", str(BEAT), "core-7", str(ws), str(watched.pid)],
+                ["bash", str(BEAT), "worker-7", str(ws), str(watched.pid)],
                 env=env)
-            alive = ws / "state" / "cores" / "core-7.alive"
+            alive = ws / "state" / "cores" / "worker-7.alive"
             try:
                 self.assertTrue(_wait_for(alive.exists),
                                 "beat file never appeared")
                 payload = json.loads(alive.read_text())
                 self.assertEqual(payload["role"], "follower")
-                self.assertEqual(payload["instance"], "core-7")
+                self.assertEqual(payload["instance"], "worker-7")
                 self.assertEqual(payload["pid"], watched.pid)
 
                 m1 = alive.stat().st_mtime
@@ -70,7 +70,7 @@ class PoolFollowerBeatTest(unittest.TestCase):
                     if p.poll() is None:
                         p.kill()
 
-    def test_wrapper_beats_core_id_and_exits_when_session_ends(self):
+    def test_wrapper_beats_worker_id_and_exits_when_session_ends(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
             stub_claude = ws / "stub-claude"
@@ -100,11 +100,11 @@ class PoolFollowerBeatTest(unittest.TestCase):
                 SUTANDO_POOL_BEAT_INTERVAL="1",
                 SUTANDO_POOL_SESSION_POLL="1")
             wrapper = subprocess.Popen(["bash", str(WRAPPER)], env=env)
-            alive = ws / "state" / "cores" / "core-9.alive"
+            alive = ws / "state" / "cores" / "worker-9.alive"
             try:
                 self.assertTrue(
                     _wait_for(alive.exists),
-                    "wrapper never produced core-9.alive while the "
+                    "wrapper never produced worker-9.alive while the "
                     "session ran")
                 pane_pid = int((ws / "pane-pid").read_text().strip())
                 self.assertEqual(
@@ -188,7 +188,7 @@ class PoolWrapperRuntimeDispatchTest(unittest.TestCase):
                              "codex has no slash-command surface")
             self.assertIn("skills/proactive-loop-pool/CODEX.md", cmd,
                           "the codex entry must point at CODEX.md")
-            self.assertIn("core-4", cmd, "the entry must name the core")
+            self.assertIn("worker-4", cmd, "the entry must name the core")
             self.assertIn(f"CODEX_HOME='{td / 'codex-home'}'", cmd,
                           "the resolved codex store must be forwarded")
 
@@ -224,7 +224,7 @@ class PoolWrapperRuntimeDispatchTest(unittest.TestCase):
                              "an unknown runtime must fail loudly, like "
                              "src/agent/start-cli.sh")
             self.assertIsNone(cmd, "no session may start for an unknown runtime")
-            self.assertIn("unsupported core runtime", r.stderr)
+            self.assertIn("unsupported worker runtime", r.stderr)
 
 
 class PoolWrapperNudgeTest(unittest.TestCase):
@@ -294,7 +294,7 @@ class PoolWrapperNudgeTest(unittest.TestCase):
             self.assertTrue(sends, "the wrapper never swept")
             for c in sends:
                 self.assertEqual(
-                    c, ["send-keys", "-t", "core-4",
+                    c, ["send-keys", "-t", "worker-4",
                         "/proactive-loop-pool pass", "Enter"])
 
     def test_codex_sweep_defers_while_the_session_is_busy(self):
@@ -311,7 +311,7 @@ class PoolWrapperNudgeTest(unittest.TestCase):
             td = Path(t)
             tasks = td / "tasks"
             tasks.mkdir()
-            (tasks / "task-wake.assigned-core-4.txt").write_text("assigned\n")
+            (tasks / "task-wake.assigned-worker-4.txt").write_text("assigned\n")
             sends = self.run_wrapper(
                 td, self.IDLE,
                 POOL_RUNTIME="codex",
@@ -327,7 +327,7 @@ class PoolWrapperNudgeTest(unittest.TestCase):
                 "one durable assignment must produce one literal send + submit")
             self.assertIn("skills/proactive-loop-pool/CODEX.md", sends[0][5])
             self.assertEqual(sends[1],
-                             ["send-keys", "-t", "core-4", "C-m"])
+                             ["send-keys", "-t", "worker-4", "C-m"])
 
     # The wrapper path drives codex every 300s. It must reach the SAME verdict
     # as the kick path, which classifies each of these panes positively.
@@ -348,9 +348,9 @@ class PoolWrapperNudgeTest(unittest.TestCase):
             sends = self._codex_sends(td, self.IDLE)
             self.assertTrue(sends, "an idle ANSI prompt must receive the entry")
             self.assertEqual(sends[0][:5],
-                             ["send-keys", "-t", "core-4", "-l", "--"])
+                             ["send-keys", "-t", "worker-4", "-l", "--"])
             self.assertIn("skills/proactive-loop-pool/CODEX.md", sends[0][5])
-            self.assertEqual(sends[1], ["send-keys", "-t", "core-4", "C-m"])
+            self.assertEqual(sends[1], ["send-keys", "-t", "worker-4", "C-m"])
 
     def test_codex_sweep_never_types_into_a_pane_it_did_not_recognize(self):
         """This test previously asserted the OPPOSITE for the staged case: it fed
