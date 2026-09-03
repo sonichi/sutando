@@ -218,6 +218,15 @@ def _parse_timestamp(raw: str, fallback: float) -> float:
         return fallback
 
 
+def _declared_id(path: Path) -> str | None:
+    try:
+        content = path.read_text(errors="replace")
+    except OSError:
+        return None
+    declared = local_task_protocol.parse_task_headers_lenient(content).headers.get("id")
+    return str(declared) if declared else None
+
+
 def _archive_task_id(name: str) -> str | None:
     """Prefix-agnostic id for an archived file (ask-*, sc-ask-*, reco-skill-*),
     gated by the archive lookup contract; the live pool grammar stays task-*."""
@@ -235,9 +244,16 @@ def _task_paths(tasks_dir: Path):
     candidates.extend(local_task_protocol.iter_archived_tasks(tasks_dir))
     # Prefer the live copy per id; keyed on the canonical id because a claimed
     # file's stem differs from its archived copy's, hiding that they are one.
+    # The persisted `id:` outranks the filename: a gateway id may itself end
+    # in `.claimed-<x>`, which only the header can tell from a pool rename.
     for path in candidates:
         task_id = task_id_from_filename(path.name) or _archive_task_id(path.name)
-        if task_id is None or task_id in seen:
+        if task_id is None:
+            continue
+        declared = _declared_id(path)
+        if declared is not None and local_task_protocol.valid_archive_lookup_id(declared):
+            task_id = declared
+        if task_id in seen:
             continue
         seen.add(task_id)
         yield task_id, path

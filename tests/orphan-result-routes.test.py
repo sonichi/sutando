@@ -39,8 +39,8 @@ def snowflake_ok(value: str) -> bool:
 
 
 def task_text(channel_id: str | None = SNOWFLAKE, source: str = "news-radar",
-              body: str = "do the thing") -> str:
-    lines = ["id: task-1", f"source: {source}"]
+              body: str = "do the thing", task_id: str = "task-1") -> str:
+    lines = [f"id: {task_id}", f"source: {source}"]
     if channel_id is not None:
         lines.append(f"channel_id: {channel_id}")
     lines += ["access_tier: owner", f"task: {body}"]
@@ -95,6 +95,17 @@ class OrphanResultRoutesTest(unittest.TestCase):
         (self.tasks / f"{tid}.txt.archive-failed.1").write_text(task_text())
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
 
+    def test_a_quarantined_long_id_does_not_route_the_short_ids_result(self):
+        """`task-a.txt.archive-failed-review.txt` that itself failed to archive
+        is `…txt.archive-failed`; its id is read from the rightmost .txt, so a
+        result for plain `task-a` is not routed with the long task's channel."""
+        long_id = "task-a.txt.archive-failed-review"
+        (self.tasks / f"{long_id}.txt.archive-failed").write_text(task_text())
+        self._result("task-a")
+        self.assertEqual(self.routes(), {})
+        self._result(long_id)
+        self.assertEqual(self.routes(), {long_id: SNOWFLAKE})
+
     def test_a_live_task_outranks_a_quarantined_leftover(self):
         """Precedence matters: the quarantined copy can be older, and routing
         the stale channel_id would post the reply to the wrong place."""
@@ -137,8 +148,11 @@ class OrphanResultRoutesTest(unittest.TestCase):
     def test_a_claimed_task_file_is_found(self):
         # find_task_file's shape: a claimed task is `<id>.claimed-core-N.txt`.
         tid = self._result()
-        (self.tasks / f"{tid}.claimed-core-1.txt").write_text(task_text())
+        # A claimed file carries its own id; one declaring ANOTHER id is not this task's.
+        (self.tasks / f"{tid}.claimed-core-1.txt").write_text(task_text(task_id=tid))
         self.assertEqual(self.routes(), {tid: SNOWFLAKE})
+        (self.tasks / f"{tid}.claimed-core-1.txt").write_text(task_text(task_id="task-other"))
+        self.assertEqual(self.routes(), {})
 
     # --- must not fire --------------------------------------------------
 

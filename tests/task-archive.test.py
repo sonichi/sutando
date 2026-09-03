@@ -13,6 +13,7 @@ from datetime import datetime
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from task_archive import archive_file, find_task_file, task_id_from_filename
+import task_archive as _task_archive  # noqa: E402
 
 
 def exdev_from(src):
@@ -159,6 +160,53 @@ class TestFindTaskFile(unittest.TestCase):
         self.assertIsNone(find_task_file(self.tasks_dir, "task-a"))
         longer = find_task_file(self.tasks_dir, "task-a.txt.archive-failed-review")
         self.assertEqual(longer.name, "task-a.txt.archive-failed-review.txt")
+
+    def test_a_state_looking_ordinary_id_is_told_apart_by_its_declared_id(self) -> None:
+        """`task-a.claimed-review` is a legal gateway id, not a pool rename. Only
+        the persisted `id:` can say which, so a lookup for `task-a` must skip a
+        file that declares the longer id, and still take a real claim."""
+        (self.tasks_dir / "task-a.claimed-review.txt").write_text(
+            "id: task-a.claimed-review\nsource: ag2space\ntask: long\n")
+        self.assertIsNone(find_task_file(self.tasks_dir, "task-a"))
+        self.assertEqual(find_task_file(self.tasks_dir, "task-a.claimed-review").name,
+                         "task-a.claimed-review.txt")
+        (self.tasks_dir / "task-a.claimed-core-1.txt").write_text(
+            "id: task-a\nsource: ag2space\ntask: claimed\n")
+        self.assertEqual(find_task_file(self.tasks_dir, "task-a").name,
+                         "task-a.claimed-core-1.txt")
+        # legacy: a variant with no id header is still matched by filename
+        (self.tasks_dir / "task-b.claimed-core-2.txt").write_text("task: no header\n")
+        self.assertEqual(find_task_file(self.tasks_dir, "task-b").name,
+                         "task-b.claimed-core-2.txt")
+
+    def test_quarantining_a_long_id_keeps_its_identity(self) -> None:
+        """A real archive failure on `task-a.txt.archive-failed-review.txt`
+        mints `…txt.archive-failed`; the id is read from the rightmost
+        structural .txt, so `task-a` cannot alias it and the long id still can."""
+        long_id = "task-a.txt.archive-failed-review"
+        live = self.tasks_dir
+        arch_tasks, arch_results = live / "archive", live / "results-archive"
+        src = live / f"{long_id}.txt"
+        src.write_text(f"id: {long_id}\nsource: ag2space\ntask: x\n")
+        real = _task_archive._move_without_clobbering
+        calls = []
+        def first_fails(s, d):
+            calls.append(d.name)
+            if len(calls) == 1:
+                raise OSError(5, "simulated archive failure")
+            return real(s, d)
+        with mock.patch.object(_task_archive, "_move_without_clobbering", side_effect=first_fails):
+            ok = archive_file(src, "task", long_id, tasks_dir=arch_tasks,
+                              results_dir=arch_results, log=lambda *a: None)
+        self.assertTrue(ok)
+        quarantine = live / f"{long_id}.txt.archive-failed"
+        self.assertTrue(quarantine.exists())
+        self.assertEqual(task_id_from_filename(quarantine.name), long_id)
+        self.assertIsNone(find_task_file(live, "task-a"))
+        self.assertEqual(find_task_file(live, long_id), quarantine)
+        # rightmost control: a plain short-id quarantine still resolves to the short id
+        (live / "task-a.txt.archive-failed").write_text("id: task-a\ntask: y\n")
+        self.assertEqual(find_task_file(live, "task-a").name, "task-a.txt.archive-failed")
 
     def test_real_quarantine_forms_still_resolve(self) -> None:
         self._write("task-q.txt.archive-failed")

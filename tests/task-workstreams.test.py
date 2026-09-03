@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -146,6 +147,39 @@ def test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes() 
     # The archive gate still rejects traversal-shaped names even if one landed.
     assert workstreams._archive_task_id("..txt") is None
     assert workstreams._archive_task_id("a/b.txt") is None
+
+
+def test_a_gateway_id_that_looks_claimed_is_its_own_task_beside_the_short_one() -> None:
+    # `task-a.claimed-review` passes the gateway's id charset and is written
+    # verbatim; the persisted `id:` header, not the filename, says it is not a
+    # pool rename of `task-a`. Both rows and the long id's assignment survive,
+    # while a genuine `task-a.claimed-core-3` still canonicalizes to task-a.
+    workspace = Path(tempfile.mkdtemp(prefix="sutando-gateway-id-"))
+    try:
+        tasks = workspace / "tasks"
+        write_task(tasks / "task-a.txt", "task-a", "2026-08-03T11:00:00Z", "short")
+        write_task(tasks / "task-a.claimed-review.txt", "task-a.claimed-review",
+                   "2026-08-03T11:05:00Z", "long")
+        write_task(tasks / "task-c.claimed-core-3.txt", "task-c", "2026-08-03T11:06:00Z", "pool")
+        write_result(workspace, "task-a.claimed-review", "the answer")
+        store = workspace / "data" / "task-workstreams.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({
+            "schema_version": 1,
+            "workstreams": {"workstream-x": {"title": "X", "summary": "s"}},
+            "assignments": {"task-a.claimed-review": {"workstream_id": "workstream-x"}},
+            "reviews": {},
+        }))
+        payload = workstreams.task_history_payload(workspace)
+        rows = {row["id"]: row for row in payload["tasks"]}
+        assert set(rows) == {"task-a", "task-a.claimed-review", "task-c"}, sorted(rows)
+        assert rows["task-a.claimed-review"]["status"] == "done"
+        assert rows["task-a.claimed-review"]["result"] == "the answer"
+        assert rows["task-a"]["status"] == "working"
+        assert rows["task-a.claimed-review"].get("workstream_id") == "workstream-x", rows["task-a.claimed-review"]
+        assert any(w.get("id") == "workstream-x" for w in payload["workstreams"])
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment() -> None:
@@ -1084,6 +1118,7 @@ def main() -> None:
         test_history_uses_invocation_time_and_owner_candidates,
         test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count,
         test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes,
+        test_a_gateway_id_that_looks_claimed_is_its_own_task_beside_the_short_one,
         test_a_legacy_id_that_looks_claimed_keeps_its_whole_stem_and_assignment,
         test_a_stem_containing_txt_archive_failed_is_one_record_not_a_quarantine,
         test_loader_parser_and_history_fail_open_edges,

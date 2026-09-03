@@ -23,7 +23,10 @@ from pathlib import Path
 # A name ending in .txt is one record: its id is the whole stem (task-* may
 # carry a pool-state suffix); .txt.N and .txt.archive-failed* identify by prefix.
 _STATE_SUFFIX = re.compile(r"^(task-.+?)\.(?:assigned|claimed)-.+$")
-_NOT_A_RECORD = re.compile(r"^(.+?)\.txt(?:\.\d+|\.archive-failed.*)$")
+# Greedy: the collision/quarantine tail is appended to the WHOLE name, so the
+# structural .txt is the rightmost one — a lazy match re-aliases a long id.
+_NOT_A_RECORD = re.compile(r"^(.+)\.txt(?:\.\d+|\.archive-failed.*)$")
+_DECLARED_ID = re.compile(r"^id:[ \t]*(\S+)[ \t]*$", re.M)
 
 
 def _stem_of(name: str) -> str | None:
@@ -62,6 +65,17 @@ def archive_id_from_filename(name: str) -> str | None:
     return _stem_of(name)
 
 
+def _declared_id(path: Path) -> str | None:
+    """The `id:` a task file persists in its header block, or None."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    head = text.split("\ntask:", 1)[0]
+    m = _DECLARED_ID.search(head)
+    return m.group(1) if m else None
+
+
 def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     """Return the actual task file path for task_id, or None if absent.
 
@@ -74,9 +88,12 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
     bare = tasks_dir / f"{task_id}.txt"
     if bare.exists():
         return bare
+    # An ordinary id may end in `.claimed-<x>`; only the persisted header can
+    # tell it from a pool rename, so a variant that declares another id is not ours.
     matches = sorted(
         p for p in tasks_dir.glob(f"{task_id}.*")
         if p.name != bare.name and task_id_from_filename(p.name) == task_id
+        and _declared_id(p) in (None, task_id)
     )
     if matches:
         return matches[0]
