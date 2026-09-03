@@ -107,6 +107,45 @@ class PruneTests(HygieneBase):
         self.assertEqual(self.lead.prune_done_flags(), 0)
         self.assertTrue(p.exists())
 
+    # A restore or re-clone refreshes mtime; the id stamp is what must age.
+    EPOCH = 1_800_000_000.0
+
+    def _stamped(self, age_s, unit):
+        born = self.clock[0] - age_s
+        return f"task-{int(born * 1000)}" if unit == "ms" else f"task-{int(born)}"
+
+    def test_old_ms_stamp_pruned_despite_refreshed_mtime(self):
+        self.clock[0] = self.EPOCH
+        p = self._flag("core-1", self._stamped(8 * 86400, "ms"), 0)
+        self.assertEqual(self.lead.prune_done_flags(), 1)
+        self.assertFalse(p.exists())
+
+    def test_old_s_stamp_pruned_despite_refreshed_mtime(self):
+        self.clock[0] = self.EPOCH
+        p = self._flag("core-1", self._stamped(8 * 86400, "s"), 0)
+        self.assertEqual(self.lead.prune_done_flags(), 1)
+        self.assertFalse(p.exists())
+
+    def test_young_stamp_kept_despite_old_mtime(self):
+        self.clock[0] = self.EPOCH
+        p = self._flag("core-1", self._stamped(3600, "ms"), 8 * 86400)
+        self.assertEqual(self.lead.prune_done_flags(), 0)
+        self.assertTrue(p.exists())
+
+    def test_unstamped_id_still_ages_by_mtime(self):
+        self.clock[0] = self.EPOCH
+        old_s = int(self.EPOCH - 8 * 86400)
+        # Leading component is a word or hex, so the trailing number is not
+        # a stamp: mtime decides, in both directions.
+        kept = [self._flag("core-1", f"task-chat-{old_s}", 0),
+                self._flag("core-1", "task-local~task-0f3a9c1d2b4e5f60", 0),
+                self._flag("core-1", f"task-{old_s}abc", 0)]
+        gone = [self._flag("core-2", "task-local~task-9e8d7c6b5a4f3e2d", 8 * 86400),
+                self._flag("core-2", f"task-chat-{old_s}", 8 * 86400)]
+        self.assertEqual(self.lead.prune_done_flags(), len(gone))
+        self.assertTrue(all(p.exists() for p in kept))
+        self.assertFalse(any(p.exists() for p in gone))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

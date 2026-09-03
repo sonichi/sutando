@@ -34,10 +34,22 @@ DONE_FLAG_RETENTION_S = 7 * 86400
 BUSY_EXIT_GRACE_S = 60.0     # claim window left after a busy spell ends
 NOCLAIM_COOLDOWN_S = ASSIGN_STUCK_S  # repool pops ledger; keep follower marked non-claiming
 
+# Leading id component that is an epoch in ms or s; restore/re-clone resets
+# mtime, so the name is the only immutable birth time a done-flag carries.
+_FLAG_STAMP_RE = re.compile(r"^task-(\d{13}|\d{10})(?![0-9A-Za-z])")
+
 # ids legitimately contain dots (task-<inst>~<id>), so exclude the
 # assigned/claimed states explicitly rather than banning dots
 _TASK_RE = re.compile(
     r"^task-(?!.*\.(?:assigned|claimed)-)[A-Za-z0-9._~-]+\.txt$")
+
+
+def _flag_stamp_s(name: str) -> "float | None":
+    m = _FLAG_STAMP_RE.match(name)
+    if not m:
+        return None
+    digits = m.group(1)
+    return int(digits) / (1000.0 if len(digits) == 13 else 1.0)
 _CHANNEL_RE = re.compile(r"^(?:channel_id|chat_id):\s*(\S+)", re.M)
 _TARGET_RE = re.compile(r"^target_worker:\s*(\S+)", re.M)
 _FANOUT_RE = re.compile(r"^fan_out:\s*true\s*$", re.M | re.I)
@@ -569,7 +581,10 @@ class PoolLead:
         for d in dirs:
             for flag in d.glob("task-*.flag"):
                 try:
-                    if self.now() - flag.stat().st_mtime < retention_s:
+                    born = _flag_stamp_s(flag.name)
+                    if born is None:
+                        born = flag.stat().st_mtime
+                    if self.now() - born < retention_s:
                         continue
                     stem = flag.name[:-len(".flag")]
                     if any(self.tasks_dir.glob(f"{stem}*.txt")):
