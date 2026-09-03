@@ -52,6 +52,10 @@ if _VOICE_PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)";
 else
     echo "  WARN no usable python3 for the guarded voice lock helper — skipping voice-agent stop (fail closed)"
 fi
+# Deliberate restart: the launchd bridge wrappers treat an exit inside this
+# window as ours, not a crash, so the owner is not alerted for every restart.
+_WS="$(bash "$(dirname "$0")/../scripts/sutando-config.sh" workspace 2>/dev/null)"
+if [ -n "$_WS" ]; then mkdir -p "$_WS/state/channel-bridge-supervisor"; date +%s > "$_WS/state/channel-bridge-supervisor/deliberate-restart"; fi
 pkill -f "web-client.ts" 2>/dev/null
 pkill -f "dashboard.py" 2>/dev/null
 pkill -f "agent-api.py" 2>/dev/null
