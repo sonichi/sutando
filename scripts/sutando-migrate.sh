@@ -1015,31 +1015,51 @@ any_source_sentinel() {
 
 # `cp -p` carries a FILE's mode, but `mkdir -p` parents take umask, so a 0700
 # source dir lands 0755. The dest takes the INTERSECTION — it never widens.
-mirror_dir_modes() {
+# Governed parents, outermost first: basename-agreeing ancestors STRICTLY
+# inside the dest root. The writer and the verifier walk this one chain.
+dir_mode_chain() {
     local s d
     s="$(dirname "$1")"; d="$(dirname "$2")"
     local -a sd=() dd=()
     while [ "$s" != "/" ] && [ "$d" != "/" ] && [ "$(basename "$s")" = "$(basename "$d")" ]; do
-        # Bound to paths STRICTLY inside the dest root. Basename agreement alone
-        # lets the walk climb past it and chmod ancestors outside the rollback.
+        # Basename agreement alone lets the walk climb past the dest root and
+        # chmod ancestors outside the rollback.
         [ -n "${DEST_REAL:-}" ] && [ "${d#"$DEST_REAL"/}" != "$d" ] || break
         sd+=("$s"); dd+=("$d")
         s="$(dirname "$s")"; d="$(dirname "$d")"
     done
-    local i sm dm want got rc=0
-    for (( i=${#sd[@]}-1; i>=0; i-- )); do
-        [ -d "${sd[$i]}" ] && [ -d "${dd[$i]}" ] || continue
-        sm="$(mode_of "${sd[$i]}")"; dm="$(mode_of "${dd[$i]}")"
+    local i
+    for (( i=${#sd[@]}-1; i>=0; i-- )); do printf '%s\t%s\n' "${sd[$i]}" "${dd[$i]}"; done
+}
+
+mirror_dir_modes() {
+    local sdir ddir sm dm want got rc=0
+    while IFS=$'\t' read -r sdir ddir; do
+        [ -d "$sdir" ] && [ -d "$ddir" ] || continue
+        sm="$(mode_of "$sdir")"; dm="$(mode_of "$ddir")"
         # A failed probe on an EXISTING dir fails closed: committing under an
         # unknown mode is a confidentiality window certified as success.
         if [ -z "$sm" ] || [ -z "$dm" ]; then rc=1; continue; fi
         [ "$sm" = "$dm" ] && continue
         want="$(printf '%o' $(( 0$sm & 0$dm )))"
-        if ! chmod "$want" "${dd[$i]}" 2>/dev/null; then rc=1; continue; fi
-        got="$(mode_of "${dd[$i]}")"
+        if ! chmod "$want" "$ddir" 2>/dev/null; then rc=1; continue; fi
+        got="$(mode_of "$ddir")"
         if [ -z "$got" ] || [ "$(( 0$got ))" -ne "$(( 0$want ))" ]; then rc=1; fi
-    done
+    done < <(dir_mode_chain "$1" "$2")
     return "$rc"
+}
+
+# Read-only twin for phase three: a governed parent wider than its source
+# discloses what the source protected, whatever the leaf's own mode says.
+verify_dir_modes() {
+    local sdir ddir sm dm
+    while IFS=$'\t' read -r sdir ddir; do
+        [ -d "$sdir" ] && [ -d "$ddir" ] || continue
+        sm="$(mode_of "$sdir")"; dm="$(mode_of "$ddir")"
+        [ -n "$sm" ] && [ -n "$dm" ] || return 1
+        [ "$(( 0$dm & ~0$sm ))" -eq 0 ] || return 1
+    done < <(dir_mode_chain "$1" "$2")
+    return 0
 }
 
 # Containment is proven on the RESOLVED path and BEFORE mkdir: a textual
@@ -1084,6 +1104,12 @@ copy_preserving_mtime() {
 union_json_arrays_into() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")"
+    # Parents take the intersection BEFORE the leaf exists in any form: a
+    # failure here leaves the pre-union destination exactly as it was.
+    mirror_dir_modes "$src" "$dst" || {
+        echo "ERROR: directory-mode enforcement failed for $dst" >&2
+        return 1
+    }
     local tmp="$dst.tmp.$$"
     local py; py="$(resolve_python "$REPO_DIR")"
     [ -n "$py" ] || return 1
@@ -1118,19 +1144,20 @@ for key in set(src_doc) | set(dst_doc):
             seen.add(fp)
             out.append(entry)
     merged[key] = out
-with open(tmp, "w", encoding="utf-8") as fh:
+# The temp is born at the intersection and narrowed again before its first
+# byte: a fresh 0644 temp holding merged grants is readable until then.
+import stat as _stat
+_s = _stat.S_IMODE(os.stat(src).st_mode)
+_d = _stat.S_IMODE(os.stat(dst).st_mode)
+_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _s & _d)
+os.fchmod(_fd, _s & _d)
+with os.fdopen(_fd, "w", encoding="utf-8") as fh:
     json.dump(merged, fh, indent=2, sort_keys=True)
     fh.write("\n")
 # The union rewrites dst, so the result must carry the winner's mtime; otherwise
 # the next source compares against "now" and its scalars can never win.
 win = max(os.path.getmtime(src), os.path.getmtime(dst))
 os.utime(tmp, (win, win))
-# The temp is fresh, so umask would otherwise decide the result. Intersect:
-# the union may narrow permissions, never widen either input's.
-import stat as _stat
-_s = _stat.S_IMODE(os.stat(src).st_mode)
-_d = _stat.S_IMODE(os.stat(dst).st_mode)
-os.chmod(tmp, _s & _d)
 PY
     then
         mv -f "$tmp" "$dst"
@@ -1399,6 +1426,12 @@ identity_match() {
 # An identical drop keeps the destination bytes but must carry the newer
 # source's mtime, or a later OLDER source outranks it and its scalars win.
 identity_drop_keeping_newest() {
+    # A drop writes no leaf, but its parents are still published: an older or
+    # equal source must narrow them exactly as a copied one would.
+    mirror_dir_modes "$1" "$2" || {
+        echo "ERROR: directory-mode enforcement failed for $2" >&2
+        return 1
+    }
     [ "$1" -nt "$2" ] || return 0
     # Never mutate the existing inode: a hard link (or a symlink touch follows)
     # can alias a file outside DEST_REAL. Materialize a contained inode instead.
@@ -1464,11 +1497,6 @@ commit_one() {
                 echo "write-failed"
                 return 1
             fi
-            # The union rewrote the leaf in place: its parents must take the same
-            # non-widening intersection every copied file gets, or fail closed.
-            mirror_dir_modes "$src_file" "$dst_path" || {
-                echo "ERROR: directory-mode enforcement failed for $dst_path" >&2
-                echo "write-failed"; return 1; }
             # The manifest is what lets phase three verify the scalar winner
             # when the pre-union dest won — failing to record it fails closed.
             record_union_scalars "$dst_path" "$rel" "$(union_scalar_manifest)" \
@@ -2356,12 +2384,20 @@ verify_main() {
         done
         # A union entry must clear union_contains, which owns the manifest mode
         # check; byte identity with one input must never stand in for it.
+        # The leaf alone certifies nothing under a widened parent: the same
+        # governed chain the commit narrowed is re-checked here, read-only.
         if [ -n "$landed" ] && [ "$cls" != "union-json-array" ]; then
-            pass=$((pass+1))
+            if verify_dir_modes "$src_file" "$landed"; then
+                pass=$((pass+1))
+            else
+                mismatch=$((mismatch+1))
+                [ "$mismatch" -le 5 ] && echo "  MISMATCH: $tag/$rel ($cls) — a destination parent is wider than the source's"
+            fi
         elif [ "$cls" = "union-json-array" ] && [ -f "$dst_canonical" ] \
                 && union_contains "$src_file" "$dst_canonical" \
                     "$(ls -t "$DEST_REAL/state/.migration-union-scalars-"*.json 2>/dev/null | head -1)" \
-                    "$rel"; then
+                    "$rel" \
+                && verify_dir_modes "$src_file" "$dst_canonical"; then
             # A union result differs from both inputs by design, so the
             # invariant is containment via the union owner's fingerprint.
             pass=$((pass+1))

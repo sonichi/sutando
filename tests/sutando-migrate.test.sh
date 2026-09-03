@@ -501,11 +501,16 @@ python3 - "$MIGRATE" "$u3_fn" "$REPO" <<'PYX'
 import sys
 src, out, repo = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(src).read()
-i = s.index("union_json_arrays_into() {")
-j = s.index("\n}\n", i) + 3
+def fn(name):
+    i = s.index(name + "() {")
+    return s[i:s.index("\n}\n", i) + 3]
+# The writer delegates parent modes to the shared policy; extract that too,
+# or the harness fails on a missing command rather than on the rule.
+body = "".join(fn(n) for n in
+               ("_stat", "mode_of", "dir_mode_chain", "mirror_dir_modes", "union_json_arrays_into"))
 open(out, "w").write(
     f'SCRIPT_DIR="{repo}/scripts"\nREPO_DIR="{repo}"\n'
-    f'. "{repo}/scripts/python-binary.sh"\n\n' + s[i:j])
+    f'. "{repo}/scripts/python-binary.sh"\n\n' + body)
 PYX
 u3_check="$(
   . "$u3_fn"
