@@ -211,6 +211,31 @@ and loads whichever repo it reviews.
     The tell: the same expression supplies both the default and the measurement, usually as
     `x or 0`, `.get(k, 0)`, or an `except` that returns the empty case.
 
+    **The same rule binds the REVIEW's own prose, not just the patch's code.** Every instance
+    above is a formatter substituting a default for a measurement. A reviewer does it in
+    sentences: a version number, a platform threshold, a library behaviour written from
+    recall and set beside figures that were actually measured against the repo. On the page
+    they are indistinguishable, and the recalled one is often the actionable one — it is
+    what the author will go and act on. So **cite or label every external fact**: link the
+    source, or write "unverified" next to it. A review that mixes six measured claims with
+    one recalled claim does not read as five-sixths reliable; the measured majority launders
+    the recalled sentence.
+    *Grounded by:* 2026-08-30 — a review of [`ag2-space/cinny-webclient#703`][cinny-703]
+    correctly measured that `color-mix()` had zero precedent in that codebase (with a positive control
+    proving the search worked), then asserted it "needs WebKitGTK 2.42+" from recall. The 2.42
+    figure was never checked. Checking produces the sharper finding the review should have
+    carried: [Tauri's webview-versions table][tauri-webviews] pairs Ubuntu 22.04 with WebKitGTK
+    2.36, and lists that row as Safari "TP 140 (16.0)" — a technology preview, not a shipped
+    16.0 — against a Safari 16.2 threshold for the settled `color-mix()` syntax (**unverified**:
+    that threshold comes from secondary sources, not a primary WebKit release note). Note what the citation
+    itself says: the same table warns its Linux data is "a very incomplete list", so it is
+    evidence, not proof — which is why `@supports (color: color-mix(in srgb, red 50%, blue))`
+    is the right instrument here and a version comparison is not. The unmeasured sentence sat
+    in the paragraph the review named as the blocker.
+
+    [tauri-webviews]: https://v2.tauri.app/reference/webview-versions/
+    [cinny-703]: https://github.com/ag2-space/cinny-webclient/pull/703
+
 14. **Never assert on source text as a stand-in for a behavioral claim.** When a module
     cannot be imported by tests (import-time side effects, heavy SDK deps), extract the
     decision into an importable unit and test THAT — do not regex the file. A source-text
@@ -280,6 +305,134 @@ and loads whichever repo it reviews.
     `dismiss_stale_reviews_on_push: false`) — an approval CAN be stale at arm
     time, which is exactly why the re-read is necessary rather than optional. The current state, not the
     remembered one, is what authorizes.
+
+17. **`reviewDecision: APPROVED` is not the merge gate — check the base branch and
+    whether the approvers can approve.** The ruleset that requires two approvals scopes
+    `ref_name.include` to `refs/heads/main` only, and GitHub counts an approval toward it
+    only from an account with write access. `reviewDecision` is GitHub's summary of the
+    review conversation, so it reads `APPROVED` on a single approval when the PR targets a
+    feature or rescue branch, and it renders a non-collaborator's approval identically to a
+    counting one. Before treating a PR as review-ready, read `baseRefName`, and resolve each
+    approver with the **membership** endpoint `repos/{o}/{r}/collaborators/{user}` (204 vs
+    404). Do not use `collaborators/{user}/permission` for this — it answers `read` for
+    accounts that are not collaborators at all, so it cannot distinguish them. **The
+    membership endpoint needs write access to answer at all**: without it every lookup
+    returns `403`, including for the repo owner, so a reader applying "not 204 → not a
+    collaborator" marks every approver non-counting. Treat `403` as *undetermined* and say
+    so, never as a negative — the check is only usable by an account that already has
+    push access.
+    *Grounded by:* a scan of 132 open sonichi/sutando PRs (2026-09-01). The predicate "≥2
+    collaborator approvals and no standing `CHANGES_REQUESTED`" matched `reviewDecision ==
+    APPROVED` on 124 and disagreed on 8 — every disagreement `APPROVED` on ONE counting
+    approval, and not one of the 8 based off `main` — their bases were
+    `feat/sutando-server`, `feat/pool-operability`, `rescue/pool-uncommitted-2026-08-26`,
+    `feat/sparrow-b1-identity-contract` and `fix/pool-wakeup-runtime-aware`. Restricted to
+    main-based PRs the predicate holds without exception, and the failure is one-directional
+    — never a PR predicted ready that isn't. The second half is measured separately: two
+    accounts hold 21 approvals across those PRs whose membership endpoint returns 404, and 8
+    PRs carry only such approvals while reporting `REVIEW_REQUIRED` and `BLOCKED` with zero
+    failing checks and no standing block — visibly reviewed, actually at 0-of-2. A peer
+    validated the same predicate over 35 PRs with no exceptions and stated it unscoped; all
+    35 were `base=main`, so their population could not have exposed the base dependency at
+    any sample size.
+
+18. **A test that never ran cannot fail — verify the runner collected the expected new tests,
+    by count and, where available, by name, before you interpret a discrimination result.** The standard proof that a new test earns its place is: revert the
+    source, keep the test, watch it fail. That inference is sound only if the test *ran*, and the
+    two failure modes are invisible in the diff and produce output identical to "the test does not
+    discriminate" — which is a blocking review finding. Read the runner's own count, and require it
+    to move by the number of tests added.
+    *Grounded by:* two independent instances on 2026-09-01, in different runner idioms, neither
+    detectable by reading the change. In `tests/morning-briefing-pending-extract.test.py` a new
+    class was appended *below* the file's `if __name__ == "__main__": unittest.main()`. Run as
+    `__main__` that call raises `SystemExit`, so execution stops there and **the class is never
+    even defined** (verified: a `print` on the following line does not fire, and `runpy` with
+    `run_name="__main__"` exits at that point; the same file *imported* defines both classes).
+    The suite reported `Ran 8 tests OK` with the source reverted AND restored, which reads exactly
+    like a non-discriminating test. Moving the class above the guard
+    gave `Ran 10 tests` and the reverted arm then failed with `'Top item' unexpectedly found`. On a
+    peer's host the same night, `tests/task-workstreams.test.py` drives an explicit list at the
+    bottom of the file; a test added without registering in that list was defined, never called,
+    and passed at the parent commit. Different mechanisms, one symptom: **the file changed and the
+    executed set did not.** Outcomes cannot separate them — "passed" and "never ran" render the
+    same — so use the runner's own report of what it collected: the count always, and the test
+    NAMES where the runner prints them (`-v`, or a per-test tick). Name enumeration is the stronger
+    signal when available, because it identifies *which* test is missing rather than only that one
+    is.
+
+19. **On a shared review login, check the existing reviews before you spend one —
+    the count does not move and you overwrite a peer.** Several agents review through the
+    same GitHub account here. GitHub resolves a PR's decision by latest-state-per-USER, so
+    two APPROVED reviews from that one account are **one** approver, not two, and the later
+    review *replaces* the earlier one as the effective record. Two consequences a reviewer
+    cannot see from the PR page: a second approval from the fleet moves the required count
+    by zero, and it can bury a disclosure or a dissent the first reviewer recorded. The
+    same mechanic lets the account contradict itself — an approve and a block on code that
+    never changed — where whichever landed last silently becomes the verdict. Before
+    reviewing, list that account's existing reviews on the PR, not just `reviewDecision`.
+    Judge the account's **current** decisive state, not its history. The mandatory
+    preflight prints this for you as `DECISIVE STATE`: latest verdict per login, never
+    truncated, and independent of whether the review carried any prose — a bare APPROVED
+    is a verdict with nothing to read, and it used to render as an empty thread. If a peer's APPROVED
+    is the latest decisive review, do not file another — a second approval moves the count
+    by zero and buries theirs; carry what you verified in a COMMENT, or recruit an approver
+    on a **different** login. But if the latest decisive review from that account is a
+    CHANGES_REQUESTED and you have verified the blocker fixed, an APPROVED (or a dismissal)
+    is exactly what clears it, and a comment would leave the block latched. "Never a second
+    approval" is wrong as a blanket rule for precisely that case.
+    **This is one of two failure modes on a shared login, not the whole hazard.** On a third
+    party's PR two reviews collapse into one, as above. On a PR that account itself authored,
+    GitHub refuses only the *decisive* verdicts — the author login cannot APPROVE or request
+    changes, only COMMENT — so **the author's own reviews never move `reviewDecision`, however
+    many it files.** So a self-authored PR can look unreviewed while carrying real review, and
+    `pulls/N/reviews` is **not** empty either. Read `reviewDecision` for the decision and the
+    reviews list for the substance, and never take COMMENT volume for either. Same account,
+    opposite polarity: two-becomes-one on someone else's PR, no-decision-possible on your own.
+    **And `reviewDecision` over *other* logins is a THRESHOLD, not a latest-verdict flag.** An
+    active block reads `CHANGES_REQUESTED`; approvals below the repo's required count still read
+    `REVIEW_REQUIRED`; only a met requirement reads `APPROVED`. One approval is not an approved
+    PR. Measured on #3482 with the head unchanged throughout: `john-the-dev` APPROVED at
+    12:14:45Z and the field read `REVIEW_REQUIRED` at 12:16:58Z; `sonichi` APPROVED at 12:51:36Z
+    and it read `APPROVED`.
+    *Grounded by:* #3481 (2026-08-28) — approved without looking, twenty minutes after a
+    peer had approved on the same account; the PR still read `REVIEW_REQUIRED` afterwards
+    and the peer's conflict-of-interest disclosure was left in the superseded review. A
+    sweep of 92 open PRs then found the account holding more than one review on 69 of
+    them, and 32 verdict flips across 17 PRs where **no commit landed between** the two
+    opposing reviews. Force-pushes were ruled out by the issue timeline on #3471 (zero
+    `head_ref_force_pushed` events) but not on every PR in that set, so treat 32 as the
+    measured figure for the PRs checked rather than a proven fleet-wide total.
+
+20. **Read the PR's own failing checks before you approve — a red gate is OFTEN a finding
+    the CI already made for you, and you cannot know which without reading it.** Lesson 8
+    says the verdict is a recommendation and never the merge gate, which is true and is
+    *not* a licence to skip looking: the reason to read a failing check is not that your
+    approval could merge something broken, it is that the check is frequently reporting a
+    defect in the diff you are reviewing.
+    A coverage gate naming uncovered lines is pointing at untested behavior; a failing
+    suite is naming the case the change breaks. Approving without reading it means
+    shipping a review that missed a finding the repository had already surfaced, and it
+    tells the author "ready" while the PR is not.
+    *Grounded by:* two approvals cast over red gates on 2026-08-31 by the same reviewer
+    within eight minutes. On #3567 the coverage gate read
+    `scripts/review-preflight.py (90.3%): Missing lines 147-148,153-154,173,192` — those
+    lines are the failure branches of `_gh_json`, the fail-closed design the review had
+    just singled out for praise. The gate had found that the praised behavior has no test
+    behind it, and the review said the opposite. On #3600 the gate was red at the reviewed
+    head (`89.7%`) and the author pushed a fix six minutes later, so nothing came of it —
+    luck, not process. Neither review looked. The cheap form is one call before the
+    verdict: `gh pr checks <PR>`. Mapping a failing check to an issue already filed
+    about it is worth doing by hand until tooling for it lands.
+    **Reading it is necessary and not sufficient — check that the job actually RAN.**
+    Sometimes a red check is naming the infrastructure rather than the diff: a job killed
+    by an Actions budget wall reports `conclusion=failure` with **`steps=0`**, which is
+    indistinguishable from a real failure by conclusion alone (reported by @qingyun-air.agent
+    from a SIBLING org — not this one — on two "Engine pin staleness" failures that were the
+    wall, not findings).
+    A check that never executed has no finding in it, and telling an author to fix one is
+    worse than not looking. Same reason `conclusion` alone is never the whole answer: an
+    IN_PROGRESS run carries `conclusion == ""`, so a filter keyed only on it calls a running
+    check failing.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 

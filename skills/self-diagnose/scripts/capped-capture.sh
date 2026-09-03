@@ -15,7 +15,9 @@ primary_rc=0
 
 # Count the real population separately: --limit is what hides the rest, so the
 # same capped call can never report how much it dropped.
-total="$("$GH" pr list "$@" --limit 1000 --json number --jq 'length' 2>/dev/null || echo "")"
+COUNT_LIMIT=1000
+total="$("$GH" pr list "$@" --limit "$COUNT_LIMIT" --json number --jq 'length' 2>/dev/null || echo "")"
+
 # The two calls are independent, so the count can succeed while the capture failed;
 # a footer built from $total alone then asserts rows the file does not hold.
 rows="$(grep -c . "$OUT" 2>/dev/null)" || rows=0
@@ -31,7 +33,11 @@ if [ "$primary_ok" -eq 0 ]; then
 else
 	case "$total" in
 		''|*[!0-9]*) echo "(population unknown — could not count; this file may be truncated at $CAP)" >> "$OUT" ;;
-		*) if [ "$total" -gt "$CAP" ]; then
+		*) if [ "$total" -ge "$COUNT_LIMIT" ]; then
+			# A count equal to its own limit cannot be told from more-than-limit,
+			# so it is UNKNOWN rather than a number.
+			echo "(population unknown — the count itself saturated at $COUNT_LIMIT; this file shows $CAP and may omit far more)" >> "$OUT"
+		elif [ "$total" -gt "$CAP" ]; then
 			echo "($CAP of $total shown — capped for bundle size, $((total - CAP)) omitted)" >> "$OUT"
 		fi ;;
 	esac

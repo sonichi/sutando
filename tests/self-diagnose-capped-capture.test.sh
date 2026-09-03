@@ -84,6 +84,16 @@ bash "$CAP" "$TMP/gh" "$TMP/silent.txt" 20 '.[]' --state open --json number
 check "silent-empty capture does NOT claim a count either" \
 	bash -c '! grep -q "20 of 117 shown" "$1"' _ "$TMP/silent.txt"
 
+# --- the COUNT itself caps: `length` == the count limit is indistinguishable from
+# more-than-the-limit, so reporting it as a population repeats the very defect this
+# script exists to catch, one level up. It must degrade to UNKNOWN, not to a number.
+mk_stub 1000
+bash "$CAP" "$TMP/gh" "$TMP/sat.txt" 20 '.[]' --state open --json number
+check "saturated count degrades to unknown, not a confident population" \
+	grep -q 'population unknown' "$TMP/sat.txt"
+check "saturated count does NOT report the cap as if it were the total" \
+	bash -c '! grep -q "20 of 1000 shown" "$1"' _ "$TMP/sat.txt"
+
 # --- the caller must be wired to the helper, with the gh binary in place ---
 G="$REPO_ROOT/skills/self-diagnose/scripts/gather.sh"
 # Match the dispatch as WRITTEN: the helper path is held in $_cap, so a grep for

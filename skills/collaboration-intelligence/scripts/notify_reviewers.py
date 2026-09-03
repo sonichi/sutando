@@ -40,24 +40,70 @@ _PY = sys.executable or "python3"
 sys.path.insert(0, str(_REPO / "src"))
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roster_union import host_rosters, roster_union
+
+_ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
+
+
+def _host_label() -> str:
+    """The canonical per-host slug, from the ONE helper that defines it.
+
+    Re-deriving the precedence here would be a second copy of a policy that
+    already drifted once; a failure to read it is not a licence to guess.
+    """
+    import subprocess
+    out = subprocess.run(["bash", "scripts/sutando-config.sh", "host-label"],
+                         capture_output=True, text=True, cwd=str(_REPO))
+    return out.stdout.strip()
+
+
 def roster_path() -> Path:
+    """The path THIS host writes. Reads union over peers (see roster_paths)."""
     override = os.environ.get("SUTANDO_SCI_ROSTER")
     if override:
         return Path(override)
     from workspace_default import resolve_workspace
-    return (Path(resolve_workspace()) / "data" / "collaboration-intelligence"
-            / "reviewer-stands.json")
+    ws = Path(resolve_workspace())
+    host = _host_label()
+    if host:
+        per_host = ws / "hosts" / host / _ROSTER_LEAF
+        if per_host.is_file() or not (ws / _ROSTER_LEAF).is_file():
+            return per_host
+    return ws / _ROSTER_LEAF          # legacy shared path, until the move lands
+
+
+def roster_paths() -> "list[tuple[str, Path]]":
+    """(host, path) for every roster on disk, LOCAL FIRST.
+
+    An override names one file and means it: globbing past it would let a
+    peer's rows answer a lookup a test pinned to a fixture.
+    """
+    override = os.environ.get("SUTANDO_SCI_ROSTER")
+    if override:
+        # An absent override is a REFUSAL, not an empty union: falling through
+        # to the glob would let host rosters answer a lookup pinned to a fixture.
+        p = Path(override)
+        return [("", p)] if p.is_file() else []
+    from workspace_default import resolve_workspace
+    ws = Path(resolve_workspace())
+    local = roster_path()
+    # Label from the PATH, as host_rosters does: a second `host-label` subprocess here
+    # made a refused ask spawn a process before refusing (sci-notify-reviewers-shorthand-refusal).
+    label = local.parents[2].name if local.parent.parent.parent.parent.name == "hosts" else "legacy"
+    out = [(label, local)] if local.is_file() else []
+    out += [(h, p) for h, p in host_rosters(ws) if p != local]
+    return out
 
 
 def load_roster() -> dict:
-    p = roster_path()
-    if not p.is_file():
-        raise SystemExit(f"no roster at {p} — seed it from the map before "
+    """Union across hosts; the merge policy is roster_union's, not restated here."""
+    paths = roster_paths()
+    if not paths:
+        where = os.environ.get("SUTANDO_SCI_ROSTER") or "any host"
+        raise SystemExit(f"no roster at {where} — seed it from the map before "
                          "notifying (never guess Stand identities)")
-    data = json.loads(p.read_text())
-    if not isinstance(data, dict):
-        raise SystemExit(f"roster at {p} is not an object")
-    return data
+    return roster_union(paths)
 
 
 def stated_reason(entry: dict) -> str:
@@ -78,6 +124,7 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
     batch — resolvable reviewers are still notified, the worst refusal code
     is carried to the exit so the caller sees somebody was skipped."""
     out, worst = [], 0
+    actor_of, covered = _actor_map(roster), {}
     for name in names:
         entry = roster.get(name)
         if entry is None:
@@ -87,6 +134,10 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
             continue
         stand, room = entry.get("stand"), entry.get("room")
         why = stated_reason(entry)
+        # A caveat nobody prints is a note, not a step. Shared-login entries
+        # look like one actor from GitHub; surface it here, before the send.
+        if entry.get("identity_caveat"):
+            print(f"IDENTITY CAVEAT '{name}': {entry['identity_caveat']}", file=sys.stderr)
         if not stand or not room:
             # a human id alone cannot be a target: person-mentions trigger no Stand
             print(f"UNUSABLE entry '{name}': needs both 'stand' and 'room' "
@@ -106,9 +157,80 @@ def resolve(names: "list[str]", roster: dict) -> "tuple[list[dict], int]":
                   file=sys.stderr)
             worst = max(worst, 4)
             continue
+        # One person can hold several roster keys, so counting NAMES lets the
+        # two-reviewer gate in main() pass on one recipient addressed twice.
+        actor = actor_of.get(name, name)
+        # Tagged keys: a single dict would alias a roster key against an mxid.
+        prior = covered.get(("actor", actor)) or covered.get(("stand", stand))
+        if prior is not None:
+            print(f"DUPLICATE '{name}': same person as '{prior}' "
+                  f"({stand}) — already covered, not a second reviewer",
+                  file=sys.stderr)
+            continue
+        covered[("actor", actor)] = covered[("stand", stand)] = name
         out.append({"name": name, "stand": stand, "room": room,
                     "human": entry.get("human")})
     return out, worst
+
+
+def gate_capability(repo: str, login: str) -> "tuple[bool | None, str]":
+    """(can this login's approval discharge repo's approval gate?, why).
+
+    Asked of GitHub, not of the roster: a cached tier goes stale silently and an
+    approval from a read-only account is indistinguishable in the UI from one
+    that counts. None = could not determine; the caller prints, never refuses.
+    """
+    try:
+        p = subprocess.run(
+            ["gh", "api", f"repos/{repo}/collaborators/{login}/permission",
+             "-q", ".permission"],
+            capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return None, f"unverified ({type(exc).__name__})"
+    if p.returncode != 0:
+        return None, f"unverified (gh rc={p.returncode})"
+    perm = p.stdout.strip()
+    if perm in ("write", "admin", "maintain"):
+        return True, perm
+    if perm in ("read", "none", "triage"):
+        # `read` is also what this endpoint returns for someone who is not a
+        # collaborator at all, so the reason needs the membership check.
+        return False, perm if _is_collaborator(repo, login) else "not a collaborator"
+    return None, f"unverified (permission={perm!r})"
+
+
+def _is_collaborator(repo: str, login: str) -> bool:
+    try:
+        p = subprocess.run(["gh", "api", f"repos/{repo}/collaborators/{login}"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:                            # noqa: BLE001 - probe must not raise
+        return True                              # unknown -> the milder wording
+    return p.returncode == 0
+
+
+def _github_login(name: str, roster: dict) -> "tuple[str, str]":
+    """(login GitHub can answer for, why) — a roster key is not always one.
+
+    `johnm-desktop` is a Stand handle, not a login; probing it 404s and the
+    capability check degrades to a silent no-op on exactly the aliased keys
+    `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
+    """
+    entry = (roster or {}).get(name) or {}
+    if _is_github_user(name):
+        return name, "key is a login"
+    sib = entry.get("same_actor_as")
+    if sib and _is_github_user(sib):
+        return sib, f"via same_actor_as -> {sib}"
+    return name, "no login found for this key"
+
+
+def _is_github_user(login: str) -> bool:
+    try:
+        p = subprocess.run(["gh", "api", f"users/{login}", "-q", ".login"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:                            # noqa: BLE001 - probe must not raise
+        return False
+    return p.returncode == 0 and p.stdout.strip().lower() == login.lower()
 
 
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
@@ -159,6 +281,30 @@ def command_for(target: dict, message: str) -> "list[str]":
 
 
 _PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
+
+# `owner/repo#12` and a bare `#12`. Two digits minimum is a DELIBERATE trade, not
+# an oversight: `#7` is a real PR and passes silently, but `#1` is usually prose.
+_PR_SHORTHAND = re.compile(
+    r"(?:(?P<repo>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#|(?<![\w/#])#)(?P<num>[0-9]{2,})")
+
+
+def unrecordable_pr_refs(message: str) -> list:
+    """Shorthand PR references record_asks() will not log: (token, form that works).
+
+    Absence is never reported — an ask need not concern a PR. Only shorthand is,
+    because that is the case that reads as a PR reference and records nothing.
+    """
+    pairs = set(_PR_URL.findall(message))
+    nums = {num for _, num in pairs}
+    out = []
+    for m in _PR_SHORTHAND.finditer(message):
+        repo, num = m.group("repo"), m.group("num")
+        # Pair-keyed when the repo is known: a URL to one repo must not suppress
+        # another repo's same-numbered shorthand. Bare `#n` can only match a number.
+        if (repo, num) in pairs if repo is not None else num in nums:
+            continue
+        out.append((m.group(0), f"https://github.com/{repo or '<owner>/<repo>'}/pull/{num}"))
+    return out
 
 def ledger_path() -> Path:
     from workspace_default import resolve_workspace
@@ -308,6 +454,41 @@ def main() -> int:
     targets, refusal_rc = resolve(names, load_roster())
     # Gates run on RESOLVED targets before any send, so no partial batch notifies
     # one person; plan mode is exempt because only a real ASK can strand a PR.
+    # A read-only approval looks identical in the UI and discharges nothing, so
+    # ask the repo named in the message rather than trusting a cached tier.
+    if a.kind == "ask" and targets:
+        refs = _PR_URL.findall(a.message or "")
+        if not refs:
+            # Every other refusal path here prints; the one case that cannot be
+            # checked must not be the one case that is silent.
+            print("gate capability NOT CHECKED: the message names no "
+                  "github.com/<owner>/<repo>/pull/<n> URL, so there is no repo to "
+                  "ask about — an unchecked send is not a checked one",
+                  file=sys.stderr)
+        if refs:
+            repo = refs[0][0]
+            roster_now = load_roster()
+            kept = []
+            for t in targets:
+                login, why_login = _github_login(t["name"], roster_now)
+                can, why_cap = gate_capability(repo, login)
+                if login != t["name"]:
+                    print(f"{t['name']}: probing GitHub as {login} ({why_login})",
+                          file=sys.stderr)
+                if can is False:
+                    detail = (why_cap if why_cap == "not a collaborator"
+                              else f"{why_cap}-only")
+                    print(f"CANNOT GATE '{t['name']}': {detail} on {repo} — an "
+                          f"approval from this account does not count toward the "
+                          f"required approvals", file=sys.stderr)
+                    refusal_rc = max(refusal_rc, 7)
+                    continue
+                if can is None:
+                    print(f"{t['name']}: gate capability {why_cap} on {repo} — "
+                          f"sending, but this is not a confirmation it can approve",
+                          file=sys.stderr)
+                kept.append(t)
+            targets = kept
     # The two-reviewer rule exists so one person being busy cannot stall a PR.
     # A notice asks for nothing, so it cannot stall anything by going to one.
     if a.send and a.kind == "ask" and len(targets) < 2 and not a.allow_single:
@@ -319,6 +500,14 @@ def main() -> int:
         return refusal_rc if refusal_rc > 0 else 5
     if a.allow_single and len(targets) < 2:
         print(f"single-reviewer ask allowed: {a.allow_single}", file=sys.stderr)
+    if a.send and a.kind == "ask":
+        loose = unrecordable_pr_refs(a.message)
+        if loose:
+            print("REFUSED: this ask would DELIVER and record NOTHING. record_asks() logs "
+                  "only full github.com/<owner>/<repo>/pull/<n> URLs, so pr-unattended would "
+                  "read the PR as never asked. Refused reference(s), and the form that works: "
+                  + "; ".join(f"{tok} -> {fix}" for tok, fix in loose), file=sys.stderr)
+            return 7
     stale, why = _stale_repeat_ask(a.message, targets, load_roster()) if a.kind == "ask" else (False, "")
     if stale and not a.widen_override:
         print(f"REFUSED: {why} Re-asking the same people is not escalation — "
