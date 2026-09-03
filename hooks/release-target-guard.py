@@ -42,30 +42,39 @@ def _deny(reason):
 
 
 def _newline_separators(command: str) -> str:
-    """A newline ends the command unless it sits inside a quoted argument.
-
-    Same policy as hooks/inline-body-substitution-guard.py, deliberately
-    duplicated: hooks are standalone by convention. Extraction tracked separately.
-    """
-    out, quote, esc = [], None, False
+    """Unquoted `#` comments out to end of line; an unquoted line break ends the
+    command. Comments go FIRST: once a newline is a `;`, nothing terminates one."""
+    out, quote, esc, comment = [], None, False, False
+    prev = " "
     for i, ch in enumerate(command):
+        if comment:
+            if ch in "\r\n":
+                comment = False
+            else:
+                prev = ch
+                continue
         if esc:
-            out.append(ch); esc = False; continue
+            out.append(ch); esc = False; prev = ch; continue
         if ch == "\\" and quote != "'":
-            out.append(ch); esc = True; continue
+            out.append(ch); esc = True; prev = ch; continue
         if quote is None and ch in ("'", '"'):
             quote = ch
         elif ch == quote:
             quote = None
+        # bash opens a comment only at a word start, and `;&|()` end a word too.
+        # `a#b` and `x/y#frag` stay literal.
+        if ch == "#" and quote is None and (
+                prev.isspace() or prev == "" or prev in ";&|()"):
+            comment = True; prev = ch; continue
         if ch in "\r\n" and quote is None:
             # CRLF is ONE separator: two `;` lex as the single token `;;`,
             # which is not in SEPARATORS, so `armed` would never reset.
             if not (ch == "\r" and command[i + 1:i + 2] == "\n"):
                 out.append(";")
+            prev = ch
             continue
-        out.append(ch)
+        out.append(ch); prev = ch
     return "".join(out)
-
 
 def _is_release_cut(rest) -> bool:
     """`release create|edit` anywhere in this gh command, not at a fixed offset.
@@ -91,6 +100,7 @@ def targets(command: str):
     command = _newline_separators(command)
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.commenters = ""  # _newline_separators owns comments; shlex's fire mid-word
         lex.whitespace_split = True
         words = list(lex)
     except ValueError:

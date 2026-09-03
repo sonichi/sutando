@@ -123,6 +123,35 @@ class TestOffenders(unittest.TestCase):
         self.assertEqual(
             G.offenders("gh release create v1 --target main\ndocker build --target abcdef1234 ."), [])
 
+    def test_a_comment_on_an_EARLIER_line_must_not_swallow_the_next_one(self):
+        """The newline rewrite made every line break a `;`, and after that
+        nothing terminates a `#` comment — so the guard's own normaliser
+        commented out the rest of the command it was inspecting."""
+        self.assertEqual(G.offenders(f"echo hi # note\ngh release edit v1 --target {SHORT}"),
+                         [SHORT])
+
+    def test_the_same_with_CRLF(self):
+        self.assertEqual(G.offenders(f"echo hi # x\r\ngh release edit v1 --target {SHORT}"),
+                         [SHORT])
+
+    def test_a_hash_opens_a_comment_after_a_separator_too_not_only_whitespace(self):
+        """bash starts a comment at a word start, and `;` `&` `|` `(` `)` all
+        end a word — so `;#` comments the line and the NEXT one still runs."""
+        self.assertEqual(G.offenders(f"echo hi;# note\ngh release edit v1 --target {SHORT}"),
+                         [SHORT])
+
+    def test_a_release_cut_INSIDE_a_comment_is_not_a_cut(self):
+        """The over-correction control: bash never runs it, so neither do we."""
+        self.assertEqual(G.offenders(f"echo hi\n# gh release edit v1 --target {SHORT}"), [])
+        self.assertEqual(G.offenders(f"echo hi # gh release edit v1 --target {SHORT}"), [])
+
+    def test_a_mid_word_hash_is_literal_and_must_not_blank_the_rest(self):
+        """A URL fragment or an issue ref is not a comment to bash. `shlex`'s
+        own `commenters` fires mid-word, which silently disabled the guard."""
+        self.assertEqual(
+            G.offenders(f"echo https://x/y#frag && gh release edit v1 --target {SHORT}"),
+            [SHORT])
+
     def test_CRLF_is_ONE_separator_not_two(self):
         """Mapping both \r and \n to ';' yields ';;', which lexes as a single
         token that is not in SEPARATORS — so `armed` would never reset and the
