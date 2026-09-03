@@ -28,6 +28,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
+- [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
 - [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
 - [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
 
@@ -65,6 +66,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
 - [Lead-follower agent pool design](lead-follower-pool.md)
+- [Sparrow delivery identity — frozen definitions](sparrow-delivery-identity.md)
 - [Mediated capability layer RFC](design-mediated-capability-layer.md)
 - [Claude Code hook contract v1](runtime/claude-hook-contract-v1.md)
 - [Workspace two-space model](workspace-design.md)

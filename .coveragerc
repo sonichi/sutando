@@ -14,6 +14,9 @@ parallel = True
 # combinable after the worktrees are removed (parallel-suite-lane.sh).
 relative_files = True
 sigterm = True
+# Children of a multiprocessing test get their own tracer + data fragment
+# instead of inheriting (fork) or losing (spawn/forkserver) the parent's.
+concurrency = multiprocessing
 source =
     src
     scripts

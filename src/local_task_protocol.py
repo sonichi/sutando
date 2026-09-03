@@ -170,6 +170,9 @@ KNOWN_HEADER_KEYS = (
     # Per-message worker addressing: intake-stamped, lead-honored; header
     # status defangs a forged body line — a message can never route itself.
     "target_worker", "fan_out",
+    # Broker attestation that a Team sender is a collaborator. The bridge
+    # appends this line directly, bypassing serialize_task_last's key check.
+    "collaborator",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 
