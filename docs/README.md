@@ -24,6 +24,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.
+- [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
 - [CLAUDE.md moved detail](claude-md-moved-detail.md) — verbatim parking for relocated snippets.
 - [Subagent delegation](subagent-delegation.md) — when to spawn a subagent and how to pick its model.
 

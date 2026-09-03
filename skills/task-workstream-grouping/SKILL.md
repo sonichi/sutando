@@ -41,6 +41,18 @@ labels.
      unrelated roadmap workstream, after five earlier passes had looked correct —
      those five all had wide margins, so the streak was evidence about the
      inputs, not about the method.
+
+     **Derive `keywords` from the task being classified, inside the per-task
+     loop.** Hoisting one keyword list out of the loop is the mistake this
+     parameter invites, and it is silent: `best_match` then scores the same fixed
+     query against the workstream field on every iteration, so every task in the
+     batch gets a byte-identical ranking and no task title is ever read. The call
+     still returns well-formed ids and margins, and the shortlist still prints.
+     The only tell is two unrelated tasks scoring identically — easy to miss when
+     the answer is `None`, because a refusal is what a careful classifier looks
+     like. Both arguments fail this way: a degenerate input to either one yields
+     a well-formed refusal rather than an error, so neither can be caught by
+     checking that the call succeeded.
 4. Submit strict JSON to the validator:
 
    ```bash
