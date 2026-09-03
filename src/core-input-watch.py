@@ -67,6 +67,7 @@ _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -74,6 +75,7 @@ import re
 import shutil
 import subprocess
 import time
+from pathlib import Path as _Path
 
 
 def _ensure_tmux_on_path():
@@ -405,13 +407,15 @@ AUTO_ANSWER_CARRY_S = 120.0
 
 
 # ESCALATE (Layer 3) — the banner is a window the owner has to be looking at.
-# When nothing automatic can clear the gate, say so where they already are.
+# A blocked core is exactly a HumanRequirement, so it goes through `src/hitl`
+# like every other one: the Manager dedups, the projector renders the card.
 _CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+HITL_KIND = "core-blocked"
 
 
-def escalation_body(state, detail, kind, prompt):
-    """The owner-facing text. The core is blocked, so this is the only thing
-    that will reach them until they act."""
+def escalation_message(state, detail, kind, prompt):
+    """The card body. The core is blocked, so this is the only thing that will
+    reach the owner until they act."""
     head = ("I am blocked and cannot continue without you."
             if state == "blocked-human" else
             "I am signed out and cannot continue without you.")
@@ -426,27 +430,60 @@ def escalation_body(state, detail, kind, prompt):
     return "\n".join(lines)
 
 
-def escalate_to_chat(out_path, state, detail, kind, prompt):
-    """Write ONE proactive message per episode. The bridge claims it independently
-    of the core, which is the point: the core is the thing that is stuck.
-
-    Returns the path written, or None when this episode was already announced —
-    a stuck core must not become a stuck core plus a message every tick.
-    """
-    ws = os.path.dirname(os.path.dirname(os.path.abspath(out_path)))
-    results = os.path.join(ws, "results")
+def _hitl_manager(out_path):
+    """The shared requirement store, or None when `src/hitl` is unavailable —
+    the monitor must keep writing its state file either way."""
     try:
-        os.makedirs(results, exist_ok=True)
-        path = os.path.join(results, f"proactive-core-blocked-{int(time.time())}.txt")
-        with open(path, "w") as f:
-            f.write(escalation_body(state, detail, kind, prompt) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        return path
-    except OSError as exc:
-        # Never let the escalation take down the monitor that produces it.
-        print(f"chat escalation failed: {exc}", file=_sys.stderr)
+        here = _osp.dirname(_osp.abspath(__file__))
+        if here not in _sys.path:
+            _sys.path.insert(0, here)
+        from hitl.manager import HitlManager, HitlStore, default_store
+    except Exception as exc:  # noqa: BLE001
+        print(f"hitl unavailable ({exc}); no card will be raised", file=_sys.stderr)
         return None
+    ws = _osp.dirname(_osp.dirname(_osp.abspath(out_path)))
+    return HitlManager(HitlStore(default_store(_Path(ws))))
+
+
+def escalate(manager, state, detail, kind, prompt, session):
+    """Raise ONE requirement per episode. The Manager dedups on
+    (runtime, kind, device) + guard, so the prompt IS the episode key: the same
+    prompt returns the same record, a different one mints a new card.
+
+    Returns the requirement, or None when nothing could be raised.
+    """
+    if manager is None:
+        return None
+    try:
+        from hitl.schema import Action, HumanRequirement
+        req = HumanRequirement(
+            kind=HITL_KIND,
+            runtime="claude",
+            message=escalation_message(state, detail, kind, prompt),
+            guard=hashlib.sha256((prompt or state).encode()).hexdigest()[:16],
+            title=f"{session} · {state}",
+            actions=[Action(id="ack", kind="acknowledge", label="I have answered it")],
+            subject={"state": state, "gate": kind or "", "detail": detail},
+        )
+        return manager.create(req)
+    except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
+        print(f"hitl escalation failed: {exc}", file=_sys.stderr)
+        return None
+
+
+def resolve_escalations(manager):
+    """Clear this driver's requirements once the core is no longer blocked —
+    the card says answered because the core moved, not because anyone clicked."""
+    if manager is None:
+        return []
+    try:
+        mine = [r.id for r in manager.active() if r.kind == HITL_KIND]
+        for req_id in mine:
+            manager.resolve(req_id)   # returns blocked task ids, not a verdict
+        return mine
+    except Exception as exc:  # noqa: BLE001
+        print(f"hitl resolve failed: {exc}", file=_sys.stderr)
+        return []
 
 
 def _atomic_write(path, payload):
@@ -470,7 +507,7 @@ def main():
     ap.add_argument("--no-auto-answer", dest="auto_answer", action="store_false",
                     help="report allowlisted gates without typing their safe answer")
     ap.add_argument("--no-chat-escalation", dest="chat_escalation", action="store_false",
-                    help="write the supervisor state but never announce a block in chat")
+                    help="write the supervisor state but never raise a card for a block")
     a = ap.parse_args()
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
@@ -485,7 +522,7 @@ def main():
     rh.SESSION = a.session
 
     last_sig = None
-    escalated_episode = None
+    hitl = _hitl_manager(a.out) if a.chat_escalation else None
     stable_prompt = 0
     last_prompt = None
     answered_prompt = None
@@ -528,15 +565,13 @@ def main():
             _atomic_write(a.out, payload)
             last_sig = sig
 
-        # One announcement per EPISODE: leaving the blocked set clears the key,
-        # so a genuine second block is not swallowed by the first.
-        if a.chat_escalation and state in _CHAT_ESCALATE_STATES:
-            ep = (state, kind, prompt)
-            if ep != escalated_episode:
-                if escalate_to_chat(a.out, state, detail, kind, prompt):
-                    escalated_episode = ep
-        elif state not in _CHAT_ESCALATE_STATES:
-            escalated_episode = None
+        # The Manager owns per-episode dedup; leaving the blocked set resolves
+        # the card, so the owner sees it close without clicking anything.
+        if a.chat_escalation:
+            if state in _CHAT_ESCALATE_STATES:
+                escalate(hitl, state, detail, kind, prompt, a.session)
+            else:
+                resolve_escalations(hitl)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)

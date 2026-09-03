@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""A blocked core must reach the owner where they already are.
+"""A blocked core raises a HumanRequirement, so it reaches the owner as a card.
 
-ESCALATE was a banner in the Runtime window, so the owner had to be looking at
-that window to learn the core was stuck (owner report 2026-09-03, after a
-weekly model-limit prompt held the core all morning). The monitor is a separate
-process and the bridge claims `results/proactive-*.txt` independently of the
-core, so the announcement can be made by the one layer that is not blocked.
+ESCALATE was a banner in the Runtime window, so learning the core was stuck
+required already looking at that window (owner report 2026-09-03, after a
+weekly model-limit prompt held the core all morning).
 
-The whole design risk is repetition: a stuck core stays stuck for as long as it
-takes someone to act, and a per-tick announcement would turn one problem into a
-room full of them. These tests pin once-per-episode.
+`src/hitl` already owns requirement dedup and card projection; the monitor is
+the driver it never had. These tests pin what the monitor contributes: the
+right states, an episode key the Manager can dedup on, resolution when the
+core moves on, and never dying of its own escalation.
 """
 import importlib.util as u
 import os
@@ -19,97 +18,107 @@ import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
-SRC = HERE.parent / "src" / "core-input-watch.py"
-spec = u.spec_from_file_location("ciw", SRC)
+SRC = HERE.parent / "src"
+sys.path.insert(0, str(SRC))
+spec = u.spec_from_file_location("ciw", SRC / "core-input-watch.py")
 M = u.module_from_spec(spec)
 spec.loader.exec_module(M)
 
-
-def _ws():
-    d = tempfile.mkdtemp()
-    os.makedirs(os.path.join(d, "state"), exist_ok=True)
-    return d, os.path.join(d, "state", "core-supervisor.json")
+from hitl.manager import HitlManager, HitlStore  # noqa: E402
+from hitl.schema import STATUS_RESOLVED  # noqa: E402
 
 
-class TestEscalationBody(unittest.TestCase):
+def _mgr():
+    return HitlManager(HitlStore(pathlib.Path(tempfile.mkdtemp())))
+
+
+class TestMessage(unittest.TestCase):
     def test_it_names_the_gate_and_quotes_the_terminal(self):
-        b = M.escalation_body("blocked-human", "awaiting user: selection",
-                              "selection", "Pick one:\n> a\n  b")
+        b = M.escalation_message("blocked-human", "awaiting user: selection",
+                                 "selection", "Pick one:\n> a\n  b")
         self.assertIn("cannot continue without you", b)
         self.assertIn("selection", b)
         self.assertIn("Pick one:", b)
 
     def test_an_unknown_gate_is_not_rendered_as_a_gate_name(self):
-        """`unknown` is the classifier saying it could not tell, so printing
-        `Gate: unknown` reads as a fact about the prompt rather than about us."""
-        b = M.escalation_body("blocked-human", "awaiting user: unknown", "unknown", "x")
+        """`unknown` is the classifier saying it could not tell, so `Gate:
+        unknown` reads as a fact about the prompt rather than about us."""
+        b = M.escalation_message("blocked-human", "d", "unknown", "x")
         self.assertNotIn("Gate: unknown", b)
 
     def test_logged_out_says_signed_out_not_blocked(self):
-        b = M.escalation_body("logged-out", "core not authenticated", None, None)
-        self.assertIn("signed out", b)
+        self.assertIn("signed out",
+                      M.escalation_message("logged-out", "d", None, None))
 
 
-class TestWriter(unittest.TestCase):
-    def test_it_writes_into_the_workspace_results_dir(self):
-        d, out = _ws()
-        p = M.escalate_to_chat(out, "blocked-human", "awaiting user: selection", "selection", "x")
-        self.assertIsNotNone(p)
-        self.assertEqual(os.path.basename(os.path.dirname(p)), "results")
-        self.assertTrue(os.path.basename(p).startswith("proactive-"))
-        self.assertIn("cannot continue", open(p).read())
+class TestEscalate(unittest.TestCase):
+    def test_it_raises_one_requirement_with_an_actionable_card(self):
+        m = _mgr()
+        req = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "sutando-core")
+        self.assertIsNotNone(req)
+        self.assertEqual(req.kind, M.HITL_KIND)
+        self.assertTrue(req.actions, "a card with no action cannot be answered")
+        self.assertIn("Pick one:", req.message)
 
-    def test_an_unwritable_results_dir_does_not_raise(self):
+    def test_the_same_prompt_held_for_many_ticks_raises_one_card(self):
+        m = _mgr()
+        ids = {M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s").id
+               for _ in range(40)}
+        self.assertEqual(len(ids), 1)
+
+    def test_a_different_prompt_is_a_different_card(self):
+        """Two things needing the owner are two cards, even back to back —
+        the second is not a redraw of the first."""
+        m = _mgr()
+        a = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
+        b = M.escalate(m, "blocked-human", "d", "login", "Log in:", "s")
+        self.assertNotEqual(a.id, b.id)
+
+    def test_the_prompt_is_the_episode_key_not_the_state(self):
+        """Guard is derived from the prompt: keying on state alone would
+        collapse two unrelated blocks into one card."""
+        m = _mgr()
+        a = M.escalate(m, "blocked-human", "d", "selection", "A", "s")
+        b = M.escalate(m, "blocked-human", "d", "selection", "B", "s")
+        self.assertNotEqual(a.guard, b.guard)
+
+    def test_no_manager_is_survivable(self):
         """The monitor must outlive its own escalation: if this raised, the
         layer that DETECTS the block would die with the block unreported."""
-        d, out = _ws()
-        os.makedirs(os.path.join(d, "results"))
-        os.chmod(os.path.join(d, "results"), 0o500)
-        try:
-            self.assertIsNone(M.escalate_to_chat(out, "blocked-human", "d", "k", "p"))
-        finally:
-            os.chmod(os.path.join(d, "results"), 0o700)
+        self.assertIsNone(M.escalate(None, "blocked-human", "d", "k", "p", "s"))
 
 
-class TestOncePerEpisode(unittest.TestCase):
-    """The loop's own dedup, exercised through the same key it uses."""
+class TestResolve(unittest.TestCase):
+    def test_leaving_the_blocked_set_resolves_the_card(self):
+        m = _mgr()
+        req = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
+        self.assertEqual(M.resolve_escalations(m), [req.id])
+        self.assertEqual(m.get(req.id).status, STATUS_RESOLVED)
 
-    def _run(self, states):
-        d, out = _ws()
-        episode = None
-        written = []
-        for state, kind, prompt in states:
-            if state in M._CHAT_ESCALATE_STATES:
-                ep = (state, kind, prompt)
-                if ep != episode:
-                    p = M.escalate_to_chat(out, state, "d", kind, prompt)
-                    if p:
-                        episode = ep
-                        written.append(p)
-            elif state not in M._CHAT_ESCALATE_STATES:
-                episode = None
-        return written
+    def test_it_resolves_only_its_own_kind(self):
+        """A permission card belongs to the hook driver; clearing it because
+        the CORE unblocked would dismiss a question nobody answered."""
+        m = _mgr()
+        from hitl.schema import Action, HumanRequirement
+        other = m.create(HumanRequirement(kind="permission", runtime="claude",
+                                          message="may I", guard="g1",
+                                          actions=[Action("allow", "allow", "Allow")]))
+        M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
+        self.assertNotIn(other.id, M.resolve_escalations(m))
+        self.assertNotEqual(m.get(other.id).status, STATUS_RESOLVED)
 
-    def test_a_block_held_for_many_ticks_announces_once(self):
-        ticks = [("blocked-human", "selection", "Pick one:")] * 40
-        self.assertEqual(len(self._run(ticks)), 1)
+    def test_a_second_block_after_recovery_raises_again(self):
+        m = _mgr()
+        first = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
+        M.resolve_escalations(m)
+        again = M.escalate(m, "blocked-human", "d", "selection", "Pick one:", "s")
+        self.assertNotEqual(first.id, again.id)
 
-    def test_a_second_block_after_recovery_announces_again(self):
-        ticks = ([("blocked-human", "selection", "Pick one:")] * 5
-                 + [("running", None, None)] * 5
-                 + [("blocked-human", "selection", "Pick one:")] * 5)
-        self.assertEqual(len(self._run(ticks)), 2)
 
-    def test_a_different_gate_in_the_same_stretch_announces_again(self):
-        """Two different things needing the owner are two announcements, even
-        back to back — the second is not a redraw of the first."""
-        ticks = ([("blocked-human", "selection", "Pick one:")] * 3
-                 + [("blocked-human", "login", "Log in:")] * 3)
-        self.assertEqual(len(self._run(ticks)), 2)
-
-    def test_states_with_an_automatic_remedy_are_not_announced(self):
+class TestScope(unittest.TestCase):
+    def test_states_with_an_automatic_remedy_are_not_escalated(self):
         """`blocked-known` is auto-answered and `hung` is RECOVER's job; both
-        would resolve without the owner, so neither is theirs to be woken for."""
+        resolve without the owner, so neither is theirs to be woken for."""
         for s in ("blocked-known", "hung", "crashed", "running", "idle-ready"):
             self.assertNotIn(s, M._CHAT_ESCALATE_STATES, s)
 
