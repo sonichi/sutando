@@ -263,6 +263,48 @@ with tempfile.TemporaryDirectory() as td:
     for f in late_files(d):
         f.unlink()
 
+    # --- lease and recovery failure branches: every failure is a skip, never a raise
+    retired = retire_with_late(d, "proactive-64.txt", "FIRST\n", "LATE11\n")
+    held = retired.with_name(retired.name + rd._SWEEP_SUFFIX)
+    held.write_text("0")  # a stale stamp; breaking it must survive a failed rename
+    real_rename = os.rename
+    rd.os.rename = lambda *a, **k: (_ for _ in ()).throw(OSError("rename refused"))
+    try:
+        got = rd._claim_for_sweep(retired, time.time(), 600)
+    finally:
+        rd.os.rename = real_rename
+    check("a stale lease whose break fails is left held (claim refused, no raise)", got is None and held.exists())
+    held.unlink()
+    real_fdopen = os.fdopen
+    rd.os.fdopen = lambda *a, **k: (_ for _ in ()).throw(OSError("stamp write refused"))
+    try:
+        got = rd._claim_for_sweep(retired, time.time(), 600)
+    finally:
+        rd.os.fdopen = real_fdopen
+    check("a lease whose stamp cannot be written is released (no half-lease left)", got is None and not held.exists())
+    marker = rd._delivered_marker(retired)
+    stage = rd._scratch_path(retired, d, 6)
+    stage.write_text("LATE11\n")
+    marker.write_text("not-an-int")
+    check("recovery with an unreadable marker publishes nothing and keeps the stage",
+          rd._recover_staged(retired, d, marker, time.time()) == [] and stage.exists())
+    marker.write_text("6")
+    check("a stage whose cursor the marker has not passed is discarded, not published",
+          rd._recover_staged(retired, d, marker, time.time()) == [] and not stage.exists())
+    odd = d / f".{retired.name}.late-abc.tmp"
+    odd.write_text("x")
+    check("a scratch name outside the grammar is left alone", rd._recover_staged(retired, d, marker, time.time()) == [] and odd.exists())
+    odd.unlink()
+    stage.write_text("LATE11\n"); marker.write_text("13")
+    real_replace2 = os.replace
+    rd.os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("publish refused"))
+    try:
+        got = rd._recover_staged(retired, d, marker, time.time())
+    finally:
+        rd.os.replace = real_replace2
+    check("recovery whose publish fails keeps the stage for the next sweep", got == [] and stage.exists())
+    stage.unlink(); marker.write_text("13")
+
     # --- a legacy retired inode (no marker) is never republished, only aged out
     legacy = d / "retired" / "proactive-50.to-telegram.sending"
     legacy.write_text("old\nbytes\n")
