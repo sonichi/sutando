@@ -368,6 +368,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`pool_lead.py`** — Lead-side assignment engine (lead-follower pool, slice L1).
 - **`pool_metrics.py`** — Lead-side pool metrics (slice L4 — the owner's 2026-05-19 quality bar).
 - **`pool_notify.py`** — Lead-side progress communication (lead-follower pool, slice L5).
+- **`pool_routing.py`** — Routing policy seam for the pool: WHO takes a task, separated from HOW it is assigned (the lead's atomic rename, reclaim and trace stay in pool_lead).
 - **`pool_scale.py`** — Lead-side follower autoscaling policy (lead-follower pool, slice L6).
 - **`pool_status.py`** — Owner-facing pool snapshot (single writer: the lead daemon).
 - **`protocol.py`** — runtime-api protocol — NDJSON JSON-RPC 2.0 over a local Unix socket.

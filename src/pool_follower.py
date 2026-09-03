@@ -22,6 +22,9 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from task_priority import sort_tasks_by_priority  # noqa: E402
 from task_archive import _move_without_clobbering  # noqa: E402
+sys.path.insert(0, str(_HERE / "runtime-api"))
+from pool_routing import (  # noqa: E402
+    CORE_ID, build_router, load_config, read_task_meta, solo_pick)
 
 LEAD_STALE_S = 90  # 3 missed 30s beats — same threshold every reader uses
 
@@ -91,10 +94,16 @@ def acquire_work(tasks_dir, state_dir, instance: str,
     # results/ is the tasks dir's workspace sibling — derived, not passed,
     # so no caller can omit the guard on the path that exists to survive crashes.
     results_dir = tasks.parent / "results"
+    # Leaderless = the same routing policy over a membership of one; a rule
+    # that excludes this member leaves the file for whoever it allows.
+    router = build_router(Path(state_dir))
     for f in sort_tasks_by_priority(pending):
         # A reclaimed task whose work already produced a result must not be
         # re-executed (same guard as the lead's pooling scan).
         if result_evidence(results_dir, f.name):
+            continue
+        if not solo_pick(router, read_task_meta(f), instance,
+                         is_core=(instance == CORE_ID)):
             continue
         # assignment-suffix convention so lead-side load counting and
         # reclaim see fallback claims (legacy .claimed-core-N stays put)
@@ -105,6 +114,40 @@ def acquire_work(tasks_dir, state_dir, instance: str,
         except OSError:
             continue
     return None
+
+
+def delegate(tasks_dir, state_dir, claimed: Path, instance: str,
+             to_worker: str) -> Path:
+    """Hand a task this member holds to a specific worker (work stealing).
+    Gated by routing.json `allow_delegation`; the result is that worker's
+    assignment, which the lead's ledger and reclaim already understand."""
+    if not load_config(Path(state_dir)).allow_delegation:
+        raise ValueError("delegation is disabled (routing.json allow_delegation)")
+    suffix = f".claimed-{instance}.txt"
+    if not claimed.name.endswith(suffix) or not claimed.name.startswith("task-"):
+        raise ValueError(f"{claimed.name} is not held by {instance}")
+    if not to_worker or to_worker == instance or "/" in to_worker:
+        raise ValueError(f"bad delegation target {to_worker!r}")
+    target = claimed.with_name(
+        claimed.name[:-len(suffix)] + f".assigned-{to_worker}.txt")
+    os.rename(claimed, target)
+    os.utime(target)
+    return target
+
+
+def _delegate_cli(argv: "list[str]") -> int:
+    if len(argv) != 3:
+        print("usage: pool_follower.py delegate <claimed_path> <instance> <worker>",
+              file=sys.stderr)
+        return 2
+    claimed = Path(argv[0]).resolve()
+    workspace = claimed.parent.parent
+    try:
+        print(delegate(claimed.parent, workspace / "state", claimed, argv[1], argv[2]))
+    except (ValueError, OSError) as e:
+        print(f"delegate refused: {e}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _source_of(claimed: Path) -> str:
@@ -218,6 +261,8 @@ def _finish_cli(argv: "list[str]") -> int:
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "finish":
         sys.exit(_finish_cli(sys.argv[2:]))
-    print("usage: pool_follower.py finish <claimed_path> <instance>",
-          file=sys.stderr)
+    if len(sys.argv) >= 2 and sys.argv[1] == "delegate":
+        sys.exit(_delegate_cli(sys.argv[2:]))
+    print("usage: pool_follower.py finish <claimed_path> <instance> | "
+          "delegate <claimed_path> <instance> <worker>", file=sys.stderr)
     sys.exit(2)

@@ -114,6 +114,46 @@ non-positive values fall back to the default rather than disabling affinity.
   per-channel latency) becomes a lead-side counter file — global view, one
   collection point, no cross-core aggregation.
 
+## Routing policy (pluggable — there is no golden answer)
+
+`src/runtime-api/pool_routing.py` separates WHO takes a task from HOW it is
+assigned. The lead keeps the atomic rename, reclaim and trace; the choice is
+a policy behind one call: `pick(task, workers, affinity) -> worker | None`.
+
+- **Members = one core + N workers.** The core is a routable member
+  (`WorkerView.is_core`), discovered by the daemon from the host heartbeat.
+  Single-core mode is the same policy evaluated over a membership of one
+  (`solo_pick`) — N=0 workers is not a separate code path.
+- **Config** `state/pool/routing.json` (or `$SUTANDO_POOL_ROUTING`), absent →
+  `affinity-first` (the lead's historical `_pick`; existing behaviour and tests
+  unchanged):
+
+  ```json
+  {"policy": "core-first", "allow_delegation": true,
+   "rules": [
+     {"match": {"room_name": "Pro-Main"},  "to": ["core-1"]},
+     {"match": {"access_tier": "team"},     "policy": "least-loaded", "exclude": ["core-1"]},
+     {"match": {"source": "voice"},         "policy": "sticky-sender"}
+   ]}
+  ```
+  Rules are first-match on `TaskMeta` fields (`channel`, `source`,
+  `access_tier`, `priority`, `sender`, `room_name`, `target`, `lane`;
+  `runtime` matches the pool); `to`/`only`/`exclude` narrow candidates
+  before the named policy runs. No rule → top-level `policy`.
+- **Built-ins:** `affinity-first`, `least-loaded`, `round-robin`,
+  `sticky-sender`, `core-first` (explicit `target_worker:` → that worker;
+  otherwise the core; no core in the pool → least-loaded).
+- **Custom code:** `"policy": "custom:/path/mod.py:pick"` — same signature
+  `(task, workers, affinity, state)`. Owner-only surface.
+- **Degrade, never strand:** a policy that raises, or names a worker that is
+  not live, is overridden by `affinity-first`; every assignment traces
+  `{"event": "routed", policy, rule, fallback, reason}`.
+- **Delegation (work stealing).** With `allow_delegation: true` the core may
+  hand a task it holds to a specific worker (`pool_follower.delegate`, CLI
+  `python3 src/pool_follower.py delegate <claimed-path> <me> <worker>`): the
+  claimed file becomes that worker's assignment, which the lead's ledger and
+  reclaim already understand. With it false the core must process itself.
+
 ## Instance registry touchpoints
 
 - Followers register with `role: "follower"` + `pool: <name>` in their
