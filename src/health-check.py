@@ -4207,7 +4207,7 @@ def mark_stale_if_outdated(check: dict, src_file: Path, pgrep_pattern: str, thre
                     return
                 age_min = int((src_mtime - bin_mtime) / 60)
                 check["status"] = "stale"
-                check["detail"] = f"running, but binary is {age_min} min older than source — rebuild needed"
+                check["detail"] = f"running, but binary is {age_min} min older than source — rebuild needed (bash src/restart.sh --rebuild-app)"
                 return
         except OSError:
             pass

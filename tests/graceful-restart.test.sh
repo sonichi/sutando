@@ -603,7 +603,13 @@ chmod +x "$stub20"
 # A fake core: stays busy until the drain task appears, keeps a copy, then goes idle.
 ( for _ in $(seq 1 40); do
     f="$(ls "$WS20"/tasks/task-restart-prep-*.txt 2>/dev/null | head -1)"
-    if [ -n "$f" ]; then cp "$f" "$TMP/ws20.task"; break; fi
+    if [ -n "$f" ]; then
+      cp "$f" "$TMP/ws20.task"
+      # The core-side half of the contract: answer the drain task in results/.
+      mkdir -p "$WS20/results"
+      printf 'nothing in flight (test)\n' > "$WS20/results/$(basename "$f")"
+      break
+    fi
     touch "$WS20/state/cores/$HOST.alive"; sleep 0.5
   done
   printf '{"status":"idle","ts":%s}\n' "$(date +%s)" > "$WS20/state/core-status.json" ) &
@@ -630,6 +636,10 @@ grep -q "restart" "$TMP/ws20.argv" 2>/dev/null \
 [ -f "$WS20/tasks/archive/task-restart-prep-$rid20.txt" ] && [ ! -f "$WS20/tasks/task-restart-prep-$rid20.txt" ] \
   && say ok "the drain task was retired to tasks/archive/ before the exec (no orphan for the next boot)" \
   || say FAIL "drain task not retired: live=$(ls "$WS20"/tasks/task-restart-prep-* 2>/dev/null) archive=$(ls "$WS20"/tasks/archive/ 2>/dev/null)"
+[ -f "$WS20/results/archive/task-restart-prep-$rid20.txt" ] && [ ! -f "$WS20/results/task-restart-prep-$rid20.txt" ] \
+  && grep -q "drain result: nothing in flight (test)" "$TMP/ws20.out" \
+  && say ok "the core's drain RESULT is logged and archived with the task (no bridge would ever collect it)" \
+  || say FAIL "drain result stranded: live=$(ls "$WS20"/results/task-restart-prep-* 2>/dev/null) archive=$(ls "$WS20"/results/archive/ 2>/dev/null) logged=$(grep -c 'drain result:' "$TMP/ws20.out")"
 
 WS20b="$TMP/ws20b"; mkws "$WS20b"; rm -f "$WS20b/state/cores/$HOST.alive"   # DEAD core
 STUB_ARGV_OUT="$TMP/ws20b.argv" GR_START_CLI="$stub20" GR_WS="$WS20b" GR_SYNC_CMD="true" \

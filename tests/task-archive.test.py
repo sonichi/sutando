@@ -12,7 +12,9 @@ from datetime import datetime
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from task_archive import archive_file, find_task_file, task_id_from_filename
+from task_archive import (archive_file, archive_id_from_filename, declared_task_id,
+                          find_task_file, task_id_for, task_id_from_filename)
+import task_archive as _task_archive  # noqa: E402
 
 
 def exdev_from(src):
@@ -105,17 +107,45 @@ class TestArchiveNeverOverwrites(unittest.TestCase):
                         "the bytes must survive somewhere in the live queue")
 
     def test_quarantine_does_not_clobber_an_earlier_quarantine(self) -> None:
-        self.tasks_dir.mkdir()
-        os.chmod(self.tasks_dir, 0o500)
-        self.addCleanup(os.chmod, self.tasks_dir, 0o700)
         (self.live / "task-z.txt.archive-failed").write_text("FIRST")
         src = self.live / "task-z.txt"
         src.write_text("SECOND")
 
-        self.assertTrue(self._archive(src, "task-z"))
+        real_move = _task_archive._move_without_clobbering
+
+        def fail_primary_move(source, destination):
+            if Path(destination).parent == self.tasks_dir / self.month:
+                raise PermissionError("archive unavailable")
+            return real_move(source, destination)
+
+        with mock.patch.object(
+                _task_archive, "_move_without_clobbering",
+                side_effect=fail_primary_move):
+            self.assertTrue(self._archive(src, "task-z"))
         self.assertEqual((self.live / "task-z.txt.archive-failed").read_text(), "FIRST")
         self.assertEqual((self.live / "task-z.txt.archive-failed.1").read_text(), "SECOND")
         self.assertFalse(src.exists())
+
+
+class TestArchiveIdFromFilename(unittest.TestCase):
+    def test_task_names_use_the_anchored_grammar(self) -> None:
+        self.assertEqual(archive_id_from_filename("task-a.txt"), "task-a")
+        self.assertEqual(
+            archive_id_from_filename("task-a.claimed-core-3.txt"), "task-a")
+
+    def test_historic_prefixes_strip_the_plain_suffix(self) -> None:
+        self.assertEqual(archive_id_from_filename("ask-9.txt"), "ask-9")
+        self.assertEqual(archive_id_from_filename("sc-ask-9.txt.2"), "sc-ask-9")
+        self.assertEqual(
+            archive_id_from_filename("reco-skill-x.txt.archive-failed"),
+            "reco-skill-x")
+
+    def test_a_name_carrying_no_structural_txt_is_not_a_filename(self) -> None:
+        # One derivation, one null contract: a bare id is not a filename, so it
+        # is None here rather than passing through a second, laxer parser.
+        self.assertIsNone(archive_id_from_filename("ask-1.2"))
+        self.assertIsNone(archive_id_from_filename("task-1788443871192.txt.sending"))
+        self.assertIsNone(archive_id_from_filename(""))
 
 
 class TestFindTaskFile(unittest.TestCase):
@@ -150,6 +180,130 @@ class TestFindTaskFile(unittest.TestCase):
     def test_returns_none_when_no_file(self) -> None:
         result = find_task_file(self.tasks_dir, "task-nonexistent")
         self.assertIsNone(result)
+
+    def test_quarantine_lookup_is_by_id_not_by_prefix(self) -> None:
+        """`task-a.txt.archive-failed-review.txt` is an ordinary record whose id
+        is the whole stem; a lookup for the shorter `task-a` must not return it,
+        or an orphan result for task-a is routed with the longer task's headers."""
+        self._write("task-a.txt.archive-failed-review.txt")
+        self.assertIsNone(find_task_file(self.tasks_dir, "task-a"))
+        longer = find_task_file(self.tasks_dir, "task-a.txt.archive-failed-review")
+        self.assertEqual(longer.name, "task-a.txt.archive-failed-review.txt")
+
+    def test_a_state_looking_ordinary_id_is_told_apart_by_its_declared_id(self) -> None:
+        """`task-a.claimed-review` is a legal gateway id, not a pool rename. Only
+        the persisted `id:` can say which, so a lookup for `task-a` must skip a
+        file that declares the longer id, and still take a real claim."""
+        (self.tasks_dir / "task-a.claimed-review.txt").write_text(
+            "id: task-a.claimed-review\nsource: ag2space\ntask: long\n")
+        self.assertIsNone(find_task_file(self.tasks_dir, "task-a"))
+        self.assertEqual(find_task_file(self.tasks_dir, "task-a.claimed-review").name,
+                         "task-a.claimed-review.txt")
+        (self.tasks_dir / "task-a.claimed-core-1.txt").write_text(
+            "id: task-a\nsource: ag2space\ntask: claimed\n")
+        self.assertEqual(find_task_file(self.tasks_dir, "task-a").name,
+                         "task-a.claimed-core-1.txt")
+        # legacy: a variant with no id header is still matched by filename
+        (self.tasks_dir / "task-b.claimed-core-2.txt").write_text("task: no header\n")
+        self.assertEqual(find_task_file(self.tasks_dir, "task-b").name,
+                         "task-b.claimed-core-2.txt")
+
+    def test_quarantining_a_long_id_keeps_its_identity(self) -> None:
+        """A real archive failure on `task-a.txt.archive-failed-review.txt`
+        mints `…txt.archive-failed`; the id is read from the rightmost
+        structural .txt, so `task-a` cannot alias it and the long id still can."""
+        long_id = "task-a.txt.archive-failed-review"
+        live = self.tasks_dir
+        arch_tasks, arch_results = live / "archive", live / "results-archive"
+        src = live / f"{long_id}.txt"
+        src.write_text(f"id: {long_id}\nsource: ag2space\ntask: x\n")
+        real = _task_archive._move_without_clobbering
+        calls = []
+        def first_fails(s, d):
+            calls.append(d.name)
+            if len(calls) == 1:
+                raise OSError(5, "simulated archive failure")
+            return real(s, d)
+        with mock.patch.object(_task_archive, "_move_without_clobbering", side_effect=first_fails):
+            ok = archive_file(src, "task", long_id, tasks_dir=arch_tasks,
+                              results_dir=arch_results, log=lambda *a: None)
+        self.assertTrue(ok)
+        quarantine = live / f"{long_id}.txt.archive-failed"
+        self.assertTrue(quarantine.exists())
+        self.assertEqual(task_id_from_filename(quarantine.name), long_id)
+        self.assertIsNone(find_task_file(live, "task-a"))
+        self.assertEqual(find_task_file(live, long_id), quarantine)
+        # rightmost control: a plain short-id quarantine still resolves to the short id
+        (live / "task-a.txt.archive-failed").write_text("id: task-a\ntask: y\n")
+        self.assertEqual(find_task_file(live, "task-a").name, "task-a.txt.archive-failed")
+
+    def test_a_quarantined_state_looking_id_is_found_by_its_declared_id(self) -> None:
+        """`task-a.claimed-review` is an ordinary gateway id. After a failed
+        archive quarantines it, the filename alone reads as a claim of task-a;
+        the persisted `id:` must stay the authority for the quarantine too."""
+        long_id = "task-a.claimed-review"
+        live = self.tasks_dir
+        src = live / f"{long_id}.txt"
+        src.write_text(f"id: {long_id}\nsource: ag2space\ntask: long\n")
+        real = _task_archive._move_without_clobbering
+        calls = []
+
+        def first_fails(s, d):
+            calls.append(d.name)
+            if len(calls) == 1:
+                raise OSError(5, "simulated archive failure")
+            return real(s, d)
+
+        with mock.patch.object(_task_archive, "_move_without_clobbering", side_effect=first_fails):
+            ok = archive_file(src, "tasks", long_id, tasks_dir=live / "archive",
+                              results_dir=live / "results-archive", log=lambda *a: None)
+        self.assertTrue(ok)
+        quarantine = live / f"{long_id}.txt.archive-failed"
+        self.assertTrue(quarantine.exists())
+        self.assertEqual(task_id_from_filename(quarantine.name), "task-a")
+        self.assertEqual(task_id_for(quarantine), long_id)
+        self.assertEqual(find_task_file(live, long_id), quarantine)
+        self.assertIsNone(find_task_file(live, "task-a"))
+        # A real claim of task-a, quarantined, is still task-a's file.
+        (live / "task-a.claimed-core-1.txt.archive-failed").write_text(
+            "id: task-a\nsource: ag2space\ntask: claimed\n")
+        self.assertEqual(find_task_file(live, "task-a").name,
+                         "task-a.claimed-core-1.txt.archive-failed")
+
+    def test_task_id_for_makes_the_persisted_id_the_positive_authority(self) -> None:
+        live = self.tasks_dir
+        declared = live / "task-a.claimed-review.txt"
+        declared.write_text("id: task-a.claimed-review\ntask: x\n")
+        self.assertEqual(declared_task_id(declared), "task-a.claimed-review")
+        self.assertEqual(task_id_for(declared), "task-a.claimed-review")
+        # The caller's grammar gates a declaration; a rejected one falls back
+        # to the filename rather than to nothing.
+        self.assertEqual(task_id_for(declared, accept=lambda tid: "." not in tid), "task-a")
+        self.assertIsNone(task_id_for(declared, accept=lambda tid: False))
+        # No header, or no file at all: the filename answers.
+        headerless = live / "task-b.claimed-core-2.txt"
+        headerless.write_text("task: no header\n")
+        self.assertIsNone(declared_task_id(headerless))
+        self.assertEqual(task_id_for(headerless), "task-b")
+        self.assertEqual(task_id_for(live / "task-c.txt.archive-failed"), "task-c")
+        self.assertIsNone(task_id_for(live / "not-a-task"))
+
+    def test_a_live_variant_outranks_a_quarantine_for_the_same_id(self) -> None:
+        live = self.tasks_dir
+        (live / "task-z.txt.archive-failed").write_text("id: task-z\ntask: old\n")
+        self.assertEqual(find_task_file(live, "task-z").name, "task-z.txt.archive-failed")
+        # 't' sorts before 'z': lexicographic order alone would pick the quarantine.
+        (live / "task-z.zassigned-core-9.txt").write_text("id: task-z\ntask: live\n")
+        (live / "task-z.claimed-core-9.txt").write_text("id: task-z\ntask: live\n")
+        self.assertEqual(find_task_file(live, "task-z").name, "task-z.claimed-core-9.txt")
+
+    def test_real_quarantine_forms_still_resolve(self) -> None:
+        self._write("task-q.txt.archive-failed")
+        self.assertEqual(find_task_file(self.tasks_dir, "task-q").name,
+                         "task-q.txt.archive-failed")
+        self._write("task-r.txt.archive-failed.1")
+        self.assertEqual(find_task_file(self.tasks_dir, "task-r").name,
+                         "task-r.txt.archive-failed.1")
 
     def test_multiple_claimed_returns_first_lexicographic(self) -> None:
         self._write("task-000.claimed-core-2.txt")
@@ -356,6 +510,32 @@ class TaskIdFromFilename(unittest.TestCase):
             self.assertEqual(task_id, "task-abc123")
             self.assertEqual(find_task_file(tasks, task_id), claimed)
 
+
+
+class TrailingTxtIsTerminal(unittest.TestCase):
+    """A name ending in .txt is an ordinary record whose id may contain dots,
+    even `.txt.archive-failed`; only a name ending in .archive-failed* is a
+    quarantine file (that suffix is appended to the whole filename)."""
+
+    def test_dotted_id_containing_archive_failed_survives(self):
+        self.assertEqual(task_id_from_filename("task-current.txt.archive-failed-review.txt"),
+                         "task-current.txt.archive-failed-review")
+        self.assertEqual(archive_id_from_filename("reco-skill-x.txt.archive-failed-r.txt"),
+                         "reco-skill-x.txt.archive-failed-r")
+
+    def test_real_quarantine_names_still_reduce(self):
+        for name in ("task-current.txt.archive-failed", "task-current.txt.archive-failed.1",
+                     "task-current.txt.archive-failed-review"):
+            self.assertEqual(task_id_from_filename(name), "task-current", name)
+        self.assertEqual(archive_id_from_filename("reco-skill-x.txt.archive-failed"), "reco-skill-x")
+
+    def test_dotted_terminal_record_round_trips_through_find_task_file(self):
+        d = Path(tempfile.mkdtemp())
+        tid = "task-current.txt.archive-failed-review"
+        (d / f"{tid}.txt").write_text("id: x\n")
+        found = find_task_file(d, tid)
+        self.assertEqual(found, d / f"{tid}.txt")
+        self.assertEqual(task_id_from_filename(found.name), tid)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
