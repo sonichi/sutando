@@ -45,20 +45,38 @@ Note: this step runs BEFORE step 2 so that the watcher (started by step 2's down
 ### Step 2 — Register schedules + start watcher
 
 Invoke `/schedule-crons`. This handles:
-- Reading `skills/schedule-crons/crons.json`
+- Reading `<workspace>/hosts/<hostname>/crons.json` (`<hostname>` = `bash scripts/sutando-config.sh host-label`) — the canonical per-host config.
+  **Not `skills/schedule-crons/crons.json`.** That path is git-ignored and installer-managed: `src/init.sh` seeds it from `crons.example.json` when it is absent and leaves it untouched when it is present. So the in-checkout copy holds whatever the host last left there — shipped sample jobs, or a stale legacy schedule — and nothing keeps it in step with the per-host file. `skills/schedule-crons/SKILL.md` records the move; `/startup` was never updated to match, so registering from the in-checkout copy silently replaces the host's real schedule with legacy state.
+- Starting the streaming task watcher via the `Monitor` tool (`bash src/watch-tasks-stream.sh`, persistent, description `"Streaming task watcher"`) — **first**, before any cron is registered (2026-08-24: moved ahead of registration so a task arriving during the registration loop isn't queued unprocessed; see `skills/schedule-crons/SKILL.md` step 1.5 for the measured impact)
 - Calling `CronCreate` for each entry that isn't already scheduled
+- Invoke the skill rather than hand-rolling `CronCreate` from this list: `/schedule-crons` also writes
+  `<workspace>/hosts/<hostname>/schedule-crons-stamp.json`, which health-check's `session-crons` probe reads —
+  a hand-rolled registration leaves that probe reporting the crons as never registered.
 - Ensuring a fallback `/proactive-loop` cron exists at `*/10 * * * *` if `crons.json` doesn't include one (post-#954 belt-and-suspenders)
-- Starting the streaming task watcher via the `Monitor` tool (`bash src/watch-tasks-stream.sh`, persistent, description `"Streaming task watcher"`)
 
-### Step 3 — Confirm
+### Step 3 — Verify, then confirm
 
-Emit a one-line summary so the operator (or main session's first turn) sees what fired:
+**Run the ceremony gate BEFORE claiming completion.** It is health-check's `session-crons` probe
+— the same stamp-vs-session-boundary test the desktop app's ceremony-health uses to decide whether
+to re-send `/startup` — so the agent sees the app's criterion at the one moment it can act on it:
 
+```bash
+python3 skills/startup/scripts/verify-ceremony.py    # rc 0 = stamped this boot; rc 1 = NOT complete
 ```
-/startup complete: orphan-check (N tasks recovered, M archived), schedules (K crons + watcher).
-```
 
-The orphan-check fields say `skipped (skill not installed)` if step 1 was skipped.
+- **rc 0** → emit the one-line summary so the operator (or main session's first turn) sees what fired:
+
+  ```
+  /startup complete: orphan-check (N tasks recovered, M archived), schedules (K crons + watcher).
+  ```
+
+  The orphan-check fields say `skipped (skill not installed)` if step 1 was skipped.
+- **rc 1** → do NOT print `/startup complete`. Print the gate's output verbatim, invoke `/schedule-crons`
+  (the only writer of `hosts/<hostname>/schedule-crons-stamp.json`), and re-run the gate. A hand-rolled
+  `CronCreate` passes every cheap check — `CronList` looks perfect and the cron fires — and still fails
+  this one, which is exactly why the app kept re-sending `/startup` to a session that believed it was
+  done (135 sends across four episodes, the longest 25 h, stamp unchanged in every one).
+- **rc 2** → the probe could not run; say so and do not claim completion.
 
 ## Sequence diagram
 
@@ -70,9 +88,9 @@ session start
     │
     ├─► step 1:  /task-orphan-check (optional) ──► classifies + archives orphan tasks
     │
-    ├─► step 2:  /schedule-crons ──┬─► step 1-3 (register crons.json entries)
+    ├─► step 2:  /schedule-crons ──┬─► step 1.5 (start watch-tasks-stream.sh via Monitor — FIRST, before registration)
+    │                               ├─► step 2-3 (register crons.json entries)
     │                               ├─► step 4 (proactive-loop fallback if missing)
-    │                               ├─► step 5 (start watch-tasks-stream.sh via Monitor)
     │                               └─► step 6 (confirm what was scheduled)
     │
     └─► step 3: emit summary

@@ -61,6 +61,7 @@ from pathlib import Path
 # is worse than no heartbeat (supervisor restarts on crash; see module header).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
+from tmux_probe import classify as _classify_session_probe  # noqa: E402
 
 WORKSPACE = resolve_workspace()
 
@@ -172,6 +173,20 @@ def _argv_names_session(args: str, sess: str) -> bool:
     return False
 
 
+# The last has-session tri-state core_pid() observed. run_forever() resets it
+# before each read so a stubbed core_pid (tests) counts as an observed answer.
+_LAST_SESSION_PROBE: bool | None = False
+
+
+def _session_present(sock: str, sess: str) -> bool | None:
+    """True / False / None for the exact session, via the shared classifier."""
+    global _LAST_SESSION_PROBE
+    has = _tmux(sock, "has-session", "-t", f"={sess}")
+    _LAST_SESSION_PROBE = (None if has is None
+                           else _classify_session_probe(has.returncode, has.stderr))
+    return _LAST_SESSION_PROBE
+
+
 def core_pid(socket_path: str | None = None, session: str | None = None) -> int | None:
     """The pid of the CORE process, or None if the core is gone.
 
@@ -198,8 +213,7 @@ def core_pid(socket_path: str | None = None, session: str | None = None) -> int 
     sock = socket_path or _socket_path()
     sess = session or core_session()
 
-    has = _tmux(sock, "has-session", "-t", f"={sess}")
-    if has is None or has.returncode != 0:
+    if not _session_present(sock, sess):
         return None
 
     # SESSION-SCOPED FIRST, then the process-name sweep as a fallback.
@@ -405,6 +419,12 @@ def _handle_signal(signum: int, frame) -> None:
     global _SHUTDOWN_REQUESTED
     _SHUTDOWN_REQUESTED = True
     try:
+        # Tombstone BEFORE the unlink: recover-core must not read a graceful
+        # stop as death and relaunch a core someone stopped on purpose (#2160).
+        mark_stopped()
+    except Exception:  # pragma: no cover — best-effort
+        pass
+    try:
         _alive_path().unlink(missing_ok=True)
     except Exception:  # pragma: no cover — best-effort cleanup
         pass
@@ -428,16 +448,23 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     # a failed boot as healthy. Keep waiting (so a late core can still arm the
     # gate), but remove any stale prior record until the real core is observed.
     saw_core = False
+    try:
+        # A new run supersedes any prior graceful-stop tombstone.
+        _alive_path().with_suffix(".stopped").unlink(missing_ok=True)
+    except Exception:  # pragma: no cover — best-effort
+        pass
     absent_streak = 0
+    global _LAST_SESSION_PROBE
     while not _SHUTDOWN_REQUESTED:
+        _LAST_SESSION_PROBE = False
         present = core_pid() is not None
         saw_core = saw_core or present
-        # `core_pid()` returns None for BOTH "the core is gone" and "I could not
-        # tell" (tmux timeout, transient exec failure) — the values are
-        # indistinguishable. Acting on a single None turns one flaky read into a
-        # removed `.alive`, i.e. a false death reported to every peer. Require
-        # CONSECUTIVE absences; any single present read resets the streak.
-        absent_streak = 0 if present else absent_streak + 1
+        # An unobserved probe (tmux missing/hung, or a refused client) is not an
+        # absence: it neither resets nor advances the streak of observed misses.
+        if present:
+            absent_streak = 0
+        elif _LAST_SESSION_PROBE is not None:
+            absent_streak += 1
         if saw_core and absent_streak >= ABSENT_BEATS_BEFORE_DEATH:
             print("core_heartbeat: core pane is gone — stopping beat and "
                   "removing .alive so readers see it leave", file=sys.stderr, flush=True)
@@ -468,16 +495,35 @@ def run_forever(interval: float = 30.0, status: str = "running") -> int:
     return 0
 
 
+def mark_stopped() -> None:
+    """Publish the durable graceful-stop tombstone for THIS host.
+
+    The one shared implementation behind both writers: the sidecar's own
+    SIGTERM/SIGINT handler, and stop-core.sh's --mark-stopped call — the
+    canonical stop path kills tmux sessions and never signals the sidecar,
+    so without this the sidecar's core-gone exit reads as a crash and
+    recover-core may relaunch a deliberately stopped core (#2160)."""
+    # mkdir: a stop can precede the first beat, and the signal handler's
+    # best-effort except would swallow the miss — tombstone silently absent.
+    CORES_DIR.mkdir(parents=True, exist_ok=True)
+    _alive_path().with_suffix(".stopped").write_text(str(time.time()))
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--interval", type=float, default=30.0, help="seconds between beats (default: 30)")
     p.add_argument("--status", type=str, default="running", help="status string written into the .alive file")
     p.add_argument("--once", action="store_true", help="write a single beat and exit (for tests/debugging)")
+    p.add_argument("--mark-stopped", action="store_true",
+                   help="write the graceful-stop tombstone and exit (called by stop-core.sh)")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.mark_stopped:
+        mark_stopped()
+        return 0
     if args.once:
         write_beat(status=args.status)
         return 0

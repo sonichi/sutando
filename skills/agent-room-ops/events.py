@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """room-ops · events — client half of Agent Event Subscription & Delivery (#184).
 
-Three surfaces, all speaking the FIXED #184 contract (the server half is built
+Four surfaces, all speaking the FIXED #184 contract (the server half is built
 separately against the same contract — this code targets the contract, never a
 server implementation):
 
   - subscription management — `events_subscribe` / `events_unsubscribe` /
     `events_subscriptions` ops on the generic `POST {base}/v1/room` envelope
     (one privileged endpoint, many ops — same shape as doc/mention).
+  - typed emit — the `event` op on that same envelope: send one typed
+    `space.ag2.*` TIMELINE event as this agent. The receive half above had no
+    counterpart, so an agent could subscribe to typed events it had no way to
+    produce.
   - long-poll pull — `GET {base}/v1/events?cursor=<int>&wait=<sec>`; one
     bounded round per call; timeout = empty `events` + unchanged cursor.
   - SSE push — `GET {base}/v1/events/stream`; each event is `id: <cursor>` +
@@ -28,7 +32,8 @@ import time
 import urllib.request
 
 from _gateway import (HTTP_TIMEOUT, gate_allows, load_gate, gateway, http_json,
-                      degrade_reason, urlencode, HTTPError, URLError)
+                      degrade_reason_from, urlencode, HTTPError, URLError)
+import receipt as _receipt
 
 DEFAULT_WAIT = 30
 
@@ -46,9 +51,13 @@ class StreamDisconnected(ConnectionError):
     decide for themselves."""
 
 
-def _result(ok, *, room_id=None, subscription_id=None, subscriptions=None, reason=None):
+# emit's fields live HERE, not in a private builder: all seven `_op_call`
+# failure paths return through this one, so a split would KeyError on denial.
+def _result(ok, *, room_id=None, subscription_id=None, subscriptions=None, reason=None,
+            event_id=None, state=None):
     return {"ok": bool(ok), "room_id": room_id, "subscription_id": subscription_id,
-            "subscriptions": subscriptions, "reason": reason}
+            "subscriptions": subscriptions, "reason": reason,
+            "event_id": event_id, "state": state}
 
 
 # --------------------------------------------------------------------------- #
@@ -72,7 +81,7 @@ def _op_call(op, room_id, agent_mxid, gate, extra=None, *, gated=True):
     try:
         _status, res = http_json("POST", f"{base}/v1/room", headers, payload)
     except HTTPError as e:
-        return _result(False, room_id=room_id, reason=degrade_reason(e.code))
+        return _result(False, room_id=room_id, reason=degrade_reason_from(e))
     except (URLError, TimeoutError) as e:
         return _result(False, room_id=room_id, reason=f"network error: {e}")
     if not isinstance(res, dict):
@@ -120,6 +129,23 @@ def subscriptions(agent_mxid=None):
     return _result(True, subscriptions=res.get("subscriptions") or [])
 
 
+def emit(room_id, event_type, content, agent_mxid=None, *, gate=None):
+    """op `event` → one typed TIMELINE event sent as this agent.
+
+    The accepted type namespace is the SERVER's rule, not re-encoded here — a
+    client copy would drift. Do NOT infer the refusal SHAPE either: a rejected
+    type may return a bare HTTP 502 with no `reason` rather than refuse legibly.
+    """
+    res = _op_call("event", room_id, agent_mxid, gate,
+                   {"type": event_type, "content": content})
+    if res.get("ok") is False:
+        return res
+    # Same three-state receipt as say/mention: UNCONFIRMED stays ok:true so a
+    # caller cannot re-send an event that already landed.
+    state, event_id, reason = _receipt.classify(res)
+    return _result(True, room_id=room_id, event_id=event_id, reason=reason, state=state)
+
+
 # --------------------------------------------------------------------------- #
 # Long-poll pull — GET /v1/events
 # --------------------------------------------------------------------------- #
@@ -153,7 +179,7 @@ def pull(cursor=0, wait=DEFAULT_WAIT):
         # empty-events response.
         res = _http_get_json(url, headers, wait + HTTP_TIMEOUT)
     except HTTPError as e:
-        return {"ok": False, "events": [], "cursor": cursor, "reason": degrade_reason(e.code)}
+        return {"ok": False, "events": [], "cursor": cursor, "reason": degrade_reason_from(e)}
     except (URLError, TimeoutError, OSError) as e:
         return {"ok": False, "events": [], "cursor": cursor, "reason": f"network error: {e}"}
     except ValueError as e:
@@ -246,7 +272,7 @@ def stream(cursor=None, on_event=None, keepalive_cb=None, *, stop=None, max_even
         resp = _open_stream(f"{base}/v1/events/stream", h)
     except HTTPError as e:
         if e.code in (401, 403, 404):
-            raise RuntimeError(degrade_reason(e.code)) from e
+            raise RuntimeError(degrade_reason_from(e)) from e
         raise StreamDisconnected(f"HTTP {e.code} opening stream") from e
     except (URLError, TimeoutError, OSError) as e:
         raise StreamDisconnected(f"connect failed: {e}") from e

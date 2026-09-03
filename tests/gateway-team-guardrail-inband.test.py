@@ -47,8 +47,9 @@ def _write(mod, **over) -> str:
     task = {"id": "inband1", "task": "please look at the parser",
             "user_id": "@x:ag2.space", "access_tier": "team"}
     task.update(over)
-    tid = mod._write_task(task)
-    assert tid, "writer returned no task id"
+    written = mod._write_task(task)
+    assert written, "writer returned no task id"
+    tid = written[0]
     return (mod.TASKS_DIR / f"{tid}.txt").read_text(), tid
 
 
@@ -84,9 +85,9 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
         # The guardrail is one text in src/, mirrored into the wheel. A fork here
         # is how the two surfaces drift back apart without any test noticing.
         root = Path(__file__).resolve().parent.parent
-        a = (root / "src" / "team_guardrail.py").read_text()
+        a = (root / "src" / "policy" / "guardrail.py").read_text()
         b = (root / "packages" / "ag2-sparrow" / "ag2_sparrow" / "team_guardrail.py").read_text()
-        self.assertEqual(a, b, "src/team_guardrail.py and the packaged copy have diverged")
+        self.assertEqual(a, b, "src/policy/guardrail.py and the packaged copy have diverged")
 
 
 
@@ -104,8 +105,9 @@ class CollaboratorBranchReachesTheBody(unittest.TestCase):
                 "user_id": "@c:ag2.space", "access_tier": "team",
                 "collaborator": True}
         task.update(over)
-        tid = mod._write_task(task)
-        assert tid, "writer returned no task id"
+        written = mod._write_task(task)
+        assert written, "writer returned no task id"
+        tid = written[0]
         return (mod.TASKS_DIR / f"{tid}.txt").read_text(), tid
 
     def test_attested_collaborator_gets_the_engage_rulebook_at_its_own_result_path(self):

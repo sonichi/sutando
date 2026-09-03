@@ -686,6 +686,35 @@ def _write_item(root: Path, item_id: str, data: dict) -> None:
     os.replace(tmp, p)
 
 
+def record_delivered(root: Path, item_id: str, *, provider: Optional[str] = None,
+                     destination: Optional[str] = None) -> None:
+    """Mark an item delivered and persist WHERE it went.
+
+    The log line naming provider/destination rotates; a receipt that omits them
+    cannot answer "delivered to where" after that. Absent values are not stored,
+    so items written before this existed read back as None rather than as a
+    destination nobody observed.
+    """
+    d = _read_item(Path(root), item_id)
+    d["status"] = "DELIVERED"
+    if provider:
+        d["provider"] = provider
+    if destination:
+        d["destination"] = destination
+    _write_item(Path(root), item_id, d)
+
+
+def item_status(root: Path, item_id: str) -> Optional[str]:
+    """Public read of an item's lifecycle status (READY/CLAIMED/DELIVERED/
+    PARKED...); None when no record exists or the record is unreadable."""
+    try:
+        if not _item_path(Path(root), item_id).exists():
+            return None
+        return _read_item(Path(root), item_id).get("status")
+    except Exception:
+        return None
+
+
 def attempts_for(root: Path, item_id: str) -> int:
     return int(_read_item(Path(root), item_id).get("attempts", 0))
 

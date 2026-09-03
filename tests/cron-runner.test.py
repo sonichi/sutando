@@ -489,7 +489,9 @@ def test_run_drops_stale_catchup_slot():
         cr.CRONS_FILE = root / "crons.json"
         cr.STATE_FILE = root / "state" / "cron-runner-state.json"
         fire = _epoch(2026, 7, 2, 6, 0)
-        now = fire + cr.MAX_EMIT_LATENESS_SECONDS + 60
+        # Past THIS job's budget, not a flat constant: the budget scales with the
+        # period, so hard-coding the floor stops exercising the drop path.
+        now = fire + cr.emit_lateness_budget("0 6 * * *", fire) + 60
         cr.CRONS_FILE.write_text(json.dumps([
             {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
         ]))
@@ -504,6 +506,44 @@ def test_run_drops_stale_catchup_slot():
         check("dropping stale slot for briefing" in stderr.getvalue(),
               "stale drop is observable")
         check(not cr.TASKS_DIR.exists(), "stale slot leaves no task file")
+
+
+def test_drop_line_is_timestamped():
+    """A drop is the ONLY record that a slot was skipped, so it must be datable.
+
+    The log carried no timestamps, so drops could be counted but never correlated
+    with a sleep window or attributed to a day — the gap #2754 and #3232 both hit.
+    """
+    import contextlib
+    import io
+    import json
+    import re
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        cr.TASKS_DIR = root / "tasks"
+        cr.CRONS_FILE = root / "crons.json"
+        cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+        fire = _epoch(2026, 7, 2, 6, 0)
+        # Past THIS job's budget, not a flat constant: the budget scales with the
+        # period, so hard-coding the floor stops exercising the drop path.
+        now = fire + cr.emit_lateness_budget("0 6 * * *", fire) + 60
+        cr.CRONS_FILE.write_text(json.dumps([
+            {"name": "briefing", "cron": "0 6 * * *", "prompt": "x", "launchd": True},
+        ]))
+        cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cr.STATE_FILE.write_text(json.dumps({"briefing": fire - 60}))
+        _mark_core_alive(root, now)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            cr.run(now_epoch=now)
+        line = stderr.getvalue()
+        check(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z cron-runner: dropping",
+                       line),
+              f"drop line starts with an ISO-8601 UTC stamp, got: {line[:60]!r}")
+        # The stamp is a PREFIX, not a replacement: the existing substring
+        # assertion above must keep passing.
+        check("dropping stale slot for briefing" in line,
+              "stamping preserves the searchable message")
 
 
 def test_run_executes_shell_command_without_core_or_task_file():
@@ -801,6 +841,26 @@ def test_malformed_shell_command_is_skipped_and_not_retried():
         finally:
             cr.REPO_ROOT = original_repo_root
 
+
+
+# A dense schedule must not expand the whole day under run()'s state lock.
+# Pin the call bound, not a duration — elapsed time is host-dependent.
+def test_dense_schedule_does_not_expand_the_day():
+    import time as _t
+    calls = {"mk": 0}
+    real = _t.mktime
+    cr.time.mktime = lambda *a: (calls.__setitem__("mk", calls["mk"] + 1) or real(*a))
+    try:
+        now = int(real((2026, 6, 15, 14, 37, 0, 0, 0, -1)))
+        assert cr.cron_period_seconds("* * * * *", now) == 60
+        # one hour is 60 minutes x <=2 epochs, plus the day/noon probes
+        assert calls["mk"] < 200, f"expanded the day: {calls['mk']} mktime calls"
+    finally:
+        cr.time.mktime = real
+    print("OK: dense '* * * * *' stays under the per-hour bound")
+
+
+test_dense_schedule_does_not_expand_the_day()
 
 if __name__ == "__main__":
     _run_all()

@@ -14,6 +14,7 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py join   <room> [--agent mxid]                 # accept own invite
     python3 room_ops.py rooms  [--agent mxid]                        # joined-rooms list
     python3 room_ops.py members <room_id> [--agent mxid]             # room member list
+    python3 room_ops.py events emit <room> --type space.ag2.app.x --content '{"k":1}'
     python3 room_ops.py events subscribe <room> --types a,b [--filters json]
     python3 room_ops.py events unsubscribe <room>
     python3 room_ops.py events list
@@ -74,6 +75,16 @@ def _events_stream(a):
 
 
 def _dispatch_events(a):
+    if a.events_cmd == "emit":
+        try:
+            content = json.loads(a.content)
+        except ValueError as e:
+            return {"ok": False, "reason": f"--content is not valid JSON: {e}"}
+        # The wire contract is a JSON object; a bare scalar or list would be
+        # rejected server-side, so name it here rather than spend a round trip.
+        if not isinstance(content, dict):
+            return {"ok": False, "reason": "--content must be a JSON object"}
+        return _events.emit(a.room_id, a.type, content, agent_mxid=a.agent_mxid)
     if a.events_cmd == "subscribe":
         types = [t.strip() for t in (a.types or "").split(",") if t.strip()]
         filters = None
@@ -99,6 +110,9 @@ def _main(argv):
     p = sub.add_parser("read", help="pull recent room history")
     p.add_argument("room_id")
     p.add_argument("--limit", type=int, default=_read.DEFAULT_LIMIT)
+    p.add_argument("--oldest-first", action="store_true",
+                   help="render oldest->newest so `| tail` shows the LATEST messages "
+                        "(default newest-first makes tail show the oldest)")
     p.add_argument("--before", default=None)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
@@ -144,6 +158,11 @@ def _main(argv):
 
     p = sub.add_parser("events", help="event subscriptions + delivery (#184 client half)")
     esub = p.add_subparsers(dest="events_cmd", required=True)
+    e = esub.add_parser("emit", help="send one typed space.ag2.* timeline event as this agent")
+    e.add_argument("room_id")
+    e.add_argument("--type", required=True, help="event type (e.g. space.ag2.app.card)")
+    e.add_argument("--content", required=True, help="JSON object body")
+    e.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
     e = esub.add_parser("subscribe", help="subscribe this agent to a room's events")
     e.add_argument("room_id")
     e.add_argument("--types", required=True,
@@ -174,11 +193,23 @@ def _main(argv):
     p.add_argument("message")
     p.add_argument("room_id")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--reply-to", dest="reply_to", default=None,
+                   help="event id ($abc) to cite as the message replied to. This is a "
+                        "CITATION: the post stays in the main timeline. It does NOT put "
+                        "the post in a Matrix thread — the gateway has no field for that.")
 
     p = sub.add_parser("say", help="post a plain message into a room (mentions no one)")
     p.add_argument("room_id")
     p.add_argument("message")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+    p.add_argument("--worker", default=None,
+                   help="worker id to stamp on the event (space.ag2.worker) so the "
+                        "client renders attribution; defaults to worker-$SUTANDO_WORKER_SEAT "
+                        "when that env var is set, pass '' to post unstamped")
+    p.add_argument("--reply-to", dest="reply_to", default=None,
+                   help="event id ($abc) to cite as the message replied to. This is a "
+                        "CITATION: the post stays in the main timeline. It does NOT put "
+                        "the post in a Matrix thread — the gateway has no field for that.")
 
     p = sub.add_parser("grant", help="make a room authoritative — its access policy "
                                      "GRANTS access, overriding agents' local allowFrom (#429)")
@@ -193,7 +224,8 @@ def _main(argv):
 
     a = ap.parse_args(argv)
     if a.cmd == "read":
-        res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before)
+        res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
+                              oldest_first=a.oldest_first)
     elif a.cmd == "fetch":
         res = _media.fetch_media(a.ref, a.agent_mxid, a.room_id)
     elif a.cmd == "send":
@@ -231,9 +263,13 @@ def _main(argv):
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
-        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid)
+        res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid,
+                               reply_to=a.reply_to)
     elif a.cmd == "say":
-        res = _say.say(a.message, a.room_id, a.agent_mxid)
+        _kw = {"reply_to": a.reply_to}
+        if a.worker:
+            _kw["worker"] = a.worker
+        res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
     elif a.cmd == "grant":
         import grant as _grant
         try:

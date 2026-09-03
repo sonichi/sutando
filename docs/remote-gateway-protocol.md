@@ -79,12 +79,23 @@ room-specific provider session.
 Claim/acknowledge a task so the server stops redelivering it.
 
 ```
-body: { "id": "task-123" }
+body: { "id": "task-123", "durable": true }
 ```
 
 The client acks each task as it is accepted. A server with at-least-once
 delivery should treat ack as "stop redelivering"; the client is idempotent and
 will not re-queue a task it already claimed or archived.
+
+`durable: true` is sent only once the task file, its media sidecar and the
+in-flight set are all fsync'd, so the task survives a crash of this host. When a
+fresh queue write, its media sidecar, the in-flight set or the pending-ack
+ledger does not commit, the client withholds the ack entirely rather than
+claiming a task it could still lose. The flag is merely absent — a plain ack the
+server should treat as "stop redelivering" and nothing more — when a redelivered
+task is already queued and its durability could not be repaired. Acks that do
+not confirm are persisted and retried; a per-task `404 {"error": "not leased …"}`
+retires the retry for good, while a bare no-route 404/405 keeps the
+endpoint-unsupported cooldown.
 
 ### `POST /v1/results`
 
@@ -139,6 +150,18 @@ Credential routing is by parsed exact origin, never string matching:
 
 Authenticated fetches refuse redirects (a 3xx is a failure), so a
 gateway-controlled URL can never bounce a bearer to another host.
+
+Outbound `[file: …]` markers upload through `POST /v1/rooms/<room>/media`. A
+task the server marked with a `signal` object instead uploads against its own
+lease, `POST /v1/tasks/<id>/media` with `{ "ordinal": 0..9, "filename":
+"<name>", "content_b64": "…" }`, where `<id>` is the id the result is delivered
+under and `ordinal` is the marker's position in the body. The client records
+that mode in `state/remote-task-media[.<instance>].json` before the task is
+queued, so it survives a restart. `409` (content conflicts with an upload the
+server already recorded) and `423` (encrypted room) are reported in-band and
+never retried; a network failure or any 5xx defers the whole result, and the
+retry re-offers the same id, ordinal and bytes so the server can resume rather
+than store a second copy.
 
 ## Delivery + idempotency
 

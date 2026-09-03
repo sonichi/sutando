@@ -48,8 +48,6 @@ import json
 import os
 import pathlib
 import sys
-import urllib.request
-import urllib.error
 from pathlib import Path
 
 # Claude Code per-user home. Mirrors src/util_paths.py `claude_home_path()`
@@ -107,20 +105,9 @@ def resolve_bot2bot_channel(access: dict) -> str:
     sys.exit("ERROR: no bot2bot channel found in access.json.groups")
 
 
-USER_AGENT = "DiscordBot (https://github.com/sonichi/sutando, 1.0)"
-
-
 def get_self_id(token: str) -> str:
-    """Discord GET /users/@me → this bot's user ID."""
-    req = urllib.request.Request(
-        "https://discord.com/api/v10/users/@me",
-        headers={
-            "Authorization": f"Bot {token}",
-            "User-Agent": USER_AGENT,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())["id"]
+    """Discord GET /users/@me → this bot's user ID (via the shared client)."""
+    return str(_client(token).get_json("/users/@me")["id"])
 
 
 def resolve_other_bot(access: dict, self_id: str, channel_id: str):
@@ -230,22 +217,14 @@ def post(channel_id: str, text: str, token: str, overhead: int = 0):
     problem = check_length(text, overhead)
     if problem:
         sys.exit(problem)
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    body = json.dumps({"content": text}).encode()
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        sys.exit(f"ERROR: Discord API {e.code}: {e.read().decode()}")
+    receipt, _status, body = _client(token).send_message_with_response(
+        channel_id, {"content": text})
+    if receipt.outcome is DeliveryOutcome.CONFIRMED and isinstance(body, dict):
+        return body
+    hint = (" The post MAY have landed — check the channel before retrying."
+            if receipt.outcome is DeliveryOutcome.OUTCOME_UNKNOWN
+            else " NOTHING WAS SENT.")
+    sys.exit(f"ERROR: Discord send {receipt.outcome.value}: {receipt.detail}.{hint}")
 
 
 # Peer roster lives in per-host config, NOT hardcoded here: this script is
@@ -286,6 +265,13 @@ _repo = next(p for p in pathlib.Path(__file__).resolve().parents
              if (p / "src" / "body_file.py").is_file())
 sys.path.insert(0, str(_repo / "src"))
 from body_file import MAX_BODY_BYTES, read_body_file as _read_body_file  # noqa: E402
+from channels.discord.post_gate import make_client  # noqa: E402  — the one Discord POST chokepoint
+from outbox import DeliveryOutcome  # noqa: E402
+
+
+def _client(token: str):
+    """Shared-DiscordRestClient seam for tests; keeps the pre-client 10s cap."""
+    return make_client(token, timeout=10)
 
 
 def main():

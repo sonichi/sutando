@@ -25,6 +25,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The sibling import must resolve both top-level (src/ on sys.path) and
+# package-style (`src.util_paths`), where src/ itself is not on the path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sutando_config import config_get, config_get_env_first  # noqa: E402
+
 def _memory_dir_env() -> str | None:
     """Return the resolved memory-dir env value, preferring the new name.
 
@@ -36,7 +41,7 @@ def _memory_dir_env() -> str | None:
 
     Returns the raw env value (caller must `os.path.expanduser` if needed),
     or None when neither is set."""
-    new = os.environ.get("SUTANDO_MEMORY_DIR")
+    new = config_get_env_first("SUTANDO_MEMORY_DIR")
     if new:
         return new
     legacy = os.environ.get("SUTANDO_PRIVATE_DIR")
@@ -125,7 +130,7 @@ def _host_label() -> str:
     `machine-<host>/` (memory-dir) and new `hosts/<host>/` (workspace)
     conventions stay in lockstep. Kept in lockstep with `_host()` in
     sync-workspace.sh (same precedence)."""
-    env = os.environ.get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
+    env = config_get("SUTANDO_HOST_LABEL") or os.environ.get("SUTANDO_HOST_OVERRIDE")
     # Strip before testing: a blank-but-set override (`SUTANDO_HOST_LABEL=" "`,
     # trivially produced by an unquoted expansion in a launcher) is truthy in
     # Python, so `if env:` returned the whitespace itself as the label. That
@@ -325,7 +330,7 @@ def claude_home_path(*subpath: str, vanilla: bool = False) -> Path:
     """
     ccd_env = None if vanilla else os.environ.get("CLAUDE_CONFIG_DIR")
     home_env = (os.environ.get("SOURCE_CLAUDE_CONFIG_DIR") if vanilla
-                else os.environ.get("CLAUDE_HOME"))
+                else config_get_env_first("CLAUDE_HOME"))
     if ccd_env:
         base = Path(os.path.expanduser(ccd_env))
     elif home_env:

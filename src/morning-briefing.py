@@ -10,6 +10,7 @@ Output: results/proactive-<ts>.txt (voice speaks it) + Discord DM.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -74,18 +75,25 @@ def get_weather() -> str:
             'do shell script "defaults read /Library/Preferences/com.apple.timezone"',
             timeout=3
         )
-        # Use lat/lon from env if set
-        import os
-        if os.environ.get("WEATHER_LAT") and os.environ.get("WEATHER_LON"):
-            lat = float(os.environ["WEATHER_LAT"])
-            lon = float(os.environ["WEATHER_LON"])
+        # Use lat/lon from config (env legacy fallback) if set
+        from sutando_config import config_get
+        _lat_cfg, _lon_cfg = config_get("WEATHER_LAT"), config_get("WEATHER_LON")
+        configured = bool(_lat_cfg and _lon_cfg)
+        if configured:
+            lat = float(_lat_cfg)
+            lon = float(_lon_cfg)
+
+        unit = (config_get("WEATHER_UNIT", "fahrenheit") or "fahrenheit").strip().lower()
+        if unit not in ("fahrenheit", "celsius"):
+            unit = "fahrenheit"
+        unit_symbol = "°F" if unit == "fahrenheit" else "°C"
 
         url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
             f"&current=temperature_2m,weather_code"
             f"&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-            f"&timezone=auto&forecast_days=1&temperature_unit=fahrenheit"
+            f"&timezone=auto&forecast_days=1&temperature_unit={unit}"
         )
         with urlopen(url, timeout=8) as resp:
             d = json.loads(resp.read())
@@ -98,7 +106,9 @@ def get_weather() -> str:
         rain = day["precipitation_probability_max"][0]
         desc = WEATHER_CODES.get(code, "variable")
         rain_note = f", {rain}% chance of rain" if rain >= 30 else ""
-        return f"{temp}°F and {desc}, high of {high}, low of {low}{rain_note}"
+        # Spoken aloud, so the label stays short and the remedy goes to the log.
+        where = "" if configured else " in San Francisco (default location)"
+        return f"{temp}{unit_symbol} and {desc}{where}, high of {high}, low of {low}{rain_note}"
     except (URLError, KeyError, ValueError, OSError):
         return None
 
@@ -141,6 +151,28 @@ def _read_calendar_cache() -> list[dict] | None:
                 out["start"] = start
             events.append(out)
     return events
+
+
+def _google_cache_configured() -> bool:
+    """True when this host has a Google-calendar cache on disk, whatever it
+    holds.
+
+    The fallback is reached when the cache is absent, stale OR corrupt, so
+    only ABSENCE is evidence the owner's calendar is not in Google. A file
+    that exists but cannot be parsed — truncated, half-written, or drifted
+    off the schema — means blind, and a blind source is never a clear day.
+    Parsing it to decide this inverted the answer on exactly those hosts.
+    """
+    try:
+        # Lexical: a dangling symlink is a BROKEN cache, and exists() calls it
+        # absent — the one filesystem shape that renders a false clear day.
+        os.lstat(CALENDAR_CACHE_FILE)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A probe that cannot answer is not evidence of absence.
+        return True
+    return True
 
 
 def _parse_start(ev: dict):
@@ -200,7 +232,9 @@ def get_calendar_events() -> list[dict] | None:
       1. The Google-calendar cache (``state/calendar-today.json``) written by the
          core agent — the ONLY source that sees the owner's Google Workspace
          calendar, which a local macOS Calendar.app may not have subscribed.
-      2. Local macOS Calendar.app via AppleScript (fallback).
+      2. Local macOS Calendar.app via AppleScript (fallback). An EMPTY result
+         from this source is only trusted on hosts that have never written a
+         Google cache; where one exists, empty means blind, so None is returned.
 
     Returns a list of events ([] means verified empty) or None when the calendar
     could not be read — callers must not render None as "clear".
@@ -280,8 +314,8 @@ return output
                     file=sys.stderr,
                 )
         return None
-    import os as _os
-    skip_cals_raw = _os.environ.get("MORNING_BRIEFING_SKIP_CALENDARS", "")
+    from sutando_config import config_get
+    skip_cals_raw = config_get("MORNING_BRIEFING_SKIP_CALENDARS", "") or ""
     skip_cals = {c.strip().lower() for c in skip_cals_raw.split(",") if c.strip()}
     # Dedup by (time_str, title) — cross-calendar duplication (#966).
     seen: set[str] = set()
@@ -310,6 +344,14 @@ return output
             continue
         seen.add(key)
         events.append({"raw": event_str, "calendar": cal_name})
+    if not events and _google_cache_configured():
+        # Local Calendar.app carries none of the Google work account here, so
+        # an empty read is "I cannot see it", never "the day is clear".
+        print(
+            "  calendar: local read empty but this host has a Google cache — reporting unread",
+            file=sys.stderr,
+        )
+        return None
     return events
 
 
@@ -635,30 +677,7 @@ def get_health_issues() -> "list[str] | None":
         return None
 
 
-def get_daily_insight() -> str | None:
-    """Get today's behavioral insight from daily-insight.py (cached via sentinel)."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    sentinel = STATE_DIR / f"daily-insight-{today}.sentinel"
-    if sentinel.exists():
-        return sentinel.read_text().strip() or None
-    # Not yet generated — run it
-    hc = _SRC_DIR / "daily-insight.py"
-    if not hc.exists():
-        return None
-    try:
-        r = subprocess.run(
-            [sys.executable, str(hc)],
-            capture_output=True, text=True, timeout=20,
-            cwd=str(WORKSPACE)
-        )
-        if r.returncode == 0 and sentinel.exists():
-            return sentinel.read_text().strip() or None
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    return None
-
-
-def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight=None) -> str:
+def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues) -> str:
     now = datetime.now()
     hour = now.hour
     if hour < 12:
@@ -717,13 +736,6 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         issues_str = "; ".join(health_issues[:2])
         parts.append(f"System note: {issues_str}.")
 
-    # Daily insight (closing thought) — take first sentence, skip if it's just raw data
-    if insight:
-        first_sentence = insight.split('.')[0].strip()
-        has_raw_data = '{' in first_sentence or first_sentence.count(':') > 2
-        if not has_raw_data and len(first_sentence) > 20:
-            parts.append(f"Insight: {first_sentence}.")
-
     # Closing — every input must be VERIFIED empty, not merely falsy. `None`
     # from any gather means that query did not run, and an unanswered query is
     # not evidence of a clean day. Previously only the calendar was checked this
@@ -767,6 +779,9 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
+    import os as _os
+    if weather and not (_os.environ.get("WEATHER_LAT") and _os.environ.get("WEATHER_LON")):
+        print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
 
     events = get_calendar_events()
     print(f"  calendar: {'unavailable' if events is None else f'{len(events)} events'}")
@@ -777,8 +792,6 @@ def main():
     discord_msgs = get_overnight_discord()
     print(f"  discord overnight: {len(discord_msgs)} messages")
 
-    insight = get_daily_insight()
-    print(f"  insight: {'yes' if insight else 'none'}")
 
     pending_qs = get_pending_questions()
     print(f"  pending questions: {len(pending_qs)}")
@@ -787,7 +800,7 @@ def main():
     print(f"  health issues: {'unavailable' if health_issues is None else len(health_issues)}")
 
     # Synthesize
-    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues, insight)
+    narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues)
 
     # Write voice result
     ts = int(time.time() * 1000)

@@ -113,12 +113,16 @@ class _Sentinel(Exception):
 
 
 def _run_one_pass(canonical: Path, sends: list, fail: bool = False,
-                  log: "list | None" = None):
-    """Drive one `poll_approved` iteration with both dirs redirected.
+                  log: "list | None" = None, corrupt: bool = False):
+    """Drive one full delivery pass — poll_approved then poll_pending_notify.
 
     `log` collects what the loop PRINTED. Needed for one property that has no
     filesystem trace: see the `is_file()` control below."""
     db.ACCESS_FILE = canonical.parent / "access.json"
+    if corrupt:
+        # mutate_access_file refuses to write over a corrupt file and returns
+        # None SILENTLY — the adopt-failure lever, no monkeypatching.
+        db.ACCESS_FILE.write_text("{not valid json")
 
     class _Chan:
         def __init__(self, cid): self.cid = cid
@@ -142,7 +146,13 @@ def _run_one_pass(canonical: Path, sends: list, fail: bool = False,
     _buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(_buf):
-            asyncio.run(db.poll_approved())
+            # Delivery is two loops now: poll_approved ADOPTS a marker into
+            # pendingNotify, poll_pending_notify is the sole sender (#3318).
+            for _loop in (db.poll_approved, db.poll_pending_notify):
+                try:
+                    asyncio.run(_loop())
+                except _Sentinel:
+                    pass
     except _Sentinel:
         pass
     finally:
@@ -212,54 +222,41 @@ def main() -> int:
           "the stale legacy marker survives and re-sends every 3s")
 
     # --- A FAILED SEND MUST NOT DESTROY THE OBLIGATION ---------------------
+    # Relocated with the send (#3318): the obligation is now a RECORD in
+    # access.json, not a marker file — same guarantee, different owner.
     canonical, legacy = _dirs("fail")
     (canonical / "9004").write_text("555000444")
     sends = []
     _run_one_pass(canonical, sends, fail=True)
-    kept = list(canonical.rglob("9004"))
-    check("a failed send LEAVES the marker recoverable", bool(kept),
-          "marker DELETED — the record that a confirmation is owed is gone")
-    # Unconditional: nesting this under `if kept:` would let it vanish silently
-    # in exactly the run where it matters. (@Sutando-Mini's mutation-rule part 3.)
-    check("  ...quarantined under undelivered/, not left to re-poll every 3s",
-          bool(kept) and kept[0].parent.name == "undelivered",
-          f"found at {kept[0] if kept else '<nowhere>'}")
-    check("  ...body preserved", bool(kept) and kept[0].read_text() == "555000444",
-          f"content changed: {kept[0].read_text() if kept else None!r}")
+    doc = json.loads((canonical.parent / "access.json").read_text())
+    owed = dict(doc.get("pendingNotify", {}))
+    owed.update(doc.get("notifyFailed", {}))
+    check("a failed send LEAVES the obligation recorded", "9004" in owed,
+          f"obligation lost — pendingNotify={doc.get('pendingNotify')} "
+          f"notifyFailed={doc.get('notifyFailed')}")
+    check("  ...with the chat_id preserved", owed.get("9004") == "555000444",
+          f"chat_id changed: {owed.get('9004')!r}")
     check("  ...and no send was recorded", not sends, f"sends={sends}")
+    check("  ...and the marker was consumed, not re-polled every 3s",
+          not (canonical / "9004").exists(),
+          "the marker survives adoption and would be adopted again forever")
 
-    # --- QUARANTINE IS STABLE ACROSS PASSES --------------------------------
-    # @Sutando-Mini reviewing #2630: `if not f.is_file(): continue` is what keeps
-    # `undelivered/` out of the poll, so it is load-bearing for the quarantine
-    # claim — and NOTHING pinned it. They removed the guard and the suite stayed
-    # rc=0, 13/13, zero failures. A structural piece every other part of this fix
-    # has a control for.
-    #
-    # The discriminating case is the SECOND pass, not the first: the directory
-    # only exists once something has been quarantined. Without the guard,
-    # `undelivered` is read as a marker named "undelivered", `read_text()` raises
-    # IsADirectoryError, and the handler tries to rename the directory into
-    # itself — so the assertion is that the quarantined body is still exactly
-    # where the first pass left it, and that nothing was sent for it.
+    # --- undelivered/ IS STILL NEVER TREATED AS A MARKER -------------------
+    # Only the LOG shows this breaking, and only once the dir already exists.
+    canonical, legacy = _dirs("quardir")
+    (canonical / "undelivered").mkdir()
+    (canonical / "9009").write_text("555000999")
     sends, log = [], []
-    _run_one_pass(canonical, sends, log=log)   # same box, undelivered/ now exists
-    still = canonical / "undelivered" / "9004"
-    check("a SECOND pass leaves the quarantined marker exactly where it was",
-          still.is_file() and still.read_text() == "555000444",
-          f"undelivered/ contents now: "
-          f"{[q.name for q in (canonical / 'undelivered').iterdir()] if (canonical / 'undelivered').exists() else '<gone>'}")
-    # ASSERT ON THE LOG, deliberately. My first version of this control checked
-    # the filesystem — that the quarantined body was untouched and no send
-    # happened — and it was VACUOUS: with the guard removed, `undelivered` is
-    # read as a marker, `read_text()` raises IsADirectoryError, the handler tries
-    # `undelivered.rename(undelivered/undelivered)`, the OS refuses, and the
-    # last-resort branch leaves everything exactly as it was. Identical
-    # filesystem, rc=0, 15/15. The ONLY trace is the log, because the defect IS
-    # log noise — every 3s, forever, for a directory that is not a marker.
-    check("  ...and undelivered/ is never TREATED as a marker",
-          "approval to undelivered" not in "".join(log),
+    _run_one_pass(canonical, sends, log=log)
+    # Match the token the FAILURE path prints. One only the success path emits
+    # is absent either way, which is a control that cannot fail.
+    check("undelivered/ is never TREATED as a marker",
+          "approval to undelivered" not in "".join(log)
+          and "for undelivered" not in "".join(log),
           "the quarantine dir entered the poll: " +
-          next((ln for ln in "".join(log).splitlines() if "undelivered:" in ln), "?"))
+          next((ln for ln in "".join(log).splitlines() if "undelivered" in ln), "?"))
+    check("  ...and the real marker beside it still delivers",
+          any(c == 555000999 for c, _ in sends), f"sends={sends}")
 
     # --- one bad entry must not abort the rest of the scan -----------------
     # The read used to sit in the OUTER try, so an unreadable entry ended the
@@ -293,24 +290,23 @@ def main() -> int:
     check("an absent candidate dir is skipped, and the present one still delivers",
           any(c == 555000777 for c, _ in sends), f"sends={sends}")
 
-    # (b) The quarantine itself fails. `undelivered` is created as a FILE, so
-    #     `mkdir(exist_ok=True)` raises FileExistsError — a plausible real state
-    #     (a stray file, a name collision), no monkeypatching. The whole
-    #     guarantee is "noise is recoverable, deletion is not", and this is the
-    #     branch that has to hold it up.
+    # (b) Adopt fails AND quarantine fails: a corrupt access.json makes
+    #     mutate_access_file a silent no-op, and `undelivered` is a FILE.
     canonical, legacy = _dirs("noquar")
     (canonical / "9008").write_text("555000888")
     (canonical / "undelivered").write_text("not a directory")
     sends, log = [], []
-    _run_one_pass(canonical, sends, fail=True, log=log)
-    check("quarantine ALSO fails -> the marker is still left in place",
+    _run_one_pass(canonical, sends, log=log, corrupt=True)
+    check("adopt fails + quarantine fails -> the marker is still left in place",
           (canonical / "9008").is_file(),
           "deleted despite the whole point being not to delete")
     check("  ...body intact on the last-resort path",
-          (canonical / "9008").read_text() == "555000888", "content lost")
+          (canonical / "9008").is_file()
+          and (canonical / "9008").read_text() == "555000888", "content lost")
     check("  ...and it says it did not lose the file",
           "leaving it in place rather than losing it" in "".join(log),
           "the log does not distinguish kept-vs-dropped")
+    check("  ...and nothing was sent for it", not sends, f"sends={sends}")
 
     # --- hermeticity, asserted rather than assumed -------------------------
     live_after = [sorted(p.iterdir()) if p.exists() else None for p in _LIVE]

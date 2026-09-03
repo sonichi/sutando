@@ -37,6 +37,7 @@ class PollProgressTest(unittest.TestCase):
         # Reset module progress state
         tg._progress_msgs.clear()
         tg.pending_task_tiers.clear()
+        tg.pending_task_private.clear()
         # Capture api() calls; sendMessage returns a fake message_id
         self.calls = []
         self._mid = 1000
@@ -75,6 +76,7 @@ class PollProgressTest(unittest.TestCase):
     def test_placeholder_after_threshold_owner(self):
         tid = self._task_id(age_s=12)  # > 8s
         tg.pending_task_tiers[tid] = "owner"
+        tg.pending_task_private[tid] = True  # 1:1 DM — step text is permitted here
         tg.poll_progress({tid: 555})
         self.assertIn("sendMessage", self._methods())
         self.assertIn(tid, tg._progress_msgs)
@@ -147,14 +149,69 @@ class PollProgressTest(unittest.TestCase):
         self.assertNotIn(tid, tg.pending_task_tiers)
 
     def test_idle_core_yields_generic_label(self):
-        # If the core is idle (no step), placeholder still posts a generic "working…"
+        # Pinned to a DM on purpose: with the audience unset the step is withheld
+        # anyway, so this would pass without exercising the idle path.
         self._write_status("idle", "")
         tid = self._task_id(age_s=12)
         tg.pending_task_tiers[tid] = "owner"
+        tg.pending_task_private[tid] = True
         tg.poll_progress({tid: 555})
         send = next((p for m, p in self.calls if m == "sendMessage"), None)
         self.assertIsNotNone(send)
         self.assertIn("working", send["text"].lower())
+
+    # --- audience gate: the step is for DMs, not group/supergroup/channel ---
+    # The allowlist gates the SENDER; that sender can address the bot from a group.
+
+    def test_group_chat_gets_placeholder_but_never_the_step(self):
+        tid = self._task_id(age_s=12)
+        tg.pending_task_tiers[tid] = "owner"
+        tg.pending_task_private[tid] = False  # group/supergroup/channel
+        tg.poll_progress({tid: 555})
+        send = next((p for m, p in self.calls if m == "sendMessage"), None)
+        self.assertIsNotNone(send, "liveness placeholder must still post in a group")
+        # The disclosure: the private step text must NOT appear...
+        self.assertNotIn("Researching flights", send["text"])
+        # ...but the contentless liveness signal must, so we did not just go dark.
+        self.assertIn("working", send["text"].lower())
+
+    def test_unknown_audience_fails_closed(self):
+        # The audience map is in-memory only, so a recovered task has an unknown
+        # audience and must degrade to contentless.
+        tid = self._task_id(age_s=12)
+        tg.pending_task_tiers[tid] = "owner"
+        # pending_task_private deliberately NOT set
+        tg.poll_progress({tid: 555})
+        send = next((p for m, p in self.calls if m == "sendMessage"), None)
+        self.assertIsNotNone(send)
+        self.assertNotIn("Researching flights", send["text"])
+
+    def test_edit_path_also_withholds_the_step(self):
+        # Both render sites are gated: the placeholder is EDITED in place every
+        # few seconds, so gating only the initial send would still leak on edit.
+        tid = self._task_id(age_s=12)
+        tg.pending_task_tiers[tid] = "owner"
+        tg.pending_task_private[tid] = False
+        tg.poll_progress({tid: 555})            # initial send
+        info = tg._progress_msgs[tid]
+        info["last_edit"] = 0                   # force the edit branch
+        self._write_status("running", "SENSITIVE-STEP-TEXT")
+        tg.poll_progress({tid: 555})
+        edits = [p for m, p in self.calls if m == "editMessageText"]
+        for e in edits:
+            self.assertNotIn("SENSITIVE-STEP-TEXT", e["text"])
+
+    def test_private_flag_is_gc_d_and_cleared(self):
+        tid = self._task_id(age_s=12)
+        tg.pending_task_tiers[tid] = "owner"
+        tg.pending_task_private[tid] = True
+        tg._clear_progress(tid)
+        self.assertNotIn(tid, tg.pending_task_private)
+        # and the GC sweep drops it for a task that never got a placeholder
+        tid2 = self._task_id(age_s=2)
+        tg.pending_task_private[tid2] = True
+        tg.poll_progress({})
+        self.assertNotIn(tid2, tg.pending_task_private)
 
 
 if __name__ == "__main__":

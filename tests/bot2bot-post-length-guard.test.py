@@ -97,23 +97,17 @@ def main() -> int:
     # absence of an exception — which would also hold if post() returned early
     # for some unrelated reason.
     calls: list[str] = []
-    _orig_urlopen = post_mod.urllib.request.urlopen
+    _orig_client = post_mod._client
 
-    class _Resp:
-        def read(self):
-            return b'{"id":"STUB"}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    def _recording_urlopen(req, timeout=None):
+    def _recording_transport(req, timeout):
         calls.append(getattr(req, "full_url", "?"))
-        return _Resp()
+        return 200, {"id": "STUB"}
 
-    post_mod.urllib.request.urlopen = _recording_urlopen
+    # The PRODUCTION DiscordRestClient stays in the loop; only its transport
+    # is scripted, so "did not send" is observed at the real chokepoint.
+    from channels.discord.client import DiscordRestClient
+    post_mod._client = lambda token: DiscordRestClient(
+        token, transport=_recording_transport)
     try:
         raised = ""
         try:
@@ -140,7 +134,7 @@ def main() -> int:
         check("POSITIVE CONTROL — a normal message DOES reach the network",
               len(calls) == 1, f"calls={calls}")
     finally:
-        post_mod.urllib.request.urlopen = _orig_urlopen
+        post_mod._client = _orig_client
 
     print()
     if FAILURES:

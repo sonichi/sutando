@@ -27,10 +27,14 @@ observer; it starts nothing and kills nothing.
 import json
 import math
 import os
+import tempfile
 import socket
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 
 SESSION = "sutando-core"
 TMUX_SOCKET = os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock")
@@ -189,13 +193,9 @@ def _run(cmd):
 
 
 def _core_running():
-    # rc None = the probe itself could not run (tmux absent / PATH broken) → that
-    # is UNKNOWN, not "not running". A real has-session miss returns rc 1, which
-    # stays False. (qingyun CR on #2527: probe-unavailable must not be a down-vote.)
-    rc, _ = _run(["tmux", "-S", TMUX_SOCKET, "has-session", "-t", SESSION])
-    if rc is None:
-        return None
-    return rc == 0
+    # None = unobserved (tmux absent, hung, or a client the server refused) and
+    # never a down-vote; only a server that answered "no session" is False.
+    return _tmux_has_session(TMUX_SOCKET, SESSION, timeout=8)
 
 
 def _gateway_configured():
@@ -334,14 +334,36 @@ def _read_station_cache(path):
 
 
 def _write_station_cache(path, data):
+    # Shared state on the derive() hot path, so it takes the same unique-staging
+    # contract; best-effort stays the caller's policy, not the writer's.
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
+        _write_json_atomic(path, data)
     except OSError:
         pass
+
+
+def _write_json_atomic(path, obj):
+    """`open(path, "w")` truncates before it writes, so a reader polling in that
+    window sees an empty or partial file. Swap a fully-written temp file in.
+
+    The staging name must be UNIQUE per writer: a fixed `<path>.tmp` is itself
+    shared state, and this module is an on-demand one-shot, so two callers can
+    truncate the same staging inode, write through separate descriptors and race
+    os.replace() -- publishing interleaved bytes, or raising ENOENT once the
+    shared path has already moved."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _cache_ts(x):
@@ -629,16 +651,14 @@ def main():
     try:
         state_dir = os.path.join(ws, "state")
         os.makedirs(state_dir, exist_ok=True)
-        with open(os.path.join(state_dir, "runtime-health.json"), "w") as f:
-            json.dump(result, f, indent=2)
+        _write_json_atomic(os.path.join(state_dir, "runtime-health.json"), result)
         # The authoritative verdict (design: docs/design-core-health-verdict.md):
         # same facts as runtime-health.json plus the persistence count the gate
         # needs. Additive — consumers migrate to this file one PR at a time.
         verdict = dict(result)
         verdict["ts"] = int(time.time())
         verdict["confirm"] = _confirm_count(state_dir, result["health"], result["severity"])
-        with open(os.path.join(state_dir, "core-verdict.json"), "w") as f:
-            json.dump(verdict, f, indent=2)
+        _write_json_atomic(os.path.join(state_dir, "core-verdict.json"), verdict)
     except OSError:
         pass
     print(json.dumps(result, indent=2))

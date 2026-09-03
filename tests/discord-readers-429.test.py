@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tests for the Discord reader scripts now that their REST calls route through
-the shared 429-backoff helper (src/discord_http.request_json).
+the shared 429-backoff helper (src/channels/discord/http.py request_json).
 
 Covers:
   * src/discord-read.py         — _fetch wire-in, main() single-page + --until

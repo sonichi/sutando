@@ -105,7 +105,9 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
         return f"bash {REPO / 'src/agent/codex/cli/task-notifier.sh'}"
 
     def expected_notifier(self) -> str:
-        return f"bash {hc._expected_codex_notifier_entrypoint()}"
+        # Quote like tmux does. An unquoted path splits on its spaces, so this
+        # suite failed on any checkout under e.g. ~/Library/Application Support.
+        return f"bash {shlex.quote(str(hc._expected_codex_notifier_entrypoint()))}"
 
     def test_bare_watcher_can_be_green_while_managed_notifier_is_missing(self):
         self.write_local_core()
@@ -117,6 +119,11 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
             ),
             mock.patch.object(
                 hc, "_watcher_trees", return_value={"4200": {"4200", "4242"}}
+            ),
+            # check_task_watcher() returns early when ps is unavailable, so
+            # without this the generic assertion measures the host, not the code.
+            mock.patch.object(
+                hc, "_ps_snapshot", return_value="PID TT STAT TIME COMMAND\n"
             ),
             mock.patch.object(hc, "_run_tmux", side_effect=tmux),
         ):

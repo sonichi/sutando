@@ -37,7 +37,7 @@ class _Base(unittest.TestCase):
         self._saved = {n: getattr(gw, n) for n in (
             "TASKS_DIR", "RESULTS_DIR", "ARCHIVE_RESULTS_DIR",
             "UNDELIVERABLE_RESULTS_DIR", "_req", "_delivery_tid", "_log",
-            "_last_orphan_sweep")}
+            "_last_orphan_sweep", "_guarded_result_body")}
         gw.TASKS_DIR = root / "tasks"
         gw.RESULTS_DIR = root / "results"
         gw.ARCHIVE_RESULTS_DIR = gw.RESULTS_DIR / "archive"
@@ -105,15 +105,36 @@ class GenuinelyUndelivered(_Base):
                          "delivered result archived out of results/")
 
     def test_lease_gone_quarantines(self):
+        # The core hides the raw 4xx, so permanence is a bounded-attempts
+        # ceiling: unconfirmed closes retry, then quarantine — never forever.
         self._archived_task()
         self._result()
 
         def gone(m, path, payload=None):
             raise urllib.error.HTTPError(path, 410, "gone", {}, None)
         gw._req = gone
+        for _ in range(gw.MAX_TRANSIENT_ATTEMPTS + 1):
+            self._sweep()
+        q = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.undeliverable-after-retries.*"))
+        self.assertEqual(len(q), 1, "permanent 4xx quarantines after bounded retries")
+        self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists())
+
+    def test_ok_false_refusal_keeps_result_and_never_archives(self):
+        # A 2xx {"ok": false} is a REFUSED close, not a delivery: the sweep
+        # must retain the only retryable copy instead of archiving it.
+        self._archived_task()
+        self._result("[no-send]\nDECLINE_SENTINEL")
+        gw._req = lambda m, path, payload=None: {"ok": False}
         self._sweep()
-        q = list(gw.UNDELIVERABLE_RESULTS_DIR.glob(f"{TID}.lease-gone.*"))
-        self.assertEqual(len(q), 1, "permanent 4xx quarantines, never retries forever")
+        self.assertTrue((gw.RESULTS_DIR / f"{TID}.txt").exists(),
+                        "refused close must keep its retryable result")
+        self.assertFalse(any("recovered + delivered" in l for l in self.logs),
+                         "a refused close must not log as delivered")
+        # And the successful retry archives through the same gate.
+        gw._req = lambda m, path, payload=None: {"ok": True}
+        self._sweep()
+        self.assertFalse((gw.RESULTS_DIR / f"{TID}.txt").exists(),
+                         "confirmed retry archives")
 
     def test_network_error_leaves_for_next_sweep(self):
         self._archived_task()
@@ -161,13 +182,25 @@ class MarkerParity(_Base):
         t.write_text(f"id: {TID}\ntask: hi\n")
         _age(t, OLD)
 
-    def test_no_send_orphan_posts_verbatim_so_server_suppresses(self):
+    def test_suppressed_orphan_closes_the_lease_and_moves_no_data(self):
+        """A suppression marker moves no data — recovery is no exception.
+
+        This used to post the file VERBATIM, so the sender's prose rode the
+        wire on the recovery path while the ordinary path sent only the
+        canonical close. The old assertion could not see it: it checked that
+        `[no-send]` was present, which is true of the body AND of the close.
+        """
         self._archived_task()
-        self._result("[no-send]\ninternal only")
+        self._result("[no-send]\nSENSITIVE_SENTINEL")
         self._sweep()
         self.assertEqual(len(self.posted), 1, "lease still closes via POST")
-        body = self.posted[0][2]["body"]
+        payload = self.posted[0][2]
+        body = payload["body"]
         self.assertIn("[no-send]", body, "marker must reach the server intact")
+        self.assertNotIn("SENSITIVE_SENTINEL", body,
+                         "the sender's prose rode a suppressed close")
+        self.assertTrue(payload.get("no_send"),
+                        "a suppressed close must gate delivery server-side")
         self.assertNotIn("recovered result", body,
                          "a suppressed result gets no user-facing label")
 
@@ -223,8 +256,8 @@ class WriteTaskSharedPredicate(_Base):
         d = gw.ARCHIVE_RESULTS_DIR / "2026-08"
         d.mkdir(parents=True)
         (d / f"{TID}.txt").write_text("the reply")
-        tid = gw._write_task({"id": TID, "task": "hi", "source": "ag2space"})
-        self.assertEqual(tid, TID)
+        written = gw._write_task({"id": TID, "task": "hi", "source": "ag2space"})
+        self.assertEqual(written, (TID, True))
         self.assertFalse((gw.TASKS_DIR / f"{TID}.txt").exists(),
                          "already-handled redelivery must not re-queue")
         self.assertIn("[no-send]", (gw.RESULTS_DIR / f"{TID}.txt").read_text())
@@ -380,6 +413,74 @@ class AbandonedHardening(_Base):
                              "old archived task: normal abandoned-drop applies")
         finally:
             gw._save_inflight = self._saved_save
+
+    def _pending_probe(self, name):
+        """Same two passes, with `name` pending in tasks/."""
+        (gw.TASKS_DIR / name).write_text("id: x\n")
+        self._saved_save = gw._save_inflight
+        gw._save_inflight = lambda s: None
+        try:
+            return self._drop_probe()
+        finally:
+            gw._save_inflight = self._saved_save
+
+    def test_every_pooled_pending_state_keeps_the_id(self):
+        # The pool renames a task through three names. A state the reconciler
+        # cannot see reads as abandoned, and the reply is dropped mid-flight.
+        for name in (f"{TID}.txt",
+                     f"{TID}.assigned-core-2.txt",
+                     f"{TID}.claimed-core-2.txt"):
+            with self.subTest(pending=name):
+                self.assertTrue(
+                    self._pending_probe(name),
+                    f"{name} is live work, not an abandoned id")
+            (gw.TASKS_DIR / name).unlink()
+
+    def test_nothing_pending_still_drops(self):
+        # The control: without it the test above passes on a reconciler that
+        # never drops anything at all.
+        self._saved_save = gw._save_inflight
+        gw._save_inflight = lambda s: None
+        try:
+            self.assertFalse(self._drop_probe())
+        finally:
+            gw._save_inflight = self._saved_save
+
+
+class GuardDelegation(_Base):
+    """Recovery runs the SAME guard as ordinary delivery, and obeys its answer."""
+
+    def _archived_task(self):
+        d = gw.TASKS_DIR / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        t = d / f"{TID}.txt"
+        t.write_text(f"id: {TID}\ntask: hi\n")
+        _age(t, OLD)
+
+    def test_guard_unavailable_leaves_the_orphan_for_retry(self):
+        """(None, reason) means the guard could not load. Delivering anyway
+        would honour markers on unscanned non-owner output."""
+        self._archived_task()
+        self._result("the reply")
+        gw._guarded_result_body = lambda tid, body: (None, "guard unavailable")
+        self._sweep()
+        self.assertEqual(self.posted, [], "posted an unguarded orphan result")
+        self.assertTrue((gw.RESULTS_DIR / f"{TID}.txt").exists(),
+                        "the result must survive for the next pass")
+        self.assertTrue(any("guard unavailable" in m for m in self.logs),
+                        "a skipped delivery must say why")
+
+    def test_the_guarded_body_ships_not_the_raw_file(self):
+        self._archived_task()
+        self._result("RAW_SENDER_PROSE")
+        gw._guarded_result_body = lambda tid, body: ("guarded replacement", "tier=team")
+        self._sweep()
+        self.assertEqual(len(self.posted), 1)
+        body = self.posted[0][2]["body"]
+        self.assertIn("guarded replacement", body, "the guard's body was discarded")
+        self.assertNotIn("RAW_SENDER_PROSE", body, "the raw file bypassed the guard")
+        self.assertTrue(any("tier=team" in m for m in self.logs),
+                        "a withheld reason must be logged")
 
 
 if __name__ == "__main__":

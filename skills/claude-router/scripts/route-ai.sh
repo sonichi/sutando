@@ -5,11 +5,11 @@ usage() {
   cat <<'EOF'
 Usage: route-ai.sh [options] -- [prompt]
 
-Route a prompt to codex or gemini.
+Route a prompt to codex, gemini, or pi.
 
 Options:
-  --check                 Verify both local wrappers are present
-  --engine <name>         Force codex or gemini
+  --check                 Verify the local wrappers are present
+  --engine <name>         Force codex, gemini, or pi
   --dry-run               Print the selected engine and command without running it
   --cd <dir>              Working directory for the delegated run
   --help                  Show this help
@@ -35,6 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILLS_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CODEX_WRAPPER="$SKILLS_DIR/claude-codex/scripts/codex-run.sh"
 GEMINI_WRAPPER="$SKILLS_DIR/claude-gemini/scripts/gemini-run.sh"
+PI_WRAPPER="$SKILLS_DIR/claude-pi/scripts/pi-run.sh"
 
 CHECK=0
 DRY_RUN=0
@@ -80,12 +81,15 @@ done
 
 [[ -x "$CODEX_WRAPPER" ]] || fail "missing Codex wrapper: $CODEX_WRAPPER"
 [[ -x "$GEMINI_WRAPPER" ]] || fail "missing Gemini wrapper: $GEMINI_WRAPPER"
+[[ -x "$PI_WRAPPER" ]] || fail "missing Pi wrapper: $PI_WRAPPER"
 
 if [[ "$CHECK" -eq 1 ]]; then
   echo "codex-wrapper: $CODEX_WRAPPER"
   echo "gemini-wrapper: $GEMINI_WRAPPER"
+  echo "pi-wrapper: $PI_WRAPPER"
   bash "$CODEX_WRAPPER" --check
   bash "$GEMINI_WRAPPER" --check
+  bash "$PI_WRAPPER" --check
   exit 0
 fi
 
@@ -100,6 +104,8 @@ if [[ -z "$ENGINE" ]]; then
     ENGINE="codex"
   elif [[ "$PROMPT_LC" == *"gemini"* ]]; then
     ENGINE="gemini"
+  elif [[ "$PROMPT_LC" == *"kimi"* ]] || [[ "$PROMPT_LC" =~ (^|[^a-z0-9])pi([^a-z0-9]|$) ]]; then
+    ENGINE="pi"
   elif [[ "$PROMPT_LC" == *"review"* ]] || [[ "$PROMPT_LC" == *"diff"* ]] || [[ "$PROMPT_LC" == *"regression"* ]] || [[ "$PROMPT_LC" == *"bug"* ]] || [[ "$PROMPT_LC" == *"implement"* ]] || [[ "$PROMPT_LC" == *"patch"* ]]; then
     ENGINE="codex"
   elif [[ "$PROMPT_LC" == *"architecture"* ]] || [[ "$PROMPT_LC" == *"repo-wide"* ]] || [[ "$PROMPT_LC" == *"entire repo"* ]] || [[ "$PROMPT_LC" == *"whole repo"* ]] || [[ "$PROMPT_LC" == *"trace"* ]] || [[ "$PROMPT_LC" == *"dependency"* ]] || [[ "$PROMPT_LC" == *"dependencies"* ]] || [[ "$PROMPT_LC" == *"summarize"* ]] || [[ "$PROMPT_LC" == *"json"* ]] || [[ "$PROMPT_LC" == *"multimodal"* ]]; then
@@ -115,6 +121,9 @@ case "$ENGINE" in
     ;;
   gemini)
     cmd=(bash "$GEMINI_WRAPPER" --cd "$WORKDIR" --approval-mode plan -- "$PROMPT")
+    ;;
+  pi)
+    cmd=(bash "$PI_WRAPPER" --cd "$WORKDIR" --read-only -- "$PROMPT")
     ;;
   *)
     fail "unsupported engine: $ENGINE"

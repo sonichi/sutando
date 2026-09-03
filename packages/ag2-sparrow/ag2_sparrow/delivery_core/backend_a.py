@@ -18,6 +18,8 @@ class DesignAClaimBackend:
     Reclaim TTL is A's dead-owner recovery window; force-release exists
     (declared) as the administrative-destruction mechanism."""
 
+    persists_receipt_metadata = True   # record_delivered() stores both
+
     capabilities = BackendCapabilities(supports_force_release=True)
 
     def __init__(self, root: Path, reclaim_ttl_s: float = 300.0):
@@ -25,15 +27,21 @@ class DesignAClaimBackend:
         self.reclaim_ttl_s = reclaim_ttl_s
 
     def publish(self, item_id: str, payload: bytes) -> bool:
-        if outbox._item_path(self.root, item_id).exists():
-            return False
-        outbox._write_item(self.root, item_id, {
-            "item_id": item_id,
-            "payload": payload.decode("utf-8", "replace"),
-            "status": "READY",
-            "published_at": time.time(),
-        })
-        return True
+        with outbox._item_lock(self.root, item_id):
+            if outbox._item_path(self.root, item_id).exists():
+                # DELIVERED = completed lifecycle -> fresh cycle (C-parity);
+                # PARKED stays refused: the operator holds it.
+                if outbox._read_item(self.root, item_id).get("status") != "DELIVERED":
+                    return False
+                if outbox.read_delivery_claim(self.root, item_id) is not None:
+                    return False
+            outbox._write_item(self.root, item_id, {
+                "item_id": item_id,
+                "payload": payload.decode("utf-8", "replace"),
+                "status": "READY",
+                "published_at": time.time(),
+            })
+            return True
 
     def _incarnation_of(self, item_id: str) -> Optional[str]:
         """The claim record's non-reusable identity: pid + process birth +
@@ -71,8 +79,17 @@ class DesignAClaimBackend:
             return ClaimToken(item_id=item_id, worker=worker,
                               incarnation=incarnation)
 
+    def is_terminal(self, item_id: str) -> bool:
+        with outbox._item_lock(self.root, item_id):
+            if not outbox._item_path(self.root, item_id).exists():
+                return False
+            return outbox._read_item(
+                self.root, item_id).get("status") in self.TERMINAL
+
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
-                 park_at_attempts: Optional[int] = None) -> bool:
+                 park_at_attempts: Optional[int] = None,
+                 provider: Optional[str] = None,
+                 destination: Optional[str] = None) -> bool:
         item_id = token.item_id
         # Validate -> transition -> retire, all under the item lock: a stale
         # incarnation must not mutate or park its successor's item.
@@ -82,9 +99,8 @@ class DesignAClaimBackend:
                     self._incarnation_of(item_id) != token.incarnation:
                 return False
             if outcome is DeliveryOutcome.CONFIRMED:
-                d = outbox._read_item(self.root, item_id)
-                d["status"] = "DELIVERED"
-                outbox._write_item(self.root, item_id, d)
+                outbox.record_delivered(self.root, item_id,
+                                        provider=provider, destination=destination)
             elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                 outbox.park_item(self.root, item_id, "outcome-unknown")
             else:
