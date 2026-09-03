@@ -187,6 +187,8 @@ def classify(command: str) -> Optional[str]:
         nested = classify(inner)
         if nested is not None:
             return nested
+    # Bodies are settled above; the segment pass must not re-read them as commands.
+    command = _HEREDOC.sub("\n", command)
     for seg in _segments(command):
         if _DISMISSAL.search(seg):
             continue
