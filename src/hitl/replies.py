@@ -81,6 +81,12 @@ class HitlReplyHandler:
         self._workspace = Path(workspace) if workspace is not None else None
         self._log = log
         self.last_path = None  # handler-contract compat (never promotes tasks)
+        # What the most recent offer() did: applied | rejected | ignored (+ reason).
+        self.last_outcome = None
+        self.last_reason = ""
+        # Form task_to_event() last recognised: "click" (hitl_action) or
+        # "fallback" (typed label) — a non-owner's fallback is a MESSAGE.
+        self.last_branch = None
 
     def claims(self, event: Dict[str, Any]) -> bool:
         content = event.get("content") or {}
@@ -92,6 +98,8 @@ class HitlReplyHandler:
         if not self.claims(event):
             return claimed
         actor = str(event.get("actor_id") or "")
+        self.last_outcome = "ignored"
+        self.last_reason = ""
         # AUTHORIZATION — the whole point: only the owner resolves.
         if not self._owner or actor != self._owner:
             self._log(f"hitl: action reply from non-owner {actor or '?'} ignored")
@@ -99,12 +107,17 @@ class HitlReplyHandler:
         reply = parse_reply(event)
         if reply is None:
             self._log("hitl: malformed action reply ignored")
+            self.last_outcome = "rejected"
+            self.last_reason = "malformed action payload"
             return claimed
         try:
             action = self._manager.apply_action(reply)
         except (StaleRequirementError, MalformedActionError) as e:
             self._log(f"hitl: reply for {reply.hitl_id} rejected — {e}")
+            self.last_outcome = "rejected"
+            self.last_reason = str(e)
             return claimed
+        self.last_outcome = "applied"
         note = ""
         if action.kind == TUI_ACTION_KIND and self._workspace is not None:
             req = self._manager.get(reply.hitl_id)
@@ -112,3 +125,66 @@ class HitlReplyHandler:
                 note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
         self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (in_progress{note})")
         return claimed
+
+    # -- task-relay path ---------------------------------------------------------
+
+    def offer_task(self, task: Dict[str, Any]) -> Optional[str]:
+        """A click delivered as a relay TASK, not an event (an owner DM travels
+        only the task relay). Returns "applied" / "rejected" / "ignored" for a
+        click (consumed either way), or None for an ordinary message that stays
+        on the task path. A rejection is the owner's to hear about."""
+        event = self.task_to_event(task)
+        if event is None:
+            return None
+        self.offer(event)
+        return self.last_outcome or "ignored"
+
+    def task_to_event(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Exact form: `hitl_action` (the relay forwards the message's action
+        field). Fallback: a reply to a card's own event whose text is one of
+        that card's action labels — the projection ledger names the card event,
+        so no field is needed. Anything else is not a click."""
+        base = {
+            "type": EVENT_TYPE,
+            "event_id": str(task.get("source_message_id") or task.get("id") or ""),
+            "room_id": task.get("channel_id"),
+            "actor_id": str(task.get("user_id") or ""),
+        }
+        self.last_branch = None
+        payload = task.get("hitl_action")
+        if isinstance(payload, dict):
+            self.last_branch = "click"
+            return {**base, "content": {REPLY_FIELD: dict(payload)}}
+        target = str(task.get("reply_to_event") or "")
+        if not target:
+            return None
+        req = self.requirement_for_event(target)
+        if req is None:
+            return None
+        label = _reply_text(str(task.get("task") or "")).strip().lower()
+        action = next((a for a in req.actions
+                       if a.label.strip().lower() == label or a.id.lower() == label), None)
+        if action is None:
+            return None  # a reply to the card that is not a click stays a message
+        self.last_branch = "fallback"
+        return {**base, "content": {REPLY_FIELD: {
+            "hitl_id": req.id, "expected_revision": req.revision,
+            "action_id": action.id, "guard": req.guard}}}
+
+    def requirement_for_event(self, event_id: str) -> Optional[HumanRequirement]:
+        """The active requirement whose card is `event_id` (CREATE projection;
+        status EDITs keep the same event id, so a reply to any revision maps)."""
+        for req in self._manager.active():
+            if self._manager.projection_target(req.id) == event_id:
+                return req
+        return None
+
+
+REPLY_CONTEXT_END = "[End AG2 Space reply context]"
+
+
+def _reply_text(task_text: str) -> str:
+    """The message text after the relay's quoted reply context. A wrong cut can
+    only fail to match a label (the task then stays a message), never pick one."""
+    head, sep, tail = task_text.rpartition(REPLY_CONTEXT_END)
+    return tail if sep else task_text
