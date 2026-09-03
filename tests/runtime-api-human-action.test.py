@@ -117,6 +117,62 @@ class HumanActionTests(unittest.TestCase):
         self.assertEqual(st["requestId"], rid)
 
 
+class AdapterEdgeTests(unittest.TestCase):
+    """The adapter's own branches, driven without a dispatcher: the free-text
+    decision both ways, expiry, malformed answers, the stale duplicate, and the
+    answer-shape helper's fallbacks (the coverage gate's 12 lines on #3753)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ha = HumanActionAdapter(str(Path(self.tmp.name) / "ha"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _req(self, rid, **params):
+        return {"requestId": rid, "params": params}
+
+    def test_free_text_decision_round_trips_the_typed_answer(self):
+        aid = self.ha.open_elicitation(self._req("r-ft", type="text", question="Your name?"))
+        req = self.ha.manager.get(aid)
+        self.assertEqual([(a.id, a.kind, a.label) for a in req.actions], [("answer", "free_text", "Answer")])
+        self.assertIn("expires_at", req.to_wire())
+        self.ha.resolve(aid, {"1": "Alice"}, "@owner:x")
+        self.assertEqual(self.ha.poll_resolution(aid), ("resolved", {"1": "Alice"}, "@owner:x"))
+
+    def test_an_expired_requirement_reports_expired_on_every_poll(self):
+        r = self._req("r-exp", action="x"); r["expiresAt"] = 1.0
+        aid = self.ha.open_approval(r)
+        self.assertEqual(self.ha.poll_resolution(aid), ("expired", None, None))
+        status, answers, _by = self.ha.poll_resolution(aid)
+        self.assertEqual((status, answers), ("expired", None))
+
+    def test_resolve_refuses_an_unknown_requirement_and_a_bad_index(self):
+        from hitl.schema import MalformedActionError
+        with self.assertRaises(MalformedActionError):
+            self.ha.resolve("ha-nope", {"1": [1]}, "@owner:x")
+        aid = self.ha.open_approval(self._req("r-idx", action="x"))
+        with self.assertRaises(MalformedActionError):
+            self.ha.resolve(aid, {"1": [9]}, "@owner:x")
+        with self.assertRaises(MalformedActionError):
+            self.ha.resolve(aid, {"1": "Maybe"}, "@owner:x")
+
+    def test_a_duplicate_answer_is_swallowed_not_raised(self):
+        aid = self.ha.open_approval(self._req("r-dup", action="x"))
+        self.ha.resolve(aid, {"1": [1]}, "@owner:x")
+        self.assertIsNone(self.ha.resolve(aid, {"1": [2]}, "@owner:x"))
+        self.assertEqual(self.ha.poll_resolution(aid)[0], "resolved")
+        self.assertEqual(self.ha.manager.get(aid).chosen_action, "approve")
+
+    def test_answer_shape_fallbacks(self):
+        aid = self.ha.open_approval(self._req("r-shape", action="x"))
+        req = self.ha.manager.get(aid)
+        req.chosen_action = "ghost"; req.answer = None
+        self.assertEqual(self.ha._answers(req), {})
+        req.chosen_action = "approve"; req.subject["options"] = []
+        self.assertEqual(self.ha._answers(req), {"1": "Approve"})
+
+
 class ProductionComposedSettleTests(unittest.TestCase):
     """The control that matters: the dispatcher the SHIPPED server composes,
     reached the way `RuntimeServer.client()` reaches it. A hand-built
