@@ -8,6 +8,10 @@ in the output distinguishes the artifact from a finding.
 
 Run: python3 tests/arm-test-distinct-revisions.test.py
 """
+import contextlib
+import importlib.util
+import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -26,31 +30,67 @@ def git(cwd, *args):
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
 
 
+def _repo() -> str:
+    """A throwaway two-commit repo whose test passes only at the second."""
+    d = Path(tempfile.mkdtemp())
+    git(d, "init", "-q", ".")
+    git(d, "config", "user.email", "t@t")
+    git(d, "config", "user.name", "t")
+    (d / "src").mkdir(exist_ok=True)
+    (d / "tests").mkdir(exist_ok=True)
+    (d / "src" / "m.py").write_text("VALUE = 1\n")
+    (d / "tests" / "t.py").write_text(
+        "import sys, importlib.util\n"
+        "s = importlib.util.spec_from_file_location('m', 'src/m.py')\n"
+        "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+        "print('OK' if m.VALUE == 2 else 'FAILED')\n"
+        "sys.exit(0 if m.VALUE == 2 else 1)\n")
+    git(d, "add", "-A")
+    git(d, "commit", "-qm", "base")
+    (d / "src" / "m.py").write_text("VALUE = 2\n")
+    git(d, "add", "src/m.py")
+    git(d, "commit", "-qm", "fix")
+    return str(d)
+
+
+class _Result:
+    def __init__(self, rc, stdout, stderr):
+        self.returncode, self.stdout, self.stderr = rc, stdout, stderr
+
+
+def _load_arm():
+    spec = importlib.util.spec_from_file_location("arm_test", ARM)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TestArming(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = _repo()
         d = Path(self.tmp)
-        git(d, "init", "-q", ".")
-        git(d, "config", "user.email", "t@t")
-        git(d, "config", "user.name", "t")
-        (d / "src").mkdir()
-        (d / "tests").mkdir()
-        (d / "src" / "m.py").write_text("VALUE = 1\n")
-        (d / "tests" / "t.py").write_text(
-            "import sys, importlib.util\n"
-            "s = importlib.util.spec_from_file_location('m', 'src/m.py')\n"
-            "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
-            "print('OK' if m.VALUE == 2 else 'FAILED')\n"
-            "sys.exit(0 if m.VALUE == 2 else 1)\n")
-        git(d, "add", "-A")
-        git(d, "commit", "-qm", "base")
-        self.base = git(d, "rev-parse", "HEAD").stdout.strip()
-        (d / "src" / "m.py").write_text("VALUE = 2\n")
-        git(d, "add", "src/m.py")
-        git(d, "commit", "-qm", "fix")
+        self.base = git(d, "rev-parse", "HEAD~1").stdout.strip()
         self.head = git(d, "rev-parse", "HEAD").stdout.strip()
 
     def _run(self, *extra):
+        """Drive main() IN-PROCESS.
+
+        A subprocess CLI is invisible to coverage (`concurrency = multiprocessing`
+        in .coveragerc does not follow an arbitrary child), so a suite built only
+        on subprocesses reports 0% on the file it exercises most.
+        """
+        out, err = io.StringIO(), io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = _load_arm().main(["tests/t.py", "--file", "src/m.py", *extra])
+        finally:
+            os.chdir(cwd)
+        return _Result(rc, out.getvalue(), err.getvalue())
+
+    def _run_cli(self, *extra):
+        """The real CLI, for the contract in-process calls cannot check."""
         return subprocess.run(
             [sys.executable, str(ARM), "tests/t.py", "--file", "src/m.py", *extra],
             cwd=self.tmp, capture_output=True, text=True)
@@ -123,6 +163,75 @@ class TestArming(unittest.TestCase):
         self.assertIn("does not resolve", r.stderr)
         self.assertIn("SKIPPED", r.stderr)
         self.assertIn(self.head[:9], r.stdout)
+
+
+class TestRefusalsInProcess(unittest.TestCase):
+    """The error paths, in-process so coverage sees them."""
+
+    def setUp(self):
+        self.tmp = _repo()
+
+    def _main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = _load_arm().main(list(argv))
+        finally:
+            os.chdir(cwd)
+        return _Result(rc, out.getvalue(), err.getvalue())
+
+    def test_a_missing_file_is_named_and_exits_1(self):
+        r = self._main("tests/t.py", "--file", "src/nope.py", "--rev", "HEAD")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is not a file", r.stderr)
+
+    def test_an_unreadable_blob_skips_that_arm_without_crashing(self):
+        arm = _load_arm()
+        real = arm._git
+
+        def cat_file_fails(*args):
+            if args and args[0] == "cat-file":
+                return None
+            return real(*args)
+        arm._git = cat_file_fails
+        out, err = io.StringIO(), io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = arm.main(["tests/t.py", "--file", "src/m.py",
+                               "--rev", "HEAD", "--no-worktree-arm"])
+        finally:
+            os.chdir(cwd)
+            arm._git = real
+        self.assertIn("could not read blob", err.getvalue())
+        self.assertIn("SKIPPED", err.getvalue())
+        self.assertEqual(rc, 0)
+
+
+class TestTheRealCli(unittest.TestCase):
+    """One end-to-end run: in-process calls cannot check argv parsing or exit."""
+
+    def setUp(self):
+        self.tmp = _repo()
+
+    def test_the_cli_exits_2_on_a_self_comparison(self):
+        r = subprocess.run(
+            [sys.executable, str(ARM), "tests/t.py", "--file", "src/m.py",
+             "--rev", "HEAD", "--rev", "HEAD", "--no-worktree-arm"],
+            cwd=self.tmp, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("NOT A COMPARISON", r.stderr)
+
+    def test_the_cli_exits_1_when_the_file_is_missing(self):
+        r = subprocess.run(
+            [sys.executable, str(ARM), "tests/t.py", "--file", "src/nope.py",
+             "--rev", "HEAD"],
+            cwd=self.tmp, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("is not a file", r.stderr)
 
 
 if __name__ == "__main__":
