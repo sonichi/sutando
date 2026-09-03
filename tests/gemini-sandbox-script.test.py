@@ -2,7 +2,9 @@
 """gemini-sandbox.sh keeps codex's `-o FILE -- PROMPT` contract, with a fake gemini
 on PATH so nothing here needs a key or the network.
 
-  - the final answer, and only it, lands in FILE
+  - the assistant text, and only it, lands in FILE
+  - events reach stderr as they arrive, and a heartbeat when they do not, which is what
+    the bounded runner watches; a quiet run is not a dead one
   - a nonzero gemini exit is forwarded and FILE is not written
   - exit 0 with an empty answer writes no file and exits 0 (Stage 2 no-output)
   - an error object, or a non-JSON body, is a failure even on exit 0
@@ -37,12 +39,14 @@ printf '%s\n' "$@" > "$FAKE_GEMINI_ARGS"
 cat > "$FAKE_GEMINI_STDIN"
 pwd > "$FAKE_GEMINI_PWD"
 printf '%s\n' "$HOME" > "$FAKE_GEMINI_HOME"
+# stream-json: newline delimited events, which is what the stall watchdog needs to see.
 case "${FAKE_GEMINI_MODE:-ok}" in
-  ok)      printf '{"response": "The answer is 42.\\nSecond line.", "stats": {"x": 1}}' ;;
-  empty)   printf '{"response": "   ", "stats": {}}' ;;
-  error)   printf '{"response": "", "error": {"type": "Quota", "message": "rate limited"}}' ;;
-  garbage) printf 'not json at all' ;;
+  ok)      printf '{"type":"init"}\n{"type":"message","role":"assistant","content":"The answer is 42.\\nSecond line."}\n{"type":"result","status":"success"}\n' ;;
+  empty)   printf '{"type":"init"}\n{"type":"message","role":"assistant","content":"   "}\n{"type":"result","status":"success"}\n' ;;
+  error)   printf '{"type":"init"}\n{"type":"result","status":"error","error":{"type":"Quota","message":"rate limited"}}\n' ;;
+  garbage) printf 'not json at all\n' ;;
   fail)    echo "boom" >&2; exit 3 ;;
+  slow)    printf '{"type":"init"}\n'; sleep "${FAKE_GEMINI_SLEEP:-6}"; printf '{"type":"message","role":"assistant","content":"late but complete"}\n{"type":"result","status":"success"}\n' ;;
 esac
 ''')
 fake.chmod(0o755)
@@ -77,7 +81,8 @@ args = (tmp / "args").read_text().splitlines()
 check(args[:2] == ["--prompt", "What is the answer?"], "the prompt reaches gemini verbatim, joined by spaces")
 check("--approval-mode" in args and args[args.index("--approval-mode") + 1] == "plan", "plan mode, no edits")
 check("--sandbox" in args, "sandboxed")
-check("--output-format" in args and args[args.index("--output-format") + 1] == "json", "json output")
+check("--output-format" in args and args[args.index("--output-format") + 1] == "stream-json",
+      "streaming output, so the stall watchdog sees the run working")
 check((tmp / "stdin").read_text() == "", "stdin is closed, so gemini cannot wait on it")
 check(os.path.realpath((tmp / "pwd").read_text().strip()) == os.path.realpath(str(work)), "runs in --cd")
 
@@ -86,12 +91,44 @@ check(seen_home != os.environ.get("HOME") and "gemini-sandbox-home." in seen_hom
       "with GEMINI_API_KEY set the run gets a fresh empty HOME, not the user's")
 check(not pathlib.Path(seen_home).exists(), "and that HOME is removed when the run ends")
 
+# Every key based auth scrubs HOME, not only GEMINI_API_KEY.
+base_env = {k: v for k, v in env.items() if k not in ("GEMINI_API_KEY", "GOOGLE_API_KEY",
+                                                       "GOOGLE_APPLICATION_CREDENTIALS",
+                                                       "GEMINI_SANDBOX_AUTH_HOME")}
+for var in ("GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"):
+    r_key = subprocess.run(["bash", str(SCRIPT), "--cd", str(work), "-o", str(tmp / f"{var}.txt"), "--", "hi"],
+                           env={**base_env, "FAKE_GEMINI_MODE": "ok", var: "x"},
+                           capture_output=True, text=True)
+    seen = (tmp / "home").read_text().strip()
+    check(r_key.returncode == 0 and seen != os.environ.get("HOME") and "gemini-sandbox-home." in seen,
+          f"{var} alone also gets a fresh empty HOME")
+
+# OAuth: an isolated auth home is used as HOME, and without one the run is refused.
+auth_home = tmp / "auth-home"
+auth_home.mkdir()
+r_auth = subprocess.run(["bash", str(SCRIPT), "--cd", str(work), "-o", str(tmp / "auth.txt"), "--", "hi"],
+                        env={**base_env, "FAKE_GEMINI_MODE": "ok", "GEMINI_SANDBOX_AUTH_HOME": str(auth_home)},
+                        capture_output=True, text=True)
+check(r_auth.returncode == 0 and os.path.realpath((tmp / "home").read_text().strip()) == os.path.realpath(str(auth_home))
+      and "GEMINI_SANDBOX_AUTH_HOME" in r_auth.stderr,
+      "with no key, GEMINI_SANDBOX_AUTH_HOME is used as HOME and stderr says so")
 r_nokey = subprocess.run(["bash", str(SCRIPT), "--cd", str(work), "-o", str(tmp / "nokey.txt"), "--", "hi"],
-                         env={k: v for k, v in {**env, "FAKE_GEMINI_MODE": "ok"}.items() if k != "GEMINI_API_KEY"},
-                         capture_output=True, text=True)
-check(r_nokey.returncode == 0 and (tmp / "home").read_text().strip() == os.environ.get("HOME")
-      and "keeping HOME" in r_nokey.stderr,
-      "without the key HOME is kept for the CLI's own auth, and stderr says so")
+                         env={**base_env, "FAKE_GEMINI_MODE": "ok"}, capture_output=True, text=True)
+check(r_nokey.returncode == 2 and not (tmp / "nokey.txt").exists() and "refusing" in r_nokey.stderr,
+      "with no key and no auth home the run is refused, never run with the owner's HOME")
+
+# Through the real bounded runner with a short stall: a gemini quiet for longer than
+# the stall must still land its answer, because the heartbeat is what the runner sees.
+BOUNDED = REPO / "skills" / "claude-codex" / "scripts" / "codex-bounded.sh"
+slow_out = tmp / "slow.txt"
+r_slow = subprocess.run(["bash", str(BOUNDED), "--stall", "2", "--max", "60", "--",
+                         "bash", str(SCRIPT), "--cd", str(work), "-o", str(slow_out), "--", "take your time"],
+                        env={**env, "FAKE_GEMINI_MODE": "slow", "FAKE_GEMINI_SLEEP": "6",
+                             "GEMINI_SANDBOX_HEARTBEAT": "1"},
+                        capture_output=True, text=True, timeout=120)
+check(r_slow.returncode == 0 and slow_out.exists() and slow_out.read_text().strip() == "late but complete",
+      "a gemini quiet for longer than the stall guard still lands its answer, rc 0 not 125")
+check("waiting" in r_slow.stderr, "the heartbeat is what kept it alive, and it is visible")
 
 # A PATH with everything the script needs and no container runtime at all. /usr/bin
 # cannot be on it: GitHub's Linux runners ship /usr/bin/docker.
@@ -123,7 +160,8 @@ r, out = run("error")
 check(r.returncode == 1 and not out.exists() and "rate limited" in r.stderr, "an error object on exit 0 is a failure, named on stderr")
 
 r, out = run("garbage")
-check(r.returncode == 1 and not out.exists(), "a non-JSON body is a failure")
+check(r.returncode == 0 and not out.exists(),
+      "an unparsable event is noted and skipped, and a run that produced no assistant text writes no file")
 
 r, out = run("ok", "--model", "gemini-2.5-flash")
 args = (tmp / "args").read_text().splitlines()

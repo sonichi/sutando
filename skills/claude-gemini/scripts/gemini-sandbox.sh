@@ -13,9 +13,12 @@
 #
 # Usage: gemini-sandbox.sh --cd DIR -o FILE [--model M] -- PROMPT...
 #
-# Env: GEMINI_API_KEY (or whatever auth the gemini CLI is configured with).
-#      With the key set, the run gets a fresh empty HOME so no user-level
-#      ~/.gemini state reaches a non-owner task.
+# Env: GEMINI_API_KEY, GOOGLE_API_KEY or GOOGLE_APPLICATION_CREDENTIALS: key based
+#      auth, and the run gets a fresh empty HOME so no user-level ~/.gemini state
+#      reaches a non-owner task. GEMINI_SANDBOX_AUTH_HOME: a directory holding only
+#      the CLI's OAuth credentials, used as HOME when there is no key. With neither
+#      the script refuses. GEMINI_SANDBOX_HEARTBEAT: seconds between progress lines
+#      while the model is quiet, default 10.
 #      SEATBELT_PROFILE defaults to restrictive-open on macOS: strict file
 #      restrictions, network allowed (the model call needs it). Off macOS the
 #      sandbox needs docker or podman, and the script refuses without one.
@@ -25,7 +28,7 @@ WORKDIR=""
 OUT=""
 MODEL=""
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
 }
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,16 +51,23 @@ if ! command -v gemini >/dev/null 2>&1; then
 fi
 
 # The Gemini CLI reads user-level state from ~/.gemini (GEMINI.md context, history,
-# projects, extensions) whatever the working directory is. A non-owner task must not
-# see any of that, so when the API key is in the environment the child gets a fresh,
-# empty HOME. With no key the user's own ~/.gemini is the only place OAuth
-# credentials can come from, so HOME is kept and that is said on stderr.
-if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+# projects, extensions) whatever the working directory is, and it does so before the
+# sandbox confines anything. A non-owner task must not see any of that.
+#   - key based auth (GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_APPLICATION_CREDENTIALS)
+#     needs nothing from HOME, so the child gets a fresh, empty HOME.
+#   - OAuth lives in ~/.gemini, so it needs a HOME. GEMINI_SANDBOX_AUTH_HOME names a
+#     directory holding only the credentials for this purpose, and it is used as HOME.
+#   - with neither, this refuses. A warning is not isolation.
+if [[ -n "${GEMINI_API_KEY:-}" || -n "${GOOGLE_API_KEY:-}" || -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
   SCRUB_HOME="$(mktemp -d "${TMPDIR:-/tmp}/gemini-sandbox-home.XXXXXX")"
   trap 'rm -rf "$SCRUB_HOME"' EXIT
   export HOME="$SCRUB_HOME"
+elif [[ -n "${GEMINI_SANDBOX_AUTH_HOME:-}" && -d "${GEMINI_SANDBOX_AUTH_HOME}" ]]; then
+  export HOME="$GEMINI_SANDBOX_AUTH_HOME"
+  echo "gemini-sandbox: using GEMINI_SANDBOX_AUTH_HOME as HOME for the CLI's own auth" >&2
 else
-  echo "gemini-sandbox: GEMINI_API_KEY is not set, keeping HOME so the CLI's own auth can be used; user-level ~/.gemini state is visible to this run" >&2
+  echo "gemini-sandbox: no key based auth in the environment (GEMINI_API_KEY, GOOGLE_API_KEY or GOOGLE_APPLICATION_CREDENTIALS) and no GEMINI_SANDBOX_AUTH_HOME; refusing to run a non-owner task with the owner's HOME" >&2
+  exit 2
 fi
 
 # Headless runs have nobody to answer the folder-trust prompt. Trust here means the
@@ -77,11 +87,64 @@ elif ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1;
   exit 2
 fi
 
-cmd=(gemini --prompt "$PROMPT" --approval-mode plan --sandbox --output-format json)
+# stream-json, not json, plus a heartbeat. The bounded runner that wraps this kills a
+# command that emits nothing for 45 seconds, on the reasoning that a working sandbox
+# streams as it goes. In plain json mode the CLI prints one object at the end and
+# nothing before, so a healthy run looked wedged and was killed: 8 of 36 scenarios came
+# back as "Sandbox unavailable (gemini exit 125)", the watchdog's own kill code.
+# Streaming gives the guard real events, and the gaps between events can still reach
+# tens of seconds while the model thinks, so the filter below also writes a heartbeat
+# to stderr whenever nothing has arrived for GEMINI_SANDBOX_HEARTBEAT seconds (10 by
+# default). For this runtime the stall guard therefore cannot fire on a quiet but live
+# process; the bounded runner's --max cap is the backstop, and the docs say so.
+cmd=(gemini --prompt "$PROMPT" --approval-mode plan --sandbox --output-format stream-json)
 [[ -n "$MODEL" ]] && cmd+=(--model "$MODEL")
 
 set +e
-raw="$(cd "$WORKDIR" && "${cmd[@]}" < /dev/null)"
+raw="$(cd "$WORKDIR" && "${cmd[@]}" < /dev/null | GEMINI_SANDBOX_HEARTBEAT="${GEMINI_SANDBOX_HEARTBEAT:-10}" python3 -u -c '
+import json, os, select, sys, time
+parts, status, err = [], None, None
+beat = float(os.environ.get("GEMINI_SANDBOX_HEARTBEAT") or 10)
+waited = 0.0
+while True:
+    ready, _, _ = select.select([sys.stdin], [], [], beat)
+    if not ready:
+        waited += beat
+        sys.stderr.write("gemini-sandbox: waiting, %.0fs without an event\n" % waited)
+        sys.stderr.flush()
+        continue
+    line = sys.stdin.readline()
+    if not line:
+        break
+    waited = 0.0
+    line = line.strip()
+    if not line:
+        continue
+    # One progress line per event on stderr: this is what the stall watchdog watches.
+    try:
+        ev = json.loads(line)
+    except Exception:
+        sys.stderr.write("gemini-sandbox: unparsable event\n")
+        continue
+    kind = ev.get("type")
+    sys.stderr.write("gemini-sandbox: %s\n" % kind)
+    sys.stderr.flush()
+    if kind == "message" and ev.get("role") == "assistant":
+        parts.append(str(ev.get("content") or ""))
+    elif kind == "error":
+        err = ev.get("error") or ev
+    elif kind == "result":
+        status = ev.get("status")
+        if ev.get("error"):
+            err = ev["error"]
+if err is not None:
+    sys.stderr.write("gemini-sandbox: gemini reported an error: %s\n" % (err,))
+    sys.exit(1)
+if status not in (None, "success"):
+    sys.stderr.write("gemini-sandbox: gemini finished with status %s\n" % (status,))
+    sys.exit(1)
+sys.stdout.write("".join(parts))
+')"
 rc=$?
 set -e
 if [[ $rc -ne 0 ]]; then
@@ -89,21 +152,7 @@ if [[ $rc -ne 0 ]]; then
   exit "$rc"
 fi
 
-# The JSON envelope is {"response": str, "stats": {...}, "error"?: {...}}.
-# An error object with exit 0 is still a failure, and a non-JSON body is too.
-response="$(printf '%s' "$raw" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception as exc:
-    sys.stderr.write(f"gemini-sandbox: output is not JSON: {exc}\n")
-    sys.exit(1)
-err = d.get("error")
-if err:
-    sys.stderr.write("gemini-sandbox: gemini reported an error: %s\n" % (err,))
-    sys.exit(1)
-sys.stdout.write(str(d.get("response") or ""))
-')" || exit 1
+response="$raw"
 
 if [[ -z "${response//[[:space:]]/}" ]]; then
   echo "gemini-sandbox: gemini exited 0 with no output" >&2

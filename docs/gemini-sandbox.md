@@ -70,10 +70,19 @@ Checked on macOS with the real CLI, both directions, so a null result means some
   file did not exist afterwards. So the confinement engages.
 
 The CLI itself still reads user-level state from `~/.gemini` at startup (a
-`GEMINI.md` there, history, extensions), whatever the working directory. With
-`GEMINI_API_KEY` set the wrapper therefore runs the CLI with a fresh, empty `HOME`
-that is deleted when the run ends. Without the key the user's own `~/.gemini` is
-where OAuth credentials live, so `HOME` is kept and the wrapper says so on stderr.
+`GEMINI.md` there, history, extensions), whatever the working directory, and before
+the sandbox confines anything. So the wrapper decides HOME by how the CLI is
+authenticated:
+
+| auth in the environment | HOME the CLI sees |
+| --- | --- |
+| `GEMINI_API_KEY`, `GOOGLE_API_KEY` or `GOOGLE_APPLICATION_CREDENTIALS` | a fresh empty directory, deleted after the run |
+| none of those, `GEMINI_SANDBOX_AUTH_HOME` set to a directory | that directory, meant to hold only the CLI's OAuth credentials |
+| none of those | the run is refused, exit 2 |
+
+A non-owner task never runs with the owner's own HOME. If you sign in to the CLI with
+OAuth, put a copy of `~/.gemini/oauth_creds.json` in a directory of its own and point
+`GEMINI_SANDBOX_AUTH_HOME` at it.
 
 `GEMINI_CLI_TRUST_WORKSPACE=true` is set because a headless run has nobody to
 answer the trust prompt. Trust means the CLI may load context files from the
@@ -87,6 +96,42 @@ One thing to know when reading answers: the bridge's sandbox prompt tells the
 model it is answering as Sutando and to refer to Sutando's skills, so an answer
 may name skills from the model's own knowledge of this public repository even
 when it could read nothing. That is the prompt, not a leak.
+
+## The stall guard, and what it means for this runtime
+
+Stage 1 is wrapped by `codex-bounded.sh --stall 45 --max 240`. The stall guard kills a
+command that writes nothing to stdout or stderr for 45 seconds, on the reasoning that a
+working codex streams events as it goes. In plain JSON mode the Gemini CLI prints one
+object at the end and nothing before, so a healthy run looked wedged and was killed: 8
+of 36 scenarios in one run came back as `Sandbox unavailable (gemini exit 125)`, which
+is the guard's own kill code.
+
+The wrapper therefore asks for `--output-format stream-json`, writes one line to stderr
+per event, and writes a heartbeat line whenever nothing has arrived for
+`GEMINI_SANDBOX_HEARTBEAT` seconds (default 10). Two consequences, stated plainly:
+
+- For this runtime the stall guard cannot fire on a quiet but live process. Only the
+  `--max 240` cap ends a run that never finishes. The guard's setting is unchanged and
+  its effect is now that of a cap.
+- Gaps between events while the model thinks were measured at up to 36 seconds on a
+  heavy prompt, so streaming alone would leave a thin margin against 45. The heartbeat
+  is what closes it.
+
+## When the bridge refuses to start
+
+`sandbox.runtime` is read once when the Discord bridge starts. Two things stop the
+bridge there, loudly, rather than failing later on a non-owner message:
+
+- a value that is not `codex` or `gemini`
+- a runtime the tier rulebooks cannot be rendered for, which happens if the rulebook
+  text in `discord-bridge.py` drifts from the Stage-1 templates the renderer matches,
+  or the PR-review paragraph's headings are reworded
+
+The message names which of the two it was. This is fail closed on purpose: a setting
+that only affects non-owner sandboxing can keep the whole bridge down, because the
+alternative is a bridge that runs and hands non-owner tasks a command that does not
+exist. Owner traffic is otherwise untouched by the setting: each message renders only
+the rulebook it will carry, and owner and collaborator books are never rewritten.
 
 ## Verify
 

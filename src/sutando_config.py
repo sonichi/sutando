@@ -52,7 +52,6 @@ _LOCAL_FILENAME = "sutando.config.local.json"
 # break. Per Mini's review #8 on PR #1395.
 _KNOWN_TOP_LEVEL_KEYS = {
     "core",
-    "sandbox",
     "workspace",
     "claude_sutando_config_dir",
     "core_config_dirs",
