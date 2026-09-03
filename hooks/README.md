@@ -185,6 +185,37 @@ PY
 
 Test: `python3 tests/gmail-write-guard.test.py`.
 
+## `review-authority-guard.py`
+
+Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /
+`--request-changes` (and `--comment` under `hold`), or `gh api .../pulls/N/reviews`
+carrying `APPROVE` / `REQUEST_CHANGES` — while the owner's standing answer on
+review authority is unresolved. An APPROVE moves a merge gate, and merges are
+the owner's; verifying a change carefully is not authorization to vote on it.
+The mode lives in `<workspace>/state/authority.json`:
+
+```json
+{"github_formal_review": "hold" | "findings-only" | "allow"}
+```
+
+A missing or unreadable file means `hold` (policy: the restrictive reading
+applies until the owner rules). Never gated: review dismissals (a reduction of
+standing), `gh pr comment`, `--comment` under `findings-only`, and every
+non-review command. Compound commands are split per segment so an earlier
+benign `gh` cannot shadow a later review.
+
+Escape hatch: `SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1`. Fail-OPEN on hook errors.
+
+### Registration
+
+Not auto-registered. Deploy per node into `$CLAUDE_CONFIG_DIR` and add a
+`PreToolUse` entry with matcher `Bash`, the same way as the manual block under
+`gmail-write-guard.py` above (command: `python3 <deployed path>/review-authority-guard.py`).
+The deployed copy locates the workspace by searching upward for
+`state/authority.json`; set `SUTANDO_WORKSPACE_FOR_HOOK=<workspace>` to pin it.
+
+Test: `python3 tests/review-authority-guard.test.py`.
+
 ## `result-file-marker-guard.py`
 
 Denies a **Write/Edit into `<workspace>/results/`** whose body carries a
