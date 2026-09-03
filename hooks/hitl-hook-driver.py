@@ -1,12 +1,28 @@
 #!/usr/bin/env python3
-"""hitl-hook-driver — PreToolUse hook that routes a tool-permission decision
+"""hitl-hook-driver — permission hook that routes a tool-permission decision
 through the HumanRequirement Manager instead of the terminal.
 
-Layer 1 of the no-TUI stack: structured, no screen parsing. Claude Code runs
-this hook before every tool call and feeds it JSON on stdin; the hook blocks
-until a human answers the card (or a policy answers for them), then prints
-`{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision":
-"allow" | "deny", ...}}`. The card itself is posted by the supervisor's
+Layer 1 of the no-TUI stack: structured, no screen parsing. Claude Code feeds
+this hook JSON on stdin; the hook blocks until a human answers the card (or a
+policy answers for them), then prints the decision in the shape the firing
+event expects. Two events are served, told apart by `hook_event_name`:
+
+  PermissionRequest — fires only when Claude Code would render a permission
+    dialog, so every requirement it creates is a real block, and its payload
+    carries `permission_suggestions` (the basis for an "allow always"). Output:
+    `{"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+      "decision": {"behavior": "allow"} | {"behavior": "deny", "message": ...}}}`
+    Measured (2.1.258): the TUI still DRAWS the dialog while this hook waits;
+    the decision resolves it. A screen sensor must treat that dialog as owned.
+  PreToolUse — fires before EVERY tool call, dialog or not; while it waits
+    nothing is drawn (the screen shows "Waiting…"). Output:
+    `{"hookSpecificOutput": {"hookEventName": "PreToolUse",
+      "permissionDecision": "allow" | "deny", "permissionDecisionReason": ...}}`
+    Neither event's allow clears the ExitPlanMode plan dialog (it asks HOW to
+    proceed, not whether); that dialog stays with the screen layer.
+
+A payload with no `hook_event_name` is treated as PreToolUse (the shape every
+existing registration produces). The card itself is posted by the supervisor's
 projector from the same requirement record — this hook never talks to Matrix.
 
 Invariants (same as hooks/human-action-bridge.py, which owns AskUserQuestion):
@@ -15,8 +31,10 @@ Invariants (same as hooks/human-action-bridge.py, which owns AskUserQuestion):
     so Claude Code falls back to its own permission flow
   - policy first: an allowlisted tool never creates a requirement
 
-Registration (settings.json):
-  "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command",
+Registration (settings.json) is a choice, not a default: PreToolUse keeps the
+terminal dialog-free; PermissionRequest is exact and enables "allow always" but
+leaves the dialog drawn under it. Register ONE of the two, never both:
+  "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command",
       "command": "python3 <repo>/hooks/hitl-hook-driver.py", "timeout": 900}]}]
 The hook's own wait (SUTANDO_HITL_TIMEOUT, default 600s) must stay below the
 registered hook timeout, or Claude Code kills it before it can deny.
@@ -107,8 +125,22 @@ def _requirement(data: dict) -> HumanRequirement:
     )
 
 
-def _emit(decision: dict) -> None:
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", **decision}}))
+PERMISSION_REQUEST = "PermissionRequest"
+PRE_TOOL_USE = "PreToolUse"
+
+
+def _event(data: dict) -> str:
+    # Absent = PreToolUse: every registration that predates PermissionRequest sends no name.
+    return PERMISSION_REQUEST if data.get("hook_event_name") == PERMISSION_REQUEST else PRE_TOOL_USE
+
+
+def _emit(event: str, behavior: str, reason: str) -> None:
+    if event == PERMISSION_REQUEST:
+        decision = {"behavior": "allow"} if behavior == "allow" else {"behavior": "deny", "message": reason}
+        out = {"hookEventName": PERMISSION_REQUEST, "decision": decision}
+    else:
+        out = {"hookEventName": PRE_TOOL_USE, "permissionDecision": behavior, "permissionDecisionReason": reason}
+    print(json.dumps({"hookSpecificOutput": out}))
 
 
 def _wait(manager: HitlManager, rid: str, timeout_s: float, poll_s: float):
@@ -131,23 +163,24 @@ def main() -> None:
     tool = str(data.get("tool_name") or "")
     if not tool or tool in OWNED_ELSEWHERE:
         sys.exit(0)  # not ours — no decision, Claude's own flow continues
+    event = _event(data)
     manager = HitlManager(HitlStore(default_store(_workspace())), policy=policy_from_env())
     req = manager.create(_requirement(data))
     if req.decided_by == POLICY_DECIDER and req.chosen_action == "allow":
         manager.resolve(req.id)
-        _emit({"permissionDecision": "allow", "permissionDecisionReason": f"hitl policy: allowlisted tool ({req.id})"})
+        _emit(event, "allow", f"hitl policy: allowlisted tool ({req.id})")
         sys.exit(0)
     timeout_s = float(os.environ.get("SUTANDO_HITL_TIMEOUT", "600"))
     poll_s = float(os.environ.get("SUTANDO_HITL_POLL", "1"))
     chosen = _wait(manager, req.id, timeout_s, poll_s)
     if chosen == "allow":
         manager.resolve(req.id)
-        _emit({"permissionDecision": "allow", "permissionDecisionReason": f"owner allowed via card {req.id}"})
+        _emit(event, "allow", f"owner allowed via card {req.id}")
     elif chosen == "deny":
         manager.resolve(req.id)
-        _emit({"permissionDecision": "deny", "permissionDecisionReason": f"owner denied via card {req.id}"})
+        _emit(event, "deny", f"owner denied via card {req.id}")
     else:
-        _emit({"permissionDecision": "deny", "permissionDecisionReason": TIMEOUT_REASON.format(rid=req.id)})
+        _emit(event, "deny", TIMEOUT_REASON.format(rid=req.id))
     sys.exit(0)
 
 

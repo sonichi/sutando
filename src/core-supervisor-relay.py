@@ -110,7 +110,8 @@ def _limit_remedy(signal: dict) -> str:
     when = f"at {m.group(1)}" if m else "when the limit window resets"
     return (f" — the core hit its Claude usage limit, not a login problem; it resumes"
             f" on its own {when}. Nothing to do unless you want it sooner: at the"
-            " core's terminal, /usage-credits spends credits now and Esc stops the wait.")
+            " core's terminal, /usage-credits spends credits now, signing in under a"
+            " different subscription starts a fresh allowance, and Esc stops the wait.")
 
 
 #: A record older than this is a core that stopped beating; the socket it names
