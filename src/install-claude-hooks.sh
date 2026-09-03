@@ -99,6 +99,19 @@ HOOKS=(
   "Stop|src/check-pending-tasks.sh|bash $(shq "$REPO_DIR/src/check-pending-tasks.sh")"
 )
 
+# The transcript archiver writes OUTSIDE the workspace (~/Desktop). Omitting it
+# is install-only: phase 0 skips it anyway (no repo path), so an opt-in survives.
+if [ "${SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE:-0}" = "1" ]; then
+  _kept=()
+  for _h in "${HOOKS[@]}"; do
+    case "$_h" in
+      "PreCompact|sutando-conversations/|"*) ;;
+      *) _kept+=("$_h") ;;
+    esac
+  done
+  HOOKS=("${_kept[@]}")
+fi
+
 # Parallel to HOOKS by index, not another `|` field: CMD must stay last to hold a
 # `|`, and a second path-bearing field cannot also be last. Sized from HOOKS.
 HOOK_PRIOR=()
