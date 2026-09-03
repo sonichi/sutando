@@ -14,6 +14,9 @@ import tempfile
 from pathlib import Path
 
 TOOL = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts" / "tool-suites-check.py"
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={Path(__file__).resolve().parents[1] / '.coveragerc'}"]
 spec = importlib.util.spec_from_file_location("tsc", TOOL)
 tsc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tsc)
@@ -45,7 +48,7 @@ def scaffold(td, extras=None, suite_body="print('PASS')\n", make_suite=True):
 
 
 def run(ws, repo, *extra_argv):
-    p = subprocess.run([sys.executable, str(TOOL), "--workspace", str(ws),
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws),
                         "--repo", str(repo), "--force", *extra_argv],
                        capture_output=True, text=True)
     return p.returncode, p.stdout + p.stderr
@@ -108,13 +111,23 @@ print("6. an extra suite joins the CHANGE trigger, not just the run set")
 with tempfile.TemporaryDirectory() as td:
     ws, repo = scaffold(td, extras=["tests/extra.test.py"])
     run(ws, repo)                                    # seed the sentinel (--force)
-    p = subprocess.run([sys.executable, str(TOOL), "--workspace", str(ws), "--repo", str(repo)],
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(repo)],
                        capture_output=True, text=True)
     check("second run is fresh", "fresh" in p.stdout, True)
     os.utime(repo / "tests" / "extra.test.py", None)  # touch ONLY the extra
-    p = subprocess.run([sys.executable, str(TOOL), "--workspace", str(ws), "--repo", str(repo)],
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(repo)],
                        capture_output=True, text=True)
     check("touching the extra re-triggers", "running" in p.stdout, True)
+
+print("7. in-process: the trigger rule and the two scope refusals")
+check("no recorded run -> run", tsc.should_run({}, 0.0, 3600, 100.0)[0], True)
+check("unchanged and young -> fresh", tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0}, 5.0, 3600, 100.0)[0], False)
+go, why = tsc.should_run({"tools_mtime": 5.0, "ran_at": 0.0}, 5.0, 3600, 7200.0)
+check("unchanged but older than --max-age -> run", (go, "last run was" in why), (True, True))
+with tempfile.TemporaryDirectory() as td:
+    check("no scripts/ dir -> exit 2", tsc.main(["--workspace", td]), 2)
+    (Path(td) / "scripts").mkdir()
+    check("zero suites -> exit 2 (a scope result, not a clean bill)", tsc.main(["--workspace", td]), 2)
 
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")

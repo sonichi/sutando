@@ -130,5 +130,47 @@ class Refusals(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class WarnPath(unittest.TestCase):
+    """The stdin path: health-check warns piped in, one verdict per warn."""
+
+    WARNS = ("\u26a0 widget-cache warn `widget-cache.py` is stale\n"
+             "\u267b other-probe stale nothing named here at all\n")
+
+    def _main(self, stdin, files):
+        import sys
+        from unittest.mock import patch
+        buf = io.StringIO()
+        with patch.object(wat, "parking_files", lambda: files), \
+                patch.object(sys, "argv", ["wat"]), \
+                patch.object(sys, "stdin", io.StringIO(stdin)), \
+                contextlib.redirect_stdout(buf):
+            rc = wat.main()
+        return rc, buf.getvalue()
+
+    def test_no_warns_on_stdin_is_cannot_answer(self):
+        rc, out = self._main("all green\n", _files("## x\n"))
+        self.assertEqual(rc, 2)
+        self.assertIn("no warns on stdin", out)
+
+    def test_missing_parking_files_is_cannot_answer(self):
+        rc, out = self._main(self.WARNS, [])
+        self.assertEqual(rc, 2)
+        self.assertIn("PARKING FILES NOT FOUND", out)
+
+    def test_each_warn_gets_a_verdict_and_the_summary_names_the_untriaged(self):
+        rc, out = self._main(self.WARNS, _files("## the `widget-cache.py` decision\n"))
+        self.assertEqual(rc, 0)
+        self.assertIn("searching 1 parking file(s) for 2 warn(s)", out)
+        self.assertIn("1 with candidate parkings, 1 with none: other-probe", out)
+
+
+
+class ParkingFiles(unittest.TestCase):
+    def test_resolves_through_the_repo_resolver_and_returns_only_existing_files(self):
+        files = wat.parking_files()
+        self.assertIsInstance(files, list)
+        self.assertTrue(all(p.exists() for p in files))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

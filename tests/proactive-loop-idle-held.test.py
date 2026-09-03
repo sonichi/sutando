@@ -64,6 +64,15 @@ check("--add without a gate is refused", rc == 1 and "ID:GATE" in err, err[:70])
 check("no --items/--set/stdin path exists",
       not any(f in (SCRIPTS / "idle-held.py").read_text() for f in ('"--items"', '"--set"', "stdin.read()")))
 
+bad = pathlib.Path(tempfile.mkdtemp()) / "bad.json"; bad.write_text("{not json")
+rc, _, err = run(["--state", str(bad)])
+check("a state file that is not JSON is cannot-answer (exit 2)", rc == 2 and "not JSON" in err, err[:70])
+_o = io.StringIO()
+with contextlib.redirect_stdout(_o):
+    ih.audit_notes({"held_item_notes": {"k": "note"}}, ".")
+check("audit-notes: with no held_item_ids the orphan check is SKIPPED, not judged",
+      "orphan check SKIPPED" in _o.getvalue(), _o.getvalue()[:80])
+
 missing = pathlib.Path(tempfile.mkdtemp()) / "nope.json"
 rc, _, err = run(["--state", str(missing)])
 check("absent state -> cannot answer (2), never an empty list", rc == 2 and "CANNOT ANSWER" in err)
@@ -160,13 +169,37 @@ check("audit: note-less held ids are named", "2" in _out3 and "no note" in _out3
 import os as _os
 import sys as _sys
 _TOOL = str(SCRIPTS / "idle-held.py")
+_PY = [_sys.executable]
+if _os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    _PY += ["-m", "coverage", "run", f"--rcfile={SCRIPTS.parents[2] / '.coveragerc'}"]
 
-def _audit(doc):
+
+def _gh_shim(td):
+    """A fake `gh` on PATH: #3487 is MERGED, #3198 is OPEN, anything else fails.
+    Hermetic — the real tool shells out to gh, which CI cannot reach."""
+    d = pathlib.Path(td) / "bin"; d.mkdir()
+    gh = d / "gh"
+    gh.write_text("""#!/bin/sh
+# argv: pr view <num> --repo <repo> --json ...
+[ -n "$IH_TEST_GH_FAIL" ] && { echo "gh: could not resolve" >&2; exit 1; }
+case "$3" in
+  3487) echo '{"state": "MERGED", "mergeStateStatus": "CLEAN"}' ;;
+  3198) echo '{"state": "OPEN", "mergeStateStatus": "CLEAN"}' ;;
+  *) echo "gh: could not resolve" >&2; exit 1 ;;
+esac
+""")
+    gh.chmod(0o755)
+    return {**_os.environ, "PATH": f"{d}{_os.pathsep}{_os.environ.get('PATH', '')}"}
+
+def _audit(doc, gh_fail=False):
     with _tf.TemporaryDirectory() as td:
         f = _os.path.join(td, "s.json")
         open(f, "w").write(json.dumps(doc))
-        r = _sp.run([_sys.executable, _TOOL, "--state", f, "--audit-prs"],
-                    capture_output=True, text=True)
+        env = _gh_shim(td)
+        if gh_fail:
+            env["IH_TEST_GH_FAIL"] = "1"
+        r = _sp.run([*_PY, _TOOL, "--state", f, "--audit-prs"],
+                    capture_output=True, text=True, env=env)
         return r.returncode, r.stdout + r.stderr
 
 rc, out = _audit({"held_item_ids": [["merged-one", "owner"]],
@@ -186,6 +219,14 @@ check("audit-prs: does NOT infer a PR from the id (exit 0)", rc == 0, f"rc={rc}"
 check("audit-prs: reports it unmapped instead", "unmapped" in out)
 check("audit-prs: never emits the phantom number", "36177" not in out.replace("stroke-fix-36177568", ""))
 
+# A PR that cannot be read is not a PR known to be fine.
+rc, out = _audit({"held_item_ids": [["open-one", "owner"]],
+                  "held_item_notes": {"open-one": "PR sonichi/sutando#3198 waiting"}}, gh_fail=True)
+check("audit-prs: an unreadable PR is cannot-answer (exit 2), not a clean bill", rc == 2, f"rc={rc}")
+check("audit-prs: names the unresolvable row", "ERROR  open-one" in out, out[:120])
+rc, out = _audit({"held_item_ids": "not-a-list"})
+check("audit-prs: no held_item_ids list -> exit 2", rc == 2, f"rc={rc}")
+
 
 # --- archive-orphan-notes: an orphan note outlives the id it described, and
 # the audit stays red until something can clear it -------------------------
@@ -194,7 +235,7 @@ def _arch(doc, write=False):
     with _tf.TemporaryDirectory() as td:
         f = _os.path.join(td, "s.json")
         open(f, "w").write(json.dumps(doc))
-        cmd = [_sys.executable, _TOOL, "--state", f, "--archive-orphan-notes"]
+        cmd = [*_PY, _TOOL, "--state", f, "--archive-orphan-notes"]
         if write:
             cmd.append("--write")
         r = _sp.run(cmd, capture_output=True, text=True)
@@ -249,9 +290,9 @@ check("archive: no orphans -> exit 0 and no archive key created", rc == 0 and
 with _tf.TemporaryDirectory() as td:
     f = _os.path.join(td, "s.json")
     open(f, "w").write(json.dumps(ORPH))
-    _sp.run([_sys.executable, _TOOL, "--state", f, "--archive-orphan-notes", "--write"],
+    _sp.run([*_PY, _TOOL, "--state", f, "--archive-orphan-notes", "--write"],
             capture_output=True, text=True)
-    r = _sp.run([_sys.executable, _TOOL, "--state", f, "--audit-notes", str(SCRIPTS)],
+    r = _sp.run([*_PY, _TOOL, "--state", f, "--audit-notes", str(SCRIPTS)],
                 capture_output=True, text=True)
     check("archive: --audit-notes goes GREEN afterwards", r.returncode == 0,
           f"rc={r.returncode} {r.stdout}{r.stderr}")

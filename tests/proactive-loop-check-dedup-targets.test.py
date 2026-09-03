@@ -7,10 +7,13 @@ internal task id the peer cannot resolve. Measured on this host: 68 such pairs
 on disk all-time, 12 of which produced a DELIVERED room message.
 """
 
+import contextlib
 import importlib.util
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts"
 _s = importlib.util.spec_from_file_location("cdt", str(SCRIPTS / "check-dedup-targets.py"))
@@ -116,6 +119,48 @@ class ExitCodes(unittest.TestCase):
     def test_cannot_answer_is_2_not_0(self):
         rc = cdt.main([str(Path(tempfile.mkdtemp()) / "nope.txt")])
         self.assertEqual(rc, 2)
+
+    def _main(self, ws, argv):
+        buf, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cdt, "workspace", lambda: ws), \
+                contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = cdt.main(argv)
+        return rc, buf.getvalue() + err.getvalue()
+
+    def test_explicit_files_clean_is_0_and_contradiction_is_1(self):
+        ws = _ws({"a.txt": "[deduped: task-b]\n", "task-b.txt": "real reply\n"})
+        rc, out = self._main(ws, [str(ws / "results" / "a.txt")])
+        self.assertEqual(rc, 0)
+        self.assertIn("no dedup resolves", out)
+        (ws / "results" / "task-b.txt").write_text("[no-send]\n")
+        rc, out = self._main(ws, [str(ws / "results" / "a.txt")])
+        self.assertEqual(rc, 1)
+        self.assertIn("CONTRADICTION a.txt -> [deduped: task-b]", out)
+        self.assertIn("use [no-send] on BOTH", out)
+
+    def test_no_argv_audits_results_and_archive(self):
+        ws = _ws({"a.txt": "[deduped: task-b]\n"}, archive={"task-b-1.txt": "[no-send]\n"})
+        rc, out = self._main(ws, [])
+        self.assertEqual(rc, 1)
+        self.assertIn("checked 2 result file(s)", out)
+
+    def test_no_results_dir_is_cannot_answer(self):
+        rc, out = self._main(Path(tempfile.mkdtemp()), [])
+        self.assertEqual(rc, 2)
+        self.assertIn("no results/ directory", out)
+
+
+class Refusals(unittest.TestCase):
+    def test_an_unreadable_file_is_skipped_not_fatal(self):
+        ws = _ws({})
+        self.assertEqual(cdt.check(ws, [ws / "results"]), [])   # a directory: OSError
+
+    def test_without_the_policy_owner_the_checker_refuses(self):
+        # No local fallback rule: result_markers.py absent -> RuntimeError, never "clean".
+        ws = _ws({"a.txt": "[deduped: task-b]\n", "task-b.txt": "reply\n"})
+        with mock.patch.object(cdt, "REPO", Path(tempfile.mkdtemp())):
+            with self.assertRaises(RuntimeError):
+                cdt.resolve(ws, "task-b")
 
 
 if __name__ == "__main__":

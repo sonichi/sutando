@@ -49,6 +49,10 @@ class PerWindowRules(unittest.TestCase):
         self.assertEqual(qt.tier_7d(99, 0.20), "MEDIUM")
         self.assertEqual(qt.tier_7d(90, 0.40), "FULL")      # headroom 1.5 exactly
 
+    def test_a_window_at_or_past_its_reset_is_FULL(self):
+        self.assertEqual(qt.tier_5h(50, 0), "FULL")      # window just reset
+        self.assertEqual(qt.tier_7d(50, 1.0), "FULL")
+
     def test_zero_remaining_is_MINIMAL_on_either_window(self):
         self.assertEqual(qt.tier_5h(0, 100), "MINIMAL")
         self.assertEqual(qt.tier_7d(0, 0.5), "MINIMAL")
@@ -86,6 +90,42 @@ class ResetParsing(unittest.TestCase):
     def test_refuses_an_unparseable_string_rather_than_defaulting(self):
         with self.assertRaises(ValueError):
             qt.parse_reset("sometime soon", self.NOW, 6)
+
+    def test_an_impossible_calendar_date_is_refused_in_both_candidate_years(self):
+        with self.assertRaises(ValueError):
+            qt.parse_reset("00:30 Feb 30", self.NOW, 8 * 24)
+
+
+class ResetFallback(unittest.TestCase):
+    """Without --reset5/--reset7 the printed `Resets:` lines are parsed, bounds-checked."""
+
+    def _run(self, text, argv=()):
+        out = io.StringIO()
+        real = sys.stdin
+        sys.stdin = io.StringIO(text)
+        try:
+            with redirect_stdout(out), __import__("contextlib").redirect_stderr(out):
+                rc = qt.main(list(argv))
+        finally:
+            sys.stdin = real
+        return rc, out.getvalue()
+
+    def test_printed_resets_within_horizon_are_used(self):
+        import datetime
+        now = datetime.datetime.now()
+        r5 = (now + datetime.timedelta(hours=4)).strftime("%H:%M %b %d")
+        r7 = (now + datetime.timedelta(days=6)).strftime("%H:%M %b %d")
+        text = (f"5h window: 10% used, 90% remaining\n  Resets: {r5}\n"
+                f"7d window: 20% used, 80% remaining\n  Resets: {r7}\n")
+        rc, out = self._run(text)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("TIER", out)
+
+    def test_missing_reset_lines_are_cannot_answer_not_guessed(self):
+        text = "5h window: 10% used, 90% remaining\n7d window: 20% used, 80% remaining\n"
+        rc, out = self._run(text)
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot resolve reset times", out)
 
 
 class FreshWindowZeroBurn(unittest.TestCase):

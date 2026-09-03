@@ -102,6 +102,41 @@ with tempfile.TemporaryDirectory() as d:
         rc_ok = mib.main(["--repo", str(REPO), "--index", str(p), "--adding", row(5000).strip()])
     check("exit 1 refuses, exit 0 permits", (rc_bad, rc_ok) == (1, 0), f"got {(rc_bad, rc_ok)}")
 
+# --- main(): report mode, --adding-file, --at-top, and the refusal prints ----
+with tempfile.TemporaryDirectory() as d:
+    p = pathlib.Path(d) / "MEMORY.md"; p.write_text(over)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mib.main(["--repo", str(REPO), "--index", str(p)])
+    check("report mode on an over-budget index exits 1 and names the rows",
+          rc == 1 and "ALREADY NOT LOADING" in buf.getvalue(), f"rc={rc}")
+    p.write_text(small)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mib.main(["--repo", str(REPO), "--index", str(p)])
+    check("report mode on a healthy index exits 0", rc == 0 and "load (limit" in buf.getvalue(), f"rc={rc}")
+    add = pathlib.Path(d) / "add.md"; add.write_text(row(7000))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mib.main(["--repo", str(REPO), "--index", str(p), "--adding-file", str(add)])
+    check("--adding-file reads the addition and permits it", rc == 0 and "safe" in buf.getvalue(), f"rc={rc}")
+    p.write_text(full)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mib.main(["--repo", str(REPO), "--index", str(p), "--adding", row(5000).strip(), "--at-top"])
+    check("--at-top on a full index REFUSES and names the dropped row",
+          rc == 1 and "REFUSE" in buf.getvalue() and "- [row" in buf.getvalue(), f"rc={rc}")
+
+# --- the authority must be the real one: a stand-in that lacks the primitives is None
+with tempfile.TemporaryDirectory() as d:
+    (pathlib.Path(d) / "src").mkdir()
+    hc = pathlib.Path(d) / "src" / "health-check.py"
+    hc.write_text("raise SystemExit(0)\n")
+    check("a health-check.py that exits on import (CLI) but lacks the primitives -> None",
+          mib._health_check(pathlib.Path(d)) is None)
+    hc.write_text("raise RuntimeError('broken')\n")
+    check("a health-check.py that raises on import -> None", mib._health_check(pathlib.Path(d)) is None)
+
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} "
       f"({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)
