@@ -100,6 +100,46 @@ check "$([ "$out" = "REACHED_END" ] && echo 0 || echo 1)" \
       "the guarded form survives a missing .env (vault-only Slack)" \
       "startup would have aborted; got: $out"
 
+# --- the REAL gateway predicate (src/startup-runtime.sh) --------------------
+# keweichen on #3338: the gate hardcoded channels/ag2space/.env, ran a bare
+# python3, and collapsed every resolver failure into "not configured". Drive
+# gateway_lane_configured() itself with a stub resolver and a lane file.
+GW="$TMP/gw"; mkdir -p "$GW/src" "$GW/scripts"
+cp "$REPO/src/startup-runtime.sh" "$REPO/src/repo_root.sh" "$REPO/src/watcher_sentinel.sh" "$GW/src/"
+printf '#!/bin/bash\necho "%s/lane.env"\n' "$GW" > "$GW/scripts/sutando-config.sh"
+gw_gate() {  # $1 = stub resolver rc, $2 = lane file contents ('' = absent), rest = env
+  local _rc="$1" _lane="$2"; shift 2
+  rm -f "$GW/lane.env"; [ -n "$_lane" ] && printf '%s\n' "$_lane" > "$GW/lane.env"
+  printf 'import sys; sys.exit(%s)\n' "$_rc" > "$GW/src/channel_token.py"
+  ( export REPO="$GW" PY="$PY" REMOTE_TASK_TOKEN= AG2_REMOTE_TOKEN= "$@"
+    # shellcheck disable=SC1090
+    . "$GW/src/startup-runtime.sh"; gateway_lane_configured ) 2>/dev/null
+}
+check "$(gw_gate 0 '' && echo 0 || echo 1)" \
+      "gateway: resolver says usable (device-only host, no lane file) -> configured"
+check "$(gw_gate 3 'REMOTE_TASK_TOKEN=x' && echo 1 || echo 0)" \
+      "gateway: resolver says definitively absent -> NOT configured, no grep fallback"
+check "$(gw_gate 1 'REMOTE_TASK_TOKEN=usable' && echo 0 || echo 1)" \
+      "gateway: broken resolver + usable lane file -> configured (degrades to the file)"
+check "$(gw_gate 1 '' && echo 1 || echo 0)" \
+      "gateway: broken resolver + no lane file -> NOT configured"
+check "$(gw_gate 1 'REMOTE_TASK_TOKEN=' && echo 1 || echo 0)" \
+      "gateway: broken resolver + empty lane value -> NOT configured"
+check "$( ( export REPO="$GW" PY= REMOTE_TASK_TOKEN= AG2_REMOTE_TOKEN=
+            printf 'REMOTE_TASK_TOKEN=usable\n' > "$GW/lane.env"
+            . "$GW/src/startup-runtime.sh"; gateway_lane_configured ) 2>/dev/null && echo 0 || echo 1)" \
+      "gateway: no resolved \$PY never runs a bare python3 — falls to the lane file"
+check "$( ( export REPO="$GW" PY="$PY" REMOTE_TASK_CHANNEL_DIR=dev
+            . "$GW/src/startup-runtime.sh"; gateway_lane_env_file >/dev/null; echo 0 ) )" \
+      "gateway: the lane file is named through the resolver helper, not a literal"
+SR="$REPO/src/startup-runtime.sh"
+check "$(grep -q 'claude-home-path channels/ag2space/.env' "$SR" && echo 1 || echo 0)" \
+      "startup-runtime.sh no longer resolves a hardcoded channels/ag2space/.env"
+check "$(grep -qE '"\$\{PY:-python3\}"' "$SR" && echo 1 || echo 0)" \
+      "startup-runtime.sh has no bare-python3 fallback in the gateway gate"
+check "$(grep -q 'if gateway_lane_configured' "$SR" && echo 0 || echo 1)" \
+      "start_gateway_lanes delegates to gateway_lane_configured"
+
 # --- the real startup.sh, asserted structurally -----------------------------
 S="$REPO/src/startup.sh"
 check "$(grep -c 'if \[ -f "\$_SL_ENV" \]; then set -a' "$S" >/dev/null && echo 0 || echo 1)" \

@@ -53,6 +53,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from util_paths import claude_home_path  # noqa: E402
+
 # Both spellings the gateway contract accepts (docs/remote-gateway-protocol.md);
 # AG2_REMOTE_TOKEN is the legacy alias still present on older installs.
 RELAY_TOKEN_VARS: tuple[str, ...] = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
@@ -106,7 +108,9 @@ def _clean_for(var: str, value: object) -> str:
 def token_from_env_file(var: str, env_file: Path) -> str:
     """Read `var` from a `KEY=VALUE` file. '' when absent, empty, or unreadable."""
     try:
-        text = env_file.read_text()
+        # Decode leniently: one stray byte ELSEWHERE must not hide a clean token
+        # line. The value itself is checked below, so nothing lossy is returned.
+        text = env_file.read_text(errors="replace")
     except OSError:
         return ""
     for line in text.splitlines():
@@ -115,7 +119,10 @@ def token_from_env_file(var: str, env_file: Path) -> str:
             continue
         key, _, value = line.partition("=")
         if key.strip() == var:
-            return _clean_for(var, value)
+            # A value that lost bytes to replacement is unreadable, not a token:
+            # returning it hands the caller mojibake every caller treats as real.
+            got = _clean_for(var, value)
+            return "" if "\ufffd" in got else got
     return ""
 
 
@@ -157,6 +164,101 @@ def resolve_channel_token(var: str, env_file: Path | None = None,
     return token_from_vault(var, vault_get=vault_get)
 
 
+#: Both spellings of the ag2.space gateway token, newest first. One tuple with
+#: the relay-peel key so the cleaner and this resolver cannot disagree.
+GATEWAY_TOKEN_VARS = RELAY_TOKEN_VARS
+
+
+def gateway_channel_dir(environ=None) -> str:
+    """The `channels/<dir>` lane this host's gateway bridge reads.
+
+    Env-only, as in the bridge: a lane's `.env` cannot name its own directory.
+    """
+    environ = os.environ if environ is None else environ
+    return environ.get("REMOTE_TASK_CHANNEL_DIR") or "ag2space"
+
+
+def gateway_env_candidates(environ=None) -> list[Path]:
+    """The channel `.env` candidates the gateway bridge reads, in its order.
+
+    `AG2_DEVICE_ENV` first, then `$CLAUDE_CONFIG_DIR/channels/<dir>/.env`.
+    Never a bare `~/.claude`: the bridge refuses that guess because it is the
+    one path that can bind an unrelated old install's token as this identity,
+    and a gate that consults it would call such a host configured.
+    """
+    environ = os.environ if environ is None else environ
+    out: list[Path] = []
+    override = environ.get("AG2_DEVICE_ENV") or ""
+    if override:
+        out.append(Path(override))
+    cfg = environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_CONFIG_DIR") or ""
+    if cfg:
+        out.append(Path(cfg) / "channels" / gateway_channel_dir(environ) / ".env")
+    return out
+
+
+def _file_token(env_file: Path) -> str:
+    for var in GATEWAY_TOKEN_VARS:
+        found = token_from_env_file(var, env_file)
+        if found:
+            return found
+    return ""
+
+
+def gateway_env_file(environ=None) -> Path | None:
+    """The channel `.env` the gateway bridge would take its token from.
+
+    The first candidate carrying a token wins — a readable candidate without
+    one must not shadow a later one that has it (the bridge's contract). With
+    no token anywhere: the first readable candidate, else the first candidate,
+    else None. Every gate resolves the file HERE so a non-default lane cannot
+    be judged from prod's file.
+    """
+    candidates = gateway_env_candidates(environ)
+    for path in candidates:
+        if _file_token(path):
+            return path
+    for path in candidates:
+        if path.is_file():
+            return path
+    # Nothing readable: the lane file is where connect writes, so name it.
+    return candidates[-1] if candidates else None
+
+
+def gateway_token(env_file: Path | None = None, environ=None,
+                  vault_get=None) -> str:
+    """The ag2.space gateway token from env -> `.env` candidates -> vault, or ''.
+
+    ONE resolver for every lifecycle gate. Launch, health and recovery each had
+    their own env+file copy, so a vault-only host was configured for the bridge
+    and invisible to the gates that install, watch and restart it.
+
+    SOURCE-first across both aliases, which is what the bridge does: it reads
+    both spellings from env, then both from each file candidate in order, then
+    both from the vault. Looping aliases outermost instead made a canonical
+    value in a LATER source beat a legacy value in an EARLIER one.
+
+    `env_file=None` means the candidate sequence the bridge would walk
+    (`gateway_env_candidates`), not "no file tier"; an explicit file is the
+    only file consulted (the CLI's `--env-file` contract).
+    """
+    environ = os.environ if environ is None else environ
+    for var in GATEWAY_TOKEN_VARS:
+        found = _clean_for(var, environ.get(var, ""))
+        if found:
+            return found
+    files = [env_file] if env_file is not None else gateway_env_candidates(environ)
+    for path in files:
+        found = _file_token(path)
+        if found:
+            return found
+    for var in GATEWAY_TOKEN_VARS:
+        found = token_from_vault(var, vault_get=vault_get)
+        if found:
+            return found
+    return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     """`--has VAR [--env-file PATH]` -> 0 = usable token, 3 = definitively absent.
 
@@ -175,8 +277,13 @@ def main(argv: list[str] | None = None) -> int:
     leak into a log.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--gateway":
+        # The whole gateway predicate: env -> candidate files -> vault, both
+        # aliases; 0 = usable, 3 = definitively absent, anything else = broken.
+        return 0 if gateway_token() else 3
     if not argv or argv[0] != "--has" or len(argv) < 2:
-        print("usage: channel_token.py --has VAR [--env-file PATH]", file=sys.stderr)
+        print("usage: channel_token.py --has VAR [--env-file PATH] | --gateway",
+              file=sys.stderr)
         return 2
     var = argv[1]
     env_file = None

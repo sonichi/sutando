@@ -337,6 +337,118 @@ def main() -> int:
         else:
             sys.modules["vault_intercept"] = _saved
 
+    # gateway_token must be SOURCE-first across both aliases: the bridge reads
+    # both spellings per tier, and an alias-outer loop inverted that.
+    def _envfile(**pairs):
+        f = tempfile.NamedTemporaryFile("w", suffix=".env", delete=False)
+        for k, v in pairs.items():
+            f.write(f"{k}={v}\n")
+        f.close()
+        return Path(f.name)
+
+    LEGACY, CANON = "AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN"
+
+    # The two mixed-source cases the review measured as inverted.
+    ef = _envfile(**{CANON: "from-file"})
+    check("legacy in ENV beats canonical in FILE (env tier wins)",
+          ct.gateway_token(env_file=ef, environ={LEGACY: "from-env"},
+                           vault_get=lambda v: "") == "from-env")
+
+    ef2 = _envfile(**{LEGACY: "legacy-file"})
+    check("legacy in FILE beats canonical in VAULT (file tier wins)",
+          ct.gateway_token(env_file=ef2, environ={},
+                           vault_get=lambda v: "vault-canon"
+                           if v == CANON else "") == "legacy-file")
+
+    # Within one source the canonical spelling still wins — the alias order is
+    # preserved, only the tier order changed.
+    check("canonical beats legacy INSIDE the same source",
+          ct.gateway_token(environ={CANON: "canon-env", LEGACY: "legacy-env"},
+                           vault_get=lambda v: "") == "canon-env")
+
+    ef3 = _envfile(**{CANON: "canon-file", LEGACY: "legacy-file"})
+    check("canonical beats legacy inside the FILE too",
+          ct.gateway_token(env_file=ef3, environ={},
+                           vault_get=lambda v: "") == "canon-file")
+
+    # Controls: the vault tier still answers when nothing earlier does, and a
+    # host with nothing anywhere still yields '' rather than a stray value.
+    check("vault still answers when env and file are empty",
+          ct.gateway_token(environ={}, vault_get=lambda v: "vault-tok"
+                           if v == CANON else "") == "vault-tok")
+    check("no token in any source yields ''",
+          ct.gateway_token(environ={}, vault_get=lambda v: "") == "")
+
+    # An undecodable .env is ABSENCE, never a mojibake bearer: errors="replace"
+    # turns unreadable bytes into a string that every caller reads as a token.
+    bf = tempfile.NamedTemporaryFile("wb", suffix=".env", delete=False)
+    bf.write(b"REMOTE_TASK_TOKEN=\xff\xfe\x00binary\n")
+    bf.close()
+    check("undecodable file reads as absence, not a garbage token",
+          ct.token_from_env_file(CANON, Path(bf.name)) == "")
+    # Positive control: the '' above is the FILE tier declining, not every tier
+    # failing — the vault still answers behind it.
+    check("gateway_token falls through an undecodable file to the vault",
+          ct.gateway_token(env_file=Path(bf.name), environ={},
+                           vault_get=lambda v: "vault-tok"
+                           if v == CANON else "") == "vault-tok")
+
+    # The lane lives INSIDE the resolver: AG2_DEVICE_ENV, then channels/<REMOTE_
+    # TASK_CHANNEL_DIR or ag2space>/.env, so no gate judges dev from prod's file.
+    cfg = Path(os.environ["CLAUDE_CONFIG_DIR"])
+    prod = cfg / "channels" / "ag2space" / ".env"
+    dev = cfg / "channels" / "dev" / ".env"
+    check("default lane is channels/ag2space/.env under the Claude home",
+          ct.gateway_env_file(environ={}) == prod, str(ct.gateway_env_file(environ={})))
+    check("REMOTE_TASK_CHANNEL_DIR=dev resolves channels/dev/.env",
+          ct.gateway_env_file(environ={"REMOTE_TASK_CHANNEL_DIR": "dev"}) == dev)
+    device = _envfile(**{CANON: "device-tok"})
+    check("AG2_DEVICE_ENV wins over the lane when it names an existing file",
+          ct.gateway_env_file(environ={"AG2_DEVICE_ENV": str(device),
+                                       "REMOTE_TASK_CHANNEL_DIR": "dev"}) == device)
+    check("a missing AG2_DEVICE_ENV falls through to the lane file, as the bridge does",
+          ct.gateway_env_file(environ={"AG2_DEVICE_ENV": str(cfg / "nope.env"),
+                                       "REMOTE_TASK_CHANNEL_DIR": "dev"}) == dev)
+    # A readable candidate WITHOUT a token must not shadow a later one that has
+    # it — the bridge walks every candidate (remote_gateway_bridge, #3338 B1).
+    urlonly = _envfile(REMOTE_TASK_URL="https://gw.invalid")
+    lane_ok = cfg / "channels" / "lane1" / ".env"
+    lane_ok.parent.mkdir(parents=True, exist_ok=True)
+    lane_ok.write_text(f"{CANON}=lane-secret\n")
+    _env = {"AG2_DEVICE_ENV": str(urlonly), "REMOTE_TASK_CHANNEL_DIR": "lane1"}
+    check("url-only AG2_DEVICE_ENV does not shadow a lane file with the token",
+          ct.gateway_token(environ=_env, vault_get=lambda v: "") == "lane-secret")
+    check("gateway_env_file names the candidate that supplied the token",
+          ct.gateway_env_file(environ=_env) == lane_ok, str(ct.gateway_env_file(environ=_env)))
+    check("candidate sequence is device file then lane file, in that order",
+          ct.gateway_env_candidates(environ=_env) == [urlonly, lane_ok])
+    # Never a bare ~/.claude: with no AG2_DEVICE_ENV and no CLAUDE_CONFIG_DIR the
+    # bridge refuses to guess, so the gate must resolve nothing, not an old install.
+    _saved_ccd = os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    try:
+        check("no pointers at all -> no candidates (no bare-home guess)",
+              ct.gateway_env_candidates(environ={}) == [] and ct.gateway_env_file(environ={}) is None)
+        check("no pointers at all -> no token even if a home install exists",
+              ct.gateway_token(environ={}, vault_get=lambda v: "") == "")
+    finally:
+        if _saved_ccd is not None:
+            os.environ["CLAUDE_CONFIG_DIR"] = _saved_ccd
+    # The detector-shaped call: no env_file argument, so the resolver picks it.
+    dev.parent.mkdir(parents=True, exist_ok=True)
+    dev.write_text(f"{CANON}=dev-lane-tok\n")
+    try:
+        check("a dev-lane host with prod's file absent resolves the dev token",
+              not prod.exists()
+              and ct.gateway_token(environ={"REMOTE_TASK_CHANNEL_DIR": "dev"},
+                                   vault_get=lambda v: "") == "dev-lane-tok")
+        check("...and the same host with the lane unset still reads prod (absent -> '')",
+              ct.gateway_token(environ={}, vault_get=lambda v: "") == "")
+        check("AG2_DEVICE_ENV alone configures the gateway with no lane file at all",
+              ct.gateway_token(environ={"AG2_DEVICE_ENV": str(device)},
+                               vault_get=lambda v: "") == "device-tok")
+    finally:
+        dev.unlink()
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}):")

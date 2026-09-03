@@ -19,20 +19,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO"
 
-# python3 resolves via PATH. The launchd plist sets PATH to
-# "__BREW_BIN__:/usr/bin:/bin:/usr/sbin:/sbin", where __BREW_BIN__ is the
-# interpreter dir the installer resolved from its own `command -v python3` — so
-# the bridge runs under the same interpreter the installer validated, with no
-# clone-, arch-, or user-specific fallback probe baked into this committed file.
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "[gateway-bridge-wrapper] no python3 on PATH (check the plist PATH)" >&2
-    exit 1
-fi
+# `command -v` proves a PATH entry EXISTS; on a Mac without the Xcode CLT that
+# entry is Apple's stub, and merely running it raises the install dialog.
+# shellcheck source=../../scripts/python-binary.sh
+. "$REPO/scripts/python-binary.sh"
+PYBIN="$(require_python "$REPO" "run the ag2.space gateway bridge")" || exit 1
 
 # Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
 # $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
 # config helper falls back to ~/.claude otherwise.
-if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)"; then
+if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path "channels/${REMOTE_TASK_CHANNEL_DIR:-ag2space}/.env" 2>/dev/null)"; then
     [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
 fi
 
@@ -55,12 +51,32 @@ REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
 REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
 export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
 
+# The bridge resolves env -> .env -> VAULT (_token_from_vault_ag2space, which
+# reuses channel_token.token_from_vault), so an .env-only gate here is NARROWER
+# than the thing it gates: a vault-only token parks the job before the bridge
+# ever gets the chance to resolve it. Ask the same shared resolver the bridge
+# would. rc 0 = usable, 3 = definitively absent; any other rc means the resolver
+# itself is unrunnable, so fall through to the .env answer rather than taking
+# the bridge down on a resolver bug.
+_TOKEN_PRESENT="$REMOTE_TASK_TOKEN"
+if [ -z "$_TOKEN_PRESENT" ]; then
+    _tok_rc=0
+    "$PYBIN" "$REPO/src/channel_token.py" --gateway >/dev/null 2>&1 || _tok_rc=$?
+    if [ "$_tok_rc" -eq 0 ]; then
+        _TOKEN_PRESENT="resolver"
+    elif [ "$_tok_rc" -ne 3 ]; then
+        echo "[gateway-bridge-wrapper] token resolver failed (rc=$_tok_rc) — using the lane file check" >&2
+        [ -f "$_RELAY_ENV" ] && grep -qE '^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=.+' "$_RELAY_ENV" \
+            && _TOKEN_PRESENT="lane-file"
+    fi
+fi
+
 # If there's still no token, the bridge would FATAL-exit and KeepAlive would
 # crash-loop. Exit 0 quietly instead — the install path only loads this job when
 # a token is configured, so reaching here means the token was removed after
 # install; don't hammer the system, just stop cleanly (launchd honors the clean
 # exit under our KeepAlive.SuccessfulExit=false policy).
-if [ -z "$REMOTE_TASK_TOKEN" ]; then
+if [ -z "$_TOKEN_PRESENT" ]; then
     echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — nothing to run; exiting cleanly." >&2
     exit 0
 fi
@@ -77,4 +93,4 @@ if [ -f "$_EVICT_HELPER" ]; then
   sleep 0.3
 fi
 
-exec python3 "$REPO/src/remote-gateway-bridge.py"
+exec "$PYBIN" "$REPO/src/remote-gateway-bridge.py"

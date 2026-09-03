@@ -405,11 +405,35 @@ reap_stale_task_watcher() {
 #
 # Requires REPO, PY (resolved via scripts/python-binary.sh) and LOGS_DIR set
 # by the caller — same contract as every other block in startup.sh.
+# The gateway's lane .env: AG2_DEVICE_ENV is the bridge's first candidate, the
+# lane file its second; this names the lane file so callers can source it.
+gateway_lane_env_file() {
+  bash "$REPO/scripts/sutando-config.sh" claude-home-path \
+    "channels/${REMOTE_TASK_CHANNEL_DIR:-ag2space}/.env" 2>/dev/null || true
+}
+
+# The one gateway predicate every launcher asks. 0 = configured, 1 = not.
+# Delegates to the shared resolver (env -> candidate files -> vault, both
+# aliases) with its 0/3/other contract: 3 is a definitive no; any other
+# failure degrades to the legacy file grep, never to "not configured".
+gateway_lane_configured() {
+  local _lane_env="${1:-$(gateway_lane_env_file)}" _rc=0
+  [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ] && return 0
+  if [ -n "${PY:-}" ]; then
+    "$PY" "$REPO/src/channel_token.py" --gateway >/dev/null 2>&1 || _rc=$?
+    [ "$_rc" -eq 0 ] && return 0
+    [ "$_rc" -eq 3 ] && return 1
+    echo "  ⚠ gateway token resolver failed (rc=$_rc) — using the lane file check" >&2
+  else
+    echo "  ⚠ no resolved interpreter for the gateway gate — using the lane file check" >&2
+  fi
+  [ -f "$_lane_env" ] && grep -qE '^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=.+' "$_lane_env"
+}
+
 start_gateway_lanes() {
   local _RELAY_ENV
-  if _RELAY_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"; \
-     { [ -f "$_RELAY_ENV" ] && grep -qE "^(REMOTE_TASK_TOKEN|AG2_REMOTE_TOKEN)=" "$_RELAY_ENV" 2>/dev/null; } \
-     || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+  _RELAY_ENV="$(gateway_lane_env_file)"
+  if gateway_lane_configured "$_RELAY_ENV"; then
     [ -f "$_RELAY_ENV" ] && { set -a; . "$_RELAY_ENV"; set +a; }
     # Tell the bridge where the durable token lives so auth-rejection recovery
     # (revoked/expired key) can re-read it after the connect flow rewrites it —

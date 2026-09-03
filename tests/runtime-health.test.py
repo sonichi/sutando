@@ -250,5 +250,58 @@ try:
 finally:
     rh._resolve_workspace = _ow
 
+# 8) _gateway_configured() reads the lane file the bridge reads: AG2_DEVICE_ENV,
+# else channels/<REMOTE_TASK_CHANNEL_DIR or ag2space>/.env, never prod's by name.
+_ct = sys.modules["channel_token"]
+_RESOLVER_VARS = ("CLAUDE_CONFIG_DIR", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
+                  "AG2_DEVICE_ENV", "REMOTE_TASK_CHANNEL_DIR")
+
+
+def _configured_at(cfg, **env):
+    saved = {k: os.environ.get(k) for k in _RESOLVER_VARS}
+    _tfv = _ct.token_from_vault
+    _ct.token_from_vault = lambda var, vault_get=None: ""   # never the real Keychain
+    try:
+        for k in _RESOLVER_VARS:
+            os.environ.pop(k, None)
+        os.environ["CLAUDE_CONFIG_DIR"] = str(cfg)
+        os.environ.update(env)
+        return rh._gateway_configured()
+    finally:
+        _ct.token_from_vault = _tfv
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+with tempfile.TemporaryDirectory() as _td:
+    _dev = os.path.join(_td, "channels", "dev", ".env")
+    os.makedirs(os.path.dirname(_dev))
+    with open(_dev, "w") as fh:
+        fh.write("REMOTE_TASK_TOKEN=dev-lane-tok\n")
+    _device = os.path.join(_td, "device.env")
+    with open(_device, "w") as fh:
+        fh.write("REMOTE_TASK_TOKEN=device-tok\n")
+    _prod = os.path.join(_td, "channels", "ag2space", ".env")
+    check("_gateway_configured: dev lane, prod absent, REMOTE_TASK_CHANNEL_DIR=dev -> True",
+          not os.path.exists(_prod)
+          and _configured_at(_td, REMOTE_TASK_CHANNEL_DIR="dev") is True)
+    check("_gateway_configured: same host, lane unset -> None (prod absent = can't tell)",
+          _configured_at(_td) is None)
+    check("_gateway_configured: AG2_DEVICE_ENV alone -> True",
+          _configured_at(_td, AG2_DEVICE_ENV=_device) is True)
+    _urlonly = os.path.join(_td, "device-url-only.env")
+    with open(_urlonly, "w") as fh:
+        fh.write("REMOTE_TASK_URL=https://gw.invalid\n")
+    check("_gateway_configured: url-only AG2_DEVICE_ENV + dev lane with token -> True",
+          _configured_at(_td, AG2_DEVICE_ENV=_urlonly, REMOTE_TASK_CHANNEL_DIR="dev") is True)
+    os.makedirs(os.path.dirname(_prod))
+    with open(_prod, "w") as fh:
+        fh.write("OTHER=1\n")
+    check("_gateway_configured: readable prod file with no token, lane unset -> False",
+          _configured_at(_td) is False)
+
 print("\n" + ("PASS — runtime-health green" if fails == 0 else "FAIL — %d failing" % fails))
 sys.exit(fails)

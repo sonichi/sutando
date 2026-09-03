@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 import tempfile
 import unittest.mock
 from pathlib import Path
@@ -33,6 +34,14 @@ REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hc)
+# The channel-.env path is resolved inside the shared token resolver now, so
+# pinning it means pinning THAT module's home lookup, not health-check's.
+ct = sys.modules["channel_token"]
+
+# Every var the resolver reads. A host's own lane/device settings must not leak
+# into a case that pins the file by patching the home lookup.
+_RESOLVER_VARS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
+                  "AG2_DEVICE_ENV", "REMOTE_TASK_CHANNEL_DIR")
 
 FAILURES = []
 
@@ -67,10 +76,12 @@ def _run(*, env=None, gw_env_path=None, pgrep_rc=1, pgrep_out="", pgrep_raises=F
     is pinned: unpinned, every serving=None case would read the host's own
     sidecar and flip to warn on a machine whose bridge stopped writing one."""
     env = env or {}
-    # Clear both token vars, then apply the requested env.
-    base = {k: v for k, v in hc.os.environ.items()
-            if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+    # Clear the resolver's vars, then apply the requested env.
+    base = {k: v for k, v in hc.os.environ.items() if k not in _RESOLVER_VARS}
     base.update(env)
+    # The resolver walks the bridge's own candidates; pin the file as the first one.
+    if gw_env_path:
+        base["AG2_DEVICE_ENV"] = str(gw_env_path)
     run_mock = (unittest.mock.Mock(side_effect=OSError("pgrep exploded"))
                 if pgrep_raises else unittest.mock.Mock(side_effect=_pgrep(pgrep_rc, pgrep_out)))
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
@@ -92,11 +103,27 @@ def _configured(*, env=None, gw_env_path=None):
     question would ship untested.
     """
     env = env or {}
-    base = {k: v for k, v in hc.os.environ.items()
-            if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+    base = {k: v for k, v in hc.os.environ.items() if k not in _RESOLVER_VARS}
     base.update(env)
+    if gw_env_path:
+        base["AG2_DEVICE_ENV"] = str(gw_env_path)
+    # The vault is stubbed empty: "no token, no file" must not read as True on
+    # a host whose Keychain holds a real bearer.
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
-         unittest.mock.patch.object(hc, "claude_home_path", return_value=gw_env_path):
+         unittest.mock.patch.object(ct, "token_from_vault", return_value=""):
+        return hc._gateway_configured()
+
+
+def _configured_on_host(cfg_dir, env=None):
+    """_gateway_configured() with the REAL path resolution, homed at `cfg_dir`.
+
+    The lane cases need the resolver to pick the file itself; pinning the path
+    would test the pin, not the lane.
+    """
+    base = {"CLAUDE_CONFIG_DIR": str(cfg_dir)}
+    base.update(env or {})
+    with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
+         unittest.mock.patch.object(ct, "token_from_vault", return_value=""):
         return hc._gateway_configured()
 
 
@@ -335,14 +362,13 @@ def main() -> int:
     # goes silent. Fail-open in the one direction this probe must not fail.
     #
     # These pin the classification itself, so narrowing cannot be undone quietly.
-    base = {k: v for k, v in hc.os.environ.items()
-            if k not in ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")}
+    base = {k: v for k, v in hc.os.environ.items() if k not in _RESOLVER_VARS}
 
     # 1) UNEXPECTED exception must NOT be classified as unconfigured. The
     #    reviewer's exact repro: a resolver contract bug.
     raised = None
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
-         unittest.mock.patch.object(hc, "claude_home_path",
+         unittest.mock.patch.object(ct, "gateway_env_candidates",
                                     side_effect=ValueError("resolver contract bug")):
         try:
             got = hc._gateway_configured()
@@ -357,10 +383,37 @@ def main() -> int:
     # 2) EXPECTED I/O failure still means unconfigured (the narrowing must not
     #    break the case the catch legitimately exists for).
     with unittest.mock.patch.dict(hc.os.environ, base, clear=True), \
-         unittest.mock.patch.object(hc, "claude_home_path",
+         unittest.mock.patch.object(ct, "gateway_env_candidates",
                                     side_effect=OSError("unreadable")):
         check("_gateway_configured: OSError → False (expected I/O failure)",
               hc._gateway_configured() is False)
+
+    # --- the LANE: AG2_DEVICE_ENV, then channels/<REMOTE_TASK_CHANNEL_DIR or
+    # ag2space>/.env. A detector reading prod's file judged a dev host from it.
+    with _tf.TemporaryDirectory() as _td:
+        _cfg = Path(_td)
+        _prod = _cfg / "channels" / "ag2space" / ".env"
+        _dev = _cfg / "channels" / "dev" / ".env"
+        _dev.parent.mkdir(parents=True)
+        _dev.write_text("REMOTE_TASK_TOKEN=dev-lane-tok\n")
+        _device = _cfg / "device.env"
+        _device.write_text("REMOTE_TASK_TOKEN=device-tok\n")
+
+        _urlonly = _cfg / "device-url-only.env"
+        _urlonly.write_text("REMOTE_TASK_URL=https://gw.invalid\n")
+        check("lane: url-only AG2_DEVICE_ENV must not shadow the dev lane's token → True",
+              _configured_on_host(_cfg, {"AG2_DEVICE_ENV": str(_urlonly),
+                                          "REMOTE_TASK_CHANNEL_DIR": "dev"}) is True)
+        check("lane: dev host, prod file absent, REMOTE_TASK_CHANNEL_DIR=dev → True",
+              not _prod.exists()
+              and _configured_on_host(_cfg, {"REMOTE_TASK_CHANNEL_DIR": "dev"}) is True)
+        check("lane: same host with the lane unset still answers from prod → False",
+              _configured_on_host(_cfg) is False)
+        check("lane: AG2_DEVICE_ENV alone configures the gateway → True",
+              _configured_on_host(_cfg, {"AG2_DEVICE_ENV": str(_device)}) is True)
+        check("lane: a missing AG2_DEVICE_ENV falls through to the lane file → True",
+              _configured_on_host(_cfg, {"AG2_DEVICE_ENV": str(_cfg / "nope.env"),
+                                         "REMOTE_TASK_CHANNEL_DIR": "dev"}) is True)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s)")
