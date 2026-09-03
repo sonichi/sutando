@@ -106,6 +106,16 @@ class SpawnWorkerTest(unittest.TestCase):
         self.assertEqual(r.stdout.strip(),
                          "mode=multi-worker workers=2 live=1 lead=installed")
 
+    def test_live_is_unknown_when_the_workspace_has_no_beat_dir(self):
+        # A checkout that resolves an unwritten workspace must not read as
+        # "installed but all dead".
+        self.preinstall(2)
+        shutil.rmtree(self.ws / "state")
+        r = self.run_skill("--status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(),
+                         "mode=multi-worker workers=2 live=? lead=installed")
+
     def test_dry_run_plans_without_installing(self):
         r = self.run_skill("--dry-run")
         self.assertEqual(r.returncode, 0, r.stderr)

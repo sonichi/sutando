@@ -45,9 +45,11 @@ lead_state() {
 }
 
 live_workers() {
-  # A beat younger than 90s is the pool's own liveness rule.
+  # A beat younger than 90s is the pool's own liveness rule. No beat dir means
+  # this checkout resolves a workspace the pool never wrote: unknown, not zero.
   local ws n=0 f age now
-  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || { echo 0; return; }
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || { echo "?"; return; }
+  [ -d "$ws/state/cores" ] || { echo "?"; return; }
   now="$(date +%s)"
   shopt -s nullglob
   for f in "$ws"/state/cores/core-[0-9]*.alive; do
