@@ -68,13 +68,13 @@ Each pass, in order:
 
    ```bash
    python3 $CLAUDE_CONFIG_DIR/skills/quota-tracker/scripts/read-quota.py \
-     | python3 "$WORKSPACE/scripts/quota-tier.py"
+     | python3 skills/proactive-loop/scripts/quota-tier.py
    # -> 5h ... -> FULL / 7d ... -> MEDIUM / TIER MEDIUM (bound by 7d)  sustainable Nx CURRENT pace
    ```
 
    It tiers each window by its OWN rule, selects with `max` over an ordered scale (`min` returns the
    LEAST restrictive — that was the bug), infers reset years with a bounds check, and refuses rather
-   than guessing. 13 tests; the discriminating ones are the MIXED pairs, since same-tier pairs pass
+   than guessing. 15 tests; the discriminating ones are the MIXED pairs, since same-tier pairs pass
    under both `min` and `max`. The prose below stays as the rationale — read it to understand the
    two rules, but do not execute it by hand.
    **Tier EACH window by its OWN rule, then take the MOST RESTRICTIVE TIER.** `read-quota.py`
@@ -154,11 +154,11 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
      **⚠ AND THE WHOLE JUDGEMENT BELONGS TO `src/result_markers.py`, WHICH ALREADY HAD IT.** `dedup_holder_delivered()` and `dedup_decision()` ship in the repo: the bridge already detects this, REQUEUES the asking task with a "holder delivered nothing, answer directly" reason, and only reports to the room after a requeue ALSO failed. So the room notice is the third step, not the first. I built a checker that re-implemented that policy and it drifted TWICE in one night — a hand-rolled `[no-send]` test called a `[REPLIED]` holder delivered, and hand-rolled chain-WALKING (`a -> b -> real reply` => clean) was **more permissive than production**, because `[deduped:]` is itself a skip action so the bridge requeues a chained holder and never walks it. A guard that clears what the bridge rejects is worse than no guard. The checker now delegates and refuses (exit 2) if the module cannot be imported, rather than falling back to a weaker local rule. Corpus went 68 -> 88 findings on the fix.
 
      ```bash
-     python3 "$WORKSPACE/scripts/check-dedup-targets.py" "$WORKSPACE/results/<file>.txt"
+     python3 skills/proactive-loop/scripts/check-dedup-targets.py "$WORKSPACE/results/<file>.txt"
      # 0 clean · 1 the dedup resolves to nothing · 2 could not answer (NOT a green light)
      ```
 
-     If every message in the group is a notice needing no reply, use `[no-send]` on **all** of them — never `[deduped:]` pointing at one. Guarded by `scripts/check-dedup-targets.test.py` (7 tests; mutations verified red). The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
+     If every message in the group is a notice needing no reply, use `[no-send]` on **all** of them — never `[deduped:]` pointing at one. Guarded by `skills/proactive-loop/scripts/check-dedup-targets.test.py` (11 tests; mutations verified red). The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
 
 2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
@@ -250,7 +250,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    ⇒ **RUN IT. It is one command and it takes a second:**
 
    ```bash
-   python3 "$WORKSPACE/scripts/warn-already-triaged.py" --claim "<the sentence you are about to say>"
+   python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence you are about to say>"
    # exit 1 = already parked, with file:line -> READ IT, then extend or say nothing is new
    # exit 0 = genuinely untriaged -> proceed
    # exit 2 = could not answer (no parking files / empty claim) -> NOT a green light
@@ -258,7 +258,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    Same `tokens()` + search the warn path uses, so the two cannot drift. Verified against the
    failure that produced it: the exact sentence I sent her returns exit 1 pointing at the parked
-   entry. Guarded by `scripts/warn-already-triaged.test.py` (8 tests; the discriminating one asserts
+   entry. Guarded by `skills/proactive-loop/scripts/warn-already-triaged.test.py` (10 tests; the discriminating one asserts
    the verdict flips when the subject is redacted from **both** parking files — a one-file redaction
    leaves it firing and reads as insensitivity that is not there).
 
@@ -294,7 +294,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    every shepherd sweep quotes had gone unexecuted**.
 
    ```bash
-   python3 "$WORKSPACE/scripts/tool-suites-check.py" --workspace "$WORKSPACE" --repo "$PWD"
+   python3 skills/proactive-loop/scripts/tool-suites-check.py --workspace "$WORKSPACE" --repo "$PWD"
    # fresh -> two stat() calls, prints one line · 0 all pass · 1 a suite FAILED · 2 cannot answer
    ```
 
@@ -303,6 +303,11 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    last green run, and otherwise only after 24h, so an edited tool cannot keep a stale pass.
    Controls verified: unchanged -> skip; `touch` one tool -> runs; break one tool -> exit 1 naming
    the suite; restore -> exit 0.
+
+   The six suites shipped under `skills/proactive-loop/scripts/` sit outside `$WORKSPACE/scripts`,
+   so declare them (repo-relative) in `$WORKSPACE/state/tool-suites-extra.json` —
+   `{"suites": ["skills/proactive-loop/scripts/idle-held.test.py", ...]}` — to put them under the
+   same changed-since-last-green trigger; a declared path that does not exist is exit 2, never a skip.
 
    ⚠ It invokes each suite with **no extra argv**. A `unittest`-based suite reads `argv[1]` as a
    test-NAME selector, so passing a repo path makes it error with `AttributeError: module
@@ -363,7 +368,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    is why prose cannot fix it.
 
    ```bash
-   python3 "$WORKSPACE/scripts/idle-held.py" --state "$WORKSPACE/state/idle-streak.json" \
+   python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" \
        --remove <id> --reason "<why>" --add <id>:<gate> --write \
      | python3 skills/proactive-loop/scripts/idle-surface-hash.py \
          --state "$WORKSPACE/state/idle-streak.json" --commit
@@ -372,7 +377,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    It reads `held_item_ids` from the state file and applies explicit ops; **there is no interface
    that accepts a whole list**, so a recall-built set cannot be expressed. A `--remove` of an id the
    record does not hold is refused and the near-miss named; a removal without `--reason` is refused,
-   because a silent shrink is the failure that corrupted the baseline. 16 tests, 5 mutations red.
+   because a silent shrink is the failure that corrupted the baseline. 48 assertions, 5 mutations red.
    ⚠ Nothing else writes `held_item_ids` — verified across 10,024 files in both trees, where the key
    appears only in the state file, in prose records and in one patch. It was hand-maintained, which
    is exactly why it drifted.
@@ -383,7 +388,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    of one fact, disagreeing with both. Audit them against git, not against another note:
 
    ```bash
-   python3 "$WORKSPACE/scripts/idle-held.py" --state "$WORKSPACE/state/idle-streak.json" \
+   python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" \
        --audit-notes "$PWD"        # 0 all match git · 1 a note disagrees, named
    ```
 
@@ -497,7 +502,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a lesson stopped loading is a warn on a later pass, and it never names the casualty.
 
    ```bash
-   python3 "$WORKSPACE/scripts/memory-index-budget.py" --adding "<the exact row you are about to add>"
+   python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<the exact row you are about to add>"
    # 0 safe · 1 REFUSE — it names the row that would drop, or says the addition itself won't load
    #                     · 2 cannot answer (health-check not importable) — NOT a green light
    ```
