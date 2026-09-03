@@ -52,15 +52,23 @@ def _next_fire(expr: str, now: datetime.datetime) -> str:
         return "—"
     try:
         mins, hrs = _field_set(p[0], 0, 59), _field_set(p[1], 0, 23)
-        dows = _field_set(p[3 + 1], 0, 6)  # cron dow 0-6 (Sun=0); mon field p[3] ignored (always * here)
+        doms, mons = _field_set(p[2], 1, 31), _field_set(p[3], 1, 12)
+        dows = _field_set(p[4], 0, 6)  # cron dow 0-6 (Sun=0)
     except Exception:
         return "—"
+    # Vixie cron: dom and dow are OR-ed when BOTH are restricted, AND-ed otherwise.
+    both = p[2] != "*" and p[4] != "*"
     t = now.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
-    for _ in range(8 * 24 * 60):  # minute scan, 8-day bound
+    end = t + datetime.timedelta(days=400)  # bound: an annual job is inside, a never-firing one is not
+    while t < end:
         # python weekday(): Mon=0..Sun=6 -> cron dow Sun=0..Sat=6
-        if t.minute in mins and t.hour in hrs and ((t.weekday() + 1) % 7) in dows:
-            return t.strftime("%Y-%m-%dT%H:%MZ")
-        t += datetime.timedelta(minutes=1)
+        dom_ok, dow_ok = t.day in doms, ((t.weekday() + 1) % 7) in dows
+        if t.month in mons and ((dom_ok or dow_ok) if both else (dom_ok and dow_ok)):
+            if t.minute in mins and t.hour in hrs:
+                return t.strftime("%Y-%m-%dT%H:%MZ")
+            t += datetime.timedelta(minutes=1)
+        else:
+            t = (t + datetime.timedelta(days=1)).replace(hour=0, minute=0)
     return "—"
 
 def _iso(ts) -> str:
@@ -77,7 +85,8 @@ def _last_fired(job: dict, ws: str, host: str) -> str:
     state = os.path.join(ws, "state")
     def _read(path, key):
         try:
-            d = json.load(open(path)); return d.get(key)
+            with open(path) as fh:
+                return json.load(fh).get(key)
         except Exception:
             return None
     if name == "main-loop":
