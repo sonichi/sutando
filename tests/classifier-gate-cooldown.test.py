@@ -52,9 +52,18 @@ def write_state(ws: Path, **kw) -> None:
 
 
 def main() -> int:
+    import os
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
+
+        # --- the enqueue gate is OFF by default (main, 2026-09-02); every
+        # cooldown case below presumes it is on, so prove the control first
+        os.environ.pop("SUTANDO_WORKSTREAM_CLASSIFIER", None)
+        r = tw.maybe_enqueue_classifier_task(make_workspace(tmp, "off"))
+        check(r.reason == "disabled",
+              f"unset SUTANDO_WORKSTREAM_CLASSIFIER -> disabled (got {r.reason})")
+        os.environ["SUTANDO_WORKSTREAM_CLASSIFIER"] = "1"
 
         # --- fresh completion + changed candidates -> cooling-down, no task file
         ws = make_workspace(tmp, "cooling")
