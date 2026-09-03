@@ -14,9 +14,10 @@ import sys
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-REPO = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else HERE.parents[2]
+REPO = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else HERE.parents[0]
+SCRIPT = REPO / "skills" / "proactive-loop" / "scripts" / "memory-index-budget.py"
 
-spec = importlib.util.spec_from_file_location("mib", HERE / "memory-index-budget.py")
+spec = importlib.util.spec_from_file_location("mib", SCRIPT)
 mib = importlib.util.module_from_spec(spec); spec.loader.exec_module(mib)
 
 MOD = mib._health_check(REPO)
@@ -84,7 +85,7 @@ check("a huge HTML comment costs no budget (strip is delegated, not re-implement
 # --- refusal ---------------------------------------------------------------
 with tempfile.TemporaryDirectory() as d:
     check("no health-check.py -> None, so main() can refuse", mib._health_check(pathlib.Path(d)) is None)
-    rc = mib.main(["--repo", d, "--index", str(HERE / "memory-index-budget.py")])
+    rc = mib.main(["--repo", d, "--index", str(SCRIPT)])
     check("exit 2 when the authority is unreadable (never a hardcoded fallback)", rc == 2, f"rc={rc}")
 
 with tempfile.TemporaryDirectory() as d:

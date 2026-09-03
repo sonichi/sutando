@@ -11,8 +11,8 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 
-HERE = pathlib.Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("qt", HERE / "quota-tier.py")
+SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts"
+spec = importlib.util.spec_from_file_location("qt", SCRIPTS / "quota-tier.py")
 qt = importlib.util.module_from_spec(spec); spec.loader.exec_module(qt)
 
 

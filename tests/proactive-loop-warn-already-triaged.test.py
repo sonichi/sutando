@@ -14,8 +14,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-_s = importlib.util.spec_from_file_location(
-    "wat", str(Path(__file__).resolve().parent / "warn-already-triaged.py"))
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts"
+_s = importlib.util.spec_from_file_location("wat", str(SCRIPTS / "warn-already-triaged.py"))
 wat = importlib.util.module_from_spec(_s)
 _s.loader.exec_module(wat)
 

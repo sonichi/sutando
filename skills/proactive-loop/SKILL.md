@@ -158,7 +158,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
      # 0 clean · 1 the dedup resolves to nothing · 2 could not answer (NOT a green light)
      ```
 
-     If every message in the group is a notice needing no reply, use `[no-send]` on **all** of them — never `[deduped:]` pointing at one. Guarded by `skills/proactive-loop/scripts/check-dedup-targets.test.py` (11 tests; mutations verified red). The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
+     If every message in the group is a notice needing no reply, use `[no-send]` on **all** of them — never `[deduped:]` pointing at one. Guarded by `tests/proactive-loop-check-dedup-targets.test.py` (11 tests; mutations verified red). The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.
 
 2. **Check pending questions.** Read the **per-host** `pending-questions.md` — `<workspace>/hosts/<hostname>/pending-questions.md` (`<hostname>` = `bash scripts/sutando-config.sh host-label`; this is the F1 per-host location, carried by `hosts/*/`, and where `personal_path("pending-questions.md")` resolves). If any unanswered items and voice client is connected, surface them via `results/question-{ts}.txt`. Also send a macOS notification.
 
@@ -258,7 +258,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    Same `tokens()` + search the warn path uses, so the two cannot drift. Verified against the
    failure that produced it: the exact sentence I sent her returns exit 1 pointing at the parked
-   entry. Guarded by `skills/proactive-loop/scripts/warn-already-triaged.test.py` (10 tests; the discriminating one asserts
+   entry. Guarded by `tests/proactive-loop-warn-already-triaged.test.py` (10 tests; the discriminating one asserts
    the verdict flips when the subject is redacted from **both** parking files — a one-file redaction
    leaves it firing and reads as insensitivity that is not there).
 
@@ -304,10 +304,11 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    Controls verified: unchanged -> skip; `touch` one tool -> runs; break one tool -> exit 1 naming
    the suite; restore -> exit 0.
 
-   The six suites shipped under `skills/proactive-loop/scripts/` sit outside `$WORKSPACE/scripts`,
-   so declare them (repo-relative) in `$WORKSPACE/state/tool-suites-extra.json` —
-   `{"suites": ["skills/proactive-loop/scripts/idle-held.test.py", ...]}` — to put them under the
-   same changed-since-last-green trigger; a declared path that does not exist is exit 2, never a skip.
+   The six suites ship as `tests/proactive-loop-*.test.py` (CI discovers only `tests/*.test.py`;
+   `tests/ci-covers-every-python-test.test.py` refuses a suite anywhere else). They sit outside
+   `$WORKSPACE/scripts`, so declare them (repo-relative) in `$WORKSPACE/state/tool-suites-extra.json`
+   — `{"suites": ["tests/proactive-loop-idle-held.test.py", ...]}` — to put them under the same
+   changed-since-last-green trigger; a declared path that does not exist is exit 2, never a skip.
 
    ⚠ It invokes each suite with **no extra argv**. A `unittest`-based suite reads `argv[1]` as a
    test-NAME selector, so passing a repo path makes it error with `AttributeError: module

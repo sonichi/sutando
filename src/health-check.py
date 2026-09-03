@@ -1471,6 +1471,7 @@ WORKSPACE_ROOT_SENTINEL_GLOBS = (".*-migrated*", ".legacy-notice-printed")
 #: so the probe's "state belongs under state/" remedy would break the reader.
 WORKSPACE_ROOT_PERSONAL_ASSETS = frozenset({
     "PERSONAL_CLAUDE.md",
+    "current-track.md",      # per-host under hosts/<host>/; personal_path() falls back to the root
     "stand-identity.json",
     "stand-avatar.png",
     "voice-context-active",

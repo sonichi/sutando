@@ -8,8 +8,8 @@ import pathlib
 import sys
 import tempfile
 
-HERE = pathlib.Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("ih", HERE / "idle-held.py")
+SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts"
+spec = importlib.util.spec_from_file_location("ih", SCRIPTS / "idle-held.py")
 ih = importlib.util.module_from_spec(spec); spec.loader.exec_module(ih)
 
 fails, ran = [], 0
@@ -62,7 +62,7 @@ check("--add without a gate is refused", rc == 1 and "ID:GATE" in err, err[:70])
 
 # there is NO interface that takes a whole list — the defect, made unreachable
 check("no --items/--set/stdin path exists",
-      not any(f in (HERE/"idle-held.py").read_text() for f in ('"--items"', '"--set"', "stdin.read()")))
+      not any(f in (SCRIPTS / "idle-held.py").read_text() for f in ('"--items"', '"--set"', "stdin.read()")))
 
 missing = pathlib.Path(tempfile.mkdtemp()) / "nope.json"
 rc, _, err = run(["--state", str(missing)])
@@ -159,7 +159,7 @@ check("audit: note-less held ids are named", "2" in _out3 and "no note" in _out3
 # fixture, so a held item pointing at it MUST be reported stale -----------------
 import os as _os
 import sys as _sys
-_TOOL = str(HERE / "idle-held.py")
+_TOOL = str(SCRIPTS / "idle-held.py")
 
 def _audit(doc):
     with _tf.TemporaryDirectory() as td:
@@ -251,7 +251,7 @@ with _tf.TemporaryDirectory() as td:
     open(f, "w").write(json.dumps(ORPH))
     _sp.run([_sys.executable, _TOOL, "--state", f, "--archive-orphan-notes", "--write"],
             capture_output=True, text=True)
-    r = _sp.run([_sys.executable, _TOOL, "--state", f, "--audit-notes", str(HERE)],
+    r = _sp.run([_sys.executable, _TOOL, "--state", f, "--audit-notes", str(SCRIPTS)],
                 capture_output=True, text=True)
     check("archive: --audit-notes goes GREEN afterwards", r.returncode == 0,
           f"rc={r.returncode} {r.stdout}{r.stderr}")

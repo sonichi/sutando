@@ -13,7 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-TOOL = Path(__file__).resolve().parent / "tool-suites-check.py"
+TOOL = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts" / "tool-suites-check.py"
 spec = importlib.util.spec_from_file_location("tsc", TOOL)
 tsc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tsc)

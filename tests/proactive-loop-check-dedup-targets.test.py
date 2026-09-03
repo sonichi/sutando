@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-_s = importlib.util.spec_from_file_location(
-    "cdt", str(Path(__file__).resolve().parent / "check-dedup-targets.py"))
+SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "scripts"
+_s = importlib.util.spec_from_file_location("cdt", str(SCRIPTS / "check-dedup-targets.py"))
 cdt = importlib.util.module_from_spec(_s)
 _s.loader.exec_module(cdt)
 
