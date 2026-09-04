@@ -221,21 +221,38 @@ two files answering "whose room is this" is worse than either alone.
 
 Every pool command is an owner task, written by whatever surface the owner used
 (the ag2space app's picker or a create-worker control, a room message, voice, or
-the CLI skill), enveloped and verified like any task, with `source:` naming the
-intent. One channel, one shape, one code path to test. The core executes all of
-them, and a pinned room must not divert them: a command envelope carries
-`requested_worker: core`, set by the surface that minted it, and every worker's
-handler suppresses a task whose `source:` is a pool command **before** it
+the CLI skill), enveloped and verified like any task. One channel, one shape, one
+code path to test.
+
+**The discriminator is its own field, `pool_command:`, and NOT `source:`.** An
+earlier draft of this section used `source:` to name the intent, which cannot
+work: `source` already carries transport provenance and two live consumers
+depend on it. `default_priority_for_source()` (`src/task_priority.py:38-55`)
+branches on it to assign urgent/normal/low, and Telegram crash recovery claims
+only the tasks that bridge wrote by testing `headers.get("source") != "telegram"`
+(`src/telegram-bridge.py:~580`). So preserving `source: telegram` leaves the
+pre-pin predicate unable to recognise a command, and overwriting it silently
+disables that bridge's recovery and mis-prioritises the task. One field cannot
+answer "which transport delivered this" and "is this a pool command" at once.
+
+`pool_command` carries the command KIND (`resize`, `pin`, `unpin`,
+`create-worker`, …). `source` keeps its transport meaning untouched, so priority
+and crash recovery are unaffected.
+
+The core executes commands, and a pinned room must not divert them: a command
+envelope carries `requested_worker: core`, set by the surface that minted it, and
+every worker's handler suppresses a task carrying `pool_command` **before** it
 evaluates pin eligibility — suppress in the same sense as the routing rules
 above, since `requested_worker: core` makes every worker a non-target and a
-discard here would race the core's emit exactly as it would there. Both fields live in the verified envelope, never in
-the body, so a room message whose text reads "resize to 0" is an ordinary task.
+discard here would race the core's emit exactly as it would there. Both fields
+live in the verified envelope, never in the body, so a room message whose text
+reads "resize to 0" is an ordinary task.
 
 **"In the envelope" means minted before the stamp, not appended after it.**
 `stamp_text` MACs the whole body, so a field appended post-mint either
 invalidates the stamp or displaces it, and a displacing edit reads `unsigned`
 rather than `invalid` — tamper is not always loud. The server writes
-`requested_worker` and the command marker into the body it then stamps, the way
+`requested_worker` and `pool_command` into the body it then stamps, the way
 `collaborator` already is (its append at `remote_gateway_bridge.py:2722` feeds
 the same list the single stamp call at `:2811` hands to the stamper; CLAUDE.md's
 "bypassing `serialize_task_last`'s key check" means the key allowlist, not the
@@ -248,6 +265,26 @@ never lost but may be unstamped. "The field is in the verified envelope" is
 therefore a property of a stamped task, not of every task. The step-2 suite
 carries two negative tests: a forged body line, and a `requested_worker` added
 after stamping, refused on the `unsigned` verdict rather than honoured.
+
+**So fail-open signing needs a stated disposition, or a legitimate command
+emitted during a signer outage has nowhere to go.** Refusing unsigned routing
+fields without saying what happens to the task leaves exactly two outcomes, and
+both are wrong: it reaches a worker in a pinned room — the bug this section
+exists to prevent — or it is silently stranded. The matrix is therefore explicit,
+and the invariant is that **an unverified command is never worker work**:
+
+| stamp verdict | `pool_command` honoured? | `requested_worker` honoured? | disposition |
+|---|---|---|---|
+| **verified** | yes | yes | the core executes the command. |
+| **unsigned** (no stamper, or the stamper raised) | **no** | **no** | refused as a command AND withheld from every worker. Quarantined with the reason, and the owner is told the command did not run and why. It is not retried silently — a command that changes pool topology must not execute on an unverified envelope. |
+| **invalid** (stamp present, MAC mismatch) | **no** | **no** | same refusal, quarantined as tamper rather than outage, and reported loudly. |
+
+Both non-verified rows fail SAFE in the sense that matters here: the task never
+becomes worker work and never mutates the pool. What it costs is availability
+during a signer outage — commands stop working until signing recovers — and that
+is the correct trade for an operation that resizes or re-pins the pool. The step-2
+suite owes one test per row, including the positive control that a verified
+command still executes, or the matrix is prose that never ran.
 
 | command | effect |
 |---|---|
