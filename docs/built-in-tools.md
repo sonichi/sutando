@@ -62,6 +62,30 @@ python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/contacts.py search "Bob"  
 ```
 Use before sending email to resolve "email Bob" → actual email address. Returns name, emails, phones.
 
+**Google Contacts (read + WRITE) — a Gmail app password already reaches CardDAV.** The entry above is
+macOS Contacts and is lookup-only; it is not the only contacts path. A stored Gmail **app password**
+authenticates Basic auth against Google's CardDAV endpoint, so the same secret held for IMAP/SMTP can
+create and read contacts with no extra scope, no service-account delegation and no Admin-console
+change:
+
+```bash
+BASE="https://www.googleapis.com/carddav/v1/principals/$USER_EMAIL/lists/default/"
+curl -su "$USER_EMAIL:$APP_PASSWORD" -X PROPFIND "$BASE" -H 'Depth: 1'      # 207 = reachable
+curl -su "$USER_EMAIL:$APP_PASSWORD" -X PUT "$BASE<uid>.vcf" \
+     -H 'Content-Type: text/vcard; charset=utf-8' -H 'If-None-Match: *' \
+     --data-binary @contact.vcf                                            # 201 = created
+curl -su "$USER_EMAIL:$APP_PASSWORD" "$BASE<uid>.vcf"                      # read it back
+```
+
+`If-None-Match: *` makes the PUT create-only, so a retry cannot silently overwrite an existing card.
+Get the app password from the vault (`secret-vault.py get <KEY>`); never inline it.
+
+**⚠ The general rule this entry exists to teach: a credential's reach is not the name of the tool you
+got it for.** One Google app password unlocks **IMAP + SMTP + CardDAV + CalDAV**. Before telling the
+owner "I have no way to do X", check what your *held credentials* reach by protocol — not what this
+catalog happens to list. Answering from the catalog is how a capability that already existed gets
+reported as missing.
+
 **iMessage** — send and read iMessages:
 ```bash
 imsg send --to "+14155551234" --text "Hello!"    # send message
