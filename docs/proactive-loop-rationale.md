@@ -144,7 +144,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
   purpose (`restart.sh --stop-only`, the menu-bar Stop). Finish the task in hand, start no new one,
   write `{"status":"idle"}` and end the loop cleanly — do not treat it as a crash and do not relaunch.
   Which paths set it, which clear it, and why a plain restart clears it:
-  [`docs/graceful-shutdown.md`](../../docs/graceful-shutdown.md).
+  [`docs/graceful-shutdown.md`](graceful-shutdown.md).
 - **(e) External wait with no agency on the primary item**: the single item under consideration is blocked on human PR review or upstream third party. Only gates THAT item — other menu items remain fair game.
 
 **Blocker ≠ stop.** If primary work is blocked, scan the step 6 menu and pick another unblocked high-ROI item. Idling because "nothing to do" is laziness, not a skip.
