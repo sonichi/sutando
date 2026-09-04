@@ -5,7 +5,9 @@ never manufacture a second delivery.
 Epoch assertions run against the SHIPPED key derivation, not a re-computation.
 """
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -359,6 +361,34 @@ class Delegation(unittest.TestCase):
         self.assertEqual(private, [],
                          f"outbox_cli.py reaches into outbox internals: {private}")
         self.assertNotIn("_write_item", src)
+
+
+class EntryPointImportsInThePackage(unittest.TestCase):
+    """The console script imports ONLY ag2_sparrow.outbox_cli, so it must work
+    with nothing else loaded. In-process this is unprovable: the bridge does
+    sys.path.insert(0, src), so anything importing it first masks a flat-import
+    failure. Hence a subprocess with only the package on PYTHONPATH.
+    """
+
+    def _run(self, code: str, pkg_parent: str):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=pkg_parent, PYTHONDONTWRITEBYTECODE="1")
+        return subprocess.run([sys.executable, "-c", code], env=env,
+                              capture_output=True, text=True, cwd=tempfile.gettempdir())
+
+    def test_console_script_entry_imports_alone(self):
+        import shutil
+        with TemporaryDirectory() as td:
+            shutil.copytree(ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow",
+                            Path(td) / "ag2_sparrow")
+            r = self._run("from ag2_sparrow.outbox_cli import main", td)
+            self.assertEqual(r.returncode, 0,
+                             f"`ag2-sparrow-outbox` cannot start:\n{r.stderr}")
+
+    def test_flat_import_from_src_still_works(self):
+        """The same file is src-canonical, where the names are top-level."""
+        r = self._run("import outbox_cli", str(ROOT / "src"))
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class VendoredCopyInSync(unittest.TestCase):

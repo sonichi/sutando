@@ -20,8 +20,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-import outbox
-import undelivered_quarantine
+# This module is src-canonical AND vendored into ag2_sparrow, so it must import
+# both ways. Relative first: it fails unambiguously when there is no package.
+try:
+    from . import outbox, undelivered_quarantine
+except ImportError:
+    import outbox
+    import undelivered_quarantine
 
 
 def _default_operator() -> str:
