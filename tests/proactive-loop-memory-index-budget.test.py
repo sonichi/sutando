@@ -288,6 +288,17 @@ with tempfile.TemporaryDirectory() as d:
     check("main() with the override set resolves without ambiguity and does not refuse",
           rc == 0 and "CANNOT ANSWER" not in err, f"rc={rc} err={err[:100]!r}")
 
+with tempfile.TemporaryDirectory() as d:
+    # main()'s refusal path: reachable only when _live_index cannot resolve, which
+    # the override CAN produce -- it names a directory holding no index.
+    projects = pathlib.Path(d) / "projects"
+    _tree(projects, "slug-present", index_of(LIMIT // 3), age_s=60)
+    empty = projects / "slug-empty" / "memory"
+    empty.mkdir(parents=True)
+    rc, out, err = _main_with_memory_dir(empty, ["--repo", str(REPO)])
+    check("main() REFUSES (rc 2) when the resolver cannot name an index, and says why on stderr",
+          rc == 2 and "CANNOT ANSWER" in err and out == "", f"rc={rc} err={err[:90]!r} out={out[:40]!r}")
+
 # --- the authority must be the real one: a stand-in that lacks the primitives is None
 with tempfile.TemporaryDirectory() as d:
     (pathlib.Path(d) / "src").mkdir()

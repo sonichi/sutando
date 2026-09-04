@@ -147,10 +147,9 @@ def main(argv=None) -> int:
     else:
         index, note = _live_index(Path(getattr(mod, "MEMORY_DIR", "")))
         if index is None:
+            # note is non-empty IFF index is None -- every resolved path returns "".
             print(note, file=sys.stderr)
             return 2
-    if note:
-        print(note)
     if not index.is_file():
         print(f"CANNOT ANSWER: no index at {index}", file=sys.stderr)
         return 2
