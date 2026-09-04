@@ -150,6 +150,40 @@ with tempfile.TemporaryDirectory() as td:
     check("touching a tool under tools/ re-triggers", "running" in p.stdout, True)
 
 
+def both_populated_case(td):
+    """BOTH scripts/ and tools/ hold .py — the ordinary mid-migration state.
+
+    `next(...)` returned scripts/ and stopped, so tools/ was neither watched nor
+    DISCOVERED: its suites never ran at all (3852-r1). Healthy from inside,
+    because the selected dir still yields a non-empty runnable set.
+    """
+    ws = Path(td) / "ws5"
+    for d in ("scripts", "tools", "state"):
+        (ws / d).mkdir(parents=True)
+    (ws / "scripts" / "legacy.py").write_text("def verdict():\n    return 1\n")
+    (ws / "scripts" / "legacy.test.py").write_text("import sys\nprint('ok')\nsys.exit(0)\n")
+    (ws / "tools" / "newer.py").write_text("def verdict():\n    return 2\n")
+    (ws / "tools" / "newer.test.py").write_text("import sys\nprint('ok')\nsys.exit(0)\n")
+    return ws
+
+
+with tempfile.TemporaryDirectory() as td:
+    ws = both_populated_case(td)
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                       capture_output=True, text=True)
+    check("both dirs populated: the scripts/ suite runs", "legacy.test.py" in p.stdout, True)
+    check("...and the tools/ suite runs too (next() dropped it)", "newer.test.py" in p.stdout, True)
+    check("...counted as 2, so neither is silently outside the set",
+          "2 of 2 suites pass" in p.stdout, True)
+    # The trigger must key on an edit in EITHER dir, not only the first one.
+    subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                   capture_output=True, text=True)
+    os.utime(ws / "tools" / "newer.py", None)
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                       capture_output=True, text=True)
+    check("touching a tool in the UNSELECTED dir re-triggers", "running" in p.stdout, True)
+
+
 print("7. in-process: the trigger rule and the two scope refusals")
 check("no recorded run -> run", tsc.should_run({}, 0.0, 3600, 100.0)[0], True)
 check("unchanged and young -> fresh", tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0}, 5.0, 3600, 100.0)[0], False)

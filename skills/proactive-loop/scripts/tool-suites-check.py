@@ -38,9 +38,14 @@ SENTINEL = "tool-suites-last-run.json"
 EXTRAS = "tool-suites-extra.json"       # {"suites": ["tests/x.test.py", ...]}
 
 
-def tools_and_suites(scripts: Path):
-    suites = sorted(p for p in scripts.glob("*.test.py"))
-    tools = sorted(p for p in scripts.glob("*.py") if not p.name.endswith(".test.py"))
+def tools_and_suites(dirs):
+    """Union over EVERY candidate dir, not the first that matches: a workspace
+    mid-migration holds .py in both, and picking one hides the other's suites."""
+    if isinstance(dirs, Path):
+        dirs = [dirs]
+    found = [p for d in dirs for p in d.glob("*.py")]
+    suites = sorted(p for p in found if p.name.endswith(".test.py"))
+    tools = sorted(p for p in found if not p.name.endswith(".test.py"))
     return tools, suites
 
 
@@ -157,14 +162,14 @@ def main(argv=None) -> int:
 
     ws = Path(a.workspace)
     statedir = ws / "state"
-    # A `scripts/` that exists but holds no .py makes the mtime trigger vacuous, so
-    # watch whichever of scripts//tools/ the tools are actually in.
-    scripts = next((d for d in (ws / "scripts", ws / "tools")
-                    if d.is_dir() and any(d.glob("*.py"))), ws / "scripts")
-    if not scripts.is_dir():
-        print(f"CANNOT ANSWER: no {scripts}", file=sys.stderr)
+    # A `scripts/` that exists but holds no .py makes the mtime trigger vacuous,
+    # so watch EVERY one of scripts/ and tools/ that holds .py, never the first.
+    candidates = [d for d in (ws / "scripts", ws / "tools")
+                  if d.is_dir() and any(d.glob("*.py"))]
+    if not candidates:
+        print(f"CANNOT ANSWER: no {ws / 'scripts'}", file=sys.stderr)
         return 2
-    tools, suites = tools_and_suites(scripts)
+    tools, suites = tools_and_suites(candidates)
     try:
         extras = extra_suites(statedir, Path(a.repo).resolve())
     except ExtrasError as e:
