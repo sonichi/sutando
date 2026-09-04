@@ -186,6 +186,61 @@ class TestProactiveQuarantine(unittest.TestCase):
                       "a body with no reason token must not be given one")
 
 
+    # --- recency: is this directory FILLING, or inert history? -----------
+    def _park(self, q, stem, age_s):
+        b = q / f"{stem}.txt"
+        b.write_text("body")
+        t = time.time() - age_s
+        os.utime(b, (t, t))
+        return b
+
+    def test_an_inert_backlog_and_a_filling_one_do_not_read_the_same(self):
+        """The control the change exists for.
+
+        Both directories hold the same COUNT and the same OLDEST file, so a
+        verdict built from those two alone is byte-identical for a backlog
+        nobody has added to in weeks and one that took a message a minute ago.
+        Only an arrival age separates them, and the operator's question --
+        "must I act now?" -- is answered by that and nothing else.
+        """
+        details = {}
+        for label, newest_age in (("inert", 300 * 3600), ("filling", 60)):
+            with tempfile.TemporaryDirectory() as td:
+                q = self._quarantine(td)
+                self._park(q, "proactive-old", 600 * 3600)
+                self._park(q, "proactive-new", newest_age)
+                details[label] = self._run(td)["detail"]
+        # same population, same oldest -> the ONLY admissible difference is arrival
+        self.assertIn("proactive-old", details["inert"])
+        self.assertIn("proactive-old", details["filling"])
+        self.assertIn("600h0m", details["inert"])
+        self.assertIn("600h0m", details["filling"])
+        self.assertNotEqual(details["inert"], details["filling"],
+                            "inert and actively-filling quarantines render identically")
+        self.assertIn("300h0m ago", details["inert"])
+        self.assertIn("0h1m ago", details["filling"])
+
+    def test_a_single_body_does_not_repeat_its_own_age(self):
+        """With one file the oldest IS the newest; saying it twice is noise."""
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            self._park(q, "proactive-solo", 5 * 3600)
+            d = self._run(td)["detail"]
+            self.assertIn("5h0m", d)
+            self.assertNotIn("newest arrived", d)
+
+    def test_the_arrival_age_tracks_the_newest_not_the_count(self):
+        """Adding OLDER files must not change the reported arrival age -- a
+        clause keyed on len() or on the oldest would move here."""
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            self._park(q, "proactive-a", 400 * 3600)
+            self._park(q, "proactive-b", 100 * 3600)
+            first = self._run(td)["detail"]
+            self._park(q, "proactive-c", 900 * 3600)   # older than both
+            self.assertIn("100h0m ago", first)
+            self.assertIn("100h0m ago", self._run(td)["detail"])
+
     def test_the_operators_real_workspace_is_never_touched(self):
         before = None
         real = hc.WORKSPACE_DIR / "results" / "undelivered"

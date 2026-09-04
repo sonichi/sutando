@@ -8086,6 +8086,11 @@ def check_proactive_quarantine() -> dict:
                 "detail": f"no quarantined proactive bodies{partial}"}
     kept.sort(key=lambda item: -item[1])
     oldest_name, oldest_age = kept[0]
+    # The oldest age only ever increases: it reads the same whether the
+    # directory is filling now or has been inert for a month. The newest says which.
+    newest_age = kept[-1][1]
+    arrival = (f"; newest arrived {newest_age // 3600}h{newest_age % 3600 // 60}m ago"
+               if len(kept) > 1 else "")
     return {
         "name": name,
         "status": "warn",
@@ -8095,7 +8100,7 @@ def check_proactive_quarantine() -> dict:
                    f"({_park_reason_tally(kept)}) — preserved, but no consumer drains this "
                    f"directory, so they stay until someone acts; oldest {oldest_name} "
                    f"({oldest_age // 3600}h{oldest_age % 3600 // 60}m)"
-                   f"{partial}"),
+                   f"{arrival}{partial}"),
     }
 
 
