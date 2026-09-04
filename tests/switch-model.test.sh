@@ -103,4 +103,11 @@ LASTSEND=$(grep -- "-l /model" "$T/tmux.log" | tail -1 | sed 's/.*\/model //')
 SEQ="$(grep send-keys "$T/tmux.log" | sed -E 's/.*-l \/model (sonnet|haiku)$/lit:\1/; s/.*Enter$/enter/' | tr '\n' ' ')"
 case "$SEQ" in "lit:sonnet enter lit:haiku enter "|"lit:haiku enter lit:sonnet enter ") ok "27 ...and the live sends do not interleave";; *) fail "27 interleave" "$SEQ";; esac
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 27 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- cross-sender regression: a model switch and an app watcher line through the SAME sender never interleave
+: > "$T/tmux.log"; printf '{"model":"opus"}\n' > "$T/cfg/settings.json"
+(TMUX_CAP_DELAY=0.5 "$HERE/scripts/switch-model.sh" sonnet --state-dir "$T/state" --brain "$T/cfg" --socket "$T/x.sock" >/dev/null 2>&1) & sleep 0.15
+(PATH="$T/bin:$PATH" bash "$HERE/scripts/tmux-send-line.sh" sutando-core watcher --socket "$T/x.sock" --skip-if-queued watcher >/dev/null 2>&1) & wait
+SEQ="$(grep send-keys "$T/tmux.log" | sed -E 's/.*-l \/model sonnet$/lit:model/; s/.*-l watcher$/lit:watcher/; s/.*Enter$/enter/' | tr '\n' ' ')"
+case "$SEQ" in "lit:model enter lit:watcher enter "|"lit:watcher enter lit:model enter ") ok "28 cross-sender: model switch and watcher line serialize through one lock: $SEQ";; *) fail "28 cross-sender interleave" "$SEQ";; esac
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 28 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

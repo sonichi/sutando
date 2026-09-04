@@ -48,22 +48,21 @@ RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || ec
 if [ "$RUNTIME" = "codex" ]; then
   echo "switch-model: refused — the configured core runtime is codex; its model is a launch argument: SUTANDO_CORE_MODEL=$MODEL bash src/agent/codex/cli/start-cli.sh --restart (owner-gated restart). Nothing changed." >&2; exit 4
 fi
-# Preflight the live pane before any write: a prompt line carrying text would get
-# our command appended to it. The input line is the '❯'/'>' line above the footer.
-LIVE=""; PENDING=""
-if tmux -S "$SOCK" has-session -t "=$SESSION" 2>/dev/null; then
-  LIVE=1
-  PENDING="$(tmux -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null | "$PY" -c "$(cat <<'PYEOF'
-import sys
-lines = [l.rstrip() for l in sys.stdin.read().splitlines()]
-prompt = [l for l in lines if l.lstrip().startswith(("\u276f", "> "))]
-if prompt:
-    print(prompt[-1].lstrip()[1:].replace("\u00a0", " ").strip())
-PYEOF
-)")"
-  if [ -n "$PENDING" ]; then
-    echo "switch-model: refused — the core input box is not clear (pending: ${PENDING:0:60}); nothing changed" >&2; exit 5
-  fi
+# Preflight the live pane before any write through the ONE sender
+# (scripts/tmux-send-line.sh): its --dry-run inspects the prompt under the
+# socket lock and refuses (5) on pending text, (7) on a failed inspection.
+SENDER="$REPO/scripts/tmux-send-line.sh"
+LIVE=""
+if [ -x "$SENDER" ] || [ -f "$SENDER" ]; then
+  bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending --dry-run > /dev/null 2> "$STATE_DIR/.send-preflight.err"; PRC=$?
+  case $PRC in
+    0) LIVE=1;;
+    3) LIVE="";;
+    5) echo "switch-model: refused — $(cat "$STATE_DIR/.send-preflight.err"); nothing changed" >&2; exit 5;;
+    *) echo "switch-model: refused — $(cat "$STATE_DIR/.send-preflight.err"); nothing changed" >&2; exit 7;;
+  esac
+else
+  echo "switch-model: shared sender missing ($SENDER) — nothing changed" >&2; exit 7
 fi
 # Record first, then pin; a failed pin removes the record it would have described.
 OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" <<'PYEOF'
@@ -124,8 +123,7 @@ case "$OUT" in
   *) echo "switch-model: unexpected python outcome (rc=$RC): $OUT" >&2; exit 1;;
 esac
 echo "pinned: $CFG model=$MODEL (was ${OUT#OK }); record: $STATE_DIR/model-switch.json"
-if [ -n "$LIVE" ] && tmux -S "$SOCK" send-keys -t "$SESSION" -l "/model $MODEL" \
-   && tmux -S "$SOCK" send-keys -t "$SESSION" Enter; then
+if [ -n "$LIVE" ] && bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null; then
   echo "live: sent '/model $MODEL' to tmux session $SESSION (if a turn is running, the CLI queues it and switches when the turn ends)"; exit 0
 fi
 echo "live: NOT sent — no tmux session '$SESSION' on $SOCK; the pin applies at the next launch" >&2
