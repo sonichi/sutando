@@ -132,8 +132,12 @@ def main(argv=None) -> int:
 
     toks = list(tokens(None, a.title))
     for w in bare_words(a.title, stop):
-        if w not in {t.lower() for t in toks}:
-            toks.append(w)
+        low = {t.lower() for t in toks}
+        # Skip a word already CONTAINED in an entity token: `watch-tasks-stream`
+        # then `watch`/`tasks`/`stream` spends the query budget re-asking itself.
+        if w in low or any(w in t for t in low):
+            continue
+        toks.append(w)
     if not toks:
         print(f"CANNOT ANSWER: no entity tokens in {a.title!r}, so nothing would be "
               f"searched and a clean result would be produced by construction.", file=sys.stderr)
@@ -161,8 +165,12 @@ def main(argv=None) -> int:
                   key=lambda p: -p[0])
     hits = [(s, it) for s, it in hits if s >= a.min_overlap]
 
-    print(f"searched {a.repo} on {len(toks[:a.max_queries])} token(s): "
-          f"{', '.join(toks[:a.max_queries])}")
+    used, dropped = toks[:a.max_queries], toks[a.max_queries:]
+    print(f"searched {a.repo} on {len(used)} of {len(toks)} token(s): {', '.join(used)}")
+    if dropped:
+        # Naming them keeps the bound visible: a duplicate sharing ONLY a dropped
+        # token scores 0, and token order is title order, not distinctiveness.
+        print(f"  ⚠ NOT searched (--max-queries={a.max_queries}): {', '.join(dropped)}")
     if failures:
         print(f"  ⚠ {failures} query(ies) failed — coverage is partial")
     if not hits:
@@ -173,9 +181,11 @@ def main(argv=None) -> int:
                   f"and the rest matched nothing, so this is 'not fully searched', "
                   f"not 'nothing is there'.", file=sys.stderr)
             return 2
-        print("  NO CANDIDATE  — but that is 'no title matched these tokens', "
-              "not proof of absence. A duplicate worded differently in the TITLE "
-              "is invisible to an in:title search.")
+        bound = (f" and {len(dropped)} token(s) were never searched"
+                 if dropped else "")
+        print(f"  NO CANDIDATE  — but that is 'no title matched these tokens'{bound}, "
+              f"not proof of absence. A duplicate worded differently in the TITLE "
+              f"is invisible to an in:title search.")
         return 0
 
     print(f"  DO NOT FILE — {len(hits)} candidate(s) share >= {a.min_overlap} tokens:")

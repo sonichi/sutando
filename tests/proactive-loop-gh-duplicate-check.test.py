@@ -26,7 +26,7 @@ REAL = ("eslint: 34 of 300 runs (11%) are killed by timeout-minutes: 5, and the 
 ORIG = {"number": 3862, "state": "open", "html_url": "u",
         "title": "CI: eslint job times out in npm ci since 2026-09-03T22:37Z — 12 of "
                  "last 100 runs killed at the 5-min cap, reported as 'cancelled'",
-        "body": "timeout-minutes: 5 ... npm ci ... eslint"}
+        "body": "timeout-minutes: 5 ... npm ci ... eslint ... variance in install time"}
 
 
 def run(argv, stub):
@@ -129,12 +129,35 @@ class Scoring(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("not proof of absence", out)
 
+
+    def test_a_clean_result_names_the_tokens_it_never_searched(self):
+        # The cap drops 2-8 tokens on real titles, often the most distinctive
+        # ones, so an unstated bound reads as a wider search than was run.
+        rc, out, _ = run(BASE + ["--max-queries", "1"], lambda r, t, **k: [])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("NOT searched", out)
+        self.assertIn("never searched", out)
+
+    def test_the_header_states_used_of_total(self):
+        rc, out, _ = run(BASE + ["--max-queries", "1"], lambda r, t, **k: [])
+        self.assertRegex(out, r"searched \S+ on 1 of \d+ token")
+
     def test_candidates_are_ranked_by_overlap(self):
+        # weak scores 2, ORIG 3 — a real gap. The old fixture tied on a phantom
+        # point: the token `lint` matching inside the word `eslint`.
         weak = {"number": 1, "state": "open", "html_url": "u",
-                "title": "eslint npm", "body": ""}
+                "title": "eslint variance", "body": ""}
         rc, out, _ = run(BASE, lambda r, t, **k: [weak, ORIG])
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 1, out)
         self.assertLess(out.index("3862"), out.index("#1 "))
+
+    def test_a_substring_only_match_does_not_reach_the_threshold(self):
+        # `score()` matches substrings, so a short token can hit inside a longer
+        # word; one real token plus such a hit must not clear an overlap of 2.
+        sub = {"number": 2, "state": "open", "html_url": "u",
+               "title": "eslint", "body": ""}
+        rc, out, _ = run(BASE, lambda r, t, **k: [sub])
+        self.assertEqual(rc, 0, out)
 
 
 class Delegation(unittest.TestCase):
