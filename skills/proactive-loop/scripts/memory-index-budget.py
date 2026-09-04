@@ -88,6 +88,38 @@ def evaluate(mod, current: str, addition: str = "", at_top: bool = False) -> dic
             "delta_bytes": a_bytes - b_bytes}
 
 
+# MEMORY_DIR is derived from THIS process's cwd, not from the tree the session
+# loads; a checkout can host several. Prefer the freshest under projects/.
+_AMBIGUOUS_S = 120
+
+
+def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
+    """(index, note). index None means refuse — the note says why."""
+    default = memory_dir / "MEMORY.md"
+    projects = memory_dir.parent.parent
+    try:
+        cands = sorted(
+            (p for p in projects.glob("*/memory/MEMORY.md") if p.is_file()),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        cands = []
+    if not cands:
+        return (default, "") if default.is_file() else (
+            None, f"CANNOT ANSWER: no index at {default} and none under {projects}")
+    live = cands[0]
+    if len(cands) > 1:
+        gap = live.stat().st_mtime - cands[1].stat().st_mtime
+        if gap < _AMBIGUOUS_S:
+            return (None,
+                    f"CANNOT ANSWER: {len(cands)} indexes and the two freshest are "
+                    f"{gap:.0f}s apart — name one with --index")
+    if live.resolve() == default.resolve():
+        return live, ""
+    return live, (f"note: measuring {live.parent.parent.name} (freshest, "
+                  f"{live.stat().st_size:,} B); health-check's MEMORY_DIR names "
+                  f"{default.parent.parent.name} — pass --index to override")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -106,7 +138,15 @@ def main(argv=None) -> int:
               "than measuring with a private copy of the limit", file=sys.stderr)
         return 2
 
-    index = Path(a.index) if a.index else Path(getattr(mod, "MEMORY_DIR", "")) / "MEMORY.md"
+    if a.index:
+        index, note = Path(a.index), ""
+    else:
+        index, note = _live_index(Path(getattr(mod, "MEMORY_DIR", "")))
+        if index is None:
+            print(note, file=sys.stderr)
+            return 2
+    if note:
+        print(note)
     if not index.is_file():
         print(f"CANNOT ANSWER: no index at {index}", file=sys.stderr)
         return 2

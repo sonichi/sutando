@@ -8,10 +8,12 @@ private copy of 25,000 hardcoded — the exact defect the guard refuses to have.
 import contextlib
 import importlib.util
 import io
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else HERE.parents[0]
@@ -126,6 +128,65 @@ with tempfile.TemporaryDirectory() as d:
         rc = mib.main(["--repo", str(REPO), "--index", str(p), "--adding", row(5000).strip(), "--at-top"])
     check("--at-top on a full index REFUSES and names the dropped row",
           rc == 1 and "REFUSE" in buf.getvalue() and "- [row" in buf.getvalue(), f"rc={rc}")
+
+# --- corpus resolution: MEMORY_DIR is derived from cwd, not from what loads ----
+# Live host: the MEMORY_DIR sibling read 45.8% while the loaded tree was 90.2%.
+
+def _tree(projects, slug, text, age_s):
+    d = projects / slug / "memory"
+    d.mkdir(parents=True)
+    m = d / "MEMORY.md"
+    m.write_text(text)
+    os.utime(m, (time.time() - age_s, time.time() - age_s))
+    return d
+
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "projects"
+    stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
+    live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
+    got, note = mib._live_index(stale)
+    check("resolution: the FRESHEST index wins over the one MEMORY_DIR names",
+          got == live / "MEMORY.md", f"got {got}")
+    check("resolution: the disagreement is announced, not silent",
+          "slug-live" in note and "slug-stale" in note, f"note={note!r}")
+
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "projects"
+    only = _tree(projects, "slug-only", index_of(LIMIT // 3), age_s=60)
+    got, note = mib._live_index(only)
+    check("resolution: a single corpus is unchanged behaviour and says nothing",
+          got == only / "MEMORY.md" and note == "", f"got={got} note={note!r}")
+
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "projects"
+    a = _tree(projects, "slug-a", index_of(LIMIT // 3), age_s=10)
+    _tree(projects, "slug-b", index_of(LIMIT // 3), age_s=11)
+    got, note = mib._live_index(a)
+    check("resolution: two indexes written seconds apart REFUSE rather than guess",
+          got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
+
+with tempfile.TemporaryDirectory() as d:
+    # A fresher tree OUTSIDE the projects/ parent must not be reachable: the scope
+    # bound is what keeps this from wandering the filesystem.
+    projects = pathlib.Path(d) / "projects"
+    mine = _tree(projects, "slug-mine", index_of(LIMIT // 3), age_s=3600)
+    outside = pathlib.Path(d) / "elsewhere" / "memory"
+    outside.mkdir(parents=True)
+    (outside / "MEMORY.md").write_text(index_of(LIMIT // 2))
+    got, _ = mib._live_index(mine)
+    check("resolution: a fresher index OUTSIDE projects/ is not eligible",
+          got == mine / "MEMORY.md", f"got {got}")
+
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "projects"
+    stale = _tree(projects, "slug-stale2", index_of(LIMIT // 3), age_s=86400)
+    _tree(projects, "slug-live2", index_of(LIMIT // 2), age_s=60)
+    named = stale / "MEMORY.md"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = mib.main(["--repo", str(REPO), "--index", str(named)])
+    check("--index still wins: an explicit path is never second-guessed",
+          rc == 0 and "note: measuring" not in buf.getvalue(), f"rc={rc}")
 
 # --- the authority must be the real one: a stand-in that lacks the primitives is None
 with tempfile.TemporaryDirectory() as d:
