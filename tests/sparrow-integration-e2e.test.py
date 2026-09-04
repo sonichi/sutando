@@ -125,19 +125,22 @@ def drive_poll(rtc, tasks):
     added = False
     pending_ack = []
     for task in tasks:
-        tid = rtc._write_task(task)
-        if tid:
+        written = rtc._write_task(task)
+        if written:
+            tid, durable = written
             if tid not in inflight:
                 inflight.add(tid)
                 added = True
-            pending_ack.append(tid)
-    if added:
-        rtc._save_inflight(inflight)
-    # Ack only after task file + in-flight state are durable (main()'s ordering).
-    for tid in pending_ack:
-        rtc._post_task_ack(tid)
+            pending_ack.append((tid, durable))
+    # Ack only after task file, in-flight state and ack ledger are durable
+    # (main()'s ordering).
+    committed = rtc._save_inflight(inflight) if pending_ack else True
+    if pending_ack and committed:
+        committed = rtc._record_pending_acks(pending_ack)
+    for tid, durable in pending_ack if committed else ():
+        rtc._post_task_ack(tid, durable)
     rtc._post_ready_results(inflight)
-    return pending_ack
+    return [tid for tid, _ in pending_ack]
 
 
 def main() -> int:

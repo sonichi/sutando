@@ -32,7 +32,9 @@ jobs:
   eslint:
     name: eslint over first-party TS + JS
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # `npm ci` alone spends ~4 min of a cold cache; a 5-min job cap left it
+    # ~50s and GitHub reports the kill as `cancelled`, which reads as red.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout

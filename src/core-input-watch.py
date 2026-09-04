@@ -31,7 +31,8 @@ idle / wedged":
     needs_login             →   logged-out        (unless an ACTIVE gate shows, below)
     working                 →   running
     idle                    →   idle-ready
-    unknown (status stale)  →   hung
+    unknown (status stale)  →   hung              (only when the process probe SAW a session)
+    unknown (unobserved)    →   unobserved        (probe could not run: hold, never RECOVER)
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
     (any, + active gate)    →   blocked-known / blocked-human   (net-new: pane classify)
 
@@ -66,6 +67,7 @@ _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
 from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -73,6 +75,7 @@ import re
 import shutil
 import subprocess
 import time
+from pathlib import Path as _Path
 
 
 def _ensure_tmux_on_path():
@@ -226,13 +229,16 @@ _BASE_TO_STATE = {
 }
 
 
-def compose_state(pane, base_health, gateway_alive):
+def compose_state(pane, base_health, gateway_alive, process=True):
     """Refine runtime-health's coarse `base_health` into a supervisor state.
 
     `base_health` ∈ {offline, needs_login, working, idle, unknown} comes from
     runtime_health.derive() — the SHARED derivation. This function adds only the
     escalation-specific refinements: an active gate in the pane (finest signal),
     and the bundled-gateway-down state. Returns (state, detail, prompt, kind).
+
+    `process` is runtime-health's `signals.process` tri-state: True (session
+    seen), False (server answered "no session"), None (the probe could not run).
     """
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
@@ -263,6 +269,9 @@ def compose_state(pane, base_health, gateway_alive):
         if pane and _is_idle_ready(pane):
             return "idle-ready", _BASE_TO_STATE["idle"][1], None, None
         tail = "\n".join([ln for ln in (pane or "").splitlines() if ln.strip()][-14:])
+        if process is None:  # no session observed = no wedge evidence; never RECOVER
+            return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
+                    tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None
 
@@ -397,6 +406,96 @@ def answer_step(state, kind, prompt, answered_prompt, enabled=True):
 AUTO_ANSWER_CARRY_S = 120.0
 
 
+# ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
+# `src/hitl` — the Manager dedups, the projector renders the card.
+_CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+HITL_KIND = "core-blocked"
+
+
+def escalation_message(state, detail, kind, prompt):
+    """The card body. The core is blocked, so this is the only thing that will
+    reach the owner until they act."""
+    head = ("I am blocked and cannot continue without you."
+            if state == "blocked-human" else
+            "I am signed out and cannot continue without you.")
+    lines = [head, "", f"State: {state} — {detail}"]
+    if kind and kind != "unknown":
+        lines.append(f"Gate: {kind}")
+    if prompt:
+        excerpt = "\n".join(prompt.strip().splitlines()[-6:])
+        lines += ["", "What the terminal is showing:", "```", excerpt, "```"]
+    lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
+                  "Nothing else I do can clear this one."]
+    return "\n".join(lines)
+
+
+def _hitl_manager(out_path):
+    """The shared requirement store, or None when `src/hitl` is unavailable —
+    the monitor must keep writing its state file either way."""
+    try:
+        here = _osp.dirname(_osp.abspath(__file__))
+        if here not in _sys.path:
+            _sys.path.insert(0, here)
+        from hitl.manager import HitlManager, HitlStore, default_store
+
+        ws = _osp.dirname(_osp.dirname(_osp.abspath(out_path)))
+        return HitlManager(HitlStore(default_store(_Path(ws))))
+    except Exception as exc:  # noqa: BLE001
+        # A store that cannot be BUILT is as optional as one that cannot import.
+        print(f"hitl unavailable ({exc}); no card will be raised", file=_sys.stderr)
+        return None
+
+
+def escalate(manager, state, detail, kind, prompt, session):
+    """Raise ONE requirement per episode. The Manager dedups on
+    (runtime, kind, device) + guard, so the prompt IS the episode key: the same
+    prompt returns the same record, a different one mints a new card.
+
+    Returns the requirement, or None when nothing could be raised.
+    """
+    if manager is None:
+        return None
+    try:
+        from hitl.schema import Action, HumanRequirement
+        # Session in BOTH the guard and the identity: a pool shares one login, so
+        # a weekly limit blocks every worker on byte-identical prompt text at once.
+        req = HumanRequirement(
+            kind=HITL_KIND,
+            runtime="claude",
+            message=escalation_message(state, detail, kind, prompt),
+            guard=hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16],
+            device={"id": session},
+            title=f"{session} · {state}",
+            actions=[Action(id="ack", kind="acknowledge", label="I have answered it")],
+            subject={"state": state, "gate": kind or "", "detail": detail,
+                     "session": session},
+        )
+        return manager.create(req)
+    except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
+        print(f"hitl escalation failed: {exc}", file=_sys.stderr)
+        return None
+
+
+def resolve_escalations(manager, session):
+    """Clear THIS session's requirements once its core is no longer blocked —
+    the card says answered because the core moved, not because anyone clicked.
+
+    Scoped by session: one worker recovering must not clear a sibling's card.
+    """
+    if manager is None:
+        return []
+    try:
+        mine = [r.id for r in manager.active()
+                if r.kind == HITL_KIND
+                and (r.subject or {}).get("session") == session]
+        for req_id in mine:
+            manager.resolve(req_id)   # returns blocked task ids, not a verdict
+        return mine
+    except Exception as exc:  # noqa: BLE001
+        print(f"hitl resolve failed: {exc}", file=_sys.stderr)
+        return []
+
+
 def _atomic_write(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -417,6 +516,8 @@ def main():
     ap.add_argument("--once", action="store_true", help="one tick then exit (for tests/probes)")
     ap.add_argument("--no-auto-answer", dest="auto_answer", action="store_false",
                     help="report allowlisted gates without typing their safe answer")
+    ap.add_argument("--no-chat-escalation", dest="chat_escalation", action="store_false",
+                    help="write the supervisor state but never raise a card for a block")
     a = ap.parse_args()
 
     # Make bare `tmux` resolvable before ANY probe (ours or runtime-health's) —
@@ -431,6 +532,7 @@ def main():
     rh.SESSION = a.session
 
     last_sig = None
+    hitl = _hitl_manager(a.out) if a.chat_escalation else None
     stable_prompt = 0
     last_prompt = None
     answered_prompt = None
@@ -440,7 +542,8 @@ def main():
         base = rh.derive()  # shared: offline|needs_login|working|idle|unknown
         state, detail, prompt, kind = compose_state(
             pane or "", base.get("health", "unknown"),
-            gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))))
+            gateway_alive(a.app_data, os.path.dirname(os.path.abspath(a.out))),
+            process=(base.get("signals") or {}).get("process", True))
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -471,6 +574,14 @@ def main():
                 payload["auto_answered"] = last_answered
             _atomic_write(a.out, payload)
             last_sig = sig
+
+        # The Manager owns per-episode dedup; leaving the blocked set resolves
+        # the card, so the owner sees it close without clicking anything.
+        if a.chat_escalation:
+            if state in _CHAT_ESCALATE_STATES:
+                escalate(hitl, state, detail, kind, prompt, a.session)
+            else:
+                resolve_escalations(hitl, a.session)
         if a.once:
             return
         time.sleep(a.interval)  # pragma: no cover - daemon heartbeat (tests use --once)

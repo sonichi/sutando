@@ -18,14 +18,24 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .manager import HitlManager
 from .schema import (
+    CATEGORY_BLOCKED,
+    CATEGORY_DECISION,
     HumanRequirement,
     STATUS_CANCELLED,
     STATUS_EXPIRED,
     STATUS_RESOLVED,
     WIRE_FIELD,
+    category_of,
 )
 
 Sender = Callable[[Dict], Dict]
+
+# The card colours these two apart; a client that ignores the card field saw the
+# blocking header for every kind, so a mere decision read as an alarm.
+_CATEGORY_HEADS = {
+    CATEGORY_BLOCKED: "⚠ Sutando needs your attention",
+    CATEGORY_DECISION: "Sutando needs a decision",
+}
 
 _STATUS_LINES = {
     STATUS_RESOLVED: "✓ Resolved — Sutando has continued its work.",
@@ -38,11 +48,22 @@ def fallback_body(req: HumanRequirement) -> str:
     """Plain-text rendering for clients that ignore the hitl content field."""
     device = (req.device or {}).get("name", "")
     where = f" (on {device})" if device else ""
-    head = f"⚠ Sutando needs your attention — {req.message}{where}"
+    lead = _CATEGORY_HEADS.get(category_of(req.kind),
+                               _CATEGORY_HEADS[CATEGORY_BLOCKED])
+    head = f"{lead} — {req.message}{where}"
     closer = _STATUS_LINES.get(req.status)
     if closer:
         return f"{head}\n\n{closer}"
     return head
+
+
+def pending_ids(manager: HitlManager) -> List[str]:
+    """Requirement ids whose revision is ahead of their projection.
+
+    A caller owning retry cadence needs to tell "nothing to send" from "every
+    send was refused"; `project()` returns an empty list for both.
+    """
+    return [r.id for r in manager.store.all() if manager.needs_projection(r.id)]
 
 
 def project(manager: HitlManager, send: Sender, room_id: str) -> List[Tuple[str, Optional[str]]]:

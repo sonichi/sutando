@@ -55,6 +55,42 @@ check("request-changes denied", run(REQCH, "hold")[0], True)
 check("comment denied under hold", run(COMMENT, "hold")[0], True)
 
 print("2. MISSING state file behaves as findings-only — votes gated, --comment stays possible")
+# A PATH-QUALIFIED gh is still gh. The scan compared the whole word against "gh",
+# so an absolute path was not classified as a review at all and the gate let it by.
+check("approve denied when gh is path-qualified",
+      run("/opt/homebrew/bin/" + APPROVE, "hold")[0], True)
+check("approve denied when gh is relative-pathed",
+      run("./bin/" + APPROVE, "hold")[0], True)
+check("request-changes denied when gh is path-qualified",
+      run("/usr/local/bin/" + REQCH, "hold")[0], True)
+# The basename match must stay EXACT: a different binary ending in those two
+# letters is not gh, and denying it would be a false positive.
+check("a binary merely ending in gh is NOT gh",
+      run("/usr/bin/notgh pr review 1 --approve", "hold")[0], False)
+
+# macOS filesystems are case-insensitive, so `GH` is the same binary, and the
+# early `"gh" not in command` prefilter ran before the token scan lowercased.
+check("approve denied when the path is mixed-case",
+      run("/opt/homebrew/bin/" + APPROVE.replace("gh ", "GH ", 1), "hold")[0], True)
+check("approve denied when a bare gh is uppercase",
+      run(APPROVE.replace("gh ", "GH ", 1), "hold")[0], True)
+check("request-changes denied when the path is mixed-case",
+      run("/usr/local/bin/" + REQCH.replace("gh ", "Gh ", 1), "hold")[0], True)
+# Same boundary as the lowercase control: case-folding must not widen the match.
+check("a mixed-case binary merely ending in gh is NOT gh",
+      run("/usr/bin/notGH pr review 1 --approve", "hold")[0], False)
+check("an uppercase NON-review gh subcommand is still allowed",
+      run("GH pr view 1", "hold")[0], False)
+
+# keweichen's coverage note: the `gh api .../reviews` branch was only ever
+# exercised UNQUALIFIED, so reverting the basename fix left every path arm green.
+check("the api review form is denied when gh is path-qualified",
+      run("/opt/homebrew/bin/gh api repos/o/r/pulls/1/reviews -f event=APPROVE",
+          "hold")[0], True)
+check("the api review form is denied when gh is mixed-case",
+      run("/opt/homebrew/bin/GH api repos/o/r/pulls/1/reviews -f event=APPROVE",
+          "hold")[0], True)
+
 check("approve denied with no state file", run(APPROVE)[0], True)
 check("request-changes denied with no state file", run(REQCH)[0], True)
 check("comment ALLOWED with no state file", run(COMMENT)[0], False)
