@@ -9251,7 +9251,7 @@ def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
         return "unknown", "no resolve_workspace() to analyse"
 
     def reads_env(node) -> bool:
-        """os.environ.get("SUTANDO_WORKSPACE") or os.environ["SUTANDO_WORKSPACE"]."""
+        """An environ subscript or .get keyed by the removed workspace env var."""
         for n in ast.walk(node):
             if isinstance(n, ast.Subscript) and _dots(n.value).endswith("environ"):
                 if _const_str(n.slice) == "SUTANDO_WORKSPACE":
