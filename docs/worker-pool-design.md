@@ -30,8 +30,8 @@ mode the pool has to detect; it is the absence of a pool.
 
 | component | may do | must not do |
 |---|---|---|
-| **core** | create, destroy and resize the pool; choose a worker's model; execute every lifecycle command; write the pin table; claim every task no pin sends elsewhere; sweep worker beats, reclaim, revive, report | claim a task pinned to a live worker |
-| **worker** | claim tasks for the rooms pinned to it; execute them | claim anything else; create, destroy or reclaim anything |
+| **core** | create, destroy and resize the pool; choose a worker's model; execute every lifecycle command; write the pin table; claim every task addressed to no live worker; sweep worker beats, reclaim, revive, report | claim a task addressed to a live worker |
+| **worker** | claim tasks **addressed to it**; execute them | claim anything else; create, destroy or reclaim anything |
 | **launchd** | keep the processes it was given alive | decide how many there are |
 | **app / bridges** | produce intent as owner tasks; render `state/pool-status.json` | call an API into the pool or touch its state |
 
@@ -42,8 +42,13 @@ belongs to the core on the owner's word.
 
 ## Routing policy: worker only when obvious, otherwise the core
 
-Routing is two pieces of data and one rule, evaluated by each watcher for
-itself. The data: the envelope field **`requested_worker`**, which the server
+A worker claims what is **addressed to it**. Addressing is the general idea;
+v1 ships two ways of expressing it and leaves room for more, because a later
+way to address a worker is a new input to the same rule, not a new rule. The
+core claims whatever no live worker is addressed by.
+
+Routing is therefore two pieces of data and one rule, evaluated by each watcher
+for itself. The data, both of them forms of addressing: the envelope field **`requested_worker`**, which the server
 writes at ingress when the sender addressed a worker (one envelope per
 addressed worker, so a message addressed to three workers arrives as three
 tasks with three ids); and the **pin table**. A sender's text is never a
@@ -58,14 +63,17 @@ carry their own), at the handler's probe, before any claim:
    taken (probe exit 3). Names another instance whose beat is fresh: claim and
    discard. Names an instance whose beat is stale: the core emits (stand-in),
    workers discard.
-2. No field, and the task's room is **pinned** to this worker, or this is a
-   **dedicated** worker's own room: emit with no claim. Pinned to a bound set
+2. No field, and the room addresses this worker — it is **pinned** to it, or
+   this is a **dedicated** worker's own room: emit with no claim. Pinned to a bound set
    this worker belongs to: members race for the watcher's shared atomic claim
    (a hard link in `state/task-event-handler-claims/`); the winner emits.
 3. Otherwise the core emits and workers claim and discard.
 
 A task is eligible to exactly one instance except inside a bound set, where the
-claim settles it. There is no least-loaded fallback, no automatic binding of a
+claim settles it. A later form of addressing (an app control, a room command, a
+skill that binds a task to a worker at mint time) enters at the same point: it
+either sets `requested_worker` or writes the pin table, and the rule above is
+unchanged. There is no least-loaded fallback, no automatic binding of a
 room to whichever worker took its first task, no lane busy-cap, no
 saturated-pool overflow and no least-recently-picked tie-break. Rooms bind only
 by an explicit pin. Each of those was a shipped rule in #3604's `_pick()`; each
