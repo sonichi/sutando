@@ -206,12 +206,11 @@ The menu-bar app is optional and is not built or launched by the headless core's
 
 ```bash
 bash scripts/switch-model.sh claude-opus-5          # alias (opus/sonnet/haiku/fable/default) or a claude-* id, optional [1m]
-bash scripts/switch-model.sh fable --dry-run        # prints the two effects, changes nothing
+bash scripts/switch-model.sh fable --dry-run        # prints what it would do, changes nothing
 ```
 
-Two effects, both visible: pins `model` in `$CLAUDE_CONFIG_DIR/settings.json` (what the next launch
-inherits — the launcher passes no `--model`), and sends `/model <name>` to the live `sutando-core`
-tmux pane so the running session switches now. Every switch is recorded in
-`<workspace>/state/model-switch.json` with `previous` and a timestamp. Exit 2 = name refused, nothing
-touched; exit 3 = pinned but no live pane found. An owner message like "switch model to opus" is
-handled by running this script; the dashboard's Quota tile shows the model the proxy then sees.
+Records the switch in `<workspace>/state/model-switch.json` (with the previous model) and types
+`/model <name>` into the live `sutando-core` pane through the shared sender, refusing when the input
+box carries text or on a Codex runtime. It never writes `settings.json`: Claude Code's `/model`
+persists the choice itself. Exit 2 = name refused; 3 = recorded, no live pane; 4 = Codex runtime;
+5 = input box busy. The capability lives in `skills/model-switch/`.

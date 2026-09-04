@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # switch-model.sh <model> [--dry-run] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
-# Change the core's model without the CLI: record the switch, pin it in the
-# runtime's settings.json (next launch), send `/model <model>` to the live core
-# pane (now). The record is written first so a pin can never exist unrecorded.
+# Change the core's model without the CLI: record the switch, then send
+# `/model <model>` to the live core pane through the shared sender. Persistence
+# is the CLI's own (/model writes settings.json itself); this script never does.
 set -u
 MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"
 while [ $# -gt 0 ]; do case "$1" in
@@ -35,7 +35,7 @@ CFG="$BRAIN/settings.json"
 [ -n "$SESSION" ] || SESSION="${DSESSION:-sutando-core}"
 [ -n "$STATE_DIR" ] || STATE_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/state"
 if [ -n "$DRY" ]; then
-  echo "dry-run: would record $STATE_DIR/model-switch.json, pin model=$MODEL in $CFG, send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"; exit 0
+  echo "dry-run: would record $STATE_DIR/model-switch.json (previous read from $CFG), send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"; exit 0
 fi
 # One switch at a time per brain: the lock spans preflight, the settings/record
 # transaction and the live send, so two invocations cannot interleave.
@@ -64,67 +64,34 @@ if [ -x "$SENDER" ] || [ -f "$SENDER" ]; then
 else
   echo "switch-model: shared sender missing ($SENDER) — nothing changed" >&2; exit 7
 fi
-# Record first, then pin; a failed pin removes the record it would have described.
+# Record the switch (previous model read from settings.json, read-only). The
+# CLI persists /model itself, so there is no settings write here to roll back.
 OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" <<'PYEOF'
 import json, os, sys, time, tempfile
 cfg, model, state_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-try: prior_bytes = open(cfg, "rb").read()
-except OSError: prior_bytes = None
-try: data = json.loads(prior_bytes) if prior_bytes is not None else {}
-except ValueError: data = {}
+try: data = json.load(open(cfg))
+except (OSError, ValueError): data = {}
 prev = data.get("model")
 rec = {"model": model, "previous": prev, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-       "by": "skills/model-switch/scripts/switch-model.sh", "settings": cfg}
-rec_path = os.path.join(state_dir, "model-switch.json")
-# Stage the record beside the old one; the prior record is never touched until
-# the pin has succeeded, so a failed pin leaves the last trusted record intact.
+       "by": "skills/model-switch/scripts/switch-model.sh", "settings_read": cfg}
 try:
     os.makedirs(state_dir, exist_ok=True)
-    fd, staged = tempfile.mkstemp(dir=state_dir, prefix=".model-switch.staged.")
+    fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".model-switch.staged.")
     with os.fdopen(fd, "w") as f: json.dump(rec, f, indent=2); f.write("\n")
+    os.replace(tmp, os.path.join(state_dir, "model-switch.json"))
 except OSError as e:
     print(f"RECORD-FAILED {e}"); sys.exit(1)
-try:
-    data["model"] = model
-    os.makedirs(os.path.dirname(cfg), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cfg), prefix=".settings.")
-    with os.fdopen(fd, "w") as f: json.dump(data, f, indent=2); f.write("\n")
-    os.replace(tmp, cfg)
-except OSError as e:
-    try: os.remove(staged)
-    except OSError: pass
-    print(f"PIN-FAILED {e}"); sys.exit(1)
-try:
-    os.replace(staged, rec_path)
-except OSError as e:
-    # The pin landed but cannot be recorded: an unrecorded pin is the one state
-    # this transaction forbids, so restore the exact prior settings bytes.
-    try:
-        if prior_bytes is None:
-            os.remove(cfg)
-        else:
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cfg), prefix=".settings.")
-            with os.fdopen(fd, "wb") as f: f.write(prior_bytes)
-            os.replace(tmp, cfg)
-        rolled = "settings rolled back to the prior bytes"
-    except OSError as e2:
-        rolled = f"ROLLBACK FAILED ({e2}) — settings.json is pinned and UNRECORDED"
-    try: os.remove(staged)
-    except OSError: pass
-    print(f"RECORD-COMMIT-FAILED {e}; {rolled}"); sys.exit(1)
 print(f"OK {prev if prev else '-'}")
 PYEOF
 )"; RC=$?
 case "$OUT" in
   RECORD-FAILED*) echo "switch-model: could not write the switch record ($STATE_DIR) — nothing changed: ${OUT#RECORD-FAILED }" >&2; exit 1;;
-  PIN-FAILED*)    echo "switch-model: settings pin FAILED ($CFG) — prior switch record kept, nothing changed: ${OUT#PIN-FAILED }" >&2; exit 1;;
-  RECORD-COMMIT-FAILED*) echo "switch-model: switch record could not be committed ($STATE_DIR/model-switch.json) — ${OUT#RECORD-COMMIT-FAILED }" >&2; exit 1;;
   OK*) ;;
   *) echo "switch-model: unexpected python outcome (rc=$RC): $OUT" >&2; exit 1;;
 esac
-echo "pinned: $CFG model=$MODEL (was ${OUT#OK }); record: $STATE_DIR/model-switch.json"
+echo "recorded: model=$MODEL (was ${OUT#OK }); record: $STATE_DIR/model-switch.json"
 if [ -n "$LIVE" ] && bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null; then
   echo "live: sent '/model $MODEL' to tmux session $SESSION (if a turn is running, the CLI queues it and switches when the turn ends)"; exit 0
 fi
-echo "live: NOT sent — no tmux session '$SESSION' on $SOCK; the pin applies at the next launch" >&2
+echo "live: NOT sent — no tmux session '$SESSION' on $SOCK; nothing switched" >&2
 exit 3
