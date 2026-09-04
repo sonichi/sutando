@@ -8089,8 +8089,10 @@ def check_proactive_quarantine() -> dict:
     # The oldest age only ever increases: it reads the same whether the
     # directory is filling now or has been inert for a month. The newest says which.
     newest_age = kept[-1][1]
+    # Gate on the ages DIFFERING, not on the count: identical mtimes would print
+    # one duration twice, and bulk writes leave exactly that shape.
     arrival = (f"; newest arrived {newest_age // 3600}h{newest_age % 3600 // 60}m ago"
-               if len(kept) > 1 else "")
+               if newest_age != oldest_age else "")
     return {
         "name": name,
         "status": "warn",

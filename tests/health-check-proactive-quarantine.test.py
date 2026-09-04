@@ -229,6 +229,26 @@ class TestProactiveQuarantine(unittest.TestCase):
             self.assertIn("5h0m", d)
             self.assertNotIn("newest arrived", d)
 
+    def test_identical_ages_do_not_print_the_same_duration_twice(self):
+        """Two bodies, one mtime: oldest and newest ARE the same instant.
+
+        Gating on `len(kept) > 1` would emit "oldest X (2h0m); newest arrived
+        2h0m ago" — true, and redundant. Bulk writes and replays leave exactly
+        this shape (842 identical-mtime clusters measured in one live archive),
+        so it is the common case here rather than a corner.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            self._park(q, "proactive-a", 2 * 3600)
+            self._park(q, "proactive-b", 2 * 3600)
+            d = self._run(td)["detail"]
+            self.assertIn("2h0m", d)
+            self.assertNotIn("newest arrived", d)
+            # ...and one second of spread is enough to bring it back, so the
+            # guard keys on the ages rather than on suppressing pairs.
+            self._park(q, "proactive-c", 2 * 3600 + 60)
+            self.assertIn("newest arrived", self._run(td)["detail"])
+
     def test_the_arrival_age_tracks_the_newest_not_the_count(self):
         """Adding OLDER files must not change the reported arrival age -- a
         clause keyed on len() or on the oldest would move here."""
