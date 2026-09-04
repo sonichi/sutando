@@ -162,6 +162,13 @@ def words(command: str) -> List[Word]:
             i += 1
             continue
 
+        if ch == "\\" and st.quote != "'" and command[i + 1:i + 2] == "\n":
+            # Line continuation: bash removes BOTH characters. Emitting the
+            # newline would split the command at a point bash never splits.
+            st.cur.raw += command[i:i + 2]
+            i += 2
+            continue
+
         if ch == "\\" and st.quote != "'":
             if st.quote == '"' and not _double_quote_escapes(command[i + 1:i + 2] or " "):
                 # Literal backslash inside double quotes. It does NOT escape the

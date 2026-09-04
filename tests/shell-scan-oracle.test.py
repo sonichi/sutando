@@ -88,6 +88,11 @@ class MatchesBash(unittest.TestCase):
         # under-deny as $'...' reached the sha match by a second route.
         'gh release create v1 --target $"abc1234"',
         'gh pr comment 1 --body $"hello world"',
+        # A line continuation: bash removes the backslash AND the newline, so
+        # emitting the newline splits where bash never splits (sonichi).
+        'gh release create v1 \\\n  --target abc',
+        'gh pr comment 1 --body "a \\\n b"',
+        "gh pr comment 1 --body 'a \\\n b'",
     ]
 
     # bash rewrites these too and we deliberately do NOT flag them: `$VAR` is an
