@@ -188,6 +188,73 @@ with tempfile.TemporaryDirectory() as d:
     check("--index still wins: an explicit path is never second-guessed",
           rc == 0 and "note: measuring" not in buf.getvalue(), f"rc={rc}")
 
+# --- the branches the coverage gate flagged: refusal, fallback, and main()'s default -
+with tempfile.TemporaryDirectory() as d:
+    # No candidates under projects/, but MEMORY_DIR's own index exists -> use it, quietly.
+    md = pathlib.Path(d) / "projects" / "only" / "memory"
+    md.mkdir(parents=True)
+    (md / "MEMORY.md").write_text(index_of(LIMIT // 3))
+    empty = pathlib.Path(d) / "elsewhere" / "memory"
+    empty.mkdir(parents=True)
+    (empty / "MEMORY.md").write_text(index_of(LIMIT // 3))
+    got, note = mib._live_index(empty)          # its projects/ parent holds no */memory/MEMORY.md
+    check("fallback: no candidates under projects/ but MEMORY_DIR has one -> use it",
+          got == empty / "MEMORY.md" and note == "", f"got={got} note={note!r}")
+
+with tempfile.TemporaryDirectory() as d:
+    missing = pathlib.Path(d) / "nowhere" / "memory"
+    got, note = mib._live_index(missing)
+    check("refusal: no candidates and no index at MEMORY_DIR -> None + CANNOT ANSWER",
+          got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
+
+with tempfile.TemporaryDirectory() as d:
+    # Injected, not filesystem-induced: a FILE where projects/ should be does not
+    # raise on macOS, it yields nothing — the wrong branch, same visible outcome.
+    projects = pathlib.Path(d) / "projects"
+    live = _tree(projects, "slug-os", index_of(LIMIT // 3), age_s=60)
+    real_glob = pathlib.Path.glob
+    def boom(self, pattern, *a, **k):
+        if "memory/MEMORY.md" in pattern:
+            raise OSError("injected: scan failed")
+        return real_glob(self, pattern, *a, **k)
+    pathlib.Path.glob = boom
+    try:
+        got, note = mib._live_index(live)
+    finally:
+        pathlib.Path.glob = real_glob
+    # The scan raised, so cands is empty; MEMORY_DIR's own index still exists, so it is used.
+    check("an OSError from the scan is CAUGHT and falls back, not raised",
+          got == live / "MEMORY.md" and note == "", f"got={got} note={note!r}")
+
+def _main_with_memory_dir(memory_dir, args):
+    """main() re-imports health-check, so SUTANDO_MEMORY_DIR is how MEMORY_DIR is set."""
+    prev = os.environ.get("SUTANDO_MEMORY_DIR")
+    os.environ["SUTANDO_MEMORY_DIR"] = str(memory_dir)
+    buf, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = mib.main(args)
+    finally:
+        if prev is None: os.environ.pop("SUTANDO_MEMORY_DIR", None)
+        else: os.environ["SUTANDO_MEMORY_DIR"] = prev
+    return rc, buf.getvalue(), err.getvalue()
+
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "projects"
+    stale = _tree(projects, "slug-stale3", index_of(LIMIT // 3), age_s=86400)
+    _tree(projects, "slug-live3", index_of(LIMIT // 2), age_s=60)
+    rc, out, _ = _main_with_memory_dir(stale, ["--repo", str(REPO)])
+    check("main() with no --index measures the FRESH tree and says so",
+          rc == 0 and "slug-live3" in out and "note: measuring" in out, f"rc={rc} out={out[:120]!r}")
+
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "projects"
+    a2 = _tree(projects, "slug-tie-a", index_of(LIMIT // 3), age_s=10)
+    _tree(projects, "slug-tie-b", index_of(LIMIT // 3), age_s=11)
+    rc, out, err = _main_with_memory_dir(a2, ["--repo", str(REPO)])
+    check("main() REFUSES (rc 2) on an ambiguous tie and explains on stderr",
+          rc == 2 and "CANNOT ANSWER" in err, f"rc={rc} err={err[:100]!r}")
+
 # --- the authority must be the real one: a stand-in that lacks the primitives is None
 with tempfile.TemporaryDirectory() as d:
     (pathlib.Path(d) / "src").mkdir()
