@@ -216,7 +216,8 @@ async def _note_empty_result(task_id: str, result_file) -> None:
 
 
 import local_task_protocol  # noqa: E402
-from task_body_guard import confine_user_content  # noqa: E402
+from task_body_guard import (confine_user_content,  # noqa: E402
+                             header_safe_value)
 from task_envelope import stamp_text  # noqa: E402
 import progress_stream  # noqa: E402  — pure helpers for the progress-streamer (poll_progress)
 from vault_intercept import intercept_vault_commands, redact_vault_commands  # noqa: E402
@@ -4158,11 +4159,10 @@ async def _handle_discord_message(message, force=False):
     # channel_name / guild_name: human-readable labels so the task-consumer can
     # disambiguate one team channel from another without grepping numeric IDs
     # against a memory file. DM channels have no `.name` attr; DMs have no
-    # guild. Default to "DM" for both. Newline-sanitize so a Discord name
-    # containing \n (rare but possible) can't inject a spurious metadata
-    # line into the task file's k:v shape (per qingyun review on #1077).
-    channel_name = (getattr(message.channel, "name", None) or "DM").replace("\n", " ")
-    guild_name = (message.guild.name if message.guild else "DM").replace("\n", " ")
+    # guild. Default to "DM" for both. Both are attacker-settable (a server or
+    # channel name), and land above `access_tier:`, so they flatten via the guard.
+    channel_name = header_safe_value(getattr(message.channel, "name", None) or "DM")
+    guild_name = header_safe_value(message.guild.name if message.guild else "DM")
     # When this message is a REPLY, emit the parent's id so the core agent can
     # re-fetch the full original on demand rather than relying on the lossy
     # 400-char `[Replying to ...]` snippet. Mirrors how the official Claude
