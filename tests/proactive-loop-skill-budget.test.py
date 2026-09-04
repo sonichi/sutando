@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""The proactive-loop skill loads on EVERY pass, so it carries commands, not lessons.
-
-Owner, 2026-09-04: "I don't like inflating the proactive loop skill." The file had grown from
-10 KB to 66 KB in about thirty commits, most of it dated incident prose. This pins the shape:
-a byte cap, no date stamps (incidents live in docs/proactive-loop-rationale.md), and every
-command path the rationale doc names must still be reachable from the skill.
-"""
+"""The proactive-loop skill loads on every pass: a byte cap, no date stamps, and no command
+named by the rationale doc may go missing from it."""
 import pathlib
 import re
 import unittest
