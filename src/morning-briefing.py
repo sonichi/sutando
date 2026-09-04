@@ -645,6 +645,24 @@ def get_pending_questions() -> list[str]:
 
 
 
+def below_fold_count(total: int) -> int:
+    """How many waiting questions render on no surface the owner reads.
+
+    The notifier sends `questions[:VISIBLE_PREFIX]`, so waiting order IS
+    priority order and everything past it counts as open while reaching
+    nobody. Returns 0 when the prefix cannot be read — an unknown cutoff
+    must not be guessed into a number the briefing then states as fact.
+    """
+    prefix = getattr(_CPQ, "VISIBLE_PREFIX", None)
+    if not isinstance(prefix, int) or isinstance(prefix, bool) or prefix < 0:
+        # Say so: without this, an unreadable prefix and a genuinely unhidden
+        # list both render as no line, which is the silent no-op this fixes.
+        print(f"  below-fold: VISIBLE_PREFIX unreadable ({prefix!r}) — line omitted",
+              file=sys.stderr)
+        return 0
+    return max(0, total - prefix)
+
+
 def get_health_issues() -> "list[str] | None":
     """Failed health items, or None when the check could not run.
 
@@ -743,6 +761,9 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
             # "Top item" asserted a ranking this code does not perform: get_waiting_questions()
             # yields FILE order, so index 0 is first-listed, not most important.
             parts.append(f"{len(pending_qs)} pending questions. First on the list: {pending_qs[0]}.")
+        hidden = below_fold_count(len(pending_qs))
+        if hidden:
+            parts.append(f"{hidden} of them render below the fold.")
 
     # Overnight Discord
     if discord_msgs:
