@@ -129,6 +129,45 @@ with tempfile.TemporaryDirectory() as td:
     (Path(td) / "scripts").mkdir()
     check("zero suites -> exit 2 (a scope result, not a clean bill)", tsc.main(["--workspace", td]), 2)
 
+def stale_bytecode_case(td):
+    """A tool the suite imports, run once, then edited to the same length.
+
+    A same-size edit in the same second is served the pre-edit bytecode, so the
+    suite asserts against code that is not on disk and still exits 0.
+    """
+    ws = Path(td) / "ws2"
+    (ws / "scripts").mkdir(parents=True)
+    (ws / "state").mkdir()
+    (ws / "scripts" / "thing.py").write_text('def verdict():\n    return "AAAA"\n')
+    (ws / "scripts" / "thing.test.py").write_text(
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        "p = Path(__file__).with_name('thing.py')\n"
+        "s = importlib.util.spec_from_file_location('thing', p)\n"
+        "m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+        "print('verdict', m.verdict())\n"
+        "sys.exit(0 if m.verdict() == 'AAAA' else 1)\n")
+    return ws
+
+
+with tempfile.TemporaryDirectory() as td:
+    ws = stale_bytecode_case(td)
+    args = ["--workspace", str(ws), "--repo", str(Path(td))]
+    r1 = subprocess.run(PYBASE + [str(TOOL)] + args, capture_output=True, text=True)
+    check("stale-bytecode: first run passes (the tool really does say AAAA)", r1.returncode, 0)
+
+    tool = ws / "scripts" / "thing.py"
+    tool.write_text(tool.read_text().replace('"AAAA"', '"BBBB"'))
+    check("stale-bytecode: the edit is on disk", '"BBBB"' in tool.read_text(), True)
+
+    r2 = subprocess.run(PYBASE + [str(TOOL)] + args, capture_output=True, text=True)
+    # Without a fresh cache the suite imports the PRE-edit module, still sees
+    # AAAA, and this run reports 0 — green on code that no longer exists.
+    check("stale-bytecode: the edited tool is seen, so the suite FAILS",
+          r2.returncode, 1)
+    check("stale-bytecode: and the failure names the suite",
+          "thing.test.py" in (r2.stdout + r2.stderr), True)
+
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")
     for f in FAILURES:
