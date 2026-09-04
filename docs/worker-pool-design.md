@@ -95,31 +95,42 @@ recomputing it from beats they can only partially observe.
 
 **Suppress means: take no claim, emit nothing, queue nothing, and leave the task
 file untouched.** It is not "claim and discard", and the difference is the whole
-correctness argument. The claim is keyed on the task FILENAME and is therefore
-global across instances — `acquire_task_claim` hard-links
-`state/task-event-handler-claims/<filename>` and the first linker wins
-(`src/watch-tasks-stream.sh:127-147`). Suppression and claim-before-emit answer two
+correctness argument. The claim is keyed on the task's CANONICAL ID and is
+therefore global across instances — `acquire_task_claim` hard-links
+`state/task-event-handler-claims/<task-id>` and the first linker wins
+(`src/watch-tasks-stream.sh:127-147`, which keys on the filename today and is
+part of step 2's change). Suppression and claim-before-emit answer two
 different races, and both are needed. Suppression removes the non-target/target
 race: a non-target that claimed-and-discarded could win the claim and rename the
 file before the target's session read the path it had been handed. Claim-before-emit
 removes the target/target race: **addressing is not exclusive**, so two instances
-can each correctly believe they are the addressee, and only a claim keyed on the
-filename decides between them. An earlier version of this section argued that
+can each correctly believe they are the addressee, and only a claim on a key
+both compute identically decides between them. An earlier version of this section argued that
 racing two discards is safe — true, and insufficient, because neither of the
 races that matter is discard-against-discard.
 
-**The claim key is the canonical task id, not the basename on disk.** Step 2 has
-the claimant rename `task-X.txt` to `task-X.claimed-W.txt` (§3 rule 1), and the
-watcher dispatches every direct-child `*.txt` on Created **and Renamed** with no
-lifecycle-name exclusion (`src/watch-tasks-stream.sh:639-702`). So a key taken from
-the basename mutates under the very operation this design prescribes: the rename
-re-enters as `task-X.claimed-W.txt`, whose key nobody holds, and the task is emitted
-a second time or the rename cycle repeats. Deriving the key by stripping the
-lifecycle suffix makes the redispatch lose the race it already lost, which is the
-correctness argument; excluding `.claimed-*` / `.assigned-*` from dispatch is the
-cheaper first gate and stops the event being raised at all. Step 2 owes both, plus a
-rename test and a restart test — an initial sweep that meets a `.claimed-*` file left
-by a previous run fails the same way with no rename in sight.
+**The claim key is the canonical task id, and that id comes from the shared
+resolver.** Step 2 has the claimant rename `task-X.txt` to `task-X.claimed-W.txt`
+(§3 rule 1), and the watcher dispatches every direct-child `*.txt` on Created **and
+Renamed** with no lifecycle-name exclusion (`src/watch-tasks-stream.sh:639-702`). So
+a key taken from the basename mutates under the very operation this design
+prescribes: the rename re-enters as `task-X.claimed-W.txt`, whose key nobody holds,
+and the task is emitted a second time or the rename cycle repeats.
+
+The id is `task_archive.task_id_for(path, accept=...)`, not a suffix strip. Those
+are not the same function: `.claimed-<x>` is a legal tail for a gateway id, so
+stripping it re-aliases a real task onto another id, and only the persisted `id:`
+header tells a gateway id from a pool rename — which is why that helper treats the
+header as the positive authority and falls back to the filename only for a file
+that declares nothing (`src/task_archive.py:22-93`). Step 2 delegates to it rather
+than restating the rule, because a second implementation of one identity is the
+same defect as a second enumerator of one question.
+
+Excluding `.claimed-*` / `.assigned-*` from dispatch is the cheaper first gate and
+stops the event being raised at all; step 2 owes both. It also owes three tests: a
+real lifecycle rename, an id whose own tail looks like a state suffix (which must
+NOT be stripped), and restart rediscovery — an initial sweep meeting a `.claimed-*`
+file left by a previous run fails the same way with no rename in sight.
 
 **Prerequisite for step 2, stated as such.** No suppress disposition exists today.
 The probe's handled results are exit 0 (queue a fallback handler), exit 4 (queue a
@@ -332,10 +343,10 @@ justify a timer, so no `proactive-loop-pool` skill ships.
 ## Coordination contract (claim-only; the primitives are #3604's)
 
 1. **Claim:** exclusivity is the watcher's hard-link claim, keyed on the
-   CANONICAL task id — `state/task-event-handler-claims/<task-id>`, the basename
-   with any `.claimed-*` / `.assigned-*` suffix stripped (first link wins, a dead
-   owner's claim retired by pid); the claimant then renames `tasks/task-X.txt`
-   to `tasks/task-X.claimed-<name>.txt` as the durable record the sweep reads.
+   CANONICAL task id — `state/task-event-handler-claims/<task-id>`, resolved by
+   `task_archive.task_id_for(path, accept=...)` (first link wins, a dead owner's
+   claim retired by pid); the claimant then renames `tasks/task-X.txt` to
+   `tasks/task-X.claimed-<name>.txt` as the durable record the sweep reads.
    Keying on the raw basename would hand the renamed file a key nobody holds.
    There is no assignment step; eligibility is `requested_worker` and the pin
    table.
