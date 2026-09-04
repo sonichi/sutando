@@ -477,5 +477,15 @@ check("a racer that already archived the orphan aborts the write, not re-moves i
       _rc == 0 and _ar.read_text() == _ar_before,
       f"rc={_rc} unchanged={_ar.read_text() == _ar_before}")
 
+# A refusal nobody can act on is a dead end: --init-empty is the only route out
+# of this state, so the message that blocks must name it.
+_dead = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_dead.write_text(json.dumps({"streak": 3}))
+_doc_d, _err2 = ih.load(_dead)
+check("the no-key refusal NAMES the flag that resolves it",
+      _doc_d is None and "--init-empty" in (_err2 or ""), repr(_err2))
+check("...and still says what it refuses to do, so the reason survives",
+      "refusing to invent one" in (_err2 or ""), repr(_err2))
+
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

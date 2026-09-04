@@ -91,7 +91,8 @@ def load(state: Path):
     except ValueError as exc:
         return None, f"state file is not JSON: {exc}"
     if KEY not in d:
-        return None, f"state file has no {KEY} — refusing to invent one"
+        return None, (f"state file has no {KEY} — refusing to invent one. "
+                      "Bootstrap it with --init-empty (seeds [], never a list).")
     items = d[KEY]
     if not isinstance(items, list) or any(
         not (isinstance(p, (list, tuple)) and len(p) == 2) for p in items
