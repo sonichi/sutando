@@ -74,7 +74,8 @@ def held_hash(items) -> str:
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from idle_state import ABORT, locked_update, read_state, write_state  # noqa: E402
+from idle_state import (ABORT, REFUSED, locked_update, read_state,  # noqa: E402
+                        write_state)
 
 
 def record_outcome(path: Path, outcome: str) -> dict:
@@ -93,7 +94,10 @@ def record_outcome(path: Path, outcome: str) -> dict:
         doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return doc
 
-    return locked_update(path, bump)
+    doc = locked_update(path, bump)
+    if doc is REFUSED:
+        raise SystemExit(2)
+    return doc
 
 
 def main(argv=None) -> int:
@@ -165,7 +169,8 @@ def main(argv=None) -> int:
         doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return None
 
-    locked_update(path, compare_and_commit)
+    if locked_update(path, compare_and_commit) is REFUSED:
+        return 2
     print(f"{'post' if seen['changed'] else 'quiet'} {h}")
     return 0
 

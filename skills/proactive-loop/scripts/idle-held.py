@@ -39,7 +39,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import idle_state  # noqa: E402
-from idle_state import ABORT, locked_update  # noqa: E402
+from idle_state import ABORT, REFUSED, locked_update  # noqa: E402
 
 KEY = "held_item_ids"
 
@@ -74,7 +74,10 @@ def init_empty(state: Path) -> int:
         }
         return 0
 
-    if locked_update(state, seed, indent=2) is ABORT:
+    outcome = locked_update(state, seed, indent=2)
+    if outcome is REFUSED:
+        return 2
+    if outcome is ABORT:
         print(f"REFUSED: {state} already has {KEY} ({refusal[0]} entries) "
               "— --init-empty only bootstraps, it never clears", file=sys.stderr)
         return 2
@@ -319,7 +322,8 @@ def main(argv=None) -> int:
                     arch[k] = {"note": notes.pop(k), "archived_at": stamp}
                 return None
 
-            locked_update(state, archive, indent=2)
+            if locked_update(state, archive, indent=2) is REFUSED:
+                return 2
         return 0
 
     if a.audit_prs:
@@ -374,7 +378,10 @@ def main(argv=None) -> int:
                 log.append({"id": rid, "reason": why})
             return None
 
-        if locked_update(state, apply_under_lock, indent=2) is ABORT:
+        res = locked_update(state, apply_under_lock, indent=2)
+        if res is REFUSED:
+            return 2
+        if res is ABORT:
             return 1
     return 0
 

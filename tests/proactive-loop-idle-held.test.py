@@ -355,22 +355,25 @@ conc = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
 conc.write_text(json.dumps({"streak": 0, "noop_total": 0}))
 
 _racer = {}
-_orig_read = ih.idle_state.read_state
+_orig_read = ih.idle_state.read_state_strict
 def _read_then_race(path):
-    doc = _orig_read(path)
+    got = _orig_read(path)
     if not _racer:                      # once, while the seed holds the lock
         _racer["p"] = _sp.Popen([*_PY, _HASH, "--state", str(path),
                                  "--pass-outcome", "noop"],
                                 stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
         _time.sleep(0.4)                # let it reach and block on the lock
-    return doc
+    return got
 
-ih.idle_state.read_state = _read_then_race
+ih.idle_state.read_state_strict = _read_then_race
 try:
     rc, _, _ = run(["--state", str(conc), "--init-empty"])
 finally:
-    ih.idle_state.read_state = _orig_read
-_racer["p"].wait(timeout=20)
+    ih.idle_state.read_state_strict = _orig_read
+check("harness: the racer actually fired (else this arm proves nothing)",
+      "p" in _racer, "read hook never called — retarget it")
+if "p" in _racer:
+    _racer["p"].wait(timeout=20)
 
 _after = json.loads(conc.read_text())
 check("CONCURRENCY: the pass recorded during --init-empty is NOT lost",
@@ -383,6 +386,35 @@ check("both writers serialise on ONE lock file",
       conc.with_suffix(".json.lock").exists(),
       str(sorted(x.name for x in conc.parent.iterdir())))
 
+
+# FAIL-CLOSED: every writer here refuses an unparseable record rather than
+# publishing its mutate() output onto the empty dict a lenient read returns.
+def _refuses_held(argv, label):
+    f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+    f.write_text('{"streak": 7, "held_item_ids": [["keep","owner"')
+    before = f.read_text()
+    # All three refuse BEFORE locked_update — load()/the pre-lock parse — so
+    # these arms pin that guard, not the strict read inside the lock.
+    try:
+        rc, _, err = run(["--state", str(f)] + argv)
+    except SystemExit as e:
+        rc, err = e.code, "SystemExit"
+    check(f"fail-closed: {label} refuses AND leaves the file byte-identical",
+          rc == 2 and f.read_text() == before,
+          f"rc={rc} changed={f.read_text() != before} err={str(err).strip()[:60]!r}")
+
+_refuses_held(["--init-empty"], "--init-empty")
+_refuses_held(["--add", "x:owner", "--note", "n"], "--add")
+_refuses_held(["--archive"], "--archive")
+
+_valid_h = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_valid_h.write_text(json.dumps({"streak": 7}))
+_rc_h, _, _ = run(["--state", str(_valid_h), "--init-empty"])
+check("CONTROL: a VALID keyless record still initialises — corrupt is the "
+      "discriminator, not 'refuses everything'",
+      _rc_h == 0 and json.loads(_valid_h.read_text()).get("held_item_ids") == []
+      and json.loads(_valid_h.read_text()).get("streak") == 7,
+      f"rc={_rc_h} {_valid_h.read_text()[:70]}")
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

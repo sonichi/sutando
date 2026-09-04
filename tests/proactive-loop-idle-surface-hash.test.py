@@ -151,27 +151,27 @@ _race.write_text(json.dumps({"held_item_ids": [], "last_surfaced_hash": "stale"}
 
 _sys.path.insert(0, str(SCRIPTS))
 import idle_state as _ist            # the shared owner both writers use
-_orig_read = _ist.read_state
+_orig_strict = _ist.read_state_strict
 _spawned = {}
 def _read_then_race(path):
-    doc = _orig_read(path)
+    got = _orig_strict(path)
     if not _spawned:                 # once, while --commit holds the lock
         _spawned["p"] = subprocess.Popen(
             [_sys.executable, "-B", _HELD, "--state", str(path),
              "--add", "raced:owner", "--write"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         time.sleep(0.4)              # let it reach and block on the lock
-    return doc
+    return got
 
-_ish_orig_read = ish.read_state
-_ist.read_state = _read_then_race
-ish.read_state = _read_then_race
+_ist.read_state_strict = _read_then_race
 try:
     ish.main(["--state", str(_race), "--items", '[["a","owner"]]', "--commit"])
 finally:
-    _ist.read_state = _orig_read
-    ish.read_state = _ish_orig_read
-_spawned["p"].wait(timeout=20)
+    _ist.read_state_strict = _orig_strict
+check("harness: the racer actually fired (else this arm proves nothing)",
+      "p" in _spawned, "read hook never called — retarget it")
+if "p" in _spawned:
+    _spawned["p"].wait(timeout=20)
 
 _final = json.loads(_race.read_text())
 check("CONCURRENCY: --commit does not erase a locked write from idle-held",
@@ -180,6 +180,31 @@ check("CONCURRENCY: --commit does not erase a locked write from idle-held",
 check("CONCURRENCY: and --commit's own hash still landed",
       _final.get("last_surfaced_hash") == ish.held_hash([["a", "owner"]]),
       f"hash={_final.get('last_surfaced_hash')!r}")
+
+
+# FAIL-CLOSED on an unreadable record: a parse failure is not authorisation to
+# discard it. @qingyun-wu measured streak=7 + held_item_ids replaced by counters.
+def _refuses(raw, label):
+    f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+    f.write_text(raw)
+    before = f.read_text()
+    r = subprocess.run([_sys.executable, "-B", str(SCRIPTS / "idle-surface-hash.py"),
+                        "--state", str(f), "--pass-outcome", "noop"],
+                       capture_output=True, text=True, timeout=30)
+    check(f"fail-closed: {label} refuses AND leaves the file byte-identical",
+          r.returncode != 0 and f.read_text() == before,
+          f"rc={r.returncode} changed={f.read_text() != before}")
+
+_refuses('{"streak": 7, "held_item_ids": [["keep","owner"', "truncated JSON")
+_refuses('[1, 2, 3]', "valid JSON that is not an object")
+
+_fresh = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+subprocess.run([_sys.executable, "-B", str(SCRIPTS / "idle-surface-hash.py"),
+                "--state", str(_fresh), "--pass-outcome", "noop"],
+               capture_output=True, text=True, timeout=30)
+check("CONTROL: an ABSENT record still initialises — absent is not corrupt",
+      _fresh.exists() and json.loads(_fresh.read_text()).get("streak") == 1,
+      _fresh.read_text()[:60] if _fresh.exists() else "not created")
 
 
 print(f"\nidle-surface-hash: {ran - len(fails)}/{ran} passed")

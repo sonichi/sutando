@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sys
 from pathlib import Path
 
 # Returned by a mutate() that declines to write. None is NOT this sentinel, so
@@ -19,12 +20,39 @@ from pathlib import Path
 ABORT = object()
 
 
+# Returned by locked_update when the record exists but cannot be trusted. An
+# absent file is NOT this: absent means first run, and {} is the right answer.
+REFUSED = object()
+
+
 def read_state(path: Path) -> dict:
+    """Lenient read for callers that want a default. NEVER use before a write."""
     try:
         doc = json.loads(Path(path).read_text())
         return doc if isinstance(doc, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def read_state_strict(path: Path):
+    """(doc, err) — absent is ({}, None); unreadable or malformed is (None, why).
+
+    Collapsing those two into {} makes a truncated file look like a fresh one.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {}, None
+    try:
+        raw = p.read_text()
+    except OSError as exc:
+        return None, f"unreadable ({exc.__class__.__name__})"
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        return None, f"not JSON ({exc})"
+    if not isinstance(doc, dict):
+        return None, f"not a JSON object (got {type(doc).__name__})"
+    return doc, None
 
 
 def write_state(path: Path, doc: dict, indent: int | None = None) -> None:
@@ -48,7 +76,11 @@ def locked_update(path: Path, mutate, indent: int | None = None):
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
-            doc = read_state(path)
+            doc, err = read_state_strict(path)
+            if err is not None:
+                # A parse failure is not authorisation to discard the record.
+                print(f"REFUSED: {path} {err} — not overwriting", file=sys.stderr)
+                return REFUSED
             result = mutate(doc)
             if result is ABORT:
                 return ABORT
