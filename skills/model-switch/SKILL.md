@@ -10,14 +10,19 @@ user-invocable: true
 (`default|opus|sonnet|haiku|fable`) or a `claude-*` id with an optional `[1m]` tag; anything else
 is refused before any write (exit 2).
 
-Three effects, in this order: (1) `<workspace>/state/model-switch.json` records `{model, previous,
-ts, by, settings}` — written FIRST, so a pin can never exist unrecorded (the #2742 lesson: a pin
-nothing could see became a 17-day downgrade); (2) `model` is pinned in the runtime's
-`settings.json`, resolved by `sutando-config.sh claude-home-path`, which the launcher inherits
-(it passes no `--model`); a failed pin removes the record it would have described; (3) `/model
-<model>` + Enter is sent to the core's tmux pane, socket from `sutando-config.sh tmux-socket`
-(or `SUTANDO_TMUX_SOCKET` / `--socket`), session `sutando-core` (or `SUTANDO_TMUX_SESSION` /
-`--session`). Exit 3 = recorded and pinned, no live pane found; exit 1 = nothing changed.
+Order and rollback, under one lock per brain (`<workspace>/state/.model-switch.lock`, held across
+preflight, the transaction and the live send so overlapping switches linearize): (1) preflight — refuse
+on a Codex runtime (exit 4) or when the core's input box carries text (exit 5), nothing written; (2)
+the prior `settings.json` bytes are read and a new record `{model, previous, ts, by, settings}` is
+STAGED beside `<workspace>/state/model-switch.json`; (3) `model` is pinned in `settings.json` (atomic
+replace); a failed pin discards the staged record — the prior record is byte-intact; (4) the staged
+record is committed; if that commit fails the settings are rolled back to the exact prior bytes, so a
+pin can never exist unrecorded; (5) `/model <model>` + Enter is sent to the core pane. Exit 3 = pinned
+and recorded, no live pane; exit 1 = nothing changed (or, on a rollback failure, the message says so).
+
+Defaults come from the runtime descriptor (`sutando-config.sh runtime`: `brain`, `socket`,
+`session`, runtime-authored and foreign-caller safe); `--brain/--socket/--session/--descriptor-file`
+and `SUTANDO_TMUX_SOCKET`/`SUTANDO_TMUX_SESSION` are explicit overrides.
 
 Python comes from `sutando-config.sh python-bin`, never bare `python3`. The core-side entry
 `scripts/switch-model.sh` only execs this script. An owner message like "switch model to opus" is

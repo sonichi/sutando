@@ -37,6 +37,11 @@ CFG="$BRAIN/settings.json"
 if [ -n "$DRY" ]; then
   echo "dry-run: would record $STATE_DIR/model-switch.json, pin model=$MODEL in $CFG, send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"; exit 0
 fi
+# One switch at a time per brain: the lock spans preflight, the settings/record
+# transaction and the live send, so two invocations cannot interleave.
+LOCK="$STATE_DIR/.model-switch.lock"; mkdir -p "$STATE_DIR" 2>/dev/null
+if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open the switch lock ($LOCK) — nothing changed" >&2; exit 1; fi
+"$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "switch-model: could not take the switch lock — nothing changed" >&2; exit 1; }
 # Claude Code only: /model and the settings.json pin are its. The Codex core takes
 # its model at launch (codex -m from SUTANDO_CORE_MODEL), so the fix there is a restart.
 RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || echo claude)"

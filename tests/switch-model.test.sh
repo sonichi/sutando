@@ -87,4 +87,20 @@ rc=$(env -u SUTANDO_TMUX_SOCKET -u SUTANDO_TMUX_SESSION "$HERE/scripts/switch-mo
 grep -q "Brain With Spaces/settings.json" "$T/out" && grep -q -- "-S /private/tmp/socket path/s.sock -t core name" "$T/out" \
   && ok "25 descriptor paths with spaces reach brain/socket/session intact" || fail "25 spaces" "$(cat "$T/out")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 25 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- two overlapping switches must linearize: settings, record and the live command agree
+cat > "$T/bin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+case " $* " in *" capture-pane "*) [ -n "${TMUX_CAP_DELAY:-}" ] && sleep "$TMUX_CAP_DELAY"; printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
+exit 0
+SH
+chmod +x "$T/bin/tmux"; : > "$T/tmux.log"; printf '{"model":"opus"}\n' > "$T/cfg/settings.json"
+(TMUX_CAP_DELAY=0.5 "$HERE/scripts/switch-model.sh" sonnet --state-dir "$T/state" --brain "$T/cfg" >/dev/null 2>&1) & sleep 0.1
+("$HERE/scripts/switch-model.sh" haiku --state-dir "$T/state" --brain "$T/cfg" >/dev/null 2>&1) & wait
+FINAL=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])"); REC=$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))['model'])")
+LASTSEND=$(grep -- "-l /model" "$T/tmux.log" | tail -1 | sed 's/.*\/model //')
+[ "$FINAL" = "$REC" ] && [ "$FINAL" = "$LASTSEND" ] && ok "26 overlapping switches linearize: settings=$FINAL record=$REC last-send=$LASTSEND agree" || fail "26 race" "settings=$FINAL record=$REC last-send=$LASTSEND"
+SEQ="$(grep send-keys "$T/tmux.log" | sed -E 's/.*-l \/model (sonnet|haiku)$/lit:\1/; s/.*Enter$/enter/' | tr '\n' ' ')"
+case "$SEQ" in "lit:sonnet enter lit:haiku enter "|"lit:haiku enter lit:sonnet enter ") ok "27 ...and the live sends do not interleave";; *) fail "27 interleave" "$SEQ";; esac
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 27 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
