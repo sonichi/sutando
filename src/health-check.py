@@ -7100,11 +7100,25 @@ def _porcelain_z_tracked_paths(porcelain: str) -> "list[str]":
     return out
 
 
+def _trunk_ref(git) -> str:
+    """The remote trunk to measure staleness against — origin/HEAD's target,
+    else the first of origin/main, origin/master that resolves. "" if none."""
+    rc, ref = git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    if rc == 0 and ref.startswith("refs/remotes/"):
+        return ref[len("refs/remotes/"):]
+    for cand in ("origin/main", "origin/master"):
+        rc, _ = git("rev-parse", "--verify", "--quiet", cand)
+        if rc == 0:
+            return cand
+    return ""
+
+
 def check_live_tree_drift(repo_root: "Path | None" = None,
                           behind_max: int = 30,
                           dirty_age_max_s: int = 86400) -> dict:
-    """Warn when the LIVE checkout drifts: >=behind_max commits behind its own
-    upstream branch, or tracked dirty files older than dirty_age_max_s.
+    """Warn when the LIVE checkout drifts: >=behind_max commits behind the
+    remote TRUNK (falling back to the branch's upstream when no trunk ref
+    resolves), or tracked dirty files older than dirty_age_max_s.
     Measured 2026-08-26: the live tree sat 116 behind with ~190 dirty files
     (some running in production while existing in no commit); nothing alarmed.
     Diagnostic only — reconciliation needs an attended restart window."""
@@ -7121,12 +7135,21 @@ def check_live_tree_drift(repo_root: "Path | None" = None,
         rc, branch = _git("rev-parse", "--abbrev-ref", "HEAD")
         if rc != 0:
             return {"name": name, "status": "ok", "detail": "not a git checkout"}
-        behind = 0
+        def _count_behind(ref):
+            rc_, n_ = _git("rev-list", "--count", f"HEAD..{ref}")
+            return int(n_) if rc_ == 0 and n_.isdigit() else None
+        # None means UNMEASURED, never 0: a branch with no upstream would
+        # otherwise keep the initial 0 and certify the drift it exists to catch.
+        behind_up = None
         rc, up = _git("rev-parse", "--abbrev-ref", "@{upstream}")
         if rc == 0 and up:
-            rc2, n = _git("rev-list", "--count", f"HEAD..{up}")
-            if rc2 == 0 and n.isdigit():
-                behind = int(n)
+            behind_up = _count_behind(up)
+        else:
+            up = ""
+        # Staleness is against the TRUNK, not a branch's own remote copy: a PR
+        # branch tracking itself is 0 behind however far the trunk has moved.
+        trunk = _trunk_ref(_git)
+        behind_trunk = _count_behind(trunk) if trunk else None
         rc, porcelain = _git("status", "--porcelain", "-z")
         if rc != 0:
             # A failed read yields empty stdout, which would read as a clean
@@ -7145,8 +7168,13 @@ def check_live_tree_drift(repo_root: "Path | None" = None,
             except OSError:
                 continue  # deleted-in-tree entries have no mtime; count as dirty only
         problems = []
-        if behind >= behind_max:
-            problems.append(f"{behind} commits behind {up}")
+        if behind_trunk is not None and behind_trunk >= behind_max:
+            problems.append(f"{behind_trunk} commits behind {trunk}")
+        elif behind_up is not None and behind_up >= behind_max:
+            problems.append(f"{behind_up} commits behind {up}")
+        if behind_trunk is None and behind_up is None:
+            problems.append("distance to the trunk is UNMEASURED, not zero "
+                            "(no upstream and no readable trunk ref)")
         if stale:
             problems.append(f"{len(stale)} tracked dirty file(s) older than "
                             f"{dirty_age_max_s // 3600}h (e.g. {stale[0]})")
@@ -7156,8 +7184,10 @@ def check_live_tree_drift(repo_root: "Path | None" = None,
                                " — running daemons restart onto whatever is on disk; "
                                "commit/rescue the dirty state, then reconcile in an "
                                "attended restart window")}
+        measured = (f"{behind_trunk} behind {trunk}" if behind_trunk is not None
+                    else f"{behind_up} behind {up}")
         return {"name": name, "status": "ok",
-                "detail": f"{behind} behind upstream, {len(dirty)} tracked dirty"}
+                "detail": f"{measured}, {len(dirty)} tracked dirty"}
     except GitUnavailable:
         # No runnable git is a host state, not drift — never re-warn per pass.
         return {"name": name, "status": "ok", "detail": "no runnable git on this host"}
