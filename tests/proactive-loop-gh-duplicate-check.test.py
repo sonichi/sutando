@@ -151,5 +151,45 @@ class Delegation(unittest.TestCase):
         self.assertIn("drift", err.getvalue())
 
 
+class DecisionParametersCannotSilenceTheSearch(unittest.TestCase):
+    """`--max-queries 0` ran zero searches and scored NO CANDIDATE, rc 0 (review finding)."""
+
+    def test_zero_queries_is_cannot_answer(self):
+        rc, _, err = run(BASE + ["--max-queries", "0"], lambda *a, **k: [])
+        self.assertEqual(rc, 2)
+        self.assertIn("CANNOT ANSWER", err)
+
+    def test_zero_overlap_is_cannot_answer(self):
+        rc, _, err = run(BASE + ["--min-overlap", "0"], lambda *a, **k: [])
+        self.assertEqual(rc, 2)
+        self.assertIn("CANNOT ANSWER", err)
+
+    def test_one_of_each_is_still_allowed(self):
+        rc, out, _ = run(BASE + ["--max-queries", "1", "--min-overlap", "1"],
+                         lambda r, t, **k: [])
+        self.assertEqual(rc, 0, out)
+
+
+class WiredIntoTheInstruction(unittest.TestCase):
+    """An unreferenced gate runs never — worse than one described only in prose.
+
+    The tool shipped invoked by nothing, so the workflow that filed the duplicate
+    was unchanged. These pin the wiring, not the script.
+    """
+
+    SKILL = Path(__file__).resolve().parents[1] / "skills" / "proactive-loop" / "SKILL.md"
+
+    def test_the_loop_instruction_names_the_script(self):
+        self.assertIn("gh-duplicate-check.py", self.SKILL.read_text())
+
+    def test_it_is_chained_so_the_result_gates_the_create(self):
+        # Naming the script is not enough: the `&&` is what makes the verdict a
+        # precondition rather than something printed next to the action.
+        text = self.SKILL.read_text()
+        i = text.index("gh-duplicate-check.py")
+        window = text[i:i + 700]
+        self.assertIn("&& gh issue create", window)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

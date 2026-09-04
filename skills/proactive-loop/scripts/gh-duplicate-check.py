@@ -116,6 +116,14 @@ def main(argv=None) -> int:
     ap.add_argument("--max-queries", type=int, default=4)
     a = ap.parse_args(argv)
 
+    # A decision parameter that can silence the search makes the gate fail OPEN
+    # by construction -- `--max-queries 0` scored NO CANDIDATE, rc 0 (found in review).
+    if a.max_queries < 1 or a.min_overlap < 1:
+        print(f"CANNOT ANSWER: --max-queries={a.max_queries} --min-overlap={a.min_overlap}; "
+              f"either below 1 makes a clean result arithmetic rather than evidence.",
+              file=sys.stderr)
+        return 2
+
     tokens, stop = load_tokens()
     if tokens is None:
         print("CANNOT ANSWER: warn-already-triaged.py is not importable, so tokenisation "
