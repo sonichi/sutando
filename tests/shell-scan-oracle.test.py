@@ -6,6 +6,7 @@ quote, an even backslash run, an escaped space — so the oracle here IS bash: a
 shell function stands in for the program and prints its real argv.
 """
 import os
+import base64
 import subprocess
 import sys
 import unittest
@@ -15,22 +16,25 @@ HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 sys.path.insert(0, str(HOOKS))
 import _shell_scan as scan  # noqa: E402
 
-START, END = b"\x01", b"\x02"
-
-
 def bash_argv(command, program="gh"):
-    """The argv bash actually hands `program`, or None when bash refuses.
+    r"""The argv bash actually hands `program`, or None when bash refuses.
 
-    Binary, and delimited by bytes that cannot occur in a newline: text mode
-    rewrites \r to \n and splitlines() splits on it, so a line-oriented oracle
-    cannot express any argument containing a carriage return.
+    Each argument is base64'd, so no byte the payload can contain is also a
+    delimiter: a raw sentinel cannot express $'\cA', whose value IS the
+    sentinel. The leading 'x' keeps an EMPTY argument on its own line, which
+    base64 alone encodes to nothing at all.
     """
-    script = (f"{program}() {{ printf '\\x01%s\\x02' \"$@\"; }}\n"
-              f"my-tool() {{ printf '\\x01%s\\x02' \"$@\"; }}\n" + command)
-    r = subprocess.run(["bash", "-c", script], capture_output=True)
-    if r.returncode != 0 and START not in r.stdout:
+    shim = ('%s() { for a in "$@"; do printf x; printf %%s "$a" | base64 | tr -d "\\n"; '
+            'printf "\\n"; done; }\n')
+    script = (shim % program) + (shim % "my-tool") + command
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    lines = [ln[1:] for ln in r.stdout.splitlines() if ln.startswith("x")]
+    if r.returncode != 0 and not lines:
         return None
-    return [c.split(END)[0].decode() for c in r.stdout.split(START)[1:]]
+    try:
+        return [base64.b64decode(ln).decode("utf-8", "replace") for ln in lines]
+    except Exception:
+        return None
 
 
 def scan_argv(command, program="gh"):
@@ -69,6 +73,17 @@ class MatchesBash(unittest.TestCase):
         'gh release create v1 --target abc123\ngh pr view 2',
         'gh release create v1 --target abc123\r\ngh pr view 2',
         'gh release create v1 --target abc123\rgh pr view 2',
+        # ANSI-C quoting: bash DROPS the $ and decodes, so a scanner that keeps
+        # the $ hands a guard a value gh never receives (found by sonichi).
+        "gh release create v1 --target $'abc1234'",
+        "gh release create v1 --target $'\\x61bc1234'",
+        "gh release create v1 --target $'\\141bc1234'",
+        "gh pr comment 1 --body $'a\\tb'",
+        "gh pr comment 1 --body $'quote\\'inside'",
+        "gh pr comment 1 --body $'\\cA'",
+        "gh pr comment 1 --body $'\\e[0m'",
+        "gh pr comment 1 --body pre$'mid'post",
+        "gh pr comment 1 --body $'plain' --title after",
     ]
 
     # bash rewrites these too and we deliberately do NOT flag them: `$VAR` is an

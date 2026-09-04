@@ -59,6 +59,82 @@ def _flush(st: _State) -> None:
     st.in_word = False
 
 
+_ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f",
+                  "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+                  "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _ansi_c(body: str) -> str:
+    """Bash's $'...' escapes, spelled out rather than borrowed from Python.
+
+    `unicode_escape` is close but not bash — no \\e, no \\cX — and a guard that
+    mis-decodes here reports a value gh never receives.
+    """
+    out, i = [], 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\" or i + 1 >= len(body):
+            out.append(ch)
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in _ANSI_C_SIMPLE:
+            out.append(_ANSI_C_SIMPLE[nxt])
+            i += 2
+            continue
+        if nxt == "x":
+            j = i + 2
+            while j < len(body) and j < i + 4 and body[j] in "0123456789abcdefABCDEF":
+                j += 1
+            if j > i + 2:
+                out.append(chr(int(body[i + 2:j], 16)))
+                i = j
+                continue
+        if nxt in "01234567":
+            j = i + 1
+            while j < len(body) and j < i + 4 and body[j] in "01234567":
+                j += 1
+            out.append(chr(int(body[i + 1:j], 8) & 0xFF))
+            i = j
+            continue
+        if nxt in ("u", "U"):
+            width = 4 if nxt == "u" else 8
+            j = i + 2
+            while j < len(body) and j < i + 2 + width and body[j] in "0123456789abcdefABCDEF":
+                j += 1
+            if j > i + 2:
+                out.append(chr(int(body[i + 2:j], 16)))
+                i = j
+                continue
+        if nxt == "c" and i + 2 < len(body):
+            out.append(chr(ord(body[i + 2].upper()) ^ 0x40))
+            i += 3
+            continue
+        out.append("\\")
+        out.append(nxt)
+        i += 2
+    return "".join(out)
+
+
+def _ansi_c_span(command: str, i: int):
+    """(decoded, index past the closing quote) for a $'...' at i, or (None, -1)
+    when it never closes."""
+    j = i + 2
+    body = []
+    while j < len(command):
+        c = command[j]
+        if c == "\\" and j + 1 < len(command):
+            body.append(c)
+            body.append(command[j + 1])
+            j += 2
+            continue
+        if c == "'":
+            return _ansi_c("".join(body)), j + 1
+        body.append(c)
+        j += 1
+    return None, -1
+
+
 def _double_quote_escapes(ch: str) -> bool:
     """Inside double quotes bash honours a backslash only before these; before
     anything else the backslash is a literal character."""
@@ -110,6 +186,21 @@ def words(command: str) -> List[Word]:
                 if st.quote == '"' and _opens_substitution(command, i):
                     st.cur.expands = True
             i += 1
+            continue
+
+        if ch == "$" and command[i + 1:i + 2] == "'":
+            # ANSI-C quoting: bash DROPS the $ and decodes the escapes, so a
+            # scanner that keeps it reports a value gh never receives.
+            decoded, nxt = _ansi_c_span(command, i)
+            if decoded is None:
+                st.quote = "'"
+                break
+            st.in_word = True
+            st.cur.raw += command[i:nxt]
+            st.cur.text += decoded
+            if not st.cur.quoted:
+                st.cur.quoted = "'"
+            i = nxt
             continue
 
         if ch in ("'", '"'):
