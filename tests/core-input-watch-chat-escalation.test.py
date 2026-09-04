@@ -195,6 +195,23 @@ class TestDegradesWithoutDyingV(unittest.TestCase):
         self.assertIsNone(
             M.escalate(None, "blocked-human", "d", None, None, "s1"))
 
+    def test_a_store_that_cannot_be_CONSTRUCTED_is_as_optional_as_a_missing_import(self):
+        """The import sat inside the fail-open boundary and the construction did
+        not, so an unbuildable store killed the monitor before its first tick."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = pathlib.Path(td)
+            (ws / "state").mkdir()
+            (ws / "state" / "hitl").write_text("a regular file, not a directory")
+            self.assertIsNone(M._hitl_manager(str(ws / "state" / "core-status.json")))
+
+    def test_the_healthy_path_still_returns_a_manager(self):
+        """Control: without it the test above passes on a function that always
+        returns None, which is not the behaviour being pinned."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = pathlib.Path(td)
+            (ws / "state").mkdir()
+            self.assertIsNotNone(M._hitl_manager(str(ws / "state" / "core-status.json")))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

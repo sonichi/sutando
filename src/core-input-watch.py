@@ -437,11 +437,13 @@ def _hitl_manager(out_path):
         if here not in _sys.path:
             _sys.path.insert(0, here)
         from hitl.manager import HitlManager, HitlStore, default_store
+
+        ws = _osp.dirname(_osp.dirname(_osp.abspath(out_path)))
+        return HitlManager(HitlStore(default_store(_Path(ws))))
     except Exception as exc:  # noqa: BLE001
+        # A store that cannot be BUILT is as optional as one that cannot import.
         print(f"hitl unavailable ({exc}); no card will be raised", file=_sys.stderr)
         return None
-    ws = _osp.dirname(_osp.dirname(_osp.abspath(out_path)))
-    return HitlManager(HitlStore(default_store(_Path(ws))))
 
 
 def escalate(manager, state, detail, kind, prompt, session):
