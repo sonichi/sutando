@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import uuid
+from hashlib import sha256
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -216,13 +217,54 @@ def list_open(workspace: Path) -> list[dict]:
     return out
 
 
+EMPTY_DIGEST = sha256().hexdigest()
+
+
+def records_digest(workspace: Path, host: str) -> str:
+    """Content hash of everything under this host's subtree except the stamp.
+
+    A timestamp alone says only WHEN someone stamped; it cannot say WHAT was
+    stamped, so a record opened a second later still read as published."""
+    d = records_dir(workspace, host)
+    h = sha256()
+    if d.is_dir():
+        for f in sorted(x for x in d.rglob("*") if x.is_file() and x.name != STAMP_NAME
+                        and not x.name.endswith(".tmp")):
+            h.update(str(f.relative_to(d)).encode())
+            h.update(b"\0")
+            h.update(f.read_bytes())
+            h.update(b"\0")
+    return h.hexdigest()
+
+
 def publish(workspace: Path, host: str) -> Path:
-    """Stamp this host's subtree so peers can tell a fresh view from a stale one."""
-    if not isinstance(host, str) or not host.strip():
-        raise ValueError("host must be a non-empty string")
+    """Stamp this host's subtree with WHAT it contains, not just when.
+
+    Call this only after the subtree has been pushed: the stamp is a claim
+    that peers can see these records, and an unpushed stamp claims it falsely."""
+    validate_host(host)
     p = records_dir(workspace, host) / STAMP_NAME
-    _atomic_write(p, {"host": host, "published_at": _now()})
+    _atomic_write(p, {"host": host, "published_at": _now(),
+                      "records": records_digest(workspace, host)})
     return p
+
+
+def unpublished(workspace: Path, host: str) -> bool:
+    """True when this host's records have moved since it last published.
+
+    Every writer leaves this True, so opening a record un-publishes the host
+    by CONSTRUCTION rather than by waiting for a clock to age out."""
+    d = records_dir(workspace, host)
+    digest = records_digest(workspace, host)
+    try:
+        stamp = json.loads((d / STAMP_NAME).read_text())
+    except (OSError, ValueError):
+        # A host with nothing to publish is not unpublished — otherwise every
+        # host without records blocks itself and the fleet cannot move at all.
+        return digest != EMPTY_DIGEST
+    if not isinstance(stamp, dict) or stamp.get("host") != host:
+        return True
+    return stamp.get("records") != digest
 
 
 def stale_hosts(workspace: Path, host: str | None, max_age_s: float,
@@ -241,6 +283,10 @@ def stale_hosts(workspace: Path, host: str | None, max_age_s: float,
             # evidence; unchecked, one host's stamp vouched for another's view.
             if not isinstance(stamp, dict) or stamp.get("host") != h:
                 raise ValueError("stamp does not name the host whose directory holds it")
+            # The stamp must describe the records that arrived with it: a fresh
+            # timestamp beside changed records is not a published view.
+            if stamp.get("records") != records_digest(workspace, h):
+                raise ValueError("stamp does not describe this host's current records")
             t = stamp.get("published_at")
             age = (now - datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
         except (OSError, ValueError, TypeError):
@@ -322,6 +368,13 @@ def blocking(workspace: Path, repo_root: Path, target_ref: str,
     that owes the witness. With max_age_s, a foreign host whose stamp is
     missing or older blocks by itself: its records cannot be called fresh."""
     hits = []
+    if max_age_s is not None and host:
+        # A peer cannot fix this one and neither can waiting: the operator can.
+        if unpublished(workspace, host):
+            hits.append({"repo": "?", "pr": 0, "head": "", "host": host, "opened_by": "?",
+                         "opened_at": "?", "canary": None, "stale": True,
+                         "reason": f"host {host} has records its own stamp does not describe: "
+                                   "publish and push this subtree before activating"})
     if max_age_s is not None:
         for h in stale_hosts(workspace, host, max_age_s):
             hits.append({"repo": "?", "pr": 0, "head": "", "host": h, "opened_by": "?",
