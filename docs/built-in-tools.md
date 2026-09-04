@@ -201,3 +201,17 @@ open "https://github.com"           # open URL in default browser
 **Context drop + shortcuts** — the Sutando menu bar app (`src/Sutando/`) provides global hotkeys. **Live config**: `~/.config/sutando/hotkeys.json` (per-user override) with defaults registered in `src/Sutando/main.swift:944` (`registerHotKey()` action list). When the user asks "what hotkeys do I have", read those sources — don't quote a static list from this file (it would drift behind the actual registration).
 
 The menu-bar app is optional and is not built or launched by the headless core's `startup.sh`; compile and launch the app separately, including `bash skills/context-drop/build.sh` when enabling context-drop. Check `tasks/` for dropped context.
+
+## Model switch (no CLI needed)
+
+```bash
+bash scripts/switch-model.sh claude-opus-5          # alias (opus/sonnet/haiku/fable/default) or a claude-* id, optional [1m]
+bash scripts/switch-model.sh fable --dry-run        # prints the two effects, changes nothing
+```
+
+Two effects, both visible: pins `model` in `$CLAUDE_CONFIG_DIR/settings.json` (what the next launch
+inherits — the launcher passes no `--model`), and sends `/model <name>` to the live `sutando-core`
+tmux pane so the running session switches now. Every switch is recorded in
+`<workspace>/state/model-switch.json` with `previous` and a timestamp. Exit 2 = name refused, nothing
+touched; exit 3 = pinned but no live pane found. An owner message like "switch model to opus" is
+handled by running this script; the dashboard's Quota tile shows the model the proxy then sees.
