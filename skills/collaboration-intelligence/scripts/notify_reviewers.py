@@ -211,16 +211,19 @@ def _is_collaborator(repo: str, login: str) -> bool:
 def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     """(login GitHub can answer for, why) — a roster key is not always one.
 
+    An explicit same_actor_as wins over the key itself: a roster key can
+    coincide with an unrelated real login, and then the key is not evidence.
+
     `johnm-desktop` is a Stand handle, not a login; probing it 404s and the
     capability check degrades to a silent no-op on exactly the aliased keys
     `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
     """
     entry = (roster or {}).get(name) or {}
-    if _is_github_user(name):
-        return name, "key is a login"
     sib = entry.get("same_actor_as")
     if sib and _is_github_user(sib):
         return sib, f"via same_actor_as -> {sib}"
+    if _is_github_user(name):
+        return name, "key is a login"
     return name, "no login found for this key"
 
 
