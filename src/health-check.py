@@ -9493,6 +9493,18 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
             else:
                 binds.append((nm, dflt))
         bound = {nm for nm, _ in binds} | set(murky)
+
+        def opaque_import(expr) -> "str | None":
+            """An imported name read as a VALUE. Same edge as an unresolved call,
+            so it must run in the fixpoint too: one local hop hides it otherwise."""
+            bases = _callee_bases(expr)
+            for x in (n.id for n in ast.walk(expr) if isinstance(n, ast.Name)):
+                if (x in imported and x not in proven and x not in bound
+                        and x not in modfns and x not in _RESOLVED_CALLS
+                        and x not in bases):
+                    return f"the imported value {x}"
+            return None
+
         changed = True
         while changed:                           # two fixpoints, one walk
             changed = False
@@ -9502,6 +9514,7 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                 env = (reads_env(val) or any(x in tainted for x in names)
                        or (dv is not None and dv[0] == "honours"))
                 unk = (unresolved_call(val) or murky_env_read(val)
+                       or opaque_import(val)
                        or next((murky[x] for x in names if x in murky), None)
                        or (dv[1] if dv is not None and dv[0] == "unknown" else None))
                 if env and name not in tainted:
@@ -9524,11 +9537,7 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                 return dv
             bad = (unresolved_call(n.value) or murky_env_read(n.value)
                    or next((murky[x] for x in names if x in murky), None)
-                   or next((f"the imported value {x}" for x in names
-                            if x in imported and x not in proven
-                            and x not in bound and x not in modfns
-                            and x not in _RESOLVED_CALLS
-                            and x not in _callee_bases(n.value)), None)
+                   or opaque_import(n.value)
                    or next((f"the unbound name {x}" for x in names
                             if x not in bound and x not in imported
                             and x not in modfns and x not in _RESOLVED_CALLS

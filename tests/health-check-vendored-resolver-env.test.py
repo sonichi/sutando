@@ -996,6 +996,53 @@ class ScopeAndOriginAreProven(unittest.TestCase):
         self.assertEqual(
             hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
 
+    def test_one_local_hop_does_not_wash_out_the_import(self):
+        """The backstop must run in the BINDING fixpoint, not only on the return:
+        an assignment moves the imported name out of the return expression."""
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(
+            "import os\nWORKSPACE = os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "from pathlib import Path\nfrom helper import WORKSPACE\n"
+            "def resolve_workspace():\n"
+            "    resolved = WORKSPACE\n"
+            "    return Path(resolved)\n")
+        v, why = hc._resolver_env_verdict(d / "workspace_default.py")
+        self.assertEqual(v, "unknown", why)
+        self.assertIn("WORKSPACE", why)
+
+    def test_two_hops_do_not_either(self):
+        """One hop is not a special case; the fixpoint carries it any distance."""
+        self.assertEqual(
+            self._v("import helper\nfrom pathlib import Path\n"
+                    "def resolve_workspace():\n"
+                    "    a = helper.WORKSPACE\n    b = a\n"
+                    "    return Path(b)\n"), "unknown")
+
+    def test_a_module_constant_defined_HERE_still_reads_ignores(self):
+        """Negative control: the rule is about IMPORTED values, not module scope.
+        A constant this file binds is dataflow the analysis fully resolved."""
+        self.assertEqual(
+            self._v("from pathlib import Path\nWS = '/fixed'\n"
+                    "def resolve_workspace():\n"
+                    "    r = WS\n    return Path(r)\n"), "ignores")
+
+    def test_the_probe_reports_the_one_hop_import_too(self):
+        """Integrated: the fixpoint verdict must reach the probe's status."""
+        ws = Path(tempfile.mkdtemp())
+        d = ws / "skill-repos" / "hopped" / "scripts"
+        d.mkdir(parents=True)
+        (d / "helper.py").write_text(
+            "import os\nWORKSPACE = os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "from pathlib import Path\nfrom helper import WORKSPACE\n"
+            "def resolve_workspace():\n"
+            "    resolved = WORKSPACE\n"
+            "    return Path(resolved)\n")
+        r = hc.check_vendored_resolver_env(workspace_dir=ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertNotIn("none honour", r["detail"])
+
     def test_the_probe_reports_the_opaque_import_rather_than_ok(self):
         """Integrated: the classifier verdict must reach the probe's status."""
         ws = Path(tempfile.mkdtemp())
