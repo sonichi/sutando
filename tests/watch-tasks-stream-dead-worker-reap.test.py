@@ -113,14 +113,25 @@ class Harness:
         with self.feed.open("a") as fh:
             fh.write(str(p.resolve()) + "\n")
 
-    def kill_workers(self) -> list[int]:
+    def worker_pids(self) -> list[int]:
+        """Receipts that actually carry a pid yet.
+
+        The dispatcher creates `workers/<name>` EMPTY and writes the pid only
+        after spawning, so an unreadable receipt means "not ready", not "no worker".
+        """
         pids = []
-        d = self.dispatch()
-        for r in (d / "workers").iterdir():
+        for r in (self.dispatch() / "workers").iterdir():
             try:
                 pids.append(int(r.read_text().strip()))
             except (ValueError, OSError):
                 pass
+        return pids
+
+    def kill_workers(self, expect: int = 1) -> list[int]:
+        # `running/` appears before the receipt exists and again before it holds
+        # a pid, so waiting on it alone reads a short list and kills nothing.
+        wait_for(lambda: len(self.worker_pids()) >= expect, 15.0)
+        pids = self.worker_pids()
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGKILL)
@@ -161,7 +172,7 @@ def scenario_slot_recovery() -> None:
             check("both worker slots filled by the startup sweep", False, str(h.dispatch()))
             return
         check("both worker slots filled by the startup sweep", True)
-        check("worker pids recorded and killed", len(h.kill_workers()) >= 2)
+        check("worker pids recorded and killed", len(h.kill_workers(expect=2)) >= 2)
         h.deliver("task-ccc.txt")
         got = wait_for(lambda: "task-ccc.txt" in names(h.dispatch() / "running"))
         d = h.dispatch()
