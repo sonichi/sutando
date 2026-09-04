@@ -46,6 +46,13 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
     --chat-user-avatar-fg: #d8e8f8;
     --chat-agent-avatar: #1e4028;
     --chat-code-bg: #14141e;
+    --chat-heading: #f0f0f8;
+    --chat-code-fg: #f8b878;
+    --chat-quote: #a0a0b0;
+    --chat-link: #6ea3ff;
+    --chat-line-hover: #3a3a52;
+    --chat-hint-code: #888888;
+    --chat-caps-key: #66aaff;
   }
   :root.theme-light {
     --chat-bg: #ffffff;
@@ -62,6 +69,13 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
     --chat-user-avatar-fg: #23446e;
     --chat-agent-avatar: #dff0e6;
     --chat-code-bg: #f4f4f7;
+    --chat-heading: #111118;
+    --chat-code-fg: #8a3200;
+    --chat-quote: #5a5a68;
+    --chat-link: #1a56c4;
+    --chat-line-hover: #c9c9d4;
+    --chat-hint-code: #5a5a68;
+    --chat-caps-key: #1a56c4;
   }
   /* No explicit choice: follow the host OS. An explicit ?theme= wins over it,
      which is why both stamps are classes on <html> rather than media-only. */
@@ -81,6 +95,13 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
       --chat-user-avatar-fg: #23446e;
       --chat-agent-avatar: #dff0e6;
       --chat-code-bg: #f4f4f7;
+      --chat-heading: #111118;
+      --chat-code-fg: #8a3200;
+      --chat-quote: #5a5a68;
+      --chat-link: #1a56c4;
+      --chat-line-hover: #c9c9d4;
+      --chat-hint-code: #5a5a68;
+      --chat-caps-key: #1a56c4;
     }
   }
   /* Embedded in a host that draws its own title bar: one header, not two. */
@@ -110,7 +131,7 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
     padding: 5px 12px; border-radius: 6px; border: 1px solid var(--chat-line-soft);
     transition: all 0.12s ease;
   }
-  .header a:hover { color: var(--chat-text); border-color: #3a3a52; }
+  .header a:hover { color: var(--chat-text); border-color: var(--chat-line-hover); }
   .header .clear-btn {
     color: var(--chat-text-3); font-size: 12px; font-family: inherit;
     background: transparent; cursor: pointer;
@@ -118,7 +139,7 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
     padding: 5px 12px;
     transition: all 0.12s ease;
   }
-  .header .clear-btn:hover { color: var(--chat-text); border-color: #3a3a52; }
+  .header .clear-btn:hover { color: var(--chat-text); border-color: var(--chat-line-hover); }
 
   .chat {
     flex: 1; overflow-y: auto; padding: 32px 0 16px;
@@ -140,13 +161,13 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
   }
   .empty .hint code {
     background: var(--chat-raised); padding: 2px 6px; border-radius: 4px;
-    color: #888; font-size: 12px;
+    color: var(--chat-hint-code); font-size: 12px;
   }
   .empty .caps {
     display: inline-grid; grid-template-columns: auto 1fr;
     gap: 3px 12px; margin-top: 28px; text-align: left;
   }
-  .empty .caps dt { color: #6af; font-size: 12px; white-space: nowrap; }
+  .empty .caps dt { color: var(--chat-caps-key); font-size: 12px; white-space: nowrap; }
   .empty .caps dd { color: #444; font-size: 12px; margin: 0; }
 
   .msg { display: flex; gap: 12px; max-width: 100%; }
@@ -185,8 +206,8 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
 
   /* Markdown styles inside bubbles */
   .bubble h1 { font-size: 1.5em; margin: 0.6em 0 0.4em; font-weight: 700; }
-  .bubble h2 { font-size: 1.25em; margin: 0.6em 0 0.4em; font-weight: 700; color: #f0f0f8; }
-  .bubble h3 { font-size: 1.1em; margin: 0.6em 0 0.3em; font-weight: 700; color: #f0f0f8; }
+  .bubble h2 { font-size: 1.25em; margin: 0.6em 0 0.4em; font-weight: 700; color: var(--chat-heading); }
+  .bubble h3 { font-size: 1.1em; margin: 0.6em 0 0.3em; font-weight: 700; color: var(--chat-heading); }
   .bubble h4 { font-size: 1em; margin: 0.5em 0 0.3em; font-weight: 700; }
   .bubble p { margin: 0.5em 0; }
   .bubble p:first-child { margin-top: 0; }
@@ -194,20 +215,20 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
   .bubble ul, .bubble ol { margin: 0.5em 0; padding-left: 1.6em; }
   .bubble li { margin: 0.25em 0; }
   .bubble code {
-    background: #0a0a12; padding: 2px 6px; border-radius: 4px;
+    background: var(--chat-code-bg); padding: 2px 6px; border-radius: 4px;
     font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.85em;
-    color: #f8b878;
+    color: var(--chat-code-fg);
   }
   .bubble pre {
-    background: #0a0a12; padding: 12px 14px; border-radius: 8px;
+    background: var(--chat-code-bg); padding: 12px 14px; border-radius: 8px;
     overflow-x: auto; margin: 0.6em 0; border: 1px solid var(--chat-line);
   }
   .bubble pre code { background: none; padding: 0; color: var(--chat-text-2); font-size: 0.9em; }
-  .bubble a { color: #6ea3ff; text-decoration: none; }
+  .bubble a { color: var(--chat-link); text-decoration: none; }
   .bubble a:hover { text-decoration: underline; }
   .bubble blockquote {
     border-left: 3px solid var(--chat-user-avatar); padding-left: 12px;
-    margin: 0.6em 0; color: #a0a0b0;
+    margin: 0.6em 0; color: var(--chat-quote);
   }
   .bubble table {
     border-collapse: collapse; margin: 0.5em 0; width: 100%;
@@ -217,7 +238,7 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
     border: 1px solid var(--chat-line); padding: 6px 10px; text-align: left;
   }
   .bubble th { background: var(--chat-raised); }
-  .bubble strong { font-weight: 700; color: #f0f0f8; }
+  .bubble strong { font-weight: 700; color: var(--chat-heading); }
   .bubble em { color: var(--chat-text-2); }
   .bubble hr { border: 0; border-top: 1px solid var(--chat-line); margin: 1em 0; }
 
@@ -240,7 +261,7 @@ export const CHAT_HTML = /* html */ `<!DOCTYPE html>
     transition: border-color 0.12s ease;
   }
   .input-textarea:focus { border-color: var(--chat-accent); }
-  .input-textarea::placeholder { color: #555; }
+  .input-textarea::placeholder { color: var(--chat-text-3); }
   .send-btn {
     background: var(--chat-agent-avatar); color: var(--chat-accent);
     border: 1px solid #2a4a36; border-radius: 12px;
