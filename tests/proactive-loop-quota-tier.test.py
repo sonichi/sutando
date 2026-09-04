@@ -170,5 +170,81 @@ class FreshWindowZeroBurn(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assertRegex(text, r"sustainable \d+\.\d+x CURRENT pace")
 
+
+class TopTierLane(unittest.TestCase):
+    """The API meters a third window, `7d_oi` (top-tier models). A pinned Fable/Opus
+    core can exhaust it while 5h and 7d read fine, so it must be able to BIND."""
+
+    def _run(self, text, argv=()):
+        out = io.StringIO(); real = sys.stdin; sys.stdin = io.StringIO(text)
+        try:
+            with redirect_stdout(out), __import__("contextlib").redirect_stderr(out):
+                rc = qt.main(list(argv))
+        finally:
+            sys.stdin = real
+        return rc, out.getvalue()
+
+    def _argv(self):
+        import datetime
+        now = datetime.datetime.now()
+        r7 = (now + datetime.timedelta(days=3, hours=12)).isoformat()   # elapsed 0.5
+        return ["--reset5", (now + datetime.timedelta(hours=1)).isoformat(), "--reset7", r7, "--reset7oi", r7]
+
+    BASE = "5h window: 1% used, 99% remaining\n7d window: 4% used, 96% remaining\n"
+
+    def test_parse_reads_the_oi_line_and_tolerates_its_absence(self):
+        q = qt.parse(self.BASE + "7d-oi window (top-tier models): 80% used, 20% remaining\n")
+        self.assertEqual((q["used7oi"], q["rem7oi"]), (80, 20))
+        self.assertNotIn("rem7oi", qt.parse(self.BASE))
+
+    def test_an_exhausted_oi_lane_binds_while_5h_and_7d_are_FULL(self):
+        # THE discriminating pair: identical 5h/7d, the oi line flips the verdict.
+        rc, out = self._run(self.BASE, self._argv())
+        self.assertEqual(rc, 0, out); self.assertIn("TIER FULL (bound by both)", out)
+        rc, out = self._run(self.BASE + "7d-oi window (top-tier models): 80% used, 20% remaining\n", self._argv())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("7d-oi (top-tier models) 20% rem", out)
+        self.assertIn("TIER LIGHT (bound by 7d-oi)", out)   # headroom 0.2/0.5 = 0.4
+
+    def test_the_oi_lane_is_tiered_against_ITS_OWN_reset_not_the_ordinary_week(self):
+        # Hold the oi lane fixed and move ONLY the ordinary 7d reset: its verdict must not
+        # change. Then move only the oi reset: it must.
+        import datetime
+        now = datetime.datetime.now(); iso = lambda d: (now + datetime.timedelta(days=d)).isoformat()
+        text = self.BASE + "7d-oi window (top-tier models): 80% used, 20% remaining\n"
+        r5 = (now + datetime.timedelta(hours=1)).isoformat()
+        far_7d, near_7d = iso(6), iso(1)
+        a = self._run(text, ["--reset5", r5, "--reset7", near_7d, "--reset7oi", iso(6)])
+        b = self._run(text, ["--reset5", r5, "--reset7", far_7d, "--reset7oi", iso(6)])
+        self.assertEqual(a[0], 0, a[1]); self.assertEqual(b[0], 0, b[1])
+        oi = lambda out: [l for l in out.splitlines() if l.startswith("7d-oi")][0]
+        self.assertEqual(oi(a[1]), oi(b[1]), "moving the ORDINARY reset changed the top-tier line")
+        self.assertIn("-> LIGHT", oi(a[1]))                       # 0.2 / (1 - 1/7) = 0.233
+        c = self._run(text, ["--reset5", r5, "--reset7", far_7d, "--reset7oi", iso(1)])
+        self.assertIn("-> MEDIUM", oi(c[1]))                      # 0.2 / (1 - 6/7) = 1.4
+
+    def test_oi_utilization_without_its_reset_is_a_refusal_not_a_borrowed_week(self):
+        import datetime
+        now = datetime.datetime.now()
+        text = self.BASE + "7d-oi window (top-tier models): 80% used, 20% remaining\n"
+        rc, out = self._run(text, ["--reset5", (now + datetime.timedelta(hours=1)).isoformat(),
+                                   "--reset7", (now + datetime.timedelta(days=3)).isoformat()])
+        self.assertEqual(rc, 2, out); self.assertIn("its reset is missing", out)
+
+    def test_printed_resets_bind_to_their_own_window_lines(self):
+        import datetime
+        now = datetime.datetime.now(); fmt = lambda d: (now + datetime.timedelta(days=d)).strftime("%H:%M %b %d")
+        text = ("5h window: 1% used, 99% remaining\n  Resets: " + (now + datetime.timedelta(hours=1)).strftime("%H:%M %b %d") +
+                "\n7d window: 4% used, 96% remaining\n  Resets: " + fmt(6) +
+                "\n7d-oi window (top-tier models): 80% used, 20% remaining\n  Resets: " + fmt(1) + "\n")
+        q = qt.parse(text)
+        self.assertEqual(q["resets_by_window"]["7d-oi"], fmt(1))
+        rc, out = self._run(text)
+        self.assertEqual(rc, 0, out); self.assertIn("-> MEDIUM", [l for l in out.splitlines() if l.startswith("7d-oi")][0])
+
+    def test_a_healthy_oi_lane_changes_nothing(self):
+        rc, out = self._run(self.BASE + "7d-oi window (top-tier models): 5% used, 95% remaining\n", self._argv())
+        self.assertEqual(rc, 0, out); self.assertIn("TIER FULL", out)
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

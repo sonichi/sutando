@@ -143,6 +143,116 @@ check("CONTROL: and it LOSES counts, so the locked assertion is discriminating",
       lost < N, f"unlocked total={lost}; equal to {N} means the barrier did not "
                 f"overlap the windows and this harness cannot see the bug")
 
+# The --commit writer used to read outside the lock and replace the whole doc,
+# so a locked write landing in that window was erased and --commit reported ok.
+_HELD = str(SCRIPTS / "idle-held.py")
+_race = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_race.write_text(json.dumps({"held_item_ids": [], "last_surfaced_hash": "stale"}))
+
+_sys.path.insert(0, str(SCRIPTS))
+import idle_state as _ist            # the shared owner both writers use
+_orig_strict = _ist.read_state_strict
+_spawned = {}
+def _read_then_race(path):
+    got = _orig_strict(path)
+    if not _spawned:                 # once, while --commit holds the lock
+        _spawned["p"] = subprocess.Popen(
+            [_sys.executable, "-B", _HELD, "--state", str(path),
+             "--add", "raced:owner", "--write"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(0.4)              # let it reach and block on the lock
+    return got
+
+_ist.read_state_strict = _read_then_race
+try:
+    ish.main(["--state", str(_race), "--items", '[["a","owner"]]', "--commit"])
+finally:
+    _ist.read_state_strict = _orig_strict
+check("harness: the racer actually fired (else this arm proves nothing)",
+      "p" in _spawned, "read hook never called — retarget it")
+if "p" in _spawned:
+    _spawned["p"].wait(timeout=20)
+
+_final = json.loads(_race.read_text())
+check("CONCURRENCY: --commit does not erase a locked write from idle-held",
+      _final.get("held_item_ids") == [["raced", "owner"]],
+      f"held_item_ids={_final.get('held_item_ids')!r}")
+check("CONCURRENCY: and --commit's own hash still landed",
+      _final.get("last_surfaced_hash") == ish.held_hash([["a", "owner"]]),
+      f"hash={_final.get('last_surfaced_hash')!r}")
+
+
+# FAIL-CLOSED: a parse failure is not authorisation to discard the record,
+# which a lenient read turns into {} that the counters are then written onto.
+def _refuses(raw, label):
+    f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+    f.write_text(raw)
+    before = f.read_text()
+    r = subprocess.run([_sys.executable, "-B", str(SCRIPTS / "idle-surface-hash.py"),
+                        "--state", str(f), "--pass-outcome", "noop"],
+                       capture_output=True, text=True, timeout=30)
+    check(f"fail-closed: {label} refuses AND leaves the file byte-identical",
+          r.returncode != 0 and f.read_text() == before,
+          f"rc={r.returncode} changed={f.read_text() != before}")
+
+_refuses('{"streak": 7, "held_item_ids": [["keep","owner"', "truncated JSON")
+_refuses('[1, 2, 3]', "valid JSON that is not an object")
+
+# The DECISION path fails open (a torn record must not suppress the surface,
+# per tests/idle-surface-canonical-hash.test.py) while the WRITE stays closed.
+_torn = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_torn.write_text('{"streak": 7, "held_item_ids": [["keep","owner"')
+_torn_before = _torn.read_text()
+_r = subprocess.run([_sys.executable, "-B", str(SCRIPTS / "idle-surface-hash.py"),
+                     "--state", str(_torn), "--items", '[["a","owner"]]', "--commit"],
+                    capture_output=True, text=True, timeout=30)
+check("torn record: --commit still POSTS (open on the decision) AND leaves the "
+      "file byte-identical (closed on the write)",
+      _r.returncode == 0 and _r.stdout.startswith("post")
+      and _torn.read_text() == _torn_before,
+      f"rc={_r.returncode} out={_r.stdout.strip()[:40]!r} "
+      f"changed={_torn.read_text() != _torn_before}")
+
+_fresh = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+subprocess.run([_sys.executable, "-B", str(SCRIPTS / "idle-surface-hash.py"),
+                "--state", str(_fresh), "--pass-outcome", "noop"],
+               capture_output=True, text=True, timeout=30)
+check("CONTROL: an ABSENT record still initialises — absent is not corrupt",
+      _fresh.exists() and json.loads(_fresh.read_text()).get("streak") == 1,
+      _fresh.read_text()[:60] if _fresh.exists() else "not created")
+
+
+# read_state_strict's three refusal shapes, in-process: a subprocess arm proves
+# the same behaviour but is invisible to the coverage gate.
+_d = pathlib.Path(tempfile.mkdtemp()) / "adir.json"
+_d.mkdir()
+_doc, _err = _ist.read_state_strict(_d)
+check("read_state_strict: an unreadable path is (None, why), not a default",
+      _doc is None and _err and "unreadable" in _err, f"{_doc!r} {_err!r}")
+
+_nd = pathlib.Path(tempfile.mkdtemp()) / "s.json"
+_nd.write_text("[1, 2, 3]")
+_doc, _err = _ist.read_state_strict(_nd)
+check("read_state_strict: valid JSON that is not an object is (None, why)",
+      _doc is None and _err and "not a JSON object" in _err, f"{_doc!r} {_err!r}")
+
+_ab = pathlib.Path(tempfile.mkdtemp()) / "missing.json"
+check("read_state_strict CONTROL: absent is ({}, None) — a first run, not a fault",
+      _ist.read_state_strict(_ab) == ({}, None), repr(_ist.read_state_strict(_ab)))
+
+# record_outcome is the pure-write path: it must abort the process, not return.
+_ro = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_ro.write_text('{"streak": 7, "held_item_ids": [["keep","owner"')
+_ro_before = _ro.read_text()
+try:
+    ish.record_outcome(_ro, "noop")
+    _code = None
+except SystemExit as e:
+    _code = e.code
+check("record_outcome on a torn record raises SystemExit(2) and writes nothing",
+      _code == 2 and _ro.read_text() == _ro_before,
+      f"code={_code!r} changed={_ro.read_text() != _ro_before}")
+
 print(f"\nidle-surface-hash: {ran - len(fails)}/{ran} passed")
 if fails:
     print("FAILED: " + ", ".join(fails))

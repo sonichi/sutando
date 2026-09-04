@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for scripts/review-preflight.py.
+"""Tests for skills/review-preflight/scripts/review-preflight.py.
 
 The failure this guards is silent: `CLAUDE.md` and `REVIEW.md` both instruct
 reviewers to run a preflight that prints the criteria, and for months no such
@@ -19,7 +19,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "scripts" / "review-preflight.py"
+SCRIPT = REPO / "skills" / "review-preflight" / "scripts" / "review-preflight.py"
 SPEC = importlib.util.spec_from_file_location("review_preflight", SCRIPT)
 assert SPEC and SPEC.loader
 pf = importlib.util.module_from_spec(SPEC)
@@ -131,8 +131,8 @@ class ReviewPreflightErrorPathTest(unittest.TestCase):
 
         with mock.patch.object(pf.subprocess, "run", side_effect=boom):
             root = pf.repo_root()
-        # The fallback is <script dir>/.. — i.e. the repo containing scripts/.
-        self.assertEqual(root, Path(pf.__file__).resolve().parent.parent)
+        # The fallback is three levels above the script — the repo containing skills/.
+        self.assertEqual(root, Path(pf.__file__).resolve().parents[3])
         self.assertTrue((root / "REVIEW.md").is_file(),
                         "fallback must still locate the shipped guide")
 
@@ -143,7 +143,7 @@ class ReviewPreflightErrorPathTest(unittest.TestCase):
         done = _sp.CompletedProcess(args=[], returncode=0, stdout="   \n", stderr="")
         with mock.patch.object(pf.subprocess, "run", return_value=done):
             root = pf.repo_root()
-        self.assertEqual(root, Path(pf.__file__).resolve().parent.parent)
+        self.assertEqual(root, Path(pf.__file__).resolve().parents[3])
 
     def test_unreadable_guide_exits_nonzero_without_traceback(self):
         """A guide that exists but cannot be read reports and exits 1."""

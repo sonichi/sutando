@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""The one writer contract for `state/idle-streak.json`.
+
+Two tools mutate this record; an unlocked read-modify-replace drops one silently.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+REPO = next(
+    parent for parent in Path(__file__).resolve().parents
+    if (parent / "src" / "file_lock.py").is_file()
+)
+sys.path.insert(0, str(REPO / "src"))
+
+from file_lock import locked_file  # noqa: E402
+
+# Returned by a mutate() that declines to write. None is NOT this sentinel, so
+# a mutate that forgets to return cannot silently skip its own write.
+ABORT = object()
+
+
+# Returned by locked_update when the record exists but cannot be trusted. An
+# absent file is NOT this: absent means first run, and {} is the right answer.
+REFUSED = object()
+
+
+def read_state_strict(path: Path):
+    """(doc, err): absent is ({}, None), unreadable/malformed is (None, why).
+    Collapsing the two makes a truncated file look like a fresh one."""
+    p = Path(path)
+    if not p.exists():
+        return {}, None
+    try:
+        raw = p.read_text()
+    except OSError as exc:
+        return None, f"unreadable ({exc.__class__.__name__})"
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        return None, f"not JSON ({exc})"
+    if not isinstance(doc, dict):
+        return None, f"not a JSON object (got {type(doc).__name__})"
+    return doc, None
+
+
+def write_state(path: Path, doc: dict, indent: int | None = None) -> None:
+    """Per-PID staging: several loop processes may publish this file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(doc, indent=indent,
+                              sort_keys=indent is not None))
+    os.replace(tmp, path)
+
+
+def locked_update(path: Path, mutate, indent: int | None = None):
+    """Read, `mutate(doc)`, write — all inside the record's exclusive lock.
+    The read must be INSIDE it: a doc read earlier is already stale."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.with_suffix(".json.lock")
+    with locked_file(lock):
+        doc, err = read_state_strict(path)
+        if err is not None:
+            # A parse failure is not authorisation to discard the record.
+            print(f"REFUSED: {path} {err} — not overwriting", file=sys.stderr)
+            return REFUSED
+        result = mutate(doc)
+        if result is ABORT:
+            return ABORT
+        write_state(path, doc, indent=indent)
+        return result
