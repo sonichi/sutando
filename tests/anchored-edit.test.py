@@ -15,6 +15,7 @@ import importlib.util
 import io
 import subprocess
 import sys
+import time
 import tempfile
 import unittest
 import unittest.mock
@@ -153,8 +154,13 @@ class AtomicReplacement(unittest.TestCase):
                 rc = ae.main([str(f), "--old", "beta", "--new", "gamma"])
         self.assertEqual(rc, 2)
         self.assertEqual(f.read_text(), "alpha beta")
-        self.assertEqual([q.name for q in f.parent.iterdir()], ["target.txt"],
-                         "a failed replace must not leave a temp file behind")
+        # The lock sidecar is durable and expected; a .tmp is the leak. Listing
+        # every name would now pass for the wrong reason, so name the leak.
+        leaked = [q.name for q in f.parent.iterdir() if q.name.endswith(".tmp")]
+        self.assertEqual(leaked, [], "a failed replace must not leave a temp file behind")
+        self.assertEqual(sorted(q.name for q in f.parent.iterdir()),
+                         ["target.txt", "target.txt" + ae.LOCK_SUFFIX],
+                         "nothing but the target and its lock may remain")
 
 
 class InProcessPaths(unittest.TestCase):
@@ -285,6 +291,76 @@ class IntegrityContract(unittest.TestCase):
         rc, out, err = self._main([str(f), "--old", "beta", "--new", "gamma"])
         self.assertEqual(rc, 0)
         self.assertEqual(f.read_text(), "alpha gamma")
+
+    def test_the_lock_is_held_across_the_replace_not_only_the_precondition(self):
+        """The window the precondition CANNOT close: after the reread, at replace.
+
+        qingyun-wu reproduced a clobber by injecting exactly there. A cooperating
+        writer is now excluded for that whole span, and this proves it by trying
+        to take the lock at the moment of replacement.
+        """
+        d = self._dir()
+        f = d / "t.txt"
+        f.write_text("alpha beta")
+        seen = {}
+        real_replace = ae.os.replace
+
+        def _at_replace(src, dst):
+            lock = Path(str(f) + ae.LOCK_SUFFIX)
+            fd = ae.os.open(str(lock), ae.os.O_CREAT | ae.os.O_RDWR, 0o644)
+            try:
+                ae.fcntl.flock(fd, ae.fcntl.LOCK_EX | ae.fcntl.LOCK_NB)
+                seen["held"] = False          # got in -> the window is OPEN
+                ae.fcntl.flock(fd, ae.fcntl.LOCK_UN)
+            except BlockingIOError:
+                seen["held"] = True           # refused -> the window is CLOSED
+            finally:
+                ae.os.close(fd)
+            return real_replace(src, dst)
+
+        with unittest.mock.patch.object(ae.os, "replace", side_effect=_at_replace):
+            rc, out, err = self._main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen.get("held"),
+                        "a cooperating writer got the lock DURING the replace — "
+                        "the read-to-replace span is not actually locked")
+        self.assertEqual(f.read_text(), "alpha gamma")
+
+    def test_a_second_process_holding_the_lock_blocks_the_edit(self):
+        """End-to-end: the lock is a real cross-process exclusion, not bookkeeping."""
+        import subprocess
+        import textwrap
+        d = self._dir()
+        f = d / "t.txt"
+        f.write_text("alpha beta")
+        holder = subprocess.Popen(
+            [sys.executable, "-c", textwrap.dedent(f"""
+                import fcntl, os, sys, time
+                fd = os.open({str(f) + ".anchored-lock"!r}, os.O_CREAT | os.O_RDWR, 0o644)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                sys.stdout.write("held"); sys.stdout.flush()
+                time.sleep(1.5)
+            """)], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(holder.stdout.read(4), "held")
+        started = time.monotonic()
+        rc, out, err = self._main([str(f), "--old", "beta", "--new", "gamma"])
+        waited = time.monotonic() - started
+        holder.wait()
+        self.assertEqual(rc, 0)
+        self.assertGreater(waited, 0.5,
+                           "the edit did not wait for the lock — exclusion is not real")
+        self.assertEqual(f.read_text(), "alpha gamma")
+
+    def test_the_lock_does_not_leak_into_the_edited_content(self):
+        """Negative control: the sidecar is beside the file, never inside it."""
+        d = self._dir()
+        f = d / "t.txt"
+        f.write_text("alpha beta")
+        rc, out, err = self._main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(f.read_text(), "alpha gamma")
+        self.assertNotIn(ae.LOCK_SUFFIX, f.read_text())
+        self.assertTrue((d / ("t.txt" + ae.LOCK_SUFFIX)).exists())
 
 
 if __name__ == "__main__":

@@ -18,11 +18,22 @@ refusal is an exit code:
     0  the file changed, and the receipt counts the new text in it
     2  the anchor is absent, ambiguous, or the edit is a no-op
 
+CONCURRENCY, AND ITS BOUNDARY — this is a cooperative protocol, not a
+guarantee against arbitrary writers. The read, the compute and the replace are
+held under an exclusive flock on `<file>.anchored-lock`, so two writers that
+BOTH take that lock cannot interleave and neither can lose an update. A writer
+that ignores the lock is outside the protocol: the pre-replace reread narrows
+the window it can land in, but does not close it, and such an update can still
+be overwritten. Take `<file>.anchored-lock` if you edit these files from
+elsewhere. Do not read this tool as making arbitrary post-read updates safe.
+
 Usage:
     anchored-edit.py FILE --old-file OLD --new-file NEW [--count N] [--allow-multi]
     anchored-edit.py FILE --old TEXT --new TEXT
 """
 import argparse
+import contextlib
+import fcntl
 import os
 import shutil
 import sys
@@ -47,6 +58,25 @@ def apply_edit(text: str, old: str, new: str, allow_multi: bool = False):
             else text.replace(old, new, 1)), n
 
 
+LOCK_SUFFIX = ".anchored-lock"
+
+
+@contextlib.contextmanager
+def _edit_lock(p: Path):
+    """Exclusive flock on a sidecar, held across the read AND the replace.
+
+    Locking p itself cannot work: os.replace swaps the inode, so the lock a
+    writer holds no longer guards the file its successor sees.
+    """
+    lock = p.with_name(p.name + LOCK_SUFFIX)
+    fd = os.open(str(lock), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _atomic_write(p: Path, text: str, expect: str) -> None:
     """Replace p's contents or leave them untouched — never a truncated middle.
 
@@ -60,8 +90,8 @@ def _atomic_write(p: Path, text: str, expect: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         shutil.copymode(p, tmp)
-        # Precondition, not a posterior check: a writer that lands between the
-        # caller's read and this replace is invisible to any after-the-fact test.
+        # Second line of defence, for writers that ignore LOCK_SUFFIX. It
+        # narrows the window; only the lock closes it. See _edit_lock.
         if p.read_text() != expect:
             raise RuntimeError("target changed since it was read — refusing to overwrite")
         os.replace(tmp, p)          # atomic within a filesystem
@@ -96,6 +126,12 @@ def main(argv=None) -> int:
     if not p.is_file():
         print(f"anchored-edit: no such file: {p}", file=sys.stderr)
         return 2
+    with _edit_lock(p):
+        return _edit_locked(p, old, new, a)
+
+
+def _edit_locked(p: Path, old, new, a) -> int:
+    """The read-compute-replace critical section. Caller holds the edit lock."""
     before = p.read_text()
     try:
         after, n = apply_edit(before, old, new, a.allow_multi)
