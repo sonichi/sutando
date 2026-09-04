@@ -4279,6 +4279,9 @@ async def _handle_discord_message(message, force=False):
         rulebook_key = select_rulebook_key(access_tier, is_collaborator)
         return (
             f"id: {task_id}\n"
+            # Second line on purpose: every reader is first-match, so nothing a
+            # sender can set (channel_name, guild_name) may precede the tier.
+            f"access_tier: {access_tier}\n"
             f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
             f"source: discord\n"
             f"interaction_type: message\n"
@@ -4292,7 +4295,6 @@ async def _handle_discord_message(message, force=False):
             f"receiving_instance: {getattr(getattr(client, 'user', None), 'id', '')}\n"
             f"{parent_msg_line}"
             f"user_id: {message.author.id}\n"
-            f"access_tier: {access_tier}\n"
             f"{collaborator_line}"
             f"priority: {priority}\n"
             f"task: {user_task_text}\n"
@@ -5173,10 +5175,8 @@ async def poll_results():
                                 task_body = _tier_path.read_text()
                             except Exception:
                                 continue
-                            for ln in task_body.splitlines():
-                                if ln.startswith("access_tier:"):
-                                    task_tier = ln.split(":", 1)[1].strip() or "other"
-                                    break
+                            task_tier = (local_task_protocol.parse_task_headers(task_body)
+                                         .headers.get("access_tier") or "other").strip() or "other"
                             break  # first readable file wins; missing all → "other"
                         if task_tier != "owner":
                             print(
@@ -6035,10 +6035,8 @@ async def poll_dm_fallback():
                     task_tier = "other"
                     try:
                         task_body = (TASKS_DIR / f"{_task_id}.txt").read_text()
-                        for ln in task_body.splitlines():
-                            if ln.startswith("access_tier:"):
-                                task_tier = ln.split(":", 1)[1].strip() or "other"
-                                break
+                        task_tier = (local_task_protocol.parse_task_headers(task_body)
+                                     .headers.get("access_tier") or "other").strip() or "other"
                     except Exception:
                         task_tier = "other"
 
