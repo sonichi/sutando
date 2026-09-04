@@ -140,6 +140,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'single-instance.test.py failed' }
           python tests/file-lock.test.py
           if ($LASTEXITCODE -ne 0) { throw 'file-lock.test.py failed' }
+          python tests/process-pins.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'process-pins.test.py failed' }
+          python tests/process-pins-reader-rejects-what-writer-rejects.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'process-pins-reader-rejects-what-writer-rejects.test.py failed' }
+          python tests/process-pins-writer-atomicity.test.py
+          if ($LASTEXITCODE -ne 0) { throw 'process-pins-writer-atomicity.test.py failed' }
           python tests/hitl-manager-identity.test.py
           if ($LASTEXITCODE -ne 0) { throw 'hitl-manager-identity.test.py failed' }
           python tests/hitl-schema.test.py
@@ -179,9 +185,11 @@ jobs:
           python -c "import sys; sys.path.insert(0, 'src'); import task_workstreams"
           if ($LASTEXITCODE -ne 0) { throw 'task_workstreams Windows import failed' }
 
-      - name: Run voice-agent crash-only integration
+      - name: Run Windows TypeScript integrations
         shell: pwsh
         run: |
+          .\node_modules\.bin\tsx.cmd --test --test-force-exit tests\task-bridge-result-scan-error.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'task-bridge-result-scan-error.test.ts failed' }
           .\node_modules\.bin\tsx.cmd --test --test-force-exit tests\voice-agent-crash-only.test.ts
           if ($LASTEXITCODE -ne 0) { throw 'voice-agent-crash-only.test.ts failed' }
 

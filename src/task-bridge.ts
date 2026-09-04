@@ -1144,7 +1144,7 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 			// unusual exceptions (not ENOENT) so a real file-system
 			// problem is observable, while still containing the throw.
 			const code = (err as NodeJS.ErrnoException)?.code;
-			if (code && code !== 'ENOENT') {
+			if (code !== 'ENOENT') {
 				console.error(`${ts()} [TaskBridge] result-scan threw (non-fatal):`, err);
 			}
 		}

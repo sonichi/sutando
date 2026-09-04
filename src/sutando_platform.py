@@ -223,8 +223,8 @@ def process_snapshot() -> str | None:
         return None
 
 
-def find_pids(pattern: str) -> list[str]:
-    """Return PIDs (as strings) of running processes whose command line matches `pattern`.
+def probe_pids(pattern: str) -> tuple[list[str], bool]:
+    """Return matching PIDs and whether process enumeration succeeded.
 
     macOS/Linux: `pgrep -f <pattern>` (pattern is a regex, per pgrep).
     Windows: substring match on CommandLine (case-insensitive) via
@@ -233,14 +233,15 @@ def find_pids(pattern: str) -> list[str]:
     pgrep's `$`), and a leading `^` as a start anchor, so one `foo\\.py$`-style
     pattern means the same thing on both platforms. Regex backslash-escapes
     (`\\.`) are normalized to plain chars for the Windows literal compare.
-    Never raises; returns [] on any failure.
+    The boolean distinguishes a clean no-match from a failed probe.
     """
     try:
         if is_macos() or is_linux():
             r = subprocess.run(["pgrep", "-f", pattern], timeout=3.0, capture_output=True, text=True, check=False)
-            if r.returncode != 0:
-                return []
-            return [p for p in (r.stdout or "").strip().split("\n") if p]
+            if r.returncode not in (0, 1):
+                return [], False
+            pids = [p for p in (r.stdout or "").strip().split("\n") if p]
+            return pids, True
         if is_windows():
             anchor_start = pattern.startswith("^")
             anchor_end = pattern.endswith("$")
@@ -273,10 +274,19 @@ def find_pids(pattern: str) -> list[str]:
                 text=True,
                 check=False,
             )
-            return [p for p in (r.stdout or "").strip().split("\n") if p.strip().isdigit()]
+            if r.returncode != 0:
+                return [], False
+            pids = [p for p in (r.stdout or "").strip().split("\n")
+                    if p.strip().isdigit()]
+            return pids, True
     except Exception:
         pass
-    return []
+    return [], False
+
+
+def find_pids(pattern: str) -> list[str]:
+    """Return matching process IDs; preserve the legacy empty-on-failure API."""
+    return probe_pids(pattern)[0]
 
 
 def is_process_running(pattern: str) -> bool:

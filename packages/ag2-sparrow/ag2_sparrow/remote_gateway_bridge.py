@@ -1177,6 +1177,68 @@ def _monorepo_src(marker: str) -> str:
         cur = parent
 
 
+# `project()` assigns retry cadence to its caller and the worker drives this
+# every ~1s. Skip-until-deadline, not sleep: other drains share this thread.
+_HITL_BACKOFF = {"until": 0.0, "delay": 0.0}
+_HITL_BACKOFF_MAX_S = 60.0
+
+
+def _hitl_backoff_bump(log=print) -> None:
+    d = min((_HITL_BACKOFF["delay"] or 0.5) * 2, _HITL_BACKOFF_MAX_S)
+    _HITL_BACKOFF["delay"] = d
+    _HITL_BACKOFF["until"] = time.monotonic() + d
+    log(f"hitl: projection refused — backing off {d:g}s")
+
+
+def _hitl_backoff_reset() -> None:
+    _HITL_BACKOFF["delay"] = 0.0
+    _HITL_BACKOFF["until"] = 0.0
+
+
+def _project_hitl(log=print) -> int:
+    """Push every un-projected HITL requirement out as a card, or 0 when
+    `src/hitl` is absent (standalone sparrow) — same optional tier as the
+    reply handler, and the outbound half of the same card.
+
+    The projector owns idempotency (a projection ledger per requirement), so
+    calling this every pulse re-sends nothing; it is the driver that was
+    missing, not the machinery.
+    """
+    if not PROACTIVE_ROOM:
+        return 0
+    if time.monotonic() < _HITL_BACKOFF["until"]:
+        return 0
+    try:
+        src = _monorepo_src(os.path.join("hitl", "projector.py"))
+        if not src:
+            return 0
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl.manager import HitlManager, HitlStore, default_store
+        from hitl.projector import pending_ids, project
+    except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
+        log(f"hitl: projector unavailable ({e}); cards will not be delivered")
+        return 0
+    workspace = _STATE.parent
+    manager = HitlManager(HitlStore(default_store(workspace)))
+    if not pending_ids(manager):
+        _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
+        return 0
+    try:
+        done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
+                       PROACTIVE_ROOM)
+    except Exception:
+        _hitl_backoff_bump(log)  # a raising sender is a refusal too
+        raise
+    if not done:
+        _hitl_backoff_bump(log)
+        return 0
+    _hitl_backoff_reset()
+    for req_id, event_id in done:
+        log(f"hitl: projected {req_id} -> {event_id or 'no event id'}")
+    return len(done)
+
+
 def _hitl_reply_handler(owner_mxid: str, log=print):
     """Owner card-click handler for HITL cards, or None when `src/hitl` is not
     around (standalone sparrow) — the chain then simply lacks it, like the vault tier."""
@@ -1316,6 +1378,10 @@ def _outbound_worker(inflight: "set[str]") -> None:
             _post_proactive()
         except Exception as e:  # noqa: BLE001
             _log(f"outbound worker: proactive drain error (isolated): {e}")
+        try:
+            _project_hitl(log=_log)
+        except Exception as e:  # noqa: BLE001
+            _log(f"outbound worker: hitl projection error (isolated): {e}")
         try:
             _retry_pending_acks(inflight)
         except Exception as e:  # noqa: BLE001

@@ -111,6 +111,32 @@ class TestFindPids(unittest.TestCase):
             self.assertEqual(self.mod.find_pids("marker"), ["4242"])
         self.assertGreaterEqual(run.call_args.kwargs["timeout"], 15)
 
+    def test_probe_pids_distinguishes_no_match_from_failure(self):
+        no_match = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="denied")
+        with mock.patch.object(self.mod, "is_macos", return_value=False), \
+                mock.patch.object(self.mod, "is_linux", return_value=False), \
+                mock.patch.object(self.mod, "is_windows", return_value=True), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=no_match):
+            self.assertEqual(self.mod.probe_pids("marker"), ([], True))
+        with mock.patch.object(self.mod, "is_macos", return_value=False), \
+                mock.patch.object(self.mod, "is_linux", return_value=False), \
+                mock.patch.object(self.mod, "is_windows", return_value=True), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=failed):
+            self.assertEqual(self.mod.probe_pids("marker"), ([], False))
+
+    def test_posix_probe_pids_treats_pgrep_one_as_a_clean_no_match(self):
+        no_match = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+        failed = subprocess.CompletedProcess([], 2, stdout="", stderr="bad regex")
+        with mock.patch.object(self.mod, "is_macos", return_value=True), \
+                mock.patch.object(self.mod, "is_linux", return_value=False), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=no_match):
+            self.assertEqual(self.mod.probe_pids("marker"), ([], True))
+        with mock.patch.object(self.mod, "is_macos", return_value=True), \
+                mock.patch.object(self.mod, "is_linux", return_value=False), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=failed):
+            self.assertEqual(self.mod.probe_pids("marker"), ([], False))
+
     def test_process_executable_finds_current_python(self):
         executable = self.mod.process_executable(os.getpid())
         self.assertIsNotNone(executable)
