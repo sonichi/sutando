@@ -409,7 +409,9 @@ def _carried_seeds(entry, arbitrated: set, observed: dict,
         id_ = rec.get("id")
         if not id_ or str(id_) in arbitrated:
             continue
-        if not _is_snowflake(str(id_)):
+        # NOT `str(id_)`: converting first makes the type test a formatting
+        # step, and a JSON number then mints the same claim as a string.
+        if not _is_snowflake(id_):
             continue                    # a partial id resolves the wrong account
         for seed in rec.get("seeded_by") or []:
             if not isinstance(seed, dict):

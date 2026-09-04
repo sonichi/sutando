@@ -2034,5 +2034,64 @@ class AMalformedObservationStillContradictsASeed(unittest.TestCase):
         self.assertTrue(slot, "the contested slot vanished, so nothing was repaired")
 
 
+class AJsonNumberIsNotASnowflake(unittest.TestCase):
+    """`_is_snowflake` correctly rejects a number; `_is_snowflake(str(id_))` at
+    the call site turned the type test into a formatting step, so a JSON number
+    minted the same carried claim as a quoted id."""
+
+    X_STR = "1025828152183885925"
+    X_NUM = 1025828152183885925
+
+    def _seeds(self, id_):
+        entry = {"_schema": {"version": 2},
+                 "unresolved_discord_ids": [{
+                     "id": id_,
+                     "seeded_by": [{"path": "human_discord_id",
+                                    "verdict": "human", "reason": "s"}]}]}
+        return list(mig._carried_seeds(entry, set(), {}, {}, "", 2))
+
+    def test_a_quoted_snowflake_still_seeds(self):
+        self.assertEqual(len(self._seeds(self.X_STR)), 1)
+
+    def test_a_json_number_seeds_nothing(self):
+        self.assertEqual(self._seeds(self.X_NUM), [])
+
+    def test_the_predicate_itself_was_never_wrong(self):
+        self.assertFalse(mig._is_snowflake(self.X_NUM))
+        self.assertTrue(mig._is_snowflake(self.X_STR))
+
+
+class ThePluralStandAccessorValidatesItsContainer(unittest.TestCase):
+    """`stand_discord_ids` iterated whatever it was handed: a bare string gave
+    one fake id per character, a mapping gave its KEYS, an int raised. The
+    module already had `_snowflake_list` carrying this exact lesson."""
+
+    X = "1025828152183885925"
+    A = "1504316176686120980"
+
+    def _ids(self, extras):
+        return mig.ri.stand_discord_ids({"other_stand_discord_ids": extras})
+
+    def test_the_documented_shapes_still_work(self):
+        self.assertEqual(self._ids([self.X]), [self.X])
+        self.assertEqual(self._ids([{"id": self.X}]), [self.X])
+        self.assertEqual(
+            mig.ri.stand_discord_ids({"stand_discord_id": self.A,
+                                      "other_stand_discord_ids": [self.X]}),
+            [self.A, self.X])
+
+    def test_a_bare_string_is_not_iterated(self):
+        self.assertEqual(self._ids(self.X), [])
+
+    def test_a_mapping_does_not_yield_its_keys(self):
+        self.assertEqual(self._ids({"id": self.X}), [])
+
+    def test_a_non_container_does_not_raise(self):
+        self.assertEqual(self._ids(12), [])
+
+    def test_a_non_snowflake_member_is_dropped(self):
+        self.assertEqual(self._ids(["nope", 12, {"id": 12}, self.X]), [self.X])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

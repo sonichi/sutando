@@ -60,6 +60,13 @@ def path_referent(path):
 _REFERENTS = ("human", "stand")
 
 
+def _is_snowflake_str(v) -> bool:
+    """A snowflake is a STRING of digits. A JSON number is not one, and
+    `str(v)` at a call site turns that check into a formatting step."""
+    import re as _re
+    return isinstance(v, str) and bool(_re.fullmatch(r"\d{17,20}", v))
+
+
 def _snowflake_list(value) -> list:
     """Whole snowflakes only. A bare string is NOT iterated — doing so wrote
     one fake id per character into `unresolved_discord_ids`."""
@@ -200,14 +207,22 @@ def stand_discord_id(entry: dict):
 
 
 def stand_discord_ids(entry: dict) -> list:
-    """Primary stand first, then any secondary agents."""
+    """Primary stand first, then any secondary agents.
+
+    Shape-validating: the plural field is a LIST of snowflakes or of `{"id":
+    ...}` records. Iterating anything else yielded one fake id per character
+    for a bare string, and dict KEYS for a mapping.
+    """
     out = []
     primary = stand_discord_id(entry)
-    if primary:
+    if _is_snowflake_str(primary):
         out.append(primary)
-    for extra in (entry or {}).get(OTHER_STANDS_FIELD) or []:
+    extras = (entry or {}).get(OTHER_STANDS_FIELD)
+    if not isinstance(extras, (list, tuple)):
+        return out
+    for extra in extras:
         eid = extra.get("id") if isinstance(extra, dict) else extra
-        if eid and eid not in out:
+        if _is_snowflake_str(eid) and eid not in out:
             out.append(eid)
     return out
 
