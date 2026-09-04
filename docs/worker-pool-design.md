@@ -288,9 +288,15 @@ outcome exists precisely so this branch stops guessing.
 So the direct lifecycle completes the rule with five obligations, and they are the same five the
 earlier revision listed as unowned: a durable receipt written **before** the emit, a named ownership
 handoff, an idempotent completion acknowledgement, exactly one release writer, and restart handling for
-THREE crash windows, not two: receipt-before-emit, emit-before-ack, and a third keweichen named
-that has not reached me intact. It is left unnamed rather than guessed — the phrase previously here,
-"emit-without-completion", was my own inference and was wrong.
+THREE crash windows, and they are distinct states rather than one described three ways:
+
+1. **`receipt-before-emit`** — the receipt is durable, the emit has not happened.
+2. **`emit-before-ack`** — the emit happened, the completion acknowledgement is not yet durable.
+3. **`ack-before-release`** — the ack IS durable and the single release writer has not finished.
+   On restart, reconcile the existing receipt and complete the release **idempotently**: do not
+   re-emit, and do not create a new admission. Keeping this separate from `emit-before-ack` is the
+   point — collapsing them loses the distinction between "nobody has been told" and "everybody has
+   been told and the bookkeeping is half-done", which need opposite recoveries.
 
 (This section is keweichen's design. Two shapes of mine were falsified before it — one that put the
 primitive inside `queue_handler_task`, and one that took the lock at `dispatch_task` entry and would
