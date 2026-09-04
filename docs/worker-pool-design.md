@@ -93,13 +93,50 @@ corrupt; step 3's pins the transition.
 The record's contract, because a routing-critical shared file without one drifts:
 **one writer** (the core sweep; a worker that writes it is a defect, not a
 fallback), written **atomically** by temp-file plus `os.replace` so a reader never
-sees a partial file, carrying a **`computed_at`** stamp and a per-instance verdict.
-A record older than two sweep intervals is **stale**, and stale reads as absent —
-not as its last value, which is how a dead publisher would otherwise keep a worker
-diverted indefinitely. A parse failure reads as absent too. This is the same
-one-writer/atomic/fail-toward-absence shape `core-status.json` already uses, and
-for the same reason: a truncated read of a status file was taken as a verdict once
-already.
+sees a partial file. This is the same one-writer/atomic/fail-toward-absence shape
+`core-status.json` already uses, and for the same reason: a truncated read of a
+status file was taken as a verdict once already.
+
+Shape, pinned exactly — a step-2 reader and a step-3 writer are built at different
+times by different people, so "a per-instance verdict" is not a contract. It lives
+under the `eligibility` key of `state/pool-status.json`:
+
+```json
+{"eligibility": {
+   "version": 1,
+   "computed_at": 1788546000,
+   "stale_after_s": 180,
+   "instances": {"worker-1": "eligible", "worker-2": "wedged"}}}
+```
+
+`computed_at` is **Unix seconds**, integer. `stale_after_s` travels **inside the
+record** rather than being derived from the sweep interval: the step-2 consumer
+ships before the sweep exists and has no way to know that interval, so a bound
+stated as "two sweep intervals" is one the earlier reader cannot evaluate — the
+publisher must say it outright. `instances` maps an instance name to the enum
+`eligible` | `wedged`, and nothing else.
+
+Validation is a matrix, and **every failing cell means ABSENT for that instance**,
+which by the default above means eligible-if-its-beat-is-fresh:
+
+| condition | verdict for that instance |
+|---|---|
+| file missing, unreadable, or not valid JSON | absent |
+| `version` absent, not an integer, or not one this reader implements | absent |
+| `computed_at` absent, not an integer, or more than 60 s in the FUTURE | absent — a clock ahead must not confer permanent freshness |
+| `now > computed_at + stale_after_s` | absent (stale) — never its last value, or a dead publisher keeps a worker diverted forever |
+| `stale_after_s` absent or not a positive integer | absent |
+| the instance is not a key of `instances` | absent — an unlisted instance is unjudged, not judged clean |
+| its value is not exactly `eligible` or `wedged` | absent |
+| any other key present anywhere | ignored, so the writer may add fields without stranding an old reader |
+
+Absent is the ONLY failure mode, deliberately: it collapses every partial-read
+disagreement onto the pre-rule behaviour, so two conforming readers cannot choose
+opposite eligibility for one bad record. `version` is what makes a shape change
+safe — a reader that does not implement the version reads absent rather than
+guessing at fields it does not know, and the step-3 suite exercises a reader
+meeting both an old and a new record across the atomic swap, since that is the one
+moment two versions coexist on disk.
 
 1. `requested_worker` names this instance: claim, then emit to this session.
    Names another instance whose beat is fresh: **suppress**.
