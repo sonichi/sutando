@@ -476,11 +476,16 @@ def _runtime_identity():
         if spec is None or spec.loader is None:
             return None
         mod = importlib.util.module_from_spec(spec)
+        # Registered only AFTER exec succeeds: a half-initialised module left in
+        # sys.modules poisons `rundir`'s own `from instance_key import ...`.
         sys.modules[f"_wsent_{name}"] = mod
         sys.modules.setdefault(name, mod)
         try:
             spec.loader.exec_module(mod)
         except Exception:  # noqa: BLE001 — an absent runtime is not a path error
+            sys.modules.pop(f"_wsent_{name}", None)
+            if sys.modules.get(name) is mod:
+                del sys.modules[name]
             return None
         mods[name] = mod
     return mods["rundir"], mods["instance_key"]

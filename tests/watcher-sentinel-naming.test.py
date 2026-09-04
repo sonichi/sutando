@@ -14,6 +14,7 @@ registry already share. An earlier revision of this file keyed on an invented
 with each other and disagreed with production, which is why "the two agree" is
 no longer an assertion here.
 """
+import importlib.util
 import os
 import subprocess
 import sys
@@ -211,6 +212,63 @@ class ReadersUseTheResolver(unittest.TestCase):
                 if "watch-tasks-stream.pid" in line and not line.lstrip().startswith("#"):
                     offenders.append(f"{rel}:{i}: {line.strip()}")
         self.assertEqual(offenders, [], "readers must resolve the sentinel, not name it")
+
+
+class TheFallbackReceiptIsScopedLikeTheSentinel(unittest.TestCase):
+    """Same identity, second path. A shared receipt made one instance bypass
+    another's handler, so this must move with the sentinel, not beside it."""
+
+    def setUp(self):
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID",
+                  "AGENT_ID", "SUTANDO_INSTANCE"):
+            os.environ.pop(k, None)
+        self.d = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        os.environ.pop("SUTANDO_INSTANCE_ID", None)
+
+    def test_the_canonical_default_keeps_the_historic_directory(self):
+        self.assertEqual(up.handler_fallbacks_dir(self.d),
+                         self.d / "task-event-handler-fallbacks")
+
+    def test_each_instance_gets_its_own_subdirectory(self):
+        os.environ["SUTANDO_INSTANCE_ID"] = "worker-1"
+        one = up.handler_fallbacks_dir(self.d)
+        os.environ["SUTANDO_INSTANCE_ID"] = "worker-2"
+        two = up.handler_fallbacks_dir(self.d)
+        self.assertNotEqual(one, two)
+        for p in (one, two):
+            self.assertEqual(p.parent, self.d / "task-event-handler-fallbacks")
+
+    def test_it_shares_the_sentinel_key_rather_than_deriving_its_own(self):
+        os.environ["SUTANDO_INSTANCE_ID"] = "worker-1"
+        key = up.instance_scope_key(self.d)
+        self.assertTrue(key)
+        self.assertEqual(up.handler_fallbacks_dir(self.d).name, key)
+        self.assertIn(key, up.watcher_sentinel_path(self.d).name)
+
+
+class AnUnavailableEncoderIsNotADefaultInstance(unittest.TestCase):
+    """`_runtime_identity` returns None on both import failures. Covering it
+    through the public helper only exercises the caller, not these branches."""
+
+    def test_an_unloadable_spec_returns_none(self):
+        with unittest.mock.patch("importlib.util.spec_from_file_location",
+                                 return_value=None):
+            self.assertIsNone(up._runtime_identity())
+
+    def test_a_raising_exec_module_returns_none(self):
+        real = importlib.util.spec_from_file_location
+
+        def boom(name, src):
+            spec = real(name, src)
+            if spec is not None:
+                spec.loader.exec_module = lambda mod: (_ for _ in ()).throw(
+                    RuntimeError("no runtime here"))
+            return spec
+
+        with unittest.mock.patch("importlib.util.spec_from_file_location", boom):
+            self.assertIsNone(up._runtime_identity())
 
 
 if __name__ == "__main__":
