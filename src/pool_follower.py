@@ -54,12 +54,25 @@ def _claim_assignment(tasks_dir: Path, f: Path, instance: str) -> "Path | None":
         return None  # lead reclaimed or a restart raced us — not an error
 
 
-def _pinned_owner(state_dir, task_file: Path) -> "str | None":
+def _read_bindings(state_dir) -> dict:
+    """The pin table, once per sweep. Read per candidate file it was the same
+    few KB parsed N times for one answer that cannot change mid-loop."""
+    try:
+        raw = (Path(state_dir) / "pool" / "affinity.json").read_text(encoding="utf-8")
+        table = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return table if isinstance(table, dict) else {}
+
+
+def _pinned_owner(bindings: dict, task_file: Path) -> "str | None":
     """The instance a task's channel is explicitly pinned to, or None.
 
     Only `pinned: true` counts. A bare sticky entry is a decayed handler, not an
     owner's binding, and must not stop the fallback from draining the queue.
     """
+    if not bindings:
+        return None
     try:
         head = task_file.read_text(encoding="utf-8", errors="replace")[:4096]
     except OSError:
@@ -67,11 +80,7 @@ def _pinned_owner(state_dir, task_file: Path) -> "str | None":
     m = re.search(r"^channel_id:[ \t]*(.+?)[ \t]*$", head, re.MULTILINE)
     if not m:
         return None
-    try:
-        raw = (Path(state_dir) / "pool" / "affinity.json").read_text(encoding="utf-8")
-        entry = json.loads(raw).get(m.group(1))
-    except (OSError, json.JSONDecodeError, AttributeError):
-        return None
+    entry = bindings.get(m.group(1))
     if isinstance(entry, dict) and entry.get("pinned") is True:
         return entry.get("instance") or None
     return None
@@ -99,10 +108,11 @@ def acquire_work(tasks_dir, state_dir, instance: str,
         pending = [f for f in tasks.iterdir() if _UNASSIGNED_RE.match(f.name)]
     except OSError:
         return None
+    bindings = _read_bindings(state_dir)
     for f in sort_tasks_by_priority(pending):
         # Honor an explicit pin even with no lead: affinity is otherwise the
         # first thing lost when the lead dies, and the race ignores it entirely.
-        owner = _pinned_owner(state_dir, f)
+        owner = _pinned_owner(bindings, f)
         if owner and owner != instance and lead_alive(state_dir, owner, now_fn):
             continue  # its owner is alive and will take it; a dead one does not stall the queue
         # assignment-suffix convention so lead-side load counting and
