@@ -1131,8 +1131,8 @@ def _guarded_result_body(tid: str, body: str):
                 "source_message_id", "user_id")}
         except OSError:
             pass
-    # 5G ⑤a-cap: a TEAM task whose sidecar says task-media may attach from its own
-    # `<results>/<tid>/`; guest/unknown tiers and an unreadable sidecar grant nothing.
+    # 5G ⑤a-cap: a TEAM task whose sidecar says task-media may attach from the DELIVERY
+    # task's `<results>/<id>/` (a dedup requeue carries the original's instruction).
     attach_roots: tuple = ()
     if tier == "team":
         _delivery_for_media = _delivery_tid(tid)
@@ -1140,7 +1140,7 @@ def _guarded_result_body(tid: str, body: str):
         if (_media_modes is not None
                 and (_media_modes.get(_broker_tid(_delivery_for_media)) or {}).get("mode")
                 == "task-media"):
-            attach_roots = (str(RESULTS_DIR / tid),)
+            attach_roots = (str(RESULTS_DIR / _delivery_for_media),)
     verdict = classify(
         body, tier, None, secret_filter=filter_chat_secrets,
         scan_sensitive_data=scan_sensitive_data, attach_roots=attach_roots)

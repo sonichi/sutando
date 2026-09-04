@@ -88,6 +88,18 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
             # Still the narrower Team guardrail, in the same body.
             self.assertIn("TEAM-tier request from a trusted collaborator", body)
 
+    def test_media_command_is_shell_quoted_when_the_workspace_path_has_spaces(self):
+        with tempfile.TemporaryDirectory(suffix=" with space") as d:
+            mod = _load(Path(d))
+            mod.RESULTS_DIR = Path(d) / "results"
+            body, tid = _write(mod, signal={"v": 1, "cid": "c2", "route_attempt": 1,
+                                             "source_root": "$r:s", "source_room": "!r:s"})
+            media_dir = str(Path(d) / "results" / tid)
+            self.assertIn(f"--output '{media_dir}/<name>.png'", body,
+                          "the generate.py --output path must be shell-quoted")
+            self.assertIn(f"[file: {media_dir}/<name>.png]", body,
+                          "…while the marker form stays a plain path")
+
     def test_ordinary_team_task_carries_no_media_instruction(self):
         with tempfile.TemporaryDirectory() as d:
             mod = _load(Path(d))

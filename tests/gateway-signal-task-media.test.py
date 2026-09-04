@@ -181,6 +181,34 @@ class TaskMediaRoute(unittest.TestCase):
             pass
         self.assertEqual(self._media_posts(), [], "guest/unknown provenance never earns the Team allowance")
 
+    def test_team_dedup_requeue_attaches_from_the_original_tasks_dir(self):
+        """A requeue's body is the ORIGINAL body (media instruction naming the
+        original's dir) and it answers the ORIGINAL delivery — so that is the dir
+        the allowance confines to, not the requeue id's."""
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        holder = "task-22d83e59601f3a1fef"
+        mod._write_task(self._team_signal_task("task-team-rq"))
+        mod.ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        (mod.ARCHIVE_RESULTS_DIR / f"{holder}-1785976425.txt").write_text("")
+        self._result(mod, "task-team-rq", f"[deduped: {holder}]")
+        inflight = {"task-team-rq"}
+        mod._post_ready_results(inflight)
+        reask = [p.stem for p in mod.TASKS_DIR.glob("task-*.txt") if p.stem != "task-team-rq"]
+        self.assertEqual(len(reask), 1, "the dedup was not re-asked")
+        body = (mod.TASKS_DIR / f"{reask[0]}.txt").read_text()
+        orig_dir = mod.RESULTS_DIR / "task-team-rq"
+        self.assertIn(f"[file: {orig_dir}/<name>.png]", body,
+                      "the requeue carries the ORIGINAL media instruction verbatim")
+        orig_dir.mkdir(parents=True, exist_ok=True)
+        (orig_dir / "chart.png").write_bytes(b"payload")
+        self._result(mod, reask[0], f"here [file: {orig_dir / 'chart.png'}]")
+        mod._post_ready_results(inflight)
+        self.assertEqual([c[1] for c in self._media_posts()], ["/v1/tasks/task-team-rq/media"],
+                         "a file under the ORIGINAL task's dir uploads on the original delivery's lease")
+
     def test_team_result_pointing_outside_its_dir_uploads_nothing(self):
         mod = self.mod
         mod.LOCAL_TIER = "team"
