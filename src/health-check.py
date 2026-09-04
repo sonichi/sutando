@@ -9232,6 +9232,60 @@ def _file_digest(path: Path) -> str:
         return f"<unreadable:{path}>"
 
 
+def check_vendored_resolver_env(workspace_dir: "Path | None" = None) -> "dict | None":
+    """A vendored `workspace_default` that still honours $SUTANDO_WORKSPACE.
+
+    v0.8 (#1440) removed that env var as a workspace source. A copy predating the
+    change returns the env's value, so two resolvers disagree only when the env is
+    set — silently, and only for whoever imports the stale copy. Measured
+    2026-09-04: wire-skill's copy resolved to the pre-v0.8 legacy tree and
+    peg-signal output had been landing there since 08-16.
+
+    Deliberately a BEHAVIOUR probe, not a diff against src. That night's census
+    found 17 same-named vendored files and 3 content-drifted, of which one was
+    defective: `sparrowd.py` is two files by design and `send_allowlist.py`'s copy
+    uses package-internal paths on purpose. Hash-comparing names would flag 3 to
+    catch 1, and a gate that cries wolf gets ignored.
+    """
+    name = "vendored-resolver-env"
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    roots = [ws / "skill-repos", REPO_DIR / "packages", REPO_DIR / "skills"]
+    canonical = (REPO_DIR / "src" / "workspace_default.py").resolve()
+    copies = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for f in root.rglob("workspace_default.py"):
+            if ".git" in f.parts or f.resolve() == canonical:
+                continue
+            copies.append(f)
+    if not copies:
+        return None                       # nothing vendored here; not a finding
+    bogus = "/tmp/sutando-healthcheck-not-the-workspace"
+    probe_src = ("import sys; sys.path.insert(0, %r)\n"
+                 "from workspace_default import resolve_workspace\n"
+                 "print(resolve_workspace())\n")
+    offenders = []
+    for f in sorted(set(copies)):
+        env = dict(os.environ, SUTANDO_WORKSPACE=bogus)
+        try:
+            r = subprocess.run([sys.executable, "-c", probe_src % str(f.parent)],
+                               capture_output=True, text=True, env=env, timeout=30)
+        except Exception:                 # noqa: BLE001 — a probe must not raise
+            continue
+        if r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == [bogus]:
+            offenders.append(str(f))
+    if not offenders:
+        return {"name": name, "status": "ok",
+                "detail": f"{len(set(copies))} vendored resolver(s), none honour "
+                          "$SUTANDO_WORKSPACE"}
+    return {"name": name, "status": "warn",
+            "detail": f"{len(offenders)} vendored workspace_default still honour(s) "
+                      f"$SUTANDO_WORKSPACE, removed in v0.8 — it resolves elsewhere "
+                      f"than every v0.8 consumer whenever that env is set: "
+                      + ", ".join(offenders)}
+
+
 def check_legacy_notes_divergence() -> "dict | None":
     """Detect a canonical-vs-legacy notes/ divergence the #1266 probe cannot see.
 
@@ -10801,6 +10855,10 @@ def run_all_checks() -> list[dict]:
     _legacy_nd = check_legacy_notes_divergence()
     if _legacy_nd:
         checks.append(_legacy_nd)
+
+    _vre = check_vendored_resolver_env()
+    if _vre:
+        checks.append(_vre)
 
     # Memory sync
     checks.append(check_memory_sync())
