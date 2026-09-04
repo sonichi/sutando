@@ -367,6 +367,23 @@ def main() -> int:
           "no receiving_instance header when the agent identity is unknown")
     rtc._reenroll_identity = _orig_reenroll
 
+    # priority must survive to the reader that sorts the queue. The safe parser
+    # stops at `task:`, so a priority serialized below it is silently invisible.
+    import task_priority as _tp
+    for _want in ("urgent", "low"):
+        _pid = f"task-PRIO{_want.upper()}"
+        rtc._write_task({**TASK, "id": _pid, "task": "hi", "priority": _want})
+        _pf = rtc.TASKS_DIR / f"{_pid}.txt"
+        _pbody = _pf.read_text()
+        check(_pbody.index("priority:") < _pbody.index("task:"),
+              f"priority is serialized above task: ({_want})")
+        check(local_task_protocol.parse_task_headers(_pbody).get("priority") == _want,
+              f"safe parser reads a gateway priority ({_want})")
+        check(_tp.parse_priority_from_text(_pbody) == _want,
+              f"the production priority reader sees a gateway {_want}")
+        check(_tp.parse_priority_from_file(_pf) == _want,
+              f"parse_priority_from_file agrees for a gateway {_want}")
+
     rtc._write_task({**TASK, "id": "task-ROOMSESSION", "session_scope": "room"})
     room_session = (rtc.TASKS_DIR / "task-ROOMSESSION.txt").read_text()
     check(room_session.count("session_scope: room") == 1

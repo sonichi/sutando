@@ -1590,9 +1590,9 @@ _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
-                # Which worker the sender asked for. Ahead of "task" so it can never
-                # be read from under the untrusted body; copied verbatim, never derived.
-                "requested_worker",
+                # Both ahead of "task": the safe parser stops at the body, so a
+                # field written below it is invisible to every task-last reader.
+                "requested_worker", "priority",
                 "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -1604,7 +1604,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Room-membership context (gateway writer side, same contract):
                 # a capped one-line mxid list + the true joined total.
                 "room_members", "room_member_count",
-                "source_message_id", "user_id", "priority", "interaction_type",
+                "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
                 "platform_card")
