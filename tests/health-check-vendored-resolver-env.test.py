@@ -105,6 +105,53 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(r["status"], "ok", r["detail"])
 
 
+class EquivalentForms(unittest.TestCase):
+    """Three spellings that honour the env without the two shapes the first
+    analysis recognized. All three read 'ignores' at 12d5f2ad."""
+
+    def _verdict(self, src):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text(src)
+        return hc._resolver_env_verdict(f)[0]
+
+    def test_os_getenv_is_the_same_read(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('SUTANDO_WORKSPACE'))\n"), "honours")
+
+    def test_a_module_level_environ_alias_is_the_same_read(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "env = os.environ\n"
+            "def resolve_workspace():\n"
+            "    raw = env.get('SUTANDO_WORKSPACE')\n"
+            "    return Path(raw)\n"), "honours")
+
+    def test_the_read_may_sit_in_another_function(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def legacy():\n"
+            "    return os.environ.get('SUTANDO_WORKSPACE')\n"
+            "def resolve_workspace():\n"
+            "    return Path(legacy())\n"), "honours")
+
+    def test_an_unresolvable_call_is_unknown_not_clean(self):
+        """The general guard: what the analysis cannot follow is never 'ignores'."""
+        self.assertEqual(self._verdict(
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(mystery())\n"), "unknown")
+
+    def test_a_genuinely_clean_resolver_is_still_clean(self):
+        """Negative control: the guard above must not make everything unknown."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.path.expanduser('~/w'))\n"), "ignores")
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""

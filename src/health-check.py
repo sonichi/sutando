@@ -9233,52 +9233,106 @@ def _file_digest(path: Path) -> str:
         return f"<unreadable:{path}>"
 
 
+# The workspace env var retired in v0.8 (#1440). A vendored resolver that still
+# reads it resolves a path nothing else agrees with.
+_REMOVED_WS_ENV = "SUTANDO_WORKSPACE"
+# Callees whose result cannot smuggle an env read past the analysis: pure
+# constructors over arguments this pass already walks.
+_RESOLVED_CALLS = frozenset({"Path", "str", "expanduser", "resolve", "home"})
+
+
 def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
     """(verdict, why) for one workspace_default copy, WITHOUT importing it.
 
     Verdicts: "honours" / "ignores" / "unknown". Static because detection must not
-    execute discovered source — a subprocess is failure isolation, not a security
-    boundary, and any checked-out skill could run import-time code otherwise.
+    execute discovered source. "ignores" is asserted only for dataflow this
+    analysis fully resolved; an unresolved call or alias is "unknown", never clean.
     """
     try:
         tree = ast.parse(path.read_text())
     except Exception as e:                       # noqa: BLE001 — unparseable is UNKNOWN
         return "unknown", f"could not parse: {str(e)[:60]}"
-    fn = next((n for n in ast.walk(tree)
-               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-               and n.name == "resolve_workspace"), None)
+    modfns = {n.name: n for n in ast.walk(tree)
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    fn = modfns.get("resolve_workspace")
     if fn is None:
         return "unknown", "no resolve_workspace() to analyse"
 
+    # Names bound to the environ mapping itself (env = os.environ), so a .get on
+    # the alias is the same read as a .get on os.environ.
+    aliases = {t.id for n in ast.walk(tree)
+               if isinstance(n, ast.Assign) and _dots(n.value).endswith("environ")
+               for t in n.targets if isinstance(t, ast.Name)}
+
+    def _keyed(node) -> bool:
+        return _const_str(node) == _REMOVED_WS_ENV
+
     def reads_env(node) -> bool:
-        """An environ subscript or .get keyed by the removed workspace env var."""
+        """Any supported spelling of a read keyed by the removed env var."""
         for n in ast.walk(node):
-            if isinstance(n, ast.Subscript) and _dots(n.value).endswith("environ"):
-                if _const_str(n.slice) == "SUTANDO_WORKSPACE":
+            if isinstance(n, ast.Subscript):
+                base = _dots(n.value)
+                if (base.endswith("environ") or base in aliases) and _keyed(n.slice):
                     return True
-            if isinstance(n, ast.Call) and _dots(n.func).endswith("environ.get"):
-                if n.args and _const_str(n.args[0]) == "SUTANDO_WORKSPACE":
+            if isinstance(n, ast.Call):
+                d = _dots(n.func)
+                head, _, attr = d.rpartition(".")
+                hit = (d.endswith("environ.get") or d.endswith("getenv")
+                       or (attr == "get" and head in aliases))
+                if hit and n.args and _keyed(n.args[0]):
                     return True
         return False
 
-    tainted, changed = set(), True
-    while changed:                               # tiny fixpoint over local aliases
-        changed = False
-        for n in ast.walk(fn):
-            if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
-                src = reads_env(n.value) or any(
-                    isinstance(x, ast.Name) and x.id in tainted
-                    for x in ast.walk(n.value))
-                if not src:
-                    continue
-                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
-                    if isinstance(t, ast.Name) and t.id not in tainted:
-                        tainted.add(t.id); changed = True
-    for n in ast.walk(fn):
-        if isinstance(n, ast.Return) and n.value is not None:
+    def opaque_call(node) -> "str | None":
+        """Name a call whose result this analysis cannot account for."""
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Call):
+                continue
+            d = _dots(n.func)
+            if d in modfns or d in _RESOLVED_CALLS or d.startswith("os.path."):
+                continue
+            if "." not in d and d not in modfns:
+                return d or "<expr>"
+        return None
+
+    def verdict(node, seen: frozenset) -> "tuple[str, str] | None":
+        """honours/unknown for one function; None means nothing found here."""
+        if node.name in seen:
+            return None                          # recursion guard
+        seen = seen | {node.name}
+        tainted, changed = set(), True
+        while changed:                           # tiny fixpoint over local aliases
+            changed = False
+            for n in ast.walk(node):
+                if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
+                    if not (reads_env(n.value) or any(
+                            isinstance(x, ast.Name) and x.id in tainted
+                            for x in ast.walk(n.value))):
+                        continue
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                        if isinstance(t, ast.Name) and t.id not in tainted:
+                            tainted.add(t.id); changed = True
+        for n in ast.walk(node):
+            if not (isinstance(n, ast.Return) and n.value is not None):
+                continue
             if reads_env(n.value) or any(isinstance(x, ast.Name) and x.id in tainted
                                          for x in ast.walk(n.value)):
-                return "honours", f"a return in resolve_workspace() derives from the env (line {n.lineno})"
+                return "honours", (f"a return in {node.name}() derives from the env "
+                                   f"(line {n.lineno})")
+            for c in ast.walk(n.value):          # follow calls into this module
+                if isinstance(c, ast.Call) and _dots(c.func) in modfns:
+                    deeper = verdict(modfns[_dots(c.func)], seen)
+                    if deeper is not None:
+                        return deeper
+            bad = opaque_call(n.value)
+            if bad is not None:
+                return "unknown", (f"a return in {node.name}() flows through "
+                                   f"{bad}(), which this analysis cannot resolve")
+        return None
+
+    found = verdict(fn, frozenset())
+    if found is not None:
+        return found
     return "ignores", "no return derives from $SUTANDO_WORKSPACE"
 
 
