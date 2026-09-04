@@ -27,6 +27,14 @@ the window it can land in, but does not close it, and such an update can still
 be overwritten. Take `<file>.anchored-lock` if you edit these files from
 elsewhere. Do not read this tool as making arbitrary post-read updates safe.
 
+NOT FOR APPEND-ONLY SHARED STATE. The two shapes need different primitives:
+an append-only multi-writer file (build_log.md is the repo's documented case)
+wants O_APPEND, which is atomic per write and needs no lock; this tool does a
+REPLACEMENT, which has no lock-free form. A correct replacement of an
+append-only file still discards every append that landed since the read — the
+lock above does not change that, because nothing was raced, the write simply
+was not an append. Use O_APPEND there and this tool for replacements.
+
 Usage:
     anchored-edit.py FILE --old-file OLD --new-file NEW [--count N] [--allow-multi]
     anchored-edit.py FILE --old TEXT --new TEXT
