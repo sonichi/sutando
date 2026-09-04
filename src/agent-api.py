@@ -128,8 +128,8 @@ PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
 # over the public workspace.
 from util_paths import personal_path  # noqa: E402
 from pending_questions_md import active_region  # noqa: E402
-from task_body_guard import (confine_user_content,  # noqa: E402
-                             header_safe_value)
+from task_body_guard import confine_user_content  # noqa: E402
+from task_body_guard import header_safe_value  # noqa: E402
 from signal_room_tasks import (SIGNAL_ROOM_TIER, SIGNAL_TASK_PREFIX, SignalRoomBusy,
                                submit_signal_room_task, submission_status)  # noqa: E402
 
