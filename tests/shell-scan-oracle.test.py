@@ -74,7 +74,7 @@ class MatchesBash(unittest.TestCase):
         'gh release create v1 --target abc123\r\ngh pr view 2',
         'gh release create v1 --target abc123\rgh pr view 2',
         # ANSI-C quoting: bash DROPS the $ and decodes, so a scanner that keeps
-        # the $ hands a guard a value gh never receives (found by sonichi).
+        # the $ hands a guard a value gh never receives.
         "gh release create v1 --target $'abc1234'",
         "gh release create v1 --target $'\\x61bc1234'",
         "gh release create v1 --target $'\\141bc1234'",
@@ -89,7 +89,7 @@ class MatchesBash(unittest.TestCase):
         'gh release create v1 --target $"abc1234"',
         'gh pr comment 1 --body $"hello world"',
         # A line continuation: bash removes the backslash AND the newline, so
-        # emitting the newline splits where bash never splits (sonichi).
+        # emitting the newline splits where bash never splits.
         'gh release create v1 \\\n  --target abc',
         'gh pr comment 1 --body "a \\\n b"',
         "gh pr comment 1 --body 'a \\\n b'",
@@ -155,7 +155,7 @@ class MatchesBash(unittest.TestCase):
         self.assertNotEqual(expected, ["pr", "comment", "1", "--body", "WRONG"])
 
 
-class UnderDeniesKeweichenFound(unittest.TestCase):
+class UnderDeniesTheOldParserMissed(unittest.TestCase):
     """Each of these had the value's danger hidden from the old parser."""
 
     def _body(self, cmd):
@@ -187,7 +187,7 @@ class UnderDeniesKeweichenFound(unittest.TestCase):
         self.assertFalse(w.expands, "an ODD run escapes it; nothing is substituted")
 
 
-class FalsePositiveKeweichenFound(unittest.TestCase):
+class FalsePositiveOnCommentThenNewline(unittest.TestCase):
     def test_a_comment_then_a_new_line_disarms_before_a_different_tool(self):
         """`gh ...;# note` then a NON-gh tool on the next line: the old parser
         normalised the break to `;;`, which it did not recognise, so `gh` stayed

@@ -25,7 +25,7 @@ class TestOffenders(unittest.TestCase):
     def test_an_unquoted_hash_comments_out_the_rest_of_ITS_line_only(self):
         """`shlex` keeps commenters='#', and once newlines became ';' nothing
         terminated a comment — so a '#' on line 1 hid a violation on line 2
-        (vidhuUC, reproduced by sonichi, on both guards)."""
+        (vidhuUC, on both guards)."""
         self.assertEqual(
             G.offenders('echo hi # deploying now\n'
                         'gh pr comment 1 --body "cost is $(wc -l)"'), ["--body"])
@@ -41,7 +41,7 @@ class TestOffenders(unittest.TestCase):
         self.assertEqual(G.offenders('gh pr comment 1 --body "a # b"'), [])
 
     def test_an_escaped_backtick_publishes_literally(self):
-        """It is not a rewrite, so denying it cries wolf (sonichi)."""
+        """It is not a rewrite, so denying it cries wolf."""
         self.assertEqual(G.offenders(r'gh pr comment 1 --body "use \`code\` here"'), [])
         self.assertEqual(G.offenders('gh pr comment 1 --body "use `code` here"'), ["--body"])
 
@@ -212,7 +212,7 @@ class TestHookIO(unittest.TestCase):
         self.assertEqual(p.stdout.strip(), "")
 
 
-class KeweichenRegressions(unittest.TestCase):
+class PrecedingCharStateRegressions(unittest.TestCase):
     """The three under-denies and one false positive found against bash itself.
 
     Each was invisible to a parser that decided state from the immediately
