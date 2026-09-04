@@ -1,0 +1,14 @@
+{
+  "name": "model-switch",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "stable",
+  "description": "Switch the core CLI's model through its /model command, recording only after the CLI accepts. Contributes no tools; manifest present to DECLARE config per skills/MANIFEST.md: MODEL_SWITCH_CHOICES is the id=Title list the menu-bar app's Model submenu offers.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "MODEL_SWITCH_CHOICES": "default=Default (auto-fallback);opus=Opus 5;sonnet=Sonnet 5;haiku=Haiku 4.5;claude-fable-5-1[1m]=Fable 5.1"
+  }
+}
