@@ -12,7 +12,11 @@ The words below are the ones the code uses from now on: **core** (the one
 session every install has), **worker** (an extra session the core created),
 **pin table** (the owner's room-to-worker bindings, a file), **pool** (core +
 workers). There is no router process in v1: routing is data, not a daemon.
-"Lead", "follower" and "router" are retired.
+"Lead", "follower" and "router" are retired as design terms.
+The shipped artifacts that still carry them (`pool-lead.alive`,
+`pool-lead-daemon.py`, the `com.sutando.pool-lead` launchd label, the health
+probes keyed on them) are tolerated until steps 3 and 4 replace them; nothing
+new is named after them.
 
 ## The starting point is zero workers
 
@@ -54,10 +58,18 @@ took its first task, no lane busy-cap, no saturated-pool overflow, no
 least-recently-picked tie-break, and no fan-out. Rooms bind only by an explicit
 pin. Each of those was a shipped rule in #3604's `_pick()`; each is a later PR
 if the owner asks for it, and none is assumed here.
+If #3787's `pool_routing.py` seam lands, v1's rule is its `home-first`
+configuration (worker when pinned, else the core), not new code; naming the
+seam does not widen v1.
 
 Nothing outside the pin table decides placement. The `target_worker` /
 `fan_out` task headers and every writer and reader of them are gone: a sender's
 message is not a routing instruction.
+The same line supersedes #3859's binding at ingress (`_bound_dest()` in the
+sparrow bridge writing `.assigned-<worker>` into the filename): with eligibility
+read from the pin table on every claim, there is nothing for a bridge to assign,
+and the lead-outage it works around no longer exists. #3859 closes or narrows on
+this document, not the reverse.
 
 ## Commands: the owner's intent arrives as an ordinary task
 
