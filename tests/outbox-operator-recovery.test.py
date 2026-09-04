@@ -336,6 +336,102 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         self.assertIn("undelivered_quarantine.quarantine(", bridge)
 
 
+class CliRenderingAndErrorPaths(unittest.TestCase):
+    """The CLI's own output and refusal paths. Calling outbox directly, as the
+    other tests do, leaves every line of `_emit` and both readers unrun."""
+
+    def _capture(self, argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = outbox_cli.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_list_empty_says_so_rather_than_printing_nothing(self):
+        with TemporaryDirectory() as td:
+            rc, out, _ = self._capture(["--root", td, "list"])
+            self.assertEqual(rc, 0)
+            self.assertIn("(no items)", out)
+
+    def test_list_renders_status_attempts_epoch_and_reason(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            _parked(root)
+            rc, out, _ = self._capture(["--root", td, "list", "--status", "PARKED"])
+            self.assertEqual(rc, 0)
+            self.assertIn("PARKED", out)
+            self.assertIn("attempts=5", out)
+            self.assertIn("epoch=0", out)
+            self.assertIn("max-attempts", out)
+
+    def test_json_output_is_machine_readable(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            _parked(root)
+            rc, out, _ = self._capture(["--root", td, "--json", "list"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(out)[0]["status"], "PARKED")
+
+    def test_inspect_reports_the_claim_and_exits_2_when_absent(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            _parked(root)
+            outbox.acquire_delivery_claim(root, ITEM, "drainer-9")
+            rc, out, _ = self._capture(["--root", td, "inspect", ITEM])
+            self.assertEqual(rc, 0)
+            self.assertIn("drainer-9", out)
+            rc, _, err = self._capture(["--root", td, "inspect", "ghost"])
+            self.assertEqual(rc, 2)
+            self.assertIn("no such item", err)
+
+    def test_inspect_json_reports_a_null_claim_when_free(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            _parked(root)
+            rc, out, _ = self._capture(["--root", td, "--json", "inspect", ITEM])
+            self.assertEqual(rc, 0)
+            self.assertIsNone(json.loads(out)["claim"])
+
+    def test_operator_falls_back_when_the_login_name_is_unavailable(self):
+        """A container with no passwd entry must still record something."""
+        import getpass
+        real = getpass.getuser
+        getpass.getuser = lambda: (_ for _ in ()).throw(KeyError("no passwd"))
+        try:
+            self.assertEqual(outbox_cli._login_name(), None)
+            self.assertTrue(outbox_cli._default_operator())
+        finally:
+            getpass.getuser = real
+
+
+class OutboxReaderEdges(unittest.TestCase):
+    """Malformed and absent state must degrade, never raise: these readers run
+    on an operator's machine against a store a crashed writer may have left."""
+
+    def test_absent_item_and_absent_store(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            self.assertIsNone(outbox.read_item(root, "ghost"))
+            self.assertEqual(outbox.list_items(root), [])
+
+    def test_a_corrupt_record_is_skipped_not_fatal(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            _parked(root)
+            (outbox._items_dir(root) / "torn.json").write_text("{not json",
+                                                              encoding="utf-8")
+            got = outbox.list_items(root)
+            self.assertEqual([r["item_id"] for r in got], [ITEM])
+
+    def test_a_non_integer_epoch_reads_as_zero(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "QUEUED",
+                                            "resend_epoch": "not-a-number"})
+            self.assertEqual(outbox.resend_epoch_for(root, ITEM), 0)
+
+
 class Delegation(unittest.TestCase):
     """`sutando outbox` must hand off, never re-implement outbox policy."""
 
