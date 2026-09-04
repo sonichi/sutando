@@ -39,7 +39,7 @@ grep -q -- "-S /tmp/sutando-tmux.sock" "$T/tmux.log" && ok "7 targets the core's
 [ "$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")" = opus ] && ok "9 ...and the pin still landed (alias accepted)" || fail "9 pin" "$(cat "$T/cfg/settings.json")"
 grep -q "NOT sent" "$T/err" && ok "10 ...and it says so on stderr" || fail "10 stderr" "$(cat "$T/err")"
 
-: > "$T/tmux.log"; rc=$(run sonnet --dry-run); [ "$rc" = 0 ] && [ ! -s "$T/tmux.log" ] \
+: > "$T/tmux.log"; rc=$(run sonnet --dry-run); [ "$rc" = 0 ] && ! grep -q send-keys "$T/tmux.log" \
   && [ "$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")" = opus ] \
   && ok "11 --dry-run changes nothing and sends nothing" || fail "11 dry-run" "rc=$rc $(cat "$T/tmux.log")"
 
@@ -50,7 +50,8 @@ grep -q "NOT sent" "$T/err" && ok "10 ...and it says so on stderr" || fail "10 s
 ! grep -q send-keys "$T/tmux.log" && grep -q "nothing changed" "$T/err" && ok "13 ...nothing sent, and the message says nothing changed" || fail "13 partial msg" "$(cat "$T/err")"
 ! grep -Eq '(^|[^a-z-])python3( |$)' "$HERE/skills/model-switch/scripts/switch-model.sh" && grep -q 'python-bin' "$HERE/skills/model-switch/scripts/switch-model.sh" \
   && ok "14 no bare python3; python resolved through sutando-config.sh python-bin" || fail "14 python resolver" "$(grep -nE 'python3( |$)' "$HERE/skills/model-switch/scripts/switch-model.sh")"
-grep -q 'tmux-socket' "$HERE/skills/model-switch/scripts/switch-model.sh" && ok "15 socket resolved through sutando-config.sh tmux-socket when unset" || fail "15 socket resolver" ""
+grep -q 'sutando-config.sh" runtime' "$HERE/skills/model-switch/scripts/switch-model.sh" && ! grep -q 'tmux-socket' "$HERE/skills/model-switch/scripts/switch-model.sh" \
+  && ok "15 brain/socket/session default from the runtime descriptor, not the ambient tmux-socket getter" || fail "15 descriptor" ""
 
 # --- the input box is read before anything is written
 : > "$T/tmux.log"; rc=$(TMUX_PANE_TEXT='────\n❯ half-typed message\n────\n' run haiku)
