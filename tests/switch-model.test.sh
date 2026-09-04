@@ -17,7 +17,15 @@ case " $* " in *" capture-pane "*)
   k=$M; dlg=""
   if [ -n "${TMUX_DIALOG:-}" ] && [ "$M" -gt 0 ] && [ "$E" -le "$M" ]; then k=$((M-1)); dlg="   ❯ 1. Yes, switch to X\n     2. No, go back\n"; fi
   [ -n "${TMUX_NO_ACCEPT:-}" ] && { k=0; dlg=""; }
-  acc=""; i=0; while [ "$i" -lt "$k" ]; do acc="$acc  ⎿  Set model to X and saved as your default\n"; i=$((i+1)); done
+  # Render what the real CLI prints for each ACCEPTED send (display name, not id);
+  # TMUX_ACCEPT_AS forces a different model's line; TMUX_PERSIST_SETTINGS mimics the CLI saving the pick.
+  disp() { case "$1" in opus|claude-opus-5*) echo "Opus 5";; sonnet|claude-sonnet-5*) echo "Sonnet 5";; haiku|claude-haiku-4-5*) echo "Haiku 4.5";; fable|claude-fable-5-1*) echo "Fable 5.1";; default) echo "Default (recommended)";; *) echo "$1";; esac; }
+  acc=""; i=0
+  while [ "$i" -lt "$k" ]; do
+    i=$((i+1)); sent="$(grep -- "-l /model" "$TMUX_LOG" | sed -n "${i}p" | sed 's/.*-l \/model //')"
+    name="$(disp "${TMUX_ACCEPT_AS:-$sent}")"; acc="$acc  ⎿  Set model to $name and saved as your default\n"
+    [ -n "${TMUX_PERSIST_SETTINGS:-}" ] && printf '{"model":"%s"}\n' "${TMUX_ACCEPT_AS:-$sent}" > "$TMUX_PERSIST_SETTINGS"
+  done
   printf '%b' "$acc$dlg${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
 exit 0
 SH
@@ -86,4 +94,15 @@ printf '%s\n' "$SETTINGS_BEFORE" > "$T/cfg/settings.json"
 rc=$(run haiku); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['previous_source'])" 2>/dev/null)
 [ "$rc" = 0 ] && [ "$R" = "settings.json" ] && ok "26 with a model key present, previous comes from settings.json" || fail "26" "rc=$rc R=$R"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 26 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- the accepted MODEL is matched, and previous is snapshotted BEFORE the send
+rm -f "$T/state/model-switch.json"
+rc=$(TMUX_ACCEPT_AS=haiku run opus --accept-timeout 1); [ "$rc" = 8 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "OF THAT MODEL" "$T/err" \
+  && ok "27 the pane accepts a DIFFERENT model (Haiku while opus was asked): exit 8, NO record" || fail "27 wrong-model acceptance" "rc=$rc $(cat "$T/err")"
+rc=$(run 'claude-fable-5-1[1m]'); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['model'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$R" = "claude-fable-5-1[1m]" ] && ok "28 a full id is matched against the CLI's display name (Fable 5.1)" || fail "28" "rc=$rc R=$R $(cat "$T/err")"
+printf '{"model":"claude-fable-5-1[1m]"}\n' > "$T/cfg/settings.json"
+rc=$(TMUX_PERSIST_SETTINGS="$T/cfg/settings.json" run opus); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['previous'],d['previous_source'])" 2>/dev/null); NOW=$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")
+[ "$rc" = 0 ] && [ "$R" = "claude-fable-5-1[1m] settings.json" ] && [ "$NOW" = "opus" ] && ok "29 the CLI persisted the NEW model on acceptance; previous still records the model BEFORE the send" || fail "29 previous read after acceptance" "rc=$rc R=$R settings-now=$NOW"
+printf '%s\n' "$SETTINGS_BEFORE" > "$T/cfg/settings.json"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 29 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
