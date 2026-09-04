@@ -47,7 +47,7 @@ def apply_edit(text: str, old: str, new: str, allow_multi: bool = False):
             else text.replace(old, new, 1)), n
 
 
-def _atomic_write(p: Path, text: str) -> None:
+def _atomic_write(p: Path, text: str, expect: str) -> None:
     """Replace p's contents or leave them untouched — never a truncated middle.
 
     write_text() truncates the live file first, so an interrupted or short
@@ -60,6 +60,10 @@ def _atomic_write(p: Path, text: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         shutil.copymode(p, tmp)
+        # Precondition, not a posterior check: a writer that lands between the
+        # caller's read and this replace is invisible to any after-the-fact test.
+        if p.read_text() != expect:
+            raise RuntimeError("target changed since it was read — refusing to overwrite")
         os.replace(tmp, p)          # atomic within a filesystem
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -83,6 +87,12 @@ def main(argv=None) -> int:
         return 2
 
     p = Path(a.file)
+    if p.is_symlink():
+        # os.replace() swaps the LINK entry, leaving the target untouched and
+        # turning the link into a regular file. Refuse rather than retarget.
+        print(f"anchored-edit: REFUSED — {p} is a symlink; edit its target directly",
+              file=sys.stderr)
+        return 2
     if not p.is_file():
         print(f"anchored-edit: no such file: {p}", file=sys.stderr)
         return 2
@@ -97,9 +107,10 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
     try:
-        _atomic_write(p, after)
-    except OSError as e:
-        print(f"anchored-edit: REFUSED — write failed, original retained: {e}", file=sys.stderr)
+        _atomic_write(p, after, before)
+    except (OSError, RuntimeError) as e:
+        # RuntimeError is the changed-target precondition; both leave p untouched.
+        print(f"anchored-edit: REFUSED — write not applied, original retained: {e}", file=sys.stderr)
         return 2
 
     # Must equal `after` EXACTLY: comparing against `before` only proves

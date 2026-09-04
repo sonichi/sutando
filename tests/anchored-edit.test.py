@@ -108,7 +108,7 @@ class AtomicReplacement(unittest.TestCase):
         concurrent writer's bytes as proof that MY edit landed."""
         f = self._tmp("alpha beta")
 
-        def _clobber(path, text):
+        def _clobber(path, text, expect):
             path.write_text("something another writer put here")
 
         with unittest.mock.patch.object(ae, "_atomic_write", side_effect=_clobber):
@@ -217,7 +217,7 @@ class AtomicWriteDirect(unittest.TestCase):
         f = Path(tempfile.mkdtemp()) / "t.txt"
         f.write_text("old")
         f.chmod(0o600)
-        ae._atomic_write(f, "new")
+        ae._atomic_write(f, "new", "old")
         self.assertEqual(f.read_text(), "new")
         self.assertEqual(f.stat().st_mode & 0o777, 0o600)
 
@@ -226,9 +226,65 @@ class AtomicWriteDirect(unittest.TestCase):
         f.write_text("original")
         with unittest.mock.patch.object(ae.os, "replace", side_effect=OSError("boom")):
             with self.assertRaises(OSError):
-                ae._atomic_write(f, "replacement")
+                ae._atomic_write(f, "replacement", "original")
         self.assertEqual(f.read_text(), "original")
         self.assertEqual([q.name for q in f.parent.iterdir()], ["t.txt"])
+
+
+class IntegrityContract(unittest.TestCase):
+    """qingyun-wu, 2026-09-04, both reproduced with controls: os.replace swaps a
+    SYMLINK entry rather than editing its target, and the edit computed from
+    `before` was written unconditionally, so a writer landing between the read
+    and the replace was silently lost."""
+
+    def _dir(self):
+        return Path(tempfile.mkdtemp())
+
+    def _main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = ae.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_symlink_target_is_refused_not_retargeted(self):
+        d = self._dir()
+        real = d / "real.txt"
+        real.write_text("alpha beta")
+        link = d / "link.txt"
+        link.symlink_to(real)
+        rc, out, err = self._main([str(link), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 2)
+        self.assertIn("symlink", err)
+        self.assertEqual(out, "", "a refusal must print no receipt")
+        self.assertEqual(real.read_text(), "alpha beta", "the target must be untouched")
+        self.assertTrue(link.is_symlink(), "the link must still be a link, not a regular file")
+
+    def test_a_write_landing_after_the_read_is_refused_not_clobbered(self):
+        d = self._dir()
+        f = d / "t.txt"
+        f.write_text("alpha beta")
+        real_copymode = ae.shutil.copymode
+
+        def _race(src, dst):
+            # copymode(src=p, dst=tmp): SRC is the live target, and this runs
+            # inside the one window the precondition can actually observe.
+            Path(src).write_text("third-party")
+            return real_copymode(src, dst)
+
+        with unittest.mock.patch.object(ae.shutil, "copymode", side_effect=_race):
+            rc, out, err = self._main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 2, "a changed target must refuse, not overwrite")
+        self.assertEqual(f.read_text(), "third-party", "the concurrent update must survive")
+        self.assertEqual(out, "")
+
+    def test_the_unchanged_case_still_succeeds(self):
+        """Negative control: the precondition must not refuse an ordinary edit."""
+        d = self._dir()
+        f = d / "t.txt"
+        f.write_text("alpha beta")
+        rc, out, err = self._main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(f.read_text(), "alpha gamma")
 
 
 if __name__ == "__main__":
