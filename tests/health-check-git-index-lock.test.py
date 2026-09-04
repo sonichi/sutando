@@ -75,7 +75,9 @@ class GitIndexLock(unittest.TestCase):
         r = hc.check_git_index_lock(self.repo)
         self.assertEqual(r["status"], "warn")
         self.assertIn("9.4h", r["detail"])
-        self.assertIn(f"rm {lock}", r["detail"])
+        # git reports the fully resolved gitdir (/var -> /private/var on macOS),
+        # so the advice names the unambiguous path; compare resolved to resolved.
+        self.assertIn(f"rm {lock.resolve()}", r["detail"])
         self.assertIn("lsof", r["detail"], "the remedy must be gated on checking for a live holder")
 
     def test_the_warn_is_reachable_from_a_REAL_blocked_write(self):
@@ -119,15 +121,17 @@ class GitIndexLock(unittest.TestCase):
         self.assertIsNone(hc._git_dir(odd))
         self.assertEqual(hc.check_git_index_lock(odd)["status"], "ok")
 
-    def test_a_RELATIVE_gitdir_pointer_resolves_against_the_checkout(self):
-        # git writes a relative `gitdir:` in some layouts; resolving it against
-        # the process cwd instead of the checkout would probe the wrong file.
-        host = Path(self.tmp.name) / "host"
-        (host / "real-gitdir").mkdir(parents=True)
-        (host / ".git").write_text("gitdir: real-gitdir\n")
-        self.assertEqual(hc._git_dir(host), (host / "real-gitdir").resolve())
+    def test_a_REAL_worktree_probes_its_own_gitdir_not_the_common_dir(self):
+        # Built with `git worktree add`, not a hand-written pointer: the probe
+        # asks git, so only a checkout git recognises resolves at all.
+        host = Path(self.tmp.name) / "wt"
+        _git(self.repo, "worktree", "add", "-q", "--detach", str(host))
+        gitdir = hc._git_dir(host)
+        self.assertIsNotNone(gitdir)
+        self.assertNotEqual(gitdir, (self.repo / ".git").resolve(),
+                            "a worktree must not resolve to the common dir")
         self.assertEqual(hc.check_git_index_lock(host)["status"], "ok")
-        lock = host / "real-gitdir" / "index.lock"
+        lock = gitdir / "index.lock"
         lock.write_text("")
         old = time.time() - 9.4 * 3600
         os.utime(lock, (old, old))
@@ -140,7 +144,7 @@ class GitIndexLock(unittest.TestCase):
         plain.mkdir()
         self.assertEqual(hc.check_git_index_lock(plain)["status"], "ok")
 
-    # ---- malformed `gitdir:` pointers (keweichen, 2026-09-04) ----------------
+    # ---- malformed `gitdir:` pointers ---------------------------------------
 
     def _worktree_like(self, name, pointer_body):
         """A checkout whose `.git` is a FILE, as a worktree's is."""
@@ -187,7 +191,7 @@ class GitIndexLock(unittest.TestCase):
                 raise PermissionError(13, "Permission denied")
             return real_stat(self_path, *a, **k)
 
-        with unittest.mock.patch.object(Path, "stat", boom):
+        with unittest.mock.patch.object(Path, "lstat", boom):
             r = hc.check_git_index_lock(repo)
         self.assertEqual(r["status"], "warn")
         self.assertIn("UNMEASURED", r["detail"])
@@ -210,13 +214,77 @@ class GitIndexLock(unittest.TestCase):
         detail = hc.check_git_index_lock(repo)["detail"]
         for verb in ("lsof", "rm"):
             argv = shlex.split(detail.split(f"`{verb} ", 1)[1].split("`", 1)[0])
-            self.assertEqual(argv, [str(lock)],
+            self.assertEqual(argv, [str(lock.resolve())],
                              f"{verb} would act on {len(argv)} operands, not the lock")
 
     def test_the_probe_is_wired_into_the_run(self):
         src = (ROOT / "src" / "health-check.py").read_text()
         self.assertIn("checks.append(check_git_index_lock())", src,
                       "a probe nobody calls reports nothing")
+
+
+
+class TargetMustBelongToThisCheckout(unittest.TestCase):
+    """keweichen's blockers: a pointer git does not recognise must not produce
+    `rm` advice, and neither resolution nor a dangling/future lock may read clean."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _worktree(self, pointer: str) -> Path:
+        co = self.root / "checkout"
+        co.mkdir()
+        (co / ".git").write_text(pointer)
+        return co
+
+    def test_pointer_to_an_unrelated_directory_gets_no_removal_advice(self):
+        unrelated = self.root / "unrelated"
+        unrelated.mkdir()
+        (unrelated / "index.lock").write_text("")
+        os.utime(unrelated / "index.lock", (0, 0))
+        r = hc.check_git_index_lock(self._worktree(f"gitdir: {unrelated}"))
+        self.assertNotIn("rm ", r["detail"],
+                         "advised removing a lock git never associated with this checkout")
+
+    def test_symlink_loop_target_does_not_escape_the_probe(self):
+        co = self._worktree("gitdir: loop")
+        loop = co / "loop"
+        os.symlink(loop, loop)  # self-referential: Path.resolve() raises RuntimeError
+        r = hc.check_git_index_lock(co)   # must return, not raise
+        self.assertIn(r["status"], ("ok", "warn"))
+
+    def test_a_dangling_lock_symlink_is_not_absent(self):
+        co = self.root / "real"
+        subprocess.run(["git", "init", "-q", str(co)], check=True, capture_output=True)
+        gd = co / ".git"
+        link = gd / "index.lock"
+        os.symlink(gd / "nonexistent-target", link)
+        stale = time.time() - 9.4 * 3600
+        os.utime(link, (stale, stale), follow_symlinks=False)
+        self.assertTrue(link.is_symlink())
+        self.assertFalse(link.exists(), "control: stat() through the link sees it as absent")
+        add = subprocess.run(["git", "-C", str(co), "add", "-A"], capture_output=True)
+        self.assertNotEqual(add.returncode, 0, "control: git really is blocked by the entry")
+        r = hc.check_git_index_lock(co)
+        self.assertEqual(r["status"], "warn")
+        self.assertNotIn("unblocked", r["detail"],
+                         "a dangling entry blocks git; stat() would have called it absent")
+
+    def test_a_future_dated_lock_is_unmeasured_not_in_flight(self):
+        co = self.root / "future"
+        subprocess.run(["git", "init", "-q", str(co)], check=True, capture_output=True)
+        lock = co / ".git" / "index.lock"
+        lock.write_text("")
+        future = time.time() + 86400
+        os.utime(lock, (future, future))
+        r = hc.check_git_index_lock(co)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn("FUTURE", r["detail"])
+        self.assertNotIn("in flight", r["detail"])
 
 
 if __name__ == "__main__":

@@ -3089,30 +3089,26 @@ GIT_LOCK_STALE_S = 300.0
 
 
 def _git_dir(repo: Path) -> "Path | None":
-    """The real .git directory, following a worktree's `.git` FILE pointer.
+    """The real .git directory, as GIT resolves it.
 
-    A worktree's index.lock lives in its own gitdir, not the common dir, so
-    resolving to the common dir would probe the wrong file."""
-    g = repo / ".git"
-    if g.is_dir():
-        return g
+    Asking git is what proves the answer belongs to THIS checkout. A
+    hand-parsed `gitdir:` pointer can name any existing directory, and the
+    probe would then advise removing an unrelated repository's lock; git's own
+    resolver also sidesteps `Path.resolve()`, whose symlink-loop RuntimeError
+    would escape an always-on sweep. Unresolvable means no remedy, not a guess.
+    """
+    import subprocess as _sp
     try:
-        line = g.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
+        r = _sp.run(git_argv("-C", str(repo), "rev-parse", "--absolute-git-dir"),
+                    capture_output=True, text=True, timeout=20)
+    except (OSError, ValueError, _sp.SubprocessError):
         return None
-    if not line.startswith("gitdir:"):
-        return None
-    raw = line.split(":", 1)[1].strip()
-    # Path("") resolves to the checkout, aiming the removal advice at the wrong
-    # file; NUL and over-long targets raise out of an always-on sweep.
-    if not raw:
+    if r.returncode != 0 or not r.stdout.strip():
         return None
     try:
-        target = Path(raw)
-        if not target.is_absolute():
-            target = (repo / target).resolve()
-        return target if target.is_dir() else None
-    except (ValueError, OSError):
+        g = Path(r.stdout.strip())
+        return g if g.is_dir() else None
+    except (ValueError, OSError, RuntimeError):
         return None
 
 
@@ -3140,16 +3136,25 @@ def check_git_index_lock(repo_dir: "Path | None" = None,
                 "detail": f"{repo} is not a git checkout — nothing to lock"}
     lock = gitdir / "index.lock"
     try:
-        st = lock.stat()
+        # lstat, not stat: a DANGLING symlink named index.lock still occupies the
+        # directory entry, so git's exclusive create fails while stat() says absent.
+        st = lock.lstat()
     except FileNotFoundError:
         return {"name": name, "status": "ok", "detail": "no index.lock — git writes are unblocked"}
-    except OSError as e:
+    except (OSError, ValueError, RuntimeError) as e:
         # Only a missing file is an absence; any other stat error leaves the
         # question unanswered, and "unblocked" would state an unmade measurement.
         return {"name": name, "status": "warn",
                 "detail": (f"cannot tell whether {lock} exists ({type(e).__name__}: {e.strerror or e}) "
                            f"— this is UNMEASURED, not a clean checkout")}
     age = (now if now is not None else time.time()) - st.st_mtime
+    if age < 0:
+        # A future mtime makes every age comparison meaningless, and "in flight"
+        # would report an in-progress write this probe never observed.
+        return {"name": name, "status": "warn",
+                "detail": (f"{lock} is dated {-age:.0f}s in the FUTURE — its age is UNMEASURED, "
+                           f"not young; git writes may be blocked. Check the clock, then inspect "
+                           f"the lock by hand")}
     if age < GIT_LOCK_STALE_S:
         return {"name": name, "status": "ok",
                 "detail": f"index.lock present but only {age:.0f}s old — a git write is in flight"}
