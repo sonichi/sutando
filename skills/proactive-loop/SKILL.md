@@ -267,7 +267,11 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    ```bash
    python3 skills/proactive-loop/scripts/warn-already-triaged.py --claim "<the sentence you are about to say>"
    # exit 1 = already parked, with file:line -> READ IT, then extend or say nothing is new
-   # exit 0 = genuinely untriaged -> proceed
+   # exit 0 = NO TOKEN MATCHED. That is not proof of absence -- the tool's own message says
+   #          "OR every token missed". Before proceeding, do step 3's fallback:
+   #          grep -n '^## ' "$H"/*.md  and read the ~25 headings. Enumerating cannot miss
+   #          the way a self-chosen token does, and the suspicion never generates the token
+   #          the answer is filed under.
    # exit 2 = could not answer (no parking files / empty claim) -> NOT a green light
    ```
 
