@@ -42,34 +42,47 @@ belongs to the core on the owner's word.
 
 ## Routing policy: worker only when obvious, otherwise the core
 
-Routing is the pin table plus one claim rule. A worker claims a task in
-exactly two cases:
+Routing is two pieces of data and one rule, evaluated by each watcher for
+itself. The data: the envelope field **`requested_worker`**, which the server
+writes at ingress when the sender addressed a worker (one envelope per
+addressed worker, so a message addressed to three workers arrives as three
+tasks with three ids); and the **pin table**. A sender's text is never a
+routing instruction: the field is the server's decision, the bridge records it
+verbatim, and nothing on the sutando side writes it.
 
-1. the task's room is **pinned** to that worker, or to a bound set it belongs
-   to;
-2. the task belongs to a **dedicated** worker's own room.
+The rule runs inside each watcher's own event handler
+(`SUTANDO_TASK_EVENT_HANDLER`, read per process, so the core and every worker
+carry their own), at the handler's probe, before any claim:
 
-The core claims everything else. Nothing decides placement at run time: a
-worker's candidate set is fixed by the pin table, the core's candidate set is
-the complement, and a task is never eligible to both. Two members of a bound
-set may both be eligible for one task; the claim rename settles it. There is
-no least-loaded fallback, no automatic binding of a room to whichever worker
-took its first task, no lane busy-cap, no saturated-pool overflow, no
-least-recently-picked tie-break, and no fan-out. Rooms bind only by an explicit
-pin. Each of those was a shipped rule in #3604's `_pick()`; each is a later PR
-if the owner asks for it, and none is assumed here.
-If #3787's `pool_routing.py` seam lands, v1's rule is its `home-first`
-configuration (worker when pinned, else the core), not new code; naming the
-seam does not widen v1.
+1. `requested_worker` names this instance: emit to this session with no claim
+   taken (probe exit 3). Names another instance whose beat is fresh: claim and
+   discard. Names an instance whose beat is stale: the core emits (stand-in),
+   workers discard.
+2. No field, and the task's room is **pinned** to this worker, or this is a
+   **dedicated** worker's own room: emit with no claim. Pinned to a bound set
+   this worker belongs to: members race for the watcher's shared atomic claim
+   (a hard link in `state/task-event-handler-claims/`); the winner emits.
+3. Otherwise the core emits and workers claim and discard.
 
-Nothing outside the pin table decides placement. The `target_worker` /
-`fan_out` task headers and every writer and reader of them are gone: a sender's
-message is not a routing instruction.
-The same line supersedes #3859's binding at ingress (`_bound_dest()` in the
-sparrow bridge writing `.assigned-<worker>` into the filename): with eligibility
-read from the pin table on every claim, there is nothing for a bridge to assign,
-and the lead-outage it works around no longer exists. #3859 closes or narrows on
-this document, not the reverse.
+A task is eligible to exactly one instance except inside a bound set, where the
+claim settles it. There is no least-loaded fallback, no automatic binding of a
+room to whichever worker took its first task, no lane busy-cap, no
+saturated-pool overflow and no least-recently-picked tie-break. Rooms bind only
+by an explicit pin. Each of those was a shipped rule in #3604's `_pick()`; each
+is a later PR if the owner asks for it, and none is assumed here.
+
+#3787's `pool_routing.py` does **not** implement this rule as it stands: at
+`aab2e473` its `home-first` configuration ignores affinity and returns the home
+seat for pinned and unpinned rooms alike (`pool_routing.py:167-176`), selecting
+a worker only on the retired `target_worker` header. v1 has no dependency on
+#3787; if it lands first it must become pin- and `requested_worker`-aware
+before anything here uses it.
+
+`requested_worker` supersedes the retired `target_worker` / `fan_out` headers
+(one writer, the server, instead of a sender-controlled field) and #3859's
+binding at ingress (`_bound_dest()` in the sparrow bridge writing
+`.assigned-<worker>` into the filename): the bridge records a field, it does
+not decide one. #3859 closed on this document.
 
 ## Commands: the owner's intent arrives as an ordinary task
 
@@ -77,8 +90,12 @@ Every pool command is an owner task, written by whatever surface the owner used
 (the ag2space app's picker or a create-worker control, a room message, voice, or
 the CLI skill), enveloped and verified like any task, with `source:` naming the
 intent. One channel, one shape, one code path to test. The core executes all of
-them: it is the only claimant no pin can divert, so a command reaches it under
-the routing rule above without any special case.
+them, and a pinned room must not divert them: a command envelope carries
+`requested_worker: core`, set by the surface that minted it, and every worker's
+handler discards a task whose `source:` is a pool command **before** it
+evaluates pin eligibility. Both fields live in the verified envelope, never in
+the body, so a room message whose text reads "resize to 0" is an ordinary task;
+the step-2 suite carries that forged-body case as a negative test.
 
 | command | effect |
 |---|---|
@@ -98,9 +115,12 @@ justify a timer, so no `proactive-loop-pool` skill ships.
 
 ## Coordination contract (claim-only; the primitives are #3604's)
 
-1. **Claim:** a claimant renames `tasks/task-X.txt` to
-   `tasks/task-X.claimed-<name>.txt`, one atomic rename, before working. There
-   is no assignment step; eligibility is the pin table.
+1. **Claim:** exclusivity is the watcher's hard-link claim
+   (`state/task-event-handler-claims/<filename>`, first link wins, a dead
+   owner's claim retired by pid); the claimant then renames `tasks/task-X.txt`
+   to `tasks/task-X.claimed-<name>.txt` as the durable record the sweep reads.
+   There is no assignment step; eligibility is `requested_worker` and the pin
+   table.
 2. **Done-flags:** `state/cores/<name>/done/task-X.flag` is written before any
    external side effect; the at-most-once floor is unchanged.
 3. **Heartbeat / lease:** per-process `.alive`, 30 s beat, 90 s stale.
@@ -110,6 +130,14 @@ justify a timer, so no `proactive-loop-pool` skill ships.
 5. **Stand-in:** while a pinned worker's beat is stale, the core claims that
    room's tasks itself, and stops the moment the beat is fresh. The pin is not
    changed; nothing is loaned or re-bound.
+6. **Busy is not hung.** A worker with a fresh beat and a claimed, unfinished
+   task is busy, and the core leaves its rooms alone. The core stands in for a
+   fresh-beat worker only when a pinned room's oldest unclaimed task is older
+   than `stand_in_after_s` (default 300) **and** the worker holds no claimed
+   task, plus one sweep of grace after its last finish. This is the claim-only
+   form of #3604's claimed-load, busy-deferral cap and post-busy grace
+   (`pool_lead.py:514-547`), so a long task never has the core answering the
+   same room concurrently.
 
 There is no election, no consensus and no degraded mode: the core is the only
 process whose absence stops work, which is already true of every install today.
@@ -128,7 +156,11 @@ process whose absence stops work, which is already true of every install today.
 
 Each claimant orders its own candidates: `urgent > normal > low`
 (`src/task_priority.py`'s contract), and within a priority oldest first by
-mtime, then claims the top. Because candidate sets are fixed by the pin table,
+mtime, then claims the top. That contract holds only for task-last writers:
+the gateway's `_TASK_FIELDS` places `task` before `priority`
+(`remote_gateway_bridge.py:1592-1604`), so the safe parser reads gateway
+priorities as absent and a gateway `urgent` sorts as `normal`. Converging the
+gateway writer on task-last is a prerequisite of step 2, its own PR. Because candidate sets are fixed by the pin table,
 priority needs no global view: the "first rename wins regardless of priority"
 defect of the 2026-05 leaderless design came from every core competing for
 every task, and pins remove the competition.
@@ -146,7 +178,8 @@ worker that stopped, carried from #3604's operations section:
 |---|---|---|
 | auth errors, `401`, expired credentials | auth state, per process | recycle that worker (`launchctl kickstart -k`); a re-login elsewhere reaches only newly started processes |
 | timeouts, 5xx | transport | back off and retry; do not touch the session |
-| beat fresh, pinned tasks sit unclaimed | hung session | the core stands in for the room; the kick script un-wedges an idle prompt |
+| beat fresh, no claimed task, a pinned task unclaimed past `stand_in_after_s` | hung session | the core stands in for the room; the kick script un-wedges an idle prompt |
+| beat fresh, a claimed task unfinished | busy | leave it; the room waits for its worker |
 | no tmux session | dead | the core's reconcile kickstarts the plist |
 
 **Codex workers have no in-session task watcher.** A Codex worker learns of a
@@ -194,8 +227,15 @@ with its own reason.
 ## Staged PRs against main
 
 1. this document;
-2. worker side: the claim path (eligibility from the pin table, priority
-   order, done-flags) and the worker heartbeat;
+2. worker side: the per-instance event handler (eligibility from
+   `requested_worker` and the pin table, priority order, done-flags) and the
+   worker heartbeat. Prerequisites, each its own PR because each edits an
+   existing file: the gateway writer converges on task-last; the watcher
+   sentinel becomes per instance (`state/watch-tasks-stream-<name>.pid` and
+   its four readers, since N watchers on one host overwrite the single file
+   today) and the fallback-receipt directory with it; the sparrow bridge
+   records `requested_worker` from the server envelope; the pin reader matches
+   `channel_id` or `chat_id`, as the lead's own regex does;
 3. core side: the pin table writer, the sweep (reclaim, stand-in, revive,
    status line, timing record), with claim and liveness tests;
 4. installer and plists, including per-worker model;
@@ -209,8 +249,10 @@ base after step 3.
 
 A router process: it earns a process only when a policy needs to see the whole
 queue at once (burst consolidation for `[deduped:]`, fairness across sets,
-fan-out, auto-scale), and every one of those is out of v1. Also out:
-auto-scale in either direction; fan-out; router-minted task ids (the admission
+auto-scale), and every one of those is out of v1. Fan-out is in, but only in
+the server-side form above (one envelope per addressed worker); a sutando-side
+fan-out of one task to N workers is out. Also out:
+auto-scale in either direction; router-minted task ids (the admission
 / census gap stays its own track, and bridges keep minting ids as they do
 today); idle-timeout rebalancing and the channel-affinity freshness gate (rooms
 bind only by pin, so there is nothing to rebalance); lane routing. Install

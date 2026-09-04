@@ -445,13 +445,13 @@
    "last_verified": "2026-08-25"
   },
   "docs/worker-pool-design.md": {
-   "title": "Worker pool — router design (v1)",
+   "title": "Worker pool — design (v1)",
    "audience": [
     "contributors",
     "maintainers"
    ],
    "status": "draft",
-   "canonical_for": "the v1 worker-pool router: core/worker/router/pool vocabulary, routing policy, lifecycle ownership, and the pool command surface",
+   "canonical_for": "the v1 worker pool: core/worker/pin-table/pool vocabulary, routing policy, lifecycle ownership, and the pool command surface",
    "last_verified": "2026-09-04"
   }
  }
