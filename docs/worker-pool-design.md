@@ -213,9 +213,10 @@ future mtime is either never eligible or immediately eligible depending on a com
 nobody specified. Re-listing everything pending removes all three questions — a task
 already claimed is skipped by the claim, not by an age test, so the gate was never
 load-bearing. Order is the queue's existing priority order, not directory order. One
-tick claims every file this instance is the candidate for, bounded by the same
-capacity/busy rule that bounds event-driven claiming; reconciliation is not a second
-scheduler and must not be able to admit work the event path would refuse.
+tick claims every file this instance is the candidate for **up to the ticker's own
+admission bound** (defined under **The reconciliation ticker**), not "the same rule as
+the event path" — the event path has no admission bound to inherit. Reconciliation is
+not a second scheduler and must not be able to outrun what the instance can run.
 
 **That sentence named a bound that does not exist, and the ticker cannot reuse what is not
 there.** Production bounds EXECUTION, not ADMISSION: `queue_handler_task` takes the dispatch
@@ -226,12 +227,34 @@ event path that claims everything and runs two is correct for events, because ev
 the rate work arrives. A ticker re-listing the whole pending directory is not rate-limited by
 anything, so "the same bound" would be no bound at all.
 
-So the ticker needs an ADMISSION bound of its own, and it is stated here rather than borrowed:
-a reconciliation pass claims at most `2 * runners` tasks beyond those already pending for this
-instance, and stops. The next tick re-lists from scratch, so a pass that stops early loses
-nothing — the same property single-flight relies on. The number is a starting point, not a
-result; what is load-bearing is that the bound is on CLAIMS and belongs to the ticker, because
-the event path has no admission bound to inherit. A suppress/suppress pair therefore costs one beat of
+So the ticker needs an ADMISSION bound of its own. **It is a bound on TOTAL OUTSTANDING, not a
+per-pass allowance** — a per-pass allowance adds its quota again every 30 s whether or not
+anything finished, which is the same unbounded growth wearing a limit:
+
+```
+runners     = TASK_HANDLER_WORKERS (src/watch-tasks-stream.sh:89, currently 2).
+              0 runners => no handler => no ticker at all, so the zero case is the
+              inertness gate, not a division by zero.
+outstanding = |DISPATCH_DIR/running| + |DISPATCH_DIR/pending|   (counted, not inferred)
+admit while   outstanding < 2 * runners,  re-counting after each claim
+```
+
+The counts come from the two directories, **not from `queue_handler_task`'s return value**,
+because that call returns success both when it enqueues and when it loses the claim to another
+instance — so a lost claim is indistinguishable from an admitted one at the call site and
+cannot be allowed to consume quota. Counting the directory instead makes the question moot:
+a lost claim leaves no marker, so it never counted.
+
+Concurrency with Created events needs no new rule: both paths take the same dispatch lock, and
+the ticker counts under it, so an event admitted mid-pass is visible to the next re-count.
+Priority is unchanged — the queue's own order — and the bound only decides where a pass stops,
+never which task is next. **The startup sweep obeys the same rule**, which is the one place an
+"only the ticker is bounded" reading would leak: a full sweep at boot is exactly the unbounded
+admission this bound exists to prevent.
+
+`2 *` is a starting point and should be tuned; what is load-bearing is that the bound is on
+CLAIMS, is measured over total outstanding, and belongs to the ticker — because the event path
+has no admission bound to inherit. A suppress/suppress pair therefore costs one beat of
 latency instead of stranding the task, in step 2 and step 3 alike.
 
 **It IS a scan, and an earlier revision claimed otherwise to make it sound cheaper.**
@@ -334,9 +357,9 @@ from scratch and a coalesced tick therefore loses nothing. This is what stops a 
 `dispatch_task` from stacking passes that each re-emit the same files.
 
 **Overrun.** A pass that outruns its period is a load signal, not an error. It is
-bounded by the same capacity/busy rule as the event path, so it can never admit work
-the event path would refuse; a pass that hits the bound stops early and the next tick
-resumes from a fresh listing rather than a saved cursor.
+bounded by the ticker's own admission bound, so it can never outrun what the instance
+can run; a pass that hits the bound stops early and the next tick resumes from a fresh
+listing rather than a saved cursor.
 
 **Shutdown.** The ticker stops before the watcher stops claiming, so no pass is
 mid-`dispatch_task` while the claim path tears down. An in-flight pass is abandoned
@@ -802,7 +825,17 @@ with its own reason.
    sort defect alone can be fixed first and separately by moving `priority`
    ahead of `task` in `_TASK_FIELDS`, exactly as #3872 did for
    `requested_worker`; that decouples the user-visible half from convergence.
-   Its own PR against an existing file, and the only one left: the watcher
+   Its own PR against an existing file, and one of TWO left. The other is the
+   **membership prerequisite**, which must land BEFORE the reconciliation ticker:
+   `instance_registry.py` gains `role: "worker"` and `pool: <name>` on the manifest
+   writer and a deregistration path (today it has neither — zero occurrences of
+   either field, against 51 of `instance`), the create/remove commands gain the
+   arm/disarm signal to the core's watcher under commit-then-notify ordering, and
+   the watcher gains the input to receive it. Its suite pins the five activation
+   edges the routing suite does not reach: core startup at zero workers, core
+   startup at nonzero, live `0 -> 1`, live `1 -> 0`, a worker arming from its own
+   manifest, and an unreadable registry failing closed to not-a-member. The
+   remaining one: the watcher
    sentinel becomes per instance (`state/watch-tasks-stream-<name>.pid` and its
    four readers, since N watchers on one host overwrite the single file today)
    and the fallback-receipt directory with it. The sparrow bridge carrying
@@ -823,7 +856,8 @@ with its own reason.
    "older than one beat" form costs a second tick, inverts priority against a fresher
    urgent task, and leaves future mtimes undefined, while buying nothing the claim does
    not already do. Order is the queue's priority order; one tick claims everything this
-   instance is the candidate for, under the same capacity/busy rule as the event path.
+   instance is the candidate for, under the ticker's own admission bound (there is no
+   event-path admission bound to inherit).
    Production scans once at startup and then reacts to Created/Renamed events only
    (`src/watch-tasks-stream.sh:639-702`), and suppression creates neither, so without
    this every zero-candidate schedule is terminal. Its suite pins BOTH reverse orders —
