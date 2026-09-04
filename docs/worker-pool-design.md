@@ -865,6 +865,14 @@ with its own reason.
    swapping between two workers' reads — plus a repin-after-suppress case where no event
    is generated at all, and one asserting the reconciliation claims through
    `dispatch_task` rather than a path of its own.
+   **Three more pin the admission bound, which the routing cases do not reach:**
+   a pass beginning with outstanding ALREADY at the bound admits nothing (the
+   pre-existing running/pending backlog counts, so the bound is not a fresh
+   per-pass allowance); a pass cut short by the bound admits in the queue's
+   PRIORITY order rather than directory order, so the cutoff never strands an
+   urgent task behind an older low-priority one; and the remainder is admitted on
+   a LATER tick once outstanding drops, from a fresh listing rather than a saved
+   cursor — which is also the control proving an early stop loses nothing.
 
    **Not a prerequisite PR, a
    requirement on step 2's own code:** the eligibility reader matches both
