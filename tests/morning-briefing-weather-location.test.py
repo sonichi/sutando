@@ -159,5 +159,45 @@ class TestWeatherUnit(unittest.TestCase):
         self.assertIn("°F", w)
 
 
+class DiagnosticAgreesWithRendering(unittest.TestCase):
+    """The operator line and the sentence it describes must read one source.
+
+    `get_weather()` resolves the location through `config_get`, which reads the
+    config stanza BEFORE os.environ. An env-only check therefore answers a
+    different question, and on the documented way to configure this — the
+    config file — it reported "default location" over a correctly configured
+    install, which trains the reader to ignore the one warning that matters.
+    """
+
+    def setUp(self):
+        self.mod = _load()
+
+    def _configured(self, cfg):
+        import sutando_config
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("WEATHER_LAT", "WEATHER_LON")}
+        with patch.dict(os.environ, clean, clear=True), \
+                patch.object(sutando_config, "config_get",
+                             lambda k, d=None: cfg.get(k, d)):
+            return self.mod.weather_location_configured()
+
+    def test_config_file_only_counts_as_configured(self):
+        # The discriminating case: env is empty, the config stanza is not.
+        self.assertTrue(self._configured({"WEATHER_LAT": "33.4255",
+                                          "WEATHER_LON": "-111.9400"}))
+
+    def test_nothing_set_is_unconfigured(self):
+        self.assertFalse(self._configured({}))
+
+    def test_a_half_set_location_is_unconfigured(self):
+        self.assertFalse(self._configured({"WEATHER_LAT": "33.4255"}))
+
+    def test_env_alone_still_counts(self):
+        """config_get falls back to os.environ, so the legacy path is intact."""
+        with patch.dict(os.environ,
+                        {"WEATHER_LAT": "33.4255", "WEATHER_LON": "-111.9400"}):
+            self.assertTrue(self.mod.weather_location_configured())
+
+
 if __name__ == "__main__":
     unittest.main()
