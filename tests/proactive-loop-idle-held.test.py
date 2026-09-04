@@ -334,6 +334,13 @@ check("--init-empty on a POPULATED record refuses and does not wipe it",
       rc == 2 and "REFUSED" in err
       and json.loads(pop.read_text())["held_item_ids"] == BASE, err[:80])
 
+corrupt = pathlib.Path(tempfile.mkdtemp()) / "s.json"
+corrupt.write_text('{"streak": 0, "noop_tot')   # truncated mid-write
+rc, _, err = run(["--state", str(corrupt), "--init-empty"])
+check("--init-empty on a CORRUPT state cannot answer and does not overwrite it",
+      rc == 2 and "not JSON" in err and corrupt.read_text() == '{"streak": 0, "noop_tot',
+      f"rc={rc} {err[:60]}")
+
 nofile = pathlib.Path(tempfile.mkdtemp()) / "nope.json"
 rc, _, err = run(["--state", str(nofile), "--init-empty"])
 check("--init-empty on a MISSING state file cannot answer, never creates one",
