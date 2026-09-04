@@ -182,7 +182,26 @@ class HitlReplyHandler:
 
 # The separator is required: without it a label prefix-matches an unrelated
 # sentence that merely starts with it, silently turning prose into a decision.
-NOTE_SEPARATORS = ("\u2014", "\u2013", "-", ":")
+NOTE_SEPARATORS = ("\u2014", "\u2013", ":", "-")
+# A bare hyphen is ordinary INSIDE a word ("Not now-ish"), so it only separates
+# at a word boundary; the dashes and colon are unambiguous on their own.
+_NEEDS_BOUNDARY = ("-",)
+
+
+def _split_note(rest: str):
+    """(note, True) when `rest` opens with a separator, else (None, False).
+
+    `rest` is the raw text after the label, whitespace INCLUDED — whether there
+    was a space before the separator is half the boundary test.
+    """
+    lead_ws = len(rest) - len(rest.lstrip())
+    body = rest.lstrip()
+    sep = body[:1]
+    if sep not in NOTE_SEPARATORS:
+        return None, False
+    if sep in _NEEDS_BOUNDARY and not lead_ws and not body[1:2].isspace():
+        return None, False          # "Not now-ish" is one word, not a decision
+    return (body[1:].strip() or None), True
 
 
 def match_action(req: HumanRequirement, text: str):
@@ -193,20 +212,26 @@ def match_action(req: HumanRequirement, text: str):
     """
     t = (text or "").strip()
     low = t.lower()
+    # Exact match across EVERY action first: with actions [Approve, Approve-all],
+    # a prefix scan lets the shorter sibling claim the longer label's click.
+    for action in req.actions:
+        for cand in (action.label or "", action.id or ""):
+            if cand.strip() and low == cand.strip().lower():
+                return action, None
+    best = None
     for action in req.actions:
         for cand in (action.label or "", action.id or ""):
             c = cand.strip()
-            if not c:
+            if not c or not low.startswith(c.lower()):
                 continue
-            if low == c.lower():
-                return action, None
-            if low.startswith(c.lower()):
-                rest = t[len(c):].lstrip()
-                if rest[:1] in NOTE_SEPARATORS:
-                    # A separator with nothing after it is still the click; the
-                    # human just left the note empty.
-                    return action, (rest[1:].strip() or None)
-    return None, None
+            note, ok = _split_note(t[len(c):])
+            if not ok:
+                continue
+            if best is None or len(c) > len(best[0]):
+                best = (c, action, note)   # longest label wins the same text
+    if best is None:
+        return None, None
+    return best[1], best[2]
 
 
 REPLY_CONTEXT_END = "[End AG2 Space reply context]"
