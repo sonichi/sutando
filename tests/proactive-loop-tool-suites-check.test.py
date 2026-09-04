@@ -202,10 +202,12 @@ with tempfile.TemporaryDirectory() as td:
     msg = buf.getvalue()
     check("it warns at all", "NOT tracked" in msg, True)
     check("it points at hosts/<host>/", "hosts/<host>/" in msg, True)
-    # The old remedy was "Add its path to vault.sync.include", which cannot
-    # reach a child of an excluded parent -- following it changes nothing.
-    check("it does not prescribe an include entry as the fix",
-          "Add its path to vault.sync.include" in msg, False)
+    # The old remedy was a bare "Add its path to vault.sync.include". A whitelist
+    # re-include DOES work in general; it fails here for two other reasons.
+    check("it does not prescribe a bare include entry as the fix",
+          "Add its path to vault.sync.include." in msg, False)
+    check("it names the carve-out ordering", "after includes" in msg, True)
+    check("it warns that include REPLACES the carrier set", "REPLACES" in msg, True)
 
 print("\ncase: a state DIRECTORY still resolves (the pre-move call shape)")
 with tempfile.TemporaryDirectory() as td:

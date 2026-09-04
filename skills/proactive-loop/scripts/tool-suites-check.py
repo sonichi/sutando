@@ -51,8 +51,8 @@ class ExtrasError(Exception):
 def extras_path(ws: Path, host: str | None = None) -> Path:
     """Where the extras declaration lives, preferring the CARRIED location.
 
-    `state/` is in the vault's exclude set, and gitignore cannot re-include a
-    child of an excluded parent, so a file under it can never be backed up.
+    An include entry for a `state/` path is re-ignored by the `state/` carve-out
+    the vault emits after the includes, and setting `include` REPLACES the set.
     """
     if host:
         carried = ws / "hosts" / host / EXTRAS
@@ -121,9 +121,11 @@ def _warn_if_uncarried(decl: Path) -> None:
     if r.returncode != 0:
         print(f"[tool-suites-check] WARNING: {decl} is NOT tracked in the workspace vault. "
               f"If it is lost, the suites it registers stop running SILENTLY (absent = no extras). "
-              f"Move it to hosts/<host>/{EXTRAS}, which the vault carries: `state/` is in the "
-              f"exclude set and gitignore cannot re-include a child of an excluded parent, so no "
-              f"vault.sync.include entry can reach it.", file=sys.stderr)
+              f"Move it to hosts/<host>/{EXTRAS}, which the vault already carries with no config "
+              f"edit. Do NOT add a state/ path to vault.sync.include: the vault emits carve-outs "
+              f"after includes so a `state/` exclude re-ignores it, and `include` REPLACES the "
+              f"carrier set rather than extending it (see sync-workspace.sh:36-45).",
+              file=sys.stderr)
 
 
 def newest_mtime(paths) -> float:
