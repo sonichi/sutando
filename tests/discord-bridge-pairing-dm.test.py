@@ -87,7 +87,7 @@ CODE = "zzz999"
 
 # ── Case 1: owner reachable → code in DM only, channel stays generic ─────────
 owner = FakeMessageable()
-channel = FakeMessageable(name="review-preflight")
+channel = FakeMessageable(name="pr-review")
 with patch.object(mod, "client", FakeClient(owner)):
     route = asyncio.run(
         mod._deliver_pairing_prompt(channel, CODE, "newuser", "42", {"777"})
@@ -95,14 +95,14 @@ with patch.object(mod, "client", FakeClient(owner)):
 check("route reported as dm", route == "dm")
 check("owner DM contains the pairing code", any(CODE in m for m in owner.sent))
 check("owner DM names the requester and channel",
-      any("newuser" in m and "review-preflight" in m for m in owner.sent))
+      any("newuser" in m and "pr-review" in m for m in owner.sent))
 check("channel got exactly one message", len(channel.sent) == 1)
 check("channel message does NOT contain the code",
       all(CODE not in m for m in channel.sent), f"leaked: {channel.sent}")
 
 # ── Case 1b: BEFORE/AFTER channel-leak contrast ──────────────────────────────
 # Reconstructs the pre-fix call so the leak is demonstrated, not just asserted.
-_before_ch = FakeMessageable(name="review-preflight")
+_before_ch = FakeMessageable(name="pr-review")
 asyncio.run(_before_ch.send(f"Pairing required. Ask the owner to run:\n`/discord:access pair {CODE}`"))
 before_leaked = any(CODE in m for m in _before_ch.sent)
 # AFTER: same event, owner reachable → channel post generic, code only in DM.
@@ -117,7 +117,7 @@ check("AFTER-fix: the code is delivered only via the owner DM",
 
 # ── Case 2: owner unreachable → fail-SAFE fallback, code NOT leaked ──────────
 # The fallback must not recreate the leak: channel notice stays code-free.
-channel2 = FakeMessageable(name="review-preflight")
+channel2 = FakeMessageable(name="pr-review")
 with patch.object(mod, "client", FakeClient(None)):
     route2 = asyncio.run(
         mod._deliver_pairing_prompt(channel2, CODE, "newuser", "42", {"777"})
