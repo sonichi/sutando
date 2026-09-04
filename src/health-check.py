@@ -9354,15 +9354,22 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     # it holds; only these four sets carry a followed origin.
     proven = os_names | getenv_names | environ_names | expandvars_names
 
-    def _callee_bases(expr) -> set:
-        """Head name of every callee in expr — unresolved_call() already judged
-        these, so the import merely names a module it followed."""
+    def _callee_base_nodes(expr) -> set:
+        """id() of the Name NODE at the base of each callee chain.
+
+        Node-specific, not name-wide: `helper.resolve_workspace()` follows the
+        call while `helper.WORKSPACE` two characters away is an opaque value,
+        and exempting the NAME exempts both.
+        """
         out = set()
         for c in ast.walk(expr):
-            if isinstance(c, ast.Call):
-                d = _dots(c.func)
-                if d:
-                    out.add(d.split(".")[0])
+            if not isinstance(c, ast.Call):
+                continue
+            f = c.func
+            while isinstance(f, ast.Attribute):
+                f = f.value
+            if isinstance(f, ast.Name):
+                out.add(id(f))
         return out
 
     def _keyed(node) -> bool:
@@ -9497,11 +9504,13 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
         def opaque_import(expr) -> "str | None":
             """An imported name read as a VALUE. Same edge as an unresolved call,
             so it must run in the fixpoint too: one local hop hides it otherwise."""
-            bases = _callee_bases(expr)
-            for x in (n.id for n in ast.walk(expr) if isinstance(n, ast.Name)):
+            callee = _callee_base_nodes(expr)
+            for n in ast.walk(expr):
+                if not isinstance(n, ast.Name) or id(n) in callee:
+                    continue
+                x = n.id
                 if (x in imported and x not in proven and x not in bound
-                        and x not in modfns and x not in _RESOLVED_CALLS
-                        and x not in bases):
+                        and x not in modfns and x not in _RESOLVED_CALLS):
                     return f"the imported value {x}"
             return None
 
