@@ -15,17 +15,22 @@ HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 sys.path.insert(0, str(HOOKS))
 import _shell_scan as scan  # noqa: E402
 
-MARK = "\x01ARG\x01"
+START, END = b"\x01", b"\x02"
 
 
 def bash_argv(command, program="gh"):
-    """The argv bash actually hands `program`, or None when bash refuses."""
-    script = (f"{program}() {{ printf '{MARK}%s\\n' \"$@\"; }}\n"
-              f"my-tool() {{ printf '{MARK}%s\\n' \"$@\"; }}\n" + command)
-    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
-    if r.returncode != 0 and MARK not in r.stdout:
+    """The argv bash actually hands `program`, or None when bash refuses.
+
+    Binary, and delimited by bytes that cannot occur in a newline: text mode
+    rewrites \r to \n and splitlines() splits on it, so a line-oriented oracle
+    cannot express any argument containing a carriage return.
+    """
+    script = (f"{program}() {{ printf '\\x01%s\\x02' \"$@\"; }}\n"
+              f"my-tool() {{ printf '\\x01%s\\x02' \"$@\"; }}\n" + command)
+    r = subprocess.run(["bash", "-c", script], capture_output=True)
+    if r.returncode != 0 and START not in r.stdout:
         return None
-    return [ln[len(MARK):] for ln in r.stdout.splitlines() if ln.startswith(MARK)]
+    return [c.split(END)[0].decode() for c in r.stdout.split(START)[1:]]
 
 
 def scan_argv(command, program="gh"):
@@ -59,6 +64,11 @@ class MatchesBash(unittest.TestCase):
         'gh pr comment 1 --body "paren ( ) inside"',
         'gh pr comment 1 --body "literal \\$(true)"',
         '"gh" pr comment 1 --body "quoted program"',
+        # A newline separates commands; a CR does not. The replaced normaliser's
+        # two copies differed exactly here, so pin against bash, not reasoning.
+        'gh release create v1 --target abc123\ngh pr view 2',
+        'gh release create v1 --target abc123\r\ngh pr view 2',
+        'gh release create v1 --target abc123\rgh pr view 2',
     ]
 
     # bash rewrites these too and we deliberately do NOT flag them: `$VAR` is an
