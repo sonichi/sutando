@@ -265,8 +265,30 @@ lifecycle that clears a `running/` marker. Then:
 - an admission made by the EVENT path is visible to the ticker on its next recount, because it
   left the same kind of receipt.
 
-Count, claim and receipt happen under ONE hold of the dispatch lock, so the three cannot
-interleave; a Created event admitted between passes is visible to the next re-count.
+**One lock hold for count+claim+receipt DEADLOCKS, and the source says so.** An earlier
+revision prescribed exactly that. `acquire_dispatch_lock` is a `mkdir` spinlock with no
+timeout (`src/watch-tasks-stream.sh:220-226`), reconciliation must call `dispatch_task`,
+and its queued branch calls `queue_handler_task`, which takes that same lock (`:353`) —
+so the ticker holding it would spin on its own hold forever. The code carries the warning
+verbatim at `:289-290`: *"the dispatch lock is a mkdir spinlock with no timeout — a nested
+call would deadlock on it."*
+
+**So the lock has ONE owner, and it is `queue_handler_task`, not the ticker.** The ticker
+never holds the dispatch lock; it calls `dispatch_task` exactly as an event does. The
+atomicity the bound needs is therefore not one outer hold but a **count-and-claim
+primitive inside the existing critical section**: `queue_handler_task` already holds the
+lock across its marker test and `acquire_task_claim`, so the admission test belongs there
+too, and it returns the outcome the ticker reads (`queued` / `direct` / `lost` /
+`suppressed` / `refused-over-bound`). Step 2 must ship that already-locked primitive
+rather than a second lock, and exercise it against a Created event racing a pass — the
+case an outer hold was reaching for and could not have survived.
+
+**The startup sweep obeys the same bound**, restated because an earlier revision of this
+section dropped the sentence while rewriting around it: production loops every pre-existing
+`tasks/*.txt` through `dispatch_task` at boot, so without this a restart carrying a backlog
+claims and emits the whole of it before any ticker exists. Startup IS the first
+reconciliation pass, bounded like every other, and its control uses a backlog larger than
+the cap.
 
 `2 *` is a starting point and should be tuned; what is load-bearing is that the bound is on
 CLAIMS, is measured over total outstanding, and belongs to the ticker — because the event path
