@@ -232,21 +232,34 @@ per-pass allowance** — a per-pass allowance adds its quota again every 30 s wh
 anything finished, which is the same unbounded growth wearing a limit:
 
 ```
-runners     = TASK_HANDLER_WORKERS (src/watch-tasks-stream.sh:89, currently 2).
-              0 runners => no handler => no ticker at all, so the zero case is the
-              inertness gate, not a division by zero.
-outstanding = |DISPATCH_DIR/running| + |DISPATCH_DIR/pending|   (counted, not inferred)
+handler?    = DISPATCH_DIR is non-empty (src/watch-tasks-stream.sh:91 initialises it to "").
+              THIS is how "no handler" is represented — NOT runners == 0. TASK_HANDLER_WORKERS
+              is unconditionally 2 at :89, so a zero there is unreachable and cannot carry the
+              inertness case. The ticker requires a pool, a pool requires a handler, so an
+              empty DISPATCH_DIR means the ticker is not armed in the first place.
+runners     = TASK_HANDLER_WORKERS (:89) while a handler exists.
+admitted    = claims THIS PASS has made, counted by the ticker itself
+outstanding = |DISPATCH_DIR/running| + |DISPATCH_DIR/pending| + admitted
 admit while   outstanding < 2 * runners,  re-counting after each claim
 ```
 
-The counts come from the two directories, **not from `queue_handler_task`'s return value**,
-because that call returns success both when it enqueues and when it loses the claim to another
-instance — so a lost claim is indistinguishable from an admitted one at the call site and
-cannot be allowed to consume quota. Counting the directory instead makes the question moot:
-a lost claim leaves no marker, so it never counted.
+**`admitted` is not bookkeeping — without it the bound counts a population the bounded path
+does not populate.** `dispatch_task` has three receipt-less exits: an empty `DISPATCH_DIR`
+(`:373-375`), a handler that declines with rc 3 (`:398-399`), and a failed probe falling back to
+the live core (`:400-402`). Only `queue_handler_task` writes a `pending/` marker (`:358`). So a
+pass whose candidates take any of those routes leaves the directory count unchanged and could
+claim the entire backlog while reading zero outstanding. The ticker therefore counts **its own
+admissions**, and a receipt-less emit consumes quota exactly like a queued one — the task was
+admitted either way, which is what the bound is about.
 
-Concurrency with Created events needs no new rule: both paths take the same dispatch lock, and
-the ticker counts under it, so an event admitted mid-pass is visible to the next re-count.
+The directory half stays because it is the only thing that sees work admitted by the EVENT path
+and by other instances, and because it cannot be fooled by `queue_handler_task`'s return value:
+that call reports success both when it enqueues and when it loses the claim, so a lost claim is
+indistinguishable from an admitted one at the call site. A lost claim leaves no marker and the
+ticker does not increment `admitted` for it, so it never consumes quota by either route.
+
+Count, claim and receipt happen under ONE hold of the dispatch lock, so the three cannot
+interleave; a Created event admitted between passes is visible to the next re-count.
 Priority is unchanged — the queue's own order — and the bound only decides where a pass stops,
 never which task is next. **The startup sweep obeys the same rule**, which is the one place an
 "only the ticker is bounded" reading would leak: a full sweep at boot is exactly the unbounded
@@ -860,7 +873,10 @@ with its own reason.
    event-path admission bound to inherit).
    Production scans once at startup and then reacts to Created/Renamed events only
    (`src/watch-tasks-stream.sh:639-702`), and suppression creates neither, so without
-   this every zero-candidate schedule is terminal. Its suite pins BOTH reverse orders —
+   this every zero-candidate schedule is terminal. Its suite ALSO pins a
+   direct-emitter backlog (candidates taking a receipt-less `dispatch_task` exit still
+   consume the bound), a no-handler start (empty `DISPATCH_DIR` arms no ticker), and a
+   Created event interleaved with a pass. It pins BOTH reverse orders —
    the beat crossing stale between the core's read and the target's, and the pin
    swapping between two workers' reads — plus a repin-after-suppress case where no event
    is generated at all, and one asserting the reconciliation claims through
