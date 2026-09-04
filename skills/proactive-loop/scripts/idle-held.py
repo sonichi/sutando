@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 import re
 import subprocess
@@ -306,14 +305,21 @@ def main(argv=None) -> int:
         print(f"{len(moved)} orphan note(s)"
               + ("" if a.write else "  (not written; pass --write)"), file=sys.stderr)
         if a.write:
-            notes = doc["held_item_notes"]
-            arch = doc.setdefault(ARCHIVE_KEY, {})
             stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            for k in moved:
-                arch[k] = {"note": notes.pop(k), "archived_at": stamp}
-            tmp = state.with_suffix(state.suffix + ".tmp")
-            tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
-            os.replace(tmp, state)
+
+            def archive(fresh):
+                # Re-derive from the doc read under the lock: `moved` above came
+                # from a snapshot and the notes may have changed since.
+                again, err2 = archive_orphan_notes(fresh, stamp)
+                if err2 or not again:
+                    return ABORT
+                notes = fresh["held_item_notes"]
+                arch = fresh.setdefault(ARCHIVE_KEY, {})
+                for k in again:
+                    arch[k] = {"note": notes.pop(k), "archived_at": stamp}
+                return None
+
+            locked_update(state, archive, indent=2)
         return 0
 
     if a.audit_prs:
@@ -355,13 +361,21 @@ def main(argv=None) -> int:
         print(f"  removed {rid}: {why}", file=sys.stderr)
 
     if a.write:
-        doc[KEY] = after
-        log = doc.setdefault("held_item_removals", [])
-        for rid, why in zip(a.remove, a.reason):
-            log.append({"id": rid, "reason": why})
-        tmp = state.with_suffix(state.suffix + ".tmp")
-        tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
-        os.replace(tmp, state)
+        def apply_under_lock(fresh):
+            # The ops are a DIFF, so re-apply them to the doc read under the
+            # lock rather than writing back the snapshot `after` came from.
+            fresh[KEY], errs2 = apply_ops(fresh.get(KEY) or [], adds, a.remove)
+            if errs2:
+                for e in errs2:
+                    print(f"REFUSED: {e}", file=sys.stderr)
+                return ABORT
+            log = fresh.setdefault("held_item_removals", [])
+            for rid, why in zip(a.remove, a.reason):
+                log.append({"id": rid, "reason": why})
+            return None
+
+        if locked_update(state, apply_under_lock, indent=2) is ABORT:
+            return 1
     return 0
 
 

@@ -143,6 +143,45 @@ check("CONTROL: and it LOSES counts, so the locked assertion is discriminating",
       lost < N, f"unlocked total={lost}; equal to {N} means the barrier did not "
                 f"overlap the windows and this harness cannot see the bug")
 
+# The --commit writer used to read outside the lock and replace the whole doc,
+# so a locked write landing in that window was erased and --commit reported ok.
+_HELD = str(SCRIPTS / "idle-held.py")
+_race = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+_race.write_text(json.dumps({"held_item_ids": [], "last_surfaced_hash": "stale"}))
+
+_sys.path.insert(0, str(SCRIPTS))
+import idle_state as _ist            # the shared owner both writers use
+_orig_read = _ist.read_state
+_spawned = {}
+def _read_then_race(path):
+    doc = _orig_read(path)
+    if not _spawned:                 # once, while --commit holds the lock
+        _spawned["p"] = subprocess.Popen(
+            [_sys.executable, "-B", _HELD, "--state", str(path),
+             "--add", "raced:owner", "--write"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(0.4)              # let it reach and block on the lock
+    return doc
+
+_ish_orig_read = ish.read_state
+_ist.read_state = _read_then_race
+ish.read_state = _read_then_race
+try:
+    ish.main(["--state", str(_race), "--items", '[["a","owner"]]', "--commit"])
+finally:
+    _ist.read_state = _orig_read
+    ish.read_state = _ish_orig_read
+_spawned["p"].wait(timeout=20)
+
+_final = json.loads(_race.read_text())
+check("CONCURRENCY: --commit does not erase a locked write from idle-held",
+      _final.get("held_item_ids") == [["raced", "owner"]],
+      f"held_item_ids={_final.get('held_item_ids')!r}")
+check("CONCURRENCY: and --commit's own hash still landed",
+      _final.get("last_surfaced_hash") == ish.held_hash([["a", "owner"]]),
+      f"hash={_final.get('last_surfaced_hash')!r}")
+
+
 print(f"\nidle-surface-hash: {ran - len(fails)}/{ran} passed")
 if fails:
     print("FAILED: " + ", ".join(fails))

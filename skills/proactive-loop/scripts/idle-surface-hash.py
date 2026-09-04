@@ -134,31 +134,39 @@ def main(argv=None) -> int:
         return 2
 
     path = Path(a.state)
-    doc = read_state(path)
-    changed = doc.get("last_surfaced_hash") != h
-    prev = doc.get("last_surfaced_ids")
-    have_ids = isinstance(prev, list)
-    if changed:
-        # Without the previous ids a hash change is unauditable: a renamed id
-        # and a genuinely new blocker are the same opaque digest move.
-        if have_ids:
-            now = set(lines)
-            before = set(str(x) for x in prev)
-            added, gone = sorted(now - before), sorted(before - now)
-            print(f"changed: +{added} -{gone}", file=sys.stderr)
-        else:
-            print("changed: no previous ids recorded (first commit "
-                  "or pre-upgrade state)", file=sys.stderr)
-    elif a.commit and not have_ids:
-        # A legacy state carries the hash but no ids. A quiet pass is the only
-        # cheap chance to seed them BEFORE the set moves and needs explaining.
-        print("backfilled: recorded ids for an existing hash", file=sys.stderr)
-    if a.commit and (changed or not have_ids):
+    seen = {}
+
+    def compare_and_commit(doc):
+        # Compare INSIDE the lock: a doc read before acquiring it is stale, so
+        # committing it back erases whatever landed in between.
+        changed = doc.get("last_surfaced_hash") != h
+        prev = doc.get("last_surfaced_ids")
+        have_ids = isinstance(prev, list)
+        seen["changed"] = changed
+        if changed:
+            # Without the previous ids a hash change is unauditable: a renamed
+            # id and a genuinely new blocker are the same opaque digest move.
+            if have_ids:
+                now = set(lines)
+                before = set(str(x) for x in prev)
+                added, gone = sorted(now - before), sorted(before - now)
+                print(f"changed: +{added} -{gone}", file=sys.stderr)
+            else:
+                print("changed: no previous ids recorded (first commit "
+                      "or pre-upgrade state)", file=sys.stderr)
+        elif a.commit and not have_ids:
+            # A legacy state carries the hash but no ids. A quiet pass is the
+            # only cheap chance to seed them BEFORE the set moves.
+            print("backfilled: recorded ids for an existing hash", file=sys.stderr)
+        if not (a.commit and (changed or not have_ids)):
+            return ABORT
         doc["last_surfaced_hash"] = h
         doc["last_surfaced_ids"] = lines
         doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        write_state(path, doc)
-    print(f"{'post' if changed else 'quiet'} {h}")
+        return None
+
+    locked_update(path, compare_and_commit)
+    print(f"{'post' if seen['changed'] else 'quiet'} {h}")
     return 0
 
 
