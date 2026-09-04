@@ -10,6 +10,11 @@ sends (a bounced mention notifies no one).
 
 Usage:
   notify_reviewers.py --reviewers rui,kewei --message "re-review #3303" [--send]
+  notify_reviewers.py --reviewers rui,kewei --body-file ask.md [--send]
+
+Use --body-file for any prose carrying backticks, $ or an apostrophe: the shell
+rewrites those before argv reaches this process, so no validation here can
+recover the original. Same policy as bot2bot-post and discord-bridge.
 
 Without --send it prints the exact room_ops commands (plan mode). A refused
 entry never starves the batch: resolvable reviewers are still notified and
@@ -45,7 +50,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roster_union import host_rosters, roster_union
+from roster_union import host_rosters, roster_login, roster_union
 
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
 
@@ -263,16 +268,28 @@ def _is_collaborator(repo: str, login: str) -> bool:
 def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     """(login GitHub can answer for, why) — a roster key is not always one.
 
+    Explicit roster fields win over the key itself, unconditionally: a roster
+    key can coincide with an unrelated real login, and then the key is not
+    evidence. Which field declares that login is roster_union.roster_login's
+    call, not this reader's.
+
     `johnm-desktop` is a Stand handle, not a login; probing it 404s and the
     capability check degrades to a silent no-op on exactly the aliased keys
     `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
     """
     entry = (roster or {}).get(name) or {}
+    # `or {}` keeps a truthy non-dict, and a hand-edited roster produces one.
+    entry = entry if isinstance(entry, dict) else {}
+    gh, field = roster_login(entry)
+    # Not probed: _is_github_user collapses "no such user" and "probe failed",
+    # so a timeout would discard owner-stated identity for the colliding key.
+    if gh:
+        return gh, f"roster {field} -> {gh}"
+    sib = entry.get("same_actor_as")
+    if sib:
+        return sib, f"via same_actor_as -> {sib}"
     if _is_github_user(name):
         return name, "key is a login"
-    sib = entry.get("same_actor_as")
-    if sib and _is_github_user(sib):
-        return sib, f"via same_actor_as -> {sib}"
     return name, "no login found for this key"
 
 
@@ -1332,11 +1349,34 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
                   f"Not yet asked: {', '.join(unasked) or '<roster exhausted>'}")
 
 
+def resolve_body(message, body_file) -> str:
+    """The ask body, from argv or from a file — exactly one of the two.
+
+    A body that reached argv has already been through the shell and cannot be
+    recovered, so --body-file is the only path that preserves backticks and $.
+    """
+    if (message is None) == (body_file is None):
+        raise SystemExit("ERROR: give exactly one of --message or --body-file")
+    if body_file is None:
+        return message
+    # Imported here, not at module scope: `_REPO` is positional, so a copy run
+    # from elsewhere has no src/ path and a top-level import breaks --message too.
+    from body_file import read_body_file
+    text = read_body_file(body_file)
+    if not text.strip():
+        raise SystemExit(f"ERROR: --body-file {body_file!r} is empty — refusing to send")
+    return text
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--reviewers", required=True,
                     help="comma-separated roster keys")
-    ap.add_argument("--message", required=True)
+    ap.add_argument("--message", default=None)
+    ap.add_argument("--body-file", dest="body_file", default=None,
+                    help="read the message from a FILE instead of argv. Use it for any "
+                         "prose containing backticks, $ or an apostrophe — the shell "
+                         "mangles those before this script can see them.")
     ap.add_argument("--send", action="store_true")
     ap.add_argument("--allow-single", metavar="REASON", default="",
                     help="deliberately notify ONE reviewer; requires a reason")
@@ -1350,10 +1390,11 @@ def main() -> int:
                          "Stand is not a member THERE is REFUSED rather than silently notified "
                          "in their recorded room — correctly addressed, wrong venue.")
     a = ap.parse_args()
+    a.message = resolve_body(a.message, a.body_file)
     names = list(dict.fromkeys(n.strip() for n in a.reviewers.split(",") if n.strip()))
     roster = load_roster()
-    # resolve() owns per-person dedup (actor OR durable endpoint) so the
-    # two-reviewer gate below counts PEOPLE, not roster rows.
+    # resolve() dedups per person, so the two-reviewer gate counts PEOPLE, not
+    # roster rows; gates then run on RESOLVED targets, never a partial batch.
     targets, refusal_rc = resolve(names, roster)
     # A read-only approval looks identical in the UI and discharges nothing, so
     # ask the repo named in the message rather than trusting a cached tier.

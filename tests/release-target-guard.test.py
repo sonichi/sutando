@@ -38,6 +38,20 @@ class TestOffenders(unittest.TestCase):
     def test_equals_form_is_the_same_case(self):
         self.assertEqual(G.offenders(f"gh release create v1 --target={SHORT}"), [SHORT])
 
+    def test_a_NUL_escape_cannot_hide_an_abbreviated_sha(self):
+        """bash truncates the $'...' span at a NUL, so gh receives the sha alone.
+        A scanner that keeps the NUL sees a longer, non-matching target and lets
+        the paste through. All three spellings reach the same argv."""
+        for lit in ("\\0", "\\x00", "\\000"):
+            cmd = f"gh release create v1 --target $'{SHORT}{lit}suffix'"
+            self.assertEqual(G.offenders(cmd), [SHORT], f"under-deny via {lit}")
+
+    def test_the_bare_control_still_denies(self):
+        """Without it, the case above could pass because the guard denies
+        everything, which would pin nothing."""
+        self.assertEqual(G.offenders(f"gh release create v1 --target {SHORT}"), [SHORT])
+        self.assertEqual(G.offenders("gh release create v1 --target main"), [])
+
     def test_a_seven_char_sha_is_still_abbreviated(self):
         self.assertEqual(G.offenders("gh release create v1 --target 544a68f"), ["544a68f"])
 
