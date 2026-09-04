@@ -79,6 +79,28 @@ Eligibility is **one value, computed once**: the core evaluates it in its sweep
 it alongside the pool status; handlers read that verdict rather than each
 recomputing it from beats they can only partially observe.
 
+**That publisher is a step-3 component, and the handler ships in step 2** — so the
+wedge path has a window with a consumer and no producer, which is a latent no-op at
+best and a silent misroute at worst. It is resolved by a stated default rather than
+by ordering luck: **when the record is absent, unreadable, or stale, every
+fresh-beat target is eligible** — exactly the behaviour before this rule existed, so
+step 2 is a no-regression change and the wedge path simply does not fire until step
+3 lands the sweep. Defaulting the other way would divert healthy pinned work to the
+core for the whole window, breaking the pin contract to fix a case that cannot yet
+be detected. Step 2's suite pins the default with the record absent and with it
+corrupt; step 3's pins the transition.
+
+The record's contract, because a routing-critical shared file without one drifts:
+**one writer** (the core sweep; a worker that writes it is a defect, not a
+fallback), written **atomically** by temp-file plus `os.replace` so a reader never
+sees a partial file, carrying a **`computed_at`** stamp and a per-instance verdict.
+A record older than two sweep intervals is **stale**, and stale reads as absent —
+not as its last value, which is how a dead publisher would otherwise keep a worker
+diverted indefinitely. A parse failure reads as absent too. This is the same
+one-writer/atomic/fail-toward-absence shape `core-status.json` already uses, and
+for the same reason: a truncated read of a status file was taken as a verdict once
+already.
+
 1. `requested_worker` names this instance: claim, then emit to this session.
    Names another instance whose beat is fresh: **suppress**.
    Names an instance whose beat is stale: the core claims and emits (stand-in),
@@ -141,6 +163,12 @@ claim today — probe exit 3 prints `TASK_FILE:` directly (`:398-400`) — so
 claim-before-emit is a change to that path, not a rule expressible over it. Step 2
 must add both the suppress disposition and the claim on emit before this rule can
 be implemented; until then the rule is a contract, not a description.
+
+The trace below reads beats directly because it models the step-2 window, where the
+published record does not exist and every fresh-beat target is eligible by the
+default above. Once step 3 lands, "fresh" in it means the published verdict; the
+race it demonstrates is unchanged either way, because the claim — not the freshness
+read — is what decides.
 
 Traced for the case the rule used to get wrong — a task with no
 `requested_worker` in a room pinned to worker-2, with worker-2 fresh — and
