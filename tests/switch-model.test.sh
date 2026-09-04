@@ -74,4 +74,17 @@ rc=$(run sonnet); rmdir "$T/cfg/settings.json"; mv "$T/cfg/settings.bak" "$T/cfg
 grep -q "prior switch record kept" "$T/err" && ok "21 ...and the message says the prior record was kept" || fail "21 msg" "$(cat "$T/err")"
 [ -z "$(ls -A "$T/state" | grep staged)" ] && ok "22 ...and no staged file is left behind" || fail "22 staged leftover" "$(ls -A "$T/state")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 22 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- the record path is a DIRECTORY: the pin must not survive unrecorded
+rm -f "$T/state/model-switch.json"; mkdir -p "$T/state/model-switch.json"; : > "$T/tmux.log"; PRIOR="$(cat "$T/cfg/settings.json")"
+rc=$(run sonnet); rmdir "$T/state/model-switch.json"
+[ "$rc" = 1 ] && [ "$(cat "$T/cfg/settings.json")" = "$PRIOR" ] && ! grep -q send-keys "$T/tmux.log" \
+  && ok "23 record commit fails after the pin: settings rolled back to the prior bytes, nothing sent" || fail "23 rollback" "rc=$rc $(cat "$T/cfg/settings.json")"
+grep -q "rolled back" "$T/err" && ok "24 ...and the message says so" || fail "24 msg" "$(cat "$T/err")"
+# --- a descriptor whose paths carry spaces must survive the JSON->shell hop
+mkdir -p "$T/Brain With Spaces"; printf '{"model":"claude-opus-5"}\n' > "$T/Brain With Spaces/settings.json"
+printf '{"brain":"%s","socket":"/private/tmp/socket path/s.sock","session":"core name"}\n' "$T/Brain With Spaces" > "$T/desc.json"
+rc=$(env -u SUTANDO_TMUX_SOCKET -u SUTANDO_TMUX_SESSION "$HERE/scripts/switch-model.sh" haiku --dry-run --descriptor-file "$T/desc.json" --state-dir "$T/state" > "$T/out" 2> "$T/err"; echo $?)
+grep -q "Brain With Spaces/settings.json" "$T/out" && grep -q -- "-S /private/tmp/socket path/s.sock -t core name" "$T/out" \
+  && ok "25 descriptor paths with spaces reach brain/socket/session intact" || fail "25 spaces" "$(cat "$T/out")"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 25 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

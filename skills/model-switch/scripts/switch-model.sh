@@ -4,10 +4,10 @@
 # runtime's settings.json (next launch), send `/model <model>` to the live core
 # pane (now). The record is written first so a pin can never exist unrecorded.
 set -u
-MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"
+MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"
 while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY=1;; --state-dir) STATE_DIR="${2:?}"; shift;;
-  --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;;
+  --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
   -*) echo "switch-model: unknown flag $1" >&2; exit 2;;
   *) [ -z "$MODEL" ] && MODEL="$1" || { echo "switch-model: one model, got '$1' too" >&2; exit 2; };;
 esac; shift; done
@@ -20,12 +20,14 @@ REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin)"
 # Defaults come from the configured core's runtime descriptor (brain, socket,
 # session — runtime-authored, foreign-caller safe), never from ambient env.
-DESC="$(bash "$REPO/scripts/sutando-config.sh" runtime 2>/dev/null)"
-read -r DBRAIN DSOCK DSESSION <<EOF_DESC
+if [ -n "$DESCF" ]; then DESC="$(cat "$DESCF")"; else DESC="$(bash "$REPO/scripts/sutando-config.sh" runtime 2>/dev/null)"; fi
+# One field per line, read whole-line: a brain under "Application Support" or a
+# spaced socket/session must survive the hop from JSON into shell variables.
+{ IFS= read -r DBRAIN; IFS= read -r DSOCK; IFS= read -r DSESSION; } <<EOF_DESC
 $(printf '%s' "$DESC" | "$PY" -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: d={}
-print(d.get("brain") or "", d.get("socket") or "", d.get("session") or "")')
+for k in ("brain","socket","session"): print(str(d.get(k) or "").replace("\n"," "))')
 EOF_DESC
 [ -n "$BRAIN" ] || BRAIN="${DBRAIN:-$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir)}"
 CFG="$BRAIN/settings.json"
@@ -62,8 +64,10 @@ fi
 OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" <<'PYEOF'
 import json, os, sys, time, tempfile
 cfg, model, state_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-try: data = json.load(open(cfg))
-except (OSError, ValueError): data = {}
+try: prior_bytes = open(cfg, "rb").read()
+except OSError: prior_bytes = None
+try: data = json.loads(prior_bytes) if prior_bytes is not None else {}
+except ValueError: data = {}
 prev = data.get("model")
 rec = {"model": model, "previous": prev, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
        "by": "skills/model-switch/scripts/switch-model.sh", "settings": cfg}
@@ -86,13 +90,31 @@ except OSError as e:
     try: os.remove(staged)
     except OSError: pass
     print(f"PIN-FAILED {e}"); sys.exit(1)
-os.replace(staged, rec_path)
+try:
+    os.replace(staged, rec_path)
+except OSError as e:
+    # The pin landed but cannot be recorded: an unrecorded pin is the one state
+    # this transaction forbids, so restore the exact prior settings bytes.
+    try:
+        if prior_bytes is None:
+            os.remove(cfg)
+        else:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(cfg), prefix=".settings.")
+            with os.fdopen(fd, "wb") as f: f.write(prior_bytes)
+            os.replace(tmp, cfg)
+        rolled = "settings rolled back to the prior bytes"
+    except OSError as e2:
+        rolled = f"ROLLBACK FAILED ({e2}) — settings.json is pinned and UNRECORDED"
+    try: os.remove(staged)
+    except OSError: pass
+    print(f"RECORD-COMMIT-FAILED {e}; {rolled}"); sys.exit(1)
 print(f"OK {prev if prev else '-'}")
 PYEOF
 )"; RC=$?
 case "$OUT" in
   RECORD-FAILED*) echo "switch-model: could not write the switch record ($STATE_DIR) — nothing changed: ${OUT#RECORD-FAILED }" >&2; exit 1;;
   PIN-FAILED*)    echo "switch-model: settings pin FAILED ($CFG) — prior switch record kept, nothing changed: ${OUT#PIN-FAILED }" >&2; exit 1;;
+  RECORD-COMMIT-FAILED*) echo "switch-model: switch record could not be committed ($STATE_DIR/model-switch.json) — ${OUT#RECORD-COMMIT-FAILED }" >&2; exit 1;;
   OK*) ;;
   *) echo "switch-model: unexpected python outcome (rc=$RC): $OUT" >&2; exit 1;;
 esac
