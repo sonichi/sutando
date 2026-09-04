@@ -131,13 +131,20 @@ the body, so a room message whose text reads "resize to 0" is an ordinary task.
 **"In the envelope" means minted before the stamp, not appended after it.**
 `stamp_text` MACs the whole body, so a field appended post-mint either
 invalidates the stamp or displaces it, and a displacing edit reads `unsigned`
-rather than `invalid` — tamper is not always loud. `collaborator` is written by
-direct append today, which makes its guarantee bridge discipline rather than
-cryptography; `requested_worker` and the command marker do not follow that
-precedent, because the server writes them into the body it then stamps. The
-step-2 suite therefore carries two negative tests: a forged body line, and a
-`requested_worker` added after stamping, which must be refused on the `unsigned`
-verdict rather than honoured.
+rather than `invalid` — tamper is not always loud. The server writes
+`requested_worker` and the command marker into the body it then stamps, the way
+`collaborator` already is (its append at `remote_gateway_bridge.py:2722` feeds
+the same list the single stamp call at `:2811` hands to the stamper; CLAUDE.md's
+"bypassing `serialize_task_last`'s key check" means the key allowlist, not the
+stamp).
+
+Being inside the stamp is not the same as being verified, which is why step 2
+still owes the test: `apply_task_stamper` is fail-open by design, returning the
+text unchanged when no stamper is injected and when one raises, so a task is
+never lost but may be unstamped. "The field is in the verified envelope" is
+therefore a property of a stamped task, not of every task. The step-2 suite
+carries two negative tests: a forged body line, and a `requested_worker` added
+after stamping, refused on the `unsigned` verdict rather than honoured.
 
 | command | effect |
 |---|---|
