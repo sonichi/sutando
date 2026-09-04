@@ -356,6 +356,7 @@ if not TOKEN:
 TASKS_DIR = REPO / "tasks"
 RESULTS_DIR = REPO / "results"
 STATE_DIR = REPO / "state"
+SANDBOX_PROMPTS_DIR = STATE_DIR / "sandbox-prompts"
 ARCHIVE_TASKS_DIR = REPO / "tasks" / "archive"
 ARCHIVE_RESULTS_DIR = REPO / "results" / "archive"
 OWNER_ACTIVITY_FILE = STATE_DIR / "last-owner-activity.json"
@@ -579,13 +580,63 @@ def archive_path(kind: str, task_id: str) -> "Path":
     return month_dir / f"{task_id}.txt"
 
 
+def sandbox_prompt_path(task_id: str) -> "Path":
+    """Where the prompt the core inlines into the sandbox command lives: under the
+    workspace, never /tmp, which is the cwd the untrusted tier is started in."""
+    return SANDBOX_PROMPTS_DIR / f"{task_id}.txt"
+
+
+def write_sandbox_prompt(task_id: str, text: str) -> "Path":
+    # 0700/0600: a read-only sandbox reads anything its user can, so the prompt
+    # must be unreachable by path, not merely outside its working directory.
+    SANDBOX_PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(SANDBOX_PROMPTS_DIR, 0o700)
+    path = sandbox_prompt_path(task_id)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+    return path
+
+
+def remove_sandbox_prompt(task_id: str) -> bool:
+    try:
+        sandbox_prompt_path(task_id).unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def sweep_sandbox_prompts(max_age_s: float = 600.0, now: float = None) -> int:
+    """Remove prompts whose task is no longer live and is older than max_age_s;
+    covers tasks the core archives itself, which never pass through archive_file."""
+    now = time.time() if now is None else now
+    removed = 0
+    try:
+        entries = list(SANDBOX_PROMPTS_DIR.iterdir())
+    except FileNotFoundError:
+        return 0
+    for f in entries:
+        if f.suffix != ".txt" or (TASKS_DIR / f.name).exists():
+            continue
+        try:
+            if now - f.stat().st_mtime >= max_age_s:
+                f.unlink()
+                removed += 1
+        except FileNotFoundError:
+            continue
+    return removed
+
+
 def archive_file(src: "Path", kind: str, task_id: str) -> bool:
     """Adapter: inject this bridge's archive roots + logger into the shared
     never-delete policy in task_archive."""
-    return _shared_archive_file(
+    ok = _shared_archive_file(
         src, kind, task_id,
         tasks_dir=ARCHIVE_TASKS_DIR, results_dir=ARCHIVE_RESULTS_DIR,
         log=lambda m: print(m, flush=True))
+    if kind == "tasks":
+        remove_sandbox_prompt(task_id)
+    return ok
 
 
 def _archive_delivered_pair(result_file: "Path", task_id: str) -> None:
@@ -3996,9 +4047,13 @@ async def _handle_discord_message(message, force=False):
     else:
         codex_prompt_text = user_task_text
 
-    prompt_path = f"/tmp/sutando-{task_id}.txt"
-    Path(prompt_path).write_text(codex_prompt_text)
-    quoted_task = f'"$(cat {prompt_path})"'
+    try:
+        prompt_path = write_sandbox_prompt(task_id, codex_prompt_text)
+    except OSError as exc:
+        print(f"  [task-write] FAILED for @{username}: sandbox prompt not written ({exc})",
+              flush=True)
+        return
+    quoted_task = f'"$(cat {shlex.quote(str(prompt_path))})"'
 
     # Pre-classify Discord-state-reference tasks. Two-tier flow (per Chi's
     # 2026-05-08 strategy chat — option 3 systemic fix):
@@ -4906,6 +4961,11 @@ async def poll_results():
         # A task written straight into tasks/ was never in pending_replies, so
         # its result would sit forever. Adopt the route it declared, then let
         # the existing resolution below turn it into a channel.
+        try:
+            sweep_sandbox_prompts()
+        except Exception as exc:  # noqa: BLE001 - a sweep must never stop delivery
+            print(f"  [sandbox-prompt] sweep failed: {exc}", flush=True)
+
         global _orphan_route_cursor
         _adopted, _orphan_route_cursor = orphan_result_routes(
             RESULTS_DIR, TASKS_DIR,
