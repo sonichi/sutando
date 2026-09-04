@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -121,11 +122,22 @@ def should_run(state: dict, newest: float, max_age: float, now: float) -> "tuple
 
 def run_suites(suites, cwd) -> "list[tuple[str, int, str]]":
     out = []
+    # A fresh bytecode cache per run: an edited tool can otherwise be served its
+    # PRE-edit .pyc and report green. `-B` stops writing, not reading.
+    env = dict(os.environ)
+    with tempfile.TemporaryDirectory(prefix="tool-suites-pyc-") as pycache:
+        env["PYTHONPYCACHEPREFIX"] = pycache
+        out.extend(_run_each(suites, cwd, env))
+    return out
+
+
+def _run_each(suites, cwd, env) -> "list[tuple[str, int, str]]":
+    out = []
     for s in suites:
         try:
             # NO extra argv: unittest would read it as a test-name selector.
             r = subprocess.run([sys.executable, str(s)], capture_output=True,
-                               text=True, timeout=180, cwd=cwd)
+                               text=True, timeout=180, cwd=cwd, env=env)
             lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
             last = lines[-1] if lines else (r.stderr.strip().splitlines() or ["(no output)"])[-1]
             out.append((s.name, r.returncode, last[:100]))
