@@ -60,33 +60,68 @@ The rule runs inside each watcher's own event handler
 carry their own), at the handler's probe, before any claim:
 
 1. `requested_worker` names this instance: emit to this session with no claim
-   taken (probe exit 3). Names another instance whose beat is fresh: claim and
-   discard. Names an instance whose beat is stale: the core emits (stand-in),
-   workers discard.
+   taken (probe exit 3). Names another instance whose beat is fresh: **suppress**.
+   Names an instance whose beat is stale: the core emits (stand-in), workers
+   suppress.
 2. No field, and the room addresses this worker — it is **pinned** to it, or
    this is a **dedicated** worker's own room: emit with no claim. Pinned to a bound set
    this worker belongs to: members race for the watcher's shared atomic claim
-   (a hard link in `state/task-event-handler-claims/`); the winner emits.
-   Pinned to a FRESH instance that is not this one: claim and discard — the core
-   included. A pin is addressing, so the core is a non-target here exactly as a
-   worker is, and rule 3 must not be reached. Pinned to an instance whose beat
-   is stale: the pin is unclaimable, so it falls through to rule 3 and the core
-   stands in.
-3. The task is addressed to no live instance: the core emits and workers claim
-   and discard.
+   (a hard link in `state/task-event-handler-claims/`); the winner emits and the
+   losers suppress. Pinned to a FRESH instance that is not this one: **suppress**
+   — the core included. A pin is addressing, so the core is a non-target here
+   exactly as a worker is, and rule 3 must not be reached. Pinned to an instance
+   whose beat is stale: the pin is unclaimable, so it falls through to rule 3 and
+   the core stands in.
+3. The task is addressed to no live instance: the core emits and workers suppress.
+
+**Suppress means: take no claim, emit nothing, queue nothing, and leave the task
+file untouched.** It is not "claim and discard", and the difference is the whole
+correctness argument. The claim is keyed on the task FILENAME and is therefore
+global across instances — `acquire_task_claim` hard-links
+`state/task-event-handler-claims/<filename>` and the first linker wins
+(`src/watch-tasks-stream.sh:127-147`) — while the addressed instance's emit path
+takes **no claim at all** (probe exit 3 prints `TASK_FILE:` directly,
+`:398-400`). So a discarding non-target and an emitting target are not mutually
+exclusive: any non-target can win the shared claim and run its discard before the
+target's session has consumed the filename it was handed. If the discard renames
+or removes the file, the target is handed a path it can no longer read; if it does
+not, then the claim never settled ownership and there is no exactly-once property
+to appeal to. Racing two discards against each other is safe, which is what the
+earlier version of this section argued; racing a discard against the emit is the
+case that argument never covered.
+
+**Prerequisite for step 2, stated as such.** No suppress disposition exists today.
+The probe's handled results are exit 0 (queue a fallback handler), exit 4 (queue a
+required handler), exit 3 (emit directly) and an else branch that also emits
+(`:385-402`) — every one of them either emits or queues, so a non-target watcher
+currently cannot be inert. Step 2 must add the disposition before this rule can be
+implemented; until then the rule is a contract, not a description.
 
 Traced for the case the rule used to get wrong — a task with no
-`requested_worker` in a room pinned to worker-2, with worker-2 fresh:
+`requested_worker` in a room pinned to worker-2, with worker-2 fresh — and
+scheduled adversarially, with **both non-targets running to completion before the
+target's handler is even entered**:
 
-| instance | rule 1 | rule 2 | rule 3 | result |
+| step | instance | disposition | shared claim | task file |
 |---|---|---|---|---|
-| core     | no field | pin names a fresh instance, not me: claim, discard | not reached | discards |
-| worker-2 | no field | pin names me: emit, no claim | not reached | **emits** |
-| worker-3 | no field | pin names a fresh instance, not me: claim, discard | not reached | discards |
+| 1 | core     | pin names a fresh instance, not me: suppress | untouched | untouched |
+| 2 | worker-3 | pin names a fresh instance, not me: suppress | untouched | untouched |
+| 3 | worker-2 | pin names me: emit, no claim | untouched | consumed once |
 
-Exactly one emit, and the claim is what makes the two discards safe to race.
+The target consumes exactly once *because* nothing else ever contended — not
+because a claim arbitrated a contention. Ordering is irrelevant: run steps 1 and 2
+in either order, any number of times, and the state they observe and leave is
+identical, so there is no schedule in which worker-2 is handed an unreadable path.
+
 With worker-2's beat STALE the second column falls through for everyone, rule 3
-selects the core, and the workers discard — one emit again, by the stand-in.
+selects the core, and the workers suppress. The same adversarial ordering holds —
+both workers suppress first, the core then emits, and the stand-in consumes
+exactly once, again with no claim taken by anyone.
+
+The bound-set case is the one place a claim is still doing work, and it is the
+case it was designed for: every member is a target, so the contention is
+target-against-target, the winner emits and the losers suppress rather than
+discard.
 
 A task is eligible to exactly one instance except inside a bound set, where the
 claim settles it. A later form of addressing (an app control, a room command, a
@@ -143,8 +178,10 @@ the CLI skill), enveloped and verified like any task, with `source:` naming the
 intent. One channel, one shape, one code path to test. The core executes all of
 them, and a pinned room must not divert them: a command envelope carries
 `requested_worker: core`, set by the surface that minted it, and every worker's
-handler discards a task whose `source:` is a pool command **before** it
-evaluates pin eligibility. Both fields live in the verified envelope, never in
+handler suppresses a task whose `source:` is a pool command **before** it
+evaluates pin eligibility — suppress in the same sense as the routing rules
+above, since `requested_worker: core` makes every worker a non-target and a
+discard here would race the core's emit exactly as it would there. Both fields live in the verified envelope, never in
 the body, so a room message whose text reads "resize to 0" is an ordinary task.
 
 **"In the envelope" means minted before the stamp, not appended after it.**
