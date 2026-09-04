@@ -63,12 +63,20 @@ def load_roster(d):
     reviewer as absent (measured twice: 2026-08-27, 2026-08-28 — both times
     `get("john-the-dev")` missed the entry keyed `rui`).
     """
-    import json
-    p = d / "reviewer-stands.json"
-    if not p.exists():
+    # Same union, same collision semantics as notify_reviewers: both readers of
+    # this store delegate to roster_union so they cannot drift apart.
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from roster_union import host_rosters, roster_union
+    # The file this reader was pointed at is its LOCAL and goes first: on a
+    # legacy host it is the shared file, which host_rosters lists LAST.
+    local = d / "reviewer-stands.json"
+    paths = [("local", local)] if local.is_file() else []
+    paths += [(h, p) for h, p in host_rosters(d.parent.parent) if p != local]
+    merged = roster_union(paths)
+    if not merged:
         return []
     rows = []
-    for key, r in json.loads(p.read_text()).items():
+    for key, r in merged.items():
         # A v2 document carries a reserved `_schema` block. Accepting every
         # top-level dict renders metadata as a person the caller can address.
         if not isinstance(r, dict) or not _ri().is_person_key(key):
@@ -82,6 +90,16 @@ def load_roster(d):
             "one_line": f"github={r.get('github','')} human={r.get('human','')} stand={r.get('stand','')}",
         })
     return rows
+
+def _name_of(r):
+    """quick-lookup.yaml keys people as `id`/`who`, the roster as `entity_id`/
+    `one_line`; match() reads both, so every render site must too."""
+    return r.get("entity_id") or r.get("id") or ""
+
+
+def _role_of(r):
+    return str(r.get("one_line") or r.get("who") or "")
+
 
 def _identity_id(i):
     # schema.md names this field `user_id`; this reader only ever read
@@ -146,7 +164,7 @@ def main():
         print(f"KNOWN ENTITIES ({len(rows)})\n{stale}")
         for r in rows:
             st = r.get("agent_mxid") or "-- no Stand recorded --"
-            print(f"  {r.get('entity_id',''):<28} {r.get('kind',''):<6} {st}")
+            print(f"  {_name_of(r):<28} {r.get('kind',''):<6} {st}")
         return 0
 
     hits = match(rows, a.query, ents)
@@ -157,14 +175,14 @@ def main():
         return 0
 
     for r in hits:
-        eid = r.get("entity_id", "")
+        eid = _name_of(r)
         stand = r.get("agent_mxid")
         print(f"\n  {eid}  [{r.get('kind','?')}]")
-        print(f"    role: {str(r.get('one_line',''))[:150]}")
+        print(f"    role: {_role_of(r)[:150]}")
         if stand:
             print(f"    ADDRESS THIS -> {stand}")
         else:
-            loose = re.findall(r"@[\w.\-]+", str(r.get("one_line", "")))
+            loose = re.findall(r"@[\w.\-]+", _role_of(r))
             if loose:
                 print(f"    ⚠ NO STRUCTURED Stand, but the role text names: {', '.join(loose)}")
                 print("      UNVERIFIED -- prose is not a resolved id. Use it, and say it is unconfirmed.")

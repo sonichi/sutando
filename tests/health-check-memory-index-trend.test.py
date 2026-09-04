@@ -14,6 +14,7 @@ draft.
 """
 from __future__ import annotations
 import importlib.util
+import os
 import subprocess
 import tempfile
 import time
@@ -31,8 +32,18 @@ def _hc():
     return m
 
 
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True)
+# gc/fsmonitor writing into .git races TemporaryDirectory teardown (ENOTEMPTY),
+# so the fixture git ignores ambient config and background maintenance.
+_GIT_PIN = ["-c", "gc.auto=0", "-c", "maintenance.auto=false",
+            "-c", "core.fsmonitor=false"]
+_GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def _git(cwd: Path, *args: str, env: "dict | None" = None) -> None:
+    subprocess.run(["git", *_GIT_PIN, "-C", str(cwd), *args], check=True,
+                   capture_output=True,
+                   env={**os.environ, **_GIT_ENV, **(env or {})})
 
 
 def _repo_with_sizes(tmp: Path, sizes: "list[int]", ago_h: float = 0.0) -> Path:
@@ -56,12 +67,8 @@ def _repo_with_sizes(tmp: Path, sizes: "list[int]", ago_h: float = 0.0) -> Path:
         _git(repo, "add", "MEMORY.md")
         # distinct, increasing author dates so the window spans real hours
         env_date = f"{base + 3600 * i} +0000"
-        subprocess.run(
-            ["git", "-C", str(repo), "commit", "-q", "-m", f"c{i}",
-             "--date", env_date],
-            check=True, capture_output=True,
-            env={**__import__("os").environ, "GIT_COMMITTER_DATE": env_date},
-        )
+        _git(repo, "commit", "-q", "-m", f"c{i}", "--date", env_date,
+             env={"GIT_COMMITTER_DATE": env_date})
     return idx
 
 
@@ -343,9 +350,8 @@ class HistoricalBytesUseTheSAMEUnitsAsTheLimit(unittest.TestCase):
                 idx.write_text(text)
                 _git(repo, "add", "MEMORY.md")
                 d = f"2026-08-03T{i:02d}:00:00"
-                subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", f"c{i}", "--date", d],
-                               check=True, capture_output=True,
-                               env={**os.environ, "GIT_COMMITTER_DATE": d})
+                _git(repo, "commit", "-q", "-m", f"c{i}", "--date", d,
+                     env={"GIT_COMMITTER_DATE": d})
             note = m._index_growth_note(idx, len(m._index_effective_text(lean).encode()))
 
         self.assertNotIn("ALREADY EXCEEDED", note,

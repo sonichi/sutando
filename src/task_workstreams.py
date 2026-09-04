@@ -25,11 +25,15 @@ from typing import Optional
 
 import local_task_protocol
 from result_markers import parse_markers
+from task_archive import archive_id_from_filename, task_id_for
 from workspace_default import status_read_path
 
 
 SCHEMA_VERSION = 1
 CLASSIFIER_VERSION = "task-workstream-grouping-v1"
+# Fleet churn shifts the candidate window on every completed task; a cooldown
+# bounds how often that churn can re-queue the classifier.
+CLASSIFIER_COOLDOWN_SECONDS = 1800
 CLASSIFIER_TASK_PREFIX = "task-workstream-grouping-"
 LEGACY_CLASSIFIER_TASK_PREFIX = "task-project-grouping-"
 MIN_CONFIDENCE = 0.65
@@ -217,17 +221,24 @@ def _parse_timestamp(raw: str, fallback: float) -> float:
         return fallback
 
 
+def _task_id_of(path: Path) -> str | None:
+    """Canonical id of a task file under the archive-lookup grammar; the
+    persisted `id:` outranks the filename, and pool suffixes canonicalize."""
+    return task_id_for(path, accept=local_task_protocol.valid_archive_lookup_id)
+
+
 def _task_paths(tasks_dir: Path):
+    """Yield (canonical task id, path) for each distinct task, live copy first."""
     seen = set()
     candidates = list(tasks_dir.glob("task-*.txt"))
     candidates.extend((tasks_dir / "processed").glob("task-*.txt"))
     candidates.extend(local_task_protocol.iter_archived_tasks(tasks_dir))
-    # Prefer the live copy when duplicate ids exist; archive copies follow.
     for path in candidates:
-        if path.stem in seen:
+        task_id = _task_id_of(path)
+        if task_id is None or task_id in seen:
             continue
-        seen.add(path.stem)
-        yield path
+        seen.add(task_id)
+        yield task_id, path
 
 
 def _result_index(results_dir: Path) -> dict[str, Path]:
@@ -258,8 +269,7 @@ def scan_task_history(workspace: Path) -> list[TaskRecord]:
     tasks_dir = workspace / "tasks"
     results = _result_index(workspace / "results")
     rows: list[TaskRecord] = []
-    for path in _task_paths(tasks_dir):
-        task_id = path.stem
+    for task_id, path in _task_paths(tasks_dir):
         if task_id.startswith((CLASSIFIER_TASK_PREFIX, LEGACY_CLASSIFIER_TASK_PREFIX)):
             continue
         try:
@@ -358,10 +368,43 @@ def enrich_task_rows(workspace: Path, rows: list[dict]) -> list[dict]:
     return enriched
 
 
+def _unique_task_file(tasks_dir: Path, task_id: str) -> Optional[Path]:
+    """The one live file carrying task_id, or None when zero or several do.
+
+    Access tier is read from this file, so a same-id sibling (a stale bare
+    owner copy beside a claimed team file) must not be silently preferred.
+    """
+    if not tasks_dir.is_dir():
+        return None
+    candidates = sorted(
+        p for p in tasks_dir.glob(f"{task_id}.*")
+        if p.is_file() and _task_id_of(p) == task_id
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def resolve_context_request(workspace: Path, argument: str) -> tuple[Optional[str], Optional[Path]]:
+    """(task id, exact file) for a `context` argument, or (None, None).
+
+    A name carrying a structural `.txt` is an exact authorization request: its
+    id is read from that file, and a missing one fails closed rather than
+    resolving to another record that happens to share the id.
+    """
+    name = Path(argument).name
+    if archive_id_from_filename(name) is None:
+        return name, None
+    exact = Path(workspace) / "tasks" / name
+    if not exact.is_file():
+        return None, None
+    return _task_id_of(exact), exact
+
+
 def build_workstream_context(
     workspace: Path,
     task_id: str,
     limit: int = CONTEXT_MAX_TASKS,
+    *,
+    task_path: Optional[Path] = None,
 ) -> Optional[dict]:
     """Return bounded prior context for an owner task's assigned workstream.
 
@@ -375,7 +418,15 @@ def build_workstream_context(
     task_id = str(task_id)
     if not local_task_protocol.valid_archive_lookup_id(task_id):
         return None
-    current = _task_record_from_path(workspace / "tasks" / f"{task_id}.txt")
+    # The caller's exact file is the authorization read; a bare id only
+    # resolves when exactly one live file (bare, claimed, assigned) carries it.
+    if task_path is not None:
+        current_path = Path(task_path)
+        if not current_path.is_file() or _task_id_of(current_path) != task_id:
+            return None
+    else:
+        current_path = _unique_task_file(workspace / "tasks", task_id)
+    current = _task_record_from_path(current_path) if current_path else None
     # Never attach owner history to a sandboxed/non-owner task.  Missing or
     # malformed records also fail open with no injected context.
     if current is None or current.id != task_id or current.access_tier != "owner":
@@ -919,6 +970,7 @@ def classifier_status(
     workspace: Path,
     ttl_seconds: int = 900,
     limit: int = 100,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
     """Report whether the current snapshot needs classification without writing."""
     workspace = Path(workspace)
@@ -945,6 +997,23 @@ def classifier_status(
             return _queue_result(
                 True, False, "already-queued", snapshot_hash,
                 str(state.get("task_id") or ""), source_state,
+            )
+
+    # Sources change on every completed owner task; a completed run younger
+    # than the cooldown absorbs that churn before the expensive discover+scan.
+    if state.get("status") == "complete" and cooldown_seconds > 0:
+        try:
+            # completed_at is absent on pre-cooldown state files and on the
+            # refresh-source-token path; fall back to enqueued_at there.
+            age = time.time() - float(
+                state.get("completed_at") or state.get("enqueued_at", 0))
+        except (TypeError, ValueError):
+            age = -1.0
+        # A negative age means a clock step or bad state; never cool on it.
+        if 0 <= age < cooldown_seconds:
+            return ClassifierQueueResult(
+                False, False, "cooling-down",
+                str(state.get("snapshot_hash") or ""),
             )
 
     # Discover archive directories immediately before the expensive scan, then
@@ -984,26 +1053,48 @@ def classifier_status(
     return _queue_result(True, False, "ready", snapshot_hash, "", source_state)
 
 
+#: Dashboard-driven enqueue is OFF by default (owner request 2026-09-02, pending
+#: a redesign). Set SUTANDO_WORKSTREAM_CLASSIFIER truthy to re-enable.
+_CLASSIFIER_ENABLE_VALUES = frozenset({"1", "on", "true", "yes", "enabled"})
+
+
+def classifier_enqueue_enabled() -> bool:
+    """Whether the classifier may enqueue a maintenance task. Default: no."""
+    return (os.environ.get("SUTANDO_WORKSTREAM_CLASSIFIER", "")
+            .strip().lower() in _CLASSIFIER_ENABLE_VALUES)
+
+
 def maybe_enqueue_classifier_task(
     workspace: Path,
     ttl_seconds: int = 900,
     limit: int = 100,
     skill_file: Optional[Path] = None,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
+    # Off by default gates EVERY caller — the dashboard POST and the manual
+    # endpoint alike; read-only classifier_status is unaffected.
+    if not classifier_enqueue_enabled():
+        return ClassifierQueueResult(False, False, "disabled")
     if skill_file is not None and not Path(skill_file).is_file():
         return ClassifierQueueResult(False, False, "skill-unavailable")
     with _workstream_store_lock(Path(workspace)):
-        return _maybe_enqueue_classifier_task_locked(workspace, ttl_seconds, limit)
+        return _maybe_enqueue_classifier_task_locked(
+            workspace, ttl_seconds, limit, cooldown_seconds,
+        )
 
 
 def _maybe_enqueue_classifier_task_locked(
     workspace: Path,
     ttl_seconds: int,
     limit: int,
+    cooldown_seconds: int = CLASSIFIER_COOLDOWN_SECONDS,
 ) -> ClassifierQueueResult:
     """Queue one deduped classifier task only while the selected core is idle."""
     workspace = Path(workspace)
-    readiness = classifier_status(workspace, ttl_seconds=ttl_seconds, limit=limit)
+    readiness = classifier_status(
+        workspace, ttl_seconds=ttl_seconds, limit=limit,
+        cooldown_seconds=cooldown_seconds,
+    )
     if readiness.reason != "ready":
         if readiness.reason in {"complete", "already-queued"} and readiness.source_token:
             state_path = _classifier_state_path(workspace)
@@ -1105,8 +1196,8 @@ def _archive_superseded_classifier_task(workspace: Path, state: dict) -> bool:
     # file-type guard: a same-named DIRECTORY must not be os.replace'd away.
     if task_path is None or not task_path.is_file():
         return False
-    # Ask whether ANY claimed variant exists, not whether the returned one is
-    # claimed: find_task_file sorts, and `.assigned-` sorts before `.claimed-`.
+    # claimed-only: asks whether ANY claimed variant exists, not whether the
+    # returned one is claimed — find_task_file sorts `.assigned-` first.
     if any(tasks_dir.glob(f"{task_id}.claimed-*")):
         return False
     archive_dir = task_path.parent / "archive" / datetime.now(timezone.utc).strftime("%Y-%m")

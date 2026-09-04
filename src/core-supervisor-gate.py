@@ -42,9 +42,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tmux_probe import has_session as _tmux_has_session  # noqa: E402
 
 
 def _positive_int(v: str) -> int:
@@ -79,15 +81,12 @@ def heartbeat_stale(alive_path: str, stale_sec: float, now: float | None = None)
 
 def session_gone(socket: str, session: str) -> bool | None:
     """True = session definitely absent, False = definitely present,
-    None = probe failed (tmux missing/hung) — UNKNOWN, never confirmed death.
+    None = probe failed (tmux missing/hung, or a client the server refused —
+    version skew) — UNKNOWN, never confirmed death.
     The gate holds on None (fail-closed): a broken probe must not classify a
     possibly-running core as dead (john-the-dev review, #2404)."""
-    try:
-        r = subprocess.run(["tmux", "-S", socket, "has-session", "-t", session],
-                           capture_output=True, timeout=10)
-        return r.returncode != 0
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    present = _tmux_has_session(socket, session, timeout=10)
+    return None if present is None else not present
 
 
 def operator_intent(sentinel_path: str) -> bool:

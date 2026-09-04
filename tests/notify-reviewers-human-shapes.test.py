@@ -61,5 +61,53 @@ class HumanShapeTests(unittest.TestCase):
         self.assertEqual(self._body(self._cmd(None)), "body")
 
 
+class IdentityCaveatSurfaces(unittest.TestCase):
+    """`identity_caveat` is data the operator must see, not data we act on.
+
+    A roster can record that two agents share one GitHub login; before this
+    fired, nothing read the field, so the note existed and never reached
+    anyone. Populating it is per-host, which is why it is pinned here.
+    """
+
+    ROOM = "!r:ag2.space"
+
+    def _resolve(self, roster):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            targets, rc = self.mod.resolve(sorted(roster), roster)
+        return targets, rc, buf.getvalue()
+
+    def setUp(self):
+        self.mod = _load()
+
+    def test_a_caveat_entry_prints_before_the_send(self):
+        roster = {"a": {"stand": "@a:ag2.space", "room": self.ROOM,
+                        "identity_caveat": "SHARED LOGIN: a and b push as X"}}
+        targets, rc, err = self._resolve(roster)
+        self.assertIn("IDENTITY CAVEAT 'a'", err)
+        self.assertIn("SHARED LOGIN", err)
+        self.assertEqual((len(targets), rc), (1, 0))
+
+    def test_an_entry_without_one_is_silent(self):
+        # Control: without this, a hook that printed for every entry would
+        # look identical on the affected one.
+        roster = {"b": {"stand": "@b:ag2.space", "room": self.ROOM}}
+        targets, rc, err = self._resolve(roster)
+        self.assertNotIn("IDENTITY CAVEAT", err)
+        self.assertEqual((len(targets), rc), (1, 0))
+
+    def test_the_caveat_does_not_refuse_the_target(self):
+        # A shared login is a reason to check WHICH person, never a reason to
+        # skip them: the entry must still resolve to a real target.
+        roster = {"a": {"stand": "@a:ag2.space", "room": self.ROOM,
+                        "identity_caveat": "x"},
+                  "b": {"stand": "@b:ag2.space", "room": self.ROOM}}
+        targets, rc, _ = self._resolve(roster)
+        self.assertEqual(rc, 0)
+        self.assertEqual({t["name"] for t in targets}, {"a", "b"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
