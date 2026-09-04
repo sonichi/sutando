@@ -101,6 +101,7 @@ check("without --write the file is UNCHANGED", json.loads(nw.read_text())["held_
 
 # --- --audit-notes: a sha in a note is a COPY of a fact git owns ---------------
 import subprocess as _sp
+import time as _time
 import tempfile as _tf
 
 def _git_repo():
@@ -345,6 +346,42 @@ nofile = pathlib.Path(tempfile.mkdtemp()) / "nope.json"
 rc, _, err = run(["--state", str(nofile), "--init-empty"])
 check("--init-empty on a MISSING state file cannot answer, never creates one",
       rc == 2 and not nofile.exists(), f"rc={rc} exists={nofile.exists()}")
+
+
+# CONCURRENCY REGRESSION, both PRODUCTION writers, in two PROCESSES: an
+# in-process racer deadlocks on the same flock and a hung suite proves nothing.
+_HASH = str(SCRIPTS / "idle-surface-hash.py")
+conc = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
+conc.write_text(json.dumps({"streak": 0, "noop_total": 0}))
+
+_racer = {}
+_orig_read = ih.idle_state.read_state
+def _read_then_race(path):
+    doc = _orig_read(path)
+    if not _racer:                      # once, while the seed holds the lock
+        _racer["p"] = _sp.Popen([*_PY, _HASH, "--state", str(path),
+                                 "--pass-outcome", "noop"],
+                                stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
+        _time.sleep(0.4)                # let it reach and block on the lock
+    return doc
+
+ih.idle_state.read_state = _read_then_race
+try:
+    rc, _, _ = run(["--state", str(conc), "--init-empty"])
+finally:
+    ih.idle_state.read_state = _orig_read
+_racer["p"].wait(timeout=20)
+
+_after = json.loads(conc.read_text())
+check("CONCURRENCY: the pass recorded during --init-empty is NOT lost",
+      _after.get("noop_total") == 1 and _after.get("streak") == 1,
+      f"streak={_after.get('streak')} noop_total={_after.get('noop_total')}")
+check("CONCURRENCY: and the seed survives the interleaving",
+      rc == 0 and _after.get("held_item_ids") == [],
+      f"rc={rc} {_after.get('held_item_ids')!r}")
+check("both writers serialise on ONE lock file",
+      conc.with_suffix(".json.lock").exists(),
+      str(sorted(x.name for x in conc.parent.iterdir())))
 
 
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")

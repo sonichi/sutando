@@ -19,7 +19,6 @@ held-list" naturally hashes the sentence it was about to send.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -74,20 +73,8 @@ def held_hash(items) -> str:
     return hashlib.sha1(canonical_key(items).encode("utf-8")).hexdigest()[:16]
 
 
-def read_state(path: Path) -> dict:
-    try:
-        doc = json.loads(path.read_text())
-        return doc if isinstance(doc, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def write_state(path: Path, doc: dict) -> None:
-    """Per-PID staging: several loop processes may publish this file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(doc))
-    os.replace(tmp, path)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from idle_state import ABORT, locked_update, read_state, write_state  # noqa: E402
 
 
 def record_outcome(path: Path, outcome: str) -> dict:
@@ -98,21 +85,15 @@ def record_outcome(path: Path, outcome: str) -> dict:
     vanish. The hash path is unaffected — replacing it with a stale-but-valid
     hash costs at most one extra surface.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock = path.with_suffix(".json.lock")
-    with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            doc = read_state(path)
-            noop = outcome == "noop"
-            doc["streak"] = int(doc.get("streak") or 0) + 1 if noop else 0
-            key = "noop_total" if noop else "substantive_total"
-            doc[key] = int(doc.get(key) or 0) + 1
-            doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            write_state(path, doc)
-            return doc
-        finally:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    def bump(doc):
+        noop = outcome == "noop"
+        doc["streak"] = int(doc.get("streak") or 0) + 1 if noop else 0
+        key = "noop_total" if noop else "substantive_total"
+        doc[key] = int(doc.get(key) or 0) + 1
+        doc["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return doc
+
+    return locked_update(path, bump)
 
 
 def main(argv=None) -> int:

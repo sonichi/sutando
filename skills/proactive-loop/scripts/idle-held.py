@@ -38,39 +38,47 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import idle_state  # noqa: E402
+from idle_state import ABORT, locked_update  # noqa: E402
+
 KEY = "held_item_ids"
 
 
 def init_empty(state: Path) -> int:
-    """Create the key as [] on a host that never had one, so --add can work.
+    """The one path that may create the key, and only when it is absent.
 
-    An ABSENT key and a DRIFTED one need opposite treatment, and `load` cannot
-    tell them apart, so it refuses both. This is the one path that may create
-    the key — and only when it does not exist, which is what keeps "inventing a
-    list" impossible: [] asserts nothing about what is held.
+    [] asserts nothing held, so this cannot become the invented list.
     """
     if not state.is_file():
         print(f"CANNOT ANSWER: no state file at {state}", file=sys.stderr)
         return 2
     try:
-        doc = json.loads(state.read_text())
+        json.loads(state.read_text())
     except ValueError as exc:
         print(f"CANNOT ANSWER: state file is not JSON: {exc}", file=sys.stderr)
         return 2
-    if KEY in doc:
-        print(f"REFUSED: {state} already has {KEY} "
-              f"({len(doc[KEY]) if isinstance(doc[KEY], list) else '?'} entries) "
+
+    refusal = []
+
+    def seed(doc):
+        # Re-read under the lock: the parse above proves the file is JSON, not
+        # that it still lacks the key when the lock is finally held.
+        if KEY in doc:
+            refusal.append(len(doc[KEY]) if isinstance(doc[KEY], list) else "?")
+            return ABORT
+        doc[KEY] = []
+        doc["held_item_seed"] = {
+            "seeded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "by": "idle-held.py --init-empty",
+            "note": "empty bootstrap; the record is populated by --add, never by a list",
+        }
+        return 0
+
+    if locked_update(state, seed, indent=2) is ABORT:
+        print(f"REFUSED: {state} already has {KEY} ({refusal[0]} entries) "
               "— --init-empty only bootstraps, it never clears", file=sys.stderr)
         return 2
-    doc[KEY] = []
-    doc["held_item_seed"] = {
-        "seeded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "by": "idle-held.py --init-empty",
-        "note": "empty bootstrap; the record is populated by --add, never by a list",
-    }
-    tmp = state.with_suffix(state.suffix + ".tmp")
-    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
-    os.replace(tmp, state)
     print(f"seeded {KEY} = [] in {state}  (provenance in held_item_seed)")
     return 0
 
