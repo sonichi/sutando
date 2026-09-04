@@ -881,8 +881,10 @@ with its own reason.
    counted on the NEXT pass, which is the case a per-pass counter loses), a queued
    winner counted ONCE rather than by both its marker and a second tally, a LOST claim
    consuming no quota (production reports `lost`; the caller cannot infer it, since
-   `queue_handler_task` returns 0 either way), a no-handler start (empty `DISPATCH_DIR`
-   arms no ticker), and a Created event interleaved with a pass. It pins BOTH reverse orders —
+   `queue_handler_task` returns 0 either way), a MIXED pass carrying both a queued and a
+   direct admission — neither single-route case can detect an ASYMMETRY between the two,
+   which is exactly what a second tally beside the markers would introduce — a no-handler
+   start (empty `DISPATCH_DIR` arms no ticker), and a Created event interleaved with a pass. It pins BOTH reverse orders —
    the beat crossing stale between the core's read and the target's, and the pin
    swapping between two workers' reads — plus a repin-after-suppress case where no event
    is generated at all, and one asserting the reconciliation claims through
