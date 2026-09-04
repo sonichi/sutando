@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# switch-model.sh <model> [--dry-run] [--state-dir DIR] [--session NAME] [--socket PATH]
+# switch-model.sh <model> [--dry-run] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
 # Change the core's model without the CLI: record the switch, pin it in the
 # runtime's settings.json (next launch), send `/model <model>` to the live core
 # pane (now). The record is written first so a pin can never exist unrecorded.
 set -u
-MODEL=""; DRY=""; STATE_DIR=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"
+MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"
 while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY=1;; --state-dir) STATE_DIR="${2:?}"; shift;;
-  --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;;
+  --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;;
   -*) echo "switch-model: unknown flag $1" >&2; exit 2;;
   *) [ -z "$MODEL" ] && MODEL="$1" || { echo "switch-model: one model, got '$1' too" >&2; exit 2; };;
 esac; shift; done
@@ -17,10 +17,20 @@ if ! printf '%s' "$MODEL" | grep -Eq '^(default|opus|sonnet|haiku|fable|claude-[
   echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
 fi
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
-CFG="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path settings.json)"
 PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin)"
-[ -n "$SOCK" ] || SOCK="$(bash "$REPO/scripts/sutando-config.sh" tmux-socket)"
-[ -n "$SESSION" ] || SESSION="sutando-core"
+# Defaults come from the configured core's runtime descriptor (brain, socket,
+# session — runtime-authored, foreign-caller safe), never from ambient env.
+DESC="$(bash "$REPO/scripts/sutando-config.sh" runtime 2>/dev/null)"
+read -r DBRAIN DSOCK DSESSION <<EOF_DESC
+$(printf '%s' "$DESC" | "$PY" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+print(d.get("brain") or "", d.get("socket") or "", d.get("session") or "")')
+EOF_DESC
+[ -n "$BRAIN" ] || BRAIN="${DBRAIN:-$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir)}"
+CFG="$BRAIN/settings.json"
+[ -n "$SOCK" ] || SOCK="${DSOCK:-/tmp/sutando-tmux.sock}"
+[ -n "$SESSION" ] || SESSION="${DSESSION:-sutando-core}"
 [ -n "$STATE_DIR" ] || STATE_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/state"
 if [ -n "$DRY" ]; then
   echo "dry-run: would record $STATE_DIR/model-switch.json, pin model=$MODEL in $CFG, send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"; exit 0
@@ -58,11 +68,12 @@ prev = data.get("model")
 rec = {"model": model, "previous": prev, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
        "by": "skills/model-switch/scripts/switch-model.sh", "settings": cfg}
 rec_path = os.path.join(state_dir, "model-switch.json")
+# Stage the record beside the old one; the prior record is never touched until
+# the pin has succeeded, so a failed pin leaves the last trusted record intact.
 try:
     os.makedirs(state_dir, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".model-switch.")
+    fd, staged = tempfile.mkstemp(dir=state_dir, prefix=".model-switch.staged.")
     with os.fdopen(fd, "w") as f: json.dump(rec, f, indent=2); f.write("\n")
-    os.replace(tmp, rec_path)
 except OSError as e:
     print(f"RECORD-FAILED {e}"); sys.exit(1)
 try:
@@ -72,15 +83,16 @@ try:
     with os.fdopen(fd, "w") as f: json.dump(data, f, indent=2); f.write("\n")
     os.replace(tmp, cfg)
 except OSError as e:
-    try: os.remove(rec_path)
+    try: os.remove(staged)
     except OSError: pass
     print(f"PIN-FAILED {e}"); sys.exit(1)
+os.replace(staged, rec_path)
 print(f"OK {prev if prev else '-'}")
 PYEOF
 )"; RC=$?
 case "$OUT" in
   RECORD-FAILED*) echo "switch-model: could not write the switch record ($STATE_DIR) — nothing changed: ${OUT#RECORD-FAILED }" >&2; exit 1;;
-  PIN-FAILED*)    echo "switch-model: settings pin FAILED ($CFG) — record removed, nothing changed: ${OUT#PIN-FAILED }" >&2; exit 1;;
+  PIN-FAILED*)    echo "switch-model: settings pin FAILED ($CFG) — prior switch record kept, nothing changed: ${OUT#PIN-FAILED }" >&2; exit 1;;
   OK*) ;;
   *) echo "switch-model: unexpected python outcome (rc=$RC): $OUT" >&2; exit 1;;
 esac

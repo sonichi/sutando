@@ -19,8 +19,8 @@ printf '{"model":"claude-opus-5","permissions":{"allow":["Bash"]}}\n' > "$T/cfg/
 fails=0
 ok() { echo "  ok   $1"; }
 fail() { echo "  FAIL $1 — $2"; fails=$((fails+1)); }
-run() { "$HERE/scripts/switch-model.sh" "$@" --state-dir "$T/state" > "$T/out" 2> "$T/err"; echo $?; }
-runraw() { "$HERE/scripts/switch-model.sh" "$@" > "$T/out" 2> "$T/err"; echo $?; }
+run() { "$HERE/scripts/switch-model.sh" "$@" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
+runraw() { "$HERE/scripts/switch-model.sh" "$@" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
 
 rc=$(run 'gpt-5; rm -rf /'); [ "$rc" = 2 ] && ok "1 a non-claude name is refused (rc=2)" || fail "1 refused rc" "$rc"
 [ ! -e "$T/tmux.log" ] && [ "$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")" = claude-opus-5 ] \
@@ -33,7 +33,7 @@ R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));prin
 case "$R" in "claude-fable-5-1[1m] claude-opus-5 20"*" skills/model-switch/scripts/switch-model.sh") ok "5 switch record carries model, previous, a dated ts, and the writer";; *) fail "5 record" "$R";; esac
 grep -q -- "send-keys -t sutando-core -l /model claude-fable-5-1\[1m\]" "$T/tmux.log" && grep -q -- "send-keys -t sutando-core Enter" "$T/tmux.log" \
   && ok "6 the live pane got '/model <id>' then Enter, literal (-l)" || fail "6 tmux argv" "$(cat "$T/tmux.log")"
-grep -q -- "-S /tmp/sutando-tmux.sock" "$T/tmux.log" && ok "7 targets the core's socket by default" || fail "7 socket" "$(head -1 "$T/tmux.log")"
+grep -q -- "-S /tmp/sutando-tmux.sock" "$T/tmux.log" && ok "7 targets the core's socket (descriptor/env) by default" || fail "7 socket" "$(head -1 "$T/tmux.log")"
 
 : > "$T/tmux.log"; rc=$(TMUX_FAIL=1 run opus); [ "$rc" = 3 ] && ok "8 no live session: pin applied, exit 3 says the live half did not happen" || fail "8 rc" "$rc"
 [ "$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")" = opus ] && ok "9 ...and the pin still landed (alias accepted)" || fail "9 pin" "$(cat "$T/cfg/settings.json")"
@@ -64,4 +64,13 @@ grep -q "half-typed" "$T/err" && ok "17 ...and the refusal quotes the pending te
 [ "$rc" = 4 ] && ! grep -q send-keys "$T/tmux.log" && grep -q "start-cli.sh --restart" "$T/err" \
   && ok "19 codex runtime: exit 4, nothing sent, the restart path named" || fail "19 codex" "rc=$rc $(cat "$T/err")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 19 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- the reviewer's case: an EXISTING record must survive a failed pin
+python3 -c "import json;json.dump({'model':'claude-opus-5','previous':None,'ts':'T0','by':'prior'},open('$T/state/model-switch.json','w'))"
+mv "$T/cfg/settings.json" "$T/cfg/settings.bak"; mkdir "$T/cfg/settings.json"   # a directory forces the replace to fail
+rc=$(run sonnet); rmdir "$T/cfg/settings.json"; mv "$T/cfg/settings.bak" "$T/cfg/settings.json"
+[ "$rc" = 1 ] && [ "$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))['by'])")" = prior ] \
+  && ok "20 failed pin: the prior switch record is byte-intact (staged record discarded)" || fail "20 prior record" "rc=$rc $(cat "$T/state/model-switch.json" 2>&1 | head -c 120)"
+grep -q "prior switch record kept" "$T/err" && ok "21 ...and the message says the prior record was kept" || fail "21 msg" "$(cat "$T/err")"
+[ -z "$(ls -A "$T/state" | grep staged)" ] && ok "22 ...and no staged file is left behind" || fail "22 staged leftover" "$(ls -A "$T/state")"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 22 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
