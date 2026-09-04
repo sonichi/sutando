@@ -410,6 +410,9 @@ AUTO_ANSWER_CARRY_S = 120.0
 # `src/hitl` — the Manager dedups, the projector renders the card.
 _CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
 HITL_KIND = "core-blocked"
+_TUI_SOURCE = "tui"
+#: a driven click that has not moved the core by then expires as "did not take".
+DRIVE_SETTLE_S = 15.0
 
 
 def escalation_message(state, detail, kind, prompt):
@@ -456,20 +459,9 @@ def escalate(manager, state, detail, kind, prompt, session):
     if manager is None:
         return None
     try:
-        from hitl.schema import Action, HumanRequirement
-        # Session in BOTH the guard and the identity: a pool shares one login, so
-        # a weekly limit blocks every worker on byte-identical prompt text at once.
-        req = HumanRequirement(
-            kind=HITL_KIND,
-            runtime="claude",
-            message=escalation_message(state, detail, kind, prompt),
-            guard=hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16],
-            device={"id": session},
-            title=f"{session} · {state}",
-            actions=[Action(id="ack", kind="acknowledge", label="I have answered it")],
-            subject={"state": state, "gate": kind or "", "detail": detail,
-                     "session": session},
-        )
+        from hitl import tui_gate
+        req = tui_gate.requirement_for(state, kind, prompt, session, detail,
+                                       escalation_message(state, detail, kind, prompt))
         return manager.create(req)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
@@ -486,7 +478,7 @@ def resolve_escalations(manager, session):
         return []
     try:
         mine = [r.id for r in manager.active()
-                if r.kind == HITL_KIND
+                if (r.subject or {}).get("source") == _TUI_SOURCE
                 and (r.subject or {}).get("session") == session]
         for req_id in mine:
             manager.resolve(req_id)   # returns blocked task ids, not a verdict
@@ -494,6 +486,57 @@ def resolve_escalations(manager, session):
     except Exception as exc:  # noqa: BLE001
         print(f"hitl resolve failed: {exc}", file=_sys.stderr)
         return []
+
+
+def drive_escalations(manager, session, prompt, state, send):
+    """Realise the owner's click: the keys tui_gate derives for the dialog on screen
+    NOW, sent once. A dialog that changed since the click expires the card instead.
+    Returns [(req_id, keys or None)] for what this tick acted on.
+    """
+    if manager is None:
+        return []
+    acted = []
+    try:
+        from hitl import tui_gate
+        from hitl.manager import POLICY_DECIDER
+        from hitl.schema import STATUS_IN_PROGRESS
+
+        def _expire(req_id, note):
+            with manager.store.locked():
+                cur = manager.get(req_id)
+                if cur is not None:
+                    cur.answer = {"note": note}
+                    manager.store.save(cur)
+            manager.expire(req_id)
+
+        for r in manager.active():
+            subj = r.subject or {}
+            if (subj.get("source") != _TUI_SOURCE or subj.get("session") != session
+                    or r.status != STATUS_IN_PROGRESS or not r.chosen_action
+                    or r.decided_by == POLICY_DECIDER):
+                continue
+            keys = tui_gate.keys_for(r, prompt, state)
+            if subj.get("driven_at"):
+                if keys is not None and time.time() - subj["driven_at"] > DRIVE_SETTLE_S:
+                    _expire(r.id, tui_gate.DID_NOT_TAKE_NOTE)
+                    acted.append((r.id, None))
+                continue
+            if keys is None:
+                _expire(r.id, tui_gate.STALE_NOTE)
+                acted.append((r.id, None))
+                continue
+            for k in keys:
+                if not send(k):
+                    break
+            with manager.store.locked():
+                cur = manager.get(r.id)
+                if cur is not None:
+                    cur.subject = {**(cur.subject or {}), "driven_at": time.time(), "driven_keys": keys}
+                    manager.store.save(cur)
+            acted.append((r.id, keys))
+    except Exception as exc:  # noqa: BLE001 — never let the driver take down the monitor
+        print(f"hitl drive failed: {exc}", file=_sys.stderr)
+    return acted
 
 
 def _atomic_write(path, payload):
@@ -579,6 +622,8 @@ def main():
         # the card, so the owner sees it close without clicking anything.
         if a.chat_escalation:
             if state in _CHAT_ESCALATE_STATES:
+                drive_escalations(hitl, a.session, prompt, state,
+                                  lambda k: send_keys(a.socket, a.session, k))
                 escalate(hitl, state, detail, kind, prompt, a.session)
             else:
                 resolve_escalations(hitl, a.session)
