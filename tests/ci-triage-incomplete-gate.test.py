@@ -91,6 +91,29 @@ class TestIncompletePredicate(unittest.TestCase):
         self.assertFalse(self.ct._is_incomplete(GREEN_CHECKRUN))
         self.assertFalse(self.ct._is_incomplete(FAILED_CHECKRUN))
 
+    def test_a_cancelled_checkrun_is_incomplete_not_clean(self):
+        # `_is_bad` excludes CANCELLED, so not-incomplete too would mean a
+        # completed-but-unsuccessful check renders as a clean rollup.
+        c = {"name": "typecheck", "status": "COMPLETED", "conclusion": "CANCELLED"}
+        self.assertFalse(self.ct._is_bad(c))
+        self.assertTrue(self.ct._is_incomplete(c))
+
+    def test_no_conclusion_can_fall_through_both_predicates(self):
+        # The real invariant, asserted over the whole enum rather than the cases
+        # someone remembered: every completed conclusion is green, bad, or incomplete.
+        green = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+        for concl in ("SUCCESS", "NEUTRAL", "SKIPPED", "FAILURE", "TIMED_OUT",
+                      "CANCELLED", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE",
+                      "SOME_CONCLUSION_GITHUB_ADDS_LATER"):
+            c = {"name": "x", "status": "COMPLETED", "conclusion": concl}
+            bad, inc = self.ct._is_bad(c), self.ct._is_incomplete(c)
+            self.assertFalse(bad and inc, f"{concl} counted twice")
+            if concl in green:
+                self.assertFalse(bad or inc, f"{concl} should be clean")
+            else:
+                # Unknown conclusions land here too: fail-closed is the safe default.
+                self.assertTrue(bad or inc, f"{concl} falls through both -> false all-clear")
+
     def test_the_running_checkrun_conclusion_is_empty_string_not_none(self):
         # Pinned so a `conclusion != None` filter is a visible mistake:
         # a RUNNING CheckRun carries `''`, which that test lets through.
@@ -154,6 +177,15 @@ class TestMainOutput(unittest.TestCase):
     def test_an_expected_context_is_named(self):
         out = self._main_with([GREEN_CHECKRUN, EXPECTED_CONTEXT])
         self.assertIn("required/never-reported", out)
+        self.assertIn("still gated", out)
+
+    def test_a_cancelled_required_check_is_named_not_all_clear(self):
+        # The end-to-end form of the predicate fix: a cancelled required check
+        # must reach the reviewer, not be rendered as a clean rollup.
+        out = self._main_with([GREEN_CHECKRUN,
+                               {"name": "typecheck", "status": "COMPLETED",
+                                "conclusion": "CANCELLED"}])
+        self.assertIn("typecheck", out)
         self.assertIn("still gated", out)
 
     def test_an_unreadable_rollup_is_unknown_not_ready(self):

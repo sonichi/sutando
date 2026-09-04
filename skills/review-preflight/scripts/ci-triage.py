@@ -93,7 +93,11 @@ def _is_incomplete(c: dict) -> bool:
     if _is_bad(c):
         return False
     if "status" in c:
-        return c.get("status") != "COMPLETED"
+        if c.get("status") != "COMPLETED":
+            return True
+        # Whitelist the GREEN conclusions, so an unknown one is blocking rather
+        # than silently clean; CANCELLED completes without succeeding.
+        return c.get("conclusion") not in ("SUCCESS", "NEUTRAL", "SKIPPED")
     # Not-SUCCESS, never an enum whitelist: StatusState also has EXPECTED, and
     # listing only PENDING lets a required context that never reported read green.
     return c.get("state") != "SUCCESS"
