@@ -183,6 +183,18 @@ for _name, _env in [("unset", {}),
 for _k in ("SUTANDO_HOST_LABEL", "SUTANDO_HOST_OVERRIDE"):
     os.environ.pop(_k, None)
 
+# A repo with no src/util_paths.py: the label owner cannot answer, so the pointer
+# must refuse rather than fall back to a guessed label.
+with tempfile.TemporaryDirectory() as _d:
+    _empty = pathlib.Path(_d)
+    check("no label owner -> _host_label is None, not a guessed hostname",
+          mib._host_label(_empty) is None, f"got {mib._host_label(_empty)!r}")
+    check("no label owner -> pointer path is None, so no hosts/<guess>/ is addressed",
+          mib._host_pointer_path(pathlib.Path("/tmp/ws/.claude-sutando/projects"), _empty) is None)
+    _g, _n = mib._host_stated_index(pathlib.Path("/tmp/ws/.claude-sutando/projects"), _empty)
+    check("no label owner -> UNRECORDED, not a bogus pointer the caller would trust",
+          _g is None and _n == "", f"got {_g!r} {_n!r}")
+
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
     stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
