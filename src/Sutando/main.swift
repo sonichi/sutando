@@ -585,23 +585,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Skip when "watcher" is already queued in the CLI input buffer.
-        // claude-code queues keystrokes during a turn and processes them
-        // when the turn ends. cliIsWorking() catches fresh (<60s) tool
-        // children, but a long-running tool (>60s) returns false here —
-        // the next watcher tick would then double-send "watcher", so the
-        // CLI processes "watcher\nwatcher" serially and spawns watcher
-        // twice. Capture-pane the bottom of the pane and skip if
-        // "watcher" appears near the prompt area.
-        if watcherKeystrokesQueued() {
-            logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
-            return
-        }
-
+        // One sender for lines typed into the core pane: scripts/tmux-send-line.sh
+        // owns has-session, the current-prompt read and the queued-word skip.
         // (Removed 120s inner throttle 2026-05-14: now strictly dead code under
         // the 300s outer Timer cadence — two consecutive ticks are always 300s
         // apart, so the throttle never gated. Flood-protection is now solely
-        // the watcherKeystrokesQueued() check above + the Timer interval.)
+        // the shared sender's queued-word skip + the Timer interval.)
 
         // If the core CLI is running inside the `sutando-core` tmux session
         // (launch via src/agent/start-cli.sh), send the word `watcher` to
@@ -610,7 +599,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // — so the watcher's stdout routes through the task-notification
         // pipe correctly. Any externally-started watcher (nohup etc.)
         // has stdout → /dev/null and is useless.
-        if tmuxSendKeys(session: "sutando-core", keys: "watcher") {
+        let rc = tmuxSendLine(session: "sutando-core", line: "watcher", skipIfQueued: "watcher")
+        if rc == 6 {
+            logToFile("watcher dead; 'watcher' already queued in pane — skipping send")
+            return
+        }
+        if rc == 0 {
             notify("Sutando", "Task watcher down — sent 'watcher' to sutando-core tmux")
             logToFile("watcher dead; tmux send-keys to sutando-core")
             return
@@ -866,100 +860,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Send keystrokes to a tmux pane. Returns true if the session exists
-    /// and send-keys succeeded. False otherwise — caller should fall back
-    /// to a macOS notification.
-    func tmuxSendKeys(session: String, keys: String) -> Bool {
-        // Find tmux binary: Homebrew on Apple Silicon, /usr/local on Intel.
-        let tmuxPath: String
-        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
-            tmuxPath = "/opt/homebrew/bin/tmux"
-        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
-            tmuxPath = "/usr/local/bin/tmux"
-        } else {
-            return false
-        }
-        // Check session exists: `tmux has-session -t <name>` exits 0 if alive.
-        let has = Process()
-        has.executableURL = URL(fileURLWithPath: tmuxPath)
-        has.arguments = ["-S", sutandoTmuxSocket, "has-session", "-t", session]
-        has.standardOutput = FileHandle.nullDevice
-        has.standardError = FileHandle.nullDevice
-        do { try has.run() } catch { return false }
-        has.waitUntilExit()
-        if has.terminationStatus != 0 { return false }
-
-        // Session exists — send keys + Enter.
-        let send = Process()
-        send.executableURL = URL(fileURLWithPath: tmuxPath)
-        send.arguments = ["-S", sutandoTmuxSocket, "send-keys", "-t", session, keys, "Enter"]
-        send.standardOutput = FileHandle.nullDevice
-        send.standardError = FileHandle.nullDevice
-        do { try send.run() } catch { return false }
-        send.waitUntilExit()
-        return send.terminationStatus == 0
-    }
-
-    /// Detect whether the word "watcher" is already typed at claude-code's
-    /// CURRENT prompt line in the sutando-core pane. Only the current prompt
-    /// (the bottom-most `❯ ` line) indicates queued input — past prompts in
-    /// scrollback don't.
-    ///
-    /// History of this function:
-    /// - PR #553: matched `\bwatcher\b` across bottom 5 lines → over-fired
-    ///   on prose like "Ensure the watcher is running" in tool output.
-    /// - PR #557: filtered to lines starting with `❯ `. But `capture-pane
-    ///   -S -3` returns the visible pane PLUS scrollback (≠ "last 3 lines"),
-    ///   so old prompts like `❯ why is watcher reminder not sent?` were
-    ///   still treated as queued input → still over-fired.
-    /// - This PR: walk all lines, remember the LAST `❯ ` line seen (the
-    ///   current prompt), check only that one.
-    ///
-    /// Returns false on any tmux failure so a missing tmux doesn't suppress
-    /// alerts.
-    func watcherKeystrokesQueued() -> Bool {
-        let tmuxPath: String
-        if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/tmux") {
-            tmuxPath = "/opt/homebrew/bin/tmux"
-        } else if FileManager.default.fileExists(atPath: "/usr/local/bin/tmux") {
-            tmuxPath = "/usr/local/bin/tmux"
-        } else {
-            return false
-        }
-        let cap = Process()
-        cap.executableURL = URL(fileURLWithPath: tmuxPath)
-        cap.arguments = ["-S", sutandoTmuxSocket, "capture-pane", "-t", "sutando-core", "-p"]
-        let pipe = Pipe()
-        cap.standardOutput = pipe
-        cap.standardError = FileHandle.nullDevice
-        do { try cap.run() } catch { return false }
-        cap.waitUntilExit()
-        if cap.terminationStatus != 0 { return false }
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        // Find the LAST line starting with "❯" — that's the current prompt.
-        // Past prompts in scrollback don't represent queued input.
-        //
-        // Match "❯" without requiring a trailing space: an EMPTY prompt is
-        // rendered as `❯ ` (prompt + space), but `trimmingCharacters` strips
-        // the trailing space → we'd miss the empty prompt and fall back to
-        // an earlier prompt-with-text in scrollback. Bug from PR #559 that
-        // caused continuous "queued in pane — skipping send" even on empty
-        // prompt. Fix: trim only LEADING whitespace; check `❯` prefix; the
-        // input portion is whatever follows.
-        var lastPromptInput: String? = nil
-        for line in out.split(separator: "\n") {
-            // Trim only leading whitespace (not trailing) so empty prompt
-            // `❯ ` is preserved as `❯ ` (prompt + space + nothing).
-            let leading = line.drop(while: { $0 == " " || $0 == "\t" })
-            if leading.hasPrefix("❯") {
-                // Drop the prompt char + any single space that follows it.
-                var rest = leading.dropFirst()  // drop "❯"
-                if rest.hasPrefix(" ") { rest = rest.dropFirst() }  // drop one space if present
-                lastPromptInput = String(rest)
-            }
-        }
-        guard let input = lastPromptInput else { return false }
-        return input.range(of: #"\bwatcher\b"#, options: .regularExpression) != nil
+    /// Type one line into a core pane through the shared sender
+    /// (`scripts/tmux-send-line.sh`), which owns the session check, the
+    /// current-prompt read and the queued-word skip. Exit codes: 0 sent,
+    /// 3 no session, 4 no tmux, 5 pending text, 6 the word is already queued.
+    func tmuxSendLine(session: String, line: String, skipIfQueued: String? = nil) -> Int32 {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        var args = [repoRoot + "/scripts/tmux-send-line.sh", session, line, "--socket", sutandoTmuxSocket]
+        if let w = skipIfQueued { args += ["--skip-if-queued", w] }
+        proc.arguments = args
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return 4 }
+        proc.waitUntilExit()
+        return proc.terminationStatus
     }
 
     /// Return the avatar image, badged per composite mode:
