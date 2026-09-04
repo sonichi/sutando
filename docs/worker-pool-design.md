@@ -265,10 +265,20 @@ shutdown knows those four (`:575-595`). Creating `direct/` alone only moves the 
 completion event the receipts fill the cap permanently. So step 2 owes all five, and a partial
 implementation is worse than none: a named direct consumer, ownership transfer at the emit, a
 completion acknowledgement, a single release writer, and a restart/crash contract (`DISPATCH_DIR` is
-per-watcher `mktemp` at `:206`, so a restart forgets every receipt in it). The claim record is the
-candidate worth trying first, because it already has the durability the receipt lacks and already
-carries a `disposition` field (`acquire_task_claim:131`) that `next_pending_task:188` currently
-ignores in favour of a bare existence test. Then:
+per-watcher `mktemp` at `:206`, so a restart forgets every receipt in it). The claim record looked like the
+candidate; **it is not one yet, and the reason is worth recording rather than quietly dropping.** I
+wrote that it "already has the durability the receipt lacks." It does not: `claim_is_live` is
+`kill -0` on the owner pid (`:101-109`), so every claim dies with its watcher and a restart retires
+the lot — the same restart hole as the per-watcher `mktemp`, relocated. Its `disposition` field is
+likewise not free to extend: `claim_disposition` (`:169-177`) maps `must-handle` to 0, `fallback` to
+1 and **everything else to 2 = unknown**, with only the first two reaching the live-core branches, so
+a `direct` value is excluded by default and needs that function changed too. Both were found by
+keweichen checking the claim I made for it.
+
+So step 2 owes the five obligations above with **no mechanism yet identified** — a durable receipt
+needs a liveness test that outlives a process, which neither candidate currently has. Until one is
+designed and reviewed, the accounting below is a **specification of the target state, not a
+description of anything that runs**. Then:
 
 - `outstanding` is a count of durable receipts, so nothing is lost across passes and nothing is
   counted twice; the ticker holds no state between ticks.
@@ -854,21 +864,20 @@ same way.
 
 ## Packaging
 
-The pool ships as **new files only**: the worker claim path and pin table, the
-core's sweep, installer and plists, or as a skill. Existing Sutando files are
-not edited except the index and test bookkeeping CI requires when new modules
-land under `src/`. Anything that needs an existing file changed is its own PR
-with its own reason.
+**Except for the watcher-integration PRs named below, the pool ships as new
+files only**: the worker claim path and pin table, the core's sweep, installer
+and plists, or as a skill. Apart from those PRs, existing Sutando files are not
+edited except the index and test bookkeeping CI requires when new modules land
+under `src/`.
 
-**Step 2 is exactly such a PR, and this document previously implied otherwise.**
-The ticker is assigned to the watcher rather than to a new file, so step 2
-necessarily edits `src/watch-tasks-stream.sh` — its initializer (a new receipt
-namespace), its dispatch admission (the bound), its completion handling (the
-release), and its cleanup. That is a direct-file change to the most
-load-bearing script in the repo, and it does not travel under the new-files-only
-rule above; it travels under the last sentence of it. Sequenced accordingly:
-step 2 lands alone, with its own reason and its own production-path tests, and
-nothing else rides in the same PR.
+The exception is not a footnote, so it is stated as part of the rule rather than
+after it. Step 2's ticker is assigned to the watcher rather than to a new file,
+so it necessarily edits `src/watch-tasks-stream.sh` — its initializer (a new
+receipt namespace), its dispatch admission (the bound), its completion handling
+(the release), its cleanup, and `claim_disposition` if the receipt is built on
+the claim record. That is a direct change to the most load-bearing script in the
+repo. Each such change is its own PR with its own reason and its own
+production-path tests; the staged list below marks which those are.
 
 ## Staged PRs against main
 
