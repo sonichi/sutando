@@ -298,5 +298,47 @@ with _tf.TemporaryDirectory() as td:
           f"rc={r.returncode} {r.stdout}{r.stderr}")
 
 
+# --init-empty: the ONE path that may create the key, and only when absent (#3773).
+# `load` cannot tell a never-seeded host from a drifted one, so it refuses both.
+fresh = pathlib.Path(tempfile.mkdtemp()) / "s.json"
+fresh.write_text(json.dumps({"streak": 0, "noop_total": 48,
+                             "last_surfaced_ids": ["3753:peer-review"]}))
+
+rc, _, err = run(["--state", str(fresh), "--add", "3857:owner", "--write"])
+check("PRE-CONTROL: --add on a keyless state still refuses",
+      rc == 2 and "refusing to invent" in err, err[:80])
+
+rc, out, _ = run(["--state", str(fresh), "--init-empty"])
+_d = json.loads(fresh.read_text())
+check("--init-empty creates the key as [] and exits 0",
+      rc == 0 and _d.get("held_item_ids") == [], f"rc={rc} {_d.get('held_item_ids')!r}")
+check("--init-empty records provenance, so a seeded key is never anonymous",
+      _d.get("held_item_seed", {}).get("by") == "idle-held.py --init-empty",
+      str(_d.get("held_item_seed"))[:70])
+check("--init-empty leaves every other key untouched",
+      _d.get("streak") == 0 and _d.get("noop_total") == 48
+      and _d.get("last_surfaced_ids") == ["3753:peer-review"], str(_d)[:90])
+
+rc, _, err = run(["--state", str(fresh), "--init-empty"])
+check("--init-empty REFUSES a second time — it bootstraps, never clears",
+      rc == 2 and "REFUSED" in err, err[:80])
+
+rc, _, _ = run(["--state", str(fresh), "--add", "3857:owner", "--write"])
+check("THE POINT: --add works after the bootstrap",
+      rc == 0 and json.loads(fresh.read_text())["held_item_ids"] == [["3857", "owner"]],
+      str(json.loads(fresh.read_text()).get("held_item_ids"))[:60])
+
+pop = state(BASE)
+rc, _, err = run(["--state", str(pop), "--init-empty"])
+check("--init-empty on a POPULATED record refuses and does not wipe it",
+      rc == 2 and "REFUSED" in err
+      and json.loads(pop.read_text())["held_item_ids"] == BASE, err[:80])
+
+nofile = pathlib.Path(tempfile.mkdtemp()) / "nope.json"
+rc, _, err = run(["--state", str(nofile), "--init-empty"])
+check("--init-empty on a MISSING state file cannot answer, never creates one",
+      rc == 2 and not nofile.exists(), f"rc={rc} exists={nofile.exists()}")
+
+
 print(f"\n{'FAILED: ' + ', '.join(fails) if fails else 'all passed'} ({ran - len(fails)}/{ran} assertions)")
 sys.exit(1 if fails else 0)

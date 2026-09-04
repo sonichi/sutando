@@ -41,6 +41,40 @@ from pathlib import Path
 KEY = "held_item_ids"
 
 
+def init_empty(state: Path) -> int:
+    """Create the key as [] on a host that never had one, so --add can work.
+
+    An ABSENT key and a DRIFTED one need opposite treatment, and `load` cannot
+    tell them apart, so it refuses both. This is the one path that may create
+    the key — and only when it does not exist, which is what keeps "inventing a
+    list" impossible: [] asserts nothing about what is held.
+    """
+    if not state.is_file():
+        print(f"CANNOT ANSWER: no state file at {state}", file=sys.stderr)
+        return 2
+    try:
+        doc = json.loads(state.read_text())
+    except ValueError as exc:
+        print(f"CANNOT ANSWER: state file is not JSON: {exc}", file=sys.stderr)
+        return 2
+    if KEY in doc:
+        print(f"REFUSED: {state} already has {KEY} "
+              f"({len(doc[KEY]) if isinstance(doc[KEY], list) else '?'} entries) "
+              "— --init-empty only bootstraps, it never clears", file=sys.stderr)
+        return 2
+    doc[KEY] = []
+    doc["held_item_seed"] = {
+        "seeded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "by": "idle-held.py --init-empty",
+        "note": "empty bootstrap; the record is populated by --add, never by a list",
+    }
+    tmp = state.with_suffix(state.suffix + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True))
+    os.replace(tmp, state)
+    print(f"seeded {KEY} = [] in {state}  (provenance in held_item_seed)")
+    return 0
+
+
 def load(state: Path):
     if not state.is_file():
         return None, f"no state file at {state}"
@@ -233,12 +267,19 @@ def main(argv=None) -> int:
     ap.add_argument("--audit-notes", metavar="REPO",
                     help="resolve every `<branch> @ <sha>` in held_item_notes against that git "
                          "repo and report drift; exit 1 if any note disagrees with git")
+    ap.add_argument("--init-empty", action="store_true",
+                    help="create held_item_ids as [] on a state file that has "
+                         "no such key, so --add works; REFUSES if it exists")
     ap.add_argument("--archive-orphan-notes", action="store_true",
                     help="move every held_item_notes entry whose id is no longer held into "
                          "held_item_notes_archived (never deletes); needs --write to persist")
     a = ap.parse_args(argv)
 
     state = Path(a.state)
+
+    if a.init_empty:
+        return init_empty(state)
+
     doc, err = load(state)
     if err:
         print(f"CANNOT ANSWER: {err}", file=sys.stderr)
