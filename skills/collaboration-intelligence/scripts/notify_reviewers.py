@@ -41,7 +41,7 @@ sys.path.insert(0, str(_REPO / "src"))
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from roster_union import host_rosters, roster_union
+from roster_union import host_rosters, roster_login, roster_union
 
 _ROSTER_LEAF = Path("data") / "collaboration-intelligence" / "reviewer-stands.json"
 
@@ -212,16 +212,17 @@ def _github_login(name: str, roster: dict) -> "tuple[str, str]":
     """(login GitHub can answer for, why) — a roster key is not always one.
 
     Explicit roster fields win over the key itself: a roster key can coincide
-    with an unrelated real login, and then the key is not evidence.
+    with an unrelated real login, and then the key is not evidence. Which field
+    declares that login is roster_union.roster_login's call, not this reader's.
 
     `johnm-desktop` is a Stand handle, not a login; probing it 404s and the
     capability check degrades to a silent no-op on exactly the aliased keys
     `_actor_map` exists to normalize. Follow same_actor_as to a sibling that is.
     """
     entry = (roster or {}).get(name) or {}
-    gh = entry.get("gh")
+    gh, field = roster_login(entry)
     if gh and _is_github_user(gh):
-        return gh, f"roster gh -> {gh}"
+        return gh, f"roster {field} -> {gh}"
     sib = entry.get("same_actor_as")
     if sib and _is_github_user(sib):
         return sib, f"via same_actor_as -> {sib}"

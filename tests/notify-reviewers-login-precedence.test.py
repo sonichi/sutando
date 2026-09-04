@@ -68,6 +68,34 @@ class LoginPrecedenceTests(unittest.TestCase):
         self.assertEqual(login, "sonichi")
         self.assertEqual(why, "key is a login")
 
+    def test_the_github_spelling_resolves_exactly_like_gh(self):
+        # Both spellings are deployed in ONE live roster file (5 `gh`, 2
+        # `github`); the other reader of this store reads only `github`.
+        roster = {"yixuan": {"github": "yixuan-ag2"}}
+        login, why = self.mod._github_login("yixuan", roster)
+        self.assertEqual(login, "yixuan-ag2")
+        self.assertIn("github", why)
+
+    def test_a_github_that_is_not_a_login_falls_through(self):
+        roster = {"sonichi": {"github": "no-such-account"}}
+        login, why = self.mod._github_login("sonichi", roster)
+        self.assertEqual(login, "sonichi")
+        self.assertEqual(why, "key is a login")
+
+    def test_gh_wins_when_a_row_carries_BOTH_spellings(self):
+        """Deterministic, so the two readers cannot pick different answers."""
+        roster = {"yixuan": {"gh": "yixuan-ag2", "github": "sonichi"}}
+        login, why = self.mod._github_login("yixuan", roster)
+        self.assertEqual(login, "yixuan-ag2")
+        self.assertEqual(why, "roster gh -> yixuan-ag2")
+
+    def test_an_EMPTY_identity_field_does_not_shadow_the_other_spelling(self):
+        # A live row carries `gh: null`; `get("gh") or get("github")` must not
+        # be re-derived per reader, and null must fall through, not dead-end.
+        roster = {"yixuan": {"gh": None, "github": "yixuan-ag2"}}
+        login, _ = self.mod._github_login("yixuan", roster)
+        self.assertEqual(login, "yixuan-ag2")
+
     def test_neither_resolves(self):
         login, why = self.mod._github_login("stand-handle", {"stand-handle": {}})
         self.assertEqual(login, "stand-handle")
