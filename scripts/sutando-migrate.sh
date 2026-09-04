@@ -563,7 +563,7 @@ scan_source() {
         # state/<basename>, not the original relpath, so we index under the
         # re-homed path so re-home collisions surface correctly.
         case "$cls" in
-            structural|append|newest-mtime|collision-keep-both)
+            structural|append|newest-mtime|collision-keep-both|pins-union)
                 record_xsrc "$tag" "$rel" "$cls" "$file"
                 ;;
             rehome-state)
@@ -2154,6 +2154,48 @@ commit_main() {
     fi
 }
 
+# pins-union verify contract. stdout: MISSING / MALFORMED: ... / LOST: ... on
+# failure (rc 1); rc 0 when every live, unexpired source pin is in the canonical file.
+verify_pins_union() {
+    local src="$1" dst="$2" py
+    py="$(require_python "$REPO_DIR" "verify process-pin snapshots")" || { echo "MALFORMED: no python"; return 1; }
+    "$py" - "$SCRIPT_DIR/../src" "$src" "$dst" <<'PY'
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import process_pins as pp
+src, dst = sys.argv[2], sys.argv[3]
+try:
+    canon = pp._load_strict(dst)
+except FileNotFoundError:
+    print("MISSING"); sys.exit(1)
+except Exception as e:  # noqa: BLE001 — any malformed canonical is a verify failure
+    print(f"MALFORMED: {e}"); sys.exit(1)
+import os
+if not os.path.exists(dst):
+    print("MISSING"); sys.exit(1)
+try:
+    source = pp._load_strict(src)
+except Exception as e:  # noqa: BLE001
+    print(f"MALFORMED-SOURCE: {e}"); sys.exit(1)
+live = pp.live_lstart_by_pid()
+have = {pp._identity(p) for p in canon}
+now = time.time()
+lost = []
+for p in source:
+    if pp._expired(p, now):
+        continue
+    if live is not None:
+        got = live.get(str(p.get("pid") or ""))
+        if got is None or str(got).strip() != str(p.get("lstart") or "").strip():
+            continue
+    if pp._identity(p) not in have:
+        lost.append(f"{p['service']} pid {p['pid']}")
+if lost:
+    print("LOST: " + ", ".join(lost)); sys.exit(1)
+print("ok")
+PY
+}
+
 verify_main() {
     # Per Mini #design 2026-06-02: verify must sha-compare content, not just
     # check path existence. The previous version could pass even after a
@@ -2196,6 +2238,20 @@ verify_main() {
         local src_file="$src_root/$rel"
         [ ! -f "$src_file" ] && src_file="$src_root/$(basename "$rel")"
         [ ! -f "$src_file" ] && { missing=$((missing+1)); [ "$missing" -le 5 ] && echo "  MISSING-SRC: $tag/$rel ($cls)"; continue; }
+        # A union has no byte-identical landing: the contract is that the
+        # canonical file loads strictly and holds every live, unexpired source pin.
+        if [ "$cls" = "pins-union" ]; then
+            local pv
+            if ! pv="$(verify_pins_union "$src_file" "$DEST_REAL/$rel")"; then
+                case "$pv" in
+                    MISSING*)  missing=$((missing+1)); [ "$missing" -le 5 ] && echo "  MISSING: $tag/$rel ($cls) — no canonical pin file" ;;
+                    *)         mismatch=$((mismatch+1)); [ "$mismatch" -le 5 ] && echo "  MISMATCH: $tag/$rel ($cls) — $pv" ;;
+                esac
+            else
+                pass=$((pass+1))
+            fi
+            continue
+        fi
         # Candidate destinations to check (in order of likelihood per class).
         local dst_canonical="$DEST_REAL/$rel"
         local dst_sidecar_legacy="$DEST_REAL/legacy/$tag/$rel"
@@ -2453,6 +2509,7 @@ explain_main() {
                             *) dest_hint="<dest>/state/$base" ;;
                         esac
                         ;;
+                    pins-union) dest_hint="<dest>/$rel  (pin snapshots: the newest taken whole, older-only pins kept while live and unexpired; one locked merge via src/process_pins.py)" ;;
                     union-json-array) dest_hint="<dest>/$rel  (accumulated: top-level arrays unioned across sources, other fields from the newer file; malformed input aborts rather than picking a winner)" ;;
                     rehome-dated-snapshot) dest_hint="<dest>/notes/archive/$(basename "$rel")" ;;
                     rehome-narrative-log) dest_hint="<dest>/logs/workspace-narrative.log  (renamed to dodge logs/conversation.log collision)" ;;

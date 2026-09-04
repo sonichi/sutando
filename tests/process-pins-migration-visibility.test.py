@@ -573,6 +573,60 @@ finish(a, *dispatch(a))
         got = sorted((p["reason"], p["expires_at"]) for p in pins)
         self.assertEqual(got, [("extended witness", FUTURE), ("unrelated", FUTURE)], got)
 
+    def _run(self, *args, expect_rc=None):
+        env = dict(os.environ)
+        env.update(HOME=str(self.tmp / "home"),
+                   SUTANDO_MIGRATE_DEST=str(self.tmp / "dest"),
+                   SUTANDO_MIGRATE_SRC_A=str(self.tmp / "src/a"),
+                   SUTANDO_MIGRATE_SRC_B=str(self.tmp / "src/b"),
+                   SUTANDO_MIGRATE_SRC_C=str(self.tmp / "src/c"))
+        r = subprocess.run(["bash", str(REPO / "scripts" / "sutando-migrate.sh"), *args],
+                           capture_output=True, text=True, env=env, timeout=180)
+        if expect_rc is not None:
+            self.assertEqual(r.returncode, expect_rc, r.stdout + r.stderr)
+        return r
+
+    def test_SCAN_indexes_the_class_and_EXPLAIN_names_its_destination(self) -> None:
+        """Two sources holding the pin file are a collision the scan must see,
+        and `explain` must name the canonical landing rather than <unknown>."""
+        me = os.getpid()
+        my_lstart = subprocess.run(["ps", "-o", "lstart=", "-p", str(me)],
+                                   capture_output=True, text=True).stdout.strip()
+        self._write("src/a", [pin(me, my_lstart, "a")], OLDER)
+        self._write("src/c", [pin(me, my_lstart, "c")], NEWER)
+        r = self._run("--json", "--no-confirm", expect_rc=0)
+        doc = json.loads(r.stdout[r.stdout.index("{"):])
+        rels = [n["rel"] for n in doc["notable_collisions"]]
+        self.assertIn("state/process-pins.json", rels, rels)
+        r = self._run("explain", "state/process-pins.json", expect_rc=0)
+        self.assertIn("class:  pins-union", r.stdout)
+        self.assertIn("dest:   <dest>/state/process-pins.json", r.stdout)
+        self.assertNotIn("<unknown>", r.stdout)
+
+    def test_VERIFY_holds_the_union_contract_and_fails_on_a_malformed_canonical(self) -> None:
+        me = os.getpid()
+        my_lstart = subprocess.run(["ps", "-o", "lstart=", "-p", str(me)],
+                                   capture_output=True, text=True).stdout.strip()
+        self._write("src/a", [pin(me, my_lstart, "a-live")], OLDER)
+        self._write("src/c", [pin(me, my_lstart, "c-live")], NEWER)
+        self._migrate()
+        canonical = self.tmp / "dest" / "state" / "process-pins.json"
+        r = self._run("verify", expect_rc=0)
+        self.assertIn("verify: OK", r.stdout)
+        self.assertNotIn("pass=0", r.stdout, "the pin class was not verified at all")
+        # a live source pin dropped from the canonical file is a MISMATCH
+        canonical.write_text(json.dumps({"pins": []}))
+        r = self._run("verify", expect_rc=1)
+        self.assertIn("MISMATCH", r.stdout); self.assertIn("LOST", r.stdout)
+        # malformed canonical is a MISMATCH, never a pass
+        canonical.write_text("{not json")
+        r = self._run("verify", expect_rc=1)
+        self.assertIn("MISMATCH", r.stdout); self.assertIn("MALFORMED", r.stdout)
+        # absent canonical is MISSING
+        canonical.unlink()
+        r = self._run("verify", expect_rc=1)
+        self.assertIn("MISSING", r.stdout)
+
     def test_FAILED_stat_call_printing_a_number_is_NOT_a_successful_answer(self) -> None:
         """Numeric OUTPUT is not a successful CALL.
 
