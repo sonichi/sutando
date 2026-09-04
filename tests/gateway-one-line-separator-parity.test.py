@@ -71,9 +71,9 @@ class FlattenMatchesTheReader(unittest.TestCase):
 
 class DerivedNotEnumerated(unittest.TestCase):
     def test_no_splitlines_boundary_survives(self):
-        # The whole point of deriving from splitlines(): the guarantee is over
-        # its set, not over a list someone remembered to keep current.
-        boundaries = [chr(c) for c in range(0x3000)
+        # Scans ALL of Unicode: a bound would be the same kind of typed
+        # constant this test exists to catch going stale. ~135ms, once.
+        boundaries = [chr(c) for c in range(sys.maxunicode + 1)
                       if len(("a" + chr(c) + "b").splitlines()) > 1]
         self.assertEqual(len(boundaries), 10, boundaries)
         for c in boundaries:
