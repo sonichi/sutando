@@ -84,6 +84,10 @@ class MatchesBash(unittest.TestCase):
         "gh pr comment 1 --body $'\\e[0m'",
         "gh pr comment 1 --body pre$'mid'post",
         "gh pr comment 1 --body $'plain' --title after",
+        # $"..." is locale translation: bash drops the $ too, so the same
+        # under-deny as $'...' reached the sha match by a second route.
+        'gh release create v1 --target $"abc1234"',
+        'gh pr comment 1 --body $"hello world"',
     ]
 
     # bash rewrites these too and we deliberately do NOT flag them: `$VAR` is an

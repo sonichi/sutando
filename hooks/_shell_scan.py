@@ -188,6 +188,17 @@ def words(command: str) -> List[Word]:
             i += 1
             continue
 
+        if ch == "$" and command[i + 1:i + 2] == '"':
+            # $"..." is locale translation: bash drops the $ and the string
+            # behaves as an ordinary double-quoted one, expansions included.
+            st.quote = '"'
+            st.in_word = True
+            st.cur.raw += command[i:i + 2]
+            if not st.cur.quoted:
+                st.cur.quoted = '"'
+            i += 2
+            continue
+
         if ch == "$" and command[i + 1:i + 2] == "'":
             # ANSI-C quoting: bash DROPS the $ and decodes the escapes, so a
             # scanner that keeps it reports a value gh never receives.
