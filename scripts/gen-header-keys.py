@@ -17,6 +17,14 @@ OWNER = REPO / "src" / "local_task_protocol.py"
 OUT = REPO / "src" / "header_keys.ts"
 
 
+def _rel(p: Path) -> str:
+    """OUT is overridable, so a display path may sit outside the repo."""
+    try:
+        return str(p.relative_to(REPO))
+    except ValueError:
+        return str(p)
+
+
 def keys() -> tuple:
     spec = importlib.util.spec_from_file_location("_ltp_gen", OWNER)
     mod = importlib.util.module_from_spec(spec)
@@ -50,14 +58,14 @@ def main(argv=None) -> int:
     if "--check" in argv:
         current = OUT.read_text() if OUT.is_file() else ""
         if current == text:
-            print(f"gen-header-keys: {OUT.relative_to(REPO)} is current")
+            print(f"gen-header-keys: {_rel(OUT)} is current")
             return 0
-        print(f"gen-header-keys: STALE — {OUT.relative_to(REPO)} does not match "
-              f"{OWNER.relative_to(REPO)}. Run: python3 scripts/gen-header-keys.py",
+        print(f"gen-header-keys: STALE — {_rel(OUT)} does not match "
+              f"{_rel(OWNER)}. Run: python3 scripts/gen-header-keys.py",
               file=sys.stderr)
         return 1
     OUT.write_text(text)
-    print(f"gen-header-keys: wrote {OUT.relative_to(REPO)} ({len(keys())} keys)")
+    print(f"gen-header-keys: wrote {_rel(OUT)} ({len(keys())} keys)")
     return 0
 
 
