@@ -384,7 +384,9 @@ def get_reminders() -> "list[str] | None":
             line = line.strip()
             if line and not line.startswith("#") and line.lower() not in empty_sentinels:
                 items.append(line)
-        return _demote_stale_reminders(items)[:5]
+        # No cap here, for the same reason as get_health_issues(): the renderer
+        # is the only place that can still see the total it is omitting from.
+        return _demote_stale_reminders(items)
     except (subprocess.TimeoutExpired, OSError):
         return None
 
@@ -672,7 +674,9 @@ def get_health_issues() -> "list[str] | None":
         # "unknown", not "clean".
         if r.returncode != 0 and not issues:
             return None
-        return issues[:3]
+        # No cap here: the count is what makes a partial list honest, and a cap
+        # applied before the renderer destroys it. synthesize() bounds the prose.
+        return issues
     except (subprocess.TimeoutExpired, OSError):
         return None
 
@@ -716,25 +720,37 @@ def synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issu
         parts.append("Your calendar is clear today.")
 
     # Reminders
+    n_rem = 0 if reminders is None else len(reminders)
     if reminders:
-        r_list = ", ".join(reminders[:3])
-        parts.append(f"Reminders due: {r_list}.")
+        shown = reminders[:3]
+        more = f" (+{n_rem - len(shown)} more)" if n_rem > len(shown) else ""
+        parts.append(f"Reminders due: {', '.join(shown)}{more}.")
 
     # Pending questions
     if pending_qs:
         if len(pending_qs) == 1:
             parts.append(f"One pending question waiting: {pending_qs[0]}.")
         else:
-            parts.append(f"{len(pending_qs)} pending questions. Top item: {pending_qs[0]}.")
+            # "Top item" asserted a ranking this code does not perform: get_waiting_questions()
+            # yields FILE order, so index 0 is first-listed, not most important.
+            parts.append(f"{len(pending_qs)} pending questions. First on the list: {pending_qs[0]}.")
 
     # Overnight Discord
     if discord_msgs:
         parts.append(f"Overnight: {len(discord_msgs)} Discord message{'s' if len(discord_msgs) > 1 else ''}.")
 
     # Health issues
+    n_health = 0 if health_issues is None else len(health_issues)
     if health_issues:
-        issues_str = "; ".join(health_issues[:2])
-        parts.append(f"System note: {issues_str}.")
+        shown = health_issues[:2]
+        # Lead with the count and name the remainder, as the health-check
+        # notifiers already do — two of nine must not read as two of two.
+        more = f" (+{n_health - len(shown)} more)" if n_health > len(shown) else ""
+        noun = "failure" if n_health == 1 else "failures"
+        parts.append(
+            f"System note: {n_health} health {noun} — "
+            f"{'; '.join(shown)}{more}."
+        )
 
     # Closing — every input must be VERIFIED empty, not merely falsy. `None`
     # from any gather means that query did not run, and an unanswered query is
