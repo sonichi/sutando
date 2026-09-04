@@ -145,10 +145,14 @@ with tempfile.TemporaryDirectory() as d:
     stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
     live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
     got, note = mib._live_index(stale)
-    check("resolution: the FRESHEST index wins over the one MEMORY_DIR names",
-          got == live / "MEMORY.md", f"got {got}")
-    check("resolution: the disagreement is announced, not silent",
+    # A 12-day gap is exactly the case where "freshest" looks authoritative and
+    # is not: an unrelated project edited later is still not what loads here.
+    check("resolution: two corpora and no authoritative signal REFUSES, however wide the gap",
+          got is None and "CANNOT ANSWER" in note, f"got={got}")
+    check("resolution: the refusal NAMES the candidates rather than picking one",
           "slug-live" in note and "slug-stale" in note, f"note={note!r}")
+    check("resolution: the refusal says what to do instead of leaving the caller stuck",
+          "SUTANDO_MEMORY_DIR" in note and "--index" in note, f"note={note!r}")
 
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "projects"
@@ -162,7 +166,7 @@ with tempfile.TemporaryDirectory() as d:
     a = _tree(projects, "slug-a", index_of(LIMIT // 3), age_s=10)
     _tree(projects, "slug-b", index_of(LIMIT // 3), age_s=11)
     got, note = mib._live_index(a)
-    check("resolution: two indexes written seconds apart REFUSE rather than guess",
+    check("resolution: near-simultaneous indexes REFUSE too -- the gap never decides",
           got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
 
 with tempfile.TemporaryDirectory() as d:
@@ -187,6 +191,30 @@ with tempfile.TemporaryDirectory() as d:
         rc = mib.main(["--repo", str(REPO), "--index", str(named)])
     check("--index still wins: an explicit path is never second-guessed",
           rc == 0 and "note: measuring" not in buf.getvalue(), f"rc={rc}")
+
+with tempfile.TemporaryDirectory() as d:
+    # The override outranks every heuristic, including when it names the OLDER
+    # tree: the owner states identity, the tool does not infer it.
+    projects = pathlib.Path(d) / "projects"
+    older = _tree(projects, "slug-older", index_of(LIMIT // 3), age_s=86400)
+    newer = _tree(projects, "slug-newer", index_of(LIMIT // 2), age_s=60)
+    _prev = os.environ.get("SUTANDO_MEMORY_DIR")
+    os.environ["SUTANDO_MEMORY_DIR"] = str(older)
+    try:
+        got, note = mib._live_index(older)
+        check("resolution: with the override set, the caller's memory_dir is trusted outright",
+              got == older / "MEMORY.md" and note == "", f"got={got} note={note!r}")
+        got, note = mib._live_index(newer)
+        check("resolution: an override set means NO sibling scan -- a fresher tree is ignored",
+              got == newer / "MEMORY.md" and note == "", f"got={got} note={note!r}")
+        got, note = mib._live_index(projects / "slug-absent" / "memory")
+        check("resolution: override set but the index missing REFUSES, never falls back to a scan",
+              got is None and "CANNOT ANSWER" in note, f"got={got} note={note!r}")
+    finally:
+        if _prev is None:
+            os.environ.pop("SUTANDO_MEMORY_DIR", None)
+        else:
+            os.environ["SUTANDO_MEMORY_DIR"] = _prev
 
 # --- the branches the coverage gate flagged: refusal, fallback, and main()'s default -
 with tempfile.TemporaryDirectory() as d:
@@ -244,16 +272,21 @@ with tempfile.TemporaryDirectory() as d:
     stale = _tree(projects, "slug-stale3", index_of(LIMIT // 3), age_s=86400)
     _tree(projects, "slug-live3", index_of(LIMIT // 2), age_s=60)
     rc, out, _ = _main_with_memory_dir(stale, ["--repo", str(REPO)])
-    check("main() with no --index measures the FRESH tree and says so",
-          rc == 0 and "slug-live3" in out and "note: measuring" in out, f"rc={rc} out={out[:120]!r}")
+    # The helper sets the override, so main() measures what MEMORY_DIR names and
+    # never scans siblings -- even with a fresher one beside it.
+    check("main() honours the override and does NOT drift to the fresher sibling",
+          rc == 0 and "slug-live3" not in out and "note: measuring" not in out,
+          f"rc={rc} out={out[:120]!r}")
 
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "projects"
     a2 = _tree(projects, "slug-tie-a", index_of(LIMIT // 3), age_s=10)
     _tree(projects, "slug-tie-b", index_of(LIMIT // 3), age_s=11)
     rc, out, err = _main_with_memory_dir(a2, ["--repo", str(REPO)])
-    check("main() REFUSES (rc 2) on an ambiguous tie and explains on stderr",
-          rc == 2 and "CANNOT ANSWER" in err, f"rc={rc} err={err[:100]!r}")
+    # An override leaves no ambiguity to resolve; the refusal path needs it ABSENT,
+    # which this harness cannot produce, so _live_index covers that directly above.
+    check("main() with the override set resolves without ambiguity and does not refuse",
+          rc == 0 and "CANNOT ANSWER" not in err, f"rc={rc} err={err[:100]!r}")
 
 # --- the authority must be the real one: a stand-in that lacks the primitives is None
 with tempfile.TemporaryDirectory() as d:

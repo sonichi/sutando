@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -89,35 +90,38 @@ def evaluate(mod, current: str, addition: str = "", at_top: bool = False) -> dic
 
 
 # MEMORY_DIR is derived from THIS process's cwd, not from the tree the session
-# loads; a checkout can host several. Prefer the freshest under projects/.
-_AMBIGUOUS_S = 120
+# loads; a checkout can host several. Resolve by IDENTITY, never by freshness.
 
 
 def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
-    """(index, note). index None means refuse — the note says why."""
+    """(index, note). index None means refuse -- the note says why.
+
+    Freshness is not identity: an unrelated project edited more recently is not
+    the corpus this session loads, and an mtime cannot separate the two.
+    """
     default = memory_dir / "MEMORY.md"
+    # MEMORY_DIR is already derived FROM this override when it is set, so the
+    # caller's memory_dir is owner-stated identity -- do not re-read the var.
+    if os.environ.get("SUTANDO_MEMORY_DIR"):
+        if default.is_file():
+            return default, ""
+        return None, f"CANNOT ANSWER: SUTANDO_MEMORY_DIR resolves to {default}, which is not a file"
     projects = memory_dir.parent.parent
     try:
-        cands = sorted(
-            (p for p in projects.glob("*/memory/MEMORY.md") if p.is_file()),
-            key=lambda p: p.stat().st_mtime, reverse=True)
+        cands = sorted(p for p in projects.glob("*/memory/MEMORY.md") if p.is_file())
     except OSError:
         cands = []
     if not cands:
-        return (default, "") if default.is_file() else (
-            None, f"CANNOT ANSWER: no index at {default} and none under {projects}")
-    live = cands[0]
-    if len(cands) > 1:
-        gap = live.stat().st_mtime - cands[1].stat().st_mtime
-        if gap < _AMBIGUOUS_S:
-            return (None,
-                    f"CANNOT ANSWER: {len(cands)} indexes and the two freshest are "
-                    f"{gap:.0f}s apart — name one with --index")
-    if live.resolve() == default.resolve():
-        return live, ""
-    return live, (f"note: measuring {live.parent.parent.name} (freshest, "
-                  f"{live.stat().st_size:,} B); health-check's MEMORY_DIR names "
-                  f"{default.parent.parent.name} — pass --index to override")
+        if default.is_file():
+            return default, ""
+        return None, f"CANNOT ANSWER: no index at {default} and none under {projects}"
+    if len(cands) == 1:
+        return cands[0], ""
+    names = ", ".join(c.parent.parent.name for c in cands)
+    return None, (
+        f"CANNOT ANSWER: {len(cands)} corpora under {projects} and nothing authoritative "
+        f"names one ({names}). Set SUTANDO_MEMORY_DIR or pass --index -- an mtime says "
+        f"which was edited last, not which one this session loads.")
 
 
 def main(argv=None) -> int:
