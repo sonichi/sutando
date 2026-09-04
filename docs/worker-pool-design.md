@@ -160,13 +160,15 @@ instance holds the claim, and every loser leaves the file untouched.
 
 With worker-2's beat STALE the second column falls through for everyone, rule 3
 selects the core, and the workers suppress. The same adversarial ordering holds —
-both workers suppress first, the core then emits, and the stand-in consumes
-exactly once, again with no claim taken by anyone.
+both workers suppress without taking a claim, the core then takes the claim on
+that key, wins it uncontested, and consumes exactly once. The stand-in is not
+exempt from the claim; it is simply the only instance contending for it here.
 
-The bound-set case is the one place a claim is still doing work, and it is the
-case it was designed for: every member is a target, so the contention is
-target-against-target, the winner emits and the losers suppress rather than
-discard.
+The bound-set case is the one place the claim arbitrates target-against-target,
+and it is the case it was designed for: every member is a target, so the winner
+emits and the losers suppress rather than discard. Elsewhere the claim is still
+load-bearing — Trace A is target-against-stand-in — but only ever between one
+target and the core.
 
 A task is eligible to exactly one instance except inside a bound set, where the
 claim settles it. A later form of addressing (an app control, a room command, a
