@@ -215,7 +215,23 @@ already claimed is skipped by the claim, not by an age test, so the gate was nev
 load-bearing. Order is the queue's existing priority order, not directory order. One
 tick claims every file this instance is the candidate for, bounded by the same
 capacity/busy rule that bounds event-driven claiming; reconciliation is not a second
-scheduler and must not be able to admit work the event path would refuse. A suppress/suppress pair therefore costs one beat of
+scheduler and must not be able to admit work the event path would refuse.
+
+**That sentence named a bound that does not exist, and the ticker cannot reuse what is not
+there.** Production bounds EXECUTION, not ADMISSION: `queue_handler_task` takes the dispatch
+lock, calls `acquire_task_claim` and writes the pending marker, and only then calls
+`drain_dispatch_queue` — so the two-runner cap gates how many run, never how many are claimed.
+Measured control, five tasks against an unchanged tree: **5 claims, 2 running, 3 pending.** An
+event path that claims everything and runs two is correct for events, because events arrive at
+the rate work arrives. A ticker re-listing the whole pending directory is not rate-limited by
+anything, so "the same bound" would be no bound at all.
+
+So the ticker needs an ADMISSION bound of its own, and it is stated here rather than borrowed:
+a reconciliation pass claims at most `2 * runners` tasks beyond those already pending for this
+instance, and stops. The next tick re-lists from scratch, so a pass that stops early loses
+nothing — the same property single-flight relies on. The number is a starting point, not a
+result; what is load-bearing is that the bound is on CLAIMS and belongs to the ticker, because
+the event path has no admission bound to inherit. A suppress/suppress pair therefore costs one beat of
 latency instead of stranding the task, in step 2 and step 3 alike.
 
 **It IS a scan, and an earlier revision claimed otherwise to make it sound cheaper.**
@@ -278,7 +294,28 @@ else may write membership.
 - **A live `1 -> 0` is the same edge reversed**: the command that removes the last worker
   signals the core's watcher to disarm before it stops that worker.
 
-**The fallback is fail-closed, and the direction is deliberate.** If a signal is ever missed,
+****The registry does not carry this yet, and that fixes the staging order.**
+`src/runtime-api/instance_registry.py` today has zero occurrences of `role` or `pool` and no
+deregistration path at all (control: 51 occurrences of `instance`, so the file is the right
+one). The watcher has no arm/disarm input either. So the reconciliation ticker CANNOT ship in
+step 2 as the staged list has it: step 2 would ship a gate whose input does not exist, and a
+gate with no input either never arms — leaving the zero-candidate race terminal — or is
+implemented as "always on", which is the every-30-seconds re-emit this whole section exists to
+prevent. **The membership machinery is therefore a prerequisite PR of its own, ahead of the
+ticker:** the registry gains `role` and `pool`, gains a deregistration path, and the watcher
+gains an arm/disarm input. The ticker ships after it, never beside it.
+
+**And "signals the core's watcher" is not yet a specification.** It names no endpoint, no
+acknowledgement or retry, and no ordering. The ordering is the part that decides correctness
+and it goes one way only: **commit the registry change first, notify second.** Notify-then-commit
+can arm a ticker for a pool that does not exist if the commit then fails, and the missed-signal
+case is already covered by the startup re-read — so a lost notification costs latency until the
+next restart, while a premature one costs duplicate delivery. The retry policy follows from the
+same asymmetry: retry the ARM (recoverable, bounded by the next restart), and treat a failed
+DISARM as an error that must be surfaced rather than retried silently, because the window it
+leaves open is the expensive one.
+
+The fallback is fail-closed, and the direction is deliberate.** If a signal is ever missed,
 the next watcher start re-reads the registry and converges; and a registry that is absent,
 unreadable or unparseable reads as **not a member**, so the ticker does not arm. Both failure
 directions are bad, but they are not equally bad: a ticker that fails to arm leaves the
