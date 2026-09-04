@@ -304,7 +304,7 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
         rec = json.loads(out.read_text())["y"]
         self.assertIsNone(rec["human_discord_id"])
         self.assertIsNone(rec["stand_discord_id"])
-        # CHANGED (#3537): neither value contains an id, and this field is
+        # neither value contains an id, and this field is
         # documented as ids only — no invented ones. rc is still 5.
         self.assertEqual(rec["unresolved_discord_ids"], [])
 
@@ -577,7 +577,7 @@ class TheCommandLineActuallyRuns(unittest.TestCase):
 
 
 class AnAxisCollisionBlocksWithoutAnyId(unittest.TestCase):
-    """The reviewer's exact production-CLI fixture (#3537).
+    """The production-CLI fixture this rule was measured on.
 
     The collision was reported only from inside a loop over the ids extracted
     from the colliding row, so an EMPTY row yielded no ids, no record, and rc 0
@@ -644,7 +644,7 @@ class AnAxisCollisionBlocksWithoutAnyId(unittest.TestCase):
 
 class AFieldNameStatesAWordNotASubstring(unittest.TestCase):
     """`_verdict_from_field` matched substrings, so a name could carry a
-    referent it never claimed (#3537). Reviewer's production-CLI controls."""
+    referent it never claimed. Production-CLI controls."""
 
     def _verdict(self, field):
         return mig._verdict_from_field(field)[0]
@@ -912,7 +912,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
                "provider_user_id": "user-42"}
 
     def test_a_foreign_id_field_is_not_a_discord_slot(self):
-        # Reviewer, 2026-08-30: the last word alone made every `*_id` a
+        # the last word alone made every `*_id` a
         # snowflake slot, so a valid roster returned 5 and could not promote.
         for field, value in self.FOREIGN.items():
             rc, err, _ = self._cli({field: value,
@@ -934,7 +934,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertEqual(rec[field], value, f"{field} was rewritten")
 
     def test_a_foreign_id_under_a_referent_ancestor_is_not_a_discord_slot(self):
-        # Reviewer, 2026-08-30: `_typed_path` matches ANY ancestor, so nesting
+        # `_typed_path` matches ANY ancestor, so nesting
         # a provider-native id under `human` made it a snowflake slot.
         for parent in ("human", "secondary_agent"):
             for field, value in self.FOREIGN.items():
@@ -958,7 +958,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertIn("SHAPE x", err)
 
     def test_a_snowflake_shaped_foreign_id_is_not_mined_into_a_slot(self):
-        # Reviewer, 2026-08-30: the leaf rule reached VALIDATION only, so
+        # the leaf rule reached VALIDATION only, so
         # discovery mined a provider id that merely looked like a snowflake.
         for parent, slot in (("human", "human_discord_id"),
                              ("secondary_agent", ri.OTHER_STANDS_FIELD)):
@@ -991,7 +991,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual([u["id"] for u in ri.unresolved_discord_ids(rec)], [])
 
     def test_another_providers_key_is_not_a_discord_slot(self):
-        # Reviewer, 2026-08-30: naming the REFERENT is not naming DISCORD.
+        # naming the REFERENT is not naming DISCORD.
         # `telegram_human_id` routed a Discord ping to a Telegram number.
         for field in ("telegram_human_id", "slack_human_id",
                       "matrix_stand_id", "github_human_id"):
@@ -1020,7 +1020,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertIsNone(rec["human_discord_id"])
 
     def test_a_referent_key_naming_an_unknown_provider_fails_closed(self):
-        # CHANGED (#3537): asserted the opposite, on a fixture I invented.
+        # asserted the opposite, on a fixture I invented.
         # Measured: the live roster holds NO unqualified id key.
         for field in ("teams_human_id", "webex_human_id", "other_agent_ids"):
             rc, err, rec = self._cli({field: self.SECOND,
@@ -1030,7 +1030,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertIsNone(rec["human_discord_id"], field)
 
     def test_an_explicit_sibling_provider_decides_both_ways(self):
-        # Reviewer, 2026-08-30: a non-Discord sibling was ignored, so the bare
+        # a non-Discord sibling was ignored, so the bare
         # `id` fell through to the legacy rule and was published anyway.
         for provider, expect in (("discord", HUMAN), ("matrix", None),
                                  ("teams", None)):
@@ -1050,7 +1050,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertIsNone(rec["human_discord_id"], field)
 
     def test_a_non_id_leaf_under_a_referent_is_not_mined(self):
-        # Reviewer, 2026-08-30: the provider rule guarded `*_id` leaves only,
+        # the provider rule guarded `*_id` leaves only,
         # so `schema.md`'s documented non-evidence field was still mined.
         rc, err, rec = self._cli({"human": {"display_name": HUMAN},
                                   "stand_discord_id": self.STAND})
@@ -1077,7 +1077,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
     ROOM = "1535008729106485288"
 
     def test_a_discord_provider_does_not_grant_every_sibling(self):
-        # Reviewer, 2026-08-30: the provider names the NAMESPACE. Under it,
+        # the provider names the NAMESPACE. Under it,
         # a room id was published as the human and could erase the real one.
         rc, err, rec = self._cli({"human": {"provider": "discord",
                                             "activity": {"rooms": [self.ROOM]}},
@@ -1113,7 +1113,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertIsNone(rec["human_discord_id"])
 
     def test_ordinary_metadata_is_not_a_shape_failure(self):
-        # Reviewer, 2026-08-30: the STRING branch consulted the source rule and
+        # the STRING branch consulted the source rule and
         # the non-string branch did not, so a bool refused a valid roster.
         rc, err, _ = self._cli({"human": {"provider": "matrix", "active": True},
                                 "stand_discord_id": self.STAND})
@@ -1147,7 +1147,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rec["human_discord_id"], HUMAN)
 
     def test_a_compound_slot_refuses_the_members_the_collector_drops(self):
-        # Reviewer, 2026-08-30: validation approximated the collector, so an
+        # validation approximated the collector, so an
         # unreadable member rode along beside a readable one.
         for value in ([self.SECOND, 1529720369668292629],
                       [1529720369668292629], [{"value": self.SECOND}]):
@@ -1157,7 +1157,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertIn("SHAPE x", err)
 
     def test_a_nested_member_is_validated_leaf_by_leaf(self):
-        # Reviewer, 2026-08-30: only the OUTER list was flattened, so one
+        # only the OUTER list was flattened, so one
         # readable string made a whole nested member "readable".
         for entry in ({"secondary_agent": {"ids": [[self.SECOND,
                                                     1529720369668292629]]}},
@@ -1175,7 +1175,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertIn(self.SECOND, ri.stand_discord_ids(rec))
 
     def test_two_ids_in_a_singular_slot_resolve_to_neither(self):
-        # Reviewer, 2026-08-30: both reached `stands` and the primary was the
+        # both reached `stands` and the primary was the
         # first traversal result, so reversing the input changed the answer.
         first, second = [], []
         for order, sink in (([self.SECOND, BOT], first), ([BOT, self.SECOND], second)):
@@ -1187,7 +1187,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(sorted(first), sorted([BOT, self.SECOND]))
 
     def test_an_over_full_slot_keeps_the_referent_it_stated(self):
-        # Reviewer, 2026-08-30: I recorded the arbitrated ids with states=None,
+        # I recorded the arbitrated ids with states=None,
         # so a contradicting source read as agreement and published a human.
         cfg = Path(self.tmp) / "tri.json"
         cfg.write_text(json.dumps({"people": {"x": {"discord": HUMAN,
@@ -1218,7 +1218,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
             self.assertEqual(ri.stand_discord_id(rec), self.SECOND, note)
 
     def test_an_ancestor_slot_keeps_its_referent_too(self):
-        # Reviewer, 2026-08-30: arbitration read `path[-1]`, so a bare `id`
+        # arbitration read `path[-1]`, so a bare `id`
         # under `human` yielded states=None — later treated as agreement.
         cfg = Path(self.tmp) / "t.json"
         cfg.write_text(json.dumps({"people": {"x": {"bots": [BOT]}}}))
@@ -1252,7 +1252,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         return rc, err.getvalue(), json.loads(out.read_text())["x"]
 
     def test_two_stated_referents_cannot_agree_with_either(self):
-        # Reviewer, 2026-08-30: a both-referent path collapsed to None, which
+        # a both-referent path collapsed to None, which
         # the agreement rule accepts. Earlier tests had no independent source.
         rc, err, rec = self._cli_tri(
             {"human_profile": {"secondary_agent": {"id": [HUMAN, BOT]}}},
@@ -1271,7 +1271,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertEqual(rec["human_discord_id"], HUMAN)
 
     def test_member_order_cannot_decide_a_referent(self):
-        # Reviewer, 2026-08-30: `arb_states` was a dict comprehension, so when
+        # `arb_states` was a dict comprehension, so when
         # one id appears in TWO failures the later record overwrote the earlier.
         outs = []
         for entry in ({ri.HUMAN_FIELD: [HUMAN, BOT], ri.STAND_FIELD: [HUMAN, self.SECOND]},
@@ -1454,7 +1454,7 @@ class ADeclaredIdSlotFailsClosedOnEveryPresentValue(unittest.TestCase):
         self.assertIsNone(outs[0][0], "an over-full slot published its id")
 
     def test_cross_record_union_covers_the_stand_side_too(self):
-        # Reviewer: a STAND-precedence overwrite mutant passed every test,
+        # a STAND-precedence overwrite mutant passed every test,
         # because the member-order case supplied only HUMAN evidence.
         for tri in ({"discord": HUMAN, "bots": []}, {"bots": [HUMAN]}):
             outs = []
@@ -1629,7 +1629,7 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
 
     def test_CONTROL_a_slot_that_reads_again_drops_its_stale_seed(self):
         # The guard's OTHER branch. An operator repairing the slot by hand is
-        # the case a carried seed would refuse — found by air (agent of qingyun).
+        # the case a carried seed would refuse.
         triage = {"people": {"alice": {"bots": [BOT]}}}
         rc1, d1 = self._pass({"alice": {"github": "alice",
                                         ri.HUMAN_FIELD: BOT}}, triage)
@@ -1700,7 +1700,7 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
         return rc, (json.loads(out.read_text()) if out.exists() else {})
 
     def test_a_seed_contested_only_via_the_owner_id_is_not_discharged(self):
-        """The owner_id half of the same lookup -- gap found by air (agent of qingyun).
+        """The owner_id half of the same lookup.
 
         Two lookups were added together for one reason; only peers.json was
         covered. This one's symptom is the INVERSE: the source stamping HUMAN is
@@ -1724,7 +1724,7 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
                       "the contested id stopped being unresolved")
 
     def test_a_seed_contested_only_via_peers_json_is_not_discharged(self):
-        """The same defect one source over -- found by air (agent of qingyun).
+        """The same defect one source over.
 
         Discharge reads what THIS pass says about the id. Triage claims are in
         `claims` by then, but peers.json and the owner id are stamped later, so
@@ -1749,7 +1749,7 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
 
     def test_a_blank_slot_is_erased_like_a_null_one(self):
         # Reachable only from a hand-edited roster: our writer emits None, never
-        # "". Found by air (agent of qingyun) as an untested third of the rule.
+        # "". An untested third of the rule.
         triage = {"people": {"alice": {"bots": [BOT]}}}
         rc1, d1 = self._pass({"alice": {"github": "alice",
                                         ri.HUMAN_FIELD: BOT}}, triage)
@@ -1826,7 +1826,7 @@ class DisagreementSurvivesReMigration(unittest.TestCase):
 
 
 class TwoPassShapeRepairDoesNotDischargeASeed(unittest.TestCase):
-    """A shape-only repair must not clear a refusal (keweichen, #3537).
+    """A shape-only repair must not clear a refusal.
 
     The malformed source changes REPRESENTATION (scalar <-> list); its stated
     referent and id do not. Before the seed was attached on every unresolved
@@ -1956,6 +1956,33 @@ class ACarriedSeedIsUntrustedInput(unittest.TestCase):
         rc, rec = self._run(self._doc(self.V2, "human_discord_id", "human", id_="150431"))
         self.assertEqual(rc, 5, "a truncated id resolves the wrong account")
         self.assertIsNone(rec.get("human_discord_id"))
+
+
+class ANamespaceWordDoesNotMakeAContainerAPrincipal(unittest.TestCase):
+    """`discord` names the namespace; the object word decides the referent.
+
+    A slot naming a room, channel, guild or message is refused outright, while
+    an id slot whose object word is merely unstated stays mined-and-unresolved.
+    """
+
+    def test_the_schema_named_containers_are_refused(self):
+        for field in ("discord_room_id", "discord_channel_id",
+                      "discord_guild_id", "discord_message_id",
+                      "discord_display_name"):
+            self.assertFalse(mig._discord_source([], field, None), field)
+
+    def test_the_identity_slots_still_qualify(self):
+        for field in ("discord_user_id", "discord_id", "discord_human_id",
+                      "stand_discord_id", "other_stand_discord_ids"):
+            self.assertTrue(mig._discord_source([], field, None), field)
+
+    def test_a_declared_provider_does_not_promote_a_container(self):
+        self.assertFalse(mig._discord_source([], "room_id", "discord"))
+        self.assertFalse(mig._discord_source([], "display_name", "discord"))
+        self.assertTrue(mig._discord_source([], "id", "discord"))
+
+    def test_an_unstated_object_word_is_still_mined(self):
+        self.assertTrue(mig._discord_source([], "understanding_discord_id", None))
 
 
 if __name__ == "__main__":

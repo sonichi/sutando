@@ -164,6 +164,33 @@ def _id_slot(field: str):
 # rosters and tests. `telegram_human` names a person AND another provider.
 _LEGACY_ID_ANCESTORS = frozenset({"human", "secondary_agent", "stand_status"})
 
+# Words naming a CONTAINER, not a principal: `room_id` is a room
+# (`schema.md:67-70`) and `:230` a provider channel; the rest are its siblings.
+_NON_IDENTITY_OBJECTS = frozenset({
+    "room", "channel", "guild", "server", "thread", "category",
+    "message", "webhook", "emoji", "role", "invite", "attachment",
+})
+
+
+def _namespaced_identity_leaf(key: str, namespace: str) -> bool:
+    """May a snowflake in this leaf be a PRINCIPAL's id, reading `namespace`
+    as the namespace rather than as the referent?
+
+    An id slot still qualifies when its object word is merely unstated, so an
+    unattributed id is mined and left unresolved rather than dropped; a slot
+    naming a container is refused outright.
+    """
+    words = [w.lower() for w in _WORDS.findall(str(key))]
+    if set(words) & _NON_IDENTITY_OBJECTS:
+        return False
+    if _identity_leaf(key):
+        return True
+    rest = [w for w in words if w != namespace]
+    if rest == words:
+        return False
+    return bool(_id_slot(key)) or bool(_verdicts_from_field("_".join(rest)))
+
+
 # An identity leaf, positively: it names the referent, or it is the schema's
 # own `user_id` / a bare `id`. `room_id` names a ROOM (`schema.md:67-70`).
 def _identity_leaf(key: str) -> bool:
@@ -196,7 +223,7 @@ def _discord_source(ancestors: list, key: str, provider: "str | None") -> bool:
     MEASURED ancestor, because any typed ancestor let `telegram_human.id`
     become Discord by moving the key one level down.
     """
-    if not _identity_leaf(key) and "discord" not in _field_words(key):
+    if not _namespaced_identity_leaf(key, "discord"):
         return False
     if provider is not None:
         return provider == "discord"
