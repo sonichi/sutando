@@ -26,6 +26,7 @@ exit 0 all pass (or fresh) · 1 a suite failed · 2 cannot answer
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -46,6 +47,22 @@ def tools_and_suites(scripts: Path):
 
 class ExtrasError(Exception):
     """A declared extra suite could not be resolved."""
+
+
+def resolve_host(repo: Path) -> "str | None":
+    """The canonical per-host label, via the repo's own resolver.
+
+    Reading `$SUTANDO_HOST_LABEL` alone made a migrated host with no export
+    fall back to the absent `state/` copy and silently run zero extras.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_tsc_util_paths", repo / "src" / "util_paths.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod._host_label()
+    except Exception:
+        return os.environ.get("SUTANDO_HOST_LABEL")
 
 
 def extras_path(ws: Path, host: str | None = None) -> Path:
@@ -176,8 +193,8 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=".", help="cwd for the suites (some import from src/)")
     ap.add_argument("--max-age-hours", type=float, default=24.0)
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--host", default=os.environ.get("SUTANDO_HOST_LABEL"),
-                    help="host label; selects hosts/<host>/ over the uncarried state/ copy")
+    ap.add_argument("--host", default=None,
+                    help="host label; defaults to the repo's canonical resolver")
     a = ap.parse_args(argv)
 
     ws = Path(a.workspace)
@@ -187,7 +204,8 @@ def main(argv=None) -> int:
         return 2
     tools, suites = tools_and_suites(scripts)
     try:
-        extras = extra_suites(extras_path(ws, a.host), Path(a.repo).resolve())
+        host = a.host or resolve_host(Path(a.repo).resolve())
+        extras = extra_suites(extras_path(ws, host), Path(a.repo).resolve())
     except ExtrasError as e:
         print(f"CANNOT ANSWER: {e}", file=sys.stderr)
         return 2
