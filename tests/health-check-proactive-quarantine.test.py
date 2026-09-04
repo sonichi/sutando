@@ -39,6 +39,10 @@ _SRC = os.path.join(_HERE, "..", "src", "health-check.py")
 _spec = importlib.util.spec_from_file_location("health_check", _SRC)
 hc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hc)
+_SFP = os.path.join(_HERE, "..", "src", "send_failure_policy.py")
+_sfp_spec = importlib.util.spec_from_file_location("send_failure_policy", _SFP)
+sfp = importlib.util.module_from_spec(_sfp_spec)
+_sfp_spec.loader.exec_module(sfp)
 
 
 class TestProactiveQuarantine(unittest.TestCase):
@@ -187,6 +191,9 @@ class TestProactiveQuarantine(unittest.TestCase):
 
 
     # --- recency: is this directory FILLING, or inert history? -----------
+
+    # Arrival is ctime, which no test can assign: aged history is made by
+    # advancing the probe's clock, "just arrived" by the production writer.
     def _park(self, q, stem, age_s):
         b = q / f"{stem}.txt"
         b.write_text("body")
@@ -194,60 +201,83 @@ class TestProactiveQuarantine(unittest.TestCase):
         os.utime(b, (t, t))
         return b
 
-    def test_an_inert_backlog_and_a_filling_one_do_not_read_the_same(self):
-        """The control the change exists for.
+    def _run_at(self, td, later_s):
+        with mock.patch.object(hc.time, "time", return_value=time.time() + later_s):
+            return self._run(td)
 
-        Both directories hold the same COUNT and the same OLDEST file, so a
-        verdict built from those two alone is byte-identical for a backlog
-        nobody has added to in weeks and one that took a message a minute ago.
-        Only an arrival age separates them, and the operator's question --
-        "must I act now?" -- is answered by that and nothing else.
-        """
-        details = {}
-        for label, newest_age in (("inert", 300 * 3600), ("filling", 60)):
-            with tempfile.TemporaryDirectory() as td:
-                q = self._quarantine(td)
-                self._park(q, "proactive-old", 600 * 3600)
-                self._park(q, "proactive-new", newest_age)
-                details[label] = self._run(td)["detail"]
-        # same population, same oldest -> the ONLY admissible difference is arrival
-        self.assertIn("proactive-old", details["inert"])
-        self.assertIn("proactive-old", details["filling"])
-        self.assertIn("600h0m", details["inert"])
-        self.assertIn("600h0m", details["filling"])
-        self.assertNotEqual(details["inert"], details["filling"],
-                            "inert and actively-filling quarantines render identically")
-        self.assertIn("300h0m ago", details["inert"])
-        self.assertIn("0h1m ago", details["filling"])
+    def _park_through_the_writer(self, q, stem, body_age_s):
+        """Drive `send_failure_policy.resolve_failed_send` -- the production
+        writer, bundled verbatim into ag2_sparrow -- so the body reaches
+        undelivered/ by ITS rename, with the mtime it already had."""
+        # The bridge claims `proactive-<ts>.txt` by renaming it to `.sending`;
+        # the writer derives the parked name back with `with_suffix(".txt")`.
+        claim = q.parent / f"{stem}.sending"
+        claim.write_text("body")
+        t = time.time() - body_age_s
+        os.utime(claim, (t, t))
+        # A 413 never becomes a 200: a status-less, non-transient error parks.
+        out = sfp.resolve_failed_send(claim, RuntimeError("413"), {},
+                                      undelivered_dir=q)
+        self.assertEqual(out, "parked")
+        return q / f"{stem}.txt"
 
-    def test_a_single_body_does_not_repeat_its_own_age(self):
-        """With one file the oldest IS the newest; saying it twice is noise."""
+    def test_the_production_writer_keeps_mtime_and_the_probe_still_sees_arrival(self):
+        """The blocker: `rename()` parks an existing inode with its OLD mtime,
+        so an mtime-derived "arrived" reports the body's age, not the park."""
         with tempfile.TemporaryDirectory() as td:
             q = self._quarantine(td)
-            self._park(q, "proactive-solo", 5 * 3600)
+            body = self._park_through_the_writer(q, "proactive-day-old", 24 * 3600)
+            self.assertGreater(time.time() - body.stat().st_mtime, 23 * 3600,
+                               "the writer must not have refreshed mtime, or this "
+                               "test proves nothing about the rename path")
             d = self._run(td)["detail"]
+        self.assertIn("oldest proactive-day-old.txt (24h0m)", d)
+        self.assertIn("newest arrived 0h0m ago", d)
+
+    def test_an_inert_backlog_and_a_filling_one_do_not_read_the_same(self):
+        """The control the change exists for, in the reviewer's shape: same
+        names, same count, same oldest label, same file mtimes -- one directory
+        untouched for seven days, the other parked by the writer just now."""
+        details = {}
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            self._park(q, "proactive-old", 100 * 3600)
+            self._park(q, "proactive-new", 24 * 3600)
+            details["inert"] = self._run_at(td, 168 * 3600)["detail"]
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            self._park(q, "proactive-old", 268 * 3600)
+            self._park_through_the_writer(q, "proactive-new", 192 * 3600)
+            details["filling"] = self._run(td)["detail"]
+        for d in details.values():
+            self.assertIn("oldest proactive-old.txt (268h0m)", d)
+        self.assertIn("newest arrived 168h0m ago", details["inert"])
+        self.assertIn("newest arrived 0h0m ago", details["filling"])
+        self.assertNotEqual(details["inert"], details["filling"],
+                            "inert and actively-filling quarantines render identically")
+
+    def test_a_single_body_does_not_repeat_its_own_age(self):
+        """One body written and parked at the same instant: oldest IS newest."""
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            (q / "proactive-solo.txt").write_text("body")
+            d = self._run_at(td, 5 * 3600)["detail"]
             self.assertIn("5h0m", d)
             self.assertNotIn("newest arrived", d)
 
-    def test_identical_ages_do_not_print_the_same_duration_twice(self):
-        """Two bodies, one mtime: oldest and newest ARE the same instant.
-
-        Gating on `len(kept) > 1` would emit "oldest X (2h0m); newest arrived
-        2h0m ago" — true, and redundant. Bulk writes and replays leave exactly
-        this shape (842 identical-mtime clusters measured in one live archive),
-        so it is the common case here rather than a corner.
-        """
+    def test_identical_rendered_durations_do_not_print_twice(self):
+        """7201s and 7200s both render 2h0m; gating on raw seconds would print
+        "oldest X (2h0m); newest arrived 2h0m ago" -- true, and redundant."""
         with tempfile.TemporaryDirectory() as td:
             q = self._quarantine(td)
-            self._park(q, "proactive-a", 2 * 3600)
-            self._park(q, "proactive-b", 2 * 3600)
-            d = self._run(td)["detail"]
+            self._park(q, "proactive-a", 1)          # mtime one second older
+            (q / "proactive-b.txt").write_text("body")
+            d = self._run_at(td, 7200)["detail"]
             self.assertIn("2h0m", d)
             self.assertNotIn("newest arrived", d)
-            # ...and one second of spread is enough to bring it back, so the
-            # guard keys on the ages rather than on suppressing pairs.
-            self._park(q, "proactive-c", 2 * 3600 + 60)
-            self.assertIn("newest arrived", self._run(td)["detail"])
+            # ...and a minute of spread is enough to bring the clause back.
+            self._park(q, "proactive-c", 60)
+            self.assertIn("newest arrived 2h0m ago", self._run_at(td, 7200)["detail"])
 
     def test_the_arrival_age_tracks_the_newest_not_the_count(self):
         """Adding OLDER files must not change the reported arrival age -- a
@@ -256,10 +286,20 @@ class TestProactiveQuarantine(unittest.TestCase):
             q = self._quarantine(td)
             self._park(q, "proactive-a", 400 * 3600)
             self._park(q, "proactive-b", 100 * 3600)
-            first = self._run(td)["detail"]
+            first = self._run_at(td, 100 * 3600)["detail"]
             self._park(q, "proactive-c", 900 * 3600)   # older than both
             self.assertIn("100h0m ago", first)
-            self.assertIn("100h0m ago", self._run(td)["detail"])
+            self.assertIn("100h0m ago", self._run_at(td, 100 * 3600)["detail"])
+
+    def test_a_clock_behind_the_files_is_labelled_not_rendered_as_ago(self):
+        """A negative age is skew, not a recent arrival: never "-1h55m ago"."""
+        with tempfile.TemporaryDirectory() as td:
+            q = self._quarantine(td)
+            (q / "proactive-ahead.txt").write_text("body")
+            d = self._run_at(td, -630)["detail"]
+        self.assertIn("future-dated by 0h10m", d)
+        self.assertNotIn(" ago", d)
+        self.assertNotRegex(d, r"-\d+h")
 
     def test_the_operators_real_workspace_is_never_touched(self):
         before = None
