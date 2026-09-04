@@ -194,6 +194,31 @@ with tempfile.TemporaryDirectory() as td:
     (Path(td) / "scripts").mkdir()
     check("zero suites -> exit 2 (a scope result, not a clean bill)", tsc.main(["--workspace", td]), 2)
 
+
+# 8. the EXTRAS-ONLY workspace: no local *.py at all, every suite declared.
+#    An empty candidate list is a fact about the dirs, not the suite set —
+#    refusing on it skipped all 10 declared suites on a real host (3852-r2).
+print("8. extras-only: no local *.py, suites come entirely from the extras file")
+with tempfile.TemporaryDirectory() as td:
+    ws, repo = Path(td) / "ws8", Path(td) / "repo"
+    (ws / "scripts").mkdir(parents=True)          # exists, 0 *.py — and no tools/
+    (ws / "state").mkdir()
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "declared.test.py").write_text("import sys\nprint('ok')\nsys.exit(0)\n")
+    (ws / "state" / "tool-suites-extra.json").write_text(
+        '{"suites": ["tests/declared.test.py"]}')
+    p2 = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(repo)],
+                        capture_output=True, text=True)
+    check("extras-only workspace still RUNS (does not refuse on empty candidates)",
+          p2.returncode == 0 and "running" in p2.stdout, True)
+    check("...and the declared suite is the one that ran",
+          "declared.test.py" in p2.stdout, True)
+    # and with the extras file removed there is genuinely nothing -> refuse
+    (ws / "state" / "tool-suites-extra.json").unlink()
+    p2 = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(repo)],
+                        capture_output=True, text=True)
+    check("no local *.py AND no extras -> still exit 2", p2.returncode, 2)
+
 def stale_bytecode_case(td):
     """A tool the suite imports, run once, then edited to the same length.
 

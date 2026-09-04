@@ -162,11 +162,11 @@ def main(argv=None) -> int:
     statedir = ws / "state"
     # A `scripts/` that exists but holds no .py makes the mtime trigger vacuous,
     # so watch EVERY one of scripts/ and tools/ that holds .py, never the first.
+    # No local candidate is a fact about the DIRS, not about the suite set: a
+    # workspace can run entirely off tool-suites-extra.json. Refusing here would
+    # skip every extra, so the only refusal is the zero-SUITES one below.
     candidates = [d for d in (ws / "scripts", ws / "tools")
                   if d.is_dir() and any(d.glob("*.py"))]
-    if not candidates:
-        print(f"CANNOT ANSWER: no {ws / 'scripts'}", file=sys.stderr)
-        return 2
     tools, suites = tools_and_suites(candidates)
     try:
         extras = extra_suites(statedir, Path(a.repo).resolve())
