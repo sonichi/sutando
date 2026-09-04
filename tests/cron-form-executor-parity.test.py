@@ -209,5 +209,59 @@ check("step 3 could actually register" in step4,
 check("shell_command" in step4 and "NO recurring driver" in step4,
       "step 4 must name the shell-carrying case and its consequence")
 
+# Regression: three sites each read the raw keys, each concluded "not mine",
+# so a record naming the loop while selecting shell was owned by nobody.
+LOOP_MIXED = {"name": "main-loop", "cron": "*/5 * * * *",
+              "shell_command": "echo hi", "prompt_skill": "proactive-loop"}
+LOOP_PLAIN = {"name": "main-loop", "cron": "*/5 * * * *",
+              "prompt_skill": "proactive-loop"}
+HEALTHY = {"name": "digest", "cron": "0 6 * * *",
+           "prompt_skill": "morning-briefing", "execution": "codex-task"}
+
+recon = _load("reconcile_launchd",
+              REPO / "skills" / "schedule-crons" / "scripts" / "reconcile_launchd.py")
+
+# The real Codex bootstrap. Before the fix this raised ValueError, and because
+# load_jobs raises for the whole file, the unrelated healthy job died with it.
+with tempfile.TemporaryDirectory() as td:
+    cfg = write(Path(td), [LOOP_MIXED, HEALTHY])
+    try:
+        names = [j["name"] for j in sched.load_jobs(cfg, include_main_loop=True)]
+        err = None
+    except Exception as exc:                      # noqa: BLE001 - the defect
+        names, err = [], f"{type(exc).__name__}: {exc}"
+    check(err is None, f"mixed record must not abort load_jobs (got {err})")
+    check(names == ["digest"],
+          f"an unrelated codex-task must survive a mixed record (got {names})")
+
+with tempfile.TemporaryDirectory() as td:                      # control
+    cfg = write(Path(td), [LOOP_PLAIN])
+    names = [j["name"] for j in sched.load_jobs(cfg, include_main_loop=True)]
+    check(names == ["main-loop"],
+          f"the ordinary loop record is still claimed by Codex (got {names})")
+
+# The real reconciliation decision.
+check(recon.launchd_eligible(LOOP_MIXED),
+      "launchd must own a shell-selecting record even when it names the loop")
+check(not recon.launchd_eligible(LOOP_PLAIN),
+      "the ordinary loop record is still exempt from launchd")
+
+# Delegation, not a fourth copy: every site resolves to the owner's function.
+from cron_execution_form import launchd_eligible as _owner_eligible  # noqa: E402
+check(recon.launchd_eligible(LOOP_MIXED) == _owner_eligible(LOOP_MIXED)
+      and recon.launchd_eligible(LOOP_PLAIN) == _owner_eligible(LOOP_PLAIN),
+      "reconcile_launchd must delegate to the shared predicate")
+
+# Health must say the configuration is unowned, not report ok.
+for label, entry, want in (("mixed", LOOP_MIXED, "down"), ("plain", LOOP_PLAIN, "ok")):
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        write(ws, [entry]).parent.rename(ws / "hosts" / "H")
+        r = hc.check_cron_runner(workspace_dir=ws, host_label="H", runtime="codex",
+                                 launchd_check=lambda *a, **k: {"running": True, "exit": 0})
+    check(r["status"] == want,
+          f"health on the {label} record must be {want} (got {r['status']!r}: {r['detail']!r})")
+
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)

@@ -820,14 +820,8 @@ def check_cron_runner(
     if not isinstance(crons, list):
         return {"name": name, "status": "fail", "detail": "crons.json is not a list"}
 
-    def eligible(entry: dict) -> bool:
-        if entry.get("execution") == "codex-task" or entry.get("launchd") is True:
-            return False
-        if entry.get("loop") == "dynamic" or not entry.get("cron"):
-            return False
-        if entry.get("name") == "main-loop" or entry.get("prompt_skill") == "proactive-loop":
-            return False
-        return str(entry.get("prompt") or "").strip() != "/proactive-loop"
+    # One owner: the reconciler and the Codex scheduler bind this same predicate.
+    from cron_execution_form import launchd_eligible as eligible  # noqa: PLC0415
 
     launchd_count = sum(
         1 for entry in crons if isinstance(entry, dict) and entry.get("launchd") is True

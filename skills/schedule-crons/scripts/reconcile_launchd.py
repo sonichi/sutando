@@ -19,19 +19,19 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from cron_execution_form import (  # noqa: E402
+    launchd_eligible as _shared_launchd_eligible)
+
 
 def launchd_eligible(entry: dict[str, Any]) -> bool:
-    """Return whether Codex should move this entry to the launchd runner."""
-    if entry.get("launchd") is True or entry.get("execution") == "codex-task":
-        return False
-    if entry.get("loop") == "dynamic" or not entry.get("cron"):
-        return False
-    if entry.get("name") == "main-loop" or entry.get("prompt_skill") == "proactive-loop":
-        return False
-    prompt = str(entry.get("prompt") or "").strip()
-    if prompt == "/proactive-loop":
-        return False
-    return True
+    """Return whether Codex should move this entry to the launchd runner.
+
+    Delegates: this predicate is also read by the Codex scheduler and the
+    session-crons health probe, and a private copy is how a record they all
+    declined came to be owned by nobody.
+    """
+    return _shared_launchd_eligible(entry)
 
 
 def runner_required(crons: list[Any]) -> bool:

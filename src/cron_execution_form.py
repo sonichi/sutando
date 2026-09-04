@@ -80,3 +80,39 @@ def select_for_executor(entry: dict, supported) -> tuple[str, str]:
     if kind not in supported:
         return MALFORMED, f"{kind} entries are not runnable by this scheduler"
     return kind, target
+
+
+# ── who owns a schedule ───────────────────────────────────────────────────
+LOOP_SKILL = "proactive-loop"
+LOOP_NAME = "main-loop"
+
+
+def is_proactive_loop(entry: dict) -> bool:
+    """Whether this entry IS the recurring proactive driver.
+
+    Decided by the SELECTED form, never by a raw key. `shell_command` outranks
+    `prompt_skill`, so a record carrying both runs as shell — and a shell
+    record that merely mentions the loop is a shell schedule. Reading the raw
+    key exempts that shell form from launchd (the only executor that can run
+    it) and hands it to Codex (which cannot), leaving it owned by nobody.
+    """
+    kind, target = select_execution_form(entry)
+    if kind in (SHELL, MALFORMED):
+        return False
+    return target.strip().lstrip("/") == LOOP_SKILL or entry.get("name") == LOOP_NAME
+
+
+def launchd_eligible(entry: dict) -> bool:
+    """Whether the durable launchd runner should own this entry.
+
+    The reconciler, the Codex scheduler and the health probe all have to agree
+    on this; when each spelled it out separately they agreed only by
+    coincidence, and a mixed record made all three answer "not mine".
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("launchd") is True or entry.get("execution") == "codex-task":
+        return False
+    if entry.get("loop") == "dynamic" or not entry.get("cron"):
+        return False
+    return not is_proactive_loop(entry)

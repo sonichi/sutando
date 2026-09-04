@@ -27,6 +27,7 @@ from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from cron_execution_form import (  # noqa: E402
+    is_proactive_loop,
     CODEX_FORMS, MALFORMED, SKILL, select_for_executor)
 
 
@@ -171,10 +172,10 @@ def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dic
     for raw_entry in raw:
         if not isinstance(raw_entry, dict):
             continue
+        # Selected form, not raw keys: claiming a shell-carrying record here
+        # strips only the skill leg, leaving a form load_jobs then refuses.
         canonical_main_loop = (
-            raw_entry.get("name") == "main-loop"
-            and raw_entry.get("prompt_skill") == "proactive-loop"
-            and not raw_entry.get("launchd")
+            is_proactive_loop(raw_entry) and not raw_entry.get("launchd")
         )
         implicit_main_loop = (
             include_main_loop and canonical_main_loop and raw_entry.get("execution") is None
