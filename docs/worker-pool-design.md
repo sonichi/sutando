@@ -238,32 +238,35 @@ handler?    = DISPATCH_DIR is non-empty (src/watch-tasks-stream.sh:91 initialise
               inertness case. The ticker requires a pool, a pool requires a handler, so an
               empty DISPATCH_DIR means the ticker is not armed in the first place.
 runners     = TASK_HANDLER_WORKERS (:89) while a handler exists.
-admitted    = claims THIS PASS has made, counted by the ticker itself
-outstanding = |DISPATCH_DIR/running| + |DISPATCH_DIR/pending| + admitted
+outstanding = |DISPATCH_DIR/running| + |DISPATCH_DIR/pending| + |DISPATCH_DIR/direct|
 admit while   outstanding < 2 * runners,  re-counting after each claim
 ```
 
-**`admitted` is not bookkeeping — without it the bound counts a population the bounded path
-does not populate.** `dispatch_task` has three receipt-less exits: an empty `DISPATCH_DIR`
-(`:373-375`), a handler that declines with rc 3 (`:398-399`), and a failed probe falling back to
-the live core (`:400-402`). Only `queue_handler_task` writes a `pending/` marker (`:358`). So a
-pass whose candidates take any of those routes leaves the directory count unchanged and could
-claim the entire backlog while reading zero outstanding. The ticker therefore counts **its own
-admissions**, and a receipt-less emit consumes quota exactly like a queued one — the task was
-admitted either way, which is what the bound is about.
+**Every admission leaves a receipt, and the ticker keeps NO counter of its own.** An earlier
+revision had the ticker count "claims made this pass" and add that to the directory count. That
+was wrong three ways at once, and the first is the one this section had already condemned in
+its own words: a per-pass counter resets, so a receipt-less admission vanishes from the next
+recount and every tick adds another `2 * runners` without any completion — *the per-pass
+allowance wearing a limit*. Second, a queued winner both wrote a `pending/` marker AND
+incremented the counter, so a bound of four admitted two. Third, and fatal to the idea: the
+ticker cannot tell a lost claim from a won one, so "do not count a loss" was not implementable.
+`queue_handler_task` returns 0 for BOTH — it releases the lock and returns 0 when
+`acquire_task_claim` fails (`:360-363`), and returns 0 after writing the marker when it wins.
 
-The directory half stays because it is the only thing that sees work admitted by the EVENT path
-and by other instances, and because it cannot be fooled by `queue_handler_task`'s return value:
-that call reports success both when it enqueues and when it loses the claim, so a lost claim is
-indistinguishable from an admitted one at the call site. A lost claim leaves no marker and the
-ticker does not increment `admitted` for it, so it never consumes quota by either route.
+**So the accounting is production-owned, not ticker-owned.** `dispatch_task` reports which of
+four things happened — `queued`, `direct`, `lost`, `suppressed` — and the DIRECT branches write
+a receipt under `DISPATCH_DIR/direct/` before emitting, with the same completion/release
+lifecycle that clears a `running/` marker. Then:
+
+- `outstanding` is a count of durable receipts, so nothing is lost across passes and nothing is
+  counted twice; the ticker holds no state between ticks.
+- `lost` and `suppressed` write nothing, so they consume no quota — and that is now a property
+  of production rather than an assertion by the caller.
+- an admission made by the EVENT path is visible to the ticker on its next recount, because it
+  left the same kind of receipt.
 
 Count, claim and receipt happen under ONE hold of the dispatch lock, so the three cannot
 interleave; a Created event admitted between passes is visible to the next re-count.
-Priority is unchanged — the queue's own order — and the bound only decides where a pass stops,
-never which task is next. **The startup sweep obeys the same rule**, which is the one place an
-"only the ticker is bounded" reading would leak: a full sweep at boot is exactly the unbounded
-admission this bound exists to prevent.
 
 `2 *` is a starting point and should be tuned; what is load-bearing is that the bound is on
 CLAIMS, is measured over total outstanding, and belongs to the ticker — because the event path
@@ -874,9 +877,12 @@ with its own reason.
    Production scans once at startup and then reacts to Created/Renamed events only
    (`src/watch-tasks-stream.sh:639-702`), and suppression creates neither, so without
    this every zero-candidate schedule is terminal. Its suite ALSO pins a
-   direct-emitter backlog (candidates taking a receipt-less `dispatch_task` exit still
-   consume the bound), a no-handler start (empty `DISPATCH_DIR` arms no ticker), and a
-   Created event interleaved with a pass. It pins BOTH reverse orders —
+   direct-emitter backlog (a direct admission writes a `direct/` receipt and is still
+   counted on the NEXT pass, which is the case a per-pass counter loses), a queued
+   winner counted ONCE rather than by both its marker and a second tally, a LOST claim
+   consuming no quota (production reports `lost`; the caller cannot infer it, since
+   `queue_handler_task` returns 0 either way), a no-handler start (empty `DISPATCH_DIR`
+   arms no ticker), and a Created event interleaved with a pass. It pins BOTH reverse orders —
    the beat crossing stale between the core's read and the target's, and the pin
    swapping between two workers' reads — plus a repin-after-suppress case where no event
    is generated at all, and one asserting the reconciliation claims through
