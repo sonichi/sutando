@@ -295,6 +295,66 @@ class TheKeyAndTheBindingAreDataflowToo(unittest.TestCase):
             "    return Path(b)\n"), "ignores")
 
 
+class EveryBindingFormIsModelled(unittest.TestCase):
+    """One test per binding form _bind_sites() enumerates. An untested branch
+    here IS the defect this round fixed: a form the pass does not reach leaves
+    its names clean."""
+
+    def _verdict(self, body):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text("import os\nfrom pathlib import Path\n"
+                     "def resolve_workspace():\n" + body)
+        return hc._resolver_env_verdict(f)[0]
+
+    def test_an_annotated_binding(self):
+        self.assertEqual(self._verdict(
+            "    raw: str = os.environ['SUTANDO_WORKSPACE']\n"
+            "    return Path(raw)\n"), "honours")
+
+    def test_an_augmented_binding(self):
+        self.assertEqual(self._verdict(
+            "    raw = ''\n"
+            "    raw += os.environ['SUTANDO_WORKSPACE']\n"
+            "    return Path(raw)\n"), "honours")
+
+    def test_a_walrus_binding(self):
+        self.assertEqual(self._verdict(
+            "    if (raw := os.environ['SUTANDO_WORKSPACE']):\n"
+            "        return Path(raw)\n"
+            "    return Path('/configured')\n"), "honours")
+
+    def test_a_loop_binding(self):
+        self.assertEqual(self._verdict(
+            "    for raw in [os.environ['SUTANDO_WORKSPACE']]:\n"
+            "        return Path(raw)\n"
+            "    return Path('/configured')\n"), "honours")
+
+    def test_a_starred_target_binds_the_whole_value(self):
+        """No element-wise pairing is possible across a star, so every name it
+        binds takes the whole value — over-tainting, which is the safe side."""
+        self.assertEqual(self._verdict(
+            "    first, *rest = os.environ['SUTANDO_WORKSPACE'], '/a'\n"
+            "    return Path(first)\n"), "honours")
+
+    def test_a_subscript_target_taints_its_container(self):
+        self.assertEqual(self._verdict(
+            "    holder = {}\n"
+            "    holder['w'] = os.environ['SUTANDO_WORKSPACE']\n"
+            "    return Path(holder['w'])\n"), "honours")
+
+    def test_an_env_read_with_no_key_is_unknown(self):
+        self.assertEqual(self._verdict(
+            "    return Path(os.environ.get())\n"), "unknown")
+
+    def test_a_subscript_on_something_else_is_not_an_env_read(self):
+        """Negative control: the key guard keys on the BASE, so an ordinary
+        dict lookup must not turn a clean resolver unknown."""
+        self.assertEqual(self._verdict(
+            "    d = {'w': '/configured'}\n"
+            "    return Path(d['w'])\n"), "ignores")
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""

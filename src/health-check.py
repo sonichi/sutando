@@ -9428,10 +9428,6 @@ def _bind_sites(node):
             for item in n.items:
                 if item.optional_vars is not None:
                     yield item.optional_vars, item.context_expr
-        elif isinstance(n, (ast.ListComp, ast.SetComp,
-                            ast.DictComp, ast.GeneratorExp)):
-            for g in n.generators:
-                yield g.target, g.iter
 
 
 def _binding_pairs(target, value):
