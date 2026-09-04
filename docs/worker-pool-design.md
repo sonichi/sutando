@@ -271,6 +271,29 @@ primitive* — with the empty-`DISPATCH_DIR` path as the explicit unpooled excep
 is the correction that matters, because putting the primitive inside it left the four direct exits
 bypassing admission entirely.
 
+**And the direct receipt is created by TRANSITION, never by a second admission.** Handler fallback
+(`:255`, `:506`, `:542` — the disposition-1 branch) already emits a task that *holds a claim*: it
+writes a `FALLBACKS_DIR` marker and calls `emit_fallback_task_file` / `emit_task_file`. So the task
+was counted when it was first admitted, and moving it to `direct` is a state change on an existing
+receipt rather than a new one. That is what closes the double-admission hole without a second
+counter — the earlier drafts of this section kept looking for a way to *admit* a direct dispatch,
+and the answer is that it was already admitted.
+
+**`:390` must separate refusal from failure, and today it cannot.** It reads
+`queue_handler_task ... || printf 'TASK_FILE: %s\n' ... || exit 0`, and `queue_handler_task`
+returns non-zero for a lost claim *and* for an operational failure — so a generic `|| printf`
+publishes in both cases and cannot tell `refused-over-bound` from a genuine error. The typed
+outcome exists precisely so this branch stops guessing.
+
+So the direct lifecycle completes the rule with five obligations, and they are the same five the
+earlier revision listed as unowned: a durable receipt written **before** the emit, a named ownership
+handoff, an idempotent completion acknowledgement, exactly one release writer, and restart handling
+for the receipt-before-emit and emit-without-completion windows.
+
+(This section is keweichen's design. Two shapes of mine were falsified before it — one that put the
+primitive inside `queue_handler_task`, and one that took the lock at `dispatch_task` entry and would
+have held a no-timeout spinlock across a subprocess probe.)
+
 **Every admission leaves a receipt, and the ticker keeps NO counter of its own.** An earlier
 revision had the ticker count "claims made this pass" and add that to the directory count. That
 was wrong three ways at once, and the first is the one this section had already condemned in
