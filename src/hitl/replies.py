@@ -193,19 +193,34 @@ def match_action(req: HumanRequirement, text: str):
     """
     t = (text or "").strip()
     low = t.lower()
+    # Exact match over the WHOLE action set outranks any prefix, or a shorter
+    # sibling label claims the click and eats the rest of the longer one.
     for action in req.actions:
         for cand in (action.label or "", action.id or ""):
             c = cand.strip()
-            if not c:
-                continue
-            if low == c.lower():
+            if c and low == c.lower():
                 return action, None
-            if low.startswith(c.lower()):
-                rest = t[len(c):].lstrip()
-                if rest[:1] in NOTE_SEPARATORS:
-                    # A separator with nothing after it is still the click; the
-                    # human just left the note empty.
-                    return action, (rest[1:].strip() or None)
+    best = None
+    for action in req.actions:
+        for cand in (action.label or "", action.id or ""):
+            c = cand.strip()
+            if not c or not low.startswith(c.lower()):
+                continue
+            tail = t[len(c):]
+            rest = tail.lstrip()
+            sep = rest[:1]
+            if sep not in NOTE_SEPARATORS:
+                continue
+            # "-" joins words in English, so it separates only where the text
+            # breaks around it; the dashes and ":" never join a word.
+            if sep == "-" and not (tail[:1].isspace() or rest[1:2].isspace()):
+                continue
+            # A separator with nothing after it is still the click; the human
+            # just left the note empty.
+            if best is None or len(c) > len(best[0]):
+                best = (c, action, rest[1:].strip() or None)
+    if best is not None:
+        return best[1], best[2]
     return None, None
 
 
