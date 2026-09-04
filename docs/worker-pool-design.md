@@ -251,6 +251,40 @@ still-pending file to the live core every 30 s, forever, on the majority
 configuration. Deactivation is that edge in reverse: removing the last worker disarms
 the ticker and the install is again exactly what it was.
 
+**And "pool member" is not a new signal — it is the registry.** An earlier revision made
+membership load-bearing without saying what reads it, which is a gate with no defined
+input and cannot be implemented. The source of truth is the one `## Registry touchpoints`
+already names: a worker registers `role: "worker"` and `pool: <name>` in its instance
+manifest, and the core discovers workers *through the registry, never by scanning*. No
+second file, no sentinel, no count cached anywhere — a membership record that can disagree
+with the registry is the defect, not the mechanism.
+
+**Who writes it:** the same commands that already create and remove workers. Creation
+registers the manifest and starts the instance; removal deregisters and stops it. Nothing
+else may write membership.
+
+**How each watcher observes a transition, in both directions:**
+
+- **A worker watcher is a member by construction.** Its own manifest carries `role:
+  "worker"`, so it arms at boot and never needs to observe a transition — it stops being a
+  member by being removed, which stops the process. There is no `1 -> 0` for a worker to see.
+- **The core watcher reads the registry once at startup** and arms or does not. That alone
+  settles every restart case in both directions, which is the case an implementation is most
+  likely to get wrong.
+- **A live `0 -> 1` is pushed, not polled**, and it has to be: a disarmed watcher has no tick
+  on which to re-read anything, and giving it one would be a timer running at zero workers —
+  precisely what `## The starting point is zero workers` forbids. So the command that creates
+  worker 1 signals the core's watcher to arm, as part of the same act that starts worker 1.
+- **A live `1 -> 0` is the same edge reversed**: the command that removes the last worker
+  signals the core's watcher to disarm before it stops that worker.
+
+**The fallback is fail-closed, and the direction is deliberate.** If a signal is ever missed,
+the next watcher start re-reads the registry and converges; and a registry that is absent,
+unreadable or unparseable reads as **not a member**, so the ticker does not arm. Both failure
+directions are bad, but they are not equally bad: a ticker that fails to arm leaves the
+zero-candidate race terminal until the next restart, while one that fails to disarm re-emits
+every pending task every 30 s to a live core. The recoverable failure is the one to prefer.
+
 **Supervision.** The ticker is owned by the watcher process and shares its lifetime,
 rather than being a detached timer that can outlive it. If the watcher exits the
 ticker goes with it — a separate process would reintroduce exactly the split that put
