@@ -3083,6 +3083,74 @@ def _commits_behind(repo: "Path", branch: str, git_bin: str = "git") -> "int | N
     return int(raw) if raw.isdigit() else None
 
 
+# A git write holds index.lock for well under a second; five minutes is ~300x
+# the slowest legitimate case measured here and 113x below the incident's 9.4h.
+GIT_LOCK_STALE_S = 300.0
+
+
+def _git_dir(repo: Path) -> "Path | None":
+    """The real .git directory, following a worktree's `.git` FILE pointer.
+
+    A worktree's index.lock lives in its own gitdir, not the common dir, so
+    resolving to the common dir would probe the wrong file."""
+    g = repo / ".git"
+    if g.is_dir():
+        return g
+    try:
+        line = g.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    target = Path(line.split(":", 1)[1].strip())
+    if not target.is_absolute():
+        target = (repo / target).resolve()
+    return target if target.is_dir() else None
+
+
+def check_git_index_lock(repo_dir: "Path | None" = None,
+                         now: "float | None" = None) -> dict:
+    """Warn when `.git/index.lock` has outlived any plausible git operation.
+
+    A crashed or killed git leaves the lock behind, and from then on EVERY
+    write in that checkout fails with "Another git process seems to be
+    running" — add, checkout, commit, stash, rebase. Nothing else surfaces it:
+    the failure is per-command, so a seat that does not happen to write sees a
+    healthy repo, and a seat that does write reads the message as a transient
+    collision and retries later. Measured on the live checkout 2026-09-04: a
+    ZERO-byte lock, 9.4 hours old, with no process holding it, had been
+    silently failing git writes for the whole night.
+
+    Read-only and warn-only: a lock younger than the threshold is an ordinary
+    in-flight write, and an unreadable repo is not this probe's business.
+    """
+    name = "git-index-lock"
+    repo = Path(repo_dir) if repo_dir is not None else REPO_DIR
+    gitdir = _git_dir(repo)
+    if gitdir is None:
+        return {"name": name, "status": "ok",
+                "detail": f"{repo} is not a git checkout — nothing to lock"}
+    lock = gitdir / "index.lock"
+    try:
+        st = lock.stat()
+    except OSError:
+        return {"name": name, "status": "ok", "detail": "no index.lock — git writes are unblocked"}
+    age = (now if now is not None else time.time()) - st.st_mtime
+    if age < GIT_LOCK_STALE_S:
+        return {"name": name, "status": "ok",
+                "detail": f"index.lock present but only {age:.0f}s old — a git write is in flight"}
+    hrs = age / 3600.0
+    when = f"{hrs:.1f}h" if hrs >= 1 else f"{age / 60:.0f}m"
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"{lock} is {when} old ({st.st_size} bytes) — every git write in this checkout "
+                   f"is failing with \"Another git process seems to be running\". Confirm nothing "
+                   f"holds it (`lsof {lock}`; a real writer also keeps a git process in `ps`), "
+                   f"then `rm {lock}`"),
+    }
+
+
 def check_live_checkout_branch(repo_dir: "Path | None" = None) -> dict:
     """Warn when the live checkout has drifted off its expected branch.
 
@@ -10810,6 +10878,7 @@ def run_all_checks() -> list[dict]:
     # Per-host channel access.json backup drift (live vs vault-carried copy)
     checks.append(check_per_host_config_backup())
     # Live checkout on its expected branch (PR-branch drift, 2026-07-29 incident)
+    checks.append(check_git_index_lock())
     checks.append(check_live_checkout_branch())
     checks.append(check_engine_revision_drift())
     onboarding_check = check_onboarding_status()
