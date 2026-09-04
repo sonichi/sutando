@@ -9587,15 +9587,19 @@ def _rebound_names(src):
     """
     out = set()
 
-    def walk(tbl):
+    def walk(tbl, is_module):
         for s in tbl.get_symbols():
             if s.is_assigned() or s.is_parameter():
                 out.add(s.get_name())
+            # `global os; import helper as os` REPLACES the module binding, and
+            # CPython calls that imported+global in the child scope, never assigned.
+            elif not is_module and s.is_declared_global() and s.is_imported():
+                out.add(s.get_name())
         for child in tbl.get_children():
-            walk(child)
+            walk(child, False)
 
     try:
-        walk(symtable.symtable(src, "<resolver>", "exec"))
+        walk(symtable.symtable(src, "<resolver>", "exec"), True)
     except (SyntaxError, ValueError):
         return None                  # unknown-by-refusal, never an empty clean set
     return out

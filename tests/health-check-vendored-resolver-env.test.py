@@ -743,6 +743,52 @@ class ProvenanceCertifiesAProvenShape(unittest.TestCase):
             __import__("ast").parse("from helper import *\n")))
 
 
+class AGlobalRebindingIsABinding(unittest.TestCase):
+    """qingyun-wu's round-15 control: `global os; import helper as os` in a
+    function called at module init REPLACES the module binding, and CPython
+    records it as imported+global in that scope — never `assigned`. So a
+    revocation reading only is_assigned()/is_parameter() misses it."""
+
+    def _v(self, body):
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(
+            "import os\ndef getenv(key):\n"
+            "    return os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(body)
+        return hc._resolver_env_verdict(d / "workspace_default.py")[0]
+
+    def test_a_nested_global_import_revokes_the_module_binding(self):
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def poison():\n    global os\n    import helper as os\n"
+            "poison()\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "unknown")
+
+    def test_a_global_READ_does_not_revoke(self):
+        """The discriminating negative: revoking on the mere presence of
+        `global` would make any module that reads a global unanalysable."""
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def helper_fn():\n    global os\n    return os\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "ignores")
+
+    def test_symtable_reports_the_shape_this_relies_on(self):
+        """Pin the CPython fact the rule rests on, so a semantics change is
+        caught here rather than as a silent false clean."""
+        import symtable
+        st = symtable.symtable(
+            "import os\ndef poison():\n    global os\n    import helper as os\n",
+            "m.py", "exec")
+        # By NAME, not index: 3.12+ emits an __annotate__ child scope first.
+        child = next(c for c in st.get_children() if c.get_name() == "poison")
+        sym = next(s for s in child.get_symbols() if s.get_name() == "os")
+        self.assertTrue(sym.is_declared_global())
+        self.assertTrue(sym.is_imported())
+        self.assertFalse(sym.is_assigned())
+
+
 class BindingRevocationIsNotEnumerated(unittest.TestCase):
     """Six rounds each shipped a binding form the next round found, so the
     enumeration itself was the defect. CPython's symbol table is the language's
