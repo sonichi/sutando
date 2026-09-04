@@ -9245,7 +9245,6 @@ _BUILTIN_NAMES = frozenset(dir(__import__("builtins")))
 _PURE_OSPATH = frozenset({"join", "dirname", "basename", "abspath", "normpath",
                           "realpath", "split", "splitext", "isabs", "exists",
                           "isfile", "isdir", "relpath", "expanduser"})
-_EXPANDVARS = ("os.path.expandvars", "expandvars", "posixpath.expandvars")
 _VAR_RE = re.compile(r"\$(\w+)|\$\{(\w+)\}")
 
 
@@ -9285,11 +9284,44 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     if fn is None:
         return "unknown", "no resolve_workspace() to analyse"
 
-    # env = os.environ: a .get on the alias is the same read. Collected through
-    # the same binding model the taint pass uses, so the two cannot drift.
+    # Which names PROVABLY are os and its members. A suffix test cannot tell
+    # os.getenv from helper.getenv, and the second is arbitrary code.
+    os_names, getenv_names, environ_names, expandvars_names = set(), set(), set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                if al.name == "os":
+                    os_names.add(al.asname or "os")
+        elif isinstance(n, ast.ImportFrom) and n.module in ("os", "posixpath", "os.path"):
+            for al in n.names:
+                bound = al.asname or al.name
+                if al.name == "getenv" and n.module == "os":
+                    getenv_names.add(bound)
+                elif al.name == "environ" and n.module == "os":
+                    environ_names.add(bound)
+                elif al.name == "expandvars":
+                    expandvars_names.add(bound)
+
+    # env = os.environ: a .get on the alias is the same read, but only when the
+    # base is a name proven to be os. Collected through the taint pass's own model.
     aliases = {nm for tgt, val in _bind_sites(tree)
                for nm, v in _binding_pairs(tgt, val)
-               if _dots(v).endswith("environ")}
+               if _dots(v) in {f"{o}.environ" for o in os_names}}
+    aliases |= environ_names
+
+    def _is_getenv(d: str) -> bool:
+        return d in getenv_names or d in {f"{o}.getenv" for o in os_names}
+
+    def _is_environ_get(d: str) -> bool:
+        head, _, attr = d.rpartition(".")
+        return attr == "get" and (head in aliases
+                                  or head in {f"{o}.environ" for o in os_names})
+
+    def _is_environ_base(base: str) -> bool:
+        return base in aliases or base in {f"{o}.environ" for o in os_names}
+
+    def _is_expandvars(d: str) -> bool:
+        return d in expandvars_names or d in {f"{o}.path.expandvars" for o in os_names}
 
     # Module scope is where a name can be bound once and read by every function
     # below it, and a body-scoped walk cannot see any of it.
@@ -9310,7 +9342,7 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     def _expandvars_names(n) -> "frozenset | None":
         """Variables an expandvars() call expands, or None if unprovable."""
         d = _dots(n.func)
-        if d not in _EXPANDVARS or not n.args:
+        if not _is_expandvars(d) or not n.args:
             return None
         lit = _const_str(n.args[0])
         if lit is None:
@@ -9325,21 +9357,17 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                 if names and _REMOVED_WS_ENV in names:
                     return True
             if isinstance(n, ast.Subscript):
-                base = _dots(n.value)
-                if (base.endswith("environ") or base in aliases) and _keyed(n.slice):
+                if _is_environ_base(_dots(n.value)) and _keyed(n.slice):
                     return True
             if isinstance(n, ast.Call):
                 d = _dots(n.func)
-                head, _, attr = d.rpartition(".")
-                hit = (d.endswith("environ.get") or d.endswith("getenv")
-                       or (attr == "get" and head in aliases))
-                if hit and n.args and _keyed(n.args[0]):
+                if (_is_getenv(d) or _is_environ_get(d)) and n.args and _keyed(n.args[0]):
                     return True
         return False
 
     def murky_env_read(node) -> "str | None":
         for n in ast.walk(node):
-            if isinstance(n, ast.Call) and _dots(n.func) in _EXPANDVARS:
+            if isinstance(n, ast.Call) and _is_expandvars(_dots(n.func)):
                 if _expandvars_names(n) == frozenset():
                     return "an expandvars() whose argument is not a literal"
         return _murky_env_read_keys(node)
@@ -9353,14 +9381,16 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
         for n in ast.walk(node):
             if isinstance(n, ast.Subscript):
                 base = _dots(n.value)
-                if not (base.endswith("environ") or base in aliases):
+                if not _is_environ_base(base):
+                    # A subscript on an imported module's attribute is arbitrary
+                    # code, and no Call node exists for unresolved_call to catch.
+                    if "." in base and base.split(".")[0] in imported:
+                        return f"a subscript on the unresolved {base}"
                     continue
                 key = n.slice
             elif isinstance(n, ast.Call):
                 d = _dots(n.func)
-                head, _, attr = d.rpartition(".")
-                if not (d.endswith("environ.get") or d.endswith("getenv")
-                        or (attr == "get" and head in aliases)):
+                if not (_is_getenv(d) or _is_environ_get(d)):
                     continue
                 if not n.args:
                     return "an environment read with no key argument"
@@ -9386,9 +9416,8 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                 continue
             if d.startswith("os.path.") and d.rpartition(".")[2] in _PURE_OSPATH:
                 continue
-            if (d.endswith(".environ.get") or d.endswith("getenv")
-                    or d in _EXPANDVARS):
-                continue                         # an env read: reads_env judges it
+            if _is_getenv(d) or _is_environ_get(d) or _is_expandvars(d):
+                continue                         # a PROVEN env read: reads_env judges it
             sib = sibling(d)
             if _hops > 0 and sib is not None and sib[1].name == "resolve_workspace":
                 continue                         # same-name delegate: analysed below

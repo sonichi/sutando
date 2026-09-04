@@ -510,6 +510,74 @@ class OsPathIsNotAPureNamespace(unittest.TestCase):
             "    return Path(os.path.join(os.path.expanduser('~'), 'w'))\n"), "ignores")
 
 
+class ProvenanceNotSuffix(unittest.TestCase):
+    """Round 9: the env APIs were matched by SUFFIX, so `helper.getenv(...)` and
+    `helper.environ[...]` — arbitrary imported code — were treated as understood
+    OS reads and exempted. qingyun-wu's controls read 'ignores' at cf974224."""
+
+    def _verdict(self, src):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text(src)
+        return hc._resolver_env_verdict(f)[0]
+
+    def test_a_lookalike_dotted_getenv_is_unknown(self):
+        self.assertEqual(self._verdict(
+            "import helper\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(helper.getenv('HOME'))\n"), "unknown")
+
+    def test_a_lookalike_environ_subscript_is_unknown(self):
+        """No Call node exists here, so unresolved_call cannot see it; the
+        subscript itself has to be judged."""
+        self.assertEqual(self._verdict(
+            "import helper\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(helper.environ['HOME'])\n"), "unknown")
+
+    def test_a_bare_getenv_from_a_foreign_module_is_unknown(self):
+        """`from helper import getenv` and `from os import getenv` produce an
+        identical call site; only the import statement tells them apart."""
+        self.assertEqual(self._verdict(
+            "from helper import getenv\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(getenv('HOME'))\n"), "unknown")
+
+    def test_a_lookalike_expandvars_is_unknown(self):
+        self.assertEqual(self._verdict(
+            "import helper\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(helper.path.expandvars('$HOME'))\n"), "unknown")
+
+    def test_real_os_getenv_stays_analysed(self):
+        """Negative control: provenance must not make the genuine article
+        unanalysable, or the probe reports unknown for every resolver."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "ignores")
+
+    def test_an_os_module_alias_is_followed(self):
+        self.assertEqual(self._verdict(
+            "import os as _o\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(_o.getenv('HOME'))\n"), "ignores")
+
+    def test_from_os_import_getenv_is_followed(self):
+        self.assertEqual(self._verdict(
+            "from os import getenv\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(getenv('HOME'))\n"), "ignores")
+
+    def test_and_it_still_catches_the_removed_variable_through_them(self):
+        """Both directions on the same import shape: provenance decides whether
+        the read is analysed, the KEY decides the verdict."""
+        self.assertEqual(self._verdict(
+            "from os import getenv\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(getenv('SUTANDO_WORKSPACE'))\n"), "honours")
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""
