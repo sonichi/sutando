@@ -22,12 +22,17 @@ Mirrors Sutando's existing `tasks/` and `results/` convention:
 
 ```
 workspace/relay/
-├── relay-{epoch_seconds}.md     # pending relay notes (drained into session-state.md, then archived)
+├── relay-{YYYYMMDD}T{HHMMSS}Z.md  # pending relay notes (drained into session-state.md, then archived)
 └── processed/
-    └── relay-{epoch_seconds}.md # already drained; kept for audit
+    └── relay-{YYYYMMDD}T{HHMMSS}Z.md # already drained; kept for audit
 ```
 
-- **File naming:** `relay-{epoch}.md` — sortable + greppable, matches the `task-{epoch}.txt` shape.
+- **File naming:** `relay-$(date -u +%Y%m%dT%H%M%SZ).md` — UTC ISO basic form, e.g.
+  `relay-20260904T030402Z.md`. **Do not use the epoch form.** `session-handoff.sh` drains with
+  `find ... -name 'relay-*.md' | sort`, which is LEXICOGRAPHIC: every `relay-17…`/`relay-18…`
+  epoch name sorts before every `relay-2026…` ISO name regardless of when it was written, so a
+  single epoch-named note lands out of order among ISO ones. This file documented the epoch form
+  while every note written since 2026-08-30 used ISO; the doc was the stale half.
 - **Multiple files allowed:** `/relay` always creates a NEW file by default. `--append` appends to the LATEST unprocessed `relay-*.md` instead of creating a new one.
 - **Consumption:** `src/session-handoff.sh` reads ALL unprocessed `relay-*.md` files in sorted order, appends them to `session-state.md` under `## Relay Notes (from prior sessions)`, then `mv`s each one to `processed/` — but only after confirming its `### <basename>` header landed in the written file, so an interrupt cannot retire an uncaptured note.
 - **Cleanup:** kept indefinitely on local disk. Tiny files (~200-500 bytes each); a year of relay notes is < 1 MB. Sync via the workspace-sync engine (`scripts/sync-workspace.sh`) for fleet visibility — the legacy `sync-memory.sh` flow is deprecated in v0.3.0 and removed in v0.4.0.
