@@ -67,8 +67,8 @@ being addressed selects a *candidate*, it does not confer ownership.
 
 **"Fresh" below means ELIGIBLE, not merely beating.** A target is eligible when
 its beat is fresh *and* the core's sweep has not declared it wedged under §3 rule 6
-(a pinned room's oldest unclaimed task older than `stand_in_after_s` while that
-target holds no claimed task). A wedged target is treated exactly as a stale one:
+(the oldest unclaimed task addressed to it — by any route, not the pin alone —
+older than `stand_in_after_s` while it holds no claimed task). A wedged target is treated exactly as a stale one:
 the pin is unclaimable, so it falls through to rule 3 and the core stands in.
 Without this, rules 1 and 2 suppress on liveness alone and a handler that keeps
 beating without ever claiming holds its pinned tasks unclaimed indefinitely —
@@ -369,9 +369,14 @@ justify a timer, so no `proactive-loop-pool` skill ships.
    loaned or re-bound.
 6. **Busy is not hung.** A worker with a fresh beat and a claimed, unfinished
    task is busy, and the core leaves its rooms alone. The core stands in for a
-   fresh-beat worker only when a pinned room's oldest unclaimed task is older
-   than `stand_in_after_s` (default 300) **and** the worker holds no claimed
-   task, plus one sweep of grace after its last finish. This is the claim-only
+   fresh-beat worker only when the oldest unclaimed task ADDRESSED TO IT is
+   older than `stand_in_after_s` (default 300) **and** the worker holds no
+   claimed task, plus one sweep of grace after its last finish. "Addressed to
+   it" is every route in the routing rule, not the pin alone: a
+   `requested_worker` task, a task in a room pinned to it or to a bound set it
+   belongs to, and a dedicated worker's own room. Scoping this to pinned rooms
+   would leave the other three routes with a wedged target that is never
+   ineligible, so rules 1 and 2 suppress on it forever. This is the claim-only
    form of #3604's claimed-load, busy-deferral cap and post-busy grace
    (`pool_lead.py:514-547`), so a long task never has the core answering the
    same room concurrently.
