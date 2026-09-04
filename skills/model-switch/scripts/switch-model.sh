@@ -44,7 +44,12 @@ if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open th
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "switch-model: could not take the switch lock — nothing changed" >&2; exit 1; }
 # Claude Code only: /model and the settings.json pin are its. The Codex core takes
 # its model at launch (codex -m from SUTANDO_CORE_MODEL), so the fix there is a restart.
-RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || echo claude)"
+# Fail closed on the runtime gate: a resolver that errors, prints nothing or
+# names a runtime this script does not know is not "claude" — refuse before
+# any record or pane action.
+RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null)"; RRC=$?
+if [ $RRC -ne 0 ] || [ -z "$RUNTIME" ]; then echo "switch-model: refused — core runtime could not be resolved (rc=$RRC, value='$RUNTIME'); nothing changed" >&2; exit 4; fi
+case "$RUNTIME" in claude|codex) ;; *) echo "switch-model: refused — unrecognized core runtime '$RUNTIME'; nothing changed" >&2; exit 4;; esac
 if [ "$RUNTIME" = "codex" ]; then
   echo "switch-model: refused — the configured core runtime is codex; its model is a launch argument: SUTANDO_CORE_MODEL=$MODEL bash src/agent/codex/cli/start-cli.sh --restart (owner-gated restart). Nothing changed." >&2; exit 4
 fi
