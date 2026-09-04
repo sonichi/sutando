@@ -1973,6 +1973,18 @@ class ANamespaceWordDoesNotMakeAContainerAPrincipal(unittest.TestCase):
                       "discord_display_name"):
             self.assertFalse(mig._discord_source([], field, None), field)
 
+    def test_container_and_application_are_refused(self):
+        # schema.md:67 types provider_container_id as a workspace/guild id; an
+        # application id is the bot registration, never the person behind it.
+        for field in ("discord_provider_container_id", "discord_container_id",
+                      "discord_application_id"):
+            self.assertFalse(mig._discord_source([], field, None), field)
+
+    def test_the_positive_control_still_resolves(self):
+        # A refusal list that also refuses the person is not a fix.
+        for field in ("discord_user_id", "discord_id", "discord_ids"):
+            self.assertTrue(mig._discord_source([], field, None), field)
+
     def test_the_identity_slots_still_qualify(self):
         for field in ("discord_user_id", "discord_id", "discord_human_id",
                       "stand_discord_id", "other_stand_discord_ids"):

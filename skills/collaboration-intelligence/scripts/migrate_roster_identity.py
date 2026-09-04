@@ -169,6 +169,9 @@ _LEGACY_ID_ANCESTORS = frozenset({"human", "secondary_agent", "stand_status"})
 _NON_IDENTITY_OBJECTS = frozenset({
     "room", "channel", "guild", "server", "thread", "category",
     "message", "webhook", "emoji", "role", "invite", "attachment",
+    # schema.md:67 types provider_container_id as a workspace/guild id, and an
+    # application is the bot registration, not the person operating it.
+    "container", "application",
 })
 
 
