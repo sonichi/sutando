@@ -170,6 +170,46 @@ class FreshWindowZeroBurn(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assertRegex(text, r"sustainable \d+\.\d+x CURRENT pace")
 
+
+class TopTierLane(unittest.TestCase):
+    """The API meters a third window, `7d_oi` (top-tier models). A pinned Fable/Opus
+    core can exhaust it while 5h and 7d read fine, so it must be able to BIND."""
+
+    def _run(self, text, argv=()):
+        out = io.StringIO(); real = sys.stdin; sys.stdin = io.StringIO(text)
+        try:
+            with redirect_stdout(out), __import__("contextlib").redirect_stderr(out):
+                rc = qt.main(list(argv))
+        finally:
+            sys.stdin = real
+        return rc, out.getvalue()
+
+    def _argv(self):
+        import datetime
+        now = datetime.datetime.now()
+        return ["--reset5", (now + datetime.timedelta(hours=1)).isoformat(),
+                "--reset7", (now + datetime.timedelta(days=3, hours=12)).isoformat()]  # elapsed 0.5
+
+    BASE = "5h window: 1% used, 99% remaining\n7d window: 4% used, 96% remaining\n"
+
+    def test_parse_reads_the_oi_line_and_tolerates_its_absence(self):
+        q = qt.parse(self.BASE + "7d-oi window (top-tier models): 80% used, 20% remaining\n")
+        self.assertEqual((q["used7oi"], q["rem7oi"]), (80, 20))
+        self.assertNotIn("rem7oi", qt.parse(self.BASE))
+
+    def test_an_exhausted_oi_lane_binds_while_5h_and_7d_are_FULL(self):
+        # THE discriminating pair: identical 5h/7d, the oi line flips the verdict.
+        rc, out = self._run(self.BASE, self._argv())
+        self.assertEqual(rc, 0, out); self.assertIn("TIER FULL (bound by both)", out)
+        rc, out = self._run(self.BASE + "7d-oi window (top-tier models): 80% used, 20% remaining\n", self._argv())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("7d-oi (top-tier models) 20% rem", out)
+        self.assertIn("TIER LIGHT (bound by 7d-oi)", out)   # headroom 0.2/0.5 = 0.4
+
+    def test_a_healthy_oi_lane_changes_nothing(self):
+        rc, out = self._run(self.BASE + "7d-oi window (top-tier models): 5% used, 95% remaining\n", self._argv())
+        self.assertEqual(rc, 0, out); self.assertIn("TIER FULL", out)
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
 

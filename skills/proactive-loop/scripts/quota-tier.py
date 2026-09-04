@@ -71,9 +71,15 @@ def parse(text: str) -> dict:
             raise ValueError(f"no {win} window line in input")
         return int(m.group(1)) if what == "used" else int(m.group(2))
     resets = re.findall(r"Resets: (.+)", text)
-    return {"used5": grab("5h", "used"), "rem5": grab("5h", "rem"),
-            "used7": grab("7d", "used"), "rem7": grab("7d", "rem"),
-            "resets": resets}
+    out = {"used5": grab("5h", "used"), "rem5": grab("5h", "rem"),
+           "used7": grab("7d", "used"), "rem7": grab("7d", "rem"),
+           "resets": resets}
+    # Optional third lane, the top-tier-model weekly cap: same week as 7d, its
+    # own tier; absent on readers that do not report it.
+    m = re.search(r"7d-oi window[^:]*: (\d+)% used, (\d+)% remaining", text)
+    if m:
+        out["used7oi"], out["rem7oi"] = int(m.group(1)), int(m.group(2))
+    return out
 
 
 def main(argv=None) -> int:
@@ -100,12 +106,19 @@ def main(argv=None) -> int:
     t5, t7 = tier_5h(q["rem5"], m5), tier_7d(q["rem7"], el)
     burn = (q["used7"] / 100) / el if el > 0 else float("inf")
     head = (q["rem7"] / 100) / (1 - el) if el < 1 else float("inf")
-    sel = most_restrictive(t5, t7)
-    binding = "both" if t5 == t7 else ("5h" if sel == t5 else "7d")
+    tiers = {"5h": t5, "7d": t7}
+    if "rem7oi" in q:
+        tiers["7d-oi"] = tier_7d(q["rem7oi"], el)
+    sel = most_restrictive(*tiers.values())
+    bound = [w for w, t in tiers.items() if t == sel]
+    binding = "both" if len(bound) == len(tiers) == 2 else "+".join(bound)
     print(f"5h  {q['rem5']}% rem, {m5:.0f} min -> retained "
           f"{q['rem5']/(m5/5):.2f} %/pass -> {t5}")
     print(f"7d  {q['rem7']}% rem, elapsed {el:.4f}, burn {burn:.2f}, "
           f"headroom {head:.3f} -> {t7}")
+    if "rem7oi" in q:
+        head_oi = (q["rem7oi"] / 100) / (1 - el) if el < 1 else float("inf")
+        print(f"7d-oi (top-tier models) {q['rem7oi']}% rem, headroom {head_oi:.3f} -> {tiers['7d-oi']}")
     # burn guards its own denominator above and then BECOMES one here. A
     # just-reset window has used7 == 0, so the ratio is unbounded, not a number.
     ratio = (f"{head/burn:.2f}x CURRENT pace" if burn > 0
