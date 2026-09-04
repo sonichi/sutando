@@ -455,3 +455,34 @@ def write_private_text(path: "Path", text: str) -> None:
         raise
     with os.fdopen(fd, "w") as fh:  # fdopen takes ownership of fd from here
         fh.write(text)
+
+
+# Unset instance keeps the historic name; mirrored in src/watcher_sentinel.sh
+# and a test asserts the two namers agree.
+WATCHER_SENTINEL_STEM = "watch-tasks-stream"
+
+
+def watcher_sentinel_path(state_dir, instance: "str | None" = None) -> Path:
+    """The sentinel this instance writes. No instance -> the historic name."""
+    if instance is None:
+        instance = os.environ.get("SUTANDO_INSTANCE", "")
+    instance = re.sub(r"[^A-Za-z0-9._-]", "-", instance.strip()).strip(".-")
+    suffix = f"-{instance}" if instance else ""
+    return Path(state_dir) / f"{WATCHER_SENTINEL_STEM}{suffix}.pid"
+
+
+def watcher_sentinel_paths(state_dir) -> "list[Path]":
+    """Every sentinel present, historic name first.
+
+    A reader must consider all of them: asking about one file answers about one
+    watcher, and on a pool host the others are equally real.
+    """
+    state = Path(state_dir)
+    bare = state / f"{WATCHER_SENTINEL_STEM}.pid"
+    found = [bare] if bare.exists() else []
+    try:
+        rest = sorted(p for p in state.glob(f"{WATCHER_SENTINEL_STEM}-*.pid")
+                      if p.is_file())
+    except OSError:
+        rest = []
+    return found + rest

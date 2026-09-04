@@ -55,7 +55,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
-from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
+from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from workspace_layout import inspect_layout  # noqa: E402
@@ -8293,7 +8293,10 @@ def check_task_watcher() -> dict:
     as one that is always green.
     """
     name = "task-watcher"
-    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    # Newest-stamped of every instance's sentinel: on a pool host each watcher
+    # writes its own, and asking about one file answers about one watcher.
+    _sentinels = watcher_sentinel_paths(WORKSPACE_DIR / "state")
+    pid_file = _sentinels[0] if _sentinels else watcher_sentinel_path(WORKSPACE_DIR / "state")
     # `_watcher_trees()` returns {} for BOTH a clean empty scan and a failed ps,
     # so take the snapshot here: None is unavailable, "" is genuinely empty.
     ps_out = _ps_snapshot()
@@ -8654,7 +8657,7 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     pid = str(check.get("_sentinel_restamp_pid") or "")
     if not pid.isdigit():
         return "no re-stampable watcher pid"
-    pid_file = WORKSPACE_DIR / "state" / "watch-tasks-stream.pid"
+    pid_file = watcher_sentinel_path(WORKSPACE_DIR / "state")
     # Re-measure before writing: the check ran earlier, and this file is what
     # the Stop hook kills.
     if not _is_watcher_argv(_proc_argv(int(pid))):

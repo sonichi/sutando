@@ -24,6 +24,35 @@
 # file (health-check.py, services_status.py, and the tests), so a richer token
 # would convert this bug into a different false "watcher is broken" signal.
 
+# --- naming ------------------------------------------------------------------
+# Unset instance keeps the historic name, so a single-instance install is
+# unchanged. Mirrored in src/util_paths.py; a test asserts they agree.
+WATCHER_SENTINEL_STEM="watch-tasks-stream"
+
+# The sentinel THIS process writes. $1 = state dir, $2 = instance (optional;
+# defaults to $SUTANDO_INSTANCE, empty for the historic name).
+sentinel_path_for() {
+  local state_dir="$1" instance="${2-${SUTANDO_INSTANCE:-}}" clean
+  clean="$(printf '%s' "$instance" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^[.-]*//; s/[.-]*$//')"
+  if [ -n "$clean" ]; then
+    printf '%s/%s-%s.pid' "$state_dir" "$WATCHER_SENTINEL_STEM" "$clean"
+  else
+    printf '%s/%s.pid' "$state_dir" "$WATCHER_SENTINEL_STEM"
+  fi
+}
+
+# Every sentinel present, historic name first, one per line. A caller that asks
+# about one file has asked about one watcher; on a pool host the others are
+# equally real.
+sentinel_paths_in() {
+  local state_dir="$1" p
+  [ -f "$state_dir/$WATCHER_SENTINEL_STEM.pid" ] && printf '%s/%s.pid\n' "$state_dir" "$WATCHER_SENTINEL_STEM"
+  for p in "$state_dir/$WATCHER_SENTINEL_STEM"-*.pid; do
+    [ -f "$p" ] && printf '%s\n' "$p"
+  done
+  return 0
+}
+
 # Seconds of elapsed time for a pid, or empty when it cannot be determined.
 # `etime` is [[DD-]HH:]MM:SS on both BSD and GNU ps.
 sentinel_pid_elapsed() {

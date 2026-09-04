@@ -10,7 +10,8 @@ Why aggregate, not re-probe
 ---------------------------
 Each sidecar already leaves a liveness trace — the core heartbeat's
 `state/cores/<host>.alive` (mtime = liveness), the task watcher's
-`state/watch-tasks-stream.pid`, a listening TCP port for network services.
+a per-instance `state/watch-tasks-stream[-<instance>].pid`, a listening TCP
+port for network services.
 This emitter *reads those existing signals* and folds them into one file the
 UI can consume, rather than inventing a second, divergent source of truth.
 
@@ -102,6 +103,15 @@ def probe_alive_file(path: Path, now: float, ttl: float = ALIVE_TTL_S) -> tuple[
         return ("offline", f"stale {int(age)}s", mtime)
     except OSError as e:  # pragma: no cover — defensive; hard to trigger in tests
         return ("unknown", f"stat failed: {e}", None)
+
+
+def _watcher_sentinel() -> Path:
+    """The sentinel this row reports on: the historic name when present, else
+    the first per-instance one. A pool host has several and this row has always
+    reported one -- naming which is a display change, not a probe change."""
+    from util_paths import watcher_sentinel_path, watcher_sentinel_paths
+    found = watcher_sentinel_paths(STATE_DIR)
+    return found[0] if found else watcher_sentinel_path(STATE_DIR)
 
 
 def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:
@@ -241,7 +251,8 @@ def service_registry() -> list[dict]:
         {"id": "gateway", "name": "AG2 Gateway",
          "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",
-         "probe": ("pidfile", STATE_DIR / "watch-tasks-stream.pid")},
+         # Every instance's sentinel; one fixed name reported only the newest.
+         "probe": ("pidfile", _watcher_sentinel())},
         {"id": "voice-agent", "name": "Voice Agent",
          "probe": ("port", 9900)},
         {"id": "web-client", "name": "Web Client",

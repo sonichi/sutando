@@ -415,7 +415,9 @@ dispatch_task() {
 # env-var + hardcoded fallbacks are gone — fail-loud if helper missing.
 STATE_DIR="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)/state"
 mkdir -p "$STATE_DIR"
-PID_FILE="$STATE_DIR/watch-tasks-stream.pid"
+# Per instance: N watchers on one host each stamped the same file, so the
+# readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
+PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"

@@ -667,7 +667,11 @@ if [ -x "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" ]; then
   bash "$REPO/src/agent/claude/cli/sutando-shell-setup.sh" --auto || true
 fi
 
-reap_stale_task_watcher "$WORKSPACE/state/watch-tasks-stream.pid"
+# Every instance's sentinel: reaping only the historic name leaves a pool
+# host's other watchers untracked and unreaped.
+while IFS= read -r __sentinel; do
+  [ -n "$__sentinel" ] && reap_stale_task_watcher "$__sentinel"
+done < <(sentinel_paths_in "$WORKSPACE/state")
 
 # Post-M0: repo-root tasks/results/data are NOT created. Pre-M0 this block
 # ran `mkdir -p tasks results data` as back-compat for unmigrated scripts —

@@ -125,8 +125,11 @@ fi
 fi  # have_fn
 
 # --- wiring: startup.sh must delegate, not re-implement ------------------------
-if grep -q 'reap_stale_task_watcher "\$WORKSPACE/state/watch-tasks-stream.pid"' "$REPO/src/startup.sh"; then
-  ok "startup.sh delegates to the shared reaper"
+# The argument is now every sentinel the resolver finds (one per instance), so
+# assert the delegation and the enumeration, not one literal path.
+if grep -q 'reap_stale_task_watcher "\$__sentinel"' "$REPO/src/startup.sh" \
+   && grep -q 'sentinel_paths_in "\$WORKSPACE/state"' "$REPO/src/startup.sh"; then
+  ok "startup.sh delegates to the shared reaper, once per instance sentinel"
 else
   bad "startup.sh delegates to the shared reaper" "call site not found"
 fi
