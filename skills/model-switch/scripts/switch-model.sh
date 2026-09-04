@@ -25,6 +25,29 @@ PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin)"
 if [ -n "$DRY" ]; then
   echo "dry-run: would record $STATE_DIR/model-switch.json, pin model=$MODEL in $CFG, send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"; exit 0
 fi
+# Claude Code only: /model and the settings.json pin are its. The Codex core takes
+# its model at launch (codex -m from SUTANDO_CORE_MODEL), so the fix there is a restart.
+RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || echo claude)"
+if [ "$RUNTIME" = "codex" ]; then
+  echo "switch-model: refused — the configured core runtime is codex; its model is a launch argument: SUTANDO_CORE_MODEL=$MODEL bash src/agent/codex/cli/start-cli.sh --restart (owner-gated restart). Nothing changed." >&2; exit 4
+fi
+# Preflight the live pane before any write: a prompt line carrying text would get
+# our command appended to it. The input line is the '❯'/'>' line above the footer.
+LIVE=""; PENDING=""
+if tmux -S "$SOCK" has-session -t "=$SESSION" 2>/dev/null; then
+  LIVE=1
+  PENDING="$(tmux -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null | "$PY" -c "$(cat <<'PYEOF'
+import sys
+lines = [l.rstrip() for l in sys.stdin.read().splitlines()]
+prompt = [l for l in lines if l.lstrip().startswith(("\u276f", "> "))]
+if prompt:
+    print(prompt[-1].lstrip()[1:].replace("\u00a0", " ").strip())
+PYEOF
+)")"
+  if [ -n "$PENDING" ]; then
+    echo "switch-model: refused — the core input box is not clear (pending: ${PENDING:0:60}); nothing changed" >&2; exit 5
+  fi
+fi
 # Record first, then pin; a failed pin removes the record it would have described.
 OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" <<'PYEOF'
 import json, os, sys, time, tempfile
@@ -62,10 +85,9 @@ case "$OUT" in
   *) echo "switch-model: unexpected python outcome (rc=$RC): $OUT" >&2; exit 1;;
 esac
 echo "pinned: $CFG model=$MODEL (was ${OUT#OK }); record: $STATE_DIR/model-switch.json"
-if tmux -S "$SOCK" has-session -t "=$SESSION" 2>/dev/null \
-   && tmux -S "$SOCK" send-keys -t "$SESSION" -l "/model $MODEL" \
+if [ -n "$LIVE" ] && tmux -S "$SOCK" send-keys -t "$SESSION" -l "/model $MODEL" \
    && tmux -S "$SOCK" send-keys -t "$SESSION" Enter; then
-  echo "live: sent '/model $MODEL' to tmux session $SESSION"; exit 0
+  echo "live: sent '/model $MODEL' to tmux session $SESSION (if a turn is running, the CLI queues it and switches when the turn ends)"; exit 0
 fi
 echo "live: NOT sent — no tmux session '$SESSION' on $SOCK; the pin applies at the next launch" >&2
 exit 3

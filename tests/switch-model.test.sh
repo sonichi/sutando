@@ -10,6 +10,7 @@ cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ -n "${TMUX_FAIL:-}" ] && exit 1
+case " $* " in *" capture-pane "*) printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
 exit 0
 SH
 chmod +x "$T/bin/tmux"
@@ -46,9 +47,21 @@ grep -q "NOT sent" "$T/err" && ok "10 ...and it says so on stderr" || fail "10 s
 : > "$T/tmux.log"; touch "$T/statefile"; rc=$(runraw sonnet --state-dir "$T/statefile")
 [ "$rc" = 1 ] && [ "$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")" = opus ] \
   && ok "12 unwritable record: exit 1 and settings.json UNCHANGED (record is written first)" || fail "12 partial failure" "rc=$rc model=$(cat "$T/cfg/settings.json")"
-[ ! -s "$T/tmux.log" ] && grep -q "nothing changed" "$T/err" && ok "13 ...nothing sent, and the message says nothing changed" || fail "13 partial msg" "$(cat "$T/err")"
+! grep -q send-keys "$T/tmux.log" && grep -q "nothing changed" "$T/err" && ok "13 ...nothing sent, and the message says nothing changed" || fail "13 partial msg" "$(cat "$T/err")"
 ! grep -Eq '(^|[^a-z-])python3( |$)' "$HERE/skills/model-switch/scripts/switch-model.sh" && grep -q 'python-bin' "$HERE/skills/model-switch/scripts/switch-model.sh" \
   && ok "14 no bare python3; python resolved through sutando-config.sh python-bin" || fail "14 python resolver" "$(grep -nE 'python3( |$)' "$HERE/skills/model-switch/scripts/switch-model.sh")"
 grep -q 'tmux-socket' "$HERE/skills/model-switch/scripts/switch-model.sh" && ok "15 socket resolved through sutando-config.sh tmux-socket when unset" || fail "15 socket resolver" ""
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 15 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- the input box is read before anything is written
+: > "$T/tmux.log"; rc=$(TMUX_PANE_TEXT='────\n❯ half-typed message\n────\n' run haiku)
+[ "$rc" = 5 ] && [ "$(python3 -c "import json;print(json.load(open('$T/cfg/settings.json'))['model'])")" = opus ] && ! grep -q send-keys "$T/tmux.log" \
+  && ok "16 pending text in the input box: exit 5, nothing pinned, nothing sent" || fail "16 input box" "rc=$rc $(cat "$T/tmux.log")"
+grep -q "half-typed" "$T/err" && ok "17 ...and the refusal quotes the pending text" || fail "17 quote" "$(cat "$T/err")"
+: > "$T/tmux.log"; rc=$(TMUX_PANE_TEXT='✽ Thinking… (12s)\n────\n❯\xc2\xa0\n────\n' run haiku)
+[ "$rc" = 0 ] && grep -q "send-keys -t sutando-core -l /model haiku" "$T/tmux.log" && ok "18 a clear prompt (nbsp after ❯, turn running) still sends — the CLI queues it" || fail "18 clear prompt" "rc=$rc $(cat "$T/err")"
+# --- Claude Code only
+: > "$T/tmux.log"; rc=$(SUTANDO_CORE_RUNTIME=codex run opus)
+[ "$rc" = 4 ] && ! grep -q send-keys "$T/tmux.log" && grep -q "start-cli.sh --restart" "$T/err" \
+  && ok "19 codex runtime: exit 4, nothing sent, the restart path named" || fail "19 codex" "rc=$rc $(cat "$T/err")"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 19 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
