@@ -222,14 +222,16 @@ event handler keeps routing on beats exactly as in step 2 and never consults the
 record. Workers read the record to gate THEMSELVES. One reader per decision, and the
 one party that could disagree with the file is the party that wrote it.
 
-The residue is then bounded by a thing that already exists rather than by a timer
-this design would have to invent: a worker that suppresses on a `wedged` verdict the
-core has not yet acted on waits until the core's next sweep, and the sweep is one of
-the two periodic things a pool has (see "Workers are task-only"). Step 2 owes NO new
-periodic re-evaluation — an earlier revision of this section asserted one and said it
-was listed with the step-2 prerequisites; it was not listed, and it contradicted both
-that section and the migration note that says the core sweep does not exist in the
-step-2 window. The correct resolution is the staging above, not a timer.
+This paragraph is about the STEP-3 residue only, and an earlier revision let it
+deny the step-2 contract as well. To be explicit, because the two sit close enough
+to be read as one rule: **step 2 DOES owe a periodic re-evaluation** — the
+per-heartbeat re-list specified above and again in the step-2 prerequisite list —
+and using an existing 30s tick rather than a second timer does not make repeated
+work non-periodic. What is bounded HERE is a different race: a worker that
+suppresses on a `wedged` verdict the core has not yet acted on waits until the
+core's next SWEEP, which is step 3's and is one of the two periodic things
+"Workers are task-only" already admits. Two residues, two owners, two mechanisms;
+neither replaces the other.
 
 **And a target checks its OWN verdict before claiming.** The eligibility rule above
 tells every OTHER instance when to stop suppressing; on its own it leaves rules 1 and
