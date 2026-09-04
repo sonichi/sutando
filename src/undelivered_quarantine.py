@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -25,13 +26,14 @@ def quarantine_dir(results_dir: Path) -> Path:
     return Path(results_dir) / DIRNAME
 
 
-def quarantine_name(stem: str, when: Optional[float] = None) -> str:
-    """The one place the quarantined filename is spelled."""
-    return f"{stem}-{int(when if when is not None else time.time())}.txt"
+def quarantine_name(stem: str, when: Optional[int] = None) -> str:
+    """The one place the quarantined filename is spelled. Nanoseconds, not
+    seconds: the drain can quarantine one task several times inside a second."""
+    return f"{stem}-{int(when if when is not None else time.time_ns())}.txt"
 
 
 def quarantine(rfile: Path, results_dir: Path,
-               when: Optional[float] = None) -> Path:
+               when: Optional[int] = None) -> Path:
     """Move a refused result out of the drain's view. Returns the new path."""
     d = quarantine_dir(results_dir)
     d.mkdir(parents=True, exist_ok=True)
@@ -58,19 +60,28 @@ def find_quarantined(results_dir: Path, task_id: str) -> list[Path]:
     return [p for _, p in sorted(out)]
 
 
-def restore(results_dir: Path, task_id: str) -> Optional[Path]:
+class RestoreOutcome(str, Enum):
+    """Absence and refusal are different answers: one means the body is gone,
+    the other that a newer reply is already queued. Collapsing them to None
+    leaves the operator unable to tell whether they still have a problem."""
+
+    RESTORED = "restored"
+    NOTHING_QUARANTINED = "nothing-quarantined"
+    LIVE_RESULT_PRESENT = "live-result-present"
+
+
+def restore(results_dir: Path, task_id: str) -> "tuple[RestoreOutcome, Optional[Path]]":
     """Return the NEWEST quarantined body to the drain's canonical name.
 
-    Returns the restored path, or None when nothing was quarantined. Refuses to
-    overwrite a live result: a newer reply already waiting to go is the one the
-    user should get, not a resurrected older one.
+    Refuses to overwrite a live result: a newer reply already waiting to go is
+    the one the user should get, not a resurrected older one.
     """
     found = find_quarantined(results_dir, task_id)
     if not found:
-        return None
+        return RestoreOutcome.NOTHING_QUARANTINED, None
     stem = f"task-{task_id}" if not str(task_id).startswith("task-") else str(task_id)
     target = Path(results_dir) / f"{stem}.txt"
     if target.exists():
-        return None
+        return RestoreOutcome.LIVE_RESULT_PRESENT, target
     found[-1].rename(target)
-    return target
+    return RestoreOutcome.RESTORED, target

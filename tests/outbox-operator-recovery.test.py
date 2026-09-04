@@ -253,21 +253,48 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
     non-recursive glob over results/ — so a requeue that only flips the record
     delivers nothing, silently, which is the failure this PR exists to fix."""
 
-    def _quarantined(self, td):
-        root, results = Path(td) / "ob", Path(td) / "results"
+    def _quarantined(self, td, root_inside_results=False):
+        results = Path(td) / "results"
         results.mkdir()
+        root = (results / ".outbox-test") if root_inside_results else Path(td) / "ob"
         _parked(root)
         (results / f"{ITEM}.txt").write_text("the reply", encoding="utf-8")
         uq.quarantine(results / f"{ITEM}.txt", results, when=1700000000)
         return root, results
 
-    def test_requeue_without_results_dir_leaves_the_body_quarantined(self):
+    def test_the_DEFAULT_requeue_restores_the_body(self):
+        """The common path must not be the broken one. `--root` is required and
+        every lane puts the outbox at RESULTS_DIR/.outbox-*, so root.parent IS
+        the results dir — no flag needed to get a complete recovery."""
         with TemporaryDirectory() as td:
-            root, results = self._quarantined(td)
+            root, results = self._quarantined(td, root_inside_results=True)
             self.assertEqual(outbox_cli.main(
                 ["--root", str(root), "requeue", ITEM]), 0)
-            self.assertFalse((results / f"{ITEM}.txt").exists())
-            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1)
+            self.assertTrue((results / f"{ITEM}.txt").exists(),
+                            "requeue with no flag must still restore the body")
+
+    def test_outcome_distinguishes_absent_from_refused(self):
+        """`None` for both left the operator unable to tell 'the body is gone'
+        from 'a newer reply is already queued'."""
+        with TemporaryDirectory() as td:
+            results = Path(td) / "results"; results.mkdir()
+            self.assertEqual(uq.restore(results, ITEM)[0],
+                             uq.RestoreOutcome.NOTHING_QUARANTINED)
+            (results / f"{ITEM}.txt").write_text("old", encoding="utf-8")
+            uq.quarantine(results / f"{ITEM}.txt", results)
+            (results / f"{ITEM}.txt").write_text("newer", encoding="utf-8")
+            self.assertEqual(uq.restore(results, ITEM)[0],
+                             uq.RestoreOutcome.LIVE_RESULT_PRESENT)
+
+    def test_two_quarantines_in_one_second_do_not_collide(self):
+        """Whole seconds silently overwrote; the incident had five attempts in
+        six seconds, and recovery needs the set to be complete."""
+        with TemporaryDirectory() as td:
+            results = Path(td) / "results"; results.mkdir()
+            for body in ("first", "second"):
+                (results / f"{ITEM}.txt").write_text(body, encoding="utf-8")
+                uq.quarantine(results / f"{ITEM}.txt", results)
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 2)
 
     def test_requeue_with_results_dir_returns_the_body_to_the_drain(self):
         with TemporaryDirectory() as td:

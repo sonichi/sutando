@@ -91,9 +91,10 @@ def cmd_requeue(args) -> int:
         payload["resend_epoch"] = outbox.resend_epoch_for(args.root, args.item_id)
         # The record is only half the recovery: the BODY was moved out of the
         # drain's view, and nothing re-reads the quarantine directory.
-        if args.results_dir:
-            restored = undelivered_quarantine.restore(args.results_dir, args.item_id)
-            payload["restored_body"] = str(restored) if restored else None
+        results_dir = args.results_dir or Path(args.root).parent
+        outcome, path = undelivered_quarantine.restore(results_dir, args.item_id)
+        payload["body"] = outcome.value
+        payload["body_path"] = str(path) if path else None
     _emit(payload, args.json)
     if result is outbox.RequeueOutcome.REQUEUED:
         return 0
@@ -123,9 +124,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="restore the full attempt budget (default: keep the "
                          "count, so one more failure re-parks)")
     rq.add_argument("--results-dir", type=Path,
-                    help="results/ directory: also returns the quarantined "
-                         "body to the drain (without it the record is "
-                         "requeued but nothing is re-sent)")
+                    help="override where result bodies live; defaults to the "
+                         "outbox root's parent, which is where every lane "
+                         "puts it (RESULTS_DIR/.outbox-*)")
     rq.add_argument("--operator", help="recorded as who did it")
     rq.add_argument("--reason", help="recorded as why")
     rq.set_defaults(func=cmd_requeue)

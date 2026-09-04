@@ -294,6 +294,7 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
+from . import undelivered_quarantine
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
@@ -3383,7 +3384,6 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
     the same quarantine the proactive path uses. Without this the file is
     rescanned every pass and the refusal is invisible."""
     try:
-        import undelivered_quarantine
         undelivered_quarantine.quarantine(rfile, RESULTS_DIR)
         _log(f"result {tid}: {why} — quarantined to "
              f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox requeue "
