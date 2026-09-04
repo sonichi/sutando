@@ -15,6 +15,7 @@ from __future__ import annotations
 
 
 import http.server
+import html
 import json
 import os
 import re
@@ -245,6 +246,9 @@ def _quota_freshness(data: dict, quota_file) -> dict:
 
 
 
+_QUOTA_MODEL_MAX_LEN = 64
+
+
 def _quota_model_label(quota: dict) -> str:
     """The model last seen consuming quota, from the proxy's `last_request`.
 
@@ -253,7 +257,11 @@ def _quota_model_label(quota: dict) -> str:
     """
     lr = quota.get("last_request")
     model = lr.get("model") if isinstance(lr, dict) else None
-    return model.strip() if isinstance(model, str) and model.strip() else "model —"
+    if not isinstance(model, str) or not model.strip():
+        return "model —"
+    # The value comes from a request body any local caller can send: escape
+    # at the sink and cap it, so the tile cannot carry markup or a novel.
+    return html.escape(model.strip()[:_QUOTA_MODEL_MAX_LEN])
 
 
 def _quota_has_data(quota: dict) -> bool:

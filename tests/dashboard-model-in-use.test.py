@@ -60,6 +60,14 @@ tile = quota_tile(render_with({**LIVE, "last_request": None}))
 check("A5 absence is visible in the tile, not a blank", "model —" in tile, tile)
 check("A6 absence never borrows a model from elsewhere", "claude-" not in tile, tile)
 
+# --- the value is attacker-reachable: any local caller can put markup in a request body
+EVIL = {**LIVE, "last_request": {"model": "<img src=x onerror=alert(1)>", "at": "T"}}
+tile = quota_tile(render_with(EVIL))
+check("S1 markup in the model is escaped at the sink", "&lt;img src=x onerror=alert(1)&gt;" in tile, tile)
+check("S2 ...and never rendered raw", "<img src=x" not in tile, tile)
+LONG = {**LIVE, "last_request": {"model": "claude-" + "x" * 500, "at": "T"}}
+check("S3 a pathological model string is capped", len(dash._quota_model_label(LONG)) <= 64, str(len(dash._quota_model_label(LONG))))
+
 print()
 if fails:
     print(f"FAILED ({len(fails)}): " + "; ".join(fails)); sys.exit(1)
