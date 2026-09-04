@@ -387,7 +387,7 @@ def _canonical_seeds(seeds: list) -> list:
     return sorted(out, key=lambda s: (str(s["path"]), str(s["verdict"])))
 
 
-def _carried_seeds(entry, arbitrated: set, fresh_claims: dict,
+def _carried_seeds(entry, arbitrated: set, observed: dict,
                    peer_ids: dict, owner_id: str, src_version: int = 0):
     """Claims from a carried disagreement whose writer-owned slot we erased.
 
@@ -422,8 +422,8 @@ def _carried_seeds(entry, arbitrated: set, fresh_claims: dict,
             if ri.path_referent(path) != verdict:
                 continue
             # Every source, not just `claims`: peers.json and owner_id are
-            # stamped later, so an id contested only there would look uncontested.
-            states = set(fresh_claims.get(str(id_)) or {})
+            # stamped later, and a MALFORMED observation states a referent too.
+            states = set(observed.get(str(id_)) or ())
             if str(id_) in (peer_ids or {}):
                 states.add(STAND)
             if owner_id and str(id_) == str(owner_id):
@@ -598,10 +598,18 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
                  f"pr-triage `{src}.bots[]` entry is not a snowflake",
                  shapes=shape_failures)
 
+    # A malformed observation STATES a referent; it lands in `bad`, not in
+    # `claims`, so a discharge reading claims alone sees no contradiction.
+    observed = {i: set(v) for i, v in claims.items()}
+    for _b in bad:
+        _st, _bid = _b.get("states"), _b.get("id")
+        if _bid and _st in (HUMAN, STAND):
+            observed.setdefault(str(_bid), set()).add(_st)
+
     # Below the triage read, not above it: the discharge test needs what THIS
     # pass states about the id, which does not exist until the config is read.
     for id_, verdict, reason, seed in _carried_seeds(
-            entry, arbitrated, claims, peer_ids, owner_id, src_version):
+            entry, arbitrated, observed, peer_ids, owner_id, src_version):
         claim(id_, verdict, reason)
         seeds.setdefault(id_, []).append(seed)
 

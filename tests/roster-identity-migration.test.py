@@ -27,6 +27,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+MIG = (Path(__file__).resolve().parent.parent / "skills"
+       / "collaboration-intelligence" / "scripts" / "migrate_roster_identity.py")
 SCRIPTS = (Path(__file__).resolve().parent.parent / "skills"
            / "collaboration-intelligence" / "scripts")
 
@@ -1983,6 +1985,53 @@ class ANamespaceWordDoesNotMakeAContainerAPrincipal(unittest.TestCase):
 
     def test_an_unstated_object_word_is_still_mined(self):
         self.assertTrue(mig._discord_source([], "understanding_discord_id", None))
+
+
+class AMalformedObservationStillContradictsASeed(unittest.TestCase):
+    """A seed is discharged by REPAIR, not by the evidence becoming unreadable.
+
+    The discharge test consulted the valid claims only. A malformed observation
+    states a referent too and lands in `bad`, so an intermediate pass saw no
+    contradiction, dropped the seed, and a later SHAPE-ONLY correction then
+    published the opposite principal while the writer-owned slot still said the
+    other thing and had never been repaired.
+    """
+
+    A = "1504316176686120980"
+    X = "1025828152183885925"
+    Y = "1289777888888888881"
+
+    def _pass(self, src, triage, out):
+        cfg = out.parent / (out.stem + "-cfg.json")
+        cfg.write_text(json.dumps({"people": {"p": {"discord": triage}}}))
+        rc = subprocess.run(
+            [sys.executable, str(MIG), "--roster", str(src),
+             "--triage-config", str(cfg), "--out", str(out)],
+            capture_output=True, text=True).returncode
+        rec = json.loads(out.read_text()).get("p", {})
+        unresolved = rec.get("unresolved_discord_ids") or []
+        return rc, rec.get("human_discord_id"), any(u.get("seeded_by") for u in unresolved)
+
+    def test_three_passes_over_an_occupied_plural_slot(self):
+        d = Path(tempfile.mkdtemp())
+        src = d / "v2.json"
+        src.write_text(json.dumps({
+            "_schema": {"version": 2},
+            "p": {"stand_discord_id": self.A,
+                  "other_stand_discord_ids": [self.X, self.Y]}}))
+        cur = src
+        # Passes 1 and 2 carry IDENTICAL malformed evidence: a list where the
+        # schema documents a single id. Pass 3 corrects only its SHAPE.
+        for i, triage in enumerate(([self.X], [self.X], self.X), 1):
+            out = d / f"o{i}.json"
+            rc, human, seeded = self._pass(cur, triage, out)
+            self.assertEqual(rc, 5, f"pass {i} published a contested id")
+            self.assertIsNone(human, f"pass {i} published {human} as the human")
+            self.assertTrue(seeded, f"pass {i} dropped the seed")
+            cur = out
+        # The writer-owned slot was never repaired, which is the whole point.
+        slot = json.loads(cur.read_text())["p"].get("other_stand_discord_ids")
+        self.assertTrue(slot, "the contested slot vanished, so nothing was repaired")
 
 
 if __name__ == "__main__":
