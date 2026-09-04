@@ -137,10 +137,12 @@ _RUN_PREFIX_RE = re.compile(r"^Run:?\s*")
 def schedule_owner(job: dict) -> str:
     """Which scheduler fires this entry: the OS-backed codex runner, the
     launchd cron-runner, a self-pacing /loop, or the live session's cron."""
-    if job.get("execution") == "codex-task":
-        return "codex"
+    # `launchd` first: cron-runner gates on it alone and never reads
+    # `execution`, so a record carrying both is fired by launchd.
     if job.get("launchd"):
         return "launchd"
+    if job.get("execution") == "codex-task":
+        return "codex"
     if job.get("loop") == "dynamic":
         return "dynamic-loop"
     return "session"
@@ -313,6 +315,9 @@ def upsert_schedule(path: Path, body: dict) -> tuple[int, dict]:
             # Only the launchd runner executes shell jobs and the session
             # scheduler skips them, so an unflagged one would never run at all.
             merged["launchd"] = True
+            # `merged` starts from the on-disk entry, so a codex-owned job
+            # switched to a shell body would keep both owner markers.
+            merged.pop("execution", None)
         err = validate_job(merged)
         if err:
             return 400, {"error": err}

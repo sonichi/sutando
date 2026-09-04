@@ -46,6 +46,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 3. For each job in the config:
    - Skip entries carrying a `monitor` object — they are Monitors, not crons (no `cron`, no prompt to register); step 5.4 owns their arming, and a `CronCreate` attempt on one is invalid.
    - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
+   - **Skip any entry carrying `shell_command`, whatever else it carries.** The session scheduler has no shell leg, so registering one means firing the `prompt_skill` or `prompt` the operator did not ask for while every listing surface says the shell command is what runs. `select_for_executor(entry, EXECUTOR_FORMS["session"])` in `src/cron_execution_form.py` is that rule in code; this bullet is the same rule for the agent following this file. A shell entry belongs to the launchd runner and the writer marks it `"launchd": true` — an unmarked one is a hand-edit, and skipping it is what makes the surfaces agree.
    - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).
    - **For a `CronCreate`-registered entry (one visible as a job in `CronList`): if a job for this
      entry already exists, RE-REGISTER it rather than skipping** — `CronDelete` the existing job,

@@ -179,6 +179,10 @@ def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dic
         implicit_main_loop = (
             include_main_loop and canonical_main_loop and raw_entry.get("execution") is None
         )
+        if raw_entry.get("launchd"):
+            # launchd owns it: claiming it too would double-dispatch, and
+            # raising over its shell form would abort every other schedule.
+            continue
         if raw_entry.get("execution") != "codex-task" and not implicit_main_loop:
             continue
         entry = dict(raw_entry)

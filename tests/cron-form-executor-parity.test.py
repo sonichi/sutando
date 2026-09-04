@@ -98,5 +98,65 @@ with tempfile.TemporaryDirectory() as td:
     check(row["kind"] == "shell" and row["prompt_or_skill"] == "bash scripts/poll.sh",
           "control: launchd still runs and advertises the shell leg")
 
+# --- two owner markers on one record ---------------------------------------
+
+# A record carrying both listed as codex-owned "WILL NOT RUN" while launchd
+# dispatched it.
+cr_spec = importlib.util.spec_from_file_location("cron_runner", REPO / "src" / "cron-runner.py")
+cr = importlib.util.module_from_spec(cr_spec)
+cr_spec.loader.exec_module(cr)
+
+with tempfile.TemporaryDirectory() as td:
+    cfg = write(Path(td), [{**CODEX, "name": "convert", "prompt_skill": "digest"}])
+    status, _ = dash.upsert_schedule(
+        cfg, {"name": "convert", "cron": "0 6 * * *", "shell_command": "echo hi"})
+    stored = {j["name"]: j for j in json.loads(cfg.read_text())}["convert"]
+    check(status == 200, "writer: the shell conversion is accepted")
+    check(stored.get("launchd") is True and "execution" not in stored,
+          "writer: converting a codex job to a shell body leaves ONE owner marker "
+          f"(got launchd={stored.get('launchd')!r} execution={stored.get('execution')!r})")
+
+# A record that already carries both — hand-edited, or written before the fix.
+CONFLICT = {"name": "conflict", "cron": "2 6 * * *", "timezone": "UTC",
+            "execution": "codex-task", "launchd": True, "shell_command": "echo hi"}
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    cfg = write(root, [CONFLICT, {**CODEX, "name": "sibling", "prompt_skill": "digest"}])
+
+    row = {r["name"]: r for r in dash.list_schedules(cfg)}["conflict"]
+    check(row["owner"] == "launchd",
+          f"conflict: listed under the owner that fires it (got {row['owner']!r})")
+    check(row["kind"] == "shell" and row["prompt_or_skill"] == "echo hi",
+          f"conflict: the listing names what launchd will run (got kind={row['kind']!r})")
+
+    # "threw" and "claimed it" are different defects; an uncaught ValueError
+    # here IS the tick-wide abort, so catch it and report it as a failed check.
+    try:
+        loaded = [j["name"] for j in sched.load_jobs(cfg)]
+    except ValueError as exc:
+        loaded = f"raised: {exc}"
+    check(isinstance(loaded, list) and "conflict" not in loaded,
+          f"conflict: the codex loader does not claim it (got {loaded})")
+    check(isinstance(loaded, list) and "sibling" in loaded,
+          "conflict: and one bad record no longer stops every other codex schedule "
+          f"from loading (got {loaded})")
+
+    # Why launchd wins: it really does dispatch the record. Drive the real
+    # run() rather than assert the premise.
+    cr.TASKS_DIR = root / "tasks"
+    cr.CRONS_FILE = root / "crons.json"
+    cr.STATE_FILE = root / "state" / "cron-runner-state.json"
+    cr.CRONS_FILE.write_text(json.dumps([CONFLICT]))
+    cr.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # cron-runner evaluates expressions in LOCAL time.
+    now = int(datetime(2026, 7, 2, 6, 2).timestamp())
+    cr.STATE_FILE.write_text(json.dumps({"conflict": now - 60}))
+    ran = []
+    cr._run_shell_command = lambda name, target, timeout: ran.append((name, target))
+    emitted = cr.run(now_epoch=now)
+    check(emitted == ["conflict"] and ran == [("conflict", "echo hi")],
+          f"conflict: launchd really is the executor (emitted={emitted} ran={ran})")
+
 print(f"\n{'FAILED' if failures else 'OK'} — {len(failures)} failure(s)")
 sys.exit(1 if failures else 0)
