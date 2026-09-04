@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# switch-model.sh <model> [--dry-run] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
-# Change the core's model without the CLI: record the switch, then send
-# `/model <model>` to the live core pane through the shared sender. Persistence
-# is the CLI's own (/model writes settings.json itself); this script never does.
+# switch-model.sh <model> [--dry-run] [--confirm] [--accept-timeout S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH]
+# Change the core's model without the CLI: send `/model <model>` through the
+# shared sender, wait for the CLI to ACCEPT it (a warm core first asks to confirm;
+# answered only under --confirm), and record the switch only once accepted.
+# Persistence is the CLI's own (/model writes settings.json itself); never here.
 set -u
-MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"
+MODEL=""; DRY=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20
 while [ $# -gt 0 ]; do case "$1" in
-  --dry-run) DRY=1;; --state-dir) STATE_DIR="${2:?}"; shift;;
+  --dry-run) DRY=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;;
   --session) SESSION="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
   -*) echo "switch-model: unknown flag $1" >&2; exit 2;;
   *) [ -z "$MODEL" ] && MODEL="$1" || { echo "switch-model: one model, got '$1' too" >&2; exit 2; };;
@@ -69,34 +70,55 @@ if [ -x "$SENDER" ] || [ -f "$SENDER" ]; then
 else
   echo "switch-model: shared sender missing ($SENDER) — nothing changed" >&2; exit 7
 fi
-# Record the switch (previous model read from settings.json, read-only). The
-# CLI persists /model itself, so there is no settings write here to roll back.
-OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" <<'PYEOF'
+OBS="$REPO/skills/model-switch/scripts/pane-observe.sh"
+if [ -z "$LIVE" ]; then echo "live: NOT sent — no tmux session '$SESSION' on $SOCK; nothing switched, nothing recorded" >&2; exit 3; fi
+# The send is initiation, not success. Baseline the acceptance lines already on
+# screen so a stale "Set model to" from an earlier switch cannot pass as this one.
+BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --count)"; BASE="${BASE:-0}"
+bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null || { echo "switch-model: send failed; nothing recorded" >&2; exit 7; }
+CONFIRMED=false
+VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
+case "$VERDICT" in
+  ACCEPTED) ;;
+  DIALOG)
+    if [ -n "$CONFIRM" ]; then
+      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; CONFIRMED=true
+      [ "$VERDICT" = ACCEPTED ] || { echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
+    else
+      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null
+      echo "switch-model: the core asked to confirm the switch (warm conversation cache); not confirmed — pass --confirm on an owner instruction. Dialog cancelled, nothing recorded" >&2; exit 6
+    fi;;
+  *) echo "switch-model: sent '/model $MODEL' but saw no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8;;
+esac
+# Record only now. `previous` prefers settings.json, else the last record: the
+# CLI does not always persist a /model pick, so the file can lag the session.
+OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" "$CONFIRMED" <<'PYEOF'
 import json, os, sys, time, tempfile
-cfg, model, state_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg, model, state_dir, confirmed = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "true"
 try: data = json.load(open(cfg))
 except (OSError, ValueError): data = {}
-prev = data.get("model")
-rec = {"model": model, "previous": prev, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+prev, src = data.get("model"), "settings.json"
+recp = os.path.join(state_dir, "model-switch.json")
+if not prev:
+    try: prev, src = json.load(open(recp)).get("model"), "last-record"
+    except (OSError, ValueError): prev, src = None, "none"
+rec = {"model": model, "previous": prev, "previous_source": src, "accepted": True, "confirmed": confirmed,
+       "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
        "by": "skills/model-switch/scripts/switch-model.sh", "settings_read": cfg}
 try:
     os.makedirs(state_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".model-switch.staged.")
     with os.fdopen(fd, "w") as f: json.dump(rec, f, indent=2); f.write("\n")
-    os.replace(tmp, os.path.join(state_dir, "model-switch.json"))
+    os.replace(tmp, recp)
 except OSError as e:
     print(f"RECORD-FAILED {e}"); sys.exit(1)
 print(f"OK {prev if prev else '-'}")
 PYEOF
 )"; RC=$?
 case "$OUT" in
-  RECORD-FAILED*) echo "switch-model: could not write the switch record ($STATE_DIR) — nothing changed: ${OUT#RECORD-FAILED }" >&2; exit 1;;
+  RECORD-FAILED*) echo "switch-model: switched, but could not write the record ($STATE_DIR): ${OUT#RECORD-FAILED }" >&2; exit 1;;
   OK*) ;;
   *) echo "switch-model: unexpected python outcome (rc=$RC): $OUT" >&2; exit 1;;
 esac
-echo "recorded: model=$MODEL (was ${OUT#OK }); record: $STATE_DIR/model-switch.json"
-if [ -n "$LIVE" ] && bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null; then
-  echo "live: sent '/model $MODEL' to tmux session $SESSION (if a turn is running, the CLI queues it and switches when the turn ends)"; exit 0
-fi
-echo "live: NOT sent — no tmux session '$SESSION' on $SOCK; nothing switched" >&2
-exit 3
+echo "switched: model=$MODEL (was ${OUT#OK }); accepted by the CLI$([ "$CONFIRMED" = true ] && echo ' after confirming its dialog'); record: $STATE_DIR/model-switch.json"
+exit 0

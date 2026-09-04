@@ -9,14 +9,23 @@ cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ -n "${TMUX_FAIL:-}" ] && exit 1
-case " $* " in *" capture-pane "*) [ -n "${TMUX_CAP_DELAY:-}" ] && sleep "$TMUX_CAP_DELAY"; printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
+case " $* " in *" capture-pane "*)
+  [ -n "${TMUX_CAP_DELAY:-}" ] && sleep "$TMUX_CAP_DELAY"
+  # State-driven pane: one acceptance line per /model sent; in TMUX_DIALOG mode the
+  # newest send shows the confirm dialog until a SECOND Enter lands.
+  M=$(grep -c -- "-l /model" "$TMUX_LOG"); E=$(grep -c -- " Enter$" "$TMUX_LOG")
+  k=$M; dlg=""
+  if [ -n "${TMUX_DIALOG:-}" ] && [ "$M" -gt 0 ] && [ "$E" -le "$M" ]; then k=$((M-1)); dlg="   ❯ 1. Yes, switch to X\n     2. No, go back\n"; fi
+  [ -n "${TMUX_NO_ACCEPT:-}" ] && { k=0; dlg=""; }
+  acc=""; i=0; while [ "$i" -lt "$k" ]; do acc="$acc  ⎿  Set model to X and saved as your default\n"; i=$((i+1)); done
+  printf '%b' "$acc$dlg${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
 exit 0
 SH
 chmod +x "$T/bin/tmux"
 export PATH="$T/bin:$PATH" TMUX_LOG="$T/tmux.log" SUTANDO_TMUX_SOCKET="/tmp/sutando-tmux.sock"
 printf '{"model":"claude-opus-5","permissions":{"allow":["Bash"]}}\n' > "$T/cfg/settings.json"; SETTINGS_BEFORE="$(cat "$T/cfg/settings.json")"
 fails=0; ok(){ echo "  ok   $1"; }; fail(){ echo "  FAIL $1 — $2"; fails=$((fails+1)); }
-run(){ : > "$TMUX_LOG"; "$HERE/scripts/switch-model.sh" "$@" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
+run(){ : > "$TMUX_LOG"; "$HERE/scripts/switch-model.sh" --accept-timeout 3 "$@" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
 settings_untouched(){ [ "$(cat "$T/cfg/settings.json")" = "$SETTINGS_BEFORE" ]; }
 
 rc=$(run 'gpt-5; rm -rf /'); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" && [ ! -e "$T/state/model-switch.json" ] && ok "1 a non-claude name is refused (rc=2), nothing written or sent" || fail "1" "rc=$rc"
@@ -26,7 +35,7 @@ R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));prin
 case "$R" in "claude-fable-5-1[1m] claude-opus-5 20 skills/model-switch/scripts/switch-model.sh") ok "4 record carries model, previous (read from settings), a dated ts, the writer";; *) fail "4 record" "$R";; esac
 grep -q -- "send-keys -t sutando-core -l /model claude-fable-5-1\[1m\]" "$TMUX_LOG" && grep -q -- "send-keys -t sutando-core Enter" "$TMUX_LOG" && ok "5 the live pane got '/model <id>' then Enter, literal, via the shared sender" || fail "5 tmux argv" "$(cat "$TMUX_LOG")"
 grep -q -- "-S /tmp/sutando-tmux.sock" "$TMUX_LOG" && ok "6 targets the core's socket (descriptor/env)" || fail "6 socket" ""
-rc=$(TMUX_FAIL=1 run opus); [ "$rc" = 3 ] && ! grep -q send-keys "$TMUX_LOG" && ok "7 no live session: exit 3, nothing sent" || fail "7" "rc=$rc"
+rc=$(TMUX_FAIL=1 run opus); [ "$rc" = 3 ] && ! grep -q send-keys "$TMUX_LOG" && [ ! -e "$T/state/.never" ] && ok "7 no live session: exit 3, nothing sent" || fail "7" "rc=$rc"
 rc=$(run sonnet --dry-run); [ "$rc" = 0 ] && ! grep -q send-keys "$TMUX_LOG" && ok "8 --dry-run sends nothing" || fail "8" "rc=$rc"
 touch "$T/statefile"; rc=$("$HERE/scripts/switch-model.sh" sonnet --state-dir "$T/statefile" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?)
 [ "$rc" = 1 ] && grep -q "nothing changed" "$T/err" && settings_untouched && ok "9 unwritable state path: exit 1, 'nothing changed', settings untouched" || fail "9" "rc=$rc $(cat "$T/err")"
@@ -60,4 +69,21 @@ ln -sfn "$HERE/skills" "$T/fakerepo/skills"
 rc=$(bash "$T/fakerepo/skills/model-switch/scripts/switch-model.sh" opus --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?)
 [ "$rc" = 4 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "could not be resolved" "$T/err" && ok "21 resolver exits nonzero: exit 4, no record" || fail "21 resolver failure" "rc=$rc $(cat "$T/err")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 21 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+# --- acceptance is VERIFIED from the pane, never inferred from the send
+rm -f "$T/state/model-switch.json"
+rc=$(TMUX_DIALOG=1 run opus); [ "$rc" = 6 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q -- "send-keys -t sutando-core Escape" "$TMUX_LOG" && [ "$(grep -c -- ' Enter$' "$TMUX_LOG")" = 1 ] \
+  && ok "22 warm-core confirm dialog without --confirm: exit 6, dialog cancelled (Escape), NO record" || fail "22" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_DIALOG=1 run opus --confirm); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['model'],d['accepted'],d['confirmed'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$(grep -c -- ' Enter$' "$TMUX_LOG")" = 2 ] && [ "$R" = "opus True True" ] && grep -q "after confirming its dialog" "$T/out" \
+  && ok "23 --confirm answers the dialog with ONE Enter, waits for acceptance, records confirmed=true" || fail "23" "rc=$rc R=$R $(cat "$T/err")"
+rm -f "$T/state/model-switch.json"
+rc=$(TMUX_NO_ACCEPT=1 run sonnet --accept-timeout 1); [ "$rc" = 8 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "no acceptance" "$T/err" \
+  && ok "24 no acceptance line within the timeout: exit 8, NO record — the send is not the switch" || fail "24" "rc=$rc $(cat "$T/err")"
+printf '{"permissions":{"allow":["Bash"]}}\n' > "$T/cfg/settings.json"; printf '{"model":"claude-opus-5"}\n' > "$T/state/model-switch.json"
+rc=$(run haiku); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['previous'],d['previous_source'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$R" = "claude-opus-5 last-record" ] && ok "25 settings.json without a model key: previous falls back to the last record and names its source" || fail "25" "rc=$rc R=$R"
+printf '%s\n' "$SETTINGS_BEFORE" > "$T/cfg/settings.json"
+rc=$(run haiku); R=$(python3 -c "import json;d=json.load(open('$T/state/model-switch.json'));print(d['previous_source'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$R" = "settings.json" ] && ok "26 with a model key present, previous comes from settings.json" || fail "26" "rc=$rc R=$R"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 26 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
