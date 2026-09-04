@@ -66,6 +66,16 @@ def _run_applescript(script: str, timeout: int = 8) -> tuple[str | None, str]:
         return None, ""
 
 
+def weather_location_configured() -> bool:
+    """Are WEATHER_LAT/WEATHER_LON set for this install?
+
+    `config_get` reads the config stanza before os.environ, so an env-only
+    check answers a different question than the one get_weather() asks.
+    """
+    from sutando_config import config_get
+    return bool(config_get("WEATHER_LAT") and config_get("WEATHER_LON"))
+
+
 def get_weather() -> str:
     """Fetch current conditions from Open-Meteo (no key needed)."""
     try:
@@ -77,11 +87,10 @@ def get_weather() -> str:
         )
         # Use lat/lon from config (env legacy fallback) if set
         from sutando_config import config_get
-        _lat_cfg, _lon_cfg = config_get("WEATHER_LAT"), config_get("WEATHER_LON")
-        configured = bool(_lat_cfg and _lon_cfg)
+        configured = weather_location_configured()
         if configured:
-            lat = float(_lat_cfg)
-            lon = float(_lon_cfg)
+            lat = float(config_get("WEATHER_LAT"))
+            lon = float(config_get("WEATHER_LON"))
 
         unit = (config_get("WEATHER_UNIT", "fahrenheit") or "fahrenheit").strip().lower()
         if unit not in ("fahrenheit", "celsius"):
@@ -795,8 +804,7 @@ def main():
     # Gather all sources (skip errors silently)
     weather = get_weather()
     print(f"  weather: {weather or 'unavailable'}")
-    import os as _os
-    if weather and not (_os.environ.get("WEATHER_LAT") and _os.environ.get("WEATHER_LON")):
+    if weather and not weather_location_configured():
         print("    (default location; set WEATHER_LAT/WEATHER_LON for the owner's)")
 
     events = get_calendar_events()
