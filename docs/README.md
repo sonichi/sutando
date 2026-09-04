@@ -21,6 +21,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 - [Channel access control](access-control.md) — per-channel tier rules and gates.
 - [Core pool + standing sessions](core-pool-standing-sessions.md) — how the lead-follower pool composes with standing sessions; design record, not yet implemented.
+- [Worker pool router design (v1)](worker-pool-design.md) — core / worker / router / pool vocabulary and the v1 routing policy; supersedes Decision 4 of the record above.
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — walkthrough procedure.

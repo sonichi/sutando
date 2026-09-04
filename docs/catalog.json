@@ -443,6 +443,16 @@
    "status": "draft",
    "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
    "last_verified": "2026-08-25"
+  },
+  "docs/worker-pool-design.md": {
+   "title": "Worker pool — router design (v1)",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "draft",
+   "canonical_for": "the v1 worker-pool router: core/worker/router/pool vocabulary, routing policy, lifecycle ownership, and the pool command surface",
+   "last_verified": "2026-09-04"
   }
  }
 }
