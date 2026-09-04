@@ -157,10 +157,8 @@ def main(argv=None) -> int:
 
     ws = Path(a.workspace)
     statedir = ws / "state"
-    # Watch wherever the tools actually are. This read ws/"scripts" unconditionally,
-    # and on a workspace whose tools live in ws/"tools" that directory can exist and
-    # hold zero .py — so the mtime trigger globbed an empty dir and could never fire
-    # on a tool edit, leaving only the 24h fallback.
+    # A `scripts/` that exists but holds no .py makes the mtime trigger vacuous, so
+    # watch whichever of scripts//tools/ the tools are actually in.
     scripts = next((d for d in (ws / "scripts", ws / "tools")
                     if d.is_dir() and any(d.glob("*.py"))), ws / "scripts")
     if not scripts.is_dir():
