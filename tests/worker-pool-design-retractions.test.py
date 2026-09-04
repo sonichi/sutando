@@ -41,6 +41,46 @@ def live_hits(text, phrase):
     return out
 
 
+# The phrase check cannot see an obsolete MODEL left beside its replacement:
+# nothing is re-worded, so nothing trips it. Pin both sides of the contract.
+CONTRACT = [
+    # (must be present, must NOT be asserted, why)
+    ("downstream executor",
+     "the admission test belongs there",
+     "queue_handler_task is a downstream executor; putting the primitive inside it "
+     "left all four direct exits bypassing admission."),
+    ("refused-over-bound",
+     "four things happened",
+     "the outcome set is five, not four: refused-over-bound is distinct from "
+     "operational failure and :390 must tell them apart."),
+]
+
+
+class ChosenContractIsPinned(unittest.TestCase):
+    """The phrase check cannot see an obsolete MODEL left beside its replacement."""
+
+    def test_chosen_side_is_present(self):
+        text = DOC.read_text(encoding="utf-8")
+        for present, _, why in CONTRACT:
+            with self.subTest(present=present):
+                self.assertIn(present, text, f"chosen contract missing: {why}")
+
+    def test_superseded_side_is_not_asserted(self):
+        text = DOC.read_text(encoding="utf-8")
+        for _, gone, why in CONTRACT:
+            with self.subTest(gone=gone):
+                lines = live_hits(text, gone)
+                self.assertEqual(
+                    lines, [],
+                    f"superseded contract asserted at line(s) {lines}: {why}")
+
+    def test_the_pin_can_fail(self):
+        """Control: reconstruct the flagged state and confirm it is caught."""
+        bad = DOC.read_text(encoding="utf-8") + "\ndispatch_task reports which of four things happened.\n"
+        self.assertNotEqual(live_hits(bad, "four things happened"), [],
+                            "the pin cannot detect the state qingyun-wu flagged")
+
+
 class RetractedClaimsStayRetracted(unittest.TestCase):
     def test_doc_is_present_and_substantial(self):
         # Positive control: a missing or truncated doc makes every absence

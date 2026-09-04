@@ -313,57 +313,27 @@ ticker cannot tell a lost claim from a won one, so "do not count a loss" was not
 `queue_handler_task` returns 0 for BOTH — it releases the lock and returns 0 when
 `acquire_task_claim` fails (`:360-363`), and returns 0 after writing the marker when it wins.
 
-**So the accounting is production-owned, not ticker-owned.** `dispatch_task` reports which of
-four things happened — `queued`, `direct`, `lost`, `suppressed` — and the DIRECT branches write
-a receipt under `DISPATCH_DIR/direct/` before emitting.
+**What this section replaced, kept short because the falsifications are the useful part.** Earlier
+revisions of this design said three things that are now false, and each was corrected by a reviewer
+rather than by me:
 
-**That receipt has no owner yet, and step 2 does not ship until it does.** `running/` is settled by
-`finish_handler_task`, driven by a `HANDLER_DONE` the handler subprocess emits (`:46`, consumed at
-`:680`) — and the direct branch is by definition the path with no handler, so there is no event for
-it to reuse. Nor does the namespace exist: `:207` creates `pending/ running/ settled/ workers/` and
-shutdown knows those four (`:575-595`). Creating `direct/` alone only moves the failure — with no
-completion event the receipts fill the cap permanently. So step 2 owes all five, and a partial
-implementation is worse than none: a named direct consumer, ownership transfer at the emit, a
-completion acknowledgement, a single release writer, and a restart/crash contract (`DISPATCH_DIR` is
-per-watcher `mktemp` at `:206`, so a restart forgets every receipt in it). The claim record looked like the
-candidate; **it is not one yet, and the reason is worth recording rather than quietly dropping.** I
-wrote that it "already has the durability the receipt lacks." It does not: `claim_is_live` is
-`kill -0` on the owner pid (`:101-109`), so every claim dies with its watcher and a restart retires
-the lot — the same restart hole as the per-watcher `mktemp`, relocated. Its `disposition` field is
-likewise not free to extend: `claim_disposition` (`:169-177`) maps `must-handle` to 0, `fallback` to
-1 and **everything else to 2 = unknown**, with only the first two reaching the live-core branches, so
-a `direct` value is excluded by default and needs that function changed too. Both were found by
-keweichen checking the claim I made for it.
+- **a four-outcome `dispatch_task`** (`queued` / `direct` / `lost` / `suppressed`). The contract is
+  five: `refused-over-bound` is a distinct outcome from operational failure, and `:390` must tell
+  them apart instead of falling through to a generic `|| printf`.
+- **an ownerless `direct/` receipt** that step 2 would have to invent an owner for. It is not a new
+  admission at all — handler fallback transitions an already-claimed receipt (`:255`, `:506`,
+  `:542`), so it was counted at its first admission.
+- **`queue_handler_task` as the admission owner**, with the count-and-claim primitive placed inside
+  it. That left all four direct exits bypassing admission, and it is why `queue_handler_task` is now
+  a **downstream executor** instead.
 
-So step 2 owes the five obligations above with **no mechanism yet identified** — a durable receipt
-needs a liveness test that outlives a process, which neither candidate currently has. Until one is
-designed and reviewed, the accounting below is a **specification of the target state, not a
-description of anything that runs**. Then:
-
-- `outstanding` is a count of durable receipts, so nothing is lost across passes and nothing is
-  counted twice; the ticker holds no state between ticks.
-- `lost` and `suppressed` write nothing, so they consume no quota — and that is now a property
-  of production rather than an assertion by the caller.
-- an admission made by the EVENT path is visible to the ticker on its next recount, because it
-  left the same kind of receipt.
-
-**One lock hold for count+claim+receipt DEADLOCKS, and the source says so.** An earlier
-revision prescribed exactly that. `acquire_dispatch_lock` is a `mkdir` spinlock with no
-timeout (`src/watch-tasks-stream.sh:220-226`), reconciliation must call `dispatch_task`,
-and its queued branch calls `queue_handler_task`, which takes that same lock (`:353`) —
-so the ticker holding it would spin on its own hold forever. The code carries the warning
-verbatim at `:289-290`: *"the dispatch lock is a mkdir spinlock with no timeout — a nested
-call would deadlock on it."*
-
-**So the lock has ONE owner, and it is `queue_handler_task`, not the ticker.** The ticker
-never holds the dispatch lock; it calls `dispatch_task` exactly as an event does. The
-atomicity the bound needs is therefore not one outer hold but a **count-and-claim
-primitive inside the existing critical section**: `queue_handler_task` already holds the
-lock across its marker test and `acquire_task_claim`, so the admission test belongs there
-too, and it returns the outcome the ticker reads (`queued` / `direct` / `lost` /
-`suppressed` / `refused-over-bound`). Step 2 must ship that already-locked primitive
-rather than a second lock, and exercise it against a Created event racing a pass — the
-case an outer hold was reaching for and could not have survived.
+One measured correction is worth keeping in full because it kills an obvious-looking fix: the claim
+record is **not** a durable-receipt candidate. `claim_is_live` is `kill -0` on the owner pid
+(`:101-109`), so every claim dies with its watcher and a restart retires the lot — the same restart
+hole as the per-watcher `mktemp`, relocated. And `claim_disposition` (`:169-177`) maps `must-handle`
+to 0, `fallback` to 1 and everything else to 2 = unknown, with only the first two reaching the
+live-core branches, so a `direct` value is excluded by default. Both found by keweichen, checking a
+claim I had made without checking it.
 
 **The startup sweep obeys the same bound**, restated because an earlier revision of this
 section dropped the sentence while rewriting around it: production loops every pre-existing
