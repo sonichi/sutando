@@ -160,11 +160,8 @@ def main(argv=None) -> int:
 
     ws = Path(a.workspace)
     statedir = ws / "state"
-    # A `scripts/` that exists but holds no .py makes the mtime trigger vacuous,
-    # so watch EVERY one of scripts/ and tools/ that holds .py, never the first.
-    # No local candidate is a fact about the DIRS, not about the suite set: a
-    # workspace can run entirely off tool-suites-extra.json. Refusing here would
-    # skip every extra, so the only refusal is the zero-SUITES one below.
+    # Watch EVERY dir holding .py, never the first: an empty result is a fact
+    # about the dirs, not the suite set (extras alone can supply every suite).
     candidates = [d for d in (ws / "scripts", ws / "tools")
                   if d.is_dir() and any(d.glob("*.py"))]
     tools, suites = tools_and_suites(candidates)

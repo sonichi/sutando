@@ -195,9 +195,8 @@ with tempfile.TemporaryDirectory() as td:
     check("zero suites -> exit 2 (a scope result, not a clean bill)", tsc.main(["--workspace", td]), 2)
 
 
-# 8. the EXTRAS-ONLY workspace: no local *.py at all, every suite declared.
-#    An empty candidate list is a fact about the dirs, not the suite set —
-#    refusing on it skipped all 10 declared suites on a real host (3852-r2).
+# 8. EXTRAS-ONLY: no local *.py; refusing on an empty candidate list skipped
+#    all 10 declared suites on a real host (3852-r2).
 print("8. extras-only: no local *.py, suites come entirely from the extras file")
 with tempfile.TemporaryDirectory() as td:
     ws, repo = Path(td) / "ws8", Path(td) / "repo"
