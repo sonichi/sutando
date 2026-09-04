@@ -691,6 +691,29 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
    **Don't hand-roll a process check to second-guess the probe.** `pgrep -f watch-tasks` / `ps | grep watch-tasks-stream` both match the wrapper shell that runs the check (its own argv contains the search string), so they return a pid for a transient subshell or pick the wrapper instead of the watcher — an attempt at this on 2026-08-07 reported rc=1 with the watcher demonstrably alive. `_watcher_trees()` already solves this by scoping to process trees; use its verdict via the probe.
 
+9.5. **⚠ BEFORE POSTING TO A PR THREAD, CHECK YOU ARE NOT TALKING TO YOURSELF (added
+   2026-09-04 after measuring it on this host).** Re-verifying a standing review is right; posting
+   that re-verification into silence is noise, and each repeat makes the next less likely to be
+   read. Measured across 36 open PRs: **5 threads where every recent event was mine and unanswered**
+   — #2300 at **7 events over 14.3 days** with the author never replying once, and I was composing
+   an eighth when this check was written.
+
+   ```bash
+   python3 skills/proactive-loop/scripts/pr-monologue-check.py <number> --me <your-login>
+   # 0 safe to post · 1 REFUSE, naming the run and its span · 2 could not answer (NOT a green light)
+   ```
+
+   It merges BOTH surfaces (issue comments + reviews) so a thread answered only by a review does not
+   read as silence, and **drops `*[bot]` logins**: a CI bot commenting is not a human reading you.
+   That bot case was a live false SAFE — `github-actions[bot]` reset a real run of 2 to 0 on #2406,
+   clearing exactly the post the guard exists to stop. `--count-bots` reproduces the old answer, so
+   the fix has a control rather than an assertion.
+
+   **On a REFUSE, the answer is not "post anyway with better wording."** The thread has no reader;
+   re-solicit through a stand (`collaboration-intelligence`), or leave the flag standing and spend
+   the pass elsewhere. Guarded by `tests/proactive-loop-pr-monologue-check.test.py` (17 tests;
+   4 mutations verified red, including one that makes a fetch failure read as safe).
+
 10. **Monitor Discord.** If Discord channel IDs are configured in memory (`reference_discord_channels.md`), check those channels for new messages. Forward actionable items from public channels to the dev channel. Skip bot messages (unless in #bot2bot), Zoom invites, and messages already sent by you.
 
    **#bot2bot conventions** (cross-bot coordination channel):
