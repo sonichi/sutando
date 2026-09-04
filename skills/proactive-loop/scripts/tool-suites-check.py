@@ -41,8 +41,6 @@ EXTRAS = "tool-suites-extra.json"       # {"suites": ["tests/x.test.py", ...]}
 def tools_and_suites(dirs):
     """Union over EVERY candidate dir, not the first that matches: a workspace
     mid-migration holds .py in both, and picking one hides the other's suites."""
-    if isinstance(dirs, Path):
-        dirs = [dirs]
     found = [p for d in dirs for p in d.glob("*.py")]
     suites = sorted(p for p in found if p.name.endswith(".test.py"))
     tools = sorted(p for p in found if not p.name.endswith(".test.py"))
