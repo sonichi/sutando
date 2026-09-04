@@ -98,6 +98,31 @@ class GitIndexLock(unittest.TestCase):
         os.utime(p, (old, old))
         self.assertEqual(hc.check_git_index_lock(wt)["status"], "warn")
 
+    def test_a_dot_git_file_that_is_not_a_gitdir_pointer_is_not_a_repo(self):
+        # A `.git` FILE that is not a gitdir pointer: guessing a path from it
+        # would probe an arbitrary location.
+        odd = Path(self.tmp.name) / "odd"
+        odd.mkdir()
+        (odd / ".git").write_text("this is not a gitdir pointer\n")
+        self.assertIsNone(hc._git_dir(odd))
+        self.assertEqual(hc.check_git_index_lock(odd)["status"], "ok")
+
+    def test_a_RELATIVE_gitdir_pointer_resolves_against_the_checkout(self):
+        # git writes a relative `gitdir:` in some layouts; resolving it against
+        # the process cwd instead of the checkout would probe the wrong file.
+        host = Path(self.tmp.name) / "host"
+        (host / "real-gitdir").mkdir(parents=True)
+        (host / ".git").write_text("gitdir: real-gitdir\n")
+        self.assertEqual(hc._git_dir(host), (host / "real-gitdir").resolve())
+        self.assertEqual(hc.check_git_index_lock(host)["status"], "ok")
+        lock = host / "real-gitdir" / "index.lock"
+        lock.write_text("")
+        old = time.time() - 9.4 * 3600
+        os.utime(lock, (old, old))
+        r = hc.check_git_index_lock(host)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn(str(lock), r["detail"])
+
     def test_a_non_repo_is_not_this_probes_business(self):
         plain = Path(self.tmp.name) / "plain"
         plain.mkdir()
