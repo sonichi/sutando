@@ -127,9 +127,11 @@ class Harness:
                 pass
         return pids
 
-    def kill_workers(self, expect: int = 1) -> list[int]:
-        # `running/` appears before the receipt exists and again before it holds
-        # a pid, so waiting on it alone reads a short list and kills nothing.
+    def kill_workers(self, expect: "int | None" = None) -> list[int]:
+        # Derived, not passed: every `running/` marker owes a receipt, and the
+        # marker is written first -- so a call site cannot under-wait by default.
+        if expect is None:
+            expect = max(1, len(names(self.dispatch() / "running")))
         wait_for(lambda: len(self.worker_pids()) >= expect, 15.0)
         pids = self.worker_pids()
         for pid in pids:
@@ -172,7 +174,7 @@ def scenario_slot_recovery() -> None:
             check("both worker slots filled by the startup sweep", False, str(h.dispatch()))
             return
         check("both worker slots filled by the startup sweep", True)
-        check("worker pids recorded and killed", len(h.kill_workers(expect=2)) >= 2)
+        check("worker pids recorded and killed", len(h.kill_workers()) >= 2)
         h.deliver("task-ccc.txt")
         got = wait_for(lambda: "task-ccc.txt" in names(h.dispatch() / "running"))
         d = h.dispatch()
