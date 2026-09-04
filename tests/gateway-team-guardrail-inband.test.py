@@ -66,6 +66,29 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
             self.assertIn(f"results/{tid}.txt", body,
                           "the guardrail must name THIS task's result path, not a template")
 
+    def test_signal_room_team_task_names_its_own_media_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            mod.RESULTS_DIR = Path(d) / "results"
+            body, tid = _write(mod, signal={"v": 1, "cid": "c1", "route_attempt": 1,
+                                             "source_root": "$r:s", "source_room": "!r:s"})
+            media_dir = str(Path(d) / "results" / tid)
+            self.assertIn("Signal Room media:", body)
+            self.assertIn(f"[file: {media_dir}/<name>.png]", body,
+                          "the instruction must name THIS task's absolute media directory")
+            self.assertIn("image-generation", body)
+            self.assertEqual(body.count(FENCE), 1,
+                             "the media lines are prose after the guardrail, not a second fence")
+            # Still the narrower Team guardrail, in the same body.
+            self.assertIn("TEAM-tier request from a trusted collaborator", body)
+
+    def test_ordinary_team_task_carries_no_media_instruction(self):
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            body, _tid = _write(mod)
+            self.assertNotIn("Signal Room media:", body)
+            self.assertNotIn("image-generation", body)
+
     def test_owner_task_carries_no_team_guardrail(self):
         with tempfile.TemporaryDirectory() as d:
             mod = _load(Path(d))

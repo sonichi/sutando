@@ -295,7 +295,8 @@ from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
+                             signal_task_media_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox_adapter import classify_response
@@ -1130,9 +1131,23 @@ def _guarded_result_body(tid: str, body: str):
                 "source_message_id", "user_id")}
         except OSError:
             pass
+    # Task-scoped attachment allowance (Signal Room, 5G ⑤a-cap): a task the relay
+    # stamped `signal` (its media mode is committed in the sidecar BEFORE the
+    # task is queued) may carry `[file:]` markers for files under its own
+    # `<results>/<tid>/` -- the directory the task body named. Anything else
+    # stays a delivery-control leak. Fail-closed on any doubt: an unreadable
+    # sidecar or ledger grants nothing (the delivery itself defers later).
+    attach_roots: tuple = ()
+    if guarded_tier(tier):
+        _delivery_for_media = _delivery_tid(tid)
+        _media_modes = _load_task_media() if _delivery_for_media is not None else None
+        if (_media_modes is not None
+                and (_media_modes.get(_broker_tid(_delivery_for_media)) or {}).get("mode")
+                == "task-media"):
+            attach_roots = (str(RESULTS_DIR / tid),)
     verdict = classify(
         body, tier, None, secret_filter=filter_chat_secrets,
-        scan_sensitive_data=scan_sensitive_data)
+        scan_sensitive_data=scan_sensitive_data, attach_roots=attach_roots)
     is_leak = verdict.kind == "leak"
     agent_id = _reenroll_identity()
     verdict = materialize(
@@ -2798,6 +2813,12 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
             lines.append(engage_rulebook("room", AG2SPACE_PROVENANCE, f"results/{tid}.txt"))
         else:
             lines.extend(team_guardrail_lines(f"results/{tid}.txt"))
+        # A Signal Room task (relay-stamped `signal`) may hand the room files it
+        # produced under ITS OWN output directory -- the task-scoped allowance
+        # `_guarded_result_body` grants at result time. Name that directory here,
+        # absolute, so the marker the agent writes is the one the guard confines.
+        if isinstance(task.get("signal"), dict):
+            lines.extend(signal_task_media_lines(str(RESULTS_DIR / tid)))
     if sender_tier == "guest":
         lines.extend(sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", f"results/{tid}.txt",

@@ -118,3 +118,23 @@ def engage_rulebook(surface: str, provenance: str, result_path: str) -> str:
         surface=surface, provenance=provenance, result_path=result_path,
         trust_boundary=SHARED_TRUST_BOUNDARY,
     )
+
+
+# Signal Room tasks (design 5G ⑤a-cap, room-native): the ONE place a Team result
+# may hand the room a file is the task's own output directory. This tells the
+# agent where that is and how to reference what it puts there; the egress guard
+# (`attach_markers_confined`) withholds any marker that points anywhere else.
+def signal_task_media_lines(media_dir: str) -> list[str]:
+    """Prose lines (no fence, no header-shaped line) appended after the Team
+    guardrail of a Signal Room task, naming the task's own media directory."""
+    return [
+        "",
+        "Signal Room media: this request came from a live Signal Room call. If it asks for "
+        "an image, illustration, chart or diagram, you MAY create ONE with the "
+        "image-generation skill (python3 skills/image-generation/scripts/generate.py "
+        f"--prompt \"...\" --output {media_dir}/<name>.png), and you may save images you "
+        f"actually found. Save such files ONLY under {media_dir}/ (create the directory), "
+        f"then reference each on its own line as [file: {media_dir}/<name>.png] -- an "
+        "absolute path, up to 10 files. A file anywhere else is withheld from the room. "
+        "Write the prose answer first; a picture is garnish, never the answer.",
+    ]

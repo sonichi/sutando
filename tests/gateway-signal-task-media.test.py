@@ -113,6 +113,56 @@ class TaskMediaRoute(unittest.TestCase):
     def _result_posts(self):
         return [c for c in self.calls if c[1] == "/v1/results"]
 
+    # -- 0. the team-tier allowance (5G ⑤a-cap): the guard runs for real ------ #
+
+    def _team_signal_task(self, tid: str) -> dict:
+        task = self._signal_task(tid)
+        task["access_tier"] = "team"
+        task["user_id"] = "@collab:server"
+        return task
+
+    def _allow_this_workspace_results(self, mod) -> None:
+        # `send_allowlist` fixes its results root at FIRST import (sutando's shim
+        # calls set_dirs() before it, so in production RESULTS_DIR IS that root).
+        # This harness reloads the bridge per test but the allowlist module stays
+        # cached with the first test's workspace, so register this one's — the
+        # same wiring the shim does, and not the thing these tests assert.
+        import ag2_sparrow.send_allowlist as send_allowlist
+        send_allowlist.register_extra_roots(str(mod.RESULTS_DIR))
+
+    def test_team_result_attaches_a_file_from_its_own_output_dir(self):
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        mod._write_task(self._team_signal_task("task-team-in"))
+        own = mod.RESULTS_DIR / "task-team-in"
+        own.mkdir(parents=True, exist_ok=True)
+        (own / "chart.png").write_bytes(b"payload")
+        self._result(mod, "task-team-in", f"the chart [file: {own / 'chart.png'}]")
+        mod._post_ready_results({"task-team-in"})
+        media = self._media_posts()
+        self.assertEqual(len(media), 1, "an in-root attachment is uploaded on the task's lease")
+        self.assertTrue(media[0][1].startswith("/v1/tasks/"), media[0][1])
+        self.assertEqual(media[0][2]["filename"], "chart.png")
+        self.assertTrue(self._result_posts(), "and the result itself is delivered")
+
+    def test_team_result_pointing_outside_its_dir_uploads_nothing(self):
+        mod = self.mod
+        mod.LOCAL_TIER = "team"
+        mod._load_tier_map = lambda: {}
+        self._allow_this_workspace_results(mod)
+        mod._write_task(self._team_signal_task("task-team-out"))
+        stray = self._attachment()  # a /tmp file — allowlisted for OWNER sends, not this task's root
+        self._result(mod, "task-team-out", f"the chart [file: {stray}]")
+        try:
+            mod._post_ready_results({"task-team-out"})
+        except Exception:
+            pass  # a review-routing failure leaves the result for retry; either way no upload
+        self.assertEqual(self._media_posts(), [], "an out-of-root marker never reaches the media route")
+        delivered = [c for c in self._result_posts() if c[2].get("result", "").startswith("the chart")]
+        self.assertEqual(delivered, [], "and the raw body is never delivered to the room")
+
     # -- 1. wire-id resolution --------------------------------------------- #
 
     def test_upload_uses_the_delivery_id_not_the_local_id(self):
