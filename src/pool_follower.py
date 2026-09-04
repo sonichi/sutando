@@ -55,8 +55,10 @@ def _claim_assignment(tasks_dir: Path, f: Path, instance: str) -> "Path | None":
 
 
 def _read_bindings(state_dir) -> dict:
-    """The pin table, once per sweep. Read per candidate file it was the same
-    few KB parsed N times for one answer that cannot change mid-loop."""
+    """The pin table, read once per sweep rather than per candidate file.
+
+    A snapshot: a pin written mid-sweep lands on the next one, and every
+    candidate in this one is judged against the same table."""
     try:
         raw = (Path(state_dir) / "pool" / "affinity.json").read_text(encoding="utf-8")
         table = json.loads(raw)
