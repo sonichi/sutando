@@ -55,8 +55,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIFF="$(gh pr diff "${GH_R[@]+"${GH_R[@]}"}" "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff ${REPO:+-R $REPO }$PR\` failed (bad PR number, or no gh auth/remote)" >&2; exit 2; }
 # Identify what was actually resolved, so a wrong-repo review is visible in the verdict
 # rather than only in the caller's assumption.
-SUBJECT="$(gh pr view "${GH_R[@]+"${GH_R[@]}"}" "$PR" --json url,title \
-    --jq '"\(.url) — \(.title)"' 2>/dev/null || true)"
+# URL only, shape-checked. A title is free text and would put unvalidated bytes
+# after the verdict marker, which is the one region that must stay trace-free.
+SUBJECT="$(gh pr view "${GH_R[@]+"${GH_R[@]}"}" "$PR" --json url --jq '.url' 2>/dev/null | head -1 || true)"
+[[ "$SUBJECT" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$ ]] || SUBJECT=""
 [[ -n "$DIFF" ]] || { echo "review-pr: empty diff for #$PR (already merged with no changes, or not found)" >&2; exit 2; }
 
 OUT="$(mktemp -t review-pr.XXXXXX)"
