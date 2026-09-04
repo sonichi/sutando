@@ -255,8 +255,20 @@ ticker cannot tell a lost claim from a won one, so "do not count a loss" was not
 
 **So the accounting is production-owned, not ticker-owned.** `dispatch_task` reports which of
 four things happened — `queued`, `direct`, `lost`, `suppressed` — and the DIRECT branches write
-a receipt under `DISPATCH_DIR/direct/` before emitting, with the same completion/release
-lifecycle that clears a `running/` marker. Then:
+a receipt under `DISPATCH_DIR/direct/` before emitting.
+
+**That receipt has no owner yet, and step 2 does not ship until it does.** `running/` is settled by
+`finish_handler_task`, driven by a `HANDLER_DONE` the handler subprocess emits (`:46`, consumed at
+`:680`) — and the direct branch is by definition the path with no handler, so there is no event for
+it to reuse. Nor does the namespace exist: `:207` creates `pending/ running/ settled/ workers/` and
+shutdown knows those four (`:575-595`). Creating `direct/` alone only moves the failure — with no
+completion event the receipts fill the cap permanently. So step 2 owes all five, and a partial
+implementation is worse than none: a named direct consumer, ownership transfer at the emit, a
+completion acknowledgement, a single release writer, and a restart/crash contract (`DISPATCH_DIR` is
+per-watcher `mktemp` at `:206`, so a restart forgets every receipt in it). The claim record is the
+candidate worth trying first, because it already has the durability the receipt lacks and already
+carries a `disposition` field (`acquire_task_claim:131`) that `next_pending_task:188` currently
+ignores in favour of a bare existence test. Then:
 
 - `outstanding` is a count of durable receipts, so nothing is lost across passes and nothing is
   counted twice; the ticker holds no state between ticks.
@@ -847,6 +859,16 @@ core's sweep, installer and plists, or as a skill. Existing Sutando files are
 not edited except the index and test bookkeeping CI requires when new modules
 land under `src/`. Anything that needs an existing file changed is its own PR
 with its own reason.
+
+**Step 2 is exactly such a PR, and this document previously implied otherwise.**
+The ticker is assigned to the watcher rather than to a new file, so step 2
+necessarily edits `src/watch-tasks-stream.sh` — its initializer (a new receipt
+namespace), its dispatch admission (the bound), its completion handling (the
+release), and its cleanup. That is a direct-file change to the most
+load-bearing script in the repo, and it does not travel under the new-files-only
+rule above; it travels under the last sentence of it. Sequenced accordingly:
+step 2 lands alone, with its own reason and its own production-path tests, and
+nothing else rides in the same PR.
 
 ## Staged PRs against main
 
