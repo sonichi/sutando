@@ -803,8 +803,10 @@ def main():
     narrative = synthesize(weather, events, reminders, discord_msgs, pending_qs, health_issues)
 
     # Write voice result
+    # The DATE leads the suffix so health-check's daily-cron-punctuality probe
+    # can see this run: it matches `<stem>-YYYY-MM-DD`, never an epoch.
     ts = int(time.time() * 1000)
-    result_file = RESULTS_DIR / f"proactive-morning-{ts}.txt"
+    result_file = RESULTS_DIR / f"proactive-morning-{time.strftime('%Y-%m-%d')}-{ts}.txt"
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     # Privacy: the briefing carries calendar + email — private data that must
     # go to the owner's DM only. The `[dm-only]` marker forces DM delivery and
