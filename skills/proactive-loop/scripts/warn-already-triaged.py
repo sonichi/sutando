@@ -29,7 +29,9 @@ def parking_files():
                         personal_path("current-track.md")) if p.exists()]
 
 # entities worth searching for: paths, dotted filenames, backticked identifiers
-ENT = re.compile(r'`([^`]{3,40})`|([\w./-]+\.(?:py|sh|json|md|ts|yml))|\b([a-z][a-z0-9]+(?:-[a-z0-9]+){1,3})\b|\b(_?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+){1,4})\b')
+# Component count is unbounded; the 3..40 length check below is the only size
+# bound. A cap truncates a hyphenated name and drops a snake_case one entirely.
+ENT = re.compile(r'`([^`]{3,40})`|([\w./-]+\.(?:py|sh|json|md|ts|yml))|\b([a-z][a-z0-9]+(?:-[a-z0-9]+)+)\b|\b(_?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)\b')
 STOP = {"health-check", "not-running", "restart-needed", "session-read", "read-limit"}
 
 def tokens(name, text):

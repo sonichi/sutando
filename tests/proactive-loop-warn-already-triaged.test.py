@@ -66,6 +66,20 @@ class SnakeCaseIdentifiers(unittest.TestCase):
         self.assertIn("_quarantine_undelivered",
                       wat.tokens("", "_quarantine_undelivered drops its why argument"))
 
+    def test_a_long_snake_case_identifier_is_extracted(self):
+        # A component cap made the tokenizer drop the LONGEST identifiers -- the
+        # most distinctive ones -- so the refusal survived the fix it motivated.
+        self.assertIn(
+            "this_is_a_long_snake_case_identifier",
+            wat.tokens("", "this_is_a_long_snake_case_identifier failed"))
+
+    def test_a_long_hyphenated_identifier_is_not_truncated(self):
+        # The hyphen alternative failed OPEN where snake_case failed closed: it
+        # returned a prefix, so the search ran against a name nobody asked about.
+        self.assertEqual(
+            ["one-two-three-four-five-six"],
+            wat.tokens("", "one-two-three-four-five-six failed"))
+
     def test_a_snake_case_claim_reaches_parked_material(self):
         # The end-to-end shape: before the fix this returned "no_tokens" and
         # nothing was searched, so parked material stayed invisible.
