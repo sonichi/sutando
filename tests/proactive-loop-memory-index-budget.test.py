@@ -154,6 +154,43 @@ with tempfile.TemporaryDirectory() as d:
     check("resolution: the refusal says what to do instead of leaving the caller stuck",
           "SUTANDO_MEMORY_DIR" in note and "--index" in note, f"note={note!r}")
 
+# The pointer lives at <workspace>/hosts/<label>/memory-corpus; pin the label so
+# the test does not depend on the machine it runs on.
+def _ptr_for(projects):
+    os.environ["SUTANDO_HOST_LABEL"] = "test-host"
+    return mib._host_pointer_path(projects)
+
+with tempfile.TemporaryDirectory() as d:
+    projects = pathlib.Path(d) / "ws" / ".claude-sutando" / "projects"
+    stale = _tree(projects, "slug-stale", index_of(LIMIT // 3), age_s=86400)
+    live = _tree(projects, "slug-live", index_of(LIMIT // 2), age_s=60)
+    ptr = _ptr_for(projects)
+    check("pointer: it is per-host by construction, not a shared filename",
+          ptr.parent.name == "test-host" and ptr.parent.parent.name == "hosts", f"ptr={ptr}")
+    # The pointer adds a way in; it does not soften the ambiguous refusal.
+    got, note = mib._live_index(stale)
+    check("pointer: absent pointer leaves the ambiguous refusal intact",
+          got is None and "CANNOT ANSWER" in note, f"got={got}")
+    check("pointer: the refusal now names the file to record, so a host is not stuck",
+          str(ptr) in note and "RECORD IT ONCE" in note, f"note={note!r}")
+    # Point at the corpus that is neither freshest nor the derived one, so only
+    # the pointer can produce this answer.
+    ptr.parent.mkdir(parents=True, exist_ok=True)
+    ptr.write_text(str(live / "MEMORY.md") + "\n")
+    got, note = mib._live_index(stale)
+    check("pointer: a recorded corpus resolves, outranking both cwd and freshness",
+          got == live / "MEMORY.md" and note == "", f"got={got} note={note!r}")
+    # Falling through here would let a typo silently measure a different corpus.
+    ptr.write_text(str(projects / "no-such" / "memory" / "MEMORY.md"))
+    got, note = mib._live_index(stale)
+    check("pointer: a pointer to a missing file REFUSES, never falls back to inference",
+          got is None and "is not a file" in note, f"got={got} note={note!r}")
+    ptr.write_text("   \n")
+    got, note = mib._live_index(stale)
+    check("pointer: an empty pointer is 'unrecorded', not 'recorded as nothing'",
+          got is None and "CANNOT ANSWER" in note and "RECORD IT ONCE" in note, f"note={note!r}")
+    os.environ.pop("SUTANDO_HOST_LABEL", None)
+
 with tempfile.TemporaryDirectory() as d:
     projects = pathlib.Path(d) / "projects"
     only = _tree(projects, "slug-only", index_of(LIMIT // 3), age_s=60)

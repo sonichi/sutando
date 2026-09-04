@@ -28,6 +28,8 @@ exit 0 safe · 1 an entry would drop (or the addition would not load) · 2 canno
 from __future__ import annotations
 
 import argparse
+import socket
+import subprocess
 import importlib.util
 import os
 import sys
@@ -93,6 +95,38 @@ def evaluate(mod, current: str, addition: str = "", at_top: bool = False) -> dic
 # loads; a checkout can host several. Resolve by IDENTITY, never by freshness.
 
 
+def _host_pointer_path(projects: Path) -> Path:
+    """Where THIS host records which corpus it loads. Per-host by construction:
+    `hosts/` is synced, so a shared filename would deliver a peer's answer here."""
+    workspace = projects.parent.parent
+    label = os.environ.get("SUTANDO_HOST_LABEL") or ""
+    if not label:
+        try:
+            label = subprocess.run(["scutil", "--get", "LocalHostName"],
+                                   capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            label = ""
+    if not label:
+        label = socket.gethostname().split(".")[0]
+    return workspace / "hosts" / label / "memory-corpus"
+
+
+def _host_stated_index(projects: Path) -> "tuple[Path | None, str]":
+    """(index, why) from this host's recorded pointer; (None, "") when unrecorded.
+
+    A pointer is owner-stated identity, so it outranks every inference below it --
+    but it is NOT a guess: absent means absent, and the caller still refuses.
+    """
+    ptr = _host_pointer_path(projects)
+    try:
+        raw = ptr.read_text().strip()
+    except OSError:
+        return None, ""
+    if not raw:
+        return None, ""
+    return Path(raw).expanduser(), f"{ptr}"
+
+
 def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
     """(index, note). index None means refuse -- the note says why.
 
@@ -107,6 +141,12 @@ def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
             return default, ""
         return None, f"CANNOT ANSWER: SUTANDO_MEMORY_DIR resolves to {default}, which is not a file"
     projects = memory_dir.parent.parent
+    stated, why = _host_stated_index(projects)
+    if stated is not None:
+        if stated.is_file():
+            return stated, ""
+        return None, (f"CANNOT ANSWER: {why} names {stated}, which is not a file — "
+                      f"fix that pointer rather than guessing past it.")
     try:
         cands = sorted(p for p in projects.glob("*/memory/MEMORY.md") if p.is_file())
     except OSError as e:
@@ -121,10 +161,15 @@ def _live_index(memory_dir: Path) -> "tuple[Path | None, str]":
     if len(cands) == 1:
         return cands[0], ""
     names = ", ".join(c.parent.parent.name for c in cands)
+    ptr = _host_pointer_path(projects)
     return None, (
-        f"CANNOT ANSWER: {len(cands)} corpora under {projects} and nothing authoritative "
-        f"names one ({names}). Set SUTANDO_MEMORY_DIR or pass --index -- an mtime says "
-        f"which was edited last, not which one this session loads.")
+        f"CANNOT ANSWER: {len(cands)} candidate indexes under {projects} and nothing "
+        f"authoritative names one ({names}). An mtime says which was edited last, not "
+        f"which one this session loads, and most of these are ordinary Claude Code "
+        f"projects rather than this agent's corpus.\n"
+        f"RECORD IT ONCE -- this host then answers unattended forever:\n"
+        f"    echo '<abs path to the MEMORY.md this session loads>' > {ptr}\n"
+        f"(or set SUTANDO_MEMORY_DIR, or pass --index for a one-off.)")
 
 
 def main(argv=None) -> int:
