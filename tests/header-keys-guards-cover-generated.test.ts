@@ -1,16 +1,6 @@
 /**
- * The guards must COVER the generated key set, not merely import it.
- *
- * The delegation tests assert an import and a symbol occur somewhere in the
- * source. keweichen showed that is not the same claim: replacing both regex
- * constructions with 45-key literals omitting only `requested_worker`, while
- * retaining the imports, left every one of them green — recreating the exact
- * forged-header hole this PR exists to close.
- *
- * So this asserts BEHAVIOUR on the constructed regex: every generated key is
- * defanged. Drop one from the construction and this fails by construction.
- *
- * Run: node --import tsx/esm tests/header-keys-guards-cover-generated.test.ts
+ * Asserts BEHAVIOUR on the constructed regex, not that the guard imports the
+ * key set: a 45-key literal dropping one key leaves an import-only test green.
  */
 
 import { describe, it } from 'node:test';
