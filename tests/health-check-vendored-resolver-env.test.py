@@ -443,6 +443,73 @@ class BindingsOutsideTheBody(unittest.TestCase):
         self.assertIn("still honour", r["detail"])
 
 
+class OsPathIsNotAPureNamespace(unittest.TestCase):
+    """Round 8: unresolved_call() exempted `os.path.*` wholesale, and that
+    namespace contains expandvars(), which reads the environment. qingyun-wu's
+    control read 'ignores' at 1cca14b2, verdict AND probe detail."""
+
+    def _verdict(self, src):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text(src)
+        return hc._resolver_env_verdict(f)[0]
+
+    def test_expandvars_naming_the_removed_variable(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.path.expandvars('$SUTANDO_WORKSPACE'))\n"), "honours")
+
+    def test_the_braced_spelling_counts_too(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.path.expandvars('${SUTANDO_WORKSPACE}/w'))\n"), "honours")
+
+    def test_a_direct_import_of_expandvars_counts_too(self):
+        self.assertEqual(self._verdict(
+            "from os.path import expandvars\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(expandvars('$SUTANDO_WORKSPACE'))\n"), "honours")
+
+    def test_an_unresolvable_expandvars_argument_is_unknown(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "T = '$SUTANDO_WORKSPACE'\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.path.expandvars(T))\n"), "unknown")
+
+    def test_an_unlisted_os_path_member_is_unknown(self):
+        """The class, not the case: a member-by-member allowlist means a helper
+        nobody has classified fails closed instead of inheriting the namespace."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.path.some_future_helper('x'))\n"), "unknown")
+
+    def test_expanduser_stays_clean(self):
+        """Negative control: expanduser reads $HOME, which structurally cannot
+        yield the retired variable, so it stays on the pure list."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.path.expanduser('~/w'))\n"), "ignores")
+
+    def test_expandvars_naming_another_variable_stays_clean(self):
+        """Negative control: the literal PROVES which variable it expands, so
+        this is analysed-and-clean, not unknown."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.path.expandvars('$HOME/w'))\n"), "ignores")
+
+    def test_a_listed_os_path_helper_stays_clean(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.path.join(os.path.expanduser('~'), 'w'))\n"), "ignores")
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""

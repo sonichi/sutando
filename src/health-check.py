@@ -9240,6 +9240,13 @@ _REMOVED_WS_ENV = "SUTANDO_WORKSPACE"
 # constructors over arguments this pass already walks.
 _RESOLVED_CALLS = frozenset({"Path", "str", "expanduser", "resolve", "home"})
 _BUILTIN_NAMES = frozenset(dir(__import__("builtins")))
+# os.path member-by-member, not namespace-wide: expandvars() reads the environment,
+# and an unlisted member is unknown rather than assumed pure.
+_PURE_OSPATH = frozenset({"join", "dirname", "basename", "abspath", "normpath",
+                          "realpath", "split", "splitext", "isabs", "exists",
+                          "isfile", "isdir", "relpath", "expanduser"})
+_EXPANDVARS = ("os.path.expandvars", "expandvars", "posixpath.expandvars")
+_VAR_RE = re.compile(r"\$(\w+)|\$\{(\w+)\}")
 
 
 def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
@@ -9300,9 +9307,23 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     def _keyed(node) -> bool:
         return _const_str(node) == _REMOVED_WS_ENV
 
+    def _expandvars_names(n) -> "frozenset | None":
+        """Variables an expandvars() call expands, or None if unprovable."""
+        d = _dots(n.func)
+        if d not in _EXPANDVARS or not n.args:
+            return None
+        lit = _const_str(n.args[0])
+        if lit is None:
+            return frozenset()                   # unresolved argument: caller decides
+        return frozenset(a or b for a, b in _VAR_RE.findall(lit))
+
     def reads_env(node) -> bool:
         """Any supported spelling of a read keyed by the removed env var."""
         for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                names = _expandvars_names(n)
+                if names and _REMOVED_WS_ENV in names:
+                    return True
             if isinstance(n, ast.Subscript):
                 base = _dots(n.value)
                 if (base.endswith("environ") or base in aliases) and _keyed(n.slice):
@@ -9317,6 +9338,13 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
         return False
 
     def murky_env_read(node) -> "str | None":
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call) and _dots(n.func) in _EXPANDVARS:
+                if _expandvars_names(n) == frozenset():
+                    return "an expandvars() whose argument is not a literal"
+        return _murky_env_read_keys(node)
+
+    def _murky_env_read_keys(node) -> "str | None":
         """An environment read whose KEY this analysis did not resolve.
 
         reads_env() recognizes a literal key only, so `os.getenv(KEY)` would
@@ -9354,9 +9382,12 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
             if not isinstance(n, ast.Call):
                 continue
             d = _dots(n.func)
-            if d in modfns or d in _RESOLVED_CALLS or d.startswith("os.path."):
+            if d in modfns or d in _RESOLVED_CALLS:
                 continue
-            if d.endswith(".environ.get") or d.endswith("getenv"):
+            if d.startswith("os.path.") and d.rpartition(".")[2] in _PURE_OSPATH:
+                continue
+            if (d.endswith(".environ.get") or d.endswith("getenv")
+                    or d in _EXPANDVARS):
                 continue                         # an env read: reads_env judges it
             sib = sibling(d)
             if _hops > 0 and sib is not None and sib[1].name == "resolve_workspace":
