@@ -287,8 +287,10 @@ outcome exists precisely so this branch stops guessing.
 
 So the direct lifecycle completes the rule with five obligations, and they are the same five the
 earlier revision listed as unowned: a durable receipt written **before** the emit, a named ownership
-handoff, an idempotent completion acknowledgement, exactly one release writer, and restart handling
-for the receipt-before-emit and emit-without-completion windows.
+handoff, an idempotent completion acknowledgement, exactly one release writer, and restart handling for
+THREE crash windows, not two: receipt-before-emit, emit-before-ack, and a third keweichen named
+that has not reached me intact. It is left unnamed rather than guessed — the phrase previously here,
+"emit-without-completion", was my own inference and was wrong.
 
 (This section is keweichen's design. Two shapes of mine were falsified before it — one that put the
 primitive inside `queue_handler_task`, and one that took the lock at `dispatch_task` entry and would
