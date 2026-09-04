@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
-"""A retracted claim must not survive as a LIVE claim anywhere in the design doc.
-
-Three review rounds on this document had one shape: a normative claim was
-corrected in the passage that ARGUES for it and left standing in the passages
-that merely mention it, so the doc specified two contradicting rules at once and
-each reviewer found a different one. Naming the pattern did not stop it
-recurring, so it is a check instead of a lesson.
-
-A retracted phrase may still appear while NARRATING its own retraction ("an
-earlier revision still called this ..."), and a checker that cannot tell those
-apart flags the write-up of the fix. So a line is exempt when it marks the
-phrase as historical.
+"""A phrase the design has retracted must not be ASSERTED again anywhere in it.
+A line narrating its own retraction is exempt, or this flags the fix itself.
 """
 import pathlib
 import unittest

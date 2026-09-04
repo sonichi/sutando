@@ -317,7 +317,7 @@ else may write membership.
 - **A live `1 -> 0` is the same edge reversed**: the command that removes the last worker
   signals the core's watcher to disarm before it stops that worker.
 
-****The registry does not carry this yet, and that fixes the staging order.**
+**The registry does not carry this yet, and that fixes the staging order.**
 `src/runtime-api/instance_registry.py` today has zero occurrences of `role` or `pool` and no
 deregistration path at all (control: 51 occurrences of `instance`, so the file is the right
 one). The watcher has no arm/disarm input either. So the reconciliation ticker CANNOT ship in
@@ -338,7 +338,7 @@ same asymmetry: retry the ARM (recoverable, bounded by the next restart), and tr
 DISARM as an error that must be surfaced rather than retried silently, because the window it
 leaves open is the expensive one.
 
-The fallback is fail-closed, and the direction is deliberate.** If a signal is ever missed,
+**The fallback is fail-closed, and the direction is deliberate.** If a signal is ever missed,
 the next watcher start re-reads the registry and converges; and a registry that is absent,
 unreadable or unparseable reads as **not a member**, so the ticker does not arm. Both failure
 directions are bad, but they are not equally bad: a ticker that fails to arm leaves the
