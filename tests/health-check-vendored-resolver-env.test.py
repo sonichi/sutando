@@ -236,6 +236,65 @@ class TheHopIsBudgeted(unittest.TestCase):
         self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
 
 
+class TheKeyAndTheBindingAreDataflowToo(unittest.TestCase):
+    """Round 6: reads_env() recognized a literal key only and the taint pass
+    modelled Name targets only, so an env read reached the return unseen.
+    qingyun-wu's three controls all read 'ignores' at 2ca05484."""
+
+    def _verdict(self, src):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text(src)
+        return hc._resolver_env_verdict(f)[0]
+
+    def test_getenv_through_a_named_key_is_not_clean(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "KEY = 'SUTANDO_WORKSPACE'\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv(KEY))\n"), "unknown")
+
+    def test_subscript_through_a_named_key_is_not_clean(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "KEY = 'SUTANDO_WORKSPACE'\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.environ[KEY])\n"), "unknown")
+
+    def test_a_tuple_target_carries_the_taint(self):
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    raw, other = os.getenv('SUTANDO_WORKSPACE'), None\n"
+            "    return Path(raw)\n"), "honours")
+
+    def test_a_with_binding_is_modelled_too(self):
+        """The two shapes above are instances; an unmodelled binding form is
+        the class. `with ... as` bound a name the old loop never visited."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    with open(os.environ['SUTANDO_WORKSPACE']) as raw:\n"
+            "        return Path(raw)\n"), "honours")
+
+    def test_a_literal_key_for_another_variable_stays_clean(self):
+        """Negative control: only an UNRESOLVED key is unknown. A resolved key
+        naming some other variable is analysed, and analysed means clean."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "ignores")
+
+    def test_the_untainted_half_of_a_tuple_stays_clean(self):
+        """Negative control: element-wise pairing, not blanket over-tainting —
+        otherwise every tuple mentioning the env would read 'honours'."""
+        self.assertEqual(self._verdict(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    a, b = os.getenv('SUTANDO_WORKSPACE'), '/configured'\n"
+            "    return Path(b)\n"), "ignores")
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
         """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""

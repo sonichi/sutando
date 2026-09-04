@@ -9302,6 +9302,33 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                     return True
         return False
 
+    def murky_env_read(node) -> "str | None":
+        """An environment read whose KEY this analysis did not resolve.
+
+        reads_env() recognizes a literal key only, so `os.getenv(KEY)` would
+        otherwise register as no env read at all — a clean bill for a resolver
+        that still returns the removed variable."""
+        for n in ast.walk(node):
+            if isinstance(n, ast.Subscript):
+                base = _dots(n.value)
+                if not (base.endswith("environ") or base in aliases):
+                    continue
+                key = n.slice
+            elif isinstance(n, ast.Call):
+                d = _dots(n.func)
+                head, _, attr = d.rpartition(".")
+                if not (d.endswith("environ.get") or d.endswith("getenv")
+                        or (attr == "get" and head in aliases)):
+                    continue
+                if not n.args:
+                    return "an environment read with no key argument"
+                key = n.args[0]
+            else:
+                continue
+            if _const_str(key) is None:
+                return "an environment read whose key is not a literal"
+        return None
+
     def unresolved_call(node) -> "str | None":
         """Name the first call whose result this analysis cannot account for.
 
@@ -9320,7 +9347,7 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
             sib = sibling(d)
             if _hops > 0 and sib is not None and sib[1].name == "resolve_workspace":
                 continue                         # same-name delegate: analysed below
-            return d or "<expr>"
+            return f"{d}()" if d else "<expr>"
         return None
 
     def verdict(node, seen: frozenset) -> "tuple[str, str] | None":
@@ -9328,23 +9355,20 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
         if node.name in seen:
             return None                          # recursion guard
         seen = seen | {node.name}
+        binds = [pair for tgt, val in _bind_sites(node)
+                 for pair in _binding_pairs(tgt, val)]
         tainted, murky, changed = set(), {}, True
         while changed:                           # two fixpoints, one walk
             changed = False
-            for n in ast.walk(node):
-                if not (isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None):
-                    continue
-                names = [x.id for x in ast.walk(n.value) if isinstance(x, ast.Name)]
-                env = reads_env(n.value) or any(x in tainted for x in names)
-                unk = unresolved_call(n.value) or next(
-                    (murky[x] for x in names if x in murky), None)
-                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
-                    if not isinstance(t, ast.Name):
-                        continue
-                    if env and t.id not in tainted:
-                        tainted.add(t.id); changed = True
-                    if unk and t.id not in murky:
-                        murky[t.id] = unk; changed = True
+            for name, val in binds:
+                names = [x.id for x in ast.walk(val) if isinstance(x, ast.Name)]
+                env = reads_env(val) or any(x in tainted for x in names)
+                unk = (unresolved_call(val) or murky_env_read(val)
+                       or next((murky[x] for x in names if x in murky), None))
+                if env and name not in tainted:
+                    tainted.add(name); changed = True
+                if unk and name not in murky:
+                    murky[name] = unk; changed = True
         for n in ast.walk(node):
             if not (isinstance(n, ast.Return) and n.value is not None):
                 continue
@@ -9370,17 +9394,65 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                     if sub != "ignores":
                         return sub, (f"{node.name}() delegates to {d}(), which is "
                                      f"{sub}")
-            bad = unresolved_call(n.value) or next(
-                (murky[x] for x in names if x in murky), None)
+            bad = (unresolved_call(n.value) or murky_env_read(n.value)
+                   or next((murky[x] for x in names if x in murky), None))
             if bad is not None:
                 return "unknown", (f"a return in {node.name}() flows through "
-                                   f"{bad}(), which this analysis cannot resolve")
+                                   f"{bad}, which this analysis cannot resolve")
         return None
 
     found = verdict(fn, frozenset())
     if found is not None:
         return found
     return "ignores", "no return derives from $SUTANDO_WORKSPACE"
+
+
+def _bind_sites(node):
+    """(target, value) for every name-binding form in a function body.
+
+    Enumerated rather than matched statement by statement: a binding form the
+    taint pass does not model leaves its names untainted, which reads as clean.
+    """
+    for n in ast.walk(node):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                yield t, n.value
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+            if n.value is not None:
+                yield n.target, n.value
+        elif isinstance(n, ast.NamedExpr):
+            yield n.target, n.value
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            yield n.target, n.iter
+        elif isinstance(n, (ast.With, ast.AsyncWith)):
+            for item in n.items:
+                if item.optional_vars is not None:
+                    yield item.optional_vars, item.context_expr
+        elif isinstance(n, (ast.ListComp, ast.SetComp,
+                            ast.DictComp, ast.GeneratorExp)):
+            for g in n.generators:
+                yield g.target, g.iter
+
+
+def _binding_pairs(target, value):
+    """(name, value-node) for one binding.
+
+    A tuple target pairs element-wise with a tuple value of equal length; every
+    other shape binds the WHOLE value, which over-taints rather than under-taints.
+    """
+    if isinstance(target, ast.Name):
+        return [(target.id, value)]
+    if isinstance(target, ast.Starred):
+        return _binding_pairs(target.value, value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        elts = target.elts
+        if (isinstance(value, (ast.Tuple, ast.List))
+                and len(value.elts) == len(elts)
+                and not any(isinstance(e, ast.Starred) for e in elts + value.elts)):
+            return [pair for t, v in zip(elts, value.elts)
+                    for pair in _binding_pairs(t, v)]
+        return [pair for t in elts for pair in _binding_pairs(t, value)]
+    return [(x.id, value) for x in ast.walk(target) if isinstance(x, ast.Name)]
 
 
 def _dots(node) -> str:
