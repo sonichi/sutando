@@ -9,7 +9,7 @@ failure reads as novel. This extracts subjects from the failure text and
 searches those.
 
 Usage:
-    python3 skills/pr-review/scripts/ci-triage.py <PR> [--repo owner/name]
+    python3 skills/review-preflight/scripts/ci-triage.py <PR> [--repo owner/name]
 
 Exit code: 0 always — this is an advisory lookup, never a gate.
 """

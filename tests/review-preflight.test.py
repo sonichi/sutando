@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for skills/pr-review/scripts/review-preflight.py.
+"""Tests for skills/review-preflight/scripts/review-preflight.py.
 
 The failure this guards is silent: `CLAUDE.md` and `REVIEW.md` both instruct
 reviewers to run a preflight that prints the criteria, and for months no such
@@ -19,7 +19,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SCRIPT = REPO / "skills" / "pr-review" / "scripts" / "review-preflight.py"
+SCRIPT = REPO / "skills" / "review-preflight" / "scripts" / "review-preflight.py"
 SPEC = importlib.util.spec_from_file_location("review_preflight", SCRIPT)
 assert SPEC and SPEC.loader
 pf = importlib.util.module_from_spec(SPEC)

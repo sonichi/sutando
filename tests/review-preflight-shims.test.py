@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The exec shims at the old scripts/ paths hand off to skills/pr-review/scripts/ with argv intact."""
+"""The exec shims at the old scripts/ paths hand off to skills/review-preflight/scripts/ with argv intact."""
 import os
 import runpy
 import sys
@@ -26,14 +26,14 @@ class ShimTests(unittest.TestCase):
     def test_ci_triage_shim_execs_the_moved_script(self):
         exe, args = self._run_shim("ci-triage.py", ["--pr", "42"])
         self.assertEqual(exe, sys.executable)
-        self.assertEqual(os.path.normpath(args[1]), os.path.join(ROOT, "skills", "pr-review", "scripts", "ci-triage.py"))
+        self.assertEqual(os.path.normpath(args[1]), os.path.join(ROOT, "skills", "review-preflight", "scripts", "ci-triage.py"))
         self.assertEqual(args[2:], ["--pr", "42"])
         self.assertTrue(os.path.exists(args[1]), "the exec target must exist")
 
     def test_review_preflight_shim_execs_the_moved_script(self):
         exe, args = self._run_shim("review-preflight.py", ["3902"])
         self.assertEqual(exe, sys.executable)
-        self.assertEqual(os.path.normpath(args[1]), os.path.join(ROOT, "skills", "pr-review", "scripts", "review-preflight.py"))
+        self.assertEqual(os.path.normpath(args[1]), os.path.join(ROOT, "skills", "review-preflight", "scripts", "review-preflight.py"))
         self.assertEqual(args[2:], ["3902"])
         self.assertTrue(os.path.exists(args[1]), "the exec target must exist")
 

@@ -46,7 +46,7 @@ def repo_root(start: Path | None = None) -> Path:
             return Path(out)
     except Exception:
         pass
-    return Path(__file__).resolve().parents[3]  # skills/pr-review/scripts/ -> repo
+    return Path(__file__).resolve().parents[3]  # skills/review-preflight/scripts/ -> repo
 
 
 def resolve_guide(explicit: str | None, root: Path | None = None) -> Path:

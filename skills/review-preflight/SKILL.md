@@ -1,16 +1,16 @@
 ---
-name: pr-review
+name: review-preflight
 description: "Review tooling for a PR: review-preflight prints REVIEW.md's criteria and the PR's live gate state before a review; ci-triage maps a PR's failing checks to already-filed issues."
 user-invocable: true
 ---
 
-# pr-review
+# review-preflight
 
 Two tools, invoked by path; neither is a boot dependency of the core.
 
 ```bash
-python3 skills/pr-review/scripts/review-preflight.py <PR>      # run before reviewing; reads <repo>/REVIEW.md
-python3 skills/pr-review/scripts/ci-triage.py <PR> [--repo o/n] # a red check is a pointer into the record: search its SUBJECT, not its name
+python3 skills/review-preflight/scripts/review-preflight.py <PR>      # run before reviewing; reads <repo>/REVIEW.md
+python3 skills/review-preflight/scripts/ci-triage.py <PR> [--repo o/n] # a red check is a pointer into the record: search its SUBJECT, not its name
 ```
 
 `review-preflight.py` resolves the repo root via `git rev-parse --show-toplevel`, falling back to three

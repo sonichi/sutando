@@ -75,7 +75,7 @@ class FakeChannel:
     the handler takes the `not is_dm` branch where the placeholder guard lives."""
     def __init__(self, cid=555000):
         self.id = cid
-        self.name = "pr-review"
+        self.name = "review-preflight"
         self.sent: list[str] = []
 
     async def send(self, text):
