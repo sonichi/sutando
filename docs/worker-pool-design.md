@@ -59,14 +59,19 @@ The rule runs inside each watcher's own event handler
 (`SUTANDO_TASK_EVENT_HANDLER`, read per process, so the core and every worker
 carry their own), at the handler's probe, before any claim:
 
-1. `requested_worker` names this instance: emit to this session with no claim
-   taken (probe exit 3). Names another instance whose beat is fresh: **suppress**.
-   Names an instance whose beat is stale: the core emits (stand-in), workers
-   suppress.
+**Every emitter claims first.** An instance that decides it may emit acquires the
+task-specific claim (a hard link in `state/task-event-handler-claims/`, keyed on the
+task FILENAME) and emits only if it wins; a loser suppresses. This holds for the
+named target, the pinned target, a bound-set member and the core stand-in alike —
+being addressed selects a *candidate*, it does not confer ownership.
+
+1. `requested_worker` names this instance: claim, then emit to this session.
+   Names another instance whose beat is fresh: **suppress**.
+   Names an instance whose beat is stale: the core claims and emits (stand-in),
+   workers suppress.
 2. No field, and the room addresses this worker — it is **pinned** to it, or
-   this is a **dedicated** worker's own room: emit with no claim. Pinned to a bound set
-   this worker belongs to: members race for the watcher's shared atomic claim
-   (a hard link in `state/task-event-handler-claims/`); the winner emits and the
+   this is a **dedicated** worker's own room: claim, then emit. Pinned to a bound set
+   this worker belongs to: members race for the same claim; the winner emits and the
    losers suppress. Pinned to a FRESH instance that is not this one: **suppress**
    — the core included. A pin is addressing, so the core is a non-target here
    exactly as a worker is, and rule 3 must not be reached. Pinned to an instance
@@ -79,23 +84,25 @@ file untouched.** It is not "claim and discard", and the difference is the whole
 correctness argument. The claim is keyed on the task FILENAME and is therefore
 global across instances — `acquire_task_claim` hard-links
 `state/task-event-handler-claims/<filename>` and the first linker wins
-(`src/watch-tasks-stream.sh:127-147`) — while the addressed instance's emit path
-takes **no claim at all** (probe exit 3 prints `TASK_FILE:` directly,
-`:398-400`). So a discarding non-target and an emitting target are not mutually
-exclusive: any non-target can win the shared claim and run its discard before the
-target's session has consumed the filename it was handed. If the discard renames
-or removes the file, the target is handed a path it can no longer read; if it does
-not, then the claim never settled ownership and there is no exactly-once property
-to appeal to. Racing two discards against each other is safe, which is what the
-earlier version of this section argued; racing a discard against the emit is the
-case that argument never covered.
+(`src/watch-tasks-stream.sh:127-147`). Suppression and claim-before-emit answer two
+different races, and both are needed. Suppression removes the non-target/target
+race: a non-target that claimed-and-discarded could win the claim and rename the
+file before the target's session read the path it had been handed. Claim-before-emit
+removes the target/target race: **addressing is not exclusive**, so two instances
+can each correctly believe they are the addressee, and only a claim keyed on the
+filename decides between them. An earlier version of this section argued that
+racing two discards is safe — true, and insufficient, because neither of the
+races that matter is discard-against-discard.
 
 **Prerequisite for step 2, stated as such.** No suppress disposition exists today.
 The probe's handled results are exit 0 (queue a fallback handler), exit 4 (queue a
 required handler), exit 3 (emit directly) and an else branch that also emits
 (`:385-402`) — every one of them either emits or queues, so a non-target watcher
-currently cannot be inert. Step 2 must add the disposition before this rule can be
-implemented; until then the rule is a contract, not a description.
+currently cannot be inert. **And a second prerequisite:** the emit path takes no
+claim today — probe exit 3 prints `TASK_FILE:` directly (`:398-400`) — so
+claim-before-emit is a change to that path, not a rule expressible over it. Step 2
+must add both the suppress disposition and the claim on emit before this rule can
+be implemented; until then the rule is a contract, not a description.
 
 Traced for the case the rule used to get wrong — a task with no
 `requested_worker` in a room pinned to worker-2, with worker-2 fresh — and
@@ -106,12 +113,50 @@ target's handler is even entered**:
 |---|---|---|---|---|
 | 1 | core     | pin names a fresh instance, not me: suppress | untouched | untouched |
 | 2 | worker-3 | pin names a fresh instance, not me: suppress | untouched | untouched |
-| 3 | worker-2 | pin names me: emit, no claim | untouched | consumed once |
+| 3 | worker-2 | pin names me: claim (wins, uncontended), emit | held by worker-2 | consumed once |
 
-The target consumes exactly once *because* nothing else ever contended — not
-because a claim arbitrated a contention. Ordering is irrelevant: run steps 1 and 2
-in either order, any number of times, and the state they observe and leave is
-identical, so there is no schedule in which worker-2 is handed an unreadable path.
+Ordering is irrelevant here: run steps 1 and 2 in either order, any number of
+times, and the state they observe and leave is identical.
+
+**But that trace proves nothing about exactly-once**, because nothing contended.
+The two schedules below are the ones that do, and both turn on the same fact:
+*two instances can each correctly believe they are the addressee.*
+
+**Trace A — the heartbeat crosses stale between two evaluations.** Freshness is
+read per watcher, from a beat that ages in real time, so there is no instant at
+which all instances agree on it:
+
+| t | instance | reads | claim | emits |
+|---|---|---|---|---|
+| 89.9s | worker-2 | my own beat; `requested_worker` names me | **wins** | yes |
+| 90.1s | core | worker-2's beat now stale -> I am the stand-in | **loses** | no, suppresses |
+
+Without the claim both emit and the task is delivered twice. With it the core's
+`link()` fails against worker-2's existing entry, so the stand-in stands down.
+The reverse interleaving is equally fine and is the point: whichever runs first
+wins, and the loser suppresses rather than deciding it was wrong to be a candidate.
+
+**Trace B — an atomic repin between two evaluations.** Each watcher independently
+re-reads mutable `bindings.json`, so an atomic replacement still hands two readers
+two different valid versions:
+
+| t | instance | reads `bindings.json` | claim | emits |
+|---|---|---|---|---|
+| t0 | worker-2 | pin -> worker-2 (old, valid) | **wins** | yes |
+| t0+e | *(repin)* | `os.replace` swaps in pin -> worker-3 | — | — |
+| t1 | worker-3 | pin -> worker-3 (new, valid) | **loses** | no, suppresses |
+
+Neither read is torn and neither instance is wrong; atomic replacement rules out a
+malformed read, not two valid versions selecting two targets. Only the claim
+arbitrates, and it does so without either watcher having to observe the repin.
+
+**The stale-target stand-in is Trace A**: the core reaches rule 1's stand-in branch
+or rule 3 exactly when a worker's beat has aged out, which is the transition the
+table above schedules against. It carries no exemption — the core takes the same
+claim on the same key and suppresses on a loss.
+
+In all three schedules the task file is consumed exactly once, by whichever
+instance holds the claim, and every loser leaves the file untouched.
 
 With worker-2's beat STALE the second column falls through for everyone, rule 3
 selects the core, and the workers suppress. The same adversarial ordering holds —
