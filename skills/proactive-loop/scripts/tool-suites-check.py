@@ -156,7 +156,13 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     ws = Path(a.workspace)
-    scripts, statedir = ws / "scripts", ws / "state"
+    statedir = ws / "state"
+    # Watch wherever the tools actually are. This read ws/"scripts" unconditionally,
+    # and on a workspace whose tools live in ws/"tools" that directory can exist and
+    # hold zero .py — so the mtime trigger globbed an empty dir and could never fire
+    # on a tool edit, leaving only the 24h fallback.
+    scripts = next((d for d in (ws / "scripts", ws / "tools")
+                    if d.is_dir() and any(d.glob("*.py"))), ws / "scripts")
     if not scripts.is_dir():
         print(f"CANNOT ANSWER: no {scripts}", file=sys.stderr)
         return 2

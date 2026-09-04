@@ -119,6 +119,37 @@ with tempfile.TemporaryDirectory() as td:
                        capture_output=True, text=True)
     check("touching the extra re-triggers", "running" in p.stdout, True)
 
+def watched_dir_case(td):
+    """A workspace whose tools live in tools/, with an EMPTY scripts/ beside it.
+
+    The empty dir is the trap: it exists, so the `no scripts/` refusal does not
+    fire, and it holds no .py, so the newest-mtime trigger has nothing to watch.
+    """
+    ws = Path(td) / "ws3"
+    (ws / "scripts").mkdir(parents=True)          # exists, deliberately empty
+    (ws / "tools").mkdir()
+    (ws / "state").mkdir()
+    (ws / "tools" / "thing.py").write_text("def verdict():\n    return 1\n")
+    (ws / "tools" / "thing.test.py").write_text("import sys\nprint('ok')\nsys.exit(0)\n")
+    return ws
+
+
+with tempfile.TemporaryDirectory() as td:
+    ws = watched_dir_case(td)
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                       capture_output=True, text=True)
+    check("tools/ is watched when scripts/ is empty", "running" in p.stdout, True)
+    check("and the suite under tools/ actually ran", "thing.test.py" in p.stdout, True)
+    # The trigger must still key on an edit, not merely on the first run.
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                       capture_output=True, text=True)
+    check("second run is fresh", "fresh" in p.stdout, True)
+    os.utime(ws / "tools" / "thing.py", None)
+    p = subprocess.run([*PYBASE, str(TOOL), "--workspace", str(ws), "--repo", str(Path(td))],
+                       capture_output=True, text=True)
+    check("touching a tool under tools/ re-triggers", "running" in p.stdout, True)
+
+
 print("7. in-process: the trigger rule and the two scope refusals")
 check("no recorded run -> run", tsc.should_run({}, 0.0, 3600, 100.0)[0], True)
 check("unchanged and young -> fresh", tsc.should_run({"tools_mtime": 5.0, "ran_at": 90.0}, 5.0, 3600, 100.0)[0], False)
