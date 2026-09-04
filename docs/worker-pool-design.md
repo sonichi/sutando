@@ -238,7 +238,16 @@ with its own reason.
 2. worker side: the per-instance event handler (eligibility from
    `requested_worker` and the pin table, priority order, done-flags) and the
    worker heartbeat. Prerequisites, each its own PR because each edits an
-   existing file: the gateway writer converges on task-last; the watcher
+   existing file: the gateway writer converges on task-last, **with its
+   `parse_task_headers_trusted` readers migrated in the same PR** — that parser
+   is only valid for a task-mid writer, so converging the writer without the
+   readers would leave a last-wins parser reading `access_tier` off a task-last
+   file, resting the trust boundary on an unstated invariant (the body flatten
+   still stands behind it, so this is a sequencing rule, not a live hole). The
+   sort defect alone can be fixed first and separately by moving `priority`
+   ahead of `task` in `_TASK_FIELDS`, exactly as #3872 did for
+   `requested_worker`; that decouples the user-visible half from convergence.
+   Also each its own PR: the watcher
    sentinel becomes per instance (`state/watch-tasks-stream-<name>.pid` and
    its four readers, since N watchers on one host overwrite the single file
    today) and the fallback-receipt directory with it; the sparrow bridge
