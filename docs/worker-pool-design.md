@@ -289,12 +289,16 @@ with its own reason.
    sort defect alone can be fixed first and separately by moving `priority`
    ahead of `task` in `_TASK_FIELDS`, exactly as #3872 did for
    `requested_worker`; that decouples the user-visible half from convergence.
-   Also each its own PR: the watcher
-   sentinel becomes per instance (`state/watch-tasks-stream-<name>.pid` and
-   its four readers, since N watchers on one host overwrite the single file
-   today) and the fallback-receipt directory with it; the sparrow bridge
-   records `requested_worker` from the server envelope; the pin reader matches
-   `channel_id` or `chat_id`, as the lead's own regex does;
+   Also each its own PR against an existing file: the watcher sentinel becomes
+   per instance (`state/watch-tasks-stream-<name>.pid` and its four readers,
+   since N watchers on one host overwrite the single file today) and the
+   fallback-receipt directory with it; the sparrow bridge records
+   `requested_worker` from the server envelope. **Not a prerequisite PR, a
+   requirement on step 2's own code:** the eligibility reader matches both
+   `channel_id` and `chat_id`. No such reader exists on `main` — checked, it
+   has never been there — so there is nothing to fix ahead of time; the failure
+   is a Telegram-addressed task silently reading as unbound the first time
+   someone pins a chat, and step 2's suite carries that case.
 3. core side: the pin table writer, the sweep (reclaim, stand-in, revive,
    status line, timing record), with claim and liveness tests;
 4. installer and plists, including per-worker model;
