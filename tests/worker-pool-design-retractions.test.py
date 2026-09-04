@@ -53,7 +53,13 @@ CONTRACT = [
      "four things happened",
      "the outcome set is five, not four: refused-over-bound is distinct from "
      "operational failure and :390 must tell them apart."),
+    ("prior receipt",
+     "never by a second admission",
+     "two contracts, not one: a direct exit WITH a prior receipt transitions it, one "
+     "WITHOUT must admit. Stating only the transition half reads as universal and "
+     "leaves the probe-direct path with no admission at all."),
 ]
+
 
 
 class ChosenContractIsPinned(unittest.TestCase):

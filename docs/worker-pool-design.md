@@ -272,8 +272,23 @@ primitive* — with the empty-`DISPATCH_DIR` path as the explicit unpooled excep
 is the correction that matters, because putting the primitive inside it left the four direct exits
 bypassing admission entirely.
 
-**And the direct receipt is created by TRANSITION, never by a second admission.** Handler fallback
-(`:255`, `:506`, `:542` — the disposition-1 branch) already emits a task that *holds a claim*: it
+**A direct receipt is created by TRANSITION or by ADMISSION, and which one is a property of the
+exit, not of the design.** These are two contracts and an earlier draft of this section stated only
+the first, as though it held for every direct dispatch. It does not.
+
+The discriminator is whether a receipt for that task already exists when the exit runs:
+
+| exit | prior receipt | what it must do |
+|---|---|---|
+| handler fallback, disposition-1 | **yes** — the task was admitted when the handler took it | **transition** the existing receipt to `direct`; a second admission here is the double-count |
+| a direct dispatch with no handler behind it (initial probe-direct, operational direct) | **no** | perform a **fresh admission** through the shared primitive and create the receipt |
+
+So every direct exit must declare which case it is, and an exit that cannot say is a defect in the
+exit rather than a gap in this contract. The rule that generalises both: **a task is admitted
+exactly once, and `direct` is a state that admission can be entered into or moved into — never a
+state that skips it.**
+
+Handler fallback (`:255`, `:506`, `:542` — the disposition-1 branch) already emits a task that *holds a claim*: it
 writes a `FALLBACKS_DIR` marker and calls `emit_fallback_task_file` / `emit_task_file`. So the task
 was counted when it was first admitted, and moving it to `direct` is a state change on an existing
 receipt rather than a new one. That is what closes the double-admission hole without a second
