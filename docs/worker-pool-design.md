@@ -5,7 +5,11 @@ of staging #3604 into PRs against `main`; #3604 stays open as the reference
 implementation and is not merged as one piece. It supersedes the
 "lead = the runtime daemon" and "lead-managed sizing" placements in #3604's
 `docs/lead-follower-pool.md` and Decision 4 of
-[`core-pool-standing-sessions.md`](core-pool-standing-sessions.md); every other
+[`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), and Decision 5
+of that record (the unclaimed-work backstop belongs to the lead; followers stay
+purely event-driven) — superseded because it sites the backstop on a lead this
+design no longer has, not because its reasoning was wrong; see **The reconciliation
+ticker**, which answers its O(N) objection rather than dropping it. Every other
 decision in that record stands.
 
 The words below are the ones the code uses from now on: **core** (the one
@@ -223,6 +227,51 @@ dead worker emits no further beat, so the core's tick must consider tasks addres
 ELSEWHERE and apply the stale-target fallthrough, which is by definition not
 "addressed to me".
 
+### The reconciliation ticker
+
+**It is a THIRD periodic mechanism, and it is gated on pool membership.** Two
+passages had to change for that to be true rather than merely intended: "Workers are
+task-only" named the heartbeat and the core's sweep as the only periodic things in a
+pool, and the routing section still called this a per-heartbeat re-list after the
+owner had moved. Both now name the watcher. It also supersedes Decision 5 of
+[`core-pool-standing-sessions.md`](core-pool-standing-sessions.md), which sited the
+unclaimed-work backstop on the LEAD and required followers to stay purely
+event-driven — a placement this design cannot use, because the lead-as-daemon it
+rests on is itself superseded at the top of this file. Decision 5's *cost* argument
+is not superseded and is answered rather than dropped: it is O(N) wakeups, where N is
+the number of workers deliberately created, and at N=0 there is no ticker at all.
+
+**Activation.** The ticker exists only while the instance is a pool member. A default
+install has no pool, so nothing arms it, and `## The starting point is zero workers`
+keeps its guarantee literally rather than approximately. That gate is load-bearing,
+not decorative: with no handler configured `DISPATCH_DIR` is empty and `dispatch_task`
+prints `TASK_FILE:` unconditionally — no claim, no dedup, no probe
+(`src/watch-tasks-stream.sh:370-376`) — so an ungated tick would re-emit every
+still-pending file to the live core every 30 s, forever, on the majority
+configuration. Deactivation is that edge in reverse: removing the last worker disarms
+the ticker and the install is again exactly what it was.
+
+**Supervision.** The ticker is owned by the watcher process and shares its lifetime,
+rather than being a detached timer that can outlive it. If the watcher exits the
+ticker goes with it — a separate process would reintroduce exactly the split that put
+the first version of this work on the heartbeat, which had the timer and not the
+capability.
+
+**Single-flight.** One pass runs at a time. A tick arriving while the previous pass is
+still walking the directory is DROPPED, not queued, because the next pass re-lists
+from scratch and a coalesced tick therefore loses nothing. This is what stops a slow
+`dispatch_task` from stacking passes that each re-emit the same files.
+
+**Overrun.** A pass that outruns its period is a load signal, not an error. It is
+bounded by the same capacity/busy rule as the event path, so it can never admit work
+the event path would refuse; a pass that hits the bound stops early and the next tick
+resumes from a fresh listing rather than a saved cursor.
+
+**Shutdown.** The ticker stops before the watcher stops claiming, so no pass is
+mid-`dispatch_task` while the claim path tears down. An in-flight pass is abandoned
+rather than drained: everything it would have emitted is still on disk, and the next
+instance to arm a ticker re-lists it.
+
 The cost is the one production already pays. `watch-tasks-stream.sh:639-645` lists
 `tasks/*.txt` at every startup for exactly this reason — a restart gap leaves files
 no event will re-announce — so the watcher's 30 s reconciliation is that same sweep on a timer,
@@ -247,9 +296,10 @@ one party that could disagree with the file is the party that wrote it.
 This paragraph is about the STEP-3 residue only, and an earlier revision let it
 deny the step-2 contract as well. To be explicit, because the two sit close enough
 to be read as one rule: **step 2 DOES owe a periodic re-evaluation** — the
-per-heartbeat re-list specified above and again in the step-2 prerequisite list —
-and using an existing 30s tick rather than a second timer does not make repeated
-work non-periodic. What is bounded HERE is a different race: a worker that
+watcher's 30s reconciliation specified above and again in the step-2 prerequisite
+list — and running it on a timer the watcher owns rather than folding it into an
+existing beat does not make repeated work non-periodic. What is bounded HERE
+is a different race: a worker that
 suppresses on a `wedged` verdict the core has not yet acted on waits until the
 core's next SWEEP, which is step 3's and is one of the two periodic things
 "Workers are task-only" already admits. Two residues, two owners, two mechanisms;
@@ -538,9 +588,11 @@ the core's status line), which the core writes and the bridge already pushes.
 
 A worker has no proactive loop. It starts its task watcher at boot, claims any
 eligible task already on disk, and after that every claim and finish is
-triggered by a watcher event. The only periodic things in a pool are each
-process's heartbeat and the core's sweep. Activation, claim and finish do not
-justify a timer, so no `proactive-loop-pool` skill ships.
+triggered by a watcher event. A pool has three periodic things: each process's
+heartbeat, the core's sweep, and the watcher's 30s reconciliation — the last armed
+only while the instance is a pool member, so a fresh install still has two. Its
+contract is in **The reconciliation ticker** above. Activation, claim and finish do
+not justify a timer of their own, so no `proactive-loop-pool` skill ships.
 
 ## Coordination contract (claim-only; the primitives are #3604's)
 
