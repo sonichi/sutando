@@ -9240,6 +9240,9 @@ _REMOVED_WS_ENV = "SUTANDO_WORKSPACE"
 # Callees whose result cannot smuggle an env read past the analysis: pure
 # constructors over arguments this pass already walks.
 _RESOLVED_CALLS = frozenset({"Path", "str", "expanduser", "resolve", "home"})
+# ...but only where the SPELLING still means what it says. `from helper import Path`
+# rebinds the name to arbitrary code, so trust is per-file, not global.
+_CANONICAL_CALL_ORIGIN = {"Path": "pathlib.Path"}
 _BUILTIN_NAMES = frozenset(dir(__import__("builtins")))
 # os.path member-by-member, not namespace-wide: expandvars() reads the environment,
 # and an unlisted member is unknown rather than assumed pure.
@@ -9354,13 +9357,16 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     # it holds; only these four sets carry a followed origin.
     proven = os_names | getenv_names | environ_names | expandvars_names
 
-    def _callee_base_nodes(expr) -> set:
-        """id() of the Name NODE at the base of each callee chain.
+    # A pure-callee spelling is trusted only where nothing rebinds it: an import
+    # or assignment of the same name supplies a different callable entirely.
+    resolved_calls = {n for n in _RESOLVED_CALLS
+                      if n not in rebound
+                      and (n not in provable
+                           or provable[n] == [_CANONICAL_CALL_ORIGIN.get(n)])}
 
-        Node-specific, not name-wide: `helper.resolve_workspace()` follows the
-        call while `helper.WORKSPACE` two characters away is an opaque value,
-        and exempting the NAME exempts both.
-        """
+    def _callee_base_nodes(expr) -> set:
+        """id() of the Name NODE at the base of each callee chain — node-specific,
+        because one identifier can be a followed callee and an opaque value at once."""
         out = set()
         for c in ast.walk(expr):
             if not isinstance(c, ast.Call):
@@ -9448,7 +9454,7 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
             if not isinstance(n, ast.Call):
                 continue
             d = _dots(n.func)
-            if d in modfns or d in _RESOLVED_CALLS:
+            if d in modfns or d in resolved_calls:
                 continue
             if d.startswith("os.path.") and d.rpartition(".")[2] in _PURE_OSPATH:
                 continue
@@ -9510,7 +9516,7 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                     continue
                 x = n.id
                 if (x in imported and x not in proven and x not in bound
-                        and x not in modfns and x not in _RESOLVED_CALLS):
+                        and x not in modfns and x not in resolved_calls):
                     return f"the imported value {x}"
             return None
 
@@ -9549,7 +9555,7 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                    or opaque_import(n.value)
                    or next((f"the unbound name {x}" for x in names
                             if x not in bound and x not in imported
-                            and x not in modfns and x not in _RESOLVED_CALLS
+                            and x not in modfns and x not in resolved_calls
                             and x not in _BUILTIN_NAMES), None))
             if bad is not None:
                 return "unknown", (f"a return in {node.name}() flows through "

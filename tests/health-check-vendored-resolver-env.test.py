@@ -1028,9 +1028,8 @@ class ScopeAndOriginAreProven(unittest.TestCase):
                     "    r = WS\n    return Path(r)\n"), "ignores")
 
     def test_a_followed_call_does_not_exempt_a_VALUE_read_of_the_same_name(self):
-        """The callee exemption is NODE-specific, not name-wide: `helper.f()` and
-        `helper.WORKSPACE` in one expression are a followed call and an opaque
-        value, and exempting the NAME exempts both."""
+        """One identifier, two roles: exempting the NAME exempts the value read
+        as well as the followed call."""
         d = Path(tempfile.mkdtemp())
         (d / "helper.py").write_text(
             "import os\nfrom pathlib import Path\n"
@@ -1044,6 +1043,53 @@ class ScopeAndOriginAreProven(unittest.TestCase):
         v, why = hc._resolver_env_verdict(d / "workspace_default.py")
         self.assertEqual(v, "unknown", why)
         self.assertIn("helper", why)
+
+    def test_a_shadowed_pure_callee_is_not_trusted_by_spelling(self):
+        """`Path` is trusted for what it IS, not what it is called: an import can
+        bind the spelling to arbitrary code."""
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(
+            "import os\ndef Path(_):\n    return os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "from helper import Path\ndef resolve_workspace():\n"
+            "    return Path('/fixed')\n")
+        v, why = hc._resolver_env_verdict(d / "workspace_default.py")
+        self.assertEqual(v, "unknown", why)
+
+    def test_the_real_pathlib_Path_is_still_trusted(self):
+        """Negative control: distrusting a shadowed spelling must not distrust the
+        canonical one, or every clean resolver reads unknown."""
+        d = Path(tempfile.mkdtemp())
+        (d / "workspace_default.py").write_text(
+            "from pathlib import Path\ndef resolve_workspace():\n"
+            "    return Path('/fixed')\n")
+        self.assertEqual(
+            hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
+
+    def test_a_locally_reassigned_pure_callee_is_not_trusted_either(self):
+        """An assignment rebinds the spelling as surely as an import does."""
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(
+            "import os\ndef f(_):\n    return os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "import helper\nPath = helper.f\ndef resolve_workspace():\n"
+            "    return Path('/fixed')\n")
+        v, why = hc._resolver_env_verdict(d / "workspace_default.py")
+        self.assertEqual(v, "unknown", why)
+
+    def test_the_probe_reports_the_shadowed_callee_too(self):
+        """Integrated: the classifier verdict must reach the probe's status."""
+        ws = Path(tempfile.mkdtemp())
+        d = ws / "skill-repos" / "shadowcall" / "scripts"
+        d.mkdir(parents=True)
+        (d / "helper.py").write_text(
+            "import os\ndef Path(_):\n    return os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "from helper import Path\ndef resolve_workspace():\n"
+            "    return Path('/fixed')\n")
+        r = hc.check_vendored_resolver_env(workspace_dir=ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertNotIn("none honour", r["detail"])
 
     def test_the_probe_reports_the_mixed_shape_too(self):
         """Integrated: the classifier verdict must reach the probe's status."""
