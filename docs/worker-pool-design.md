@@ -262,7 +262,8 @@ primitive* — with the empty-`DISPATCH_DIR` path as the explicit unpooled excep
 2. **Commit UNDER one lock** — the shared owner checks the bound where it applies, acquires the
    canonical claim, and creates or transitions exactly one `pending` or `direct` receipt. It
    returns a typed outcome by out-parameter, since a bash function's exit status cannot carry
-   `queued` / `direct` / `lost` / `suppressed` / `refused-over-bound` distinctly — and `:390` must
+   `queued` / `direct` / `lost` / `suppressed` / `refused-over-bound` distinctly — and the
+   **`fallback`-mode publish branch** must
    tell `refused-over-bound` apart from the others rather than folding them.
 3. **Publish AFTER unlock** — queue or emit only from that admitted token. Stdout stays exclusively
    `TASK_FILE:`.
@@ -279,7 +280,10 @@ receipt rather than a new one. That is what closes the double-admission hole wit
 counter — the earlier drafts of this section kept looking for a way to *admit* a direct dispatch,
 and the answer is that it was already admitted.
 
-**`:390` must separate refusal from failure, and today it cannot.** It reads
+**The `fallback`-mode publish branch must separate refusal from failure, and today it cannot.**
+That branch is the `queue_handler_task "$task_path" "fallback"` call and the `|| printf` that
+follows it — `watch-tasks-stream.sh:390` at the time of writing, but the mode argument is the
+identity and the line number is only a locator. It reads
 `queue_handler_task ... || printf 'TASK_FILE: %s\n' ... || exit 0`, and `queue_handler_task`
 returns non-zero for a lost claim *and* for an operational failure — so a generic `|| printf`
 publishes in both cases and cannot tell `refused-over-bound` from a genuine error. The typed
@@ -318,7 +322,8 @@ revisions of this design said three things that are now false, and each was corr
 rather than by me:
 
 - **a four-outcome `dispatch_task`** (`queued` / `direct` / `lost` / `suppressed`). The contract is
-  five: `refused-over-bound` is a distinct outcome from operational failure, and `:390` must tell
+  five: `refused-over-bound` is a distinct outcome from operational failure, and the `fallback`-mode
+  publish branch must tell
   them apart instead of falling through to a generic `|| printf`.
 - **an ownerless `direct/` receipt** that step 2 would have to invent an owner for. It is not a new
   admission at all — handler fallback transitions an already-claimed receipt (`:255`, `:506`,
@@ -1037,7 +1042,8 @@ Implementation acceptance requires all of:
 
 - one shared production admission/transition primitive, not a per-caller reimplementation
 - coverage of **both** the event and reconcile lock orders, exercised against production code
-- every direct branch, including the typed refusal at `:390`
+- every direct branch, including the typed refusal in the `fallback`-mode publish branch
+  (`watch-tasks-stream.sh:390` today; the mode argument is the identity, the line is a locator)
 - fault injection for all three crash windows (`receipt-before-emit`, `emit-before-ack`,
   `ack-before-release`)
 
