@@ -1011,6 +1011,39 @@ behind the done-flag, and a seat from an older generation — a different binary
 under the same instance name — is recycled rather than trusted, since `.alive`
 is keyed by name and cannot tell generations apart.
 
+## What the retraction tests do and do not show
+
+The retraction suite validates **document evolution only**: it shows that wording this design
+specifically retracted has not come back. It does not demonstrate that the production mechanism
+exists, or that it behaves correctly. A green suite is progress toward coherence, not toward merge,
+and the two read identically from a CI badge.
+
+`ChosenContractIsPinned` narrows that gap without closing it. It asserts the chosen owner/outcome
+contract is present and its superseded counterpart is asserted nowhere — which catches an obsolete
+model left standing beside its replacement, the failure the phrase checks structurally cannot see,
+because nothing has been re-worded. It remains a **document-level data pin**. It does not prove
+semantic consistency, and it does not prevent two incompatible rules from coexisting so long as
+neither uses retracted wording.
+
+Three statuses therefore stay distinct, and none of them implies another:
+
+| status | what it means |
+|---|---|
+| the admission design | **design-complete** — the three phases, the five outcomes and the three crash windows are settled |
+| semantic-consistency enforcement | **open** — it needs stable IDs on the normative rules and a structured mutually-exclusive-state table that can be tested directly |
+| runtime implementation proof | **a separate future gate** — see the acceptance bar below |
+
+Implementation acceptance requires all of:
+
+- one shared production admission/transition primitive, not a per-caller reimplementation
+- coverage of **both** the event and reconcile lock orders, exercised against production code
+- every direct branch, including the typed refusal at `:390`
+- fault injection for all three crash windows (`receipt-before-emit`, `emit-before-ack`,
+  `ack-before-release`)
+
+None of that is in this PR, and no test in it should be read as evidence for any of it.
+
+
 ## Out of scope for v1
 
 A router process: it earns a process only when a policy needs to see the whole
