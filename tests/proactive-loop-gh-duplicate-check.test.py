@@ -164,6 +164,24 @@ class DecisionParametersCannotSilenceTheSearch(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("CANNOT ANSWER", err)
 
+
+    def test_an_EXACT_duplicate_is_not_cleared_by_a_short_title(self):
+        # "eslint bug" yields one token; with the default overlap of 2 no candidate
+        # can reach the threshold, so rc 0 would be arithmetic (review finding).
+        exact = {"number": 9, "state": "open", "html_url": "u",
+                 "title": "eslint bug", "body": ""}
+        rc, _, err = run(["--repo", "o/n", "--title", "eslint bug"],
+                         lambda r, t, **k: [exact])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("exact duplicate would score clean", err)
+
+    def test_a_reachable_threshold_still_answers(self):
+        exact = {"number": 9, "state": "open", "html_url": "u",
+                 "title": "eslint bug", "body": ""}
+        rc, out, _ = run(["--repo", "o/n", "--title", "eslint bug", "--min-overlap", "1"],
+                         lambda r, t, **k: [exact])
+        self.assertEqual(rc, 1, out)
+
     def test_one_of_each_is_still_allowed(self):
         rc, out, _ = run(BASE + ["--max-queries", "1", "--min-overlap", "1"],
                          lambda r, t, **k: [])

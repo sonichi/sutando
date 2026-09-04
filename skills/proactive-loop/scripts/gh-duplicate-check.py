@@ -139,6 +139,15 @@ def main(argv=None) -> int:
               f"searched and a clean result would be produced by construction.", file=sys.stderr)
         return 2
 
+    # A title yielding fewer distinct tokens than the threshold makes the MAXIMUM
+    # attainable score unreachable, so rc 0 would be arithmetic, not evidence.
+    if len(toks) < a.min_overlap:
+        print(f"CANNOT ANSWER: {len(toks)} distinct token(s) in {a.title!r} but "
+              f"--min-overlap={a.min_overlap}; no candidate could reach that score, so even an "
+              f"exact duplicate would score clean. Lower --min-overlap or give a longer title.",
+              file=sys.stderr)
+        return 2
+
     seen, failures = {}, 0
     for t in toks[:a.max_queries]:
         items = search(a.repo, t)
