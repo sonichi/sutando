@@ -69,11 +69,69 @@ class FailsHonest(unittest.TestCase):
 
 
 class Verdicts(unittest.TestCase):
-    def test_the_canonical_resolver_ignores_the_env(self):
-        """Positive control: without it a detector that says 'ignores' for
-        everything would pass every case below."""
-        v, _ = hc._resolver_env_verdict(_REPO / "src" / "workspace_default.py")
-        self.assertEqual(v, "ignores")
+    def test_the_canonical_resolver_does_not_honour_the_env(self):
+        """The canonical file reads `unknown`, and that is the honest verdict.
+
+        It used to read `ignores`, but only because a callee's verdict was
+        dropped when the call was held in a local: the wrapper stores
+        `sutando_config.resolve_workspace()` in `target` and returns it, and
+        that delegate is itself `unknown` (its resolver flows through `get()`).
+        So the old `ignores` was the false clean this analysis exists to refuse.
+        What must hold is that it never reads `honours`.
+        """
+        v, why = hc._resolver_env_verdict(_REPO / "src" / "workspace_default.py")
+        self.assertNotEqual(v, "honours", why)
+        self.assertEqual(v, "unknown", why)
+
+    def test_a_clean_resolver_still_reads_ignores(self):
+        """The positive control the canonical file no longer provides: without
+        it, a detector that answers `unknown` for everything would pass."""
+        d = Path(tempfile.mkdtemp())
+        (d / "workspace_default.py").write_text(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n    return Path(os.getenv('HOME'))\n")
+        self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
+
+    def test_a_delegate_verdict_survives_being_held_in_a_local(self):
+        """keweichen's round-14 finding 2: `t = sib.resolve_workspace(); return t`
+        dropped the callee's verdict, so a dirty delegate read clean."""
+        d = Path(tempfile.mkdtemp())
+        (d / "sutando_config.py").write_text(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.environ['SUTANDO_WORKSPACE'])\n")
+        (d / "workspace_default.py").write_text(
+            "import sutando_config\n"
+            "def resolve_workspace():\n"
+            "    target = sutando_config.resolve_workspace()\n"
+            "    return target\n")
+        v, why = hc._resolver_env_verdict(d / "workspace_default.py")
+        self.assertEqual(v, "honours", why)
+
+    def test_a_clean_delegate_held_in_a_local_stays_ignores(self):
+        """The negative: propagation must not taint every held call."""
+        d = Path(tempfile.mkdtemp())
+        (d / "sutando_config.py").write_text(
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n    return Path('/configured')\n")
+        (d / "workspace_default.py").write_text(
+            "import sutando_config\n"
+            "def resolve_workspace():\n"
+            "    target = sutando_config.resolve_workspace()\n"
+            "    return target\n")
+        self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
+
+    def test_an_alias_that_is_not_os_is_never_trusted(self):
+        """keweichen's round-14 finding 1: `import helper as os` at module scope
+        while a nested `import os` supplies the identity to a file-wide scan."""
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(
+            "import os\ndef getenv(k):\n    return os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "import helper as os\nfrom pathlib import Path\n"
+            "def unrelated():\n    import os\n"
+            "def resolve_workspace():\n    return Path(os.getenv('HOME'))\n")
+        self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "unknown")
 
     def test_a_pre_v08_shape_is_flagged_and_named(self):
         ws = Path(tempfile.mkdtemp())

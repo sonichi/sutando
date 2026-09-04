@@ -9286,39 +9286,29 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     if fn is None:
         return "unknown", "no resolve_workspace() to analyse"
 
-    # Which names PROVABLY are os and its members. A suffix test cannot tell
-    # os.getenv from helper.getenv, and the second is arbitrary code.
-    os_names, getenv_names, environ_names, expandvars_names = set(), set(), set(), set()
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Import):
-            for al in n.names:
-                if al.name == "os":
-                    os_names.add(al.asname or "os")
-        elif isinstance(n, ast.ImportFrom) and n.module in ("os", "posixpath", "os.path"):
-            for al in n.names:
-                bound = al.asname or al.name
-                if al.name == "getenv" and n.module == "os":
-                    getenv_names.add(bound)
-                elif al.name == "environ" and n.module == "os":
-                    environ_names.add(bound)
-                elif al.name == "expandvars":
-                    expandvars_names.add(bound)
+    # Which names PROVABLY are os and its members — from ONE module-scope,
+    # origin-preserving pass, so a name cannot borrow an identity from elsewhere.
+    provable = _import_provenance(tree)
+    if provable is None:
+        return "unknown", "a star import binds names this analysis cannot enumerate"
+
+    def _only(origin) -> set:
+        # Exactly one module-scope import AND it is the origin claimed. A nested
+        # `import os` never reaches here; `import helper as os` fails the origin.
+        return {nm for nm, o in provable.items() if o == [origin]}
+
+    os_names = _only("os")
+    getenv_names = _only("os.getenv")
+    environ_names = _only("os.environ")
+    expandvars_names = (_only("os.path.expandvars") | _only("posixpath.expandvars"))
 
     # Binding revocation is delegated to CPython's OWN symbol table, not enumerated
     # here: six hand-written rounds each shipped a form the next one found.
     rebound = _rebound_names(src)
     if rebound is None:
         return "unknown", "symbol table refused this source"
-    # `ignores` is certified for a PROVEN shape and refused otherwise, rather than
-    # for anything no blacklist has caught yet — the tail is unbounded, the shape is not.
-    provable = _import_provenance(tree)
-    if provable is None:
-        return "unknown", "a star import binds names this analysis cannot enumerate"
-    # Proven == bound by exactly one MODULE-SCOPE import. A nested `import os` does
-    # not prove a module-scope name, and two bindings prove neither.
-    rebound |= {nm for nm, c in provable.items() if c != 1}
-    for s in (os_names, getenv_names, environ_names, expandvars_names):
-        rebound |= {nm for nm in s if nm not in provable}
+    # The trusted sets above are already module-scope and origin-checked, so the
+    # only thing left to revoke is a name symtable saw bound somewhere as well.
     os_names -= rebound
     getenv_names -= rebound
     environ_names -= rebound
@@ -9450,6 +9440,32 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
         """honours/unknown for one function; None means nothing found here."""
         if node.name in seen:
             return None                          # recursion guard
+
+        def delegated(expr, who):
+            """A followed callee's verdict, for ANY expression holding one.
+
+            The return path and the binding fixpoint both need this; when only
+            the return path had it, `t = sibling.resolve_workspace(); return t`
+            lost the callee's verdict — the shape the canonical wrapper uses.
+            """
+            for c in ast.walk(expr):
+                if not isinstance(c, ast.Call):
+                    continue
+                d = _dots(c.func)
+                if d in modfns:
+                    deeper = verdict(modfns[d], seen)
+                    if deeper is not None:
+                        return deeper
+                    continue
+                sib = sibling(d)
+                if sib is not None and sib[1].name == who:
+                    if _hops <= 0:               # budget spent: mutual delegates
+                        return "unknown", (f"{who}() delegates to {d}() beyond "
+                                           f"the one-hop limit")
+                    sub, _ = _resolver_env_verdict(sib[0], _hops - 1)
+                    if sub != "ignores":
+                        return sub, f"{who}() delegates to {d}(), which is {sub}"
+            return None
         seen = seen | {node.name}
         binds = list(mod_binds) + [pair for tgt, val in _bind_sites(node)
                                    for pair in _binding_pairs(tgt, val)]
@@ -9465,9 +9481,12 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
             changed = False
             for name, val in binds:
                 names = [x.id for x in ast.walk(val) if isinstance(x, ast.Name)]
-                env = reads_env(val) or any(x in tainted for x in names)
+                dv = delegated(val, node.name)
+                env = (reads_env(val) or any(x in tainted for x in names)
+                       or (dv is not None and dv[0] == "honours"))
                 unk = (unresolved_call(val) or murky_env_read(val)
-                       or next((murky[x] for x in names if x in murky), None))
+                       or next((murky[x] for x in names if x in murky), None)
+                       or (dv[1] if dv is not None and dv[0] == "unknown" else None))
                 if env and name not in tainted:
                     tainted.add(name); changed = True
                 if unk and name not in murky:
@@ -9482,21 +9501,10 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
             for c in ast.walk(n.value):          # follow calls we can read
                 if not isinstance(c, ast.Call):
                     continue
-                d = _dots(c.func)
-                if d in modfns:
-                    deeper = verdict(modfns[d], seen)
-                    if deeper is not None:
-                        return deeper
-                    continue
-                sib = sibling(d)
-                if sib is not None and sib[1].name == node.name:
-                    if _hops <= 0:               # budget spent: mutual delegates
-                        return "unknown", (f"{node.name}() delegates to {d}() beyond "
-                                           f"the one-hop limit")
-                    sub, _ = _resolver_env_verdict(sib[0], _hops - 1)
-                    if sub != "ignores":
-                        return sub, (f"{node.name}() delegates to {d}(), which is "
-                                     f"{sub}")
+                pass
+            dv = delegated(n.value, node.name)
+            if dv is not None:
+                return dv
             bad = (unresolved_call(n.value) or murky_env_read(n.value)
                    or next((murky[x] for x in names if x in murky), None)
                    or next((f"the unbound name {x}" for x in names
@@ -9550,24 +9558,23 @@ def _walk_outside_functions(node):
 
 
 def _import_provenance(tree):
-    """{name: module-scope import count}, or None if the module star-imports.
+    """{bound name: [origin, ...]} for MODULE-SCOPE imports; None on a star import.
 
-    Scoped to module level on purpose: a nested `import os` is found by a
-    file-wide walk and proves nothing about the name the resolver actually sees.
+    Origin-preserving, because a COUNT cannot certify provenance: `import helper
+    as os` and `import os` are both one module-scope import of the name `os`.
     """
-    counts = {}
+    origins: "dict[str, list]" = {}
     for n in _walk_outside_functions(tree):
         if isinstance(n, ast.Import):
             for al in n.names:
-                nm = al.asname or al.name.split(".")[0]
-                counts[nm] = counts.get(nm, 0) + 1
+                origins.setdefault(al.asname or al.name.split(".")[0], []).append(al.name)
         elif isinstance(n, ast.ImportFrom):
             for al in n.names:
                 if al.name == "*":
                     return None
                 nm = al.asname or al.name
-                counts[nm] = counts.get(nm, 0) + 1
-    return counts
+                origins.setdefault(nm, []).append(f"{n.module}.{al.name}")
+    return origins
 
 
 def _rebound_names(src):
