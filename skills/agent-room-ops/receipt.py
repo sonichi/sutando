@@ -22,6 +22,8 @@ from __future__ import annotations
 CONFIRMED = "confirmed"
 UNCONFIRMED = "unconfirmed"
 FAILED = "failed"
+# The request may have reached the gateway (timeout, transport error): not a no.
+UNKNOWN = "unknown"
 
 
 def event_id_of(parsed) -> str | None:

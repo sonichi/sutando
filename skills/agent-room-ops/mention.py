@@ -21,9 +21,13 @@ import receipt as _receipt
 from relations import RelationError, relation_fields
 
 
-def _result(ok, *, room_id=None, mxid=None, event_id=None, candidates=None, reason=None):
+def _result(ok, *, room_id=None, mxid=None, event_id=None, candidates=None, reason=None,
+            state=None):
+    # Same tri-state as `say` (receipt.py): a caller reading only `ok` cannot
+    # tell a timeout from a refusal, and the two license opposite retries.
     return {"ok": bool(ok), "room_id": room_id, "mxid": mxid, "event_id": event_id,
-            "candidates": candidates or [], "reason": reason}
+            "candidates": candidates or [], "reason": reason,
+            "state": state or (_receipt.CONFIRMED if ok else _receipt.FAILED)}
 
 
 def build_body(mxid: str, message: str) -> str:
@@ -102,7 +106,9 @@ def mention(handle: str, message: str, room_id: str, agent_mxid: str | None = No
     except HTTPError as e:
         return _result(False, room_id=room_id, mxid=mxid, reason=degrade_reason(e.code))
     except (URLError, TimeoutError) as e:
-        return _result(False, room_id=room_id, mxid=mxid, reason=f"network error: {e}")
+        return _result(False, room_id=room_id, mxid=mxid, reason=f"network error: {e}",
+                       state=_receipt.UNKNOWN)
     # Same envelope as `say`, so the same reading — see receipt.py.
     _state, event_id, _reason = _receipt.classify(parsed)
-    return _result(True, room_id=room_id, mxid=mxid, event_id=event_id)
+    return _result(True, room_id=room_id, mxid=mxid, event_id=event_id, reason=_reason,
+                   state=_state)

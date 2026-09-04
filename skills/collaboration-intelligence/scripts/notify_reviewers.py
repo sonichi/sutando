@@ -1498,13 +1498,24 @@ def main() -> int:
             payload = None
         # A non-object payload has no .get and a non-string event_id breaks
         # the slice; an unusable one must not occupy `reason` and hide stderr.
+        state = ""
         if isinstance(payload, dict):
             ok = bool(payload.get("ok"))
             event = str(payload.get("event_id") or "")
             reason = str(payload.get("reason") or "")
+            state = str(payload.get("state") or "")
             fallback = "no reason reported"
         else:
             fallback = "unparseable room_ops output"
+        # The receipt tri-state outranks `ok`: a timeout inside room_ops and a
+        # 200 without an event id both MAY have landed, so the park must hold.
+        if isinstance(payload, dict) and (state == "unknown" or (ok and not event)):
+            detail = reason or ("posted without an event id" if ok else fallback)
+            _settle("unknown", f"room_ops {state or 'unconfirmed'}: {detail[:80]}")
+            print(f"{t['name']}: UNKNOWN outcome ({detail[:80]}) — the post may have "
+                  f"landed; {retry_clause(a.kind)}", file=sys.stderr)
+            unknowns += 1
+            continue
         # room_ops reports refusals in-band: rc 0, empty stderr, ok:false + reason.
         # Printing stderr alone renders every such refusal as a blank line.
         if ok:
