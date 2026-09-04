@@ -636,6 +636,78 @@ class ProvenanceIsBindingAware(unittest.TestCase):
             "    return Path(os.getenv('SUTANDO_WORKSPACE'))\n"), "honours")
 
 
+class BindingRevocationIsNotEnumerated(unittest.TestCase):
+    """Six rounds each shipped a binding form the next round found, so the
+    enumeration itself was the defect. CPython's symbol table is the language's
+    own answer and cannot omit a construct; these cases are evidence of that
+    property, not a list to extend when a seventh form appears."""
+
+    def _v(self, body):
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(
+            "import os\ndef getenv(key):\n"
+            "    return os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(body)
+        return hc._resolver_env_verdict(d / "workspace_default.py")[0]
+
+    def test_a_comprehension_target_is_not_proven(self):
+        """qingyun-wu's round-12 control. An earlier round DELETED the
+        comprehension branch as 'unreachable'; the value escapes via [0]."""
+        self.assertEqual(self._v(
+            "import os, helper\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path([os.getenv('HOME') for os in [helper]][0])\n"), "unknown")
+
+    def test_a_with_as_rebinding_is_not_proven(self):
+        """Never named by any round — covered because symtable covers it."""
+        self.assertEqual(self._v(
+            "import os, helper\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    with open('/x') as os:\n        pass\n"
+            "    return Path(os.getenv('HOME'))\n"), "unknown")
+
+    def test_a_walrus_rebinding_is_not_proven(self):
+        """Likewise never named."""
+        self.assertEqual(self._v(
+            "import os, helper\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path((os := helper).getenv('HOME'))\n"), "unknown")
+
+    def test_colliding_imports_still_revoke(self):
+        """symtable calls both `imported` and neither `assigned`, so imports stay
+        AST-checked — a CLOSED set of two node types, unlike binding forms."""
+        self.assertEqual(self._v(
+            "from os import getenv\nfrom helper import getenv\n"
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(getenv('HOME'))\n"), "unknown")
+
+    def test_a_source_symtable_refuses_is_unknown_not_clean(self):
+        """The refusal must not degrade to an empty set, which reads as clean."""
+        self.assertIsNone(hc._rebound_names("def (:\n"))
+
+    def test_an_unshadowed_import_is_still_proven(self):
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.getenv('HOME'))\n"), "ignores")
+
+    def test_an_alias_binds_the_alias_not_the_module(self):
+        """`env = os.environ` binds env; revoking os here would make every
+        aliasing resolver unanalysable."""
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "env = os.environ\n"
+            "def resolve_workspace():\n"
+            "    return Path(env['HOME'])\n"), "ignores")
+
+    def test_a_real_read_is_still_detected(self):
+        self.assertEqual(self._v(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.environ['SUTANDO_WORKSPACE'])\n"), "honours")
+
+
 class EveryBindingSourceRevokes(unittest.TestCase):
     """Round 10 revoked provenance for imports and _bind_sites; parameters were a
     SECOND enumerator it never consulted, so a parameter default could shadow a

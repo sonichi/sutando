@@ -34,6 +34,7 @@ import shutil
 import tempfile
 import socket
 import subprocess
+import symtable
 import sys
 import time
 import urllib.request
@@ -9256,7 +9257,8 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
     analysis fully resolved; an unresolved call or alias is "unknown", never clean.
     """
     try:
-        tree = ast.parse(path.read_text())
+        src = path.read_text()
+        tree = ast.parse(src)
     except Exception as e:                       # noqa: BLE001 — unparseable is UNKNOWN
         return "unknown", f"could not parse: {str(e)[:60]}"
     modfns = {n.name: n for n in ast.walk(tree)
@@ -9302,12 +9304,24 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                 elif al.name == "expandvars":
                     expandvars_names.add(bound)
 
-    # A trusted name REBOUND anywhere is no longer proven — import, assignment or
-    # parameter default alike. One enumerator: a form left out is a false clean.
-    bound_counts: "dict[str, int]" = {}
-    for nm in _all_bound_names(tree):
-        bound_counts[nm] = bound_counts.get(nm, 0) + 1
-    rebound = {nm for nm, c in bound_counts.items() if c > 1}
+    # Binding revocation is delegated to CPython's OWN symbol table, not enumerated
+    # here: six hand-written rounds each shipped a form the next one found.
+    rebound = _rebound_names(src)
+    if rebound is None:
+        return "unknown", "symbol table refused this source"
+    # symtable calls colliding imports both `imported`, neither `assigned`; unlike
+    # binding forms, imports are a CLOSED set of two node types, so this enumerates.
+    imp_counts: "dict[str, int]" = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                nm = al.asname or al.name.split(".")[0]
+                imp_counts[nm] = imp_counts.get(nm, 0) + 1
+        elif isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                nm = al.asname or al.name
+                imp_counts[nm] = imp_counts.get(nm, 0) + 1
+    rebound |= {nm for nm, c in imp_counts.items() if c > 1}
     os_names -= rebound
     getenv_names -= rebound
     environ_names -= rebound
@@ -9538,40 +9552,28 @@ def _walk_outside_functions(node):
         stack.extend(ast.iter_child_nodes(n))
 
 
-def _all_bound_names(tree):
-    """Every name bound anywhere in the module, once per binding site.
+def _rebound_names(src):
+    """Every name BOUND by something other than an import, per CPython itself.
 
-    One enumerator, so a form modelled for taint but forgotten by revocation
-    cannot leave a shadowed name certified clean. Over-counting only costs an
-    `unknown`; under-counting is the false clean this exists to prevent.
+    symtable is the language's own answer, so no binding construct can be
+    forgotten — comprehension targets, parameters, `except as`, `with as`,
+    walrus, `global`, match captures included. It builds a table; it does not
+    execute the source, which the probe's first property requires.
     """
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Import):
-            for al in n.names:
-                yield al.asname or al.name.split(".")[0]
-        elif isinstance(n, ast.ImportFrom):
-            for al in n.names:
-                yield al.asname or al.name
-        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            yield n.name
-            for nm, _d in _param_binds(n):
-                yield nm
-        elif isinstance(n, ast.Lambda):
-            for nm, _d in _param_binds(n):
-                yield nm
-        elif isinstance(n, ast.ClassDef):
-            yield n.name
-        elif isinstance(n, ast.ExceptHandler) and n.name:
-            yield n.name
-        elif isinstance(n, ast.Global) or isinstance(n, ast.Nonlocal):
-            for nm in n.names:
-                yield nm
-        # `match x: case os:` binds too; ast.MatchAs is 3.10+, so probe by name.
-        elif type(n).__name__ == "MatchAs" and getattr(n, "name", None):
-            yield n.name
-    for tgt, val in _bind_sites(tree):
-        for nm, _v in _binding_pairs(tgt, val):
-            yield nm
+    out = set()
+
+    def walk(tbl):
+        for s in tbl.get_symbols():
+            if s.is_assigned() or s.is_parameter():
+                out.add(s.get_name())
+        for child in tbl.get_children():
+            walk(child)
+
+    try:
+        walk(symtable.symtable(src, "<resolver>", "exec"))
+    except (SyntaxError, ValueError):
+        return None                  # unknown-by-refusal, never an empty clean set
+    return out
 
 
 def _param_binds(fn):
