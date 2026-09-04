@@ -43,11 +43,18 @@ class LoginPrecedenceTests(unittest.TestCase):
         self.assertEqual(login, "sonichi")
         self.assertEqual(why, "key is a login")
 
-    def test_same_actor_as_to_a_nonlogin_falls_back_to_the_key(self):
+    def test_an_unresolvable_same_actor_as_is_KEPT_not_swapped_for_the_key(self):
+        """Owner-stated, so it is not discarded on a probe that answers False.
+
+        This arm previously asserted the opposite. The premise changed: falling
+        back to the key is what routes the gate at a colliding stranger, and
+        `_is_github_user` cannot tell "no such user" from "the probe failed".
+        An unresolvable login reaches `gate_capability` and reports unverified.
+        """
         roster = {"sonichi": {"same_actor_as": "not-a-real-account"}}
         login, why = self.mod._github_login("sonichi", roster)
-        self.assertEqual(login, "sonichi")
-        self.assertEqual(why, "key is a login")
+        self.assertEqual(login, "not-a-real-account")
+        self.assertIn("same_actor_as", why)
 
     def test_roster_gh_wins_over_a_colliding_key(self):
         # `gh` is the documented roster field and is a direct login, so it is
@@ -62,11 +69,11 @@ class LoginPrecedenceTests(unittest.TestCase):
         login, _ = self.mod._github_login("yixuan", roster)
         self.assertEqual(login, "yixuan-ag2")
 
-    def test_a_gh_that_is_not_a_login_falls_through(self):
+    def test_an_unresolvable_gh_is_KEPT_not_swapped_for_the_key(self):
         roster = {"sonichi": {"gh": "no-such-account"}}
         login, why = self.mod._github_login("sonichi", roster)
-        self.assertEqual(login, "sonichi")
-        self.assertEqual(why, "key is a login")
+        self.assertEqual(login, "no-such-account")
+        self.assertEqual(why, "roster gh -> no-such-account")
 
     def test_the_github_spelling_resolves_exactly_like_gh(self):
         # Both spellings are deployed in ONE live roster file (5 `gh`, 2
@@ -76,11 +83,11 @@ class LoginPrecedenceTests(unittest.TestCase):
         self.assertEqual(login, "yixuan-ag2")
         self.assertIn("github", why)
 
-    def test_a_github_that_is_not_a_login_falls_through(self):
+    def test_an_unresolvable_github_is_KEPT_not_swapped_for_the_key(self):
         roster = {"sonichi": {"github": "no-such-account"}}
         login, why = self.mod._github_login("sonichi", roster)
-        self.assertEqual(login, "sonichi")
-        self.assertEqual(why, "key is a login")
+        self.assertEqual(login, "no-such-account")
+        self.assertEqual(why, "roster github -> no-such-account")
 
     def test_gh_wins_when_a_row_carries_BOTH_spellings(self):
         """Deterministic, so the two readers cannot pick different answers."""
@@ -102,6 +109,32 @@ class LoginPrecedenceTests(unittest.TestCase):
         login, why = self.mod._github_login("sonichi", {"sonichi": "yixuan-ag2"})
         self.assertEqual(login, "sonichi")
         self.assertEqual(why, "key is a login")
+
+    def test_a_TRANSIENT_probe_failure_does_not_route_at_the_colliding_key(self):
+        """The reviewer's repro: mapped login probes False, colliding key True.
+
+        `_is_github_user` collapses timeout, nonzero rc and definitive absence
+        into one False, so a network blip on the explicit login used to select
+        the stranger — and if that stranger holds write, the gate certifies it.
+        """
+        calls = []
+
+        def two_result_stub(login):
+            calls.append(login)
+            return login == "yixuan"      # the unrelated real account
+
+        self.mod._is_github_user = two_result_stub
+        login, why = self.mod._github_login("yixuan", {"yixuan": {"gh": "yixuan-ag2"}})
+        self.assertEqual(login, "yixuan-ag2")
+        self.assertIn("gh", why)
+
+    def test_an_explicit_identity_is_never_PROBED(self):
+        """Structural, not behavioural: no probe means no transient to lose to."""
+        calls = []
+        self.mod._is_github_user = lambda l: calls.append(l) or True
+        self.mod._github_login("yixuan", {"yixuan": {"gh": "yixuan-ag2"}})
+        self.mod._github_login("kewei", {"kewei": {"same_actor_as": "keweichen"}})
+        self.assertEqual(calls, [], f"owner-stated identity was probed: {calls}")
 
     def test_neither_resolves(self):
         login, why = self.mod._github_login("stand-handle", {"stand-handle": {}})
