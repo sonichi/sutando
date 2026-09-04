@@ -8329,6 +8329,7 @@ def check_task_watcher() -> dict:
                 # so naming it restores Stop-hook cleanup without the restart.
                 return {"name": name, "status": "warn",
                         "_sentinel_restamp_pid": roots[0],
+                        "_sentinel_restamp_path": str(pid_file),
                         "detail": f"watcher pid {roots[0]} runs under a live session "
                                   f"(ppid {parents[roots[0]]}) but wrote no PID "
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
@@ -8352,9 +8353,9 @@ def check_task_watcher() -> dict:
             continue
         sargv = _proc_argv(spid)
         if not sargv:
-            dead_pids.append(spid)
+            dead_pids.append((spid, sp))
         elif "watch-tasks-stream" not in sargv:
-            reused.append((spid, sargv))
+            reused.append((spid, sargv, sp))
         else:
             live[spid] = sp
 
@@ -8365,10 +8366,10 @@ def check_task_watcher() -> dict:
         if reused and not dead_pids:
             # PID reuse: the sentinel outlived the watcher and the OS handed the
             # number to something else. `kill -0` alone would call this alive.
-            rpid, rargv = reused[0]
+            rpid, rargv, _rsp = reused[0]
             return {"name": name, "status": "warn",
                     "detail": f"pid {rpid} is not the watcher (PID reuse): {rargv[:60]}"}
-        pid = dead_pids[0] if dead_pids else 0
+        pid = dead_pids[0][0] if dead_pids else 0
         if roots:
             # A dead sentinel does NOT mean nothing drains tasks/ — restarting
             # here is what makes the duplicates.
@@ -8388,6 +8389,24 @@ def check_task_watcher() -> dict:
                           f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
                           f"more than once. Keep the tracked one(s) ({keep}), stop the rest"}
     alive = ", ".join(str(p) for p in sorted(live))
+    # An anomaly belongs to the instance whose sentinel carries it, so a live
+    # PEER is not evidence about a crashed one and must not discard its record.
+    faults = []
+    if dead_pids:
+        faults.append("crashed: " + ", ".join(
+            f"{sp.name} (pid {spid} dead)" for spid, sp in dead_pids))
+    if reused:
+        faults.append("PID reuse: " + ", ".join(
+            f"{sp.name} (pid {spid} is {sargv[:32]})" for spid, sargv, sp in reused))
+    if unreadable:
+        faults.append("unreadable: " + ", ".join(
+            f"{sp.name} ({err})" for sp, err in unreadable))
+    if faults:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(live)} watcher(s) alive (pids {alive}), but "
+                          f"{len(dead_pids) + len(reused) + len(unreadable)} sentinel(s) name no "
+                          f"live watcher — {'; '.join(faults)}. Each is a separate instance's "
+                          "record; a live peer does not clear it"}
     if len(live) == 1:
         return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
     return {"name": name, "status": "ok",
@@ -8680,7 +8699,12 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     pid = str(check.get("_sentinel_restamp_pid") or "")
     if not pid.isdigit():
         return "no re-stampable watcher pid"
-    pid_file = watcher_sentinel_path(WORKSPACE_DIR / "state")
+    # The CHECK's path, not this process's ambient one: the two resolve from the
+    # environment and a repair that re-derives it can stamp another instance.
+    target = check.get("_sentinel_restamp_path")
+    if not target:
+        return "check named no sentinel path — not re-stamped"
+    pid_file = Path(target)
     # Re-measure before writing: the check ran earlier, and this file is what
     # the Stop hook kills.
     if not _is_watcher_argv(_proc_argv(int(pid))):

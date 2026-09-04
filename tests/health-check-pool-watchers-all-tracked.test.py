@@ -84,14 +84,74 @@ class PoolHost(unittest.TestCase):
         self.assertIn("888", r["detail"])
         self.assertIn("Keep the tracked one(s) (200)", r["detail"])
 
-    def test_a_dead_sentinel_beside_a_live_one_does_not_warn(self):
-        """A worker that exited leaves its file; the rest are still correct."""
+    def test_a_dead_sentinel_beside_a_live_one_still_warns(self):
+        """A clean exit REMOVES the sentinel (the cleanup trap), so a file that
+        outlives its pid is a crash — and a live peer is a different instance,
+        not evidence about this one.
+
+        This assertion used to read `does_not_warn`, on the rationale that "a
+        worker that exited leaves its file". That contradicts the probe's own
+        docstring, and it pinned the false green rather than catching it.
+        """
         argv = lambda pid: "" if str(pid) == "100" else WATCHER_ARGV  # noqa: E731
         r = run({"watch-tasks-stream.pid": "100\n",
                  "watch-tasks-stream-worker-1.pid": "200\n"},
                 {"200": {"200"}}, argv=argv)
-        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertEqual(r["status"], "warn", r["detail"])
         self.assertIn("200", r["detail"])
+        self.assertIn("100", r["detail"])
+        self.assertIn("watch-tasks-stream.pid", r["detail"])
+
+    def test_a_reused_pid_beside_a_live_one_still_warns(self):
+        argv = lambda pid: ("/usr/bin/python3 unrelated" if str(pid) == "300"  # noqa: E731
+                            else WATCHER_ARGV)
+        r = run({"watch-tasks-stream.pid": "300\n",
+                 "watch-tasks-stream-worker-1.pid": "200\n"},
+                {"200": {"200"}}, argv=argv)
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("PID reuse", r["detail"])
+
+    def test_an_unreadable_sentinel_beside_a_live_one_still_warns(self):
+        r = run({"watch-tasks-stream.pid": "not-a-pid\n",
+                 "watch-tasks-stream-worker-1.pid": "200\n"},
+                {"200": {"200"}})
+        self.assertEqual(r["status"], "warn", r["detail"])
+        self.assertIn("unreadable", r["detail"])
+
+    def test_a_clean_pool_is_still_ok(self):
+        """The negative control for the three above: nothing anomalous, no warn."""
+        r = run({"watch-tasks-stream.pid": "200\n",
+                 "watch-tasks-stream-worker-1.pid": "201\n"},
+                {"200": {"200"}, "201": {"201"}})
+        self.assertEqual(r["status"], "ok", r["detail"])
+
+    def test_the_repair_writes_the_path_the_check_resolved(self):
+        """`fix_task_watcher_sentinel` used to re-derive the path from its own
+        environment, so a repair could stamp a different instance's file than
+        the one the check found missing."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "watch-tasks-stream-worker-9.pid"
+            # WORKSPACE_DIR is pinned inside the tempdir so a regression that
+            # re-derives the ambient path cannot reach a real workspace.
+            saved = (hc._proc_argv, hc._is_watcher_argv, hc.WORKSPACE_DIR)
+            try:
+                hc._proc_argv = lambda pid: WATCHER_ARGV
+                hc._is_watcher_argv = lambda argv: True
+                hc.WORKSPACE_DIR = Path(td) / "ws"
+                out = hc.fix_task_watcher_sentinel(
+                    {"_sentinel_restamp_pid": "4242",
+                     "_sentinel_restamp_path": str(target)})
+            finally:
+                (hc._proc_argv, hc._is_watcher_argv, hc.WORKSPACE_DIR) = saved
+            self.assertTrue(target.exists(), out)
+            self.assertFalse((Path(td) / "ws").exists(),
+                             "the repair touched the ambient workspace")
+            self.assertEqual(target.read_text().strip(), "4242")
+
+    def test_the_repair_refuses_when_the_check_named_no_path(self):
+        out = hc.fix_task_watcher_sentinel({"_sentinel_restamp_pid": "4242"})
+        self.assertIn("no sentinel path", out)
 
     def test_all_sentinels_dead_with_watchers_running_keeps_the_old_verdict(self):
         r = run({"watch-tasks-stream.pid": "100\n"}, {"777": {"777"}}, argv="")
