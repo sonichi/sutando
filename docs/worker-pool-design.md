@@ -187,10 +187,27 @@ record**, so removing the record does not remove it.
 HEARTBEAT — not a new timer.** Every process already beats every 30s, and the beat is
 one of the two periodic things a pool has, so this adds work to an existing tick
 rather than a mechanism the "workers are task-only" rule would forbid. On its own
-tick each instance re-runs the routing rule for any task addressed to it that is
-still unclaimed and older than one beat interval; the ordinary claim then arbitrates
-whoever wakes. A suppress/suppress pair therefore costs one beat of latency instead
-of stranding the task, in step 2 and step 3 alike. That IS a step-2 prerequisite, and
+tick each instance re-lists the pending task directory, re-runs the routing rule
+over what it finds, and claims what it is now the candidate for; the ordinary claim
+arbitrates whoever wakes. A suppress/suppress pair therefore costs one beat of
+latency instead of stranding the task, in step 2 and step 3 alike.
+
+**It IS a scan, and an earlier revision claimed otherwise to make it sound cheaper.**
+"Only tasks addressed to me" is not enumerable: `requested_worker` and the room id
+live INSIDE flat task files, the pin is mutable, and suppression leaves no receipt —
+so after a repin, no event tells the new target that an existing file now addresses
+it. It can learn that only by looking. The same argument binds the CORE harder: a
+dead worker emits no further beat, so the core's tick must consider tasks addressed
+ELSEWHERE and apply the stale-target fallthrough, which is by definition not
+"addressed to me".
+
+The cost is the one production already pays. `watch-tasks-stream.sh:639-645` lists
+`tasks/*.txt` at every startup for exactly this reason — a restart gap leaves files
+no event will re-announce — so a per-beat re-list is that same sweep on a 30s tick,
+not a new capability. It is bounded by the PENDING directory, which is small by
+construction because tasks are consumed and archived promptly (measured on this host
+while writing: 1 pending against 8,442 archived). If that ever stops holding, the
+answer is an index, and the index is what this section would then owe. That IS a step-2 prerequisite, and
 it is written into the step-2 list rather than asserted to be there — an earlier
 revision asserted a listing it never made.
 
@@ -649,13 +666,20 @@ with its own reason.
    suppress/suppress pair from stranding a task: each instance re-runs the routing
    rule ON ITS OWN HEARTBEAT TICK** for any task addressed to it that is still
    unclaimed and older than one beat interval. Not a new timer — the beat already
-   exists in every process and is one of the two periodic things a pool has — and
-   not a scan of the queue: only tasks this instance is a candidate for. Production
-   scans once at startup and then reacts to Created/Renamed events only
-   (`src/watch-tasks-stream.sh:639-702`), and suppression creates neither, so
-   without this every zero-candidate schedule is terminal. Its suite pins BOTH
-   reverse orders: the beat crossing stale between the core's read and the
-   target's, and the pin swapping between two workers' reads.
+   exists in every process and is one of the two periodic things a pool has — and it
+   IS a re-list of the pending directory, not a filtered walk of "tasks addressed to
+   me": that set is not enumerable without looking, since the fields that address a
+   task live inside the file and the pin can change after the file lands. The core's
+   tick additionally considers tasks addressed elsewhere, because a dead worker emits
+   no beat and someone must apply the stale-target fallthrough. Production scans once
+   at startup and then reacts to Created/Renamed events only
+   (`src/watch-tasks-stream.sh:639-702`), and suppression creates neither, so without
+   this every zero-candidate schedule is terminal; the per-beat re-list is that same
+   startup sweep on a tick, bounded by a pending directory that is small by
+   construction. Its suite pins BOTH reverse orders — the beat crossing stale between
+   the core's read and the target's, and the pin swapping between two workers' reads —
+   and a repin-after-suppress case, where no event is generated and only the re-list
+   finds the task.
 
    **Not a prerequisite PR, a
    requirement on step 2's own code:** the eligibility reader matches both
