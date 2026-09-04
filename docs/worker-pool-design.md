@@ -112,6 +112,54 @@ timer, so no `proactive-loop-pool` skill ships.
 | resume after host sleep | router | beats return | a host sleep is not N dead workers; the router waits for beats before reclaiming (#3782) |
 | death of a worker | router | beat stale past the window | its assignments come back to the queue within about a minute; the router kickstarts the plist; nothing is lost silently |
 
+## Order of assignment
+
+The router assigns unassigned tasks in priority order, `urgent > normal > low`
+(`src/task_priority.py`'s contract), and within a priority oldest first by
+mtime. This is the one scheduling rule leaderless claiming could never honor
+and the reason a router exists at all; it is carried from #3604 unchanged.
+
+## What the router and the operator read to judge a worker
+
+A worker's heartbeat is bound to its process, not to its usefulness: it keeps
+beating with dead credentials, and a Codex worker's beat is a sidecar of the
+pane pid. So `.alive` answers only "is the process up". The signal for "is it
+working" is **assigned-but-unclaimed age**, and the router's stuck-assignment
+reclaim is what acts on it. Classifying a worker that stopped, carried from
+#3604's operations section:
+
+| symptom | class | action |
+|---|---|---|
+| auth errors, `401`, expired credentials | auth state, per process | recycle that worker (`launchctl kickstart -k`); a re-login elsewhere reaches only newly started processes |
+| timeouts, 5xx | transport | back off and retry; do not touch the session |
+| beat fresh, assignments sit unclaimed | hung session | the router's stuck reclaim repools the work; the kick script un-wedges an idle prompt |
+| no tmux session | dead | the router's reconcile kickstarts the plist |
+
+**Codex workers have no in-session task watcher.** A Codex worker learns of an
+assignment only when something types the pool entry at it, so its worst-case
+claim latency is the sweep interval, not the sub-second watcher latency a
+Claude worker gets, and one wedged inside a turn reads as healthy. v1 states
+this as a known limit of Codex workers rather than pretending the task-only,
+watcher-driven rule covers them; a Codex-side notifier is its own later PR.
+
+## The durable record of pool timing
+
+`finish_task` appends one line per completed task to `data/pool-metrics.jsonl`
+(`task_id`, worker, `source`, `arrived_at`, `finished_at`, `duration_s`);
+arrival is the claimed file's mtime, which survives the renames. Result files
+are deleted on delivery and archive mtimes are arrival times, so without this
+file "did anything wait on a busy worker" is unanswerable afterwards. It is the
+only measurement the router's saturation report and any later scaling decision
+can rest on, so it ships with the router PR, not with metrics later.
+
+## Registry touchpoints
+
+A worker registers with `role: "worker"` and `pool: <name>` in its instance
+manifest; the router discovers workers through the registry, never by
+scanning plists. `start_instance` injects manifest identity, so a worker never
+inherits the actor identity of whatever created it, and `sutando list` shows
+the pool for free once the manifests exist.
+
 ## Per-worker model
 
 At creation the owner may choose each worker's model, and may change it in
@@ -145,4 +193,8 @@ base after step 3.
 
 Auto-scale in either direction; fan-out; burst consolidation for `[deduped:]`;
 router-minted task ids (the admission / census gap stays its own track, and
-bridges keep minting ids as they do today).
+bridges keep minting ids as they do today); idle-timeout rebalancing and the
+channel-affinity freshness gate (rooms bind only by pin, so there is nothing to
+rebalance); lane routing. Install troubleshooting (TCC under `~/Documents`,
+config-dir capture, error-log marks) and `--only-core` / uninstall semantics
+belong to the installer PR's own doc.
