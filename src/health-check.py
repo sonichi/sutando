@@ -20,6 +20,7 @@ Checks:
   - Notes directory
 """
 
+import ast
 import functools
 import hashlib
 import fnmatch
@@ -9232,64 +9233,119 @@ def _file_digest(path: Path) -> str:
         return f"<unreadable:{path}>"
 
 
+def _resolver_env_verdict(path: "Path") -> "tuple[str, str]":
+    """(verdict, why) for one workspace_default copy, WITHOUT importing it.
+
+    Verdicts: "honours" / "ignores" / "unknown". Static because detection must not
+    execute discovered source — a subprocess is failure isolation, not a security
+    boundary, and any checked-out skill could run import-time code otherwise.
+    """
+    try:
+        tree = ast.parse(path.read_text())
+    except Exception as e:                       # noqa: BLE001 — unparseable is UNKNOWN
+        return "unknown", f"could not parse: {str(e)[:60]}"
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == "resolve_workspace"), None)
+    if fn is None:
+        return "unknown", "no resolve_workspace() to analyse"
+
+    def reads_env(node) -> bool:
+        """os.environ.get("SUTANDO_WORKSPACE") or os.environ["SUTANDO_WORKSPACE"]."""
+        for n in ast.walk(node):
+            if isinstance(n, ast.Subscript) and _dots(n.value).endswith("environ"):
+                if _const_str(n.slice) == "SUTANDO_WORKSPACE":
+                    return True
+            if isinstance(n, ast.Call) and _dots(n.func).endswith("environ.get"):
+                if n.args and _const_str(n.args[0]) == "SUTANDO_WORKSPACE":
+                    return True
+        return False
+
+    tainted, changed = set(), True
+    while changed:                               # tiny fixpoint over local aliases
+        changed = False
+        for n in ast.walk(fn):
+            if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
+                src = reads_env(n.value) or any(
+                    isinstance(x, ast.Name) and x.id in tainted
+                    for x in ast.walk(n.value))
+                if not src:
+                    continue
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                    if isinstance(t, ast.Name) and t.id not in tainted:
+                        tainted.add(t.id); changed = True
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Return) and n.value is not None:
+            if reads_env(n.value) or any(isinstance(x, ast.Name) and x.id in tainted
+                                         for x in ast.walk(n.value)):
+                return "honours", f"a return in resolve_workspace() derives from the env (line {n.lineno})"
+    return "ignores", "no return derives from $SUTANDO_WORKSPACE"
+
+
+def _dots(node) -> str:
+    """Dotted name for Attribute/Name chains; '' for anything else."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr); node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _const_str(node) -> "str | None":
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
 def check_vendored_resolver_env(workspace_dir: "Path | None" = None) -> "dict | None":
     """A vendored `workspace_default` that still honours $SUTANDO_WORKSPACE.
 
-    v0.8 (#1440) removed that env var as a workspace source. A copy predating the
-    change returns the env's value, so two resolvers disagree only when the env is
-    set — silently, and only for whoever imports the stale copy. Measured
-    2026-09-04: wire-skill's copy resolved to the pre-v0.8 legacy tree and
-    peg-signal output had been landing there since 08-16.
+    v0.8 (#1440) removed that env var as a workspace source, so a copy predating
+    the change resolves elsewhere than every v0.8 consumer whenever it is set.
 
-    Deliberately a BEHAVIOUR probe, not a diff against src. That night's census
-    found 17 same-named vendored files and 3 content-drifted, of which one was
-    defective: `sparrowd.py` is two files by design and `send_allowlist.py`'s copy
-    uses package-internal paths on purpose. Hash-comparing names would flag 3 to
-    catch 1, and a gate that cries wolf gets ignored.
+    STATIC ONLY. An earlier draft imported each discovered copy in a subprocess;
+    qingyun-wu showed that executes arbitrary checked-out source with the health
+    check's environment. Nothing here runs the files it inspects.
+
+    Three-valued on purpose: a copy that cannot be analysed is `unknown`, never
+    folded into a clean bill — an unmeasured offender is the case this exists for.
     """
     name = "vendored-resolver-env"
     ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
     roots = [ws / "skill-repos", REPO_DIR / "packages", REPO_DIR / "skills"]
     canonical = (REPO_DIR / "src" / "workspace_default.py").resolve()
-    copies = []
+    copies, roots_seen = [], [str(r) for r in roots if r.is_dir()]
     for root in roots:
         if not root.is_dir():
             continue
         for f in root.rglob("workspace_default.py"):
-            if ".git" in f.parts or f.resolve() == canonical:
-                continue
-            copies.append(f)
-    roots_seen = [str(r) for r in roots if r.is_dir()]
+            if ".git" not in f.parts and f.resolve() != canonical:
+                copies.append(f)
     if not copies:
-        # NOT None. A silent absence cannot be told from a scan that looked in the
-        # wrong place — the vacuous-green shape this probe exists to catch.
         return {"name": name, "status": "ok",
                 "detail": f"no vendored workspace_default under {len(roots_seen)} "
                           f"root(s) ({', '.join(roots_seen) or 'none present'}) — "
                           "zero copies scanned, so this is coverage, not a clean bill"}
-    bogus = "/tmp/sutando-healthcheck-not-the-workspace"
-    probe_src = ("import sys; sys.path.insert(0, %r)\n"
-                 "from workspace_default import resolve_workspace\n"
-                 "print(resolve_workspace())\n")
-    offenders = []
+    honours, unknown = [], []
     for f in sorted(set(copies)):
-        env = dict(os.environ, SUTANDO_WORKSPACE=bogus)
-        try:
-            r = subprocess.run([sys.executable, "-c", probe_src % str(f.parent)],
-                               capture_output=True, text=True, env=env, timeout=30)
-        except Exception:                 # noqa: BLE001 — a probe must not raise
-            continue
-        if r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == [bogus]:
-            offenders.append(str(f))
-    if not offenders:
-        return {"name": name, "status": "ok",
-                "detail": f"{len(set(copies))} vendored resolver(s), none honour "
-                          "$SUTANDO_WORKSPACE"}
-    return {"name": name, "status": "warn",
-            "detail": f"{len(offenders)} vendored workspace_default still honour(s) "
-                      f"$SUTANDO_WORKSPACE, removed in v0.8 — it resolves elsewhere "
-                      f"than every v0.8 consumer whenever that env is set: "
-                      + ", ".join(offenders)}
+        verdict, why = _resolver_env_verdict(f)
+        if verdict == "honours":
+            honours.append(f"{f} ({why})")
+        elif verdict == "unknown":
+            unknown.append(f"{f} ({why})")
+    if honours:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(honours)} vendored workspace_default still honour(s) "
+                          f"$SUTANDO_WORKSPACE, removed in v0.8: " + "; ".join(honours)
+                          + (f" · {len(unknown)} more could not be analysed: "
+                             + "; ".join(unknown) if unknown else "")}
+    if unknown:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(unknown)} of {len(set(copies))} vendored resolver(s) "
+                          "could NOT be analysed, so this is not a clean bill: "
+                          + "; ".join(unknown)}
+    return {"name": name, "status": "ok",
+            "detail": f"{len(set(copies))} vendored resolver(s), all analysed, "
+                      "none honour $SUTANDO_WORKSPACE"}
 
 
 def check_legacy_notes_divergence() -> "dict | None":
