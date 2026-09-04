@@ -10,11 +10,14 @@ evidence about the operation at all.
 
 Run: python3 tests/anchored-edit.test.py
 """
+import contextlib
 import importlib.util
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -75,6 +78,83 @@ class AnchoredEdit(unittest.TestCase):
                                        "--allow-multi", "--count", "3")
         self.assertEqual(rc, 2)
         self.assertEqual(text, "x x")
+
+
+class AtomicReplacement(unittest.TestCase):
+    """qingyun-wu, 2026-09-04: write_text() truncates the live target, and a
+    read-back compared against `before` passes on ANY different content --
+    including a concurrent writer's. Both halves are tested here."""
+
+    def _tmp(self, body):
+        d = Path(tempfile.mkdtemp())
+        f = d / "target.txt"
+        f.write_text(body)
+        return f
+
+    def test_a_failed_write_retains_the_original_and_prints_no_receipt(self):
+        f = self._tmp("alpha beta")
+        with unittest.mock.patch.object(ae, "_atomic_write",
+                                        side_effect=OSError("ENOSPC")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = ae.main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(f.read_text(), "alpha beta",
+                         "a failed write must leave the original intact")
+        self.assertEqual(buf.getvalue(), "", "no success receipt on a failed write")
+
+    def test_content_that_is_merely_DIFFERENT_does_not_satisfy_the_receipt(self):
+        """The measured hole: comparing the re-read against `before` accepts a
+        concurrent writer's bytes as proof that MY edit landed."""
+        f = self._tmp("alpha beta")
+
+        def _clobber(path, text):
+            path.write_text("something another writer put here")
+
+        with unittest.mock.patch.object(ae, "_atomic_write", side_effect=_clobber):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = ae.main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 2, "different-from-before is not proof the edit landed")
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_the_target_is_never_truncated_in_place(self):
+        """No window exists in which the target is empty: the temp sibling
+        carries the new bytes and os.replace swaps them in one step."""
+        f = self._tmp("alpha beta")
+        seen = []
+        real = ae.os.replace
+
+        def _spy(src, dst):
+            seen.append(Path(dst).read_text())   # the target, just before the swap
+            return real(src, dst)
+
+        with unittest.mock.patch.object(ae.os, "replace", side_effect=_spy):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = ae.main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, ["alpha beta"],
+                         "the target still held its ORIGINAL bytes at swap time")
+        self.assertEqual(f.read_text(), "alpha gamma")
+
+    def test_mode_is_preserved_across_the_replace(self):
+        f = self._tmp("alpha beta")
+        f.chmod(0o640)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = ae.main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(f.stat().st_mode & 0o777, 0o640)
+
+    def test_no_temp_sibling_survives_a_failure(self):
+        f = self._tmp("alpha beta")
+        with unittest.mock.patch.object(ae.os, "replace", side_effect=OSError("boom")):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = ae.main([str(f), "--old", "beta", "--new", "gamma"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(f.read_text(), "alpha beta")
+        self.assertEqual([q.name for q in f.parent.iterdir()], ["target.txt"],
+                         "a failed replace must not leave a temp file behind")
 
 
 if __name__ == "__main__":

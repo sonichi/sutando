@@ -23,7 +23,10 @@ Usage:
     anchored-edit.py FILE --old TEXT --new TEXT
 """
 import argparse
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -42,6 +45,25 @@ def apply_edit(text: str, old: str, new: str, allow_multi: bool = False):
         raise ValueError("old == new: the edit is a no-op")
     return (text.replace(old, new) if allow_multi
             else text.replace(old, new, 1)), n
+
+
+def _atomic_write(p: Path, text: str) -> None:
+    """Replace p's contents or leave them untouched — never a truncated middle.
+
+    write_text() truncates the live file first, so an interrupted or short
+    write destroys the original. A sibling temp + fsync + os.replace cannot.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        shutil.copymode(p, tmp)
+        os.replace(tmp, p)          # atomic within a filesystem
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def main(argv=None) -> int:
@@ -74,13 +96,17 @@ def main(argv=None) -> int:
         print(f"anchored-edit: REFUSED — anchor occurs {n} times, --count said {a.count}",
               file=sys.stderr)
         return 2
-    p.write_text(after)
+    try:
+        _atomic_write(p, after)
+    except OSError as e:
+        print(f"anchored-edit: REFUSED — write failed, original retained: {e}", file=sys.stderr)
+        return 2
 
-    # Read the file BACK. A receipt computed from `after` would still print if
-    # the write silently failed; this one cannot exist unless the bytes landed.
+    # Must equal `after` EXACTLY: comparing against `before` only proves
+    # something changed, which a concurrent writer's content also satisfies.
     reread = p.read_text()
-    if reread == before:
-        print("anchored-edit: REFUSED — the file is unchanged after the write",
+    if reread != after:
+        print("anchored-edit: REFUSED — the file on disk is not what this edit computed",
               file=sys.stderr)
         return 2
     print(f"anchored-edit: {p} — anchor matched {n}x, "
