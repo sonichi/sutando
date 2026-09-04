@@ -53,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # bends here rather than the guard.
 from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
+from core_heartbeat import _argv_names_session  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, channel_access_path, claude_home_path, claude_project_slug, legacy_dotted_workspace, shared_personal_path  # noqa: E402
@@ -8271,6 +8272,197 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
     return trees
 
 
+#: A core session is the main core's (env-overridable) or a pool follower's
+#: `core-<N>`; every other session on these sockets is a user shell.
+_POOL_SESSION_RE = re.compile(r"^core-\d+$")
+
+
+def _is_core_session(name: str) -> bool:
+    main = os.environ.get("SUTANDO_TMUX_SESSION", "sutando-core")
+    return name == main or bool(_POOL_SESSION_RE.match(name))
+
+
+def _is_core_launcher_argv(argv: str, session: str) -> bool:
+    """True iff this pane's ROOT argv carries identity a LAUNCHER authored.
+
+    A runtime BASENAME is not identity. `claude --resume user-work`, preserved
+    as a sibling inside the canonical session by the G10 heal, is a `claude`
+    process too — and accepting it conferred core ownership on any watcher it
+    parented, blessing a hand-started duplicate and handing it a sentinel
+    re-stamp (review-caught, keweichen on #3328).
+
+    Exact-match policy has ONE owner: `core_heartbeat._argv_names_session`,
+    already hardened so `--name sutando-core` does not match the prefixed
+    sibling session `sutando-core-watcher`.
+
+    What this deliberately does NOT verify, and why that is safe: no launcher
+    that starts a `core-<N>` pool pane exists on this base (`git grep -l
+    proactive-loop-pool` -> 0; `scripts/pool-core-wrapper.sh` absent from
+    origin/main and from this head — it ships with the unmerged pool series and
+    is staged to ~/.sutando/bin at install). A Codex core carries no `--name`
+    either. Both therefore fall to `unverified`, which is neither stopped nor
+    re-stamped: the caller gates its affirmative verdict on `not orphaned and
+    not unverified` and its fallback names ONLY the ownerless roots. That is a
+    strictly safer degradation than the pre-fix verdict this probe removes,
+    which named every extra root as "stop the rest".
+    """
+    return _argv_names_session(argv, session)
+
+
+def _argv_by_pid(ps_out: "str | None") -> "dict | None":
+    """pid -> argv from a `pid ppid args` snapshot, or None if ps did not run.
+
+    None must not collapse into an empty map: an empty map verifies no pane, so
+    every watcher falls to `unverified` on a host whose `ps` merely timed out.
+    """
+    if ps_out is None:
+        return None
+    out: dict = {}
+    for line in ps_out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 3 and parts[0].isdigit():
+            out[parts[0]] = parts[2]
+    return out
+
+
+def _core_pane_pids(stdout: str, argv_by_pid: dict) -> set:
+    """Core-session pane pids whose argv carries LAUNCHER-authored identity.
+
+    The session name alone is not ownership. The Claude launcher deliberately
+    PRESERVES sibling windows inside the core session when the core window dies
+    (`src/agent/claude/cli/start-cli.sh`, the G10 heal), so an ordinary shell
+    pane legitimately sits in the canonical session — and would otherwise confer
+    core ownership on any watcher it happens to parent, blessing a hand-started
+    duplicate as a pool member.
+    """
+    pids = set()
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit() and _is_core_session(parts[0]):
+            if _is_core_launcher_argv(argv_by_pid.get(parts[1], ""), parts[0]):
+                pids.add(parts[1])
+    return pids
+
+
+def _local_core_pids() -> "set | None":
+    """PIDs of core sessions on THIS host, or None if that cannot be determined.
+
+    Scoped to sessions a Sutando launcher created. An unscoped census admits
+    every tmux pane on the host, so any user shell would confer ownership on a
+    watcher it happens to parent — which reports a stray duplicate as legitimate.
+
+    Deliberately NOT from `state/cores/*.alive`: nothing prunes a record whose
+    host LABEL has since changed, so that directory accumulates stale files from
+    this same machine, and a recycled pid in one of them names a live unrelated
+    process (measured: three labels, one heartbeat pid; a fourth naming a pid
+    dead since June). tmux is asked live, so it cannot go stale this way.
+    """
+    argv_by_pid = _argv_by_pid(_ps_snapshot())
+    if argv_by_pid is None:
+        return None          # ps did not run: unknown, never "no cores here"
+    pids, saw_any = set(), False
+    fmt = "#{session_name} #{pane_pid}"
+    try:
+        done = subprocess.run([_resolve_tmux_bin(), "list-panes", "-a", "-F", fmt],
+                              env=_resolve_launch_env(), capture_output=True,
+                              text=True, timeout=10)
+        if done.returncode == 0:
+            saw_any = True
+            pids.update(_core_pane_pids(done.stdout, argv_by_pid))
+    except Exception:  # noqa: BLE001
+        pass
+    # The pool runs on tmux's DEFAULT socket; the main core runs on the runtime
+    # one. Miss it and that core's own watcher is unverifiable, not owned.
+    for sock in {os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
+                 _local_core_socket()}:
+        if not sock:
+            continue
+        done = _run_tmux(sock, "list-panes", "-a", "-F", fmt)
+        if done is not None and done.returncode == 0:
+            saw_any = True
+            pids.update(_core_pane_pids(done.stdout, argv_by_pid))
+    return pids if saw_any else None
+
+
+def _full_parent_map(ps_out: "str | None") -> dict:
+    """pid -> ppid for EVERY process, not just watchers.
+
+    `_watcher_trees` maps watchers only, so a tree root's ancestors above the
+    spawning shell are invisible to it — and that is exactly where a core
+    session sits.
+    """
+    out: dict = {}
+    for line in (ps_out or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            out[parts[0]] = parts[1]
+    return out
+
+
+def _ancestry(pid: str, parents: dict, limit: int = 64) -> list:
+    """Ancestors of `pid`, nearest first, stopping at init/unknown/cycle."""
+    seen, cur, chain = set(), str(pid), []
+    while cur and cur not in seen and cur != "1" and len(chain) < limit:
+        seen.add(cur)
+        cur = parents.get(cur)
+        if cur:
+            chain.append(cur)
+    return chain
+
+
+def _split_by_core_ownership(roots, ps_out, core_pids, keep=None) -> tuple:
+    """Partition roots into (owned, unverified, ownerless, duplicates). Owned needs a
+    verified core ancestor; a second root under the SAME core is a duplicate, not a pool."""
+    parents = _full_parent_map(ps_out)
+    owner, unverified, ownerless = {}, [], []
+    for r in roots:
+        # The immediate parent goes through `_pid_parent`, which is the seam the
+        # rest of the probe (and its callers' fixtures) already reads.
+        pp = _pid_parent(r, ps_out)
+        if not pp or pp == "1":
+            ownerless.append(r)
+            continue
+        core = next((a for a in _ancestry(r, {**parents, r: pp}) if a in (core_pids or ())), None)
+        if core is None:
+            unverified.append(r)
+        else:
+            owner[r] = core
+    by_core: dict = {}
+    for r, core in owner.items():
+        by_core.setdefault(core, []).append(r)
+    # One watcher per core survives: the sentinel's root if it is one, else the lowest pid.
+    survivors = {keep if keep in group else min(group, key=lambda p: (len(p), p))
+                 for group in by_core.values()}
+    owned = [r for r in roots if r in survivors]
+    duplicates = [r for r in roots if r in owner and r not in survivors]
+    return owned, unverified, ownerless, duplicates
+
+
+def _ownership_groups(owned, unverified, ownerless, duplicates) -> str:
+    """Name every group, including the empty ones.
+
+    An omitted group leaves one undifferentiated pid list, which the step-9
+    contract must read as "change nothing" — so silently dropping a label turns
+    a real all-ownerless duplicate into a no-op.
+    """
+    def _g(label, pids):
+        return f"; {label} ({len(pids)}): {', '.join(pids) if pids else 'none'}"
+    return (_g("session-owned", owned) + _g("unverified", unverified)
+            + _g("ownerless", ownerless) + _g("same-core duplicates", duplicates))
+
+
+def _watcher_cleanup_remedy(owned, unverified, ownerless, duplicates, keep: str = "") -> str:
+    """The one post-cleanup contract every sentinel branch appends: stop only the
+    ownerless roots, rerun this probe, start exactly ONE only if no tree remains."""
+    if not owned and not unverified:
+        return ("Stop them ALL, then start exactly ONE via Monitor: bash src/watch-tasks-stream.sh "
+                "(rerun this probe in between and start only if no tree remains) — stopping "
+                "without restarting leaves tasks/ undrained")
+    also = " and the same-core duplicates" if duplicates else ""
+    return (f"Stop ONLY the ownerless roots{also}{keep}, then rerun this probe — while any tree "
+            f"remains, start none")
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -8310,15 +8502,22 @@ def check_task_watcher() -> dict:
                 "detail": "no local core running and no watcher processes — watcher not expected"}
     if not pid_file.exists():
         if roots:
-            # Sentinel gone but watchers alive: they are draining tasks/ but
-            # nothing supervises them, and each new start adds another (observed
-            # 2026-07-21: two trees, both reporting the same TASK_FILE — i.e.
-            # duplicate processing, not a stalled queue).
+            # Watchers alive with no sentinel are draining tasks/ unsupervised,
+            # and each new start adds another that reports the same TASK_FILE.
 
-            # A KNOWN parent that is not init: its spawning session still owns it.
-            # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
-            supervised = [r for r, pp in parents.items() if pp and pp != "1"]
+            core_pids = _local_core_pids()
+            supervised, unverified, unowned, dups = _split_by_core_ownership(
+                roots, ps_out, core_pids)
+            if len(roots) == 1 and unverified:
+                # One tree, a live parent, no core attribution. Nothing to
+                # duplicate and nothing proved: no stop, no blessing, no restamp.
+                return {"name": name, "status": "warn",
+                        "detail": f"watcher pid {roots[0]} runs under a live parent "
+                                  f"(ppid {parents[roots[0]]}) that could not be traced to a "
+                                  "core session, and wrote no PID sentinel. Ownership is "
+                                  "UNVERIFIED — do not stop it and do not assume it is "
+                                  "supervised; restart cleanly only when tasks/ is empty."}
             if len(roots) == 1 and supervised:
                 # Its session is still its parent, so it IS supervised and there is
                 # no second tree to duplicate work. Killing it is what opens a gap.
@@ -8326,15 +8525,31 @@ def check_task_watcher() -> dict:
                 # so naming it restores Stop-hook cleanup without the restart.
                 return {"name": name, "status": "warn",
                         "_sentinel_restamp_pid": roots[0],
-                        "detail": f"watcher pid {roots[0]} runs under a live session "
+                        "detail": f"watcher pid {roots[0]} traces to a live core session "
                                   f"(ppid {parents[roots[0]]}) but wrote no PID "
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
+            if not unowned and not unverified and not dups:
+                return {"name": name, "status": "warn",
+                        "_sentinel_restamp_pid": supervised[0],
+                        "detail": f"{len(roots)} watcher trees running with no PID sentinel "
+                                  f"(root pids {', '.join(roots)}) — every one traced to a "
+                                  f"DISTINCT live core session, and a pool runs one watcher per "
+                                  f"core, so these are legitimate. Do NOT stop them: they ARE "
+                                  f"draining tasks/. Re-stamp the sentinel with --fix"
+                                  + _ownership_groups(supervised, unverified, unowned, dups)}
+            if not supervised and not unverified:
+                return {"name": name, "status": "warn",
+                        "detail": f"{len(roots)} watcher trees running with no PID sentinel, and "
+                                  f"NONE traces to a live core session. "
+                                  + _watcher_cleanup_remedy(supervised, unverified, unowned, dups)
+                                  + _ownership_groups(supervised, unverified, unowned, dups)}
             return {"name": name, "status": "warn",
-                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
-                              f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"{len(roots)} watcher trees running with no PID sentinel; tasks/ IS "
+                              f"being drained, but duplicates process each task more than once. "
+                              + _watcher_cleanup_remedy(supervised, unverified, unowned, dups)
+                              + _ownership_groups(supervised, unverified, unowned, dups)}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
@@ -8344,27 +8559,67 @@ def check_task_watcher() -> dict:
         return {"name": name, "status": "warn",
                 "detail": f"unreadable PID sentinel ({str(e)[:40]}) — restart the watcher"}
     argv = _proc_argv(pid)
-    if not argv:
+    # Anchored, not a substring: an observer that merely names the script would
+    # otherwise pass as the watcher, and a recycled pid is as gone as a dead one.
+    if not argv or not _is_watcher_argv(argv):
+        why = "dead" if not argv else f"not the watcher (PID reuse: {argv[:40]})"
         if roots:
             # The sentinel tracks only the MOST RECENT start, so a dead one does
             # NOT mean nothing drains tasks/ — restarting here makes duplicates.
+            core_pids = _local_core_pids()
+            owned, unverified, unowned, dups = _split_by_core_ownership(roots, ps_out, core_pids)
+            if not unowned and not unverified and not dups:
+                return {"name": name, "status": "warn",
+                        "detail": f"sentinel pid {pid} is {why} but {len(roots)} watcher tree(s) "
+                                  f"still run — every one traced to a DISTINCT live core session, "
+                                  f"and a pool runs one watcher per core, so these are legitimate. "
+                                  f"Do NOT stop them: tasks/ IS being drained"
+                                  + _ownership_groups(owned, unverified, unowned, dups)}
             return {"name": name, "status": "warn",
-                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
-                              f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
-                              "stop them and restart one cleanly"}
-        return {"name": name, "status": "warn",
-                "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
-    if "watch-tasks-stream" not in argv:
+                    "detail": f"sentinel pid {pid} is {why}; tasks/ IS being drained by "
+                              f"{len(roots)} tree(s), but duplicates process each task more than once. "
+                              + _watcher_cleanup_remedy(owned, unverified, unowned, dups)
+                              + _ownership_groups(owned, unverified, unowned, dups)}
+        if not argv:
+            return {"name": name, "status": "warn",
+                    "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
         # PID reuse: the sentinel outlived the watcher and the OS handed the
         # number to something else. `kill -0` alone would call this alive.
         return {"name": name, "status": "warn",
                 "detail": f"pid {pid} is not the watcher (PID reuse): {argv[:60]}"}
     extras = sorted(r for r, members in trees.items() if str(pid) not in members)
     if extras:
+        core_pids = _local_core_pids()
+        sentinel_root = next((r for r, m in trees.items() if str(pid) in m), None)
+        # Every root is partitioned, the sentinel's included: splitting only
+        # `extras` left it in no group when its parent was a live shell.
+        all_roots = sorted(set(extras) | ({sentinel_root} if sentinel_root else set()))
+        owned, unverified, orphaned, dups = _split_by_core_ownership(
+            all_roots, ps_out, core_pids, keep=sentinel_root)
+        # Only a READ parent of 1 makes the sentinel stoppable: unreadable
+        # parentage is ownerless for a stranger, absence of evidence for it.
+        sentinel_reparented = (bool(sentinel_root)
+                               and _pid_parent(sentinel_root, ps_out) == "1")
+        if (sentinel_root is not None and not sentinel_reparented
+                and sentinel_root in orphaned):
+            # Protected, but still partitioned: dropping it left the sentinel's
+            # root in no group, so the all-traced predicate never saw it.
+            orphaned = [r for r in orphaned if r != sentinel_root]
+            unverified = sorted(unverified + [sentinel_root])
+        sentinel_orphaned = sentinel_reparented
+        keep = "" if sentinel_orphaned else f", keep the sentinel's ({pid})"
+        if not orphaned and not unverified and not dups:
+            return {"name": name, "status": "warn",
+                    "detail": f"{len(trees)} watcher trees running, {len(extras)} not tracked by the "
+                              f"sentinel — every root traced to a DISTINCT live core session, and a "
+                              f"pool runs one watcher per core, so these are legitimate. Do NOT stop "
+                              f"them: the sentinel is single-valued and whichever core stamped last "
+                              f"holds it" + _ownership_groups(owned, unverified, orphaned, dups)}
         return {"name": name, "status": "warn",
-                "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by the "
-                          f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
-                          f"more than once. Keep the sentinel's ({pid}), stop the rest"}
+                "detail": f"{len(trees)} watcher trees running, {len(extras)} not tracked by the "
+                          f"sentinel; duplicates process each task more than once. "
+                          + _watcher_cleanup_remedy(owned, unverified, orphaned, dups, keep)
+                          + _ownership_groups(owned, unverified, orphaned, dups)}
     return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {pid})"}
 
 

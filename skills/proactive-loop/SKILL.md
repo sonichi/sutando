@@ -641,27 +641,39 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
-   **⚠ STOP ONLY THE PIDS THE PROBE ITSELF CLASSIFIES AS OWNERLESS.** The sentinel is
-   single-valued, but a pool legitimately runs **one watcher per core**, so N-1 correct watchers
-   always read as "untracked duplicates" and which pid holds the sentinel is arbitrary.
+   **⚠ STOP EXACTLY THE PIDS THE PROBE CLASSIFIES AS `ownerless` OR `same-core duplicates`, AND
+   NOTHING ELSE.** The sentinel is single-valued, but a pool legitimately runs **one watcher per
+   core**, so N-1 correct watchers always read as "untracked duplicates" and which pid holds the
+   sentinel is arbitrary. The probe's four groups are the whole contract: `session-owned` keeps one
+   survivor per core and `unverified` is neither stopped nor counted, so "untracked by the sentinel"
+   is never on its own a reason to stop anything.
 
-   The probe does this classification for you, same-host, from the local process table — but only in
-   *some* of its branches. **Act only on a verdict that presents owned and ownerless as two
-   separately-labelled groups.** Key on that structure, never on wording:
+   The probe does this classification for you, same-host, and now does it in **every** multi-root
+   branch. **Act only on the four labelled groups it emits.** Key on that structure, never on
+   wording:
 
-   - two groups, one of them ownerless → stop exactly the ownerless roots, leave the rest.
-   - two groups, none ownerless (every untracked tree session-owned) → **change nothing**.
-   - **one undifferentiated list of pids → change nothing** and say so, *whatever adjective it
-     carries* — including "orphaned" and "unsupervised", and including when it ends in the
-     imperative "stop them and restart one cleanly". Ambiguous ownership is not a licence to stop a
-     watcher; it is a reason not to.
+   ```
+   ; session-owned (N): <pids>; unverified (N): <pids>; ownerless (N): <pids>; same-core duplicates (N): <pids>
+   ```
 
-   **The last bullet is the common case, not a legacy edge case.** On `main` every multi-root
-   verdict is a single undifferentiated list, and #3328 splits only the branch where the sentinel is
-   *live* — one of three. After it lands, the no-sentinel and dead-sentinel branches still emit
-   `N orphaned watcher(s) … stop them and restart one cleanly`, naming every root including the
-   session-owned ones. Read structurally, that is the safe bullet; read for tone, it is the
-   dangerous one. That gap is why this rule tests for two groups instead of trusting the adjective.
+   - **`ownerless`** — reparented to init, or parentage unreadable. Stop these.
+   - **`same-core duplicates`** — a second (third, ...) root traced to the SAME core as a
+     session-owned one. A pool runs one watcher per core, so these are duplicates, not pool
+     members: stop these too. The survivor (the sentinel's root when it is one of them, else the
+     lowest pid) is listed under `session-owned`.
+   - **`session-owned`** — ancestry traced to a verified local core session, one per core. Leave alone.
+   - **`unverified`** — a live parent that could not be attributed to a core. **Neither stop nor
+     bless.** Ambiguous ownership is not a licence to stop a watcher; it is a reason not to.
+
+   Every group is named in every multi-root verdict, including empty ones (`ownerless (0): none`).
+   **A verdict carrying no groups clause at all is a build predating this contract, or a
+   single-root branch: change nothing and use the table below.**
+
+   **Why `unverified` exists.** An earlier build counted any live parent as ownership, so a
+   `sleep 999` qualified — two duplicate watchers on a single-core host read as a legitimate pool
+   and were protected. Requiring a verified core ancestor fixes that, and this third group holds
+   the trees that can be neither proved nor disproved.
+
 
    **Do not re-derive this yourself.** `ps -p <pid>` prints an identical row for a supervised watcher
    and an ownerless one — the roots come from `_watcher_trees()` and are alive by construction — so a
@@ -669,21 +681,30 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    this step exists to prevent. That is also what the "don't hand-roll a process check" rule below
    means: the probe is the authority for ownership as well as for liveness.
 
-   **Do NOT scope this by counting `state/cores/*.alive`.** That directory is SYNCED ACROSS HOSTS, so a
-   peer's fresh heartbeat inflates the count on a single-core machine and suppresses cleanup of
-   genuinely orphaned local watchers — the inverse failure, equally bad. Measured on a live host: a
-   remote `Mac-186.alive` carried the *same pid* as the local record.
+   **Do NOT scope this by counting `state/cores/*.alive`.** Those records are not a process census:
+   the sync layer now hard-denies `*.alive` (`scripts/sync-workspace.sh`), so the directory holds
+   whatever landed historically — including cross-host records from before the deny, one of which
+   (`Mac-186.alive`) was measured carrying the *same pid* as the local record. Stale-or-foreign
+   either way, a file count can inflate the census and suppress cleanup of genuinely orphaned local
+   watchers. The probe verifies ownership from the local tmux session→pane map instead — pool
+   records carry no `host` field at all, so they cannot be filtered back to this machine even in
+   principle.
 
-   | probe says | action (apply the two-group test above first) |
+   | probe says | action (apply the four-group split above first: session-owned / unverified / ownerless / same-core duplicates) |
    |---|---|
    | `ok` | nothing to do. |
-   | watcher(s) running with **no PID sentinel** (orphaned) | **Do NOT start another** — that is what creates the duplicate. This branch emits ONE undifferentiated list, so the two-group test fails: **change nothing**. Stop roots only if a future build names owned and ownerless separately here. |
-   | sentinel pid dead but **other watcher(s) still run** | same — one undifferentiated list, so **change nothing**. |
-   | multiple trees, some **not tracked by the sentinel**, reported as two groups | stop exactly the group with **no live owning session**; leave the session-owned group alone. If the ownerless group is empty, change nothing. |
-   | not running (no sentinel, no trees) / pid dead with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
+   | watcher(s) running with **no PID sentinel**, and at least one is session-owned or unverified | **Do NOT start another** — that is what creates the duplicate. Apply the group rules: stop only `ownerless` and `same-core duplicates`. |
+   | watcher(s) running with **no PID sentinel** and **every root ownerless** | Stop them ALL, then start exactly ONE via `Monitor`. Stopping alone leaves `tasks/` undrained — the probe says this explicitly in its detail. |
+   | sentinel pid dead or recycled, but **other watcher(s) still run** | same — apply the group rules, then the post-cleanup contract: stop only the ownerless roots and same-core duplicates, rerun this probe, and start exactly ONE via `Monitor` only if no tree remains (every root ownerless leaves none). |
+   | multiple trees, some **not tracked by the sentinel** | same — group rules, then the same post-cleanup contract (stop ownerless + same-core duplicates → rerun probe → start exactly ONE only if none remains). The sentinel's own tree is classified too, so an orphaned sentinel beside a live replacement is named for cleanup rather than protected. |
+   | not running (no sentinel, no trees) / pid dead or recycled with none running | start one with the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`. |
 
-   **Never stop a watcher whose owning core is alive** — that is the invariant the table cannot
-   express on its own, and the one that makes the difference between a cleanup and an outage.
+   **Never stop a core's LAST live watcher** — that is the invariant the table cannot express on its
+   own, and the one that makes the difference between a cleanup and an outage. Note the shape: a
+   `same-core duplicate` also has a live owning core, and stopping it is correct precisely because
+   the same core keeps its `session-owned` survivor. The protected thing is the survivor, not the
+   owner's liveness; phrasing it as "never stop a watcher whose owning core is alive" forbids the
+   duplicate cleanup this step exists to perform.
 
    **A missing sentinel is UNKNOWN, not DEAD.** The sentinel is written once at startup (`watch-tasks-stream.sh` line ~316) and removed by cleanup only when the content still matches that pid, so an absent file cannot distinguish "no watcher" from "a live watcher whose file was removed". Measured 2026-08-07 on a live core: the watcher had held one pid for ~5h, was **functioning** (it emitted `TASK_FILE:` for a probe written during the check), and the sentinel was absent from disk entirely. The instruction this step used to carry — *missing OR dead → restart* — would have attached a second watcher to that live one, and both then emit every task, so each task gets processed twice. `health-check.py` names this failure directly at its `task-watcher` probe: restarting on a dead-looking sentinel "is what produces the duplicates in the first place."
 

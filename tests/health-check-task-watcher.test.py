@@ -16,6 +16,8 @@ Covers:
   c) core alive, sentinel holds a dead PID → warn (crashed, sentinel left behind)
   d) core alive, PID alive but argv is not the watcher → warn (PID reuse)
   e) core alive, PID alive and argv names the watcher → ok
+  e2) sentinel names an observer that merely MENTIONS the script → never ok,
+     before or after the cleanup it prescribes (anchored predicate, not substring)
   f) core alive, sentinel unparseable → warn (not a crash)
   g) the check is registered in run_checks' output
   h) _proc_argv against real PIDs (live + nonexistent) — the OS-facing half
@@ -50,6 +52,7 @@ import io
 import json
 import shutil
 import os
+import re
 import sys
 import tempfile
 import time
@@ -101,7 +104,7 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
     with tempfile.TemporaryDirectory() as td:
         make_workspace(Path(td), core_alive=core_alive, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent)
+                 hc._ps_snapshot, hc._pid_parent, hc._local_core_pids)
         try:
             hc.WORKSPACE_DIR = Path(td)
             if argv is not None:
@@ -109,10 +112,13 @@ def run_check(*, core_alive: bool, pid_text: str | None, argv: str | None = None
             hc._watcher_trees = lambda *a, **k: (trees or {})
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda pid, ps=None: (parents or {}).get(pid)
+            # Unstubbed this reads the HOST's tmux, the leak this fixture already
+            # avoids for parents; a fabricated parent stands in for the core.
+            hc._local_core_pids = lambda: {v for v in (parents or {}).values() if v != "1"}
             return hc.check_task_watcher()
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._local_core_pids) = saved
 
 
 @contextlib.contextmanager
@@ -127,17 +133,20 @@ def supervised_watcher(*, pid: str = "7100", pid_text: str | None = None,
     with tempfile.TemporaryDirectory() as td:
         ws = make_workspace(Path(td), core_alive=True, pid_text=pid_text)
         saved = (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-                 hc._ps_snapshot, hc._pid_parent)
+                 hc._ps_snapshot, hc._pid_parent, hc._local_core_pids)
         try:
             hc.WORKSPACE_DIR = ws
             hc._proc_argv = lambda p: argv
             hc._watcher_trees = lambda *a, **k: {pid: {pid}}
             hc._ps_snapshot = lambda *a, **k: ""
             hc._pid_parent = lambda p, ps=None: "500"
+            # 500 stands in for the core session that spawned this watcher;
+            # unstubbed, this would read the HOST's tmux.
+            hc._local_core_pids = lambda: {"500"}
             yield ws
         finally:
             (hc.WORKSPACE_DIR, hc._proc_argv, hc._watcher_trees,
-             hc._ps_snapshot, hc._pid_parent) = saved
+             hc._ps_snapshot, hc._pid_parent, hc._local_core_pids) = saved
 
 
 def case_r_supervised_watcher_exposes_restamp_pid() -> list[str]:
@@ -518,6 +527,23 @@ def case_e_live_watcher_is_ok() -> list[str]:
     return []
 
 
+def case_e2_an_observer_sentinel_is_never_blessed_across_cleanup() -> list[str]:
+    """Cleanup driven twice with the sentinel naming a process that merely MENTIONS the
+    script: pass 1 still names the live root; pass 2 (root gone, sentinel kept) is never ok."""
+    fails = []
+    for argv in ("python3 observer.py watch-tasks-stream.sh",
+                 "bash -c ps aux | grep watch-tasks-stream"):
+        before = run_check(core_alive=True, pid_text="4242", argv=argv,
+                           trees={"100": {"100"}})
+        after = run_check(core_alive=True, pid_text="4242", argv=argv, trees={})
+        if "ownerless (1): 100" not in before["detail"] or "start exactly ONE" not in before["detail"]:
+            fails.append(f"e2) pass 1 must name root 100 for cleanup ({argv!r}): {before['detail']!r}")
+        for label, r in (("pass 1", before), ("pass 2", after)):
+            if r["status"] == "ok" or "alive (pid 4242)" in r["detail"]:
+                fails.append(f"e2) {label} blessed the observer ({argv!r}): {r!r}")
+    return fails
+
+
 def case_f_unparseable_sentinel_warns() -> list[str]:
     r = run_check(core_alive=True, pid_text="not-a-pid", argv="")
     if r["status"] != "warn":
@@ -594,8 +620,13 @@ def case_j_extra_tree_warns() -> list[str]:
         fails.append(f"j) an untracked extra tree should warn, got {r['status']}")
     if "9000" not in r["detail"]:
         fails.append(f"j) detail must name the untracked root, got {r['detail']!r}")
-    if "4200" in r["detail"]:
-        fails.append("j) must NOT list the sentinel's own tree as an extra")
+    # "not an extra" is the extras COUNT and the stoppable group, not a bare
+    # substring: the sentinel's root is now named in a protected group.
+    if "1 not tracked by the sentinel" not in r["detail"]:
+        fails.append(f"j) sentinel's tree inflated the extras count: {r['detail']!r}")
+    stoppable = re.search(r"ownerless \((\d+)\): ([^;]*)", r["detail"])
+    if stoppable and "4200" in stoppable.group(2):
+        fails.append("j) must NOT offer the sentinel's own tree for stopping")
     return fails
 
 
@@ -619,7 +650,7 @@ def case_l_dead_sentinel_with_live_orphan() -> list[str]:
     fails = []
     if r["status"] != "warn":
         fails.append(f"l) expected warn, got {r['status']}")
-    if "orphaned" not in r["detail"]:
+    if "ownerless (1): 9000" not in r["detail"]:
         fails.append(f"l) detail should name the orphan, got {r['detail']!r}")
     if "IS being drained" not in r["detail"]:
         fails.append("l) must not claim tasks/ is unattended when a watcher runs")
@@ -631,7 +662,7 @@ def case_m_absent_sentinel_with_live_orphan() -> list[str]:
     fails = []
     if r["status"] != "warn":
         fails.append(f"m) expected warn, got {r['status']}")
-    if "orphaned" not in r["detail"]:
+    if "ownerless (1): 9000" not in r["detail"]:
         fails.append(f"m) detail should name the orphan, got {r['detail']!r}")
     return fails
 
@@ -647,7 +678,7 @@ def case_m2_fabricated_pid_ignores_the_host_process_table() -> list[str]:
         r = run_check(core_alive=True, pid_text=None, trees={"9000": {"9000"}})
     finally:
         hc._pid_parent = saved
-    if "orphaned" not in r["detail"]:
+    if "ownerless (1): 9000" not in r["detail"]:
         return [f"m2) host pid table leaked into the verdict, got {r['detail']!r}"]
     return []
 
@@ -738,6 +769,7 @@ def main() -> int:
         ("c", case_c_dead_pid_warns),
         ("d", case_d_pid_reuse_warns),
         ("e", case_e_live_watcher_is_ok),
+        ("e2", case_e2_an_observer_sentinel_is_never_blessed_across_cleanup),
         ("f", case_f_unparseable_sentinel_warns),
         ("g", case_g_registered_in_run_checks),
         ("h", case_h_proc_argv_reads_a_real_process),

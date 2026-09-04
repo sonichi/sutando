@@ -153,17 +153,30 @@ def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess | None:
         return None
 
 
-def _argv_names_session(args: str, sess: str) -> bool:
-    """True only if argv names EXACTLY this session via --name.
+#: Executables a Sutando launcher execs as the pane command. A `--name` on any
+#: other program is not launcher-authored identity.
+_CORE_RUNTIME_BASENAMES = frozenset({"claude"})
 
-    Substring matching is wrong here and was a live false-healthy path
-    (review-caught, qingyun-wu on #2488): `"--name sutando-core" in args` is
-    also satisfied by `claude --name sutando-core-watcher`, so a prefixed
-    sibling session kept this host's `.alive` fresh over a dead core — the exact
-    class of bug this module exists to remove. Compare the whole token instead:
-    the next token after a bare `--name`, or the value after `--name=`.
+
+def _argv_names_session(args: str, sess: str) -> bool:
+    """True only if a CORE RUNTIME argv names EXACTLY this session via --name.
+
+    Three independent things must hold, and each has drawn a live bug:
+
+    1. **Exact token, not substring** (qingyun-wu, #2488): `"--name sutando-core"
+       in args` is also satisfied by `claude --name sutando-core-watcher`, so a
+       prefixed sibling kept `.alive` fresh over a dead core.
+    2. **Before the `--` option terminator** (keweichen, #3328): the launchers
+       run `claude --name <sess> ... -- "/startup"`, so every token after `--`
+       is PROMPT TEXT. `claude -- --name sutando-core` names nothing.
+    3. **A core runtime** (keweichen, #3328): `python3 worker.py --name
+       sutando-core` is an ordinary program, not a launcher-authored core.
     """
     toks = args.split()
+    if "--" in toks:                       # options end here; the rest is prompt
+        toks = toks[:toks.index("--")]
+    if not toks or toks[0].rsplit("/", 1)[-1] not in _CORE_RUNTIME_BASENAMES:
+        return False
     for i, tok in enumerate(toks):
         if tok == "--name":
             if i + 1 < len(toks) and toks[i + 1] == sess:
