@@ -105,13 +105,32 @@ def probe_alive_file(path: Path, now: float, ttl: float = ALIVE_TTL_S) -> tuple[
         return ("unknown", f"stat failed: {e}", None)
 
 
-def _watcher_sentinel() -> Path:
-    """The sentinel this row reports on: the historic name when present, else
-    the first per-instance one. A pool host has several and this row has always
-    reported one -- naming which is a display change, not a probe change."""
+def probe_watcher_sentinels(state_dir: Path, pid_alive
+                            ) -> "tuple[str, str, float | None]":
+    """Every watcher sentinel as ONE row. Reporting the first file answers about
+    one instance, which is wrong in both directions on a pool: a dead historic
+    pid beside a live worker read `offline`, and the reverse read `running`.
+
+    Enumerated at probe time, so a sentinel written after startup is seen.
+    """
     from util_paths import watcher_sentinel_path, watcher_sentinel_paths
-    found = watcher_sentinel_paths(STATE_DIR)
-    return found[0] if found else watcher_sentinel_path(STATE_DIR)
+    found = watcher_sentinel_paths(state_dir)
+    if not found:
+        return probe_pidfile(watcher_sentinel_path(state_dir), pid_alive)
+    rows = [(sp.name, *probe_pidfile(sp, pid_alive)[:2]) for sp in found]
+    running = [r for r in rows if r[1] == "running"]
+    if len(running) == len(rows):
+        pids = ", ".join(d for _, _, d in rows)
+        return ("running", pids if len(rows) == 1 else
+                f"{len(rows)} watchers: {pids}", None)
+    rest = "; ".join(f"{n}: {d}" for n, s, d in rows if s != "running")
+    if not running:
+        # No instance is up. `unknown` outranks `offline`: an unreadable
+        # sentinel is a question, and answering it "offline" overstates.
+        worst = "unknown" if any(s == "unknown" for _, s, _ in rows) else "offline"
+        return (worst, rest, None)
+    ok = ", ".join(d for _, s, d in rows if s == "running")
+    return ("degraded", f"{len(running)} of {len(rows)} up ({ok}); {rest}", None)
 
 
 def probe_pidfile(path: Path, pid_alive) -> tuple[str, str, float | None]:
@@ -252,7 +271,7 @@ def service_registry() -> list[dict]:
          "probe": ("gateway", GATEWAY_STATUS_PATH, r"remote-gateway-bridge\.py$")},
         {"id": "task-watcher", "name": "Task Watcher",
          # Every instance's sentinel; one fixed name reported only the newest.
-         "probe": ("pidfile", _watcher_sentinel())},
+         "probe": ("watcher_sentinels", STATE_DIR)},
         {"id": "voice-agent", "name": "Voice Agent",
          "probe": ("port", 9900)},
         {"id": "web-client", "name": "Web Client",
@@ -300,6 +319,8 @@ def build_payload(
             status, detail, since = probe_alive_file(arg, now)
         elif kind == "pidfile":
             status, detail, since = probe_pidfile(arg, pid_alive)
+        elif kind == "watcher_sentinels":
+            status, detail, since = probe_watcher_sentinels(arg, pid_alive)
         elif kind == "port":
             status, detail, since = probe_port(arg, connect)
         elif kind == "process":
