@@ -69,5 +69,23 @@ class FlattenMatchesTheReader(unittest.TestCase):
         self.assertEqual(_one_line(None), "None")
 
 
+class DerivedNotEnumerated(unittest.TestCase):
+    def test_no_splitlines_boundary_survives(self):
+        # The whole point of deriving from splitlines(): the guarantee is over
+        # its set, not over a list someone remembered to keep current.
+        boundaries = [chr(c) for c in range(0x3000)
+                      if len(("a" + chr(c) + "b").splitlines()) > 1]
+        self.assertEqual(len(boundaries), 10, boundaries)
+        for c in boundaries:
+            self.assertEqual(len(_one_line("a" + c + "b").splitlines()), 1,
+                             f"{c!r} still splits after the flatten")
+
+    def test_a_separator_only_value_flattens_to_empty(self):
+        # Behaviour change, pinned so it is not "fixed" into a skip later: the
+        # emission guard tests the RAW value, so the field is still emitted.
+        self.assertEqual(_one_line("\x0b"), "")
+        self.assertEqual(_one_line("\x85\u2028"), " ")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
