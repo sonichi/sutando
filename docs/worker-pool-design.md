@@ -92,6 +92,30 @@ binding at ingress (`_bound_dest()` in the sparrow bridge writing
 `.assigned-<worker>` into the filename): the bridge records a field, it does
 not decide one. #3859 closed on this document.
 
+## The binding table
+
+`state/pool/bindings.json`, an object keyed by room id:
+`{"<room>": {"instance": "<name>", "pinned": true}}`. One writer (the core) and
+N readers (every worker, on every claim), so it carries the contract this repo
+has twice been bitten for lacking:
+
+- **Write:** temp file plus `os.replace` in the same directory, never `>` and
+  never read-modify-write. A reader inside a truncate window saw zero bytes and
+  read it as "no bindings" — #3156 is that shape on `core-status.json`, and
+  `scripts/core-status.sh` exists so a caller cannot get it wrong.
+- **Read:** every claim re-reads; there is no cached copy to invalidate.
+- **Missing, unreadable or unparseable: fail toward the core.** The reader
+  answers "not bound", the task falls to the core, and work continues. Failing
+  closed to "not mine" would strand every task on a corrupt file. A binding
+  exists to stop scatter, never to stop work.
+- **Only `pinned: true` binds.** A bare entry without it is decayed handler
+  state, not an owner's binding, and must not constrain routing.
+
+`state/cores/channel-<room-id>.handler` is the automatic room-to-instance
+affinity this design retires: it binds a room to whoever handled it first, which
+the routing section excludes by name. Step 3's writer ignores it and deletes it;
+two files answering "whose room is this" is worse than either alone.
+
 ## Commands: the owner's intent arrives as an ordinary task
 
 Every pool command is an owner task, written by whatever surface the owner used
@@ -102,8 +126,18 @@ them, and a pinned room must not divert them: a command envelope carries
 `requested_worker: core`, set by the surface that minted it, and every worker's
 handler discards a task whose `source:` is a pool command **before** it
 evaluates pin eligibility. Both fields live in the verified envelope, never in
-the body, so a room message whose text reads "resize to 0" is an ordinary task;
-the step-2 suite carries that forged-body case as a negative test.
+the body, so a room message whose text reads "resize to 0" is an ordinary task.
+
+**"In the envelope" means minted before the stamp, not appended after it.**
+`stamp_text` MACs the whole body, so a field appended post-mint either
+invalidates the stamp or displaces it, and a displacing edit reads `unsigned`
+rather than `invalid` — tamper is not always loud. `collaborator` is written by
+direct append today, which makes its guarantee bridge discipline rather than
+cryptography; `requested_worker` and the command marker do not follow that
+precedent, because the server writes them into the body it then stamps. The
+step-2 suite therefore carries two negative tests: a forged body line, and a
+`requested_worker` added after stamping, which must be refused on the `unsigned`
+verdict rather than honoured.
 
 | command | effect |
 |---|---|
@@ -187,6 +221,7 @@ worker that stopped, carried from #3604's operations section:
 | auth errors, `401`, expired credentials | auth state, per process | recycle that worker (`launchctl kickstart -k`); a re-login elsewhere reaches only newly started processes |
 | timeouts, 5xx | transport | back off and retry; do not touch the session |
 | beat fresh, no claimed task, a pinned task unclaimed past `stand_in_after_s` | hung session | the core stands in for the room; the kick script un-wedges an idle prompt |
+| beat fresh, credentials valid, every turn returns an out-of-credits error | **quota spent** | **quiesce** — the worker stops claiming until its window resets and the core stands in. Kicking is worse than nothing: the seat still claims and then fails, so the task leaves the unclaimed state and the stand-in never fires. Measured live: four seats beating normally at zero throughput |
 | beat fresh, a claimed task unfinished | busy | leave it; the room waits for its worker |
 | no tmux session | dead | the core's reconcile kickstarts the plist |
 
@@ -261,6 +296,17 @@ with its own reason.
 
 Each merges before the next opens. #3604's children re-cut against the new
 base after step 3.
+
+**The pool running today is migrated, not assumed away.** Between step 2 and
+step 3 the worker handler exists and the core sweep does not, so in that window
+the current lead keeps reclaiming and the new handler claims only what the
+binding table sends it; a host enters step 2 with its lead either running or
+deliberately stopped, never ambiguous. Step 3 takes reclaim over in one cut. Two
+on-disk carry-overs are step 3's to resolve rather than inherit: `.claimed-*`
+and `.assigned-*` files minted by the lead are re-examined by the new sweep
+behind the done-flag, and a seat from an older generation — a different binary
+under the same instance name — is recycled rather than trusted, since `.alive`
+is keyed by name and cannot tell generations apart.
 
 ## Out of scope for v1
 
