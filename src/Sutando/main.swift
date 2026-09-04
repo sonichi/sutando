@@ -343,6 +343,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pauseItem.submenu = pauseSubmenu
         menu.addItem(pauseItem)
         menu.addItem(NSMenuItem(title: "Resume Loop", action: #selector(resumeLoop), keyEquivalent: ""))
+        // Model submenu — switches the core's model through scripts/switch-model.sh
+        // with --confirm, so it works while the core itself is stalled on an exhausted model.
+        let modelSubmenu = NSMenu()
+        for (title, model) in [("Default (auto-fallback)", "default"), ("Opus 5", "opus"), ("Sonnet 5", "sonnet"),
+                               ("Haiku 4.5", "haiku"), ("Fable 5.1", "claude-fable-5-1[1m]")] {
+            let it = NSMenuItem(title: title, action: #selector(switchModel(_:)), keyEquivalent: "")
+            it.representedObject = model
+            modelSubmenu.addItem(it)
+        }
+        let modelItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
+        modelItem.submenu = modelSubmenu
+        menu.addItem(modelItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Core CLI", action: #selector(restartCore), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Force Restart Core CLI", action: #selector(forceRestartCore), keyEquivalent: ""))
@@ -2541,6 +2553,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         runCoreAction(script: repoRoot + "/src/agent/stop-core.sh", args: [],
                       okMessage: "Core stopped. It stays stopped until you restart it.",
                       failVerb: "Core stop")
+    }
+
+    /// Switch the core's model via scripts/switch-model.sh --confirm: the click is the
+    /// owner's instruction, and the script records only after the CLI accepts.
+    @objc func switchModel(_ sender: NSMenuItem) {
+        guard let model = sender.representedObject as? String else { return }
+        notify("Sutando", "Switching core to \(sender.title)…")
+        runCoreAction(script: repoRoot + "/scripts/switch-model.sh",
+                      args: [model, "--confirm", "--session", "sutando-core", "--socket", sutandoTmuxSocket],
+                      okMessage: "Core switched to \(sender.title) — accepted by the CLI and saved as its default.",
+                      failVerb: "Model switch to \(sender.title)")
     }
 
     /// Shared runner for core start/stop scripts: detached bash, stderr
