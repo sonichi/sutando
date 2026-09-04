@@ -294,7 +294,6 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
-from . import pool_affinity
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
                              AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
 from . import team_result_guard
@@ -2641,19 +2640,6 @@ def _repair_pending_task(tid: str, task: dict) -> bool:
     return _record_task_media(tid, task)
 
 
-def _bound_dest(dest: Path, tid: str, channel_id: str) -> Path:
-    """`dest`, or its `.assigned-<worker>` form when the room is pinned to a
-    beating worker. Any failure returns `dest`: routing is advisory, delivery is
-    not, and an unassigned task is claimable by anyone."""
-    try:
-        inst = pool_affinity.route_to(_STATE, channel_id)
-        if inst:
-            return dest.with_name(f"{tid}.assigned-{inst}.txt")
-    except Exception as e:  # noqa: BLE001 — never wedge ingress on a routing read
-        _log(f"ingress binding skipped for {tid} ({e}) — queued unassigned")
-    return dest
-
-
 def _write_task(task: dict) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
@@ -2821,9 +2807,6 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         lines.extend(render_skill_prelude(
             _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
             _one_line(task.get("addressed_to") or "")))
-    # Bind here when the room is pinned to a LIVE worker. This process is the
-    # one thing that must be up for a task to exist at all, unlike the lead.
-    dest = _bound_dest(dest, tid, _one_line(task.get("channel_id") or ""))
     from .local_task_protocol import apply_task_stamper
     tmp = _stage_durable(dest, apply_task_stamper("\n".join(lines) + "\n"))
     if tmp is None:
@@ -2838,8 +2821,7 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
-    _log(f"queued {tid}" + (f" -> {dest.name[len(tid) + len('.assigned-'):-4]}"
-                            if ".assigned-" in dest.name else ""))
+    _log(f"queued {tid}")
     # #2274 parity: one task_processed per NEWLY queued task (idempotent early
     # returns never reach here), bucketed to this gateway's own "remote" surface
     try:

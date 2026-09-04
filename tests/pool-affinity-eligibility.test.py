@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Ingress binds a task to a pinned worker — the routing decision moved off the
-lead and onto the one process that must be up for a task to exist at all.
+"""Eligibility from the pin table: which worker, if any, a room is bound to.
 
-The safety property is the negative one: a pin must never strand work. A dead
-pinned worker, a missing table and a corrupt table all fall through to the
-unassigned name, which anyone can claim.
+The safety property is the negative one — a pin must never strand work. A dead
+pinned worker, a missing table and a corrupt table all answer "nobody", which
+leaves the task claimable by the core.
 """
 import json
 import sys
@@ -96,70 +95,6 @@ class RouteTo(unittest.TestCase):
     def test_instance_alive_rejects_an_empty_name(self):
         with TemporaryDirectory() as td:
             self.assertFalse(pa.instance_alive(_state(td), ""))
-
-
-class BoundDestIsExercised(unittest.TestCase):
-    """Calls the SHIPPED function rather than grepping for it. A source scan
-    passes while `_bound_dest` is called but never defined — which is exactly
-    the state this file's first draft shipped."""
-
-    def _bridge(self, state):
-        sys.path.insert(0, str(ROOT / "packages" / "ag2-sparrow"))
-        from ag2_sparrow import remote_gateway_bridge as b
-        b._STATE = Path(state)
-        return b
-
-    def test_names_the_worker_when_pinned_and_alive(self):
-        with TemporaryDirectory() as td:
-            b = self._bridge(_state(td, pinned_to="core-2", alive="core-2"))
-            got = b._bound_dest(Path(td) / "task-abc.txt", "task-abc", ROOM)
-            self.assertEqual(got.name, "task-abc.assigned-core-2.txt")
-
-    def test_leaves_it_unassigned_when_the_worker_is_dead(self):
-        with TemporaryDirectory() as td:
-            b = self._bridge(_state(td, pinned_to="core-2", alive=None))
-            got = b._bound_dest(Path(td) / "task-abc.txt", "task-abc", ROOM)
-            self.assertEqual(got.name, "task-abc.txt")
-
-    def test_a_raising_policy_still_queues_the_task(self):
-        """Ingress must never wedge on a routing read."""
-        with TemporaryDirectory() as td:
-            b = self._bridge(_state(td, pinned_to="core-2", alive="core-2"))
-            # b.pool_affinity, not the flat import: they are different module
-            # objects and patching the wrong one tests nothing.
-            real = b.pool_affinity.route_to
-            b.pool_affinity.route_to = lambda *a, **k: (_ for _ in ()).throw(
-                RuntimeError("table on fire"))
-            try:
-                got = b._bound_dest(Path(td) / "task-abc.txt", "task-abc", ROOM)
-            finally:
-                b.pool_affinity.route_to = real
-            self.assertEqual(got.name, "task-abc.txt")
-
-
-class BridgeDelegates(unittest.TestCase):
-    """The bridge must not re-derive the rule; two readers of one table that
-    disagree is how the pin and the claim path stop agreeing on who owns a room."""
-
-    def _bridge_src(self) -> str:
-        return (ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow"
-                / "remote_gateway_bridge.py").read_text(encoding="utf-8")
-
-    def test_bridge_calls_the_shared_policy(self):
-        src = self._bridge_src()
-        self.assertIn("pool_affinity.route_to(", src)
-        self.assertIn("from . import pool_affinity", src)
-
-    def test_bridge_does_not_read_the_table_itself(self):
-        src = self._bridge_src()
-        self.assertNotIn("affinity.json", src)
-        self.assertNotIn('"pinned"', src)
-
-    def test_vendored_copy_matches_src(self):
-        a = (ROOT / "src" / "pool_affinity.py").read_text(encoding="utf-8")
-        b = (ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow"
-             / "pool_affinity.py").read_text(encoding="utf-8")
-        self.assertIn(a.strip(), b, "run tools/sync_from_src.py")
 
 
 if __name__ == "__main__":
