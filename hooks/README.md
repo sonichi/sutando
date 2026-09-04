@@ -313,3 +313,23 @@ printf '{"tool_name":"Write","tool_input":{"file_path":"%s/results/task-probe.tx
 ```
 
 Tests: `python3 tests/result-file-marker-guard.test.py`
+
+## `comment-signature-guard.py`
+
+Denies a `gh pr comment` / `gh issue comment` / `gh pr create` / `gh issue create`
+whose body carries no agent MXID. Attribution under a shared GitHub login rests on
+the body signature — the login cannot tell two agents apart and the commit email is
+many-to-one — and nothing enforced it.
+
+The check matches the **MXID**, never the surrounding prose: measured across three
+PRs, 39 of one agent's comments used an older `Signed: @<mxid>` form and 2 the newer
+`— name (@<mxid>)`, so a wording-keyed check sees 2 of 41.
+
+- `SUTANDO_AGENT_MXID` — the identity to require. **No default.** Unset means the
+  guard does not enforce and says so once on stderr, so a node cannot silently
+  inherit another agent's identity and deny every comment it writes.
+- `SUTANDO_ALLOW_UNSIGNED_COMMENT=1` — one-shot override.
+
+**Not covered:** `gh api repos/o/r/issues/N/comments -f body=…` publishes prose under
+the same login and is outside the subcommand set, as is a body read from stdin
+(`-F -`). Both are deliberate — the guard reads a body it can see.
