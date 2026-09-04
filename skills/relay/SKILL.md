@@ -53,7 +53,7 @@ Don't write things that are already in the structured snapshot (recent commits, 
 1. Resolve `WORKSPACE="$(bash scripts/sutando-config.sh workspace)"`.
 2. `mkdir -p "$WORKSPACE/relay" "$WORKSPACE/relay/processed"` (idempotent).
 3. **If `--append`:** find the latest unprocessed file via `ls -t "$WORKSPACE/relay/"relay-*.md 2>/dev/null | head -1`. If none, fall through to new-file mode. If found, append to it (with a `---` separator + timestamp header).
-4. **Otherwise (new file):** generate filename `relay-$(date +%s).md` under `$WORKSPACE/relay/`.
+4. **Otherwise (new file):** generate filename `relay-$(date -u +%Y%m%dT%H%M%SZ).md` under `$WORKSPACE/relay/` — UTC ISO basic form, never `$(date +%s)`; see File naming above for why the drain's lexicographic sort makes the two unmixable.
 5. Write a narrative note (markdown formatting) as described above.
 6. Save to the resolved path.
 7. Print "Relay note written to <path>" with the absolute path. Mention briefly what's in it.
@@ -82,4 +82,4 @@ If the session was genuinely uneventful (read-only, no decisions, no in-flight w
 
 ## Where it lives
 
-`workspace/relay/relay-{epoch}.md` (pending) + `workspace/relay/processed/relay-{epoch}.md` (drained by session-handoff). Workspace-root parallel to `build_log.md` + `pending-questions.md` + `tasks/`. Owner-readable; both LLM and human can `cat` it cleanly.
+`workspace/relay/relay-{YYYYMMDD}T{HHMMSS}Z.md` (pending) + `workspace/relay/processed/relay-{YYYYMMDD}T{HHMMSS}Z.md` (drained by session-handoff). Workspace-root parallel to `build_log.md` + `pending-questions.md` + `tasks/`. Owner-readable; both LLM and human can `cat` it cleanly.
