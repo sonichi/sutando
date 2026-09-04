@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """`check_vendored_resolver_env` must be non-executing and fail honest.
 
-Two properties, both from qingyun-wu's review of the first draft (#3892):
-
-1. It must NOT execute discovered source. The first draft imported each copy in a
-   subprocess; a subprocess is failure isolation, not a security boundary, so any
-   checked-out skill could run import-time code with the health check's env. Their
-   control was a copy whose top level wrote a marker — it existed before the probe
-   returned. `test_a_marker_writing_copy_is_never_executed` is that control.
-
-2. An unmeasurable copy must NOT read as clean. The first draft skipped timeouts
-   and import errors, so `offenders == []` reported "none honour". The original
-   test PINNED that false reassurance; it is now inverted.
+Non-executing: a subprocess is failure isolation, not a security boundary, so a
+checked-out copy must never be imported. Fail-honest: an unmeasurable copy reads
+`unknown`, never as one of the clean ones.
 """
 import importlib.util
 import tempfile
@@ -41,7 +33,7 @@ def _vendor(ws: Path, body: str, name: str = "someskill") -> Path:
 
 class NonExecuting(unittest.TestCase):
     def test_a_marker_writing_copy_is_never_executed(self):
-        """qingyun-wu's control: detection must not run what it inspects."""
+        """Detection must not run what it inspects."""
         ws = Path(tempfile.mkdtemp())
         marker = ws / "side_effect_marker"
         _vendor(ws, f"open({str(marker)!r}, 'w').write('x')\n" + _HONOURS)
@@ -93,8 +85,8 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
 
     def test_a_delegate_verdict_survives_being_held_in_a_local(self):
-        """keweichen's round-14 finding 2: `t = sib.resolve_workspace(); return t`
-        dropped the callee's verdict, so a dirty delegate read clean."""
+        """`t = sib.resolve_workspace(); return t` must carry the callee's
+        verdict: a verdict taken only on the return path drops this shape."""
         d = Path(tempfile.mkdtemp())
         (d / "sutando_config.py").write_text(
             "import os\nfrom pathlib import Path\n"
@@ -122,8 +114,8 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
 
     def test_an_alias_that_is_not_os_is_never_trusted(self):
-        """keweichen's round-14 finding 1: `import helper as os` at module scope
-        while a nested `import os` supplies the identity to a file-wide scan."""
+        """`import helper as os` at module scope, with a nested `import os`
+        supplying the identity a file-wide scan would count instead."""
         d = Path(tempfile.mkdtemp())
         (d / "helper.py").write_text(
             "import os\ndef getenv(k):\n    return os.environ['SUTANDO_WORKSPACE']\n")
@@ -211,8 +203,8 @@ class EquivalentForms(unittest.TestCase):
 
 
 class UnresolvedIsNeverClean(unittest.TestCase):
-    """Round 4: the fallback was applied only to the return expression and
-    ignored dotted callees, so both shapes below read 'ignores' at 6a4ace97."""
+    """A call whose result is unaccounted for is `unknown`. Bare and dotted
+    callees alike: `mystery()` and `config.workspace()` each return a value."""
 
     def _verdict(self, src):
         d = Path(tempfile.mkdtemp())
@@ -262,8 +254,8 @@ class UnresolvedIsNeverClean(unittest.TestCase):
 
 
 class TheHopIsBudgeted(unittest.TestCase):
-    """Round 5: the one-hop limit was documented in prose and unenforced, so
-    mutual delegates recursed to RecursionError instead of failing closed."""
+    """The one-hop delegate limit is enforced, not documented: mutual
+    delegates must fail closed rather than recurse."""
 
     def test_mutual_delegates_fail_closed_instead_of_recursing(self):
         d = Path(tempfile.mkdtemp())
@@ -295,9 +287,8 @@ class TheHopIsBudgeted(unittest.TestCase):
 
 
 class TheKeyAndTheBindingAreDataflowToo(unittest.TestCase):
-    """Round 6: reads_env() recognized a literal key only and the taint pass
-    modelled Name targets only, so an env read reached the return unseen.
-    qingyun-wu's three controls all read 'ignores' at 2ca05484."""
+    """A non-literal key and a non-Name binding target are both dataflow. A
+    reader that models only literals and only Name targets misses the read."""
 
     def _verdict(self, src):
         d = Path(tempfile.mkdtemp())
@@ -414,10 +405,8 @@ class EveryBindingFormIsModelled(unittest.TestCase):
 
 
 class BindingsOutsideTheBody(unittest.TestCase):
-    """Round 7: the taint pass walked the FUNCTION BODY only, and the alias
-    collector kept a private rule that never learned the new binding forms.
-    qingyun-wu's three controls all read 'ignores' at 757e2c90; the fourth is
-    the same class, found by asking what else binds a name before the body."""
+    """Module scope binds names every function below reads, so a body-scoped
+    walk cannot see them; one shared binding enumerator, not a private rule."""
 
     def _verdict(self, src):
         d = Path(tempfile.mkdtemp())
@@ -489,8 +478,7 @@ class BindingsOutsideTheBody(unittest.TestCase):
             "    return Path(raw)\n"), "ignores")
 
     def test_the_probe_reports_it_too_not_only_the_verdict(self):
-        """qingyun ran both levels: a verdict that never reaches the probe's
-        detail is a fix nobody sees."""
+        """A verdict that never reaches the probe's detail is a fix nobody sees."""
         ws = Path(tempfile.mkdtemp())
         _vendor(ws, "import os\nfrom pathlib import Path\n"
                     "RAW = os.getenv('SUTANDO_WORKSPACE')\n"
@@ -502,9 +490,8 @@ class BindingsOutsideTheBody(unittest.TestCase):
 
 
 class OsPathIsNotAPureNamespace(unittest.TestCase):
-    """Round 8: unresolved_call() exempted `os.path.*` wholesale, and that
-    namespace contains expandvars(), which reads the environment. qingyun-wu's
-    control read 'ignores' at 1cca14b2, verdict AND probe detail."""
+    """`os.path` is not a pure namespace: it contains expandvars(), which reads
+    the environment, so a wholesale exemption of the namespace is a false clean."""
 
     def _verdict(self, src):
         d = Path(tempfile.mkdtemp())
@@ -569,9 +556,8 @@ class OsPathIsNotAPureNamespace(unittest.TestCase):
 
 
 class ProvenanceNotSuffix(unittest.TestCase):
-    """Round 9: the env APIs were matched by SUFFIX, so `helper.getenv(...)` and
-    `helper.environ[...]` — arbitrary imported code — were treated as understood
-    OS reads and exempted. qingyun-wu's controls read 'ignores' at cf974224."""
+    """Env APIs are matched by PROVEN origin, not by suffix: `helper.getenv(...)`
+    and `helper.environ[...]` are arbitrary imported code, not understood reads."""
 
     def _verdict(self, src):
         d = Path(tempfile.mkdtemp())
@@ -637,9 +623,8 @@ class ProvenanceNotSuffix(unittest.TestCase):
 
 
 class ProvenanceIsBindingAware(unittest.TestCase):
-    """Round 10: provenance was collected into unordered sets and never
-    invalidated, so a REBOUND trusted name kept its proof. qingyun-wu's two
-    controls read 'ignores' at 5ffd704b."""
+    """Proof of provenance is revoked by any later binding of the same name;
+    a trusted name that is rebound has stopped being the thing that was proven."""
 
     def _verdict(self, src):
         d = Path(tempfile.mkdtemp())
@@ -709,8 +694,8 @@ class ProvenanceCertifiesAProvenShape(unittest.TestCase):
         return hc._resolver_env_verdict(d / "workspace_default.py")[0]
 
     def test_a_star_import_is_never_proven(self):
-        """qingyun-wu's round-13 control: the star binds `os`, the nested import
-        is what the file-wide walk counted."""
+        """The star binds `os` unenumerably; a file-wide walk counts the nested
+        import instead and calls that provenance."""
         self.assertEqual(self._v(
             "from helper import *\nfrom pathlib import Path\n"
             "def unrelated():\n    import os\n"
@@ -744,10 +729,8 @@ class ProvenanceCertifiesAProvenShape(unittest.TestCase):
 
 
 class AGlobalRebindingIsABinding(unittest.TestCase):
-    """qingyun-wu's round-15 control: `global os; import helper as os` in a
-    function called at module init REPLACES the module binding, and CPython
-    records it as imported+global in that scope — never `assigned`. So a
-    revocation reading only is_assigned()/is_parameter() misses it."""
+    """`global os; import helper as os` REPLACES the module binding, and CPython
+    records it as imported+global in the child scope, never as assigned."""
 
     def _v(self, body):
         d = Path(tempfile.mkdtemp())
@@ -804,8 +787,8 @@ class BindingRevocationIsNotEnumerated(unittest.TestCase):
         return hc._resolver_env_verdict(d / "workspace_default.py")[0]
 
     def test_a_comprehension_target_is_not_proven(self):
-        """qingyun-wu's round-12 control. An earlier round DELETED the
-        comprehension branch as 'unreachable'; the value escapes via [0]."""
+        """A comprehension target binds the name for the comprehension, and the
+        value escapes via [0] — the branch is reachable."""
         self.assertEqual(self._v(
             "import os, helper\nfrom pathlib import Path\n"
             "def resolve_workspace():\n"
@@ -862,10 +845,8 @@ class BindingRevocationIsNotEnumerated(unittest.TestCase):
 
 
 class EveryBindingSourceRevokes(unittest.TestCase):
-    """Round 10 revoked provenance for imports and _bind_sites; parameters were a
-    SECOND enumerator it never consulted, so a parameter default could shadow a
-    trusted name and keep the module-level proof. Two enumerators of the same
-    question is the defect — one left out is one false clean per form."""
+    """Every source that binds a name revokes provenance. Two enumerators of
+    the same question is the defect: one left out is one false clean per form."""
 
     def _v(self, body):
         d = Path(tempfile.mkdtemp())
@@ -876,7 +857,7 @@ class EveryBindingSourceRevokes(unittest.TestCase):
         return hc._resolver_env_verdict(d / "workspace_default.py")[0]
 
     def test_a_parameter_default_shadowing_os_is_not_proven(self):
-        """qingyun-wu's round-11 control, verbatim. `ignores` at the parent."""
+        """A parameter default can shadow a trusted module-level name."""
         self.assertEqual(self._v(
             "import os, helper\nfrom pathlib import Path\n"
             "def resolve_workspace(os=helper):\n"
@@ -931,9 +912,109 @@ class EveryBindingSourceRevokes(unittest.TestCase):
         self.assertNotIn("none honour", r["detail"])
 
 
+class ScopeAndOriginAreProven(unittest.TestCase):
+    """A file-wide walk picks a function by NAME, and an import binds a name
+    without saying what it holds. Neither is the property being certified."""
+
+    def _v(self, body):
+        d = Path(tempfile.mkdtemp())
+        f = d / "workspace_default.py"
+        f.write_text(body)
+        return hc._resolver_env_verdict(f)[0]
+
+    _DIRTY = ("import os\nfrom pathlib import Path\n"
+              "def resolve_workspace():\n"
+              "    return Path(os.environ['SUTANDO_WORKSPACE'])\n")
+    _NESTED = ("def unrelated():\n"
+               "    def resolve_workspace():\n"
+               "        return Path('/clean')\n"
+               "    return resolve_workspace\n")
+
+    def test_a_nested_same_name_def_after_it_does_not_shadow_the_real_one(self):
+        self.assertEqual(self._v(self._DIRTY + self._NESTED), "honours")
+
+    def test_nor_does_one_declared_before_it(self):
+        """Ordering pair: a dict built by walking cannot depend on source order."""
+        self.assertEqual(
+            self._v("import os\nfrom pathlib import Path\n"
+                    + self._NESTED + self._DIRTY.split("\n", 2)[2]), "honours")
+
+    def test_a_genuinely_clean_module_level_resolver_still_reads_ignores(self):
+        """Positive control: scoping the lookup must not condemn every file."""
+        self.assertEqual(
+            self._v("from pathlib import Path\n"
+                    "def resolve_workspace():\n"
+                    "    return Path('/fixed')\n" + self._NESTED), "ignores")
+
+    def test_a_nested_def_in_the_DELEGATE_does_not_shadow_it_either(self):
+        """The sibling lookup selects by name across the whole file too."""
+        d = Path(tempfile.mkdtemp())
+        (d / "sutando_config.py").write_text(
+            "import os\nfrom pathlib import Path\n"
+            "def resolve_workspace():\n"
+            "    return Path(os.environ['SUTANDO_WORKSPACE'])\n"
+            "def unrelated():\n"
+            "    def resolve_workspace():\n"
+            "        return Path('/clean')\n"
+            "    return resolve_workspace\n")
+        (d / "workspace_default.py").write_text(
+            "import sutando_config\n"
+            "def resolve_workspace():\n"
+            "    return sutando_config.resolve_workspace()\n")
+        self.assertEqual(
+            hc._resolver_env_verdict(d / "workspace_default.py")[0], "honours")
+
+    def test_an_imported_value_is_unresolved_dataflow_not_a_clean_name(self):
+        """`WORKSPACE` holds whatever the other module put there — here, the env."""
+        d = Path(tempfile.mkdtemp())
+        (d / "helper.py").write_text(
+            "import os\nWORKSPACE = os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "from pathlib import Path\nfrom helper import WORKSPACE\n"
+            "def resolve_workspace():\n"
+            "    return Path(WORKSPACE)\n")
+        v, why = hc._resolver_env_verdict(d / "workspace_default.py")
+        self.assertEqual(v, "unknown", why)
+        self.assertIn("WORKSPACE", why)
+
+    def test_a_dotted_read_off_an_imported_module_is_unresolved_too(self):
+        self.assertEqual(
+            self._v("import helper\nfrom pathlib import Path\n"
+                    "def resolve_workspace():\n"
+                    "    return Path(helper.WORKSPACE)\n"), "unknown")
+
+    def test_but_a_followed_module_call_is_not_an_opaque_value(self):
+        """Negative control: the delegate hop must survive the origin rule."""
+        d = Path(tempfile.mkdtemp())
+        (d / "sutando_config.py").write_text(
+            "from pathlib import Path\n"
+            "def resolve_workspace():\n    return Path('/c')\n")
+        (d / "workspace_default.py").write_text(
+            "import sutando_config\n"
+            "def resolve_workspace():\n"
+            "    return sutando_config.resolve_workspace()\n")
+        self.assertEqual(
+            hc._resolver_env_verdict(d / "workspace_default.py")[0], "ignores")
+
+    def test_the_probe_reports_the_opaque_import_rather_than_ok(self):
+        """Integrated: the classifier verdict must reach the probe's status."""
+        ws = Path(tempfile.mkdtemp())
+        d = ws / "skill-repos" / "opaque" / "scripts"
+        d.mkdir(parents=True)
+        (d / "helper.py").write_text(
+            "import os\nWORKSPACE = os.environ['SUTANDO_WORKSPACE']\n")
+        (d / "workspace_default.py").write_text(
+            "from pathlib import Path\nfrom helper import WORKSPACE\n"
+            "def resolve_workspace():\n"
+            "    return Path(WORKSPACE)\n")
+        r = hc.check_vendored_resolver_env(workspace_dir=ws)
+        self.assertEqual(r["status"], "warn")
+        self.assertNotIn("none honour", r["detail"])
+
+
 class Coverage(unittest.TestCase):
     def test_zero_copies_reports_coverage_rather_than_going_silent(self):
-        """Sutando-Mini on #3892: a probe that finds nothing must SAY so."""
+        """A probe that finds nothing must SAY so."""
         r = hc.check_vendored_resolver_env(workspace_dir=Path(tempfile.mkdtemp()))
         self.assertIsNotNone(r)
         self.assertEqual(r["status"], "ok")

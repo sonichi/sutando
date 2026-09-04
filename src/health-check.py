@@ -9261,7 +9261,9 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
         tree = ast.parse(src)
     except Exception as e:                       # noqa: BLE001 — unparseable is UNKNOWN
         return "unknown", f"could not parse: {str(e)[:60]}"
-    modfns = {n.name: n for n in ast.walk(tree)
+    # MODULE scope, not the whole file: a nested def of the same name would
+    # otherwise overwrite the one the runtime actually calls.
+    modfns = {n.name: n for n in _walk_outside_functions(tree)
               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
     def sibling(dotted: "str"):
@@ -9277,7 +9279,7 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
             sub = ast.parse(sib.read_text())
         except Exception:                        # noqa: BLE001
             return None
-        for n in ast.walk(sub):
+        for n in _walk_outside_functions(sub):
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
                 return sib, n
         return None
@@ -9347,6 +9349,21 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
         elif isinstance(n, ast.ImportFrom):
             for al in n.names:
                 imported.add(al.asname or al.name)
+
+    # Membership in `imported` proves a name was BOUND by an import, never what
+    # it holds; only these four sets carry a followed origin.
+    proven = os_names | getenv_names | environ_names | expandvars_names
+
+    def _callee_bases(expr) -> set:
+        """Head name of every callee in expr — unresolved_call() already judged
+        these, so the import merely names a module it followed."""
+        out = set()
+        for c in ast.walk(expr):
+            if isinstance(c, ast.Call):
+                d = _dots(c.func)
+                if d:
+                    out.add(d.split(".")[0])
+        return out
 
     def _keyed(node) -> bool:
         return _const_str(node) == _REMOVED_WS_ENV
@@ -9507,6 +9524,11 @@ def _resolver_env_verdict(path: "Path", _hops: int = 1) -> "tuple[str, str]":
                 return dv
             bad = (unresolved_call(n.value) or murky_env_read(n.value)
                    or next((murky[x] for x in names if x in murky), None)
+                   or next((f"the imported value {x}" for x in names
+                            if x in imported and x not in proven
+                            and x not in bound and x not in modfns
+                            and x not in _RESOLVED_CALLS
+                            and x not in _callee_bases(n.value)), None)
                    or next((f"the unbound name {x}" for x in names
                             if x not in bound and x not in imported
                             and x not in modfns and x not in _RESOLVED_CALLS
@@ -9665,9 +9687,9 @@ def check_vendored_resolver_env(workspace_dir: "Path | None" = None) -> "dict | 
     v0.8 (#1440) removed that env var as a workspace source, so a copy predating
     the change resolves elsewhere than every v0.8 consumer whenever it is set.
 
-    STATIC ONLY. An earlier draft imported each discovered copy in a subprocess;
-    qingyun-wu showed that executes arbitrary checked-out source with the health
-    check's environment. Nothing here runs the files it inspects.
+    STATIC ONLY. Importing a copy — even in a subprocess — executes arbitrary
+    checked-out source with this process's environment. Nothing here runs the
+    files it inspects.
 
     Three-valued on purpose: a copy that cannot be analysed is `unknown`, never
     folded into a clean bill — an unmeasured offender is the case this exists for.
