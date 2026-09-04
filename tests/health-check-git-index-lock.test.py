@@ -180,6 +180,62 @@ class GitIndexLock(unittest.TestCase):
         self.assertIsNone(hc._git_dir(d))
         self.assertEqual(hc.check_git_index_lock(d)["status"], "ok")
 
+    # ---- the answer must belong to THIS checkout ------------------------------
+
+    def _stale(self, lock):
+        lock.write_text("")
+        old = time.time() - 9 * 3600
+        os.utime(lock, (old, old))
+
+    def test_an_inherited_GIT_DIR_does_not_make_git_answer_for_another_repo(self):
+        """`git -C` does not neutralise GIT_DIR: inherited, it points the whole
+        resolver at another repository. False-clean AND wrong-target."""
+        a, b = self._repo("a"), self._repo("b")
+        self._stale(a / ".git" / "index.lock")
+        with unittest.mock.patch.dict(os.environ, {"GIT_DIR": str(b / ".git")}):
+            r = hc.check_git_index_lock(a)
+        self.assertEqual(r["status"], "warn")
+        self.assertIn(str(a / ".git" / "index.lock"), r["detail"])
+        os.unlink(a / ".git" / "index.lock")
+        self._stale(b / ".git" / "index.lock")
+        with unittest.mock.patch.dict(os.environ, {"GIT_DIR": str(b / ".git")}):
+            r = hc.check_git_index_lock(a)
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn(str(b), r["detail"])
+
+    def test_the_stripped_set_covers_gits_own_local_env_list(self):
+        """Git enumerates its repository-selection variables itself; the
+        shipped set must be a superset of what the installed git reports."""
+        out = _git(self.repo, "rev-parse", "--local-env-vars")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        theirs = set(out.stdout.split())
+        self.assertTrue(theirs)
+        self.assertLessEqual(theirs, hc.GIT_REPO_SELECTION_ENV,
+                             f"git names variables the probe does not strip: "
+                             f"{sorted(theirs - hc.GIT_REPO_SELECTION_ENV)}")
+
+    def test_a_gitdir_with_a_trailing_space_is_probed_where_git_says_it_is(self):
+        """Git returns the significant trailing space; `.strip()` turned it into
+        the stripped SIBLING, which is a different existing directory."""
+        wt = Path(self.tmp.name) / "wt"
+        wt.mkdir()
+        real = Path(self.tmp.name) / "gitdir "
+        r = _git(wt, "init", "-q", "-b", "main", "--separate-git-dir", str(real))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        (wt / "f.txt").write_text("x")
+        _git(wt, "add", "f.txt")
+        sibling = Path(self.tmp.name) / "gitdir"
+        sibling.mkdir()
+        self._stale(sibling / "index.lock")          # unrelated: wrong-target bait
+        r = hc.check_git_index_lock(wt)
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self._stale(real / "index.lock")             # the real lock: false-clean bait
+        r = hc.check_git_index_lock(wt)
+        self.assertEqual(r["status"], "warn")
+        # git reports the realpath (/private/var on macOS); the space survives.
+        self.assertIn(shlex.quote(str(real.resolve() / "index.lock")), r["detail"])
+        self.assertNotIn(str(sibling.resolve() / "index.lock"), r["detail"])
+
     # ---- unknown stat result is not a measured absence -----------------------
 
     def test_a_stat_error_that_is_not_absence_is_reported_as_unmeasured(self):
@@ -196,6 +252,24 @@ class GitIndexLock(unittest.TestCase):
         self.assertEqual(r["status"], "warn")
         self.assertIn("UNMEASURED", r["detail"])
         self.assertNotIn("unblocked", r["detail"])
+
+    def test_every_caught_stat_error_class_is_reported_not_raised(self):
+        """The handler catches ValueError and RuntimeError too; formatting via
+        the OSError-only `.strerror` raised AttributeError out of the sweep."""
+        repo = self._repo("stat-classes")
+        real_stat = Path.lstat
+        for exc in (RuntimeError("symlink loop"), ValueError("embedded null"),
+                    PermissionError(13, "Permission denied")):
+            def boom(self_path, *a, _e=exc, **k):
+                if self_path.name == "index.lock":
+                    raise _e
+                return real_stat(self_path, *a, **k)
+            with unittest.mock.patch.object(Path, "lstat", boom):
+                r = hc.check_git_index_lock(repo)
+            self.assertEqual(r["status"], "warn", type(exc).__name__)
+            self.assertIn("UNMEASURED", r["detail"])
+            self.assertIn(type(exc).__name__, r["detail"])
+            self.assertIn(str(exc.args[-1]), r["detail"])
 
     def test_a_genuinely_missing_lock_is_still_a_clean_ok(self):
         repo = self._repo("no-lock")
