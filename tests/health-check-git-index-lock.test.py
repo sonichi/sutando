@@ -274,6 +274,41 @@ class TargetMustBelongToThisCheckout(unittest.TestCase):
         self.assertNotIn("unblocked", r["detail"],
                          "a dangling entry blocks git; stat() would have called it absent")
 
+    def test_git_unavailable_fails_closed_with_no_remedy(self):
+        """keweichen: when association cannot be established, no `rm` advice."""
+        import subprocess as sp
+        real = sp.run
+
+        def boom(argv, *a, **k):
+            if "rev-parse" in argv:
+                raise OSError(2, "No such file or directory: git")
+            return real(argv, *a, **k)
+
+        co = self.root / "nogit"
+        subprocess.run(["git", "init", "-q", str(co)], check=True, capture_output=True)
+        (co / ".git" / "index.lock").write_text("")
+        with unittest.mock.patch.object(sp, "run", boom):
+            r = hc.check_git_index_lock(co)
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("not a git checkout", r["detail"])
+        self.assertNotIn("rm ", r["detail"])
+
+    def test_an_unusable_resolver_answer_fails_closed(self):
+        """A path git returns that cannot even be inspected is not a gitdir."""
+        real_is_dir = Path.is_dir
+
+        def boom(self_path, *a, **k):
+            if self_path.name == ".git":
+                raise RuntimeError("Symlink loop")
+            return real_is_dir(self_path, *a, **k)
+
+        co = self.root / "loopy"
+        subprocess.run(["git", "init", "-q", str(co)], check=True, capture_output=True)
+        with unittest.mock.patch.object(Path, "is_dir", boom):
+            r = hc.check_git_index_lock(co)
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("rm ", r["detail"])
+
     def test_a_future_dated_lock_is_unmeasured_not_in_flight(self):
         co = self.root / "future"
         subprocess.run(["git", "init", "-q", str(co)], check=True, capture_output=True)
