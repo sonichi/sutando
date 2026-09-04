@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """The one writer contract for `state/idle-streak.json`.
 
-Two tools mutate this record — `idle-surface-hash.py` (counters, hash) and
-`idle-held.py` (the held list, notes). A read-modify-replace that skips the
-sidecar lock silently drops whichever concurrent write lands first, and the
-losing writer still reports success, so the contract lives here rather than
-being restated per call site.
+Two tools mutate this record; an unlocked read-modify-replace drops one silently.
 """
 from __future__ import annotations
 
@@ -26,10 +22,8 @@ REFUSED = object()
 
 
 def read_state_strict(path: Path):
-    """(doc, err) — absent is ({}, None); unreadable or malformed is (None, why).
-
-    Collapsing those two into {} makes a truncated file look like a fresh one.
-    """
+    """(doc, err): absent is ({}, None), unreadable/malformed is (None, why).
+    Collapsing the two makes a truncated file look like a fresh one."""
     p = Path(path)
     if not p.exists():
         return {}, None
@@ -58,9 +52,7 @@ def write_state(path: Path, doc: dict, indent: int | None = None) -> None:
 
 def locked_update(path: Path, mutate, indent: int | None = None):
     """Read, `mutate(doc)`, write — all inside the record's exclusive lock.
-
-    The read must be INSIDE it: a doc read earlier is already stale.
-    """
+    The read must be INSIDE it: a doc read earlier is already stale."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_suffix(".json.lock")

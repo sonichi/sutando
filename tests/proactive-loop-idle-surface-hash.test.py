@@ -182,8 +182,8 @@ check("CONCURRENCY: and --commit's own hash still landed",
       f"hash={_final.get('last_surfaced_hash')!r}")
 
 
-# FAIL-CLOSED on an unreadable record: a parse failure is not authorisation to
-# discard it. @qingyun-wu measured streak=7 + held_item_ids replaced by counters.
+# FAIL-CLOSED: a parse failure is not authorisation to discard the record,
+# which a lenient read turns into {} that the counters are then written onto.
 def _refuses(raw, label):
     f = pathlib.Path(tempfile.mkdtemp()) / "idle-streak.json"
     f.write_text(raw)

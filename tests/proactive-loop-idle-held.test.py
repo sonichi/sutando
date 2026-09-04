@@ -300,7 +300,7 @@ with _tf.TemporaryDirectory() as td:
           f"rc={r.returncode} {r.stdout}{r.stderr}")
 
 
-# --init-empty: the ONE path that may create the key, and only when absent (#3773).
+# --init-empty: the ONE path that may create the key, and only when absent.
 # `load` cannot tell a never-seeded host from a drifted one, so it refuses both.
 fresh = pathlib.Path(tempfile.mkdtemp()) / "s.json"
 fresh.write_text(json.dumps({"streak": 0, "noop_total": 48,

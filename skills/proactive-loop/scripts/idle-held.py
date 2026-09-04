@@ -46,9 +46,7 @@ KEY = "held_item_ids"
 
 def init_empty(state: Path) -> int:
     """The one path that may create the key, and only when it is absent.
-
-    [] asserts nothing held, so this cannot become the invented list.
-    """
+    [] asserts nothing held, so this cannot become the invented list."""
     if not state.is_file():
         print(f"CANNOT ANSWER: no state file at {state}", file=sys.stderr)
         return 2
