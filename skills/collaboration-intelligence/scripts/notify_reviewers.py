@@ -700,6 +700,18 @@ def _latest_outcomes(led: Path) -> dict:
     return _fold(_streams(led), lambda st: st["last"], lambda a, b: b)
 
 
+def _latest_with_identity(led: Path) -> dict:
+    """(repo, pr, RAW spelling) -> ((outcome, ts), identity-as-written).
+
+    The identity rides along so a reader can compare on the AXIS the row used.
+    A raw spelling alone cannot: one person's endpoint and another's roster key
+    can be the same text, and resolving that by a fixed axis order aliases them.
+    """
+    return _fold(_streams(led),
+                 lambda st: (st["last"], dict(st.get("last_identity") or {})),
+                 lambda a, b: b)
+
+
 def _first_ask(led: Path, canonical=None) -> dict:
     """(repo, pr, actor) -> earliest ts at which an ask actually reached them."""
     def per_stream(st):
@@ -744,18 +756,30 @@ def unknown_parked(message: str, reviewer: str, actor: str = None,
     try:
         # Per RAW spelling, then OR across the actor: alpha's definite failure
         # settles alpha's reservation and proves nothing about beta's post.
-        latest = _latest_outcomes(led)
+        latest = _latest_with_identity(led)
     except OSError:
         # Cannot read the park state, so cannot prove this was NOT parked. Fail
         # closed: refusing a send is recoverable, a duplicated unsafe post is not.
         return True
     canon = canonical or (lambda w: w)
-    for (repo, num, row_who), (outcome, _ts) in latest.items():
-        # Endpoint first — it names the recipient under any spelling; the name
-        # comparison stays for legacy rows carrying only `reviewer`.
-        if not (endpoint and row_who == endpoint):
-            if canon(row_who) != canon(who) and row_who not in (who, reviewer):
+    for (repo, num, row_who), ((outcome, _ts), ident) in latest.items():
+        # Compare on the axis the ROW recorded: a bare `row_who` is ambiguous,
+        # since one person's endpoint can be another's roster key.
+        row_endpoint = ident.get("endpoint")
+        row_names = {ident.get(f) for f in ("reviewer", "actor")} - {None}
+        if row_endpoint and endpoint:
+            # Both sides name a recipient: the endpoint decides, alone. Falling
+            # back to names here re-aliases two people who share a roster key.
+            if row_endpoint != endpoint:
                 continue
+        elif row_endpoint or row_names:
+            cands = row_names or {row_endpoint}
+            if not any(canon(n) == canon(who) or n in (who, reviewer)
+                       for n in cands):
+                continue
+        # Legacy rows carry no identity fields at all; fall back to the raw key.
+        elif canon(row_who) != canon(who) and row_who not in (who, reviewer):
+            continue
         if any(_canon_repo(repo) in (r, None) and num == str(n)
                for r, n in refs):
             if outcome in _UNSAFE_OUTCOMES:

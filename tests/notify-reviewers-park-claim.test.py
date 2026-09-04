@@ -781,6 +781,32 @@ class TypedIdentityMembership(unittest.TestCase):
         tags = nr.component_tags(self._shared_endpoint(nr._MAX_TAGS - 112), "p0")
         self.assertEqual(len(tags), nr._MAX_TAGS - 111)
 
+    def test_a_persisted_endpoint_does_not_park_the_person_it_is_named_after(self):
+        """The direction the resolver test cannot reach.
+
+        `canon("@shared:x") != canon("bob")` passes precisely while a PERSISTED
+        endpoint row for bob is read as the reviewer whose roster key is that
+        same text -- so it certifies nothing about the park.
+        """
+        nr = _nr()
+        td = tempfile.mkdtemp()
+        os.environ["SUTANDO_SCI_LEDGER"] = os.path.join(td, "ledger.jsonl")
+        canon = nr.component_resolver(self.COLLIDING)
+        ep = lambda n: nr.durable_endpoint(self.COLLIDING[n])
+        nr.record_asks(MSG, "bob", "unknown", actor="bob", endpoint=ep("bob"),
+                       membership=nr.component_tags(self.COLLIDING, "bob"))
+        self.assertTrue(
+            nr.unknown_parked(MSG, "bob", "bob", canonical=canon, endpoint=ep("bob")),
+            "bob's own unknown must still park bob")
+        self.assertFalse(
+            nr.unknown_parked(MSG, "@shared:x", "@shared:x", canonical=canon,
+                              endpoint=ep("@shared:x")),
+            "an unknown to bob parked the unrelated reviewer named @shared:x")
+        self.assertFalse(
+            nr.unknown_parked(MSG, "carol", "carol", canonical=canon,
+                              endpoint="@carol:x"),
+            "control: an unrelated third party must never be parked")
+
     def test_a_legacy_row_still_overlaps_a_freshly_encoded_one(self):
         # The encoding is a two-sided change: rows written before it must
         # canonicalize to the same tag or every standing park reads as absent.
